@@ -32,7 +32,9 @@ enum class ViewMode : int {
     ExtraLargeIcons = 5, // Bardzo duże ikony (256px)
     JumboIcons = 6,      // Gigantyczne ikony (380px)
     Proportions = 7,     // Proporcje (WinDirStat / WizTree Squarified Treemap)
-    FullViewer = 8       // Pełny podgląd w oknie (In-Window Image/Media Viewer + filmstrip)
+    PieChart = 8,        // Kołowy (Multi-ring Sunburst / Radial Pie Disk Space Chart)
+    Hardware = 9,        // Sprzęt (Pro Mode Hardware & Real-Time Telemetry Workstation)
+    FullViewer = 10      // Pełny podgląd w oknie (In-Window Image/Media Viewer + filmstrip)
 };
 
 enum class SortColumn : int {
@@ -47,7 +49,19 @@ enum class RibbonTab : int {
     Home = 1,
     Share = 2,
     View = 3,
-    Search = 4
+    Search = 4,
+    Hardware = 5
+};
+
+enum class HardwareSubTab : int {
+    All = 0,
+    Cpu = 1,
+    Gpu = 2,
+    Ram = 3,
+    Motherboard = 4,
+    Disks = 5,
+    Network = 6,
+    System = 7
 };
 
 enum class SearchSizeUnit : int {
@@ -182,6 +196,31 @@ struct TreemapHitNode {
     std::wstring name;
     std::wstring relPath;
     std::wstring fullPath;
+};
+
+struct PieSectorHitNode {
+    float startAngleDeg = 0.0f;
+    float sweepAngleDeg = 0.0f;
+    float innerRadius = 0.0f;
+    float outerRadius = 0.0f;
+    D2D1_RECT_F legendRect = {};
+    bool hasLegendRect = false;
+    int topItemIndex = -1;
+    int depth = 0;
+    uint32_t color = 0x546E7A;
+    uint64_t size = 0;
+    bool isDirectory = false;
+    bool isInFlight = false;
+    std::wstring name;
+    std::wstring relPath;
+    std::wstring fullPath;
+};
+
+struct HardwareCardHit {
+    D2D1_RECT_F rect = {};
+    int cmdId = 0;
+    std::wstring copyText;
+    std::wstring label;
 };
 
 struct UndoDeleteBatch {

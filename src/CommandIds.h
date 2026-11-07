@@ -13,6 +13,7 @@ enum CommandId : int {
     CMD_TOGGLE_LANG = 5,
     CMD_TOGGLE_RIBBON = 6,
     CMD_TAB_SEARCH = 7,
+    CMD_TAB_HARDWARE = 8,
 
     // Home Tab Commands
     CMD_PIN_QUICK = 10,
@@ -50,6 +51,7 @@ enum CommandId : int {
     CMD_TOGGLE_HIDDEN = 51,
     CMD_VIEW_JUMBO = 52,
     CMD_VIEW_PROPORTIONS = 53,
+    CMD_VIEW_PIECHART = 54,
 
     // Navigation Bar & Column Header Buttons
     CMD_NAV_BACK = 60,
@@ -110,6 +112,41 @@ enum CommandId : int {
     CMD_SEARCH_CAT_DOCS = 117,
     CMD_SEARCH_TYPE_LIST_MENU = 118,
     CMD_SEARCH_EDIT_CUSTOM_EXT = 119,
+
+    // Share ("Udostępnianie") & File ("Plik") Ribbon Tab Commands (120..135)
+    CMD_SHARE_ZIP = 120,
+    CMD_SHARE_EXTRACT_ZIP = 121,
+    CMD_SHARE_EMAIL = 122,
+    CMD_SHARE_PRINT = 123,
+    CMD_SHARE_COPY_NAME = 124,
+    CMD_SHARE_WIN_EXPLORER = 125,
+    CMD_SHARE_POWERSHELL = 126,
+    CMD_SHARE_CMD = 127,
+    CMD_SHARE_MAP_DRIVE = 128,
+    CMD_SHARE_DISCONNECT_DRIVE = 129,
+    CMD_FILE_NEW_WINDOW = 130,
+    CMD_FILE_EXIT = 131,
+
+    // Hardware Pro Mode ("Sprzęt") Ribbon & Dashboard Commands (140..165)
+    CMD_HW_SUB_ALL = 140,
+    CMD_HW_SUB_CPU = 141,
+    CMD_HW_SUB_GPU = 142,
+    CMD_HW_SUB_RAM = 143,
+    CMD_HW_SUB_MOBO = 144,
+    CMD_HW_SUB_DISKS = 145,
+    CMD_HW_SUB_NET = 146,
+    CMD_HW_SUB_SYSTEM = 147,
+    CMD_HW_REFRESH = 148,
+    CMD_HW_TOGGLE_LIVE = 149,
+    CMD_HW_BENCH_CPU = 150,
+    CMD_HW_BENCH_RAM = 151,
+    CMD_HW_COPY_REPORT = 152,
+    CMD_HW_SAVE_REPORT = 153,
+    CMD_HW_OPEN_DEVMGR = 154,
+    CMD_HW_OPEN_TASKMGR = 155,
+    CMD_HW_OPEN_MSINFO = 156,
+    CMD_HW_OPEN_DXDIAG = 157,
+    CMD_HW_BACK_TO_FILES = 158,
 
     CMD_BASE_SEARCH_EXT_MENU = 700, // 700..799
 

@@ -5,6 +5,7 @@
 #include "ImageCache.h"
 #include "ShellMenuEmulator.h"
 #include "MediaPlayer.h"
+#include "HardwareInfo.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <string>
@@ -44,6 +45,8 @@ private:
     void DrawDetailsView(const D2D1_RECT_F& rect);
     void DrawGridOrListView(const D2D1_RECT_F& rect);
     void DrawProportionsView(const D2D1_RECT_F& rect);
+    void DrawPieChartView(const D2D1_RECT_F& rect);
+    void DrawHardwareProView(const D2D1_RECT_F& rect);
     void DrawMarqueeOverlay();
     void DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilmstrip);
     void DrawPreviewPane(const D2D1_RECT_F& rect);
@@ -258,6 +261,21 @@ private:
     std::vector<RibbonButtonHit> m_ribbonHits;
     std::vector<TreemapHitNode> m_treemapHits;
     int m_hoverTreemapHitIndex = -1;
+    std::vector<PieSectorHitNode> m_pieHits;
+    int m_hoverPieHitIndex = -1;
+    D2D1_POINT_2F m_pieCenterPt = {};
+    float m_pieCenterRadius = 0.0f;
+
+    // Hardware Pro Mode state & hit regions
+    HardwareInspector m_hwInspector;
+    HardwareSubTab m_hwSubTab = HardwareSubTab::All;
+    bool m_hwLiveRefresh = true;
+    ULONGLONG m_lastHwLiveUpdateTick = 0;
+    float m_hwScrollY = 0.0f;
+    float m_hwMaxScrollY = 0.0f;
+    std::vector<HardwareCardHit> m_hwCardHits;
+    int m_hoverHwCardIndex = -1;
+
     D2D1_RECT_F m_addressBarRect = {};
     D2D1_RECT_F m_searchBarRect = {};
     D2D1_RECT_F m_ScrollbarThumbRect = {};

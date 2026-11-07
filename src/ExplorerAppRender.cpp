@@ -422,6 +422,125 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
         m_rt->FillRectangle(b3, m_solidBrush);
         break;
     }
+    case CMD_SHARE_ZIP:
+    case CMD_SHARE_EXTRACT_ZIP: {
+        // Golden folder with vertical zipper teeth
+        DrawFolderVectorIcon(D2D1::RectF(cx - sz * 0.9f, cy - sz * 0.8f, cx + sz * 0.9f, cy + sz * 0.8f));
+        m_solidBrush->SetColor(HexColor(0x5D4037));
+        for (int z = -2; z <= 3; ++z) {
+            float zy = cy + z * (sz * 0.22f);
+            float zx = cx + ((z & 1) ? -1.5f : 1.5f);
+            m_rt->FillRectangle(D2D1::RectF(zx - 2.0f, zy - 1.2f, zx + 2.0f, zy + 1.2f), m_solidBrush);
+        }
+        if (cmdId == CMD_SHARE_EXTRACT_ZIP) {
+            m_solidBrush->SetColor(HexColor(0x0078D7));
+            m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.35f, cy + sz * 0.5f), D2D1::Point2F(cx + sz * 0.35f, cy - sz * 0.45f), m_solidBrush, 2.2f);
+            m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.35f, cy - sz * 0.45f), D2D1::Point2F(cx + sz * 0.05f, cy - sz * 0.15f), m_solidBrush, 2.2f);
+            m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.35f, cy - sz * 0.45f), D2D1::Point2F(cx + sz * 0.65f, cy - sz * 0.15f), m_solidBrush, 2.2f);
+        }
+        break;
+    }
+    case CMD_SHARE_EMAIL: {
+        // Blue/white envelope icon
+        D2D1_RECT_F env = D2D1::RectF(cx - sz * 0.88f, cy - sz * 0.62f, cx + sz * 0.88f, cy + sz * 0.62f);
+        m_solidBrush->SetColor(HexColor(0xFFFFFF));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(env, 2.0f, 2.0f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x0078D7));
+        m_rt->DrawRoundedRectangle(D2D1::RoundedRect(env, 2.0f, 2.0f), m_solidBrush, 1.5f);
+        m_rt->DrawLine(D2D1::Point2F(env.left + 1.5f, env.top + 1.5f), D2D1::Point2F(cx, cy + sz * 0.1f), m_solidBrush, 1.5f);
+        m_rt->DrawLine(D2D1::Point2F(env.right - 1.5f, env.top + 1.5f), D2D1::Point2F(cx, cy + sz * 0.1f), m_solidBrush, 1.5f);
+        break;
+    }
+    case CMD_SHARE_PRINT: {
+        // Printer icon
+        D2D1_RECT_F bodyR = D2D1::RectF(cx - sz * 0.85f, cy - sz * 0.25f, cx + sz * 0.85f, cy + sz * 0.45f);
+        D2D1_RECT_F paperR = D2D1::RectF(cx - sz * 0.55f, cy - sz * 0.75f, cx + sz * 0.55f, cy + sz * 0.8f);
+        m_solidBrush->SetColor(HexColor(0xFFFFFF));
+        m_rt->FillRectangle(paperR, m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x6D7885));
+        m_rt->DrawRectangle(paperR, m_solidBrush, 1.2f);
+        m_solidBrush->SetColor(HexColor(0x455A64));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(bodyR, 2.0f, 2.0f), m_solidBrush);
+        break;
+    }
+    case CMD_SHARE_POWERSHELL:
+    case CMD_SHARE_CMD: {
+        // Console window [>_]
+        D2D1_RECT_F winR = D2D1::RectF(cx - sz * 0.88f, cy - sz * 0.72f, cx + sz * 0.88f, cy + sz * 0.72f);
+        m_solidBrush->SetColor(HexColor(cmdId == CMD_SHARE_POWERSHELL ? 0x012456 : 0x1E1E1E));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(winR, 2.5f, 2.5f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0xECEFF4));
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.48f, cy - sz * 0.25f), D2D1::Point2F(cx - sz * 0.12f, cy + sz * 0.05f), m_solidBrush, 1.8f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.48f, cy + sz * 0.35f), D2D1::Point2F(cx - sz * 0.12f, cy + sz * 0.05f), m_solidBrush, 1.8f);
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.05f, cy + sz * 0.35f), D2D1::Point2F(cx + sz * 0.50f, cy + sz * 0.35f), m_solidBrush, 1.8f);
+        break;
+    }
+    case CMD_SHARE_WIN_EXPLORER:
+    case CMD_FILE_NEW_WINDOW: {
+        DrawFolderVectorIcon(D2D1::RectF(cx - sz * 0.9f, cy - sz * 0.8f, cx + sz * 0.9f, cy + sz * 0.8f));
+        m_solidBrush->SetColor(HexColor(0x0078D7));
+        m_rt->FillRectangle(D2D1::RectF(cx - sz * 0.6f, cy + sz * 0.35f, cx + sz * 0.6f, cy + sz * 0.7f), m_solidBrush);
+        break;
+    }
+    case CMD_FILE_EXIT: {
+        m_solidBrush->SetColor(HexColor(0xE81123));
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.65f, cy - sz * 0.65f), D2D1::Point2F(cx + sz * 0.65f, cy + sz * 0.65f), m_solidBrush, 2.6f);
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.65f, cy - sz * 0.65f), D2D1::Point2F(cx - sz * 0.65f, cy + sz * 0.65f), m_solidBrush, 2.6f);
+        break;
+    }
+    case CMD_VIEW_PIECHART: {
+        // Multi-colored circular pie chart icon
+        float r = sz * 0.85f;
+        m_solidBrush->SetColor(HexColor(0x1E88E5));
+        m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), m_solidBrush);
+        if (m_d2dFactory) {
+            auto drawSlice = [&](float a0, float a1, UINT32 col) {
+                ID2D1PathGeometry* pg = nullptr;
+                if (SUCCEEDED(m_d2dFactory->CreatePathGeometry(&pg)) && pg) {
+                    ID2D1GeometrySink* sk = nullptr;
+                    if (SUCCEEDED(pg->Open(&sk)) && sk) {
+                        sk->BeginFigure(D2D1::Point2F(cx, cy), D2D1_FIGURE_BEGIN_FILLED);
+                        sk->AddLine(D2D1::Point2F(cx + std::cos(a0) * r, cy + std::sin(a0) * r));
+                        sk->AddArc(D2D1::ArcSegment(
+                            D2D1::Point2F(cx + std::cos(a1) * r, cy + std::sin(a1) * r),
+                            D2D1::SizeF(r, r), 0.0f, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                            (a1 - a0 > 3.14159f) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL));
+                        sk->EndFigure(D2D1_FIGURE_END_CLOSED);
+                        sk->Close();
+                        sk->Release();
+                    }
+                    m_solidBrush->SetColor(HexColor(col));
+                    m_rt->FillGeometry(pg, m_solidBrush);
+                    pg->Release();
+                }
+            };
+            drawSlice(-1.57f, 0.55f, 0x43A047);
+            drawSlice(0.55f, 2.35f, 0xFB8C00);
+        }
+        m_solidBrush->SetColor(HexColor(0xFFFFFF));
+        m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r * 0.32f, r * 0.32f), m_solidBrush);
+        break;
+    }
+    case CMD_TAB_HARDWARE:
+    case CMD_HW_BENCH_CPU:
+    case CMD_HW_BENCH_RAM:
+    case CMD_HW_REFRESH: {
+        // CPU / Microchip vector icon
+        D2D1_RECT_F chip = D2D1::RectF(cx - sz * 0.58f, cy - sz * 0.58f, cx + sz * 0.58f, cy + sz * 0.58f);
+        m_solidBrush->SetColor(HexColor(0x0078D7));
+        m_rt->FillRectangle(chip, m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x50E6FF));
+        m_rt->FillRectangle(D2D1::RectF(cx - sz * 0.32f, cy - sz * 0.32f, cx + sz * 0.32f, cy + sz * 0.32f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x005A9E));
+        for (int i = -1; i <= 1; ++i) {
+            float off = i * sz * 0.35f;
+            m_rt->DrawLine(D2D1::Point2F(cx + off, cy - sz * 0.88f), D2D1::Point2F(cx + off, cy - sz * 0.58f), m_solidBrush, 1.5f);
+            m_rt->DrawLine(D2D1::Point2F(cx + off, cy + sz * 0.58f), D2D1::Point2F(cx + off, cy + sz * 0.88f), m_solidBrush, 1.5f);
+            m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.88f, cy + off), D2D1::Point2F(cx - sz * 0.58f, cy + off), m_solidBrush, 1.5f);
+            m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.58f, cy + off), D2D1::Point2F(cx + sz * 0.88f, cy + off), m_solidBrush, 1.5f);
+        }
+        break;
+    }
     default: {
         D2D1_RECT_F box = D2D1::RectF(cx - sz * 0.55f, cy - sz * 0.55f, cx + sz * 0.55f, cy + sz * 0.55f);
         m_solidBrush->SetColor(HexColor(0x4B89DA));
@@ -451,11 +570,12 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         bool isBlueFileTab;
     };
     TabDef tabs[] = {
-        { CMD_TAB_FILE,   RibbonTab::File,   s.tabFile,   58.0f,  true  },
-        { CMD_TAB_HOME,   RibbonTab::Home,   s.tabHome,   118.0f, false },
-        { CMD_TAB_SHARE,  RibbonTab::Share,  s.tabShare,  102.0f, false },
-        { CMD_TAB_VIEW,   RibbonTab::View,   s.tabView,   68.0f,  false },
-        { CMD_TAB_SEARCH, RibbonTab::Search, s.tabSearch, 96.0f,  false }
+        { CMD_TAB_FILE,     RibbonTab::File,     s.tabFile,     58.0f,  true  },
+        { CMD_TAB_HOME,     RibbonTab::Home,     s.tabHome,     118.0f, false },
+        { CMD_TAB_SHARE,    RibbonTab::Share,    s.tabShare,    102.0f, false },
+        { CMD_TAB_VIEW,     RibbonTab::View,     s.tabView,     68.0f,  false },
+        { CMD_TAB_SEARCH,   RibbonTab::Search,   s.tabSearch,   96.0f,  false },
+        { CMD_TAB_HARDWARE, RibbonTab::Hardware, s.tabHardware, 76.0f,  false }
     };
 
     float tx = rect.left;
@@ -588,6 +708,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
 
         drawSmallRowButton(CMD_VIEW_DETAILS,     lx + 263.0f, body.top + 6.0f,  98.0f,  s.viewDetails,     m_viewMode == ViewMode::Details);
         drawSmallRowButton(CMD_VIEW_PROPORTIONS, lx + 263.0f, body.top + 29.0f, 98.0f,  s.viewProportions, m_viewMode == ViewMode::Proportions);
+        drawSmallRowButton(CMD_VIEW_PIECHART,    lx + 263.0f, body.top + 52.0f, 98.0f,  s.viewPieChart,    m_viewMode == ViewMode::PieChart);
 
         // Next to Layout: In-Window Full Viewer & Full Screen buttons!
         drawLargeButton(CMD_VIEW_FULLVIEWER, lx + 365.0f, 88.0f, s.viewFullViewer, m_viewMode == ViewMode::FullViewer);
@@ -730,6 +851,116 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawPresetPill(CMD_SEARCH_RESET_FILTERS, sx, body.top + 53.0f, 92.0f, m_lang == Lang::PL ? L"\x21BA Resetuj filtry" : L"\x21BA Reset Filters", false);
         sx += 98.0f;
         drawGroupSeparatorAndTitle(g5Start, sx, m_lang == Lang::PL ? L"Akcje" : L"Actions");
+        return;
+    }
+
+    if (m_activeRibbonTab == RibbonTab::Share) {
+        // UDOSTĘPNIANIE (Share) Ribbon Tab — fully alive!
+        float sx = rect.left + 8.0f;
+
+        // Group 1: Wysyłanie i archiwa (Zip, Extract, Email, Print)
+        float g1Start = sx;
+        drawLargeButton(CMD_SHARE_ZIP,         sx, 86.0f, m_lang == Lang::PL ? L"Spakuj do\n.ZIP" : L"Compress\nto .ZIP"); sx += 88.0f;
+        drawLargeButton(CMD_SHARE_EXTRACT_ZIP, sx, 86.0f, m_lang == Lang::PL ? L"Wypakuj\narchiwum" : L"Extract\nArchive"); sx += 88.0f;
+        drawLargeButton(CMD_SHARE_EMAIL,       sx, 72.0f, m_lang == Lang::PL ? L"Wyślij\ne-mailem" : L"Send\nEmail"); sx += 74.0f;
+        drawLargeButton(CMD_SHARE_PRINT,       sx, 68.0f, m_lang == Lang::PL ? L"Drukuj" : L"Print"); sx += 72.0f;
+        drawGroupSeparatorAndTitle(g1Start, sx, m_lang == Lang::PL ? L"Wysyłanie i archiwa" : L"Send & Archives");
+        sx += 8.0f;
+
+        // Group 2: Schowek i ścieżki (Copy Path, Copy Name, Explorer)
+        float g2Start = sx;
+        drawSmallRowButton(CMD_COPY_PATH,          sx, body.top + 6.0f,  148.0f, m_lang == Lang::PL ? L"Kopiuj pełną ścieżkę" : L"Copy full path");
+        drawSmallRowButton(CMD_SHARE_COPY_NAME,    sx, body.top + 29.0f, 148.0f, m_lang == Lang::PL ? L"Kopiuj samą nazwę" : L"Copy file name");
+        drawSmallRowButton(CMD_SHARE_WIN_EXPLORER, sx, body.top + 52.0f, 148.0f, m_lang == Lang::PL ? L"Pokaż w Eksploratorze" : L"Show in Explorer");
+        sx += 154.0f;
+        drawGroupSeparatorAndTitle(g2Start, sx, m_lang == Lang::PL ? L"Ścieżki i powłoka" : L"Paths & Shell");
+        sx += 8.0f;
+
+        // Group 3: Terminal i sieć (PowerShell, CMD, Map Network Drive, Properties)
+        float g3Start = sx;
+        drawLargeButton(CMD_SHARE_POWERSHELL, sx, 76.0f, m_lang == Lang::PL ? L"PowerShell\ntutaj" : L"PowerShell\nhere"); sx += 78.0f;
+        drawLargeButton(CMD_SHARE_CMD,        sx, 74.0f, m_lang == Lang::PL ? L"Wiersz\npoleceń" : L"CMD\nhere"); sx += 76.0f;
+        drawSmallRowButton(CMD_SHARE_MAP_DRIVE,        sx, body.top + 8.0f,  154.0f, m_lang == Lang::PL ? L"Mapuj dysk sieciowy..." : L"Map network drive...");
+        drawSmallRowButton(CMD_SHARE_DISCONNECT_DRIVE, sx, body.top + 31.0f, 154.0f, m_lang == Lang::PL ? L"Odłącz dysk sieciowy..." : L"Disconnect net drive...");
+        drawSmallRowButton(CMD_PROPERTIES,             sx, body.top + 54.0f, 154.0f, m_lang == Lang::PL ? L"Właściwości / Uprawnienia" : L"Properties / Sharing");
+        sx += 160.0f;
+        drawGroupSeparatorAndTitle(g3Start, sx, m_lang == Lang::PL ? L"Terminal i sieć" : L"Terminal & Network");
+        return;
+    }
+
+    if (m_activeRibbonTab == RibbonTab::File) {
+        // PLIK (File) Ribbon Tab
+        float fx = rect.left + 8.0f;
+        float g1Start = fx;
+        drawLargeButton(CMD_FILE_NEW_WINDOW,   fx, 82.0f, m_lang == Lang::PL ? L"Nowe\nokno" : L"New\nWindow"); fx += 84.0f;
+        drawLargeButton(CMD_SHARE_POWERSHELL,  fx, 82.0f, m_lang == Lang::PL ? L"PowerShell\ntutaj" : L"PowerShell\nhere"); fx += 84.0f;
+        drawLargeButton(CMD_SHARE_CMD,         fx, 76.0f, m_lang == Lang::PL ? L"Wiersz\npoleceń" : L"CMD\nhere"); fx += 78.0f;
+        drawLargeButton(CMD_SHARE_WIN_EXPLORER,fx, 92.0f, m_lang == Lang::PL ? L"Otwórz w\nWindows" : L"Open in\nWindows"); fx += 94.0f;
+        drawLargeButton(CMD_PROPERTIES,        fx, 72.0f, s.btnProperties); fx += 74.0f;
+        drawLargeButton(CMD_FILE_EXIT,         fx, 72.0f, m_lang == Lang::PL ? L"Zamknij\nprogram" : L"Exit\nApp"); fx += 76.0f;
+        drawGroupSeparatorAndTitle(g1Start, fx, m_lang == Lang::PL ? L"Plik i okno aplikacji" : L"Application & Shell");
+        return;
+    }
+
+    if (m_activeRibbonTab == RibbonTab::Hardware) {
+        // SPRZĘT (Hardware Pro Workstation) Ribbon Tab
+        auto drawPill = [&](int cmdId, float x, float y, float w, const wchar_t* label, bool active = false) {
+            D2D1_RECT_F pr = D2D1::RectF(x, y + 1.0f, x + w, y + 21.0f);
+            m_ribbonHits.push_back({ cmdId, pr });
+            m_solidBrush->SetColor(active ? HexColor(0x0078D7) : (m_hoverRibbonBtn == cmdId ? HexColor(0xDCEBFC) : HexColor(0xE8EEF4)));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush);
+            m_solidBrush->SetColor(active ? HexColor(0x005A9E) : HexColor(0xB8C4D0));
+            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush, 1.0f);
+            m_solidBrush->SetColor(active ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
+            m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, pr, m_solidBrush);
+            m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        };
+
+        float hx = rect.left + 8.0f;
+        // Group 1: Sekcje sprzętowe (Sub-tabs)
+        float g1 = hx;
+        drawPill(CMD_HW_SUB_ALL,    hx,          body.top + 5.0f,  92.0f, m_lang == Lang::PL ? L"\x25C9 Wszystko PRO" : L"\x25C9 All PRO", m_hwSubTab == HardwareSubTab::All);
+        drawPill(CMD_HW_SUB_CPU,    hx + 96.0f,  body.top + 5.0f,  86.0f, L"CPU & Cache", m_hwSubTab == HardwareSubTab::Cpu);
+        drawPill(CMD_HW_SUB_GPU,    hx + 186.0f, body.top + 5.0f,  96.0f, L"GPU & Monitory", m_hwSubTab == HardwareSubTab::Gpu);
+        drawPill(CMD_HW_SUB_RAM,    hx,          body.top + 29.0f, 92.0f, L"RAM (SMBIOS)", m_hwSubTab == HardwareSubTab::Ram);
+        drawPill(CMD_HW_SUB_MOBO,   hx + 96.0f,  body.top + 29.0f, 86.0f, m_lang == Lang::PL ? L"Płyta & BIOS" : L"Board & BIOS", m_hwSubTab == HardwareSubTab::Motherboard);
+        drawPill(CMD_HW_SUB_DISKS,  hx + 186.0f, body.top + 29.0f, 96.0f, m_lang == Lang::PL ? L"Dyski NVMe/SMART" : L"Storage/NVMe", m_hwSubTab == HardwareSubTab::Disks);
+        drawPill(CMD_HW_SUB_NET,    hx,          body.top + 53.0f, 92.0f, m_lang == Lang::PL ? L"Sieć & NIC" : L"Network & NIC", m_hwSubTab == HardwareSubTab::Network);
+        drawPill(CMD_HW_SUB_SYSTEM, hx + 96.0f,  body.top + 53.0f, 186.0f, m_lang == Lang::PL ? L"System, Audio, Bateria i Procesy" : L"OS, Audio, Battery & Procs", m_hwSubTab == HardwareSubTab::System);
+        hx += 288.0f;
+        drawGroupSeparatorAndTitle(g1, hx, m_lang == Lang::PL ? L"Moduły diagnostyczne PRO" : L"Diagnostic Modules");
+        hx += 8.0f;
+
+        // Group 2: Telemetria i odświeżanie
+        float g2 = hx;
+        drawLargeButton(CMD_HW_REFRESH, hx, 74.0f, m_lang == Lang::PL ? L"Odśwież\nsprzęt" : L"Rescan\nHardware", m_viewMode == ViewMode::Hardware);
+        hx += 76.0f;
+        drawPill(CMD_HW_TOGGLE_LIVE,  hx, body.top + 8.0f,  118.0f, !m_hwLiveRefresh ? (m_lang == Lang::PL ? L"\x25B6 Wznów wykresy" : L"\x25B6 Resume Live") : (m_lang == Lang::PL ? L"\x23F8 Pauza wykresów" : L"\x23F8 Pause Live"), !m_hwLiveRefresh);
+        drawPill(CMD_HW_BACK_TO_FILES,hx, body.top + 38.0f, 118.0f, m_lang == Lang::PL ? L"\xD83D\xDCC1 Wróć do plików" : L"\xD83D\xDCC1 Back to Files", m_viewMode != ViewMode::Hardware);
+        hx += 124.0f;
+        drawGroupSeparatorAndTitle(g2, hx, m_lang == Lang::PL ? L"Telemetria Live" : L"Live Telemetry");
+        hx += 8.0f;
+
+        // Group 3: Benchmarki PRO (CPU & RAM)
+        float g3 = hx;
+        drawLargeButton(CMD_HW_BENCH_CPU, hx, 82.0f, m_lang == Lang::PL ? L"Benchmark\nCPU (GOPS)" : L"CPU Bench\n(GOPS)", m_hwInspector.GetCpu().benchMultiCoreGops > 0.0);
+        hx += 84.0f;
+        drawLargeButton(CMD_HW_BENCH_RAM, hx, 82.0f, m_lang == Lang::PL ? L"Benchmark\nRAM (GB/s)" : L"RAM Bench\n(GB/s)", m_hwInspector.GetRam().benchReadGBps > 0.0);
+        hx += 88.0f;
+        drawGroupSeparatorAndTitle(g3, hx, m_lang == Lang::PL ? L"Testy wydajności" : L"Benchmarks");
+        hx += 8.0f;
+
+        // Group 4: Eksport i Narzędzia systemowe
+        float g4 = hx;
+        drawPill(CMD_HW_COPY_REPORT, hx,          body.top + 6.0f,  116.0f, m_lang == Lang::PL ? L"\xD83D\xDCCB Kopiuj raport" : L"\xD83D\xDCCB Copy Report", false);
+        drawPill(CMD_HW_SAVE_REPORT, hx,          body.top + 30.0f, 116.0f, m_lang == Lang::PL ? L"\xD83D\xDCBE Zapisz .TXT" : L"\xD83D\xDCBE Save .TXT", false);
+        drawPill(CMD_HW_OPEN_DXDIAG, hx,          body.top + 53.0f, 116.0f, L"DirectX (dxdiag)", false);
+        drawPill(CMD_HW_OPEN_DEVMGR, hx + 120.0f, body.top + 6.0f,  128.0f, m_lang == Lang::PL ? L"Menedżer urządzeń" : L"Device Manager", false);
+        drawPill(CMD_HW_OPEN_TASKMGR,hx + 120.0f, body.top + 30.0f, 128.0f, m_lang == Lang::PL ? L"Menedżer zadań" : L"Task Manager", false);
+        drawPill(CMD_HW_OPEN_MSINFO, hx + 120.0f, body.top + 53.0f, 128.0f, L"System Info (msinfo32)", false);
+        hx += 254.0f;
+        drawGroupSeparatorAndTitle(g4, hx, m_lang == Lang::PL ? L"Raport i Narzędzia Windows" : L"Report & System Tools");
         return;
     }
 
@@ -1042,6 +1273,11 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
         DrawFullViewerCanvas(rect, true);
         return;
     }
+    if (m_viewMode == ViewMode::Hardware) {
+        m_ScrollbarThumbRect = {};
+        DrawHardwareProView(rect);
+        return;
+    }
 
     D2D1_RECT_F viewRect = rect;
     if (m_isSearchActive) {
@@ -1138,6 +1374,11 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
     if (m_viewMode == ViewMode::Proportions) {
         m_ScrollbarThumbRect = {};
         DrawProportionsView(viewRect);
+        return;
+    }
+    if (m_viewMode == ViewMode::PieChart) {
+        m_ScrollbarThumbRect = {};
+        DrawPieChartView(viewRect);
         return;
     }
 
@@ -2511,6 +2752,15 @@ void ExplorerApp::DrawStatusBar(const D2D1_RECT_F& rect) {
             m_rt->FillRectangle(D2D1::RectF(br.left + 12.0f, br.top + 4.0f, br.right - 3.0f, br.top + 11.0f), m_solidBrush);
             m_solidBrush->SetColor(HexColor(0xFB8C00));
             m_rt->FillRectangle(D2D1::RectF(br.left + 12.0f, br.top + 12.0f, br.right - 3.0f, br.bottom - 4.0f), m_solidBrush);
+        } else if (iconKind == 4) {
+            // Pie Chart icon (circle with sectors)
+            D2D1_POINT_2F c = D2D1::Point2F((br.left + br.right) * 0.5f, (br.top + br.bottom) * 0.5f);
+            m_solidBrush->SetColor(HexColor(0x1E88E5));
+            m_rt->FillEllipse(D2D1::Ellipse(c, 6.5f, 6.5f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(0xFFFFFF));
+            m_rt->DrawLine(c, D2D1::Point2F(c.x, c.y - 6.5f), m_solidBrush, 1.3f);
+            m_rt->DrawLine(c, D2D1::Point2F(c.x + 5.5f, c.y + 3.2f), m_solidBrush, 1.3f);
+            m_rt->FillEllipse(D2D1::Ellipse(c, 2.2f, 2.2f), m_solidBrush);
         } else {
             // Full Viewer icon (maximised photo frame with center dot)
             m_rt->DrawRectangle(D2D1::RectF(br.left + 3.0f, br.top + 4.0f, br.right - 3.0f, br.bottom - 4.0f), m_solidBrush, 1.4f);
@@ -2520,10 +2770,1117 @@ void ExplorerApp::DrawStatusBar(const D2D1_RECT_F& rect) {
 
     bool isThumbs = (m_viewMode == ViewMode::MediumIcons || m_viewMode == ViewMode::LargeIcons ||
                      m_viewMode == ViewMode::ExtraLargeIcons || m_viewMode == ViewMode::JumboIcons);
-    drawBottomViewBtn(CMD_VIEW_DETAILS,     76.0f, m_viewMode == ViewMode::Details,     0);
-    drawBottomViewBtn(CMD_VIEW_EXTRALARGE,  52.0f, isThumbs,                            1);
-    drawBottomViewBtn(CMD_VIEW_PROPORTIONS, 28.0f, m_viewMode == ViewMode::Proportions, 3);
-    drawBottomViewBtn(CMD_VIEW_FULLVIEWER,  4.0f,  m_viewMode == ViewMode::FullViewer,  2);
+    drawBottomViewBtn(CMD_VIEW_DETAILS,     100.0f, m_viewMode == ViewMode::Details,     0);
+    drawBottomViewBtn(CMD_VIEW_EXTRALARGE,   76.0f, isThumbs,                            1);
+    drawBottomViewBtn(CMD_VIEW_PROPORTIONS,  52.0f, m_viewMode == ViewMode::Proportions, 3);
+    drawBottomViewBtn(CMD_VIEW_PIECHART,     28.0f, m_viewMode == ViewMode::PieChart,    4);
+    drawBottomViewBtn(CMD_VIEW_FULLVIEWER,    4.0f, m_viewMode == ViewMode::FullViewer,  2);
+}
+
+void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
+    m_pieHits.clear();
+    m_treemapHits.clear();
+
+    m_rt->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    // Dark slate background matching Proportions view
+    m_solidBrush->SetColor(HexColor(0x161B24));
+    m_rt->FillRectangle(rect, m_solidBrush);
+
+    if (m_items.empty()) {
+        m_solidBrush->SetColor(HexColor(0x9BA3B0));
+        m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        D2D1_RECT_F emptyR = D2D1::RectF(rect.left, (rect.top + rect.bottom) * 0.5f - 15.0f, rect.right, (rect.top + rect.bottom) * 0.5f + 15.0f);
+        const wchar_t* msg = (m_lang == Lang::PL) ? L"Ten folder jest pusty" : L"This folder is empty";
+        m_rt->DrawTextW(msg, static_cast<UINT32>(wcslen(msg)), m_fmtRegular, emptyR, m_solidBrush);
+        m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        m_rt->PopAxisAlignedClip();
+        return;
+    }
+
+    auto getExtColor = [](const std::wstring& path, bool isDir, bool isDrive) -> UINT32 {
+        if (isDrive) return 0x00897B;
+        if (isDir)   return 0x2B6CB0;
+        std::wstring ext = PathUtils::GetExtensionLower(path);
+        if (ext == L".mp4" || ext == L".mkv" || ext == L".avi" || ext == L".mov" || ext == L".webm" || ext == L".wmv") return 0x7E57C2;
+        if (ext == L".jpg" || ext == L".jpeg" || ext == L".png" || ext == L".webp" || ext == L".gif" || ext == L".bmp" || ext == L".tga" || ext == L".psd") return 0x26A69A;
+        if (ext == L".zip" || ext == L".rar" || ext == L".7z" || ext == L".tar" || ext == L".gz" || ext == L".iso" || ext == L".vmdk" || ext == L".ova" || ext == L".vhd") return 0xEF6C00;
+        if (ext == L".exe" || ext == L".dll" || ext == L".msi" || ext == L".sys" || ext == L".bat") return 0xD32F2F;
+        if (ext == L".cpp" || ext == L".h" || ext == L".cs" || ext == L".py" || ext == L".js" || ext == L".ts" || ext == L".json" || ext == L".xml" || ext == L".html" || ext == L".css") return 0x1976D2;
+        if (ext == L".mp3" || ext == L".wav" || ext == L".flac" || ext == L".ogg" || ext == L".m4a") return 0xEC407A;
+        if (ext == L".pdf" || ext == L".doc" || ext == L".docx" || ext == L".xls" || ext == L".xlsx" || ext == L".ppt" || ext == L".pptx" || ext == L".txt" || ext == L".md") return 0x43A047;
+        if (ext == L".safetensors" || ext == L".ckpt" || ext == L".pth" || ext == L".onnx" || ext == L".bin" || ext == L".pak" || ext == L".assets" || ext == L".fbx" || ext == L".obj" || ext == L".blend") return 0xAB47BC;
+        return 0x546E7A;
+    };
+
+    // Palette for distinct top-level folders so neighboring pie slices stand out clearly
+    static const UINT32 kFolderPalette[] = {
+        0x1E88E5, 0x00ACC1, 0x43A047, 0xFB8C00, 0x8E24AA, 0xE53935,
+        0x3949AB, 0x00897B, 0x7CB342, 0xF4511E, 0x5E35B1, 0x039BE5
+    };
+
+    struct SortItem {
+        int index;
+        uint64_t bytes;
+        bool isPending;
+        UINT32 baseColor;
+    };
+    std::vector<SortItem> sorted;
+    sorted.reserve(m_items.size());
+
+    uint64_t totalBytes = 0;
+    bool anyPending = false;
+    int totalFolders = 0;
+    int doneFolders = 0;
+    std::wstring currentCalcName;
+
+    for (int i = 0; i < static_cast<int>(m_items.size()); ++i) {
+        const auto& it = m_items[i];
+        bool pend = (it.isDirectory && !it.isDrive && !it.folderSizeReady);
+        if (it.isDirectory && !it.isDrive) {
+            totalFolders++;
+            if (it.folderSizeReady) {
+                doneFolders++;
+            } else if (it.folderSizeCalculating && currentCalcName.empty()) {
+                currentCalcName = it.name;
+            }
+        }
+        if (pend) anyPending = true;
+        uint64_t b = it.sizeBytes;
+        if (it.isDrive && it.driveTotalBytes > 0) {
+            b = (it.driveTotalBytes > it.driveFreeBytes) ? (it.driveTotalBytes - it.driveFreeBytes) : it.driveTotalBytes;
+        }
+        totalBytes += b;
+        UINT32 col = it.isDirectory ? kFolderPalette[i % 12] : getExtColor(it.fullPath, it.isDirectory, it.isDrive);
+        sorted.push_back({ i, b, pend, col });
+    }
+
+    std::sort(sorted.begin(), sorted.end(), [](const SortItem& a, const SortItem& b) {
+        if (a.bytes != b.bytes) return a.bytes > b.bytes;
+        return a.index < b.index;
+    });
+
+    // 1. Top Header Bar (26px)
+    D2D1_RECT_F hdrR = D2D1::RectF(rect.left, rect.top, rect.right, rect.top + 26.0f);
+    m_solidBrush->SetColor(HexColor(0x0E1218));
+    m_rt->FillRectangle(hdrR, m_solidBrush);
+
+    std::wstring hdrTitle = (m_lang == Lang::PL ? L"Wykres kołowy (Sunburst 360\x00B0)  \x2022  Razem: " : L"Radial Pie Chart (Sunburst 360\x00B0)  \x2022  Total: ")
+                            + FileEngine::FormatSizeShort(totalBytes);
+    D2D1_RECT_F hdrTxtR = D2D1::RectF(hdrR.left + 10.0f, hdrR.top, hdrR.left + 440.0f, hdrR.bottom);
+    m_solidBrush->SetColor(HexColor(0xE2E8F0));
+    m_rt->DrawTextW(hdrTitle.c_str(), static_cast<UINT32>(hdrTitle.size()), m_fmtBold, hdrTxtR, m_solidBrush);
+
+    // [↻ Przelicz] button & [Widok: Proporcje] switch button
+    D2D1_RECT_F recalcR = D2D1::RectF(hdrR.left + 380.0f, hdrR.top + 3.0f, hdrR.left + 462.0f, hdrR.bottom - 3.0f);
+    m_ribbonHits.push_back({ CMD_RECALC_FOLDER_SIZES, recalcR });
+    m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_RECALC_FOLDER_SIZES ? HexColor(0x3B4A62) : HexColor(0x252F3F));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(recalcR, 3.0f, 3.0f), m_solidBrush);
+    m_solidBrush->SetColor(HexColor(0xE2E8F0));
+    const wchar_t* recalcLbl = (m_lang == Lang::PL) ? L"\x21BB Przelicz" : L"\x21BB Rescan";
+    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_rt->DrawTextW(recalcLbl, static_cast<UINT32>(wcslen(recalcLbl)), m_fmtSmall, recalcR, m_solidBrush);
+
+    D2D1_RECT_F propSwitchR = D2D1::RectF(hdrR.left + 468.0f, hdrR.top + 3.0f, hdrR.left + 572.0f, hdrR.bottom - 3.0f);
+    m_ribbonHits.push_back({ CMD_VIEW_PROPORTIONS, propSwitchR });
+    m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_VIEW_PROPORTIONS ? HexColor(0x0078D7) : HexColor(0x252F3F));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(propSwitchR, 3.0f, 3.0f), m_solidBrush);
+    m_solidBrush->SetColor(HexColor(0xE2E8F0));
+    const wchar_t* propLbl = (m_lang == Lang::PL) ? L"\x25A6 Mapa Proporcje" : L"\x25A6 Treemap View";
+    m_rt->DrawTextW(propLbl, static_cast<UINT32>(wcslen(propLbl)), m_fmtSmall, propSwitchR, m_solidBrush);
+    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    float canvasTop = hdrR.bottom + 2.0f;
+    float animPhase = static_cast<float>(GetTickCount64() % 100000ULL) * 0.001f;
+
+    // 2. Prominent Animated Scanning Progress Banner when calculating subfolders
+    if (anyPending) {
+        D2D1_RECT_F scanR = D2D1::RectF(rect.left + 4.0f, canvasTop, rect.right - 4.0f, canvasTop + 32.0f);
+        canvasTop = scanR.bottom + 4.0f;
+
+        m_solidBrush->SetColor(HexColor(0x2A1F0D));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(scanR, 4.0f, 4.0f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0xF59E0B));
+        m_rt->DrawRoundedRectangle(D2D1::RoundedRect(scanR, 4.0f, 4.0f), m_solidBrush, 1.2f);
+
+        float pct = (totalFolders > 0) ? (static_cast<float>(doneFolders) / static_cast<float>(totalFolders)) : 0.0f;
+        D2D1_RECT_F barBg = D2D1::RectF(scanR.left + 8.0f, scanR.bottom - 7.0f, scanR.right - 8.0f, scanR.bottom - 2.5f);
+        m_solidBrush->SetColor(HexColor(0x453214));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(barBg, 2.0f, 2.0f), m_solidBrush);
+
+        float fillW = std::max(24.0f, (barBg.right - barBg.left) * pct);
+        D2D1_RECT_F barFg = D2D1::RectF(barBg.left, barBg.top, barBg.left + fillW, barBg.bottom);
+        m_solidBrush->SetColor(HexColor(0xFBBF24));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(barFg, 2.0f, 2.0f), m_solidBrush);
+
+        float spCx = scanR.left + 18.0f;
+        float spCy = scanR.top + 13.0f;
+        for (int s = 0; s < 8; ++s) {
+            float a = animPhase * 7.0f + s * (3.14159265f * 0.25f);
+            m_solidBrush->SetColor(HexColor(0xFBBF24, 0.2f + 0.8f * (s / 8.0f)));
+            m_rt->DrawLine(D2D1::Point2F(spCx + std::cos(a) * 3.5f, spCy + std::sin(a) * 3.5f),
+                           D2D1::Point2F(spCx + std::cos(a) * 7.5f, spCy + std::sin(a) * 7.5f), m_solidBrush, 1.8f);
+        }
+
+        wchar_t scanBuf[512] = {};
+        int pctInt = static_cast<int>(pct * 100.0f + 0.5f);
+        if (m_lang == Lang::PL) {
+            swprintf_s(scanBuf, L"TRWA SKANOWANIE PODFOLDERÓW (%d / %d gotowe \x2022 %d%%)   \x2022   Dotychczas: %s%s%s",
+                       doneFolders, totalFolders, pctInt,
+                       FileEngine::FormatSizeShort(totalBytes).c_str(),
+                       currentCalcName.empty() ? L"" : L"   \x2022   Teraz: ",
+                       currentCalcName.c_str());
+        } else {
+            swprintf_s(scanBuf, L"SCANNING SUBFOLDERS (%d / %d done \x2022 %d%%)   \x2022   So far: %s%s%s",
+                       doneFolders, totalFolders, pctInt,
+                       FileEngine::FormatSizeShort(totalBytes).c_str(),
+                       currentCalcName.empty() ? L"" : L"   \x2022   Now: ",
+                       currentCalcName.c_str());
+        }
+        D2D1_RECT_F stR = D2D1::RectF(scanR.left + 32.0f, scanR.top + 2.0f, scanR.right - 10.0f, scanR.top + 22.0f);
+        m_solidBrush->SetColor(HexColor(0xFDE68A));
+        m_rt->DrawTextW(scanBuf, static_cast<UINT32>(wcslen(scanBuf)), m_fmtBold, stR, m_solidBrush);
+    }
+
+    D2D1_RECT_F bodyR = D2D1::RectF(rect.left + 6.0f, canvasTop, rect.right - 6.0f, rect.bottom - 26.0f);
+    float totalW = std::max(100.0f, bodyR.right - bodyR.left);
+    float totalH = std::max(100.0f, bodyR.bottom - bodyR.top);
+
+    // Split into Left Sunburst Chart area (58%) and Right Ranked Legend List (42%)
+    float chartW = std::max(260.0f, totalW * 0.58f);
+    D2D1_RECT_F chartArea = D2D1::RectF(bodyR.left, bodyR.top, bodyR.left + chartW, bodyR.bottom);
+    D2D1_RECT_F listArea  = D2D1::RectF(bodyR.left + chartW + 8.0f, bodyR.top, bodyR.right, bodyR.bottom);
+
+    float cx = (chartArea.left + chartArea.right) * 0.5f;
+    float cy = (chartArea.top + chartArea.bottom) * 0.5f;
+    float maxRadius = std::max(80.0f, std::min(chartW, totalH) * 0.46f);
+
+    // 4 Concentric Rings:
+    // Center Hub: 0 .. 0.25 * maxRadius
+    // Ring 0 (Top-level items): 0.26 .. 0.52 * maxRadius
+    // Ring 1 (Depth 1 children): 0.53 .. 0.73 * maxRadius
+    // Ring 2 (Depth 2 children): 0.74 .. 0.89 * maxRadius
+    // Ring 3 (Depth 3 children): 0.90 .. 1.00 * maxRadius
+    float hubR = maxRadius * 0.25f;
+    float ringInner[4] = { maxRadius * 0.265f, maxRadius * 0.535f, maxRadius * 0.740f, maxRadius * 0.895f };
+    float ringOuter[4] = { maxRadius * 0.525f, maxRadius * 0.730f, maxRadius * 0.885f, maxRadius * 1.000f };
+
+    // Helper to draw an annular pie sector using ID2D1PathGeometry
+    auto drawAnnularSector = [&](float rIn, float rOut, float a0, float a1, UINT32 fillHex, float fillAlpha, UINT32 strokeHex, float strokeWidth) {
+        if (!m_d2dFactory || a1 <= a0 + 0.001f || rOut <= rIn) return;
+        float span = a1 - a0;
+        if (span >= 6.282f) span = 6.282f;
+        float endA = a0 + span;
+
+        ID2D1PathGeometry* path = nullptr;
+        if (SUCCEEDED(m_d2dFactory->CreatePathGeometry(&path)) && path) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(path->Open(&sink)) && sink) {
+                D2D1_POINT_2F pOut0 = D2D1::Point2F(cx + std::cos(a0) * rOut,   cy + std::sin(a0) * rOut);
+                D2D1_POINT_2F pOut1 = D2D1::Point2F(cx + std::cos(endA) * rOut, cy + std::sin(endA) * rOut);
+                D2D1_POINT_2F pIn1  = D2D1::Point2F(cx + std::cos(endA) * rIn,  cy + std::sin(endA) * rIn);
+                D2D1_POINT_2F pIn0  = D2D1::Point2F(cx + std::cos(a0) * rIn,   cy + std::sin(a0) * rIn);
+
+                D2D1_ARC_SIZE arcSz = (span > 3.14159265f) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
+
+                sink->BeginFigure(pOut0, D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddArc(D2D1::ArcSegment(pOut1, D2D1::SizeF(rOut, rOut), 0.0f, D2D1_SWEEP_DIRECTION_CLOCKWISE, arcSz));
+                sink->AddLine(pIn1);
+                sink->AddArc(D2D1::ArcSegment(pIn0, D2D1::SizeF(rIn, rIn), 0.0f, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, arcSz));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                sink->Release();
+            }
+            m_solidBrush->SetColor(HexColor(fillHex, fillAlpha));
+            m_rt->FillGeometry(path, m_solidBrush);
+            if (strokeWidth > 0.0f) {
+                m_solidBrush->SetColor(HexColor(strokeHex, 0.9f));
+                m_rt->DrawGeometry(path, m_solidBrush, strokeWidth);
+            }
+            path->Release();
+        }
+    };
+
+    // Subtle background guide rings
+    for (int r = 0; r < 4; ++r) {
+        m_solidBrush->SetColor(HexColor(0x1E2634, 0.55f));
+        m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), ringOuter[r], ringOuter[r]), m_solidBrush, 1.0f);
+    }
+
+    // Recursive helper for rings 1..3
+    std::function<void(const std::vector<FolderTreeSizeNode>&, int, float, float, uint64_t, int, UINT32)> renderChildRing;
+    renderChildRing = [&](const std::vector<FolderTreeSizeNode>& nodes, int parentItemIdx, float startA, float endA, uint64_t parentBytes, int depth, UINT32 parentColor) {
+        if (depth > 3 || nodes.empty() || parentBytes == 0 || endA <= startA + 0.015f) return;
+        float rIn  = ringInner[depth];
+        float rOut = ringOuter[depth];
+        float curA = startA;
+        float totalSpan = endA - startA;
+
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const auto& nd = nodes[i];
+            if (nd.sizeBytes == 0) continue;
+            float frac = static_cast<float>(static_cast<double>(nd.sizeBytes) / static_cast<double>(parentBytes));
+            float span = totalSpan * frac;
+            if (span < 0.008f) continue; // skip sub-pixel slivers in outer rings
+
+            float nextA = std::min(endA, curA + span);
+            UINT32 col = nd.isDirectory ? parentColor : getExtColor(nd.fullPath, nd.isDirectory, false);
+            float alpha = 0.88f - depth * 0.10f;
+
+            drawAnnularSector(rIn, rOut, curA, nextA, col, alpha, 0x161B24, 1.0f);
+
+            PieSectorHitNode hit;
+            hit.cx = cx;
+            hit.cy = cy;
+            hit.innerR = rIn;
+            hit.outerR = rOut;
+            hit.startAngle = curA;
+            hit.endAngle = nextA;
+            hit.itemIndex = parentItemIdx;
+            hit.fullPath = nd.fullPath;
+            hit.name = nd.name;
+            hit.sizeBytes = nd.sizeBytes;
+            hit.isDirectory = nd.isDirectory;
+            hit.depth = depth;
+            hit.colorHex = col;
+            m_pieHits.push_back(std::move(hit));
+
+            // Label on outer ring sector if wide enough
+            if (span > 0.24f && (rOut - rIn) >= 18.0f) {
+                float midA = (curA + nextA) * 0.5f;
+                float midR = (rIn + rOut) * 0.5f;
+                float lx = cx + std::cos(midA) * midR;
+                float ly = cy + std::sin(midA) * midR;
+                D2D1_RECT_F lblR = D2D1::RectF(lx - 42.0f, ly - 9.0f, lx + 42.0f, ly + 9.0f);
+                m_solidBrush->SetColor(HexColor(0x0F141C, 0.72f));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(lblR, 2.5f, 2.5f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(0xF1F5F9));
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                m_rt->DrawTextW(nd.name.c_str(), static_cast<UINT32>(nd.name.size()), m_fmtSmall, lblR, m_solidBrush);
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+
+            if (nd.isDirectory && !nd.children.empty() && depth < 3) {
+                renderChildRing(nd.children, parentItemIdx, curA, nextA, nd.sizeBytes, depth + 1, col);
+            }
+            curA = nextA;
+        }
+    };
+
+    // Render Ring 0 (Top-level items) with 100% true angular proportions
+    float curAngle = -1.5707963f; // Start at 12 o'clock (-PI/2)
+    float fullCircle = 6.2831853f;
+    uint64_t denomBytes = std::max<uint64_t>(1, totalBytes);
+
+    uint64_t smallAggBytes = 0;
+    int smallAggCount = 0;
+    int firstSmallIdx = -1;
+
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        const auto& si = sorted[i];
+        const auto& item = m_items[si.index];
+        double frac = static_cast<double>(si.bytes) / static_cast<double>(denomBytes);
+        float span = static_cast<float>(frac * fullCircle);
+
+        if (span < 0.012f && i > 0 && (sorted.size() - i) > 1) {
+            // Group very tiny slices (< 0.7 deg) into a single clean Remainder slice
+            smallAggBytes += si.bytes;
+            smallAggCount++;
+            if (firstSmallIdx < 0) firstSmallIdx = si.index;
+            continue;
+        }
+
+        if (si.bytes == 0 && !si.isPending) continue;
+        if (span < 0.008f) span = 0.008f;
+        float nextAngle = std::min(-1.5707963f + fullCircle, curAngle + span);
+
+        bool isSel = item.selected;
+        bool isHov = (m_hoverIndex == si.index);
+        float rIn  = ringInner[0];
+        float rOut = ringOuter[0] + (isHov ? 4.0f : 0.0f);
+
+        drawAnnularSector(rIn, rOut, curAngle, nextAngle, si.baseColor, isHov ? 1.0f : 0.92f,
+                          isSel ? 0xFFFFFF : (isHov ? 0x7DD3FC : 0x161B24),
+                          isSel ? 2.2f : (isHov ? 1.8f : 1.2f));
+
+        PieSectorHitNode hit;
+        hit.cx = cx;
+        hit.cy = cy;
+        hit.innerR = rIn;
+        hit.outerR = rOut;
+        hit.startAngle = curAngle;
+        hit.endAngle = nextAngle;
+        hit.itemIndex = si.index;
+        hit.fullPath = item.fullPath;
+        hit.name = item.name;
+        hit.sizeBytes = si.bytes;
+        hit.isDirectory = item.isDirectory;
+        hit.depth = 0;
+        hit.colorHex = si.baseColor;
+        m_pieHits.push_back(std::move(hit));
+
+        // Draw label on Ring 0 sector if wide enough
+        if (span > 0.16f) {
+            float midA = (curAngle + nextAngle) * 0.5f;
+            float midR = (rIn + rOut) * 0.5f;
+            float lx = cx + std::cos(midA) * midR;
+            float ly = cy + std::sin(midA) * midR;
+            wchar_t pctBuf[32] = {};
+            swprintf_s(pctBuf, L"%.1f%%", frac * 100.0);
+            std::wstring lbl = item.name + L"\n" + pctBuf;
+            D2D1_RECT_F lblR = D2D1::RectF(lx - 48.0f, ly - 15.0f, lx + 48.0f, ly + 15.0f);
+            m_solidBrush->SetColor(HexColor(0x0F141C, 0.78f));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(lblR, 3.0f, 3.0f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(0xFFFFFF));
+            m_rt->DrawTextW(lbl.c_str(), static_cast<UINT32>(lbl.size()), m_fmtCenterSmall, lblR, m_solidBrush);
+        }
+
+        // Render recursive outer rings (Depth 1..3)
+        if (item.isDirectory && item.subTreeReady && !item.subTreeChildren.empty()) {
+            renderChildRing(item.subTreeChildren, si.index, curAngle, nextAngle, si.bytes, 1, si.baseColor);
+        }
+
+        curAngle = nextAngle;
+    }
+
+    // Draw aggregated tiny items sector if any
+    if (smallAggCount > 0 && curAngle < -1.5707963f + fullCircle) {
+        float nextAngle = -1.5707963f + fullCircle;
+        drawAnnularSector(ringInner[0], ringOuter[0], curAngle, nextAngle, 0x475569, 0.85f, 0x161B24, 1.0f);
+        PieSectorHitNode hit;
+        hit.cx = cx;
+        hit.cy = cy;
+        hit.innerR = ringInner[0];
+        hit.outerR = ringOuter[0];
+        hit.startAngle = curAngle;
+        hit.endAngle = nextAngle;
+        hit.itemIndex = firstSmallIdx;
+        hit.name = L"[+" + std::to_wstring(smallAggCount) + (m_lang == Lang::PL ? L" mniejszych]" : L" smaller]");
+        hit.sizeBytes = smallAggBytes;
+        hit.isDirectory = false;
+        hit.depth = 0;
+        hit.colorHex = 0x475569;
+        m_pieHits.push_back(std::move(hit));
+    }
+
+    // Interactive Center Hub Circle ("Click center to go Up" + Hovered item summary)
+    bool hubHover = false;
+    {
+        float dx = static_cast<float>(m_mousePt.x) - cx;
+        float dy = static_cast<float>(m_mousePt.y) - cy;
+        if (std::sqrt(dx * dx + dy * dy) <= hubR) hubHover = true;
+    }
+    m_solidBrush->SetColor(hubHover ? HexColor(0x1E293B) : HexColor(0x0F141C));
+    m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), hubR, hubR), m_solidBrush);
+    m_solidBrush->SetColor(hubHover ? HexColor(0x38BDF8) : HexColor(0x334155));
+    m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), hubR, hubR), m_solidBrush, hubHover ? 2.2f : 1.5f);
+
+    // Register Center Hub in m_pieHits with itemIndex = -2 (Navigate Up on click!)
+    {
+        PieSectorHitNode hubHit;
+        hubHit.cx = cx;
+        hubHit.cy = cy;
+        hubHit.innerR = 0.0f;
+        hubHit.outerR = hubR;
+        hubHit.startAngle = -3.14159265f;
+        hubHit.endAngle = 3.14159265f;
+        hubHit.itemIndex = -2;
+        hubHit.name = m_lang == Lang::PL ? L"W górę (Folder nadrzędny)" : L"Go Up (Parent folder)";
+        hubHit.sizeBytes = totalBytes;
+        m_pieHits.push_back(std::move(hubHit));
+    }
+
+    std::wstring centerTitle = PathUtils::GetFileName(m_currentPath);
+    if (centerTitle.empty()) centerTitle = m_currentPath;
+    std::wstring centerSize = FileEngine::FormatSizeShort(totalBytes);
+    std::wstring centerSub  = m_lang == Lang::PL ? L"\x2191 Klik = W górę" : L"\x2191 Click = Up";
+
+    if (m_hoverIndex >= 0 && m_hoverIndex < static_cast<int>(m_items.size())) {
+        const auto& hov = m_items[m_hoverIndex];
+        centerTitle = hov.name;
+        centerSize  = FileEngine::FormatSizeShort(hov.sizeBytes);
+        double pct = (totalBytes > 0) ? (100.0 * static_cast<double>(hov.sizeBytes) / static_cast<double>(totalBytes)) : 0.0;
+        wchar_t pBuf[64] = {};
+        swprintf_s(pBuf, L"%.2f%% folderu", pct);
+        centerSub = pBuf;
+    }
+
+    D2D1_RECT_F hubTitleR = D2D1::RectF(cx - hubR * 0.85f, cy - 28.0f, cx + hubR * 0.85f, cy - 6.0f);
+    D2D1_RECT_F hubSizeR  = D2D1::RectF(cx - hubR * 0.85f, cy - 6.0f,  cx + hubR * 0.85f, cy + 14.0f);
+    D2D1_RECT_F hubSubR   = D2D1::RectF(cx - hubR * 0.85f, cy + 14.0f, cx + hubR * 0.85f, cy + 32.0f);
+
+    m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_solidBrush->SetColor(HexColor(0xF8FAFC));
+    m_rt->DrawTextW(centerTitle.c_str(), static_cast<UINT32>(centerTitle.size()), m_fmtBold, hubTitleR, m_solidBrush);
+    m_solidBrush->SetColor(HexColor(0x38BDF8));
+    m_rt->DrawTextW(centerSize.c_str(), static_cast<UINT32>(centerSize.size()), m_fmtBold, hubSizeR, m_solidBrush);
+    m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    m_solidBrush->SetColor(HexColor(0x94A3B8));
+    m_rt->DrawTextW(centerSub.c_str(), static_cast<UINT32>(centerSub.size()), m_fmtSmall, hubSubR, m_solidBrush);
+    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    // 3. Right-Side Ranked Breakdown & Legend Panel
+    m_solidBrush->SetColor(HexColor(0x11161F));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(listArea, 5.0f, 5.0f), m_solidBrush);
+    m_solidBrush->SetColor(HexColor(0x263042));
+    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(listArea, 5.0f, 5.0f), m_solidBrush, 1.0f);
+
+    D2D1_RECT_F listHdrR = D2D1::RectF(listArea.left + 10.0f, listArea.top + 6.0f, listArea.right - 10.0f, listArea.top + 28.0f);
+    m_solidBrush->SetColor(HexColor(0x94A3B8));
+    const wchar_t* rankTitle = m_lang == Lang::PL
+        ? L"RANKING ROZMIARU (2\x00D7 Klik = Wejdź / Otwórz)"
+        : L"SIZE RANKING BREAKDOWN (2\x00D7 Click = Open)";
+    m_rt->DrawTextW(rankTitle, static_cast<UINT32>(wcslen(rankTitle)), m_fmtBold, listHdrR, m_solidBrush);
+
+    float rowY = listArea.top + 32.0f;
+    float rowH = 26.0f;
+    int maxRows = std::max(1, static_cast<int>((listArea.bottom - rowY - 6.0f) / rowH));
+    int countRows = std::min(static_cast<int>(sorted.size()), maxRows);
+
+    for (int r = 0; r < countRows; ++r) {
+        const auto& si = sorted[r];
+        const auto& item = m_items[si.index];
+        D2D1_RECT_F rowR = D2D1::RectF(listArea.left + 6.0f, rowY, listArea.right - 6.0f, rowY + rowH - 2.0f);
+
+        bool isSel = item.selected;
+        bool isHov = (m_hoverIndex == si.index);
+        if (isSel || isHov) {
+            m_solidBrush->SetColor(isSel ? HexColor(0x1E3A5F) : HexColor(0x1C2636));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(rowR, 3.0f, 3.0f), m_solidBrush);
+            m_solidBrush->SetColor(isSel ? HexColor(0x38BDF8) : HexColor(0x334155));
+            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rowR, 3.0f, 3.0f), m_solidBrush, 1.0f);
+        }
+
+        // Proportional background bar inside row
+        double frac = (totalBytes > 0) ? (static_cast<double>(si.bytes) / static_cast<double>(totalBytes)) : 0.0;
+        float barW = static_cast<float>((rowR.right - rowR.left) * frac);
+        if (barW > 2.0f) {
+            D2D1_RECT_F pBar = D2D1::RectF(rowR.left, rowR.bottom - 3.0f, rowR.left + barW, rowR.bottom);
+            m_solidBrush->SetColor(HexColor(si.baseColor, 0.75f));
+            m_rt->FillRectangle(pBar, m_solidBrush);
+        }
+
+        // Color swatch
+        D2D1_RECT_F swR = D2D1::RectF(rowR.left + 6.0f, rowR.top + 5.0f, rowR.left + 18.0f, rowR.top + 17.0f);
+        m_solidBrush->SetColor(HexColor(si.baseColor));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(swR, 2.5f, 2.5f), m_solidBrush);
+
+        // Name
+        std::wstring prefix = item.isDirectory ? L"\xD83D\xDCC1 " : L"";
+        std::wstring dispName = prefix + item.name;
+        D2D1_RECT_F nameR = D2D1::RectF(rowR.left + 24.0f, rowR.top + 2.0f, rowR.right - 135.0f, rowR.bottom - 2.0f);
+        m_solidBrush->SetColor(HexColor(0xF1F5F9));
+        m_rt->DrawTextW(dispName.c_str(), static_cast<UINT32>(dispName.size()), m_fmtSmall, nameR, m_solidBrush);
+
+        // Size & %
+        wchar_t statBuf[64] = {};
+        if (si.isPending) {
+            swprintf_s(statBuf, L"\x23F3 ...");
+        } else {
+            swprintf_s(statBuf, L"%s  (%.1f%%)", FileEngine::FormatSizeShort(si.bytes).c_str(), frac * 100.0);
+        }
+        D2D1_RECT_F statR = D2D1::RectF(rowR.right - 132.0f, rowR.top + 2.0f, rowR.right - 6.0f, rowR.bottom - 2.0f);
+        m_solidBrush->SetColor(si.isPending ? HexColor(0xFBBF24) : HexColor(0x94A3B8));
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        m_rt->DrawTextW(statBuf, static_cast<UINT32>(wcslen(statBuf)), m_fmtSmall, statR, m_solidBrush);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        // Register legend row for click/double-click hit-testing
+        PieSectorHitNode rowHit;
+        rowHit.legendRowRect = rowR;
+        rowHit.itemIndex = si.index;
+        rowHit.fullPath = item.fullPath;
+        rowHit.name = item.name;
+        rowHit.sizeBytes = si.bytes;
+        rowHit.isDirectory = item.isDirectory;
+        rowHit.depth = 0;
+        rowHit.colorHex = si.baseColor;
+        m_pieHits.push_back(std::move(rowHit));
+
+        rowY += rowH;
+    }
+
+    // 4. Bottom Inspector Bar (22px)
+    D2D1_RECT_F botR = D2D1::RectF(rect.left, rect.bottom - 22.0f, rect.right, rect.bottom);
+    m_solidBrush->SetColor(HexColor(0x0E1218));
+    m_rt->FillRectangle(botR, m_solidBrush);
+
+    std::wstring botInfo = m_lang == Lang::PL
+        ? L"Najedź na wycinek koła lub listę po prawej  \x2022  2\x00D7 Klik = Wejdź w folder / Otwórz plik  \x2022  Kliknij środek koła = W górę"
+        : L"Hover any pie sector or list row  \x2022  Double-click = Enter folder / Open file  \x2022  Click center hub = Go Up";
+    if (m_hoverIndex >= 0 && m_hoverIndex < static_cast<int>(m_items.size())) {
+        const auto& hov = m_items[m_hoverIndex];
+        double pct = (totalBytes > 0) ? (100.0 * static_cast<double>(hov.sizeBytes) / static_cast<double>(totalBytes)) : 0.0;
+        wchar_t pBuf[64] = {};
+        swprintf_s(pBuf, L" (%.2f%%)", pct);
+        botInfo = hov.fullPath + L"   \x2022   " + FileEngine::FormatSizeDetailed(hov.sizeBytes) + pBuf;
+    }
+    D2D1_RECT_F botTxtR = D2D1::RectF(botR.left + 10.0f, botR.top + 2.0f, botR.right - 10.0f, botR.bottom);
+    m_solidBrush->SetColor(HexColor(0xCBD5E1));
+    m_rt->DrawTextW(botInfo.c_str(), static_cast<UINT32>(botInfo.size()), m_fmtSmall, botTxtR, m_solidBrush);
+
+    m_rt->PopAxisAlignedClip();
+}
+
+void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
+    m_hwCardHits.clear();
+    const auto& snap = m_hwInspector.Snapshot();
+
+    m_rt->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    // Deep Pro Dark Workstation Theme (#0B0F17 background)
+    m_solidBrush->SetColor(HexColor(0x0B0F17));
+    m_rt->FillRectangle(rect, m_solidBrush);
+
+    // 1. Top Workstation Control & Status Bar (36px)
+    D2D1_RECT_F topBar = D2D1::RectF(rect.left, rect.top, rect.right, rect.top + 36.0f);
+    m_solidBrush->SetColor(HexColor(0x111827));
+    m_rt->FillRectangle(topBar, m_solidBrush);
+    m_solidBrush->SetColor(HexColor(0x1F2937));
+    m_rt->DrawLine(D2D1::Point2F(topBar.left, topBar.bottom), D2D1::Point2F(topBar.right, topBar.bottom), m_solidBrush, 1.0f);
+
+    // Live Pulse Indicator
+    bool paused = m_hwInspector.IsPaused();
+    m_solidBrush->SetColor(paused ? HexColor(0xF59E0B) : HexColor(0x10B981));
+    m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(topBar.left + 16.0f, topBar.top + 18.0f), 5.0f, 5.0f), m_solidBrush);
+
+    std::wstring wsTitle = (m_lang == Lang::PL ? L"STACJA DIAGNOSTYCZNA SPRZĘTU PRO  \x2022  " : L"PRO HARDWARE & TELEMETRY WORKSTATION  \x2022  ")
+                           + snap.os.computerName + L" (" + snap.board.boardManufacturer + L" " + snap.board.boardProduct + L")";
+    D2D1_RECT_F titleR = D2D1::RectF(topBar.left + 28.0f, topBar.top, topBar.right - 390.0f, topBar.bottom);
+    m_solidBrush->SetColor(HexColor(0xF8FAFC));
+    m_rt->DrawTextW(wsTitle.c_str(), static_cast<UINT32>(wsTitle.size()), m_fmtBold, titleR, m_solidBrush);
+
+    // Top-right quick action buttons inside the Hardware view
+    auto drawTopActionBtn = [&](int cmdId, float rightOff, float w, const wchar_t* label, UINT32 bgHex) {
+        D2D1_RECT_F br = D2D1::RectF(topBar.right - rightOff - w, topBar.top + 6.0f, topBar.right - rightOff, topBar.bottom - 6.0f);
+        m_ribbonHits.push_back({ cmdId, br });
+        m_solidBrush->SetColor(m_hoverRibbonBtn == cmdId ? HexColor(0x2563EB) : HexColor(bgHex));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(br, 3.5f, 3.5f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x3B82F6, 0.6f));
+        m_rt->DrawRoundedRectangle(D2D1::RoundedRect(br, 3.5f, 3.5f), m_solidBrush, 1.0f);
+        m_solidBrush->SetColor(HexColor(0xF8FAFC));
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, br, m_solidBrush);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    };
+
+    drawTopActionBtn(CMD_HW_BACK_TO_FILES, 8.0f,   110.0f, m_lang == Lang::PL ? L"\xD83D\xDCC1 Wróć do plików" : L"\xD83D\xDCC1 Back to Files", 0x1E293B);
+    drawTopActionBtn(CMD_HW_SAVE_REPORT,   124.0f, 96.0f,  m_lang == Lang::PL ? L"\xD83D\xDCBE Zapisz .TXT" : L"\xD83D\xDCBE Save .TXT", 0x1E293B);
+    drawTopActionBtn(CMD_HW_COPY_REPORT,   226.0f, 106.0f, m_lang == Lang::PL ? L"\xD83D\xDCCB Kopiuj raport" : L"\xD83D\xDCCB Copy Report", 0x1E293B);
+    drawTopActionBtn(CMD_HW_BENCH_CPU,     338.0f, 96.0f,  m_lang == Lang::PL ? L"\x26A1 Test CPU/RAM" : L"\x26A1 Bench CPU", 0x1D4ED8);
+
+    // 2. Sub-Tab Filter Strip (28px)
+    D2D1_RECT_F subStrip = D2D1::RectF(rect.left, topBar.bottom, rect.right, topBar.bottom + 28.0f);
+    m_solidBrush->SetColor(HexColor(0x0F172A));
+    m_rt->FillRectangle(subStrip, m_solidBrush);
+
+    struct SubDef { int cmd; HardwareSubTab tab; const wchar_t* pl; const wchar_t* en; float w; };
+    SubDef subs[] = {
+        { CMD_HW_SUB_ALL,     HardwareSubTab::Overview,          L"Wszystko (Dashboard)", L"All (Dashboard)", 136.0f },
+        { CMD_HW_SUB_CPU,     HardwareSubTab::CpuCores,          L"CPU, Rdzenie i Cache", L"CPU, Cores & Cache", 136.0f },
+        { CMD_HW_SUB_GPU,     HardwareSubTab::GpuDisplays,       L"GPU, VRAM i Monitory", L"GPU, VRAM & Displays", 142.0f },
+        { CMD_HW_SUB_RAM,     HardwareSubTab::MemoryDimms,       L"RAM (Sloty DIMM SMBIOS)", L"RAM (SMBIOS DIMMs)", 156.0f },
+        { CMD_HW_SUB_BOARD,   HardwareSubTab::MotherboardBios,   L"Płyta główna i UEFI/BIOS", L"Motherboard & BIOS", 156.0f },
+        { CMD_HW_SUB_STORAGE, HardwareSubTab::StorageSmart,      L"Dyski fizyczne NVMe/SATA", L"Physical Disks NVMe/SATA", 156.0f },
+        { CMD_HW_SUB_NET,     HardwareSubTab::NetworkInterfaces, L"Sieć i Przepustowość", L"Network & Live Traffic", 142.0f },
+        { CMD_HW_SUB_SYS,     HardwareSubTab::SystemPowerProcs,  L"System, Audio i Procesy", L"OS, Audio & Processes", 148.0f }
+    };
+    float sx = subStrip.left + 8.0f;
+    for (const auto& sd : subs) {
+        D2D1_RECT_F sr = D2D1::RectF(sx, subStrip.top + 3.0f, sx + sd.w, subStrip.bottom - 3.0f);
+        m_ribbonHits.push_back({ sd.cmd, sr });
+        bool act = (m_hwSubTab == sd.tab);
+        m_solidBrush->SetColor(act ? HexColor(0x0284C7) : (m_hoverRibbonBtn == sd.cmd ? HexColor(0x1E293B) : HexColor(0x131C2E)));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(sr, 3.0f, 3.0f), m_solidBrush);
+        m_solidBrush->SetColor(act ? HexColor(0xFFFFFF) : HexColor(0x94A3B8));
+        const wchar_t* lbl = (m_lang == Lang::PL) ? sd.pl : sd.en;
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        m_rt->DrawTextW(lbl, static_cast<UINT32>(wcslen(lbl)), m_fmtSmall, sr, m_solidBrush);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        sx += sd.w + 5.0f;
+    }
+
+    // 3. Scrollable Content Area
+    D2D1_RECT_F workR = D2D1::RectF(rect.left, subStrip.bottom + 4.0f, rect.right, rect.bottom);
+    m_rt->PushAxisAlignedClip(workR, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    float curY = workR.top + 4.0f - m_scrollY;
+    float padX = 10.0f;
+    float availW = std::max(300.0f, (workR.right - workR.left) - padX * 2.0f);
+
+    // Helper to draw a real-time 60s oscilloscope graph box
+    auto drawOscilloscope = [&](const D2D1_RECT_F& boxR, const wchar_t* title, const std::wstring& bigValue,
+                                const std::wstring& subValue, const std::array<float, 60>& hist, int cursor,
+                                UINT32 accentHex) {
+        m_solidBrush->SetColor(HexColor(0x131B2B));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(boxR, 5.0f, 5.0f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x26334D));
+        m_rt->DrawRoundedRectangle(D2D1::RoundedRect(boxR, 5.0f, 5.0f), m_solidBrush, 1.0f);
+
+        // Header text
+        D2D1_RECT_F tR = D2D1::RectF(boxR.left + 10.0f, boxR.top + 5.0f, boxR.right - 90.0f, boxR.top + 22.0f);
+        m_solidBrush->SetColor(HexColor(0x94A3B8));
+        m_rt->DrawTextW(title, static_cast<UINT32>(wcslen(title)), m_fmtSmall, tR, m_solidBrush);
+
+        D2D1_RECT_F vR = D2D1::RectF(boxR.right - 115.0f, boxR.top + 4.0f, boxR.right - 8.0f, boxR.top + 24.0f);
+        m_solidBrush->SetColor(HexColor(accentHex));
+        m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        m_rt->DrawTextW(bigValue.c_str(), static_cast<UINT32>(bigValue.size()), m_fmtBold, vR, m_solidBrush);
+        m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        D2D1_RECT_F subR = D2D1::RectF(boxR.left + 10.0f, boxR.top + 21.0f, boxR.right - 8.0f, boxR.top + 38.0f);
+        m_solidBrush->SetColor(HexColor(0xCBD5E1));
+        m_rt->DrawTextW(subValue.c_str(), static_cast<UINT32>(subValue.size()), m_fmtSmall, subR, m_solidBrush);
+
+        // Graph plot area
+        D2D1_RECT_F plotR = D2D1::RectF(boxR.left + 8.0f, boxR.top + 40.0f, boxR.right - 8.0f, boxR.bottom - 7.0f);
+        m_solidBrush->SetColor(HexColor(0x0B101B));
+        m_rt->FillRectangle(plotR, m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x1E293B));
+        m_rt->DrawRectangle(plotR, m_solidBrush, 1.0f);
+
+        // Subtle grid lines (25%, 50%, 75%)
+        float pw = plotR.right - plotR.left;
+        float ph = plotR.bottom - plotR.top;
+        for (int g = 1; g <= 3; ++g) {
+            float gy = plotR.top + ph * (g * 0.25f);
+            m_rt->DrawLine(D2D1::Point2F(plotR.left, gy), D2D1::Point2F(plotR.right, gy), m_solidBrush, 0.7f);
+        }
+
+        // Waveform lines
+        float stepX = pw / 59.0f;
+        for (int i = 0; i < 59; ++i) {
+            int idx0 = (cursor + i) % 60;
+            int idx1 = (cursor + i + 1) % 60;
+            float v0 = std::clamp(hist[idx0], 0.0f, 100.0f) * 0.01f;
+            float v1 = std::clamp(hist[idx1], 0.0f, 100.0f) * 0.01f;
+            float x0 = plotR.left + i * stepX;
+            float x1 = plotR.left + (i + 1) * stepX;
+            float y0 = plotR.bottom - v0 * (ph - 2.0f) - 1.0f;
+            float y1 = plotR.bottom - v1 * (ph - 2.0f) - 1.0f;
+
+            // Vertical fill column under curve
+            m_solidBrush->SetColor(HexColor(accentHex, 0.18f));
+            m_rt->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x1, plotR.bottom), m_solidBrush, stepX + 0.5f);
+
+            // Top bright trace
+            m_solidBrush->SetColor(HexColor(accentHex, 0.95f));
+            m_rt->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), m_solidBrush, 1.8f);
+        }
+    };
+
+    // Row 1: 4 Real-Time Oscilloscopes (Always shown at top of workstation)
+    float oscGap = 8.0f;
+    float oscW = (availW - oscGap * 3.0f) * 0.25f;
+    float oscH = 104.0f;
+
+    wchar_t cpuVal[32] = {}, cpuSub[128] = {};
+    swprintf_s(cpuVal, L"%.1f%%", snap.cpuTotalUsagePct);
+    swprintf_s(cpuSub, L"%uR / %uW  \x2022  %u MHz", snap.cpu.physicalCores, snap.cpu.logicalCores, snap.cpu.baseClockMHz);
+    drawOscilloscope(D2D1::RectF(workR.left + padX, curY, workR.left + padX + oscW, curY + oscH),
+                     L"PROCESOR (CPU LIVE 60s)", cpuVal, cpuSub, snap.historyCpu, snap.historyCursor, 0x38BDF8);
+
+    wchar_t ramVal[32] = {}, ramSub[128] = {};
+    swprintf_s(ramVal, L"%.1f%%", snap.ram.usagePct);
+    swprintf_s(ramSub, L"%s / %s", FileEngine::FormatSizeShort(snap.ram.usedPhysBytes).c_str(), FileEngine::FormatSizeShort(snap.ram.totalPhysBytes).c_str());
+    drawOscilloscope(D2D1::RectF(workR.left + padX + (oscW + oscGap), curY, workR.left + padX + oscW * 2 + oscGap, curY + oscH),
+                     L"PAMIĘĆ RAM (LIVE 60s)", ramVal, ramSub, snap.historyRam, snap.historyCursor, 0xA855F7);
+
+    wchar_t gpuVal[32] = {}, gpuSub[128] = {};
+    uint64_t gVramUsed = snap.gpus.empty() ? 0 : snap.gpus[0].dedicatedVramUsedBytes;
+    uint64_t gVramTot  = snap.gpus.empty() ? 0 : snap.gpus[0].dedicatedVramBytes;
+    float gLoad = (!snap.gpus.empty() && snap.gpus[0].hasNvmlTelemetry)
+                  ? static_cast<float>(snap.gpus[0].gpuUtilPct)
+                  : (gVramTot > 0 ? static_cast<float>(100.0 * double(gVramUsed) / double(gVramTot)) : 0.0f);
+    swprintf_s(gpuVal, L"%.0f%%", gLoad);
+    if (!snap.gpus.empty() && snap.gpus[0].hasNvmlTelemetry) {
+        swprintf_s(gpuSub, L"VRAM: %s / %s  \x2022  %u\x00B0C", FileEngine::FormatSizeShort(gVramUsed).c_str(), FileEngine::FormatSizeShort(gVramTot).c_str(), snap.gpus[0].tempC);
+    } else {
+        swprintf_s(gpuSub, L"VRAM: %s / %s", FileEngine::FormatSizeShort(gVramUsed).c_str(), FileEngine::FormatSizeShort(gVramTot).c_str());
+    }
+    drawOscilloscope(D2D1::RectF(workR.left + padX + (oscW + oscGap) * 2, curY, workR.left + padX + oscW * 3 + oscGap * 2, curY + oscH),
+                     L"KARTA GRAFICZNA (GPU/VRAM)", gpuVal, gpuSub, snap.historyGpu, snap.historyCursor, 0x10B981);
+
+    double totalRxKB = 0.0, totalTxKB = 0.0;
+    for (const auto& n : snap.networks) {
+        totalRxKB += n.rxRateKBps;
+        totalTxKB += n.txRateKBps;
+    }
+    wchar_t netVal[64] = {}, netSub[128] = {};
+    if (totalRxKB + totalTxKB >= 1024.0) {
+        swprintf_s(netVal, L"%.2f MB/s", (totalRxKB + totalTxKB) / 1024.0);
+    } else {
+        swprintf_s(netVal, L"%.1f KB/s", totalRxKB + totalTxKB);
+    }
+    swprintf_s(netSub, L"\x2193 RX: %.1f KB/s   \x2191 TX: %.1f KB/s", totalRxKB, totalTxKB);
+    drawOscilloscope(D2D1::RectF(workR.left + padX + (oscW + oscGap) * 3, curY, workR.left + padX + availW, curY + oscH),
+                     L"SIEĆ (PRZEPUSTOWOŚĆ LIVE)", netVal, netSub, snap.historyNetKBps, snap.historyCursor, 0xF59E0B);
+
+    curY += oscH + 10.0f;
+
+    // Helper to render a structured Pro Diagnostic Card with key-value rows and register click-to-copy
+    struct KvRow { std::wstring key; std::wstring val; UINT32 valColor = 0xF1F5F9; };
+    auto drawProCard = [&](float x, float y, float w, const std::wstring& title, UINT32 badgeHex, const std::vector<KvRow>& rows) -> float {
+        float rowH = 20.0f;
+        float h = 34.0f + static_cast<float>(rows.size()) * rowH + 8.0f;
+        D2D1_RECT_F cardR = D2D1::RectF(x, y, x + w, y + h);
+
+        m_solidBrush->SetColor(HexColor(0x131B2B));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(cardR, 5.0f, 5.0f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x26334D));
+        m_rt->DrawRoundedRectangle(D2D1::RoundedRect(cardR, 5.0f, 5.0f), m_solidBrush, 1.0f);
+
+        // Top accent bar on card header
+        D2D1_RECT_F hdrR = D2D1::RectF(x, y, x + w, y + 28.0f);
+        m_solidBrush->SetColor(HexColor(0x192338));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(hdrR, 5.0f, 5.0f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(badgeHex));
+        m_rt->FillRectangle(D2D1::RectF(x, y + 4.0f, x + 4.0f, y + 24.0f), m_solidBrush);
+
+        D2D1_RECT_F titleR = D2D1::RectF(x + 12.0f, y + 4.0f, x + w - 85.0f, y + 26.0f);
+        m_solidBrush->SetColor(HexColor(0xF8FAFC));
+        m_rt->DrawTextW(title.c_str(), static_cast<UINT32>(title.size()), m_fmtBold, titleR, m_solidBrush);
+
+        D2D1_RECT_F copyHintR = D2D1::RectF(x + w - 82.0f, y + 5.0f, x + w - 8.0f, y + 25.0f);
+        m_solidBrush->SetColor(HexColor(0x64748B));
+        const wchar_t* cpLbl = (m_lang == Lang::PL) ? L"[\xD83D\xDCCB Kopiuj]" : L"[\xD83D\xDCCB Copy]";
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        m_rt->DrawTextW(cpLbl, static_cast<UINT32>(wcslen(cpLbl)), m_fmtSmall, copyHintR, m_solidBrush);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        std::wstring clipPayload = L"=== " + title + L" ===\r\n";
+        float ry = y + 32.0f;
+        float keyW = std::min(195.0f, w * 0.38f);
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i % 2 == 1) {
+                m_solidBrush->SetColor(HexColor(0x162032, 0.55f));
+                m_rt->FillRectangle(D2D1::RectF(x + 4.0f, ry, x + w - 4.0f, ry + rowH), m_solidBrush);
+            }
+            D2D1_RECT_F kR = D2D1::RectF(x + 12.0f, ry + 1.0f, x + keyW, ry + rowH);
+            D2D1_RECT_F vR = D2D1::RectF(x + keyW + 4.0f, ry + 1.0f, x + w - 10.0f, ry + rowH);
+
+            m_solidBrush->SetColor(HexColor(0x94A3B8));
+            m_rt->DrawTextW(rows[i].key.c_str(), static_cast<UINT32>(rows[i].key.size()), m_fmtSmall, kR, m_solidBrush);
+
+            m_solidBrush->SetColor(HexColor(rows[i].valColor));
+            m_rt->DrawTextW(rows[i].val.c_str(), static_cast<UINT32>(rows[i].val.size()), m_fmtSmall, vR, m_solidBrush);
+
+            clipPayload += rows[i].key + L": " + rows[i].val + L"\r\n";
+            ry += rowH;
+        }
+
+        m_hwCardHits.push_back({ cardR, title, clipPayload });
+        return h;
+    };
+
+    float colGap = 10.0f;
+    float halfW = (availW - colGap) * 0.5f;
+    float leftX = workR.left + padX;
+    float rightX = leftX + halfW + colGap;
+
+    bool showAll = (m_hwSubTab == HardwareSubTab::Overview);
+
+    // =========================================================================
+    // SECTION A: CPU Architecture, Cache Hierarchy, ISA Flags & Per-Core Heatmap
+    // =========================================================================
+    if (showAll || m_hwSubTab == HardwareSubTab::CpuCores) {
+        std::vector<KvRow> cpuRows;
+        cpuRows.push_back({ m_lang == Lang::PL ? L"Model procesora" : L"Processor Brand", snap.cpu.brand, 0x38BDF8 });
+        cpuRows.push_back({ m_lang == Lang::PL ? L"Producent / Gniazdo" : L"Vendor / Socket", snap.cpu.vendor + L"  \x2022  " + snap.cpu.socketDesignation });
+        wchar_t topoBuf[128] = {};
+        swprintf_s(topoBuf, L"%u fizycznych rdzeni  /  %u wątków logicznych  (%u pakiet)", snap.cpu.physicalCores, snap.cpu.logicalCores, snap.cpu.packages);
+        cpuRows.push_back({ m_lang == Lang::PL ? L"Rdzenie / Wątki" : L"Cores / Threads", topoBuf, 0x4ADE80 });
+        wchar_t famBuf[128] = {};
+        swprintf_s(famBuf, L"Family %u (0x%X), Model %u (0x%X), Stepping %u", snap.cpu.family, snap.cpu.family, snap.cpu.model, snap.cpu.model, snap.cpu.stepping);
+        cpuRows.push_back({ L"Architektura (CPUID)", famBuf });
+        wchar_t clkBuf[128] = {};
+        swprintf_s(clkBuf, L"Bazowe: %u MHz   \x2022   Max Boost: %u MHz", snap.cpu.baseClockMHz, snap.cpu.maxClockMHz);
+        cpuRows.push_back({ m_lang == Lang::PL ? L"Taktowanie" : L"Clock Speeds", clkBuf });
+        wchar_t cacheBuf[160] = {};
+        swprintf_s(cacheBuf, L"L1D: %u KB  |  L1I: %u KB  |  L2: %u KB  |  L3: %u KB (Linia %u B)",
+                   snap.cpu.l1DataKB, snap.cpu.l1InstKB, snap.cpu.l2KB, snap.cpu.l3KB, snap.cpu.cacheLineBytes);
+        cpuRows.push_back({ L"Hierarchia Cache", cacheBuf, 0xFBBF24 });
+
+        std::wstring isa;
+        if (snap.cpu.sse42)    isa += L"[SSE4.2] ";
+        if (snap.cpu.avx)      isa += L"[AVX] ";
+        if (snap.cpu.avx2)     isa += L"[AVX2] ";
+        if (snap.cpu.avx512f)  isa += L"[AVX-512] ";
+        if (snap.cpu.fma3)     isa += L"[FMA3] ";
+        if (snap.cpu.aesNi)    isa += L"[AES-NI] ";
+        if (snap.cpu.sha)      isa += L"[SHA] ";
+        if (snap.cpu.vtX_amdV) isa += L"[VT-x/AMD-V] ";
+        if (snap.cpu.hypervisorPresent) isa += L"[Hypervisor]";
+        cpuRows.push_back({ L"Instrukcje ISA", isa, 0xC084FC });
+
+        if (snap.cpuBenchRunning) {
+            cpuRows.push_back({ L"Benchmark CPU", L"\x23F3 Trwa test wielowątkowy...", 0xFBBF24 });
+        } else if (snap.cpuSingleCoreGops > 0.0) {
+            wchar_t bBuf[128] = {};
+            swprintf_s(bBuf, L"1-Wątek: %.2f GOPS   \x2022   Wielowątkowo (%uW): %.2f GOPS", snap.cpuSingleCoreGops, snap.cpu.logicalCores, snap.cpuMultiCoreGops);
+            cpuRows.push_back({ L"\x26A1 Wynik Benchmarku CPU", bBuf, 0x38BDF8 });
+        }
+
+        float hLeft = drawProCard(leftX, curY, halfW, m_lang == Lang::PL ? L"PROCESOR (ARCHITEKTURA CPUID & CACHE)" : L"PROCESSOR (CPUID & CACHE TOPOLOGY)", 0x38BDF8, cpuRows);
+
+        // Right card: Per-Core Live Utilization Heatmap Grid
+        int nCores = static_cast<int>(snap.perCoreUsagePct.size());
+        int cols = (nCores > 16) ? 8 : 4;
+        int rowsCount = std::max(1, (nCores + cols - 1) / cols);
+        float cellH = 30.0f;
+        float heatH = std::max(hLeft, 44.0f + rowsCount * cellH + 10.0f);
+
+        D2D1_RECT_F heatCard = D2D1::RectF(rightX, curY, rightX + halfW, curY + heatH);
+        m_solidBrush->SetColor(HexColor(0x131B2B));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(heatCard, 5.0f, 5.0f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x26334D));
+        m_rt->DrawRoundedRectangle(D2D1::RoundedRect(heatCard, 5.0f, 5.0f), m_solidBrush, 1.0f);
+
+        D2D1_RECT_F hhR = D2D1::RectF(rightX, curY, rightX + halfW, curY + 28.0f);
+        m_solidBrush->SetColor(HexColor(0x192338));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(hhR, 5.0f, 5.0f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x10B981));
+        m_rt->FillRectangle(D2D1::RectF(rightX, curY + 4.0f, rightX + 4.0f, curY + 24.0f), m_solidBrush);
+
+        wchar_t heatTitle[128] = {};
+        swprintf_s(heatTitle, L"OBCIĄŻENIE RDZENI NA ŻYWO (%d WĄTKÓW \x2022 %.1f%%)", nCores, snap.cpuTotalUsagePct);
+        D2D1_RECT_F htR = D2D1::RectF(rightX + 12.0f, curY + 4.0f, rightX + halfW - 10.0f, curY + 26.0f);
+        m_solidBrush->SetColor(HexColor(0xF8FAFC));
+        m_rt->DrawTextW(heatTitle, static_cast<UINT32>(wcslen(heatTitle)), m_fmtBold, htR, m_solidBrush);
+
+        float gridPad = 8.0f;
+        float cellW = (halfW - gridPad * 2.0f - (cols - 1) * 4.0f) / static_cast<float>(cols);
+        for (int c = 0; c < nCores; ++c) {
+            int rIdx = c / cols;
+            int cIdx = c % cols;
+            float cx0 = rightX + gridPad + cIdx * (cellW + 4.0f);
+            float cy0 = curY + 36.0f + rIdx * cellH;
+            D2D1_RECT_F cBox = D2D1::RectF(cx0, cy0, cx0 + cellW, cy0 + cellH - 4.0f);
+
+            float pct = std::clamp(snap.perCoreUsagePct[c], 0.0f, 100.0f);
+            UINT32 barCol = (pct > 85.0f) ? 0xEF4444 : (pct > 55.0f ? 0xF59E0B : (pct > 20.0f ? 0x10B981 : 0x0284C7));
+
+            m_solidBrush->SetColor(HexColor(0x0B101B));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(cBox, 3.0f, 3.0f), m_solidBrush);
+
+            float fillW = (cBox.right - cBox.left) * (pct * 0.01f);
+            if (fillW > 1.5f) {
+                D2D1_RECT_F fBox = D2D1::RectF(cBox.left, cBox.top, cBox.left + fillW, cBox.bottom);
+                m_solidBrush->SetColor(HexColor(barCol, 0.42f));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(fBox, 3.0f, 3.0f), m_solidBrush);
+            }
+            m_solidBrush->SetColor(HexColor(barCol, 0.75f));
+            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(cBox, 3.0f, 3.0f), m_solidBrush, 1.0f);
+
+            wchar_t cLbl[32] = {};
+            swprintf_s(cLbl, L"C%d: %.0f%%", c, pct);
+            m_solidBrush->SetColor(HexColor(0xF1F5F9));
+            m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            m_rt->DrawTextW(cLbl, static_cast<UINT32>(wcslen(cLbl)), m_fmtSmall, cBox, m_solidBrush);
+            m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+
+        curY += std::max(hLeft, heatH) + 10.0f;
+    }
+
+    // =========================================================================
+    // SECTION B: GPU & Connected Monitors Inspector (DXGI + NVML)
+    // =========================================================================
+    if (showAll || m_hwSubTab == HardwareSubTab::GpuDisplays) {
+        std::vector<KvRow> gpuRows;
+        for (size_t i = 0; i < snap.gpus.size(); ++i) {
+            const auto& g = snap.gpus[i];
+            std::wstring prefix = L"[GPU " + std::to_wstring(i) + L"] ";
+            gpuRows.push_back({ prefix + L"Układ graficzny", g.name, 0x10B981 });
+            gpuRows.push_back({ prefix + L"VRAM Dedykowany (Użycie)",
+                                FileEngine::FormatSizeShort(g.dedicatedVramUsedBytes) + L" / " + FileEngine::FormatSizeShort(g.dedicatedVramBytes) +
+                                L"   (Współdzielony: " + FileEngine::FormatSizeShort(g.sharedSystemBytes) + L")", 0x38BDF8 });
+            wchar_t pciBuf[128] = {};
+            swprintf_s(pciBuf, L"Vendor: 0x%04X  \x2022  Device: 0x%04X  \x2022  Rev: 0x%02X", g.vendorId, g.deviceId, g.revision);
+            gpuRows.push_back({ prefix + L"Identyfikatory PCI", pciBuf });
+            if (!g.driverVersion.empty()) {
+                gpuRows.push_back({ prefix + L"Wersja sterownika", g.driverVersion + (g.driverDate.empty() ? L"" : (L" (" + g.driverDate + L")")) });
+            }
+            if (g.hasNvmlTelemetry) {
+                wchar_t nvBuf[160] = {};
+                swprintf_s(nvBuf, L"Rdzeń: %u%% (%u MHz)  \x2022  VRAM: %u MHz  \x2022  Temp: %u\x00B0C  \x2022  Wentylator: %u%%  \x2022  Moc: %.1f W",
+                           g.gpuUtilPct, g.coreClockMHz, g.memClockMHz, g.tempC, g.fanSpeedPct, double(g.powerMilliwatts) / 1000.0);
+                gpuRows.push_back({ prefix + L"Sensory NVML Live", nvBuf, 0xFBBF24 });
+            }
+        }
+
+        std::vector<KvRow> monRows;
+        for (size_t i = 0; i < snap.displays.size(); ++i) {
+            const auto& d = snap.displays[i];
+            wchar_t resBuf[128] = {};
+            swprintf_s(resBuf, L"%u \x00D7 %u @ %u Hz (%u-bit)%s",
+                       d.width, d.height, d.refreshHz, d.bitsPerPel, d.isPrimary ? L"  [GŁÓWNY]" : L"");
+            monRows.push_back({ d.monitorName + L" (" + d.deviceName + L")", resBuf, d.isPrimary ? 0x38BDF8 : 0xF1F5F9 });
+            if (!d.adapterName.empty()) {
+                monRows.push_back({ L"   Podłączony do", d.adapterName, 0x94A3B8 });
+            }
+        }
+        if (monRows.empty()) {
+            monRows.push_back({ L"Ekran", L"Brak dodatkowych danych EDID" });
+        }
+
+        float hG = drawProCard(leftX,  curY, halfW, m_lang == Lang::PL ? L"KARTY GRAFICZNE (DXGI / VRAM / NVML)" : L"GRAPHICS ADAPTERS (DXGI / VRAM / NVML)", 0x10B981, gpuRows);
+        float hM = drawProCard(rightX, curY, halfW, m_lang == Lang::PL ? L"MONITORY I MATRYCE (ROZDZIELCZOŚĆ & HZ)" : L"CONNECTED DISPLAYS & REFRESH RATE", 0x06B6D4, monRows);
+        curY += std::max(hG, hM) + 10.0f;
+    }
+
+    // =========================================================================
+    // SECTION C: Physical RAM DIMM Slots (SMBIOS Type 17) & Motherboard/BIOS
+    // =========================================================================
+    if (showAll || m_hwSubTab == HardwareSubTab::MemoryDimms || m_hwSubTab == HardwareSubTab::MotherboardBios) {
+        std::vector<KvRow> ramRows;
+        wchar_t totRamBuf[160] = {};
+        swprintf_s(totRamBuf, L"%s używane z %s (%.1f%%)   \x2022   Wolne: %s",
+                   FileEngine::FormatSizeShort(snap.ram.usedPhysBytes).c_str(),
+                   FileEngine::FormatSizeShort(snap.ram.totalPhysBytes).c_str(),
+                   snap.ram.usagePct,
+                   FileEngine::FormatSizeShort(snap.ram.availPhysBytes).c_str());
+        ramRows.push_back({ L"Pamięć fizyczna RAM", totRamBuf, 0xA855F7 });
+        ramRows.push_back({ L"Pamięć zadeklarowana (Commit)",
+                            FileEngine::FormatSizeShort(snap.ram.commitTotalBytes) + L" / " + FileEngine::FormatSizeShort(snap.ram.commitLimitBytes) +
+                            L"   (Szczyt: " + FileEngine::FormatSizeShort(snap.ram.commitPeakBytes) + L")" });
+        ramRows.push_back({ L"Pula jądra (Paged / Non-Paged)",
+                            FileEngine::FormatSizeShort(snap.ram.kernelPagedBytes) + L" / " + FileEngine::FormatSizeShort(snap.ram.kernelNonPagedBytes) });
+
+        if (snap.ramBenchRunning) {
+            ramRows.push_back({ L"Benchmark RAM", L"\x23F3 Trwa test przepustowości RAM (256 MB)...", 0xFBBF24 });
+        } else if (snap.ramReadGBps > 0.0) {
+            wchar_t rbBuf[128] = {};
+            swprintf_s(rbBuf, L"Odczyt: %.2f GB/s   \x2022   Zapis: %.2f GB/s   \x2022   Kopiowanie: %.2f GB/s",
+                       snap.ramReadGBps, snap.ramWriteGBps, snap.ramCopyGBps);
+            ramRows.push_back({ L"\x26A1 Przepustowość RAM", rbBuf, 0x4ADE80 });
+        }
+
+        for (size_t i = 0; i < snap.ram.dimms.size(); ++i) {
+            const auto& dm = snap.ram.dimms[i];
+            wchar_t dSpec[256] = {};
+            swprintf_s(dSpec, L"%s  \x2022  %s @ %u MT/s (Max %u)  \x2022  %s %s",
+                       FileEngine::FormatSizeShort(dm.capacityBytes).c_str(),
+                       dm.memoryType.c_str(), dm.configuredSpeedMTs, dm.speedMTs,
+                       dm.manufacturer.c_str(), dm.partNumber.c_str());
+            ramRows.push_back({ L"Slot [" + dm.slotLocator + L"]", dSpec, 0x38BDF8 });
+        }
+
+        std::vector<KvRow> brdRows;
+        brdRows.push_back({ L"Producent płyty głównej", snap.board.boardManufacturer, 0xF59E0B });
+        brdRows.push_back({ L"Model płyty głównej", snap.board.boardProduct + (snap.board.boardVersion.empty() ? L"" : (L" (Rev " + snap.board.boardVersion + L")")), 0x38BDF8 });
+        if (!snap.board.boardSerial.empty()) {
+            brdRows.push_back({ L"Numer seryjny płyty", snap.board.boardSerial });
+        }
+        brdRows.push_back({ L"Producent UEFI / BIOS", snap.board.biosVendor });
+        brdRows.push_back({ L"Wersja i Data BIOS", snap.board.biosVersion + L"   (" + snap.board.biosDate + L")", 0x4ADE80 });
+        brdRows.push_back({ L"System / Produkt", snap.board.sysManufacturer + L" " + snap.board.sysProductName });
+        if (!snap.board.sysSku.empty()) {
+            brdRows.push_back({ L"SKU / Rodzina", snap.board.sysSku + L" / " + snap.board.sysFamily });
+        }
+
+        float hR = drawProCard(leftX,  curY, halfW, m_lang == Lang::PL ? L"PAMIĘĆ RAM & KOŚCI FIZYCZNE (SMBIOS TYPE 17)" : L"PHYSICAL RAM & DIMM SLOTS (SMBIOS TYPE 17)", 0xA855F7, ramRows);
+        float hB = drawProCard(rightX, curY, halfW, m_lang == Lang::PL ? L"PŁYTA GŁÓWNA, CHIPSET & UEFI / BIOS (SMBIOS)" : L"MOTHERBOARD & UEFI / BIOS FIRMWARE", 0xF59E0B, brdRows);
+        curY += std::max(hR, hB) + 10.0f;
+    }
+
+    // =========================================================================
+    // SECTION D: Physical Disks (NVMe/SATA/USB IOCTL) & Logical Volumes
+    // =========================================================================
+    if (showAll || m_hwSubTab == HardwareSubTab::StorageSmart) {
+        std::vector<KvRow> pdRows;
+        for (const auto& pd : snap.physicalDisks) {
+            std::wstring tag = L"Dysk #" + std::to_wstring(pd.index) + L" [" + pd.busType + L" " + pd.mediaType + L"]";
+            pdRows.push_back({ tag, pd.model + L"  (" + FileEngine::FormatSizeShort(pd.sizeBytes) + L")", 0x38BDF8 });
+            wchar_t detBuf[256] = {};
+            swprintf_s(detBuf, L"FW: %s  \x2022  Sektor: %uB/%uB  \x2022  TRIM: %s  \x2022  NCQ: %s%s%s",
+                       pd.firmwareRev.empty() ? L"-" : pd.firmwareRev.c_str(),
+                       pd.bytesPerLogicalSector, pd.bytesPerPhysicalSector,
+                       pd.trimEnabled ? L"Tak" : L"Nie",
+                       pd.ncqSupported ? L"Tak" : L"Nie",
+                       pd.serialNumber.empty() ? L"" : L"  \x2022  S/N: ",
+                       pd.serialNumber.c_str());
+            pdRows.push_back({ L"   Parametry kontrolera", detBuf, 0xCBD5E1 });
+        }
+
+        std::vector<KvRow> volRows;
+        for (const auto& v : snap.volumes) {
+            wchar_t vBuf[256] = {};
+            swprintf_s(vBuf, L"[%s]  Użyte: %s / %s (%.1f%%)  \x2022  Wolne: %s",
+                       v.fileSystem.c_str(),
+                       FileEngine::FormatSizeShort(v.usedBytes).c_str(),
+                       FileEngine::FormatSizeShort(v.totalBytes).c_str(),
+                       v.usagePct,
+                       FileEngine::FormatSizeShort(v.freeBytes).c_str());
+            UINT32 col = (v.usagePct > 90.0f) ? 0xEF4444 : (v.usagePct > 75.0f ? 0xFBBF24 : 0x4ADE80);
+            volRows.push_back({ v.rootPath + L" " + v.label + L" (" + v.driveType + L")", vBuf, col });
+        }
+
+        float hP = drawProCard(leftX,  curY, halfW, m_lang == Lang::PL ? L"FIZYCZNE NOŚNIKI DANYCH (NVMe / SATA / USB IOCTL)" : L"PHYSICAL STORAGE DRIVES (IOCTL)", 0x0EA5E9, pdRows);
+        float hV = drawProCard(rightX, curY, halfW, m_lang == Lang::PL ? L"PARTYCJE LOGICZNE I SYSTEMY PLIKÓW" : L"LOGICAL VOLUMES & PARTITIONS", 0x10B981, volRows);
+        curY += std::max(hP, hV) + 10.0f;
+    }
+
+    // =========================================================================
+    // SECTION E: Network Interfaces & OS / Power / Audio / Top 10 Processes
+    // =========================================================================
+    if (showAll || m_hwSubTab == HardwareSubTab::NetworkInterfaces || m_hwSubTab == HardwareSubTab::SystemPowerProcs) {
+        std::vector<KvRow> netRows;
+        for (const auto& n : snap.networks) {
+            std::wstring status = n.isUp ? L"[AKTYWNA] " : L"[NIEAKTYWNA] ";
+            netRows.push_back({ status + n.friendlyName, n.description, n.isUp ? 0x4ADE80 : 0x94A3B8 });
+            wchar_t ipBuf[256] = {};
+            swprintf_s(ipBuf, L"IPv4: %s   \x2022   Brama: %s   \x2022   DNS: %s",
+                       n.ipv4.empty() ? L"-" : n.ipv4.c_str(),
+                       n.gateway.empty() ? L"-" : n.gateway.c_str(),
+                       n.dnsServers.empty() ? L"-" : n.dnsServers.c_str());
+            netRows.push_back({ L"   Adresacja IP / DNS", ipBuf, 0x38BDF8 });
+            wchar_t trBuf[256] = {};
+            swprintf_s(trBuf, L"MAC: %s  \x2022  Link: %llu Mbps  \x2022  RX: %s (%.1f KB/s)  \x2022  TX: %s (%.1f KB/s)",
+                       n.macAddress.c_str(),
+                       static_cast<unsigned long long>(n.linkSpeedBitsPerSec / 1000000ULL),
+                       FileEngine::FormatSizeShort(n.rxBytesTotal).c_str(), n.rxRateKBps,
+                       FileEngine::FormatSizeShort(n.txBytesTotal).c_str(), n.txRateKBps);
+            netRows.push_back({ L"   Statystyki pakietów", trBuf, 0xCBD5E1 });
+        }
+
+        std::vector<KvRow> sysRows;
+        sysRows.push_back({ L"System operacyjny", snap.os.osName + L" (" + snap.os.architecture + L", " + snap.os.buildNumber + L")", 0x38BDF8 });
+        uint64_t upSec = snap.os.uptimeSeconds;
+        wchar_t upBuf[128] = {};
+        swprintf_s(upBuf, L"%llu dni, %llu godz., %llu min, %llu sek.", upSec / 86400ULL, (upSec % 86400ULL) / 3600ULL, (upSec % 3600ULL) / 60ULL, upSec % 60ULL);
+        sysRows.push_back({ L"Czas pracy systemu (Uptime)", upBuf, 0x4ADE80 });
+        sysRows.push_back({ L"Komputer / Użytkownik", snap.os.computerName + L"  /  " + snap.os.userName });
+        wchar_t cntBuf[128] = {};
+        swprintf_s(cntBuf, L"Procesy: %u   \x2022   Wątki: %u   \x2022   Uchwyty (Handles): %u", snap.os.processCount, snap.os.threadCount, snap.os.handleCount);
+        sysRows.push_back({ L"Obiekty jądra NT", cntBuf });
+
+        if (!snap.audioDevices.empty()) {
+            std::wstring audStr;
+            for (size_t i = 0; i < snap.audioDevices.size(); ++i) {
+                if (i > 0) audStr += L"  |  ";
+                audStr += snap.audioDevices[i];
+            }
+            sysRows.push_back({ L"Urządzenia Audio", audStr, 0xFBBF24 });
+        }
+
+        for (size_t i = 0; i < std::min<size_t>(6, snap.topProcesses.size()); ++i) {
+            const auto& tp = snap.topProcesses[i];
+            wchar_t pBuf[128] = {};
+            swprintf_s(pBuf, L"%s   (PID: %u, Wątki: %u)", FileEngine::FormatSizeShort(tp.workingSetBytes).c_str(), tp.pid, tp.threads);
+            sysRows.push_back({ L"Top RAM #" + std::to_wstring(i + 1) + L": " + tp.name, pBuf, 0xE2E8F0 });
+        }
+
+        float hN = drawProCard(leftX,  curY, halfW, m_lang == Lang::PL ? L"KARTY SIECIOWE (IPv4 / IPv6 / MAC / RUCH LIVE)" : L"NETWORK INTERFACES (IPv4 / MAC / LIVE TRAFFIC)", 0xF59E0B, netRows);
+        float hS = drawProCard(rightX, curY, halfW, m_lang == Lang::PL ? L"SYSTEM WINDOWS, AUDIO & TOP PROCESY RAM" : L"WINDOWS OS, AUDIO & TOP PROCESSES BY RAM", 0xEC4899, sysRows);
+        curY += std::max(hN, hS) + 16.0f;
+    }
+
+    m_rt->PopAxisAlignedClip();
+    m_rt->PopAxisAlignedClip();
 }
 
 } // namespace Explorer2

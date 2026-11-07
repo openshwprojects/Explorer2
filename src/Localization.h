@@ -15,6 +15,7 @@ struct Strings {
     const wchar_t* tabShare;
     const wchar_t* tabView;
     const wchar_t* tabSearch;
+    const wchar_t* tabHardware;
 
     // Home Ribbon Groups
     const wchar_t* grpClipboard;
@@ -65,6 +66,7 @@ struct Strings {
     const wchar_t* viewList;
     const wchar_t* viewDetails;
     const wchar_t* viewProportions;
+    const wchar_t* viewPieChart;
     const wchar_t* viewFullViewer;
     const wchar_t* viewFullScreen;
     const wchar_t* chkFileExt;
@@ -157,7 +159,7 @@ struct Strings {
 };
 
 inline const Strings kStringsPL = {
-    L"Plik", L"Narzędzia główne", L"Udostępnianie", L"Widok", L"Wyszukiwanie",
+    L"Plik", L"Narzędzia główne", L"Udostępnianie", L"Widok", L"Wyszukiwanie", L"Sprzęt",
     L"Schowek", L"Organizowanie", L"Nowy", L"Otwieranie", L"Zaznaczanie",
     L"Przypnij do paska\nSzybki dostęp", L"Kopiuj", L"Wklej", L"Wytnij", L"Kopiuj ścieżkę", L"Wklej skrót",
     L"Przenieś\ndo", L"Kopiuj\ndo", L"Usuń", L"Zmień\nnazwę",
@@ -172,7 +174,7 @@ inline const Strings kStringsPL = {
     L"Okienka", L"Układ", L"Widok bieżący", L"Pokazywanie/ukrywanie",
     L"Okienko\nnawigacji", L"Okienko\npodglądu",
     L"Gigantyczne ikony", L"Bardzo duże ikony", L"Duże ikony", L"Średnie ikony", L"Małe ikony",
-    L"Lista", L"Szczegóły", L"Proporcje", L"Pełny podgląd (Viewer)", L"Pełny ekran (F11)",
+    L"Lista", L"Szczegóły", L"Proporcje", L"Kołowy", L"Pełny podgląd (Viewer)", L"Pełny ekran (F11)",
     L"Rozszerzenia nazw plików", L"Ukryte elementy",
 
     L"Szybki dostęp", L"Ten komputer", L"Sieć",
@@ -238,7 +240,7 @@ inline const Strings kStringsPL = {
 };
 
 inline const Strings kStringsEN = {
-    L"File", L"Home", L"Share", L"View", L"Search",
+    L"File", L"Home", L"Share", L"View", L"Search", L"Hardware",
     L"Clipboard", L"Organize", L"New", L"Open", L"Select",
     L"Pin to\nQuick access", L"Copy", L"Paste", L"Cut", L"Copy path", L"Paste shortcut",
     L"Move\nto", L"Copy\nto", L"Delete", L"Rename",
@@ -253,7 +255,7 @@ inline const Strings kStringsEN = {
     L"Panes", L"Layout", L"Current view", L"Show/hide",
     L"Navigation\npane", L"Preview\npane",
     L"Jumbo icons", L"Extra large icons", L"Large icons", L"Medium icons", L"Small icons",
-    L"List", L"Details", L"Proportions", L"Full Viewer (In-Window)", L"Full Screen (F11)",
+    L"List", L"Details", L"Proportions", L"Pie chart", L"Full Viewer (In-Window)", L"Full Screen (F11)",
     L"File name extensions", L"Hidden items",
 
     L"Quick access", L"This PC", L"Network",

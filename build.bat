@@ -9,6 +9,7 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 ^
     src\ImageCache.cpp ^
     src\ShellMenuEmulator.cpp ^
     src\MediaPlayer.cpp ^
+    src\HardwareInfo.cpp ^
     src\ExplorerApp.cpp ^
     src\ExplorerAppRender.cpp ^
     /Fo:build\ ^
