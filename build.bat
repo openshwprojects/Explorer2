@@ -10,6 +10,15 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 ^
     src\ShellMenuEmulator.cpp ^
     src\MediaPlayer.cpp ^
     src\HardwareInfo.cpp ^
+    src\ProgramsInfo.cpp ^
+    src\Monitoring.cpp ^
+    src\LanScanner.cpp ^
+    src\GitIntegration.cpp ^
+    src\AppLog.cpp ^
+    src\NotepadViewer.cpp ^
+    src\HexViewer.cpp ^
+    src\Model3DViewer.cpp ^
+    src\FileContentPane.cpp ^
     src\ExplorerApp.cpp ^
     src\ExplorerAppRender.cpp ^
     /Fo:build\ ^

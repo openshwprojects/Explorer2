@@ -7,6 +7,7 @@
 #include <wincodec.h>
 #include <thread>
 #include <algorithm>
+#include <cmath>
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -604,6 +605,557 @@ bool ShellMenuEmulator::RotateImageFile(const std::wstring& imagePath, bool cloc
         DeleteFileW(tmpPath.c_str());
         return false;
     }
+    return true;
+}
+
+bool ShellMenuEmulator::ProbeImageDimensions(const std::wstring& imagePath, uint32_t& outW, uint32_t& outH, uint64_t* outFileBytes) {
+    outW = 0;
+    outH = 0;
+    if (outFileBytes) *outFileBytes = 0;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (GetFileAttributesExW(imagePath.c_str(), GetFileExInfoStandard, &fad)) {
+        if (outFileBytes) {
+            *outFileBytes = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        }
+    }
+
+    ComPtr<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(wic->CreateDecoderFromFilename(imagePath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) || !decoder) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) return false;
+
+    UINT w = 0, h = 0;
+    if (FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0) return false;
+    outW = w;
+    outH = h;
+    return true;
+}
+
+static bool EncodeWicSourceToMemory(
+    IWICImagingFactory* wic,
+    IWICBitmapSource* source,
+    GUID containerFormat,
+    float jpegQuality,
+    std::vector<uint8_t>& outEncoded,
+    GUID* outActualContainer = nullptr) {
+    outEncoded.clear();
+    if (!wic || !source) return false;
+
+    ComPtr<IStream> memStream;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &memStream)) || !memStream) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(wic->CreateEncoder(containerFormat, nullptr, &encoder)) || !encoder) {
+        // Fallback for formats without a built-in WIC encoder (e.g. WebP / RAW): encode as JPEG
+        containerFormat = GUID_ContainerFormatJpeg;
+        if (FAILED(wic->CreateEncoder(containerFormat, nullptr, &encoder)) || !encoder) {
+            return false;
+        }
+    }
+    if (outActualContainer) *outActualContainer = containerFormat;
+
+    if (FAILED(encoder->Initialize(memStream.Get(), WICBitmapEncoderNoCache))) {
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameEncode> frameEncode;
+    ComPtr<IPropertyBag2> propBag;
+    if (FAILED(encoder->CreateNewFrame(&frameEncode, &propBag)) || !frameEncode) {
+        return false;
+    }
+
+    if (containerFormat == GUID_ContainerFormatJpeg && propBag) {
+        PROPBAG2 option = {};
+        option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT varValue;
+        VariantInit(&varValue);
+        varValue.vt = VT_R4;
+        varValue.fltVal = std::clamp(jpegQuality, 0.05f, 1.0f);
+        propBag->Write(1, &option, &varValue);
+    }
+
+    if (FAILED(frameEncode->Initialize(propBag.Get()))) {
+        return false;
+    }
+
+    // Ensure pixel format compatibility with the target container (e.g. 32bpp RGBA PNG -> 24bpp BGR JPEG)
+    ComPtr<IWICBitmapSource> writeSource = source;
+    WICPixelFormatGUID srcPf = {};
+    if (SUCCEEDED(source->GetPixelFormat(&srcPf))) {
+        if (containerFormat == GUID_ContainerFormatJpeg || containerFormat == GUID_ContainerFormatBmp) {
+            if (srcPf != GUID_WICPixelFormat24bppBGR && srcPf != GUID_WICPixelFormat8bppGray) {
+                ComPtr<IWICFormatConverter> conv;
+                if (SUCCEEDED(wic->CreateFormatConverter(&conv)) && conv &&
+                    SUCCEEDED(conv->Initialize(source, GUID_WICPixelFormat24bppBGR, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+                    writeSource = conv;
+                }
+            }
+        } else if (containerFormat == GUID_ContainerFormatPng) {
+            if (srcPf != GUID_WICPixelFormat32bppBGRA && srcPf != GUID_WICPixelFormat24bppBGR) {
+                ComPtr<IWICFormatConverter> conv;
+                if (SUCCEEDED(wic->CreateFormatConverter(&conv)) && conv &&
+                    SUCCEEDED(conv->Initialize(source, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+                    writeSource = conv;
+                }
+            }
+        }
+    }
+
+    if (FAILED(frameEncode->WriteSource(writeSource.Get(), nullptr)) ||
+        FAILED(frameEncode->Commit()) ||
+        FAILED(encoder->Commit())) {
+        return false;
+    }
+
+    STATSTG stat = {};
+    if (FAILED(memStream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart == 0) {
+        return false;
+    }
+
+    HGLOBAL hMem = nullptr;
+    if (FAILED(GetHGlobalFromStream(memStream.Get(), &hMem)) || !hMem) {
+        return false;
+    }
+
+    void* ptr = GlobalLock(hMem);
+    if (!ptr) return false;
+    size_t byteCount = static_cast<size_t>(stat.cbSize.QuadPart);
+    outEncoded.assign(static_cast<const uint8_t*>(ptr), static_cast<const uint8_t*>(ptr) + byteCount);
+    GlobalUnlock(hMem);
+    return !outEncoded.empty();
+}
+
+static ComPtr<IWICBitmap> ScaleBitmapCached(
+    IWICImagingFactory* wic,
+    IWICBitmapSource* source,
+    uint32_t newW,
+    uint32_t newH) {
+    newW = std::max(1u, newW);
+    newH = std::max(1u, newH);
+
+    ComPtr<IWICBitmapScaler> scaler;
+    if (FAILED(wic->CreateBitmapScaler(&scaler)) || !scaler) return nullptr;
+    if (FAILED(scaler->Initialize(source, newW, newH, WICBitmapInterpolationModeHighQualityCubic))) {
+        if (FAILED(scaler->Initialize(source, newW, newH, WICBitmapInterpolationModeFant))) {
+            return nullptr;
+        }
+    }
+
+    ComPtr<IWICBitmap> cached;
+    if (FAILED(wic->CreateBitmapFromSource(scaler.Get(), WICBitmapCacheOnLoad, &cached))) {
+        return nullptr;
+    }
+    return cached;
+}
+
+static bool WriteBytesToFileAtomic(const std::wstring& destPath, const std::vector<uint8_t>& data) {
+    if (data.empty()) return false;
+    std::wstring tmpPath = destPath + L".img_tmp";
+    DeleteFileW(tmpPath.c_str());
+
+    HANDLE hOut = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hOut == INVALID_HANDLE_VALUE) return false;
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(hOut, data.data(), static_cast<DWORD>(data.size()), &written, nullptr);
+    CloseHandle(hOut);
+    if (!ok || written != static_cast<DWORD>(data.size())) {
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+
+    if (!MoveFileExW(tmpPath.c_str(), destPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const ImageTransformParams& params, ImageTransformResult& outRes) {
+    outRes = {};
+    outRes.srcPath = imagePath;
+
+    ComPtr<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic) {
+        outRes.errorMsg = L"WIC factory init failed";
+        return false;
+    }
+
+    HANDLE hIn = CreateFileW(imagePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hIn == INVALID_HANDLE_VALUE) {
+        outRes.errorMsg = L"Cannot open source image";
+        return false;
+    }
+
+    LARGE_INTEGER sz = {};
+    if (!GetFileSizeEx(hIn, &sz) || sz.QuadPart <= 0) {
+        CloseHandle(hIn);
+        outRes.errorMsg = L"Empty or invalid image file";
+        return false;
+    }
+    std::vector<uint8_t> srcBytes(static_cast<size_t>(sz.QuadPart));
+    DWORD readBytes = 0;
+    BOOL readOk = ReadFile(hIn, srcBytes.data(), static_cast<DWORD>(srcBytes.size()), &readBytes, nullptr);
+    CloseHandle(hIn);
+    if (!readOk || readBytes == 0) {
+        outRes.errorMsg = L"Failed reading source image";
+        return false;
+    }
+    outRes.origBytes = readBytes;
+
+    ComPtr<IWICStream> inStream;
+    if (FAILED(wic->CreateStream(&inStream)) || FAILED(inStream->InitializeFromMemory(srcBytes.data(), readBytes))) {
+        outRes.errorMsg = L"WIC stream init failed";
+        return false;
+    }
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (FAILED(wic->CreateDecoderFromStream(inStream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder)) || !decoder) {
+        outRes.errorMsg = L"Unsupported image format";
+        return false;
+    }
+
+    GUID containerFormat = GUID_ContainerFormatPng;
+    decoder->GetContainerFormat(&containerFormat);
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) {
+        outRes.errorMsg = L"Cannot decode image frame";
+        return false;
+    }
+
+    UINT origW = 0, origH = 0;
+    if (FAILED(frame->GetSize(&origW, &origH)) || origW == 0 || origH == 0) {
+        outRes.errorMsg = L"Invalid image dimensions";
+        return false;
+    }
+    outRes.origW = origW;
+    outRes.origH = origH;
+
+    // Cache decoded frame ONCE in RAM so all scaling/rotation/encoding passes are fast
+    ComPtr<IWICBitmap> cachedBitmap;
+    if (FAILED(wic->CreateBitmapFromSource(frame.Get(), WICBitmapCacheOnLoad, &cachedBitmap)) || !cachedBitmap) {
+        outRes.errorMsg = L"Out of memory caching bitmap";
+        return false;
+    }
+
+    // Parse source path parts: parentDir, stem, srcExt
+    std::wstring parentDir = PathUtils::EnsureTrailingSlash(PathUtils::GetParentPath(imagePath));
+    std::wstring fileName  = PathUtils::GetFileName(imagePath);
+    std::wstring stem      = fileName;
+    std::wstring srcExt    = L".jpg";
+    size_t dotPos = fileName.find_last_of(L'.');
+    if (dotPos != std::wstring::npos && dotPos > 0) {
+        stem   = fileName.substr(0, dotPos);
+        srcExt = fileName.substr(dotPos);
+    }
+    std::wstring srcExtLower = PathUtils::ToLower(srcExt);
+
+    GUID targetContainer = containerFormat;
+    std::wstring outExt  = srcExt;
+    if (!params.forceExt.empty()) {
+        std::wstring fe = PathUtils::ToLower(params.forceExt);
+        outExt = fe;
+        if (fe == L".jpg" || fe == L".jpeg") targetContainer = GUID_ContainerFormatJpeg;
+        else if (fe == L".png")              targetContainer = GUID_ContainerFormatPng;
+        else if (fe == L".bmp")              targetContainer = GUID_ContainerFormatBmp;
+    }
+
+    std::vector<uint8_t> finalBytes;
+    uint32_t finalW = origW;
+    uint32_t finalH = origH;
+    float finalQuality = params.jpegQuality;
+    GUID actualContainer = targetContainer;
+
+    if (params.kind == ImageTransformKind::TargetFileSize) {
+        uint64_t targetB = std::max<uint64_t>(2048, params.targetBytes);
+        targetContainer = GUID_ContainerFormatJpeg;
+        actualContainer = GUID_ContainerFormatJpeg;
+        if (srcExtLower != L".jpg" && srcExtLower != L".jpeg") {
+            outExt = L".jpg";
+        }
+
+        // If original file is already a JPEG within targetB, keep exact original bytes!
+        if (outRes.origBytes <= targetB && (srcExtLower == L".jpg" || srcExtLower == L".jpeg")) {
+            finalBytes = srcBytes;
+            finalW = origW;
+            finalH = origH;
+            finalQuality = 1.0f;
+        } else {
+            // Iterative quality + dimension solver in RAM
+            double curScale = 1.0;
+            uint32_t longest = std::max(origW, origH);
+            if (longest > 4096 && targetB <= 512 * 1024) {
+                curScale = 4096.0 / static_cast<double>(longest);
+            }
+
+            bool solved = false;
+            std::vector<uint8_t> bestFitBytes;
+            uint32_t bestFitW = origW, bestFitH = origH;
+            float bestFitQ = 0.85f;
+
+            std::vector<uint8_t> smallestTrialBytes;
+            uint32_t smallestTrialW = origW, smallestTrialH = origH;
+            float smallestTrialQ = 0.30f;
+
+            for (int step = 0; step < 8 && !solved; ++step) {
+                uint32_t sw = std::max(1u, static_cast<uint32_t>(std::lround(origW * curScale)));
+                uint32_t sh = std::max(1u, static_cast<uint32_t>(std::lround(origH * curScale)));
+
+                ComPtr<IWICBitmapSource> stepBmp = cachedBitmap;
+                if (sw != origW || sh != origH) {
+                    ComPtr<IWICBitmap> scaled = ScaleBitmapCached(wic.Get(), cachedBitmap.Get(), sw, sh);
+                    if (scaled) stepBmp = scaled;
+                }
+
+                // 1) Try high quality (0.90 on first pass, 0.82 on scaled passes)
+                float hiQ = (step == 0) ? 0.92f : 0.84f;
+                std::vector<uint8_t> trialHi;
+                if (EncodeWicSourceToMemory(wic.Get(), stepBmp.Get(), GUID_ContainerFormatJpeg, hiQ, trialHi)) {
+                    if (smallestTrialBytes.empty() || trialHi.size() < smallestTrialBytes.size()) {
+                        smallestTrialBytes = trialHi;
+                        smallestTrialW = sw;
+                        smallestTrialH = sh;
+                        smallestTrialQ = hiQ;
+                    }
+                    if (trialHi.size() <= targetB) {
+                        // Even high quality at this scale fits! Binary search upward toward 0.95 if step > 0
+                        bestFitBytes = std::move(trialHi);
+                        bestFitW = sw;
+                        bestFitH = sh;
+                        bestFitQ = hiQ;
+                        if (step > 0 && bestFitBytes.size() < targetB * 85 / 100) {
+                            float lo = hiQ, hi = 0.94f;
+                            for (int b = 0; b < 3; ++b) {
+                                float mid = (lo + hi) * 0.5f;
+                                std::vector<uint8_t> tr;
+                                if (EncodeWicSourceToMemory(wic.Get(), stepBmp.Get(), GUID_ContainerFormatJpeg, mid, tr) && tr.size() <= targetB) {
+                                    bestFitBytes = std::move(tr);
+                                    bestFitQ = mid;
+                                    lo = mid;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                        }
+                        solved = true;
+                        break;
+                    }
+                }
+
+                // 2) Try visual floor quality (0.50f) at current resolution
+                float floorQ = 0.50f;
+                std::vector<uint8_t> trialFloor;
+                if (EncodeWicSourceToMemory(wic.Get(), stepBmp.Get(), GUID_ContainerFormatJpeg, floorQ, trialFloor)) {
+                    if (smallestTrialBytes.empty() || trialFloor.size() < smallestTrialBytes.size()) {
+                        smallestTrialBytes = trialFloor;
+                        smallestTrialW = sw;
+                        smallestTrialH = sh;
+                        smallestTrialQ = floorQ;
+                    }
+                    if (trialFloor.size() <= targetB) {
+                        // Optimal quality at (sw x sh) is between [floorQ, hiQ]! Binary search 5 iterations:
+                        bestFitBytes = std::move(trialFloor);
+                        bestFitW = sw;
+                        bestFitH = sh;
+                        bestFitQ = floorQ;
+
+                        float lo = floorQ, hi = hiQ;
+                        for (int b = 0; b < 5; ++b) {
+                            float mid = (lo + hi) * 0.5f;
+                            std::vector<uint8_t> tr;
+                            if (EncodeWicSourceToMemory(wic.Get(), stepBmp.Get(), GUID_ContainerFormatJpeg, mid, tr)) {
+                                if (tr.size() <= targetB) {
+                                    bestFitBytes = std::move(tr);
+                                    bestFitQ = mid;
+                                    lo = mid;
+                                    if (bestFitBytes.size() >= targetB * 94 / 100) break;
+                                } else {
+                                    hi = mid;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        solved = true;
+                        break;
+                    }
+
+                    // Still larger than targetB even at q = 0.50: step down resolution proportionally
+                    double ratio = static_cast<double>(targetB) / static_cast<double>(trialFloor.size());
+                    double factor = std::clamp(std::sqrt(ratio) * 0.90, 0.32, 0.84);
+                    curScale *= factor;
+                    if (curScale < 0.05 || (sw <= 64 && sh <= 64)) {
+                        // Reached minimum resolution floor: binary search quality down to 0.10f
+                        float lo = 0.08f, hi = floorQ;
+                        for (int b = 0; b < 5; ++b) {
+                            float mid = (lo + hi) * 0.5f;
+                            std::vector<uint8_t> tr;
+                            if (EncodeWicSourceToMemory(wic.Get(), stepBmp.Get(), GUID_ContainerFormatJpeg, mid, tr)) {
+                                if (smallestTrialBytes.empty() || tr.size() < smallestTrialBytes.size()) {
+                                    smallestTrialBytes = tr;
+                                    smallestTrialW = sw;
+                                    smallestTrialH = sh;
+                                    smallestTrialQ = mid;
+                                }
+                                if (tr.size() <= targetB) {
+                                    bestFitBytes = std::move(tr);
+                                    bestFitW = sw;
+                                    bestFitH = sh;
+                                    bestFitQ = mid;
+                                    lo = mid;
+                                    solved = true;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if (!bestFitBytes.empty()) {
+                finalBytes = std::move(bestFitBytes);
+                finalW = bestFitW;
+                finalH = bestFitH;
+                finalQuality = bestFitQ;
+            } else if (!smallestTrialBytes.empty()) {
+                finalBytes = std::move(smallestTrialBytes);
+                finalW = smallestTrialW;
+                finalH = smallestTrialH;
+                finalQuality = smallestTrialQ;
+            } else {
+                outRes.errorMsg = L"Failed encoding to target size";
+                return false;
+            }
+        }
+    } else {
+        // Geometric or format transform
+        ComPtr<IWICBitmapSource> transformed = cachedBitmap;
+
+        if (params.kind == ImageTransformKind::RotateCW ||
+            params.kind == ImageTransformKind::RotateCCW ||
+            params.kind == ImageTransformKind::Rotate180 ||
+            params.kind == ImageTransformKind::FlipH ||
+            params.kind == ImageTransformKind::FlipV) {
+            WICBitmapTransformOptions opt = WICBitmapTransformRotate0;
+            if (params.kind == ImageTransformKind::RotateCW)       opt = WICBitmapTransformRotate90;
+            else if (params.kind == ImageTransformKind::RotateCCW) opt = WICBitmapTransformRotate270;
+            else if (params.kind == ImageTransformKind::Rotate180) opt = WICBitmapTransformRotate180;
+            else if (params.kind == ImageTransformKind::FlipH)     opt = WICBitmapTransformFlipHorizontal;
+            else if (params.kind == ImageTransformKind::FlipV)     opt = WICBitmapTransformFlipVertical;
+
+            ComPtr<IWICBitmapFlipRotator> rotator;
+            if (FAILED(wic->CreateBitmapFlipRotator(&rotator)) || FAILED(rotator->Initialize(cachedBitmap.Get(), opt))) {
+                outRes.errorMsg = L"Flip/Rotate initialization failed";
+                return false;
+            }
+            UINT rw = origW, rh = origH;
+            rotator->GetSize(&rw, &rh);
+            finalW = rw;
+            finalH = rh;
+            transformed = rotator;
+        } else if (params.kind == ImageTransformKind::ScalePercent) {
+            double s = std::clamp(params.scalePct, 1, 800) / 100.0;
+            finalW = std::max(1u, static_cast<uint32_t>(std::lround(origW * s)));
+            finalH = std::max(1u, static_cast<uint32_t>(std::lround(origH * s)));
+            if (finalW != origW || finalH != origH) {
+                ComPtr<IWICBitmap> scaled = ScaleBitmapCached(wic.Get(), cachedBitmap.Get(), finalW, finalH);
+                if (!scaled) {
+                    outRes.errorMsg = L"Image scaling failed";
+                    return false;
+                }
+                transformed = scaled;
+            }
+        } else if (params.kind == ImageTransformKind::FitMaxDim) {
+            uint32_t maxD = std::max(1u, params.maxDim);
+            uint32_t longest = std::max(origW, origH);
+            if (longest > maxD) {
+                double s = static_cast<double>(maxD) / static_cast<double>(longest);
+                finalW = std::max(1u, static_cast<uint32_t>(std::lround(origW * s)));
+                finalH = std::max(1u, static_cast<uint32_t>(std::lround(origH * s)));
+                ComPtr<IWICBitmap> scaled = ScaleBitmapCached(wic.Get(), cachedBitmap.Get(), finalW, finalH);
+                if (!scaled) {
+                    outRes.errorMsg = L"Image downscaling failed";
+                    return false;
+                }
+                transformed = scaled;
+            }
+        } else if (params.kind == ImageTransformKind::ExactWidthHeight) {
+            finalW = std::max(1u, params.targetW);
+            finalH = std::max(1u, params.targetH);
+            if (finalW != origW || finalH != origH) {
+                ComPtr<IWICBitmap> scaled = ScaleBitmapCached(wic.Get(), cachedBitmap.Get(), finalW, finalH);
+                if (!scaled) {
+                    outRes.errorMsg = L"Image resize failed";
+                    return false;
+                }
+                transformed = scaled;
+            }
+        }
+
+        if (!EncodeWicSourceToMemory(wic.Get(), transformed.Get(), targetContainer, params.jpegQuality, finalBytes, &actualContainer)) {
+            outRes.errorMsg = L"Failed encoding output image";
+            return false;
+        }
+        if (actualContainer == GUID_ContainerFormatJpeg && targetContainer != GUID_ContainerFormatJpeg) {
+            outExt = L".jpg";
+        }
+    }
+
+    // Determine final output file path (overwrite in-place OR save as sibling copy)
+    std::wstring destPath;
+    if (params.overwriteOriginal) {
+        destPath = parentDir + stem + outExt;
+        if (!WriteBytesToFileAtomic(destPath, finalBytes)) {
+            outRes.errorMsg = L"Cannot write output file";
+            return false;
+        }
+        if (_wcsicmp(destPath.c_str(), imagePath.c_str()) != 0) {
+            DeleteFileW(imagePath.c_str());
+        }
+    } else {
+        std::wstring sfx = params.suffix;
+        if (sfx.empty()) {
+            if (_wcsicmp(outExt.c_str(), srcExt.c_str()) == 0) sfx = L"_copy";
+        }
+        std::wstring baseCandidate = parentDir + stem + sfx + outExt;
+        destPath = baseCandidate;
+        if (GetFileAttributesW(destPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            for (int n = 2; n < 1000; ++n) {
+                std::wstring tryPath = parentDir + stem + sfx + L"_" + std::to_wstring(n) + outExt;
+                if (GetFileAttributesW(tryPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                    destPath = tryPath;
+                    break;
+                }
+            }
+        }
+        if (!WriteBytesToFileAtomic(destPath, finalBytes)) {
+            outRes.errorMsg = L"Cannot write copy file";
+            return false;
+        }
+    }
+
+    outRes.ok          = true;
+    outRes.outPath     = destPath;
+    outRes.newW        = finalW;
+    outRes.newH        = finalH;
+    outRes.newBytes    = finalBytes.size();
+    outRes.usedQuality = finalQuality;
     return true;
 }
 

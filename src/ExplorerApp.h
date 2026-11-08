@@ -6,16 +6,58 @@
 #include "ShellMenuEmulator.h"
 #include "MediaPlayer.h"
 #include "HardwareInfo.h"
+#include "ProgramsInfo.h"
+#include "Monitoring.h"
+#include "LanScanner.h"
+#include "GitIntegration.h"
+#include "AppLog.h"
+#include "FileContentPane.h"
+#include <atomic>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <string>
 #include <vector>
+#include <map>
 
 namespace Explorer2 {
 
 struct RibbonButtonHit {
     int id = 0;
     D2D1_RECT_F rect = {};
+};
+
+struct FolderViewState {
+    float scrollY = 0.0f;
+    float filmstripScrollX = 0.0f;
+    std::wstring focusedPath;
+};
+
+struct ExplorerPaneState {
+    std::wstring currentPath;
+    std::wstring currentNormKey;
+    std::vector<std::wstring> history;
+    int historyIndex = -1;
+    std::wstring filterText;
+    bool isSearchActive = false;
+    std::vector<FileEntry> allItems;
+    std::vector<FileEntry> items;
+    std::vector<BreadcrumbSegment> breadcrumbs;
+    SortColumn sortCol = SortColumn::Name;
+    bool sortAsc = true;
+    float scrollY = 0.0f;
+    float filmstripScrollX = 0.0f;
+    int focusedIndex = -1;
+    int anchorIndex = -1;
+    int hoverIndex = -1;
+    int hoverRowActionKind = 0;
+    D2D1_RECT_F scrollbarThumbRect = {};
+    std::map<std::wstring, FolderViewState> folderViewStates;
+    std::vector<TreemapHitNode> treemapHits;
+    int hoverTreemapHitIndex = -1;
+    std::vector<PieSectorHitNode> pieHits;
+    int hoverPieHitIndex = -1;
+    D2D1_POINT_2F pieCenterPt = {};
+    float pieCenterRadius = 0.0f;
 };
 
 class ExplorerApp {
@@ -47,10 +89,48 @@ private:
     void DrawProportionsView(const D2D1_RECT_F& rect);
     void DrawPieChartView(const D2D1_RECT_F& rect);
     void DrawHardwareProView(const D2D1_RECT_F& rect);
+    void DrawProgramsView(const D2D1_RECT_F& rect);
+    void DrawMonitoringView(const D2D1_RECT_F& rect);
+    void DrawLanView(const D2D1_RECT_F& rect);
+    void DrawLogView(const D2D1_RECT_F& rect);
+    void MergeFolderInto(const std::wstring& srcDir, const std::wstring& dstDir, const std::wstring& srcName, const std::wstring& dstName);
+    void StartRenameJob(const std::wstring& oldPath, const std::wstring& oldName, const std::wstring& newName);
+    void ShowRenameFailure(const std::wstring& oldName, const std::wstring& newName, const std::wstring& reason, DWORD err);
+
+    // Git dock (right side) for folders inside a git repository
+    void DrawGitDock(const D2D1_RECT_F& dock);
+    D2D1_RECT_F GetGitDockRect() const;
+    // 0 = none, 1 = navigation tree splitter, 2 = git dock splitter, 3 = details column edge
+    int HitResizeHandle(float x, float y) const;
+    bool GitDockVisible() const {
+        return m_gitEnabled && !m_gitRoot.empty() && !m_isFullScreen &&
+               m_viewMode != ViewMode::FullViewer && m_viewMode != ViewMode::Hardware;
+    }
+    bool PreviewPaneVisible() const {
+        return m_showPreviewPane && !m_isFullScreen &&
+               m_viewMode != ViewMode::FullViewer && m_viewMode != ViewMode::Hardware;
+    }
+    D2D1_RECT_F GetPreviewPaneRect() const;
+    void SyncGitRepo(bool force = false);
+    bool HandleGitDockClick(float x, float y, bool rightButton);
+    void SaveUiSettings() const;
+    void LoadUiSettings();
+    bool IsLanView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Lan; }
+    bool IsLogView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Log; }
+    bool IsMonitoringView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Monitoring; }
+    void DrawCardShell(float x, float y, float w, float h, const std::wstring& title, uint32_t badgeHex, bool showCopyHint, float extraRightPad = 0.0f);
+    // Shared building blocks of the card-based views (Sprzęt / Programy)
+    void DrawCardTinyButton(const D2D1_RECT_F& r, const std::wstring& label, int cmdId, const std::wstring& arg, int actionIndex = 0,
+                            const D2D1_RECT_F* hitClip = nullptr);
+    void DrawClippedText(const std::wstring& text, const D2D1_RECT_F& r, IDWriteTextFormat* fmt, uint32_t colorHex);
+    // The "Programy" tab is hosted by the same scrollable card-hit view as "Sprzęt".
+    bool IsProgramsView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Programs; }
+    void ScheduleProgramsRefresh(int attempts);
     void DrawMarqueeOverlay();
     void DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilmstrip);
     void DrawPreviewPane(const D2D1_RECT_F& rect);
     void DrawStatusBar(const D2D1_RECT_F& rect);
+    void DrawOperationToastBanner(const D2D1_RECT_F& mainRect);
 
     // Custom vector icons for Ribbon & Chrome
     void DrawFolderVectorIcon(const D2D1_RECT_F& r, bool smallIcon = false);
@@ -90,6 +170,20 @@ private:
     void SyncMediaPlayerToSelection();
 
     // Layout & Hit-testing
+    bool IsSplitViewActive() const {
+        return m_splitView && !m_isFullScreen &&
+               m_viewMode != ViewMode::Hardware && m_viewMode != ViewMode::FullViewer;
+    }
+    D2D1_RECT_F GetFullWorkspaceRect() const;
+    D2D1_RECT_F GetSplitPaneOuterRect(int paneIdx) const;
+    D2D1_RECT_F GetSplitPaneContentMainRect(int paneIdx) const;
+    void DrawSplitPaneHeader(int paneIdx, const D2D1_RECT_F& headerRect, bool isActivePane);
+    void SwapWithOtherPane();
+    void SetActivePane(int paneIdx);
+    void ToggleSplitView();
+    void CopyOrMoveToOtherPane(bool move);
+    void BeginPaneAddressEdit(int paneIdx);
+
     D2D1_RECT_F GetMainViewRect() const;
     D2D1_RECT_F GetContentItemsRect() const;
     D2D1_RECT_F GetItemRect(int index, const D2D1_RECT_F& contentRect) const;
@@ -129,12 +223,18 @@ private:
     void CreateNewFolderAction();
     void StartInlineRename();
     void CommitAddressOrRenameEdit(HWND editHwnd);
-    void CancelInlineEdits();
+    void CancelInlineEdits(bool byEscape = false);
     void ShowContextMenu(int screenX, int screenY, int hitIndex);
     void ShowTreeContextMenu(int screenX, int screenY, int treeNodeIndex);
     void ShowBreadcrumbSubfolderMenu(int breadcrumbIndex);
+    void RecordVisitedDirectory(const std::wstring& path);
+    void ShowRecentDirsDropdown(int triggerCmdId = 827);
     void ConfirmAndDeleteRowItem(int itemIndex, bool permanent);
     void ShowDeleteDropdownMenu(int screenX, int screenY);
+    std::vector<std::wstring> GetSelectedImagePaths(int fallbackHitIndex = -1) const;
+    HMENU BuildImageToolsSubmenu(const std::vector<std::wstring>& imgPaths) const;
+    void ShowImageToolsMenu(int screenX, int screenY, int fallbackHitIndex = -1);
+    bool HandleImageToolCommand(int cmdId, int fallbackHitIndex = -1);
 
     // Full Viewer & Fullscreen controls
     void ToggleFullViewerMode();
@@ -189,6 +289,7 @@ private:
     std::wstring m_currentNormKey;
     std::vector<std::wstring> m_history;
     int m_historyIndex = -1;
+    std::vector<std::wstring> m_recentDirs; // Last 30 unique visited folders (MRU order, persisted in settings.ini)
     std::wstring m_filterText;
     SearchOptions m_searchOpts;
     SearchProgressInfo m_searchProgress;
@@ -213,7 +314,7 @@ private:
 
     // Splitter state
     float m_treePaneWidth = 235.0f;
-    float m_previewPaneWidth = 360.0f;
+    float m_previewPaneWidth = 450.0f;
     bool m_draggingTreeSplitter = false;
     bool m_draggingPreviewSplitter = false;
 
@@ -233,6 +334,19 @@ private:
     int m_hoverBreadcrumbArrowIndex = -1;
     int m_hoverRibbonBtn = 0;
     int m_renamingIndex = -1;
+    std::wstring m_renamingPath;
+    std::wstring m_renamingOldName;
+
+    // Rename & merge job tracking (both run on worker threads; the status bar and floating banner show their state)
+    std::atomic<int> m_renamePending{ 0 };
+    std::wstring m_renamePendingText;     // "old -> new" shown while the job runs (UI thread only)
+    std::atomic<int> m_mergePending{ 0 };
+    std::atomic<int> m_mergeMovedCount{ 0 };
+    std::wstring m_mergePendingText;      // "src -> dst" shown while the merge runs (UI thread only)
+    int m_logFilter = 0;                  // Log tab: 0 = everything, 1 = warnings and errors, 2 = errors only
+    bool m_gitWasBusy = false;            // for logging the end of a git action
+    bool m_gitActionLogPending = false;   // a fetch / pull / push / switch was started and its result is not logged yet
+    bool m_lanWasScanning = false;        // for logging the end of a LAN scan
 
     // Rubber-band / Marquee Box Selection
     bool m_isBoxSelecting = false;
@@ -256,6 +370,7 @@ private:
     // Status message toast
     std::wstring m_statusToast;
     ULONGLONG m_statusToastExpireTick = 0;
+    bool m_imgToolsOverwrite = false; // false = save as copy (safe default), true = overwrite original in-place
 
     // Interactive hit regions rebuilt each frame
     std::vector<RibbonButtonHit> m_ribbonHits;
@@ -275,11 +390,95 @@ private:
     float m_hwMaxScrollY = 0.0f;
     std::vector<HardwareCardHit> m_hwCardHits;
     int m_hoverHwCardIndex = -1;
+    int m_hwSelectedDisk = -1;     // physical disk index shown in the SMART panel
+    bool m_hwSmartInit = false;    // SMART for all disks read once on first visit
+
+    // Payload of the card-hit that was just clicked (Sprzęt / Programy views)
+    int m_hwActionIndex = 0;
+    std::wstring m_hwActionArg;
+
+    // "Programy" tab state
+    ProgramInventory m_programs;
+    bool m_progLoaded = false;
+    int m_progSortCol = 0;
+    bool m_progSortAsc = true;
+    std::wstring m_progSelectedKey;
+    std::wstring m_progFilter;             // text typed into the top-right search box while on the Programy tab
+    ULONGLONG m_progRefreshAtTick = 0;     // pending auto-refresh (after install / uninstall was launched)
+    int m_progRefreshesLeft = 0;
+
+    // "Monitoring" tab state (the recorder itself runs in a separate background process)
+    int m_monRangeIdx = 2;                         // 0:1h 1:6h 2:24h 3:7d 4:30d
+    int m_monLoadedRangeIdx = -1;
+    MonitorHistory m_monHistory;                   // incremental reader of the recorder's CSV files
+    std::vector<MonitorSmartPoint> m_monSmart;     // hourly SMART snapshots in the selected range
+    struct MonitorSeriesCacheEntry {
+        uint64_t version = 0;
+        int range = -1;
+        int buckets = 0;
+        std::vector<float> a, b;                   // bucketed series (NaN = no data)
+        bool hasData = false;
+    };
+    std::map<int, MonitorSeriesCacheEntry> m_monSeriesCache;   // chart id -> bucketed series
+    int m_monZoomChart = -1;                       // chart id shown "fill window", -1 = overview
+    ULONGLONG m_monLoadTick = 0;
+    MonitorSettings m_monSettings;
+    bool m_monDaemonRunning = false;
+    int m_monAutostartMode = -1;                   // -1 = needs refresh, 0 off, 1 Run key, 2 elevated scheduled task
+    uint64_t m_monDataBytes = 0;
+    bool m_monForceReload = true;
+
+    // "LAN" tab state (scanner threads live inside LanScanner)
+    LanScanner m_lan;
+    std::vector<LanAdapterInfo> m_lanAdapters;
+    int m_lanAdapterIdx = 0;
+    bool m_lanInit = false;
+    std::wstring m_lanSelectedIp;
+
+    // Git dock state (the git CLI work happens on GitIntegration's worker thread)
+    enum GitHitKind { GH_Tab = 1, GH_Refresh, GH_Fetch, GH_Pull, GH_Push, GH_DiffStat, GH_File, GH_Commit,
+                      GH_CopyHash, GH_Branch, GH_CloseOutput, GH_CopyOutput };
+    struct GitDockHit {
+        D2D1_RECT_F rect = {};
+        int kind = 0;
+        std::wstring arg;
+        int index = 0;
+    };
+    GitIntegration m_git;
+    bool m_gitEnabled = true;                     // "Integracja GIT" checkbox (persisted)
+    std::wstring m_gitRoot;                       // repo root of the current folder, empty = not a repo
+    GitRepoState m_gitState;
+    std::wstring m_gitOutput;
+    bool m_gitOutputOk = true;
+    uint64_t m_gitStateVersion = ~0ull;
+    int m_gitTab = 0;                             // 0 changes, 1 commits, 2 branches
+    float m_gitScrollY = 0.0f;
+    float m_gitMaxScrollY = 0.0f;
+    float m_gitDockWidth = 340.0f;
+    bool m_draggingGitSplitter = false;
+    bool m_gitShowOutput = false;
+    bool m_gitReloadFolderWhenIdle = false;       // folder listing refresh after pull / checkout finished
+    std::wstring m_gitSelectedCommit;
+    ULONGLONG m_gitLastRequestTick = 0;
+    std::vector<GitDockHit> m_gitHits;
 
     D2D1_RECT_F m_addressBarRect = {};
     D2D1_RECT_F m_searchBarRect = {};
     D2D1_RECT_F m_ScrollbarThumbRect = {};
     D2D1_RECT_F m_mediaSeekBarRect = {};
+
+    // Per-folder scroll/selection memory & Dual-Pane Split View state
+    std::map<std::wstring, FolderViewState> m_folderViewStates;
+    bool m_splitView = false;
+    int m_activePane = 0;
+    float m_splitRatio = 0.5f;
+    bool m_draggingSplitSplitter = false;
+    bool m_inSplitRefresh = false;
+    mutable bool m_overrideMainRect = false;
+    mutable D2D1_RECT_F m_customMainRect = {};
+    D2D1_RECT_F m_paneHeaderAddressRect[2] = {};
+    ExplorerPaneState m_otherPane;
+    FileContentPane m_contentPane;
 };
 
 } // namespace Explorer2

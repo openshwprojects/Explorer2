@@ -24,7 +24,7 @@ enum CommandId : int {
     CMD_PASTE_SHORTCUT = 15,
     CMD_MOVE_TO = 16,
     CMD_COPY_TO = 17,
-    CMD_DELETE_MAIN = 18,      // Top half of "Usuń" button (Recycle Bin)
+    CMD_DELETE_MAIN = 18,      // "Kosz" big button (move to Recycle Bin)
     CMD_DELETE_DROPDOWN = 19,  // Bottom "Usuń v" arrow (Menu: Recycle / Permanent / Confirm)
     CMD_RENAME = 20,
     CMD_NEW_FOLDER = 21,
@@ -35,6 +35,7 @@ enum CommandId : int {
     CMD_SELECT_ALL = 26,
     CMD_SELECT_NONE = 27,
     CMD_INVERT_SEL = 28,
+    CMD_DELETE_PERM = 29,      // Top half of split "Usuń" button (permanent delete)
 
     // View Tab & Status Bar Mode Switchers
     CMD_TOGGLE_NAVPANE = 40,
@@ -147,6 +148,55 @@ enum CommandId : int {
     CMD_HW_OPEN_MSINFO = 156,
     CMD_HW_OPEN_DXDIAG = 157,
     CMD_HW_BACK_TO_FILES = 158,
+    CMD_HW_SUB_THERMAL = 159,
+    CMD_HW_RELAUNCH_ADMIN = 160,
+    CMD_HW_REFRESH_SMART = 161,
+    CMD_HW_NET_SETTINGS = 162,   // card-hit only: opens the Windows adapter properties dialog
+    CMD_HW_SELECT_DISK = 163,    // card-hit only: selects a physical disk for the SMART panel
+
+    // "Programy" (installed programs) tab: add / remove programs
+    CMD_TAB_PROGRAMS = 164,
+    CMD_PROG_ADD = 165,            // pick an installer (.exe / .msi / .msix) and run it
+    CMD_PROG_UNINSTALL = 166,      // uninstall the selected program
+    CMD_PROG_REFRESH = 167,
+    CMD_PROG_APPWIZ = 168,         // classic "Programs and Features"
+    CMD_PROG_SETTINGS = 169,       // Windows Settings > Apps & features
+    CMD_PROG_OPENLOC = 170,        // open install folder of the selected program
+    CMD_PROG_SELECT = 171,         // card-hit only: row click (actionArg = registry key)
+    CMD_PROG_UNINSTALL_ROW = 172,  // card-hit only: per-row uninstall button
+    CMD_PROG_SORT = 173,           // card-hit only: column header (actionIndex = column)
+
+    // "Monitoring" tab: background recorder + history graphs
+    CMD_TAB_MONITORING = 174,
+    CMD_MON_TOGGLE = 175,          // start / stop the background recorder
+    CMD_MON_AUTOSTART = 176,       // start the recorder at Windows logon
+    CMD_MON_RANGE = 177,           // card-hit only: time range chip (actionIndex = range)
+    CMD_MON_INTERVAL = 178,        // cycle sampling interval
+    CMD_MON_RETENTION = 179,       // cycle retention (days)
+    CMD_MON_OPENDIR = 180,         // open the data folder in Explorer
+    CMD_MON_REFRESH = 181,         // reload history now
+    CMD_MON_ELEVATED = 182,        // run the recorder as administrator (SATA SMART)
+    CMD_MON_ZOOM = 183,            // card-hit only: chart "fill window" (actionIndex = chart id, -1 = back)
+
+    // "LAN" tab: network scanner + SSDP
+    CMD_TAB_LAN = 184,
+    CMD_LAN_SCAN = 185,            // start / stop host discovery
+    CMD_LAN_SSDP = 186,            // SSDP (UPnP) discovery
+    CMD_LAN_ADAPTER = 187,         // next adapter (rescans)
+    CMD_LAN_SELECT = 188,          // card-hit only: select a host (actionArg = ip)
+    CMD_LAN_PORTSCAN = 189,        // TCP port scan of the selected host
+    CMD_LAN_OPEN_WEB = 190,        // open actionArg (URL) in the default browser
+    CMD_LAN_OPEN_SMB = 191,        // open \\<actionArg ip> in Windows Explorer
+    CMD_LAN_COPY = 192,            // copy actionArg to the clipboard
+
+    // Git dock
+    CMD_TOGGLE_GIT = 193,          // "Integracja GIT" checkbox
+    CMD_TAB_LOG = 194,             // "Log" tab
+    CMD_LOG_LEVEL = 195,           // cycle the minimum level filter (all / warnings+ / errors)
+    CMD_LOG_CLEAR = 196,           // clear the on-screen list (the file is kept)
+    CMD_LOG_OPEN_FOLDER = 197,     // open the Logs folder
+    CMD_LOG_OPEN_FILE = 198,       // open this run's log file in the default editor
+    CMD_LOG_COPY = 199,            // copy actionArg (a log line) / the whole visible log if empty
 
     CMD_BASE_SEARCH_EXT_MENU = 700, // 700..799
 
@@ -200,7 +250,62 @@ enum CommandId : int {
     CMD_BASE_OPENWITH = 320,      // 320..349
     CMD_BASE_SENDTO = 350,        // 350..399
     CMD_BASE_REG_VERBS = 400,     // 400..499
-    CMD_BASE_BREADCRUMB = 500     // 500..699
+    CMD_BASE_BREADCRUMB = 500,    // 500..699
+
+    // Split View (Dual-pane Explorer)
+    CMD_TOGGLE_SPLIT_VIEW = 800,
+    CMD_SPLIT_SWAP_PANES  = 801,
+    CMD_SPLIT_COPY_OTHER  = 802,
+    CMD_SPLIT_MOVE_OTHER  = 803,
+    CMD_SPLIT_SYNC_OTHER  = 804,
+    CMD_PANE0_BACK        = 810,
+    CMD_PANE0_FWD         = 811,
+    CMD_PANE0_UP          = 812,
+    CMD_PANE0_REFRESH     = 813,
+    CMD_PANE0_ADDR        = 814,
+    CMD_PANE0_COPY_OTHER  = 815,
+    CMD_PANE0_MOVE_OTHER  = 816,
+    CMD_PANE1_BACK        = 820,
+    CMD_PANE1_FWD         = 821,
+    CMD_PANE1_UP          = 822,
+    CMD_PANE1_REFRESH     = 823,
+    CMD_PANE1_ADDR        = 824,
+    CMD_PANE1_COPY_OTHER  = 825,
+    CMD_PANE1_MOVE_OTHER  = 826,
+    CMD_NAV_RECENT_DIRS   = 827,
+    CMD_PANE0_RECENT_DIRS = 828,
+    CMD_PANE1_RECENT_DIRS = 829,
+
+    // Integrated Per-Image Tools (Resize, Downscale, Target File Size, Flip, Convert)
+    CMD_IMG_TOOL_MENU        = 830,
+    CMD_IMG_TOGGLE_OVERWRITE = 831,
+    CMD_IMG_SCALE_75         = 832,
+    CMD_IMG_SCALE_50         = 833,
+    CMD_IMG_SCALE_33         = 834,
+    CMD_IMG_SCALE_25         = 835,
+    CMD_IMG_SCALE_CUSTOM     = 836,
+    CMD_IMG_MAXDIM_3840      = 837,
+    CMD_IMG_MAXDIM_2560      = 838,
+    CMD_IMG_MAXDIM_1920      = 839,
+    CMD_IMG_MAXDIM_1280      = 840,
+    CMD_IMG_MAXDIM_1024      = 841,
+    CMD_IMG_MAXDIM_512       = 842,
+    CMD_IMG_TARGET_5MB       = 843,
+    CMD_IMG_TARGET_2MB       = 844,
+    CMD_IMG_TARGET_1MB       = 845,
+    CMD_IMG_TARGET_500KB     = 846,
+    CMD_IMG_TARGET_250KB     = 847,
+    CMD_IMG_TARGET_100KB     = 848,
+    CMD_IMG_TARGET_CUSTOM    = 849,
+    CMD_IMG_FLIP_H           = 850,
+    CMD_IMG_FLIP_V           = 851,
+    CMD_IMG_ROTATE_180       = 852,
+    CMD_IMG_CONVERT_JPG_92   = 853,
+    CMD_IMG_CONVERT_JPG_80   = 854,
+    CMD_IMG_CONVERT_PNG      = 855,
+    CMD_IMG_CONVERT_BMP      = 856,
+    CMD_CLEAR_RECENT_DIRS    = 857,
+    CMD_BASE_RECENT_DIRS     = 900  // 900..949
 };
 
 // Layout constants (in DIPs / pixels)
@@ -212,5 +317,6 @@ constexpr float kDetailsHeaderHeight = 25.0f;
 constexpr float kDetailsRowHeight = 22.0f;
 constexpr float kScrollbarWidth = 14.0f;
 constexpr float kFilmstripHeight = 84.0f;
+constexpr float kSplitPaneHeaderHeight = 30.0f;
 
 } // namespace Explorer2

@@ -728,6 +728,53 @@ bool ImageCache::IsPathRotating(const std::wstring& normKey) const {
     return m_rotatingNormKeys.find(normKey) != m_rotatingNormKeys.end();
 }
 
+bool ImageCache::IsAnyImageTransforming() const {
+    std::lock_guard<std::mutex> lock(m_rotateMutex);
+    return !m_rotatingNormKeys.empty();
+}
+
+void ImageCache::QueueTransformImages(const std::vector<std::wstring>& paths, const ImageTransformParams& params) {
+    if (paths.empty()) return;
+
+    std::vector<std::wstring> toProcess;
+    {
+        std::lock_guard<std::mutex> lock(m_rotateMutex);
+        for (const auto& p : paths) {
+            std::wstring nk = PathUtils::NormalizePathKey(p);
+            if (!nk.empty() && m_rotatingNormKeys.find(nk) == m_rotatingNormKeys.end()) {
+                m_rotatingNormKeys.insert(nk);
+                toProcess.push_back(p);
+            }
+        }
+    }
+    if (toProcess.empty()) return;
+
+    HWND notifyHwnd = m_notifyHwnd;
+    std::thread([this, toProcess = std::move(toProcess), params, notifyHwnd]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        for (const auto& imgPath : toProcess) {
+            if (!m_running) break;
+            ImageTransformResult res;
+            ShellMenuEmulator::TransformImageFile(imgPath, params, res);
+
+            std::wstring nk = PathUtils::NormalizePathKey(imgPath);
+            {
+                std::lock_guard<std::mutex> lock(m_rotateMutex);
+                m_rotatingNormKeys.erase(nk);
+                m_completedRotationPaths.push_back(imgPath);
+                if (!res.outPath.empty() && _wcsicmp(res.outPath.c_str(), imgPath.c_str()) != 0) {
+                    m_completedRotationPaths.push_back(res.outPath);
+                }
+                m_completedTransforms.push_back(std::move(res));
+            }
+            if (notifyHwnd && m_running) {
+                PostMessageW(notifyHwnd, WM_APP_IMAGE_ROTATED, 0, 0);
+            }
+        }
+        CoUninitialize();
+    }).detach();
+}
+
 std::vector<std::wstring> ImageCache::TakeCompletedRotations() {
     std::vector<std::wstring> done;
     {
@@ -736,6 +783,19 @@ std::vector<std::wstring> ImageCache::TakeCompletedRotations() {
     }
     for (const auto& p : done) {
         EvictPath(p);
+    }
+    return done;
+}
+
+std::vector<ImageTransformResult> ImageCache::TakeCompletedTransforms() {
+    std::vector<ImageTransformResult> done;
+    {
+        std::lock_guard<std::mutex> lock(m_rotateMutex);
+        done.swap(m_completedTransforms);
+    }
+    for (const auto& r : done) {
+        if (!r.srcPath.empty()) EvictPath(r.srcPath);
+        if (!r.outPath.empty()) EvictPath(r.outPath);
     }
     return done;
 }

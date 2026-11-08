@@ -5,6 +5,7 @@
 #include <vector>
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -15,6 +16,24 @@ namespace Explorer2 {
 struct DeleteTask {
     std::vector<std::wstring> paths;
     bool permanent = false;
+};
+
+// One item a background delete could not remove (error = Win32 code, 0 = unknown)
+struct DeleteFailure {
+    std::wstring path;
+    unsigned long error = 0;
+};
+
+struct MergeFolderResult {
+    std::wstring srcDir;
+    std::wstring dstDir;
+    std::wstring srcName;
+    std::wstring dstName;
+    int movedItems = 0;
+    int renamedCollisions = 0;
+    bool srcRemoved = false;
+    std::vector<DeleteFailure> failures;
+    std::vector<std::wstring> collisionNotes;
 };
 
 struct FolderSizeTask {
@@ -59,6 +78,12 @@ public:
 
     // Async non-blocking delete (Recycle Bin or Permanent POSIX unlink)
     void EnqueueDelete(const std::vector<std::wstring>& paths, bool permanent);
+    // Items the background delete could not remove since the last call (reported to the user, then cleared)
+    std::vector<DeleteFailure> TakeDeleteFailures();
+    // Number of delete batches still queued or running
+    size_t PendingDeleteBatches() const;
+    void AddPendingHiddenPath(const std::wstring& path);
+    void RemovePendingHiddenPath(const std::wstring& path);
 
     // Undo last Recycle Bin delete (Ctrl+Z)
     bool UndoLastDelete(std::wstring& outRestoredDir);
@@ -94,7 +119,8 @@ public:
 
     // File management operations
     static bool CreateNewFolder(const std::wstring& parentDir, const std::wstring& baseName, std::wstring& outCreatedPath);
-    static bool RenameFileOrFolder(const std::wstring& oldPath, const std::wstring& newName, std::wstring& outNewPath);
+    static bool RenameFileOrFolder(const std::wstring& oldPath, const std::wstring& newName, std::wstring& outNewPath, DWORD* outError = nullptr);
+    static void MergeDirectoryContents(const std::wstring& srcDir, const std::wstring& dstDir, std::atomic<int>* progressCounter, MergeFolderResult& outResult);
     static void OpenFileOrProperties(HWND hwnd, const std::wstring& path, bool propertiesOnly = false);
     static void OpenInClassicExplorer(const std::wstring& path, bool selectItem);
     static void OpenTerminalInFolder(const std::wstring& dirPath);
@@ -106,7 +132,7 @@ public:
 
 private:
     void DeleteWorkerLoop();
-    static bool DeletePathPermanently(const std::wstring& path);
+    static bool DeletePathPermanently(const std::wstring& path, std::vector<DeleteFailure>* failures = nullptr);
     static std::wstring GetUndoStagingDirForPath(const std::wstring& path);
     void CleanupAllUndoStaging();
 
@@ -128,6 +154,12 @@ private:
     std::condition_variable m_deleteCv;
     std::deque<DeleteTask> m_deleteQueue;
     std::atomic<bool> m_running{ false };
+
+    // Items currently queued / being deleted (hidden from listings) and failures awaiting a UI report
+    mutable std::mutex m_deleteStateMutex;
+    std::unordered_set<std::wstring> m_pendingDeleteKeys;
+    std::vector<DeleteFailure> m_deleteFailures;
+    size_t m_activeDeleteBatches = 0;
 
     // Undo stack for Ctrl+Z
     std::mutex m_undoMutex;

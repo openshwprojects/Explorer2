@@ -352,6 +352,17 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
 
     FindClose(hFind);
 
+    // Hide entries that a background delete is still working on, so a refresh during a long delete
+    // does not make a half-deleted folder "come back" before it is really gone.
+    {
+        std::lock_guard<std::mutex> lock(m_deleteStateMutex);
+        if (!m_pendingDeleteKeys.empty()) {
+            results.erase(std::remove_if(results.begin(), results.end(), [this](const FileEntry& e) {
+                return m_pendingDeleteKeys.count(e.normKey) != 0;
+            }), results.end());
+        }
+    }
+
     // Single-lock sync of any cached folder sizes from our hash table!
     SyncDirectorySizes(results);
     return results;
@@ -627,10 +638,38 @@ void FileEngine::EnqueueDelete(const std::vector<std::wstring>& paths, bool perm
     }
 
     {
+        // Hide the items from listings until the background thread has really removed them
+        std::lock_guard<std::mutex> stateLock(m_deleteStateMutex);
+        for (const auto& p : paths) m_pendingDeleteKeys.insert(PathUtils::NormalizePathKey(p));
+        ++m_activeDeleteBatches;
+    }
+    {
         std::lock_guard<std::mutex> lock(m_deleteMutex);
         m_deleteQueue.push_back(DeleteTask{ paths, permanent });
     }
     m_deleteCv.notify_one();
+}
+
+std::vector<DeleteFailure> FileEngine::TakeDeleteFailures() {
+    std::lock_guard<std::mutex> lock(m_deleteStateMutex);
+    std::vector<DeleteFailure> out;
+    out.swap(m_deleteFailures);
+    return out;
+}
+
+size_t FileEngine::PendingDeleteBatches() const {
+    std::lock_guard<std::mutex> lock(m_deleteStateMutex);
+    return m_activeDeleteBatches;
+}
+
+void FileEngine::AddPendingHiddenPath(const std::wstring& path) {
+    std::lock_guard<std::mutex> lock(m_deleteStateMutex);
+    m_pendingDeleteKeys.insert(PathUtils::NormalizePathKey(path));
+}
+
+void FileEngine::RemovePendingHiddenPath(const std::wstring& path) {
+    std::lock_guard<std::mutex> lock(m_deleteStateMutex);
+    m_pendingDeleteKeys.erase(PathUtils::NormalizePathKey(path));
 }
 
 bool FileEngine::UndoLastDelete(std::wstring& outRestoredDir) {
@@ -670,56 +709,108 @@ void FileEngine::CleanupAllUndoStaging() {
     m_stagingDirsCreated.clear();
 }
 
-bool FileEngine::DeletePathPermanently(const std::wstring& path) {
-    DWORD attrs = GetFileAttributesW(path.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) return true;
+namespace {
+
+// Extended-length form (\\?\C:\... / \\?\UNC\server\share\...) so deep trees (> MAX_PATH) and names with
+// trailing dots / spaces can be deleted too.
+std::wstring ToExtendedPath(const std::wstring& p) {
+    if (p.rfind(L"\\\\?\\", 0) == 0) return p;
+    if (p.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + p.substr(2);
+    if (p.size() >= 2 && p[1] == L':') return L"\\\\?\\" + p;
+    return p;
+}
+
+bool IsTransientDeleteError(DWORD e) {
+    return e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED || e == ERROR_LOCK_VIOLATION || e == ERROR_DIR_NOT_EMPTY;
+}
+
+} // namespace
+
+bool FileEngine::DeletePathPermanently(const std::wstring& path, std::vector<DeleteFailure>* failures) {
+    const std::wstring ext = ToExtendedPath(path);
+    auto fail = [&](DWORD err) {
+        if (failures) failures->push_back({ path, err });
+        return false;
+    };
+
+    DWORD attrs = GetFileAttributesW(ext.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return true;   // already gone
+        return fail(e);
+    }
 
     if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-        std::wstring pattern = PathUtils::EnsureTrailingSlash(path) + L"*";
-        WIN32_FIND_DATAW ffd;
-        HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &ffd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            do {
-                if (ffd.cFileName[0] == L'.' &&
-                    (ffd.cFileName[1] == L'\0' || (ffd.cFileName[1] == L'.' && ffd.cFileName[2] == L'\0'))) {
-                    continue;
-                }
-                std::wstring child = PathUtils::EnsureTrailingSlash(path) + ffd.cFileName;
-                DeletePathPermanently(child);
-            } while (FindNextFileW(hFind, &ffd));
-            FindClose(hFind);
+        bool childrenOk = true;
+        // Never descend into junctions / symlinked folders: remove the link itself, not the target's contents
+        if (!(attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            std::wstring pattern = PathUtils::EnsureTrailingSlash(ext) + L"*";
+            WIN32_FIND_DATAW ffd;
+            HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &ffd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (ffd.cFileName[0] == L'.' &&
+                        (ffd.cFileName[1] == L'\0' || (ffd.cFileName[1] == L'.' && ffd.cFileName[2] == L'\0'))) {
+                        continue;
+                    }
+                    std::wstring child = PathUtils::EnsureTrailingSlash(path) + ffd.cFileName;
+                    if (!DeletePathPermanently(child, failures)) childrenOk = false;
+                } while (FindNextFileW(hFind, &ffd));
+                FindClose(hFind);
+            } else {
+                DWORD e = GetLastError();
+                if (e != ERROR_FILE_NOT_FOUND) return fail(e);   // cannot even list it (permissions)
+            }
         }
-        if (attrs & FILE_ATTRIBUTE_READONLY) {
-            SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!childrenOk) return false;   // the failing children were already reported; the folder cannot be removed
+
+        if (attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
+            SetFileAttributesW(ext.c_str(), FILE_ATTRIBUTE_NORMAL);
         }
-        return RemoveDirectoryW(path.c_str()) != FALSE;
+        DWORD err = 0;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (RemoveDirectoryW(ext.c_str())) return true;
+            err = GetLastError();
+            if (attempt < 2 && IsTransientDeleteError(err)) Sleep(120); else break;   // AV / indexer may hold it briefly
+        }
+        return fail(err);
     }
 
-    HANDLE hFile = CreateFileW(
-        path.c_str(),
-        DELETE | FILE_WRITE_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT,
-        nullptr);
+    DWORD err = 0;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        HANDLE hFile = CreateFileW(
+            ext.c_str(),
+            DELETE | FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            nullptr);
 
-    if (hFile != INVALID_HANDLE_VALUE) {
-        MY_FILE_DISPOSITION_INFO_EX dispEx = {};
-        dispEx.Flags = FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
-        BOOL ok = SetFileInformationByHandle(hFile, static_cast<FILE_INFO_BY_HANDLE_CLASS>(21), &dispEx, sizeof(dispEx));
-        if (!ok) {
-            FILE_DISPOSITION_INFO disp = { TRUE };
-            ok = SetFileInformationByHandle(hFile, FileDispositionInfo, &disp, sizeof(disp));
+        if (hFile != INVALID_HANDLE_VALUE) {
+            MY_FILE_DISPOSITION_INFO_EX dispEx = {};
+            dispEx.Flags = FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
+            BOOL ok = SetFileInformationByHandle(hFile, static_cast<FILE_INFO_BY_HANDLE_CLASS>(21), &dispEx, sizeof(dispEx));
+            if (!ok) {
+                FILE_DISPOSITION_INFO disp = { TRUE };
+                ok = SetFileInformationByHandle(hFile, FileDispositionInfo, &disp, sizeof(disp));
+            }
+            DWORD setErr = ok ? 0 : GetLastError();
+            CloseHandle(hFile);
+            if (ok) return true;
+            err = setErr;
+        } else {
+            err = GetLastError();
         }
-        CloseHandle(hFile);
-        if (ok) return true;
-    }
 
-    if (attrs & FILE_ATTRIBUTE_READONLY) {
-        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
+            SetFileAttributesW(ext.c_str(), FILE_ATTRIBUTE_NORMAL);
+        }
+        if (DeleteFileW(ext.c_str())) return true;
+        err = GetLastError();
+        if (attempt < 2 && IsTransientDeleteError(err)) Sleep(120); else break;
     }
-    return DeleteFileW(path.c_str()) != FALSE;
+    return fail(err);
 }
 
 void FileEngine::DeleteWorkerLoop() {
@@ -735,9 +826,10 @@ void FileEngine::DeleteWorkerLoop() {
             m_deleteQueue.pop_front();
         }
 
+        std::vector<DeleteFailure> failures;
         if (task.permanent) {
             for (const auto& p : task.paths) {
-                DeletePathPermanently(p);
+                DeletePathPermanently(p, &failures);
             }
         } else {
             std::vector<wchar_t> buf;
@@ -752,6 +844,18 @@ void FileEngine::DeleteWorkerLoop() {
             fileOp.pFrom = buf.data();
             fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
             SHFileOperationW(&fileOp);
+
+            // The shell API reports its own legacy codes; verify by checking what is still there
+            for (const auto& p : task.paths) {
+                if (GetFileAttributesW(ToExtendedPath(p).c_str()) != INVALID_FILE_ATTRIBUTES) failures.push_back({ p, 0 });
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> stateLock(m_deleteStateMutex);
+            for (const auto& p : task.paths) m_pendingDeleteKeys.erase(PathUtils::NormalizePathKey(p));
+            if (m_activeDeleteBatches > 0) --m_activeDeleteBatches;
+            for (auto& f : failures) m_deleteFailures.push_back(std::move(f));
         }
 
         if (m_notifyHwnd) {
@@ -906,13 +1010,217 @@ bool FileEngine::CreateNewFolder(const std::wstring& parentDir, const std::wstri
     return false;
 }
 
-bool FileEngine::RenameFileOrFolder(const std::wstring& oldPath, const std::wstring& newName, std::wstring& outNewPath) {
-    if (newName.empty()) return false;
+namespace {
+
+bool MoveFileWithRetry(const std::wstring& srcPath, const std::wstring& dstPath, bool isDirectory, bool replaceExisting, DWORD* outError) {
+    if (outError) *outError = 0;
+    const std::wstring extSrc = ToExtendedPath(srcPath);
+    const std::wstring extDst = ToExtendedPath(dstPath);
+    // Directory moves on Windows must use flags = 0; file moves can use MOVEFILE_COPY_ALLOWED / MOVEFILE_REPLACE_EXISTING
+    const DWORD flags = isDirectory ? 0 : (MOVEFILE_COPY_ALLOWED | (replaceExisting ? MOVEFILE_REPLACE_EXISTING : 0));
+
+    DWORD lastErr = 0;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (MoveFileExW(extSrc.c_str(), extDst.c_str(), flags)) return true;
+        lastErr = GetLastError();
+        if (replaceExisting && !isDirectory && (lastErr == ERROR_ACCESS_DENIED || lastErr == ERROR_SHARING_VIOLATION)) {
+            DWORD dstAttrs = GetFileAttributesW(extDst.c_str());
+            if (dstAttrs != INVALID_FILE_ATTRIBUTES && (dstAttrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+                SetFileAttributesW(extDst.c_str(), FILE_ATTRIBUTE_NORMAL);
+            }
+        }
+        if (lastErr == ERROR_ACCESS_DENIED) {
+            DWORD srcAttrs = GetFileAttributesW(extSrc.c_str());
+            if (srcAttrs != INVALID_FILE_ATTRIBUTES && (srcAttrs & FILE_ATTRIBUTE_READONLY)) {
+                SetFileAttributesW(extSrc.c_str(), srcAttrs & ~FILE_ATTRIBUTE_READONLY);
+            }
+        }
+        if (attempt < 7 && (lastErr == ERROR_SHARING_VIOLATION || lastErr == ERROR_LOCK_VIOLATION || lastErr == ERROR_ACCESS_DENIED)) {
+            Sleep(35 * (attempt + 1));
+            continue;
+        }
+        break;
+    }
+    if (outError) *outError = lastErr;
+    return false;
+}
+
+std::wstring NextFreeCollisionPath(const std::wstring& dstDir, const std::wstring& fileName) {
+    std::wstring stem = fileName;
+    std::wstring ext;
+    size_t dot = fileName.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot > 0) {
+        stem = fileName.substr(0, dot);
+        ext = fileName.substr(dot);
+    }
+    std::wstring base = PathUtils::EnsureTrailingSlash(dstDir);
+    for (int idx = 2; idx < 10000; ++idx) {
+        std::wstring cand = base + stem + L" (" + std::to_wstring(idx) + L")" + ext;
+        if (GetFileAttributesW(ToExtendedPath(cand).c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
+    }
+    return base + stem + L"_" + std::to_wstring(GetTickCount64()) + ext;
+}
+
+bool MergeDirectoriesRecursive(const std::wstring& srcDir, const std::wstring& dstDir, std::atomic<int>* progressCounter, MergeFolderResult& outResult) {
+    const std::wstring extSrcDir = ToExtendedPath(srcDir);
+    const std::wstring extDstDir = ToExtendedPath(dstDir);
+
+    CreateDirectoryW(extDstDir.c_str(), nullptr);
+
+    std::vector<WIN32_FIND_DATAW> entries;
+    {
+        std::wstring pattern = PathUtils::EnsureTrailingSlash(extSrcDir) + L"*";
+        WIN32_FIND_DATAW ffd = {};
+        HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &ffd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (hFind == INVALID_HANDLE_VALUE) {
+            DWORD e = GetLastError();
+            if (e != ERROR_FILE_NOT_FOUND) {
+                outResult.failures.push_back({ srcDir, e });
+                return false;
+            }
+        } else {
+            do {
+                if (ffd.cFileName[0] == L'.' &&
+                    (ffd.cFileName[1] == L'\0' || (ffd.cFileName[1] == L'.' && ffd.cFileName[2] == L'\0'))) {
+                    continue;
+                }
+                entries.push_back(ffd);
+            } while (FindNextFileW(hFind, &ffd));
+            FindClose(hFind);   // close handle before moving or removing anything in srcDir
+        }
+    }
+
+    bool allChildrenOk = true;
+    for (const auto& ffd : entries) {
+        const std::wstring childName = ffd.cFileName;
+        const std::wstring srcChild = PathUtils::EnsureTrailingSlash(srcDir) + childName;
+        const std::wstring dstChild = PathUtils::EnsureTrailingSlash(dstDir) + childName;
+        const bool isSrcDir = (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const bool isSrcReparse = (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+        const std::wstring extDstChild = ToExtendedPath(dstChild);
+        const DWORD dstAttrs = GetFileAttributesW(extDstChild.c_str());
+
+        if (dstAttrs == INVALID_FILE_ATTRIBUTES) {
+            // Fast path: move the file or the entire subfolder tree in O(1) metadata time
+            DWORD err = 0;
+            if (MoveFileWithRetry(srcChild, dstChild, isSrcDir, false, &err)) {
+                ++outResult.movedItems;
+                if (progressCounter) ++(*progressCounter);
+                continue;
+            }
+            if (isSrcDir && !isSrcReparse) {
+                // Fallback if a handle inside prevented whole-directory move: merge contents recursively
+                if (!MergeDirectoriesRecursive(srcChild, dstChild, progressCounter, outResult)) {
+                    allChildrenOk = false;
+                }
+                continue;
+            }
+            outResult.failures.push_back({ srcChild, err });
+            allChildrenOk = false;
+            continue;
+        }
+
+        const bool isDstDir = (dstAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (isSrcDir && !isSrcReparse && isDstDir) {
+            if (!MergeDirectoriesRecursive(srcChild, dstChild, progressCounter, outResult)) {
+                allChildrenOk = false;
+            }
+            continue;
+        }
+
+        if (!isSrcDir && !isDstDir) {
+            // Shell cache files in source can be discarded if destination already has them
+            if (_wcsicmp(childName.c_str(), L"Thumbs.db") == 0 || _wcsicmp(childName.c_str(), L"desktop.ini") == 0) {
+                const std::wstring extSrcChild = ToExtendedPath(srcChild);
+                SetFileAttributesW(extSrcChild.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (DeleteFileW(extSrcChild.c_str())) continue;
+            }
+
+            // Check if the two files have identical size and last-write timestamp
+            WIN32_FILE_ATTRIBUTE_DATA dstData = {};
+            bool identical = false;
+            if (GetFileAttributesExW(extDstChild.c_str(), GetFileExInfoStandard, &dstData)) {
+                identical = (dstData.nFileSizeHigh == ffd.nFileSizeHigh &&
+                             dstData.nFileSizeLow == ffd.nFileSizeLow &&
+                             CompareFileTime(&dstData.ftLastWriteTime, &ffd.ftLastWriteTime) == 0);
+            }
+            if (identical) {
+                DWORD err = 0;
+                if (MoveFileWithRetry(srcChild, dstChild, false, true, &err)) {
+                    ++outResult.movedItems;
+                    if (progressCounter) ++(*progressCounter);
+                    continue;
+                }
+            }
+
+            // Different files with the same name: keep both by saving as "name (2).ext" so zero data is lost
+            const std::wstring freeDst = NextFreeCollisionPath(dstDir, childName);
+            DWORD err = 0;
+            if (MoveFileWithRetry(srcChild, freeDst, false, false, &err)) {
+                ++outResult.movedItems;
+                ++outResult.renamedCollisions;
+                if (progressCounter) ++(*progressCounter);
+                if (outResult.collisionNotes.size() < 20) {
+                    outResult.collisionNotes.push_back(childName + L" -> " + PathUtils::GetFileName(freeDst));
+                }
+            } else {
+                outResult.failures.push_back({ srcChild, err });
+                allChildrenOk = false;
+            }
+            continue;
+        }
+
+        // File vs folder name clash or reparse point: move under a non-colliding name
+        const std::wstring freeDst = NextFreeCollisionPath(dstDir, childName);
+        DWORD err = 0;
+        if (MoveFileWithRetry(srcChild, freeDst, isSrcDir, false, &err)) {
+            ++outResult.movedItems;
+            ++outResult.renamedCollisions;
+            if (progressCounter) ++(*progressCounter);
+        } else {
+            outResult.failures.push_back({ srcChild, err });
+            allChildrenOk = false;
+        }
+    }
+
+    if (!allChildrenOk) return false;
+
+    DWORD srcAttrs = GetFileAttributesW(extSrcDir.c_str());
+    if (srcAttrs == INVALID_FILE_ATTRIBUTES) return true;
+    if (srcAttrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
+        SetFileAttributesW(extSrcDir.c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+    DWORD rmErr = 0;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (RemoveDirectoryW(extSrcDir.c_str())) return true;
+        rmErr = GetLastError();
+        if (rmErr == ERROR_FILE_NOT_FOUND || rmErr == ERROR_PATH_NOT_FOUND) return true;
+        if (attempt < 7 && IsTransientDeleteError(rmErr)) Sleep(40 * (attempt + 1));
+        else break;
+    }
+    outResult.failures.push_back({ srcDir, rmErr });
+    return false;
+}
+
+} // namespace
+
+bool FileEngine::RenameFileOrFolder(const std::wstring& oldPath, const std::wstring& newName, std::wstring& outNewPath, DWORD* outError) {
+    if (outError) *outError = 0;
+    if (newName.empty()) { if (outError) *outError = ERROR_INVALID_NAME; return false; }
     std::wstring parent = PathUtils::GetParentPath(oldPath);
-    if (parent.empty()) return false;
+    if (parent.empty()) { if (outError) *outError = ERROR_BAD_PATHNAME; return false; }
 
     outNewPath = PathUtils::EnsureTrailingSlash(parent) + newName;
-    return MoveFileExW(oldPath.c_str(), outNewPath.c_str(), 0) != FALSE;
+    DWORD srcAttrs = GetFileAttributesW(ToExtendedPath(oldPath).c_str());
+    bool isDir = (srcAttrs != INVALID_FILE_ATTRIBUTES) && ((srcAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0);
+    return MoveFileWithRetry(oldPath, outNewPath, isDir, false, outError);
+}
+
+void FileEngine::MergeDirectoryContents(const std::wstring& srcDir, const std::wstring& dstDir, std::atomic<int>* progressCounter, MergeFolderResult& outResult) {
+    if (_wcsicmp(PathUtils::NormalizePathKey(srcDir).c_str(), PathUtils::NormalizePathKey(dstDir).c_str()) == 0) return;
+    MergeDirectoriesRecursive(srcDir, dstDir, progressCounter, outResult);
+    outResult.srcRemoved = (GetFileAttributesW(ToExtendedPath(srcDir).c_str()) == INVALID_FILE_ATTRIBUTES);
 }
 
 void FileEngine::OpenFileOrProperties(HWND hwnd, const std::wstring& path, bool propertiesOnly) {

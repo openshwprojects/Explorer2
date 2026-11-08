@@ -4,6 +4,10 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 
 namespace Explorer2 {
 
@@ -139,6 +143,28 @@ struct HwMotherboardInfo {
     bool isSecureBoot = false;
 };
 
+// One row of the SMART table. ATA drives fill the normalized columns (current/worst/threshold);
+// NVMe health-log entries only provide the pre-formatted raw text.
+struct HwSmartAttr {
+    int id = 0;                 // ATA attribute ID (0 for NVMe log entries)
+    std::wstring name;
+    bool hasNormalized = false;
+    int current = 0;
+    int worst = 0;
+    int threshold = 0;
+    uint64_t raw = 0;
+    std::wstring rawText;
+    bool prefail = false;
+    int status = -1;            // -1 info, 0 OK, 1 warning, 2 failing
+};
+
+enum class HwSmartState : int {
+    NotQueried = 0,
+    Ok,                         // data read successfully
+    NeedsAdmin,                 // access denied: ATA SMART needs an elevated process
+    Unsupported                 // controller/bus does not expose SMART (USB bridge, RAID, virtual...)
+};
+
 struct HwPhysicalDisk {
     int index = 0;
     std::wstring model;
@@ -151,6 +177,32 @@ struct HwPhysicalDisk {
     uint32_t bytesPerSector = 512;
     bool supportsTrim = false;
     bool supportsCommandQueueing = false;
+    bool isNvme = false;
+    bool isRotational = false;
+
+    // Temperature (live, degrees Celsius; -1 = unknown)
+    int tempC = -1;
+    int tempPeakC = -1;         // highest value seen in this session
+    int tempWarnC = -1;
+    int tempCritC = -1;
+    std::vector<float> tempHistory; // 60 samples
+
+    // SMART / health
+    HwSmartState smartState = HwSmartState::NotQueried;
+    int healthLevel = -1;       // -1 unknown, 0 OK, 1 warning, 2 failing
+    int lifeRemainingPct = -1;  // SSD wear (100 = new), -1 unknown
+    int64_t powerOnHours = -1;
+    int64_t powerCycles = -1;
+    int64_t bytesWritten = -1;  // host writes (approx. for ATA)
+    int64_t bytesRead = -1;
+    std::vector<HwSmartAttr> smartAttrs;
+};
+
+struct HwThermalSensor {
+    std::wstring name;
+    float tempC = 0.0f;
+    float warnC = 0.0f;
+    float critC = 0.0f;
 };
 
 struct HwLogicalVolume {
@@ -216,14 +268,26 @@ public:
     HardwareInspector();
     ~HardwareInspector();
 
-    void InitializeStaticInventory();
-    void RefreshFullInventory();
-    void UpdateLiveTelemetry();
+    // When syncForCli is false (default for UI), runs only < 0.5 ms in-memory/registry/CPUID queries
+    // on the calling thread and offloads NVML, DXGI, Disk SMART, Network, Audio, Processes & PDH to a background thread.
+    void InitializeStaticInventory(bool syncForCli = false);
+    void EnsureDiskModelsLoaded();
+    void RefreshFullInventory(bool syncForCli = false);
+    void UpdateLiveTelemetry(bool syncForCli = false);
+
+    // Non-blocking background refresh requests for UI commands
+    void RequestAsyncRefresh(bool fullInventory, bool allSmart, int singleSmartDisk = -1);
+    bool ApplyStagedData();
+    bool IsAsyncBusy() const { return m_workerBusy.load(std::memory_order_relaxed); }
+    bool HasStagedData() const { return m_hasStagedData.load(std::memory_order_relaxed); }
+    void WaitForAsync();
 
     void RunCpuBenchmark();
     void RunRamBenchmark();
 
     std::wstring BuildFullTextReport(Lang lang) const;
+    // Raw diagnostic dump (SMART tables, thermal zones, CPU deltas) used by `Explorer2.exe --dump-hw <file>`.
+    std::wstring BuildDiagnosticsDump() const;
 
     const HwCpuInfo& GetCpu() const { return m_cpu; }
     const std::vector<HwGpuInfo>& GetGpus() const { return m_gpus; }
@@ -239,11 +303,25 @@ public:
     const std::vector<float>& GetNetRxHistoryKBps() const { return m_netRxHistoryKBps; }
     const std::vector<float>& GetNetTxHistoryKBps() const { return m_netTxHistoryKBps; }
 
+    // Temperatures
+    const std::vector<HwThermalSensor>& GetAcpiThermalZones() const { return m_thermalZones; }
+    const std::vector<float>& GetAcpiTempHistory() const { return m_acpiTempHistory; }
+    const std::vector<float>& GetGpuTempHistory() const { return m_gpuTempHistory; }
+
+    // Reads SMART health + thermal data for one physical disk (synchronous helper for CLI/daemon; UI uses RequestAsyncRefresh).
+    void RefreshDiskSmart(int physIndex);
+    static bool IsProcessElevated();
+    // Opens the classic Windows "Properties" dialog of a network connection (same as ncpa.cpl > right click > Properties).
+    // Falls back to opening the Network Connections folder when the adapter cannot be matched.
+    static void OpenNetworkAdapterProperties(HWND owner, const std::wstring& connectionName);
+
     bool IsInitialized() const { return m_initialized; }
 
 private:
     void QueryCpuStatic();
     void QueryMotherboardAndSmbios();
+    void QueryFastSystemAndRam(bool includeStaticOs);
+    void QueryFastVolumes();
     void QueryGpusAndDisplays();
     void QueryPhysicalDisksAndVolumes();
     void QueryNetworkAdapters(bool updateThroughputOnly);
@@ -251,6 +329,13 @@ private:
 
     void UpdateCpuLivePerCoreLoad();
     void UpdateGpuLiveTelemetry();
+    void UpdateDiskTemperatures();
+    void UpdateAcpiThermalZones();
+    void RefreshDiskSmartOnVector(std::vector<HwPhysicalDisk>& disks, int physIndex);
+
+    void StartWorkerThreadIfNeeded();
+    void WorkerLoop();
+    void PublishWorkerStateToStaged();
 
     bool m_initialized = false;
     HwCpuInfo m_cpu;
@@ -266,6 +351,16 @@ private:
     std::vector<float> m_gpuLoadHistory;
     std::vector<float> m_netRxHistoryKBps;
     std::vector<float> m_netTxHistoryKBps;
+
+    std::vector<HwThermalSensor> m_thermalZones;
+    std::vector<float> m_acpiTempHistory;
+    std::vector<float> m_gpuTempHistory;
+    ULONGLONG m_lastDiskTempTick = 0;
+
+    // PDH query for "\Thermal Zone Information(*)\Temperature" (opaque handles)
+    void* m_pdhThermalQuery = nullptr;
+    void* m_pdhThermalCounter = nullptr;
+    bool m_pdhThermalTried = false;
 
     // Previous per-core idle/kernel/user timestamps for delta CPU %
     struct CoreTimeSample {
@@ -284,6 +379,44 @@ private:
     // Optional dynamically loaded NVML library for NVIDIA GPU sensors
     HMODULE m_hNvml = nullptr;
     bool m_nvmlReady = false;
+    bool m_nvmlTried = false;
+
+    // Background worker & lock-free / micro-locked staging state for non-blocking UI
+    struct StagedData {
+        std::vector<HwGpuInfo> gpus;
+        std::vector<HwDisplayInfo> displays;
+        std::vector<HwPhysicalDisk> physDisks;
+        std::vector<HwLogicalVolume> volumes;
+        std::vector<HwNetAdapter> networks;
+        std::vector<std::wstring> audioOutputs;
+        std::vector<std::wstring> audioInputs;
+        std::vector<HwProcessEntry> topProcesses;
+        std::vector<HwThermalSensor> thermalZones;
+        std::vector<float> gpuLoadHistory;
+        std::vector<float> netRxHistoryKBps;
+        std::vector<float> netTxHistoryKBps;
+        std::vector<float> acpiTempHistory;
+        std::vector<float> gpuTempHistory;
+    };
+
+    // Worker-owned working copies (only accessed on m_workerThread)
+    StagedData m_wState;
+    // Mutex-protected staged snapshot (swapped to UI thread in ApplyStagedData)
+    mutable std::mutex m_stageMutex;
+    StagedData m_staged;
+    std::atomic<bool> m_hasStagedData{ false };
+
+    std::thread m_workerThread;
+    bool m_workerStarted = false;
+    mutable std::mutex m_workerMutex;
+    std::condition_variable m_workerCv;
+    std::condition_variable m_doneCv;
+    std::atomic<bool> m_stopWorker{ false };
+    std::atomic<bool> m_workerBusy{ false };
+    std::atomic<bool> m_reqFullRefresh{ false };
+    std::atomic<bool> m_reqAllSmart{ false };
+    std::atomic<int>  m_reqSingleSmartDisk{ -1 };
+    std::atomic<bool> m_reqLiveUpdate{ false };
 };
 
 } // namespace Explorer2

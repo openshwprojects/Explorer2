@@ -1,5 +1,6 @@
 #pragma once
 #include "Types.h"
+#include "ShellMenuEmulator.h"
 #include <d2d1.h>
 #include <wincodec.h>
 #include <string>
@@ -77,10 +78,13 @@ public:
 
     void ClearFullImageCache();
 
-    // Async non-blocking image rotation with per-item "Rotating..." status tracking
+    // Async non-blocking image rotation & transformation with per-item status tracking
     void QueueRotateImages(const std::vector<std::wstring>& paths, bool clockwise);
+    void QueueTransformImages(const std::vector<std::wstring>& paths, const ImageTransformParams& params);
     bool IsPathRotating(const std::wstring& normKey) const;
+    bool IsAnyImageTransforming() const;
     std::vector<std::wstring> TakeCompletedRotations();
+    std::vector<ImageTransformResult> TakeCompletedTransforms();
 
     // System icon cache (folder, .py, .json, drives, etc.)
     ID2D1Bitmap* GetSystemIconBitmap(ID2D1RenderTarget* rt, int sysIconIndex, bool largeIcon);
@@ -145,10 +149,11 @@ private:
     // System icon bitmaps
     std::unordered_map<uint64_t, ID2D1Bitmap*> m_sysIconBitmaps;
 
-    // Background rotation tracking
+    // Background rotation & image transformation tracking
     mutable std::mutex m_rotateMutex;
     std::unordered_set<std::wstring> m_rotatingNormKeys;
     std::vector<std::wstring> m_completedRotationPaths;
+    std::vector<ImageTransformResult> m_completedTransforms;
 };
 
 } // namespace Explorer2

@@ -22,6 +22,9 @@ constexpr UINT WM_APP_DIR_CHANGED         = WM_APP + 104;
 constexpr UINT WM_APP_FOLDER_SIZE_UPDATED = WM_APP + 105;
 constexpr UINT WM_APP_IMAGE_ROTATED       = WM_APP + 106;
 constexpr UINT WM_APP_SEARCH_UPDATED      = WM_APP + 107;
+constexpr UINT WM_APP_LOG_ADDED           = WM_APP + 108;   // new AppLog entry (coalesced)
+constexpr UINT WM_APP_RENAME_DONE         = WM_APP + 109;   // lParam = heap RenameJobResult*
+constexpr UINT WM_APP_MERGE_DONE          = WM_APP + 110;   // lParam = heap MergeFolderResult*
 
 enum class ViewMode : int {
     Details = 0,         // Szczegóły (table with columns)
@@ -50,7 +53,11 @@ enum class RibbonTab : int {
     Share = 2,
     View = 3,
     Search = 4,
-    Hardware = 5
+    Hardware = 5,
+    Programs = 6,  // "Programy": installed programs list (rendered through the dashboard view host)
+    Monitoring = 7, // "Monitoring": long-term system recording (rendered through the dashboard view host)
+    Lan = 8,        // "LAN": network scanner + SSDP (rendered through the dashboard view host)
+    Log = 9         // "Log": this run's operation log (rendered through the dashboard view host)
 };
 
 enum class HardwareSubTab : int {
@@ -61,7 +68,8 @@ enum class HardwareSubTab : int {
     Motherboard = 4,
     Disks = 5,
     Network = 6,
-    System = 7
+    System = 7,
+    Thermal = 8
 };
 
 enum class SearchSizeUnit : int {
@@ -191,8 +199,10 @@ struct TreemapHitNode {
     D2D1_RECT_F rect = {};
     int topItemIndex = -1;
     int depth = 0;
+    uint32_t color = 0x0078D7;
     uint64_t size = 0;
     bool isDirectory = false;
+    bool isInFlight = false;
     std::wstring name;
     std::wstring relPath;
     std::wstring fullPath;
@@ -219,6 +229,8 @@ struct PieSectorHitNode {
 struct HardwareCardHit {
     D2D1_RECT_F rect = {};
     int cmdId = 0;
+    int actionIndex = 0;        // e.g. physical disk index for CMD_HW_SELECT_DISK
+    std::wstring actionArg;     // e.g. network connection name for CMD_HW_NET_SETTINGS
     std::wstring copyText;
     std::wstring label;
 };

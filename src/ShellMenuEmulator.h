@@ -34,6 +34,46 @@ struct SendToTarget {
     bool isZipArchive = false;
 };
 
+enum class ImageTransformKind {
+    RotateCW,
+    RotateCCW,
+    Rotate180,
+    FlipH,
+    FlipV,
+    ScalePercent,      // scalePct (1..400)
+    FitMaxDim,         // maxDim (e.g. 1920): downscales longest edge to maxDim preserving aspect ratio
+    ExactWidthHeight,  // targetW x targetH
+    TargetFileSize,    // targetBytes: iterative quality + resolution solver in RAM so output <= targetBytes
+    ConvertFormat      // forceExt = ".jpg", ".png", ".bmp" with jpegQuality
+};
+
+struct ImageTransformParams {
+    ImageTransformKind kind = ImageTransformKind::ScalePercent;
+    int scalePct = 100;
+    uint32_t maxDim = 0;
+    uint32_t targetW = 0;
+    uint32_t targetH = 0;
+    uint64_t targetBytes = 0;
+    std::wstring forceExt; // e.g. L".jpg", L".png", L".bmp" (empty = preserve source or use .jpg for TargetFileSize)
+    float jpegQuality = 0.92f;
+    bool overwriteOriginal = false;
+    std::wstring suffix;   // e.g. L"_50pct", L"_1920px", L"_500KB"
+};
+
+struct ImageTransformResult {
+    bool ok = false;
+    std::wstring srcPath;
+    std::wstring outPath;
+    uint32_t origW = 0;
+    uint32_t origH = 0;
+    uint32_t newW = 0;
+    uint32_t newH = 0;
+    uint64_t origBytes = 0;
+    uint64_t newBytes = 0;
+    float usedQuality = 0.0f;
+    std::wstring errorMsg;
+};
+
 class ShellMenuEmulator {
 public:
     ShellMenuEmulator();
@@ -73,6 +113,12 @@ public:
 
     // Rotate image 90 degrees CW or CCW losslessly/via WIC
     static bool RotateImageFile(const std::wstring& imagePath, bool clockwise);
+
+    // Fast header-only dimension probe (< 0.2 ms, does not decode pixel data)
+    static bool ProbeImageDimensions(const std::wstring& imagePath, uint32_t& outW, uint32_t& outH, uint64_t* outFileBytes = nullptr);
+
+    // Integrated Per-Image Tool engine: resize, downscale, target file size solver, flip/rotate, format conversion
+    static bool TransformImageFile(const std::wstring& imagePath, const ImageTransformParams& params, ImageTransformResult& outRes);
 
     // Fallback: Show native Windows IContextMenu if user Shift+Right-Clicks or selects "System Shell Menu"
     static void ShowNativeShellContextMenu(HWND hwnd, const std::vector<std::wstring>& paths, int screenX, int screenY);
