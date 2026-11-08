@@ -4,6 +4,7 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <cwchar>
+#include <memory>
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -71,11 +72,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
         }
     }
 
-    Explorer2::ExplorerApp app;
+    auto app = std::make_unique<Explorer2::ExplorerApp>();
     int exitCode = 0;
-    if (app.Initialize(hInstance, nCmdShow, initialPath)) {
-        exitCode = app.RunMessageLoop();
+    if (app->Initialize(hInstance, nCmdShow, initialPath)) {
+        exitCode = app->RunMessageLoop();
     }
+    app.reset();
 
     CoUninitialize();
     return exitCode;

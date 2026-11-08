@@ -189,9 +189,11 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     m_shellEmulator.InitializeAsync();
     m_mediaPlayer.Initialize(m_hwnd);
     m_contentPane.Initialize(m_hwnd, hInstance, m_d2dFactory, m_dwriteFactory);
+    AppLog::Info(L"App", L"Init step 1: Subsystems initialized");
 
     m_pinnedFolders = FileEngine::GetDefaultQuickAccessFolders(m_lang);
     RebuildTreeNodes();
+    AppLog::Info(L"App", L"Init step 2: Tree nodes built");
 
     std::wstring startDir = initialPath;
     if (startDir.empty()) {
@@ -205,7 +207,9 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     }
 
     LoadUiSettings();
+    AppLog::Info(L"App", L"Init step 3: UI settings loaded, navigating to " + startDir);
     NavigateTo(startDir, true);
+    AppLog::Info(L"App", L"Init step 4: NavigateTo completed");
 
     // If the user enabled background recording earlier, make sure the single shared recorder is alive
     // (e.g. after a reboot without autostart). Any window can revive it; only one instance ever runs.
@@ -219,6 +223,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
 
     ShowWindow(m_hwnd, nCmdShow);
     UpdateWindow(m_hwnd);
+    AppLog::Info(L"App", L"Init step 5: ShowWindow & UpdateWindow completed");
     return true;
 }
 
