@@ -1,11 +1,33 @@
 #include "ExplorerApp.h"
 #include "Monitoring.h"
+#include "SelfTestSuite.h"
 #include <objbase.h>
 #include <shellapi.h>
 #include <cwchar>
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    // Automated self-test runner: `Explorer2.exe --self-test <stage> <reportFile>`
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--self-test")) {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(lpCmdLine, &argc);
+        std::wstring stage = L"all";
+        std::wstring reportFile = L"build\\selftest_report.txt";
+        if (argv) {
+            for (int i = 0; i < argc; ++i) {
+                if (wcscmp(argv[i], L"--self-test") == 0) {
+                    if (i + 1 < argc) stage = argv[i + 1];
+                    if (i + 2 < argc) reportFile = argv[i + 2];
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
+        int code = Explorer2::SelfTestSuite::RunStageTests(stage, reportFile);
+        CoUninitialize();
+        return code;
+    }
 
     // Hidden background recorder (one per user session, shared by every Explorer2 window)
     if (lpCmdLine && wcsstr(lpCmdLine, L"--monitor-daemon")) {

@@ -12,6 +12,7 @@
 #include "GitIntegration.h"
 #include "AppLog.h"
 #include "FileContentPane.h"
+#include "BackupManager.h"
 #include <atomic>
 #include <d2d1.h>
 #include <dwrite.h>
@@ -93,6 +94,7 @@ private:
     void DrawMonitoringView(const D2D1_RECT_F& rect);
     void DrawLanView(const D2D1_RECT_F& rect);
     void DrawLogView(const D2D1_RECT_F& rect);
+    void DrawBackupsView(const D2D1_RECT_F& rect);
     void MergeFolderInto(const std::wstring& srcDir, const std::wstring& dstDir, const std::wstring& srcName, const std::wstring& dstName);
     void StartRenameJob(const std::wstring& oldPath, const std::wstring& oldName, const std::wstring& newName);
     void ShowRenameFailure(const std::wstring& oldName, const std::wstring& newName, const std::wstring& reason, DWORD err);
@@ -117,6 +119,7 @@ private:
     void LoadUiSettings();
     bool IsLanView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Lan; }
     bool IsLogView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Log; }
+    bool IsBackupsView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Backups; }
     bool IsMonitoringView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Monitoring; }
     void DrawCardShell(float x, float y, float w, float h, const std::wstring& title, uint32_t badgeHex, bool showCopyHint, float extraRightPad = 0.0f);
     // Shared building blocks of the card-based views (Sprzęt / Programy)
@@ -479,6 +482,9 @@ private:
     D2D1_RECT_F m_paneHeaderAddressRect[2] = {};
     ExplorerPaneState m_otherPane;
     FileContentPane m_contentPane;
+    BackupManager m_backups;
+    int m_backupSelectedJobId = 1;
+    ULONGLONG m_lastBackupTickMs = 0;
 };
 
 } // namespace Explorer2

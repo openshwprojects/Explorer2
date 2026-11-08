@@ -305,7 +305,34 @@ enum CommandId : int {
     CMD_IMG_CONVERT_PNG      = 855,
     CMD_IMG_CONVERT_BMP      = 856,
     CMD_CLEAR_RECENT_DIRS    = 857,
-    CMD_BASE_RECENT_DIRS     = 900  // 900..949
+
+    // LAN Ping Tool Auto-Refresh (Stage 8)
+    CMD_LAN_PING_AUTOREFRESH = 860,
+    CMD_LAN_PING_INTERVAL    = 861,
+    CMD_LAN_PING_ONCE        = 862,
+
+    // Backups & Rclone Sync Tab (Stage 9)
+    CMD_TAB_BACKUPS          = 870,
+    CMD_BACKUP_ADD_JOB       = 871,
+    CMD_BACKUP_EDIT_JOB      = 872,
+    CMD_BACKUP_DELETE_JOB    = 873,
+    CMD_BACKUP_RUN_NOW       = 874,
+    CMD_BACKUP_DRY_RUN       = 875,
+    CMD_BACKUP_TOGGLE_ENABLE = 876,
+    CMD_BACKUP_TOGGLE_AVAIL  = 877,
+    CMD_BACKUP_CYCLE_SCHED   = 878,
+    CMD_BACKUP_TOGGLE_RCLONE = 879,
+    CMD_BACKUP_SELECT_JOB    = 880,
+    CMD_BACKUP_RUN_ALL_DUE   = 881,
+    CMD_BACKUP_EDIT_FILTERS  = 882,
+
+    // FTP Support (Stage 10)
+    CMD_FTP_CONNECT_DLG      = 890,
+    CMD_FTP_BOOKMARKS_MENU   = 891,
+    CMD_FTP_DISCONNECT       = 892,
+
+    CMD_BASE_RECENT_DIRS     = 900, // 900..949
+    CMD_BASE_FTP_BOOKMARKS   = 950  // 950..989
 };
 
 // Layout constants (in DIPs / pixels)

@@ -9,7 +9,7 @@
 #include <vector>
 
 // LAN scanner backend (UI-agnostic): ARP/ICMP host discovery, reverse DNS + NetBIOS names,
-// MAC vendor lookup, SSDP/UPnP discovery and a small TCP port scan.
+// MAC vendor lookup, SSDP/UPnP discovery, TCP port scan, and Continuous Ping Auto-Refresh.
 // Everything is asynchronous: Start*() returns immediately, results are polled through the
 // thread-safe Snapshot*() / Is*() / GetScanProgress() accessors. No admin rights required.
 
@@ -34,6 +34,12 @@ struct LanHost {
     std::wstring hostName;         // reverse DNS (empty if none)
     std::wstring netbiosName;      // NBSTAT answer (empty if none)
     int rttMs = -1;                // ICMP echo RTT, -1 = no reply
+    int minRttMs = -1;             // Minimum ICMP RTT observed
+    int maxRttMs = -1;             // Maximum ICMP RTT observed
+    int avgRttMs = -1;             // Rolling average ICMP RTT (up to 16 recent samples)
+    int pingSent = 0;              // Total ICMP pings sent to this host
+    int pingLost = 0;              // Total ICMP pings timed out / lost
+    std::vector<int> recentRtts;   // Up to 16 recent valid RTT samples (ms)
     bool viaArp = false, viaPing = false, viaSsdp = false, isSelf = false, isGateway = false;
     std::vector<uint16_t> openPorts;
     bool portsScanned = false;
@@ -76,6 +82,23 @@ public:
     void StartPortScan(const std::wstring& ip);
     bool IsPortScanning() const;
 
+    // Continuous Ping Auto-Refresh: periodically pings all discovered hosts in the background
+    // at `intervalMs` (clamped 500..60000 ms) and updates rolling RTT statistics.
+    void StartPingAutoRefresh(int intervalMs = 2000);
+    void StopPingAutoRefresh();
+    void TogglePingAutoRefresh();
+    void SetPingAutoRefreshInterval(int intervalMs);
+    int CyclePingAutoRefreshInterval(); // cycles 1000 -> 2000 -> 5000 -> 10000 ms
+    bool IsPingAutoRefreshEnabled() const;
+    int GetPingAutoRefreshIntervalMs() const;
+
+    // Synchronous single-host or all-hosts ping sweep (updates rolling RTT stats in hosts_).
+    int PingSingleHost(const std::wstring& ip);
+    void PingAllHostsOnce();
+
+    // Deterministic rolling RTT stats updater (also used by unit tests).
+    static void UpdateRollingPingStats(LanHost& host, int sampleRttMs);
+
     std::vector<LanHost> SnapshotHosts() const;       // sorted by IPv4, thread-safe copy
     std::vector<SsdpDevice> SnapshotSsdp() const;     // thread-safe copy
 
@@ -89,6 +112,7 @@ private:
     void ScanThreadMain(uint32_t gen, LanAdapterInfo adapter, int maxHosts);
     void SsdpThreadMain(uint32_t gen, int listenMs);
     void PortScanThreadMain(uint32_t gen, std::wstring ip);
+    void PingAutoRefreshThreadMain(uint32_t gen);
 
     // Starts fn on a new thread stored in `slot`; the new thread first joins the previous occupant of
     // the slot (which is already cancelled), so the caller never blocks.
@@ -102,12 +126,12 @@ private:
     LanAdapterInfo lastAdapter_;
     bool haveAdapter_ = false;
 
-    std::atomic<uint32_t> scanGen_{0}, ssdpGen_{0}, portGen_{0};
-    std::atomic<bool> scanning_{false}, ssdpRunning_{false}, portScanning_{false};
-    std::atomic<int> done_{0}, total_{0};
+    std::atomic<uint32_t> scanGen_{0}, ssdpGen_{0}, portGen_{0}, pingAutoGen_{0};
+    std::atomic<bool> scanning_{false}, ssdpRunning_{false}, portScanning_{false}, pingAutoEnabled_{false};
+    std::atomic<int> done_{0}, total_{0}, pingAutoIntervalMs_{2000};
 
-    std::mutex threadMutex_;            // protects the three thread handles
-    std::thread scanThread_, ssdpThread_, portThread_;
+    std::mutex threadMutex_;            // protects the worker thread handles
+    std::thread scanThread_, ssdpThread_, portThread_, pingAutoThread_;
     bool wsaOk_ = false;
 };
 

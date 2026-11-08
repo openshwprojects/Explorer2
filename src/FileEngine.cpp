@@ -1,4 +1,6 @@
 #include "FileEngine.h"
+#include "ArchiveExplorer.h"
+#include "FtpClient.h"
 #include "PathUtils.h"
 #include <shellapi.h>
 #include <shlobj.h>
@@ -280,6 +282,11 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
         return results;
     }
 
+    if (FtpClient::IsFtpPath(dirPath)) {
+        FtpClient::EnumerateFtpDirectory(dirPath, showHidden, showExtensions, lang, results, nullptr);
+        return results;
+    }
+
     results.reserve(512);
 
     std::wstring cleanDir = PathUtils::TrimTrailingSlashes(dirPath);
@@ -296,6 +303,43 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
         FIND_FIRST_EX_LARGE_FETCH);
 
     if (hFind == INVALID_HANDLE_VALUE) {
+        std::wstring arcFile, innerDir;
+        if (ArchiveExplorer::SplitVirtualArchivePath(cleanDir, arcFile, innerDir)) {
+            std::vector<ArchiveItemEntry> arcChildren;
+            if (ArchiveExplorer::EnumerateArchiveFolder(arcFile, innerDir, arcChildren)) {
+                for (const auto& ac : arcChildren) {
+                    FileEntry entry;
+                    entry.name = ac.name;
+                    entry.fullPath = prefix + ac.name;
+                    entry.normKey = PathUtils::NormalizePathKey(entry.fullPath);
+                    entry.isDirectory = ac.isDirectory;
+                    entry.size = ac.uncompressedSize;
+                    if (!entry.isDirectory) {
+                        entry.sizeStr = FormatSizeKB(entry.size);
+                        entry.ext = PathUtils::GetExtension(entry.name);
+                        entry.displayName = showExtensions ? entry.name : PathUtils::GetStem(entry.name, false);
+                        entry.isImage = IsImageExtension(entry.ext);
+                        entry.isVideo = IsVideoExtension(entry.ext);
+                        entry.isAudio = IsAudioExtension(entry.ext);
+                    } else {
+                        entry.displayName = entry.name;
+                        if (entry.size > 0) entry.sizeStr = FormatSizeKB(entry.size);
+                    }
+                    if (ac.dosDate != 0) {
+                        FILETIME localFt = {}, utcFt = {};
+                        if (DosDateTimeToFileTime(ac.dosDate, ac.dosTime, &localFt) &&
+                            LocalFileTimeToFileTime(&localFt, &utcFt)) {
+                            entry.writeTime = utcFt;
+                            entry.dateStr = FormatFileTime(utcFt);
+                        }
+                    }
+                    const ExtTypeInfo& extInfo = GetExtensionInfo(entry.ext, entry.isDirectory, lang);
+                    entry.typeName = extInfo.typeName;
+                    entry.sysIconIndex = extInfo.sysIconIndex;
+                    results.push_back(std::move(entry));
+                }
+            }
+        }
         return results;
     }
 

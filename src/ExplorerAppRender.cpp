@@ -644,9 +644,11 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
         m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx - sz * 0.15f, cy - sz * 0.15f), sz * 0.16f, sz * 0.16f), m_solidBrush);
         break;
     }
-    case CMD_LAN_SSDP: {
-        // Radiating arcs (discovery broadcast)
-        m_solidBrush->SetColor(HexColor(0x7C3AED));
+    case CMD_LAN_SSDP:
+    case CMD_FTP_CONNECT_DLG:
+    case CMD_FTP_BOOKMARKS_MENU: {
+        // Radiating arcs / network globe
+        m_solidBrush->SetColor(HexColor(0x0284C7));
         m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.14f, sz * 0.14f), m_solidBrush);
         m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.5f, sz * 0.5f), m_solidBrush, 1.8f);
         m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.85f, sz * 0.85f), m_solidBrush, 1.8f);
@@ -798,6 +800,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         { CMD_TAB_PROGRAMS, RibbonTab::Programs, m_lang == Lang::PL ? L"Programy" : L"Programs", 84.0f, false },
         { CMD_TAB_MONITORING, RibbonTab::Monitoring, L"Monitoring", 88.0f, false },
         { CMD_TAB_LAN, RibbonTab::Lan, L"LAN", 56.0f, false },
+        { CMD_TAB_BACKUPS, RibbonTab::Backups, m_lang == Lang::PL ? L"Kopie zapasowe" : L"Backups", 104.0f, false },
         { CMD_TAB_LOG, RibbonTab::Log, L"Log", 50.0f, false }
     };
 
@@ -1117,6 +1120,13 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawSmallRowButton(CMD_PROPERTIES,             sx, body.top + 54.0f, 154.0f, m_lang == Lang::PL ? L"Właściwości / Uprawnienia" : L"Properties / Sharing");
         sx += 160.0f;
         drawGroupSeparatorAndTitle(g3Start, sx, m_lang == Lang::PL ? L"Terminal i sieć" : L"Terminal & Network");
+        sx += 8.0f;
+
+        // Group 4: Klient FTP (Main & Split Pane)
+        float g4Start = sx;
+        drawLargeButton(CMD_FTP_CONNECT_DLG,    sx, 86.0f, m_lang == Lang::PL ? L"Połącz z\nFTP..." : L"Connect\nFTP..."); sx += 88.0f;
+        drawLargeButton(CMD_FTP_BOOKMARKS_MENU, sx, 88.0f, m_lang == Lang::PL ? L"Zakładki\nFTP \x25BE" : L"FTP\nBookmarks \x25BE"); sx += 90.0f;
+        drawGroupSeparatorAndTitle(g4Start, sx, m_lang == Lang::PL ? L"Klient FTP (2 panele)" : L"FTP Client (Dual-Pane)");
         return;
     }
 
@@ -1135,9 +1145,11 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
     }
 
     if (m_activeRibbonTab == RibbonTab::Lan) {
-        // LAN Ribbon Tab: scanner controls
+        // LAN Ribbon Tab: scanner controls + Ping Auto-Refresh
         const bool pl = (m_lang == Lang::PL);
         const bool scanning = m_lan.IsScanning();
+        const bool autoPing = m_lan.IsPingAutoRefreshEnabled();
+        const int pingSec = std::max(1, m_lan.GetPingAutoRefreshIntervalMs() / 1000);
         float lx = rect.left + 6.0f;
 
         float lg1 = lx;
@@ -1146,6 +1158,20 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawLargeButton(CMD_LAN_SSDP, lx, 84.0f, pl ? L"Szukaj\nSSDP / UPnP" : L"Find\nSSDP / UPnP", m_lan.IsSsdpRunning());
         lx += 86.0f;
         drawGroupSeparatorAndTitle(lg1, lx, pl ? L"Skanowanie" : L"Scanning");
+        lx += 6.0f;
+
+        float lgPing = lx;
+        std::wstring autoLbl = autoPing
+            ? (pl ? L"Auto-Ping:\nWŁĄCZONY" : L"Auto-Ping:\nENABLED")
+            : (pl ? L"Auto-Ping:\nWYŁĄCZONY" : L"Auto-Ping:\nDISABLED");
+        drawLargeButton(CMD_LAN_PING_AUTOREFRESH, lx, 92.0f, autoLbl.c_str(), autoPing);
+        lx += 94.0f;
+        std::wstring intvLbl = (pl ? L"Interwał:\nco " : L"Interval:\nevery ") + std::to_wstring(pingSec) + L" s";
+        drawLargeButton(CMD_LAN_PING_INTERVAL, lx, 82.0f, intvLbl.c_str(), false);
+        lx += 84.0f;
+        drawLargeButton(CMD_LAN_PING_ONCE, lx, 78.0f, pl ? L"Pinguj\nteraz" : L"Ping\nnow", false);
+        lx += 80.0f;
+        drawGroupSeparatorAndTitle(lgPing, lx, pl ? L"Narzędzie Ping (RTT)" : L"Ping Tool (RTT)");
         lx += 6.0f;
 
         float lg2 = lx;
@@ -1161,6 +1187,46 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawSmallRowButton(CMD_HW_BACK_TO_FILES, lx, body.top + 6.0f, 150.0f, pl ? L"Wróć do plików" : L"Back to Files");
         lx += 154.0f;
         drawGroupSeparatorAndTitle(lg3, lx, pl ? L"Okno" : L"Window");
+        return;
+    }
+
+    if (m_activeRibbonTab == RibbonTab::Backups) {
+        // KOPIE ZAPASOWE (Backups & Rclone Sync) Ribbon Tab
+        const bool pl = (m_lang == Lang::PL);
+        float bx = rect.left + 6.0f;
+
+        float bg1 = bx;
+        drawLargeButton(CMD_BACKUP_ADD_JOB, bx, 88.0f, pl ? L"Nowe\nzadanie" : L"New\nBackup Job");
+        bx += 90.0f;
+        drawLargeButton(CMD_BACKUP_EDIT_JOB, bx, 84.0f, pl ? L"Edytuj\nścieżki" : L"Edit\nPaths");
+        bx += 86.0f;
+        drawLargeButton(CMD_BACKUP_EDIT_FILTERS, bx, 88.0f, pl ? L"Filtry\nInc / Exc" : L"Filters\nInc / Exc");
+        bx += 90.0f;
+        drawLargeButton(CMD_BACKUP_DELETE_JOB, bx, 76.0f, pl ? L"Usuń\nzadanie" : L"Delete\nJob");
+        bx += 78.0f;
+        drawGroupSeparatorAndTitle(bg1, bx, pl ? L"Zadania kopii" : L"Backup Jobs");
+        bx += 6.0f;
+
+        float bg2 = bx;
+        drawLargeButton(CMD_BACKUP_RUN_NOW, bx, 92.0f, pl ? L"Uruchom\nteraz" : L"Run\nNow", m_backups.IsBusy());
+        bx += 94.0f;
+        drawLargeButton(CMD_BACKUP_DRY_RUN, bx, 86.0f, pl ? L"Symulacja\n(Dry-Run)" : L"Test\n(Dry-Run)");
+        bx += 88.0f;
+        drawGroupSeparatorAndTitle(bg2, bx, pl ? L"Wykonanie" : L"Execution");
+        bx += 6.0f;
+
+        float bg3 = bx;
+        drawSmallRowButton(CMD_BACKUP_CYCLE_SCHED,  bx, body.top + 6.0f,  176.0f, pl ? L"Zmień interwał harmonogramu" : L"Cycle schedule interval");
+        drawSmallRowButton(CMD_BACKUP_TOGGLE_AVAIL, bx, body.top + 29.0f, 176.0f, pl ? L"Przełącz: Gdy cel dostępny" : L"Toggle: When target available");
+        drawSmallRowButton(CMD_BACKUP_TOGGLE_RCLONE,bx, body.top + 52.0f, 176.0f, pl ? L"Przełącz: Silnik rclone / C++" : L"Toggle: rclone / Native C++");
+        bx += 182.0f;
+        drawGroupSeparatorAndTitle(bg3, bx, pl ? L"Automatyzacja i rclone" : L"Automation & rclone");
+        bx += 6.0f;
+
+        float bg4 = bx;
+        drawSmallRowButton(CMD_HW_BACK_TO_FILES, bx, body.top + 6.0f, 150.0f, pl ? L"Wróć do plików" : L"Back to Files");
+        bx += 154.0f;
+        drawGroupSeparatorAndTitle(bg4, bx, pl ? L"Okno" : L"Window");
         return;
     }
 
@@ -5397,12 +5463,21 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
     // ---- Control card: adapter, scan / SSDP buttons, progress ----
     {
         const float h = 98.0f;
-        DrawCardShell(leftX, curY, availW, h, pl ? L"SKANER SIECI LAN  \x2022  ARP / ICMP + SSDP (UPnP)" : L"LAN SCANNER  \x2022  ARP / ICMP + SSDP (UPnP)", 0x0284C7, false, 300.0f);
+        const bool autoPing = m_lan.IsPingAutoRefreshEnabled();
+        const int pingSec = std::max(1, m_lan.GetPingAutoRefreshIntervalMs() / 1000);
+        DrawCardShell(leftX, curY, availW, h, pl ? L"SKANER SIECI LAN  \x2022  ARP / ICMP + SSDP (UPnP)" : L"LAN SCANNER  \x2022  ARP / ICMP + SSDP (UPnP)", 0x0284C7, false, 480.0f);
         DrawCardTinyButton(D2D1::RectF(leftX + availW - 138.0f, curY + 4.0f, leftX + availW - 8.0f, curY + 25.0f),
                            pl ? L"\xD83D\xDCE1 Szukaj SSDP" : L"\xD83D\xDCE1 Find SSDP", CMD_LAN_SSDP, L"");
         DrawCardTinyButton(D2D1::RectF(leftX + availW - 308.0f, curY + 4.0f, leftX + availW - 144.0f, curY + 25.0f),
                            scanning ? (pl ? L"\x23F9 Zatrzymaj skanowanie" : L"\x23F9 Stop scan") : (pl ? L"\xD83D\xDD0D Skanuj sieć ponownie" : L"\xD83D\xDD0D Rescan network"),
                            CMD_LAN_SCAN, L"");
+        DrawCardTinyButton(D2D1::RectF(leftX + availW - 386.0f, curY + 4.0f, leftX + availW - 314.0f, curY + 25.0f),
+                           L"\x23F1 " + std::to_wstring(pingSec) + L"s",
+                           CMD_LAN_PING_INTERVAL, L"");
+        DrawCardTinyButton(D2D1::RectF(leftX + availW - 536.0f, curY + 4.0f, leftX + availW - 392.0f, curY + 25.0f),
+                           autoPing ? (pl ? L"\xD83D\xDD04 Auto-Ping: WŁ" : L"\xD83D\xDD04 Auto-Ping: ON")
+                                    : (pl ? L"\x23F8 Auto-Ping: WYŁ" : L"\x23F8 Auto-Ping: OFF"),
+                           CMD_LAN_PING_AUTOREFRESH, L"");
 
         std::wstring adapterTxt;
         if (m_lanAdapters.empty()) {
@@ -5532,9 +5607,20 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
             DrawClippedText(name, D2D1::RectF(nameX, t0, nameX + nameW, t1), m_fmtSmall, nameCol);
             DrawClippedText(hst.mac.empty() ? std::wstring(L"\x2014") : hst.mac, D2D1::RectF(macX, t0, macX + macW, t1), m_fmtSmall, 0x475569);
             DrawClippedText(vendor, D2D1::RectF(vendorX, t0, vendorX + vendorW, t1), m_fmtSmall, 0x475569);
-            wchar_t rtt[24] = {};
-            if (hst.rttMs >= 0) swprintf_s(rtt, L"%d ms", hst.rttMs); else wcscpy_s(rtt, L"\x2014");
-            DrawClippedText(rtt, D2D1::RectF(rttX, t0, rttX + rttW, t1), m_fmtSmall, hst.rttMs > 50 ? 0xD97706 : 0x059669);
+            wchar_t rtt[64] = {};
+            if (hst.rttMs >= 0) {
+                if (hst.pingSent > 1 && hst.avgRttMs >= 0) {
+                    swprintf_s(rtt, pl ? L"%d ms (śr %d)" : L"%d ms (avg %d)", hst.rttMs, hst.avgRttMs);
+                } else {
+                    swprintf_s(rtt, L"%d ms", hst.rttMs);
+                }
+            } else if (hst.pingSent > 0 && hst.pingLost > 0) {
+                int lossPct = (hst.pingLost * 100) / std::max(1, hst.pingSent);
+                swprintf_s(rtt, pl ? L"timeout (%d%%)" : L"timeout (%d%%)", lossPct);
+            } else {
+                wcscpy_s(rtt, L"\x2014");
+            }
+            DrawClippedText(rtt, D2D1::RectF(rttX, t0, rttX + rttW, t1), m_fmtSmall, hst.rttMs < 0 && hst.pingLost > 0 ? 0xDC2626 : (hst.rttMs > 50 ? 0xD97706 : 0x059669));
             DrawClippedText(ports, D2D1::RectF(portsX, t0, portsX + portsW, t1), m_fmtSmall, 0x0067B8);
             DrawClippedText(flags, D2D1::RectF(flagsX, t0, flagsX + flagsW, t1), m_fmtSmall, 0x64748B);
 
@@ -5573,10 +5659,21 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
                           (vendor.empty() ? std::wstring(selHost->randomizedMac ? (pl ? L"prywatny/losowy MAC (telefon, tablet?)" : L"private/random MAC (phone, tablet?)") : L"\x2014") : vendor);
         if (sd && !sd->modelName.empty()) l2 += L"   \x2022   " + (pl ? std::wstring(L"model: ") : std::wstring(L"model: ")) + sd->modelName;
         line(l2, 0x475569, false);
-        wchar_t l3[200] = {};
-        swprintf_s(l3, pl ? L"RTT %s   \x2022   wykryty przez: %s%s%s" : L"RTT %s   \x2022   seen by: %s%s%s",
-                   selHost->rttMs >= 0 ? (std::to_wstring(selHost->rttMs) + L" ms").c_str() : L"\x2014",
-                   selHost->viaArp ? L"ARP " : L"", selHost->viaPing ? L"ICMP " : L"", selHost->viaSsdp ? L"SSDP" : L"");
+        wchar_t l3[320] = {};
+        if (selHost->pingSent > 0) {
+            int lossPct = (selHost->pingLost * 100) / std::max(1, selHost->pingSent);
+            swprintf_s(l3,
+                pl ? L"RTT: %s   \x2022   min: %d ms   \x2022   śr: %d ms   \x2022   max: %d ms   \x2022   pingi: %d (straty: %d = %d%%)   \x2022   %s%s%s"
+                   : L"RTT: %s   \x2022   min: %d ms   \x2022   avg: %d ms   \x2022   max: %d ms   \x2022   pings: %d (lost: %d = %d%%)   \x2022   %s%s%s",
+                selHost->rttMs >= 0 ? (std::to_wstring(selHost->rttMs) + L" ms").c_str() : L"timeout",
+                std::max(0, selHost->minRttMs), std::max(0, selHost->avgRttMs), std::max(0, selHost->maxRttMs),
+                selHost->pingSent, selHost->pingLost, lossPct,
+                selHost->viaArp ? L"ARP " : L"", selHost->viaPing ? L"ICMP " : L"", selHost->viaSsdp ? L"SSDP" : L"");
+        } else {
+            swprintf_s(l3, pl ? L"RTT %s   \x2022   wykryty przez: %s%s%s" : L"RTT %s   \x2022   seen by: %s%s%s",
+                       selHost->rttMs >= 0 ? (std::to_wstring(selHost->rttMs) + L" ms").c_str() : L"\x2014",
+                       selHost->viaArp ? L"ARP " : L"", selHost->viaPing ? L"ICMP " : L"", selHost->viaSsdp ? L"SSDP" : L"");
+        }
         line(l3, 0x475569, false);
         std::wstring l4;
         if (portRun && !selHost->portsScanned) {
@@ -5599,6 +5696,7 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
             DrawCardTinyButton(D2D1::RectF(bx, by, bx + w, by + 22.0f), label, cmd, arg);
             bx += w + 8.0f;
         };
+        btn(108.0f, pl ? L"\xD83D\xDCE1 Ping teraz" : L"\xD83D\xDCE1 Ping now", CMD_LAN_PING_ONCE, selHost->ip);
         btn(130.0f, portRun ? (pl ? L"Skanowanie…" : L"Scanning…") : (pl ? L"\xD83D\xDD0E Skanuj porty" : L"\xD83D\xDD0E Scan ports"), CMD_LAN_PORTSCAN, selHost->ip);
         bool has80 = false, has443 = false;
         for (uint16_t p : selHost->openPorts) { if (p == 80) has80 = true; if (p == 443) has443 = true; }
@@ -5790,8 +5888,215 @@ void ExplorerApp::DrawLogView(const D2D1_RECT_F& rect) {
     m_rt->PopAxisAlignedClip();
 }
 
+void ExplorerApp::DrawBackupsView(const D2D1_RECT_F& rect) {
+    const bool pl = (m_lang == Lang::PL);
+    const std::vector<BackupJob> jobs = m_backups.SnapshotJobs();
+    const bool busy = m_backups.IsBusy();
+    std::wstring rcloneVer;
+    const bool rcloneFound = BackupManager::IsRcloneInstalled(&rcloneVer);
+
+    if (!jobs.empty()) {
+        bool foundSel = false;
+        for (const auto& j : jobs) {
+            if (j.id == m_backupSelectedJobId) { foundSel = true; break; }
+        }
+        if (!foundSel) m_backupSelectedJobId = jobs.front().id;
+    }
+
+    m_rt->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    m_solidBrush->SetColor(HexColor(0xF3F5F8));
+    m_rt->FillRectangle(rect, m_solidBrush);
+
+    const float padX = 10.0f, gap = 10.0f;
+    const float availW = std::max(460.0f, (rect.right - rect.left) - padX * 2.0f);
+    const float leftX = rect.left + padX;
+    const float startY = rect.top + 8.0f;
+    float curY = startY - m_hwScrollY;
+
+    // ---- 1. Header Card ----
+    {
+        const float h = 92.0f;
+        DrawCardShell(leftX, curY, availW, h,
+            pl ? L"KOPIE ZAPASOWE PRO  \x2022  HARMONOGRAM + RCLONE + AUTO-START GDY CEL DOSTĘPNY"
+               : L"PRO BACKUP MANAGER  \x2022  SCHEDULER + RCLONE + WHEN TARGET AVAILABLE",
+            0x0284C7, false, 440.0f);
+
+        DrawCardTinyButton(D2D1::RectF(leftX + availW - 128.0f, curY + 4.0f, leftX + availW - 8.0f, curY + 25.0f),
+                           pl ? L"\xD83D\xDD0D Symuluj (Dry-Run)" : L"\xD83D\xDD0D Test (Dry-Run)",
+                           CMD_BACKUP_DRY_RUN, std::to_wstring(m_backupSelectedJobId));
+        DrawCardTinyButton(D2D1::RectF(leftX + availW - 270.0f, curY + 4.0f, leftX + availW - 134.0f, curY + 25.0f),
+                           busy ? (pl ? L"\x23F3 Trwa synchronizacja…" : L"\x23F3 Syncing…")
+                                : (pl ? L"\x25B6 Uruchom wybrane" : L"\x25B6 Run selected"),
+                           CMD_BACKUP_RUN_NOW, std::to_wstring(m_backupSelectedJobId));
+        DrawCardTinyButton(D2D1::RectF(leftX + availW - 412.0f, curY + 4.0f, leftX + availW - 276.0f, curY + 25.0f),
+                           pl ? L"+ Nowe zadanie kopii" : L"+ New backup job",
+                           CMD_BACKUP_ADD_JOB, L"");
+
+        std::wstring engLine = rcloneFound
+            ? ((pl ? L"\x2713 Silnik rclone wykryty: " : L"\x2713 rclone engine detected: ") + rcloneVer + (pl ? L"  +  wbudowany silnik przyrostowy C++" : L"  +  built-in C++ incremental engine"))
+            : (pl ? L"\x2713 Aktywny wbudowany szybki silnik przyrostowy C++ (dodaj rclone.exe do PATH dla zdalnych chmur remote:path)"
+                  : L"\x2713 Built-in fast C++ incremental sync engine active (add rclone.exe to PATH for cloud remotes)");
+        DrawClippedText(engLine, D2D1::RectF(leftX + 14.0f, curY + 36.0f, leftX + availW - 14.0f, curY + 56.0f), m_fmtBold, 0x0F172A);
+
+        int activeCount = 0, onlineCount = 0;
+        for (const auto& j : jobs) {
+            if (j.enabled) ++activeCount;
+            if (BackupManager::IsTargetAvailable(j.targetPath)) ++onlineCount;
+        }
+        std::wstring prog = m_backups.GetProgressStatus();
+        wchar_t subLine[380] = {};
+        swprintf_s(subLine,
+            pl ? L"Zadań ogółem: %zu   \x2022   włączone (auto): %d   \x2022   cele dostępne teraz (online): %d   \x2022   %s"
+               : L"Total jobs: %zu   \x2022   enabled (auto): %d   \x2022   targets online now: %d   \x2022   %s",
+            jobs.size(), activeCount, onlineCount,
+            prog.empty() ? (pl ? L"Gotowe do pracy w tle" : L"Ready for background sync") : prog.c_str());
+        DrawClippedText(subLine, D2D1::RectF(leftX + 14.0f, curY + 58.0f, leftX + availW - 14.0f, curY + 78.0f), m_fmtSmall, 0x475569);
+        curY += h + gap;
+    }
+
+    // ---- 2. Jobs Table Card ----
+    {
+        const float rowH = 28.0f;
+        const float hdrY = 32.0f;
+        const float h = hdrY + 24.0f + std::max<size_t>(1, jobs.size()) * rowH + 10.0f;
+        DrawCardShell(leftX, curY, availW, h,
+            (pl ? L"ZADANIA KOPII ZAPASOWYCH (" : L"BACKUP JOBS (") + std::to_wstring(jobs.size()) + L")",
+            0x059669, false);
+
+        const float pad = 14.0f;
+        float enW = 68.0f, nameW = 190.0f, schedW = 110.0f, availColW = 116.0f, engW = 86.0f, statW = 210.0f, g = 8.0f;
+        float enX = leftX + pad;
+        float nameX = enX + enW + g;
+        float statX = leftX + availW - pad - statW;
+        float engX = statX - g - engW;
+        float availColX = engX - g - availColW;
+        float schedX = availColX - g - schedW;
+        float pathX = nameX + nameW + g;
+        float pathW = std::max(120.0f, schedX - g - pathX);
+
+        D2D1_RECT_F hdr = D2D1::RectF(leftX + 6.0f, curY + hdrY, leftX + availW - 6.0f, curY + hdrY + 22.0f);
+        m_solidBrush->SetColor(HexColor(0xEEF2F6));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(hdr, 3.0f, 3.0f), m_solidBrush);
+        auto hcell = [&](float x, float w, const wchar_t* t) {
+            DrawClippedText(t, D2D1::RectF(x, hdr.top + 3.0f, x + w, hdr.bottom), m_fmtBold, 0x334155);
+        };
+        hcell(enX, enW, pl ? L"Status" : L"Active");
+        hcell(nameX, nameW, pl ? L"Nazwa zadania" : L"Job Name");
+        hcell(pathX, pathW, pl ? L"Źródło  \x2794  Cel" : L"Source  \x2794  Target");
+        hcell(schedX, schedW, pl ? L"Jak często" : L"Frequency");
+        hcell(availColX, availColW, pl ? L"Gdy cel dostępny" : L"When available");
+        hcell(engX, engW, pl ? L"Silnik" : L"Engine");
+        hcell(statX, statW, pl ? L"Ostatni wynik" : L"Last Status");
+
+        float ry = curY + hdrY + 24.0f;
+        size_t rowIdx = 0;
+        for (const auto& j : jobs) {
+            D2D1_RECT_F rr = D2D1::RectF(leftX + 6.0f, ry, leftX + availW - 6.0f, ry + rowH - 1.0f);
+            bool sel = (j.id == m_backupSelectedJobId);
+            bool hov = PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, rr);
+            m_solidBrush->SetColor(HexColor(sel ? 0xE0F2FE : (hov ? 0xE8F1FB : (rowIdx % 2 == 0 ? 0xFFFFFF : 0xFAFBFC))));
+            m_rt->FillRectangle(rr, m_solidBrush);
+            if (sel) {
+                m_solidBrush->SetColor(HexColor(0x0078D7));
+                m_rt->FillRectangle(D2D1::RectF(rr.left, rr.top, rr.left + 3.0f, rr.bottom), m_solidBrush);
+            }
+
+            std::wstring idStr = std::to_wstring(j.id);
+            DrawCardTinyButton(D2D1::RectF(enX, ry + 3.0f, enX + enW - 4.0f, ry + rowH - 4.0f),
+                j.enabled ? (pl ? L"\x2713 WŁ" : L"\x2713 ON") : (pl ? L"WYŁ" : L"OFF"),
+                CMD_BACKUP_TOGGLE_ENABLE, idStr);
+
+            float t0 = ry + 4.0f, t1 = ry + rowH - 2.0f;
+            DrawClippedText(j.name, D2D1::RectF(nameX, t0, nameX + nameW, t1), m_fmtBold, 0x0F172A);
+            DrawClippedText(j.sourcePath + L"  \x2794  " + j.targetPath, D2D1::RectF(pathX, t0, pathX + pathW, t1), m_fmtSmall, 0x334155);
+            DrawClippedText(BackupManager::FormatScheduleLabel(j.scheduleMinutes, pl), D2D1::RectF(schedX, t0, schedX + schedW, t1), m_fmtSmall, 0x0369A1);
+            DrawClippedText(j.whenTargetAvailable ? (pl ? L"\x2713 Auto po podpięciu" : L"\x2713 Auto on connect") : L"\x2014",
+                D2D1::RectF(availColX, t0, availColX + availColW, t1), m_fmtSmall, j.whenTargetAvailable ? 0x059669 : 0x64748B);
+            DrawClippedText(j.useRclone ? L"rclone" : L"Native C++",
+                D2D1::RectF(engX, t0, engX + engW, t1), m_fmtSmall, j.useRclone ? 0x7C3AED : 0x0F172A);
+            DrawClippedText(j.lastStatus.empty() ? std::wstring(L"\x2014") : j.lastStatus,
+                D2D1::RectF(statX, t0, statX + statW, t1), m_fmtSmall, j.lastRunOk ? 0x059669 : 0xDC2626);
+
+            HardwareCardHit rowHit;
+            rowHit.rect = rr;
+            rowHit.cmdId = CMD_BACKUP_SELECT_JOB;
+            rowHit.actionArg = idStr;
+            rowHit.actionIndex = j.id;
+            rowHit.label = j.name;
+            m_hwCardHits.push_back(rowHit);
+
+            ry += rowH;
+            ++rowIdx;
+        }
+        curY += h + gap;
+    }
+
+    // ---- 3. Selected Job Inspector & Pro Editor Card ----
+    BackupJob selJob;
+    if (m_backups.GetJobById(m_backupSelectedJobId, selJob)) {
+        const float h = 216.0f;
+        const bool targetOnline = BackupManager::IsTargetAvailable(selJob.targetPath);
+        std::wstring idStr = std::to_wstring(selJob.id);
+
+        DrawCardShell(leftX, curY, availW, h,
+            (pl ? L"EDYCJA ZADANIA  \x2022  " : L"EDIT BACKUP JOB  \x2022  ") + selJob.name,
+            0xD97706, false);
+
+        float ry = curY + 36.0f;
+        auto drawPropRow = [&](const std::wstring& label, const std::wstring& val, uint32_t valCol) {
+            DrawClippedText(label, D2D1::RectF(leftX + 14.0f, ry, leftX + 190.0f, ry + 20.0f), m_fmtBold, 0x334155);
+            DrawClippedText(val, D2D1::RectF(leftX + 195.0f, ry, leftX + availW - 14.0f, ry + 20.0f), m_fmtSmall, valCol);
+            ry += 21.0f;
+        };
+
+        drawPropRow(pl ? L"Folder źródłowy (Source):" : L"Source Folder:", selJob.sourcePath, 0x0F172A);
+        std::wstring targetDesc = selJob.targetPath + L"   " +
+            (targetOnline ? (pl ? L"[\x25CF CEL DOSTĘPNY / ONLINE]" : L"[\x25CF TARGET ONLINE]")
+                          : (pl ? L"[\x25CB CEL NIEDOSTĘPNY / OFFLINE — oczekuje na podłączenie]" : L"[\x25CB TARGET OFFLINE — waiting for drive]"));
+        drawPropRow(pl ? L"Folder docelowy (Target):" : L"Target Folder / Remote:", targetDesc, targetOnline ? 0x059669 : 0xD97706);
+
+        drawPropRow(pl ? L"Filtry Włącz (Include):" : L"Include Filter:", selJob.includeFilter.empty() ? L"*" : selJob.includeFilter, 0x0369A1);
+        drawPropRow(pl ? L"Filtry Wyklucz (Exclude):" : L"Exclude Filter:", selJob.excludeFilter.empty() ? (pl ? L"(brak)" : L"(none)") : selJob.excludeFilter, 0xB91C1C);
+
+        std::wstring schedInfo = BackupManager::FormatScheduleLabel(selJob.scheduleMinutes, pl) +
+            L"   \x2022   " + (pl ? L"Gdy cel dostępny: " : L"When target available: ") +
+            (selJob.whenTargetAvailable ? (pl ? L"TAK (auto-start po podpięciu dysku)" : L"YES (auto-run on drive connect)") : (pl ? L"NIE" : L"NO")) +
+            L"   \x2022   " + (pl ? L"Ostatni bieg: " : L"Last run: ") + selJob.lastRunTimeStr;
+        drawPropRow(pl ? L"Automatyzacja:" : L"Automation:", schedInfo, 0x334155);
+
+        std::wstring rcloneCmd = BackupManager::BuildRcloneCommandLine(selJob, false);
+        drawPropRow(pl ? L"Polecenie rclone / C++:" : L"rclone / Sync Command:", rcloneCmd, 0x64748B);
+
+        float bx = leftX + 14.0f, by = curY + h - 32.0f;
+        auto btn = [&](float w, const std::wstring& lbl, int cmd) {
+            DrawCardTinyButton(D2D1::RectF(bx, by, bx + w, by + 23.0f), lbl, cmd, idStr);
+            bx += w + 8.0f;
+        };
+        btn(136.0f, pl ? L"\x25B6 Uruchom teraz" : L"\x25B6 Run Now", CMD_BACKUP_RUN_NOW);
+        btn(136.0f, pl ? L"\xD83D\xDD0D Test (Dry-Run)" : L"\xD83D\xDD0D Test (Dry-Run)", CMD_BACKUP_DRY_RUN);
+        btn(148.0f, pl ? L"\x270E Edytuj ścieżki/nazwę" : L"\x270E Edit Paths/Name", CMD_BACKUP_EDIT_JOB);
+        btn(148.0f, pl ? L"\xD83D\xDD0E Edytuj filtry Inc/Exc" : L"\xD83D\xDD0E Edit Inc/Exc Filters", CMD_BACKUP_EDIT_FILTERS);
+        btn(138.0f, (pl ? L"\x23F1 " : L"\x23F1 ") + BackupManager::FormatScheduleLabel(selJob.scheduleMinutes, pl), CMD_BACKUP_CYCLE_SCHED);
+        btn(158.0f, selJob.whenTargetAvailable ? (pl ? L"\x2713 Gdy cel dostępny: TAK" : L"\x2713 When available: YES")
+                                               : (pl ? L"Gdy cel dostępny: NIE" : L"When available: NO"), CMD_BACKUP_TOGGLE_AVAIL);
+        btn(118.0f, selJob.useRclone ? L"Silnik: rclone" : L"Silnik: Native C++", CMD_BACKUP_TOGGLE_RCLONE);
+        curY += h + gap;
+    }
+
+    const float totalHeight = (curY + m_hwScrollY) - startY;
+    const float viewH = std::max(1.0f, rect.bottom - rect.top);
+    m_hwMaxScrollY = std::max(0.0f, totalHeight - viewH + 16.0f);
+    m_hwScrollY = std::clamp(m_hwScrollY, 0.0f, m_hwMaxScrollY);
+
+    m_rt->PopAxisAlignedClip();
+}
+
 void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
     m_hwCardHits.clear();
+    if (IsBackupsView()) {
+        DrawBackupsView(rect);
+        return;
+    }
     if (IsLogView()) {
         DrawLogView(rect);
         return;

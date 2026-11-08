@@ -1,4 +1,5 @@
 #include "ShellMenuEmulator.h"
+#include "ImageFormatLoader.h"
 #include "PathUtils.h"
 #include <wrl/client.h>
 #include <shlobj.h>
@@ -814,41 +815,52 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
     }
     outRes.origBytes = readBytes;
 
-    ComPtr<IWICStream> inStream;
-    if (FAILED(wic->CreateStream(&inStream)) || FAILED(inStream->InitializeFromMemory(srcBytes.data(), readBytes))) {
-        outRes.errorMsg = L"WIC stream init failed";
-        return false;
-    }
-
-    ComPtr<IWICBitmapDecoder> decoder;
-    if (FAILED(wic->CreateDecoderFromStream(inStream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder)) || !decoder) {
-        outRes.errorMsg = L"Unsupported image format";
-        return false;
-    }
-
+    ComPtr<IWICBitmap> cachedBitmap;
     GUID containerFormat = GUID_ContainerFormatPng;
-    decoder->GetContainerFormat(&containerFormat);
-
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) {
-        outRes.errorMsg = L"Cannot decode image frame";
-        return false;
-    }
-
     UINT origW = 0, origH = 0;
-    if (FAILED(frame->GetSize(&origW, &origH)) || origW == 0 || origH == 0) {
-        outRes.errorMsg = L"Invalid image dimensions";
-        return false;
+    std::wstring extCheck = PathUtils::GetExtension(imagePath);
+
+    ComPtr<IWICStream> inStream;
+    ComPtr<IWICBitmapDecoder> decoder;
+    if (!ImageFormatLoader::IsExtendedImageExtension(extCheck) &&
+        SUCCEEDED(wic->CreateStream(&inStream)) &&
+        SUCCEEDED(inStream->InitializeFromMemory(srcBytes.data(), readBytes)) &&
+        SUCCEEDED(wic->CreateDecoderFromStream(inStream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder)) &&
+        decoder)
+    {
+        decoder->GetContainerFormat(&containerFormat);
+        ComPtr<IWICBitmapFrameDecode> frame;
+        if (FAILED(decoder->GetFrame(0, &frame)) || !frame ||
+            FAILED(frame->GetSize(&origW, &origH)) || origW == 0 || origH == 0) {
+            outRes.errorMsg = L"Cannot decode image frame";
+            return false;
+        }
+        if (FAILED(wic->CreateBitmapFromSource(frame.Get(), WICBitmapCacheOnLoad, &cachedBitmap)) || !cachedBitmap) {
+            outRes.errorMsg = L"Out of memory caching bitmap";
+            return false;
+        }
+    } else {
+        ExtendedImageInfo extInfo;
+        if (!ImageFormatLoader::DecodeImageMemory(srcBytes.data(), readBytes, extCheck, 0, extInfo) || !extInfo.valid) {
+            outRes.errorMsg = L"Unsupported image format";
+            return false;
+        }
+        origW = extInfo.width;
+        origH = extInfo.height;
+        containerFormat = GUID_ContainerFormatPng;
+        if (FAILED(wic->CreateBitmapFromMemory(
+                origW, origH,
+                GUID_WICPixelFormat32bppPBGRA,
+                origW * 4,
+                static_cast<UINT>(extInfo.bgraPixels.size()),
+                extInfo.bgraPixels.data(),
+                &cachedBitmap)) || !cachedBitmap) {
+            outRes.errorMsg = L"Out of memory caching extended bitmap";
+            return false;
+        }
     }
     outRes.origW = origW;
     outRes.origH = origH;
-
-    // Cache decoded frame ONCE in RAM so all scaling/rotation/encoding passes are fast
-    ComPtr<IWICBitmap> cachedBitmap;
-    if (FAILED(wic->CreateBitmapFromSource(frame.Get(), WICBitmapCacheOnLoad, &cachedBitmap)) || !cachedBitmap) {
-        outRes.errorMsg = L"Out of memory caching bitmap";
-        return false;
-    }
 
     // Parse source path parts: parentDir, stem, srcExt
     std::wstring parentDir = PathUtils::EnsureTrailingSlash(PathUtils::GetParentPath(imagePath));
@@ -863,7 +875,7 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
     std::wstring srcExtLower = PathUtils::ToLower(srcExt);
 
     GUID targetContainer = containerFormat;
-    std::wstring outExt  = srcExt;
+    std::wstring outExt  = ImageFormatLoader::IsExtendedImageExtension(srcExtLower) ? L".png" : srcExt;
     if (!params.forceExt.empty()) {
         std::wstring fe = PathUtils::ToLower(params.forceExt);
         outExt = fe;

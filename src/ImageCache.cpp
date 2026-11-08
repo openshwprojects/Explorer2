@@ -1,4 +1,5 @@
 #include "ImageCache.h"
+#include "ImageFormatLoader.h"
 #include "ShellMenuEmulator.h"
 #include "PathUtils.h"
 #include <wrl/client.h>
@@ -142,6 +143,20 @@ bool ImageCache::DecodeImageFromDiskZeroLock(
     if (!readOk || bytesRead == 0) {
         outBuf.failed = true;
         return false;
+    }
+
+    std::wstring extLower = PathUtils::GetExtension(path);
+    if (ImageFormatLoader::IsExtendedImageExtension(extLower)) {
+        ExtendedImageInfo extInfo;
+        if (ImageFormatLoader::DecodeImageMemory(fileBytes.data(), bytesRead, extLower, maxDimension, extInfo) && extInfo.valid) {
+            outBuf.width = extInfo.width;
+            outBuf.height = extInfo.height;
+            outBuf.origWidth = extInfo.origWidth;
+            outBuf.origHeight = extInfo.origHeight;
+            outBuf.bgraPixels = std::move(extInfo.bgraPixels);
+            outBuf.failed = false;
+            return true;
+        }
     }
 
     ComPtr<IWICStream> stream;

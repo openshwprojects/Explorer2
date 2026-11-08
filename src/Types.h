@@ -57,7 +57,8 @@ enum class RibbonTab : int {
     Programs = 6,  // "Programy": installed programs list (rendered through the dashboard view host)
     Monitoring = 7, // "Monitoring": long-term system recording (rendered through the dashboard view host)
     Lan = 8,        // "LAN": network scanner + SSDP (rendered through the dashboard view host)
-    Log = 9         // "Log": this run's operation log (rendered through the dashboard view host)
+    Log = 9,        // "Log": this run's operation log (rendered through the dashboard view host)
+    Backups = 10    // "Kopie zapasowe": rclone + incremental sync backup manager
 };
 
 enum class HardwareSubTab : int {
@@ -243,7 +244,12 @@ inline bool IsImageExtension(const std::wstring& extLower) {
     return extLower == L".png"  || extLower == L".jpg"  || extLower == L".jpeg" ||
            extLower == L".webp" || extLower == L".bmp"  || extLower == L".gif"  ||
            extLower == L".tif"  || extLower == L".tiff" || extLower == L".ico"  ||
-           extLower == L".jfif" || extLower == L".wdp"  || extLower == L".dds";
+           extLower == L".jfif" || extLower == L".wdp"  || extLower == L".dds"  ||
+           extLower == L".tga"  || extLower == L".icb"  || extLower == L".vda"  || extLower == L".vst" ||
+           extLower == L".psd"  || extLower == L".psb"  || extLower == L".xcf"  ||
+           extLower == L".hdr"  || extLower == L".pic"  ||
+           extLower == L".ppm"  || extLower == L".pgm"  || extLower == L".pbm"  || extLower == L".pnm" ||
+           extLower == L".pcx"  || extLower == L".qoi";
 }
 
 inline bool IsVideoExtension(const std::wstring& extLower) {

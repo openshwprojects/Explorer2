@@ -516,15 +516,17 @@ LanScanner::LanScanner() {
 
 LanScanner::~LanScanner() {
     // Bump every generation: all workers see "stale" and bail out at their next check.
-    ++scanGen_; ++ssdpGen_; ++portGen_;
-    std::thread a, b, c;
+    ++scanGen_; ++ssdpGen_; ++portGen_; ++pingAutoGen_;
+    pingAutoEnabled_ = false;
+    std::thread a, b, c, d;
     {
         std::lock_guard<std::mutex> lk(threadMutex_);
-        a = std::move(scanThread_); b = std::move(ssdpThread_); c = std::move(portThread_);
+        a = std::move(scanThread_); b = std::move(ssdpThread_); c = std::move(portThread_); d = std::move(pingAutoThread_);
     }
     if (a.joinable()) a.join();   // each thread transitively joined its predecessors
     if (b.joinable()) b.join();
     if (c.joinable()) c.join();
+    if (d.joinable()) d.join();
     if (wsaOk_) WSACleanup();
 }
 
@@ -894,12 +896,12 @@ void LanScanner::ScanThreadMain(uint32_t gen, LanAdapterInfo adapter, int maxHos
                 bool haveMac = ReadMacViaArp(ip, self, mac);   // answers instantly for a local address
                 upsert(ip, [&](LanHost& h) {
                     h.isSelf = true;
-                    h.rttMs = 0;
+                    UpdateRollingPingStats(h, 0);
                     if (haveMac) setMac(h, mac);
                 });
             } else {
                 int rtt = PingHost(icmp, ip);
-                if (rtt >= 0) upsert(ip, [&](LanHost& h) { h.rttMs = rtt; h.viaPing = true; });
+                if (rtt >= 0) upsert(ip, [&](LanHost& h) { UpdateRollingPingStats(h, rtt); });
             }
             if (!stale()) ++done_;
         }
@@ -1099,6 +1101,159 @@ void LanScanner::SsdpThreadMain(uint32_t gen, int listenMs) {
         for (auto& t : pool) t.join();
     }
     finish();
+}
+
+// ---------------------------------------------------------------- Continuous Ping Auto-Refresh
+
+void LanScanner::UpdateRollingPingStats(LanHost& host, int sampleRttMs) {
+    ++host.pingSent;
+    if (sampleRttMs >= 0) {
+        host.rttMs = sampleRttMs;
+        host.viaPing = true;
+        if (host.minRttMs < 0 || sampleRttMs < host.minRttMs) host.minRttMs = sampleRttMs;
+        if (host.maxRttMs < 0 || sampleRttMs > host.maxRttMs) host.maxRttMs = sampleRttMs;
+        host.recentRtts.push_back(sampleRttMs);
+        if (host.recentRtts.size() > 16) {
+            host.recentRtts.erase(host.recentRtts.begin());
+        }
+        long long sum = 0;
+        for (int v : host.recentRtts) sum += v;
+        host.avgRttMs = static_cast<int>((sum + static_cast<long long>(host.recentRtts.size()) / 2) /
+                                         static_cast<long long>(host.recentRtts.size()));
+    } else {
+        ++host.pingLost;
+        if (!host.isSelf) {
+            host.rttMs = -1;
+        }
+    }
+}
+
+int LanScanner::PingSingleHost(const std::wstring& ip) {
+    uint32_t ipHost = 0;
+    if (!ParseIp(ip, ipHost)) return -1;
+    HANDLE icmp = IcmpCreateFile();
+    int rtt = PingHost(icmp, ipHost);
+    if (icmp != INVALID_HANDLE_VALUE) IcmpCloseHandle(icmp);
+
+    std::lock_guard<std::mutex> lk(mutex_);
+    LanHost* found = nullptr;
+    for (auto& h : hosts_) {
+        if (h.ipHostOrder == ipHost) { found = &h; break; }
+    }
+    if (!found) {
+        hosts_.emplace_back();
+        found = &hosts_.back();
+        found->ipHostOrder = ipHost;
+        found->ip = FormatIp(ipHost);
+    }
+    UpdateRollingPingStats(*found, rtt);
+    return rtt;
+}
+
+void LanScanner::PingAllHostsOnce() {
+    std::vector<std::pair<uint32_t, bool>> targets;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        targets.reserve(hosts_.size());
+        for (const auto& h : hosts_) {
+            targets.emplace_back(h.ipHostOrder, h.isSelf);
+        }
+    }
+    if (targets.empty()) return;
+
+    std::vector<int> results(targets.size(), -1);
+    std::atomic<size_t> nextIdx{0};
+    auto worker = [&] {
+        HANDLE icmp = IcmpCreateFile();
+        for (;;) {
+            size_t i = nextIdx.fetch_add(1);
+            if (i >= targets.size()) break;
+            if (targets[i].second) {
+                results[i] = 0;
+            } else {
+                results[i] = PingHost(icmp, targets[i].first);
+            }
+        }
+        if (icmp != INVALID_HANDLE_VALUE) IcmpCloseHandle(icmp);
+    };
+
+    int nThreads = std::min<int>(16, static_cast<int>(targets.size()));
+    if (nThreads <= 1) {
+        worker();
+    } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nThreads);
+        for (int t = 0; t < nThreads; ++t) pool.emplace_back(worker);
+        for (auto& t : pool) t.join();
+    }
+
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (size_t i = 0; i < targets.size(); ++i) {
+        WithHostLocked(targets[i].first, [&](LanHost& h) {
+            UpdateRollingPingStats(h, results[i]);
+        });
+    }
+}
+
+void LanScanner::StartPingAutoRefresh(int intervalMs) {
+    pingAutoIntervalMs_ = std::clamp(intervalMs, 500, 60000);
+    uint32_t gen = ++pingAutoGen_;
+    pingAutoEnabled_ = true;
+    Launch(pingAutoThread_, [this, gen] { PingAutoRefreshThreadMain(gen); });
+}
+
+void LanScanner::StopPingAutoRefresh() {
+    ++pingAutoGen_;
+    pingAutoEnabled_ = false;
+}
+
+void LanScanner::TogglePingAutoRefresh() {
+    if (pingAutoEnabled_.load()) {
+        StopPingAutoRefresh();
+    } else {
+        StartPingAutoRefresh(pingAutoIntervalMs_.load());
+    }
+}
+
+void LanScanner::SetPingAutoRefreshInterval(int intervalMs) {
+    pingAutoIntervalMs_ = std::clamp(intervalMs, 500, 60000);
+}
+
+int LanScanner::CyclePingAutoRefreshInterval() {
+    static const int kIntervals[] = { 1000, 2000, 5000, 10000 };
+    int cur = pingAutoIntervalMs_.load();
+    int next = kIntervals[0];
+    for (size_t i = 0; i < std::size(kIntervals); ++i) {
+        if (kIntervals[i] == cur) {
+            next = kIntervals[(i + 1) % std::size(kIntervals)];
+            break;
+        }
+    }
+    pingAutoIntervalMs_ = next;
+    return next;
+}
+
+bool LanScanner::IsPingAutoRefreshEnabled() const {
+    return pingAutoEnabled_.load();
+}
+
+int LanScanner::GetPingAutoRefreshIntervalMs() const {
+    return pingAutoIntervalMs_.load();
+}
+
+void LanScanner::PingAutoRefreshThreadMain(uint32_t gen) {
+    auto stale = [&] { return pingAutoGen_.load() != gen || !pingAutoEnabled_.load(); };
+    while (!stale()) {
+        if (!scanning_.load()) {
+            PingAllHostsOnce();
+        }
+        int waitMs = std::clamp(pingAutoIntervalMs_.load(), 500, 60000);
+        int elapsed = 0;
+        while (elapsed < waitMs && !stale()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            elapsed += 50;
+        }
+    }
 }
 
 } // namespace Explorer2

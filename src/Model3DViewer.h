@@ -35,6 +35,7 @@ struct LoadedMesh3D {
     std::vector<MeshTriangle> tris;
     size_t rawVertexCount = 0;
     size_t rawTriangleCount = 0;
+    size_t animFrameCount = 1;
     Vec3f bboxMin = {};
     Vec3f bboxMax = {};
     Vec3f bboxSize = {};
@@ -55,6 +56,7 @@ public:
     void Shutdown();
 
     static bool Is3DModelExtension(const std::wstring& extLower);
+    static bool InspectMeshFile(const std::wstring& fullPath, LoadedMesh3D& outMesh);
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
     void Clear();

@@ -8,11 +8,7 @@
 namespace Explorer2 {
 
 static D2D1_COLOR_F HexVColor(uint32_t rgb, float a = 1.0f) {
-    return D2D1::ColorF(
-        ((rgb >> 16) & 0xFF) / 255.0f,
-        ((rgb >> 8) & 0xFF) / 255.0f,
-        (rgb & 0xFF) / 255.0f,
-        a);
+    return PathUtils::ColorFromRgb(rgb, a);
 }
 
 HexViewer::~HexViewer() {
@@ -232,20 +228,7 @@ void HexViewer::CopyVisibleHexDumpToClipboard() {
         dump += L" |" + asciiPart + L"|\r\n";
     }
 
-    if (OpenClipboard(m_parentHwnd)) {
-        EmptyClipboard();
-        size_t bytes = (dump.size() + 1) * sizeof(wchar_t);
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (hMem) {
-            void* p = GlobalLock(hMem);
-            if (p) {
-                std::memcpy(p, dump.c_str(), bytes);
-                GlobalUnlock(hMem);
-                SetClipboardData(CF_UNICODETEXT, hMem);
-            }
-        }
-        CloseClipboard();
-    }
+    PathUtils::CopyWideToClipboard(m_parentHwnd, dump);
 }
 
 void HexViewer::CopySelectedBytesHexToClipboard() {
@@ -261,20 +244,7 @@ void HexViewer::CopySelectedBytesHexToClipboard() {
         swprintf_s(b, i + 1 < got ? L"%02X " : L"%02X", buf[i]);
         hexStr += b;
     }
-    if (OpenClipboard(m_parentHwnd)) {
-        EmptyClipboard();
-        size_t bytes = (hexStr.size() + 1) * sizeof(wchar_t);
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (hMem) {
-            void* p = GlobalLock(hMem);
-            if (p) {
-                std::memcpy(p, hexStr.c_str(), bytes);
-                GlobalUnlock(hMem);
-                SetClipboardData(CF_UNICODETEXT, hMem);
-            }
-        }
-        CloseClipboard();
-    }
+    PathUtils::CopyWideToClipboard(m_parentHwnd, hexStr);
 }
 
 void HexViewer::Draw(

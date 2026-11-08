@@ -1,6 +1,7 @@
 #include "ExplorerApp.h"
 #include "CommandIds.h"
 #include "PathUtils.h"
+#include "FtpClient.h"
 #include <windowsx.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -374,7 +375,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == ID_TIMER_MEDIA && m_mediaPlayer.HasMedia() && m_mediaPlayer.IsPlaying()) {
             InvalidateRect(m_hwnd, nullptr, FALSE);
         } else if (wParam == ID_TIMER_WORK_ANIM) {
-            if (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView()) {
+            if (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView()) {
                 m_hwInspector.ApplyStagedData();
                 if (m_hwLiveRefresh) {
                     ULONGLONG now = GetTickCount64();
@@ -382,6 +383,13 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         m_lastHwLiveUpdateTick = now;
                         m_hwInspector.UpdateLiveTelemetry();
                     }
+                }
+            }
+            {
+                ULONGLONG nowMs = GetTickCount64();
+                if (nowMs - m_lastBackupTickMs >= 4000) {
+                    m_lastBackupTickMs = nowMs;
+                    m_backups.TickScheduler();
                 }
             }
             if (PreviewPaneVisible()) {
@@ -778,7 +786,7 @@ void ExplorerApp::SyncMediaPlayerToSelection() {
 void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const std::wstring& selectFileName) {
     std::wstring cleanPath = PathUtils::TrimTrailingSlashes(path);
 
-    if (cleanPath != L"THIS_PC") {
+    if (cleanPath != L"THIS_PC" && !FtpClient::IsFtpPath(cleanPath)) {
         std::wstring offlineName;
         if (m_fileEngine.IsDriveOffline(cleanPath, m_lang, &offlineName)) {
             m_statusToast = (m_lang == Lang::PL ? L"Dysk jest niedostępny (offline): " : L"Drive is unavailable (offline): ") + offlineName;
@@ -789,8 +797,10 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
         }
         DWORD attrs = GetFileAttributesW(cleanPath.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            AppLog::Warn(L"Navigate", L"Folder not found or not a folder: " + cleanPath);
-            return;
+            if (!ArchiveExplorer::IsVirtualArchivePath(cleanPath)) {
+                AppLog::Warn(L"Navigate", L"Folder not found or not a folder: " + cleanPath);
+                return;
+            }
         }
     }
 
@@ -834,7 +844,8 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
             m_activeRibbonTab == RibbonTab::Programs ||
             m_activeRibbonTab == RibbonTab::Monitoring ||
             m_activeRibbonTab == RibbonTab::Lan ||
-            m_activeRibbonTab == RibbonTab::Log) {
+            m_activeRibbonTab == RibbonTab::Log ||
+            m_activeRibbonTab == RibbonTab::Backups) {
             m_activeRibbonTab = RibbonTab::Home;
         }
     }
@@ -883,7 +894,7 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
 
     std::wstring folderTitle = (m_currentPath == L"THIS_PC")
         ? GetStrings(m_lang).navThisPC
-        : PathUtils::GetFileName(m_currentPath);
+        : (FtpClient::IsFtpPath(m_currentPath) ? FtpClient::GetFtpLeafName(m_currentPath) : PathUtils::GetFileName(m_currentPath));
     SetWindowTextW(m_hwnd, folderTitle.c_str());
 
     m_focusedIndex = -1;
@@ -949,6 +960,14 @@ void ExplorerApp::NavigateForward() {
 
 void ExplorerApp::NavigateUp() {
     if (m_currentPath.empty() || m_currentPath == L"THIS_PC") return;
+    if (FtpClient::IsFtpPath(m_currentPath)) {
+        std::wstring childName = FtpClient::GetFtpLeafName(m_currentPath);
+        std::wstring parentUrl = FtpClient::GetParentFtpUrl(m_currentPath);
+        if (!parentUrl.empty()) {
+            NavigateTo(parentUrl, true, childName);
+        }
+        return;
+    }
     if (m_currentPath.size() <= 3 && m_currentPath[1] == L':') {
         NavigateTo(L"THIS_PC", true, m_currentPath);
         return;
@@ -1025,6 +1044,40 @@ void ExplorerApp::RebuildBreadcrumbs() {
     m_breadcrumbs.push_back(rootSeg);
 
     if (m_currentPath.empty() || m_currentPath == L"THIS_PC") {
+        return;
+    }
+
+    if (FtpClient::IsFtpPath(m_currentPath)) {
+        FtpUrlInfo parsed;
+        if (FtpClient::ParseFtpUrl(m_currentPath, parsed)) {
+            FtpUrlInfo hostRoot = parsed;
+            hostRoot.remotePath = L"/";
+            BreadcrumbSegment hostSeg;
+            hostSeg.label = L"FTP: " + parsed.host + (parsed.port != 21 ? (L":" + std::to_wstring(parsed.port)) : L"");
+            hostSeg.path = FtpClient::BuildFtpUrl(hostRoot);
+            m_breadcrumbs.push_back(hostSeg);
+
+            std::wstring rp = parsed.remotePath;
+            size_t pos = 0;
+            std::wstring accum = L"";
+            while (pos < rp.size()) {
+                while (pos < rp.size() && (rp[pos] == L'/' || rp[pos] == L'\\')) ++pos;
+                if (pos >= rp.size()) break;
+                size_t nextSlash = rp.find_first_of(L"/\\", pos);
+                if (nextSlash == std::wstring::npos) nextSlash = rp.size();
+                if (nextSlash > pos) {
+                    std::wstring part = rp.substr(pos, nextSlash - pos);
+                    accum += L"/" + part;
+                    FtpUrlInfo segUrl = parsed;
+                    segUrl.remotePath = accum;
+                    BreadcrumbSegment seg;
+                    seg.label = part;
+                    seg.path = FtpClient::BuildFtpUrl(segUrl);
+                    m_breadcrumbs.push_back(seg);
+                }
+                pos = nextSlash + 1;
+            }
+        }
         return;
     }
 
@@ -1169,7 +1222,7 @@ void ExplorerApp::SetActivePane(int paneIdx) {
     SyncMediaPlayerToSelection();
     std::wstring folderTitle = (m_currentPath == L"THIS_PC")
         ? GetStrings(m_lang).navThisPC
-        : PathUtils::GetFileName(m_currentPath);
+        : (FtpClient::IsFtpPath(m_currentPath) ? FtpClient::GetFtpLeafName(m_currentPath) : PathUtils::GetFileName(m_currentPath));
     SetWindowTextW(m_hwnd, folderTitle.c_str());
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -1233,6 +1286,36 @@ void ExplorerApp::CopyOrMoveToOtherPane(bool move) {
                            : L"\x26A0 Both panes point to the same folder: " + dstDir;
         m_statusToastExpireTick = GetTickCount64() + 3500;
         InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    // FTP Dual-Pane Transfer: Local -> FTP or FTP -> Local
+    if (FtpClient::IsFtpPath(dstDir) || FtpClient::IsFtpPath(m_currentPath)) {
+        size_t okCount = 0;
+        std::wstring errText;
+        for (const auto& p : paths) {
+            if (!FtpClient::IsFtpPath(p) && FtpClient::IsFtpPath(dstDir)) {
+                std::wstring remoteFileUrl = FtpClient::JoinFtpPath(dstDir, PathUtils::GetFileName(p));
+                if (FtpClient::UploadLocalFileToFtp(p, remoteFileUrl, &errText)) {
+                    ++okCount;
+                    if (move) DeleteFileW(p.c_str());
+                }
+            } else if (FtpClient::IsFtpPath(p) && !FtpClient::IsFtpPath(dstDir)) {
+                std::wstring localDst = PathUtils::EnsureTrailingSlash(dstDir) + FtpClient::GetFtpLeafName(p);
+                if (FtpClient::DownloadFtpFileToLocal(p, localDst, &errText)) {
+                    ++okCount;
+                    if (move) FtpClient::DeleteFtpItem(p, false);
+                }
+            }
+        }
+        if (okCount > 0) {
+            m_statusToast = (pl ? L"\x2713 Przesłano przez FTP: " : L"\x2713 FTP transfer complete: ") +
+                            std::to_wstring(okCount) + L"/" + std::to_wstring(paths.size()) + L"  \x2192  " + dstDir;
+        } else {
+            m_statusToast = (pl ? L"\x2717 Błąd transferu FTP: " : L"\x2717 FTP transfer failed: ") + errText;
+        }
+        m_statusToastExpireTick = GetTickCount64() + 4200;
+        RefreshCurrentFolder();
         return;
     }
 
@@ -1931,6 +2014,11 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                     SaveUiSettings();
                 } else if (trigCmd != 0) {
                     ExecuteRibbonCommand(trigCmd);
+                    return;
+                }
+                std::wstring navPath = m_contentPane.TakePendingNavigation();
+                if (!navPath.empty()) {
+                    NavigateTo(navPath, true);
                     return;
                 }
                 if (!toastMsg.empty()) {
@@ -2780,6 +2868,16 @@ void ExplorerApp::OnChar(wchar_t ch) {
     }
 }
 
+static bool PromptCustomInputDialog(
+    HWND owner,
+    HINSTANCE hInst,
+    HFONT hFont,
+    const wchar_t* title,
+    const wchar_t* promptText,
+    const wchar_t* initialVal,
+    bool pl,
+    std::wstring& outVal);
+
 void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     switch (cmdId) {
     case CMD_TAB_FILE:
@@ -3532,6 +3630,41 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         m_statusToast = (m_lang == Lang::PL ? L"\x2713 Skopiowano: " : L"\x2713 Copied: ") + m_hwActionArg;
         m_statusToastExpireTick = GetTickCount64() + 2600;
         break;
+    case CMD_LAN_PING_AUTOREFRESH: {
+        m_lan.TogglePingAutoRefresh();
+        const bool on = m_lan.IsPingAutoRefreshEnabled();
+        const int sec = std::max(1, m_lan.GetPingAutoRefreshIntervalMs() / 1000);
+        m_statusToast = on
+            ? (m_lang == Lang::PL ? (L"\xD83D\xDD04 Auto-odświeżanie Ping WŁĄCZONE (co " + std::to_wstring(sec) + L" s)")
+                                  : (L"\xD83D\xDD04 Ping Auto-Refresh ENABLED (every " + std::to_wstring(sec) + L" s)"))
+            : (m_lang == Lang::PL ? L"\x23F8 Auto-odświeżanie Ping WYŁĄCZONE" : L"\x23F8 Ping Auto-Refresh DISABLED");
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_LAN_PING_INTERVAL: {
+        int nextMs = m_lan.CyclePingAutoRefreshInterval();
+        int sec = std::max(1, nextMs / 1000);
+        m_statusToast = (m_lang == Lang::PL ? L"\x23F1 Interwał Auto-Ping: co " : L"\x23F1 Auto-Ping interval: every ") + std::to_wstring(sec) + L" s";
+        m_statusToastExpireTick = GetTickCount64() + 2600;
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_LAN_PING_ONCE: {
+        std::wstring targetIp = m_hwActionArg.empty() ? m_lanSelectedIp : m_hwActionArg;
+        if (!targetIp.empty()) {
+            int rtt = m_lan.PingSingleHost(targetIp);
+            m_statusToast = (rtt >= 0)
+                ? ((m_lang == Lang::PL ? L"\x2713 Ping " : L"\x2713 Ping ") + targetIp + L": " + std::to_wstring(rtt) + L" ms")
+                : ((m_lang == Lang::PL ? L"\x26A0 Brak odpowiedzi ICMP od: " : L"\x26A0 No ICMP reply from: ") + targetIp);
+        } else {
+            m_lan.PingAllHostsOnce();
+            m_statusToast = m_lang == Lang::PL ? L"\x2713 Odświeżono ping dla wszystkich wykrytych hostów" : L"\x2713 Refreshed ping for all discovered hosts";
+        }
+        m_statusToastExpireTick = GetTickCount64() + 2600;
+        EnsureWorkAnimTimerState();
+        break;
+    }
     // "Log" tab: this run's operation log
     case CMD_TAB_LOG:
         m_activeRibbonTab = RibbonTab::Log;
@@ -3567,6 +3700,176 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         m_statusToastExpireTick = GetTickCount64() + 2600;
         break;
     }
+    // "Kopie zapasowe" (Backups & Rclone Sync) tab
+    case CMD_TAB_BACKUPS:
+        m_activeRibbonTab = RibbonTab::Backups;
+        m_ribbonCollapsed = false;
+        m_viewMode = ViewMode::Hardware;
+        m_hwScrollY = 0.0f;
+        EnsureWorkAnimTimerState();
+        break;
+    case CMD_BACKUP_SELECT_JOB:
+        if (!m_hwActionArg.empty()) {
+            m_backupSelectedJobId = std::max(1, _wtoi(m_hwActionArg.c_str()));
+        } else if (m_hwActionIndex > 0) {
+            m_backupSelectedJobId = m_hwActionIndex;
+        }
+        break;
+    case CMD_BACKUP_ADD_JOB: {
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring defaultSrc = (!m_currentPath.empty() && m_currentPath != L"THIS_PC") ? m_currentPath : L"W:\\GIT\\Explorer2\\src";
+        std::wstring defaultDst = (!m_otherPane.currentPath.empty() && m_otherPane.currentPath != L"THIS_PC")
+            ? m_otherPane.currentPath
+            : L"D:\\Backups\\NowaKopia";
+        std::wstring initStr = L"Moja kopia|" + defaultSrc + L"|" + defaultDst;
+        std::wstring input;
+        if (PromptCustomInputDialog(
+                m_hwnd, m_hInstance, m_editFont,
+                pl ? L"Nowe zadanie kopii zapasowej" : L"New Backup Job",
+                pl ? L"Podaj: Nazwa|Folder źródłowy|Folder docelowy (lub rclone remote:ścieżka):"
+                   : L"Enter: Name|Source folder|Target folder (or rclone remote:path):",
+                initStr.c_str(), pl, input)) {
+            size_t p1 = input.find(L'|');
+            size_t p2 = (p1 != std::wstring::npos) ? input.find(L'|', p1 + 1) : std::wstring::npos;
+            BackupJob nj;
+            if (p1 != std::wstring::npos && p2 != std::wstring::npos) {
+                nj.name = input.substr(0, p1);
+                nj.sourcePath = input.substr(p1 + 1, p2 - p1 - 1);
+                nj.targetPath = input.substr(p2 + 1);
+            } else {
+                nj.name = input;
+                nj.sourcePath = defaultSrc;
+                nj.targetPath = defaultDst;
+            }
+            nj.scheduleMinutes = 60;
+            nj.whenTargetAvailable = true;
+            nj.useRclone = BackupManager::IsRcloneRemoteSyntax(nj.targetPath);
+            nj.enabled = true;
+            m_backupSelectedJobId = m_backups.AddJob(nj);
+            m_statusToast = (pl ? L"\x2713 Dodano zadanie kopii: " : L"\x2713 Added backup job: ") + nj.name;
+            m_statusToastExpireTick = GetTickCount64() + 3200;
+        }
+        break;
+    }
+    case CMD_BACKUP_EDIT_JOB: {
+        const bool pl = (m_lang == Lang::PL);
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        BackupJob job;
+        if (m_backups.GetJobById(jid, job)) {
+            std::wstring initStr = job.name + L"|" + job.sourcePath + L"|" + job.targetPath;
+            std::wstring input;
+            if (PromptCustomInputDialog(
+                    m_hwnd, m_hInstance, m_editFont,
+                    pl ? L"Edytuj zadanie kopii zapasowej" : L"Edit Backup Job",
+                    pl ? L"Edytuj: Nazwa|Folder źródłowy|Folder docelowy (lub rclone remote:ścieżka):"
+                       : L"Edit: Name|Source folder|Target folder (or rclone remote:path):",
+                    initStr.c_str(), pl, input)) {
+                size_t p1 = input.find(L'|');
+                size_t p2 = (p1 != std::wstring::npos) ? input.find(L'|', p1 + 1) : std::wstring::npos;
+                if (p1 != std::wstring::npos && p2 != std::wstring::npos) {
+                    job.name = input.substr(0, p1);
+                    job.sourcePath = input.substr(p1 + 1, p2 - p1 - 1);
+                    job.targetPath = input.substr(p2 + 1);
+                } else {
+                    job.targetPath = input;
+                }
+                if (BackupManager::IsRcloneRemoteSyntax(job.targetPath)) job.useRclone = true;
+                m_backups.UpdateJob(job);
+                m_statusToast = (pl ? L"\x2713 Zaktualizowano zadanie: " : L"\x2713 Updated job: ") + job.name;
+                m_statusToastExpireTick = GetTickCount64() + 3000;
+            }
+        }
+        break;
+    }
+    case CMD_BACKUP_EDIT_FILTERS: {
+        const bool pl = (m_lang == Lang::PL);
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        BackupJob job;
+        if (m_backups.GetJobById(jid, job)) {
+            std::wstring initStr = job.includeFilter + L"|" + job.excludeFilter;
+            std::wstring input;
+            if (PromptCustomInputDialog(
+                    m_hwnd, m_hInstance, m_editFont,
+                    pl ? L"Filtry Włącz (Include) / Wyklucz (Exclude)" : L"Include / Exclude Filters",
+                    pl ? L"Format: Include|Exclude  (np. *.cpp;*.h;*.docx|*.tmp;*.bak;.git/*;node_modules/*):"
+                       : L"Format: Include|Exclude  (e.g. *.cpp;*.h;*.docx|*.tmp;*.bak;.git/*;node_modules/*):",
+                    initStr.c_str(), pl, input)) {
+                size_t bar = input.find(L'|');
+                if (bar != std::wstring::npos) {
+                    job.includeFilter = input.substr(0, bar);
+                    job.excludeFilter = input.substr(bar + 1);
+                } else {
+                    job.excludeFilter = input;
+                }
+                m_backups.UpdateJob(job);
+                m_statusToast = pl ? L"\x2713 Zapisano filtry Include / Exclude" : L"\x2713 Saved Include / Exclude filters";
+                m_statusToastExpireTick = GetTickCount64() + 3000;
+            }
+        }
+        break;
+    }
+    case CMD_BACKUP_DELETE_JOB: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        if (m_backups.DeleteJob(jid)) {
+            auto rem = m_backups.SnapshotJobs();
+            m_backupSelectedJobId = rem.empty() ? 0 : rem.front().id;
+            m_statusToast = m_lang == Lang::PL ? L"\x2713 Usunięto zadanie kopii zapasowej" : L"\x2713 Deleted backup job";
+            m_statusToastExpireTick = GetTickCount64() + 2800;
+        }
+        break;
+    }
+    case CMD_BACKUP_TOGGLE_ENABLE: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        BackupJob job;
+        if (m_backups.GetJobById(jid, job)) {
+            job.enabled = !job.enabled;
+            m_backups.UpdateJob(job);
+        }
+        break;
+    }
+    case CMD_BACKUP_TOGGLE_AVAIL: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        BackupJob job;
+        if (m_backups.GetJobById(jid, job)) {
+            job.whenTargetAvailable = !job.whenTargetAvailable;
+            m_backups.UpdateJob(job);
+        }
+        break;
+    }
+    case CMD_BACKUP_TOGGLE_RCLONE: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        BackupJob job;
+        if (m_backups.GetJobById(jid, job)) {
+            job.useRclone = !job.useRclone;
+            m_backups.UpdateJob(job);
+        }
+        break;
+    }
+    case CMD_BACKUP_CYCLE_SCHED: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        BackupJob job;
+        if (m_backups.GetJobById(jid, job)) {
+            job.scheduleMinutes = BackupManager::CycleScheduleMinutes(job.scheduleMinutes);
+            m_backups.UpdateJob(job);
+        }
+        break;
+    }
+    case CMD_BACKUP_RUN_NOW:
+    case CMD_BACKUP_DRY_RUN: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_backupSelectedJobId;
+        bool dry = (cmdId == CMD_BACKUP_DRY_RUN);
+        m_backups.StartJobAsync(jid, dry);
+        m_statusToast = dry
+            ? (m_lang == Lang::PL ? L"\xD83D\xDD0D Uruchomiono symulację (Dry-Run) w tle..." : L"\xD83D\xDD0D Started Dry-Run simulation in background...")
+            : (m_lang == Lang::PL ? L"\x25B6 Uruchomiono synchronizację kopii zapasowej w tle..." : L"\x25B6 Started backup synchronization in background...");
+        m_statusToastExpireTick = GetTickCount64() + 3600;
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_BACKUP_RUN_ALL_DUE:
+        m_backups.TickScheduler();
+        EnsureWorkAnimTimerState();
+        break;
     case CMD_MON_RANGE:
         m_monRangeIdx = std::clamp(m_hwActionIndex, 0, 4);
         m_monForceReload = true;
@@ -3841,6 +4144,81 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_IMG_CONVERT_BMP:
         HandleImageToolCommand(cmdId, m_focusedIndex);
         break;
+    case CMD_FTP_CONNECT_DLG: {
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring initialUrl = FtpClient::IsFtpPath(m_currentPath) ? m_currentPath : L"ftp://anonymous@ftp.gnu.org/";
+        auto bookmarks = FtpClient::LoadBookmarks();
+        if (!FtpClient::IsFtpPath(m_currentPath) && !bookmarks.empty()) {
+            initialUrl = bookmarks.front().url;
+        }
+        std::wstring inputUrl;
+        if (PromptCustomInputDialog(
+                m_hwnd, m_hInstance, m_editFont,
+                pl ? L"Połącz z serwerem FTP (główny lub podzielony panel)" : L"Connect to FTP Server (Main or Split Pane)",
+                pl ? L"Podaj adres FTP (np. ftp://user:haslo@host:21/sciezka):" : L"Enter FTP URL (e.g. ftp://user:pass@host:21/path):",
+                initialUrl.c_str(), pl, inputUrl))
+        {
+            while (!inputUrl.empty() && (inputUrl.front() == L' ' || inputUrl.front() == L'\t')) inputUrl.erase(inputUrl.begin());
+            while (!inputUrl.empty() && (inputUrl.back() == L' ' || inputUrl.back() == L'\t')) inputUrl.pop_back();
+            if (!inputUrl.empty() && !FtpClient::IsFtpPath(inputUrl)) {
+                inputUrl = L"ftp://" + inputUrl;
+            }
+            FtpUrlInfo parsed;
+            if (FtpClient::ParseFtpUrl(inputUrl, parsed)) {
+                bool exists = false;
+                for (const auto& bm : bookmarks) {
+                    if (_wcsicmp(bm.url.c_str(), inputUrl.c_str()) == 0) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    FtpBookmark bm;
+                    bm.name = parsed.host + (parsed.remotePath != L"/" ? (L" (" + parsed.remotePath + L")") : L"");
+                    bm.url = inputUrl;
+                    bookmarks.insert(bookmarks.begin(), bm);
+                    if (bookmarks.size() > 25) bookmarks.resize(25);
+                    FtpClient::SaveBookmarks(bookmarks);
+                }
+                NavigateTo(inputUrl, true);
+                m_statusToast = (pl ? L"\xD83C\xDF10 Połączono FTP: " : L"\xD83C\xDF10 Connected FTP: ") + parsed.host;
+                m_statusToastExpireTick = GetTickCount64() + 3500;
+            }
+        }
+        break;
+    }
+    case CMD_FTP_BOOKMARKS_MENU: {
+        auto bookmarks = FtpClient::LoadBookmarks();
+        HMENU hMenu = CreatePopupMenu();
+        AppendMenuW(hMenu, MF_STRING, CMD_FTP_CONNECT_DLG,
+            m_lang == Lang::PL ? L"\x2795 Nowe połączenie FTP..." : L"\x2795 New FTP Connection...");
+        if (!bookmarks.empty()) {
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            for (size_t i = 0; i < bookmarks.size() && i < 35; ++i) {
+                std::wstring label = L"\xD83C\xDF10 " + bookmarks[i].name + L"  —  " + bookmarks[i].url;
+                AppendMenuW(hMenu, MF_STRING, CMD_BASE_FTP_BOOKMARKS + static_cast<UINT>(i), label.c_str());
+            }
+        }
+        if (FtpClient::IsFtpPath(m_currentPath)) {
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING, CMD_FTP_DISCONNECT,
+                m_lang == Lang::PL ? L"\x23CF Rozłącz FTP (wróć do Ten komputer)" : L"\x23CF Disconnect FTP (return to This PC)");
+        }
+        POINT pt = {};
+        GetCursorPos(&pt);
+        int sel = static_cast<int>(TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr));
+        DestroyMenu(hMenu);
+        if (sel == CMD_FTP_CONNECT_DLG || sel == CMD_FTP_DISCONNECT) {
+            ExecuteRibbonCommand(sel);
+        } else if (sel >= CMD_BASE_FTP_BOOKMARKS && sel < CMD_BASE_FTP_BOOKMARKS + static_cast<int>(bookmarks.size())) {
+            const auto& bm = bookmarks[sel - CMD_BASE_FTP_BOOKMARKS];
+            NavigateTo(bm.url, true);
+        }
+        break;
+    }
+    case CMD_FTP_DISCONNECT:
+        NavigateTo(L"THIS_PC", true);
+        break;
     }
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -3848,7 +4226,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
 void ExplorerApp::ActivateFocusedOrSelectedItem() {
     if (m_focusedIndex < 0 || m_focusedIndex >= static_cast<int>(m_items.size())) return;
     const FileEntry& item = m_items[m_focusedIndex];
-    if (item.isDirectory) {
+    if (item.isDirectory || ArchiveExplorer::IsArchiveExtension(item.ext)) {
         NavigateTo(item.fullPath, true);
     } else if (item.isImage || item.isVideo || item.isAudio) {
         if (m_viewMode != ViewMode::FullViewer) {
@@ -3862,6 +4240,21 @@ void ExplorerApp::ActivateFocusedOrSelectedItem() {
             ToggleFullScreen();
         }
     } else {
+        if (FtpClient::IsFtpPath(item.fullPath)) {
+            std::wstring tempFile;
+            if (FtpClient::DownloadFtpFileToTempCache(item.fullPath, tempFile)) {
+                FileEngine::OpenFileOrProperties(m_hwnd, tempFile, false);
+                return;
+            }
+        }
+        std::wstring arcFile, innerPath;
+        if (ArchiveExplorer::SplitVirtualArchivePath(item.fullPath, arcFile, innerPath) && !innerPath.empty()) {
+            std::wstring tempFile;
+            if (ArchiveExplorer::ExtractSingleEntryToTempFile(arcFile, innerPath, tempFile)) {
+                FileEngine::OpenFileOrProperties(m_hwnd, tempFile, false);
+                return;
+            }
+        }
         FileEngine::OpenFileOrProperties(m_hwnd, item.fullPath, false);
     }
 }
@@ -4016,6 +4409,18 @@ void ExplorerApp::CopySelectedPaths() {
 
 void ExplorerApp::CreateNewFolderAction() {
     const Strings& s = GetStrings(m_lang);
+    if (FtpClient::IsFtpPath(m_currentPath)) {
+        std::wstring err;
+        std::wstring newFtpDirUrl = FtpClient::JoinFtpPath(m_currentPath, s.dlgNewFolderDefault);
+        if (FtpClient::CreateFtpDirectory(newFtpDirUrl, &err)) {
+            RefreshCurrentFolder();
+        } else {
+            m_statusToast = (m_lang == Lang::PL ? L"Błąd tworzenia folderu FTP: " : L"Failed to create FTP folder: ") + err;
+            m_statusToastExpireTick = GetTickCount64() + 3500;
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+        }
+        return;
+    }
     std::wstring created;
     if (FileEngine::CreateNewFolder(m_currentPath, s.dlgNewFolderDefault, created)) {
         AppLog::Ok(L"NewFolder", L"Created folder: " + created);
@@ -5293,17 +5698,18 @@ void ExplorerApp::EnsureWorkAnimTimerState() {
 
     bool searchRunning = m_fileEngine.IsSearchRunning();
     bool recentlyFinishedScan = (m_folderScanFinishedTick > 0 && (GetTickCount64() - m_folderScanFinishedTick) < 3000);
-    bool hwLiveActive = (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() &&
+    bool hwLiveActive = (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView() &&
                          (m_hwLiveRefresh || m_hwInspector.IsAsyncBusy() || m_hwInspector.HasStagedData()));
     bool programsPolling = IsProgramsView() && m_progRefreshAtTick != 0;
-    bool lanBusy = IsLanView() && (m_lan.IsScanning() || m_lan.IsSsdpRunning() || m_lan.IsPortScanning());
+    bool lanBusy = IsLanView() && (m_lan.IsScanning() || m_lan.IsSsdpRunning() || m_lan.IsPortScanning() || m_lan.IsPingAutoRefreshEnabled());
+    bool backupsBusy = m_backups.IsBusy() || IsBackupsView();
     bool gitBusy = GitDockVisible() && (m_git.IsBusy() || m_gitReloadFolderWhenIdle);
 
     bool deletePending = m_fileEngine.PendingDeleteBatches() > 0 || m_renamePending.load() > 0 || m_mergePending.load() > 0 || m_imageCache.IsAnyImageTransforming();
     bool toastActive = !m_statusToast.empty() && GetTickCount64() < m_statusToastExpireTick;
     bool contentAnim = PreviewPaneVisible() && m_contentPane.NeedsAnimationTick();
 
-    if (folderScanning || searchRunning || recentlyFinishedScan || hwLiveActive || programsPolling || deletePending || toastActive || lanBusy || gitBusy || contentAnim) {
+    if (folderScanning || searchRunning || recentlyFinishedScan || hwLiveActive || programsPolling || deletePending || toastActive || lanBusy || backupsBusy || gitBusy || contentAnim) {
         SetTimer(m_hwnd, ID_TIMER_WORK_ANIM, 35, nullptr);
     } else {
         KillTimer(m_hwnd, ID_TIMER_WORK_ANIM);
@@ -5624,6 +6030,18 @@ static bool PromptCustomImageInput(
 }
 
 } // namespace
+
+static bool PromptCustomInputDialog(
+    HWND owner,
+    HINSTANCE hInst,
+    HFONT hFont,
+    const wchar_t* title,
+    const wchar_t* promptText,
+    const wchar_t* initialVal,
+    bool pl,
+    std::wstring& outVal) {
+    return PromptCustomImageInput(owner, hInst, hFont, title, promptText, initialVal, pl, outVal);
+}
 
 std::vector<std::wstring> ExplorerApp::GetSelectedImagePaths(int fallbackHitIndex) const {
     std::vector<std::wstring> imgs;

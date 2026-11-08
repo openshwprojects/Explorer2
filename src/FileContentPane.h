@@ -4,6 +4,9 @@
 #include "NotepadViewer.h"
 #include "HexViewer.h"
 #include "Model3DViewer.h"
+#include "EdaViewer.h"
+#include "SpreadsheetDocViewer.h"
+#include "ArchiveExplorer.h"
 #include "ImageCache.h"
 #include "MediaPlayer.h"
 #include <d2d1.h>
@@ -17,7 +20,10 @@ enum class FileContentTabMode : int {
     Auto = 0,
     Notepad = 1,
     Hex = 2,
-    Model3D = 3
+    Model3D = 3,
+    EdaPcb = 4,
+    Office = 5,
+    Archive = 6
 };
 
 enum class ResolvedContentKind : int {
@@ -27,7 +33,10 @@ enum class ResolvedContentKind : int {
     MediaPreview = 3,
     NotepadEditor = 4,
     HexInspector = 5,
-    Model3DViewport = 6
+    Model3DViewport = 6,
+    EdaViewport = 7,
+    OfficeDocument = 8,
+    ArchiveSubExplorer = 9
 };
 
 class FileContentPane {
@@ -49,12 +58,21 @@ public:
     HWND GetNotepadEditHwnd() const { return m_notepad.GetEditHwnd(); }
     void OnNotepadEditChanged() { m_notepad.OnEditChanged(); }
     bool NeedsAnimationTick() const {
-        return m_resolvedKind == ResolvedContentKind::Model3DViewport && m_model3D.NeedsAnimationTick();
+        return (m_resolvedKind == ResolvedContentKind::Model3DViewport && m_model3D.NeedsAnimationTick()) ||
+               (m_resolvedKind == ResolvedContentKind::EdaViewport && m_eda.NeedsAnimationTick());
     }
     void StepAnimation() {
         if (m_resolvedKind == ResolvedContentKind::Model3DViewport) {
             m_model3D.StepAnimation();
+        } else if (m_resolvedKind == ResolvedContentKind::EdaViewport) {
+            m_eda.StepAnimation();
         }
+    }
+
+    std::wstring TakePendingNavigation() {
+        std::wstring out = std::move(m_pendingNavigatePath);
+        m_pendingNavigatePath.clear();
+        return out;
     }
 
     void Draw(
@@ -73,7 +91,6 @@ public:
         D2D1_RECT_F& outMediaSeekBarRect);
 
     // Returns true if the click was handled inside the FileContentPane.
-    // Sets *outCloseRequested = true if [X] close button was clicked, or *outTriggerCmdId if an action button (e.g. Image Tools / Play) was clicked.
     bool OnMouseDown(
         float x,
         float y,
@@ -90,6 +107,7 @@ public:
 private:
     ResolvedContentKind ResolveKindForCurrentEntry() const;
     void ActivateResolvedViewer();
+    void LoadDirectoryPreview(const std::wstring& folderPath, bool forceReload = false);
 
     enum HeaderBtnId : int {
         HBTN_NONE = 0,
@@ -99,7 +117,12 @@ private:
         HBTN_TAB_3D = 4,
         HBTN_CLOSE_PANE = 5,
         HBTN_IMG_TOOLS = 6,
-        HBTN_MEDIA_PLAY_PAUSE = 7
+        HBTN_MEDIA_PLAY_PAUSE = 7,
+        HBTN_DIR_ENTER = 8,
+        HBTN_DIR_BACK_TO_FOLDER = 9,
+        HBTN_TAB_EDA = 10,
+        HBTN_TAB_OFFICE = 11,
+        HBTN_TAB_ARCHIVE = 12
     };
 
     struct HeaderHit {
@@ -107,15 +130,49 @@ private:
         D2D1_RECT_F rect = {};
     };
 
+    struct DirPreviewEntry {
+        std::wstring name;
+        std::wstring fullPath;
+        std::wstring ext;
+        std::wstring dateStr;
+        std::wstring sizeStr;
+        uint64_t size = 0;
+        bool isDirectory = false;
+        bool isImage = false;
+    };
+
     HWND m_parentHwnd = nullptr;
     NotepadViewer m_notepad;
     HexViewer m_hex;
     Model3DViewer m_model3D;
+    EdaViewer m_eda;
+    SpreadsheetDocViewer m_office;
+    ArchiveExplorer m_archive;
 
     bool m_hasEntry = false;
     FileEntry m_currentEntry = {};
+    FileEntry m_rootFolderEntry = {};
+    bool m_inspectingChildOfFolder = false;
     FileContentTabMode m_userTabMode = FileContentTabMode::Auto;
     ResolvedContentKind m_resolvedKind = ResolvedContentKind::None;
+
+    // Folder Content Sub-Explorer state
+    std::wstring m_dirPreviewPath;
+    std::vector<DirPreviewEntry> m_dirPreviewItems;
+    size_t m_dirFolderCount = 0;
+    size_t m_dirFileCount = 0;
+    uint64_t m_dirTotalFileBytes = 0;
+    float m_dirScrollY = 0.0f;
+    int m_dirSelectedIdx = -1;
+    int m_dirHoverIdx = -1;
+    ULONGLONG m_dirLastClickTick = 0;
+    int m_dirLastClickIdx = -1;
+    D2D1_RECT_F m_dirListRect = {};
+    D2D1_RECT_F m_dirScrollTrackRect = {};
+    D2D1_RECT_F m_dirScrollThumbRect = {};
+    bool m_dirDraggingScroll = false;
+    float m_dirScrollDragOffset = 0.0f;
+    std::wstring m_pendingNavigatePath;
 
     D2D1_RECT_F m_paneRect = {};
     D2D1_RECT_F m_bodyRect = {};

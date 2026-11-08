@@ -1,5 +1,6 @@
 #include "Model3DViewer.h"
 #include "PathUtils.h"
+#include "ZipDeflate.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -55,11 +56,17 @@ void Model3DViewer::Shutdown() {
 }
 
 bool Model3DViewer::Is3DModelExtension(const std::wstring& extLower) {
-    return extLower == L".obj"  || extLower == L".stl"  || extLower == L".ply"  ||
-           extLower == L".off"  || extLower == L".gltf" || extLower == L".glb"  ||
-           extLower == L".3mf"  || extLower == L".fbx"  || extLower == L".dae"  ||
-           extLower == L".3ds"  || extLower == L".step" || extLower == L".stp"  ||
-           extLower == L".iges" || extLower == L".igs";
+    return extLower == L".obj"   || extLower == L".stl"   || extLower == L".ply"   ||
+           extLower == L".off"   || extLower == L".md2"   || extLower == L".md3"   ||
+           extLower == L".blend" || extLower == L".3ds"   || extLower == L".dae"   ||
+           extLower == L".gltf"  || extLower == L".glb"   || extLower == L".3mf"   ||
+           extLower == L".fbx"   || extLower == L".ase"   || extLower == L".step"  ||
+           extLower == L".stp"   || extLower == L".iges"  || extLower == L".igs";
+}
+
+bool Model3DViewer::InspectMeshFile(const std::wstring& fullPath, LoadedMesh3D& outMesh) {
+    outMesh = ParseMeshFromDisk(fullPath, 0, nullptr);
+    return outMesh.loadedOk;
 }
 
 void Model3DViewer::Clear() {
@@ -464,7 +471,346 @@ LoadedMesh3D Model3DViewer::ParseMeshFromDisk(
         }
     }
 
-    // 5. Fallback for container 3D formats (.glb, .gltf, .fbx, .3mf, .blend) -> Build preview geodesic crystal mesh + metadata
+    // 5. Quake II MD2 Parser (.md2 - magic "IDP2" 0x32504449, version 8)
+    if (ext == L".md2" || (buf.size() >= 68 && std::memcmp(buf.data(), "IDP2", 4) == 0)) {
+        if (buf.size() >= 68 && std::memcmp(buf.data(), "IDP2", 4) == 0) {
+            struct Md2Header {
+                int32_t ident, version, skinwidth, skinheight, framesize;
+                int32_t num_skins, num_xyz, num_st, num_tris, num_glcmds, num_frames;
+                int32_t ofs_skins, ofs_st, ofs_tris, ofs_frames, ofs_glcmds, ofs_end;
+            } hdr = {};
+            std::memcpy(&hdr, buf.data(), sizeof(hdr));
+            if (hdr.version == 8 && hdr.num_xyz > 0 && hdr.num_tris > 0 &&
+                hdr.ofs_frames >= 68 && static_cast<size_t>(hdr.ofs_frames + 40 + hdr.num_xyz * 4) <= buf.size() &&
+                hdr.ofs_tris >= 68 && static_cast<size_t>(hdr.ofs_tris + hdr.num_tris * 12) <= buf.size())
+            {
+                mesh.formatName = L"Quake II Model (.md2)";
+                mesh.animFrameCount = static_cast<size_t>(std::max(1, hdr.num_frames));
+                const uint8_t* framePtr = buf.data() + hdr.ofs_frames;
+                float scale[3] = {}, translate[3] = {};
+                std::memcpy(scale, framePtr, 12);
+                std::memcpy(translate, framePtr + 12, 12);
+                const uint8_t* vertsPtr = framePtr + 40;
+                mesh.vertices.reserve(hdr.num_xyz);
+                for (int i = 0; i < hdr.num_xyz; ++i) {
+                    const uint8_t* vp = vertsPtr + i * 4;
+                    float vx = vp[0] * scale[0] + translate[0];
+                    float vy = vp[1] * scale[1] + translate[1];
+                    float vz = vp[2] * scale[2] + translate[2];
+                    mesh.vertices.push_back({ vx, vz, -vy });
+                }
+                const uint8_t* trisPtr = buf.data() + hdr.ofs_tris;
+                mesh.tris.reserve(hdr.num_tris);
+                for (int t = 0; t < hdr.num_tris; ++t) {
+                    uint16_t vi[3] = {};
+                    std::memcpy(vi, trisPtr + t * 12, 6);
+                    if (vi[0] < mesh.vertices.size() && vi[1] < mesh.vertices.size() && vi[2] < mesh.vertices.size()) {
+                        mesh.tris.push_back({ vi[0], vi[2], vi[1], {} });
+                    }
+                }
+                FinalizeMeshBoundsAndNormals(mesh);
+                return mesh;
+            }
+        }
+    }
+
+    // 6. Quake III MD3 Parser (.md3 - magic "IDP3" 0x33504449, version 15)
+    if (ext == L".md3" || (buf.size() >= 108 && std::memcmp(buf.data(), "IDP3", 4) == 0)) {
+        if (buf.size() >= 108 && std::memcmp(buf.data(), "IDP3", 4) == 0) {
+            int32_t version = 0, numFrames = 0, numSurfaces = 0, ofsSurfaces = 0;
+            std::memcpy(&version, buf.data() + 4, 4);
+            std::memcpy(&numFrames, buf.data() + 72, 4);
+            std::memcpy(&numSurfaces, buf.data() + 80, 4);
+            std::memcpy(&ofsSurfaces, buf.data() + 96, 4);
+            if (numSurfaces > 0 && ofsSurfaces >= 108 && static_cast<size_t>(ofsSurfaces) < buf.size()) {
+                mesh.formatName = L"Quake III Model (.md3)";
+                mesh.animFrameCount = static_cast<size_t>(std::max(1, numFrames));
+                size_t surfOff = static_cast<size_t>(ofsSurfaces);
+                for (int s = 0; s < numSurfaces && surfOff + 108 <= buf.size(); ++s) {
+                    const uint8_t* sp = buf.data() + surfOff;
+                    if (std::memcmp(sp, "IDP3", 4) != 0) break;
+                    int32_t sVerts = 0, sTris = 0, ofsTris = 0, ofsXyz = 0, ofsEnd = 0;
+                    std::memcpy(&sVerts, sp + 76, 4);
+                    std::memcpy(&sTris,  sp + 80, 4);
+                    std::memcpy(&ofsTris, sp + 84, 4);
+                    std::memcpy(&ofsXyz,  sp + 100, 4);
+                    std::memcpy(&ofsEnd,  sp + 104, 4);
+                    if (sVerts > 0 && sTris > 0 &&
+                        ofsXyz > 0 && surfOff + ofsXyz + static_cast<size_t>(sVerts) * 8 <= buf.size() &&
+                        ofsTris > 0 && surfOff + ofsTris + static_cast<size_t>(sTris) * 12 <= buf.size())
+                    {
+                        uint32_t baseV = static_cast<uint32_t>(mesh.vertices.size());
+                        const uint8_t* vp = sp + ofsXyz;
+                        for (int v = 0; v < sVerts; ++v) {
+                            int16_t xyz[4] = {};
+                            std::memcpy(xyz, vp + v * 8, 8);
+                            mesh.vertices.push_back({ xyz[0] / 64.0f, xyz[2] / 64.0f, -xyz[1] / 64.0f });
+                        }
+                        const uint8_t* tp = sp + ofsTris;
+                        for (int t = 0; t < sTris; ++t) {
+                            int32_t idx[3] = {};
+                            std::memcpy(idx, tp + t * 12, 12);
+                            if (idx[0] >= 0 && idx[0] < sVerts && idx[1] >= 0 && idx[1] < sVerts && idx[2] >= 0 && idx[2] < sVerts) {
+                                mesh.tris.push_back({ baseV + static_cast<uint32_t>(idx[0]),
+                                                      baseV + static_cast<uint32_t>(idx[2]),
+                                                      baseV + static_cast<uint32_t>(idx[1]), {} });
+                            }
+                        }
+                    }
+                    if (ofsEnd <= 0) break;
+                    surfOff += static_cast<size_t>(ofsEnd);
+                }
+                FinalizeMeshBoundsAndNormals(mesh);
+                if (mesh.loadedOk) return mesh;
+            }
+        }
+    }
+
+    // 7. 3D Studio Mesh Parser (.3ds - Main Chunk 0x4D4D)
+    if (ext == L".3ds" && buf.size() >= 16) {
+        uint16_t mainId = 0;
+        std::memcpy(&mainId, buf.data(), 2);
+        if (mainId == 0x4D4D) {
+            mesh.formatName = L"Autodesk 3D Studio (.3ds)";
+            uint32_t curBaseVert = 0;
+            size_t pos = 6;
+            while (pos + 6 <= buf.size()) {
+                uint16_t cid = 0;
+                uint32_t clen = 0;
+                std::memcpy(&cid, buf.data() + pos, 2);
+                std::memcpy(&clen, buf.data() + pos + 2, 4);
+                if (clen < 6 || pos + clen > buf.size()) break;
+
+                if (cid == 0x3D3D || cid == 0x4100) {
+                    pos += 6;
+                } else if (cid == 0x4000) {
+                    size_t p = pos + 6;
+                    while (p < pos + clen && buf[p] != 0) ++p;
+                    if (p < pos + clen) ++p;
+                    pos = p;
+                } else if (cid == 0x4110 && pos + 8 <= buf.size()) {
+                    uint16_t nVerts = 0;
+                    std::memcpy(&nVerts, buf.data() + pos + 6, 2);
+                    curBaseVert = static_cast<uint32_t>(mesh.vertices.size());
+                    size_t vp = pos + 8;
+                    for (uint16_t v = 0; v < nVerts && vp + 12 <= pos + clen; ++v) {
+                        float xyz[3] = {};
+                        std::memcpy(xyz, buf.data() + vp, 12);
+                        mesh.vertices.push_back({ xyz[0], xyz[2], -xyz[1] });
+                        vp += 12;
+                    }
+                    pos += clen;
+                } else if (cid == 0x4120 && pos + 8 <= buf.size()) {
+                    uint16_t nFaces = 0;
+                    std::memcpy(&nFaces, buf.data() + pos + 6, 2);
+                    size_t fp = pos + 8;
+                    for (uint16_t f = 0; f < nFaces && fp + 8 <= pos + clen; ++f) {
+                        uint16_t fidx[4] = {};
+                        std::memcpy(fidx, buf.data() + fp, 8);
+                        uint32_t i0 = curBaseVert + fidx[0];
+                        uint32_t i1 = curBaseVert + fidx[1];
+                        uint32_t i2 = curBaseVert + fidx[2];
+                        if (i0 < mesh.vertices.size() && i1 < mesh.vertices.size() && i2 < mesh.vertices.size()) {
+                            mesh.tris.push_back({ i0, i1, i2, {} });
+                        }
+                        fp += 8;
+                    }
+                    pos += clen;
+                } else {
+                    pos += clen;
+                }
+            }
+            FinalizeMeshBoundsAndNormals(mesh);
+            if (mesh.loadedOk) return mesh;
+        }
+    }
+
+    // 8. Blender .blend Parser (BLENDER-v / BLENDER_v or Gzipped .blend)
+    if (ext == L".blend") {
+        std::vector<uint8_t> decompBlend;
+        const uint8_t* bData = buf.data();
+        size_t bSize = buf.size();
+        if (bSize >= 18 && bData[0] == 0x1F && bData[1] == 0x8B) {
+            if (ZipDeflate::InflateGzip(bData, bSize, decompBlend, 128 * 1024 * 1024)) {
+                bData = decompBlend.data();
+                bSize = decompBlend.size();
+            }
+        }
+        if (bSize >= 12 && std::memcmp(bData, "BLENDER", 7) == 0) {
+            bool is64Bit = (bData[7] == '_');
+            bool isLittleEndian = (bData[8] == 'v');
+            char verStr[4] = { static_cast<char>(bData[9]), static_cast<char>(bData[10]), static_cast<char>(bData[11]), 0 };
+            mesh.formatName = L"Blender 3D (.blend v" + PathUtils::Utf8ToWide(verStr) + L")";
+
+            if (isLittleEndian) {
+                size_t bheadSize = is64Bit ? 24 : 20;
+                size_t pos = 12;
+                bool inMeshBlock = false;
+                while (pos + bheadSize <= bSize) {
+                    const uint8_t* bh = bData + pos;
+                    if (std::memcmp(bh, "ENDB", 4) == 0) break;
+                    int32_t dataLen = 0;
+                    int32_t nr = 0;
+                    std::memcpy(&dataLen, bh + 4, 4);
+                    std::memcpy(&nr, bh + (is64Bit ? 20 : 16), 4);
+                    if (dataLen < 0 || pos + bheadSize + static_cast<size_t>(dataLen) > bSize) break;
+                    const uint8_t* payload = bh + bheadSize;
+
+                    if (bh[0] == 'M' && bh[1] == 'E') {
+                        inMeshBlock = true;
+                    } else if (bh[0] != 'D' || bh[1] != 'A' || bh[2] != 'T' || bh[3] != 'A') {
+                        inMeshBlock = false;
+                    } else if (inMeshBlock && nr >= 3 && dataLen >= nr * 12) {
+                        int elemBytes = dataLen / nr;
+                        if (elemBytes == 12 || elemBytes == 16 || elemBytes == 20) {
+                            bool allReasonableFloats = true;
+                            int checkCount = std::min(nr, 32);
+                            float minC = 1e9f, maxC = -1e9f;
+                            for (int i = 0; i < checkCount; ++i) {
+                                float xyz[3] = {};
+                                std::memcpy(xyz, payload + i * elemBytes, 12);
+                                for (int k = 0; k < 3; ++k) {
+                                    if (!std::isfinite(xyz[k]) || std::abs(xyz[k]) > 1e6f) {
+                                        allReasonableFloats = false;
+                                        break;
+                                    }
+                                    minC = std::min(minC, xyz[k]);
+                                    maxC = std::max(maxC, xyz[k]);
+                                }
+                                if (!allReasonableFloats) break;
+                            }
+                            if (allReasonableFloats && (maxC - minC) > 1e-4f) {
+                                uint32_t baseV = static_cast<uint32_t>(mesh.vertices.size());
+                                for (int i = 0; i < nr; ++i) {
+                                    float xyz[3] = {};
+                                    std::memcpy(xyz, payload + i * elemBytes, 12);
+                                    mesh.vertices.push_back({ xyz[0], xyz[2], -xyz[1] });
+                                }
+                                for (int i = 0; i + 2 < nr; i += 3) {
+                                    mesh.tris.push_back({ baseV + static_cast<uint32_t>(i),
+                                                          baseV + static_cast<uint32_t>(i + 1),
+                                                          baseV + static_cast<uint32_t>(i + 2), {} });
+                                }
+                            }
+                        }
+                    }
+                    pos += bheadSize + static_cast<size_t>(dataLen);
+                }
+                FinalizeMeshBoundsAndNormals(mesh);
+                if (mesh.loadedOk) return mesh;
+            }
+        }
+    }
+
+    // 9. Binary glTF 2.0 Parser (.glb - magic 0x46546C67 "glTF")
+    if (ext == L".glb" && buf.size() >= 28 && std::memcmp(buf.data(), "glTF", 4) == 0) {
+        mesh.formatName = L"Binary glTF 2.0 (.glb)";
+        size_t pos = 12;
+        const uint8_t* binChunk = nullptr;
+        size_t binLen = 0;
+        while (pos + 8 <= buf.size()) {
+            uint32_t cLen = 0, cType = 0;
+            std::memcpy(&cLen, buf.data() + pos, 4);
+            std::memcpy(&cType, buf.data() + pos + 4, 4);
+            if (pos + 8 + cLen > buf.size()) break;
+            if (cType == 0x004E4942u) {
+                binChunk = buf.data() + pos + 8;
+                binLen = cLen;
+                break;
+            }
+            pos += 8 + cLen;
+        }
+        if (binChunk && binLen >= 36) {
+            size_t numVerts = binLen / 12;
+            mesh.vertices.reserve(numVerts);
+            for (size_t i = 0; i < numVerts; ++i) {
+                float xyz[3] = {};
+                std::memcpy(xyz, binChunk + i * 12, 12);
+                if (std::isfinite(xyz[0]) && std::isfinite(xyz[1]) && std::isfinite(xyz[2]) &&
+                    std::abs(xyz[0]) < 1e5f && std::abs(xyz[1]) < 1e5f && std::abs(xyz[2]) < 1e5f) {
+                    mesh.vertices.push_back({ xyz[0], xyz[1], xyz[2] });
+                }
+            }
+            for (size_t i = 0; i + 2 < mesh.vertices.size(); i += 3) {
+                mesh.tris.push_back({ static_cast<uint32_t>(i), static_cast<uint32_t>(i + 1), static_cast<uint32_t>(i + 2), {} });
+            }
+            FinalizeMeshBoundsAndNormals(mesh);
+            if (mesh.loadedOk) return mesh;
+        }
+    }
+
+    // 10. 3MF Parser (.3mf - ZIP containing 3D/3dmodel.model XML)
+    if (ext == L".3mf") {
+        std::vector<uint8_t> modelXml;
+        if (ZipDeflate::ExtractZipFileByName(fullPath, L"3D/3dmodel.model", modelXml) && !modelXml.empty()) {
+            mesh.formatName = L"3D Manufacturing Format (.3mf)";
+            std::string_view sv(reinterpret_cast<const char*>(modelXml.data()), modelXml.size());
+            size_t p = 0;
+            while ((p = sv.find("<vertex ", p)) != std::string_view::npos) {
+                size_t gt = sv.find('>', p);
+                if (gt == std::string_view::npos) break;
+                std::string_view tag = sv.substr(p, gt - p);
+                auto attrF = [&](const char* k) -> float {
+                    size_t kp = tag.find(k);
+                    if (kp == std::string_view::npos) return 0.0f;
+                    kp += std::strlen(k);
+                    return std::strtof(std::string(tag.substr(kp, 24)).c_str(), nullptr);
+                };
+                mesh.vertices.push_back({ attrF("x=\""), attrF("z=\""), -attrF("y=\"") });
+                p = gt + 1;
+            }
+            p = 0;
+            while ((p = sv.find("<triangle ", p)) != std::string_view::npos) {
+                size_t gt = sv.find('>', p);
+                if (gt == std::string_view::npos) break;
+                std::string_view tag = sv.substr(p, gt - p);
+                auto attrU = [&](const char* k) -> uint32_t {
+                    size_t kp = tag.find(k);
+                    if (kp == std::string_view::npos) return 0;
+                    kp += std::strlen(k);
+                    return static_cast<uint32_t>(std::strtoul(std::string(tag.substr(kp, 16)).c_str(), nullptr, 10));
+                };
+                uint32_t v1 = attrU("v1=\""), v2 = attrU("v2=\""), v3 = attrU("v3=\"");
+                if (v1 < mesh.vertices.size() && v2 < mesh.vertices.size() && v3 < mesh.vertices.size()) {
+                    mesh.tris.push_back({ v1, v2, v3, {} });
+                }
+                p = gt + 1;
+            }
+            FinalizeMeshBoundsAndNormals(mesh);
+            if (mesh.loadedOk) return mesh;
+        }
+    }
+
+    // 11. Collada .dae XML Mesh Parser
+    if (ext == L".dae") {
+        mesh.formatName = L"COLLADA 3D (.dae)";
+        std::string_view sv(reinterpret_cast<const char*>(buf.data()), buf.size());
+        size_t faPos = sv.find("<float_array");
+        if (faPos != std::string_view::npos) {
+            size_t gt = sv.find('>', faPos);
+            size_t endFa = sv.find("</float_array>", gt);
+            if (gt != std::string_view::npos && endFa != std::string_view::npos) {
+                const char* cur = sv.data() + gt + 1;
+                const char* end = sv.data() + endFa;
+                while (cur < end) {
+                    char* next = nullptr;
+                    float x = std::strtof(cur, &next);
+                    if (next == cur) break;
+                    cur = next;
+                    float y = std::strtof(cur, &next); cur = next;
+                    float z = std::strtof(cur, &next); cur = next;
+                    mesh.vertices.push_back({ x, z, -y });
+                }
+                for (size_t i = 0; i + 2 < mesh.vertices.size(); i += 3) {
+                    mesh.tris.push_back({ static_cast<uint32_t>(i), static_cast<uint32_t>(i + 1), static_cast<uint32_t>(i + 2), {} });
+                }
+                FinalizeMeshBoundsAndNormals(mesh);
+                if (mesh.loadedOk) return mesh;
+            }
+        }
+    }
+
+    // 12. Fallback for container 3D formats (.glb, .gltf, .fbx, .3mf, .blend) -> Build preview geodesic crystal mesh + metadata
     std::wstring extUp = (ext.size() > 1) ? ext.substr(1) : ext;
     for (wchar_t& ch : extUp) ch = static_cast<wchar_t>(towupper(ch));
     mesh.formatName = extUp + L" 3D Asset";
