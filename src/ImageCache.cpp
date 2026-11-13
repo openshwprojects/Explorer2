@@ -1,5 +1,8 @@
 #include "ImageCache.h"
+#include "ThreadUtils.h"
 #include "ImageFormatLoader.h"
+#include "ArchiveExplorer.h"
+#include "FtpClient.h"
 #include "ShellMenuEmulator.h"
 #include "PathUtils.h"
 #include <wrl/client.h>
@@ -29,6 +32,7 @@ ImageCache::~ImageCache() {
 void ImageCache::Initialize(HWND notifyHwnd) {
     m_notifyHwnd = notifyHwnd;
     m_running = true;
+    m_transforms->wanted = true;
 
     unsigned int hwThreads = std::thread::hardware_concurrency();
     unsigned int numThumbWorkers = std::max(2u, std::min(8u, hwThreads > 1 ? hwThreads - 1 : 2u));
@@ -38,21 +42,28 @@ void ImageCache::Initialize(HWND notifyHwnd) {
     }
 
     m_fullImgThread = std::thread(&ImageCache::FullImageWorkerLoop, this);
+    m_iconThread = std::thread(&ImageCache::IconWorkerLoop, this);
 }
 
 void ImageCache::Shutdown() {
+    m_transforms->wanted = false;   // a rotation or resize under way finishes its current file and stops
     if (m_running.exchange(false)) {
+        // Each queue's mutex is taken before its wake-up: a worker that has just found nothing to do and is
+        // about to wait would otherwise miss the wake-up and wait for ever
+        { std::lock_guard<std::mutex> lock(m_thumbQueueMutex); }
         m_thumbQueueCv.notify_all();
+        { std::lock_guard<std::mutex> lock(m_fullImgMutex); }
         m_fullImgCv.notify_all();
+        { std::lock_guard<std::mutex> lock(m_iconMutex); }
+        m_iconCv.notify_all();
 
+        // The workers call into the shell (thumbnails, icons): see JoinServingCom
         for (auto& t : m_thumbThreads) {
-            if (t.joinable()) t.join();
+            JoinServingCom(t);
         }
         m_thumbThreads.clear();
-
-        if (m_fullImgThread.joinable()) {
-            m_fullImgThread.join();
-        }
+        JoinServingCom(m_fullImgThread);
+        JoinServingCom(m_iconThread);
     }
     DiscardDeviceResources();
 }
@@ -76,10 +87,13 @@ void ImageCache::DiscardDeviceResources() {
         m_fullImgLru.clear();
         m_fullImgInFlight.clear();
     }
-    for (auto& kv : m_sysIconBitmaps) {
-        if (kv.second) kv.second->Release();
+    for (auto& pages : m_iconPages) {
+        for (auto& page : pages) {
+            if (page.texture) page.texture->Release();
+        }
+        pages.clear();
     }
-    m_sysIconBitmaps.clear();
+    m_sysIcons.clear();
 }
 
 void ImageCache::BumpViewportGeneration() {
@@ -112,6 +126,9 @@ bool ImageCache::DecodeImageFromDiskZeroLock(
         return false;
     }
 
+    std::vector<uint8_t> fileBytes;
+    DWORD bytesRead = 0;
+
     // Open with full sharing (READ | WRITE | DELETE), copy compressed bytes into RAM,
     // and CLOSE THE FILE HANDLE IMMEDIATELY before decoding!
     HANDLE hFile = CreateFileW(
@@ -123,26 +140,52 @@ bool ImageCache::DecodeImageFromDiskZeroLock(
         FILE_FLAG_SEQUENTIAL_SCAN,
         nullptr);
 
-    if (hFile == INVALID_HANDLE_VALUE) {
-        outBuf.failed = true;
-        return false;
-    }
+    if (hFile != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER fileSize = {};
+        if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart <= 0 || fileSize.QuadPart > (256LL * 1024 * 1024)) {
+            CloseHandle(hFile);
+            outBuf.failed = true;
+            return false;
+        }
 
-    LARGE_INTEGER fileSize = {};
-    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart <= 0 || fileSize.QuadPart > (256LL * 1024 * 1024)) {
+        fileBytes.resize(static_cast<size_t>(fileSize.QuadPart));
+        BOOL readOk = ReadFile(hFile, fileBytes.data(), static_cast<DWORD>(fileBytes.size()), &bytesRead, nullptr);
         CloseHandle(hFile);
-        outBuf.failed = true;
-        return false;
-    }
 
-    std::vector<uint8_t> fileBytes(static_cast<size_t>(fileSize.QuadPart));
-    DWORD bytesRead = 0;
-    BOOL readOk = ReadFile(hFile, fileBytes.data(), static_cast<DWORD>(fileBytes.size()), &bytesRead, nullptr);
-    CloseHandle(hFile);
+        if (!readOk || bytesRead == 0) {
+            outBuf.failed = true;
+            return false;
+        }
+    } else if (FtpClient::IsFtpPath(path)) {
+        std::wstring tempFile;
+        if (!FtpClient::DownloadFtpFileToTempCache(path, tempFile) || tempFile.empty() ||
+            !PathUtils::ReadFileBytes(tempFile, 256ULL * 1024 * 1024, fileBytes) || fileBytes.empty()) {
+            outBuf.failed = true;
+            return false;
+        }
+        bytesRead = static_cast<DWORD>(fileBytes.size());
+    } else {
+        // Support virtual paths inside archives (e.g. C:\...\photos.rar\photo.png)
+        std::wstring arcFile, innerEntry;
+        if (!ArchiveExplorer::SplitVirtualArchivePath(path, arcFile, innerEntry) || innerEntry.empty()) {
+            outBuf.failed = true;
+            return false;
+        }
 
-    if (!readOk || bytesRead == 0) {
-        outBuf.failed = true;
-        return false;
+        if (ArchiveExplorer::ExtractSingleEntryToMemory(arcFile, innerEntry, fileBytes) && !fileBytes.empty()) {
+            bytesRead = static_cast<DWORD>(fileBytes.size());
+        } else {
+            std::wstring tempFile;
+            if (!ArchiveExplorer::ExtractSingleEntryToTempFile(arcFile, innerEntry, tempFile) || tempFile.empty()) {
+                outBuf.failed = true;
+                return false;
+            }
+            if (!PathUtils::ReadFileBytes(tempFile, 256ULL * 1024 * 1024, fileBytes) || fileBytes.empty()) {
+                outBuf.failed = true;
+                return false;
+            }
+            bytesRead = static_cast<DWORD>(fileBytes.size());
+        }
     }
 
     std::wstring extLower = PathUtils::GetExtension(path);
@@ -256,8 +299,18 @@ bool ImageCache::DecodeShellThumbnail(
     RawImageBuffer& outBuf)
 {
     outBuf = {};
+    std::wstring effectivePath = path;
+    if (GetFileAttributesW(effectivePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        std::wstring arcFile, innerEntry;
+        if (ArchiveExplorer::SplitVirtualArchivePath(path, arcFile, innerEntry) && !innerEntry.empty()) {
+            std::wstring tempFile;
+            if (ArchiveExplorer::ExtractSingleEntryToTempFile(arcFile, innerEntry, tempFile) && !tempFile.empty()) {
+                effectivePath = tempFile;
+            }
+        }
+    }
     ComPtr<IShellItemImageFactory> imgFactory;
-    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&imgFactory))) || !imgFactory) {
+    if (FAILED(SHCreateItemFromParsingName(effectivePath.c_str(), nullptr, IID_PPV_ARGS(&imgFactory))) || !imgFactory) {
         outBuf.failed = true;
         return false;
     }
@@ -353,7 +406,46 @@ void ImageCache::ThumbWorkerLoop() {
                     FindExSearchNameMatch,
                     nullptr,
                     FIND_FIRST_EX_LARGE_FETCH);
-                if (hFind == INVALID_HANDLE_VALUE) return;
+                if (hFind == INVALID_HANDLE_VALUE) {
+                    std::wstring arcFile, innerDir;
+                    if (ArchiveExplorer::SplitVirtualArchivePath(dirToScan, arcFile, innerDir)) {
+                        std::vector<ArchiveItemEntry> arcChildren;
+                        if (ArchiveExplorer::EnumerateArchiveFolder(arcFile, innerDir, arcChildren)) {
+                            for (const auto& ac : arcChildren) {
+                                if (countTotal) ++prevData.totalCount;
+                                if (ac.isDirectory) {
+                                    if (allowSubDirs && subDirItems.size() < 4) {
+                                        FolderPreviewItem fp;
+                                        fp.name = ac.name;
+                                        fp.fullPath = prefix + ac.name;
+                                        fp.isDirectory = true;
+                                        subDirItems.push_back(std::move(fp));
+                                    }
+                                } else {
+                                    std::wstring ext = PathUtils::GetExtension(ac.name);
+                                    bool isImg = IsImageExtension(ext);
+                                    bool isVid = !isImg && IsVideoExtension(ext);
+                                    if ((isImg || isVid) && mediaItems.size() < 4) {
+                                        FolderPreviewItem fp;
+                                        fp.name = ac.name;
+                                        fp.fullPath = prefix + ac.name;
+                                        fp.ext = std::move(ext);
+                                        fp.isImage = isImg;
+                                        fp.isVideo = isVid;
+                                        mediaItems.push_back(std::move(fp));
+                                    } else if (!isImg && !isVid && fileItems.size() < 4) {
+                                        FolderPreviewItem fp;
+                                        fp.name = ac.name;
+                                        fp.fullPath = prefix + ac.name;
+                                        fp.ext = std::move(ext);
+                                        fileItems.push_back(std::move(fp));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
 
                 int scanned = 0;
                 do {
@@ -463,6 +555,11 @@ ID2D1Bitmap* ImageCache::GetOrQueueThumbnail(ID2D1RenderTarget* rt, const std::w
 
         auto cpuIt = m_pendingThumbCpu.find(path);
         if (cpuIt != m_pendingThumbCpu.end()) {
+            if (OverPaintBudget()) {
+                // Uploaded in the next paint; until then the previous bitmap, if there is one
+                auto previous = m_thumbBitmaps.find(path);
+                return (previous != m_thumbBitmaps.end()) ? previous->second : nullptr;
+            }
             const RawImageBuffer& buf = cpuIt->second;
             if (!buf.failed && !buf.bgraPixels.empty()) {
                 D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
@@ -475,6 +572,8 @@ ID2D1Bitmap* ImageCache::GetOrQueueThumbnail(ID2D1RenderTarget* rt, const std::w
                         &props,
                         &bmp)) && bmp)
                 {
+                    NoteUpload();
+                    NoteItemMade();
                     while (m_thumbLruOrder.size() >= kMaxCachedThumbnails) {
                         std::wstring oldest = m_thumbLruOrder.front();
                         m_thumbLruOrder.pop_front();
@@ -684,6 +783,10 @@ void ImageCache::EvictPath(const std::wstring& path) {
         m_fullImgOrigDims.erase(path);
         m_fullImgLru.remove(path);
     }
+    {
+        std::lock_guard<std::mutex> lock(m_iconMutex);
+        m_perFileIconCache.erase(path);
+    }
 }
 
 void ImageCache::ClearFullImageCache() {
@@ -705,31 +808,32 @@ void ImageCache::QueueRotateImages(const std::vector<std::wstring>& paths, bool 
 
     std::vector<std::wstring> toRotate;
     {
-        std::lock_guard<std::mutex> lock(m_rotateMutex);
+        std::lock_guard<std::mutex> lock(m_transforms->mutex);
         for (const auto& p : paths) {
             std::wstring nk = PathUtils::NormalizePathKey(p);
-            if (!nk.empty() && m_rotatingNormKeys.find(nk) == m_rotatingNormKeys.end()) {
-                m_rotatingNormKeys.insert(nk);
+            if (!nk.empty() && m_transforms->busyNormKeys.find(nk) == m_transforms->busyNormKeys.end()) {
+                m_transforms->busyNormKeys.insert(nk);
                 toRotate.push_back(p);
             }
         }
     }
     if (toRotate.empty()) return;
 
+    // The thread works on the shared block only, never on the cache itself (see TransformState)
     HWND notifyHwnd = m_notifyHwnd;
-    std::thread([this, toRotate = std::move(toRotate), clockwise, notifyHwnd]() {
+    std::thread([state = m_transforms, toRotate = std::move(toRotate), clockwise, notifyHwnd]() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         for (const auto& imgPath : toRotate) {
-            if (!m_running) break;
+            if (!state->wanted) break;
             ShellMenuEmulator::RotateImageFile(imgPath, clockwise);
 
             std::wstring nk = PathUtils::NormalizePathKey(imgPath);
             {
-                std::lock_guard<std::mutex> lock(m_rotateMutex);
-                m_rotatingNormKeys.erase(nk);
-                m_completedRotationPaths.push_back(imgPath);
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->busyNormKeys.erase(nk);
+                state->completedPaths.push_back(imgPath);
             }
-            if (notifyHwnd && m_running) {
+            if (notifyHwnd && state->wanted) {
                 PostMessageW(notifyHwnd, WM_APP_IMAGE_ROTATED, 0, 0);
             }
         }
@@ -739,13 +843,13 @@ void ImageCache::QueueRotateImages(const std::vector<std::wstring>& paths, bool 
 
 bool ImageCache::IsPathRotating(const std::wstring& normKey) const {
     if (normKey.empty()) return false;
-    std::lock_guard<std::mutex> lock(m_rotateMutex);
-    return m_rotatingNormKeys.find(normKey) != m_rotatingNormKeys.end();
+    std::lock_guard<std::mutex> lock(m_transforms->mutex);
+    return m_transforms->busyNormKeys.find(normKey) != m_transforms->busyNormKeys.end();
 }
 
 bool ImageCache::IsAnyImageTransforming() const {
-    std::lock_guard<std::mutex> lock(m_rotateMutex);
-    return !m_rotatingNormKeys.empty();
+    std::lock_guard<std::mutex> lock(m_transforms->mutex);
+    return !m_transforms->busyNormKeys.empty();
 }
 
 void ImageCache::QueueTransformImages(const std::vector<std::wstring>& paths, const ImageTransformParams& params) {
@@ -753,36 +857,37 @@ void ImageCache::QueueTransformImages(const std::vector<std::wstring>& paths, co
 
     std::vector<std::wstring> toProcess;
     {
-        std::lock_guard<std::mutex> lock(m_rotateMutex);
+        std::lock_guard<std::mutex> lock(m_transforms->mutex);
         for (const auto& p : paths) {
             std::wstring nk = PathUtils::NormalizePathKey(p);
-            if (!nk.empty() && m_rotatingNormKeys.find(nk) == m_rotatingNormKeys.end()) {
-                m_rotatingNormKeys.insert(nk);
+            if (!nk.empty() && m_transforms->busyNormKeys.find(nk) == m_transforms->busyNormKeys.end()) {
+                m_transforms->busyNormKeys.insert(nk);
                 toProcess.push_back(p);
             }
         }
     }
     if (toProcess.empty()) return;
 
+    // The thread works on the shared block only, never on the cache itself (see TransformState)
     HWND notifyHwnd = m_notifyHwnd;
-    std::thread([this, toProcess = std::move(toProcess), params, notifyHwnd]() {
+    std::thread([state = m_transforms, toProcess = std::move(toProcess), params, notifyHwnd]() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         for (const auto& imgPath : toProcess) {
-            if (!m_running) break;
+            if (!state->wanted) break;
             ImageTransformResult res;
             ShellMenuEmulator::TransformImageFile(imgPath, params, res);
 
             std::wstring nk = PathUtils::NormalizePathKey(imgPath);
             {
-                std::lock_guard<std::mutex> lock(m_rotateMutex);
-                m_rotatingNormKeys.erase(nk);
-                m_completedRotationPaths.push_back(imgPath);
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->busyNormKeys.erase(nk);
+                state->completedPaths.push_back(imgPath);
                 if (!res.outPath.empty() && _wcsicmp(res.outPath.c_str(), imgPath.c_str()) != 0) {
-                    m_completedRotationPaths.push_back(res.outPath);
+                    state->completedPaths.push_back(res.outPath);
                 }
-                m_completedTransforms.push_back(std::move(res));
+                state->completedTransforms.push_back(std::move(res));
             }
-            if (notifyHwnd && m_running) {
+            if (notifyHwnd && state->wanted) {
                 PostMessageW(notifyHwnd, WM_APP_IMAGE_ROTATED, 0, 0);
             }
         }
@@ -793,8 +898,8 @@ void ImageCache::QueueTransformImages(const std::vector<std::wstring>& paths, co
 std::vector<std::wstring> ImageCache::TakeCompletedRotations() {
     std::vector<std::wstring> done;
     {
-        std::lock_guard<std::mutex> lock(m_rotateMutex);
-        done.swap(m_completedRotationPaths);
+        std::lock_guard<std::mutex> lock(m_transforms->mutex);
+        done.swap(m_transforms->completedPaths);
     }
     for (const auto& p : done) {
         EvictPath(p);
@@ -805,8 +910,8 @@ std::vector<std::wstring> ImageCache::TakeCompletedRotations() {
 std::vector<ImageTransformResult> ImageCache::TakeCompletedTransforms() {
     std::vector<ImageTransformResult> done;
     {
-        std::lock_guard<std::mutex> lock(m_rotateMutex);
-        done.swap(m_completedTransforms);
+        std::lock_guard<std::mutex> lock(m_transforms->mutex);
+        done.swap(m_transforms->completedTransforms);
     }
     for (const auto& r : done) {
         if (!r.srcPath.empty()) EvictPath(r.srcPath);
@@ -815,36 +920,272 @@ std::vector<ImageTransformResult> ImageCache::TakeCompletedTransforms() {
     return done;
 }
 
-ID2D1Bitmap* ImageCache::GetSystemIconBitmap(ID2D1RenderTarget* rt, int sysIconIndex, bool largeIcon) {
-    if (!rt || sysIconIndex < 0) return nullptr;
+int ImageCache::GetOrQueuePerFileIconIndex(const std::wstring& path, int fallbackSysIconIndex) {
+    if (path.empty() || FtpClient::IsFtpPath(path) || ArchiveExplorer::IsVirtualArchivePath(path)) {
+        return fallbackSysIconIndex;
+    }
+    m_iconNotifyPending.store(false, std::memory_order_relaxed);
 
-    uint64_t key = (static_cast<uint64_t>(sysIconIndex) << 1) | (largeIcon ? 1ULL : 0ULL);
-    auto it = m_sysIconBitmaps.find(key);
-    if (it != m_sysIconBitmaps.end()) {
+    std::lock_guard<std::mutex> lock(m_iconMutex);
+    auto it = m_perFileIconCache.find(path);
+    if (it != m_perFileIconCache.end()) {
+        // -1: the file has no icon of its own; the caller's type icon is the right one (it may have changed
+        // since the lookup, from the generic stand-in to the real type icon)
+        return (it->second >= 0) ? it->second : fallbackSysIconIndex;
+    }
+
+    if (m_inFlightIcons.find(path) == m_inFlightIcons.end()) {
+        m_inFlightIcons.insert(path);
+        m_iconQueue.push_back(IconRequest{ path, fallbackSysIconIndex, m_generation.load(std::memory_order_relaxed) });
+        m_iconCv.notify_one();
+    }
+    return fallbackSysIconIndex;
+}
+
+void ImageCache::IconWorkerLoop() {
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    while (m_running.load(std::memory_order_relaxed)) {
+        IconRequest req;
+        uint64_t sysIconKey = 0;
+        bool makeSysIcon = false;
+        {
+            std::unique_lock<std::mutex> lock(m_iconMutex);
+            m_iconCv.wait(lock, [this]() {
+                return !m_running.load(std::memory_order_relaxed) || !m_iconQueue.empty() || !m_sysIconQueue.empty();
+            });
+            if (!m_running.load(std::memory_order_relaxed)) break;
+
+            if (!m_sysIconQueue.empty()) {
+                // Icons the window is waiting to draw come first, the newest request first
+                sysIconKey = m_sysIconQueue.back();
+                m_sysIconQueue.pop_back();
+                makeSysIcon = true;
+            }
+        }
+        if (makeSysIcon) {
+            IconPixels pixels;
+            if (!RenderSystemIconPixels(static_cast<int>(sysIconKey >> 2), static_cast<int>(sysIconKey & 3), pixels)) {
+                pixels = IconPixels();
+                pixels.failed = true;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_iconMutex);
+                m_sysIconPixels[sysIconKey] = std::move(pixels);
+                m_sysIconInFlight.erase(sysIconKey);
+            }
+            if (m_notifyHwnd && !m_iconNotifyPending.exchange(true, std::memory_order_relaxed)) {
+                PostMessageW(m_notifyHwnd, WM_APP_THUMB_READY, 0, 0);
+            }
+            continue;
+        }
+        {
+            std::unique_lock<std::mutex> lock(m_iconMutex);
+            if (m_iconQueue.empty()) continue;
+
+            // LIFO pop so visible viewport items resolve first
+            req = std::move(m_iconQueue.back());
+            m_iconQueue.pop_back();
+
+            uint64_t curGen = m_generation.load(std::memory_order_relaxed);
+            if (req.generation + 2 < curGen) {
+                m_inFlightIcons.erase(req.path);
+                continue;
+            }
+        }
+
+        int resolved = -1;          // no icon of its own (see GetOrQueuePerFileIconIndex)
+        SHFILEINFOW sfi = {};
+        DWORD_PTR ok = SHGetFileInfoW(req.path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX);
+        if (ok != 0 && sfi.iIcon > 0) {
+            resolved = sfi.iIcon;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_iconMutex);
+            if (m_perFileIconCache.size() >= 4096) {
+                m_perFileIconCache.clear();
+            }
+            m_perFileIconCache[req.path] = resolved;
+            m_inFlightIcons.erase(req.path);
+        }
+
+        if (m_notifyHwnd && !m_iconNotifyPending.exchange(true, std::memory_order_relaxed)) {
+            PostMessageW(m_notifyHwnd, WM_APP_THUMB_READY, 0, 0);
+        }
+    }
+
+    if (SUCCEEDED(hrCo)) {
+        CoUninitialize();
+    }
+}
+
+void ImageCache::BeginPaintBudget(double milliseconds) {
+    LARGE_INTEGER now = {}, freq = {};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    m_paintBudgetDeadline = now.QuadPart + static_cast<LONGLONG>(milliseconds * static_cast<double>(freq.QuadPart) / 1000.0);
+    m_paintUploadsLeft = kUploadsPerPaint;
+    m_paintItemsMade = 0;
+    m_paintBudgetExceeded = false;
+}
+
+bool ImageCache::TakePaintBudgetExceeded() {
+    const bool exceeded = m_paintBudgetExceeded;
+    m_paintBudgetExceeded = false;
+    m_paintBudgetDeadline = 0;
+    return exceeded;
+}
+
+bool ImageCache::OverPaintBudget() {
+    if (m_paintBudgetDeadline == 0) return false;
+    if (m_paintItemsMade < kMinItemsPerPaint) return false;
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart < m_paintBudgetDeadline && m_paintUploadsLeft > 0) return false;
+    m_paintBudgetExceeded = true;
+    return true;
+}
+
+ImageCache::SystemIcon ImageCache::GetSystemIcon(ID2D1RenderTarget* rt, int sysIconIndex, int sizeTier) {
+    if (!rt || sysIconIndex < 0) return {};
+    sizeTier = std::clamp(sizeTier, 0, 2);
+    m_iconNotifyPending.store(false, std::memory_order_relaxed);     // the window is drawing icons: tell it again
+
+    const uint64_t key = (static_cast<uint64_t>(sysIconIndex) << 2) | static_cast<uint64_t>(sizeTier);
+    auto it = m_sysIcons.find(key);
+    if (it != m_sysIcons.end()) {
         return it->second;
     }
 
+    IconPixels pixels;
+    if (m_running.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(m_iconMutex);
+        auto ready = m_sysIconPixels.find(key);
+        if (ready == m_sysIconPixels.end()) {
+            if (m_sysIconInFlight.insert(key).second) {
+                m_sysIconQueue.push_back(key);
+                m_iconCv.notify_one();
+            }
+            return {};                          // made by the icon worker
+        }
+        pixels = std::move(ready->second);
+        m_sysIconPixels.erase(ready);
+    } else {
+        if (OverPaintBudget()) return {};       // made in the next paint
+        RenderSystemIconPixels(sysIconIndex, sizeTier, pixels);
+    }
+    if (!pixels.failed && OverPaintBudget()) {
+        // Copying into the shared texture is quick, but not free: keep the pixels for the next paint
+        std::lock_guard<std::mutex> lock(m_iconMutex);
+        m_sysIconPixels[key] = std::move(pixels);
+        return {};
+    }
+
+    SystemIcon icon;
+    if (!pixels.failed && pixels.width > 0 && pixels.height > 0 && !pixels.bgra.empty()) {
+        PlaceInIconPage(rt, sizeTier, pixels, icon);
+    }
+    m_sysIcons[key] = icon;                     // an empty one: the caller draws its generic icon
+    return icon;
+}
+
+bool ImageCache::PlaceInIconPage(ID2D1RenderTarget* rt, int sizeTier, const IconPixels& pixels, SystemIcon& out) {
+    (void)sizeTier;     // the page is chosen by the icon's real size: Windows hands out small icons for big sizes too
+    // Largest icon a cell takes, and the page size, per size class (pages are made when the first icon needs them)
+    static const uint32_t kCellContent[3] = { 32, 96, 256 };
+    static const uint32_t kPageSize[3] = { 1024, 1024, 2048 };
+    const uint32_t biggest = std::max(pixels.width, pixels.height);
+    int sizeClass = 0;
+    while (sizeClass < 2 && biggest > kCellContent[sizeClass]) ++sizeClass;
+    uint32_t content = kCellContent[sizeClass];
+    uint32_t pageSize = kPageSize[sizeClass];
+    if (biggest > content) {
+        content = biggest;                      // larger than the biggest cells (rare): a page of its own
+        pageSize = biggest + 2;
+    }
+    const uint32_t cell = content + 2;
+
+    std::vector<IconPage>& pages = m_iconPages[sizeClass];
+    IconPage* page = nullptr;
+    for (IconPage& p : pages) {
+        if (p.cell == cell && p.used < p.capacity) {
+            page = &p;
+            break;
+        }
+    }
+    if (!page) {
+        const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        ID2D1Bitmap* texture = nullptr;
+        if (FAILED(rt->CreateBitmap(D2D1::SizeU(pageSize, pageSize), nullptr, 0, &props, &texture)) || !texture) {
+            return false;
+        }
+        NoteUpload();
+        IconPage fresh;
+        fresh.texture = texture;
+        fresh.cell = cell;
+        fresh.columns = pageSize / cell;
+        fresh.capacity = fresh.columns * fresh.columns;
+        pages.push_back(fresh);
+        page = &pages.back();
+    }
+
+    const uint32_t index = page->used;
+    const uint32_t x = (index % page->columns) * cell;
+    const uint32_t y = (index / page->columns) * cell;
+    // The whole cell: the icon one pixel in from its corner, everything around it transparent. A new page
+    // holds no defined pixels, and an icon drawn smaller than it is may sample a little beyond its border.
+    const uint32_t w = cell;
+    const uint32_t h = cell;
+    std::vector<uint8_t> block(static_cast<size_t>(w) * h * 4, 0);
+    for (uint32_t row = 0; row < pixels.height; ++row) {
+        memcpy(block.data() + (static_cast<size_t>(row + 1) * w + 1) * 4,
+               pixels.bgra.data() + static_cast<size_t>(row) * pixels.width * 4, static_cast<size_t>(pixels.width) * 4);
+    }
+    const D2D1_RECT_U target = { x, y, x + w, y + h };
+    if (FAILED(page->texture->CopyFromMemory(&target, block.data(), w * 4))) return false;
+    ++page->used;
+    NoteItemMade();
+
+    out.texture = page->texture;
+    out.source = D2D1::RectF(x + 1.0f, y + 1.0f, x + 1.0f + pixels.width, y + 1.0f + pixels.height);
+    out.width = static_cast<float>(pixels.width);
+    out.height = static_cast<float>(pixels.height);
+    return true;
+}
+
+// Turns a system icon into premultiplied BGRA pixels. Thread-safe; used by the icon worker. For the jumbo
+// size, an icon Windows does not have that large comes from the extra-large list.
+bool ImageCache::RenderSystemIconPixels(int sysIconIndex, int sizeTier, IconPixels& out) {
+    out = IconPixels();
     ComPtr<IImageList> imgList;
-    int shil = largeIcon ? SHIL_EXTRALARGE : SHIL_SMALL;
+    int shil = (sizeTier == 2) ? SHIL_JUMBO : ((sizeTier == 1) ? SHIL_EXTRALARGE : SHIL_SMALL);
     if (FAILED(SHGetImageList(shil, IID_PPV_ARGS(&imgList))) || !imgList) {
-        return nullptr;
+        if (sizeTier == 2) return RenderSystemIconPixels(sysIconIndex, 1, out);
+        return false;
     }
 
     HICON hIcon = nullptr;
     if (FAILED(imgList->GetIcon(sysIconIndex, ILD_TRANSPARENT, &hIcon)) || !hIcon) {
-        return nullptr;
+        if (sizeTier == 2) return RenderSystemIconPixels(sysIconIndex, 1, out);
+        return false;
     }
 
     ICONINFO iconInfo = {};
     if (!GetIconInfo(hIcon, &iconInfo)) {
         DestroyIcon(hIcon);
-        return nullptr;
+        return false;
     }
 
+    int fallbackDim = (sizeTier == 2) ? 256 : ((sizeTier == 1) ? 48 : 16);
     BITMAP bm = {};
     GetObjectW(iconInfo.hbmColor ? iconInfo.hbmColor : iconInfo.hbmMask, sizeof(bm), &bm);
-    int w = bm.bmWidth > 0 ? bm.bmWidth : (largeIcon ? 48 : 16);
-    int h = bm.bmHeight > 0 ? bm.bmHeight : (largeIcon ? 48 : 16);
+    int w = bm.bmWidth > 0 ? bm.bmWidth : fallbackDim;
+    int h = bm.bmHeight > 0 ? bm.bmHeight : fallbackDim;
+    if (!iconInfo.hbmColor && iconInfo.hbmMask && h == w * 2) {
+        h = w;
+    }
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -855,9 +1196,18 @@ ID2D1Bitmap* ImageCache::GetSystemIconBitmap(ID2D1RenderTarget* rt, int sysIconI
     bmi.bmiHeader.biCompression = BI_RGB;
 
     std::vector<uint8_t> pixels(static_cast<size_t>(w * h * 4), 0);
+    std::vector<uint8_t> maskPixels;
+    bool hasMask = false;
+
     HDC hdc = GetDC(nullptr);
     if (iconInfo.hbmColor) {
         GetDIBits(hdc, iconInfo.hbmColor, 0, h, pixels.data(), &bmi, DIB_RGB_COLORS);
+        if (iconInfo.hbmMask) {
+            maskPixels.resize(static_cast<size_t>(w * h * 4), 0);
+            if (GetDIBits(hdc, iconInfo.hbmMask, 0, h, maskPixels.data(), &bmi, DIB_RGB_COLORS) > 0) {
+                hasMask = true;
+            }
+        }
     } else {
         void* bits = nullptr;
         HBITMAP hDib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
@@ -885,19 +1235,55 @@ ID2D1Bitmap* ImageCache::GetSystemIconBitmap(ID2D1RenderTarget* rt, int sysIconI
         }
     }
     for (size_t i = 0; i < pixels.size(); i += 4) {
-        uint8_t a = hasAlpha ? pixels[i + 3] : 255;
+        uint8_t a = hasAlpha ? pixels[i + 3] : ((hasMask && maskPixels[i] != 0) ? 0 : 255);
         pixels[i + 0] = static_cast<uint8_t>((pixels[i + 0] * a) / 255);
         pixels[i + 1] = static_cast<uint8_t>((pixels[i + 1] * a) / 255);
         pixels[i + 2] = static_cast<uint8_t>((pixels[i + 2] * a) / 255);
         pixels[i + 3] = a;
     }
 
-    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    ID2D1Bitmap* bmp = nullptr;
-    rt->CreateBitmap(D2D1::SizeU(w, h), pixels.data(), w * 4, &props, &bmp);
-    m_sysIconBitmaps[key] = bmp;
-    return bmp;
+    // SHIL_JUMBO (256x256) places legacy 32x32 / 48x48 icons in the top-left [0..48, 0..48] corner.
+    // Detect and crop legacy icons tightly so FitRectCentered centers & scales them cleanly!
+    int outW = w;
+    int outH = h;
+    const uint8_t* uploadPtr = pixels.data();
+    UINT32 uploadPitch = static_cast<UINT32>(w * 4);
+    std::vector<uint8_t> croppedPixels;
+
+    if (sizeTier == 2 && w == 256 && h == 256) {
+        int maxX = -1, maxY = -1;
+        for (int y = 0; y < h; ++y) {
+            const uint8_t* row = pixels.data() + static_cast<size_t>(y * w * 4);
+            for (int x = 0; x < w; ++x) {
+                if (row[x * 4 + 3] != 0) {
+                    if (x > maxX) maxX = x;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (maxX >= 0 && maxX < 64 && maxY >= 0 && maxY < 64) {
+            int cropDim = (maxX < 48 && maxY < 48) ? 48 : 64;
+            croppedPixels.resize(static_cast<size_t>(cropDim * cropDim * 4));
+            for (int y = 0; y < cropDim; ++y) {
+                memcpy(croppedPixels.data() + static_cast<size_t>(y * cropDim * 4),
+                       pixels.data() + static_cast<size_t>(y * w * 4),
+                       static_cast<size_t>(cropDim * 4));
+            }
+            outW = cropDim;
+            outH = cropDim;
+            uploadPtr = croppedPixels.data();
+            uploadPitch = static_cast<UINT32>(cropDim * 4);
+        }
+    }
+
+    out.width = static_cast<uint32_t>(outW);
+    out.height = static_cast<uint32_t>(outH);
+    out.bgra.resize(static_cast<size_t>(outW) * outH * 4);
+    for (int y = 0; y < outH; ++y) {
+        memcpy(out.bgra.data() + static_cast<size_t>(y) * outW * 4, uploadPtr + static_cast<size_t>(y) * uploadPitch,
+               static_cast<size_t>(outW) * 4);
+    }
+    return true;
 }
 
 } // namespace Explorer2

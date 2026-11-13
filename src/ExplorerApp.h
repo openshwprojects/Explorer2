@@ -11,20 +11,34 @@
 #include "LanScanner.h"
 #include "GitIntegration.h"
 #include "AppLog.h"
+#include "TextLayoutCache.h"
 #include "FileContentPane.h"
 #include "BackupManager.h"
+#include "TransferManager.h"
 #include <atomic>
+#include <memory>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_set>
+
+struct ITaskbarList3;
 
 namespace Explorer2 {
 
 struct RibbonButtonHit {
     int id = 0;
     D2D1_RECT_F rect = {};
+    int jobId = 0;          // a transfer card's button: the job the command is for (0: none)
+};
+
+struct TabBarHit {
+    int tabIndex = -1;
+    D2D1_RECT_F tabRect = {};
+    D2D1_RECT_F closeRect = {};
+    bool isNewTabBtn = false;
 };
 
 struct FolderViewState {
@@ -45,6 +59,7 @@ struct ExplorerPaneState {
     std::vector<BreadcrumbSegment> breadcrumbs;
     SortColumn sortCol = SortColumn::Name;
     bool sortAsc = true;
+    GroupByMode groupBy = GroupByMode::None;
     float scrollY = 0.0f;
     float filmstripScrollX = 0.0f;
     int focusedIndex = -1;
@@ -95,8 +110,11 @@ private:
     void DrawLanView(const D2D1_RECT_F& rect);
     void DrawLogView(const D2D1_RECT_F& rect);
     void DrawBackupsView(const D2D1_RECT_F& rect);
+    void DrawTransfersView(const D2D1_RECT_F& rect);
     void MergeFolderInto(const std::wstring& srcDir, const std::wstring& dstDir, const std::wstring& srcName, const std::wstring& dstName);
     void StartRenameJob(const std::wstring& oldPath, const std::wstring& oldName, const std::wstring& newName);
+    // Unpacks a whole archive on a worker thread; the outcome arrives as WM_APP_EXTRACT_DONE
+    void StartExtractJob(const std::wstring& archivePath, const std::wstring& targetFolder, bool toSubfolder);
     void ShowRenameFailure(const std::wstring& oldName, const std::wstring& newName, const std::wstring& reason, DWORD err);
 
     // Git dock (right side) for folders inside a git repository
@@ -115,11 +133,21 @@ private:
     D2D1_RECT_F GetPreviewPaneRect() const;
     void SyncGitRepo(bool force = false);
     bool HandleGitDockClick(float x, float y, bool rightButton);
-    void SaveUiSettings() const;
+    // Saves the settings file. The write normally happens in the background; with waitUntilWritten the
+    // call returns only when the file is on disk, which is what the program does on its way out.
+    void SaveUiSettings(bool waitUntilWritten = false) const;
+
+    // Draws text in the main window like m_rt->DrawText, with the layout reused from earlier paints
+    // (see TextLayoutCache.h)
+    void DrawTextCached(const wchar_t* text, UINT32 length, IDWriteTextFormat* format, const D2D1_RECT_F& rect, ID2D1Brush* brush) {
+        m_textLayouts.Draw(m_dwriteFactory, m_rt, text, length, format, rect, brush);
+    }
+    TextLayoutCache m_textLayouts;
     void LoadUiSettings();
     bool IsLanView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Lan; }
     bool IsLogView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Log; }
     bool IsBackupsView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Backups; }
+    bool IsTransfersView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Transfers; }
     bool IsMonitoringView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Monitoring; }
     void DrawCardShell(float x, float y, float w, float h, const std::wstring& title, uint32_t badgeHex, bool showCopyHint, float extraRightPad = 0.0f);
     // Shared building blocks of the card-based views (Sprzęt / Programy)
@@ -177,6 +205,18 @@ private:
         return m_splitView && !m_isFullScreen &&
                m_viewMode != ViewMode::Hardware && m_viewMode != ViewMode::FullViewer;
     }
+    bool IsTabBarVisible() const {
+        return m_tabs.size() > 1 && !IsSplitViewActive() && !m_isFullScreen &&
+               m_viewMode != ViewMode::Hardware && m_viewMode != ViewMode::FullViewer;
+    }
+    void SwapStateWith(ExplorerPaneState& state);
+    void CreateNewTab(const std::wstring& initialPath = L"", bool switchToNew = true);
+    void CloseTab(int tabIndex);
+    void SwitchToTab(int tabIndex);
+    void DrawTabBar(const D2D1_RECT_F& barRect);
+    std::wstring ResolveDropTargetFolder(float x, float y, std::wstring* outTargetLabel = nullptr) const;
+    void ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, const std::wstring& targetDir, bool forceCopy, bool forceMove);
+    void DrawDragOverlay();
     D2D1_RECT_F GetFullWorkspaceRect() const;
     D2D1_RECT_F GetSplitPaneOuterRect(int paneIdx) const;
     D2D1_RECT_F GetSplitPaneContentMainRect(int paneIdx) const;
@@ -219,9 +259,16 @@ private:
     void ExecuteRibbonCommand(int cmdId);
     void ActivateFocusedOrSelectedItem();
     void DeleteSelectedItems(bool permanent);
+    void StartDeleteJob(const std::vector<std::wstring>& paths, bool permanent);
+    bool ReportDeleteJobResult(const TransferCompletionEvent& ev);
+    void ShowDeleteFailures(const TransferCompletionEvent& ev);
     void PerformUndoDelete();
     void CopySelected(bool isCut);
-    void PasteIntoCurrent();
+    void PasteIntoCurrent(bool forceVerifyXxHash = false);
+    // Pastes the files on the clipboard into targetDir (copy, or move after a cut)
+    void PasteInto(const std::wstring& targetDir, bool forceVerifyXxHash = false);
+    void StartManagedTransfer(const std::vector<std::wstring>& srcPaths, const std::wstring& targetDir, bool isMove, bool forceVerifyXxHash = false);
+    void UpdateTaskbarProgress();
     void CopySelectedPaths();
     void CreateNewFolderAction();
     void StartInlineRename();
@@ -310,13 +357,14 @@ private:
     // Sorting & Column widths (Nazwa, Data modyfikacji, Typ, Rozmiar, Operacje)
     SortColumn m_sortCol = SortColumn::Name;
     bool m_sortAsc = true;
+    GroupByMode m_groupBy = GroupByMode::None;
     float m_colWidths[5] = { 320.0f, 145.0f, 155.0f, 115.0f, 128.0f };
     int m_resizingCol = -1;
     float m_resizeStartX = 0.0f;
     float m_resizeStartWidth = 0.0f;
 
     // Splitter state
-    float m_treePaneWidth = 235.0f;
+    float m_treePaneWidth = 265.0f;
     float m_previewPaneWidth = 450.0f;
     bool m_draggingTreeSplitter = false;
     bool m_draggingPreviewSplitter = false;
@@ -333,6 +381,7 @@ private:
     int m_hoverIndex = -1;
     int m_hoverRowActionKind = 0; // 0=none, 1=Kosz button, 2=Usuń button
     int m_hoverTreeIndex = -1;
+    int m_hoverBreadcrumbPane = -1;
     int m_hoverBreadcrumbIndex = -1;
     int m_hoverBreadcrumbArrowIndex = -1;
     int m_hoverRibbonBtn = 0;
@@ -344,18 +393,44 @@ private:
     std::atomic<int> m_renamePending{ 0 };
     std::wstring m_renamePendingText;     // "old -> new" shown while the job runs (UI thread only)
     std::atomic<int> m_mergePending{ 0 };
-    std::atomic<int> m_mergeMovedCount{ 0 };
+    // Shared with the merge thread, which counts in it and may still be running when the window is gone
+    std::shared_ptr<std::atomic<int>> m_mergeMovedCount = std::make_shared<std::atomic<int>>(0);
     std::wstring m_mergePendingText;      // "src -> dst" shown while the merge runs (UI thread only)
+    std::atomic<int> m_extractPending{ 0 };
+    std::wstring m_extractPendingText;    // archive name shown while it is being unpacked (UI thread only)
+    // Extractions under way ("archive|target"), and the one that finished last, so that a second click on
+    // the same button does not unpack the same archive to the same place twice (UI thread only)
+    std::unordered_set<std::wstring> m_extractActive;
+    std::wstring m_extractLastDoneKey;
+    ULONGLONG m_extractLastDoneTick = 0;
     int m_logFilter = 0;                  // Log tab: 0 = everything, 1 = warnings and errors, 2 = errors only
     bool m_gitWasBusy = false;            // for logging the end of a git action
     bool m_gitActionLogPending = false;   // a fetch / pull / push / switch was started and its result is not logged yet
     bool m_lanWasScanning = false;        // for logging the end of a LAN scan
 
-    // Rubber-band / Marquee Box Selection
+    // Rubber-band / Marquee Box Selection & Drag-and-Drop state
     bool m_isBoxSelecting = false;
     D2D1_POINT_2F m_boxStartPt = {};
     D2D1_POINT_2F m_boxCurrentPt = {};
     std::vector<bool> m_preBoxSelection;
+
+    bool m_dragCandidate = false;
+    bool m_dragDeferSingleSelect = false;
+    int m_dragSourceItemIdx = -1;
+    D2D1_POINT_2F m_dragStartPt = {};
+    bool m_isDraggingItems = false;
+    std::vector<std::wstring> m_dragPaths;
+    std::wstring m_dragTargetDir;
+    std::wstring m_dragTargetLabel;
+
+    // Multi-Tab state
+    std::vector<ExplorerPaneState> m_tabs;
+    int m_activeTab = 0;
+    std::vector<TabBarHit> m_tabHits;
+    int m_hoverTabIndex = -1;
+    int m_hoverTabCloseIndex = -1;
+    bool m_hoverNewTabBtn = false;
+    bool m_darkMode = false;
 
     // Full Viewer Zoom / Pan state
     float m_viewerZoom = 1.0f;
@@ -365,6 +440,14 @@ private:
     bool m_viewerDraggingPan = false;
     D2D1_POINT_2F m_viewerDragStart = {};
     float m_filmstripScrollX = 0.0f;
+    bool m_viewerCompareMode = false;
+    bool m_viewerShowHistogram = false;
+    bool m_viewerSlideshow = false;
+    std::wstring m_viewerHistPath;
+    uint32_t m_viewerHistR[64] = {};
+    uint32_t m_viewerHistG[64] = {};
+    uint32_t m_viewerHistB[64] = {};
+    uint32_t m_viewerHistMax = 1;
 
     // Type-ahead buffer
     std::wstring m_typeAheadBuf;
@@ -389,12 +472,18 @@ private:
     HardwareSubTab m_hwSubTab = HardwareSubTab::All;
     bool m_hwLiveRefresh = true;
     ULONGLONG m_lastHwLiveUpdateTick = 0;
+    UINT m_workAnimIntervalMs = 0;      // the work timer's interval; 0 = not running (EnsureWorkAnimTimerState)
     float m_hwScrollY = 0.0f;
     float m_hwMaxScrollY = 0.0f;
     std::vector<HardwareCardHit> m_hwCardHits;
     int m_hoverHwCardIndex = -1;
     int m_hwSelectedDisk = -1;     // physical disk index shown in the SMART panel
     bool m_hwSmartInit = false;    // SMART for all disks read once on first visit
+    std::wstring m_hwSelectedUsbId;      // selected USB node deviceInstanceId
+    std::wstring m_hwSelectedComPort;    // selected COMx port name
+    bool m_hwInspectComMode = false;     // true = inspect selected COM port, false = inspect selected USB node
+    bool m_hwShowUsbInterfaces = true;   // true = show child MI_xx/HID interfaces in USB TreeView
+    std::unordered_set<std::wstring> m_hwCollapsedUsbNodes; // collapsed parent deviceInstanceIds in USB TreeView
 
     // Payload of the card-hit that was just clicked (Sprzęt / Programy views)
     int m_hwActionIndex = 0;
@@ -485,6 +574,14 @@ private:
     BackupManager m_backups;
     int m_backupSelectedJobId = 1;
     ULONGLONG m_lastBackupTickMs = 0;
+    TransferManager m_transfers;
+    int m_xferSelectedJobId = 0;
+    ULONGLONG m_lastDirChangedWhileXferTick = 0;
+    bool m_pendingDeferredDirRefresh = false;
+    ITaskbarList3* m_taskbarList = nullptr;
+    UINT m_wmTaskbarBtnCreated = 0;
+    int m_lastTbState = 0;
+    int m_lastTbPermille = -1;
 };
 
 } // namespace Explorer2

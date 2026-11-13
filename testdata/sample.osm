@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="Explorer2">
+  <node id="1001" lat="52.2297" lon="21.0122">
+    <tag k="name" v="Warszawa Centrum"/>
+    <tag k="railway" v="station"/>
+  </node>
+  <node id="1002" lat="52.2319" lon="21.0067">
+    <tag k="name" v="Palace of Culture and Science"/>
+    <tag k="tourism" v="attraction"/>
+  </node>
+  <way id="2001">
+    <nd ref="1001"/>
+    <nd ref="1002"/>
+    <tag k="highway" v="primary"/>
+    <tag k="name" v="Marszalkowska"/>
+  </way>
+</osm>

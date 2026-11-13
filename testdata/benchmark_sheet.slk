@@ -1,0 +1,15 @@
+ID;PWXL;N;E
+B;Y4;X3
+C;Y1;X1;K"Module"
+C;Y1;X2;K"Latency_ms"
+C;Y1;X3;K"Status"
+C;Y2;X1;K"FastDirEnum"
+C;Y2;X2;K0.12
+C;Y2;X3;K"OK"
+C;Y3;X1;K"FtpDualPane"
+C;Y3;X2;K1.45
+C;Y3;X3;K"OK"
+C;Y4;X1;K"EdaSchematic"
+C;Y4;X2;K2.10
+C;Y4;X3;K"OK"
+E

@@ -6,6 +6,7 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <thread>
 
 namespace Explorer2 {
 
@@ -129,6 +130,7 @@ private:
 
     mutable std::mutex m_mutex;
     std::atomic<bool> m_ready{ false };
+    std::thread m_scanThread;           // the start-up scan; it works on this object, so the destructor waits for it
 
     std::wstring m_7zGPath;
     std::wstring m_7zFMPath;

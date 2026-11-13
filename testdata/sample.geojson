@@ -1,0 +1,8 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [21.0122, 52.2297] }, "properties": { "name": "Warsaw Central" } },
+    { "type": "Feature", "geometry": { "type": "Point", "coordinates": [19.9450, 50.0647] }, "properties": { "name": "Krakow Main Square" } },
+    { "type": "Feature", "geometry": { "type": "LineString", "coordinates": [[21.01, 52.22], [19.94, 50.06]] }, "properties": { "name": "Express Rail Link" } }
+  ]
+}

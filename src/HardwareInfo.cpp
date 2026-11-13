@@ -20,6 +20,8 @@
 #include <shobjidl.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <devpropdef.h>
+#include <cfgmgr32.h>
 
 #include "HardwareInfo.h"
 #include "FileEngine.h"
@@ -29,6 +31,8 @@
 #include <cstring>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -39,6 +43,7 @@
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 namespace Explorer2 {
 
@@ -414,6 +419,8 @@ bool HardwareInspector::ApplyStagedData() {
     m_system.audioInputs = m_staged.audioInputs;
     m_system.topProcesses = m_staged.topProcesses;
     m_thermalZones = m_staged.thermalZones;
+    m_usbTree = m_staged.usbTree;
+    m_comPorts = m_staged.comPorts;
     m_gpuLoadHistory = m_staged.gpuLoadHistory;
     m_netRxHistoryKBps = m_staged.netRxHistoryKBps;
     m_netTxHistoryKBps = m_staged.netTxHistoryKBps;
@@ -432,6 +439,17 @@ void HardwareInspector::RequestAsyncRefresh(bool fullInventory, bool allSmart, i
     m_workerCv.notify_one();
 }
 
+void HardwareInspector::RequestUsbComRefresh(bool syncForCli) {
+    StartWorkerThreadIfNeeded();
+    m_reqUsbComRefresh.store(true, std::memory_order_release);
+    m_workerBusy.store(true, std::memory_order_release);
+    m_workerCv.notify_one();
+    if (syncForCli) {
+        WaitForAsync();
+        ApplyStagedData();
+    }
+}
+
 void HardwareInspector::WaitForAsync() {
     std::unique_lock<std::mutex> lk(m_workerMutex);
     m_doneCv.wait(lk, [this]() {
@@ -439,7 +457,8 @@ void HardwareInspector::WaitForAsync() {
                !m_reqFullRefresh.load(std::memory_order_acquire) &&
                !m_reqAllSmart.load(std::memory_order_acquire) &&
                m_reqSingleSmartDisk.load(std::memory_order_acquire) < 0 &&
-               !m_reqLiveUpdate.load(std::memory_order_acquire);
+               !m_reqLiveUpdate.load(std::memory_order_acquire) &&
+               !m_reqUsbComRefresh.load(std::memory_order_acquire);
     });
 }
 
@@ -454,17 +473,19 @@ void HardwareInspector::WorkerLoop() {
                        m_reqFullRefresh.load(std::memory_order_acquire) ||
                        m_reqAllSmart.load(std::memory_order_acquire) ||
                        m_reqSingleSmartDisk.load(std::memory_order_acquire) >= 0 ||
-                       m_reqLiveUpdate.load(std::memory_order_acquire);
+                       m_reqLiveUpdate.load(std::memory_order_acquire) ||
+                       m_reqUsbComRefresh.load(std::memory_order_acquire);
             });
         }
         if (m_stopWorker.load(std::memory_order_acquire)) break;
 
         m_workerBusy.store(true, std::memory_order_release);
 
-        bool doFull  = m_reqFullRefresh.exchange(false, std::memory_order_acq_rel);
-        bool doAllSm = m_reqAllSmart.exchange(false, std::memory_order_acq_rel);
-        int singleSm = m_reqSingleSmartDisk.exchange(-1, std::memory_order_acq_rel);
-        bool doLive  = m_reqLiveUpdate.exchange(false, std::memory_order_acq_rel);
+        bool doFull   = m_reqFullRefresh.exchange(false, std::memory_order_acq_rel);
+        bool doAllSm  = m_reqAllSmart.exchange(false, std::memory_order_acq_rel);
+        int singleSm  = m_reqSingleSmartDisk.exchange(-1, std::memory_order_acq_rel);
+        bool doLive   = m_reqLiveUpdate.exchange(false, std::memory_order_acq_rel);
+        bool doUsbCom = m_reqUsbComRefresh.exchange(false, std::memory_order_acq_rel);
 
         // 1. One-time NVML initialization on background thread (never blocks UI!)
         if (!m_nvmlTried) {
@@ -486,7 +507,7 @@ void HardwareInspector::WorkerLoop() {
         }
         if (m_stopWorker.load(std::memory_order_acquire)) break;
 
-        // 2. Full hardware & OS/Audio/Network inventory
+        // 2. Full hardware & OS/Audio/Network/USB/COM inventory
         if (doFull) {
             QueryGpusAndDisplays();
             if (m_stopWorker.load(std::memory_order_acquire)) break;
@@ -496,8 +517,13 @@ void HardwareInspector::WorkerLoop() {
             if (m_stopWorker.load(std::memory_order_acquire)) break;
             QuerySystemAndAudio(true);
             if (m_stopWorker.load(std::memory_order_acquire)) break;
+            QueryUsbAndComPorts();
+            if (m_stopWorker.load(std::memory_order_acquire)) break;
             UpdateGpuLiveTelemetry();
-            // Publish immediately so GPUs, Displays, Networks, Audio & Processes appear before SMART IOCTLs run
+            // Publish immediately so GPUs, Displays, Networks, USB/COM, Audio & Processes appear before SMART IOCTLs run
+            PublishWorkerStateToStaged();
+        } else if (doUsbCom) {
+            QueryUsbAndComPorts();
             PublishWorkerStateToStaged();
         }
 
@@ -535,7 +561,8 @@ void HardwareInspector::WorkerLoop() {
             bool morePending = m_reqFullRefresh.load(std::memory_order_relaxed) ||
                                m_reqAllSmart.load(std::memory_order_relaxed) ||
                                m_reqSingleSmartDisk.load(std::memory_order_relaxed) >= 0 ||
-                               m_reqLiveUpdate.load(std::memory_order_relaxed);
+                               m_reqLiveUpdate.load(std::memory_order_relaxed) ||
+                               m_reqUsbComRefresh.load(std::memory_order_relaxed);
             if (!morePending) {
                 m_workerBusy.store(false, std::memory_order_release);
                 m_doneCv.notify_all();
@@ -1842,6 +1869,823 @@ void HardwareInspector::QuerySystemAndAudio(bool fullRefresh) {
     }
 }
 
+namespace {
+
+static const DEVPROPKEY kDevPkeyBusReportedDeviceDesc = {
+    { 0x540b947e, 0x8b40, 0x45bc, { 0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2 } }, 4
+};
+
+std::wstring ToUpperAscii(std::wstring s) {
+    for (wchar_t& c : s) {
+        if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
+    }
+    return s;
+}
+
+std::wstring GetDevInstId(DEVINST dn) {
+    wchar_t buf[512] = {};
+    if (CM_Get_Device_IDW(dn, buf, 511, 0) == CR_SUCCESS) {
+        return buf;
+    }
+    return L"";
+}
+
+std::wstring GetDevInstStringProp(DEVINST dn, ULONG prop) {
+    ULONG regType = 0;
+    wchar_t buf[1024] = {};
+    ULONG len = sizeof(buf);
+    if (CM_Get_DevNode_Registry_PropertyW(dn, prop, &regType, buf, &len, 0) != CR_SUCCESS) {
+        return L"";
+    }
+    if (regType == REG_SZ || regType == REG_EXPAND_SZ) {
+        return buf;
+    }
+    if (regType == REG_MULTI_SZ) {
+        std::wstring joined;
+        const wchar_t* p = buf;
+        const wchar_t* end = buf + (len / sizeof(wchar_t));
+        int count = 0;
+        while (p < end && *p && count < 2) {
+            if (!joined.empty()) joined += L"  |  ";
+            joined += p;
+            p += wcslen(p) + 1;
+            ++count;
+        }
+        return joined;
+    }
+    return L"";
+}
+
+std::wstring GetDevInstBusReportedDesc(DEVINST dn) {
+    DEVPROPTYPE propType = 0;
+    wchar_t buf[512] = {};
+    ULONG len = sizeof(buf);
+    if (CM_Get_DevNode_PropertyW(dn, &kDevPkeyBusReportedDeviceDesc, &propType, reinterpret_cast<PBYTE>(buf), &len, 0) == CR_SUCCESS &&
+        propType == DEVPROP_TYPE_STRING) {
+        std::wstring s = buf;
+        while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L'\r' || s.back() == L'\n' || s.back() == L'\0')) {
+            s.pop_back();
+        }
+        return s;
+    }
+    return L"";
+}
+
+void GetDriverVersionAndProvider(const std::wstring& driverKey, std::wstring& outVer, std::wstring& outProvider) {
+    outVer.clear();
+    outProvider.clear();
+    if (driverKey.empty()) return;
+    std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Control\\Class\\" + driverKey;
+    outVer      = ReadRegSz(HKEY_LOCAL_MACHINE, regPath.c_str(), L"DriverVersion");
+    outProvider = ReadRegSz(HKEY_LOCAL_MACHINE, regPath.c_str(), L"ProviderName");
+}
+
+std::wstring ReadDevNodePortName(DEVINST dn) {
+    HKEY hKey = nullptr;
+    if (CM_Open_DevNode_Key(dn, KEY_READ, 0, RegDisposition_OpenExisting, &hKey, CM_REGISTRY_HARDWARE) == CR_SUCCESS && hKey) {
+        wchar_t buf[128] = {};
+        DWORD sz = sizeof(buf);
+        DWORD type = 0;
+        std::wstring port;
+        if (RegQueryValueExW(hKey, L"PortName", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz) == ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ)) {
+            port = buf;
+        }
+        RegCloseKey(hKey);
+        if (port.size() >= 4 && _wcsnicmp(port.c_str(), L"COM", 3) == 0 && iswdigit(port[3])) {
+            return ToUpperAscii(port);
+        }
+    }
+    return L"";
+}
+
+std::wstring ExtractComPortFromText(const std::wstring& text) {
+    std::wstring up = ToUpperAscii(text);
+    size_t pos = 0;
+    while ((pos = up.find(L"(COM", pos)) != std::wstring::npos) {
+        size_t numStart = pos + 4;
+        size_t numEnd = numStart;
+        while (numEnd < up.size() && up[numEnd] >= L'0' && up[numEnd] <= L'9') {
+            ++numEnd;
+        }
+        if (numEnd > numStart && numEnd < up.size() && up[numEnd] == L')') {
+            return L"COM" + up.substr(numStart, numEnd - numStart);
+        }
+        pos = numStart;
+    }
+    return L"";
+}
+
+int ParseComNumber(const std::wstring& portName) {
+    if (portName.size() > 3 && _wcsnicmp(portName.c_str(), L"COM", 3) == 0) {
+        return _wtoi(portName.c_str() + 3);
+    }
+    return 0;
+}
+
+void ParseVidPidRevAndSerial(const std::wstring& instanceId, const std::wstring& hwIds,
+                             std::wstring& outVid, std::wstring& outPid,
+                             std::wstring& outRev, std::wstring& outSerial) {
+    outVid.clear();
+    outPid.clear();
+    outRev.clear();
+    outSerial.clear();
+
+    std::wstring combined = ToUpperAscii(instanceId + L" " + hwIds);
+
+    auto findHex4 = [&](const wchar_t* prefix) -> std::wstring {
+        size_t p = combined.find(prefix);
+        if (p == std::wstring::npos) return L"";
+        p += wcslen(prefix);
+        if (p + 4 > combined.size()) return L"";
+        for (int i = 0; i < 4; ++i) {
+            wchar_t c = combined[p + i];
+            bool ok = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F');
+            if (!ok) return L"";
+        }
+        return combined.substr(p, 4);
+    };
+
+    outVid = findHex4(L"VID_");
+    if (outVid.empty()) outVid = findHex4(L"VEN_");
+    outPid = findHex4(L"PID_");
+    if (outPid.empty()) outPid = findHex4(L"DEV_");
+    outRev = findHex4(L"REV_");
+
+    // Extract serial number from instance ID:
+    // 1. Standard USB\VID_xxxx&PID_xxxx\<serial> (if <serial> has no '&', it's a real USB iSerialNumber)
+    // 2. FTDI FTDIBUS\VID_0403+PID_6001+<serial>\0000
+    std::wstring upId = ToUpperAscii(instanceId);
+    if (upId.rfind(L"FTDIBUS\\", 0) == 0) {
+        size_t pPid = upId.find(L"+PID_");
+        if (pPid != std::wstring::npos && pPid + 10 < instanceId.size() && instanceId[pPid + 9] == L'+') {
+            size_t serStart = pPid + 10;
+            size_t slash = instanceId.find(L'\\', serStart);
+            if (slash != std::wstring::npos && slash > serStart) {
+                outSerial = instanceId.substr(serStart, slash - serStart);
+            }
+        }
+    } else {
+        size_t s1 = instanceId.find(L'\\');
+        size_t s2 = (s1 != std::wstring::npos) ? instanceId.find(L'\\', s1 + 1) : std::wstring::npos;
+        if (s2 != std::wstring::npos && s2 + 1 < instanceId.size()) {
+            std::wstring tail = instanceId.substr(s2 + 1);
+            if (tail.find(L'&') == std::wstring::npos && tail.size() >= 3) {
+                outSerial = tail;
+            }
+        }
+    }
+}
+
+void ParseHubAndPortFromLocation(const std::wstring& loc, int& outPort, int& outHub) {
+    outPort = 0;
+    outHub = 0;
+    if (loc.empty()) return;
+    std::wstring up = ToUpperAscii(loc);
+    size_t pPort = up.find(L"PORT_#");
+    if (pPort != std::wstring::npos && pPort + 6 < up.size()) {
+        outPort = _wtoi(up.c_str() + pPort + 6);
+    }
+    size_t pHub = up.find(L"HUB_#");
+    if (pHub != std::wstring::npos && pHub + 5 < up.size()) {
+        outHub = _wtoi(up.c_str() + pHub + 5);
+    }
+}
+
+std::wstring LookupUsbVendorName(const std::wstring& vid) {
+    if (vid.empty()) return L"";
+    struct VidEntry { const wchar_t* vid; const wchar_t* name; };
+    static const VidEntry kVendors[] = {
+        { L"8086", L"Intel Corporation" },
+        { L"8087", L"Intel Wireless / Bluetooth" },
+        { L"1022", L"AMD" },
+        { L"10DE", L"NVIDIA" },
+        { L"1A86", L"QinHeng Electronics (WCH)" },
+        { L"10C4", L"Silicon Labs" },
+        { L"0403", L"FTDI (Future Technology Devices)" },
+        { L"067B", L"Prolific Technology" },
+        { L"303A", L"Espressif Systems (ESP32)" },
+        { L"0483", L"STMicroelectronics" },
+        { L"2341", L"Arduino SA" },
+        { L"2A03", L"Arduino" },
+        { L"2E8A", L"Raspberry Pi (RP2040/RP2350)" },
+        { L"16C0", L"Van Ooijen / PJRC Teensy" },
+        { L"239A", L"Adafruit Industries" },
+        { L"1366", L"SEGGER Microcontroller" },
+        { L"0D28", L"ARM Ltd (CMSIS-DAP / DAPLink)" },
+        { L"04D8", L"Microchip Technology" },
+        { L"0424", L"Microchip / SMSC" },
+        { L"04B4", L"Cypress / Infineon" },
+        { L"04E2", L"MaxLinear / Exar" },
+        { L"046D", L"Logitech" },
+        { L"045E", L"Microsoft Corporation" },
+        { L"0B05", L"ASUSTeK Computer" },
+        { L"0BDA", L"Realtek Semiconductor" },
+        { L"04F2", L"Chicony Electronics" },
+        { L"05E3", L"Genesys Logic" },
+        { L"2109", L"VIA Labs (VLI)" },
+        { L"174C", L"ASMedia Technology" },
+        { L"1B21", L"ASMedia Technology" },
+        { L"1A40", L"Terminus Technology" },
+        { L"1033", L"Renesas / NEC" },
+        { L"1B73", L"Fresco Logic" },
+        { L"0781", L"SanDisk / Western Digital" },
+        { L"1058", L"Western Digital" },
+        { L"0BC2", L"Seagate Technology" },
+        { L"0951", L"Kingston / HyperX" },
+        { L"13FE", L"Phison Electronics" },
+        { L"152D", L"JMicron Technology" },
+        { L"058F", L"Alcor Micro" },
+        { L"04E8", L"Samsung Electronics" },
+        { L"05AC", L"Apple Inc." },
+        { L"18D1", L"Google Inc." },
+        { L"1532", L"Razer Inc." },
+        { L"1B1C", L"Corsair" },
+        { L"1038", L"SteelSeries" },
+        { L"046A", L"Cherry GmbH" },
+        { L"3434", L"Keychron" },
+        { L"054C", L"Sony Corporation" },
+        { L"28DE", L"Valve Corporation" },
+        { L"0458", L"KYE Systems (Genius)" },
+        { L"0CF3", L"Qualcomm Atheros" },
+        { L"0A5C", L"Broadcom" },
+        { L"0E8D", L"MediaTek" },
+        { L"04CA", L"Lite-On Technology" },
+        { L"04F3", L"Elan Microelectronics" },
+        { L"06CB", L"Synaptics" },
+        { L"27C6", L"Goodix Technology" },
+        { L"048D", L"ITE Tech" },
+        { L"04A9", L"Canon" },
+        { L"03F0", L"HP Inc." },
+        { L"04B8", L"Seiko Epson" },
+        { L"04F9", L"Brother Industries" },
+        { L"413C", L"Dell Inc." },
+        { L"17EF", L"Lenovo" },
+        { L"1462", L"MSI (Micro-Star International)" },
+        { L"0414", L"Gigabyte Technology" },
+        { L"26CE", L"ASRock" },
+        { L"1D6B", L"Linux Foundation" }
+    };
+    for (const auto& e : kVendors) {
+        if (_wcsicmp(vid.c_str(), e.vid) == 0) return e.name;
+    }
+    return L"";
+}
+
+std::wstring IdentifyUsbChipModel(const std::wstring& vid, const std::wstring& pid,
+                                  const std::wstring& desc, const std::wstring& busDesc) {
+    std::wstring vp = vid.empty() ? L"" : (vid + L":" + pid);
+    if (vp == L"1A86:7523") return L"QinHeng CH340 USB-UART Bridge";
+    if (vp == L"1A86:7522") return L"QinHeng CH340K USB-UART Bridge";
+    if (vp == L"1A86:5523") return L"QinHeng CH341 USB-UART/I2C/SPI";
+    if (vp == L"1A86:55D2") return L"QinHeng CH342 Dual USB-UART";
+    if (vp == L"1A86:55D3") return L"QinHeng CH343 High-Speed USB-UART";
+    if (vp == L"1A86:55D4") return L"QinHeng CH9102F/X USB-UART";
+    if (vp == L"1A86:55D5") return L"QinHeng CH9104 Quad USB-UART";
+    if (vp == L"10C4:EA60") return L"Silicon Labs CP2102 / CP2102N USB-UART";
+    if (vp == L"10C4:EA70") return L"Silicon Labs CP2105 Dual USB-UART";
+    if (vp == L"10C4:EA71") return L"Silicon Labs CP2108 Quad USB-UART";
+    if (vp == L"0403:6001") return L"FTDI FT232R / FT245R USB-UART";
+    if (vp == L"0403:6010") return L"FTDI FT2232C/D/H Dual USB-UART/JTAG";
+    if (vp == L"0403:6011") return L"FTDI FT4232H Quad USB-UART";
+    if (vp == L"0403:6014") return L"FTDI FT232H High-Speed USB-UART/FIFO";
+    if (vp == L"0403:6015") return L"FTDI FT230X / FT231X USB-UART";
+    if (vp == L"067B:2303" || vp == L"067B:23A3" || vp == L"067B:23C3") return L"Prolific PL2303 USB-to-Serial";
+    if (vp == L"303A:1001") return L"Espressif ESP32-S3/C3/C6 Native USB Serial/JTAG";
+    if (vp == L"303A:0002") return L"Espressif ESP32-S2 Native USB CDC";
+    if (vid == L"303A")     return L"Espressif ESP32 USB CDC / JTAG";
+    if (vp == L"0483:5740") return L"STMicroelectronics STM32 Virtual COM Port";
+    if (vp == L"0483:374B" || vp == L"0483:374E" || vp == L"0483:3752") return L"STMicroelectronics ST-LINK Debug / VCP";
+    if (vid == L"2341" || vid == L"2A03") return L"Arduino USB CDC Serial";
+    if (vid == L"2E8A")     return L"Raspberry Pi RP2040 / RP2350 USB CDC";
+    if (vp == L"16C0:0483") return L"PJRC Teensyduino USB Serial";
+    if (vid == L"1366")     return L"SEGGER J-Link CDC / Debug Probe";
+    if (vp == L"0D28:0204") return L"ARM CMSIS-DAP / DAPLink UART";
+    if (vp == L"04D8:000A" || vp == L"04D8:00DD") return L"Microchip MCP2200 / MCP2221 USB-UART";
+
+    std::wstring up = ToUpperAscii(desc + L" " + busDesc);
+    if (up.find(L"CH340") != std::wstring::npos) return L"QinHeng CH340 USB-UART";
+    if (up.find(L"CH341") != std::wstring::npos) return L"QinHeng CH341 USB-UART";
+    if (up.find(L"CH342") != std::wstring::npos) return L"QinHeng CH342 Dual USB-UART";
+    if (up.find(L"CH343") != std::wstring::npos) return L"QinHeng CH343 USB-UART";
+    if (up.find(L"CH9102") != std::wstring::npos) return L"QinHeng CH9102 USB-UART";
+    if (up.find(L"CP210") != std::wstring::npos) return L"Silicon Labs CP210x USB-UART";
+    if (up.find(L"FT232") != std::wstring::npos || up.find(L"FTDI") != std::wstring::npos) return L"FTDI USB-UART Bridge";
+    if (up.find(L"PL2303") != std::wstring::npos) return L"Prolific PL2303 USB-UART";
+    if (up.find(L"ESP32") != std::wstring::npos) return L"Espressif ESP32 USB Serial";
+    if (up.find(L"STM32") != std::wstring::npos || up.find(L"STLINK") != std::wstring::npos) return L"STMicroelectronics STM32 VCP";
+    if (up.find(L"COM0COM") != std::wstring::npos) return L"Virtual Serial Port Pair (com0com)";
+    if (up.find(L"BLUETOOTH") != std::wstring::npos) return L"Bluetooth RFCOMM Serial SPP";
+    return L"";
+}
+
+std::wstring FormatDevNodeStatus(ULONG status, ULONG problem) {
+    if (problem != 0) {
+        switch (problem) {
+        case CM_PROB_NOT_CONFIGURED:    return L"Brak konfiguracji / sterownika (Kod 1)";
+        case CM_PROB_FAILED_START:      return L"Nie można uruchomić urządzenia (Kod 10)";
+        case CM_PROB_NORMAL_CONFLICT:   return L"Konflikt zasobów sprzętowych (Kod 12)";
+        case CM_PROB_NEED_RESTART:      return L"Wymagany restart systemu (Kod 14)";
+        case CM_PROB_REINSTALL:         return L"Wymagana reinstalacja sterownika (Kod 18)";
+        case CM_PROB_DISABLED:          return L"Wyłączone w Menedżerze urządzeń (Kod 22)";
+        case CM_PROB_FAILED_INSTALL:    return L"Brak zainstalowanego sterownika (Kod 28)";
+        case CM_PROB_FAILED_ADD:        return L"Błąd ładowania sterownika (Kod 31)";
+        case CM_PROB_DRIVER_FAILED_LOAD:return L"Nie można załadować sterownika (Kod 39)";
+        case CM_PROB_FAILED_POST_START: return L"Urządzenie USB zgłosiło błąd (Kod 43)";
+        case CM_PROB_PHANTOM:           return L"Odłączone (Kod 45)";
+        case CM_PROB_UNSIGNED_DRIVER:   return L"Niepodpisany sterownik cyfrowo (Kod 52)";
+        default:                        return L"Problem urządzenia PnP (Kod " + std::to_wstring(problem) + L")";
+        }
+    }
+    if (status & DN_STARTED) {
+        return L"OK (Aktywne / DN_STARTED)";
+    }
+    return L"OK (Gotowe)";
+}
+
+bool IsGenericUsbDescription(const std::wstring& s) {
+    if (s.empty()) return true;
+    std::wstring up = ToUpperAscii(s);
+    return up.find(L"URZĄDZENIE KOMPOZYTOWE USB") != std::wstring::npos ||
+           up.find(L"USB COMPOSITE DEVICE") != std::wstring::npos ||
+           up.find(L"URZĄDZENIE WEJŚCIOWE USB") != std::wstring::npos ||
+           up.find(L"USB INPUT DEVICE") != std::wstring::npos ||
+           up.find(L"URZĄDZENIE PAMIĘCI MASOWEJ USB") != std::wstring::npos ||
+           up.find(L"USB MASS STORAGE DEVICE") != std::wstring::npos ||
+           up.find(L"URZĄDZENIE SZEREGOWE USB") != std::wstring::npos ||
+           up.find(L"USB SERIAL DEVICE") != std::wstring::npos ||
+           up.find(L"ZGODNE Z HID") != std::wstring::npos ||
+           up.find(L"HID-COMPLIANT") != std::wstring::npos;
+}
+
+} // namespace
+
+void HardwareInspector::QueryUsbAndComPorts() {
+    m_wState.comPorts.clear();
+    m_wState.usbTree.clear();
+
+    // 1. Read active kernel serial map from HKLM\HARDWARE\DEVICEMAP\SERIALCOMM
+    // Maps COM port name (e.g. "COM3") -> NT device path (e.g. "\Device\Serial0" or "\Device\USBSER000")
+    std::unordered_map<std::wstring, std::wstring> comToNtDevice;
+    {
+        HKEY hSerialComm = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_READ, &hSerialComm) == ERROR_SUCCESS && hSerialComm) {
+            for (DWORD idx = 0; idx < 512; ++idx) {
+                wchar_t valName[256] = {};
+                DWORD valNameLen = 255;
+                DWORD type = 0;
+                wchar_t dataBuf[128] = {};
+                DWORD dataSize = sizeof(dataBuf);
+                LONG rc = RegEnumValueW(hSerialComm, idx, valName, &valNameLen, nullptr, &type, reinterpret_cast<LPBYTE>(dataBuf), &dataSize);
+                if (rc == ERROR_NO_MORE_ITEMS) break;
+                if (rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                    std::wstring comName = ToUpperAscii(dataBuf);
+                    if (comName.size() >= 4 && comName.rfind(L"COM", 0) == 0) {
+                        comToNtDevice[comName] = valName;
+                    }
+                }
+            }
+            RegCloseKey(hSerialComm);
+        }
+    }
+
+    DEVINST rootDev = 0;
+    if (CM_Locate_DevNodeW(&rootDev, nullptr, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
+        return;
+    }
+
+    // 2. Walk the entire present CfgMgr32 device tree to:
+    //    (a) Discover all COM ports and map their parent USB DEVINSTs to COMx
+    //    (b) Identify all USB Host Controller root DEVINSTs
+    std::unordered_map<DEVINST, std::wstring> devInstToComPort;
+    std::unordered_set<std::wstring> seenComPorts;
+    std::vector<DEVINST> usbControllerRoots;
+    std::unordered_set<DEVINST> usbControllerRootSet;
+
+    auto isUsbControllerNode = [](DEVINST dn, const std::wstring& instId, const std::wstring& cls, const std::wstring& svc) -> bool {
+        std::wstring upSvc = ToUpperAscii(svc);
+        std::wstring upCls = ToUpperAscii(cls);
+        std::wstring upId  = ToUpperAscii(instId);
+        if (upSvc == L"USBXHCI" || upSvc == L"USBEHCI" || upSvc == L"USBUHCI" || upSvc == L"USBOHCI" || upSvc == L"USB4HOSTROUTER") {
+            return true;
+        }
+        // Check if this non-USB node has a direct child whose instance ID starts with "USB\" or "USB4\"
+        if (upId.rfind(L"USB\\", 0) != 0 && upId.rfind(L"USB4\\", 0) != 0) {
+            DEVINST ch = 0;
+            if (CM_Get_Child(&ch, dn, 0) == CR_SUCCESS) {
+                while (true) {
+                    std::wstring chId = ToUpperAscii(GetDevInstId(ch));
+                    if (chId.rfind(L"USB\\", 0) == 0 || chId.rfind(L"USB4\\", 0) == 0) {
+                        return true;
+                    }
+                    DEVINST sib = 0;
+                    if (CM_Get_Sibling(&sib, ch, 0) != CR_SUCCESS) break;
+                    ch = sib;
+                }
+            }
+            if (upCls == L"USB") return true;
+        }
+        return false;
+    };
+
+    // Iterative DFS stack over the entire device tree
+    std::vector<DEVINST> stack;
+    {
+        DEVINST ch = 0;
+        if (CM_Get_Child(&ch, rootDev, 0) == CR_SUCCESS) {
+            while (true) {
+                stack.push_back(ch);
+                DEVINST sib = 0;
+                if (CM_Get_Sibling(&sib, ch, 0) != CR_SUCCESS) break;
+                ch = sib;
+            }
+        }
+    }
+
+    while (!stack.empty()) {
+        DEVINST dn = stack.back();
+        stack.pop_back();
+
+        std::wstring instId   = GetDevInstId(dn);
+        std::wstring cls      = GetDevInstStringProp(dn, CM_DRP_CLASS);
+        std::wstring svc      = GetDevInstStringProp(dn, CM_DRP_SERVICE);
+        std::wstring friendly = GetDevInstStringProp(dn, CM_DRP_FRIENDLYNAME);
+        std::wstring desc     = GetDevInstStringProp(dn, CM_DRP_DEVICEDESC);
+
+        if (isUsbControllerNode(dn, instId, cls, svc)) {
+            if (usbControllerRootSet.insert(dn).second) {
+                usbControllerRoots.push_back(dn);
+            }
+        }
+
+        // Check if this node is a COM / Serial port
+        std::wstring portName;
+        if (_wcsicmp(cls.c_str(), L"Ports") == 0 || _wcsicmp(cls.c_str(), L"Modem") == 0 ||
+            friendly.find(L"(COM") != std::wstring::npos ||
+            _wcsicmp(svc.c_str(), L"usbser") == 0 || _wcsicmp(svc.c_str(), L"Serial") == 0 ||
+            _wcsicmp(svc.c_str(), L"FTDIBUS") == 0 || _wcsicmp(svc.c_str(), L"silabser") == 0 ||
+            ToUpperAscii(svc).find(L"CH34") != std::wstring::npos) {
+            portName = ReadDevNodePortName(dn);
+            if (portName.empty()) {
+                portName = ExtractComPortFromText(friendly);
+            }
+        }
+
+        if (!portName.empty()) {
+            devInstToComPort[dn] = portName;
+
+            HwComPortInfo cp;
+            cp.portName         = portName;
+            cp.portNumber       = ParseComNumber(portName);
+            cp.friendlyName     = !friendly.empty() ? friendly : (!desc.empty() ? (desc + L" (" + portName + L")") : portName);
+            cp.description      = !desc.empty() ? desc : friendly;
+            cp.busReportedDesc  = GetDevInstBusReportedDesc(dn);
+            cp.manufacturer     = GetDevInstStringProp(dn, CM_DRP_MFG);
+            cp.serviceName      = svc;
+            cp.locationInfo     = GetDevInstStringProp(dn, CM_DRP_LOCATION_INFORMATION);
+            cp.pdoName          = GetDevInstStringProp(dn, CM_DRP_PHYSICAL_DEVICE_OBJECT_NAME);
+            cp.deviceInstanceId = instId;
+            cp.hardwareIds      = GetDevInstStringProp(dn, CM_DRP_HARDWAREID);
+
+            std::wstring drvKey = GetDevInstStringProp(dn, CM_DRP_DRIVER);
+            GetDriverVersionAndProvider(drvKey, cp.driverVersion, cp.driverProvider);
+
+            ULONG st = 0, prob = 0;
+            if (CM_Get_DevNode_Status(&st, &prob, dn, 0) == CR_SUCCESS) {
+                cp.problemCode = prob;
+                cp.statusStr   = FormatDevNodeStatus(st, prob);
+            } else {
+                cp.statusStr = L"OK";
+            }
+
+            std::wstring vid, pid, rev, ser;
+            ParseVidPidRevAndSerial(instId, cp.hardwareIds, vid, pid, rev, ser);
+            cp.serialNumber = ser;
+
+            // Walk up parent DEVINSTs (up to 4 levels) so composite USB / FTDI bus children
+            // inherit the parent USB device's VID:PID, BusReportedDeviceDesc, Location (Port_#...), and mark parent in devInstToComPort!
+            DEVINST curParent = 0;
+            DEVINST walk = dn;
+            for (int depth = 0; depth < 4; ++depth) {
+                if (CM_Get_Parent(&curParent, walk, 0) != CR_SUCCESS || curParent == rootDev) break;
+                std::wstring pId = GetDevInstId(curParent);
+                std::wstring upPId = ToUpperAscii(pId);
+                if (upPId.rfind(L"USB\\", 0) == 0 && upPId.rfind(L"USB\\ROOT_HUB", 0) != 0) {
+                    std::wstring pSvc = ToUpperAscii(GetDevInstStringProp(curParent, CM_DRP_SERVICE));
+                    // Don't tag an entire USB Hub with a single child's COM port, only the device/composite parent
+                    if (pSvc != L"USBHUB3" && pSvc != L"USBHUB") {
+                        devInstToComPort[curParent] = portName;
+                        if (cp.parentInstanceId.empty()) cp.parentInstanceId = pId;
+                        if (cp.locationInfo.empty()) cp.locationInfo = GetDevInstStringProp(curParent, CM_DRP_LOCATION_INFORMATION);
+                        if (cp.busReportedDesc.empty()) cp.busReportedDesc = GetDevInstBusReportedDesc(curParent);
+                        std::wstring pVid, pPid, pRev, pSer;
+                        ParseVidPidRevAndSerial(pId, GetDevInstStringProp(curParent, CM_DRP_HARDWAREID), pVid, pPid, pRev, pSer);
+                        if (vid.empty() && !pVid.empty()) { vid = pVid; pid = pPid; }
+                        if (cp.serialNumber.empty() && !pSer.empty()) cp.serialNumber = pSer;
+                    }
+                }
+                walk = curParent;
+            }
+
+            if (!vid.empty() && !pid.empty()) {
+                cp.vidPid = vid + L":" + pid;
+            }
+            cp.vendorName = LookupUsbVendorName(vid);
+            if (cp.vendorName.empty()) cp.vendorName = cp.manufacturer;
+
+            std::wstring upId = ToUpperAscii(cp.deviceInstanceId + L" " + cp.parentInstanceId);
+            cp.isUsbBacked = (upId.find(L"USB\\") != std::wstring::npos || upId.find(L"FTDIBUS\\") != std::wstring::npos || !vid.empty());
+            cp.isBluetooth = (upId.find(L"BTHENUM\\") != std::wstring::npos || ToUpperAscii(cp.friendlyName).find(L"BLUETOOTH") != std::wstring::npos);
+            cp.isVirtual   = (!cp.isUsbBacked && !cp.isBluetooth && upId.find(L"ACPI\\") == std::wstring::npos);
+
+            cp.chipModel = IdentifyUsbChipModel(vid, pid, cp.description, cp.busReportedDesc);
+            if (cp.chipModel.empty()) {
+                if (cp.isBluetooth) cp.chipModel = L"Bluetooth SPP (Virtual RFCOMM)";
+                else if (upId.find(L"ACPI\\PNP0501") != std::wstring::npos) cp.chipModel = L"Sprzętowy UART 16550A (RS-232 / Płyta główna)";
+                else if (cp.isUsbBacked) cp.chipModel = !cp.busReportedDesc.empty() ? cp.busReportedDesc : L"USB CDC / UART Serial Bridge";
+                else cp.chipModel = L"Wirtualny / Systemowy Port Szeregowy";
+            }
+
+            auto itNt = comToNtDevice.find(portName);
+            if (itNt != comToNtDevice.end()) {
+                cp.ntDevicePath = itNt->second;
+            }
+
+            // Query default serial config from HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Ports ("9600,n,8,1")
+            // (< 0.02 ms; avoids GetDefaultCommConfigW which can block 1-2s on Bluetooth RFCOMM / virtual COM drivers!)
+            std::wstring portsValName = portName + L":";
+            std::wstring portsCfg = ReadRegSz(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Ports", portsValName.c_str());
+            if (!portsCfg.empty()) {
+                int parsedBaud = _wtoi(portsCfg.c_str());
+                if (parsedBaud > 0) cp.defaultBaud = static_cast<uint32_t>(parsedBaud);
+                size_t c1 = portsCfg.find(L',');
+                if (c1 != std::wstring::npos && c1 + 1 < portsCfg.size()) {
+                    wchar_t pCh = towlower(portsCfg[c1 + 1]);
+                    if (pCh == L'o') cp.parity = 1;
+                    else if (pCh == L'e') cp.parity = 2;
+                    else cp.parity = 0;
+                    size_t c2 = portsCfg.find(L',', c1 + 1);
+                    if (c2 != std::wstring::npos && c2 + 1 < portsCfg.size()) {
+                        int db = _wtoi(portsCfg.c_str() + c2 + 1);
+                        if (db >= 5 && db <= 8) cp.dataBits = static_cast<uint8_t>(db);
+                        size_t c3 = portsCfg.find(L',', c2 + 1);
+                        if (c3 != std::wstring::npos && c3 + 1 < portsCfg.size()) {
+                            std::wstring sbStr = portsCfg.substr(c3 + 1);
+                            if (sbStr.find(L"1.5") != std::wstring::npos) cp.stopBits = 1;
+                            else if (sbStr.find(L'2') != std::wstring::npos) cp.stopBits = 2;
+                            else cp.stopBits = 0;
+                        }
+                    }
+                }
+            }
+            if (cp.isUsbBacked && cp.defaultBaud == 9600) {
+                cp.defaultBaud = 115200; // Standard default for modern USB-UART / ESP32 / CH340 / CP210x / FTDI
+            }
+
+            if (seenComPorts.insert(portName).second) {
+                m_wState.comPorts.push_back(std::move(cp));
+            }
+        }
+
+        // Push children
+        DEVINST ch = 0;
+        if (CM_Get_Child(&ch, dn, 0) == CR_SUCCESS) {
+            while (true) {
+                stack.push_back(ch);
+                DEVINST sib = 0;
+                if (CM_Get_Sibling(&sib, ch, 0) != CR_SUCCESS) break;
+                ch = sib;
+            }
+        }
+    }
+
+    // Also add any virtual/kernel COM ports from SERIALCOMM that didn't appear as a PnP node
+    for (const auto& kv : comToNtDevice) {
+        if (seenComPorts.insert(kv.first).second) {
+            HwComPortInfo cp;
+            cp.portName     = kv.first;
+            cp.portNumber   = ParseComNumber(kv.first);
+            cp.ntDevicePath = kv.second;
+            cp.friendlyName = kv.first + L" (" + kv.second + L")";
+            cp.description  = L"Port szeregowy jądra NT (SERIALCOMM)";
+            cp.chipModel    = L"Kernel Serial Map (" + kv.second + L")";
+            cp.statusStr    = L"OK (Aktywny w SERIALCOMM)";
+            cp.isVirtual    = true;
+            m_wState.comPorts.push_back(std::move(cp));
+        }
+    }
+
+    std::sort(m_wState.comPorts.begin(), m_wState.comPorts.end(),
+              [](const HwComPortInfo& a, const HwComPortInfo& b) {
+                  if (a.portNumber != b.portNumber) return a.portNumber < b.portNumber;
+                  return a.portName < b.portName;
+              });
+
+    // 3. Build Hierarchical USB Topology TreeView starting from each USB Host Controller root
+    std::sort(usbControllerRoots.begin(), usbControllerRoots.end(),
+              [](DEVINST a, DEVINST b) { return GetDevInstId(a) < GetDevInstId(b); });
+
+    auto buildUsbSubtree = [&](auto& self, DEVINST dn, int parentIdx, int depth,
+                               bool isLastSib, uint32_t ancMask) -> void {
+        if (depth > 10) return;
+
+        HwUsbNodeInfo node;
+        node.nodeIndex            = static_cast<int>(m_wState.usbTree.size());
+        node.parentIndex          = parentIdx;
+        node.depth                = depth;
+        node.isLastSibling        = isLastSib;
+        node.ancestorContinueMask = ancMask;
+
+        node.deviceInstanceId = GetDevInstId(dn);
+        if (parentIdx >= 0 && parentIdx < static_cast<int>(m_wState.usbTree.size())) {
+            node.parentInstanceId = m_wState.usbTree[parentIdx].deviceInstanceId;
+        }
+        node.friendlyName    = GetDevInstStringProp(dn, CM_DRP_FRIENDLYNAME);
+        node.description     = GetDevInstStringProp(dn, CM_DRP_DEVICEDESC);
+        node.busReportedDesc = GetDevInstBusReportedDesc(dn);
+        node.className       = GetDevInstStringProp(dn, CM_DRP_CLASS);
+        node.manufacturer    = GetDevInstStringProp(dn, CM_DRP_MFG);
+        node.serviceDriver   = GetDevInstStringProp(dn, CM_DRP_SERVICE);
+        node.driverKey       = GetDevInstStringProp(dn, CM_DRP_DRIVER);
+        node.locationInfo    = GetDevInstStringProp(dn, CM_DRP_LOCATION_INFORMATION);
+        node.pdoName         = GetDevInstStringProp(dn, CM_DRP_PHYSICAL_DEVICE_OBJECT_NAME);
+        node.hardwareIds     = GetDevInstStringProp(dn, CM_DRP_HARDWAREID);
+        GetDriverVersionAndProvider(node.driverKey, node.driverVersion, node.driverProvider);
+
+        ParseHubAndPortFromLocation(node.locationInfo, node.portNumber, node.hubNumber);
+
+        ULONG st = 0, prob = 0;
+        if (CM_Get_DevNode_Status(&st, &prob, dn, 0) == CR_SUCCESS) {
+            node.devNodeStatus = st;
+            node.problemCode   = prob;
+            node.statusStr     = FormatDevNodeStatus(st, prob);
+        } else {
+            node.statusStr = L"OK";
+        }
+
+        std::wstring vid, pid, rev, ser;
+        ParseVidPidRevAndSerial(node.deviceInstanceId, node.hardwareIds, vid, pid, rev, ser);
+        if (!vid.empty() && !pid.empty()) node.vidPid = vid + L":" + pid;
+        node.revStr       = rev;
+        node.serialNumber = ser;
+        node.vendorName   = LookupUsbVendorName(vid);
+        if (node.vendorName.empty() && !node.manufacturer.empty() && node.manufacturer.front() != L'(') {
+            node.vendorName = node.manufacturer;
+        }
+        node.chipModel = IdentifyUsbChipModel(vid, pid, node.description, node.busReportedDesc);
+
+        auto itCom = devInstToComPort.find(dn);
+        if (itCom != devInstToComPort.end()) {
+            node.comPortName = itCom->second;
+        }
+
+        // Collect direct children and sort them by Port_#xxxx so physical ports appear in order (Port 1, Port 2, ...)
+        struct ChildEntry {
+            DEVINST dn = 0;
+            int port = 0;
+            std::wstring id;
+        };
+        std::vector<ChildEntry> children;
+        {
+            DEVINST ch = 0;
+            if (CM_Get_Child(&ch, dn, 0) == CR_SUCCESS) {
+                while (true) {
+                    ChildEntry ce;
+                    ce.dn = ch;
+                    ce.id = GetDevInstId(ch);
+                    int p = 0, h = 0;
+                    ParseHubAndPortFromLocation(GetDevInstStringProp(ch, CM_DRP_LOCATION_INFORMATION), p, h);
+                    ce.port = p;
+                    children.push_back(std::move(ce));
+                    DEVINST sib = 0;
+                    if (CM_Get_Sibling(&sib, ch, 0) != CR_SUCCESS) break;
+                    ch = sib;
+                }
+            }
+        }
+        std::sort(children.begin(), children.end(), [](const ChildEntry& a, const ChildEntry& b) {
+            int pa = a.port > 0 ? a.port : 9999;
+            int pb = b.port > 0 ? b.port : 9999;
+            if (pa != pb) return pa < pb;
+            return a.id < b.id;
+        });
+        node.childCount = static_cast<int>(children.size());
+
+        // Classify node role, badge, color, and speed hint
+        std::wstring upId  = ToUpperAscii(node.deviceInstanceId);
+        std::wstring upSvc = ToUpperAscii(node.serviceDriver);
+        std::wstring upCls = ToUpperAscii(node.className);
+        std::wstring upDesc = ToUpperAscii(node.description + L" " + node.friendlyName + L" " + node.busReportedDesc);
+
+        if (depth == 0) {
+            node.isController = true;
+            if (upSvc == L"USBXHCI" || upDesc.find(L"XHCI") != std::wstring::npos || upDesc.find(L"3.0") != std::wstring::npos || upDesc.find(L"3.1") != std::wstring::npos || upDesc.find(L"3.2") != std::wstring::npos) {
+                node.categoryBadge = L"xHCI";
+                node.badgeColor    = 0x7C3AED;
+                node.speedHint     = L"USB 3.x eXtensible Host Controller (SuperSpeed 5-20 Gbps)";
+            } else if (upSvc == L"USBEHCI" || upDesc.find(L"EHCI") != std::wstring::npos) {
+                node.categoryBadge = L"EHCI";
+                node.badgeColor    = 0x6366F1;
+                node.speedHint     = L"USB 2.0 Enhanced Host Controller (High-Speed 480 Mbps)";
+            } else if (upSvc == L"USB4HOSTROUTER") {
+                node.categoryBadge = L"USB4";
+                node.badgeColor    = 0x9333EA;
+                node.speedHint     = L"USB4 / Thunderbolt Host Router (40 Gbps)";
+            } else {
+                node.categoryBadge = L"HOST";
+                node.badgeColor    = 0x7C3AED;
+                node.speedHint     = L"Kontroler hosta USB";
+            }
+        } else if (upId.rfind(L"USB\\ROOT_HUB", 0) == 0) {
+            node.isRootHub     = true;
+            node.isHub         = true;
+            node.categoryBadge = L"ROOT";
+            node.badgeColor    = 0x0284C7;
+            node.speedHint     = (upId.find(L"ROOT_HUB30") != std::wstring::npos) ? L"Root Hub USB 3.0 (SuperSpeed + High-Speed)" : L"Root Hub USB 2.0";
+        } else if (upSvc == L"USBHUB3" || upSvc == L"USBHUB" || upDesc.find(L"HUB") != std::wstring::npos || upDesc.find(L"KONCENTRATOR") != std::wstring::npos) {
+            node.isHub         = true;
+            node.categoryBadge = L"HUB";
+            node.badgeColor    = 0x0D9488;
+            node.speedHint     = (upDesc.find(L"SUPERSPEED") != std::wstring::npos || upSvc == L"USBHUB3") ? L"Koncentrator USB Hub" : L"Koncentrator USB 2.0 Hub";
+        } else if (!node.comPortName.empty() || upCls == L"PORTS") {
+            node.categoryBadge = !node.comPortName.empty() ? node.comPortName : L"COM";
+            node.badgeColor    = 0xD97706;
+            node.speedHint     = L"Port szeregowy USB-UART / CDC";
+        } else if (upSvc == L"USBCCGP") {
+            node.isComposite   = true;
+            node.categoryBadge = L"COMP";
+            node.badgeColor    = 0x0369A1;
+            node.speedHint     = L"Urządzenie wielofunkcyjne (Composite USB)";
+        } else if (upCls == L"BLUETOOTH" || upSvc == L"BTHUSB" || upSvc == L"BTHPORT" || upDesc.find(L"BLUETOOTH") != std::wstring::npos) {
+            node.categoryBadge = L"BT";
+            node.badgeColor    = 0x4F46E5;
+            node.speedHint     = L"Adapter bezprzewodowy Bluetooth USB";
+        } else if (upCls == L"MEDIA" || upCls == L"AUDIOENDPOINT" || upSvc == L"USBAUDIO" || upDesc.find(L"AUDIO") != std::wstring::npos) {
+            node.categoryBadge = L"AUDIO";
+            node.badgeColor    = 0xDB2777;
+            node.speedHint     = L"Urządzenie dźwiękowe USB Audio";
+        } else if (upCls == L"DISKDRIVE" || upCls == L"VOLUME" || upSvc == L"USBSTOR" || upSvc == L"UASPSTOR") {
+            node.categoryBadge = L"DISK";
+            node.badgeColor    = 0x059669;
+            node.speedHint     = (upSvc == L"UASPSTOR") ? L"Pamięć masowa USB (UASP)" : L"Pamięć masowa USB (BOT)";
+        } else if (upCls == L"CAMERA" || upCls == L"IMAGE" || upSvc == L"USBVIDEO" || upDesc.find(L"WEBCAM") != std::wstring::npos || upDesc.find(L"UVC") != std::wstring::npos) {
+            node.categoryBadge = L"CAM";
+            node.badgeColor    = 0x9333EA;
+            node.speedHint     = L"Kamera / Urządzenie wideo UVC";
+        } else if (upCls == L"NET") {
+            node.categoryBadge = L"NET";
+            node.badgeColor    = 0xEA580C;
+            node.speedHint     = L"Karta sieciowa USB";
+        } else if (upCls == L"HIDCLASS" || upCls == L"MOUSE" || upCls == L"KEYBOARD" || upSvc == L"HIDUSB" || upSvc == L"MOUHID" || upSvc == L"KBDHID") {
+            node.isInterface   = (upId.find(L"&MI_") != std::wstring::npos || upId.rfind(L"HID\\", 0) == 0);
+            node.categoryBadge = L"HID";
+            node.badgeColor    = 0x475569;
+            node.speedHint     = L"Urządzenie interfejsu HID (Mysz / Klawiatura / Kontroler)";
+        } else {
+            node.isInterface   = (upId.find(L"&MI_") != std::wstring::npos);
+            node.categoryBadge = L"USB";
+            node.badgeColor    = 0x2563EB;
+            node.speedHint     = L"Urządzenie USB";
+        }
+
+        // Compose the clearest possible displayName:
+        // Prefer FriendlyName, or if the OS description is generic ("Urządzenie kompozytowe USB" / "Urządzenie wejściowe USB"),
+        // promote the hardware firmware's BusReportedDeviceDesc!
+        std::wstring baseName = !node.friendlyName.empty() ? node.friendlyName : node.description;
+        if (baseName.empty()) baseName = node.busReportedDesc;
+        if (baseName.empty()) baseName = node.deviceInstanceId;
+
+        if (!node.busReportedDesc.empty() && IsGenericUsbDescription(baseName) &&
+            _wcsicmp(node.busReportedDesc.c_str(), baseName.c_str()) != 0) {
+            node.displayName = node.busReportedDesc + L"  (" + baseName + L")";
+        } else if (!node.busReportedDesc.empty() &&
+                   ToUpperAscii(baseName).find(ToUpperAscii(node.busReportedDesc)) == std::wstring::npos &&
+                   !node.isController && !node.isRootHub) {
+            node.displayName = baseName + L"  \x2022  \"" + node.busReportedDesc + L"\"";
+        } else {
+            node.displayName = baseName;
+        }
+
+        int myIdx = static_cast<int>(m_wState.usbTree.size());
+        m_wState.usbTree.push_back(std::move(node));
+
+        uint32_t nextMask = ancMask;
+        if (depth > 0 && depth < 31 && !isLastSib) {
+            nextMask |= (1u << depth);
+        }
+
+        for (size_t i = 0; i < children.size(); ++i) {
+            bool childLast = (i + 1 == children.size());
+            self(self, children[i].dn, myIdx, depth + 1, childLast, nextMask);
+        }
+    };
+
+    for (size_t i = 0; i < usbControllerRoots.size(); ++i) {
+        bool lastRoot = (i + 1 == usbControllerRoots.size());
+        buildUsbSubtree(buildUsbSubtree, usbControllerRoots[i], -1, 0, lastRoot, 0);
+    }
+}
+
 void HardwareInspector::UpdateCpuLivePerCoreLoad() {
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (!hNtdll) return;
@@ -2202,6 +3046,30 @@ std::wstring HardwareInspector::BuildFullTextReport(Lang lang) const {
         ss << L"     IPv4: " << net.ipv4 << L"  |  MAC: " << net.macAddress
            << L"  |  RX: " << FileEngine::FormatSizeDetailed(net.totalRxBytes)
            << L"  |  TX: " << FileEngine::FormatSizeDetailed(net.totalTxBytes) << L"\r\n";
+    }
+    ss << L"\r\n";
+
+    ss << L"[PORTY SZEREGOWE COM / UART (SERIAL PORTS)]\r\n";
+    if (m_comPorts.empty()) {
+        ss << L"  (Brak aktywnych portów COM / No active COM ports)\r\n";
+    } else {
+        for (const auto& cp : m_comPorts) {
+            ss << L"  [" << cp.portName << L"] " << cp.friendlyName << L"  |  Chip: " << cp.chipModel;
+            if (!cp.vidPid.empty()) ss << L"  |  VID:PID " << cp.vidPid;
+            if (!cp.locationInfo.empty()) ss << L"  |  " << cp.locationInfo;
+            ss << L"  |  " << cp.defaultBaud << L" baud  |  Driver: " << cp.serviceName << L"  (" << cp.statusStr << L")\r\n";
+        }
+    }
+    ss << L"\r\n";
+
+    ss << L"[TOPOLOGIA DRZEWA USB (USB DEVICE TREE)]\r\n";
+    for (const auto& u : m_usbTree) {
+        std::wstring indent(static_cast<size_t>(u.depth) * 2, L' ');
+        ss << L"  " << indent << L"[" << u.categoryBadge << L"] " << u.displayName;
+        if (!u.vidPid.empty()) ss << L"  (VID:PID " << u.vidPid << L")";
+        if (!u.vendorName.empty()) ss << L"  [" << u.vendorName << L"]";
+        if (!u.locationInfo.empty() && u.depth > 0) ss << L"  @ " << u.locationInfo;
+        ss << L"\r\n";
     }
 
     return ss.str();

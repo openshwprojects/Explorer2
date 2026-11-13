@@ -1,0 +1,1 @@
+Objavro.schema{"type":"record","name":"DeviceEvent","fields":[{"name":"device_id","type":"string"},{"name":"latency_us","type":"long"},{"name":"healthy","type":"boolean"}]}

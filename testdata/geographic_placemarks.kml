@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <Placemark>
+      <name>Stacja Bazowa Alpha</name>
+      <description>Wezel pomiarowy LoRaWAN / GPS</description>
+      <Point><coordinates>21.0122,52.2297,115.0</coordinates></Point>
+    </Placemark>
+    <Placemark>
+      <name>Stacja Bazowa Beta</name>
+      <description>Przekaznik światłowodowy</description>
+      <Point><coordinates>19.9449,50.0647,219.0</coordinates></Point>
+    </Placemark>
+  </Document>
+</kml>

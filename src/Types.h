@@ -17,7 +17,6 @@ namespace Explorer2 {
 // Custom window messages for async background notifications
 constexpr UINT WM_APP_THUMB_READY         = WM_APP + 101;
 constexpr UINT WM_APP_FULLIMG_READY       = WM_APP + 102;
-constexpr UINT WM_APP_DELETE_DONE         = WM_APP + 103;
 constexpr UINT WM_APP_DIR_CHANGED         = WM_APP + 104;
 constexpr UINT WM_APP_FOLDER_SIZE_UPDATED = WM_APP + 105;
 constexpr UINT WM_APP_IMAGE_ROTATED       = WM_APP + 106;
@@ -25,6 +24,10 @@ constexpr UINT WM_APP_SEARCH_UPDATED      = WM_APP + 107;
 constexpr UINT WM_APP_LOG_ADDED           = WM_APP + 108;   // new AppLog entry (coalesced)
 constexpr UINT WM_APP_RENAME_DONE         = WM_APP + 109;   // lParam = heap RenameJobResult*
 constexpr UINT WM_APP_MERGE_DONE          = WM_APP + 110;   // lParam = heap MergeFolderResult*
+constexpr UINT WM_APP_EXTRACT_DONE        = WM_APP + 112;   // lParam = heap ExtractJobResult*
+constexpr UINT WM_APP_EXT_ICONS_READY     = WM_APP + 113;   // file-type icons were looked up (FileEngine::RefreshIconIndices)
+constexpr UINT WM_APP_PREVIEW_READY      = WM_APP + 114;   // the preview pane's worker has read a file (FileContentPane::OnPreviewLoaded)
+constexpr UINT WM_APP_TRANSFER_UPDATE     = WM_APP + 111;   // CopyHandler-style TransferManager state/completion update
 
 enum class ViewMode : int {
     Details = 0,         // Szczegóły (table with columns)
@@ -47,6 +50,14 @@ enum class SortColumn : int {
     Size = 3
 };
 
+enum class GroupByMode : int {
+    None = 0,
+    NameInitial = 1,
+    DateBucket = 2,
+    FileType = 3,
+    SizeTier = 4
+};
+
 enum class RibbonTab : int {
     File = 0,
     Home = 1,
@@ -58,7 +69,8 @@ enum class RibbonTab : int {
     Monitoring = 7, // "Monitoring": long-term system recording (rendered through the dashboard view host)
     Lan = 8,        // "LAN": network scanner + SSDP (rendered through the dashboard view host)
     Log = 9,        // "Log": this run's operation log (rendered through the dashboard view host)
-    Backups = 10    // "Kopie zapasowe": rclone + incremental sync backup manager
+    Backups = 10,   // "Kopie zapasowe": rclone + incremental sync backup manager
+    Transfers = 11  // "Transfery": CopyHandler-style high-speed file transfer queue & engine
 };
 
 enum class HardwareSubTab : int {
@@ -70,7 +82,8 @@ enum class HardwareSubTab : int {
     Disks = 5,
     Network = 6,
     System = 7,
-    Thermal = 8
+    Thermal = 8,
+    UsbCom = 9
 };
 
 enum class SearchSizeUnit : int {
@@ -174,8 +187,13 @@ struct TreeNode {
     bool isOpticalDrive = false;
     bool isOffline = false;
     bool isQuickAccess = false;
+    bool isFtpNode = false;
     bool hasChildren = true;
     bool isExpanded = false;
+    uint64_t size = 0;       // Folder size (or used bytes on drive)
+    uint64_t totalBytes = 0; // Total capacity for drives
+    uint64_t freeBytes = 0;  // Free space for drives
+    std::wstring sizeStr;    // Formatted size badge (e.g. "184 / 465 GB" or "12.4 GB")
     D2D1_RECT_F hitRect = {};
     D2D1_RECT_F chevronRect = {};
 };
@@ -249,7 +267,34 @@ inline bool IsImageExtension(const std::wstring& extLower) {
            extLower == L".psd"  || extLower == L".psb"  || extLower == L".xcf"  ||
            extLower == L".hdr"  || extLower == L".pic"  ||
            extLower == L".ppm"  || extLower == L".pgm"  || extLower == L".pbm"  || extLower == L".pnm" ||
-           extLower == L".pcx"  || extLower == L".qoi";
+           extLower == L".pcx"  || extLower == L".qoi"  ||
+           extLower == L".svg"  || extLower == L".xbm"  || extLower == L".xpm"  ||
+           extLower == L".pam"  || extLower == L".pfm"  || extLower == L".sgi"  ||
+           extLower == L".rgb"  || extLower == L".bw"   || extLower == L".rgba" ||
+           extLower == L".ras"  || extLower == L".sun"  || extLower == L".ktx"  ||
+           extLower == L".vtf"  || extLower == L".ff"   || extLower == L".farbfeld" ||
+           extLower == L".fits" || extLower == L".fts"  || extLower == L".pkm"  ||
+           extLower == L".astc" || extLower == L".pvr"  || extLower == L".iff"  ||
+           extLower == L".ilbm" || extLower == L".lbm"  || extLower == L".tim"  ||
+           extLower == L".wbmp" || extLower == L".bdf"  || extLower == L".psf"  ||
+           extLower == L".y4m"  || extLower == L".ani"  || extLower == L".gpl"  ||
+           extLower == L".pal"  || extLower == L".act"  || extLower == L".aco"  ||
+           extLower == L".dcm"  || extLower == L".dicom"|| extLower == L".exr"  ||
+           extLower == L".ktx2" || extLower == L".basis"|| extLower == L".kra"  ||
+           extLower == L".ora"  || extLower == L".clip" || extLower == L".procreate" ||
+           extLower == L".aseprite" || extLower == L".icns" || extLower == L".jxl" ||
+           extLower == L".bpg"  || extLower == L".blp"  || extLower == L".utx"  ||
+           extLower == L".dpx"  || extLower == L".cin"  || extLower == L".cube" ||
+           extLower == L".3dl"  || extLower == L".ies"  || extLower == L".ttf"  ||
+           extLower == L".otf"  || extLower == L".woff" || extLower == L".woff2"||
+           extLower == L".cr2"  || extLower == L".cr3"  || extLower == L".nef"  ||
+           extLower == L".arw"  || extLower == L".dng"  || extLower == L".raf"  ||
+           extLower == L".orf"  || extLower == L".rw2"  || extLower == L".pef"  ||
+           extLower == L".eps"  || extLower == L".ai"   || extLower == L".cdr"  ||
+           extLower == L".afphoto" || extLower == L".afdesign" || extLower == L".afpub" ||
+           extLower == L".emf"  || extLower == L".wmf"  || extLower == L".cgm"  ||
+           extLower == L".abr"  || extLower == L".pat"  || extLower == L".dst"  ||
+           extLower == L".pes"  || extLower == L".ans"  || extLower == L".sixel";
 }
 
 inline bool IsVideoExtension(const std::wstring& extLower) {

@@ -17,7 +17,8 @@ enum class EdaDocKind : int {
     EagleBrd = 3,
     EagleSch = 4,
     GerberLayer = 5,
-    ExcellonDrill = 6
+    ExcellonDrill = 6,
+    AutoCadDxf = 7
 };
 
 enum class EdaLayerId : uint8_t {
@@ -134,6 +135,13 @@ public:
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
     void Clear();
+
+    // A board read on another thread (InspectEdaFile) goes into the view, which then shows what LoadFile
+    // would have shown.
+    void ShowLoadedBoard(const std::wstring& fullPath, ParsedEdaBoard&& board);
+    bool IsShowing(const std::wstring& fullPath) const { return !m_currentPath.empty() && m_currentPath == fullPath; }
+    const std::wstring& LoadedPath() const { return m_currentPath; }
+    bool HasValidBoard() const { return m_board.valid; }
 
     bool NeedsAnimationTick() const { return m_view3D && m_autoRotate3D; }
     void StepAnimation();

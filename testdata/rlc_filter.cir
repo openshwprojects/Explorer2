@@ -1,0 +1,7 @@
+* Low-Pass RLC Filter Netlist
+V1 VIN 0 AC 1.0
+R1 VIN N1 50
+L1 N1 VOUT 10uH
+C1 VOUT 0 470pF
+R2 VOUT 0 1k
+.END

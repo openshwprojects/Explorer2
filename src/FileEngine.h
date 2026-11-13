@@ -10,15 +10,11 @@
 #include <thread>
 #include <condition_variable>
 #include <atomic>
+#include <memory>
 
 namespace Explorer2 {
 
-struct DeleteTask {
-    std::vector<std::wstring> paths;
-    bool permanent = false;
-};
-
-// One item a background delete could not remove (error = Win32 code, 0 = unknown)
+// One item a delete could not remove (error = Win32 code, 0 = unknown)
 struct DeleteFailure {
     std::wstring path;
     unsigned long error = 0;
@@ -50,6 +46,9 @@ public:
     void Initialize(HWND notifyHwnd);
     void Shutdown();
 
+    // Live Directory Change Watcher (ReadDirectoryChangesW -> WM_APP_DIR_CHANGED)
+    void WatchDirectory(const std::wstring& dirPath);
+
     // Ultra-fast directory enumeration (< 5ms for 10,000 files)
     std::vector<FileEntry> EnumerateDirectory(
         const std::wstring& dirPath,
@@ -76,17 +75,31 @@ public:
     // Non-blocking check if a drive root ("X:\", "Z:\", "F:\") is currently offline/empty
     bool IsDriveOffline(const std::wstring& path, Lang lang, std::wstring* outDisplayName = nullptr);
 
-    // Async non-blocking delete (Recycle Bin or Permanent POSIX unlink)
-    void EnqueueDelete(const std::vector<std::wstring>& paths, bool permanent);
-    // Items the background delete could not remove since the last call (reported to the user, then cleared)
-    std::vector<DeleteFailure> TakeDeleteFailures();
-    // Number of delete batches still queued or running
-    size_t PendingDeleteBatches() const;
+    // Bookkeeping around a delete job (the deleting itself is done by TransferManager::EnqueueDelete).
+    // BeginDelete hides the items from listings and, for a Recycle Bin delete, keeps what Ctrl+Z needs;
+    // EndDelete shows again whatever the job could not remove.
+    void BeginDelete(const std::vector<std::wstring>& paths, bool permanent);
+    void EndDelete(const std::vector<std::wstring>& paths);
     void AddPendingHiddenPath(const std::wstring& path);
     void RemovePendingHiddenPath(const std::wstring& path);
 
     // Undo last Recycle Bin delete (Ctrl+Z)
     bool UndoLastDelete(std::wstring& outRestoredDir);
+
+    // Ctrl+Z works from hidden copies (hard links) of the deleted files, kept in "X:\.explorer2_undo" in a
+    // folder of their own for each running Explorer2. A session that is killed or crashes cannot remove its
+    // copies, so the next start does it: StartUndoStagingSweep() queues the fixed drives for a background
+    // sweep, and any other drive is swept the first time it is used.
+    void StartUndoStagingSweep();
+    // Removes what earlier sessions left in one staging folder and returns how many items went. A folder
+    // whose lock file is held belongs to a running Explorer2 and is left alone, as is `ownSessionDir`, any
+    // session folder younger than `minAgeSeconds` (it may be just starting) and anything Explorer2 did not
+    // put there.
+    static size_t SweepStaleUndoStaging(
+        const std::wstring& stagingRoot,
+        const std::wstring& ownSessionDir = L"",
+        unsigned minAgeSeconds = 15,
+        const std::atomic<bool>* keepRunning = nullptr);
 
     // On-demand Recursive Folder Size Calculator + Hash Table Cache
     bool IsAnyFolderSizeCalculating() const;
@@ -95,8 +108,10 @@ public:
     bool HasAnyCachedFolderSizes(const std::vector<FileEntry>& entries) const;
     void RequestFolderSizes(const std::vector<FileEntry>& entries, bool forceRefresh);
 
-    // Single-lock batch sync of folder sizes from hash table into FileEntry vector
+    // Single-lock batch sync of folder sizes from hash table into FileEntry / TreeNode vectors
     void SyncDirectorySizes(std::vector<FileEntry>& entries);
+    void SyncTreeNodeSizes(std::vector<TreeNode>& treeNodes);
+    void RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, bool forceRefresh = false);
 
     // Retrieve cached nested child blocks for WinDirStat/WizTree-style Proporcje treemap
     bool GetFolderTreemapChildren(const std::wstring& normKey, std::vector<TreemapChildNode>& outChildren) const;
@@ -112,8 +127,20 @@ public:
     bool IsSearchRunning() const;
     void SyncSearchResults(std::vector<FileEntry>& outResults, SearchProgressInfo& outProgress);
 
+    // File-type icons. Asking Windows for a type's icon reads the registry and can take several milliseconds,
+    // so a type seen for the first time is looked up on a worker thread: its files are listed with a generic
+    // icon at first, and WM_APP_EXT_ICONS_READY tells the window when the right icons are known. The window
+    // then calls RefreshIconIndices on the listings it holds (true if an entry changed).
+    bool RefreshIconIndices(std::vector<FileEntry>& entries) const;
+    void AcknowledgeIconNotification() { m_extIconNotifyPending.store(false); }
+    // For the self-tests: waits until every type asked for so far has its icon (false on timeout), and
+    // whether a type's icon has been looked up in this process
+    bool WaitUntilIconsResolved(unsigned int timeoutMs);
+    static bool IsTypeIconKnown(const std::wstring& extLower);
+
     // Clipboard operations (compatible with Windows Explorer CF_HDROP)
     static bool CopyFilesToClipboard(HWND hwnd, const std::vector<std::wstring>& paths, bool isCut);
+    static bool ReadFilesFromClipboard(HWND hwnd, std::vector<std::wstring>& outPaths, bool& outIsMove);
     static bool PasteFilesFromClipboard(HWND hwnd, const std::wstring& targetDir, bool& outWasCut);
     static bool CopyTextToClipboard(HWND hwnd, const std::wstring& text);
 
@@ -131,7 +158,6 @@ public:
     static std::wstring FormatFileTime(const FILETIME& ft);
 
 private:
-    void DeleteWorkerLoop();
     static bool DeletePathPermanently(const std::wstring& path, std::vector<DeleteFailure>* failures = nullptr);
     static std::wstring GetUndoStagingDirForPath(const std::wstring& path);
     void CleanupAllUndoStaging();
@@ -139,32 +165,39 @@ private:
     struct ExtTypeInfo {
         std::wstring typeName;
         int sysIconIndex = -1;
+        bool iconPending = false;       // generic icon for now; the worker is looking the real one up
     };
 
-    const ExtTypeInfo& GetExtensionInfo(const std::wstring& extLower, bool isDir, Lang lang);
+    // A copy, taken under the lock: the icon worker updates the cached entries while listings are made
+    ExtTypeInfo GetExtensionInfo(const std::wstring& extLower, bool isDir, Lang lang);
 
     HWND m_notifyHwnd = nullptr;
     std::mutex m_extMutex;
     std::unordered_map<std::wstring, ExtTypeInfo> m_extCache;
     int m_folderIconIndex = -1;
 
-    // Background delete thread
-    std::thread m_deleteThread;
-    std::mutex m_deleteMutex;
-    std::condition_variable m_deleteCv;
-    std::deque<DeleteTask> m_deleteQueue;
     std::atomic<bool> m_running{ false };
 
-    // Items currently queued / being deleted (hidden from listings) and failures awaiting a UI report
+    // Items a delete job is working on (hidden from listings until the job reports back)
     mutable std::mutex m_deleteStateMutex;
     std::unordered_set<std::wstring> m_pendingDeleteKeys;
-    std::vector<DeleteFailure> m_deleteFailures;
-    size_t m_activeDeleteBatches = 0;
 
-    // Undo stack for Ctrl+Z
+    // Undo stack for Ctrl+Z, and this session's own folder (with its lock file) in each staging folder it uses
+    struct UndoSession {
+        std::wstring dir;
+        HANDLE lock = INVALID_HANDLE_VALUE;
+    };
+    std::wstring EnsureUndoSessionDir(const std::wstring& stagingRoot);
+    void QueueUndoSweep(const std::wstring& stagingRoot);
+    void UndoSweepWorkerLoop();
+
     std::mutex m_undoMutex;
     std::vector<UndoDeleteBatch> m_undoStack;
-    std::vector<std::wstring> m_stagingDirsCreated;
+    std::unordered_map<std::wstring, UndoSession> m_undoSessions;      // by staging folder
+    std::unordered_set<std::wstring> m_undoSweepRequested;             // staging folders already queued in this run
+    std::deque<std::wstring> m_undoSweepQueue;
+    std::condition_variable m_undoSweepCv;
+    std::thread m_undoSweepThread;
 
     // Folder Size Hash Table + Background Worker Pool
     void FolderSizeWorkerLoop();
@@ -183,15 +216,35 @@ private:
     std::atomic<int> m_activeSizeWorkers{ 0 };
     std::atomic<bool> m_sizeNotifyPending{ false };
 
-    // Non-blocking Network Drive online/offline state cache
+    // File-type icons looked up on a worker thread (see RefreshIconIndices)
+    void QueueExtIconLookup(const std::wstring& extLower);
+    void ExtIconWorkerLoop();
+    std::mutex m_extIconMutex;                          // guards the four members below
+    std::condition_variable m_extIconCv;
+    std::deque<std::wstring> m_extIconQueue;
+    std::unordered_set<std::wstring> m_extIconQueued;
+    bool m_extIconBusy = false;
+    std::thread m_extIconThread;
+    std::atomic<bool> m_extIconNotifyPending{ false };
+    int m_genericIconIndex = 0;                         // the icon of a file whose type has none of its own
+
+    // Non-blocking Network Drive online/offline state cache.
+    // Kept in a block that the probe threads share with the engine. Asking a drive that is offline can take
+    // half a minute, and the engine may be gone by the time the answer arrives; a thread that only knew the
+    // engine's address would then write into freed memory. This way the thread keeps the block alive.
     struct NetDriveInfo {
         bool probed = false;
         bool online = false;
         uint64_t totalBytes = 0;
+        uint64_t freeBytes = 0;
+    };
+    struct NetDriveState {
+        std::mutex mutex;
+        std::unordered_map<wchar_t, NetDriveInfo> drives;
+        std::atomic<bool> wanted{ true };       // false once the engine has no use for the answers any more
     };
     void ProbeNetworkDriveAsync(wchar_t driveLetter);
-    mutable std::mutex m_netDriveMutex;
-    std::unordered_map<wchar_t, NetDriveInfo> m_netDrives;
+    std::shared_ptr<NetDriveState> m_net = std::make_shared<NetDriveState>();
 
     // Async Recursive Search Worker
     void SearchWorkerLoop();
@@ -209,6 +262,15 @@ private:
     std::atomic<bool> m_searchNotifyPending{ false };
     std::vector<FileEntry> m_searchAccumResults;
     SearchProgressInfo m_searchProgress;
+
+    // Live Directory Watcher Worker
+    void DirWatcherWorkerLoop();
+    std::thread m_watcherThread;
+    mutable std::mutex m_watcherMutex;
+    std::condition_variable m_watcherCv;
+    std::wstring m_watchedDir;
+    std::atomic<uint64_t> m_watcherGeneration{ 0 };
+    HANDLE m_watcherWakeEvent = nullptr;
 };
 
 } // namespace Explorer2

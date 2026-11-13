@@ -14,7 +14,12 @@ enum class OfficeFileKind : int {
     ExcelXlsx = 2,
     ExcelXls = 3,
     WordDocx = 4,
-    RichTextRtf = 5
+    RichTextRtf = 5,
+    PowerPointPptx = 6,
+    EpubBook = 7,
+    SqliteDb = 8,
+    DbfTable = 9,
+    DifSylkTable = 10
 };
 
 struct SpreadsheetSheet {
@@ -30,6 +35,15 @@ struct DocParagraph {
     bool isTableRow = false;
 };
 
+struct GpsTrackPoint {
+    double lat = 0.0;
+    double lon = 0.0;
+    float elevM = 0.0f;
+    float cumDistKm = 0.0f;
+    int rowIndex = 0;
+    std::wstring label;
+};
+
 struct ParsedOfficeDocument {
     std::wstring filePath;
     std::wstring formatTitle;
@@ -39,6 +53,12 @@ struct ParsedOfficeDocument {
 
     // For Spreadsheets (.csv, .tsv, .xlsx, .xls)
     std::vector<SpreadsheetSheet> sheets;
+
+    // For GPS / Telemetry Map Logs (.gpx, .kml, .geojson, .osm, .tcx, .nmea, .igc)
+    bool hasGeoTrack = false;
+    std::vector<GpsTrackPoint> geoPoints;
+    double totalDistanceKm = 0.0;
+    double totalAscentM = 0.0;
 
     // For Documents (.docx, .odt, .rtf)
     std::vector<DocParagraph> paragraphs;
@@ -59,6 +79,13 @@ public:
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
     void Clear();
+
+    // A document read on another thread (InspectOfficeFile) goes into the view, which then shows what
+    // LoadFile would have shown.
+    void ShowLoadedDocument(const std::wstring& fullPath, ParsedOfficeDocument&& doc);
+    bool IsShowing(const std::wstring& fullPath) const { return !m_currentPath.empty() && m_currentPath == fullPath; }
+    const std::wstring& LoadedPath() const { return m_currentPath; }
+    bool HasValidDocument() const { return m_doc.valid; }
 
     void Draw(
         ID2D1RenderTarget* rt,
@@ -84,6 +111,9 @@ private:
         BTN_COPY_ALL = 1,
         BTN_COPY_CELL = 2,
         BTN_SORT_ASC_DESC = 3,
+        BTN_TOGGLE_MAP_VIEW = 4,
+        BTN_RESET_MAP_CAM = 5,
+        BTN_OPEN_OSM_WEB = 6,
         BTN_SHEET_BASE = 100 // 100 + sheetIdx
     };
 
@@ -113,6 +143,13 @@ private:
     double m_statMax = 0.0;
 
     int m_hoverBtnId = 0;
+    bool m_showMapView = true;
+    float m_mapZoom = 1.0f;
+    float m_mapPanX = 0.0f;
+    float m_mapPanY = 0.0f;
+    bool m_mapDragging = false;
+    float m_mapDragStartX = 0.0f;
+    float m_mapDragStartY = 0.0f;
     D2D1_RECT_F m_gridBodyRect = {};
     D2D1_RECT_F m_colHeaderRect = {};
     std::vector<HitRect> m_toolbarHits;

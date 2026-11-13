@@ -263,6 +263,80 @@ struct HwSystemInfo {
     std::vector<HwProcessEntry> topProcesses;
 };
 
+struct HwComPortInfo {
+    std::wstring portName;          // e.g. L"COM3"
+    int portNumber = 0;             // e.g. 3
+    std::wstring friendlyName;      // e.g. L"USB-SERIAL CH340 (COM3)"
+    std::wstring description;       // e.g. L"USB-SERIAL CH340"
+    std::wstring busReportedDesc;   // e.g. L"USB2.0-Serial"
+    std::wstring manufacturer;      // e.g. L"wch.cn"
+    std::wstring vendorName;        // e.g. L"QinHeng Electronics (WCH)"
+    std::wstring chipModel;         // e.g. L"QinHeng CH340 USB-UART"
+    std::wstring vidPid;            // e.g. L"1A86:7523"
+    std::wstring serialNumber;      // USB serial or instance suffix
+    std::wstring serviceName;       // e.g. L"CH341SER_A64" / L"usbser" / L"FTDIBUS" / L"Serial"
+    std::wstring driverVersion;     // e.g. L"3.8.2023.2"
+    std::wstring driverProvider;    // e.g. L"wch.cn" / L"FTDI" / L"Microsoft"
+    std::wstring locationInfo;      // e.g. L"Port_#0002.Hub_#0001"
+    std::wstring pdoName;           // e.g. L"\\Device\\USBPDO-7"
+    std::wstring ntDevicePath;      // e.g. L"\\Device\\Serial0" or L"\\Device\\USBSER000"
+    std::wstring deviceInstanceId;  // e.g. L"USB\\VID_1A86&PID_7523\\..."
+    std::wstring parentInstanceId;  // Parent USB device instance ID if composite/FTDI
+    std::wstring hardwareIds;       // e.g. L"USB\\VID_1A86&PID_7523&REV_0264"
+    uint32_t defaultBaud = 9600;
+    uint8_t dataBits = 8;
+    uint8_t stopBits = 0;           // 0=1, 1=1.5, 2=2
+    uint8_t parity = 0;             // 0=None, 1=Odd, 2=Even, 3=Mark, 4=Space
+    uint32_t problemCode = 0;
+    std::wstring statusStr;         // e.g. L"OK"
+    bool isUsbBacked = false;
+    bool isBluetooth = false;
+    bool isVirtual = false;
+};
+
+struct HwUsbNodeInfo {
+    int nodeIndex = 0;
+    int parentIndex = -1;
+    int depth = 0;                  // 0=Host Controller, 1=Root Hub, 2=Hub/Port Device, 3+=Child Device/Interface
+    int portNumber = 0;             // Parsed from "Port_#0004" if > 0
+    int hubNumber = 0;              // Parsed from "Hub_#0001" if > 0
+    int childCount = 0;
+    bool isLastSibling = false;
+    uint32_t ancestorContinueMask = 0; // Bit d is 1 if ancestor at depth d has more siblings below
+    bool isController = false;
+    bool isRootHub = false;
+    bool isHub = false;
+    bool isComposite = false;
+    bool isInterface = false;
+    std::wstring displayName;       // Best human-readable name (BusReported + Friendly/Desc)
+    std::wstring friendlyName;
+    std::wstring description;
+    std::wstring busReportedDesc;   // Direct USB firmware iProduct string (DEVPKEY_Device_BusReportedDeviceDesc)
+    std::wstring categoryBadge;     // L"xHCI", L"EHCI", L"ROOT", L"HUB", L"COM3", L"HID", L"AUDIO", L"DISK", L"BT", L"CAM", L"NET", L"COMP", L"USB"
+    uint32_t badgeColor = 0x0284C7;
+    std::wstring className;         // e.g. L"USB", L"Ports", L"HIDClass", L"Media", L"Bluetooth"
+    std::wstring vidPid;            // e.g. L"046D:C52B"
+    std::wstring revStr;            // e.g. L"24.11" (from REV_xxxx)
+    std::wstring vendorName;        // Resolved vendor name from VID or Mfg
+    std::wstring manufacturer;      // OS INF Manufacturer
+    std::wstring chipModel;         // Identified bridge/controller chip if known
+    std::wstring serviceDriver;     // e.g. L"USBXHCI", L"USBHUB3", L"usbccgp", L"HidUsb"
+    std::wstring driverVersion;     // e.g. L"10.0.19041.4355"
+    std::wstring driverProvider;
+    std::wstring driverKey;
+    std::wstring locationInfo;      // e.g. L"Port_#0004.Hub_#0001"
+    std::wstring pdoName;           // e.g. L"\\Device\\USBPDO-5"
+    std::wstring deviceInstanceId;  // e.g. L"USB\\VID_046D&PID_C52B\\..."
+    std::wstring parentInstanceId;
+    std::wstring hardwareIds;
+    std::wstring serialNumber;
+    std::wstring comPortName;       // e.g. L"COM3" if this node or its child interface exposes a COM port
+    std::wstring speedHint;         // e.g. L"USB 3.x (xHCI)", L"USB 2.0"
+    std::wstring statusStr;         // e.g. L"OK (DN_STARTED)"
+    uint32_t problemCode = 0;
+    uint32_t devNodeStatus = 0;
+};
+
 class HardwareInspector {
 public:
     HardwareInspector();
@@ -277,6 +351,7 @@ public:
 
     // Non-blocking background refresh requests for UI commands
     void RequestAsyncRefresh(bool fullInventory, bool allSmart, int singleSmartDisk = -1);
+    void RequestUsbComRefresh(bool syncForCli = false);
     bool ApplyStagedData();
     bool IsAsyncBusy() const { return m_workerBusy.load(std::memory_order_relaxed); }
     bool HasStagedData() const { return m_hasStagedData.load(std::memory_order_relaxed); }
@@ -298,6 +373,8 @@ public:
     const std::vector<HwLogicalVolume>& GetVolumes() const { return m_volumes; }
     const std::vector<HwNetAdapter>& GetNetworks() const { return m_networks; }
     const HwSystemInfo& GetSystem() const { return m_system; }
+    const std::vector<HwUsbNodeInfo>& GetUsbTree() const { return m_usbTree; }
+    const std::vector<HwComPortInfo>& GetComPorts() const { return m_comPorts; }
 
     const std::vector<float>& GetGpuLoadHistory() const { return m_gpuLoadHistory; }
     const std::vector<float>& GetNetRxHistoryKBps() const { return m_netRxHistoryKBps; }
@@ -326,6 +403,7 @@ private:
     void QueryPhysicalDisksAndVolumes();
     void QueryNetworkAdapters(bool updateThroughputOnly);
     void QuerySystemAndAudio(bool fullRefresh);
+    void QueryUsbAndComPorts();
 
     void UpdateCpuLivePerCoreLoad();
     void UpdateGpuLiveTelemetry();
@@ -347,6 +425,8 @@ private:
     std::vector<HwLogicalVolume> m_volumes;
     std::vector<HwNetAdapter> m_networks;
     HwSystemInfo m_system;
+    std::vector<HwUsbNodeInfo> m_usbTree;
+    std::vector<HwComPortInfo> m_comPorts;
 
     std::vector<float> m_gpuLoadHistory;
     std::vector<float> m_netRxHistoryKBps;
@@ -392,6 +472,8 @@ private:
         std::vector<std::wstring> audioInputs;
         std::vector<HwProcessEntry> topProcesses;
         std::vector<HwThermalSensor> thermalZones;
+        std::vector<HwUsbNodeInfo> usbTree;
+        std::vector<HwComPortInfo> comPorts;
         std::vector<float> gpuLoadHistory;
         std::vector<float> netRxHistoryKBps;
         std::vector<float> netTxHistoryKBps;
@@ -417,6 +499,7 @@ private:
     std::atomic<bool> m_reqAllSmart{ false };
     std::atomic<int>  m_reqSingleSmartDisk{ -1 };
     std::atomic<bool> m_reqLiveUpdate{ false };
+    std::atomic<bool> m_reqUsbComRefresh{ false };
 };
 
 } // namespace Explorer2

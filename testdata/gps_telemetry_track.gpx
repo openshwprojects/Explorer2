@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Explorer2 Telemetry">
+  <trk>
+    <name>Trasa Testowa Warszawa</name>
+    <trkseg>
+      <trkpt lat="52.2297" lon="21.0122"><ele>112.4</ele><time>2026-11-09T10:00:00Z</time></trkpt>
+      <trkpt lat="52.2315" lon="21.0158"><ele>114.1</ele><time>2026-11-09T10:01:00Z</time></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

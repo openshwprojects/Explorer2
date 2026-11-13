@@ -13,6 +13,9 @@ struct BitStream {
     size_t bytePos = 0;
     uint32_t bitBuf = 0;
     int bitCount = 0;
+    // Set as soon as more bits are taken than the input holds. Those bits read as zeros, and zeros can
+    // decode to data for ever, so the decoder has to stop when it sees this instead of going on.
+    bool overrun = false;
 
     void Fill(int needBits) {
         while (bitCount < needBits && bytePos < size) {
@@ -29,7 +32,10 @@ struct BitStream {
     void DropBits(int n) {
         bitBuf >>= n;
         bitCount -= n;
-        if (bitCount < 0) bitCount = 0;
+        if (bitCount < 0) {
+            bitCount = 0;
+            overrun = true;
+        }
     }
 
     uint32_t ReadBits(int n) {
@@ -58,6 +64,7 @@ struct BitStream {
             return b;
         }
         if (bytePos < size) return data[bytePos++];
+        overrun = true;
         return 0;
     }
 };
@@ -80,6 +87,13 @@ struct HuffmanTable {
             }
         }
         if (maxCodeLen == 0) return true;
+
+        // More codes of one length than a prefix code has room for: damaged data, not a Huffman code
+        int room = 1;
+        for (int bits = 1; bits <= kMaxBits; ++bits) {
+            room = (room << 1) - counts[bits];
+            if (room < 0) return false;
+        }
 
         uint16_t offsets[kMaxBits + 1] = {};
         uint16_t sum = 0;
@@ -167,6 +181,9 @@ bool InflateRaw(
 
     BitStream bs{ src, srcLen, 0, 0, 0 };
     uint32_t finalBlock = 0;
+    // Every "if (bs.overrun) return false" below ends the decoding of data that stops in the middle of a
+    // block. Without them a damaged stream of a few hundred bytes kept producing output until it reached
+    // maxOutputBytes, which took seconds.
 
     while (!finalBlock) {
         if (bs.bytePos >= bs.size && bs.bitCount < 3) break;
@@ -213,6 +230,7 @@ bool InflateRaw(
                 for (int i = 0; i < hclen; ++i) {
                     codeLenLengths[kCodeLenOrder[i]] = static_cast<uint8_t>(bs.ReadBits(3));
                 }
+                if (bs.overrun) return false;
                 HuffmanTable codeLenTable;
                 if (!codeLenTable.Build(codeLenLengths, 19)) return false;
 
@@ -221,7 +239,7 @@ bool InflateRaw(
                 int idx = 0;
                 while (idx < totalCodes) {
                     int sym = codeLenTable.Decode(bs);
-                    if (sym < 0) return false;
+                    if (sym < 0 || bs.overrun) return false;
                     if (sym < 16) {
                         allLengths[idx++] = static_cast<uint8_t>(sym);
                     } else if (sym == 16) {
@@ -239,13 +257,14 @@ bool InflateRaw(
                         return false;
                     }
                 }
+                if (bs.overrun) return false;
                 if (!litLenTable.Build(allLengths, hlit)) return false;
                 if (!distTable.Build(allLengths + hlit, hdist)) return false;
             }
 
             while (true) {
                 int sym = litLenTable.Decode(bs);
-                if (sym < 0) return false;
+                if (sym < 0 || bs.overrun) return false;
                 if (sym < 256) {
                     if (outData.size() + 1 > maxOutputBytes) return false;
                     outData.push_back(static_cast<uint8_t>(sym));
@@ -259,6 +278,7 @@ bool InflateRaw(
                     int distSym = distTable.Decode(bs);
                     if (distSym < 0 || distSym >= 30) return false;
                     uint32_t matchDist = kDistBase[distSym] + bs.ReadBits(kDistExtra[distSym]);
+                    if (bs.overrun) return false;
                     if (matchDist == 0 || matchDist > outData.size()) return false;
                     if (outData.size() + matchLen > maxOutputBytes) return false;
 
@@ -443,6 +463,60 @@ bool ListZipEntriesFromMemory(
         pos += 30 + nameLen + extraLen + compSz;
     }
     return !outEntries.empty();
+}
+
+bool ExtractZipEntryFromMemory(
+    const uint8_t* data,
+    size_t dataLen,
+    const ArchiveItemMeta& entry,
+    std::vector<uint8_t>& outBytes,
+    size_t maxOutputBytes)
+{
+    outBytes.clear();
+    if (!data || dataLen < 30 || entry.isDirectory || entry.isEncrypted) return false;
+    size_t hdrPos = static_cast<size_t>(entry.localHeaderOffset);
+    if (hdrPos + 30 > dataLen || ReadLE32(data + hdrPos) != 0x04034B50u) return false;
+    uint16_t method = ReadLE16(data + hdrPos + 8);
+    uint16_t nameLen = ReadLE16(data + hdrPos + 26);
+    uint16_t extraLen = ReadLE16(data + hdrPos + 28);
+    size_t payloadPos = hdrPos + 30 + nameLen + extraLen;
+    size_t compSz = static_cast<size_t>(entry.compressedSize);
+    if (payloadPos + compSz > dataLen) return false;
+
+    if (method == 0) {
+        if (compSz > maxOutputBytes) return false;
+        outBytes.assign(data + payloadPos, data + payloadPos + compSz);
+        return true;
+    } else if (method == 8) {
+        return InflateRaw(data + payloadPos, compSz, outBytes, maxOutputBytes);
+    }
+    return false;
+}
+
+bool ExtractZipEntryFromMemory(
+    const uint8_t* data,
+    size_t dataLen,
+    const char* nameSubstr,
+    std::vector<uint8_t>& outBytes,
+    size_t maxOutputBytes)
+{
+    outBytes.clear();
+    if (!data || dataLen < 30 || !nameSubstr) return false;
+    std::vector<ArchiveItemMeta> entries;
+    if (!ListZipEntriesFromMemory(data, dataLen, entries)) return false;
+
+    std::wstring wTarget = PathUtils::ToLower(PathUtils::Utf8ToWide(nameSubstr));
+    for (wchar_t& ch : wTarget) if (ch == L'\\') ch = L'/';
+
+    for (const auto& entry : entries) {
+        if (entry.isDirectory || entry.isEncrypted) continue;
+        std::wstring lowPath = PathUtils::ToLower(entry.pathInArchive);
+        if (lowPath.find(wTarget) == std::wstring::npos) continue;
+        if (ExtractZipEntryFromMemory(data, dataLen, entry, outBytes, maxOutputBytes)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool ListZipEntriesFromFile(

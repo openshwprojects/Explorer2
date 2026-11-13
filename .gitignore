@@ -1,5 +1,11 @@
+# Build outputs (the exe is built with build.bat, not stored in git)
 build/
 *.obj
 *.pdb
 *.ilk
+*.exe
+*.bak
 .vs/
+
+# Self-test samples share extensions with build outputs (Wavefront .obj, Protein Data Bank .pdb): keep them
+!testdata/**

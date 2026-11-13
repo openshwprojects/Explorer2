@@ -72,6 +72,87 @@ namespace {
     }
 }
 
+// ---- Crash record -----------------------------------------------------------------------------------
+// When the program dies of an unhandled exception, the last lines of its log say where: the exception
+// code, the faulting address and the call stack, each as "module+offset". The code below runs inside a
+// broken process, so it uses only stack buffers and plain Win32 calls; no heap, no locks, no C++ library.
+namespace {
+    wchar_t g_crashRecordPath[1024] = {};       // used when no log file is open (see SetCrashRecordFile)
+    HANDLE g_crashOut = INVALID_HANDLE_VALUE;   // where the record being written goes
+
+    void CrashWrite(const char* text) {
+        if (g_crashOut == INVALID_HANDLE_VALUE) return;
+        DWORD written = 0;
+        WriteFile(g_crashOut, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    }
+
+    void DescribeAddress(DWORD64 address, char* out, size_t outSize) {
+        HMODULE mod = nullptr;
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(address), &mod) && mod && GetModuleFileNameW(mod, path, MAX_PATH)) {
+            const wchar_t* leaf = wcsrchr(path, L'\\');
+            char leafUtf8[96] = {};
+            WideCharToMultiByte(CP_UTF8, 0, leaf ? leaf + 1 : path, -1, leafUtf8, sizeof(leafUtf8) - 1, nullptr, nullptr);
+            sprintf_s(out, outSize, "%s+0x%llX", leafUtf8, static_cast<unsigned long long>(address - reinterpret_cast<DWORD64>(mod)));
+        } else {
+            sprintf_s(out, outSize, "0x%llX", static_cast<unsigned long long>(address));
+        }
+    }
+
+    LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+        static volatile LONG entered = 0;
+        if (!ep || !ep->ExceptionRecord || InterlockedExchange(&entered, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+
+        g_crashOut = g_file;
+        if (g_crashOut == INVALID_HANDLE_VALUE && g_crashRecordPath[0]) {
+            g_crashOut = CreateFileW(g_crashRecordPath, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+
+        char line[320] = {};
+        char where[192] = {};
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        DescribeAddress(reinterpret_cast<DWORD64>(ep->ExceptionRecord->ExceptionAddress), where, sizeof(where));
+        sprintf_s(line, "%04d-%02d-%02d %02d:%02d:%02d.%03d  ERROR  [Crash]  Unhandled exception 0x%08lX at %s (thread %lu)\r\n",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                  ep->ExceptionRecord->ExceptionCode, where, GetCurrentThreadId());
+        CrashWrite(line);
+#if defined(_M_X64)
+        if (ep->ContextRecord) {
+            CONTEXT ctx = *ep->ContextRecord;
+            for (int frame = 0; frame < 48 && ctx.Rip != 0; ++frame) {
+                DescribeAddress(ctx.Rip, where, sizeof(where));
+                sprintf_s(line, "                         ERROR  [Crash]    #%02d %s\r\n", frame, where);
+                CrashWrite(line);
+                DWORD64 imageBase = 0;
+                PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+                if (function) {
+                    PVOID handlerData = nullptr;
+                    DWORD64 establisherFrame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, function, &ctx, &handlerData, &establisherFrame, nullptr);
+                } else {
+                    // A leaf function: the return address is on top of the stack
+                    if (IsBadReadPtr(reinterpret_cast<const void*>(ctx.Rsp), sizeof(DWORD64))) break;
+                    ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+                    ctx.Rsp += sizeof(DWORD64);
+                }
+            }
+        }
+#endif
+        if (g_crashOut != INVALID_HANDLE_VALUE) FlushFileBuffers(g_crashOut);
+        return EXCEPTION_CONTINUE_SEARCH;   // Windows then handles the crash as it always does
+    }
+}
+
+void AppLog::InstallCrashHandler() {
+    SetUnhandledExceptionFilter(CrashFilter);
+}
+
+void AppLog::SetCrashRecordFile(const std::wstring& path) {
+    wcsncpy_s(g_crashRecordPath, path.c_str(), _TRUNCATE);
+}
+
 void AppLog::Init() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file != INVALID_HANDLE_VALUE) return;

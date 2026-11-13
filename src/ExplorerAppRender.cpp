@@ -1,7 +1,9 @@
 #include "ExplorerApp.h"
 #include "CommandIds.h"
 #include "PathUtils.h"
+#include "FtpClient.h"
 #include <shlwapi.h>
+#include <wincodec.h>
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
@@ -12,7 +14,55 @@
 
 namespace Explorer2 {
 
+static bool g_renderDarkMode = false;
+
 static D2D1_COLOR_F HexColor(uint32_t rgb, float a = 1.0f) {
+    if (g_renderDarkMode) {
+        switch (rgb) {
+        case 0xFFFFFF: rgb = 0x181B20; break;
+        case 0xF8FAFC:
+        case 0xF5F6F7:
+        case 0xF3F3F3:
+        case 0xF1F5F9:
+        case 0xF0F3F6:
+        case 0xEEF2F6: rgb = 0x1E222A; break;
+        case 0xEFF6FF:
+        case 0xEBF5FF:
+        case 0xE8EEF4:
+        case 0xE8EEF5:
+        case 0xE2E8F0: rgb = 0x262C36; break;
+        case 0xE5F3FB:
+        case 0xE5F3FF:
+        case 0xE8F1FB:
+        case 0xE1ECF4:
+        case 0xDBEAFE:
+        case 0xDCEBFC:
+        case 0xE0F2FE: rgb = 0x243B55; break;
+        case 0xCBE8F6:
+        case 0xCCE8FF: rgb = 0x1E4976; break;
+        case 0xDADADA:
+        case 0xDFDFDF:
+        case 0xD9D9D9:
+        case 0xE5E5E5:
+        case 0xCBD5E1:
+        case 0xD1D5DB:
+        case 0xCCCCCC: rgb = 0x333B48; break;
+        case 0x0F172A:
+        case 0x111111:
+        case 0x1E1E1E:
+        case 0x1E293B:
+        case 0x2B2B2B:
+        case 0x333333: rgb = 0xE2E8F0; break;
+        case 0x334155:
+        case 0x454545:
+        case 0x475569:
+        case 0x4C566A: rgb = 0xCBD5E1; break;
+        case 0x64748B:
+        case 0x666666:
+        case 0x6E6E6E:
+        case 0x767676: rgb = 0x94A3B8; break;
+        }
+    }
     return D2D1::ColorF(
         ((rgb >> 16) & 0xFF) / 255.0f,
         ((rgb >> 8) & 0xFF) / 255.0f,
@@ -46,9 +96,13 @@ void ExplorerApp::OnPaint() {
 
     m_rt->BeginDraw();
     m_rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    g_renderDarkMode = m_darkMode;
+    // New icons and thumbnails get 8 ms of this paint; what is left waits for the next one (see ImageCache.h)
+    m_imageCache.BeginPaintBudget(8.0);
     m_rt->Clear(HexColor(0xFFFFFF));
 
     m_ribbonHits.clear();
+    m_tabHits.clear();
     m_mediaSeekBarRect = {};
 
     RECT rc = {};
@@ -75,14 +129,11 @@ void ExplorerApp::OnPaint() {
         if (IsSplitViewActive()) {
             int otherIdx = 1 - m_activePane;
 
-            // 1. Draw the inactive pane first
-            D2D1_RECT_F otherOuter = GetSplitPaneOuterRect(otherIdx);
-            D2D1_RECT_F otherMain  = GetSplitPaneContentMainRect(otherIdx);
-            D2D1_RECT_F otherHdr   = D2D1::RectF(otherOuter.left, otherOuter.top, otherOuter.right, otherMain.top);
+            // 1. Draw the inactive pane first (no extra sub-header bar underneath — main NavBar is split above!)
+            D2D1_RECT_F otherMain = GetSplitPaneContentMainRect(otherIdx);
             SwapWithOtherPane();
             m_overrideMainRect = true;
             m_customMainRect = otherMain;
-            DrawSplitPaneHeader(otherIdx, otherHdr, false);
             DrawMainContent(otherMain);
             m_overrideMainRect = false;
             SwapWithOtherPane();
@@ -90,8 +141,6 @@ void ExplorerApp::OnPaint() {
             // 2. Draw the active pane
             D2D1_RECT_F activeOuter = GetSplitPaneOuterRect(m_activePane);
             D2D1_RECT_F activeMain  = GetSplitPaneContentMainRect(m_activePane);
-            D2D1_RECT_F activeHdr   = D2D1::RectF(activeOuter.left, activeOuter.top, activeOuter.right, activeMain.top);
-            DrawSplitPaneHeader(m_activePane, activeHdr, true);
             DrawMainContent(activeMain);
 
             // 3. Draw the draggable center splitter bar between Pane 0 and Pane 1
@@ -131,6 +180,10 @@ void ExplorerApp::OnPaint() {
         }
 
         DrawStatusBar(D2D1::RectF(0.0f, bodyBottom, w, h));
+
+        if (m_isDraggingItems) {
+            DrawDragOverlay();
+        }
     }
 
     HRESULT hr = m_rt->EndDraw();
@@ -139,6 +192,9 @@ void ExplorerApp::OnPaint() {
     }
 
     EndPaint(m_hwnd, &ps);
+    if (m_imageCache.TakePaintBudgetExceeded()) {
+        InvalidateRect(m_hwnd, nullptr, FALSE);     // the rest of the new icons and thumbnails
+    }
 }
 
 void ExplorerApp::DrawFolderVectorIcon(const D2D1_RECT_F& r, bool smallIcon) {
@@ -251,7 +307,7 @@ void ExplorerApp::DrawFolderWithContentPreview(const D2D1_RECT_F& r, const FileE
                 if (sh >= 34.0f) {
                     D2D1_RECT_F lblR = D2D1::RectF(slotR.left + 2.0f, subFldR.bottom, slotR.right - 2.0f, slotR.bottom - 1.0f);
                     m_solidBrush->SetColor(HexColor(0x4A3508));
-                    m_rt->DrawTextW(fp.name.c_str(), static_cast<UINT32>(fp.name.size()), m_fmtCenterSmall, lblR, m_solidBrush);
+                    DrawTextCached(fp.name.c_str(), static_cast<UINT32>(fp.name.size()), m_fmtCenterSmall, lblR, m_solidBrush);
                 }
             } else {
                 // Mini document card with colored extension header band + filename
@@ -276,14 +332,14 @@ void ExplorerApp::DrawFolderWithContentPreview(const D2D1_RECT_F& r, const FileE
                     for (wchar_t& ch : extUp) ch = static_cast<wchar_t>(towupper(ch));
                     m_solidBrush->SetColor(HexColor(0xFFFFFF));
                     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    m_rt->DrawTextW(extUp.c_str(), static_cast<UINT32>(extUp.size()), m_fmtSmall, bandR, m_solidBrush);
+                    DrawTextCached(extUp.c_str(), static_cast<UINT32>(extUp.size()), m_fmtSmall, bandR, m_solidBrush);
                     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
 
                 if (sh >= 28.0f) {
                     D2D1_RECT_F nmR = D2D1::RectF(slotR.left + 2.0f, bandR.bottom + 1.0f, slotR.right - 2.0f, slotR.bottom - 1.0f);
                     m_solidBrush->SetColor(HexColor(0x334155));
-                    m_rt->DrawTextW(fp.name.c_str(), static_cast<UINT32>(fp.name.size()), m_fmtCenterSmall, nmR, m_solidBrush);
+                    DrawTextCached(fp.name.c_str(), static_cast<UINT32>(fp.name.size()), m_fmtCenterSmall, nmR, m_solidBrush);
                 }
 
                 m_solidBrush->SetColor(HexColor(0xCBD5E1));
@@ -296,7 +352,7 @@ void ExplorerApp::DrawFolderWithContentPreview(const D2D1_RECT_F& r, const FileE
         // Subtle "Pusty" / "Empty" watermark on empty folders
         m_solidBrush->SetColor(HexColor(0xB8861B, 0.55f));
         const wchar_t* emptyTxt = (m_lang == Lang::PL) ? L"(pusty)" : L"(empty)";
-        m_rt->DrawTextW(emptyTxt, static_cast<UINT32>(wcslen(emptyTxt)), m_fmtCenterSmall, bodyR, m_solidBrush);
+        DrawTextCached(emptyTxt, static_cast<UINT32>(wcslen(emptyTxt)), m_fmtCenterSmall, bodyR, m_solidBrush);
     }
 
     // 3. Front Folder Pocket Lip along the bottom + Outer Border + Item Count Badge
@@ -317,7 +373,7 @@ void ExplorerApp::DrawFolderWithContentPreview(const D2D1_RECT_F& r, const FileE
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(badgeR, 3.0f, 3.0f), m_solidBrush);
         m_solidBrush->SetColor(HexColor(0xFFFFFF));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(cntStr.c_str(), static_cast<UINT32>(cntStr.size()), m_fmtSmall, badgeR, m_solidBrush);
+        DrawTextCached(cntStr.c_str(), static_cast<UINT32>(cntStr.size()), m_fmtSmall, badgeR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 }
@@ -762,6 +818,67 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
         m_rt->DrawLine(D2D1::Point2F(cx, cy), D2D1::Point2F(cx + sz * 0.35f, cy + sz * 0.22f), m_solidBrush, 1.6f);
         break;
     }
+    case CMD_HOME_EASY_ACCESS: {
+        // Quick Access star / link badge
+        m_solidBrush->SetColor(HexColor(0xFEF3C7));
+        m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.78f, sz * 0.78f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0xD97706));
+        m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.78f, sz * 0.78f), m_solidBrush, 1.5f);
+        m_rt->DrawLine(D2D1::Point2F(cx, cy - sz * 0.48f), D2D1::Point2F(cx, cy + sz * 0.48f), m_solidBrush, 1.8f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.48f, cy), D2D1::Point2F(cx + sz * 0.48f, cy), m_solidBrush, 1.8f);
+        break;
+    }
+    case CMD_TAB_TRANSFERS:
+    case CMD_XFER_NEW_TRANSFER_DLG: {
+        // Dual high-speed bidirectional transfer arrows (⇄)
+        m_solidBrush->SetColor(HexColor(0x0284C7));
+        float y1 = cy - sz * 0.34f;
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.82f, y1), D2D1::Point2F(cx + sz * 0.78f, y1), m_solidBrush, 2.3f);
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.42f, y1 - sz * 0.32f), D2D1::Point2F(cx + sz * 0.80f, y1), m_solidBrush, 2.3f);
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.42f, y1 + sz * 0.32f), D2D1::Point2F(cx + sz * 0.80f, y1), m_solidBrush, 2.3f);
+
+        m_solidBrush->SetColor(HexColor(0x059669));
+        float y2 = cy + sz * 0.36f;
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.82f, y2), D2D1::Point2F(cx - sz * 0.78f, y2), m_solidBrush, 2.3f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.42f, y2 - sz * 0.32f), D2D1::Point2F(cx - sz * 0.80f, y2), m_solidBrush, 2.3f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.42f, y2 + sz * 0.32f), D2D1::Point2F(cx - sz * 0.80f, y2), m_solidBrush, 2.3f);
+        break;
+    }
+    case CMD_XFER_PAUSE_ALL:
+    case CMD_XFER_PAUSE_RESUME_ACTIVE: {
+        // Amber circle with twin pause bars
+        m_solidBrush->SetColor(HexColor(0xFEF3C7));
+        m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.82f, sz * 0.82f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0xD97706));
+        m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.82f, sz * 0.82f), m_solidBrush, 1.6f);
+        m_rt->FillRectangle(D2D1::RectF(cx - sz * 0.34f, cy - sz * 0.42f, cx - sz * 0.10f, cy + sz * 0.42f), m_solidBrush);
+        m_rt->FillRectangle(D2D1::RectF(cx + sz * 0.10f, cy - sz * 0.42f, cx + sz * 0.34f, cy + sz * 0.42f), m_solidBrush);
+        break;
+    }
+    case CMD_XFER_RESUME_ALL: {
+        // Emerald circle with play triangle
+        m_solidBrush->SetColor(HexColor(0xD1FAE5));
+        m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.82f, sz * 0.82f), m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0x059669));
+        m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.82f, sz * 0.82f), m_solidBrush, 1.6f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.22f, cy - sz * 0.42f), D2D1::Point2F(cx + sz * 0.40f, cy), m_solidBrush, 2.4f);
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.40f, cy), D2D1::Point2F(cx - sz * 0.22f, cy + sz * 0.42f), m_solidBrush, 2.4f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.22f, cy - sz * 0.42f), D2D1::Point2F(cx - sz * 0.22f, cy + sz * 0.42f), m_solidBrush, 2.4f);
+        break;
+    }
+    case CMD_XFER_RETRY_ALL_FAILED:
+    case CMD_XFER_JOB_RETRY_FAILED: {
+        m_solidBrush->SetColor(HexColor(0x0284C7));
+        m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.62f, sz * 0.62f), m_solidBrush, 2.0f);
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.25f, cy - sz * 0.68f), D2D1::Point2F(cx + sz * 0.72f, cy - sz * 0.35f), m_solidBrush, 2.0f);
+        break;
+    }
+    case CMD_XFER_CLEAR_FINISHED: {
+        m_solidBrush->SetColor(HexColor(0x16A34A));
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.55f, cy + sz * 0.05f), D2D1::Point2F(cx - sz * 0.12f, cy + sz * 0.50f), m_solidBrush, 2.2f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.12f, cy + sz * 0.50f), D2D1::Point2F(cx + sz * 0.62f, cy - sz * 0.45f), m_solidBrush, 2.2f);
+        break;
+    }
     default: {
         D2D1_RECT_F box = D2D1::RectF(cx - sz * 0.55f, cy - sz * 0.55f, cx + sz * 0.55f, cy + sz * 0.55f);
         m_solidBrush->SetColor(HexColor(0x4B89DA));
@@ -783,6 +900,14 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
     m_solidBrush->SetColor(HexColor(0xDADADA));
     m_rt->DrawLine(D2D1::Point2F(tabStrip.left, tabStrip.bottom), D2D1::Point2F(tabStrip.right, tabStrip.bottom), m_solidBrush, 1.0f);
 
+    TransferJobSnapshot tabHudSnap;
+    size_t tabActiveXfers = 0;
+    const bool hasLiveXfers = m_transfers.GetPrimaryHudJob(tabHudSnap, &tabActiveXfers);
+    std::wstring xferTabLabel = (m_lang == Lang::PL) ? L"Transfery" : L"Transfers";
+    if (hasLiveXfers && tabActiveXfers > 0) {
+        xferTabLabel += L" (" + std::to_wstring(tabActiveXfers) + L")";
+    }
+
     struct TabDef {
         int cmdId;
         RibbonTab tab;
@@ -791,17 +916,18 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         bool isBlueFileTab;
     };
     TabDef tabs[] = {
-        { CMD_TAB_FILE,     RibbonTab::File,     s.tabFile,     58.0f,  true  },
-        { CMD_TAB_HOME,     RibbonTab::Home,     s.tabHome,     118.0f, false },
-        { CMD_TAB_SHARE,    RibbonTab::Share,    s.tabShare,    102.0f, false },
-        { CMD_TAB_VIEW,     RibbonTab::View,     s.tabView,     68.0f,  false },
-        { CMD_TAB_SEARCH,   RibbonTab::Search,   s.tabSearch,   96.0f,  false },
-        { CMD_TAB_HARDWARE, RibbonTab::Hardware, s.tabHardware, 76.0f,  false },
-        { CMD_TAB_PROGRAMS, RibbonTab::Programs, m_lang == Lang::PL ? L"Programy" : L"Programs", 84.0f, false },
-        { CMD_TAB_MONITORING, RibbonTab::Monitoring, L"Monitoring", 88.0f, false },
-        { CMD_TAB_LAN, RibbonTab::Lan, L"LAN", 56.0f, false },
-        { CMD_TAB_BACKUPS, RibbonTab::Backups, m_lang == Lang::PL ? L"Kopie zapasowe" : L"Backups", 104.0f, false },
-        { CMD_TAB_LOG, RibbonTab::Log, L"Log", 50.0f, false }
+        { CMD_TAB_FILE,       RibbonTab::File,       s.tabFile,     56.0f,  true  },
+        { CMD_TAB_HOME,       RibbonTab::Home,       s.tabHome,     112.0f, false },
+        { CMD_TAB_SHARE,      RibbonTab::Share,      s.tabShare,    96.0f,  false },
+        { CMD_TAB_VIEW,       RibbonTab::View,       s.tabView,     66.0f,  false },
+        { CMD_TAB_SEARCH,     RibbonTab::Search,     s.tabSearch,   92.0f,  false },
+        { CMD_TAB_TRANSFERS,  RibbonTab::Transfers,  xferTabLabel.c_str(), hasLiveXfers ? 90.0f : 74.0f, false },
+        { CMD_TAB_HARDWARE,   RibbonTab::Hardware,   s.tabHardware, 74.0f,  false },
+        { CMD_TAB_PROGRAMS,   RibbonTab::Programs,   m_lang == Lang::PL ? L"Programy" : L"Programs", 80.0f, false },
+        { CMD_TAB_MONITORING, RibbonTab::Monitoring, L"Monitoring", 84.0f, false },
+        { CMD_TAB_LAN,        RibbonTab::Lan,        L"LAN",        52.0f, false },
+        { CMD_TAB_BACKUPS,    RibbonTab::Backups,    m_lang == Lang::PL ? L"Kopie zapasowe" : L"Backups", 98.0f, false },
+        { CMD_TAB_LOG,        RibbonTab::Log,        L"Log",        48.0f, false }
     };
 
     float tx = rect.left;
@@ -825,17 +951,34 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
             if (m_hoverRibbonBtn == t.cmdId) {
                 m_solidBrush->SetColor(HexColor(0xE8F1FB));
                 m_rt->FillRectangle(tr, m_solidBrush);
+            } else if (t.tab == RibbonTab::Transfers && hasLiveXfers) {
+                m_solidBrush->SetColor(HexColor(tabHudSnap.state == TransferJobState::Paused ? 0xFEF3C7 : 0xE0F2FE));
+                m_rt->FillRectangle(tr, m_solidBrush);
             }
-            m_solidBrush->SetColor(HexColor(0x2B2B2B));
+            m_solidBrush->SetColor(
+                (t.tab == RibbonTab::Transfers && hasLiveXfers)
+                    ? HexColor(tabHudSnap.state == TransferJobState::Paused ? 0xB45309 : 0x0369A1)
+                    : HexColor(0x2B2B2B));
         }
 
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(t.label, static_cast<UINT32>(wcslen(t.label)), m_fmtSmall, tr, m_solidBrush);
+        DrawTextCached(t.label, static_cast<UINT32>(wcslen(t.label)), m_fmtSmall, tr, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         tx += t.width;
     }
 
-    // Right-side controls on Tab Strip: [PL / EN] language button + Collapse Ribbon '^' + Blue Help '?'
+    // Right-side controls on Tab Strip: [🌙/☀ Theme] + [PL / EN] language button + Collapse Ribbon '^' + Blue Help '?'
+    D2D1_RECT_F themeBtn = D2D1::RectF(rect.right - 142.0f, rect.top + 4.0f, rect.right - 114.0f, rect.top + kRibbonTabsHeight - 3.0f);
+    m_ribbonHits.push_back({ CMD_TOGGLE_THEME, themeBtn });
+    m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_TOGGLE_THEME ? HexColor(0xDCEBFC) : HexColor(0xF0F3F6));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(themeBtn, 3.0f, 3.0f), m_solidBrush);
+    m_solidBrush->SetColor(HexColor(0xB8C4D0));
+    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(themeBtn, 3.0f, 3.0f), m_solidBrush, 1.0f);
+    m_solidBrush->SetColor(m_darkMode ? HexColor(0xF59E0B) : HexColor(0x334155));
+    const wchar_t* themeGlyph = m_darkMode ? L"\x2600" : L"\x263E";
+    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawTextCached(themeGlyph, 1, m_fmtSmall, themeBtn, m_solidBrush);
+
     D2D1_RECT_F langBtn = D2D1::RectF(rect.right - 110.0f, rect.top + 4.0f, rect.right - 52.0f, rect.top + kRibbonTabsHeight - 3.0f);
     m_ribbonHits.push_back({ CMD_TOGGLE_LANG, langBtn });
     m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_TOGGLE_LANG ? HexColor(0xDCEBFC) : HexColor(0xF0F3F6));
@@ -845,21 +988,22 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
     m_solidBrush->SetColor(HexColor(0x0067B8));
     const wchar_t* langLabel = (m_lang == Lang::PL) ? L"PL \x21C4 EN" : L"EN \x21C4 PL";
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_rt->DrawTextW(langLabel, static_cast<UINT32>(wcslen(langLabel)), m_fmtSmall, langBtn, m_solidBrush);
+    DrawTextCached(langLabel, static_cast<UINT32>(wcslen(langLabel)), m_fmtSmall, langBtn, m_solidBrush);
 
     D2D1_RECT_F collapseBtn = D2D1::RectF(rect.right - 48.0f, rect.top + 4.0f, rect.right - 26.0f, rect.top + kRibbonTabsHeight - 3.0f);
     m_ribbonHits.push_back({ CMD_TOGGLE_RIBBON, collapseBtn });
     m_solidBrush->SetColor(HexColor(0x666666));
     const wchar_t* chev = m_ribbonCollapsed ? L"\x25BC" : L"\x25B2";
-    m_rt->DrawTextW(chev, 1, m_fmtSmall, collapseBtn, m_solidBrush);
+    DrawTextCached(chev, 1, m_fmtSmall, collapseBtn, m_solidBrush);
 
-    // Blue '?' help circle matching Win10 screenshot
+    // Blue '?' help circle matching Win10 screenshot (clickable: opens Shortcuts & Features reference)
     D2D1_POINT_2F helpCenter = D2D1::Point2F(rect.right - 13.0f, rect.top + 15.0f);
-    m_solidBrush->SetColor(HexColor(0x0067B8));
-    m_rt->FillEllipse(D2D1::Ellipse(helpCenter, 8.0f, 8.0f), m_solidBrush);
+    D2D1_RECT_F helpR = D2D1::RectF(helpCenter.x - 9.0f, helpCenter.y - 9.0f, helpCenter.x + 9.0f, helpCenter.y + 9.0f);
+    m_ribbonHits.push_back({ CMD_HELP_SHORTCUTS, helpR });
+    m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_HELP_SHORTCUTS ? HexColor(0x005A9E) : HexColor(0x0067B8));
+    m_rt->FillEllipse(D2D1::Ellipse(helpCenter, 8.5f, 8.5f), m_solidBrush);
     m_solidBrush->SetColor(HexColor(0xFFFFFF));
-    D2D1_RECT_F helpR = D2D1::RectF(helpCenter.x - 8.0f, helpCenter.y - 8.0f, helpCenter.x + 8.0f, helpCenter.y + 8.0f);
-    m_rt->DrawTextW(L"?", 1, m_fmtSmall, helpR, m_solidBrush);
+    DrawTextCached(L"?", 1, m_fmtSmall, helpR, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     if (m_ribbonCollapsed) return;
@@ -885,7 +1029,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
 
         D2D1_RECT_F textR = D2D1::RectF(x + 2.0f, body.top + 38.0f, x + w - 2.0f, body.bottom - 18.0f);
         m_solidBrush->SetColor(HexColor(0x1E1E1E));
-        m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtCenterSmall, textR, m_solidBrush);
+        DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtCenterSmall, textR, m_solidBrush);
     };
 
     auto drawSmallRowButton = [&](int cmdId, float x, float y, float w, const wchar_t* label, bool checked = false) {
@@ -902,7 +1046,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
 
         D2D1_RECT_F textR = D2D1::RectF(x + 23.0f, y, x + w - 2.0f, y + 22.0f);
         m_solidBrush->SetColor(HexColor(0x1E1E1E));
-        m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, textR, m_solidBrush);
+        DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, textR, m_solidBrush);
     };
 
     auto drawGroupSeparatorAndTitle = [&](float groupStartX, float groupEndX, const wchar_t* groupTitle) {
@@ -912,7 +1056,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         D2D1_RECT_F titleR = D2D1::RectF(groupStartX, body.bottom - 17.0f, groupEndX, body.bottom - 2.0f);
         m_solidBrush->SetColor(HexColor(0x6E6E6E));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(groupTitle, static_cast<UINT32>(wcslen(groupTitle)), m_fmtSmall, titleR, m_solidBrush);
+        DrawTextCached(groupTitle, static_cast<UINT32>(wcslen(groupTitle)), m_fmtSmall, titleR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
 
@@ -984,13 +1128,13 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
             }
             D2D1_RECT_F txtR = D2D1::RectF(x + 21.0f, y, x + w - 2.0f, y + 21.0f);
             m_solidBrush->SetColor(HexColor(0x1E1E1E));
-            m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, txtR, m_solidBrush);
+            DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, txtR, m_solidBrush);
         };
 
         auto drawEditableBox = [&](int cmdId, float x, float y, float labelW, float boxW, const wchar_t* prefixLbl, const std::wstring& value, const wchar_t* placeholder, bool enabled) {
             D2D1_RECT_F lblR = D2D1::RectF(x, y, x + labelW, y + 21.0f);
             m_solidBrush->SetColor(enabled ? HexColor(0x1E1E1E) : HexColor(0x666666));
-            m_rt->DrawTextW(prefixLbl, static_cast<UINT32>(wcslen(prefixLbl)), m_fmtSmall, lblR, m_solidBrush);
+            DrawTextCached(prefixLbl, static_cast<UINT32>(wcslen(prefixLbl)), m_fmtSmall, lblR, m_solidBrush);
 
             D2D1_RECT_F fieldR = D2D1::RectF(x + labelW, y + 1.0f, x + labelW + boxW, y + 20.0f);
             m_ribbonHits.push_back({ cmdId, fieldR });
@@ -1002,7 +1146,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
             std::wstring disp = value.empty() ? std::wstring(placeholder) : value;
             m_solidBrush->SetColor(value.empty() ? HexColor(0x888888) : HexColor(0x111111));
             D2D1_RECT_F valR = D2D1::RectF(fieldR.left + 4.0f, fieldR.top, fieldR.right - 3.0f, fieldR.bottom);
-            m_rt->DrawTextW(disp.c_str(), static_cast<UINT32>(disp.size()), m_fmtSmall, valR, m_solidBrush);
+            DrawTextCached(disp.c_str(), static_cast<UINT32>(disp.size()), m_fmtSmall, valR, m_solidBrush);
         };
 
         auto drawPresetPill = [&](int cmdId, float x, float y, float w, const wchar_t* label, bool active = false) {
@@ -1014,7 +1158,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush, 1.0f);
             m_solidBrush->SetColor(active ? HexColor(0xFFFFFF) : HexColor(0x2B3846));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, pr, m_solidBrush);
+            DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, pr, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         };
 
@@ -1079,13 +1223,15 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawGroupSeparatorAndTitle(g4Start, sx, m_lang == Lang::PL ? L"Typy plików (Lista)" : L"File Types (List)");
         sx += 8.0f;
 
-        // 5. Akcje (Szukaj / Stop / Reset)
+        // 5. Akcje (Szukaj / Stop / Reset / Duplikaty)
         float g5Start = sx;
-        drawPresetPill(CMD_SEARCH_START,         sx, body.top + 6.0f,  92.0f, m_lang == Lang::PL ? L"\xD83D\xDD0D Szukaj teraz" : L"\xD83D\xDD0D Search Now", true);
-        drawPresetPill(CMD_SEARCH_STOP,          sx, body.top + 30.0f, 92.0f, m_lang == Lang::PL ? L"\x23F9 Zatrzymaj" : L"\x23F9 Stop", m_searchProgress.isRunning);
-        drawPresetPill(CMD_SEARCH_RESET_FILTERS, sx, body.top + 53.0f, 92.0f, m_lang == Lang::PL ? L"\x21BA Resetuj filtry" : L"\x21BA Reset Filters", false);
-        sx += 98.0f;
-        drawGroupSeparatorAndTitle(g5Start, sx, m_lang == Lang::PL ? L"Akcje" : L"Actions");
+        drawPresetPill(CMD_SEARCH_START,         sx,          body.top + 6.0f,  92.0f, m_lang == Lang::PL ? L"\xD83D\xDD0D Szukaj teraz" : L"\xD83D\xDD0D Search Now", true);
+        drawPresetPill(CMD_SEARCH_STOP,          sx,          body.top + 30.0f, 92.0f, m_lang == Lang::PL ? L"\x23F9 Zatrzymaj" : L"\x23F9 Stop", m_searchProgress.isRunning);
+        drawPresetPill(CMD_SEARCH_RESET_FILTERS, sx,          body.top + 53.0f, 92.0f, m_lang == Lang::PL ? L"\x21BA Resetuj filtry" : L"\x21BA Reset Filters", false);
+        drawPresetPill(CMD_SEARCH_DUPLICATES,    sx + 96.0f,  body.top + 6.0f,  104.0f, m_lang == Lang::PL ? L"\x29C9 Duplikaty SHA" : L"\x29C9 Duplicates", false);
+        drawPresetPill(CMD_BATCH_RENAME,         sx + 96.0f,  body.top + 30.0f, 104.0f, m_lang == Lang::PL ? L"\x270E Masowa nazwa" : L"\x270E Batch Rename", false);
+        sx += 206.0f;
+        drawGroupSeparatorAndTitle(g5Start, sx, m_lang == Lang::PL ? L"Akcje i Narzędzia" : L"Actions & Tools");
         return;
     }
 
@@ -1187,6 +1333,83 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawSmallRowButton(CMD_HW_BACK_TO_FILES, lx, body.top + 6.0f, 150.0f, pl ? L"Wróć do plików" : L"Back to Files");
         lx += 154.0f;
         drawGroupSeparatorAndTitle(lg3, lx, pl ? L"Okno" : L"Window");
+        return;
+    }
+
+    if (m_activeRibbonTab == RibbonTab::Transfers) {
+        // TRANSFERY (CopyHandler / TeraCopy-grade Ultra-Fast Transfer Queue & I/O Engine) Ribbon Tab
+        const bool pl = (m_lang == Lang::PL);
+        const TransferConfig cfg = m_transfers.GetConfig();
+        float xk = rect.left + 6.0f;
+
+        auto drawCfgPill = [&](int cmdId, float x, float y, float w, const std::wstring& label, bool active = false) {
+            D2D1_RECT_F pr = D2D1::RectF(x, y + 1.0f, x + w, y + 21.0f);
+            m_ribbonHits.push_back({ cmdId, pr });
+            m_solidBrush->SetColor(active ? HexColor(0x0078D7) : (m_hoverRibbonBtn == cmdId ? HexColor(0xDCEBFC) : HexColor(0xE8EEF4)));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush);
+            m_solidBrush->SetColor(active ? HexColor(0x005A9E) : HexColor(0xB8C4D0));
+            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush, 1.0f);
+            m_solidBrush->SetColor(active ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
+            D2D1_RECT_F tr = D2D1::RectF(pr.left + 5.0f, pr.top, pr.right - 4.0f, pr.bottom);
+            DrawClippedText(label, tr, m_fmtSmall, active ? 0xFFFFFF : 0x1E293B);
+        };
+
+        // Group 1: Sterowanie kolejką (Queue Control)
+        float g1 = xk;
+        drawLargeButton(CMD_XFER_NEW_TRANSFER_DLG, xk, 74.0f, pl ? L"Nowy\ntransfer" : L"New\nTransfer");
+        xk += 76.0f;
+        drawLargeButton(CMD_XFER_PAUSE_ALL, xk, 74.0f, pl ? L"Wstrzymaj\nwszystko" : L"Pause\nAll",
+                        hasLiveXfers && tabHudSnap.state == TransferJobState::Paused);
+        xk += 76.0f;
+        drawLargeButton(CMD_XFER_RESUME_ALL, xk, 72.0f, pl ? L"Wznów\nwszystko" : L"Resume\nAll");
+        xk += 74.0f;
+        drawSmallRowButton(CMD_XFER_RETRY_ALL_FAILED, xk, body.top + 6.0f,  156.0f, pl ? L"Ponów błędne pliki" : L"Retry failed files");
+        drawSmallRowButton(CMD_XFER_CLEAR_FINISHED,   xk, body.top + 29.0f, 156.0f, pl ? L"Wyczyść zakończone" : L"Clear finished");
+        drawSmallRowButton(CMD_HW_BACK_TO_FILES,      xk, body.top + 52.0f, 156.0f, pl ? L"Wróć do plików" : L"Back to Files");
+        xk += 162.0f;
+        drawGroupSeparatorAndTitle(g1, xk, pl ? L"Sterowanie kolejką" : L"Queue Control");
+        xk += 8.0f;
+
+        // Group 2: Tryb kolejki, kolizje i weryfikacja XXH64
+        float g2 = xk;
+        drawCfgPill(CMD_XFER_CYCLE_QUEUE_MODE, xk, body.top + 5.0f,  234.0f,
+                    (pl ? L"Kolejka: " : L"Queue: ") + TransferManager::FormatQueueMode(cfg.queueMode, pl) + L" \x25BE", false);
+        drawCfgPill(CMD_XFER_CYCLE_CONFLICT,   xk, body.top + 28.0f, 234.0f,
+                    (pl ? L"Kolizje: " : L"Conflicts: ") + TransferManager::FormatConflictPolicy(cfg.conflictPolicy, pl) + L" \x25BE", false);
+        drawCfgPill(CMD_XFER_CYCLE_VERIFY,     xk, body.top + 51.0f, 234.0f,
+                    (pl ? L"Weryfikacja: " : L"Verify: ") + TransferManager::FormatVerifyMode(cfg.verifyMode, pl) + L" \x25BE",
+                    cfg.verifyMode != TransferVerifyMode::None);
+        xk += 240.0f;
+        drawGroupSeparatorAndTitle(g2, xk, pl ? L"Kolejkowanie, kolizje i XXH64" : L"Queue, Conflicts & Verify");
+        xk += 8.0f;
+
+        // Group 3: Silnik I/O (Bufor 2xRing, Wątki, Limit prędkości)
+        float g3 = xk;
+        drawCfgPill(CMD_XFER_CYCLE_BUFFER,      xk, body.top + 5.0f,  206.0f,
+                    (pl ? L"Bufor: " : L"Buffer: ") + TransferManager::FormatBufferSize(cfg.bufferSizeKB, pl) + L" \x25BE", false);
+        drawCfgPill(CMD_XFER_CYCLE_WORKERS,     xk, body.top + 28.0f, 206.0f,
+                    (pl ? L"Wątki: " : L"Threads: ") + TransferManager::FormatWorkers(cfg.workerThreads, pl) + L" \x25BE", false);
+        drawCfgPill(CMD_XFER_CYCLE_SPEED_LIMIT, xk, body.top + 51.0f, 206.0f,
+                    (pl ? L"Limit: " : L"Speed: ") + TransferManager::FormatSpeedLimit(cfg.speedLimitMBps, pl) + L" \x25BE",
+                    cfg.speedLimitMBps > 0);
+        xk += 212.0f;
+        drawGroupSeparatorAndTitle(g3, xk, pl ? L"Silnik I/O (Double-Buffer)" : L"I/O Performance");
+        xk += 8.0f;
+
+        // Group 4: Bezpieczne wznawianie (.e2part) & Direct I/O
+        float g4 = xk;
+        drawCfgPill(CMD_XFER_TOGGLE_PARTFILE,   xk, body.top + 10.0f, 210.0f,
+                    cfg.usePartFiles
+                        ? (pl ? L"\x2713 Pliki .e2part (Resume): WŁ" : L"\x2713 .e2part Resume: ON")
+                        : (pl ? L"Pliki .e2part (Resume): WYŁ" : L".e2part Resume: OFF"),
+                    cfg.usePartFiles);
+        drawCfgPill(CMD_XFER_TOGGLE_UNBUFFERED, xk, body.top + 38.0f, 210.0f,
+                    cfg.unbufferedLargeFiles
+                        ? (pl ? L"\x2713 No-Cache >64 MB: WŁ" : L"\x2713 Bypass OS Cache >64MB: ON")
+                        : (pl ? L"No-Cache >64 MB: WYŁ" : L"Bypass OS Cache >64MB: OFF"),
+                    cfg.unbufferedLargeFiles);
+        xk += 216.0f;
+        drawGroupSeparatorAndTitle(g4, xk, pl ? L"Ochrona i Cache RAM" : L"Crash Resume & Cache");
         return;
     }
 
@@ -1355,23 +1578,24 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush, 1.0f);
             m_solidBrush->SetColor(active ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, pr, m_solidBrush);
+            DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, pr, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         };
 
         float hx = rect.left + 8.0f;
         // Group 1: Sekcje sprzętowe (Sub-tabs)
         float g1 = hx;
-        drawPill(CMD_HW_SUB_ALL,    hx,          body.top + 5.0f,  92.0f, m_lang == Lang::PL ? L"\x25C9 Wszystko PRO" : L"\x25C9 All PRO", m_hwSubTab == HardwareSubTab::All);
-        drawPill(CMD_HW_SUB_CPU,    hx + 96.0f,  body.top + 5.0f,  86.0f, L"CPU & Cache", m_hwSubTab == HardwareSubTab::Cpu);
-        drawPill(CMD_HW_SUB_GPU,    hx + 186.0f, body.top + 5.0f,  96.0f, L"GPU & Monitory", m_hwSubTab == HardwareSubTab::Gpu);
-        drawPill(CMD_HW_SUB_RAM,    hx,          body.top + 29.0f, 92.0f, L"RAM (SMBIOS)", m_hwSubTab == HardwareSubTab::Ram);
-        drawPill(CMD_HW_SUB_MOBO,   hx + 96.0f,  body.top + 29.0f, 86.0f, m_lang == Lang::PL ? L"Płyta & BIOS" : L"Board & BIOS", m_hwSubTab == HardwareSubTab::Motherboard);
-        drawPill(CMD_HW_SUB_DISKS,  hx + 186.0f, body.top + 29.0f, 96.0f, m_lang == Lang::PL ? L"Dyski NVMe/SMART" : L"Storage/NVMe", m_hwSubTab == HardwareSubTab::Disks);
-        drawPill(CMD_HW_SUB_NET,    hx,          body.top + 53.0f, 92.0f, m_lang == Lang::PL ? L"Sieć & NIC" : L"Network & NIC", m_hwSubTab == HardwareSubTab::Network);
-        drawPill(CMD_HW_SUB_SYSTEM, hx + 96.0f,  body.top + 53.0f, 90.0f, m_lang == Lang::PL ? L"System & Audio" : L"OS & Audio", m_hwSubTab == HardwareSubTab::System);
+        drawPill(CMD_HW_SUB_ALL,     hx,          body.top + 5.0f,  92.0f, m_lang == Lang::PL ? L"\x25C9 Wszystko PRO" : L"\x25C9 All PRO", m_hwSubTab == HardwareSubTab::All);
+        drawPill(CMD_HW_SUB_CPU,     hx + 96.0f,  body.top + 5.0f,  86.0f, L"CPU & Cache", m_hwSubTab == HardwareSubTab::Cpu);
+        drawPill(CMD_HW_SUB_GPU,     hx + 186.0f, body.top + 5.0f,  96.0f, L"GPU & Monitory", m_hwSubTab == HardwareSubTab::Gpu);
+        drawPill(CMD_HW_SUB_USB_COM, hx + 286.0f, body.top + 5.0f,  96.0f, m_lang == Lang::PL ? L"\xD83D\xDD0C USB & COM" : L"\xD83D\xDD0C USB & COM", m_hwSubTab == HardwareSubTab::UsbCom);
+        drawPill(CMD_HW_SUB_RAM,     hx,          body.top + 29.0f, 92.0f, L"RAM (SMBIOS)", m_hwSubTab == HardwareSubTab::Ram);
+        drawPill(CMD_HW_SUB_MOBO,    hx + 96.0f,  body.top + 29.0f, 86.0f, m_lang == Lang::PL ? L"Płyta & BIOS" : L"Board & BIOS", m_hwSubTab == HardwareSubTab::Motherboard);
+        drawPill(CMD_HW_SUB_DISKS,   hx + 186.0f, body.top + 29.0f, 96.0f, m_lang == Lang::PL ? L"Dyski NVMe/SMART" : L"Storage/NVMe", m_hwSubTab == HardwareSubTab::Disks);
+        drawPill(CMD_HW_SUB_NET,     hx,          body.top + 53.0f, 92.0f, m_lang == Lang::PL ? L"Sieć & NIC" : L"Network & NIC", m_hwSubTab == HardwareSubTab::Network);
+        drawPill(CMD_HW_SUB_SYSTEM,  hx + 96.0f,  body.top + 53.0f, 90.0f, m_lang == Lang::PL ? L"System & Audio" : L"OS & Audio", m_hwSubTab == HardwareSubTab::System);
         drawPill(CMD_HW_SUB_THERMAL, hx + 190.0f, body.top + 53.0f, 92.0f, m_lang == Lang::PL ? L"\xD83C\xDF21 Temperatury" : L"\xD83C\xDF21 Temperatures", m_hwSubTab == HardwareSubTab::Thermal);
-        hx += 288.0f;
+        hx += 388.0f;
         drawGroupSeparatorAndTitle(g1, hx, m_lang == Lang::PL ? L"Moduły diagnostyczne PRO" : L"Diagnostic Modules");
         hx += 8.0f;
 
@@ -1447,19 +1671,20 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
     DrawRibbonIcon(CMD_DELETE_PERM, D2D1::RectF(x + 11.0f, body.top + 8.0f, x + 41.0f, body.top + 38.0f));
     std::wstring delLabel = std::wstring(s.btnDelete) + L"\n\x25BE";
     m_solidBrush->SetColor(HexColor(0x1E1E1E));
-    m_rt->DrawTextW(delLabel.c_str(), static_cast<UINT32>(delLabel.size()), m_fmtCenterSmall, delBotR, m_solidBrush);
+    DrawTextCached(delLabel.c_str(), static_cast<UINT32>(delLabel.size()), m_fmtCenterSmall, delBotR, m_solidBrush);
     x += 54.0f;
 
     drawLargeButton(CMD_RENAME, x, 54.0f, s.btnRename); x += 58.0f;
     drawGroupSeparatorAndTitle(g2Start, x, s.grpOrganize);
     x += 6.0f;
 
-    // Group 3: Nowy (New folder, New item, Easy access)
+    // Group 3: Nowy (New folder, New item, Easy access, Batch Rename)
     float g3Start = x;
     drawLargeButton(CMD_NEW_FOLDER, x, 54.0f, s.btnNewFolder); x += 56.0f;
-    drawSmallRowButton(CMD_NEW_ITEM, x, body.top + 10.0f, 106.0f, s.btnNewItem);
-    drawSmallRowButton(CMD_NONE,     x, body.top + 36.0f, 106.0f, s.btnEasyAccess);
-    x += 110.0f;
+    drawSmallRowButton(CMD_NEW_ITEM,         x, body.top + 6.0f,  114.0f, s.btnNewItem);
+    drawSmallRowButton(CMD_HOME_EASY_ACCESS, x, body.top + 29.0f, 114.0f, s.btnEasyAccess);
+    drawSmallRowButton(CMD_BATCH_RENAME,     x, body.top + 52.0f, 114.0f, m_lang == Lang::PL ? L"Masowa nazwa (M)" : L"Batch Rename (M)");
+    x += 118.0f;
     drawGroupSeparatorAndTitle(g3Start, x, s.grpNew);
     x += 6.0f;
 
@@ -1506,8 +1731,8 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
 
     float cy = (rect.top + rect.bottom) * 0.5f;
 
-    auto drawNavIconBtn = [&](int cmdId, float left, const wchar_t* glyph, bool enabled) {
-        D2D1_RECT_F br = D2D1::RectF(left, rect.top + 5.0f, left + 28.0f, rect.bottom - 5.0f);
+    auto drawNavIconBtn = [&](int cmdId, float left, float btnW, const wchar_t* glyph, bool enabled) {
+        D2D1_RECT_F br = D2D1::RectF(left, rect.top + 5.0f, left + btnW, rect.bottom - 5.0f);
         m_ribbonHits.push_back({ cmdId, br });
         if (enabled && m_hoverRibbonBtn == cmdId) {
             m_solidBrush->SetColor(HexColor(0xE5F3FB));
@@ -1515,105 +1740,251 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
         }
         m_solidBrush->SetColor(enabled ? HexColor(0x454545) : HexColor(0xBBBBBB));
         m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(glyph, static_cast<UINT32>(wcslen(glyph)), m_fmtRegular, br, m_solidBrush);
+        DrawTextCached(glyph, static_cast<UINT32>(wcslen(glyph)), m_fmtRegular, br, m_solidBrush);
         m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
 
-    drawNavIconBtn(CMD_NAV_BACK,    6.0f,  L"\x2190", m_historyIndex > 0);
-    drawNavIconBtn(CMD_NAV_FORWARD, 35.0f, L"\x2192", m_historyIndex + 1 < static_cast<int>(m_history.size()));
-    drawNavIconBtn(CMD_NAV_UP,      68.0f, L"\x2191", !m_currentPath.empty() && m_currentPath != L"THIS_PC");
-
-    // Search bar on the right + Split View [◫] button + Right File Content Pane [◨] button + Advanced Gear [⚙] button
+    // Search bar on the right + New Tab [+] button + Split View [◫] button + Right File Content Pane [◨] button + Advanced Gear [⚙] button
+    const bool splitActive = IsSplitViewActive();
     float gearW = 28.0f;
     float previewBtnW = 30.0f;
     float splitBtnW = 30.0f;
-    float searchW = std::min(255.0f, std::max(145.0f, (rect.right - rect.left) * 0.20f));
+    float newTabBtnW = 28.0f;
+    float searchW = splitActive
+        ? std::min(205.0f, std::max(126.0f, (rect.right - rect.left) * 0.145f))
+        : std::min(255.0f, std::max(145.0f, (rect.right - rect.left) * 0.20f));
     D2D1_RECT_F gearBtnR    = D2D1::RectF(rect.right - gearW - 6.0f, rect.top + 5.0f, rect.right - 6.0f, rect.bottom - 5.0f);
     D2D1_RECT_F previewBtnR = D2D1::RectF(gearBtnR.left - previewBtnW - 4.0f, rect.top + 5.0f, gearBtnR.left - 4.0f, rect.bottom - 5.0f);
     D2D1_RECT_F splitBtnR   = D2D1::RectF(previewBtnR.left - splitBtnW - 4.0f, rect.top + 5.0f, previewBtnR.left - 4.0f, rect.bottom - 5.0f);
-    m_searchBarRect = D2D1::RectF(splitBtnR.left - searchW - 4.0f, rect.top + 5.0f, splitBtnR.left - 4.0f, rect.bottom - 5.0f);
+    D2D1_RECT_F newTabBtnR  = D2D1::RectF(splitBtnR.left - newTabBtnW - 4.0f, rect.top + 5.0f, splitBtnR.left - 4.0f, rect.bottom - 5.0f);
+    m_searchBarRect = D2D1::RectF(newTabBtnR.left - searchW - 4.0f, rect.top + 5.0f, newTabBtnR.left - 4.0f, rect.bottom - 5.0f);
 
-    // Address / Breadcrumb Bar between Up arrow and Recent Dirs [▾] / Refresh [↻] / Search bar
-    float refreshBtnLeft = m_searchBarRect.left - 34.0f;
-    float recentBtnLeft  = refreshBtnLeft - 26.0f;
-    m_addressBarRect = D2D1::RectF(102.0f, rect.top + 5.0f, recentBtnLeft, rect.bottom - 5.0f);
+    // Helper that renders one complete Explorer Main Path Bar ([←][→][↑] + [Icon + Breadcrumbs] + [▾][↻])
+    auto drawOneMainPathBar = [&](int paneIdx, float barLeft, float barRight,
+                                  int cmdBack, int cmdFwd, int cmdUp, int cmdRecent, int cmdRefresh,
+                                  bool highlightActiveBorder) {
+        const float navBtnW = splitActive ? 24.0f : 28.0f;
+        const float navGap  = splitActive ? 1.0f  : 2.0f;
+        drawNavIconBtn(cmdBack, barLeft, navBtnW, L"\x2190", m_historyIndex > 0);
+        drawNavIconBtn(cmdFwd,  barLeft + navBtnW + navGap, navBtnW, L"\x2192", m_historyIndex + 1 < static_cast<int>(m_history.size()));
+        drawNavIconBtn(cmdUp,   barLeft + (navBtnW + navGap) * 2.0f + (splitActive ? 1.0f : 3.0f), navBtnW, L"\x2191",
+                       !m_currentPath.empty() && m_currentPath != L"THIS_PC");
 
-    m_solidBrush->SetColor(HexColor(0xD9D9D9));
-    m_rt->DrawRectangle(m_addressBarRect, m_solidBrush, 1.0f);
+        const float addrLeft = barLeft + (navBtnW + navGap) * 3.0f + (splitActive ? 3.0f : 6.0f);
+        const float refreshW = splitActive ? 24.0f : 26.0f;
+        const float recentW  = splitActive ? 22.0f : 26.0f;
+        const float refreshBtnLeft = barRight - refreshW;
+        const float recentBtnLeft  = refreshBtnLeft - recentW;
+        D2D1_RECT_F addrR = D2D1::RectF(addrLeft, rect.top + 5.0f, std::max(addrLeft + 36.0f, recentBtnLeft), rect.bottom - 5.0f);
 
-    // Folder icon inside address bar
-    DrawFolderVectorIcon(D2D1::RectF(m_addressBarRect.left + 6.0f, cy - 8.0f, m_addressBarRect.left + 22.0f, cy + 8.0f), true);
+        if (paneIdx >= 0 && paneIdx < 2) {
+            m_paneHeaderAddressRect[paneIdx] = addrR;
+        }
 
-    // Interactive Breadcrumb segments ("Ten komputer > WORK (W:) > Fooocus_Advanced")
-    float bx = m_addressBarRect.left + 26.0f;
-    for (int segIdx = 0; segIdx < static_cast<int>(m_breadcrumbs.size()); ++segIdx) {
-        auto& seg = m_breadcrumbs[segIdx];
-        float segW = static_cast<float>(seg.label.size()) * 7.2f + 14.0f;
-        if (bx + segW > m_addressBarRect.right - 22.0f) {
+        if (highlightActiveBorder) {
+            m_solidBrush->SetColor(HexColor(0xF8FBFF));
+            m_rt->FillRectangle(addrR, m_solidBrush);
+            m_solidBrush->SetColor(HexColor(0x0078D7));
+            m_rt->DrawRectangle(addrR, m_solidBrush, 1.4f);
+        } else {
+            m_solidBrush->SetColor(HexColor(0xFFFFFF));
+            m_rt->FillRectangle(addrR, m_solidBrush);
+            m_solidBrush->SetColor(HexColor(0xD9D9D9));
+            m_rt->DrawRectangle(addrR, m_solidBrush, 1.0f);
+        }
+
+        if (m_breadcrumbs.empty() && !m_currentPath.empty()) {
+            RebuildBreadcrumbs();
+        }
+
+        // Leading folder / drive / FTP icon inside address bar
+        D2D1_RECT_F leadIconR = D2D1::RectF(addrR.left + 6.0f, cy - 8.0f, addrR.left + 22.0f, cy + 8.0f);
+        if (FtpClient::IsFtpPath(m_currentPath)) {
+            m_solidBrush->SetColor(HexColor(0x0284C7));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(leadIconR, 3.0f, 3.0f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(0xFFFFFF));
+            m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            DrawTextCached(L"F", 1, m_fmtCenterSmall, leadIconR, m_solidBrush);
+        } else if (m_currentPath == L"THIS_PC" || m_currentPath.empty()) {
+            DrawDriveVectorIcon(leadIconR, false, false, false);
+        } else {
+            DrawFolderVectorIcon(leadIconR, true);
+        }
+
+        // Clear all breadcrumb rects first, then lay out visible segments (preserving trailing current folder if narrow!)
+        for (auto& seg : m_breadcrumbs) {
             seg.hitRect = {};
             seg.arrowRect = {};
-            break;
         }
-        seg.hitRect = D2D1::RectF(bx, m_addressBarRect.top + 1.0f, bx + segW, m_addressBarRect.bottom - 1.0f);
-        seg.arrowRect = D2D1::RectF(seg.hitRect.right, seg.hitRect.top, seg.hitRect.right + 16.0f, seg.hitRect.bottom);
 
-        if (segIdx == m_hoverBreadcrumbIndex || segIdx == m_hoverBreadcrumbArrowIndex) {
-            D2D1_RECT_F fullSegR = D2D1::RectF(seg.hitRect.left, seg.hitRect.top, seg.arrowRect.right, seg.hitRect.bottom);
+        const bool editingThisBar = IsWindowVisible(m_addressEdit) && (paneIdx == m_activePane);
+        if (!editingThisBar && !m_breadcrumbs.empty()) {
+            const float availStart = addrR.left + 26.0f;
+            const float availEnd   = addrR.right - 4.0f;
+            const float availW     = std::max(0.0f, availEnd - availStart);
+            const int nSeg = static_cast<int>(m_breadcrumbs.size());
+
+            auto calcSegFullW = [&](int idx) -> float {
+                return static_cast<float>(m_breadcrumbs[idx].label.size()) * 7.1f + 13.0f + 15.0f;
+            };
+
+            float totalW = 0.0f;
+            for (int k = 0; k < nSeg; ++k) totalW += calcSegFullW(k);
+
+            int tailStart = 0;
+            bool drawRootFirst = false;
+            if (totalW > availW && nSeg > 1) {
+                float rootW = calcSegFullW(0);
+                float ellipsisW = 22.0f;
+                float budgetForTail = (rootW + ellipsisW + 60.0f < availW) ? (availW - rootW - ellipsisW) : (availW - ellipsisW);
+                drawRootFirst = (rootW + ellipsisW + 60.0f < availW);
+
+                tailStart = nSeg - 1;
+                float acc = calcSegFullW(nSeg - 1);
+                while (tailStart > (drawRootFirst ? 1 : 0)) {
+                    float prevW = calcSegFullW(tailStart - 1);
+                    if (acc + prevW > budgetForTail) break;
+                    acc += prevW;
+                    --tailStart;
+                }
+            }
+
+            m_rt->PushAxisAlignedClip(D2D1::RectF(addrR.left + 24.0f, addrR.top + 1.0f, addrR.right - 2.0f, addrR.bottom - 1.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+            float bx = availStart;
+            auto renderOneSeg = [&](int segIdx) {
+                auto& seg = m_breadcrumbs[segIdx];
+                float rawTextW = static_cast<float>(seg.label.size()) * 7.1f + 13.0f;
+                float maxAllowedTextW = std::max(28.0f, (availEnd - bx) - 15.0f);
+                float segW = std::min(rawTextW, maxAllowedTextW);
+                if (bx + 24.0f > availEnd) return;
+
+                seg.hitRect = D2D1::RectF(bx, addrR.top + 1.0f, bx + segW, addrR.bottom - 1.0f);
+                seg.arrowRect = D2D1::RectF(seg.hitRect.right, seg.hitRect.top, std::min(availEnd, seg.hitRect.right + 15.0f), seg.hitRect.bottom);
+
+                const bool paneHovMatch = (m_hoverBreadcrumbPane == paneIdx);
+                const bool segHov = paneHovMatch && (segIdx == m_hoverBreadcrumbIndex || segIdx == m_hoverBreadcrumbArrowIndex);
+                const bool arrHov = paneHovMatch && (segIdx == m_hoverBreadcrumbArrowIndex);
+
+                if (segHov) {
+                    D2D1_RECT_F fullSegR = D2D1::RectF(seg.hitRect.left, seg.hitRect.top, seg.arrowRect.right, seg.hitRect.bottom);
+                    m_solidBrush->SetColor(HexColor(0xE5F3FB));
+                    m_rt->FillRectangle(fullSegR, m_solidBrush);
+                    m_solidBrush->SetColor(HexColor(0xA8D6F0));
+                    m_rt->DrawRectangle(fullSegR, m_solidBrush, 1.0f);
+                    m_rt->DrawLine(D2D1::Point2F(seg.arrowRect.left, seg.arrowRect.top), D2D1::Point2F(seg.arrowRect.left, seg.arrowRect.bottom), m_solidBrush, 1.0f);
+                }
+                if (arrHov) {
+                    m_solidBrush->SetColor(HexColor(0xCCE8FF));
+                    m_rt->FillRectangle(seg.arrowRect, m_solidBrush);
+                }
+
+                m_solidBrush->SetColor(HexColor(0x1E1E1E));
+                D2D1_RECT_F textR = D2D1::RectF(seg.hitRect.left + 5.0f, seg.hitRect.top, seg.hitRect.right - 2.0f, seg.hitRect.bottom);
+                DrawTextCached(seg.label.c_str(), static_cast<UINT32>(seg.label.size()), m_fmtRegular, textR, m_solidBrush);
+
+                m_solidBrush->SetColor(arrHov ? HexColor(0x0067B8) : HexColor(0x666666));
+                m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(L"\x203A", 1, m_fmtRegular, seg.arrowRect, m_solidBrush);
+                m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                bx = seg.arrowRect.right;
+            };
+
+            if (tailStart > 0) {
+                if (drawRootFirst) {
+                    renderOneSeg(0);
+                }
+                // Ellipsis button opening the elided parent folder's submenu!
+                int elidedIdx = tailStart - 1;
+                if (bx + 22.0f <= availEnd && elidedIdx >= 0 && elidedIdx < nSeg) {
+                    D2D1_RECT_F ellR = D2D1::RectF(bx, addrR.top + 1.0f, bx + 22.0f, addrR.bottom - 1.0f);
+                    m_breadcrumbs[elidedIdx].arrowRect = ellR;
+                    bool ellHov = (m_hoverBreadcrumbPane == paneIdx && m_hoverBreadcrumbArrowIndex == elidedIdx);
+                    if (ellHov) {
+                        m_solidBrush->SetColor(HexColor(0xCCE8FF));
+                        m_rt->FillRectangle(ellR, m_solidBrush);
+                    }
+                    m_solidBrush->SetColor(ellHov ? HexColor(0x0067B8) : HexColor(0x64748B));
+                    m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    DrawTextCached(L"\x2026\x203A", 2, m_fmtRegular, ellR, m_solidBrush);
+                    m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    bx = ellR.right;
+                }
+            }
+
+            for (int segIdx = tailStart; segIdx < nSeg; ++segIdx) {
+                renderOneSeg(segIdx);
+            }
+
+            m_rt->PopAxisAlignedClip();
+        }
+
+        // Recent Visited Directories dropdown button [▾] attached between address bar and refresh button
+        D2D1_RECT_F recentR = D2D1::RectF(recentBtnLeft, addrR.top, refreshBtnLeft, addrR.bottom);
+        m_ribbonHits.push_back({ cmdRecent, recentR });
+        bool hovRecent = (m_hoverRibbonBtn == cmdRecent);
+        if (hovRecent) {
             m_solidBrush->SetColor(HexColor(0xE5F3FB));
-            m_rt->FillRectangle(fullSegR, m_solidBrush);
-            m_solidBrush->SetColor(HexColor(0xA8D6F0));
-            m_rt->DrawRectangle(fullSegR, m_solidBrush, 1.0f);
-            m_rt->DrawLine(D2D1::Point2F(seg.arrowRect.left, seg.arrowRect.top), D2D1::Point2F(seg.arrowRect.left, seg.arrowRect.bottom), m_solidBrush, 1.0f);
+            m_rt->FillRectangle(recentR, m_solidBrush);
+        }
+        m_solidBrush->SetColor(hovRecent ? HexColor(0x0078D7) : HexColor(0xD9D9D9));
+        m_rt->DrawRectangle(recentR, m_solidBrush, 1.0f);
+        {
+            float rcx = (recentR.left + recentR.right) * 0.5f;
+            float rcy = (recentR.top + recentR.bottom) * 0.5f;
+            m_solidBrush->SetColor(hovRecent ? HexColor(0x0067B8) : HexColor(0x454545));
+            m_rt->DrawLine(D2D1::Point2F(rcx - 4.0f, rcy - 2.0f), D2D1::Point2F(rcx, rcy + 2.5f), m_solidBrush, 1.6f);
+            m_rt->DrawLine(D2D1::Point2F(rcx, rcy + 2.5f), D2D1::Point2F(rcx + 4.0f, rcy - 2.0f), m_solidBrush, 1.6f);
         }
 
-        if (segIdx == m_hoverBreadcrumbArrowIndex) {
-            m_solidBrush->SetColor(HexColor(0xCCE8FF));
-            m_rt->FillRectangle(seg.arrowRect, m_solidBrush);
+        // Refresh button [↻] attached to right edge of address bar
+        D2D1_RECT_F refreshR = D2D1::RectF(refreshBtnLeft, addrR.top, refreshBtnLeft + refreshW, addrR.bottom);
+        m_ribbonHits.push_back({ cmdRefresh, refreshR });
+        if (m_hoverRibbonBtn == cmdRefresh) {
+            m_solidBrush->SetColor(HexColor(0xE5F3FB));
+            m_rt->FillRectangle(refreshR, m_solidBrush);
         }
-
-        m_solidBrush->SetColor(HexColor(0x1E1E1E));
-        D2D1_RECT_F textR = D2D1::RectF(seg.hitRect.left + 5.0f, seg.hitRect.top, seg.hitRect.right - 2.0f, seg.hitRect.bottom);
-        m_rt->DrawTextW(seg.label.c_str(), static_cast<UINT32>(seg.label.size()), m_fmtRegular, textR, m_solidBrush);
-
-        m_solidBrush->SetColor(segIdx == m_hoverBreadcrumbArrowIndex ? HexColor(0x0067B8) : HexColor(0x666666));
+        m_solidBrush->SetColor(HexColor(0xD9D9D9));
+        m_rt->DrawRectangle(refreshR, m_solidBrush, 1.0f);
+        m_solidBrush->SetColor(HexColor(0x454545));
         m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(L"\x203A", 1, m_fmtRegular, seg.arrowRect, m_solidBrush);
+        DrawTextCached(L"\x21BB", 1, m_fmtRegular, refreshR, m_solidBrush);
         m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        bx = seg.arrowRect.right;
-    }
+    };
 
-    // Recent Visited Directories dropdown button [▾] attached between address bar and refresh button
-    D2D1_RECT_F recentR = D2D1::RectF(recentBtnLeft, m_addressBarRect.top, refreshBtnLeft, m_addressBarRect.bottom);
-    m_ribbonHits.push_back({ CMD_NAV_RECENT_DIRS, recentR });
-    bool hovRecent = (m_hoverRibbonBtn == CMD_NAV_RECENT_DIRS);
-    if (hovRecent) {
-        m_solidBrush->SetColor(HexColor(0xE5F3FB));
-        m_rt->FillRectangle(recentR, m_solidBrush);
-    }
-    m_solidBrush->SetColor(hovRecent ? HexColor(0x0078D7) : HexColor(0xD9D9D9));
-    m_rt->DrawRectangle(recentR, m_solidBrush, 1.0f);
-    // Crisp downward chevron inside recentR
-    {
-        float rcx = (recentR.left + recentR.right) * 0.5f;
-        float rcy = (recentR.top + recentR.bottom) * 0.5f;
-        m_solidBrush->SetColor(hovRecent ? HexColor(0x0067B8) : HexColor(0x454545));
-        m_rt->DrawLine(D2D1::Point2F(rcx - 4.5f, rcy - 2.0f), D2D1::Point2F(rcx, rcy + 2.5f), m_solidBrush, 1.7f);
-        m_rt->DrawLine(D2D1::Point2F(rcx, rcy + 2.5f), D2D1::Point2F(rcx + 4.5f, rcy - 2.0f), m_solidBrush, 1.7f);
-    }
+    if (splitActive) {
+        // Split (duplicate) the main Explorer path bar row horizontally into Pane 0 (Left) and Pane 1 (Right)!
+        const float totalLeft  = 4.0f;
+        const float totalRight = m_searchBarRect.left - 6.0f;
+        const float splitMidX  = std::round(totalLeft + (totalRight - totalLeft) * std::clamp(m_splitRatio, 0.28f, 0.72f));
 
-    // Refresh button attached to right edge of address bar
-    D2D1_RECT_F refreshR = D2D1::RectF(refreshBtnLeft, m_addressBarRect.top, refreshBtnLeft + 26.0f, m_addressBarRect.bottom);
-    m_ribbonHits.push_back({ CMD_NAV_REFRESH, refreshR });
-    if (m_hoverRibbonBtn == CMD_NAV_REFRESH) {
-        m_solidBrush->SetColor(HexColor(0xE5F3FB));
-        m_rt->FillRectangle(refreshR, m_solidBrush);
+        // Pane 0 (Left main path bar)
+        if (m_activePane != 0) SwapWithOtherPane();
+        drawOneMainPathBar(0, totalLeft, splitMidX - 4.0f,
+                           CMD_PANE0_BACK, CMD_PANE0_FWD, CMD_PANE0_UP, CMD_PANE0_RECENT_DIRS, CMD_PANE0_REFRESH,
+                           m_activePane == 0);
+        if (m_activePane != 0) SwapWithOtherPane();
+
+        // Subtle center divider between Left & Right main path bars
+        m_solidBrush->SetColor(HexColor(0xCBD5E1));
+        m_rt->DrawLine(D2D1::Point2F(splitMidX, rect.top + 6.0f), D2D1::Point2F(splitMidX, rect.bottom - 6.0f), m_solidBrush, 1.2f);
+
+        // Pane 1 (Right main path bar)
+        if (m_activePane != 1) SwapWithOtherPane();
+        drawOneMainPathBar(1, splitMidX + 4.0f, totalRight,
+                           CMD_PANE1_BACK, CMD_PANE1_FWD, CMD_PANE1_UP, CMD_PANE1_RECENT_DIRS, CMD_PANE1_REFRESH,
+                           m_activePane == 1);
+        if (m_activePane != 1) SwapWithOtherPane();
+
+        m_addressBarRect = m_paneHeaderAddressRect[m_activePane];
+    } else {
+        m_paneHeaderAddressRect[0] = {};
+        m_paneHeaderAddressRect[1] = {};
+        drawOneMainPathBar(m_activePane, 6.0f, m_searchBarRect.left - 8.0f,
+                           CMD_NAV_BACK, CMD_NAV_FORWARD, CMD_NAV_UP, CMD_NAV_RECENT_DIRS, CMD_NAV_REFRESH,
+                           false);
+        m_addressBarRect = m_paneHeaderAddressRect[m_activePane];
     }
-    m_solidBrush->SetColor(HexColor(0xD9D9D9));
-    m_rt->DrawRectangle(refreshR, m_solidBrush, 1.0f);
-    m_solidBrush->SetColor(HexColor(0x454545));
-    m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_rt->DrawTextW(L"\x21BB", 1, m_fmtRegular, refreshR, m_solidBrush);
-    m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     // Search box
     m_solidBrush->SetColor(m_isSearchActive ? HexColor(0x0078D7) : HexColor(0xD9D9D9));
@@ -1625,7 +1996,7 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
         std::wstring ph = m_filterText.empty() ? (std::wstring(s.searchPlaceholder) + folderShort) : m_filterText;
         m_solidBrush->SetColor(m_filterText.empty() ? HexColor(0x767676) : HexColor(0x1E1E1E));
         D2D1_RECT_F sr = D2D1::RectF(m_searchBarRect.left + 8.0f, m_searchBarRect.top, m_searchBarRect.right - 42.0f, m_searchBarRect.bottom);
-        m_rt->DrawTextW(ph.c_str(), static_cast<UINT32>(ph.size()), m_fmtRegular, sr, m_solidBrush);
+        DrawTextCached(ph.c_str(), static_cast<UINT32>(ph.size()), m_fmtRegular, sr, m_solidBrush);
     }
     if (m_isSearchActive || !m_filterText.empty()) {
         D2D1_RECT_F clrR = D2D1::RectF(m_searchBarRect.right - 40.0f, m_searchBarRect.top + 2.0f, m_searchBarRect.right - 22.0f, m_searchBarRect.bottom - 2.0f);
@@ -1636,7 +2007,7 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
         }
         m_solidBrush->SetColor(HexColor(0xC42B1C));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(L"\x2715", 1, m_fmtSmall, clrR, m_solidBrush);
+        DrawTextCached(L"\x2715", 1, m_fmtSmall, clrR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
     D2D1_RECT_F magR = D2D1::RectF(m_searchBarRect.right - 21.0f, m_searchBarRect.top + 1.0f, m_searchBarRect.right - 1.0f, m_searchBarRect.bottom - 1.0f);
@@ -1647,7 +2018,19 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
     }
     m_solidBrush->SetColor(m_isSearchActive ? HexColor(0x0067B8) : HexColor(0x767676));
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_rt->DrawTextW(L"\xD83D\xDD0D", 2, m_fmtSmall, magR, m_solidBrush);
+    DrawTextCached(L"\xD83D\xDD0D", 2, m_fmtSmall, magR, m_solidBrush);
+
+    // Quick New Tab [+] Button right next to Search Box (opens a new folder tab; Ctrl+T)
+    m_ribbonHits.push_back({ CMD_TAB_NEW, newTabBtnR });
+    bool newTabHov = (m_hoverRibbonBtn == CMD_TAB_NEW);
+    m_solidBrush->SetColor(IsTabBarVisible() ? HexColor(0xE0F2FE) : (newTabHov ? HexColor(0xE5F3FB) : HexColor(0xF5F6F7)));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(newTabBtnR, 2.5f, 2.5f), m_solidBrush);
+    m_solidBrush->SetColor(IsTabBarVisible() ? HexColor(0x0284C7) : HexColor(0xCCCCCC));
+    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(newTabBtnR, 2.5f, 2.5f), m_solidBrush, 1.0f);
+    m_solidBrush->SetColor(IsTabBarVisible() ? HexColor(0x0369A1) : HexColor(0x333333));
+    m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawTextCached(L"+", 1, m_fmtBold, newTabBtnR, m_solidBrush);
+    m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     // Quick Split View [◫] Toggle Button right next to Search Box (toggles 2-pane Explorer from any tab!)
     m_ribbonHits.push_back({ CMD_TOGGLE_SPLIT_VIEW, splitBtnR });
@@ -1695,7 +2078,7 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
     m_solidBrush->SetColor(gearActive ? HexColor(0x0078D7) : HexColor(0xCCCCCC));
     m_rt->DrawRoundedRectangle(D2D1::RoundedRect(gearBtnR, 2.5f, 2.5f), m_solidBrush, 1.0f);
     m_solidBrush->SetColor(gearActive ? HexColor(0x005A9E) : HexColor(0x333333));
-    m_rt->DrawTextW(L"\x2699", 1, m_fmtRegular, gearBtnR, m_solidBrush);
+    DrawTextCached(L"\x2699", 1, m_fmtRegular, gearBtnR, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
@@ -1737,7 +2120,7 @@ void ExplorerApp::DrawSplitPaneHeader(int paneIdx, const D2D1_RECT_F& headerRect
         }
         m_solidBrush->SetColor(enabled ? (hov ? HexColor(0x1D4ED8) : HexColor(0x334155)) : HexColor(0xCBD5E1));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, br, m_solidBrush);
+        DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, br, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
 
@@ -1778,7 +2161,12 @@ void ExplorerApp::DrawSplitPaneHeader(int paneIdx, const D2D1_RECT_F& headerRect
     m_rt->DrawRoundedRectangle(D2D1::RoundedRect(addrR, 3.0f, 3.0f), m_solidBrush, isActivePane ? 1.3f : 1.0f);
 
     float cy = (addrR.top + addrR.bottom) * 0.5f;
-    DrawFolderVectorIcon(D2D1::RectF(addrR.left + 5.0f, cy - 7.0f, addrR.left + 19.0f, cy + 7.0f), true);
+    bool isFtpPane = FtpClient::IsFtpPath(m_currentPath);
+    if (isFtpPane) {
+        DrawDriveVectorIcon(D2D1::RectF(addrR.left + 4.0f, cy - 7.5f, addrR.left + 20.0f, cy + 7.5f), true, false, false);
+    } else {
+        DrawFolderVectorIcon(D2D1::RectF(addrR.left + 5.0f, cy - 7.0f, addrR.left + 19.0f, cy + 7.0f), true);
+    }
 
     // Item count badge inside right edge of the pane's address box
     std::wstring cntTxt = std::to_wstring(m_items.size()) + (pl ? L" el." : L" it.");
@@ -1787,13 +2175,19 @@ void ExplorerApp::DrawSplitPaneHeader(int paneIdx, const D2D1_RECT_F& headerRect
         D2D1_RECT_F cntR = D2D1::RectF(addrR.right - cntW - 4.0f, addrR.top + 1.0f, addrR.right - 4.0f, addrR.bottom - 1.0f);
         m_solidBrush->SetColor(HexColor(0x64748B));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-        m_rt->DrawTextW(cntTxt.c_str(), static_cast<UINT32>(cntTxt.size()), m_fmtSmall, cntR, m_solidBrush);
+        DrawTextCached(cntTxt.c_str(), static_cast<UINT32>(cntTxt.size()), m_fmtSmall, cntR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     } else {
         cntW = 0.0f;
     }
 
     std::wstring dispPath = (m_currentPath.empty() || m_currentPath == L"THIS_PC") ? std::wstring(s.navThisPC) : m_currentPath;
+    if (isFtpPane) {
+        FtpUrlInfo parsed;
+        if (FtpClient::ParseFtpUrl(m_currentPath, parsed)) {
+            dispPath = FtpClient::BuildFtpUrl(parsed, false);
+        }
+    }
     if (m_isSearchActive) {
         dispPath = (pl ? L"[Wyniki wyszukiwania] " : L"[Search results] ") + dispPath;
     }
@@ -1816,10 +2210,40 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
     // Determine the single best active tree node (exact match or deepest visible ancestor)
     int activeTreeIdx = -1;
     size_t bestScore = 0;
+    bool curIsFtp = FtpClient::IsFtpPath(m_currentPath);
+    FtpUrlInfo curFtp;
+    if (curIsFtp) {
+        FtpClient::ParseFtpUrl(m_currentPath, curFtp);
+    }
     if (!m_currentNormKey.empty()) {
         for (int i = 0; i < static_cast<int>(m_treeNodes.size()); ++i) {
             const std::wstring& nk = m_treeNodes[i].normKey;
             if (nk.empty()) continue;
+            if (curIsFtp && m_treeNodes[i].isFtpNode && FtpClient::IsFtpPath(m_treeNodes[i].path)) {
+                FtpUrlInfo nodeFtp;
+                if (FtpClient::ParseFtpUrl(m_treeNodes[i].path, nodeFtp) &&
+                    _wcsicmp(curFtp.host.c_str(), nodeFtp.host.c_str()) == 0 &&
+                    curFtp.port == nodeFtp.port)
+                {
+                    if (_wcsicmp(curFtp.remotePath.c_str(), nodeFtp.remotePath.c_str()) == 0) {
+                        size_t score = nodeFtp.remotePath.size() + 20000;
+                        if (score > bestScore) {
+                            bestScore = score;
+                            activeTreeIdx = i;
+                        }
+                    } else if (curFtp.remotePath.size() > nodeFtp.remotePath.size() &&
+                               _wcsnicmp(curFtp.remotePath.c_str(), nodeFtp.remotePath.c_str(), nodeFtp.remotePath.size()) == 0 &&
+                               (nodeFtp.remotePath == L"/" || curFtp.remotePath[nodeFtp.remotePath.size()] == L'/'))
+                    {
+                        size_t score = nodeFtp.remotePath.size() + 1000;
+                        if (score > bestScore) {
+                            bestScore = score;
+                            activeTreeIdx = i;
+                        }
+                    }
+                }
+                continue;
+            }
             if (m_currentNormKey == nk) {
                 size_t score = nk.size() + 10000 + (m_treeNodes[i].isQuickAccess ? 0 : 500);
                 if (score > bestScore) {
@@ -1828,7 +2252,7 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
                 }
             } else if (m_currentNormKey.size() > nk.size() &&
                        m_currentNormKey.compare(0, nk.size(), nk) == 0 &&
-                       m_currentNormKey[nk.size()] == L'\\') {
+                       (m_currentNormKey[nk.size()] == L'\\' || m_currentNormKey[nk.size()] == L'/')) {
                 size_t score = nk.size();
                 if (score > bestScore) {
                     bestScore = score;
@@ -1863,7 +2287,7 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
                                   PathUtils::PtInRectF(static_cast<float>(m_mousePt.x), static_cast<float>(m_mousePt.y), node.chevronRect));
                 m_solidBrush->SetColor(chevHover ? HexColor(0x0078D7) : (node.isExpanded ? HexColor(0x444444) : HexColor(0x888888)));
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                m_rt->DrawTextW(node.isExpanded ? L"\x25BE" : L"\x203A", 1, m_fmtSmall, node.chevronRect, m_solidBrush);
+                DrawTextCached(node.isExpanded ? L"\x25BE" : L"\x203A", 1, m_fmtSmall, node.chevronRect, m_solidBrush);
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
 
@@ -1871,19 +2295,76 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
             D2D1_RECT_F iconR = D2D1::RectF(indentX + 15.0f, y + 4.0f, indentX + 31.0f, y + 20.0f);
             if (node.isQuickAccess && node.isHeader) {
                 m_solidBrush->SetColor(HexColor(0x1E88E5));
-                m_rt->DrawTextW(L"\x2605", 1, m_fmtRegular, iconR, m_solidBrush);
+                DrawTextCached(L"\x2605", 1, m_fmtRegular, iconR, m_solidBrush);
+            } else if (node.normKey == L"__HEADER_FTP__") {
+                // FileZilla / FTPS section icon (red/blue server badge)
+                m_solidBrush->SetColor(HexColor(0xBF1E2E));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(iconR.left, iconR.top + 1.0f, iconR.right, iconR.bottom - 1.0f), 2.5f, 2.5f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(0xFFFFFF));
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(L"FZ", 2, m_fmtSmall, D2D1::RectF(iconR.left - 2.0f, iconR.top, iconR.right + 2.0f, iconR.bottom), m_solidBrush);
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             } else if (node.path == L"THIS_PC") {
                 m_solidBrush->SetColor(HexColor(0x2B6CB0));
                 m_rt->DrawRectangle(D2D1::RectF(iconR.left + 1.0f, iconR.top + 2.0f, iconR.right - 1.0f, iconR.bottom - 4.0f), m_solidBrush, 1.5f);
-            } else if (node.isDrive) {
-                DrawDriveVectorIcon(iconR, node.isNetworkDrive, node.isOpticalDrive, node.isOffline);
+            } else if (node.isDrive || (node.isFtpNode && node.indent == 2)) {
+                DrawDriveVectorIcon(iconR, true, node.isOpticalDrive, node.isOffline);
             } else {
                 DrawFolderVectorIcon(iconR, true);
             }
 
-            D2D1_RECT_F textR = D2D1::RectF(indentX + 36.0f, y, rect.right - 4.0f, y + 25.0f);
-            m_solidBrush->SetColor(node.isOffline ? HexColor(0x787878) : HexColor(0x1E1E1E));
-            m_rt->DrawTextW(node.label.c_str(), static_cast<UINT32>(node.label.size()), m_fmtRegular, textR, m_solidBrush);
+            float labelRight = rowR.right - 4.0f;
+
+            // Right-aligned Drive Capacity Badge + Mini Usage Bar OR Folder Size Badge
+            if (node.isDrive && !node.isOffline && node.totalBytes > 0 && !node.sizeStr.empty() &&
+                (rowR.right - (indentX + 36.0f)) > 110.0f)
+            {
+                float badgeW = 84.0f;
+                labelRight = std::max(indentX + 44.0f, rowR.right - badgeW - 6.0f);
+
+                float fillRatio = std::clamp(
+                    static_cast<float>(static_cast<double>(node.size) / static_cast<double>(node.totalBytes)),
+                    0.0f, 1.0f);
+                uint32_t barCol = (fillRatio >= 0.90f) ? 0xDC2626 : ((fillRatio >= 0.78f) ? 0xD97706 : 0x0078D7);
+                uint32_t txtCol = (fillRatio >= 0.90f) ? 0xB91C1C : 0x475569;
+
+                D2D1_RECT_F szR = D2D1::RectF(labelRight + 2.0f, y + 1.0f, rowR.right - 4.0f, y + 16.5f);
+                m_solidBrush->SetColor(HexColor(txtCol));
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                DrawTextCached(node.sizeStr.c_str(), static_cast<UINT32>(node.sizeStr.size()), m_fmtSmall, szR, m_solidBrush);
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+                // Mini capacity progress bar underneath the drive size text
+                float barW = 68.0f;
+                D2D1_RECT_F barBg = D2D1::RectF(rowR.right - 4.0f - barW, y + 18.0f, rowR.right - 4.0f, y + 21.5f);
+                m_solidBrush->SetColor(HexColor(0xE2E8F0));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(barBg, 1.5f, 1.5f), m_solidBrush);
+                float fillW = std::max(2.0f, barW * fillRatio);
+                D2D1_RECT_F barFg = D2D1::RectF(barBg.left, barBg.top, barBg.left + fillW, barBg.bottom);
+                m_solidBrush->SetColor(HexColor(barCol));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(barFg, 1.5f, 1.5f), m_solidBrush);
+            } else if (!node.isDrive && !node.isHeader && !node.sizeStr.empty() &&
+                       (rowR.right - (indentX + 36.0f)) > 92.0f)
+            {
+                float badgeW = 62.0f;
+                labelRight = std::max(indentX + 44.0f, rowR.right - badgeW - 6.0f);
+
+                uint32_t szCol = node.isFtpNode ? 0x0284C7 : 0x64748B;
+                if (!node.isFtpNode) {
+                    if (node.size >= (10ULL << 30)) szCol = 0x0F172A;      // >= 10 GB
+                    else if (node.size >= (1ULL << 30)) szCol = 0x334155;  // >= 1 GB
+                }
+
+                D2D1_RECT_F szR = D2D1::RectF(labelRight + 2.0f, y + 4.0f, rowR.right - 4.0f, y + 21.0f);
+                m_solidBrush->SetColor(HexColor(szCol));
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                DrawTextCached(node.sizeStr.c_str(), static_cast<UINT32>(node.sizeStr.size()), m_fmtSmall, szR, m_solidBrush);
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+
+            D2D1_RECT_F textR = D2D1::RectF(indentX + 36.0f, y + 2.0f, labelRight, y + 23.0f);
+            IDWriteTextFormat* rowFmt = (node.normKey == L"__HEADER_FTP__") ? m_fmtBold : m_fmtRegular;
+            DrawClippedText(node.label, textR, rowFmt, node.isOffline ? 0x787878 : 0x1E1E1E);
         }
 
         y += 26.0f;
@@ -1892,21 +2373,170 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
     m_rt->PopAxisAlignedClip();
 }
 
+void ExplorerApp::DrawTabBar(const D2D1_RECT_F& barRect) {
+    if (barRect.right <= barRect.left + 20.0f || barRect.bottom <= barRect.top + 4.0f) return;
+    const Strings& s = GetStrings(m_lang);
+
+    m_rt->PushAxisAlignedClip(barRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    // Subtle tab strip background + bottom border
+    m_solidBrush->SetColor(HexColor(0xEEF2F6));
+    m_rt->FillRectangle(barRect, m_solidBrush);
+    m_solidBrush->SetColor(HexColor(0xCBD5E1));
+    m_rt->DrawLine(D2D1::Point2F(barRect.left, barRect.bottom - 0.5f), D2D1::Point2F(barRect.right, barRect.bottom - 0.5f), m_solidBrush, 1.0f);
+
+    int tabCount = static_cast<int>(m_tabs.size());
+    if (tabCount <= 0) {
+        m_rt->PopAxisAlignedClip();
+        return;
+    }
+
+    float availW = std::max(80.0f, (barRect.right - barRect.left) - 42.0f);
+    float tabW = std::clamp(availW / static_cast<float>(tabCount), 86.0f, 200.0f);
+    float tx = barRect.left + 4.0f;
+
+    for (int i = 0; i < tabCount; ++i) {
+        if (tx + 54.0f > barRect.right - 32.0f) break;
+        float curW = std::min(tabW, (barRect.right - 32.0f) - tx);
+        D2D1_RECT_F tr = D2D1::RectF(tx, barRect.top + 2.5f, tx + curW - 2.0f, barRect.bottom);
+        D2D1_RECT_F closeR = D2D1::RectF(tr.right - 20.0f, tr.top + 3.0f, tr.right - 3.0f, tr.bottom - 3.0f);
+
+        m_tabHits.push_back({ i, tr, closeR, false });
+
+        bool isActive = (i == m_activeTab);
+        bool isHov = (i == m_hoverTabIndex);
+        bool isCloseHov = (i == m_hoverTabCloseIndex);
+
+        m_solidBrush->SetColor(isActive ? HexColor(0xFFFFFF) : (isHov ? HexColor(0xE2E8F0) : HexColor(0xE8EEF5)));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, tr.top, tr.right, tr.bottom + 2.0f), 4.0f, 4.0f), m_solidBrush);
+
+        if (isActive) {
+            // Top blue active tab accent line
+            m_solidBrush->SetColor(HexColor(0x0078D7));
+            m_rt->FillRectangle(D2D1::RectF(tr.left + 2.0f, tr.top, tr.right - 2.0f, tr.top + 2.5f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(0xCBD5E1));
+            m_rt->DrawLine(D2D1::Point2F(tr.left, tr.top + 2.0f), D2D1::Point2F(tr.left, tr.bottom), m_solidBrush, 1.0f);
+            m_rt->DrawLine(D2D1::Point2F(tr.right, tr.top + 2.0f), D2D1::Point2F(tr.right, tr.bottom), m_solidBrush, 1.0f);
+        } else {
+            m_solidBrush->SetColor(HexColor(0xCBD5E1));
+            m_rt->DrawLine(D2D1::Point2F(tr.right + 1.0f, tr.top + 4.0f), D2D1::Point2F(tr.right + 1.0f, tr.bottom - 4.0f), m_solidBrush, 1.0f);
+        }
+
+        // Resolve tab folder path & display label
+        std::wstring tabPath = isActive ? m_currentPath : m_tabs[i].currentPath;
+        std::wstring label;
+        if (tabPath.empty() || tabPath == L"THIS_PC") {
+            label = s.navThisPC;
+        } else if (FtpClient::IsFtpPath(tabPath)) {
+            FtpUrlInfo parsed;
+            if (FtpClient::ParseFtpUrl(tabPath, parsed)) {
+                label = parsed.host + parsed.remotePath;
+            } else {
+                label = tabPath;
+            }
+        } else {
+            label = PathUtils::GetFileName(tabPath);
+            if (label.empty()) label = tabPath;
+        }
+
+        float cy = (tr.top + tr.bottom) * 0.5f;
+        DrawFolderVectorIcon(D2D1::RectF(tr.left + 6.0f, cy - 6.5f, tr.left + 19.0f, cy + 6.5f), true);
+
+        D2D1_RECT_F lblR = D2D1::RectF(tr.left + 22.0f, tr.top + 2.0f, closeR.left - 2.0f, tr.bottom - 1.0f);
+        DrawClippedText(label, lblR, isActive ? m_fmtBold : m_fmtSmall, isActive ? 0x0F172A : 0x334155);
+
+        if (isCloseHov) {
+            m_solidBrush->SetColor(HexColor(0xFEE2E2));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(closeR, 2.5f, 2.5f), m_solidBrush);
+        }
+        m_solidBrush->SetColor(isCloseHov ? HexColor(0xDC2626) : HexColor(0x64748B));
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawTextCached(L"\x2715", 1, m_fmtSmall, closeR, m_solidBrush);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        tx += curW;
+    }
+
+    // [+] New Tab button at end of tab strip
+    D2D1_RECT_F plusR = D2D1::RectF(tx + 2.0f, barRect.top + 3.5f, tx + 26.0f, barRect.bottom - 2.5f);
+    m_tabHits.push_back({ -1, plusR, {}, true });
+    m_solidBrush->SetColor(m_hoverNewTabBtn ? HexColor(0xDBEAFE) : HexColor(0xE2E8F0));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(plusR, 3.0f, 3.0f), m_solidBrush);
+    m_solidBrush->SetColor(m_hoverNewTabBtn ? HexColor(0x0284C7) : HexColor(0x94A3B8));
+    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(plusR, 3.0f, 3.0f), m_solidBrush, 1.0f);
+    m_solidBrush->SetColor(m_hoverNewTabBtn ? HexColor(0x0369A1) : HexColor(0x334155));
+    m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawTextCached(L"+", 1, m_fmtBold, plusR, m_solidBrush);
+    m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    m_rt->PopAxisAlignedClip();
+}
+
+void ExplorerApp::DrawDragOverlay() {
+    if (!m_isDraggingItems || m_dragPaths.empty()) return;
+    const bool pl = (m_lang == Lang::PL);
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+    std::wstring badgeText;
+    uint32_t bgHex = 0x1E293B;
+    uint32_t borderHex = 0x3B82F6;
+
+    std::wstring countStr = (m_dragPaths.size() == 1)
+        ? PathUtils::GetFileName(m_dragPaths[0])
+        : (std::to_wstring(m_dragPaths.size()) + (pl ? L" elem." : L" items"));
+
+    if (!m_dragTargetDir.empty()) {
+        std::wstring srcDrive = (m_dragPaths[0].size() >= 2 && m_dragPaths[0][1] == L':') ? m_dragPaths[0].substr(0, 2) : L"";
+        std::wstring dstDrive = (m_dragTargetDir.size() >= 2 && m_dragTargetDir[1] == L':') ? m_dragTargetDir.substr(0, 2) : L"";
+        bool sameVol = (!srcDrive.empty() && !dstDrive.empty() && _wcsicmp(srcDrive.c_str(), dstDrive.c_str()) == 0);
+        bool isMove = shift ? true : (ctrl ? false : sameVol);
+        std::wstring verb = isMove ? (pl ? L"\x2192 Przenieś " : L"\x2192 Move ") : (pl ? L"+ Kopiuj " : L"+ Copy ");
+        badgeText = verb + countStr + (pl ? L" do: " : L" to: ") + m_dragTargetLabel;
+        bgHex = isMove ? 0x0F172A : 0x064E3B;
+        borderHex = isMove ? 0x38BDF8 : 0x10B981;
+    } else {
+        badgeText = (pl ? L"Przeciąganie: " : L"Dragging: ") + countStr;
+        bgHex = 0x334155;
+        borderHex = 0x94A3B8;
+    }
+
+    float bw = std::clamp(static_cast<float>(badgeText.size()) * 7.2f + 26.0f, 140.0f, 460.0f);
+    float bh = 28.0f;
+    float bx = m_mousePt.x + 16.0f;
+    float by = m_mousePt.y + 16.0f;
+
+    D2D1_RECT_F pillR = D2D1::RectF(bx, by, bx + bw, by + bh);
+    m_solidBrush->SetColor(HexColor(bgHex, 0.92f));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(pillR, 5.0f, 5.0f), m_solidBrush);
+    m_solidBrush->SetColor(HexColor(borderHex, 0.95f));
+    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(pillR, 5.0f, 5.0f), m_solidBrush, 1.5f);
+
+    D2D1_RECT_F txtR = D2D1::RectF(pillR.left + 10.0f, pillR.top + 3.0f, pillR.right - 8.0f, pillR.bottom - 3.0f);
+    DrawClippedText(badgeText, txtR, m_fmtBold, 0xFFFFFF);
+}
+
 void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
+    D2D1_RECT_F viewRect = rect;
+    if (IsTabBarVisible() && (!IsSplitViewActive() || !m_overrideMainRect)) {
+        D2D1_RECT_F tabBarR = D2D1::RectF(viewRect.left, viewRect.top, viewRect.right, viewRect.top + 26.0f);
+        DrawTabBar(tabBarR);
+        viewRect.top += 26.0f;
+    }
+
     if (m_viewMode == ViewMode::FullViewer) {
-        DrawFullViewerCanvas(rect, true);
+        DrawFullViewerCanvas(viewRect, true);
         return;
     }
     if (m_viewMode == ViewMode::Hardware) {
         m_ScrollbarThumbRect = {};
-        DrawHardwareProView(rect);
+        DrawHardwareProView(viewRect);
         return;
     }
 
-    D2D1_RECT_F viewRect = rect;
     if (m_isSearchActive) {
         // Draw Live Search Progress & Results Banner (28px height)
-        D2D1_RECT_F sBar = D2D1::RectF(rect.left, rect.top, rect.right, rect.top + 28.0f);
+        D2D1_RECT_F sBar = D2D1::RectF(viewRect.left, viewRect.top, viewRect.right, viewRect.top + 28.0f);
         viewRect.top += 28.0f;
 
         bool running = m_searchProgress.isRunning;
@@ -1966,7 +2596,7 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
 
         D2D1_RECT_F txtR = D2D1::RectF(sBar.left + (running ? 32.0f : 10.0f), sBar.top, sBar.right - 245.0f, sBar.bottom);
         m_solidBrush->SetColor(running ? HexColor(0x8D3B00) : HexColor(0x004578));
-        m_rt->DrawTextW(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtBold, txtR, m_solidBrush);
+        DrawTextCached(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtBold, txtR, m_solidBrush);
 
         // Action buttons on right side of Search Banner: [⚙ Zaawansowane] and [⏹ Stop / ✕ Zamknij]
         D2D1_RECT_F advBtnR = D2D1::RectF(sBar.right - 238.0f, sBar.top + 3.0f, sBar.right - 122.0f, sBar.bottom - 4.0f);
@@ -1978,7 +2608,7 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
         m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_SEARCH_ADVANCED_GEAR ? HexColor(0xFFFFFF) : HexColor(0x005A9E));
         const wchar_t* advLbl = m_lang == Lang::PL ? L"\x2699 Filtry / Opcje" : L"\x2699 Filters / Gear";
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(advLbl, static_cast<UINT32>(wcslen(advLbl)), m_fmtSmall, advBtnR, m_solidBrush);
+        DrawTextCached(advLbl, static_cast<UINT32>(wcslen(advLbl)), m_fmtSmall, advBtnR, m_solidBrush);
 
         int rightCmd = running ? CMD_SEARCH_STOP : CMD_CLEAR_SEARCH;
         D2D1_RECT_F closeBtnR = D2D1::RectF(sBar.right - 116.0f, sBar.top + 3.0f, sBar.right - 8.0f, sBar.bottom - 4.0f);
@@ -1991,7 +2621,7 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
         const wchar_t* clsLbl = running
             ? (m_lang == Lang::PL ? L"\x23F9 Zatrzymaj" : L"\x23F9 Stop")
             : (m_lang == Lang::PL ? L"\x2715 Zamknij wyniki" : L"\x2715 Close search");
-        m_rt->DrawTextW(clsLbl, static_cast<UINT32>(wcslen(clsLbl)), m_fmtSmall, closeBtnR, m_solidBrush);
+        DrawTextCached(clsLbl, static_cast<UINT32>(wcslen(clsLbl)), m_fmtSmall, closeBtnR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
@@ -2047,13 +2677,13 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
         float cw = m_colWidths[c];
         D2D1_RECT_F cr = D2D1::RectF(cx + 6.0f, hdrRect.top, cx + cw - 6.0f, hdrRect.bottom);
         m_solidBrush->SetColor(HexColor(0x4C566A));
-        m_rt->DrawTextW(colTitles[c], static_cast<UINT32>(wcslen(colTitles[c])), m_fmtRegular, cr, m_solidBrush);
+        DrawTextCached(colTitles[c], static_cast<UINT32>(wcslen(colTitles[c])), m_fmtRegular, cr, m_solidBrush);
 
         // Sort chevron '^' / 'v' matching Win10 screenshot
         if (c < 4 && static_cast<int>(m_sortCol) == c) {
             D2D1_RECT_F arrowR = D2D1::RectF(cx + cw * 0.5f - 8.0f, hdrRect.top, cx + cw * 0.5f + 8.0f, hdrRect.top + 11.0f);
             m_solidBrush->SetColor(HexColor(0x666666));
-            m_rt->DrawTextW(m_sortAsc ? L"\x2303" : L"\x2304", 1, m_fmtSmall, arrowR, m_solidBrush);
+            DrawTextCached(m_sortAsc ? L"\x2303" : L"\x2304", 1, m_fmtSmall, arrowR, m_solidBrush);
         }
 
         // On "Rozmiar" (Size) column (c == 3): add clickable Refresh/Calculate [↻] icon button!
@@ -2077,7 +2707,7 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
 
             m_solidBrush->SetColor((hovered || calculating) ? HexColor(0x0067B8) : HexColor(0x333333));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(L"\x21BB", 1, m_fmtSmall, calcBtn, m_solidBrush);
+            DrawTextCached(L"\x21BB", 1, m_fmtSmall, calcBtn, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
 
@@ -2120,9 +2750,12 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
         } else if (item.isDirectory) {
             DrawFolderVectorIcon(iconR, true);
         } else {
-            ID2D1Bitmap* sysIcon = m_imageCache.GetSystemIconBitmap(m_rt, item.sysIconIndex, false);
+            const bool perFileIcon = (item.ext == L".exe" || item.ext == L".lnk" || item.ext == L".msi" ||
+                                      item.ext == L".scr" || item.ext == L".url" || item.ext == L".cpl" || item.ext == L".msc");
+            int iconIdx = perFileIcon ? m_imageCache.GetOrQueuePerFileIconIndex(item.fullPath, item.sysIconIndex) : item.sysIconIndex;
+            const ImageCache::SystemIcon sysIcon = m_imageCache.GetSystemIcon(m_rt, iconIdx, 0);
             if (sysIcon) {
-                m_rt->DrawBitmap(sysIcon, iconR, alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                ImageCache::DrawSystemIcon(m_rt, sysIcon, iconR, alpha);
             } else {
                 DrawRibbonIcon(CMD_NONE, iconR);
             }
@@ -2135,26 +2768,90 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
         if (isRotating) {
             std::wstring rotTitle = item.displayName + (m_lang == Lang::PL ? L"   [\x23F3 Przetwarzanie...]" : L"   [\x23F3 Processing...]");
             m_solidBrush->SetColor(HexColor(0x0067B8));
-            m_rt->DrawTextW(rotTitle.c_str(), static_cast<UINT32>(rotTitle.size()), m_fmtRegular, nameR, m_solidBrush);
+            DrawTextCached(rotTitle.c_str(), static_cast<UINT32>(rotTitle.size()), m_fmtRegular, nameR, m_solidBrush);
         } else {
             m_solidBrush->SetColor(HexColor(0x1E1E1E, alpha));
-            m_rt->DrawTextW(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtRegular, nameR, m_solidBrush);
+            DrawTextCached(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtRegular, nameR, m_solidBrush);
+        }
+
+        // Group By Header Accent & Pill Badge on the first row of each group
+        if (m_groupBy != GroupByMode::None) {
+            auto groupLabelFor = [&](const FileEntry& e) -> std::wstring {
+                const bool pl = (m_lang == Lang::PL);
+                if (m_groupBy == GroupByMode::NameInitial) {
+                    if (e.isDirectory || e.isDrive) return pl ? L"Foldery" : L"Folders";
+                    wchar_t ch = e.name.empty() ? L'#' : static_cast<wchar_t>(towupper(e.name[0]));
+                    if (ch >= L'0' && ch <= L'9') return L"0\x2013" L"9";
+                    if (ch >= L'A' && ch <= L'E') return L"A\x2013" L"E";
+                    if (ch >= L'F' && ch <= L'J') return L"F\x2013" L"J";
+                    if (ch >= L'K' && ch <= L'O') return L"K\x2013" L"O";
+                    if (ch >= L'P' && ch <= L'T') return L"P\x2013" L"T";
+                    if (ch >= L'U' && ch <= L'Z') return L"U\x2013" L"Z";
+                    return pl ? L"Inne (#)" : L"Other (#)";
+                }
+                if (m_groupBy == GroupByMode::DateBucket) {
+                    FILETIME nowFt = {};
+                    GetSystemTimeAsFileTime(&nowFt);
+                    ULARGE_INTEGER nowUl = {}, itemUl = {};
+                    nowUl.LowPart = nowFt.dwLowDateTime; nowUl.HighPart = nowFt.dwHighDateTime;
+                    itemUl.LowPart = e.writeTime.dwLowDateTime; itemUl.HighPart = e.writeTime.dwHighDateTime;
+                    constexpr uint64_t kDay100ns = 24ULL * 3600ULL * 10000000ULL;
+                    uint64_t age = (nowUl.QuadPart > itemUl.QuadPart) ? (nowUl.QuadPart - itemUl.QuadPart) : 0ULL;
+                    if (age < kDay100ns)       return pl ? L"Dziś" : L"Today";
+                    if (age < 2 * kDay100ns)   return pl ? L"Wczoraj" : L"Yesterday";
+                    if (age < 7 * kDay100ns)   return pl ? L"W tym tygodniu" : L"Earlier this week";
+                    if (age < 30 * kDay100ns)  return pl ? L"W tym miesiącu" : L"Earlier this month";
+                    if (age < 365 * kDay100ns) return pl ? L"W tym roku" : L"Earlier this year";
+                    return pl ? L"Starsze" : L"A long time ago";
+                }
+                if (m_groupBy == GroupByMode::FileType) {
+                    return e.typeName.empty() ? (pl ? L"Plik" : L"File") : e.typeName;
+                }
+                if (m_groupBy == GroupByMode::SizeTier) {
+                    if (e.isDirectory && e.size == 0) return pl ? L"Foldery" : L"Folders";
+                    if (e.size == 0) return pl ? L"Puste (0 B)" : L"Empty (0 B)";
+                    if (e.size < 100ULL * 1024) return L"< 100 KB";
+                    if (e.size < 1024ULL * 1024) return L"100 KB \x2013 1 MB";
+                    if (e.size < 100ULL * 1024 * 1024) return L"1 \x2013 100 MB";
+                    if (e.size < 1024ULL * 1024 * 1024) return L"100 MB \x2013 1 GB";
+                    return L"> 1 GB";
+                }
+                return L"";
+            };
+            std::wstring myGrp = groupLabelFor(item);
+            bool isGroupStart = (i == 0) || (_wcsicmp(myGrp.c_str(), groupLabelFor(m_items[i - 1]).c_str()) != 0);
+            if (isGroupStart && !myGrp.empty()) {
+                m_solidBrush->SetColor(HexColor(0x0078D7, 0.55f));
+                m_rt->DrawLine(D2D1::Point2F(rowR.left + 4.0f, rowR.top + 0.5f), D2D1::Point2F(rowR.right - 4.0f, rowR.top + 0.5f), m_solidBrush, 1.2f);
+                float badgeW = std::min(145.0f, static_cast<float>(myGrp.size()) * 6.5f + 16.0f);
+                D2D1_RECT_F badgeR = D2D1::RectF(x0 + m_colWidths[0] - badgeW - 6.0f, rowR.top + 2.5f, x0 + m_colWidths[0] - 6.0f, rowR.bottom - 2.5f);
+                if (badgeR.left > x0 + 80.0f) {
+                    m_solidBrush->SetColor(HexColor(0xE0F2FE));
+                    m_rt->FillRoundedRectangle(D2D1::RoundedRect(badgeR, 3.0f, 3.0f), m_solidBrush);
+                    m_solidBrush->SetColor(HexColor(0x0284C7));
+                    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(badgeR, 3.0f, 3.0f), m_solidBrush, 1.0f);
+                    m_solidBrush->SetColor(HexColor(0x0369A1));
+                    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    DrawTextCached(myGrp.c_str(), static_cast<UINT32>(myGrp.size()), m_fmtSmall, badgeR, m_solidBrush);
+                    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
+            }
         }
 
         float x1 = x0 + m_colWidths[0];
         D2D1_RECT_F dateR = D2D1::RectF(x1 + 6.0f, rowR.top, x1 + m_colWidths[1] - 4.0f, rowR.bottom);
         m_solidBrush->SetColor(HexColor(0x555555, alpha));
-        m_rt->DrawTextW(item.dateStr.c_str(), static_cast<UINT32>(item.dateStr.size()), m_fmtRegular, dateR, m_solidBrush);
+        DrawTextCached(item.dateStr.c_str(), static_cast<UINT32>(item.dateStr.size()), m_fmtRegular, dateR, m_solidBrush);
 
         float x2 = x1 + m_colWidths[1];
         D2D1_RECT_F typeR = D2D1::RectF(x2 + 6.0f, rowR.top, x2 + m_colWidths[2] - 4.0f, rowR.bottom);
-        m_rt->DrawTextW(item.typeName.c_str(), static_cast<UINT32>(item.typeName.size()), m_fmtRegular, typeR, m_solidBrush);
+        DrawTextCached(item.typeName.c_str(), static_cast<UINT32>(item.typeName.size()), m_fmtRegular, typeR, m_solidBrush);
 
         float x3 = x2 + m_colWidths[2];
         if (!item.sizeStr.empty()) {
             D2D1_RECT_F sizeR = D2D1::RectF(x3 + 6.0f, rowR.top, x3 + m_colWidths[3] - 8.0f, rowR.bottom);
             m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-            m_rt->DrawTextW(item.sizeStr.c_str(), static_cast<UINT32>(item.sizeStr.size()), m_fmtRegular, sizeR, m_solidBrush);
+            DrawTextCached(item.sizeStr.c_str(), static_cast<UINT32>(item.sizeStr.size()), m_fmtRegular, sizeR, m_solidBrush);
             m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
 
@@ -2175,7 +2872,7 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
             m_solidBrush->SetColor(hovTrash ? HexColor(0x005A9E) : HexColor(0x3B4252));
             std::wstring trashTxt = std::wstring(L"\xD83D\xDDD1 ") + s.btnRowTrash;
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(trashTxt.c_str(), static_cast<UINT32>(trashTxt.size()), m_fmtSmall, rTrash, m_solidBrush);
+            DrawTextCached(trashTxt.c_str(), static_cast<UINT32>(trashTxt.size()), m_fmtSmall, rTrash, m_solidBrush);
 
             // [✕ Usuń] permanent delete button
             m_solidBrush->SetColor(hovPerm ? HexColor(0xFDE7E9) : HexColor(0xFAF2F2));
@@ -2184,7 +2881,7 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rPerm, 2.5f, 2.5f), m_solidBrush, 1.0f);
             m_solidBrush->SetColor(hovPerm ? HexColor(0xA80000) : HexColor(0x9E2A2B));
             std::wstring permTxt = std::wstring(L"\x2715 ") + s.btnRowPermDel;
-            m_rt->DrawTextW(permTxt.c_str(), static_cast<UINT32>(permTxt.size()), m_fmtSmall, rPerm, m_solidBrush);
+            DrawTextCached(permTxt.c_str(), static_cast<UINT32>(permTxt.size()), m_fmtSmall, rPerm, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
     }
@@ -2247,13 +2944,16 @@ void ExplorerApp::DrawGridOrListView(const D2D1_RECT_F& rect) {
             } else if (item.isDirectory) {
                 DrawFolderVectorIcon(iconR, true);
             } else {
-                ID2D1Bitmap* sysIcon = m_imageCache.GetSystemIconBitmap(m_rt, item.sysIconIndex, false);
-                if (sysIcon) m_rt->DrawBitmap(sysIcon, iconR, alpha);
+                const bool perFileIcon = (item.ext == L".exe" || item.ext == L".lnk" || item.ext == L".msi" ||
+                                          item.ext == L".scr" || item.ext == L".url" || item.ext == L".cpl" || item.ext == L".msc");
+                int iconIdx = perFileIcon ? m_imageCache.GetOrQueuePerFileIconIndex(item.fullPath, item.sysIconIndex) : item.sysIconIndex;
+                const ImageCache::SystemIcon sysIcon = m_imageCache.GetSystemIcon(m_rt, iconIdx, 0);
+                if (sysIcon) ImageCache::DrawSystemIcon(m_rt, sysIcon, iconR, alpha);
                 else DrawRibbonIcon(CMD_NONE, iconR);
             }
             D2D1_RECT_F textR = D2D1::RectF(iconR.right + 6.0f, itemR.top, itemR.right - 4.0f, itemR.bottom);
             m_solidBrush->SetColor(HexColor(0x1E1E1E, alpha));
-            m_rt->DrawTextW(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtRegular, textR, m_solidBrush);
+            DrawTextCached(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtRegular, textR, m_solidBrush);
         } else {
             // Thumbnail Tile (Medium / Large / Extra Large / Jumbo 440px Icons)
             D2D1_RECT_F thumbBox = D2D1::RectF(
@@ -2289,7 +2989,7 @@ void ExplorerApp::DrawGridOrListView(const D2D1_RECT_F& rect) {
                         m_rt->FillRoundedRectangle(D2D1::RoundedRect(badgeR, 3.0f, 3.0f), m_solidBrush);
                         m_solidBrush->SetColor(HexColor(0xFFFFFF));
                         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                        m_rt->DrawTextW(L"\x25B6", 1, m_fmtSmall, badgeR, m_solidBrush);
+                        DrawTextCached(L"\x25B6", 1, m_fmtSmall, badgeR, m_solidBrush);
                         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                     }
                 } else {
@@ -2312,24 +3012,42 @@ void ExplorerApp::DrawGridOrListView(const D2D1_RECT_F& rect) {
                     m_solidBrush->SetColor(HexColor(0xFFFFFF));
                     const wchar_t* rotTxt = (m_lang == Lang::PL) ? L"\x23F3 Przetwarzanie..." : L"\x23F3 Processing...";
                     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    m_rt->DrawTextW(rotTxt, static_cast<UINT32>(wcslen(rotTxt)), m_fmtSmall, pillR, m_solidBrush);
+                    DrawTextCached(rotTxt, static_cast<UINT32>(wcslen(rotTxt)), m_fmtSmall, pillR, m_solidBrush);
                     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
             } else {
-                ID2D1Bitmap* sysIcon = m_imageCache.GetSystemIconBitmap(m_rt, item.sysIconIndex, true);
-                float sysSz = std::min(48.0f, iconSize * 0.65f);
-                D2D1_RECT_F sysR = D2D1::RectF(
-                    (thumbBox.left + thumbBox.right - sysSz) * 0.5f,
-                    (thumbBox.top + thumbBox.bottom - sysSz) * 0.5f,
-                    (thumbBox.left + thumbBox.right + sysSz) * 0.5f,
-                    (thumbBox.top + thumbBox.bottom + sysSz) * 0.5f);
-                if (sysIcon) m_rt->DrawBitmap(sysIcon, sysR, alpha);
-                else DrawRibbonIcon(CMD_NONE, sysR);
+                const bool perFileIcon = (item.ext == L".exe" || item.ext == L".lnk" || item.ext == L".msi" ||
+                                          item.ext == L".scr" || item.ext == L".url" || item.ext == L".cpl" || item.ext == L".msc");
+                int iconIdx = perFileIcon ? m_imageCache.GetOrQueuePerFileIconIndex(item.fullPath, item.sysIconIndex) : item.sysIconIndex;
+                int sizeTier = (iconSize >= 64.0f) ? 2 : 1;
+                const ImageCache::SystemIcon sysIcon = m_imageCache.GetSystemIcon(m_rt, iconIdx, sizeTier);
+                if (sysIcon) {
+                    const D2D1_SIZE_F bmpSz = D2D1::SizeF(sysIcon.width, sysIcon.height);
+                    float maxBox = std::min(256.0f, iconSize * 0.78f);
+                    if (bmpSz.width <= 64.0f && maxBox > 64.0f) {
+                        maxBox = std::min(maxBox, std::max(48.0f, bmpSz.width * 1.35f));
+                    }
+                    D2D1_RECT_F iconBox = D2D1::RectF(
+                        (thumbBox.left + thumbBox.right - maxBox) * 0.5f,
+                        (thumbBox.top + thumbBox.bottom - maxBox) * 0.5f,
+                        (thumbBox.left + thumbBox.right + maxBox) * 0.5f,
+                        (thumbBox.top + thumbBox.bottom + maxBox) * 0.5f);
+                    D2D1_RECT_F sysR = PathUtils::FitRectCentered(iconBox, bmpSz.width, bmpSz.height);
+                    ImageCache::DrawSystemIcon(m_rt, sysIcon, sysR, alpha);
+                } else {
+                    float sysSz = std::min(48.0f, iconSize * 0.65f);
+                    D2D1_RECT_F sysR = D2D1::RectF(
+                        (thumbBox.left + thumbBox.right - sysSz) * 0.5f,
+                        (thumbBox.top + thumbBox.bottom - sysSz) * 0.5f,
+                        (thumbBox.left + thumbBox.right + sysSz) * 0.5f,
+                        (thumbBox.top + thumbBox.bottom + sysSz) * 0.5f);
+                    DrawRibbonIcon(CMD_NONE, sysR);
+                }
             }
 
             D2D1_RECT_F labelR = D2D1::RectF(itemR.left + 2.0f, thumbBox.bottom + 2.0f, itemR.right - 2.0f, itemR.bottom - 1.0f);
             m_solidBrush->SetColor(HexColor(0x1E1E1E, alpha));
-            m_rt->DrawTextW(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtCenterSmall, labelR, m_solidBrush);
+            DrawTextCached(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtCenterSmall, labelR, m_solidBrush);
         }
     }
 
@@ -2625,7 +3343,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
 
     D2D1_RECT_F hdrTxtR = D2D1::RectF(topBarR.left + 10.0f, topBarR.top, topBarR.left + 390.0f, topBarR.bottom);
     m_solidBrush->SetColor(HexColor(0x1E293B));
-    m_rt->DrawTextW(totalTxt.c_str(), static_cast<UINT32>(totalTxt.size()), m_fmtBold, hdrTxtR, m_solidBrush);
+    DrawTextCached(totalTxt.c_str(), static_cast<UINT32>(totalTxt.size()), m_fmtBold, hdrTxtR, m_solidBrush);
 
     // Rescan button
     D2D1_RECT_F rescanBtnR = D2D1::RectF(topBarR.left + 395.0f, topBarR.top + 4.0f, topBarR.left + 485.0f, topBarR.bottom - 4.0f);
@@ -2638,7 +3356,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
     m_solidBrush->SetColor(rescanHov ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
     const wchar_t* rescanLbl = (m_lang == Lang::PL) ? L"\x21BB Przelicz" : L"\x21BB Rescan";
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_rt->DrawTextW(rescanLbl, static_cast<UINT32>(wcslen(rescanLbl)), m_fmtSmall, rescanBtnR, m_solidBrush);
+    DrawTextCached(rescanLbl, static_cast<UINT32>(wcslen(rescanLbl)), m_fmtSmall, rescanBtnR, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     // High-visibility live scanning banner right below topBarR (Light Warm Amber Explorer Banner)
@@ -2695,7 +3413,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
 
         D2D1_RECT_F scanTxtR = D2D1::RectF(scanBannerR.left + 38.0f, scanBannerR.top + 2.0f, scanBannerR.right - 12.0f, scanBannerR.top + 24.0f);
         m_solidBrush->SetColor(HexColor(0x92400E));
-        m_rt->DrawTextW(fullScanTxt.c_str(), static_cast<UINT32>(fullScanTxt.size()), m_fmtBold, scanTxtR, m_solidBrush);
+        DrawTextCached(fullScanTxt.c_str(), static_cast<UINT32>(fullScanTxt.size()), m_fmtBold, scanTxtR, m_solidBrush);
 
         // Full-width progress track + animated shimmer bar at the bottom of scanBannerR
         D2D1_RECT_F progTrackR = D2D1::RectF(scanBannerR.left + 10.0f, scanBannerR.bottom - 8.0f, scanBannerR.right - 10.0f, scanBannerR.bottom - 3.0f);
@@ -2746,7 +3464,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(swR, 2.0f, 2.0f), m_solidBrush);
         D2D1_RECT_F ltR = D2D1::RectF(cr.left + 16.0f, cr.top, cr.right, cr.bottom);
         m_solidBrush->SetColor(HexColor(0x334155));
-        m_rt->DrawTextW(lbl, static_cast<UINT32>(wcslen(lbl)), m_fmtSmall, ltR, m_solidBrush);
+        DrawTextCached(lbl, static_cast<UINT32>(wcslen(lbl)), m_fmtSmall, ltR, m_solidBrush);
         chipX -= (cw + 6.0f);
     }
 
@@ -2757,7 +3475,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
         m_solidBrush->SetColor(HexColor(0x64748B));
         const wchar_t* emptyMsg = (m_lang == Lang::PL) ? L"Ten folder jest pusty." : L"This folder is empty.";
         m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(emptyMsg, static_cast<UINT32>(wcslen(emptyMsg)), m_fmtCenterSmall, canvasR, m_solidBrush);
+        DrawTextCached(emptyMsg, static_cast<UINT32>(wcslen(emptyMsg)), m_fmtCenterSmall, canvasR, m_solidBrush);
     } else {
         // Helper to draw diagonal animated scanning stripes over any in-flight block
         auto drawScanningOverlay = [&](const D2D1_RECT_F& r, bool showCenteredBadge) {
@@ -2786,7 +3504,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
                 const wchar_t* scanBadge = (m_lang == Lang::PL) ? L"\x23F3 SKANOWANIE..." : L"\x23F3 SCANNING...";
                 m_solidBrush->SetColor(HexColor(0x92400E));
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                m_rt->DrawTextW(scanBadge, static_cast<UINT32>(wcslen(scanBadge)), m_fmtSmall, pillR, m_solidBrush);
+                DrawTextCached(scanBadge, static_cast<UINT32>(wcslen(scanBadge)), m_fmtSmall, pillR, m_solidBrush);
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
             m_rt->PopAxisAlignedClip();
@@ -2841,9 +3559,9 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
                 }
                 D2D1_RECT_F shR = D2D1::RectF(txtR.left + 1.0f, txtR.top + 1.0f, txtR.right + 1.0f, txtR.bottom + 1.0f);
                 m_solidBrush->SetColor(HexColor(0x000000, 0.55f));
-                m_rt->DrawTextW(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, shR, m_solidBrush);
+                DrawTextCached(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, shR, m_solidBrush);
                 m_solidBrush->SetColor(HexColor(0xFFFFFF, 0.98f));
-                m_rt->DrawTextW(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, txtR, m_solidBrush);
+                DrawTextCached(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, txtR, m_solidBrush);
                 m_rt->PopAxisAlignedClip();
             }
         };
@@ -2925,7 +3643,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
                     }
                     D2D1_RECT_F stxtR = D2D1::RectF(shdrR.left + 3.0f, shdrR.top, shdrR.right - 2.0f, shdrR.bottom);
                     m_solidBrush->SetColor(HexColor(0x1E293B));
-                    m_rt->DrawTextW(subHdr.c_str(), static_cast<UINT32>(subHdr.size()), m_fmtSmall, stxtR, m_solidBrush);
+                    DrawTextCached(subHdr.c_str(), static_cast<UINT32>(subHdr.size()), m_fmtSmall, stxtR, m_solidBrush);
                     m_rt->PopAxisAlignedClip();
                 }
 
@@ -3024,7 +3742,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
                 }
                 D2D1_RECT_F fTxtR = D2D1::RectF(hdrR.left + 4.0f, hdrR.top, hdrR.right - 3.0f, hdrR.bottom);
                 m_solidBrush->SetColor(HexColor(folderInFlight ? 0x92400E : 0x0F172A));
-                m_rt->DrawTextW(fHdr.c_str(), static_cast<UINT32>(fHdr.size()), m_fmtBold, fTxtR, m_solidBrush);
+                DrawTextCached(fHdr.c_str(), static_cast<UINT32>(fHdr.size()), m_fmtBold, fTxtR, m_solidBrush);
                 m_rt->PopAxisAlignedClip();
             }
 
@@ -3085,7 +3803,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
 
     D2D1_RECT_F inspR = D2D1::RectF(botBarR.left + 10.0f, botBarR.top, botBarR.right - 10.0f, botBarR.bottom);
     m_solidBrush->SetColor(HexColor(0x1E293B));
-    m_rt->DrawTextW(inspectTxt.c_str(), static_cast<UINT32>(inspectTxt.size()), m_fmtSmall, inspR, m_solidBrush);
+    DrawTextCached(inspectTxt.c_str(), static_cast<UINT32>(inspectTxt.size()), m_fmtSmall, inspR, m_solidBrush);
 
     // 4. Floating On-Hover Info Popup Card (DRY shared helper)
     if (m_hoverTreemapHitIndex >= 0 && m_hoverTreemapHitIndex < static_cast<int>(m_treemapHits.size())) {
@@ -3187,12 +3905,12 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
             D2D1_RECT_F titleR = D2D1::RectF(cardR.left + 16.0f, cardR.top + 28.0f, cardR.right - 16.0f, cardR.top + 68.0f);
             m_solidBrush->SetColor(HexColor(0xECEFF4));
             m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(noteTitle.c_str(), static_cast<UINT32>(noteTitle.size()), m_fmtCenterSmall, titleR, m_solidBrush);
+            DrawTextCached(noteTitle.c_str(), static_cast<UINT32>(noteTitle.size()), m_fmtCenterSmall, titleR, m_solidBrush);
 
             std::wstring timeInfo = FormatMediaTime(m_mediaPlayer.GetCurrentTimeSec()) + L"  /  " + FormatMediaTime(m_mediaPlayer.GetDurationSec());
             D2D1_RECT_F timeR = D2D1::RectF(cardR.left + 16.0f, cardR.top + 74.0f, cardR.right - 16.0f, cardR.bottom - 20.0f);
             m_solidBrush->SetColor(HexColor(0x88C0D0));
-            m_rt->DrawTextW(timeInfo.c_str(), static_cast<UINT32>(timeInfo.size()), m_fmtCenterSmall, timeR, m_solidBrush);
+            DrawTextCached(timeInfo.c_str(), static_cast<UINT32>(timeInfo.size()), m_fmtCenterSmall, timeR, m_solidBrush);
         }
 
         // Media Transport Bar at bottom of canvasR (Play/Pause + Interactive Seek Bar + Timestamp)
@@ -3207,7 +3925,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         m_solidBrush->SetColor(HexColor(0xFFFFFF));
         const wchar_t* playGlyph = m_mediaPlayer.IsPlaying() ? L"\x23F8" : L"\x25B6";
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(playGlyph, 1, m_fmtSmall, playBtnR, m_solidBrush);
+        DrawTextCached(playGlyph, 1, m_fmtSmall, playBtnR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
         // Seek bar track
@@ -3233,7 +3951,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         D2D1_RECT_F tsR = D2D1::RectF(m_mediaSeekBarRect.right + 10.0f, barR.top, barR.right - 8.0f, barR.bottom);
         m_solidBrush->SetColor(HexColor(0xD8DEE9));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(tsStr.c_str(), static_cast<UINT32>(tsStr.size()), m_fmtSmall, tsR, m_solidBrush);
+        DrawTextCached(tsStr.c_str(), static_cast<UINT32>(tsStr.size()), m_fmtSmall, tsR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     } else if (!curPath.empty() && !isMediaItem) {
         FullImageMeta fullMeta = m_imageCache.GetOrQueueFullImage(m_rt, curPath, prevPath, nextPath);
@@ -3265,12 +3983,155 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
             float cx = (canvasR.left + canvasR.right) * 0.5f + m_viewerPanX;
             float cy = (canvasR.top + canvasR.bottom) * 0.5f + m_viewerPanY;
 
-            D2D1_RECT_F destR = D2D1::RectF(cx - drawW * 0.5f, cy - drawH * 0.5f, cx + drawW * 0.5f, cy + drawH * 0.5f);
-            m_rt->DrawBitmap(
-                bmpToDraw,
-                destR,
-                1.0f,
-                (finalScale >= 2.0f) ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            // Side-by-Side 2-Up Compare Mode (synchronized zoom & pan)
+            std::wstring comparePath;
+            std::wstring compareName;
+            if (m_viewerCompareMode) {
+                for (int i = 0; i < static_cast<int>(m_items.size()); ++i) {
+                    if (i != activeIdx && m_items[i].isSelected && m_items[i].isImage) {
+                        comparePath = m_items[i].fullPath;
+                        compareName = m_items[i].name;
+                        break;
+                    }
+                }
+                if (comparePath.empty() && !nextPath.empty()) {
+                    comparePath = nextPath;
+                    compareName = PathUtils::GetFileName(nextPath);
+                } else if (comparePath.empty() && !prevPath.empty()) {
+                    comparePath = prevPath;
+                    compareName = PathUtils::GetFileName(prevPath);
+                }
+            }
+
+            if (m_viewerCompareMode && !comparePath.empty()) {
+                float midX = (canvasR.left + canvasR.right) * 0.5f;
+                D2D1_RECT_F leftPane  = D2D1::RectF(canvasR.left, canvasR.top, midX - 2.0f, canvasR.bottom);
+                D2D1_RECT_F rightPane = D2D1::RectF(midX + 2.0f, canvasR.top, canvasR.right, canvasR.bottom);
+
+                auto drawCompareSide = [&](const D2D1_RECT_F& sideR, ID2D1Bitmap* sideBmp, uint32_t ow, uint32_t oh, const std::wstring& badgeLbl) {
+                    if (!sideBmp) return;
+                    m_rt->PushAxisAlignedClip(sideR, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    D2D1_SIZE_F ssz = sideBmp->GetSize();
+                    float sw = (ow > 0) ? static_cast<float>(ow) : ssz.width;
+                    float sh = (oh > 0) ? static_cast<float>(oh) : ssz.height;
+                    float sAvailW = std::max(40.0f, sideR.right - sideR.left - 16.0f);
+                    float sAvailH = std::max(40.0f, sideR.bottom - sideR.top - 24.0f);
+                    float sBase = m_viewerActualPixels ? 1.0f : std::min(1.0f, std::min(sAvailW / std::max(1.0f, sw), sAvailH / std::max(1.0f, sh)));
+                    float sFinal = sBase * m_viewerZoom;
+                    float sdw = sw * sFinal;
+                    float sdh = sh * sFinal;
+                    float scx = (sideR.left + sideR.right) * 0.5f + m_viewerPanX;
+                    float scy = (sideR.top + sideR.bottom) * 0.5f + m_viewerPanY;
+                    D2D1_RECT_F sDest = D2D1::RectF(scx - sdw * 0.5f, scy - sdh * 0.5f, scx + sdw * 0.5f, scy + sdh * 0.5f);
+                    m_rt->DrawBitmap(sideBmp, sDest, 1.0f, (sFinal >= 2.0f) ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+
+                    D2D1_RECT_F bR = D2D1::RectF(sideR.left + 10.0f, sideR.top + 10.0f, std::min(sideR.right - 10.0f, sideR.left + 320.0f), sideR.top + 32.0f);
+                    m_solidBrush->SetColor(HexColor(0x0F172A, 0.82f));
+                    m_rt->FillRoundedRectangle(D2D1::RoundedRect(bR, 4.0f, 4.0f), m_solidBrush);
+                    DrawClippedText(badgeLbl, D2D1::RectF(bR.left + 8.0f, bR.top + 2.0f, bR.right - 8.0f, bR.bottom - 2.0f), m_fmtBold, 0xF8FAFC);
+                    m_rt->PopAxisAlignedClip();
+                };
+
+                FullImageMeta cmpMeta = m_imageCache.GetOrQueueFullImage(m_rt, comparePath, L"", L"");
+                ID2D1Bitmap* cmpBmp = cmpMeta.bitmap ? cmpMeta.bitmap : m_imageCache.GetOrQueueThumbnail(m_rt, comparePath);
+
+                drawCompareSide(leftPane, bmpToDraw, imgOrigW, imgOrigH, L"A: " + m_items[activeIdx].name);
+                drawCompareSide(rightPane, cmpBmp, cmpMeta.origWidth, cmpMeta.origHeight, L"B: " + compareName);
+
+                m_solidBrush->SetColor(HexColor(0x38BDF8, 0.85f));
+                m_rt->DrawLine(D2D1::Point2F(midX, canvasR.top), D2D1::Point2F(midX, canvasR.bottom), m_solidBrush, 2.0f);
+            } else {
+                D2D1_RECT_F destR = D2D1::RectF(cx - drawW * 0.5f, cy - drawH * 0.5f, cx + drawW * 0.5f, cy + drawH * 0.5f);
+                m_rt->DrawBitmap(
+                    bmpToDraw,
+                    destR,
+                    1.0f,
+                    (finalScale >= 2.0f) ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            }
+
+            // Live 64-bin RGB Histogram Overlay in Top-Right of Canvas
+            if (m_viewerShowHistogram) {
+                if (m_viewerHistPath != curPath) {
+                    m_viewerHistPath = curPath;
+                    std::memset(m_viewerHistR, 0, sizeof(m_viewerHistR));
+                    std::memset(m_viewerHistG, 0, sizeof(m_viewerHistG));
+                    std::memset(m_viewerHistB, 0, sizeof(m_viewerHistB));
+                    m_viewerHistMax = 1;
+
+                    IWICImagingFactory* wic = nullptr;
+                    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) && wic) {
+                        IWICStream* stm = nullptr;
+                        if (SUCCEEDED(wic->CreateStream(&stm)) && stm) {
+                            if (SUCCEEDED(stm->InitializeFromFilename(curPath.c_str(), GENERIC_READ))) {
+                                IWICBitmapDecoder* dec = nullptr;
+                                if (SUCCEEDED(wic->CreateDecoderFromStream(stm, nullptr, WICDecodeMetadataCacheOnDemand, &dec)) && dec) {
+                                    IWICBitmapFrameDecode* frm = nullptr;
+                                    if (SUCCEEDED(dec->GetFrame(0, &frm)) && frm) {
+                                        IWICBitmapScaler* scaler = nullptr;
+                                        if (SUCCEEDED(wic->CreateBitmapScaler(&scaler)) && scaler) {
+                                            if (SUCCEEDED(scaler->Initialize(frm, 160, 120, WICBitmapInterpolationModeNearestNeighbor))) {
+                                                IWICFormatConverter* conv = nullptr;
+                                                if (SUCCEEDED(wic->CreateFormatConverter(&conv)) && conv) {
+                                                    if (SUCCEEDED(conv->Initialize(scaler, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+                                                        std::vector<uint8_t> px(160 * 120 * 4);
+                                                        if (SUCCEEDED(conv->CopyPixels(nullptr, 160 * 4, static_cast<UINT>(px.size()), px.data()))) {
+                                                            for (size_t p = 0; p + 3 < px.size(); p += 4) {
+                                                                uint32_t b = px[p] >> 2;
+                                                                uint32_t g = px[p + 1] >> 2;
+                                                                uint32_t r = px[p + 2] >> 2;
+                                                                m_viewerHistR[r]++;
+                                                                m_viewerHistG[g]++;
+                                                                m_viewerHistB[b]++;
+                                                            }
+                                                            for (int bi = 0; bi < 64; ++bi) {
+                                                                m_viewerHistMax = std::max({ m_viewerHistMax, m_viewerHistR[bi], m_viewerHistG[bi], m_viewerHistB[bi] });
+                                                            }
+                                                        }
+                                                    }
+                                                    conv->Release();
+                                                }
+                                            }
+                                            scaler->Release();
+                                        }
+                                        frm->Release();
+                                    }
+                                    dec->Release();
+                                }
+                            }
+                            stm->Release();
+                        }
+                        wic->Release();
+                    }
+                }
+
+                D2D1_RECT_F histBox = D2D1::RectF(canvasR.right - 216.0f, canvasR.top + 12.0f, canvasR.right - 12.0f, canvasR.top + 116.0f);
+                m_solidBrush->SetColor(HexColor(0x0F172A, 0.86f));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(histBox, 5.0f, 5.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(0x334155));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(histBox, 5.0f, 5.0f), m_solidBrush, 1.0f);
+
+                D2D1_RECT_F plotR = D2D1::RectF(histBox.left + 8.0f, histBox.top + 20.0f, histBox.right - 8.0f, histBox.bottom - 6.0f);
+                float pw = plotR.right - plotR.left;
+                float ph = plotR.bottom - plotR.top;
+                float stepX = pw / 63.0f;
+
+                auto drawHistCurve = [&](const uint32_t* bins, uint32_t rgb) {
+                    m_solidBrush->SetColor(HexColor(rgb, 0.85f));
+                    for (int bi = 0; bi < 63; ++bi) {
+                        float x0 = plotR.left + bi * stepX;
+                        float x1 = plotR.left + (bi + 1) * stepX;
+                        float y0 = plotR.bottom - (static_cast<float>(bins[bi]) / static_cast<float>(m_viewerHistMax)) * ph;
+                        float y1 = plotR.bottom - (static_cast<float>(bins[bi + 1]) / static_cast<float>(m_viewerHistMax)) * ph;
+                        m_rt->DrawLine(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1), m_solidBrush, 1.5f);
+                    }
+                };
+                drawHistCurve(m_viewerHistB, 0x38BDF8);
+                drawHistCurve(m_viewerHistG, 0x4ADE80);
+                drawHistCurve(m_viewerHistR, 0xF87171);
+
+                m_solidBrush->SetColor(HexColor(0xE2E8F0));
+                DrawTextCached(L"RGB Histogram", 13, m_fmtSmall, D2D1::RectF(histBox.left + 8.0f, histBox.top + 2.0f, histBox.right - 8.0f, histBox.top + 18.0f), m_solidBrush);
+            }
 
             if (activeIdx >= 0 && activeIdx < static_cast<int>(m_items.size()) &&
                 m_imageCache.IsPathRotating(m_items[activeIdx].normKey)) {
@@ -3282,14 +4143,14 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
                 m_solidBrush->SetColor(HexColor(0xFFFFFF));
                 const wchar_t* rotTxt = (m_lang == Lang::PL) ? L"\x21BB Obracanie..." : L"\x21BB Rotating...";
                 m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                m_rt->DrawTextW(rotTxt, static_cast<UINT32>(wcslen(rotTxt)), m_fmtRegular, pillR, m_solidBrush);
+                DrawTextCached(rotTxt, static_cast<UINT32>(wcslen(rotTxt)), m_fmtRegular, pillR, m_solidBrush);
                 m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
         }
     } else {
         m_solidBrush->SetColor(HexColor(0x9BA3B0));
         m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(s.viewerNoImages, static_cast<UINT32>(wcslen(s.viewerNoImages)), m_fmtCenterSmall, canvasR, m_solidBrush);
+        DrawTextCached(s.viewerNoImages, static_cast<UINT32>(wcslen(s.viewerNoImages)), m_fmtCenterSmall, canvasR, m_solidBrush);
     }
 
     // Bottom hint overlay inside canvas
@@ -3297,7 +4158,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         D2D1_RECT_F hintR = D2D1::RectF(canvasR.left + 12.0f, canvasR.bottom - 24.0f, canvasR.right - 12.0f, canvasR.bottom - 4.0f);
         m_solidBrush->SetColor(HexColor(0x8A94A6));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(s.viewerHelpHint, static_cast<UINT32>(wcslen(s.viewerHelpHint)), m_fmtSmall, hintR, m_solidBrush);
+        DrawTextCached(s.viewerHelpHint, static_cast<UINT32>(wcslen(s.viewerHelpHint)), m_fmtSmall, hintR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
@@ -3322,7 +4183,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         }
         D2D1_RECT_F infoR = D2D1::RectF(hudBar.left + 14.0f, hudBar.top, hudBar.right - 430.0f, hudBar.bottom);
         m_solidBrush->SetColor(HexColor(0xECEFF4));
-        m_rt->DrawTextW(infoBuf, static_cast<UINT32>(wcslen(infoBuf)), m_fmtViewerHud, infoR, m_solidBrush);
+        DrawTextCached(infoBuf, static_cast<UINT32>(wcslen(infoBuf)), m_fmtViewerHud, infoR, m_solidBrush);
     }
 
     auto drawHudBtn = [&](int cmdId, float rightOffset, float w, const wchar_t* label, uint32_t bgRgb = 0x262B33) {
@@ -3332,7 +4193,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), m_solidBrush);
         m_solidBrush->SetColor(HexColor(0xE5E9F0));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, br, m_solidBrush);
+        DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, br, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
 
@@ -3344,7 +4205,10 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
     drawHudBtn(CMD_VIEWER_NEXT,        328.0f, 34.0f, L"\x2192");
     drawHudBtn(CMD_VIEWER_PREV,        366.0f, 34.0f, L"\x2190");
     if (activeIdx >= 0 && activeIdx < static_cast<int>(m_items.size()) && m_items[activeIdx].isImage) {
-        drawHudBtn(CMD_IMG_TOOL_MENU,  406.0f, 108.0f, m_lang == Lang::PL ? L"\xD83D\xDCD0 Rozmiar / KB \x25BE" : L"\xD83D\xDCD0 Resize / KB \x25BE", 0x1E3A5F);
+        drawHudBtn(CMD_IMG_TOOL_MENU,    406.0f, 108.0f, m_lang == Lang::PL ? L"\xD83D\xDCD0 Rozmiar / KB \x25BE" : L"\xD83D\xDCD0 Resize / KB \x25BE", 0x1E3A5F);
+        drawHudBtn(CMD_VIEWER_COMPARE,   518.0f, 68.0f,  m_lang == Lang::PL ? L"2-Up Por." : L"2-Up Cmp", m_viewerCompareMode ? 0x0284C7 : 0x262B33);
+        drawHudBtn(CMD_VIEWER_HISTOGRAM, 590.0f, 74.0f,  L"Histogram", m_viewerShowHistogram ? 0x0284C7 : 0x262B33);
+        drawHudBtn(CMD_VIEWER_SLIDESHOW, 668.0f, 68.0f,  m_viewerSlideshow ? (m_lang == Lang::PL ? L"\x23F8 Pokaz" : L"\x23F8 Slide") : (m_lang == Lang::PL ? L"\x25B6 Pokaz" : L"\x25B6 Slide"), m_viewerSlideshow ? 0x16A34A : 0x262B33);
     }
 
     // 3. Bottom Thumbnail Filmstrip (in In-Window Full Viewer mode)
@@ -3390,7 +4254,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
 
             D2D1_RECT_F nameR = D2D1::RectF(cellR.left + 2.0f, cellR.bottom - 15.0f, cellR.right - 2.0f, cellR.bottom);
             m_solidBrush->SetColor(HexColor(0xD8DEE9));
-            m_rt->DrawTextW(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtSmall, nameR, m_solidBrush);
+            DrawTextCached(item.displayName.c_str(), static_cast<UINT32>(item.displayName.size()), m_fmtSmall, nameR, m_solidBrush);
         }
 
         m_rt->PopAxisAlignedClip();
@@ -3433,14 +4297,6 @@ void ExplorerApp::DrawStatusBar(const D2D1_RECT_F& rect) {
         }
     }
 
-    // Background delete job state: stays visible until the worker thread has really finished
-    size_t pendingDeletes = m_fileEngine.PendingDeleteBatches();
-    if (pendingDeletes > 0) {
-        int dots = static_cast<int>((GetTickCount64() / 400) % 4);
-        statusText += L"     \x2022     \x23F3 " + std::wstring(m_lang == Lang::PL ? L"Usuwanie w tle" : L"Deleting in background") +
-                      (pendingDeletes > 1 ? L" (" + std::to_wstring(pendingDeletes) + L")" : L"") + std::wstring(static_cast<size_t>(dots), L'.');
-    }
-
     // Rename job in flight (the worker thread reports back with a verified result)
     if (m_renamePending.load() > 0) {
         int dots = static_cast<int>((GetTickCount64() / 400) % 4);
@@ -3448,14 +4304,55 @@ void ExplorerApp::DrawStatusBar(const D2D1_RECT_F& rect) {
                       std::wstring(static_cast<size_t>(dots), L'.');
     }
 
+    // An archive is being unpacked in the background
+    if (m_extractPending.load() > 0) {
+        int dots = static_cast<int>((GetTickCount64() / 400) % 4);
+        statusText += L"     \x2022     \x23F3 " + std::wstring(m_lang == Lang::PL ? L"Rozpakowywanie w tle: " : L"Extracting in background: ") +
+                      m_extractPendingText + std::wstring(static_cast<size_t>(dots), L'.');
+    }
+
     // Background folder merge job in flight
     if (m_mergePending.load() > 0) {
         int dots = static_cast<int>((GetTickCount64() / 400) % 4);
-        int moved = m_mergeMovedCount.load();
+        int moved = m_mergeMovedCount->load();
         statusText += L"     \x2022     \x23F3 " + std::wstring(m_lang == Lang::PL ? L"Scalanie folderów w tle: " : L"Merging folders in background: ") +
                       m_mergePendingText +
                       (moved > 0 ? (L" (" + std::to_wstring(moved) + L")") : L"") +
                       std::wstring(static_cast<size_t>(dots), L'.');
+    }
+
+    // Native CopyHandler-grade background transfer summary in Status Bar
+    TransferJobSnapshot sbJob;
+    size_t sbTotalXfer = 0;
+    const bool hasSbXfer = m_transfers.GetPrimaryHudJob(sbJob, &sbTotalXfer);
+    if (hasSbXfer) {
+        const bool pl = (m_lang == Lang::PL);
+        const double pct = sbJob.Fraction() * 100.0;
+        wchar_t xBuf[220] = {};
+        if (sbJob.op == TransferOp::Delete) {
+            // A delete is counted in items: bytes and MB/s would say little about it
+            const wchar_t* verb = (sbJob.state == TransferJobState::Paused)
+                ? (pl ? L"\x23F8 Usuwanie wstrzymane" : L"\x23F8 Delete paused")
+                : (sbJob.recycle ? (pl ? L"\x21C4 Do Kosza" : L"\x21C4 To Recycle Bin")
+                                 : (pl ? L"\x21C4 Usuwanie" : L"\x21C4 Deleting"));
+            swprintf_s(xBuf, L"     \x2022     %s %.0f%%  (%llu / %llu)", verb, pct,
+                       static_cast<unsigned long long>(sbJob.doneFiles), static_cast<unsigned long long>(sbJob.totalFiles));
+        } else if (sbJob.state == TransferJobState::Paused) {
+            swprintf_s(xBuf, pl ? L"     \x2022     \x23F8 Wstrzymano %.0f%% (%s / %s)" : L"     \x2022     \x23F8 Paused %.0f%% (%s / %s)",
+                       pct, FileEngine::FormatSizeDetailed(sbJob.doneBytes).c_str(), FileEngine::FormatSizeDetailed(sbJob.totalBytes).c_str());
+        } else {
+            const wchar_t* opVerb = (sbJob.op == TransferOp::Move)
+                ? (pl ? L"Przenoszenie" : L"Moving")
+                : (pl ? L"Kopiowanie" : L"Copying");
+            swprintf_s(xBuf, L"     \x2022     \x21C4 %s %.0f%%  \x2022  %s  \x2022  ETA %s",
+                       opVerb, pct,
+                       TransferManager::FormatSpeed(sbJob.speedBytesPerSec).c_str(),
+                       TransferManager::FormatEta(sbJob.etaSeconds, pl).c_str());
+        }
+        statusText += xBuf;
+        if (sbTotalXfer > 1) {
+            statusText += L" [+" + std::to_wstring(sbTotalXfer - 1) + (pl ? L" w kolejce]" : L" queued]");
+        }
     }
 
     // Append active status toast (e.g. "Przeniesiono do Kosza (Ctrl+Z aby cofnąć)")
@@ -3463,17 +4360,18 @@ void ExplorerApp::DrawStatusBar(const D2D1_RECT_F& rect) {
         statusText += L"     \x2022     " + m_statusToast;
     }
 
-    D2D1_RECT_F textR = D2D1::RectF(rect.left + 10.0f, rect.top, rect.right - 90.0f, rect.bottom);
+    D2D1_RECT_F textR = D2D1::RectF(rect.left + 10.0f, rect.top, rect.right - 176.0f, rect.bottom);
     uint32_t statusCol = 0x333333;
-    if (m_renamePending.load() > 0 || m_mergePending.load() > 0) {
+    if (hasSbXfer) {
+        statusCol = (sbJob.state == TransferJobState::Paused) ? 0xB45309 : 0x0284C7;
+    } else if (m_renamePending.load() > 0 || m_mergePending.load() > 0 || m_extractPending.load() > 0) {
         statusCol = 0x0067B8;
     } else if (!m_statusToast.empty() && GetTickCount64() < m_statusToastExpireTick) {
         if (m_statusToast[0] == L'\x2717') statusCol = 0xB91C1C;        // failed
         else if (m_statusToast[0] == L'\x2713') statusCol = 0x15803D;   // done
         else if (m_statusToast[0] == L'\x26A0') statusCol = 0xB45309;   // warning
     }
-    m_solidBrush->SetColor(HexColor(statusCol));
-    m_rt->DrawTextW(statusText.c_str(), static_cast<UINT32>(statusText.size()), m_fmtSmall, textR, m_solidBrush);
+    DrawClippedText(statusText, textR, m_fmtSmall, statusCol);
 
     // Bottom-right quick view-mode buttons (matching Win10 screenshot + 3rd Full Viewer button!)
     auto drawBottomViewBtn = [&](int cmdId, float rightOffset, bool active, int iconKind) {
@@ -3559,6 +4457,191 @@ void ExplorerApp::DrawOperationToastBanner(const D2D1_RECT_F& mainRect) {
     if (m_viewMode == ViewMode::Hardware || m_viewMode == ViewMode::FullViewer) return;
 
     const bool pl = (m_lang == Lang::PL);
+    const float rightEdge = mainRect.right - 22.0f;
+    float bottomEdge = mainRect.bottom - 10.0f;
+
+    // 1. Floating transfer cards, one per job: running ones first, then paused ones, then queued ones. At most
+    //    three are stacked upwards from the bottom, each with its own pause / start and cancel buttons; the jobs
+    //    that do not fit are counted in a line above them, which opens the queue.
+    {
+        constexpr size_t kMaxCards = 3;
+        size_t pendingTotal = 0;
+        const std::vector<TransferJobSnapshot> hudJobs = m_transfers.SnapshotPendingJobs(kMaxCards, &pendingTotal);
+
+        const float maxHudW = std::max(280.0f, (mainRect.right - mainRect.left) - 36.0f);
+        const float hudW = std::min(468.0f, maxHudW);
+        const float hudH = 62.0f;
+
+        auto drawCard = [&](const TransferJobSnapshot& job, const D2D1_RECT_F& card, bool bottomCard) {
+            const bool isPaused = (job.state == TransferJobState::Paused);
+            const bool isQueued = (job.state == TransferJobState::Queued);
+            const bool isVerify = (job.state == TransferJobState::Verifying);
+            const bool isDelete = (job.op == TransferOp::Delete);
+            const uint32_t accent = isPaused ? 0xD97706 : (isVerify ? 0x7C3AED : (isQueued ? 0x64748B : 0x0284C7));
+            const uint32_t bg     = isPaused ? 0xFFFBEB : (isQueued ? 0xF8FAFC : 0xFFFFFF);
+
+            D2D1_RECT_F shadow = D2D1::RectF(card.left + 1.5f, card.top + 2.5f, card.right + 1.5f, card.bottom + 2.5f);
+            m_solidBrush->SetColor(HexColor(0x0F172A, 0.14f));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(shadow, 6.0f, 6.0f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(bg, 0.98f));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(card, 6.0f, 6.0f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(accent, 0.68f));
+            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(card, 6.0f, 6.0f), m_solidBrush, 1.3f);
+            D2D1_RECT_F stripe = D2D1::RectF(card.left, card.top, card.left + 5.0f, card.bottom);
+            m_solidBrush->SetColor(HexColor(accent));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(stripe, 3.5f, 3.5f), m_solidBrush);
+
+            // Buttons, right to left; each one acts on this card's job (registered before the card body)
+            auto drawBtn = [&](int cmdId, float bx0, float bx1, const wchar_t* lbl, uint32_t textCol, uint32_t hoverBg) {
+                D2D1_RECT_F br = D2D1::RectF(bx0, card.top + 5.0f, bx1, card.top + 24.0f);
+                m_ribbonHits.push_back({ cmdId, br, job.id });
+                const bool hov = PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, br);
+                m_solidBrush->SetColor(HexColor(hov ? hoverBg : 0xF1F5F9));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(hov ? accent : 0xCBD5E1));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), m_solidBrush, 1.0f);
+                m_solidBrush->SetColor(HexColor(textCol));
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(lbl, static_cast<UINT32>(wcslen(lbl)), m_fmtSmall, br, m_solidBrush);
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            };
+            float bx = card.right - 6.0f;
+            drawBtn(CMD_XFER_JOB_CANCEL_REMOVE, bx - 24.0f, bx, L"\x2715", 0xB91C1C, 0xFEE2E2);
+            bx -= 28.0f;
+            if (bottomCard) {
+                drawBtn(CMD_TAB_TRANSFERS, bx - 64.0f, bx, pl ? L"\x21C4 Kolejka" : L"\x21C4 Queue", 0x0369A1, 0xE0F2FE);
+                bx -= 68.0f;
+            }
+            if (isQueued) {
+                drawBtn(CMD_XFER_JOB_FORCE_START, bx - 58.0f, bx, L"\x25B6 Start", 0x047857, 0xD1FAE5);
+            } else {
+                drawBtn(CMD_XFER_JOB_PAUSE_RESUME, bx - 58.0f, bx,
+                        isPaused ? (pl ? L"\x25B6 Wznów" : L"\x25B6 Resume") : (pl ? L"\x23F8 Pauza" : L"\x23F8 Pause"),
+                        isPaused ? 0x047857 : 0x0F172A, isPaused ? 0xD1FAE5 : 0xE0F2FE);
+            }
+            const float buttonsLeft = bx - 58.0f;
+            m_ribbonHits.push_back({ CMD_TAB_TRANSFERS, card });   // the rest of the card opens the queue (no click-through)
+
+            // Header: what the job is doing, and how far it is
+            const double frac = job.Fraction();
+            std::wstring hdr;
+            if (isPaused) {
+                hdr = pl ? L"\x23F8 WSTRZYMANO " : L"\x23F8 PAUSED ";
+            } else if (isQueued) {
+                hdr = pl ? L"\x23F3 W KOLEJCE" : L"\x23F3 QUEUED";
+            } else if (isVerify) {
+                hdr = pl ? L"\x2713 WERYFIKACJA XXH64 " : L"\x2713 VERIFYING XXH64 ";
+            } else if (job.state == TransferJobState::Scanning) {
+                hdr = pl ? L"\xD83D\xDD0D SKANOWANIE DRZEWA..." : L"\xD83D\xDD0D SCANNING TREE...";
+            } else if (isDelete) {
+                hdr = job.recycle ? (pl ? L"\x21C4 DO KOSZA " : L"\x21C4 TO RECYCLE BIN ")
+                                  : (pl ? L"\x21C4 USUWANIE " : L"\x21C4 DELETING ");
+            } else {
+                hdr = (job.op == TransferOp::Move)
+                    ? (pl ? L"\x21C4 PRZENOSZENIE " : L"\x21C4 MOVING ")
+                    : (pl ? L"\x21C4 KOPIOWANIE " : L"\x21C4 COPYING ");
+            }
+            if (isQueued) {
+                const wchar_t* what = isDelete ? (job.recycle ? (pl ? L"do kosza" : L"to Recycle Bin") : (pl ? L"usuwanie" : L"deleting"))
+                                               : ((job.op == TransferOp::Move) ? (pl ? L"przenoszenie" : L"moving") : (pl ? L"kopiowanie" : L"copying"));
+                hdr += std::wstring(L"  \x2022  ") + what;
+                if (!isDelete && job.totalBytes > 0) hdr += L"  \x2022  " + FileEngine::FormatSizeDetailed(job.totalBytes);
+            } else if (job.state != TransferJobState::Scanning) {
+                wchar_t pctBuf[160] = {};
+                if (isDelete) {
+                    swprintf_s(pctBuf, L"%.1f%%  \x2022  %.0f %s  \x2022  ETA %s",
+                               frac * 100.0, job.itemsPerSec, pl ? L"el./s" : L"items/s",
+                               TransferManager::FormatEta(job.etaSeconds, pl).c_str());
+                } else {
+                    swprintf_s(pctBuf, L"%.1f%%  \x2022  %s  \x2022  ETA %s",
+                               frac * 100.0,
+                               TransferManager::FormatSpeed(job.speedBytesPerSec).c_str(),
+                               TransferManager::FormatEta(job.etaSeconds, pl).c_str());
+                }
+                hdr += pctBuf;
+            }
+            DrawClippedText(hdr, D2D1::RectF(card.left + 12.0f, card.top + 5.0f, buttonsLeft - 6.0f, card.top + 24.0f), m_fmtBold, accent);
+
+            // Progress bar track + fill
+            D2D1_RECT_F trk = D2D1::RectF(card.left + 12.0f, card.top + 28.0f, card.right - 8.0f, card.top + 37.0f);
+            m_solidBrush->SetColor(HexColor(0xE2E8F0));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(trk, 4.0f, 4.0f), m_solidBrush);
+            const float fillW = static_cast<float>((trk.right - trk.left) * frac);
+            if (fillW > 2.0f) {
+                m_solidBrush->SetColor(HexColor(isPaused ? 0xF59E0B : (isVerify ? 0x8B5CF6 : (isQueued ? 0x94A3B8 : 0x0EA5E9))));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(trk.left, trk.top, trk.left + fillW, trk.bottom), 4.0f, 4.0f), m_solidBrush);
+            }
+
+            // Bottom line: the pause reason; for a queued job what goes where; else the current file and the counts
+            const D2D1_RECT_F lineR = D2D1::RectF(card.left + 12.0f, card.top + 40.0f, card.right - 8.0f, card.bottom - 3.0f);
+            auto leafName = [](const std::wstring& path) {
+                return FtpClient::IsFtpPath(path) ? FtpClient::GetFtpLeafName(path) : PathUtils::GetFileName(PathUtils::TrimTrailingSlashes(path));
+            };
+            if (isPaused && !job.summaryText.empty()) {
+                DrawClippedText(job.summaryText, lineR, m_fmtSmall, 0xB45309);
+            } else if (isQueued) {
+                std::wstring line = job.sources.empty() ? std::wstring() : leafName(job.sources[0]);
+                if (job.sources.size() > 1) line += L" (+" + std::to_wstring(job.sources.size() - 1) + L")";
+                if (!isDelete) line += L"  \x2192  " + leafName(job.targetDir);
+                DrawClippedText(line, lineR, m_fmtSmall, 0x475569);
+            } else {
+                const std::wstring curName = leafName(job.currentFile.empty() ? job.targetDir : job.currentFile);
+                wchar_t subBuf[240] = {};
+                if (isDelete) {
+                    swprintf_s(subBuf, L"%s  \x2022  %llu / %llu %s",
+                               curName.c_str(),
+                               static_cast<unsigned long long>(job.doneFiles),
+                               static_cast<unsigned long long>(job.totalFiles),
+                               pl ? L"el." : L"items");
+                } else {
+                    swprintf_s(subBuf, L"%s  \x2022  %s / %s  (%llu/%llu)",
+                               curName.c_str(),
+                               FileEngine::FormatSizeDetailed(job.doneBytes).c_str(),
+                               FileEngine::FormatSizeDetailed(job.totalBytes).c_str(),
+                               static_cast<unsigned long long>(job.doneFiles),
+                               static_cast<unsigned long long>(job.totalFiles));
+                }
+                DrawClippedText(subBuf, lineR, m_fmtSmall, 0x475569);
+            }
+        };
+
+        size_t shown = 0;
+        for (const TransferJobSnapshot& job : hudJobs) {
+            if (shown >= kMaxCards || bottomEdge - hudH < mainRect.top + 28.0f) break;
+            drawCard(job, D2D1::RectF(rightEdge - hudW, bottomEdge - hudH, rightEdge, bottomEdge), shown == 0);
+            bottomEdge -= hudH + 6.0f;
+            ++shown;
+        }
+        if (shown > 0 && pendingTotal > shown && bottomEdge - 24.0f >= mainRect.top + 28.0f) {
+            // The jobs without a card: "+ 4 zadania  •  pokaż kolejkę", which opens the queue
+            const size_t more = pendingTotal - shown;
+            std::wstring label;
+            if (pl) {
+                const bool few = (more % 10 >= 2 && more % 10 <= 4) && !(more % 100 >= 12 && more % 100 <= 14);
+                label = L"+ " + std::to_wstring(more) + (more == 1 ? L" zadanie" : (few ? L" zadania" : L" zada\x0144")) +
+                        L"  \x2022  poka\x017C kolejk\x0119";
+            } else {
+                label = L"+ " + std::to_wstring(more) + (more == 1 ? L" more task" : L" more tasks") + L"  \x2022  show queue";
+            }
+            const float pillW = std::min(hudW, 250.0f);
+            const D2D1_RECT_F pill = D2D1::RectF(rightEdge - pillW, bottomEdge - 24.0f, rightEdge, bottomEdge);
+            m_ribbonHits.push_back({ CMD_TAB_TRANSFERS, pill });
+            const bool hov = PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, pill);
+            m_solidBrush->SetColor(HexColor(0x0F172A, 0.12f));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(pill.left + 1.0f, pill.top + 2.0f, pill.right + 1.0f, pill.bottom + 2.0f), 11.0f, 11.0f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(hov ? 0xE0F2FE : 0xF8FAFC, 0.98f));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(pill, 11.0f, 11.0f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(hov ? 0x0284C7 : 0x94A3B8));
+            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(pill, 11.0f, 11.0f), m_solidBrush, 1.1f);
+            m_solidBrush->SetColor(HexColor(0x0369A1));
+            m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            DrawTextCached(label.c_str(), static_cast<UINT32>(label.size()), m_fmtBold, pill, m_solidBrush);
+            m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            bottomEdge -= 24.0f + 6.0f;
+        }
+        if (shown > 0) bottomEdge -= 2.0f;
+    }
+
     const int dots = static_cast<int>((GetTickCount64() / 350) % 4);
     std::wstring text;
     uint32_t accent = 0x0284C7;
@@ -3566,7 +4649,7 @@ void ExplorerApp::DrawOperationToastBanner(const D2D1_RECT_F& mainRect) {
     uint32_t fg = 0x0F172A;
 
     if (m_mergePending.load() > 0) {
-        int moved = m_mergeMovedCount.load();
+        int moved = m_mergeMovedCount->load();
         text = L"\x23F3 " + std::wstring(pl ? L"Scalanie folderów w tle: " : L"Merging folders in background: ") +
                m_mergePendingText +
                (moved > 0 ? (pl ? (L"  (przeniesiono " + std::to_wstring(moved) + L" el.)") : (L"  (moved " + std::to_wstring(moved) + L")")) : L"") +
@@ -3576,6 +4659,12 @@ void ExplorerApp::DrawOperationToastBanner(const D2D1_RECT_F& mainRect) {
         fg = 0x0C4A6E;
     } else if (m_renamePending.load() > 0) {
         text = L"\x23F3 " + std::wstring(pl ? L"Zmiana nazwy: " : L"Renaming: ") + m_renamePendingText +
+               std::wstring(static_cast<size_t>(dots), L'.');
+        accent = 0x0284C7;
+        bg = 0xF0F9FF;
+        fg = 0x0C4A6E;
+    } else if (m_extractPending.load() > 0) {
+        text = L"\x23F3 " + std::wstring(pl ? L"Rozpakowywanie w tle: " : L"Extracting in background: ") + m_extractPendingText +
                std::wstring(static_cast<size_t>(dots), L'.');
         accent = 0x0284C7;
         bg = 0xF0F9FF;
@@ -3606,8 +4695,6 @@ void ExplorerApp::DrawOperationToastBanner(const D2D1_RECT_F& mainRect) {
     const float maxW = std::max(260.0f, (mainRect.right - mainRect.left) - 36.0f);
     const float desiredW = std::clamp(static_cast<float>(text.size()) * 7.2f + 36.0f, 280.0f, std::min(760.0f, maxW));
     const float bannerH = 32.0f;
-    const float rightEdge = mainRect.right - 22.0f;
-    const float bottomEdge = mainRect.bottom - 10.0f;
     if (bottomEdge - bannerH < mainRect.top + 30.0f) return;
 
     D2D1_RECT_F card = D2D1::RectF(rightEdge - desiredW, bottomEdge - bannerH, rightEdge, bottomEdge);
@@ -3642,7 +4729,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
         m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         D2D1_RECT_F emptyR = D2D1::RectF(rect.left, (rect.top + rect.bottom) * 0.5f - 15.0f, rect.right, (rect.top + rect.bottom) * 0.5f + 15.0f);
         const wchar_t* msg = (m_lang == Lang::PL) ? L"Ten folder jest pusty" : L"This folder is empty";
-        m_rt->DrawTextW(msg, static_cast<UINT32>(wcslen(msg)), m_fmtRegular, emptyR, m_solidBrush);
+        DrawTextCached(msg, static_cast<UINT32>(wcslen(msg)), m_fmtRegular, emptyR, m_solidBrush);
         m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         m_rt->PopAxisAlignedClip();
         return;
@@ -3702,7 +4789,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
                             + FileEngine::FormatSizeDetailed(totalBytes);
     D2D1_RECT_F hdrTxtR = D2D1::RectF(hdrR.left + 10.0f, hdrR.top, hdrR.left + 440.0f, hdrR.bottom);
     m_solidBrush->SetColor(HexColor(0x1E293B));
-    m_rt->DrawTextW(hdrTitle.c_str(), static_cast<UINT32>(hdrTitle.size()), m_fmtBold, hdrTxtR, m_solidBrush);
+    DrawTextCached(hdrTitle.c_str(), static_cast<UINT32>(hdrTitle.size()), m_fmtBold, hdrTxtR, m_solidBrush);
 
     // [↻ Przelicz] button & [Widok: Proporcje] switch button
     D2D1_RECT_F recalcR = D2D1::RectF(hdrR.left + 395.0f, hdrR.top + 3.0f, hdrR.left + 480.0f, hdrR.bottom - 3.0f);
@@ -3715,7 +4802,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
     m_solidBrush->SetColor(recalcHov ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
     const wchar_t* recalcLbl = (m_lang == Lang::PL) ? L"\x21BB Przelicz" : L"\x21BB Rescan";
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_rt->DrawTextW(recalcLbl, static_cast<UINT32>(wcslen(recalcLbl)), m_fmtSmall, recalcR, m_solidBrush);
+    DrawTextCached(recalcLbl, static_cast<UINT32>(wcslen(recalcLbl)), m_fmtSmall, recalcR, m_solidBrush);
 
     D2D1_RECT_F propSwitchR = D2D1::RectF(hdrR.left + 486.0f, hdrR.top + 3.0f, hdrR.left + 596.0f, hdrR.bottom - 3.0f);
     m_ribbonHits.push_back({ CMD_VIEW_PROPORTIONS, propSwitchR });
@@ -3726,7 +4813,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
     m_rt->DrawRoundedRectangle(D2D1::RoundedRect(propSwitchR, 3.0f, 3.0f), m_solidBrush, 1.0f);
     m_solidBrush->SetColor(propHov ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
     const wchar_t* propLbl = (m_lang == Lang::PL) ? L"\x25A6 Mapa Proporcje" : L"\x25A6 Treemap View";
-    m_rt->DrawTextW(propLbl, static_cast<UINT32>(wcslen(propLbl)), m_fmtSmall, propSwitchR, m_solidBrush);
+    DrawTextCached(propLbl, static_cast<UINT32>(wcslen(propLbl)), m_fmtSmall, propSwitchR, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     float canvasTop = hdrR.bottom + 2.0f;
@@ -3781,7 +4868,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
         }
         D2D1_RECT_F stR = D2D1::RectF(scanR.left + 32.0f, scanR.top + 2.0f, scanR.right - 10.0f, scanR.top + 22.0f);
         m_solidBrush->SetColor(HexColor(0x92400E));
-        m_rt->DrawTextW(scanBuf, static_cast<UINT32>(wcslen(scanBuf)), m_fmtBold, stR, m_solidBrush);
+        DrawTextCached(scanBuf, static_cast<UINT32>(wcslen(scanBuf)), m_fmtBold, stR, m_solidBrush);
     }
 
     D2D1_RECT_F bodyR = D2D1::RectF(rect.left + 6.0f, canvasTop, rect.right - 6.0f, rect.bottom - 26.0f);
@@ -3896,7 +4983,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
                 m_rt->DrawRoundedRectangle(D2D1::RoundedRect(lblR, 3.0f, 3.0f), m_solidBrush, 0.8f);
                 m_solidBrush->SetColor(HexColor(0x0F172A));
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                m_rt->DrawTextW(nd.name.c_str(), static_cast<UINT32>(nd.name.size()), m_fmtSmall, lblR, m_solidBrush);
+                DrawTextCached(nd.name.c_str(), static_cast<UINT32>(nd.name.size()), m_fmtSmall, lblR, m_solidBrush);
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
 
@@ -3975,7 +5062,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(lblR, 3.5f, 3.5f), m_solidBrush, 0.9f);
             m_solidBrush->SetColor(HexColor(0x0F172A));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(lbl.c_str(), static_cast<UINT32>(lbl.size()), m_fmtSmall, lblR, m_solidBrush);
+            DrawTextCached(lbl.c_str(), static_cast<UINT32>(lbl.size()), m_fmtSmall, lblR, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
 
@@ -4051,14 +5138,14 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
 
     m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     m_solidBrush->SetColor(HexColor(0x0F172A));
-    m_rt->DrawTextW(centerTitle.c_str(), static_cast<UINT32>(centerTitle.size()), m_fmtBold, hubTitleR, m_solidBrush);
+    DrawTextCached(centerTitle.c_str(), static_cast<UINT32>(centerTitle.size()), m_fmtBold, hubTitleR, m_solidBrush);
     m_solidBrush->SetColor(HexColor(0x0067B8));
-    m_rt->DrawTextW(centerSize.c_str(), static_cast<UINT32>(centerSize.size()), m_fmtBold, hubSizeR, m_solidBrush);
+    DrawTextCached(centerSize.c_str(), static_cast<UINT32>(centerSize.size()), m_fmtBold, hubSizeR, m_solidBrush);
     m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     m_solidBrush->SetColor(HexColor(0x64748B));
-    m_rt->DrawTextW(centerSub.c_str(), static_cast<UINT32>(centerSub.size()), m_fmtSmall, hubSubR, m_solidBrush);
+    DrawTextCached(centerSub.c_str(), static_cast<UINT32>(centerSub.size()), m_fmtSmall, hubSubR, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     // 3. Right-Side Ranked Breakdown & Legend Panel (White Explorer Card)
@@ -4072,7 +5159,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
     const wchar_t* rankTitle = m_lang == Lang::PL
         ? L"RANKING ROZMIARU (2\x00D7 Klik = Wejdź / Otwórz)"
         : L"SIZE RANKING BREAKDOWN (2\x00D7 Click = Open)";
-    m_rt->DrawTextW(rankTitle, static_cast<UINT32>(wcslen(rankTitle)), m_fmtBold, listHdrR, m_solidBrush);
+    DrawTextCached(rankTitle, static_cast<UINT32>(wcslen(rankTitle)), m_fmtBold, listHdrR, m_solidBrush);
 
     float rowY = listArea.top + 32.0f;
     float rowH = 26.0f;
@@ -4109,7 +5196,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
         std::wstring dispName = prefix + item.displayName;
         D2D1_RECT_F nameR = D2D1::RectF(rowR.left + 24.0f, rowR.top + 2.0f, rowR.right - 135.0f, rowR.bottom - 2.0f);
         m_solidBrush->SetColor(HexColor(0x0F172A));
-        m_rt->DrawTextW(dispName.c_str(), static_cast<UINT32>(dispName.size()), m_fmtSmall, nameR, m_solidBrush);
+        DrawTextCached(dispName.c_str(), static_cast<UINT32>(dispName.size()), m_fmtSmall, nameR, m_solidBrush);
 
         wchar_t statBuf[64] = {};
         if (si.isPending && si.bytes == 0) {
@@ -4120,7 +5207,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
         D2D1_RECT_F statR = D2D1::RectF(rowR.right - 132.0f, rowR.top + 2.0f, rowR.right - 6.0f, rowR.bottom - 2.0f);
         m_solidBrush->SetColor(si.isPending ? HexColor(0xD97706) : HexColor(0x475569));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-        m_rt->DrawTextW(statBuf, static_cast<UINT32>(wcslen(statBuf)), m_fmtSmall, statR, m_solidBrush);
+        DrawTextCached(statBuf, static_cast<UINT32>(wcslen(statBuf)), m_fmtSmall, statR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
         PieSectorHitNode rowHit;
@@ -4165,7 +5252,7 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
     }
     D2D1_RECT_F botTxtR = D2D1::RectF(botR.left + 10.0f, botR.top + 2.0f, botR.right - 10.0f, botR.bottom);
     m_solidBrush->SetColor(HexColor(0x334155));
-    m_rt->DrawTextW(botInfo.c_str(), static_cast<UINT32>(botInfo.size()), m_fmtSmall, botTxtR, m_solidBrush);
+    DrawTextCached(botInfo.c_str(), static_cast<UINT32>(botInfo.size()), m_fmtSmall, botTxtR, m_solidBrush);
 
     // 5. Floating On-Hover Info Popup Card (DRY shared helper)
     if (m_hoverPieHitIndex >= 0 && m_hoverPieHitIndex < static_cast<int>(m_pieHits.size())) {
@@ -4196,7 +5283,7 @@ void ExplorerApp::DrawCardTinyButton(const D2D1_RECT_F& br, const std::wstring& 
     m_rt->DrawRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), m_solidBrush, 1.0f);
     m_solidBrush->SetColor(hov ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_rt->DrawTextW(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, br, m_solidBrush);
+    DrawTextCached(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, br, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     if (hitRect.right <= hitRect.left || hitRect.bottom <= hitRect.top) return;
@@ -4212,7 +5299,7 @@ void ExplorerApp::DrawCardTinyButton(const D2D1_RECT_F& br, const std::wstring& 
 void ExplorerApp::DrawClippedText(const std::wstring& text, const D2D1_RECT_F& r, IDWriteTextFormat* fmt, uint32_t colorHex) {
     m_rt->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
     m_solidBrush->SetColor(HexColor(colorHex));
-    m_rt->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), fmt, r, m_solidBrush);
+    DrawTextCached(text.c_str(), static_cast<UINT32>(text.size()), fmt, r, m_solidBrush);
     m_rt->PopAxisAlignedClip();
 }
 
@@ -4355,7 +5442,7 @@ void ExplorerApp::DrawProgramsView(const D2D1_RECT_F& rect) {
         for (wchar_t c : p.name) { if (iswalnum(c)) { letter[0] = static_cast<wchar_t>(towupper(c)); break; } }
         m_solidBrush->SetColor(HexColor(0xFFFFFF));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(letter, 1, m_fmtSmall, D2D1::RectF(chip.left, chip.top + 1.0f, chip.right, chip.bottom), m_solidBrush);
+        DrawTextCached(letter, 1, m_fmtSmall, D2D1::RectF(chip.left, chip.top + 1.0f, chip.right, chip.bottom), m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
         float ty0 = y + 5.0f, ty1 = y + rowH - 2.0f;
@@ -4392,7 +5479,7 @@ void ExplorerApp::DrawProgramsView(const D2D1_RECT_F& rect) {
         m_solidBrush->SetColor(HexColor(0x64748B));
         const wchar_t* msg = flt.empty() ? (pl ? L"Nie znaleziono zainstalowanych programów." : L"No installed programs found.")
                                          : (pl ? L"Żaden program nie pasuje do filtra." : L"No program matches the filter.");
-        m_rt->DrawTextW(msg, static_cast<UINT32>(wcslen(msg)), m_fmtCenterSmall, listR, m_solidBrush);
+        DrawTextCached(msg, static_cast<UINT32>(wcslen(msg)), m_fmtCenterSmall, listR, m_solidBrush);
     }
     m_rt->PopAxisAlignedClip();
 
@@ -4458,7 +5545,7 @@ void ExplorerApp::DrawCardShell(float x, float y, float w, float h, const std::w
         m_solidBrush->SetColor(HexColor(0x64748B));
         const wchar_t* cpLbl = (m_lang == Lang::PL) ? L"[\xD83D\xDCCB Kopiuj]" : L"[\xD83D\xDCCB Copy]";
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-        m_rt->DrawTextW(cpLbl, static_cast<UINT32>(wcslen(cpLbl)), m_fmtSmall, copyHintR, m_solidBrush);
+        DrawTextCached(cpLbl, static_cast<UINT32>(wcslen(cpLbl)), m_fmtSmall, copyHintR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 }
@@ -4560,7 +5647,7 @@ void ExplorerApp::DrawMonitoringView(const D2D1_RECT_F& rect) {
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(cr, 9.0f, 9.0f), m_solidBrush, 1.0f);
             m_solidBrush->SetColor(HexColor(act ? 0xFFFFFF : 0x1E293B));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(rangeLabels[i], static_cast<UINT32>(wcslen(rangeLabels[i])), m_fmtSmall, D2D1::RectF(cr.left, cr.top + 1.0f, cr.right, cr.bottom), m_solidBrush);
+            DrawTextCached(rangeLabels[i], static_cast<UINT32>(wcslen(rangeLabels[i])), m_fmtSmall, D2D1::RectF(cr.left, cr.top + 1.0f, cr.right, cr.bottom), m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             HardwareCardHit ch;
             ch.rect = cr;
@@ -4774,7 +5861,7 @@ void ExplorerApp::DrawMonitoringView(const D2D1_RECT_F& rect) {
             m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             m_solidBrush->SetColor(HexColor(0x94A3B8));
             const wchar_t* msg = pl ? L"Brak danych w tym zakresie" : L"No data in this range";
-            m_rt->DrawTextW(msg, static_cast<UINT32>(wcslen(msg)), m_fmtCenterSmall, plot, m_solidBrush);
+            DrawTextCached(msg, static_cast<UINT32>(wcslen(msg)), m_fmtCenterSmall, plot, m_solidBrush);
         } else {
             m_rt->PushAxisAlignedClip(plot, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             const float bw = pw / static_cast<float>(n);
@@ -5106,7 +6193,7 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
         m_rt->DrawRoundedRectangle(D2D1::RoundedRect(r, 3.0f, 3.0f), m_solidBrush, 1.0f);
         m_solidBrush->SetColor(HexColor(hov ? 0xFFFFFF : 0x1E293B));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, r, m_solidBrush);
+        DrawTextCached(label.c_str(), static_cast<UINT32>(label.size()), m_fmtSmall, r, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         GitDockHit h;
         h.rect = r; h.kind = kind; h.arg = arg; h.index = index;
@@ -5125,7 +6212,7 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     m_rt->FillRoundedRectangle(D2D1::RoundedRect(badge, 3.0f, 3.0f), m_solidBrush);
     m_solidBrush->SetColor(HexColor(0xFFFFFF));
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    m_rt->DrawTextW(L"git", 3, m_fmtSmall, badge, m_solidBrush);
+    DrawTextCached(L"git", 3, m_fmtSmall, badge, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     std::wstring branchTxt = PathUtils::GetFileName(m_gitRoot);
@@ -5193,7 +6280,7 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
             : st.lastError;
         m_rt->PushAxisAlignedClip(D2D1::RectF(left + 10.0f, top + headerH + 10.0f, right - 10.0f, dock.bottom - 10.0f), D2D1_ANTIALIAS_MODE_ALIASED);
         m_solidBrush->SetColor(HexColor(0x64748B));
-        m_rt->DrawTextW(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtSmall, D2D1::RectF(left + 10.0f, top + headerH + 10.0f, right - 10.0f, dock.bottom - 10.0f), m_solidBrush);
+        DrawTextCached(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtSmall, D2D1::RectF(left + 10.0f, top + headerH + 10.0f, right - 10.0f, dock.bottom - 10.0f), m_solidBrush);
         m_rt->PopAxisAlignedClip();
         m_gitMaxScrollY = 0.0f;
         m_rt->PopAxisAlignedClip();
@@ -5414,7 +6501,7 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
         m_rt->PushAxisAlignedClip(tx, D2D1_ANTIALIAS_MODE_ALIASED);
         const std::wstring& shown = m_gitOutput.empty() ? (pl ? std::wstring(L"Trwa wykonywanie…") : std::wstring(L"Working…")) : m_gitOutput;
         m_solidBrush->SetColor(HexColor(m_gitOutputOk || busy ? 0x1E293B : 0xB91C1C));
-        m_rt->DrawTextW(shown.c_str(), static_cast<UINT32>(shown.size()), m_fmtSmall, tx, m_solidBrush);
+        DrawTextCached(shown.c_str(), static_cast<UINT32>(shown.size()), m_fmtSmall, tx, m_solidBrush);
         m_rt->PopAxisAlignedClip();
     }
 
@@ -6091,8 +7178,468 @@ void ExplorerApp::DrawBackupsView(const D2D1_RECT_F& rect) {
     m_rt->PopAxisAlignedClip();
 }
 
+void ExplorerApp::DrawTransfersView(const D2D1_RECT_F& rect) {
+    const bool pl = (m_lang == Lang::PL);
+    const std::vector<TransferJobSnapshot> jobs = m_transfers.SnapshotJobs();
+    const TransferAggregateTelemetry tel = m_transfers.GetTelemetry();
+    const TransferConfig cfg = m_transfers.GetConfig();
+
+    if (!jobs.empty()) {
+        bool foundSel = false;
+        for (const auto& j : jobs) {
+            if (j.id == m_xferSelectedJobId) { foundSel = true; break; }
+        }
+        if (!foundSel) m_xferSelectedJobId = jobs.front().id;
+    } else {
+        m_xferSelectedJobId = 0;
+    }
+
+    m_rt->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    m_solidBrush->SetColor(HexColor(0xF3F5F8));
+    m_rt->FillRectangle(rect, m_solidBrush);
+
+    const float padX = 10.0f, gap = 10.0f;
+    const float availW = std::max(520.0f, (rect.right - rect.left) - padX * 2.0f);
+    const float leftX = rect.left + padX;
+    const float startY = rect.top + 8.0f;
+    float curY = startY - m_hwScrollY;
+
+    // ---- 1. Header & Live Engine Control Card ----
+    {
+        const float h = 108.0f;
+        const uint32_t hdrBadge = (tel.pausedJobs > 0 && tel.activeJobs == 0) ? 0xD97706
+                                : (tel.activeJobs > 0 ? 0x0284C7 : 0x059669);
+        DrawCardShell(leftX, curY, availW, h,
+            pl ? L"MENEDŻER TRANSFERÓW ULTRA-FAST  \x2022  KOLEJKA COPYHANDLER + WZNAWIANIE .E2PART + XXH64"
+               : L"ULTRA-FAST TRANSFER MANAGER  \x2022  COPYHANDLER QUEUE + .E2PART RESUME + XXH64 VERIFY",
+            hdrBadge, false, 510.0f);
+
+        float btnR = leftX + availW - 8.0f;
+        auto hdrBtn = [&](float w, const std::wstring& lbl, int cmd) {
+            DrawCardTinyButton(D2D1::RectF(btnR - w, curY + 4.0f, btnR, curY + 25.0f), lbl, cmd, L"");
+            btnR -= (w + 6.0f);
+        };
+        hdrBtn(118.0f, pl ? L"\xD83D\xDCC1 Wróć do plików" : L"\xD83D\xDCC1 Back to Files", CMD_HW_BACK_TO_FILES);
+        hdrBtn(128.0f, pl ? L"\x2713 Wyczyść zakończone" : L"\x2713 Clear finished", CMD_XFER_CLEAR_FINISHED);
+        hdrBtn(122.0f, (tel.pausedJobs > 0 && tel.activeJobs == 0)
+            ? (pl ? L"\x25B6 Wznów aktywne" : L"\x25B6 Resume active")
+            : (pl ? L"\x23F8 Pauza / Wznów" : L"\x23F8 Pause / Resume"), CMD_XFER_PAUSE_RESUME_ACTIVE);
+        hdrBtn(122.0f, pl ? L"+ Nowy transfer" : L"+ New transfer", CMD_XFER_NEW_TRANSFER_DLG);
+
+        // Live status summary row
+        D2D1_POINT_2F dot = D2D1::Point2F(leftX + 18.0f, curY + 44.0f);
+        m_solidBrush->SetColor(HexColor(hdrBadge));
+        m_rt->FillEllipse(D2D1::Ellipse(dot, 5.0f, 5.0f), m_solidBrush);
+
+        wchar_t liveLine[384] = {};
+        swprintf_s(liveLine,
+            pl ? L"Prędkość na żywo: %s   (Szczyt: %s)   \x2022   Aktywne: %zu  |  Wstrzymane: %zu  |  W kolejce: %zu  |  Zakończone: %zu"
+               : L"Live throughput: %s   (Peak: %s)   \x2022   Active: %zu  |  Paused: %zu  |  Queued: %zu  |  Finished: %zu",
+            TransferManager::FormatSpeed(tel.liveBytesPerSec).c_str(),
+            TransferManager::FormatSpeed(tel.peakBytesPerSec).c_str(),
+            tel.activeJobs, tel.pausedJobs, tel.queuedJobs, tel.finishedJobs);
+        DrawClippedText(liveLine, D2D1::RectF(leftX + 30.0f, curY + 34.0f, leftX + availW - 12.0f, curY + 54.0f), m_fmtBold, 0x0F172A);
+
+        wchar_t sesLine[320] = {};
+        swprintf_s(sesLine,
+            pl ? L"Przesłano w tej sesji: %s (%llu plików)   \x2022   Błędne pliki: %zu   \x2022   Kliknij dowolny parametr poniżej, aby przełączyć w locie:"
+               : L"Session transferred: %s (%llu files)   \x2022   Failed files: %zu   \x2022   Click any chip below to tune engine live:",
+            FileEngine::FormatSizeDetailed(tel.sessionBytesTransferred).c_str(),
+            static_cast<unsigned long long>(tel.sessionFilesTransferred),
+            tel.totalFailedFiles);
+        DrawClippedText(sesLine, D2D1::RectF(leftX + 14.0f, curY + 56.0f, leftX + availW - 12.0f, curY + 75.0f), m_fmtSmall, 0x475569);
+
+        // Engine live tuning chips
+        float cx = leftX + 14.0f, cy = curY + 79.0f;
+        auto chip = [&](float w, const std::wstring& lbl, int cmd) {
+            if (cx + w > leftX + availW - 8.0f) return;
+            DrawCardTinyButton(D2D1::RectF(cx, cy, cx + w, cy + 22.0f), lbl, cmd, L"");
+            cx += w + 6.0f;
+        };
+        chip(176.0f, (pl ? L"Kolejka: " : L"Queue: ") + TransferManager::FormatQueueMode(cfg.queueMode, pl), CMD_XFER_CYCLE_QUEUE_MODE);
+        chip(186.0f, (pl ? L"Kolizje: " : L"Conflict: ") + TransferManager::FormatConflictPolicy(cfg.conflictPolicy, pl), CMD_XFER_CYCLE_CONFLICT);
+        chip(162.0f, (pl ? L"Weryf.: " : L"Verify: ") + TransferManager::FormatVerifyMode(cfg.verifyMode, pl), CMD_XFER_CYCLE_VERIFY);
+        chip(148.0f, (pl ? L"Bufor: " : L"Buf: ") + TransferManager::FormatBufferSize(cfg.bufferSizeKB, pl), CMD_XFER_CYCLE_BUFFER);
+        chip(148.0f, (pl ? L"Wątki: " : L"Thr: ") + TransferManager::FormatWorkers(cfg.workerThreads, pl), CMD_XFER_CYCLE_WORKERS);
+        chip(132.0f, (pl ? L"Limit: " : L"Lim: ") + TransferManager::FormatSpeedLimit(cfg.speedLimitMBps, pl), CMD_XFER_CYCLE_SPEED_LIMIT);
+        chip(116.0f, cfg.usePartFiles ? L"\x2713 .e2part ON" : L".e2part OFF", CMD_XFER_TOGGLE_PARTFILE);
+
+        curY += h + gap;
+    }
+
+    // ---- 2. 60-Second Live Throughput Oscilloscope Card ----
+    {
+        const float h = 128.0f;
+        DrawCardShell(leftX, curY, availW, h,
+            pl ? L"OSCYLOSKOP PRZEPUSTOWOŚCI I/O (OSTATNIE 60 PRÓBEK)"
+               : L"LIVE I/O THROUGHPUT OSCILLOSCOPE (LAST 60 SAMPLES)",
+            0x0EA5E9, false, 290.0f);
+
+        std::wstring rightStat = (pl ? L"Teraz: " : L"Now: ") + TransferManager::FormatSpeed(tel.liveBytesPerSec) +
+                                 (pl ? L"   \x2022   Szczyt: " : L"   \x2022   Peak: ") + TransferManager::FormatSpeed(tel.peakBytesPerSec);
+        m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        DrawClippedText(rightStat, D2D1::RectF(leftX + availW - 310.0f, curY + 5.0f, leftX + availW - 12.0f, curY + 25.0f), m_fmtBold, 0x0369A1);
+        m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        D2D1_RECT_F plot = D2D1::RectF(leftX + 64.0f, curY + 35.0f, leftX + availW - 14.0f, curY + h - 12.0f);
+        const float pw = std::max(10.0f, plot.right - plot.left);
+        const float ph = std::max(10.0f, plot.bottom - plot.top);
+
+        float maxMBps = 100.0f;
+        for (float v : tel.speedHistoryMBps) maxMBps = std::max(maxMBps, v * 1.15f);
+        if (maxMBps > 1000.0f) maxMBps = std::ceil(maxMBps / 500.0f) * 500.0f;
+        else if (maxMBps > 200.0f) maxMBps = std::ceil(maxMBps / 100.0f) * 100.0f;
+        else maxMBps = std::ceil(maxMBps / 50.0f) * 50.0f;
+
+        m_solidBrush->SetColor(HexColor(0xF8FAFC));
+        m_rt->FillRectangle(plot, m_solidBrush);
+        for (int g = 0; g <= 2; ++g) {
+            float gy = plot.bottom - ph * (static_cast<float>(g) / 2.0f);
+            m_solidBrush->SetColor(HexColor(0xE2E8F0));
+            m_rt->DrawLine(D2D1::Point2F(plot.left, gy), D2D1::Point2F(plot.right, gy), m_solidBrush, 0.8f);
+            wchar_t glbl[32] = {};
+            swprintf_s(glbl, L"%.0f MB/s", maxMBps * (static_cast<float>(g) / 2.0f));
+            m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            DrawClippedText(glbl, D2D1::RectF(leftX + 4.0f, gy - 8.0f, plot.left - 6.0f, gy + 8.0f), m_fmtSmall, 0x64748B);
+            m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        m_solidBrush->SetColor(HexColor(0xCBD5E1));
+        m_rt->DrawRectangle(plot, m_solidBrush, 1.0f);
+
+        const int n = static_cast<int>(tel.speedHistoryMBps.size());
+        if (n > 0) {
+            m_rt->PushAxisAlignedClip(plot, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            const int slots = std::max(60, n);
+            const float bw = pw / static_cast<float>(slots);
+            const int startSlot = slots - n;
+            auto sxOf = [&](int i) { return plot.left + (static_cast<float>(startSlot + i) + 0.5f) * bw; };
+            auto syOf = [&](float v) { return plot.bottom - std::clamp(v / maxMBps, 0.0f, 1.0f) * (ph - 2.0f) - 1.0f; };
+            for (int i = 0; i < n; ++i) {
+                float v = std::max(0.0f, tel.speedHistoryMBps[static_cast<size_t>(i)]);
+                m_solidBrush->SetColor(HexColor(0x0EA5E9, 0.20f));
+                m_rt->DrawLine(D2D1::Point2F(sxOf(i), syOf(v)), D2D1::Point2F(sxOf(i), plot.bottom), m_solidBrush, std::max(1.5f, bw - 0.5f));
+                if (i > 0) {
+                    float vp = std::max(0.0f, tel.speedHistoryMBps[static_cast<size_t>(i - 1)]);
+                    m_solidBrush->SetColor(HexColor(0x0284C7, 0.95f));
+                    m_rt->DrawLine(D2D1::Point2F(sxOf(i - 1), syOf(vp)), D2D1::Point2F(sxOf(i), syOf(v)), m_solidBrush, 2.0f);
+                }
+            }
+            m_rt->PopAxisAlignedClip();
+        }
+        curY += h + gap;
+    }
+
+    // ---- 3. Interactive Transfer Queue Card ----
+    {
+        const float rowH = 74.0f;
+        const float hdrY = 34.0f;
+        const float bodyH = jobs.empty() ? 76.0f : (static_cast<float>(jobs.size()) * rowH + 8.0f);
+        const float h = hdrY + bodyH;
+
+        DrawCardShell(leftX, curY, availW, h,
+            (pl ? L"KOLEJKA ZADAŃ TRANSFERU (" : L"TRANSFER JOB QUEUE (") + std::to_wstring(jobs.size()) + L")",
+            0x0284C7, false, 300.0f);
+
+        if (tel.totalFailedFiles > 0) {
+            DrawCardTinyButton(D2D1::RectF(leftX + availW - 196.0f, curY + 4.0f, leftX + availW - 8.0f, curY + 25.0f),
+                               pl ? L"\x21BB Ponów wszystkie błędne" : L"\x21BB Retry all failed",
+                               CMD_XFER_RETRY_ALL_FAILED, L"");
+        }
+
+        if (jobs.empty()) {
+            std::wstring empty1 = pl
+                ? L"Kolejka transferów jest obecnie pusta. Wszystkie operacje Ctrl+V, Przeciągnij i upuść, Kopiuj/Przenieś do 2. panelu działają tutaj w tle!"
+                : L"Transfer queue is currently empty. All Ctrl+V, Drag & Drop, Dual-Pane Copy/Move, and Copy-To/Move-To operations run non-blockingly here!";
+            std::wstring empty2 = pl
+                ? L"\x2713 Natychmiastowe O(1) przenoszenie w obrębie partycji   \x2022   \x2713 Klonowanie bloków ReFS   \x2022   \x2713 Podwójny bufor 64 KB   \x2022   \x2713 Wznawianie od bajtu (.e2part)   \x2022   \x2713 Suma kontrolna XXH64"
+                : L"\x2713 Instant O(1) same-volume Move   \x2022   \x2713 ReFS Block Cloning   \x2022   \x2713 64 KB Double-Buffered Ring   \x2022   \x2713 Byte-Offset .e2part Resume   \x2022   \x2713 Streamed XXH64 Verify";
+            DrawClippedText(empty1, D2D1::RectF(leftX + 16.0f, curY + 42.0f, leftX + availW - 16.0f, curY + 64.0f), m_fmtBold, 0x334155);
+            DrawClippedText(empty2, D2D1::RectF(leftX + 16.0f, curY + 66.0f, leftX + availW - 16.0f, curY + 88.0f), m_fmtSmall, 0x059669);
+        } else {
+            float ry = curY + hdrY;
+            for (size_t idx = 0; idx < jobs.size(); ++idx) {
+                const auto& j = jobs[idx];
+                D2D1_RECT_F rr = D2D1::RectF(leftX + 8.0f, ry, leftX + availW - 8.0f, ry + rowH - 5.0f);
+                const bool sel = (j.id == m_xferSelectedJobId);
+                const bool hov = PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, rr);
+
+                m_solidBrush->SetColor(HexColor(sel ? 0xEFF6FF : (hov ? 0xF8FAFC : 0xFFFFFF)));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(rr, 4.0f, 4.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(sel ? 0x0284C7 : 0xE2E8F0));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rr, 4.0f, 4.0f), m_solidBrush, sel ? 1.4f : 1.0f);
+
+                // State badge colors & text
+                uint32_t stFg = 0x0369A1, stBg = 0xE0F2FE, barCol = 0x0EA5E9;
+                std::wstring stTxt;
+                switch (j.state) {
+                case TransferJobState::Queued:
+                    stFg = 0x475569; stBg = 0xF1F5F9; barCol = 0x94A3B8;
+                    stTxt = pl ? L"W KOLEJCE" : L"QUEUED"; break;
+                case TransferJobState::Scanning:
+                    stFg = 0x0369A1; stBg = 0xE0F2FE; barCol = 0x38BDF8;
+                    stTxt = pl ? L"SKANOWANIE" : L"SCANNING"; break;
+                case TransferJobState::Running:
+                    stFg = 0x0369A1; stBg = 0xE0F2FE; barCol = 0x0EA5E9;
+                    if (j.op == TransferOp::Delete) stTxt = j.recycle ? (pl ? L"DO KOSZA" : L"TO BIN") : (pl ? L"USUWANIE" : L"DELETING");
+                    else stTxt = (j.op == TransferOp::Move) ? (pl ? L"PRZENOSZENIE" : L"MOVING") : (pl ? L"KOPIOWANIE" : L"COPYING");
+                    break;
+                case TransferJobState::Paused:
+                    stFg = 0xB45309; stBg = 0xFEF3C7; barCol = 0xF59E0B;
+                    stTxt = pl ? L"PAUZA" : L"PAUSED"; break;
+                case TransferJobState::Verifying:
+                    stFg = 0x6D28D9; stBg = 0xEDE9FE; barCol = 0x8B5CF6;
+                    stTxt = pl ? L"WERYFIKACJA" : L"VERIFYING"; break;
+                case TransferJobState::Completed:
+                    stFg = 0x047857; stBg = 0xD1FAE5; barCol = 0x10B981;
+                    stTxt = pl ? L"\x2713 GOTOWE" : L"\x2713 DONE"; break;
+                case TransferJobState::CompletedWithErrors:
+                    stFg = 0xB91C1C; stBg = 0xFEE2E2; barCol = 0xEF4444;
+                    stTxt = pl ? L"\x26A0 Z BŁĘDAMI" : L"\x26A0 ERRORS"; break;
+                case TransferJobState::Cancelled:
+                    stFg = 0x64748B; stBg = 0xF1F5F9; barCol = 0x94A3B8;
+                    stTxt = pl ? L"ANULOWANO" : L"CANCELLED"; break;
+                }
+
+                D2D1_RECT_F badgeR = D2D1::RectF(rr.left + 8.0f, rr.top + 6.0f, rr.left + 112.0f, rr.top + 25.0f);
+                m_solidBrush->SetColor(HexColor(stBg));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(badgeR, 3.0f, 3.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(stFg, 0.45f));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(badgeR, 3.0f, 3.0f), m_solidBrush, 1.0f);
+                m_solidBrush->SetColor(HexColor(stFg));
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(stTxt.c_str(), static_cast<UINT32>(stTxt.size()), m_fmtSmall, badgeR, m_solidBrush);
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+                // Right-side per-job action buttons (registered BEFORE row selection hit!)
+                std::wstring idStr = std::to_wstring(j.id);
+                float bx = rr.right - 8.0f;
+                auto rowBtn = [&](float w, const std::wstring& lbl, int cmd, const std::wstring& arg) {
+                    DrawCardTinyButton(D2D1::RectF(bx - w, rr.top + 5.0f, bx, rr.top + 26.0f), lbl, cmd, arg);
+                    bx -= (w + 5.0f);
+                };
+
+                const bool isTerminal = (j.state == TransferJobState::Completed ||
+                                         j.state == TransferJobState::CompletedWithErrors ||
+                                         j.state == TransferJobState::Cancelled);
+                rowBtn(68.0f, isTerminal ? (pl ? L"\x2715 Usuń" : L"\x2715 Remove") : (pl ? L"\x2715 Anuluj" : L"\x2715 Cancel"),
+                       CMD_XFER_JOB_CANCEL_REMOVE, idStr);
+                const bool isDelete = (j.op == TransferOp::Delete);   // a delete has no destination and no conflicts
+                if (!isDelete) {
+                    rowBtn(88.0f, pl ? L"\xD83D\xDCC2 Otwórz cel" : L"\xD83D\xDCC2 Open Dest",
+                           CMD_XFER_JOB_OPEN_DST, j.targetDir);
+                }
+                if (!j.errors.empty()) {
+                    rowBtn(96.0f, (pl ? L"\x21BB Ponów (" : L"\x21BB Retry (") + std::to_wstring(j.errors.size()) + L")",
+                           CMD_XFER_JOB_RETRY_FAILED, idStr);
+                }
+                if (!isTerminal && !isDelete) {
+                    rowBtn(138.0f, TransferManager::FormatConflictPolicy(j.conflictPolicy, pl),
+                           CMD_XFER_JOB_CYCLE_CONFLICT, idStr);
+                }
+                if (j.state == TransferJobState::Queued) {
+                    if (idx > 0) {
+                        rowBtn(74.0f, pl ? L"\x2191 Na górę" : L"\x2191 Top", CMD_XFER_JOB_BUMP_TOP, idStr);
+                    }
+                    rowBtn(98.0f, pl ? L"\x26A1 Wymuś start" : L"\x26A1 Force start", CMD_XFER_JOB_FORCE_START, idStr);
+                }
+                if (!isTerminal) {
+                    rowBtn(80.0f, (j.state == TransferJobState::Paused)
+                        ? (pl ? L"\x25B6 Wznów" : L"\x25B6 Resume")
+                        : (pl ? L"\x23F8 Pauza" : L"\x23F8 Pause"),
+                        CMD_XFER_JOB_PAUSE_RESUME, idStr);
+                }
+
+                // Line 1: [#ID] Source -> Target
+                std::wstring srcDesc;
+                if (!j.sources.empty()) {
+                    srcDesc = PathUtils::GetFileName(j.sources[0]);
+                    if (srcDesc.empty()) srcDesc = j.sources[0];
+                    if (j.sources.size() > 1) {
+                        srcDesc += L" (+" + std::to_wstring(j.sources.size() - 1) + (pl ? L" el.)" : L" items)");
+                    }
+                }
+                std::wstring route = L"#" + idStr + L"  ";
+                if (!j.srcVolumeLabel.empty()) route += L"[" + j.srcVolumeLabel + L"] ";
+                route += srcDesc + L"   \x2794   ";
+                if (isDelete) {
+                    route += j.recycle ? (pl ? L"Kosz" : L"Recycle Bin") : (pl ? L"usunięcie trwałe" : L"permanent delete");
+                } else {
+                    if (!j.dstVolumeLabel.empty()) route += L"[" + j.dstVolumeLabel + L"] ";
+                    route += j.targetDir;
+                }
+                DrawClippedText(route, D2D1::RectF(badgeR.right + 8.0f, rr.top + 6.0f, std::max(badgeR.right + 40.0f, bx - 6.0f), rr.top + 25.0f), m_fmtBold, 0x0F172A);
+
+                // Line 2: Progress Bar
+                const double frac = j.Fraction();
+
+                D2D1_RECT_F trk = D2D1::RectF(rr.left + 8.0f, rr.top + 31.0f, rr.right - 8.0f, rr.top + 41.0f);
+                m_solidBrush->SetColor(HexColor(0xE2E8F0));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(trk, 4.5f, 4.5f), m_solidBrush);
+                float fillW = static_cast<float>((trk.right - trk.left) * frac);
+                if (fillW > 2.0f) {
+                    m_solidBrush->SetColor(HexColor(barCol));
+                    m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(trk.left, trk.top, trk.left + fillW, trk.bottom), 4.5f, 4.5f), m_solidBrush);
+                }
+
+                // Line 3: Detailed telemetry + current file
+                wchar_t statLine[384] = {};
+                if (isDelete) {
+                    swprintf_s(statLine,
+                        L"%.1f%%   \x2022   %llu / %llu %s   \x2022   %.0f %s   \x2022   ETA: %s",
+                        frac * 100.0,
+                        static_cast<unsigned long long>(j.doneFiles),
+                        static_cast<unsigned long long>(j.totalFiles),
+                        pl ? L"el." : L"items",
+                        j.itemsPerSec, pl ? L"el./s" : L"items/s",
+                        TransferManager::FormatEta(j.etaSeconds, pl).c_str());
+                } else {
+                    swprintf_s(statLine,
+                        L"%.1f%%   \x2022   %s / %s   \x2022   %llu / %llu %s   \x2022   %s   \x2022   ETA: %s",
+                        frac * 100.0,
+                        FileEngine::FormatSizeDetailed(j.doneBytes).c_str(),
+                        FileEngine::FormatSizeDetailed(j.totalBytes).c_str(),
+                        static_cast<unsigned long long>(j.doneFiles),
+                        static_cast<unsigned long long>(j.totalFiles),
+                        pl ? L"plików" : L"files",
+                        TransferManager::FormatSpeed(j.speedBytesPerSec).c_str(),
+                        TransferManager::FormatEta(j.etaSeconds, pl).c_str());
+                }
+                std::wstring extraTags = statLine;
+                if (j.resumedFiles > 0) {
+                    extraTags += (pl ? L"   [\x21BB wznowiono .e2part: " : L"   [\x21BB resumed .e2part: ") + std::to_wstring(j.resumedFiles) + L"]";
+                }
+                if (j.verifiedFiles > 0) {
+                    extraTags += (pl ? L"   [\x2713 XXH64: " : L"   [\x2713 XXH64: ") + std::to_wstring(j.verifiedFiles) + L"]";
+                }
+                if (j.state == TransferJobState::Paused && !j.summaryText.empty()) {
+                    extraTags += L"   \x2022   " + j.summaryText;
+                } else if (!j.currentFile.empty() && !isTerminal) {
+                    std::wstring leaf = FtpClient::IsFtpPath(j.currentFile)
+                        ? FtpClient::GetFtpLeafName(j.currentFile)
+                        : PathUtils::GetFileName(j.currentFile);
+                    extraTags += L"   \x2022   " + leaf;
+                } else if (!j.summaryText.empty() && isTerminal) {
+                    extraTags += L"   \x2022   " + j.summaryText;
+                }
+                DrawClippedText(extraTags, D2D1::RectF(rr.left + 8.0f, rr.top + 45.0f, rr.right - 8.0f, rr.bottom - 3.0f), m_fmtSmall, 0x475569);
+
+                // Register full-row selection hit AFTER per-row buttons
+                HardwareCardHit selHit;
+                selHit.rect = rr;
+                selHit.cmdId = CMD_XFER_SELECT_JOB;
+                selHit.actionArg = idStr;
+                selHit.actionIndex = j.id;
+                selHit.label = route;
+                m_hwCardHits.push_back(selHit);
+
+                ry += rowH;
+            }
+        }
+        curY += h + gap;
+    }
+
+    // ---- 4. Selected Job Details & Non-Blocking Error Inspector Card ----
+    const TransferJobSnapshot* selJob = nullptr;
+    for (const auto& j : jobs) {
+        if (j.id == m_xferSelectedJobId) { selJob = &j; break; }
+    }
+    if (selJob) {
+        const size_t maxErrRows = std::min<size_t>(12, selJob->errors.size());
+        const float errSectionH = selJob->errors.empty() ? 26.0f : (32.0f + static_cast<float>(maxErrRows) * 24.0f);
+        const float h = 114.0f + errSectionH;
+
+        DrawCardShell(leftX, curY, availW, h,
+            (pl ? L"SZCZEGÓŁY ZADANIA #" : L"TRANSFER JOB INSPECTOR #") + std::to_wstring(selJob->id) +
+            (selJob->errors.empty()
+                ? (pl ? L"  \x2022  BRAK BŁĘDÓW (0)" : L"  \x2022  ZERO ERRORS (0)")
+                : ((pl ? L"  \x2022  LISTA BŁĘDÓW (" : L"  \x2022  ERROR INSPECTOR (") + std::to_wstring(selJob->errors.size()) + L")")),
+            selJob->errors.empty() ? 0x059669 : 0xDC2626, false, 220.0f);
+
+        if (!selJob->errors.empty()) {
+            DrawCardTinyButton(D2D1::RectF(leftX + availW - 208.0f, curY + 4.0f, leftX + availW - 8.0f, curY + 25.0f),
+                               pl ? L"\x21BB Ponów błędne w tym zadaniu" : L"\x21BB Retry failed in job",
+                               CMD_XFER_JOB_RETRY_FAILED, std::to_wstring(selJob->id));
+        }
+
+        float dy = curY + 35.0f;
+        std::wstring srcJoin;
+        for (size_t i = 0; i < std::min<size_t>(4, selJob->sources.size()); ++i) {
+            if (i > 0) srcJoin += L"  ;  ";
+            srcJoin += selJob->sources[i];
+        }
+        if (selJob->sources.size() > 4) {
+            srcJoin += L"  (+" + std::to_wstring(selJob->sources.size() - 4) + L")";
+        }
+        DrawClippedText((pl ? L"Źródła: " : L"Sources: ") + srcJoin,
+                        D2D1::RectF(leftX + 14.0f, dy, leftX + availW - 14.0f, dy + 20.0f), m_fmtSmall, 0x0F172A);
+        dy += 21.0f;
+
+        const std::wstring selTarget = (selJob->op == TransferOp::Delete)
+            ? std::wstring(selJob->recycle ? (pl ? L"Kosz" : L"Recycle Bin")
+                                           : (pl ? L"brak (usunięcie trwałe)" : L"none (permanent delete)"))
+            : selJob->targetDir;
+        wchar_t det2[384] = {};
+        swprintf_s(det2,
+            pl ? L"Folder docelowy: %s   \x2022   Czas aktywny: %.1f s   \x2022   Szczyt: %s   \x2022   Pominięte: %llu   \x2022   Zmienione nazwy (2): %llu"
+               : L"Target folder: %s   \x2022   Active time: %.1f s   \x2022   Peak: %s   \x2022   Skipped: %llu   \x2022   Renamed (2): %llu",
+            selTarget.c_str(),
+            static_cast<double>(selJob->elapsedActiveMs) / 1000.0,
+            TransferManager::FormatSpeed(selJob->peakBytesPerSec).c_str(),
+            static_cast<unsigned long long>(selJob->skippedFiles),
+            static_cast<unsigned long long>(selJob->renamedCollisions));
+        DrawClippedText(det2, D2D1::RectF(leftX + 14.0f, dy, leftX + availW - 14.0f, dy + 20.0f), m_fmtSmall, 0x334155);
+        dy += 24.0f;
+
+        if (selJob->errors.empty()) {
+            DrawClippedText(
+                pl ? L"\x2713 Wszystkie przetworzone pliki zapisane czysto bez blokowania interfejsu (kliknij błędy tutaj, jeśli wystąpią, aby skopiować raport lub ponowić)."
+                   : L"\x2713 All processed files written cleanly with zero UI blocking (any locked/offline file errors appear here with one-click retry).",
+                D2D1::RectF(leftX + 14.0f, dy, leftX + availW - 14.0f, dy + 22.0f), m_fmtSmall, 0x059669);
+        } else {
+            DrawClippedText(
+                pl ? L"Niezablokowane błędy plików (kliknij wiersz aby skopiować szczegóły do schowka lub kliknij Ponów):"
+                   : L"Non-blocking file errors (click any row to copy full path & Win32 error to clipboard, or click Retry):",
+                D2D1::RectF(leftX + 14.0f, dy, leftX + availW - 14.0f, dy + 20.0f), m_fmtBold, 0xB91C1C);
+            dy += 22.0f;
+
+            for (size_t ei = 0; ei < maxErrRows; ++ei) {
+                const auto& fe = selJob->errors[ei];
+                D2D1_RECT_F er = D2D1::RectF(leftX + 10.0f, dy, leftX + availW - 10.0f, dy + 22.0f);
+                m_solidBrush->SetColor(HexColor(ei % 2 == 0 ? 0xFEF2F2 : 0xFFF5F5));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(er, 2.5f, 2.5f), m_solidBrush);
+
+                std::wstring line = L"\x2717 [Win32 " + std::to_wstring(fe.win32Error) + L"] " + fe.srcPath + L"  \x2014  " + fe.message;
+                if (fe.resumedOffset > 0) {
+                    line += (pl ? L"  (zachowano .e2part: " : L"  (saved .e2part: ") + FileEngine::FormatSizeDetailed(fe.resumedOffset) + L")";
+                }
+                DrawClippedText(line, D2D1::RectF(er.left + 6.0f, er.top + 2.0f, er.right - 6.0f, er.bottom), m_fmtSmall, 0x991B1B);
+
+                HardwareCardHit copyHit;
+                copyHit.rect = er;
+                copyHit.copyText = line;
+                copyHit.label = fe.srcPath;
+                m_hwCardHits.push_back(copyHit);
+
+                dy += 24.0f;
+            }
+        }
+        curY += h + gap;
+    }
+
+    const float totalHeight = (curY + m_hwScrollY) - startY;
+    const float viewH = std::max(1.0f, rect.bottom - rect.top);
+    m_hwMaxScrollY = std::max(0.0f, totalHeight - viewH + 16.0f);
+    m_hwScrollY = std::clamp(m_hwScrollY, 0.0f, m_hwMaxScrollY);
+
+    m_rt->PopAxisAlignedClip();
+}
+
 void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
     m_hwCardHits.clear();
+    if (IsTransfersView()) {
+        DrawTransfersView(rect);
+        return;
+    }
     if (IsBackupsView()) {
         DrawBackupsView(rect);
         return;
@@ -6160,7 +7707,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
                            + sys.computerName + L" (" + mobo.boardManufacturer + L" " + mobo.boardProduct + L")";
     D2D1_RECT_F titleR = D2D1::RectF(topBar.left + 28.0f, topBar.top, topBar.right - 390.0f, topBar.bottom);
     m_solidBrush->SetColor(HexColor(0x0F172A));
-    m_rt->DrawTextW(wsTitle.c_str(), static_cast<UINT32>(wsTitle.size()), m_fmtBold, titleR, m_solidBrush);
+    DrawTextCached(wsTitle.c_str(), static_cast<UINT32>(wsTitle.size()), m_fmtBold, titleR, m_solidBrush);
 
     // Top-right quick action buttons inside the Hardware view (Explorer Light Style)
     auto drawTopActionBtn = [&](int cmdId, float rightOff, float w, const wchar_t* label, bool isPrimary) {
@@ -6176,7 +7723,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
         m_rt->DrawRoundedRectangle(D2D1::RoundedRect(br, 3.5f, 3.5f), m_solidBrush, 1.0f);
         m_solidBrush->SetColor(HexColor(fgHex));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, br, m_solidBrush);
+        DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, br, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
 
@@ -6194,15 +7741,16 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
 
     struct SubDef { int cmd; HardwareSubTab tab; const wchar_t* pl; const wchar_t* en; float w; };
     SubDef subs[] = {
-        { CMD_HW_SUB_ALL,     HardwareSubTab::All,         L"Wszystko",       L"All",            76.0f },
-        { CMD_HW_SUB_CPU,     HardwareSubTab::Cpu,         L"CPU i Cache",    L"CPU & Cache",    96.0f },
-        { CMD_HW_SUB_GPU,     HardwareSubTab::Gpu,         L"GPU i Monitory", L"GPU & Displays", 110.0f },
-        { CMD_HW_SUB_RAM,     HardwareSubTab::Ram,         L"RAM (DIMM)",     L"RAM (DIMMs)",    92.0f },
-        { CMD_HW_SUB_MOBO,    HardwareSubTab::Motherboard, L"Płyta i BIOS",   L"Board & BIOS",   100.0f },
-        { CMD_HW_SUB_DISKS,   HardwareSubTab::Disks,       L"Dyski i SMART",  L"Disks & SMART",  108.0f },
-        { CMD_HW_SUB_NET,     HardwareSubTab::Network,     L"Sieć",           L"Network",        70.0f },
-        { CMD_HW_SUB_SYSTEM,  HardwareSubTab::System,      L"System i Audio", L"OS & Audio",     108.0f },
-        { CMD_HW_SUB_THERMAL, HardwareSubTab::Thermal,     L"\xD83C\xDF21 Temperatury", L"\xD83C\xDF21 Temperatures", 112.0f }
+        { CMD_HW_SUB_ALL,     HardwareSubTab::All,         L"Wszystko",               L"All",                74.0f },
+        { CMD_HW_SUB_CPU,     HardwareSubTab::Cpu,         L"CPU i Cache",            L"CPU & Cache",        92.0f },
+        { CMD_HW_SUB_GPU,     HardwareSubTab::Gpu,         L"GPU i Monitory",         L"GPU & Displays",     106.0f },
+        { CMD_HW_SUB_RAM,     HardwareSubTab::Ram,         L"RAM (DIMM)",             L"RAM (DIMMs)",        88.0f },
+        { CMD_HW_SUB_MOBO,    HardwareSubTab::Motherboard, L"Płyta i BIOS",           L"Board & BIOS",       96.0f },
+        { CMD_HW_SUB_DISKS,   HardwareSubTab::Disks,       L"Dyski i SMART",          L"Disks & SMART",      104.0f },
+        { CMD_HW_SUB_NET,     HardwareSubTab::Network,     L"Sieć",                   L"Network",            66.0f },
+        { CMD_HW_SUB_SYSTEM,  HardwareSubTab::System,      L"System i Audio",         L"OS & Audio",         104.0f },
+        { CMD_HW_SUB_THERMAL, HardwareSubTab::Thermal,     L"\xD83C\xDF21 Temperatury",   L"\xD83C\xDF21 Temperatures",  108.0f },
+        { CMD_HW_SUB_USB_COM, HardwareSubTab::UsbCom,      L"\xD83D\xDD0C USB i Porty COM", L"\xD83D\xDD0C USB & COM",   124.0f }
     };
     float sx = subStrip.left + 8.0f;
     for (const auto& sd : subs) {
@@ -6217,7 +7765,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
         m_solidBrush->SetColor(act ? HexColor(0xFFFFFF) : HexColor(0x334155));
         const wchar_t* lbl = (m_lang == Lang::PL) ? sd.pl : sd.en;
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(lbl, static_cast<UINT32>(wcslen(lbl)), m_fmtSmall, sr, m_solidBrush);
+        DrawTextCached(lbl, static_cast<UINT32>(wcslen(lbl)), m_fmtSmall, sr, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         sx += sd.w + 5.0f;
     }
@@ -6242,17 +7790,17 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
 
         D2D1_RECT_F tR = D2D1::RectF(boxR.left + 10.0f, boxR.top + 5.0f, boxR.right - 90.0f, boxR.top + 22.0f);
         m_solidBrush->SetColor(HexColor(0x475569));
-        m_rt->DrawTextW(title, static_cast<UINT32>(wcslen(title)), m_fmtBold, tR, m_solidBrush);
+        DrawTextCached(title, static_cast<UINT32>(wcslen(title)), m_fmtBold, tR, m_solidBrush);
 
         D2D1_RECT_F vR = D2D1::RectF(boxR.right - 115.0f, boxR.top + 4.0f, boxR.right - 8.0f, boxR.top + 24.0f);
         m_solidBrush->SetColor(HexColor(accentHex));
         m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-        m_rt->DrawTextW(bigValue.c_str(), static_cast<UINT32>(bigValue.size()), m_fmtBold, vR, m_solidBrush);
+        DrawTextCached(bigValue.c_str(), static_cast<UINT32>(bigValue.size()), m_fmtBold, vR, m_solidBrush);
         m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
         D2D1_RECT_F subR = D2D1::RectF(boxR.left + 10.0f, boxR.top + 21.0f, boxR.right - 8.0f, boxR.top + 38.0f);
         m_solidBrush->SetColor(HexColor(0x64748B));
-        m_rt->DrawTextW(subValue.c_str(), static_cast<UINT32>(subValue.size()), m_fmtSmall, subR, m_solidBrush);
+        DrawTextCached(subValue.c_str(), static_cast<UINT32>(subValue.size()), m_fmtSmall, subR, m_solidBrush);
 
         D2D1_RECT_F plotR = D2D1::RectF(boxR.left + 8.0f, boxR.top + 40.0f, boxR.right - 8.0f, boxR.bottom - 7.0f);
         m_solidBrush->SetColor(HexColor(0xF8FAFC));
@@ -6447,7 +7995,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(r, 8.0f, 8.0f), m_solidBrush);
         m_solidBrush->SetColor(HexColor(fg));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), m_fmtSmall, r, m_solidBrush);
+        DrawTextCached(text.c_str(), static_cast<UINT32>(text.size()), m_fmtSmall, r, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
     auto healthLabel = [&](const HwPhysicalDisk& d, uint32_t& fg, uint32_t& bg) -> std::wstring {
@@ -6500,7 +8048,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
             m_rt->FillRoundedRectangle(D2D1::RoundedRect(chip, 4.0f, 4.0f), m_solidBrush);
             m_solidBrush->SetColor(HexColor(0xFFFFFF));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(kind, static_cast<UINT32>(wcslen(kind)), m_fmtSmall, chip, m_solidBrush);
+            DrawTextCached(kind, static_cast<UINT32>(wcslen(kind)), m_fmtSmall, chip, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
             std::wstring line1 = L"#" + std::to_wstring(pd.index) + L"  " + pd.model;
@@ -6578,7 +8126,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
             float msgRight = box.right - 10.0f - (showAdminBtn ? 262.0f : 0.0f);
             m_rt->PushAxisAlignedClip(box, D2D1_ANTIALIAS_MODE_ALIASED);
             m_solidBrush->SetColor(HexColor(0x92400E));
-            m_rt->DrawTextW(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtSmall, D2D1::RectF(box.left + 10.0f, box.top + 6.0f, msgRight, box.bottom - 4.0f), m_solidBrush);
+            DrawTextCached(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtSmall, D2D1::RectF(box.left + 10.0f, box.top + 6.0f, msgRight, box.bottom - 4.0f), m_solidBrush);
             m_rt->PopAxisAlignedClip();
             if (showAdminBtn) {
                 drawTinyButton(D2D1::RectF(box.right - 262.0f, box.top + 14.0f, box.right - 10.0f, box.top + 38.0f),
@@ -6731,7 +8279,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
         m_solidBrush->SetColor(HexColor(copyHov ? 0xFFFFFF : 0x1E293B));
         const wchar_t* cpLbl = pl ? L"\xD83D\xDCCB Kopiuj" : L"\xD83D\xDCCB Copy";
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        m_rt->DrawTextW(cpLbl, static_cast<UINT32>(wcslen(cpLbl)), m_fmtSmall, copyBtn, m_solidBrush);
+        DrawTextCached(cpLbl, static_cast<UINT32>(wcslen(cpLbl)), m_fmtSmall, copyBtn, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         pushCopyHit(copyBtn, payload, title);
         return h;
@@ -6836,7 +8384,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
                 m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
                 m_solidBrush->SetColor(HexColor(col));
                 std::wstring tv = fmtTemp(s.temp);
-                m_rt->DrawTextW(tv.c_str(), static_cast<UINT32>(tv.size()), m_fmtBold, D2D1::RectF(trackR + 6.0f, by, rightX + halfW - 10.0f, by + 20.0f), m_solidBrush);
+                DrawTextCached(tv.c_str(), static_cast<UINT32>(tv.size()), m_fmtBold, D2D1::RectF(trackR + 6.0f, by, rightX + halfW - 10.0f, by + 20.0f), m_solidBrush);
                 m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 by += 20.0f;
             }
@@ -6907,7 +8455,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
         swprintf_s(heatTitle, L"OBCIĄŻENIE RDZENI NA ŻYWO (%d WĄTKÓW \x2022 %.1f%%)", nCores, cpu.totalLoadPct);
         D2D1_RECT_F htR = D2D1::RectF(rightX + 12.0f, curY + 4.0f, rightX + halfW - 10.0f, curY + 26.0f);
         m_solidBrush->SetColor(HexColor(0x0F172A));
-        m_rt->DrawTextW(heatTitle, static_cast<UINT32>(wcslen(heatTitle)), m_fmtBold, htR, m_solidBrush);
+        DrawTextCached(heatTitle, static_cast<UINT32>(wcslen(heatTitle)), m_fmtBold, htR, m_solidBrush);
 
         float gridPad = 8.0f;
         float cellW = (halfW - gridPad * 2.0f - (cols - 1) * 4.0f) / static_cast<float>(cols);
@@ -6937,7 +8485,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
             swprintf_s(cLbl, L"C%d: %.0f%%", c, pct);
             m_solidBrush->SetColor(HexColor(0x0F172A));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            m_rt->DrawTextW(cLbl, static_cast<UINT32>(wcslen(cLbl)), m_fmtSmall, cBox, m_solidBrush);
+            DrawTextCached(cLbl, static_cast<UINT32>(wcslen(cLbl)), m_fmtSmall, cBox, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
 
@@ -7122,6 +8670,475 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
         float hN = drawProCard(leftX,  curY, halfW, m_lang == Lang::PL ? L"KARTY SIECIOWE (IPv4 / IPv6 / MAC / RUCH LIVE)" : L"NETWORK INTERFACES (IPv4 / MAC / LIVE TRAFFIC)", 0xD97706, netRows);
         float hS = drawProCard(rightX, curY, halfW, m_lang == Lang::PL ? L"SYSTEM WINDOWS, AUDIO & TOP PROCESY RAM" : L"WINDOWS OS, AUDIO & TOP PROCESSES BY RAM", 0xDB2777, sysRows);
         curY += std::max(hN, hS) + 16.0f;
+    }
+
+    // =========================================================================
+    // SECTION F: Interactive USB Topology TreeView, COM / Serial Ports & PnP Inspector
+    // =========================================================================
+    if (showAll || m_hwSubTab == HardwareSubTab::UsbCom) {
+        const auto& usbTree  = m_hwInspector.GetUsbTree();
+        const auto& comPorts = m_hwInspector.GetComPorts();
+
+        // Ensure a valid default selection for the details inspector
+        bool usbSelValid = false;
+        for (const auto& u : usbTree) {
+            if (u.deviceInstanceId == m_hwSelectedUsbId) { usbSelValid = true; break; }
+        }
+        bool comSelValid = false;
+        for (const auto& cp : comPorts) {
+            if (cp.portName == m_hwSelectedComPort) { comSelValid = true; break; }
+        }
+        if (!comSelValid && !comPorts.empty()) {
+            m_hwSelectedComPort = comPorts.front().portName;
+            comSelValid = true;
+        }
+        if (!usbSelValid && !usbTree.empty()) {
+            // Prefer first connected non-hub USB device, or fall back to first controller
+            m_hwSelectedUsbId = usbTree.front().deviceInstanceId;
+            for (const auto& u : usbTree) {
+                if (u.depth >= 2 && !u.isHub && !u.isInterface) {
+                    m_hwSelectedUsbId = u.deviceInstanceId;
+                    break;
+                }
+            }
+            usbSelValid = true;
+        }
+
+        // Filter visible USB tree nodes according to collapsed parents and interface toggle
+        std::vector<int> visUsbIndices;
+        visUsbIndices.reserve(usbTree.size());
+        auto isAncestorCollapsed = [&](int idx) -> bool {
+            int p = usbTree[idx].parentIndex;
+            int guard = 0;
+            while (p >= 0 && p < static_cast<int>(usbTree.size()) && guard++ < 16) {
+                if (m_hwCollapsedUsbNodes.count(usbTree[p].deviceInstanceId)) return true;
+                p = usbTree[p].parentIndex;
+            }
+            return false;
+        };
+        int countControllers = 0, countHubs = 0, countDevices = 0;
+        for (int i = 0; i < static_cast<int>(usbTree.size()); ++i) {
+            const auto& u = usbTree[i];
+            if (u.isController) ++countControllers;
+            else if (u.isHub) ++countHubs;
+            else if (!u.isInterface) ++countDevices;
+
+            if (isAncestorCollapsed(i)) continue;
+            if (!m_hwShowUsbInterfaces && u.isInterface && u.comPortName.empty()) continue;
+            visUsbIndices.push_back(i);
+        }
+
+        // 1. Left Card: Interactive USB Device TreeView
+        auto drawUsbTreeCard = [&](float x, float y, float w) -> float {
+            const float summaryH = 24.0f;
+            const float rowH = 26.0f;
+            size_t nRows = std::max<size_t>(1, visUsbIndices.size());
+            float h = 34.0f + summaryH + static_cast<float>(nRows) * rowH + 8.0f;
+
+            std::wstring title = pl ? L"\xD83D\xDD0C DRZEWO URZĄDZEŃ USB (TOPOLOGIA KONTROLERÓW I HUBÓW)"
+                                    : L"\xD83D\xDD0C USB DEVICE TREE (CONTROLLER & HUB TOPOLOGY)";
+            drawCardShell(x, y, w, h, title, 0x0284C7, false, 198.0f);
+
+            // Header action buttons: [± Interfejsy] and [↻ Odśwież]
+            D2D1_RECT_F btnIfR  = D2D1::RectF(x + w - 196.0f, y + 5.0f, x + w - 94.0f, y + 25.0f);
+            D2D1_RECT_F btnRefR = D2D1::RectF(x + w - 90.0f,  y + 5.0f, x + w - 8.0f,  y + 25.0f);
+            drawTinyButton(btnIfR,
+                           m_hwShowUsbInterfaces ? (pl ? L"\x229F Ukryj MI_xx" : L"\x229F Hide MI_xx")
+                                                 : (pl ? L"\x229E Pokaż MI_xx" : L"\x229E Show MI_xx"),
+                           CMD_HW_TOGGLE_USB_INTERFACES, L"");
+            drawTinyButton(btnRefR, pl ? L"\x21BB Odśwież" : L"\x21BB Refresh", CMD_HW_REFRESH_USB_COM, L"");
+
+            // Summary strip
+            float sy = y + 32.0f;
+            m_solidBrush->SetColor(HexColor(0xF8FAFC));
+            m_rt->FillRectangle(D2D1::RectF(x + 4.0f, sy, x + w - 4.0f, sy + summaryH - 2.0f), m_solidBrush);
+            wchar_t sumBuf[256] = {};
+            swprintf_s(sumBuf,
+                       pl ? L"Kontrolery: %d   \x2022   Huby: %d   \x2022   Urządzenia USB: %d   \x2022   Porty COM: %zu   (kliknij węzeł = szczegóły)"
+                          : L"Controllers: %d   \x2022   Hubs: %d   \x2022   USB Devices: %d   \x2022   COM Ports: %zu   (click node = details)",
+                       countControllers, countHubs, countDevices, comPorts.size());
+            drawClippedText(sumBuf, D2D1::RectF(x + 12.0f, sy + 2.0f, x + w - 12.0f, sy + summaryH - 2.0f), m_fmtSmall, 0x475569);
+
+            float ry = sy + summaryH;
+            if (visUsbIndices.empty()) {
+                drawClippedText(pl ? L"Trwa skanowanie magistrali USB..." : L"Scanning USB bus topology...",
+                                D2D1::RectF(x + 12.0f, ry + 4.0f, x + w - 12.0f, ry + 24.0f), m_fmtSmall, 0x64748B);
+                return h;
+            }
+
+            const float indentStep = 18.0f;
+            for (int idx : visUsbIndices) {
+                const auto& u = usbTree[idx];
+                D2D1_RECT_F rr = D2D1::RectF(x + 6.0f, ry, x + w - 6.0f, ry + rowH - 2.0f);
+                bool sel = (!m_hwInspectComMode && u.deviceInstanceId == m_hwSelectedUsbId) ||
+                           (m_hwInspectComMode && !m_hwSelectedComPort.empty() && u.comPortName == m_hwSelectedComPort);
+                bool hov = PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, rr);
+
+                uint32_t rowBg = sel ? 0xE0F2FE : (hov ? 0xF1F5F9 : (u.isController ? 0xF8FAFC : 0xFFFFFF));
+                m_solidBrush->SetColor(HexColor(rowBg));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(rr, 3.5f, 3.5f), m_solidBrush);
+                if (sel || u.isController) {
+                    m_solidBrush->SetColor(HexColor(sel ? 0x0078D7 : 0xE2E8F0));
+                    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rr, 3.5f, 3.5f), m_solidBrush, sel ? 1.4f : 1.0f);
+                }
+
+                // Draw hierarchical tree branch lines (│, ├─, └─)
+                float baseTreeX = rr.left + 8.0f;
+                m_solidBrush->SetColor(HexColor(0x94A3B8));
+                for (int d = 1; d < u.depth; ++d) {
+                    if (u.ancestorContinueMask & (1u << d)) {
+                        float lx = baseTreeX + static_cast<float>(d - 1) * indentStep + 7.0f;
+                        m_rt->DrawLine(D2D1::Point2F(lx, ry), D2D1::Point2F(lx, ry + rowH), m_solidBrush, 1.1f);
+                    }
+                }
+                if (u.depth > 0) {
+                    float branchX = baseTreeX + static_cast<float>(u.depth - 1) * indentStep + 7.0f;
+                    float midY = rr.top + (rowH - 2.0f) * 0.5f;
+                    float vBottom = u.isLastSibling ? midY : (ry + rowH);
+                    m_rt->DrawLine(D2D1::Point2F(branchX, ry), D2D1::Point2F(branchX, vBottom), m_solidBrush, 1.1f);
+                    m_rt->DrawLine(D2D1::Point2F(branchX, midY), D2D1::Point2F(branchX + 10.0f, midY), m_solidBrush, 1.1f);
+                }
+
+                float curX = baseTreeX + static_cast<float>(u.depth) * indentStep;
+
+                // Expand / Collapse [−] / [+] toggle box if node has children
+                if (u.childCount > 0) {
+                    bool collapsed = (m_hwCollapsedUsbNodes.count(u.deviceInstanceId) > 0);
+                    D2D1_RECT_F expR = D2D1::RectF(curX, rr.top + 5.0f, curX + 14.0f, rr.top + 19.0f);
+                    m_solidBrush->SetColor(HexColor(collapsed ? 0xDBEAFE : 0xF1F5F9));
+                    m_rt->FillRoundedRectangle(D2D1::RoundedRect(expR, 2.5f, 2.5f), m_solidBrush);
+                    m_solidBrush->SetColor(HexColor(collapsed ? 0x0284C7 : 0x64748B));
+                    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(expR, 2.5f, 2.5f), m_solidBrush, 1.0f);
+                    // Horizontal minus bar
+                    float cx = (expR.left + expR.right) * 0.5f;
+                    float cy = (expR.top + expR.bottom) * 0.5f;
+                    m_rt->DrawLine(D2D1::Point2F(cx - 3.5f, cy), D2D1::Point2F(cx + 3.5f, cy), m_solidBrush, 1.4f);
+                    if (collapsed) {
+                        m_rt->DrawLine(D2D1::Point2F(cx, cy - 3.5f), D2D1::Point2F(cx, cy + 3.5f), m_solidBrush, 1.4f);
+                    }
+                    HardwareCardHit th;
+                    th.rect = D2D1::RectF(expR.left - 2.0f, rr.top, expR.right + 2.0f, rr.bottom);
+                    th.cmdId = CMD_HW_TOGGLE_USB_NODE;
+                    th.actionArg = u.deviceInstanceId;
+                    th.label = u.displayName;
+                    m_hwCardHits.push_back(th);
+                    curX += 18.0f;
+                } else {
+                    curX += 4.0f;
+                }
+
+                // Category badge ([xHCI], [ROOT], [HUB], [COM3], [HID], [AUDIO], [DISK], [BT], [USB])
+                float badgeW = (u.categoryBadge.size() >= 5) ? 46.0f : 38.0f;
+                D2D1_RECT_F bR = D2D1::RectF(curX, rr.top + 4.0f, curX + badgeW, rr.bottom - 4.0f);
+                m_solidBrush->SetColor(HexColor(u.badgeColor));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(bR, 3.0f, 3.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(0xFFFFFF));
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(u.categoryBadge.c_str(), static_cast<UINT32>(u.categoryBadge.size()), m_fmtSmall, bR, m_solidBrush);
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                curX += badgeW + 5.0f;
+
+                // Optional Port number badge [P#4]
+                if (u.portNumber > 0 && !u.isInterface) {
+                    std::wstring pStr = L"P#" + std::to_wstring(u.portNumber);
+                    float pw = (u.portNumber >= 10) ? 32.0f : 26.0f;
+                    D2D1_RECT_F pR = D2D1::RectF(curX, rr.top + 4.0f, curX + pw, rr.bottom - 4.0f);
+                    m_solidBrush->SetColor(HexColor(0xE2E8F0));
+                    m_rt->FillRoundedRectangle(D2D1::RoundedRect(pR, 3.0f, 3.0f), m_solidBrush);
+                    m_solidBrush->SetColor(HexColor(0x334155));
+                    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    DrawTextCached(pStr.c_str(), static_cast<UINT32>(pStr.size()), m_fmtSmall, pR, m_solidBrush);
+                    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    curX += pw + 5.0f;
+                }
+
+                // Right-aligned VID:PID + Vendor or Problem badge
+                float rightLimit = rr.right - 6.0f;
+                if (u.problemCode != 0) {
+                    std::wstring pLbl = L"! Kod " + std::to_wstring(u.problemCode);
+                    D2D1_RECT_F prR = D2D1::RectF(rightLimit - 64.0f, rr.top + 4.0f, rightLimit, rr.bottom - 4.0f);
+                    drawBadge(prR, pLbl, 0xB91C1C, 0xFEE2E2);
+                    rightLimit -= 68.0f;
+                } else if (!u.vidPid.empty() && !u.isRootHub) {
+                    std::wstring vpTag = u.vidPid;
+                    float vpW = 68.0f;
+                    D2D1_RECT_F vpR = D2D1::RectF(rightLimit - vpW, rr.top + 4.0f, rightLimit, rr.bottom - 4.0f);
+                    drawBadge(vpR, vpTag, 0x0369A1, 0xF1F5F9);
+                    rightLimit -= (vpW + 4.0f);
+                }
+
+                // Device Name
+                if (rightLimit > curX + 20.0f) {
+                    IDWriteTextFormat* nameFmt = (u.isController || u.isRootHub || (!u.isInterface && !u.isHub)) ? m_fmtBold : m_fmtSmall;
+                    uint32_t nameCol = (u.problemCode != 0) ? 0xB91C1Cu : (u.isInterface ? 0x475569u : 0x0F172Au);
+                    drawClippedText(u.displayName, D2D1::RectF(curX, rr.top + 3.0f, rightLimit, rr.bottom - 2.0f), nameFmt, nameCol);
+                }
+
+                // Row selection hit
+                HardwareCardHit sh;
+                sh.rect = D2D1::RectF(curX - 42.0f, rr.top, rr.right, rr.bottom);
+                sh.cmdId = CMD_HW_SELECT_USB_NODE;
+                sh.actionArg = u.deviceInstanceId;
+                sh.label = u.displayName;
+                m_hwCardHits.push_back(sh);
+
+                ry += rowH;
+            }
+            return h;
+        };
+
+        // 2. Right Top Card: COM / Serial Ports Inspector
+        auto drawComPortsCard = [&](float x, float y, float w) -> float {
+            const float rowH = 52.0f;
+            float bodyH = comPorts.empty() ? 66.0f : (static_cast<float>(comPorts.size()) * rowH + 6.0f);
+            float h = 34.0f + bodyH;
+
+            std::wstring title = (pl ? L"\xD83D\xDD0C PORTY SZEREGOWE COM / UART (AKTYWNE: " : L"\xD83D\xDD0C SERIAL COM / UART PORTS (ACTIVE: ")
+                                 + std::to_wstring(comPorts.size()) + L")";
+            drawCardShell(x, y, w, h, title, 0xD97706, false, 200.0f);
+
+            D2D1_RECT_F btnDmR  = D2D1::RectF(x + w - 198.0f, y + 5.0f, x + w - 94.0f, y + 25.0f);
+            D2D1_RECT_F btnRefR = D2D1::RectF(x + w - 90.0f,  y + 5.0f, x + w - 8.0f,  y + 25.0f);
+            drawTinyButton(btnDmR,  pl ? L"\x2699 Menedżer" : L"\x2699 DevMgr", CMD_HW_OPEN_DEVMGR, L"");
+            drawTinyButton(btnRefR, pl ? L"\x21BB Odśwież" : L"\x21BB Refresh", CMD_HW_REFRESH_USB_COM, L"");
+
+            float ry = y + 34.0f;
+            if (comPorts.empty()) {
+                D2D1_RECT_F emptyR = D2D1::RectF(x + 8.0f, ry + 2.0f, x + w - 8.0f, ry + 58.0f);
+                m_solidBrush->SetColor(HexColor(0xF8FAFC));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(emptyR, 4.0f, 4.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(0xE2E8F0));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(emptyR, 4.0f, 4.0f), m_solidBrush, 1.0f);
+
+                drawClippedText(pl ? L"Brak aktywnych portów szeregowych COM w systemie (GUID_DEVCLASS_PORTS / SERIALCOMM)."
+                                   : L"No active serial COM ports currently connected (GUID_DEVCLASS_PORTS / SERIALCOMM).",
+                                D2D1::RectF(emptyR.left + 10.0f, emptyR.top + 8.0f, emptyR.right - 10.0f, emptyR.top + 28.0f),
+                                m_fmtBold, 0x475569);
+                drawClippedText(pl ? L"Podłącz układ USB-UART (CH340, CP210x, FTDI, PL2303, ESP32, STM32, Arduino) i kliknij [\x21BB Odśwież]."
+                                   : L"Plug in a USB-UART bridge (CH340, CP210x, FTDI, PL2303, ESP32, STM32, Arduino) and click [\x21BB Refresh].",
+                                D2D1::RectF(emptyR.left + 10.0f, emptyR.top + 30.0f, emptyR.right - 10.0f, emptyR.bottom - 6.0f),
+                                m_fmtSmall, 0x64748B);
+                return h;
+            }
+
+            for (const auto& cp : comPorts) {
+                D2D1_RECT_F rr = D2D1::RectF(x + 6.0f, ry, x + w - 6.0f, ry + rowH - 4.0f);
+                bool sel = (m_hwInspectComMode && cp.portName == m_hwSelectedComPort) ||
+                           (!m_hwInspectComMode && cp.portName == m_hwSelectedComPort && comPorts.size() == 1);
+                bool hov = PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, rr);
+
+                m_solidBrush->SetColor(HexColor(sel ? 0xFEF3C7 : (hov ? 0xF8FAFC : 0xFFFFFF)));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(rr, 4.0f, 4.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(sel ? 0xD97706 : 0xE2E8F0));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rr, 4.0f, 4.0f), m_solidBrush, sel ? 1.5f : 1.0f);
+
+                // [COMx] chip
+                uint32_t chipCol = cp.isUsbBacked ? 0x059669u : (cp.isBluetooth ? 0x4F46E5u : (cp.isVirtual ? 0x7C3AEDu : 0x0284C7u));
+                D2D1_RECT_F chipR = D2D1::RectF(rr.left + 8.0f, rr.top + 10.0f, rr.left + 62.0f, rr.bottom - 10.0f);
+                m_solidBrush->SetColor(HexColor(chipCol));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(chipR, 4.0f, 4.0f), m_solidBrush);
+                m_solidBrush->SetColor(HexColor(0xFFFFFF));
+                m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(cp.portName.c_str(), static_cast<UINT32>(cp.portName.size()), m_fmtBold, chipR, m_solidBrush);
+                m_fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+                // Copy button & status badge on right
+                D2D1_RECT_F copyBtnR = D2D1::RectF(rr.right - 84.0f, rr.top + 5.0f, rr.right - 6.0f, rr.top + 23.0f);
+                std::wstring copyStr = cp.portName + L" (" + cp.friendlyName +
+                                       (cp.vidPid.empty() ? L"" : (L", VID:PID " + cp.vidPid)) + L")";
+                drawTinyButton(copyBtnR, pl ? L"\xD83D\xDCCB Kopiuj" : L"\xD83D\xDCCB Copy", CMD_HW_COPY_TEXT, copyStr);
+
+                D2D1_RECT_F stR = D2D1::RectF(rr.right - 84.0f, rr.top + 26.0f, rr.right - 6.0f, rr.bottom - 5.0f);
+                if (cp.problemCode == 0) {
+                    drawBadge(stR, pl ? L"OK \x2022 Aktywny" : L"OK \x2022 Ready", 0x047857, 0xD1FAE5);
+                } else {
+                    drawBadge(stR, L"Kod " + std::to_wstring(cp.problemCode), 0xB91C1C, 0xFEE2E2);
+                }
+
+                // Line 1: Friendly Name + Chip Model
+                float textLeft = rr.left + 70.0f;
+                float textRight = rr.right - 90.0f;
+                std::wstring line1 = cp.friendlyName;
+                if (!cp.chipModel.empty() && line1.find(cp.chipModel) == std::wstring::npos) {
+                    line1 += L"   \x2022   " + cp.chipModel;
+                }
+                drawClippedText(line1, D2D1::RectF(textLeft, rr.top + 4.0f, textRight, rr.top + 24.0f), m_fmtBold, 0x0F172A);
+
+                // Line 2: VID:PID • Default Baud • Service • Location • NT Device
+                const wchar_t* parCh = (cp.parity == 1) ? L"O" : (cp.parity == 2 ? L"E" : L"N");
+                const wchar_t* stopCh = (cp.stopBits == 2) ? L"2" : (cp.stopBits == 1 ? L"1.5" : L"1");
+                wchar_t baudBuf[64] = {};
+                swprintf_s(baudBuf, L"%u %u%s%s", cp.defaultBaud, static_cast<unsigned>(cp.dataBits), parCh, stopCh);
+
+                std::wstring line2;
+                if (!cp.vidPid.empty()) line2 += L"VID:PID " + cp.vidPid + L"  \x2022  ";
+                line2 += std::wstring(L"Baud: ") + baudBuf;
+                if (!cp.serviceName.empty()) line2 += L"  \x2022  Drv: " + cp.serviceName;
+                if (!cp.locationInfo.empty()) line2 += L"  \x2022  " + cp.locationInfo;
+                if (!cp.ntDevicePath.empty()) line2 += L"  \x2022  " + cp.ntDevicePath;
+                drawClippedText(line2, D2D1::RectF(textLeft, rr.top + 25.0f, textRight, rr.bottom - 3.0f), m_fmtSmall, 0x475569);
+
+                HardwareCardHit ch;
+                ch.rect = D2D1::RectF(rr.left, rr.top, rr.right - 88.0f, rr.bottom);
+                ch.cmdId = CMD_HW_SELECT_COM_PORT;
+                ch.actionArg = cp.portName;
+                ch.label = cp.friendlyName;
+                m_hwCardHits.push_back(ch);
+
+                ry += rowH;
+            }
+            return h;
+        };
+
+        // 3. Right Bottom Card: Detailed PnP Inspector for the selected USB Node or COM Port
+        auto drawUsbComInspectorCard = [&](float x, float y, float w) -> float {
+            const HwUsbNodeInfo* selUsb = nullptr;
+            for (const auto& u : usbTree) {
+                if (u.deviceInstanceId == m_hwSelectedUsbId) { selUsb = &u; break; }
+            }
+            const HwComPortInfo* selCom = nullptr;
+            for (const auto& cp : comPorts) {
+                if (cp.portName == m_hwSelectedComPort) { selCom = &cp; break; }
+            }
+            // If user selected a USB node that has an associated COM port, link selCom automatically
+            if (!m_hwInspectComMode && selUsb && !selUsb->comPortName.empty()) {
+                for (const auto& cp : comPorts) {
+                    if (cp.portName == selUsb->comPortName) { selCom = &cp; break; }
+                }
+            }
+
+            std::vector<KvRow> detRows;
+            std::wstring cardTitle = pl ? L"\xD83D\xDD0D SZCZEGÓŁY WYBRANEGO URZĄDZENIA USB / PORTU COM"
+                                        : L"\xD83D\xDD0D SELECTED USB DEVICE / COM PORT DETAILS";
+
+            if (m_hwInspectComMode && selCom) {
+                cardTitle = (pl ? L"\xD83D\xDD0D SZCZEGÓŁY PORTU SZEREGOWEGO: " : L"\xD83D\xDD0D SERIAL PORT INSPECTOR: ") + selCom->portName;
+                detRows.push_back({ pl ? L"Oznaczenie portu COM" : L"COM Port Name",
+                                    selCom->portName + (selCom->ntDevicePath.empty() ? L"" : (L"   (" + selCom->ntDevicePath + L")")),
+                                    0x059669, CMD_HW_COPY_TEXT, pl ? L"\xD83D\xDCCB Kopiuj COM" : L"\xD83D\xDCCB Copy COM", selCom->portName });
+                detRows.push_back({ pl ? L"Przyjazna nazwa PnP" : L"Friendly Name", selCom->friendlyName, 0x0F172A });
+                detRows.push_back({ pl ? L"Układ / Mostek UART" : L"UART Bridge / Chip", selCom->chipModel, 0x0369A1 });
+                if (!selCom->busReportedDesc.empty()) {
+                    detRows.push_back({ pl ? L"Deskryptor USB (iProduct)" : L"USB Firmware iProduct", selCom->busReportedDesc, 0x7C3AED });
+                }
+                detRows.push_back({ pl ? L"Identyfikator VID:PID" : L"VID:PID Identifier",
+                                    selCom->vidPid.empty() ? (pl ? L"— (Port systemowy / ACPI)" : L"— (System / ACPI Port)") : selCom->vidPid,
+                                    0x0067B8,
+                                    selCom->vidPid.empty() ? 0 : CMD_HW_COPY_TEXT,
+                                    pl ? L"\xD83D\xDCCB VID:PID" : L"\xD83D\xDCCB VID:PID",
+                                    selCom->vidPid });
+                detRows.push_back({ pl ? L"Producent (Vendor / INF)" : L"Vendor / Manufacturer",
+                                    selCom->vendorName + (!selCom->manufacturer.empty() && selCom->manufacturer != selCom->vendorName ? (L"  (" + selCom->manufacturer + L")") : L"") });
+                const wchar_t* parCh = (selCom->parity == 1) ? L"Odd" : (selCom->parity == 2 ? L"Even" : L"None");
+                const wchar_t* stopCh = (selCom->stopBits == 2) ? L"2" : (selCom->stopBits == 1 ? L"1.5" : L"1");
+                wchar_t cfgBuf[128] = {};
+                swprintf_s(cfgBuf, L"%u baud  \x2022  %u bitów danych  \x2022  Parity: %s  \x2022  Stop: %s",
+                           selCom->defaultBaud, static_cast<unsigned>(selCom->dataBits), parCh, stopCh);
+                detRows.push_back({ pl ? L"Domyślna konfiguracja DCB" : L"Default DCB Config", cfgBuf, 0xB45309 });
+                detRows.push_back({ pl ? L"Sterownik (Service / Ver)" : L"Driver Service / Version",
+                                    selCom->serviceName + (selCom->driverVersion.empty() ? L"" : (L"  v" + selCom->driverVersion)) +
+                                    (selCom->driverProvider.empty() ? L"" : (L" (" + selCom->driverProvider + L")")) });
+                if (!selCom->locationInfo.empty()) {
+                    detRows.push_back({ pl ? L"Lokalizacja (Port / Hub)" : L"Physical Location", selCom->locationInfo, 0x0D9488 });
+                }
+                if (!selCom->serialNumber.empty()) {
+                    detRows.push_back({ pl ? L"Numer seryjny USB" : L"USB Serial Number", selCom->serialNumber, 0x059669 });
+                }
+                if (!selCom->pdoName.empty()) {
+                    detRows.push_back({ pl ? L"Obiekt jądra (PDO)" : L"Kernel PDO Name", selCom->pdoName });
+                }
+                detRows.push_back({ pl ? L"Device Instance ID" : L"Device Instance ID",
+                                    selCom->deviceInstanceId, 0x334155,
+                                    CMD_HW_COPY_TEXT, pl ? L"\xD83D\xDCCB Kopiuj ID" : L"\xD83D\xDCCB Copy ID", selCom->deviceInstanceId });
+                if (!selCom->hardwareIds.empty()) {
+                    detRows.push_back({ pl ? L"Hardware IDs (HWID)" : L"Hardware IDs", selCom->hardwareIds, 0x475569 });
+                }
+                detRows.push_back({ pl ? L"Status urządzenia PnP" : L"PnP Device Status",
+                                    selCom->statusStr, selCom->problemCode == 0 ? 0x059669u : 0xDC2626u });
+            } else if (selUsb) {
+                cardTitle = (pl ? L"\xD83D\xDD0D SZCZEGÓŁY WĘZŁA USB: [" : L"\xD83D\xDD0D USB NODE INSPECTOR: [") + selUsb->categoryBadge + L"]";
+                detRows.push_back({ pl ? L"Nazwa urządzenia" : L"Device Name", selUsb->displayName, 0x0F172A });
+                if (!selUsb->busReportedDesc.empty()) {
+                    detRows.push_back({ pl ? L"Deskryptor USB (iProduct)" : L"USB Firmware iProduct", selUsb->busReportedDesc, 0x7C3AED });
+                }
+                detRows.push_back({ pl ? L"Rola / Typ magistrali" : L"Bus Role & Speed",
+                                    L"[" + selUsb->categoryBadge + L"]  " + selUsb->speedHint +
+                                    (selUsb->childCount > 0 ? (L"  \x2022  Podrzędne węzły: " + std::to_wstring(selUsb->childCount)) : L""),
+                                    selUsb->badgeColor });
+                if (!selUsb->chipModel.empty()) {
+                    detRows.push_back({ pl ? L"Rozpoznany układ / Mostek" : L"Identified Chip / Bridge", selUsb->chipModel, 0x0369A1 });
+                }
+                if (!selUsb->vidPid.empty()) {
+                    std::wstring vpFull = selUsb->vidPid + (selUsb->revStr.empty() ? L"" : (L"   (REV_" + selUsb->revStr + L")"));
+                    detRows.push_back({ pl ? L"Identyfikator VID:PID" : L"VID:PID & Revision",
+                                        vpFull, 0x0067B8,
+                                        CMD_HW_COPY_TEXT, pl ? L"\xD83D\xDCCB VID:PID" : L"\xD83D\xDCCB VID:PID", selUsb->vidPid });
+                }
+                if (!selUsb->vendorName.empty() || !selUsb->manufacturer.empty()) {
+                    std::wstring vend = selUsb->vendorName;
+                    if (!selUsb->manufacturer.empty() && selUsb->manufacturer != selUsb->vendorName) {
+                        if (!vend.empty()) vend += L"   \x2022   INF: ";
+                        vend += selUsb->manufacturer;
+                    }
+                    detRows.push_back({ pl ? L"Producent (Vendor / INF)" : L"Vendor / Manufacturer", vend, 0x0F172A });
+                }
+                if (!selUsb->comPortName.empty()) {
+                    std::wstring comSummary = selUsb->comPortName;
+                    if (selCom) {
+                        comSummary += L"  \x2022  " + std::to_wstring(selCom->defaultBaud) + L" baud  \x2022  " + selCom->ntDevicePath;
+                    }
+                    detRows.push_back({ pl ? L"Przypisany port COM" : L"Assigned COM Port",
+                                        comSummary, 0xD97706,
+                                        CMD_HW_COPY_TEXT, pl ? L"\xD83D\xDCCB Kopiuj COM" : L"\xD83D\xDCCB Copy COM", selUsb->comPortName });
+                }
+                detRows.push_back({ pl ? L"Klasa PnP i Sterownik" : L"PnP Class & Service",
+                                    (selUsb->className.empty() ? L"USB" : selUsb->className) +
+                                    (selUsb->serviceDriver.empty() ? L"" : (L"   \x2022   Service: " + selUsb->serviceDriver)) });
+                if (!selUsb->driverVersion.empty() || !selUsb->driverProvider.empty()) {
+                    detRows.push_back({ pl ? L"Wersja sterownika" : L"Driver Version",
+                                        selUsb->driverVersion + (selUsb->driverProvider.empty() ? L"" : (L"   (" + selUsb->driverProvider + L")")),
+                                        0x059669 });
+                }
+                if (!selUsb->locationInfo.empty()) {
+                    std::wstring locStr = selUsb->locationInfo;
+                    if (selUsb->portNumber > 0) {
+                        locStr += L"   (Port #" + std::to_wstring(selUsb->portNumber) +
+                                  (selUsb->hubNumber > 0 ? (L", Hub #" + std::to_wstring(selUsb->hubNumber)) : L"") + L")";
+                    }
+                    detRows.push_back({ pl ? L"Lokalizacja fizyczna" : L"Physical Location", locStr, 0x0D9488 });
+                }
+                if (!selUsb->serialNumber.empty()) {
+                    detRows.push_back({ pl ? L"Numer seryjny (iSerial)" : L"USB Serial Number",
+                                        selUsb->serialNumber, 0x059669,
+                                        CMD_HW_COPY_TEXT, pl ? L"\xD83D\xDCCB S/N" : L"\xD83D\xDCCB S/N", selUsb->serialNumber });
+                }
+                if (!selUsb->pdoName.empty()) {
+                    detRows.push_back({ pl ? L"Obiekt jądra (PDO)" : L"Kernel PDO Name", selUsb->pdoName });
+                }
+                detRows.push_back({ pl ? L"Device Instance ID" : L"Device Instance ID",
+                                    selUsb->deviceInstanceId, 0x334155,
+                                    CMD_HW_COPY_TEXT, pl ? L"\xD83D\xDCCB Kopiuj ID" : L"\xD83D\xDCCB Copy ID", selUsb->deviceInstanceId });
+                if (!selUsb->parentInstanceId.empty()) {
+                    detRows.push_back({ pl ? L"Węzeł nadrzędny (Parent)" : L"Parent Instance ID", selUsb->parentInstanceId, 0x64748B });
+                }
+                if (!selUsb->hardwareIds.empty()) {
+                    detRows.push_back({ pl ? L"Identyfikatory HWID" : L"Hardware IDs (HWID)", selUsb->hardwareIds, 0x475569 });
+                }
+                detRows.push_back({ pl ? L"Status węzła PnP" : L"PnP Node Status",
+                                    selUsb->statusStr, selUsb->problemCode == 0 ? 0x059669u : 0xDC2626u });
+            } else {
+                detRows.push_back({ pl ? L"Wskazówka" : L"Hint",
+                                    pl ? L"Kliknij dowolny kontroler, hub lub urządzenie w drzewie USB po lewej albo port COM powyżej."
+                                       : L"Click any controller, hub, or USB device in the tree on the left or a COM port above." });
+            }
+
+            return drawProCard(x, y, w, cardTitle, 0x7C3AED, detRows);
+        };
+
+        float hLeftTree = drawUsbTreeCard(leftX, curY, halfW);
+        float hRightCom = drawComPortsCard(rightX, curY, halfW);
+        float hRightDet = drawUsbComInspectorCard(rightX, curY + hRightCom + 10.0f, halfW);
+        curY += std::max(hLeftTree, hRightCom + 10.0f + hRightDet) + 16.0f;
     }
 
     float totalHeight = (curY + m_hwScrollY) - startY;

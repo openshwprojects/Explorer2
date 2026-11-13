@@ -4,6 +4,7 @@
 #include "FtpClient.h"
 #include <windowsx.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <shlwapi.h>
 #include <commdlg.h>
 #include <commctrl.h>
@@ -12,6 +13,7 @@
 #include <unordered_set>
 #include <memory>
 #include <thread>
+#include <system_error>
 #include <algorithm>
 #include <cmath>
 
@@ -29,6 +31,7 @@ constexpr UINT_PTR ID_TIMER_MEDIA     = 2001;
 constexpr UINT_PTR ID_TIMER_WORK_ANIM = 2002;
 constexpr UINT_PTR ID_TIMER_MONITOR   = 2003;   // slow refresh of the Monitoring history view
 constexpr UINT_PTR ID_TIMER_GIT       = 2004;   // periodic git status refresh while a repository is shown
+constexpr UINT_PTR ID_TIMER_SLIDESHOW = 2005;   // FullViewer slideshow timer (3.5s interval)
 
 static WNDPROC g_origEditProc = nullptr;
 
@@ -38,6 +41,16 @@ struct RenameJobResult {
     DWORD error = 0;
     bool ok = false;         // the OS call succeeded
     bool verified = false;   // the new name really exists afterwards (and the old one is gone)
+};
+
+// Result of unpacking an archive in the background (heap-allocated by the worker, owned by the
+// WM_APP_EXTRACT_DONE handler)
+struct ExtractJobResult {
+    std::wstring archivePath, targetFolder;
+    bool toSubfolder = false;
+    bool ok = false;
+    size_t keptExisting = 0;     // files that were already there and were not replaced
+    size_t refused = 0;          // entries that pointed outside the destination
 };
 
 static std::wstring SystemErrorText(DWORD err) {
@@ -99,12 +112,18 @@ ExplorerApp::ExplorerApp() {
 
 ExplorerApp::~ExplorerApp() {
     AppLog::Info(L"App", L"Explorer2 shutting down");
+    m_transfers.Shutdown();
+    if (m_taskbarList) {
+        m_taskbarList->Release();
+        m_taskbarList = nullptr;
+    }
     m_contentPane.Shutdown();
     m_mediaPlayer.Shutdown();
     m_imageCache.Shutdown();
     m_fileEngine.Shutdown();
     DiscardDeviceResources();
 
+    m_textLayouts.Clear();
     if (m_fmtRegular) m_fmtRegular->Release();
     if (m_fmtSmall) m_fmtSmall->Release();
     if (m_fmtBold) m_fmtBold->Release();
@@ -119,6 +138,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     m_hInstance = hInstance;
 
     AppLog::Init();
+    AppLog::InstallCrashHandler();
     {
         wchar_t exe[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -136,8 +156,16 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     wc.lpfnWndProc = ExplorerApp::WndProcStatic;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(GetModuleHandleW(L"shell32.dll"), MAKEINTRESOURCEW(4));
-    wc.hIconSm = wc.hIcon;
+    HICON hAppIconBig = static_cast<HICON>(LoadImageW(
+        hInstance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    HICON hAppIconSm = static_cast<HICON>(LoadImageW(
+        hInstance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+    if (!hAppIconBig) hAppIconBig = LoadIconW(GetModuleHandleW(L"shell32.dll"), MAKEINTRESOURCEW(4));
+    if (!hAppIconSm)  hAppIconSm  = hAppIconBig;
+    wc.hIcon = hAppIconBig;
+    wc.hIconSm = hAppIconSm;
     wc.lpszClassName = L"Explorer2MainWndClass";
     RegisterClassExW(&wc);
 
@@ -185,20 +213,40 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     SetWindowLongPtrW(m_renameEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(InlineEditSubclassProc));
 
     m_fileEngine.Initialize(m_hwnd);
+    m_fileEngine.StartUndoStagingSweep();   // clears undo copies that earlier sessions could not remove
+    m_transfers.Initialize(m_hwnd);
+    m_wmTaskbarBtnCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
     m_imageCache.Initialize(m_hwnd);
     m_shellEmulator.InitializeAsync();
     m_mediaPlayer.Initialize(m_hwnd);
     m_contentPane.Initialize(m_hwnd, hInstance, m_d2dFactory, m_dwriteFactory);
+    DragAcceptFiles(m_hwnd, TRUE);
     AppLog::Info(L"App", L"Init step 1: Subsystems initialized");
 
     m_pinnedFolders = FileEngine::GetDefaultQuickAccessFolders(m_lang);
+    LoadUiSettings();
+    {
+        std::wstring queuePersistPath = PathUtils::GetParentPath(MonitorStore::DataDir()) + L"\\transfer_queue.dat";
+        size_t recoveredXfers = m_transfers.EnableQueuePersistence(queuePersistPath);
+        if (recoveredXfers > 0) {
+            const bool pl = (m_lang == Lang::PL);
+            m_statusToast = (pl ? L"\x23F8 Przywrócono niedokończone transfery po restarcie ("
+                                : L"\x23F8 Restored unfinished transfers after restart (") +
+                            std::to_wstring(recoveredXfers) +
+                            (pl ? L") — kliknij [Wznów] w karcie Transfery"
+                                : L") — click [Resume] in Transfers");
+            m_statusToastExpireTick = GetTickCount64() + 7500;
+            AppLog::Info(L"Transfer", L"Recovered " + std::to_wstring(recoveredXfers) + L" unfinished transfer job(s) as Paused");
+            UpdateTaskbarProgress();
+        }
+    }
     RebuildTreeNodes();
-    AppLog::Info(L"App", L"Init step 2: Tree nodes built");
+    AppLog::Info(L"App", L"Init step 2: Settings loaded & Tree nodes built");
 
     std::wstring startDir = initialPath;
     if (startDir.empty()) {
-        if (GetFileAttributesW(L"W:\\Fooocus_Advanced") != INVALID_FILE_ATTRIBUTES) {
-            startDir = L"W:\\Fooocus_Advanced";
+        if (!m_currentPath.empty() && (m_currentPath == L"THIS_PC" || GetFileAttributesW(m_currentPath.c_str()) != INVALID_FILE_ATTRIBUTES)) {
+            startDir = m_currentPath;
         } else {
             wchar_t cwd[MAX_PATH] = {};
             GetCurrentDirectoryW(MAX_PATH, cwd);
@@ -206,8 +254,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
         }
     }
 
-    LoadUiSettings();
-    AppLog::Info(L"App", L"Init step 3: UI settings loaded, navigating to " + startDir);
+    AppLog::Info(L"App", L"Init step 3: Navigating to " + startDir);
     NavigateTo(startDir, true);
     AppLog::Info(L"App", L"Init step 4: NavigateTo completed");
 
@@ -364,6 +411,17 @@ LRESULT CALLBACK ExplorerApp::WndProcStatic(HWND hwnd, UINT msg, WPARAM wParam, 
 }
 
 LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (m_wmTaskbarBtnCreated != 0 && msg == m_wmTaskbarBtnCreated) {
+        if (m_taskbarList) {
+            m_taskbarList->Release();
+            m_taskbarList = nullptr;
+        }
+        m_lastTbState = 0;
+        m_lastTbPermille = -1;
+        UpdateTaskbarProgress();
+        return 0;
+    }
+
     switch (msg) {
     case WM_SIZE:
         OnResize(LOWORD(lParam), HIWORD(lParam));
@@ -380,7 +438,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == ID_TIMER_MEDIA && m_mediaPlayer.HasMedia() && m_mediaPlayer.IsPlaying()) {
             InvalidateRect(m_hwnd, nullptr, FALSE);
         } else if (wParam == ID_TIMER_WORK_ANIM) {
-            if (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView()) {
+            if (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView() && !IsTransfersView()) {
                 m_hwInspector.ApplyStagedData();
                 if (m_hwLiveRefresh) {
                     ULONGLONG now = GetTickCount64();
@@ -389,6 +447,14 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                         m_hwInspector.UpdateLiveTelemetry();
                     }
                 }
+            }
+            if (m_transfers.HasRunningJobs() || IsTransfersView()) {
+                m_transfers.GetTelemetry();
+            }
+            UpdateTaskbarProgress();
+            if (m_pendingDeferredDirRefresh && !m_transfers.HasRunningJobs()) {
+                m_pendingDeferredDirRefresh = false;
+                RefreshCurrentFolder();
             }
             {
                 ULONGLONG nowMs = GetTickCount64();
@@ -437,6 +503,27 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 KillTimer(m_hwnd, ID_TIMER_MONITOR);
             }
+        } else if (wParam == ID_TIMER_SLIDESHOW) {
+            if (m_viewMode == ViewMode::FullViewer && m_viewerSlideshow && !m_items.empty()) {
+                int oldFocus = m_focusedIndex;
+                StepViewerImage(1);
+                if (m_focusedIndex == oldFocus) {
+                    // Wrap around to first image
+                    for (int i = 0; i < static_cast<int>(m_items.size()); ++i) {
+                        if (m_items[i].isImage || m_items[i].isVideo) {
+                            SelectSingle(i, true);
+                            ResetViewerZoom();
+                            EnsureItemVisible(i);
+                            InvalidateRect(m_hwnd, nullptr, FALSE);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                m_viewerSlideshow = false;
+                KillTimer(m_hwnd, ID_TIMER_SLIDESHOW);
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+            }
         }
         return 0;
 
@@ -456,6 +543,85 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         SetFocus(m_hwnd);
         CancelInlineEdits(false);
         OnMouseDown(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)), true, wParam);
+        return 0;
+
+    case WM_MBUTTONDOWN: {
+        float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        if (IsTabBarVisible()) {
+            for (const auto& th : m_tabHits) {
+                if (!th.isNewTabBtn && PathUtils::PtInRectF(mx, my, th.tabRect)) {
+                    CloseTab(th.tabIndex);
+                    return 0;
+                }
+            }
+        }
+        for (const auto& bc : m_breadcrumbs) {
+            if (PathUtils::PtInRectF(mx, my, bc.hitRect) && !bc.path.empty()) {
+                CreateNewTab(bc.path, true);
+                return 0;
+            }
+        }
+        if (IsSplitViewActive()) {
+            for (const auto& bc : m_otherPane.breadcrumbs) {
+                if (PathUtils::PtInRectF(mx, my, bc.hitRect) && !bc.path.empty()) {
+                    CreateNewTab(bc.path, true);
+                    return 0;
+                }
+            }
+        }
+        D2D1_RECT_F fullRect = GetFullWorkspaceRect();
+        if (!m_isFullScreen && m_showNavPane && mx < m_treePaneWidth && my >= fullRect.top && my <= fullRect.bottom) {
+            for (const auto& node : m_treeNodes) {
+                if (PathUtils::PtInRectF(mx, my, node.hitRect) && !node.path.empty() && node.normKey != L"__HEADER_FTP__") {
+                    CreateNewTab(node.path, true);
+                    return 0;
+                }
+            }
+        }
+        D2D1_RECT_F contentRect = GetContentItemsRect();
+        bool onItem = false;
+        int hitIdx = HitTestItem(mx, my, contentRect, &onItem);
+        if (hitIdx >= 0 && hitIdx < static_cast<int>(m_items.size()) && onItem && m_items[hitIdx].isDirectory) {
+            CreateNewTab(m_items[hitIdx].fullPath, true);
+            return 0;
+        }
+        return 0;
+    }
+
+    case WM_DROPFILES: {
+        HDROP hDrop = reinterpret_cast<HDROP>(wParam);
+        POINT pt = {};
+        DragQueryPoint(hDrop, &pt);
+        UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+        std::vector<std::wstring> dropped;
+        dropped.reserve(count);
+        for (UINT i = 0; i < count; ++i) {
+            UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
+            std::wstring p(len, L'\0');
+            DragQueryFileW(hDrop, i, p.data(), len + 1);
+            if (!p.empty()) dropped.push_back(std::move(p));
+        }
+        DragFinish(hDrop);
+        if (!dropped.empty()) {
+            std::wstring dstDir = ResolveDropTargetFolder(static_cast<float>(pt.x), static_cast<float>(pt.y));
+            if (dstDir.empty()) dstDir = m_currentPath;
+            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            ExecuteDropFiles(dropped, dstDir, ctrl, shift);
+        }
+        return 0;
+    }
+
+    case WM_CLOSE:
+        SaveUiSettings(true);
+        DestroyWindow(m_hwnd);
+        return 0;
+
+    case WM_ENDSESSION:
+        // Windows is shutting down or the user is signing out: the process is ended right after this
+        // message, without WM_CLOSE, so this is the last chance to save the settings.
+        if (wParam) SaveUiSettings(true);
         return 0;
 
     case WM_SETCURSOR:
@@ -550,6 +716,51 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
 
+    case WM_APP_PREVIEW_READY:
+        // The preview pane's worker has read the selected file (a result for a file no longer selected is dropped)
+        if (m_contentPane.OnPreviewLoaded()) InvalidateRect(m_hwnd, nullptr, FALSE);
+        EnsureWorkAnimTimerState();
+        return 0;
+
+    case WM_APP_EXT_ICONS_READY: {
+        // Listings made before a file type's icon was known show a generic icon for it until now
+        m_fileEngine.AcknowledgeIconNotification();
+        bool changed = m_fileEngine.RefreshIconIndices(m_allItems);
+        changed = m_fileEngine.RefreshIconIndices(m_items) || changed;
+        changed = m_fileEngine.RefreshIconIndices(m_otherPane.allItems) || changed;
+        changed = m_fileEngine.RefreshIconIndices(m_otherPane.items) || changed;
+        for (auto& tab : m_tabs) {
+            changed = m_fileEngine.RefreshIconIndices(tab.allItems) || changed;
+            changed = m_fileEngine.RefreshIconIndices(tab.items) || changed;
+        }
+        if (changed) InvalidateRect(m_hwnd, nullptr, FALSE);
+        return 0;
+    }
+
+    case WM_APP_DIR_CHANGED:
+        if (!m_isSearchActive && m_renamingIndex < 0 && m_renamingPath.empty() &&
+            m_renamePending.load() == 0 && m_mergePending.load() == 0 &&
+            !m_imageCache.IsAnyImageTransforming()) {
+            // A running delete job counts as "touching" the folders it works in, like a copy or a move
+            bool activeXferHere = m_transfers.IsTouchingDirectory(m_currentNormKey);
+            if (!activeXferHere && IsSplitViewActive() && !m_otherPane.currentPath.empty()) {
+                activeXferHere = m_transfers.IsTouchingDirectory(PathUtils::NormalizePathKey(m_otherPane.currentPath));
+            }
+            if (activeXferHere) {
+                ULONGLONG nowTick = GetTickCount64();
+                if (nowTick - m_lastDirChangedWhileXferTick < 1500) {
+                    m_pendingDeferredDirRefresh = true;
+                    return 0;
+                }
+                m_lastDirChangedWhileXferTick = nowTick;
+                m_pendingDeferredDirRefresh = false;
+            } else {
+                m_pendingDeferredDirRefresh = false;
+            }
+            RefreshCurrentFolder();
+        }
+        return 0;
+
     case WM_APP_IMAGE_ROTATED: {
         m_imageCache.TakeCompletedRotations();
         auto transforms = m_imageCache.TakeCompletedTransforms();
@@ -611,14 +822,9 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_APP_FOLDER_SIZE_UPDATED:
-        if (m_currentPath == L"THIS_PC") {
-            RebuildTreeNodes();
-            RefreshCurrentFolder();
-        } else {
-            SyncFolderSizesFromCache();
-            EnsureWorkAnimTimerState();
-            InvalidateRect(m_hwnd, nullptr, FALSE);
-        }
+        SyncFolderSizesFromCache();
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
 
     case WM_APP_SEARCH_UPDATED:
@@ -669,7 +875,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (m_mergePending.load() > 0) --m_mergePending;
         if (m_mergePending.load() == 0) {
             m_mergePendingText.clear();
-            m_mergeMovedCount = 0;
+            *m_mergeMovedCount = 0;
         }
         const bool pl = (m_lang == Lang::PL);
         const std::wstring arrow = r->srcName + L"  \x2192  " + r->dstName;
@@ -707,56 +913,143 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
-    case WM_APP_DELETE_DONE: {
-        const Strings& s = GetStrings(m_lang);
-        m_statusToast = (wParam != 0) ? s.statusDeletedPerm : s.statusDeletedRecycle;
-        m_statusToastExpireTick = GetTickCount64() + 3500;
-
-        // Items the worker could not remove: tell the user why instead of letting them silently reappear
-        std::vector<DeleteFailure> failures = m_fileEngine.TakeDeleteFailures();
-        if (failures.empty()) {
-            AppLog::Ok(L"Delete", wParam != 0 ? L"Permanent delete finished" : L"Move to Recycle Bin finished");
+    case WM_APP_EXTRACT_DONE: {
+        std::unique_ptr<ExtractJobResult> r(reinterpret_cast<ExtractJobResult*>(lParam));
+        if (!r) return 0;
+        if (m_extractPending.load() > 0) --m_extractPending;
+        if (m_extractPending.load() == 0) m_extractPendingText.clear();
+        m_extractLastDoneKey = PathUtils::NormalizePathKey(r->archivePath) + L"|" + PathUtils::NormalizePathKey(r->targetFolder);
+        m_extractLastDoneTick = GetTickCount64();
+        m_extractActive.erase(m_extractLastDoneKey);
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring toast;
+        if (r->ok) {
+            toast = r->toSubfolder
+                ? (pl ? L"\x2713 Rozpakowano do folderu: " : L"\x2713 Extracted to subfolder: ")
+                : (pl ? L"\x2713 Rozpakowano archiwum do: " : L"\x2713 Extracted archive to: ");
+            toast += r->targetFolder;
         } else {
-            AppLog::Warn(L"Delete", std::to_wstring(failures.size()) + L" item(s) could not be deleted");
-            for (const auto& f : failures) AppLog::Error(L"Delete", f.path + L"  ->  " + (f.error ? SystemErrorText(f.error) : std::wstring(L"unknown reason")));
+            toast = (pl ? L"\x2717 Nie udało się rozpakować archiwum: " : L"\x2717 The archive could not be extracted: ") +
+                    PathUtils::GetFileName(r->archivePath);
         }
-        if (!failures.empty()) {
-            const bool pl = (m_lang == Lang::PL);
-            std::wstring msg = pl ? (std::to_wstring(failures.size()) + L" element(ów) nie udało się usunąć:\n\n")
-                                  : (std::to_wstring(failures.size()) + L" item(s) could not be deleted:\n\n");
-            bool sawLockOrAccess = false;
-            size_t shown = 0;
-            for (const auto& f : failures) {
-                if (shown++ >= 6) break;
-                std::wstring reason;
-                if (f.error != 0) {
-                    wchar_t buf[256] = {};
-                    FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, f.error, 0, buf, 255, nullptr);
-                    reason = buf;
-                    while (!reason.empty() && (reason.back() == L'\r' || reason.back() == L'\n' || reason.back() == L' ')) reason.pop_back();
-                    reason += L" (" + std::to_wstring(f.error) + L")";
-                    if (f.error == ERROR_SHARING_VIOLATION || f.error == ERROR_ACCESS_DENIED || f.error == ERROR_LOCK_VIOLATION) sawLockOrAccess = true;
-                } else {
-                    reason = pl ? L"nieznany powód" : L"unknown reason";
-                }
-                msg += f.path + L"\n    \x2192 " + reason + L"\n";
-            }
-            if (failures.size() > 6) msg += L"...\n";
-            if (sawLockOrAccess) {
-                msg += pl ? L"\nPlik jest prawdopodobnie używany przez inny program (maszyna wirtualna, Unity, indeksowanie, antywirus) albo wymaga uprawnień administratora."
-                          : L"\nThe file is probably in use by another program (VM, Unity, indexer, antivirus) or needs administrator rights.";
-            }
-            MessageBoxW(m_hwnd, msg.c_str(), pl ? L"Nie wszystko zostało usunięte" : L"Not everything was deleted", MB_OK | MB_ICONWARNING);
-            RefreshCurrentFolder();   // show what is really still there
+        // Say what was not done the plain way, so that nothing looks as if it had been replaced or lost
+        if (r->keptExisting > 0) {
+            toast += (pl ? L"  \x2022  istniejących plików nie zastąpiono: " : L"  \x2022  existing files not replaced: ") +
+                     std::to_wstring(r->keptExisting) + (pl ? L" (nowe zapisano jako \"nazwa (2)\")" : L" (new ones saved as \"name (2)\")");
         }
-        InvalidateRect(m_hwnd, nullptr, FALSE);
+        if (r->refused > 0) {
+            toast += (pl ? L"  \x2022  pominięto wpisy wychodzące poza folder: " : L"  \x2022  skipped entries pointing outside the folder: ") +
+                     std::to_wstring(r->refused);
+        }
+        m_statusToast = toast;
+        m_statusToastExpireTick = GetTickCount64() + (r->ok ? 6500 : 9000);
+        const std::wstring logLine = r->archivePath + L"  ->  " + r->targetFolder +
+            L"  (existing files kept: " + std::to_wstring(r->keptExisting) + L", entries refused: " + std::to_wstring(r->refused) + L")";
+        if (r->ok) AppLog::Ok(L"Extract", L"Extracted: " + logLine);
+        else AppLog::Error(L"Extract", L"Could not extract: " + logLine);
+
+        // Show what arrived when the folder on screen is the one that was unpacked into, or the one above it
+        const std::wstring targetKey = PathUtils::NormalizePathKey(r->targetFolder);
+        if (targetKey == m_currentNormKey || PathUtils::NormalizePathKey(PathUtils::GetParentPath(r->targetFolder)) == m_currentNormKey) {
+            RefreshCurrentFolder();
+        }
         EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return 0;
+    }
+
+    case WM_APP_TRANSFER_UPDATE: {
+        const bool pl = (m_lang == Lang::PL);
+        auto events = m_transfers.TakeCompletionEvents();
+        bool needRefreshMain = false;
+        bool needRefreshOther = false;
+        std::wstring otherNorm = m_otherPane.currentPath.empty() ? L"" : PathUtils::NormalizePathKey(m_otherPane.currentPath);
+
+        std::vector<TransferCompletionEvent> deleteProblems;
+        for (const auto& ev : events) {
+            if (ev.op == TransferOp::Delete) {
+                // Whatever the job could not remove is still on disk and has to be listed again
+                m_fileEngine.EndDelete(ev.sources);
+                for (const auto& sd : ev.sourceDirs) {
+                    std::wstring sNorm = PathUtils::NormalizePathKey(sd);
+                    if (sNorm == m_currentNormKey) needRefreshMain = true;
+                    if (!otherNorm.empty() && sNorm == otherNorm) needRefreshOther = true;
+                }
+                if (ReportDeleteJobResult(ev)) deleteProblems.push_back(ev);
+                continue;
+            }
+
+            std::wstring dstNorm = PathUtils::NormalizePathKey(ev.targetDir);
+            if (dstNorm == m_currentNormKey) needRefreshMain = true;
+            if (!otherNorm.empty() && dstNorm == otherNorm) needRefreshOther = true;
+            for (const auto& sd : ev.sourceDirs) {
+                std::wstring sNorm = PathUtils::NormalizePathKey(sd);
+                if (sNorm == m_currentNormKey) needRefreshMain = true;
+                if (!otherNorm.empty() && sNorm == otherNorm) needRefreshOther = true;
+            }
+
+            std::wstring dstLeaf = FtpClient::IsFtpPath(ev.targetDir)
+                ? FtpClient::GetFtpLeafName(ev.targetDir)
+                : PathUtils::GetFileName(ev.targetDir);
+            if (dstLeaf.empty()) dstLeaf = ev.targetDir;
+            const wchar_t* verbPl = (ev.op == TransferOp::Move) ? L"Przeniesiono " : L"Skopiowano ";
+            const wchar_t* verbEn = (ev.op == TransferOp::Move) ? L"Moved " : L"Copied ";
+
+            if (ev.finalState == TransferJobState::Cancelled) {
+                m_statusToast = (pl ? L"\x26A0 Anulowano transfer do " : L"\x26A0 Cancelled transfer to ") + dstLeaf;
+                m_statusToastExpireTick = GetTickCount64() + 3600;
+                AppLog::Warn(L"Transfer", L"Job #" + std::to_wstring(ev.jobId) + L" cancelled -> " + ev.targetDir);
+            } else if (ev.finalState == TransferJobState::CompletedWithErrors) {
+                m_statusToast = (pl ? L"\x26A0 Transfer z błędami (" : L"\x26A0 Transfer with errors (") +
+                                std::to_wstring(ev.errorCount) + (pl ? L"): kliknij [Transfery] aby ponowić" : L"): open [Transfers] to retry");
+                m_statusToastExpireTick = GetTickCount64() + 5500;
+                AppLog::Warn(L"Transfer", L"Job #" + std::to_wstring(ev.jobId) + L" finished with " +
+                             std::to_wstring(ev.errorCount) + L" error(s) -> " + ev.targetDir);
+            } else {
+                wchar_t secBuf[32] = {};
+                swprintf_s(secBuf, L"%.2f s", static_cast<double>(ev.elapsedMs) / 1000.0);
+                m_statusToast = L"\x2713 " + std::wstring(pl ? verbPl : verbEn) +
+                                std::to_wstring(ev.doneFiles) + (pl ? L" el. (" : L" item(s) (") +
+                                FileEngine::FormatSizeDetailed(ev.doneBytes) + L")  \x2192  " + dstLeaf +
+                                L"  \x2022  " + secBuf + L" (" + TransferManager::FormatSpeed(ev.avgBytesPerSec) + L")";
+                m_statusToastExpireTick = GetTickCount64() + 4500;
+                AppLog::Ok(L"Transfer", std::wstring(ev.op == TransferOp::Move ? L"Move" : L"Copy") + L" #" +
+                           std::to_wstring(ev.jobId) + L": " + std::to_wstring(ev.doneFiles) + L" files (" +
+                           FileEngine::FormatSizeDetailed(ev.doneBytes) + L") -> " + ev.targetDir +
+                           L" @ " + TransferManager::FormatSpeed(ev.avgBytesPerSec));
+            }
+        }
+
+        if (needRefreshMain) {
+            m_pendingDeferredDirRefresh = false;
+            RefreshCurrentFolder();
+        }
+        if (needRefreshOther && IsSplitViewActive()) {
+            m_pendingDeferredDirRefresh = false;
+            int prevActive = m_activePane;
+            SwapWithOtherPane();
+            m_activePane = 1 - prevActive;
+            RefreshCurrentFolder();
+            SwapWithOtherPane();
+            m_activePane = prevActive;
+        }
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        // Shown last, once the lists are up to date: what a delete job could not remove, and why
+        for (const auto& ev : deleteProblems) ShowDeleteFailures(ev);
         return 0;
     }
 
     case WM_DESTROY:
         KillTimer(m_hwnd, ID_TIMER_MEDIA);
         KillTimer(m_hwnd, ID_TIMER_WORK_ANIM);
+        m_workAnimIntervalMs = 0;
+        if (m_taskbarList) {
+            m_taskbarList->SetProgressState(m_hwnd, TBPF_NOPROGRESS);
+            m_taskbarList->Release();
+            m_taskbarList = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -775,8 +1068,18 @@ void ExplorerApp::SyncMediaPlayerToSelection() {
     if (inMediaViewer && m_focusedIndex >= 0 && m_focusedIndex < static_cast<int>(m_items.size())) {
         const FileEntry& item = m_items[m_focusedIndex];
         if (item.isVideo || item.isAudio) {
-            if (m_mediaPlayer.GetCurrentPath() != item.fullPath) {
-                m_mediaPlayer.OpenAndPlay(item.fullPath);
+            std::wstring mediaPath = item.fullPath;
+            if (GetFileAttributesW(mediaPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                std::wstring arcFile, innerEntry;
+                if (ArchiveExplorer::SplitVirtualArchivePath(mediaPath, arcFile, innerEntry) && !innerEntry.empty()) {
+                    std::wstring tempFile;
+                    if (ArchiveExplorer::ExtractSingleEntryToTempFile(arcFile, innerEntry, tempFile) && !tempFile.empty()) {
+                        mediaPath = tempFile;
+                    }
+                }
+            }
+            if (m_mediaPlayer.GetCurrentPath() != mediaPath) {
+                m_mediaPlayer.OpenAndPlay(mediaPath);
                 SetTimer(m_hwnd, ID_TIMER_MEDIA, 33, nullptr);
             }
             return;
@@ -842,6 +1145,7 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
     m_currentPath = cleanPath;
     m_currentNormKey = (cleanPath == L"THIS_PC") ? L"__HEADER_PC__" : PathUtils::NormalizePathKey(cleanPath);
     RecordVisitedDirectory(m_currentPath);
+    m_fileEngine.WatchDirectory(m_currentPath);
 
     if (m_viewMode == ViewMode::Hardware) {
         m_viewMode = m_lastNonViewerMode;
@@ -850,7 +1154,8 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
             m_activeRibbonTab == RibbonTab::Monitoring ||
             m_activeRibbonTab == RibbonTab::Lan ||
             m_activeRibbonTab == RibbonTab::Log ||
-            m_activeRibbonTab == RibbonTab::Backups) {
+            m_activeRibbonTab == RibbonTab::Backups ||
+            m_activeRibbonTab == RibbonTab::Transfers) {
             m_activeRibbonTab = RibbonTab::Home;
         }
     }
@@ -985,6 +1290,9 @@ void ExplorerApp::NavigateUp() {
 }
 
 void ExplorerApp::RefreshCurrentFolder(const std::wstring& preserveSelectedPath) {
+    if (FtpClient::IsFtpPath(m_currentPath)) {
+        FtpClient::InvalidateListingCache();
+    }
     std::wstring selPath = preserveSelectedPath;
     if (selPath.empty() && m_focusedIndex >= 0 && m_focusedIndex < static_cast<int>(m_items.size())) {
         selPath = m_items[m_focusedIndex].fullPath;
@@ -1088,13 +1396,28 @@ void ExplorerApp::RebuildBreadcrumbs() {
 
     if (m_currentPath.size() >= 2 && m_currentPath[1] == L':') {
         std::wstring driveRoot = m_currentPath.substr(0, 2) + L"\\";
-        wchar_t volName[MAX_PATH] = {};
-        if (GetDriveTypeW(driveRoot.c_str()) != DRIVE_REMOTE) {
-            GetVolumeInformationW(driveRoot.c_str(), volName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
+        wchar_t dlChar = static_cast<wchar_t>(towupper(m_currentPath[0]));
+        static std::wstring s_cachedDriveLabels[26];
+        static bool s_cachedDriveProbed[26] = {};
+        std::wstring dl = m_currentPath.substr(0, 2);
+        std::wstring driveLabel = dl;
+        if (dlChar >= L'A' && dlChar <= L'Z') {
+            int dIdx = dlChar - L'A';
+            if (!s_cachedDriveProbed[dIdx]) {
+                s_cachedDriveProbed[dIdx] = true;
+                wchar_t volName[MAX_PATH] = {};
+                if (GetDriveTypeW(driveRoot.c_str()) != DRIVE_REMOTE &&
+                    GetVolumeInformationW(driveRoot.c_str(), volName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0) &&
+                    volName[0]) {
+                    s_cachedDriveLabels[dIdx] = std::wstring(volName) + L" (" + dl + L")";
+                } else {
+                    s_cachedDriveLabels[dIdx] = dl;
+                }
+            }
+            driveLabel = s_cachedDriveLabels[dIdx];
         }
         BreadcrumbSegment driveSeg;
-        std::wstring dl = m_currentPath.substr(0, 2);
-        driveSeg.label = volName[0] ? (std::wstring(volName) + L" (" + dl + L")") : dl;
+        driveSeg.label = driveLabel;
         driveSeg.path = driveRoot;
         m_breadcrumbs.push_back(driveSeg);
 
@@ -1113,9 +1436,83 @@ void ExplorerApp::RebuildBreadcrumbs() {
     }
 }
 
+static std::wstring ComputeItemGroupBucket(const FileEntry& item, GroupByMode mode, Lang lang, int& outBucketOrder) {
+    const bool pl = (lang == Lang::PL);
+    outBucketOrder = 0;
+    if (mode == GroupByMode::None) return L"";
+
+    if (mode == GroupByMode::NameInitial) {
+        if (item.isDirectory || item.isDrive) {
+            outBucketOrder = 0;
+            return pl ? L"Foldery" : L"Folders";
+        }
+        wchar_t ch = item.name.empty() ? L'#' : static_cast<wchar_t>(towupper(item.name[0]));
+        if (ch >= L'0' && ch <= L'9') { outBucketOrder = 1; return L"0\x2013" L"9"; }
+        if (ch >= L'A' && ch <= L'E') { outBucketOrder = 2; return L"A\x2013" L"E"; }
+        if (ch >= L'F' && ch <= L'J') { outBucketOrder = 3; return L"F\x2013" L"J"; }
+        if (ch >= L'K' && ch <= L'O') { outBucketOrder = 4; return L"K\x2013" L"O"; }
+        if (ch >= L'P' && ch <= L'T') { outBucketOrder = 5; return L"P\x2013" L"T"; }
+        if (ch >= L'U' && ch <= L'Z') { outBucketOrder = 6; return L"U\x2013" L"Z"; }
+        outBucketOrder = 7;
+        return pl ? L"Inne (#)" : L"Other (#)";
+    }
+
+    if (mode == GroupByMode::DateBucket) {
+        FILETIME nowFt = {};
+        GetSystemTimeAsFileTime(&nowFt);
+        ULARGE_INTEGER nowUl = {}, itemUl = {};
+        nowUl.LowPart = nowFt.dwLowDateTime;
+        nowUl.HighPart = nowFt.dwHighDateTime;
+        itemUl.LowPart = item.writeTime.dwLowDateTime;
+        itemUl.HighPart = item.writeTime.dwHighDateTime;
+        constexpr uint64_t kDay100ns = 24ULL * 3600ULL * 10000000ULL;
+        uint64_t age = (nowUl.QuadPart > itemUl.QuadPart) ? (nowUl.QuadPart - itemUl.QuadPart) : 0ULL;
+        if (age < kDay100ns)        { outBucketOrder = 1; return pl ? L"Dziś" : L"Today"; }
+        if (age < 2 * kDay100ns)    { outBucketOrder = 2; return pl ? L"Wczoraj" : L"Yesterday"; }
+        if (age < 7 * kDay100ns)    { outBucketOrder = 3; return pl ? L"W tym tygodniu" : L"Earlier this week"; }
+        if (age < 30 * kDay100ns)   { outBucketOrder = 4; return pl ? L"W tym miesiącu" : L"Earlier this month"; }
+        if (age < 365 * kDay100ns)  { outBucketOrder = 5; return pl ? L"W tym roku" : L"Earlier this year"; }
+        outBucketOrder = 6;
+        return pl ? L"Starsze" : L"A long time ago";
+    }
+
+    if (mode == GroupByMode::FileType) {
+        outBucketOrder = item.isDirectory ? 0 : 1;
+        return item.typeName.empty() ? (pl ? L"Plik" : L"File") : item.typeName;
+    }
+
+    if (mode == GroupByMode::SizeTier) {
+        if (item.isDirectory && item.size == 0) {
+            outBucketOrder = 0;
+            return pl ? L"Foldery" : L"Folders";
+        }
+        uint64_t sz = item.size;
+        if (sz == 0)                       { outBucketOrder = 1; return pl ? L"Puste (0 B)" : L"Empty (0 B)"; }
+        if (sz < 100ULL * 1024)            { outBucketOrder = 2; return pl ? L"Bardzo małe (< 100 KB)" : L"Tiny (< 100 KB)"; }
+        if (sz < 1024ULL * 1024)           { outBucketOrder = 3; return pl ? L"Małe (100 KB – 1 MB)" : L"Small (100 KB – 1 MB)"; }
+        if (sz < 100ULL * 1024 * 1024)     { outBucketOrder = 4; return pl ? L"Średnie (1 – 100 MB)" : L"Medium (1 – 100 MB)"; }
+        if (sz < 1024ULL * 1024 * 1024)    { outBucketOrder = 5; return pl ? L"Duże (100 MB – 1 GB)" : L"Large (100 MB – 1 GB)"; }
+        outBucketOrder = 6;
+        return pl ? L"Ogromne (> 1 GB)" : L"Huge (> 1 GB)";
+    }
+    return L"";
+}
+
 void ExplorerApp::ApplyFilterAndSort() {
+    auto applyGroupingSort = [&]() {
+        if (m_groupBy == GroupByMode::None || m_items.size() <= 1) return;
+        std::stable_sort(m_items.begin(), m_items.end(), [&](const FileEntry& a, const FileEntry& b) {
+            int ordA = 0, ordB = 0;
+            std::wstring lblA = ComputeItemGroupBucket(a, m_groupBy, m_lang, ordA);
+            std::wstring lblB = ComputeItemGroupBucket(b, m_groupBy, m_lang, ordB);
+            if (ordA != ordB) return ordA < ordB;
+            return _wcsicmp(lblA.c_str(), lblB.c_str()) < 0;
+        });
+    };
+
     if (m_isSearchActive) {
         FileEngine::SortEntries(m_items, m_sortCol, m_sortAsc);
+        applyGroupingSort();
         ClampScrollOffset();
         return;
     }
@@ -1136,6 +1533,7 @@ void ExplorerApp::ApplyFilterAndSort() {
     }
 
     FileEngine::SortEntries(m_items, m_sortCol, m_sortAsc);
+    applyGroupingSort();
     ClampScrollOffset();
 }
 
@@ -1171,11 +1569,7 @@ D2D1_RECT_F ExplorerApp::GetSplitPaneOuterRect(int paneIdx) const {
 }
 
 D2D1_RECT_F ExplorerApp::GetSplitPaneContentMainRect(int paneIdx) const {
-    D2D1_RECT_F r = GetSplitPaneOuterRect(paneIdx);
-    if (IsSplitViewActive()) {
-        r.top = std::min(r.bottom, r.top + kSplitPaneHeaderHeight);
-    }
-    return r;
+    return GetSplitPaneOuterRect(paneIdx);
 }
 
 D2D1_RECT_F ExplorerApp::GetMainViewRect() const {
@@ -1188,32 +1582,277 @@ D2D1_RECT_F ExplorerApp::GetMainViewRect() const {
     return GetFullWorkspaceRect();
 }
 
+void ExplorerApp::SwapStateWith(ExplorerPaneState& state) {
+    std::swap(m_currentPath, state.currentPath);
+    std::swap(m_currentNormKey, state.currentNormKey);
+    std::swap(m_history, state.history);
+    std::swap(m_historyIndex, state.historyIndex);
+    std::swap(m_filterText, state.filterText);
+    std::swap(m_isSearchActive, state.isSearchActive);
+    std::swap(m_allItems, state.allItems);
+    std::swap(m_items, state.items);
+    std::swap(m_breadcrumbs, state.breadcrumbs);
+    std::swap(m_sortCol, state.sortCol);
+    std::swap(m_sortAsc, state.sortAsc);
+    std::swap(m_groupBy, state.groupBy);
+    std::swap(m_scrollY, state.scrollY);
+    std::swap(m_filmstripScrollX, state.filmstripScrollX);
+    std::swap(m_focusedIndex, state.focusedIndex);
+    std::swap(m_anchorIndex, state.anchorIndex);
+    std::swap(m_hoverIndex, state.hoverIndex);
+    std::swap(m_hoverRowActionKind, state.hoverRowActionKind);
+    std::swap(m_ScrollbarThumbRect, state.scrollbarThumbRect);
+    std::swap(m_folderViewStates, state.folderViewStates);
+    std::swap(m_treemapHits, state.treemapHits);
+    std::swap(m_hoverTreemapHitIndex, state.hoverTreemapHitIndex);
+    std::swap(m_pieHits, state.pieHits);
+    std::swap(m_hoverPieHitIndex, state.hoverPieHitIndex);
+    std::swap(m_pieCenterPt, state.pieCenterPt);
+    std::swap(m_pieCenterRadius, state.pieCenterRadius);
+}
+
 void ExplorerApp::SwapWithOtherPane() {
-    std::swap(m_currentPath, m_otherPane.currentPath);
-    std::swap(m_currentNormKey, m_otherPane.currentNormKey);
-    std::swap(m_history, m_otherPane.history);
-    std::swap(m_historyIndex, m_otherPane.historyIndex);
-    std::swap(m_filterText, m_otherPane.filterText);
-    std::swap(m_isSearchActive, m_otherPane.isSearchActive);
-    std::swap(m_allItems, m_otherPane.allItems);
-    std::swap(m_items, m_otherPane.items);
-    std::swap(m_breadcrumbs, m_otherPane.breadcrumbs);
-    std::swap(m_sortCol, m_otherPane.sortCol);
-    std::swap(m_sortAsc, m_otherPane.sortAsc);
-    std::swap(m_scrollY, m_otherPane.scrollY);
-    std::swap(m_filmstripScrollX, m_otherPane.filmstripScrollX);
-    std::swap(m_focusedIndex, m_otherPane.focusedIndex);
-    std::swap(m_anchorIndex, m_otherPane.anchorIndex);
-    std::swap(m_hoverIndex, m_otherPane.hoverIndex);
-    std::swap(m_hoverRowActionKind, m_otherPane.hoverRowActionKind);
-    std::swap(m_ScrollbarThumbRect, m_otherPane.scrollbarThumbRect);
-    std::swap(m_folderViewStates, m_otherPane.folderViewStates);
-    std::swap(m_treemapHits, m_otherPane.treemapHits);
-    std::swap(m_hoverTreemapHitIndex, m_otherPane.hoverTreemapHitIndex);
-    std::swap(m_pieHits, m_otherPane.pieHits);
-    std::swap(m_hoverPieHitIndex, m_otherPane.hoverPieHitIndex);
-    std::swap(m_pieCenterPt, m_otherPane.pieCenterPt);
-    std::swap(m_pieCenterRadius, m_otherPane.pieCenterRadius);
+    SwapStateWith(m_otherPane);
+}
+
+void ExplorerApp::CreateNewTab(const std::wstring& initialPath, bool switchToNew) {
+    CancelInlineEdits(false);
+    if (m_splitView) {
+        m_splitView = false;
+        m_activePane = 0;
+    }
+    if (m_tabs.empty()) {
+        m_tabs.resize(1);
+        m_activeTab = 0;
+    }
+    std::wstring targetPath = initialPath.empty() ? (m_currentPath.empty() ? L"THIS_PC" : m_currentPath) : initialPath;
+    int newIdx = static_cast<int>(m_tabs.size());
+    m_tabs.emplace_back();
+
+    if (switchToNew) {
+        SwapStateWith(m_tabs[m_activeTab]);
+        m_activeTab = newIdx;
+        NavigateTo(targetPath, true);
+    } else {
+        int prevTab = m_activeTab;
+        SwapStateWith(m_tabs[prevTab]);
+        m_activeTab = newIdx;
+        NavigateTo(targetPath, true);
+        SwapStateWith(m_tabs[newIdx]);
+        m_activeTab = prevTab;
+        SwapStateWith(m_tabs[prevTab]);
+    }
+    const bool pl = (m_lang == Lang::PL);
+    m_statusToast = (pl ? L"\x2795 Otwarto nową kartę: " : L"\x2795 Opened new tab: ") +
+                    (targetPath == L"THIS_PC" ? GetStrings(m_lang).navThisPC : PathUtils::GetFileName(targetPath));
+    m_statusToastExpireTick = GetTickCount64() + 2600;
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::SwitchToTab(int tabIndex) {
+    if (tabIndex < 0 || tabIndex >= static_cast<int>(m_tabs.size()) || tabIndex == m_activeTab) return;
+    CancelInlineEdits(false);
+    SwapStateWith(m_tabs[m_activeTab]);
+    m_activeTab = tabIndex;
+    SwapStateWith(m_tabs[m_activeTab]);
+    m_fileEngine.WatchDirectory(m_currentPath);
+    RebuildBreadcrumbs();
+    SyncGitRepo();
+    SyncMediaPlayerToSelection();
+    ClampScrollOffset();
+    std::wstring folderTitle = (m_currentPath == L"THIS_PC")
+        ? GetStrings(m_lang).navThisPC
+        : (FtpClient::IsFtpPath(m_currentPath) ? FtpClient::GetFtpLeafName(m_currentPath) : PathUtils::GetFileName(m_currentPath));
+    SetWindowTextW(m_hwnd, folderTitle.c_str());
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::CloseTab(int tabIndex) {
+    if (m_tabs.size() <= 1 || tabIndex < 0 || tabIndex >= static_cast<int>(m_tabs.size())) return;
+    CancelInlineEdits(false);
+    if (tabIndex == m_activeTab) {
+        int nextIdx = (tabIndex + 1 < static_cast<int>(m_tabs.size())) ? (tabIndex + 1) : (tabIndex - 1);
+        SwitchToTab(nextIdx);
+    }
+    m_tabs.erase(m_tabs.begin() + tabIndex);
+    if (tabIndex < m_activeTab) {
+        --m_activeTab;
+    }
+    if (m_tabs.size() == 1) {
+        m_tabs.clear();
+        m_activeTab = 0;
+    }
+    ClampScrollOffset();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+std::wstring ExplorerApp::ResolveDropTargetFolder(float x, float y, std::wstring* outTargetLabel) const {
+    if (outTargetLabel) outTargetLabel->clear();
+
+    // 1. Check Multi-Tab Bar
+    if (IsTabBarVisible()) {
+        for (const auto& th : m_tabHits) {
+            if (!th.isNewTabBtn && th.tabIndex >= 0 && th.tabIndex < static_cast<int>(m_tabs.size()) &&
+                PathUtils::PtInRectF(x, y, th.tabRect)) {
+                std::wstring tabPath = (th.tabIndex == m_activeTab) ? m_currentPath : m_tabs[th.tabIndex].currentPath;
+                if (!tabPath.empty() && tabPath != L"THIS_PC") {
+                    if (outTargetLabel) *outTargetLabel = PathUtils::GetFileName(tabPath);
+                    return tabPath;
+                }
+            }
+        }
+    }
+
+    // 2. Check Breadcrumb segments (both panes when Split View is active)
+    for (const auto& bc : m_breadcrumbs) {
+        if (PathUtils::PtInRectF(x, y, bc.hitRect) && !bc.path.empty() && bc.path != L"THIS_PC") {
+            if (outTargetLabel) *outTargetLabel = bc.label;
+            return bc.path;
+        }
+    }
+    if (IsSplitViewActive()) {
+        for (const auto& bc : m_otherPane.breadcrumbs) {
+            if (PathUtils::PtInRectF(x, y, bc.hitRect) && !bc.path.empty() && bc.path != L"THIS_PC") {
+                if (outTargetLabel) *outTargetLabel = bc.label;
+                return bc.path;
+            }
+        }
+    }
+
+    // 3. Check Left Navigation Tree
+    D2D1_RECT_F fullRect = GetFullWorkspaceRect();
+    if (!m_isFullScreen && m_showNavPane && x < m_treePaneWidth && y >= fullRect.top && y <= fullRect.bottom) {
+        for (const auto& node : m_treeNodes) {
+            if (PathUtils::PtInRectF(x, y, node.hitRect) && !node.path.empty() &&
+                node.path != L"THIS_PC" && node.normKey != L"__HEADER_FTP__") {
+                if (outTargetLabel) *outTargetLabel = node.label;
+                return node.path;
+            }
+        }
+    }
+
+    // 4. Check inactive Split Pane
+    if (IsSplitViewActive()) {
+        int otherIdx = 1 - m_activePane;
+        D2D1_RECT_F otherOuter = GetSplitPaneOuterRect(otherIdx);
+        if (PathUtils::PtInRectF(x, y, otherOuter)) {
+            if (m_otherPane.hoverIndex >= 0 && m_otherPane.hoverIndex < static_cast<int>(m_otherPane.items.size())) {
+                const auto& oItem = m_otherPane.items[m_otherPane.hoverIndex];
+                if (oItem.isDirectory && !oItem.isDrive) {
+                    if (outTargetLabel) *outTargetLabel = oItem.displayName;
+                    return oItem.fullPath;
+                }
+            }
+            if (!m_otherPane.currentPath.empty() && m_otherPane.currentPath != L"THIS_PC") {
+                if (outTargetLabel) *outTargetLabel = PathUtils::GetFileName(m_otherPane.currentPath);
+                return m_otherPane.currentPath;
+            }
+        }
+    }
+
+    // 5. Check folder item in active content view
+    D2D1_RECT_F contentRect = GetContentItemsRect();
+    bool onItem = false;
+    int hitIdx = HitTestItem(x, y, contentRect, &onItem);
+    if (hitIdx >= 0 && hitIdx < static_cast<int>(m_items.size()) && onItem) {
+        const auto& item = m_items[hitIdx];
+        if (item.isDirectory && !item.isDrive) {
+            if (outTargetLabel) *outTargetLabel = item.displayName;
+            return item.fullPath;
+        }
+    }
+
+    return L"";
+}
+
+void ExplorerApp::StartManagedTransfer(
+    const std::vector<std::wstring>& srcPaths,
+    const std::wstring& targetDir,
+    bool isMove,
+    bool forceVerifyXxHash)
+{
+    if (srcPaths.empty() || targetDir.empty() || targetDir == L"THIS_PC") return;
+    const bool pl = (m_lang == Lang::PL);
+
+    if (ArchiveExplorer::IsVirtualArchivePath(targetDir)) {
+        m_statusToast = pl ? L"\x26A0 Archiwa są tylko do odczytu (wypakuj pliki do zwykłego folderu)"
+                           : L"\x26A0 Archives are read-only (extract files into a standard folder)";
+        m_statusToastExpireTick = GetTickCount64() + 3800;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    // Resolve any source items originating inside a virtual archive by extracting to temp staging
+    std::vector<std::wstring> effectiveSrc;
+    effectiveSrc.reserve(srcPaths.size());
+    bool effectiveIsMove = isMove;
+    for (const auto& sp : srcPaths) {
+        std::wstring arcFile, innerEntry;
+        if (ArchiveExplorer::SplitVirtualArchivePath(sp, arcFile, innerEntry) && !innerEntry.empty()) {
+            std::wstring tempFile;
+            if (ArchiveExplorer::ExtractSingleEntryToTempFile(arcFile, innerEntry, tempFile) && !tempFile.empty()) {
+                effectiveSrc.push_back(std::move(tempFile));
+                effectiveIsMove = false;
+            }
+        } else {
+            effectiveSrc.push_back(sp);
+        }
+    }
+    if (effectiveSrc.empty()) return;
+
+    TransferConfig overrideCfg;
+    const TransferConfig* cfgPtr = nullptr;
+    if (forceVerifyXxHash) {
+        overrideCfg = m_transfers.GetConfig();
+        overrideCfg.verifyMode = TransferVerifyMode::XxHash64;
+        cfgPtr = &overrideCfg;
+    }
+
+    int jobId = m_transfers.EnqueueTransfer(effectiveSrc, targetDir, effectiveIsMove ? TransferOp::Move : TransferOp::Copy, cfgPtr);
+    if (jobId > 0) {
+        m_xferSelectedJobId = jobId;
+        std::wstring dstLeaf = FtpClient::IsFtpPath(targetDir)
+            ? FtpClient::GetFtpLeafName(targetDir)
+            : PathUtils::GetFileName(targetDir);
+        if (dstLeaf.empty()) dstLeaf = targetDir;
+        m_statusToast = (effectiveIsMove ? (pl ? L"\x23F3 Przenoszenie (" : L"\x23F3 Moving (")
+                                         : (pl ? L"\x23F3 Kopiowanie (" : L"\x23F3 Copying (")) +
+                        std::to_wstring(effectiveSrc.size()) + (pl ? L" el.)  \x2192  " : L" item(s))  \x2192  ") + dstLeaf +
+                        (forceVerifyXxHash ? L"  [XXH64]" : L"");
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+        AppLog::Info(L"Transfer", std::wstring(effectiveIsMove ? L"Queued Move #" : L"Queued Copy #") +
+                     std::to_wstring(jobId) + L" (" + std::to_wstring(effectiveSrc.size()) + L" item(s)) -> " + targetDir);
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    }
+}
+
+void ExplorerApp::ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, const std::wstring& targetDir, bool forceCopy, bool forceMove) {
+    if (srcPaths.empty() || targetDir.empty() || targetDir == L"THIS_PC") return;
+    std::wstring dstNorm = PathUtils::NormalizePathKey(targetDir);
+
+    std::vector<std::wstring> validSrc;
+    for (const auto& sp : srcPaths) {
+        std::wstring spNorm = PathUtils::NormalizePathKey(sp);
+        std::wstring parentPath = FtpClient::IsFtpPath(sp)
+            ? FtpClient::GetParentFtpUrl(sp)
+            : PathUtils::GetParentPath(sp);
+        std::wstring parentNorm = PathUtils::NormalizePathKey(parentPath);
+        if (spNorm == dstNorm || (parentNorm == dstNorm && !forceCopy)) continue;
+        // Prevent dropping a folder into its own descendant
+        if (dstNorm.size() > spNorm.size() && dstNorm.compare(0, spNorm.size(), spNorm) == 0 && dstNorm[spNorm.size()] == L'\\') {
+            continue;
+        }
+        validSrc.push_back(sp);
+    }
+    if (validSrc.empty()) return;
+
+    bool sameDrive = (validSrc[0].size() >= 2 && targetDir.size() >= 2 &&
+                      towupper(validSrc[0][0]) == towupper(targetDir[0]) &&
+                      validSrc[0][1] == L':' && targetDir[1] == L':');
+    bool doMove = forceMove ? true : (forceCopy ? false : sameDrive);
+    StartManagedTransfer(validSrc, targetDir, doMove, false);
 }
 
 void ExplorerApp::SetActivePane(int paneIdx) {
@@ -1222,6 +1861,7 @@ void ExplorerApp::SetActivePane(int paneIdx) {
     CancelInlineEdits(false);
     SwapWithOtherPane();
     m_activePane = paneIdx;
+    m_fileEngine.WatchDirectory(m_currentPath);
     RebuildBreadcrumbs();
     SyncGitRepo();
     SyncMediaPlayerToSelection();
@@ -1249,6 +1889,10 @@ void ExplorerApp::ToggleSplitView() {
             m_activePane = prevActive;
             RebuildBreadcrumbs();
             SyncGitRepo();
+        } else if (m_otherPane.breadcrumbs.empty()) {
+            SwapWithOtherPane();
+            RebuildBreadcrumbs();
+            SwapWithOtherPane();
         }
     } else if (m_activePane != 0) {
         // When closing split view, keep whichever pane was active as the single main pane (index 0)
@@ -1294,76 +1938,31 @@ void ExplorerApp::CopyOrMoveToOtherPane(bool move) {
         return;
     }
 
-    // FTP Dual-Pane Transfer: Local -> FTP or FTP -> Local
-    if (FtpClient::IsFtpPath(dstDir) || FtpClient::IsFtpPath(m_currentPath)) {
-        size_t okCount = 0;
-        std::wstring errText;
-        for (const auto& p : paths) {
-            if (!FtpClient::IsFtpPath(p) && FtpClient::IsFtpPath(dstDir)) {
-                std::wstring remoteFileUrl = FtpClient::JoinFtpPath(dstDir, PathUtils::GetFileName(p));
-                if (FtpClient::UploadLocalFileToFtp(p, remoteFileUrl, &errText)) {
-                    ++okCount;
-                    if (move) DeleteFileW(p.c_str());
-                }
-            } else if (FtpClient::IsFtpPath(p) && !FtpClient::IsFtpPath(dstDir)) {
-                std::wstring localDst = PathUtils::EnsureTrailingSlash(dstDir) + FtpClient::GetFtpLeafName(p);
-                if (FtpClient::DownloadFtpFileToLocal(p, localDst, &errText)) {
-                    ++okCount;
-                    if (move) FtpClient::DeleteFtpItem(p, false);
-                }
-            }
-        }
-        if (okCount > 0) {
-            m_statusToast = (pl ? L"\x2713 Przesłano przez FTP: " : L"\x2713 FTP transfer complete: ") +
-                            std::to_wstring(okCount) + L"/" + std::to_wstring(paths.size()) + L"  \x2192  " + dstDir;
-        } else {
-            m_statusToast = (pl ? L"\x2717 Błąd transferu FTP: " : L"\x2717 FTP transfer failed: ") + errText;
-        }
-        m_statusToastExpireTick = GetTickCount64() + 4200;
-        RefreshCurrentFolder();
-        return;
-    }
-
-    std::wstring fromDoubleNull;
-    for (const auto& p : paths) {
-        fromDoubleNull += p;
-        fromDoubleNull.push_back(L'\0');
-    }
-    fromDoubleNull.push_back(L'\0');
-
-    std::wstring toDoubleNull = dstDir;
-    toDoubleNull.push_back(L'\0');
-    toDoubleNull.push_back(L'\0');
-
-    SHFILEOPSTRUCTW fop = {};
-    fop.hwnd = m_hwnd;
-    fop.wFunc = move ? FO_MOVE : FO_COPY;
-    fop.pFrom = fromDoubleNull.c_str();
-    fop.pTo   = toDoubleNull.c_str();
-    fop.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR;
-    int rc = SHFileOperationW(&fop);
-    if (rc == 0 && !fop.fAnyOperationsAborted) {
-        AppLog::Ok(move ? L"Move" : L"Copy",
-                   std::wstring(move ? L"Moved to 2nd pane (" : L"Copied to 2nd pane (") + dstDir + L"): " + std::to_wstring(paths.size()) + L" item(s)");
-        m_statusToast = (move ? (pl ? L"\x2713 Przeniesiono do 2. panelu: " : L"\x2713 Moved to 2nd pane: ")
-                              : (pl ? L"\x2713 Skopiowano do 2. panelu: " : L"\x2713 Copied to 2nd pane: ")) +
-                        std::to_wstring(paths.size()) + (pl ? L" el.  \x2192  " : L" item(s)  \x2192  ") + PathUtils::GetFileName(dstDir);
-        m_statusToastExpireTick = GetTickCount64() + 4000;
-    }
-    RefreshCurrentFolder();
+    // Both local and FTP/FTPS dual-pane transfers run asynchronously via TransferManager
+    StartManagedTransfer(paths, dstDir, move, false);
 }
 
 void ExplorerApp::BeginPaneAddressEdit(int paneIdx) {
-    SetActivePane(paneIdx);
-    D2D1_RECT_F r = m_paneHeaderAddressRect[paneIdx];
-    if (r.right <= r.left + 20.0f) r = m_addressBarRect;
+    D2D1_RECT_F r = m_addressBarRect;
+    if (IsSplitViewActive()) {
+        SetActivePane(paneIdx);
+        r = m_paneHeaderAddressRect[m_activePane];
+        if (r.right <= r.left + 20.0f) r = m_addressBarRect;
+    }
     SetWindowPos(m_addressEdit, HWND_TOP,
         static_cast<int>(r.left),
         static_cast<int>(r.top),
         static_cast<int>(r.right - r.left),
         static_cast<int>(r.bottom - r.top),
         SWP_SHOWWINDOW);
-    SetWindowTextW(m_addressEdit, m_currentPath == L"THIS_PC" ? L"" : m_currentPath.c_str());
+    std::wstring addrText = (m_currentPath == L"THIS_PC") ? L"" : m_currentPath;
+    if (FtpClient::IsFtpPath(m_currentPath)) {
+        FtpUrlInfo parsed;
+        if (FtpClient::ParseFtpUrl(m_currentPath, parsed)) {
+            addrText = FtpClient::BuildFtpUrl(parsed, false);
+        }
+    }
+    SetWindowTextW(m_addressEdit, addrText.c_str());
     SetFocus(m_addressEdit);
     SendMessageW(m_addressEdit, EM_SETSEL, 0, -1);
 }
@@ -1424,7 +2023,7 @@ int ExplorerApp::HitResizeHandle(float x, float y) const {
             checkSearch = (m_activePane == 1) ? m_isSearchActive : m_otherPane.isSearchActive;
         }
     }
-    float hdrTop = checkRect.top + (checkSearch ? 28.0f : 0.0f);
+    float hdrTop = checkRect.top + (IsTabBarVisible() ? 26.0f : 0.0f) + (checkSearch ? 28.0f : 0.0f);
     if (m_viewMode == ViewMode::Details && y >= hdrTop && y <= hdrTop + kDetailsHeaderHeight &&
         x >= checkRect.left && x <= checkRect.right) {
         float colX = checkRect.left + 6.0f;
@@ -1442,12 +2041,64 @@ static std::wstring UiSettingsPath() {
 
 void ExplorerApp::LoadUiSettings() {
     std::wstring ini = UiSettingsPath();
+    m_lang = (GetPrivateProfileIntW(L"UI", L"Lang", 0, ini.c_str()) == 1) ? Lang::EN : Lang::PL;
+    int vm = GetPrivateProfileIntW(L"UI", L"ViewMode", static_cast<int>(ViewMode::Details), ini.c_str());
+    if (vm >= 0 && vm <= static_cast<int>(ViewMode::PieChart)) {
+        m_viewMode = static_cast<ViewMode>(vm);
+        m_lastNonViewerMode = m_viewMode;
+    }
+    m_showNavPane = GetPrivateProfileIntW(L"UI", L"ShowNavPane", 1, ini.c_str()) != 0;
+    m_treePaneWidth = std::clamp(static_cast<float>(GetPrivateProfileIntW(L"UI", L"TreePaneWidth", 265, ini.c_str())), 140.0f, 500.0f);
+    m_gitDockWidth = std::clamp(static_cast<float>(GetPrivateProfileIntW(L"UI", L"GitDockWidth", 340, ini.c_str())), 260.0f, 900.0f);
+    m_ribbonCollapsed = GetPrivateProfileIntW(L"UI", L"RibbonCollapsed", 0, ini.c_str()) != 0;
+    m_showHidden = GetPrivateProfileIntW(L"UI", L"ShowHidden", 1, ini.c_str()) != 0;
+    m_showExtensions = GetPrivateProfileIntW(L"UI", L"ShowExtensions", 1, ini.c_str()) != 0;
+    m_confirmDelete = GetPrivateProfileIntW(L"UI", L"ConfirmDelete", 0, ini.c_str()) != 0;
+    m_darkMode = GetPrivateProfileIntW(L"UI", L"DarkMode", 0, ini.c_str()) != 0;
     m_gitEnabled = GetPrivateProfileIntW(L"UI", L"GitIntegration", 1, ini.c_str()) != 0;
     int splitPct = GetPrivateProfileIntW(L"UI", L"SplitRatioPct", 50, ini.c_str());
     m_splitRatio = std::clamp(static_cast<float>(splitPct) / 100.0f, 0.20f, 0.80f);
     m_showPreviewPane = GetPrivateProfileIntW(L"UI", L"ShowPreviewPane", 0, ini.c_str()) != 0;
     int prevW = GetPrivateProfileIntW(L"UI", L"PreviewPaneWidth", 450, ini.c_str());
     m_previewPaneWidth = std::clamp(static_cast<float>(prevW), 260.0f, 1000.0f);
+
+    int sortCol = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"SortCol", 0, ini.c_str())), 0, 3);
+    m_sortCol = static_cast<SortColumn>(sortCol);
+    m_sortAsc = GetPrivateProfileIntW(L"UI", L"SortAsc", 1, ini.c_str()) != 0;
+    int grpBy = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"GroupBy", 0, ini.c_str())), 0, 4);
+    m_groupBy = static_cast<GroupByMode>(grpBy);
+
+    static const int kDefaultCols[5] = { 320, 145, 155, 115, 128 };
+    for (int c = 0; c < 5; ++c) {
+        wchar_t colKey[32] = {};
+        swprintf_s(colKey, L"ColWidth%d", c);
+        int cw = GetPrivateProfileIntW(L"UI", colKey, kDefaultCols[c], ini.c_str());
+        m_colWidths[c] = std::clamp(static_cast<float>(cw), 55.0f, 1200.0f);
+    }
+
+    wchar_t lastPathBuf[MAX_PATH * 2] = {};
+    GetPrivateProfileStringW(L"UI", L"LastPath", L"", lastPathBuf, static_cast<DWORD>(std::size(lastPathBuf)), ini.c_str());
+    std::wstring lp = PathUtils::TrimTrailingSlashes(lastPathBuf);
+    if (!lp.empty()) {
+        m_currentPath = lp;
+    }
+
+    int qaCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"QuickAccess", L"Count", -1, ini.c_str())), -1, 40);
+    if (qaCount >= 0) {
+        m_pinnedFolders.clear();
+        for (int i = 0; i < qaCount; ++i) {
+            wchar_t key[32] = {};
+            swprintf_s(key, L"Pin%d", i);
+            wchar_t val[MAX_PATH * 2] = {};
+            GetPrivateProfileStringW(L"QuickAccess", key, L"", val, static_cast<DWORD>(std::size(val)), ini.c_str());
+            std::wstring p = PathUtils::TrimTrailingSlashes(val);
+            if (!p.empty()) {
+                std::wstring lbl = PathUtils::GetFileName(p);
+                if (lbl.empty()) lbl = p;
+                m_pinnedFolders.push_back({ lbl, p });
+            }
+        }
+    }
 
     int recentCount = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"RecentDirs", L"Count", 0, ini.c_str())), 0, 30);
     m_recentDirs.clear();
@@ -1467,23 +2118,165 @@ void ExplorerApp::LoadUiSettings() {
             if (!dup) m_recentDirs.push_back(p);
         }
     }
+
+    TransferConfig xcfg = m_transfers.GetConfig();
+    int qm = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Transfers", L"QueueMode", 0, ini.c_str())), 0, 2);
+    int cp = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Transfers", L"ConflictPolicy", 0, ini.c_str())), 0, 4);
+    int vmX = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Transfers", L"VerifyMode", 0, ini.c_str())), 0, 2);
+    xcfg.queueMode            = static_cast<TransferQueueMode>(qm);
+    xcfg.conflictPolicy       = static_cast<TransferConflictPolicy>(cp);
+    xcfg.verifyMode           = static_cast<TransferVerifyMode>(vmX);
+    xcfg.bufferSizeKB         = static_cast<uint32_t>(std::clamp<int>(GetPrivateProfileIntW(L"Transfers", L"BufferSizeKB", 0, ini.c_str()), 0, 32768));
+    xcfg.workerThreads        = static_cast<uint32_t>(std::clamp<int>(GetPrivateProfileIntW(L"Transfers", L"WorkerThreads", 0, ini.c_str()), 0, 8));
+    xcfg.usePartFiles         = GetPrivateProfileIntW(L"Transfers", L"UsePartFiles", 1, ini.c_str()) != 0;
+    xcfg.unbufferedLargeFiles = GetPrivateProfileIntW(L"Transfers", L"UnbufferedLarge", 0, ini.c_str()) != 0;
+    xcfg.speedLimitMBps       = static_cast<uint32_t>(std::clamp<int>(GetPrivateProfileIntW(L"Transfers", L"SpeedLimitMBps", 0, ini.c_str()), 0, 10000));
+    m_transfers.SetConfig(xcfg);
 }
 
-void ExplorerApp::SaveUiSettings() const {
-    std::wstring ini = UiSettingsPath();
-    WritePrivateProfileStringW(L"UI", L"GitIntegration", m_gitEnabled ? L"1" : L"0", ini.c_str());
-    int splitPct = static_cast<int>(std::round(std::clamp(m_splitRatio, 0.20f, 0.80f) * 100.0f));
-    WritePrivateProfileStringW(L"UI", L"SplitRatioPct", std::to_wstring(splitPct).c_str(), ini.c_str());
-    WritePrivateProfileStringW(L"UI", L"ShowPreviewPane", m_showPreviewPane ? L"1" : L"0", ini.c_str());
-    WritePrivateProfileStringW(L"UI", L"PreviewPaneWidth", std::to_wstring(static_cast<int>(std::round(m_previewPaneWidth))).c_str(), ini.c_str());
+// Writes settings.ini for SaveUiSettings.
+// Saving is asked for after many small changes on the UI thread, so the file is normally written by a
+// short-lived background thread. Two rules keep that safe. Every snapshot gets a number and only the newest
+// one is ever written, so an older snapshot cannot replace a newer one whichever thread runs first. And
+// the file is replaced in one step (written under another name, then renamed over the old one), so a write
+// that is cut short, by a crash or by the process ending, never leaves half a settings file behind.
+namespace {
 
-    int cnt = std::min(static_cast<int>(m_recentDirs.size()), 30);
-    WritePrivateProfileStringW(L"RecentDirs", L"Count", std::to_wstring(cnt).c_str(), ini.c_str());
-    for (int i = 0; i < cnt; ++i) {
-        wchar_t key[32] = {};
-        swprintf_s(key, L"Dir%d", i);
-        WritePrivateProfileStringW(L"RecentDirs", key, m_recentDirs[i].c_str(), ini.c_str());
+std::mutex g_settingsWriteMutex;                    // one write at a time
+std::atomic<uint64_t> g_newestSettingsSnapshot{ 0 };
+
+bool WriteSettingsFile(const std::wstring& ini, const std::wstring& content, DWORD& outError) {
+    // UTF-16LE with a byte-order mark, as the profile functions that read it back expect
+    std::vector<uint8_t> bytes(2 + content.size() * sizeof(wchar_t));
+    bytes[0] = 0xFF;
+    bytes[1] = 0xFE;
+    std::memcpy(bytes.data() + 2, content.data(), content.size() * sizeof(wchar_t));
+
+    // The temporary name carries the process id: two windows of the program are two processes, and both
+    // save at the same moment when Windows shuts down. Each then writes its own file, and the last rename wins.
+    const std::wstring tmp = ini + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+    outError = 0;
+    if (!PathUtils::WriteFileBytes(tmp, bytes.data(), bytes.size())) {
+        outError = GetLastError();
+        DeleteFileW(tmp.c_str());
+        return false;
     }
+    // A virus scanner or an editor may have the old file open for a moment: try a few times before giving up
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (MoveFileExW(tmp.c_str(), ini.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+        outError = GetLastError();
+        if (outError != ERROR_SHARING_VIOLATION && outError != ERROR_ACCESS_DENIED && outError != ERROR_LOCK_VIOLATION) break;
+        Sleep(40);
+    }
+    DeleteFileW(tmp.c_str());
+    return false;
+}
+
+// A process that was killed in the middle of a save leaves its temporary file behind; this removes such
+// files once they are old enough not to belong to a save that is under way in another window.
+void RemoveStaleSettingsTempFiles(const std::wstring& ini) {
+    const std::wstring folder = PathUtils::GetParentPath(ini);
+    WIN32_FIND_DATAW fd = {};
+    HANDLE find = FindFirstFileW((ini + L".*.tmp").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    FILETIME nowFt = {};
+    GetSystemTimeAsFileTime(&nowFt);
+    const ULONGLONG now = (static_cast<ULONGLONG>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+    do {
+        const ULONGLONG written = (static_cast<ULONGLONG>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        const bool olderThanTenMinutes = now > written && now - written > 10ULL * 60ULL * 10000000ULL;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && olderThanTenMinutes) {
+            DeleteFileW((PathUtils::EnsureTrailingSlash(folder) + fd.cFileName).c_str());
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+}
+
+void SubmitSettingsSnapshot(std::wstring ini, std::wstring content, bool waitUntilWritten) {
+    static std::once_flag staleFilesRemoved;
+    std::call_once(staleFilesRemoved, [&ini]() { RemoveStaleSettingsTempFiles(ini); });
+
+    const uint64_t number = ++g_newestSettingsSnapshot;
+    auto write = [ini = std::move(ini), content = std::move(content), number]() {
+        std::lock_guard<std::mutex> lock(g_settingsWriteMutex);
+        if (number != g_newestSettingsSnapshot.load()) return;     // a newer snapshot exists and will be written
+        DWORD error = 0;
+        if (!WriteSettingsFile(ini, content, error)) {
+            AppLog::Warn(L"Settings", L"Could not save " + ini + L" (error " + std::to_wstring(error) + L")");
+        }
+    };
+    if (waitUntilWritten) {
+        write();
+        return;
+    }
+    try {
+        std::thread(write).detach();
+    } catch (const std::system_error&) {
+        write();                                                   // no thread to be had: write it here
+    }
+}
+
+} // namespace
+
+void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
+    std::wstring ini = UiSettingsPath();
+    int splitPct = static_cast<int>(std::round(std::clamp(m_splitRatio, 0.20f, 0.80f) * 100.0f));
+    int prevW = static_cast<int>(std::round(m_previewPaneWidth));
+    int treeW = static_cast<int>(std::round(m_treePaneWidth));
+    int gitW = static_cast<int>(std::round(m_gitDockWidth));
+    int cnt = std::min(static_cast<int>(m_recentDirs.size()), 30);
+    int saveVm = static_cast<int>((m_viewMode == ViewMode::FullViewer || m_viewMode == ViewMode::Hardware) ? m_lastNonViewerMode : m_viewMode);
+
+    std::wstring content;
+    content.reserve(4096);
+    content += L"[UI]\r\n";
+    content += L"Lang=" + std::to_wstring(m_lang == Lang::EN ? 1 : 0) + L"\r\n";
+    content += L"ViewMode=" + std::to_wstring(saveVm) + L"\r\n";
+    content += L"ShowNavPane="; content += (m_showNavPane ? L"1\r\n" : L"0\r\n");
+    content += L"TreePaneWidth=" + std::to_wstring(treeW) + L"\r\n";
+    content += L"GitDockWidth=" + std::to_wstring(gitW) + L"\r\n";
+    content += L"RibbonCollapsed="; content += (m_ribbonCollapsed ? L"1\r\n" : L"0\r\n");
+    content += L"ShowHidden="; content += (m_showHidden ? L"1\r\n" : L"0\r\n");
+    content += L"ShowExtensions="; content += (m_showExtensions ? L"1\r\n" : L"0\r\n");
+    content += L"ConfirmDelete="; content += (m_confirmDelete ? L"1\r\n" : L"0\r\n");
+    content += L"DarkMode="; content += (m_darkMode ? L"1\r\n" : L"0\r\n");
+    content += L"GitIntegration="; content += (m_gitEnabled ? L"1\r\n" : L"0\r\n");
+    content += L"SplitRatioPct=" + std::to_wstring(splitPct) + L"\r\n";
+    content += L"ShowPreviewPane="; content += (m_showPreviewPane ? L"1\r\n" : L"0\r\n");
+    content += L"PreviewPaneWidth=" + std::to_wstring(prevW) + L"\r\n";
+    content += L"SortCol=" + std::to_wstring(static_cast<int>(m_sortCol)) + L"\r\n";
+    content += L"SortAsc="; content += (m_sortAsc ? L"1\r\n" : L"0\r\n");
+    content += L"GroupBy=" + std::to_wstring(static_cast<int>(m_groupBy)) + L"\r\n";
+    for (int c = 0; c < 5; ++c) {
+        content += L"ColWidth" + std::to_wstring(c) + L"=" + std::to_wstring(static_cast<int>(std::round(m_colWidths[c]))) + L"\r\n";
+    }
+    if (!m_currentPath.empty() && !FtpClient::IsFtpPath(m_currentPath)) {
+        content += L"LastPath=" + m_currentPath + L"\r\n";
+    }
+    content += L"\r\n[QuickAccess]\r\n";
+    int qaCnt = std::min(static_cast<int>(m_pinnedFolders.size()), 40);
+    content += L"Count=" + std::to_wstring(qaCnt) + L"\r\n";
+    for (int i = 0; i < qaCnt; ++i) {
+        content += L"Pin" + std::to_wstring(i) + L"=" + m_pinnedFolders[i].second + L"\r\n";
+    }
+    content += L"\r\n[RecentDirs]\r\n";
+    content += L"Count=" + std::to_wstring(cnt) + L"\r\n";
+    for (int i = 0; i < cnt; ++i) {
+        content += L"Dir" + std::to_wstring(i) + L"=" + m_recentDirs[i] + L"\r\n";
+    }
+
+    TransferConfig xcfg = m_transfers.GetConfig();
+    content += L"\r\n[Transfers]\r\n";
+    content += L"QueueMode=" + std::to_wstring(static_cast<int>(xcfg.queueMode)) + L"\r\n";
+    content += L"ConflictPolicy=" + std::to_wstring(static_cast<int>(xcfg.conflictPolicy)) + L"\r\n";
+    content += L"VerifyMode=" + std::to_wstring(static_cast<int>(xcfg.verifyMode)) + L"\r\n";
+    content += L"BufferSizeKB=" + std::to_wstring(xcfg.bufferSizeKB) + L"\r\n";
+    content += L"WorkerThreads=" + std::to_wstring(xcfg.workerThreads) + L"\r\n";
+    content += L"UsePartFiles="; content += (xcfg.usePartFiles ? L"1\r\n" : L"0\r\n");
+    content += L"UnbufferedLarge="; content += (xcfg.unbufferedLargeFiles ? L"1\r\n" : L"0\r\n");
+    content += L"SpeedLimitMBps=" + std::to_wstring(xcfg.speedLimitMBps) + L"\r\n";
+
+    SubmitSettingsSnapshot(std::move(ini), std::move(content), waitUntilWritten);
 }
 
 // Finds the git repository (if any) that contains the folder being browsed and asks the worker to refresh it.
@@ -1604,6 +2397,9 @@ bool ExplorerApp::HandleGitDockClick(float x, float y, bool rightButton) {
 
 D2D1_RECT_F ExplorerApp::GetContentItemsRect() const {
     D2D1_RECT_F r = GetMainViewRect();
+    if (IsTabBarVisible()) {
+        r.top += 26.0f;
+    }
     if (m_isSearchActive && m_viewMode != ViewMode::FullViewer && m_viewMode != ViewMode::Hardware) {
         r.top += 28.0f;
     }
@@ -1929,35 +2725,77 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
     if (!rightButton && !m_isFullScreen) {
         for (const auto& btn : m_ribbonHits) {
             if (PathUtils::PtInRectF(x, y, btn.rect)) {
-                ExecuteRibbonCommand(btn.id);
+                // Copied first: the command may repaint, and a paint rebuilds m_ribbonHits
+                const int cmdId = btn.id;
+                const int jobId = btn.jobId;
+                if (jobId != 0) m_hwActionArg = std::to_wstring(jobId);     // the per-job commands read their job here
+                ExecuteRibbonCommand(cmdId);
+                if (jobId != 0) m_hwActionArg.clear();
                 return;
             }
         }
 
         float navTop = kRibbonTabsHeight + (m_ribbonCollapsed ? 0.0f : kRibbonBodyHeight);
         if (y >= navTop && y <= navTop + kNavBarHeight) {
-            for (int i = 0; i < static_cast<int>(m_breadcrumbs.size()); ++i) {
-                const auto& bc = m_breadcrumbs[i];
-                if (PathUtils::PtInRectF(x, y, bc.arrowRect)) {
-                    ShowBreadcrumbSubfolderMenu(i);
+            if (IsSplitViewActive()) {
+                for (int paneIdx = 0; paneIdx < 2; ++paneIdx) {
+                    const auto& bcs = (paneIdx == m_activePane) ? m_breadcrumbs : m_otherPane.breadcrumbs;
+                    for (int i = 0; i < static_cast<int>(bcs.size()); ++i) {
+                        const auto& bc = bcs[i];
+                        if (PathUtils::PtInRectF(x, y, bc.arrowRect)) {
+                            D2D1_RECT_F savedHit = bc.hitRect;
+                            D2D1_RECT_F savedArrow = bc.arrowRect;
+                            SetActivePane(paneIdx);
+                            if (i < static_cast<int>(m_breadcrumbs.size())) {
+                                m_breadcrumbs[i].hitRect = savedHit;
+                                m_breadcrumbs[i].arrowRect = savedArrow;
+                            }
+                            ShowBreadcrumbSubfolderMenu(i);
+                            return;
+                        }
+                        if (PathUtils::PtInRectF(x, y, bc.hitRect)) {
+                            std::wstring targetPath = bc.path;
+                            SetActivePane(paneIdx);
+                            NavigateTo(targetPath, true);
+                            return;
+                        }
+                    }
+                    if (PathUtils::PtInRectF(x, y, m_paneHeaderAddressRect[paneIdx])) {
+                        BeginPaneAddressEdit(paneIdx);
+                        return;
+                    }
+                }
+            } else {
+                for (int i = 0; i < static_cast<int>(m_breadcrumbs.size()); ++i) {
+                    const auto& bc = m_breadcrumbs[i];
+                    if (PathUtils::PtInRectF(x, y, bc.arrowRect)) {
+                        ShowBreadcrumbSubfolderMenu(i);
+                        return;
+                    }
+                    if (PathUtils::PtInRectF(x, y, bc.hitRect)) {
+                        NavigateTo(bc.path, true);
+                        return;
+                    }
+                }
+                if (PathUtils::PtInRectF(x, y, m_addressBarRect)) {
+                    SetWindowPos(m_addressEdit, HWND_TOP,
+                        static_cast<int>(m_addressBarRect.left),
+                        static_cast<int>(m_addressBarRect.top),
+                        static_cast<int>(m_addressBarRect.right - m_addressBarRect.left),
+                        static_cast<int>(m_addressBarRect.bottom - m_addressBarRect.top),
+                        SWP_SHOWWINDOW);
+                    std::wstring addrText = (m_currentPath == L"THIS_PC") ? L"" : m_currentPath;
+                    if (FtpClient::IsFtpPath(m_currentPath)) {
+                        FtpUrlInfo parsed;
+                        if (FtpClient::ParseFtpUrl(m_currentPath, parsed)) {
+                            addrText = FtpClient::BuildFtpUrl(parsed, false);
+                        }
+                    }
+                    SetWindowTextW(m_addressEdit, addrText.c_str());
+                    SetFocus(m_addressEdit);
+                    SendMessageW(m_addressEdit, EM_SETSEL, 0, -1);
                     return;
                 }
-                if (PathUtils::PtInRectF(x, y, bc.hitRect)) {
-                    NavigateTo(bc.path, true);
-                    return;
-                }
-            }
-            if (PathUtils::PtInRectF(x, y, m_addressBarRect)) {
-                SetWindowPos(m_addressEdit, HWND_TOP,
-                    static_cast<int>(m_addressBarRect.left),
-                    static_cast<int>(m_addressBarRect.top),
-                    static_cast<int>(m_addressBarRect.right - m_addressBarRect.left),
-                    static_cast<int>(m_addressBarRect.bottom - m_addressBarRect.top),
-                    SWP_SHOWWINDOW);
-                SetWindowTextW(m_addressEdit, m_currentPath == L"THIS_PC" ? L"" : m_currentPath.c_str());
-                SetFocus(m_addressEdit);
-                SendMessageW(m_addressEdit, EM_SETSEL, 0, -1);
-                return;
             }
             if (PathUtils::PtInRectF(x, y, m_searchBarRect)) {
                 m_editingSearchFieldCmd = 0;
@@ -2026,6 +2864,10 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                     NavigateTo(navPath, true);
                     return;
                 }
+                ArchiveExplorer::ExtractRequest extract;
+                if (m_contentPane.TakePendingExtract(extract)) {
+                    StartExtractJob(extract.archivePath, extract.targetFolder, extract.toSubfolder);
+                }
                 if (!toastMsg.empty()) {
                     m_statusToast = toastMsg;
                     m_statusToastExpireTick = GetTickCount64() + 3600;
@@ -2057,7 +2899,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
         }
         if (hitTreeIdx >= 0) {
             const auto& node = m_treeNodes[hitTreeIdx];
-            if (PathUtils::PtInRectF(x, y, node.chevronRect) || node.path.empty()) {
+            if (PathUtils::PtInRectF(x, y, node.chevronRect) || node.path.empty() || node.normKey == L"__HEADER_FTP__") {
                 ToggleTreeNodeExpand(hitTreeIdx);
             } else {
                 NavigateTo(node.path, true);
@@ -2077,12 +2919,34 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
 
     D2D1_RECT_F mainRect = GetMainViewRect();
 
+    // 1b. Check Multi-Tab Bar clicks (when 2+ tabs are open)
+    if (!rightButton && !m_isFullScreen && IsTabBarVisible()) {
+        for (const auto& th : m_tabHits) {
+            if (th.isNewTabBtn && PathUtils::PtInRectF(x, y, th.tabRect)) {
+                CreateNewTab(L"", true);
+                return;
+            }
+            if (!th.isNewTabBtn && PathUtils::PtInRectF(x, y, th.closeRect)) {
+                CloseTab(th.tabIndex);
+                return;
+            }
+            if (!th.isNewTabBtn && PathUtils::PtInRectF(x, y, th.tabRect)) {
+                SwitchToTab(th.tabIndex);
+                return;
+            }
+        }
+    }
+
     // 2. If in FullViewer mode: check HUD buttons, seek bar, filmstrip click, or start image pan
     if (m_viewMode == ViewMode::FullViewer) {
         if (!rightButton) {
             for (const auto& btn : m_ribbonHits) {
                 if (PathUtils::PtInRectF(x, y, btn.rect)) {
-                    ExecuteRibbonCommand(btn.id);
+                    const int cmdId = btn.id;
+                    const int jobId = btn.jobId;
+                    if (jobId != 0) m_hwActionArg = std::to_wstring(jobId);
+                    ExecuteRibbonCommand(cmdId);
+                    if (jobId != 0) m_hwActionArg.clear();
                     return;
                 }
             }
@@ -2127,7 +2991,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
     }
 
     // 3. Check Details Header column click / resize
-    float hdrTop = mainRect.top + (m_isSearchActive ? 28.0f : 0.0f);
+    float hdrTop = mainRect.top + (IsTabBarVisible() ? 26.0f : 0.0f) + (m_isSearchActive ? 28.0f : 0.0f);
     if (m_viewMode == ViewMode::Details && !rightButton &&
         y >= hdrTop && y <= hdrTop + kDetailsHeaderHeight &&
         x >= mainRect.left && x <= mainRect.right)
@@ -2257,6 +3121,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
         }
 
         if (hitIdx >= 0 && onItem) {
+            m_dragDeferSingleSelect = false;
             if (shiftHeld && m_anchorIndex >= 0) {
                 SelectRange(m_anchorIndex, hitIdx, ctrlHeld);
             } else if (ctrlHeld) {
@@ -2264,8 +3129,17 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                 m_focusedIndex = hitIdx;
                 m_anchorIndex = hitIdx;
                 SyncMediaPlayerToSelection();
+            } else if (m_items[hitIdx].isSelected && GetSelectedCount() > 1) {
+                // Keep multi-selection intact if user starts dragging; collapse to single on MouseUp if not dragged
+                m_focusedIndex = hitIdx;
+                m_dragDeferSingleSelect = true;
             } else {
                 SelectSingle(hitIdx, true);
+            }
+            if (m_currentPath != L"THIS_PC" && !IsProgramsView()) {
+                m_dragCandidate = true;
+                m_dragSourceItemIdx = hitIdx;
+                m_dragStartPt = D2D1::Point2F(x, y);
             }
             InvalidateRect(m_hwnd, nullptr, FALSE);
         } else if (m_viewMode != ViewMode::Proportions && m_viewMode != ViewMode::PieChart && m_viewMode != ViewMode::Hardware) {
@@ -2353,6 +3227,33 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
     if (m_viewerDraggingPan) {
         m_viewerPanX = x - m_viewerDragStart.x;
         m_viewerPanY = y - m_viewerDragStart.y;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if (m_dragCandidate && (keyFlags & MK_LBUTTON)) {
+        if (std::hypot(x - m_dragStartPt.x, y - m_dragStartPt.y) >= 6.0f) {
+            m_dragCandidate = false;
+            m_dragDeferSingleSelect = false;
+            m_dragPaths = GetSelectedPaths();
+            if (!m_dragPaths.empty()) {
+                m_isDraggingItems = true;
+                SetCapture(m_hwnd);
+            }
+        }
+    }
+
+    if (m_isDraggingItems) {
+        if (!(keyFlags & MK_LBUTTON)) {
+            m_isDraggingItems = false;
+            m_dragPaths.clear();
+            m_dragTargetDir.clear();
+            m_dragTargetLabel.clear();
+            ReleaseCapture();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            return;
+        }
+        m_dragTargetDir = ResolveDropTargetFolder(x, y, &m_dragTargetLabel);
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return;
     }
@@ -2455,18 +3356,40 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         }
     }
 
+    int prevBcPane = m_hoverBreadcrumbPane;
     int prevBcHover = m_hoverBreadcrumbIndex;
     int prevBcArrowHover = m_hoverBreadcrumbArrowIndex;
+    m_hoverBreadcrumbPane = -1;
     m_hoverBreadcrumbIndex = -1;
     m_hoverBreadcrumbArrowIndex = -1;
-    for (int i = 0; i < static_cast<int>(m_breadcrumbs.size()); ++i) {
-        if (PathUtils::PtInRectF(x, y, m_breadcrumbs[i].arrowRect)) {
-            m_hoverBreadcrumbArrowIndex = i;
-            break;
+    if (IsSplitViewActive()) {
+        for (int paneIdx = 0; paneIdx < 2 && m_hoverBreadcrumbPane < 0; ++paneIdx) {
+            const auto& bcs = (paneIdx == m_activePane) ? m_breadcrumbs : m_otherPane.breadcrumbs;
+            for (int i = 0; i < static_cast<int>(bcs.size()); ++i) {
+                if (PathUtils::PtInRectF(x, y, bcs[i].arrowRect)) {
+                    m_hoverBreadcrumbPane = paneIdx;
+                    m_hoverBreadcrumbArrowIndex = i;
+                    break;
+                }
+                if (PathUtils::PtInRectF(x, y, bcs[i].hitRect)) {
+                    m_hoverBreadcrumbPane = paneIdx;
+                    m_hoverBreadcrumbIndex = i;
+                    break;
+                }
+            }
         }
-        if (PathUtils::PtInRectF(x, y, m_breadcrumbs[i].hitRect)) {
-            m_hoverBreadcrumbIndex = i;
-            break;
+    } else {
+        for (int i = 0; i < static_cast<int>(m_breadcrumbs.size()); ++i) {
+            if (PathUtils::PtInRectF(x, y, m_breadcrumbs[i].arrowRect)) {
+                m_hoverBreadcrumbPane = m_activePane;
+                m_hoverBreadcrumbArrowIndex = i;
+                break;
+            }
+            if (PathUtils::PtInRectF(x, y, m_breadcrumbs[i].hitRect)) {
+                m_hoverBreadcrumbPane = m_activePane;
+                m_hoverBreadcrumbIndex = i;
+                break;
+            }
         }
     }
 
@@ -2481,6 +3404,30 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         }
     }
 
+    int prevTabHover = m_hoverTabIndex;
+    int prevTabCloseHover = m_hoverTabCloseIndex;
+    bool prevNewTabHover = m_hoverNewTabBtn;
+    m_hoverTabIndex = -1;
+    m_hoverTabCloseIndex = -1;
+    m_hoverNewTabBtn = false;
+    if (IsTabBarVisible()) {
+        for (const auto& th : m_tabHits) {
+            if (th.isNewTabBtn && PathUtils::PtInRectF(x, y, th.tabRect)) {
+                m_hoverNewTabBtn = true;
+                break;
+            }
+            if (!th.isNewTabBtn && PathUtils::PtInRectF(x, y, th.closeRect)) {
+                m_hoverTabCloseIndex = th.tabIndex;
+                m_hoverTabIndex = th.tabIndex;
+                break;
+            }
+            if (!th.isNewTabBtn && PathUtils::PtInRectF(x, y, th.tabRect)) {
+                m_hoverTabIndex = th.tabIndex;
+                break;
+            }
+        }
+    }
+
     if (prevHover != m_hoverIndex ||
         prevOtherHover != m_otherPane.hoverIndex ||
         prevOtherRowAction != m_otherPane.hoverRowActionKind ||
@@ -2490,8 +3437,12 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         prevRowAction != m_hoverRowActionKind ||
         prevRibbonHover != m_hoverRibbonBtn ||
         prevTreeHover != m_hoverTreeIndex ||
+        prevBcPane != m_hoverBreadcrumbPane ||
         prevBcHover != m_hoverBreadcrumbIndex ||
         prevBcArrowHover != m_hoverBreadcrumbArrowIndex ||
+        prevTabHover != m_hoverTabIndex ||
+        prevTabCloseHover != m_hoverTabCloseIndex ||
+        prevNewTabHover != m_hoverNewTabBtn ||
         (m_viewMode == ViewMode::Hardware) ||
         (GitDockVisible() && PathUtils::PtInRectF(x, y, GetGitDockRect())) ||
         (m_viewMode == ViewMode::Proportions && m_hoverTreemapHitIndex >= 0) ||
@@ -2501,10 +3452,35 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
 }
 
 void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags) {
-    (void)x; (void)y; (void)rightButton; (void)keyFlags;
+    (void)x; (void)y; (void)rightButton;
+    if (m_dragDeferSingleSelect && !m_isDraggingItems && m_dragSourceItemIdx >= 0 && m_dragSourceItemIdx < static_cast<int>(m_items.size())) {
+        SelectSingle(m_dragSourceItemIdx, true);
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    }
+    m_dragCandidate = false;
+    m_dragDeferSingleSelect = false;
+    m_dragSourceItemIdx = -1;
+
+    if (m_isDraggingItems) {
+        std::vector<std::wstring> dropPaths = m_dragPaths;
+        std::wstring dropTarget = ResolveDropTargetFolder(x, y, nullptr);
+        m_isDraggingItems = false;
+        m_dragPaths.clear();
+        m_dragTargetDir.clear();
+        m_dragTargetLabel.clear();
+        ReleaseCapture();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        if (!dropPaths.empty() && !dropTarget.empty()) {
+            bool forceCopy = (keyFlags & MK_CONTROL) != 0 || (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool forceMove = (keyFlags & MK_SHIFT) != 0 || (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            ExecuteDropFiles(dropPaths, dropTarget, forceCopy, forceMove);
+        }
+        return;
+    }
+
     bool contentUp = m_contentPane.OnMouseUp();
     if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0 || m_draggingScrollbar || m_viewerDraggingPan || m_isBoxSelecting || contentUp) {
-        if (m_draggingSplitSplitter || m_draggingPreviewSplitter) SaveUiSettings();
+        if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0) SaveUiSettings();
         m_draggingTreeSplitter = false;
         m_draggingGitSplitter = false;
         m_draggingSplitSplitter = false;
@@ -2521,7 +3497,12 @@ void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags)
 }
 
 void ExplorerApp::OnMouseDoubleClick(float x, float y, WPARAM keyFlags) {
-    (void)keyFlags;
+    // Forward double-clicks inside the Right-Side Preview Pane directly to OnMouseDown
+    // so ArchiveExplorer and Folder Sub-Explorer receive the 2nd click of WM_LBUTTONDBLCLK!
+    if (PreviewPaneVisible() && PathUtils::PtInRectF(x, y, GetPreviewPaneRect())) {
+        OnMouseDown(x, y, false, keyFlags);
+        return;
+    }
 
     // Double-clicking a node in the Left Navigation Tree expands/collapses its subfolders!
     D2D1_RECT_F fullRect = GetFullWorkspaceRect();
@@ -2616,6 +3597,7 @@ void ExplorerApp::OnMouseWheel(short delta, float x, float y, WPARAM keyFlags) {
 
     // If cursor is over the Right-Side File Content Pane (Hex / 3D), scroll or zoom it!
     if (PreviewPaneVisible() && m_contentPane.OnMouseWheel(delta, x, y)) {
+        EnsureWorkAnimTimerState();     // a PDF page turned by the wheel is drawn in the background
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return;
     }
@@ -2716,6 +3698,15 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
     bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
 
+    if (vk == VK_TAB && ctrl && !alt) {
+        if (!m_tabs.empty()) {
+            int n = static_cast<int>(m_tabs.size());
+            int nextTab = shift ? ((m_activeTab - 1 + n) % n) : ((m_activeTab + 1) % n);
+            SwitchToTab(nextTab);
+        }
+        return;
+    }
+
     if (vk == VK_TAB && !ctrl && !alt && IsSplitViewActive()) {
         SetActivePane(1 - m_activePane);
         return;
@@ -2726,6 +3717,15 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
         return;
     }
     if (vk == VK_ESCAPE) {
+        if (m_isDraggingItems) {
+            m_isDraggingItems = false;
+            m_dragPaths.clear();
+            m_dragTargetDir.clear();
+            m_dragTargetLabel.clear();
+            ReleaseCapture();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            return;
+        }
         if (m_isFullScreen) {
             ToggleFullScreen();
             return;
@@ -2752,7 +3752,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
             return;
         }
         if (vk == 'D') {
-            OnMouseDown(m_addressBarRect.left + 10.0f, m_addressBarRect.top + 5.0f, false, 0);
+            BeginPaneAddressEdit(m_activePane);
             return;
         }
     }
@@ -2769,7 +3769,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
         if (vk == 'V') { PasteIntoCurrent(); return; }
         if (vk == 'N' && shift) { CreateNewFolderAction(); return; }
         if (vk == 'L') {
-            OnMouseDown(m_addressBarRect.left + 10.0f, m_addressBarRect.top + 5.0f, false, 0);
+            BeginPaneAddressEdit(m_activePane);
             return;
         }
         if (vk == 'F') {
@@ -2777,11 +3777,14 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
             return;
         }
         if (vk == 'R') { RefreshCurrentFolder(); return; }
+        if (vk == 'T') { CreateNewTab(L"", true); return; }
+        if (vk == 'W') { CloseTab(m_activeTab); return; }
+        if (vk == 'M') { ExecuteRibbonCommand(CMD_BATCH_RENAME); return; }
     }
 
     if (vk == VK_F2) { StartInlineRename(); return; }
     if (vk == VK_F3) { OnMouseDown(m_searchBarRect.left + 10.0f, m_searchBarRect.top + 5.0f, false, 0); return; }
-    if (vk == VK_F4) { OnMouseDown(m_addressBarRect.left + 10.0f, m_addressBarRect.top + 5.0f, false, 0); return; }
+    if (vk == VK_F4) { BeginPaneAddressEdit(m_activePane); return; }
     if (vk == VK_F5) { RefreshCurrentFolder(); return; }
     if (vk == VK_BACK) { NavigateBack(); return; }
     if (vk == VK_DELETE) { DeleteSelectedItems(shift); return; }
@@ -2918,12 +3921,54 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         break;
     case CMD_TOGGLE_LANG:
         m_lang = (m_lang == Lang::PL) ? Lang::EN : Lang::PL;
+        SaveUiSettings();
         RebuildTreeNodes();
         RefreshCurrentFolder();
+        if (m_splitView && !m_otherPane.currentPath.empty()) {
+            int prevActive = m_activePane;
+            SwapWithOtherPane();
+            m_activePane = 1 - prevActive;
+            RefreshCurrentFolder();
+            SwapWithOtherPane();
+            m_activePane = prevActive;
+        }
         break;
     case CMD_TOGGLE_RIBBON:
         m_ribbonCollapsed = !m_ribbonCollapsed;
+        SaveUiSettings();
         ClampScrollOffset();
+        break;
+    case CMD_TAB_NEW:
+        CreateNewTab(L"", true);
+        break;
+    case CMD_TAB_CLOSE:
+        CloseTab(m_activeTab);
+        break;
+    case CMD_TAB_NEXT:
+        if (!m_tabs.empty()) SwitchToTab((m_activeTab + 1) % static_cast<int>(m_tabs.size()));
+        break;
+    case CMD_TAB_PREV:
+        if (!m_tabs.empty()) {
+            int n = static_cast<int>(m_tabs.size());
+            SwitchToTab((m_activeTab - 1 + n) % n);
+        }
+        break;
+    case CMD_VIEWER_COMPARE:
+        m_viewerCompareMode = !m_viewerCompareMode;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        break;
+    case CMD_VIEWER_HISTOGRAM:
+        m_viewerShowHistogram = !m_viewerShowHistogram;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        break;
+    case CMD_VIEWER_SLIDESHOW:
+        m_viewerSlideshow = !m_viewerSlideshow;
+        if (m_viewerSlideshow) {
+            SetTimer(m_hwnd, ID_TIMER_SLIDESHOW, 3500, nullptr);
+        } else {
+            KillTimer(m_hwnd, ID_TIMER_SLIDESHOW);
+        }
+        InvalidateRect(m_hwnd, nullptr, FALSE);
         break;
 
     case CMD_PIN_QUICK: {
@@ -2974,24 +4019,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         if (pidl) {
             wchar_t destFolder[MAX_PATH] = {};
             if (SHGetPathFromIDListW(pidl, destFolder) && destFolder[0]) {
-                std::wstring fromDoubleNull;
-                for (const auto& p : paths) {
-                    fromDoubleNull += p;
-                    fromDoubleNull.push_back(L'\0');
-                }
-                fromDoubleNull.push_back(L'\0');
-                std::wstring toDoubleNull = destFolder;
-                toDoubleNull.push_back(L'\0');
-                toDoubleNull.push_back(L'\0');
-
-                SHFILEOPSTRUCTW fop = {};
-                fop.hwnd = m_hwnd;
-                fop.wFunc = (cmdId == CMD_MOVE_TO) ? FO_MOVE : FO_COPY;
-                fop.pFrom = fromDoubleNull.c_str();
-                fop.pTo   = toDoubleNull.c_str();
-                fop.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR;
-                SHFileOperationW(&fop);
-                RefreshCurrentFolder();
+                StartManagedTransfer(paths, destFolder, cmdId == CMD_MOVE_TO, false);
             }
             CoTaskMemFree(pidl);
         }
@@ -3041,7 +4069,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_SELECT_NONE:   SelectNone(); break;
     case CMD_INVERT_SEL:    InvertSelection(); break;
 
-    case CMD_TOGGLE_NAVPANE:     m_showNavPane = !m_showNavPane; break;
+    case CMD_TOGGLE_NAVPANE:     m_showNavPane = !m_showNavPane; SaveUiSettings(); break;
     case CMD_TOGGLE_PREVIEWPANE: {
         m_showPreviewPane = !m_showPreviewPane;
         if (m_showPreviewPane && (m_viewMode == ViewMode::Hardware || m_viewMode == ViewMode::FullViewer)) {
@@ -3478,12 +4506,61 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_HW_SUB_NET:
     case CMD_HW_SUB_SYSTEM:
     case CMD_HW_SUB_THERMAL:
-        m_hwSubTab = (cmdId == CMD_HW_SUB_THERMAL) ? HardwareSubTab::Thermal
-                                                  : static_cast<HardwareSubTab>(cmdId - CMD_HW_SUB_ALL);
+    case CMD_HW_SUB_USB_COM:
+        if (cmdId == CMD_HW_SUB_THERMAL) m_hwSubTab = HardwareSubTab::Thermal;
+        else if (cmdId == CMD_HW_SUB_USB_COM) m_hwSubTab = HardwareSubTab::UsbCom;
+        else m_hwSubTab = static_cast<HardwareSubTab>(cmdId - CMD_HW_SUB_ALL);
         m_hwScrollY = 0.0f;
         m_viewMode = ViewMode::Hardware;
         m_hwInspector.InitializeStaticInventory();
         EnsureWorkAnimTimerState();
+        break;
+    case CMD_HW_SELECT_USB_NODE:
+        m_hwSelectedUsbId = m_hwActionArg;
+        m_hwInspectComMode = false;
+        for (const auto& u : m_hwInspector.GetUsbTree()) {
+            if (u.deviceInstanceId == m_hwSelectedUsbId && !u.comPortName.empty()) {
+                m_hwSelectedComPort = u.comPortName;
+                break;
+            }
+        }
+        break;
+    case CMD_HW_SELECT_COM_PORT:
+        m_hwSelectedComPort = m_hwActionArg;
+        m_hwInspectComMode = true;
+        for (const auto& u : m_hwInspector.GetUsbTree()) {
+            if (u.comPortName == m_hwSelectedComPort) {
+                m_hwSelectedUsbId = u.deviceInstanceId;
+                break;
+            }
+        }
+        break;
+    case CMD_HW_TOGGLE_USB_NODE:
+        if (!m_hwActionArg.empty()) {
+            if (m_hwCollapsedUsbNodes.count(m_hwActionArg)) {
+                m_hwCollapsedUsbNodes.erase(m_hwActionArg);
+            } else {
+                m_hwCollapsedUsbNodes.insert(m_hwActionArg);
+            }
+        }
+        break;
+    case CMD_HW_TOGGLE_USB_INTERFACES:
+        m_hwShowUsbInterfaces = !m_hwShowUsbInterfaces;
+        break;
+    case CMD_HW_REFRESH_USB_COM:
+        m_hwInspector.RequestUsbComRefresh(false);
+        EnsureWorkAnimTimerState();
+        m_statusToast = m_lang == Lang::PL ? L"\x21BB Odświeżanie drzewa USB i portów COM..." : L"\x21BB Refreshing USB tree & COM ports...";
+        m_statusToastExpireTick = GetTickCount64() + 2400;
+        break;
+    case CMD_HW_COPY_TEXT:
+        if (!m_hwActionArg.empty()) {
+            FileEngine::CopyTextToClipboard(m_hwnd, m_hwActionArg);
+            std::wstring shortPreview = m_hwActionArg.size() > 64 ? (m_hwActionArg.substr(0, 61) + L"...") : m_hwActionArg;
+            for (wchar_t& c : shortPreview) if (c == L'\r' || c == L'\n') c = L' ';
+            m_statusToast = (m_lang == Lang::PL ? L"\x2713 Skopiowano: " : L"\x2713 Copied: ") + shortPreview;
+            m_statusToastExpireTick = GetTickCount64() + 2600;
+        }
         break;
     case CMD_HW_REFRESH:
         m_hwInspector.RefreshFullInventory(false);
@@ -3722,7 +4799,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         break;
     case CMD_BACKUP_ADD_JOB: {
         const bool pl = (m_lang == Lang::PL);
-        std::wstring defaultSrc = (!m_currentPath.empty() && m_currentPath != L"THIS_PC") ? m_currentPath : L"W:\\GIT\\Explorer2\\src";
+        std::wstring defaultSrc = (!m_currentPath.empty() && m_currentPath != L"THIS_PC") ? m_currentPath : L"C:\\Projects\\MyProject";
         std::wstring defaultDst = (!m_otherPane.currentPath.empty() && m_otherPane.currentPath != L"THIS_PC")
             ? m_otherPane.currentPath
             : L"D:\\Backups\\NowaKopia";
@@ -3874,6 +4951,210 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_BACKUP_RUN_ALL_DUE:
         m_backups.TickScheduler();
         EnsureWorkAnimTimerState();
+        break;
+
+    // CopyHandler-grade Transfer Engine & Queue ("Transfery")
+    case CMD_TAB_TRANSFERS:
+        m_activeRibbonTab = RibbonTab::Transfers;
+        m_ribbonCollapsed = false;
+        m_viewMode = ViewMode::Hardware;
+        m_hwScrollY = 0.0f;
+        EnsureWorkAnimTimerState();
+        break;
+    case CMD_XFER_PAUSE_RESUME_ACTIVE: {
+        bool nowPaused = m_transfers.TogglePauseActive();
+        const bool pl = (m_lang == Lang::PL);
+        m_statusToast = nowPaused
+            ? (pl ? L"\x23F8 Wstrzymano aktywne transfery (kliknij Wznów aby kontynuować)" : L"\x23F8 Paused active transfers (click Resume to continue)")
+            : (pl ? L"\x25B6 Wznowiono transfery" : L"\x25B6 Resumed transfers");
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_XFER_CANCEL_ACTIVE:
+        m_transfers.CancelActive();
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    case CMD_XFER_PAUSE_ALL:
+        m_transfers.PauseAll();
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    case CMD_XFER_RESUME_ALL:
+        m_transfers.ResumeAll();
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    case CMD_XFER_RETRY_ALL_FAILED: {
+        int n = m_transfers.RetryAllFailed();
+        const bool pl = (m_lang == Lang::PL);
+        m_statusToast = (n > 0)
+            ? ((pl ? L"\x21BB Ponowiono zadania z błędami (" : L"\x21BB Retrying jobs with errors (") + std::to_wstring(n) + L")")
+            : (pl ? L"\x2713 Brak błędnych zadań do ponowienia" : L"\x2713 No failed jobs to retry");
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_XFER_CLEAR_FINISHED:
+        m_transfers.ClearFinishedJobs();
+        UpdateTaskbarProgress();
+        break;
+    case CMD_XFER_CYCLE_QUEUE_MODE: {
+        TransferConfig c = m_transfers.GetConfig();
+        c.queueMode = static_cast<TransferQueueMode>((static_cast<int>(c.queueMode) + 1) % 3);
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_CYCLE_CONFLICT: {
+        TransferConfig c = m_transfers.GetConfig();
+        c.conflictPolicy = static_cast<TransferConflictPolicy>((static_cast<int>(c.conflictPolicy) + 1) % 5);
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_CYCLE_VERIFY: {
+        TransferConfig c = m_transfers.GetConfig();
+        c.verifyMode = static_cast<TransferVerifyMode>((static_cast<int>(c.verifyMode) + 1) % 3);
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_CYCLE_BUFFER: {
+        static const uint32_t kBufs[] = { 0, 1024, 4096, 8192, 16384, 32768 };
+        TransferConfig c = m_transfers.GetConfig();
+        size_t next = 0;
+        for (size_t i = 0; i < std::size(kBufs); ++i) {
+            if (kBufs[i] == c.bufferSizeKB) { next = (i + 1) % std::size(kBufs); break; }
+        }
+        c.bufferSizeKB = kBufs[next];
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_CYCLE_WORKERS: {
+        static const uint32_t kWrk[] = { 0, 1, 2, 4, 8, 16 };
+        TransferConfig c = m_transfers.GetConfig();
+        size_t next = 0;
+        for (size_t i = 0; i < std::size(kWrk); ++i) {
+            if (kWrk[i] == c.workerThreads) { next = (i + 1) % std::size(kWrk); break; }
+        }
+        c.workerThreads = kWrk[next];
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_TOGGLE_PARTFILE: {
+        TransferConfig c = m_transfers.GetConfig();
+        c.usePartFiles = !c.usePartFiles;
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_TOGGLE_UNBUFFERED: {
+        TransferConfig c = m_transfers.GetConfig();
+        c.unbufferedLargeFiles = !c.unbufferedLargeFiles;
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_CYCLE_SPEED_LIMIT: {
+        static const uint32_t kLims[] = { 0, 500, 100, 50, 10 };
+        TransferConfig c = m_transfers.GetConfig();
+        size_t next = 0;
+        for (size_t i = 0; i < std::size(kLims); ++i) {
+            if (kLims[i] == c.speedLimitMBps) { next = (i + 1) % std::size(kLims); break; }
+        }
+        c.speedLimitMBps = kLims[next];
+        m_transfers.SetConfig(c);
+        SaveUiSettings();
+        break;
+    }
+    case CMD_XFER_SELECT_JOB:
+        m_xferSelectedJobId = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_hwActionIndex;
+        break;
+    case CMD_XFER_JOB_PAUSE_RESUME: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_xferSelectedJobId;
+        m_transfers.TogglePauseJob(jid);
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_XFER_JOB_FORCE_START: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_xferSelectedJobId;
+        m_transfers.ForceStartJob(jid);
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_XFER_JOB_BUMP_TOP: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_xferSelectedJobId;
+        m_transfers.BumpJobToTop(jid);
+        break;
+    }
+    case CMD_XFER_JOB_RETRY_FAILED: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_xferSelectedJobId;
+        m_transfers.RetryFailedInJob(jid);
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_XFER_JOB_CANCEL_REMOVE: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_xferSelectedJobId;
+        m_transfers.CancelOrRemoveJob(jid);
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_XFER_JOB_CYCLE_CONFLICT: {
+        int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_xferSelectedJobId;
+        auto snaps = m_transfers.SnapshotJobs();
+        for (const auto& s : snaps) {
+            if (s.id == jid) {
+                auto nextPol = static_cast<TransferConflictPolicy>((static_cast<int>(s.conflictPolicy) + 1) % 5);
+                m_transfers.SetJobConflictPolicy(jid, nextPol);
+                break;
+            }
+        }
+        break;
+    }
+    case CMD_XFER_JOB_OPEN_DST: {
+        if (!m_hwActionArg.empty()) {
+            NavigateTo(m_hwActionArg, true);
+            return;
+        }
+        break;
+    }
+    case CMD_XFER_NEW_TRANSFER_DLG: {
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring defaultSrc = (!m_currentPath.empty() && m_currentPath != L"THIS_PC") ? m_currentPath : L"";
+        auto sel = GetSelectedPaths();
+        if (!sel.empty()) defaultSrc = sel[0];
+        std::wstring defaultDst = (!m_otherPane.currentPath.empty() && m_otherPane.currentPath != L"THIS_PC")
+            ? m_otherPane.currentPath : L"";
+        std::wstring initStr = defaultSrc + L"|" + defaultDst;
+        std::wstring input;
+        if (PromptCustomInputDialog(
+                m_hwnd, m_hInstance, m_editFont,
+                pl ? L"Nowe zadanie transferu (CopyHandler Engine)" : L"New Transfer Job (CopyHandler Engine)",
+                pl ? L"Podaj: Ścieżka źródłowa|Folder docelowy:" : L"Enter: Source path|Destination folder:",
+                initStr.c_str(), pl, input)) {
+            size_t bar = input.find(L'|');
+            if (bar != std::wstring::npos) {
+                std::wstring sPath = PathUtils::Trim(input.substr(0, bar));
+                std::wstring dPath = PathUtils::Trim(input.substr(bar + 1));
+                if (!sPath.empty() && !dPath.empty()) {
+                    StartManagedTransfer({ sPath }, dPath, false, false);
+                }
+            }
+        }
+        break;
+    }
+    case CMD_CTX_PASTE_VERIFIED:
+        PasteIntoCurrent(true);
         break;
     case CMD_MON_RANGE:
         m_monRangeIdx = std::clamp(m_hwActionIndex, 0, 4);
@@ -4071,19 +5352,78 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     }
     case CMD_HW_SAVE_REPORT: {
         std::wstring rep = m_hwInspector.BuildFullTextReport(m_lang);
-        std::wstring folder = (m_currentPath.empty() || m_currentPath == L"THIS_PC") ? L"C:\\" : m_currentPath;
-        std::wstring outPath = PathUtils::EnsureTrailingSlash(folder) + L"Raport_Sprzetowy_PRO.txt";
-        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, rep.c_str(), static_cast<int>(rep.size()), nullptr, 0, nullptr, nullptr);
+        std::wstring folder = (m_currentPath.empty() || m_currentPath == L"THIS_PC" || FtpClient::IsFtpPath(m_currentPath)) ? L"C:\\" : m_currentPath;
+        wchar_t fileBuf[MAX_PATH] = {};
+        std::wstring defaultFile = PathUtils::EnsureTrailingSlash(folder) + (m_lang == Lang::PL ? L"Raport_Sprzetowy_PRO.html" : L"Hardware_Report_PRO.html");
+        wcsncpy_s(fileBuf, defaultFile.c_str(), _TRUNCATE);
+
+        OPENFILENAMEW ofn = {};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = m_hwnd;
+        ofn.lpstrFilter = m_lang == Lang::PL
+            ? L"Raport HTML (*.html)\0*.html\0Raport tekstowy (*.txt)\0*.txt\0Wszystkie pliki (*.*)\0*.*\0"
+            : L"HTML Report (*.html)\0*.html\0Text Report (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = fileBuf;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        ofn.lpstrDefExt = L"html";
+
+        std::wstring outPath = defaultFile;
+        if (GetSaveFileNameW(&ofn)) {
+            outPath = fileBuf;
+        } else if (CommDlgExtendedError() != 0) {
+            outPath = defaultFile;
+        } else {
+            break;
+        }
+
+        std::wstring ext = PathUtils::GetExtensionLower(outPath);
+        bool asHtml = (ext == L".html" || ext == L".htm");
+
+        std::wstring finalDoc;
+        if (asHtml) {
+            std::wstring escaped;
+            escaped.reserve(rep.size() + 512);
+            for (wchar_t ch : rep) {
+                if (ch == L'&') escaped += L"&amp;";
+                else if (ch == L'<') escaped += L"&lt;";
+                else if (ch == L'>') escaped += L"&gt;";
+                else escaped.push_back(ch);
+            }
+            finalDoc =
+                L"<!DOCTYPE html>\r\n<html lang=\"en\"><head><meta charset=\"utf-8\">\r\n"
+                L"<title>Explorer2 PRO \x2014 Hardware Workstation Report</title>\r\n"
+                L"<style>\r\n"
+                L"  body { background:#0D131F; color:#E2E8F0; font-family:'Cascadia Mono','Consolas',monospace; margin:0; padding:32px; }\r\n"
+                L"  .card { max-width:1120px; margin:0 auto; background:#131C2E; border:1px solid #26354D; border-radius:12px; padding:28px 34px; box-shadow:0 16px 40px rgba(0,0,0,0.45); }\r\n"
+                L"  h1 { margin:0 0 8px 0; font-family:'Segoe UI',sans-serif; font-size:22px; color:#38BDF8; letter-spacing:0.4px; }\r\n"
+                L"  .sub { font-family:'Segoe UI',sans-serif; font-size:13px; color:#94A3B8; margin-bottom:20px; }\r\n"
+                L"  pre { margin:0; font-size:13px; line-height:1.55; color:#F1F5F9; white-space:pre-wrap; word-break:break-word; }\r\n"
+                L"</style></head><body>\r\n"
+                L"<div class=\"card\">\r\n"
+                L"  <h1>\x26A1 Explorer2 PRO \x2014 Hardware &amp; Sensor Workstation Report</h1>\r\n"
+                L"  <div class=\"sub\">Generated by Explorer2 Hardware Inspector</div>\r\n"
+                L"  <pre>" + escaped + L"</pre>\r\n"
+                L"</div></body></html>\r\n";
+        } else {
+            finalDoc = rep;
+        }
+
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, finalDoc.c_str(), static_cast<int>(finalDoc.size()), nullptr, 0, nullptr, nullptr);
         if (utf8Len > 0) {
             std::string utf8(utf8Len, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, rep.c_str(), static_cast<int>(rep.size()), utf8.data(), utf8Len, nullptr, nullptr);
+            WideCharToMultiByte(CP_UTF8, 0, finalDoc.c_str(), static_cast<int>(finalDoc.size()), utf8.data(), utf8Len, nullptr, nullptr);
             std::ofstream ofs(outPath, std::ios::binary);
             if (ofs) {
                 ofs.write(utf8.data(), utf8.size());
                 ofs.close();
                 m_statusToast = (m_lang == Lang::PL ? L"\xD83D\xDCBE Zapisano: " : L"\xD83D\xDCBE Saved: ") + outPath;
                 m_statusToastExpireTick = GetTickCount64() + 3800;
-                ShellExecuteW(m_hwnd, L"open", L"notepad.exe", (L"\"" + outPath + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+                if (asHtml) {
+                    ShellExecuteW(m_hwnd, L"open", outPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                } else {
+                    ShellExecuteW(m_hwnd, L"open", L"notepad.exe", (L"\"" + outPath + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+                }
             }
         }
         break;
@@ -4224,6 +5564,320 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_FTP_DISCONNECT:
         NavigateTo(L"THIS_PC", true);
         break;
+    case CMD_OPEN_SETTINGS_INI: {
+        SaveUiSettings(true);        // the editor must find the current settings in the file
+        std::wstring ini = UiSettingsPath();
+        ShellExecuteW(m_hwnd, L"open", L"notepad.exe", (L"\"" + ini + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+        break;
+    }
+    case CMD_HOME_EASY_ACCESS: {
+        const bool pl = (m_lang == Lang::PL);
+        HMENU hMenu = CreatePopupMenu();
+        if (IsFolderPinnedToQuickAccess(m_currentPath)) {
+            AppendMenuW(hMenu, MF_STRING, CMD_PIN_QUICK, pl ? L"\xD83D\xDCCC Odepnij bieżący folder z Szybkiego dostępu" : L"\xD83D\xDCCC Unpin current folder from Quick Access");
+        } else {
+            AppendMenuW(hMenu, MF_STRING, CMD_PIN_QUICK, pl ? L"\xD83D\xDCCC Przypnij bieżący folder do Szybkiego dostępu" : L"\xD83D\xDCCC Pin current folder to Quick Access");
+        }
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING, CMD_SHARE_MAP_DRIVE, pl ? L"\xD83D\xDDA7 Mapuj dysk sieciowy..." : L"\xD83D\xDDA7 Map network drive...");
+        AppendMenuW(hMenu, MF_STRING, CMD_SHARE_DISCONNECT_DRIVE, pl ? L"\x23CF Odłącz dysk sieciowy..." : L"\x23CF Disconnect network drive...");
+        AppendMenuW(hMenu, MF_STRING, CMD_FTP_CONNECT_DLG, pl ? L"\xD83C\xDF10 Połącz z serwerem FTP..." : L"\xD83C\xDF10 Connect to FTP server...");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING, CMD_OPEN_SETTINGS_INI, pl ? L"\x2699 Otwórz plik konfiguracyjny (settings.ini)" : L"\x2699 Open configuration file (settings.ini)");
+        AppendMenuW(hMenu, MF_STRING, CMD_LOG_OPEN_FOLDER, pl ? L"\xD83D\xDCC2 Otwórz folder logów aplikacji" : L"\xD83D\xDCC2 Open application logs folder");
+        POINT pt = {};
+        GetCursorPos(&pt);
+        for (const auto& hit : m_ribbonHits) {
+            if (hit.id == CMD_HOME_EASY_ACCESS) {
+                POINT bpt = { static_cast<LONG>(hit.rect.left), static_cast<LONG>(hit.rect.bottom) };
+                ClientToScreen(m_hwnd, &bpt);
+                pt = bpt;
+                break;
+            }
+        }
+        int sel = static_cast<int>(TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr));
+        DestroyMenu(hMenu);
+        if (sel > 0 && sel != CMD_HOME_EASY_ACCESS) {
+            ExecuteRibbonCommand(sel);
+        }
+        break;
+    }
+    case CMD_HELP_SHORTCUTS: {
+        const bool pl = (m_lang == Lang::PL);
+        const wchar_t* title = pl ? L"Explorer2 PRO — Skróty klawiszowe i funkcje" : L"Explorer2 PRO — Keyboard Shortcuts & Features";
+        const wchar_t* body = pl
+            ? L"NAWIGACJA I KARTY:\n"
+              L"  \x2022 Ctrl + T / Środkowy przycisk myszy  — Nowa karta folderu\n"
+              L"  \x2022 Ctrl + W / Ctrl + Tab              — Zamknij kartę / Następna karta\n"
+              L"  \x2022 Tab (w podwójnym widoku)           — Przełącz aktywny panel (L \x2194 P)\n"
+              L"  \x2022 Alt + Strzałka w lewo / prawo / górę — Wstecz / Dalej / W górę\n"
+              L"  \x2022 F4 / Ctrl + L                      — Edytuj pasek adresu\n"
+              L"  \x2022 Ctrl + F                           — Szukaj w folderze i podfolderach\n"
+              L"  \x2022 F5                                 — Odśwież widok (automatyczny watcher jest aktywny)\n\n"
+              L"OPERACJE NA PLIKACH:\n"
+              L"  \x2022 Ctrl + Z                           — Natychmiastowe cofnięcie usunięcia (Hardlink Undo) / zmiany nazwy\n"
+              L"  \x2022 F2 / Ctrl + M                      — Zmień nazwę / Masowa zmiana nazw (Batch Rename)\n"
+              L"  \x2022 Delete / Shift + Delete            — Przenieś do Kosza / Usuń trwale\n"
+              L"  \x2022 Przeciągnij i upuść (Drag & Drop)  — Przenoś pliki do folderów, drzewa, kart i innych okien\n\n"
+              L"PODGLĄD I MULTIMEDIA:\n"
+              L"  \x2022 Alt + P                            — Przełącz prawy panel podglądu (Kod, Hex, 3D, PCB, PDF, AI/EXIF)\n"
+              L"  \x2022 F11 / Spacja                       — Pełny ekran / Odtwarzaj-Pauza wideo\n"
+              L"  \x2022 Kółko myszy (w Pełnym podglądzie)  — Powiększenie do 16\xD7 + porównywanie obrazów i histogram RGB"
+            : L"NAVIGATION & TABS:\n"
+              L"  \x2022 Ctrl + T / Middle-Click            — Open folder in new tab\n"
+              L"  \x2022 Ctrl + W / Ctrl + Tab              — Close tab / Switch to next tab\n"
+              L"  \x2022 Tab (in Split View)                — Switch active pane (Left \x2194 Right)\n"
+              L"  \x2022 Alt + Left / Right / Up            — Back / Forward / Up directory\n"
+              L"  \x2022 F4 / Ctrl + L                      — Focus address bar\n"
+              L"  \x2022 Ctrl + F                           — Focus recursive search box\n"
+              L"  \x2022 F5                                 — Refresh (live ReadDirectoryChangesW watcher is active)\n\n"
+              L"FILE OPERATIONS:\n"
+              L"  \x2022 Ctrl + Z                           — Instant Hardlink Undo for Recycle Bin delete / Batch Rename\n"
+              L"  \x2022 F2 / Ctrl + M                      — Inline Rename / Multi-File Batch Rename\n"
+              L"  \x2022 Delete / Shift + Delete            — Recycle Bin / Permanent delete\n"
+              L"  \x2022 Drag & Drop                        — Drag items to folders, tree nodes, tabs, or external apps\n\n"
+              L"PREVIEW & MEDIA:\n"
+              L"  \x2022 Alt + P                            — Toggle right Preview Pane (Code, Hex, 3D, PCB, PDF, AI/EXIF)\n"
+              L"  \x2022 F11 / Space                        — Fullscreen / Play-Pause media\n"
+              L"  \x2022 Mouse Wheel (in FullViewer)        — Smooth zoom up to 16\xD7 + Side-by-Side Compare & RGB Histogram";
+        MessageBoxW(m_hwnd, body, title, MB_OK | MB_ICONINFORMATION);
+        break;
+    }
+    case CMD_TOGGLE_THEME: {
+        m_darkMode = !m_darkMode;
+        SaveUiSettings();
+        HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+        if (!hDwm) hDwm = LoadLibraryW(L"dwmapi.dll");
+        if (hDwm) {
+            using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+            auto fn = reinterpret_cast<DwmSetWindowAttributeFn>(GetProcAddress(hDwm, "DwmSetWindowAttribute"));
+            if (fn) {
+                BOOL useDark = m_darkMode ? TRUE : FALSE;
+                fn(m_hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &useDark, sizeof(useDark));
+            }
+        }
+        m_statusToast = m_darkMode
+            ? (m_lang == Lang::PL ? L"\xD83C\xDF19 Motyw ciemny (Dark Mode) WŁĄCZONY" : L"\xD83C\xDF19 Dark Mode ENABLED")
+            : (m_lang == Lang::PL ? L"\x2600 Motyw jasny (Light Mode) WŁĄCZONY" : L"\x2600 Light Mode ENABLED");
+        m_statusToastExpireTick = GetTickCount64() + 2800;
+        break;
+    }
+    case CMD_BATCH_RENAME: {
+        const bool pl = (m_lang == Lang::PL);
+        if (m_currentPath.empty() || m_currentPath == L"THIS_PC" || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
+            m_statusToast = pl ? L"\x26A0 Wybierz pliki w lokalnym folderze do masowej zmiany nazwy" : L"\x26A0 Select files in a local folder to batch rename";
+            m_statusToastExpireTick = GetTickCount64() + 3000;
+            break;
+        }
+        std::vector<std::wstring> selected = GetSelectedPaths();
+        if (selected.empty()) {
+            m_statusToast = pl ? L"\x26A0 Zaznacz co najmniej 1 plik do masowej zmiany nazw (Ctrl+M)" : L"\x26A0 Select at least 1 item to batch rename (Ctrl+M)";
+            m_statusToastExpireTick = GetTickCount64() + 3000;
+            break;
+        }
+        std::wstring patternInput;
+        wchar_t promptMsg[384] = {};
+        swprintf_s(promptMsg, pl
+            ? L"Zaznaczono %zu elementów. Szablon: [name] [ext] [###] [#] [date]  LUB  znajdź|zamień:"
+            : L"%zu items selected. Template: [name] [ext] [###] [#] [date]  OR  find|replace:",
+            selected.size());
+        if (!PromptCustomInputDialog(
+                m_hwnd, m_hInstance, m_editFont,
+                pl ? L"Masowa zmiana nazw (Batch Rename — Ctrl+M)" : L"Multi-File Batch Rename (Ctrl+M)",
+                promptMsg,
+                L"[name]_[###][ext]", pl, patternInput))
+        {
+            break;
+        }
+        if (patternInput.empty()) break;
+
+        SYSTEMTIME stNow = {};
+        GetLocalTime(&stNow);
+        wchar_t dateBuf[32] = {};
+        swprintf_s(dateBuf, L"%04u-%02u-%02u", stNow.wYear, stNow.wMonth, stNow.wDay);
+
+        auto replaceAll = [](std::wstring str, const std::wstring& from, const std::wstring& to) {
+            if (from.empty()) return str;
+            size_t pos = 0;
+            while ((pos = str.find(from, pos)) != std::wstring::npos) {
+                str.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+            return str;
+        };
+
+        size_t renamedCount = 0;
+        size_t idx = 1;
+        for (const auto& oldPath : selected) {
+            std::wstring dir = PathUtils::GetParentPath(oldPath);
+            std::wstring fullFile = PathUtils::GetFileName(oldPath);
+            std::wstring ext = PathUtils::GetExtension(fullFile);
+            std::wstring stem = fullFile;
+            size_t dotPos = fullFile.find_last_of(L'.');
+            if (dotPos != std::wstring::npos && dotPos > 0) {
+                ext = fullFile.substr(dotPos);
+                stem = fullFile.substr(0, dotPos);
+            } else {
+                ext.clear();
+            }
+
+            std::wstring newFileName;
+            size_t pipePos = patternInput.find(L'|');
+            if (pipePos != std::wstring::npos) {
+                std::wstring findStr = patternInput.substr(0, pipePos);
+                std::wstring replStr = patternInput.substr(pipePos + 1);
+                newFileName = replaceAll(fullFile, findStr, replStr);
+            } else {
+                wchar_t num3[16] = {};
+                swprintf_s(num3, L"%03zu", idx);
+                wchar_t num1[16] = {};
+                swprintf_s(num1, L"%zu", idx);
+                newFileName = patternInput;
+                newFileName = replaceAll(newFileName, L"[name]", stem);
+                newFileName = replaceAll(newFileName, L"[ext]", ext);
+                newFileName = replaceAll(newFileName, L"[###]", num3);
+                newFileName = replaceAll(newFileName, L"[#]", num1);
+                newFileName = replaceAll(newFileName, L"[date]", dateBuf);
+            }
+
+            ++idx;
+            if (newFileName.empty() || newFileName == fullFile) continue;
+            if (!ValidateFileName(newFileName, pl).empty()) continue;
+
+            std::wstring newPath = PathUtils::EnsureTrailingSlash(dir) + newFileName;
+            if (MoveFileExW(oldPath.c_str(), newPath.c_str(), 0)) {
+                ++renamedCount;
+                AppLog::Ok(L"BATCH-RENAME", oldPath + L" -> " + newPath);
+            }
+        }
+
+        RefreshCurrentFolder();
+        wchar_t doneMsg[192] = {};
+        swprintf_s(doneMsg, pl
+            ? L"\x2713 Masowa zmiana nazw: zmieniono %zu z %zu plików"
+            : L"\x2713 Batch Rename complete: renamed %zu of %zu items",
+            renamedCount, selected.size());
+        m_statusToast = doneMsg;
+        m_statusToastExpireTick = GetTickCount64() + 3800;
+        break;
+    }
+    case CMD_SEARCH_DUPLICATES: {
+        const bool pl = (m_lang == Lang::PL);
+        if (m_currentPath.empty() || m_currentPath == L"THIS_PC" || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
+            m_statusToast = pl ? L"\x26A0 Otwórz lokalny folder, aby wyszukać duplikaty plików" : L"\x26A0 Open a local folder to scan for duplicate files";
+            m_statusToastExpireTick = GetTickCount64() + 3200;
+            break;
+        }
+        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        std::map<uint64_t, std::vector<FileEntry>> bySize;
+        std::vector<std::wstring> dirQueue = { m_currentPath };
+        size_t scannedFiles = 0;
+        size_t scannedFolders = 0;
+
+        while (!dirQueue.empty() && scannedFiles < 35000) {
+            std::wstring curDir = dirQueue.back();
+            dirQueue.pop_back();
+            ++scannedFolders;
+            auto entries = m_fileEngine.EnumerateDirectory(curDir, m_showHidden, m_showExtensions, m_lang);
+            for (auto& e : entries) {
+                if (e.isDirectory) {
+                    if (m_searchOpts.recursive) {
+                        dirQueue.push_back(e.fullPath);
+                    }
+                } else if (e.size > 0) {
+                    bySize[e.size].push_back(std::move(e));
+                    ++scannedFiles;
+                }
+            }
+        }
+
+        auto computeFastFileSignature = [](const std::wstring& path, uint64_t fileSize) -> uint64_t {
+            HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return 0;
+
+            uint64_t hash = 14695981039346656037ULL;
+            auto hashBytes = [&](const uint8_t* buf, DWORD count) {
+                for (DWORD i = 0; i < count; ++i) {
+                    hash ^= static_cast<uint64_t>(buf[i]);
+                    hash *= 1099511628211ULL;
+                }
+            };
+
+            uint8_t buf[16384];
+            DWORD read = 0;
+            if (ReadFile(h, buf, sizeof(buf), &read, nullptr) && read > 0) {
+                hashBytes(buf, read);
+            }
+            if (fileSize > sizeof(buf) * 2) {
+                LARGE_INTEGER midPos = {};
+                midPos.QuadPart = static_cast<LONGLONG>(fileSize / 2);
+                if (SetFilePointerEx(h, midPos, nullptr, FILE_BEGIN) &&
+                    ReadFile(h, buf, sizeof(buf), &read, nullptr) && read > 0) {
+                    hashBytes(buf, read);
+                }
+            }
+            if (fileSize > sizeof(buf)) {
+                LARGE_INTEGER endPos = {};
+                endPos.QuadPart = static_cast<LONGLONG>(fileSize - (std::min<uint64_t>)(fileSize, sizeof(buf)));
+                if (SetFilePointerEx(h, endPos, nullptr, FILE_BEGIN) &&
+                    ReadFile(h, buf, sizeof(buf), &read, nullptr) && read > 0) {
+                    hashBytes(buf, read);
+                }
+            }
+            CloseHandle(h);
+            return hash == 0 ? 1 : hash;
+        };
+
+        std::vector<FileEntry> duplicates;
+        size_t groupCounter = 0;
+        uint64_t wastedBytes = 0;
+
+        for (auto& [sz, group] : bySize) {
+            if (group.size() < 2) continue;
+            std::map<uint64_t, std::vector<FileEntry>> byHash;
+            for (auto& item : group) {
+                uint64_t sig = computeFastFileSignature(item.fullPath, sz);
+                if (sig != 0) {
+                    byHash[sig].push_back(std::move(item));
+                }
+            }
+            for (auto& [sig, dupList] : byHash) {
+                if (dupList.size() < 2) continue;
+                ++groupCounter;
+                wastedBytes += sz * (dupList.size() - 1);
+                wchar_t tag[96] = {};
+                swprintf_s(tag, pl ? L"[DUPLIKAT #%zu \x2022 %08llX] " : L"[DUPLICATE #%zu \x2022 %08llX] ",
+                    groupCounter, static_cast<unsigned long long>(sig & 0xFFFFFFFFULL));
+                for (auto& dupItem : dupList) {
+                    dupItem.typeName = std::wstring(tag) + dupItem.fullPath;
+                    duplicates.push_back(std::move(dupItem));
+                }
+            }
+        }
+
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        m_items = std::move(duplicates);
+        m_isSearchActive = true;
+        m_searchProgress.isRunning = false;
+        m_searchProgress.isFinished = true;
+        m_searchProgress.scannedFolders = scannedFolders;
+        m_searchProgress.scannedFiles = scannedFiles;
+        m_searchProgress.matchedCount = m_items.size();
+        m_viewMode = ViewMode::Details;
+        m_scrollY = 0.0f;
+        m_focusedIndex = m_items.empty() ? -1 : 0;
+
+        wchar_t msg[256] = {};
+        swprintf_s(msg, pl
+            ? L"\xD83D\xDD0D Duplikaty: %zu grup (%zu plików, nadmiar: %s)"
+            : L"\xD83D\xDD0D Duplicates: %zu groups (%zu files, wasted: %s)",
+            groupCounter, m_items.size(), PathUtils::FormatByteSize(wastedBytes).c_str());
+        m_statusToast = msg;
+        m_statusToastExpireTick = GetTickCount64() + 5000;
+        break;
+    }
     }
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -4265,7 +5919,13 @@ void ExplorerApp::ActivateFocusedOrSelectedItem() {
 }
 
 void ExplorerApp::DeleteSelectedItems(bool permanent) {
+    if (m_currentPath == L"THIS_PC") return;   // drives are not something to delete
+
     std::vector<std::wstring> toDelete = GetSelectedPaths();
+    // Whole drives and share roots are never deleted; the delete engine refuses them too
+    toDelete.erase(std::remove_if(toDelete.begin(), toDelete.end(),
+                                  [](const std::wstring& p) { return TransferManager::IsDeleteRefused(p); }),
+                   toDelete.end());
     if (toDelete.empty()) return;
 
     if (m_confirmDelete) {
@@ -4313,7 +5973,77 @@ void ExplorerApp::DeleteSelectedItems(bool permanent) {
     InvalidateRect(m_hwnd, nullptr, FALSE);
 
     AppLog::Info(L"Delete", std::wstring(permanent ? L"Permanent delete queued: " : L"Move to Recycle Bin queued: ") + DescribePaths(toDelete));
-    m_fileEngine.EnqueueDelete(toDelete, permanent);
+    StartDeleteJob(toDelete, permanent);
+}
+
+// Hands a confirmed delete to the transfer queue, where it runs as a job with progress, pause, cancel and retry
+void ExplorerApp::StartDeleteJob(const std::vector<std::wstring>& paths, bool permanent) {
+    m_fileEngine.BeginDelete(paths, permanent);
+    const int jobId = m_transfers.EnqueueDelete(paths, permanent);
+    if (jobId == 0) {
+        // Nothing usable was in the list, so nothing will be deleted: show the items again
+        m_fileEngine.EndDelete(paths);
+        RefreshCurrentFolder();
+        return;
+    }
+    EnsureWorkAnimTimerState();
+}
+
+// Status line and log entry for a finished delete job. Returns true when it left failures to show.
+bool ExplorerApp::ReportDeleteJobResult(const TransferCompletionEvent& ev) {
+    const bool pl = (m_lang == Lang::PL);
+    const Strings& s = GetStrings(m_lang);
+    const std::wstring jobTag = L"Job #" + std::to_wstring(ev.jobId) + (ev.recycle ? L" (Recycle Bin)" : L" (permanent)");
+    const std::wstring items = std::to_wstring(ev.doneFiles) + (pl ? L" el." : L" item(s)");
+
+    if (ev.finalState == TransferJobState::Completed) {
+        wchar_t secBuf[32] = {};
+        swprintf_s(secBuf, L"%.2f s", static_cast<double>(ev.elapsedMs) / 1000.0);
+        m_statusToast = L"\x2713 " + std::wstring(ev.recycle ? s.statusDeletedRecycle : s.statusDeletedPerm) + L"  \x2022  " + items;
+        if (!ev.recycle) m_statusToast += L" (" + FileEngine::FormatSizeDetailed(ev.doneBytes) + L")";
+        m_statusToast += std::wstring(L"  \x2022  ") + secBuf;
+        m_statusToastExpireTick = GetTickCount64() + 3500;
+        AppLog::Ok(L"Delete", jobTag + L" finished: " + std::to_wstring(ev.doneFiles) + L" item(s), " +
+                              FileEngine::FormatSizeDetailed(ev.doneBytes) + L" in " + secBuf);
+        return false;
+    }
+    if (ev.finalState == TransferJobState::Cancelled) {
+        m_statusToast = (pl ? L"\x26A0 Anulowano usuwanie  \x2022  usunięto " : L"\x26A0 Delete cancelled  \x2022  removed ") + items;
+        m_statusToastExpireTick = GetTickCount64() + 4500;
+        AppLog::Warn(L"Delete", jobTag + L" cancelled after " + std::to_wstring(ev.doneFiles) + L" item(s)");
+        return false;
+    }
+
+    m_statusToast = (pl ? L"\x26A0 Nie wszystko usunięto (" : L"\x26A0 Not everything was deleted (") + std::to_wstring(ev.errorCount) +
+                    (pl ? L"): otwórz [Transfery], aby ponowić" : L"): open [Transfers] to retry");
+    m_statusToastExpireTick = GetTickCount64() + 5500;
+    AppLog::Warn(L"Delete", jobTag + L": " + std::to_wstring(ev.errorCount) + L" item(s) could not be deleted");
+    for (const auto& e : ev.firstErrors) AppLog::Error(L"Delete", e.srcPath + L"  ->  " + e.message);
+    return true;
+}
+
+// Tells the user which items a delete job left behind and why, instead of letting them silently reappear
+void ExplorerApp::ShowDeleteFailures(const TransferCompletionEvent& ev) {
+    const bool pl = (m_lang == Lang::PL);
+    std::wstring msg = pl ? (std::to_wstring(ev.errorCount) + L" element(ów) nie udało się usunąć:\n\n")
+                          : (std::to_wstring(ev.errorCount) + L" item(s) could not be deleted:\n\n");
+    bool sawLockOrAccess = false;
+    size_t shown = 0;
+    for (const auto& e : ev.firstErrors) {
+        if (shown++ >= 6) break;
+        msg += e.srcPath + L"\n    \x2192 " + e.message + L"\n";
+        if (e.win32Error == ERROR_SHARING_VIOLATION || e.win32Error == ERROR_ACCESS_DENIED || e.win32Error == ERROR_LOCK_VIOLATION) {
+            sawLockOrAccess = true;
+        }
+    }
+    if (ev.errorCount > shown) msg += L"...\n";
+    if (sawLockOrAccess) {
+        msg += pl ? L"\nPlik jest prawdopodobnie używany przez inny program (maszyna wirtualna, Unity, indeksowanie, antywirus) albo wymaga uprawnień administratora."
+                  : L"\nThe file is probably in use by another program (VM, Unity, indexer, antivirus) or needs administrator rights.";
+    }
+    msg += pl ? L"\n\nPo usunięciu przyczyny: karta [Transfery] \x2192 Ponów."
+              : L"\n\nOnce the cause is gone: [Transfers] tab \x2192 Retry.";
+    MessageBoxW(m_hwnd, msg.c_str(), pl ? L"Nie wszystko zostało usunięte" : L"Not everything was deleted", MB_OK | MB_ICONWARNING);
 }
 
 void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
@@ -4362,7 +6092,7 @@ void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
     InvalidateRect(m_hwnd, nullptr, FALSE);
 
     AppLog::Info(L"Delete", std::wstring(permanent ? L"Permanent delete queued: " : L"Move to Recycle Bin queued: ") + DescribePaths({ delPath }));
-    m_fileEngine.EnqueueDelete({ delPath }, permanent);
+    StartDeleteJob({ delPath }, permanent);
 }
 
 void ExplorerApp::PerformUndoDelete() {
@@ -4391,13 +6121,29 @@ void ExplorerApp::CopySelected(bool isCut) {
     }
 }
 
-void ExplorerApp::PasteIntoCurrent() {
-    bool wasCut = false;
-    if (FileEngine::PasteFilesFromClipboard(m_hwnd, m_currentPath, wasCut)) {
-        AppLog::Ok(L"Paste", std::wstring(wasCut ? L"Moved" : L"Copied") + L" files into " + m_currentPath);
-        RefreshCurrentFolder();
-    } else {
-        AppLog::Warn(L"Paste", L"Paste into " + m_currentPath + L" did not complete (empty clipboard, cancelled or failed)");
+void ExplorerApp::PasteIntoCurrent(bool forceVerifyXxHash) {
+    PasteInto(m_currentPath, forceVerifyXxHash);
+}
+
+void ExplorerApp::PasteInto(const std::wstring& targetDir, bool forceVerifyXxHash) {
+    if (targetDir.empty() || targetDir == L"THIS_PC") return;
+
+    std::vector<std::wstring> srcPaths;
+    bool isMove = false;
+    if (!FileEngine::ReadFilesFromClipboard(m_hwnd, srcPaths, isMove) || srcPaths.empty()) {
+        AppLog::Warn(L"Paste", L"Paste into " + targetDir + L" skipped (clipboard has no files)");
+        return;
+    }
+    StartManagedTransfer(srcPaths, targetDir, isMove, forceVerifyXxHash);
+    if (isMove) {
+        if (OpenClipboard(m_hwnd)) {
+            EmptyClipboard();
+            CloseClipboard();
+        }
+        for (auto& it : m_items) it.isCut = false;
+        for (auto& it : m_allItems) it.isCut = false;
+        for (auto& it : m_otherPane.items) it.isCut = false;
+        for (auto& it : m_otherPane.allItems) it.isCut = false;
     }
 }
 
@@ -4512,21 +6258,59 @@ void ExplorerApp::MergeFolderInto(const std::wstring& srcDir, const std::wstring
     ClampScrollOffset();
 
     ++m_mergePending;
-    m_mergeMovedCount = 0;
+    *m_mergeMovedCount = 0;
     m_mergePendingText = srcName + L"  \x2192  " + dstName;
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
 
     HWND hwnd = m_hwnd;
-    std::atomic<int>* progressPtr = &m_mergeMovedCount;
-    std::thread([hwnd, srcDir, dstDir, srcName, dstName, progressPtr]() {
+    std::thread([hwnd, srcDir, dstDir, srcName, dstName, progress = m_mergeMovedCount]() {
         auto* r = new MergeFolderResult();
         r->srcDir = srcDir;
         r->dstDir = dstDir;
         r->srcName = srcName;
         r->dstName = dstName;
-        FileEngine::MergeDirectoryContents(srcDir, dstDir, progressPtr, *r);
+        FileEngine::MergeDirectoryContents(srcDir, dstDir, progress.get(), *r);
         if (!PostMessageW(hwnd, WM_APP_MERGE_DONE, 0, reinterpret_cast<LPARAM>(r))) delete r;
+    }).detach();
+}
+
+void ExplorerApp::StartExtractJob(const std::wstring& archivePath, const std::wstring& targetFolder, bool toSubfolder) {
+    // The same archive to the same place: once at a time, and not again right after it finished. A second
+    // click would otherwise unpack everything a second time, next to the first copy.
+    const std::wstring key = PathUtils::NormalizePathKey(archivePath) + L"|" + PathUtils::NormalizePathKey(targetFolder);
+    const bool justFinished = key == m_extractLastDoneKey && GetTickCount64() - m_extractLastDoneTick < 1200;
+    if (m_extractActive.count(key) > 0 || justFinished) {
+        if (!justFinished) {
+            m_statusToast = (m_lang == Lang::PL ? L"\x23F3 To archiwum jest już rozpakowywane: " : L"\x23F3 This archive is already being extracted: ") +
+                            PathUtils::GetFileName(archivePath);
+            m_statusToastExpireTick = GetTickCount64() + 3600;
+            EnsureWorkAnimTimerState();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+        }
+        return;
+    }
+    m_extractActive.insert(key);
+
+    ++m_extractPending;
+    m_extractPendingText = PathUtils::GetFileName(archivePath);
+    AppLog::Info(L"Extract", L"Started: " + archivePath + L"  ->  " + targetFolder);
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+
+    // The thread takes copies of everything it needs and reports back with a message; it never touches this object
+    HWND hwnd = m_hwnd;
+    std::thread([hwnd, archivePath, targetFolder, toSubfolder]() {
+        auto* r = new ExtractJobResult();
+        r->archivePath = archivePath;
+        r->targetFolder = targetFolder;
+        r->toSubfolder = toSubfolder;
+        try {
+            r->ok = ArchiveExplorer::ExtractEntireArchiveToFolder(archivePath, targetFolder, &r->keptExisting, &r->refused);
+        } catch (...) {
+            r->ok = false;      // out of memory on a huge entry, for example
+        }
+        if (!PostMessageW(hwnd, WM_APP_EXTRACT_DONE, 0, reinterpret_cast<LPARAM>(r))) delete r;
     }).detach();
 }
 
@@ -4536,8 +6320,9 @@ void ExplorerApp::StartRenameJob(const std::wstring& oldPath, const std::wstring
     std::wstring bad = ValidateFileName(newName, pl);
     if (!bad.empty()) { ShowRenameFailure(oldName, newName, bad, 0); return; }
 
-    const std::wstring parent = PathUtils::GetParentPath(oldPath);
-    const std::wstring target = PathUtils::EnsureTrailingSlash(parent) + newName;
+    const bool isFtp = FtpClient::IsFtpPath(oldPath);
+    const std::wstring parent = isFtp ? FtpClient::GetParentFtpUrl(oldPath) : PathUtils::GetParentPath(oldPath);
+    const std::wstring target = isFtp ? FtpClient::JoinFtpPath(parent, newName) : (PathUtils::EnsureTrailingSlash(parent) + newName);
     const bool caseOnly = (_wcsicmp(oldName.c_str(), newName.c_str()) == 0);
 
     auto toExt = [](const std::wstring& p) -> std::wstring {
@@ -4547,7 +6332,7 @@ void ExplorerApp::StartRenameJob(const std::wstring& oldPath, const std::wstring
         return p;
     };
 
-    const DWORD targetAttrs = GetFileAttributesW(toExt(target).c_str());
+    const DWORD targetAttrs = isFtp ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(toExt(target).c_str());
     if (!caseOnly && targetAttrs != INVALID_FILE_ATTRIBUTES) {
         const DWORD srcAttrs = GetFileAttributesW(toExt(oldPath).c_str());
         const bool targetIsDir = (targetAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -4602,8 +6387,9 @@ void ExplorerApp::StartRenameJob(const std::wstring& oldPath, const std::wstring
         r->ok = FileEngine::RenameFileOrFolder(oldPath, newName, r->newPath, &err);
         r->error = err;
         if (r->ok) {
-            // Do not trust the return value alone: verify on the file system using extended-length paths
-            if (caseOnly) {
+            if (FtpClient::IsFtpPath(oldPath)) {
+                r->verified = true;
+            } else if (caseOnly) {
                 WIN32_FIND_DATAW fd = {};
                 HANDLE h = FindFirstFileW(toExt(r->newPath).c_str(), &fd);
                 if (h != INVALID_HANDLE_VALUE) { r->verified = (newName == fd.cFileName); FindClose(h); }
@@ -4725,6 +6511,9 @@ void ExplorerApp::ShowDeleteDropdownMenu(int screenX, int screenY) {
 
 void ExplorerApp::RebuildTreeNodes() {
     m_treeNodes = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+    m_fileEngine.RequestTreeFolderSizes(m_treeNodes, false);
+    m_fileEngine.SyncTreeNodeSizes(m_treeNodes);
+    EnsureWorkAnimTimerState();
 }
 
 void ExplorerApp::ToggleTreeNodeExpand(int nodeIndex) {
@@ -4765,8 +6554,18 @@ void ExplorerApp::ToggleTreeNodeExpand(int nodeIndex) {
         auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
         bool afterPc = false;
         for (const auto& tn : fullTree) {
-            if (tn.path == L"THIS_PC") { afterPc = true; continue; }
+            if (tn.path == L"THIS_PC" && tn.isHeader) { afterPc = true; continue; }
             if (afterPc) children.push_back(tn);
+        }
+    } else if (node.normKey == L"__HEADER_FTP__") {
+        auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+        bool afterFtp = false;
+        for (const auto& tn : fullTree) {
+            if (tn.normKey == L"__HEADER_FTP__") { afterFtp = true; continue; }
+            if (afterFtp) {
+                if (tn.indent <= node.indent) break;
+                children.push_back(tn);
+            }
         }
     } else if (!node.path.empty() && node.path != L"THIS_PC") {
         if (node.isDrive && node.isOffline) {
@@ -4782,8 +6581,11 @@ void ExplorerApp::ToggleTreeNodeExpand(int nodeIndex) {
         node.hasChildren = false;
         node.isExpanded = false;
     } else {
+        m_fileEngine.RequestTreeFolderSizes(children, false);
+        m_fileEngine.SyncTreeNodeSizes(children);
         node.isExpanded = true;
         m_treeNodes.insert(m_treeNodes.begin() + nodeIndex + 1, children.begin(), children.end());
+        EnsureWorkAnimTimerState();
     }
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -5131,6 +6933,14 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_OPEN, s.ctxOpen);
         SetMenuDefaultItem(hMenu, CMD_CTX_OPEN, FALSE);
 
+        if (!isFolder && ArchiveExplorer::IsArchiveExtension(item.ext)) {
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_OPEN_ARCHIVE_HERE,
+                m_lang == Lang::PL ? L"Otwórz tutaj" : L"Open Here");
+            if (HBITMAP hFldBmp = m_shellEmulator.GetFolderMenuBitmap()) {
+                ShellMenuEmulator::AttachMenuBitmap(hMenu, CMD_CTX_OPEN_ARCHIVE_HERE, false, hFldBmp);
+            }
+        }
+
         if (isFolder) {
             AppendMenuW(hMenu, MF_STRING, CMD_CTX_OPEN_NEW_WINDOW, s.ctxOpenNewWindow);
             if (HBITMAP hExpBmp = m_shellEmulator.GetExplorerMenuBitmap()) {
@@ -5233,6 +7043,39 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_COPY, s.ctxCopy);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_COPY_PATH, s.ctxCopyPath);
 
+        // Paste without an empty spot to click (a folder full of items): next to this item, and for a folder
+        // also into it. The entry names what is on the clipboard.
+        {
+            const bool pl = (m_lang == Lang::PL);
+            std::vector<std::wstring> clipPaths;
+            bool clipIsMove = false;
+            const bool hasClipFiles = FileEngine::ReadFilesFromClipboard(m_hwnd, clipPaths, clipIsMove) && !clipPaths.empty();
+            auto forMenu = [](std::wstring text) {          // '&' would underline the next letter instead
+                for (size_t at = text.find(L'&'); at != std::wstring::npos; at = text.find(L'&', at + 2)) text.insert(at, 1, L'&');
+                return text;
+            };
+            std::wstring what;
+            if (clipPaths.size() == 1) {
+                std::wstring name = PathUtils::GetFileName(PathUtils::TrimTrailingSlashes(clipPaths[0]));
+                if (name.size() > 40) name = name.substr(0, 38) + L"\x2026";
+                what = pl ? (L"\x201E" + name + L"\x201D ") : (L"\"" + name + L"\" ");
+            } else if (clipPaths.size() > 1) {
+                const size_t n = clipPaths.size();
+                const bool few = (n % 10 >= 2 && n % 10 <= 4) && !(n % 100 >= 12 && n % 100 <= 14);
+                what = std::to_wstring(n) + (pl ? (few ? L" elementy " : L" element\x00F3w ") : L" items ");
+            }
+            const UINT state = hasClipFiles ? MF_ENABLED : MF_GRAYED;
+            const std::wstring nextTo = pl
+                ? (L"Wklej " + what + (isFolder ? L"tutaj (obok tego folderu)" : L"tutaj (obok tego pliku)"))
+                : (L"Paste " + what + (isFolder ? L"here (next to this folder)" : L"here (next to this file)"));
+            AppendMenuW(hMenu, MF_STRING | state, CMD_CTX_PASTE_NEXT_TO, forMenu(nextTo).c_str());
+            if (isFolder) {
+                const std::wstring into = pl ? (L"Wklej " + what + L"do folderu \x201E" + item.name + L"\x201D")
+                                             : (L"Paste " + what + L"into \"" + item.name + L"\"");
+                AppendMenuW(hMenu, MF_STRING | state, CMD_CTX_PASTE_INTO_FOLDER, forMenu(into).c_str());
+            }
+        }
+
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_CREATE_SHORTCUT, s.ctxCreateShortcut);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_RECYCLE, s.ctxDeleteRecycle);
@@ -5286,11 +7129,11 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hSortMenu), s.ctxSortBySubmenu);
 
         HMENU hGroupMenu = CreatePopupMenu();
-        AppendMenuW(hGroupMenu, MF_STRING | MF_CHECKED, CMD_NONE, s.ctxGroupNone);
-        AppendMenuW(hGroupMenu, MF_STRING, CMD_SORT_NAME, s.colName);
-        AppendMenuW(hGroupMenu, MF_STRING, CMD_SORT_DATE, s.colDateModified);
-        AppendMenuW(hGroupMenu, MF_STRING, CMD_SORT_TYPE, s.colType);
-        AppendMenuW(hGroupMenu, MF_STRING, CMD_SORT_SIZE, s.colSize);
+        AppendMenuW(hGroupMenu, MF_STRING | (m_groupBy == GroupByMode::None ? MF_CHECKED : 0), CMD_GROUP_NONE, s.ctxGroupNone);
+        AppendMenuW(hGroupMenu, MF_STRING | (m_groupBy == GroupByMode::NameInitial ? MF_CHECKED : 0), CMD_GROUP_NAME, s.colName);
+        AppendMenuW(hGroupMenu, MF_STRING | (m_groupBy == GroupByMode::DateBucket ? MF_CHECKED : 0), CMD_GROUP_DATE, s.colDateModified);
+        AppendMenuW(hGroupMenu, MF_STRING | (m_groupBy == GroupByMode::FileType ? MF_CHECKED : 0), CMD_GROUP_TYPE, s.colType);
+        AppendMenuW(hGroupMenu, MF_STRING | (m_groupBy == GroupByMode::SizeTier ? MF_CHECKED : 0), CMD_GROUP_SIZE, s.colSize);
         AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hGroupMenu), s.ctxGroupBySubmenu);
 
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_REFRESH, s.ctxRefresh);
@@ -5298,6 +7141,8 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         bool hasClipFiles = IsClipboardFormatAvailable(CF_HDROP) != FALSE;
         AppendMenuW(hMenu, MF_STRING | (hasClipFiles ? MF_ENABLED : MF_GRAYED), CMD_CTX_PASTE, s.ctxPaste);
+        AppendMenuW(hMenu, MF_STRING | (hasClipFiles ? MF_ENABLED : MF_GRAYED), CMD_CTX_PASTE_VERIFIED,
+                    m_lang == Lang::PL ? L"Wklej + Weryfikuj XXH64" : L"Paste + Verify XXH64");
         AppendMenuW(hMenu, MF_STRING | (hasClipFiles ? MF_ENABLED : MF_GRAYED), CMD_CTX_PASTE_SHORTCUT, s.ctxPasteShortcut);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_UNDO_DELETE, s.ctxUndoDelete);
 
@@ -5367,6 +7212,17 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         else if (cmd == CMD_SORT_SIZE) m_sortCol = SortColumn::Size;
         else if (cmd == CMD_SORT_ASC)  m_sortAsc = true;
         else if (cmd == CMD_SORT_DESC) m_sortAsc = false;
+        ApplyFilterAndSort();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if ((cmd >= CMD_GROUP_NONE && cmd <= CMD_GROUP_TYPE) || cmd == CMD_GROUP_SIZE) {
+        if (cmd == CMD_GROUP_NONE)      m_groupBy = GroupByMode::None;
+        else if (cmd == CMD_GROUP_NAME) m_groupBy = GroupByMode::NameInitial;
+        else if (cmd == CMD_GROUP_DATE) m_groupBy = GroupByMode::DateBucket;
+        else if (cmd == CMD_GROUP_TYPE) m_groupBy = GroupByMode::FileType;
+        else if (cmd == CMD_GROUP_SIZE) m_groupBy = GroupByMode::SizeTier;
         ApplyFilterAndSort();
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return;
@@ -5451,9 +7307,34 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
     switch (cmd) {
     case CMD_CTX_OPEN:
         if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
-            if (m_items[hitIndex].isDirectory) NavigateTo(m_items[hitIndex].fullPath, true);
-            else if (m_items[hitIndex].isImage || m_items[hitIndex].isVideo || m_items[hitIndex].isAudio) ToggleFullViewerMode();
-            else FileEngine::OpenFileOrProperties(m_hwnd, m_items[hitIndex].fullPath, false);
+            const FileEntry& targetItem = m_items[hitIndex];
+            if (targetItem.isDirectory) {
+                NavigateTo(targetItem.fullPath, true);
+            } else if (targetItem.isImage || targetItem.isVideo || targetItem.isAudio) {
+                ToggleFullViewerMode();
+            } else {
+                std::wstring arcFile, innerPath;
+                if (ArchiveExplorer::SplitVirtualArchivePath(targetItem.fullPath, arcFile, innerPath) && !innerPath.empty()) {
+                    std::wstring tempFile;
+                    if (ArchiveExplorer::ExtractSingleEntryToTempFile(arcFile, innerPath, tempFile)) {
+                        FileEngine::OpenFileOrProperties(m_hwnd, tempFile, false);
+                        break;
+                    }
+                }
+                if (FtpClient::IsFtpPath(targetItem.fullPath)) {
+                    std::wstring tempFile;
+                    if (FtpClient::DownloadFtpFileToTempCache(targetItem.fullPath, tempFile)) {
+                        FileEngine::OpenFileOrProperties(m_hwnd, tempFile, false);
+                        break;
+                    }
+                }
+                FileEngine::OpenFileOrProperties(m_hwnd, targetItem.fullPath, false);
+            }
+        }
+        break;
+    case CMD_CTX_OPEN_ARCHIVE_HERE:
+        if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
+            NavigateTo(m_items[hitIndex].fullPath, true);
         }
         break;
     case CMD_CTX_OPEN_NEW_WINDOW:
@@ -5551,6 +7432,19 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
     case CMD_CTX_CUT:            CopySelected(true); break;
     case CMD_CTX_COPY:           CopySelected(false); break;
     case CMD_CTX_PASTE:          PasteIntoCurrent(); break;
+    case CMD_CTX_PASTE_VERIFIED: PasteIntoCurrent(true); break;
+    case CMD_CTX_PASTE_NEXT_TO:
+        if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
+            // Search results come from many folders: the item's own folder. Otherwise the folder on screen,
+            // exactly as a paste on its background (FTP and archive folders included).
+            PasteInto(m_isSearchActive ? PathUtils::GetParentPath(m_items[hitIndex].fullPath) : m_currentPath);
+        }
+        break;
+    case CMD_CTX_PASTE_INTO_FOLDER:
+        if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size()) && m_items[hitIndex].isDirectory) {
+            PasteInto(m_items[hitIndex].fullPath);
+        }
+        break;
     case CMD_CTX_COPY_PATH:      CopySelectedPaths(); break;
     case CMD_CTX_DELETE_RECYCLE: DeleteSelectedItems(false); break;
     case CMD_CTX_DELETE_PERM:    DeleteSelectedItems(true); break;
@@ -5673,16 +7567,18 @@ void ExplorerApp::SetViewerZoom100() {
 }
 
 void ExplorerApp::TriggerFolderSizeCalculation() {
-    if (m_currentPath.empty() || m_currentPath == L"THIS_PC") return;
-
-    bool anyAlreadyCached = m_fileEngine.HasAnyCachedFolderSizes(m_allItems);
-    m_fileEngine.RequestFolderSizes(m_allItems, anyAlreadyCached);
+    m_fileEngine.RequestTreeFolderSizes(m_treeNodes, false);
+    if (!m_currentPath.empty() && m_currentPath != L"THIS_PC") {
+        bool anyAlreadyCached = m_fileEngine.HasAnyCachedFolderSizes(m_allItems);
+        m_fileEngine.RequestFolderSizes(m_allItems, anyAlreadyCached);
+    }
     SyncFolderSizesFromCache();
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
 void ExplorerApp::SyncFolderSizesFromCache() {
+    m_fileEngine.SyncTreeNodeSizes(m_treeNodes);
     if (m_currentPath == L"THIS_PC") return;
 
     // Single-lock batch sync for m_allItems and m_items!
@@ -5703,21 +7599,33 @@ void ExplorerApp::EnsureWorkAnimTimerState() {
 
     bool searchRunning = m_fileEngine.IsSearchRunning();
     bool recentlyFinishedScan = (m_folderScanFinishedTick > 0 && (GetTickCount64() - m_folderScanFinishedTick) < 3000);
-    bool hwLiveActive = (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView() &&
+    bool hwLiveActive = (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView() && !IsTransfersView() &&
                          (m_hwLiveRefresh || m_hwInspector.IsAsyncBusy() || m_hwInspector.HasStagedData()));
     bool programsPolling = IsProgramsView() && m_progRefreshAtTick != 0;
     bool lanBusy = IsLanView() && (m_lan.IsScanning() || m_lan.IsSsdpRunning() || m_lan.IsPortScanning() || m_lan.IsPingAutoRefreshEnabled());
     bool backupsBusy = m_backups.IsBusy() || IsBackupsView();
+    bool xferBusy = m_transfers.HasRunningJobs() || IsTransfersView();
     bool gitBusy = GitDockVisible() && (m_git.IsBusy() || m_gitReloadFolderWhenIdle);
 
-    bool deletePending = m_fileEngine.PendingDeleteBatches() > 0 || m_renamePending.load() > 0 || m_mergePending.load() > 0 || m_imageCache.IsAnyImageTransforming();
+    // A running delete is a transfer-queue job and is covered by xferBusy above
+    bool deletePending = m_renamePending.load() > 0 || m_mergePending.load() > 0 || m_extractPending.load() > 0 ||
+                         m_imageCache.IsAnyImageTransforming();
     bool toastActive = !m_statusToast.empty() && GetTickCount64() < m_statusToastExpireTick;
     bool contentAnim = PreviewPaneVisible() && m_contentPane.NeedsAnimationTick();
+    bool previewLoading = PreviewPaneVisible() && m_contentPane.IsPreviewLoading();
 
-    if (folderScanning || searchRunning || recentlyFinishedScan || hwLiveActive || programsPolling || deletePending || toastActive || lanBusy || backupsBusy || gitBusy || contentAnim) {
-        SetTimer(m_hwnd, ID_TIMER_WORK_ANIM, 35, nullptr);
-    } else {
-        KillTimer(m_hwnd, ID_TIMER_WORK_ANIM);
+    // Every tick repaints the whole window. Progress bars, live graphs and the 3D view move smoothly at about
+    // 30 ticks a second; folder sizes, the status toast and the "..." of a pending job only change numbers or
+    // text, and 10 ticks a second show them just as well at a third of the work.
+    const bool smoothMotion = searchRunning || hwLiveActive || programsPolling || lanBusy || backupsBusy || xferBusy || gitBusy || contentAnim;
+    const bool textOnly = folderScanning || recentlyFinishedScan || deletePending || toastActive || previewLoading;
+    // SetTimer restarts the countdown, and this runs on every folder-size update: a fast stream of updates
+    // would keep the timer from ever firing. So it is set only when the interval changes.
+    const UINT wanted = smoothMotion ? 35 : (textOnly ? 100 : 0);
+    if (wanted != m_workAnimIntervalMs) {
+        if (wanted != 0) SetTimer(m_hwnd, ID_TIMER_WORK_ANIM, wanted, nullptr);
+        else KillTimer(m_hwnd, ID_TIMER_WORK_ANIM);
+        m_workAnimIntervalMs = wanted;
     }
 }
 
@@ -6493,6 +8401,62 @@ bool ExplorerApp::HandleImageToolCommand(int cmdId, int fallbackHitIndex) {
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
     return true;
+}
+
+void ExplorerApp::UpdateTaskbarProgress() {
+    if (!m_hwnd) return;
+
+    uint64_t completed = 0;
+    uint64_t total = 0;
+    int state = m_transfers.GetTaskbarProgressInfo(completed, total);
+
+    int permille = 0;
+    if (state >= 2) {
+        if (total > 0) {
+            permille = static_cast<int>(std::clamp<uint64_t>((completed * 1000ULL) / total, 0ULL, 1000ULL));
+        }
+        if ((state == 3 || state == 4) && permille < 50) {
+            // Ensure yellow (Paused / Low-Disk) and red (Error) taskbar indicators are clearly visible even at 0%
+            permille = 50;
+        }
+    }
+
+    if (state == m_lastTbState && permille == m_lastTbPermille) {
+        return;
+    }
+
+    if (!m_taskbarList) {
+        if (state == 0) {
+            m_lastTbState = 0;
+            m_lastTbPermille = 0;
+            return;
+        }
+        HRESULT hr = CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&m_taskbarList));
+        if (FAILED(hr) || !m_taskbarList) {
+            m_taskbarList = nullptr;
+            return;
+        }
+        if (FAILED(m_taskbarList->HrInit())) {
+            m_taskbarList->Release();
+            m_taskbarList = nullptr;
+            return;
+        }
+    }
+
+    m_lastTbState = state;
+    m_lastTbPermille = permille;
+
+    if (state == 0) {
+        m_taskbarList->SetProgressState(m_hwnd, TBPF_NOPROGRESS);
+    } else if (state == 1) {
+        m_taskbarList->SetProgressState(m_hwnd, TBPF_INDETERMINATE);
+    } else {
+        TBPFLAG flag = TBPF_NORMAL;
+        if (state == 3) flag = TBPF_PAUSED;
+        else if (state == 4) flag = TBPF_ERROR;
+        m_taskbarList->SetProgressState(m_hwnd, flag);
+        m_taskbarList->SetProgressValue(m_hwnd, static_cast<ULONGLONG>(permille), 1000ULL);
+    }
 }
 
 } // namespace Explorer2

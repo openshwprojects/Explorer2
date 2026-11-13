@@ -52,6 +52,22 @@ inline std::wstring GetExtension(const std::wstring& path) {
     return (extPtr && *extPtr) ? ToLower(extPtr) : L"";
 }
 
+inline std::wstring GetExtensionLower(const std::wstring& path) {
+    return GetExtension(path);
+}
+
+inline std::wstring Trim(std::wstring_view sv) {
+    size_t start = 0;
+    while (start < sv.size() && (sv[start] == L' ' || sv[start] == L'\t' || sv[start] == L'\r' || sv[start] == L'\n')) {
+        ++start;
+    }
+    size_t end = sv.size();
+    while (end > start && (sv[end - 1] == L' ' || sv[end - 1] == L'\t' || sv[end - 1] == L'\r' || sv[end - 1] == L'\n')) {
+        --end;
+    }
+    return std::wstring(sv.substr(start, end - start));
+}
+
 inline std::wstring TrimTrailingSlashes(std::wstring_view sv) {
     std::wstring out(sv);
     while (!out.empty() && (out.back() == L'\\' || out.back() == L'/')) {

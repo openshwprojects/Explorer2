@@ -1,0 +1,12 @@
+(pcb "sensor_module.dsn"
+  (structure
+    (boundary (path signal 0.25 0.0 0.0 40.0 0.0 40.0 25.0 0.0 25.0 0.0 0.0))
+  )
+  (placement
+    (component "SOIC8" (place U1 15.0 12.0 front 0))
+    (component "R0805" (place R1 28.0 12.0 front 90))
+  )
+  (wiring
+    (wire (path F.Cu 0.30 15.0 12.0 22.0 12.0 28.0 12.0))
+  )
+)

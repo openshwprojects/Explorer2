@@ -7,6 +7,7 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+#include <memory>
 #include <cstdint>
 
 namespace Explorer2 {
@@ -61,7 +62,7 @@ public:
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
     void Clear();
     const std::wstring& GetCurrentPath() const { return m_requestedPath; }
-    bool NeedsAnimationTick() const { return m_autoRotate || m_isLoading.load(); }
+    bool NeedsAnimationTick() const { return m_autoRotate || m_load->loading.load(); }
     void StepAnimation();
 
     void Draw(
@@ -100,10 +101,16 @@ private:
     ID2D1Factory* m_d2dFactory = nullptr;
 
     std::wstring m_requestedPath;
-    std::atomic<uint64_t> m_loadGeneration{ 0 };
-    std::atomic<bool> m_isLoading{ false };
-    mutable std::mutex m_meshMutex;
-    LoadedMesh3D m_mesh;
+
+    // What the loader thread and the viewer share. The thread holds a reference of its own, so a load that
+    // is still running when the viewer goes away works on memory that is still there; its result is dropped.
+    struct LoadState {
+        std::atomic<uint64_t> generation{ 0 };   // counts the requests; a load that is not the newest gives up
+        std::atomic<bool> loading{ false };
+        std::mutex mutex;                        // guards mesh
+        LoadedMesh3D mesh;
+    };
+    std::shared_ptr<LoadState> m_load = std::make_shared<LoadState>();
 
     // Camera & Viewport settings
     float m_yaw = 0.62f;

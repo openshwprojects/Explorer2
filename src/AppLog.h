@@ -21,6 +21,12 @@ class AppLog {
 public:
     // Creates the log file of this run (header with version / pid / elevation) and prunes old files.
     static void Init();
+    // Makes an unhandled exception leave a record at the end of the log file before Windows takes over:
+    // the exception code, the faulting address and the call stack, each as "module+offset".
+    static void InstallCrashHandler();
+    // Where the crash record goes when no log file is open. The self-tests use this: they run without a
+    // log file, so that test runs do not push the logs of real sessions out of the log folder.
+    static void SetCrashRecordFile(const std::wstring& path);
     // Optional: window that gets `msg` posted (coalesced) whenever a new entry arrives.
     static void SetNotify(HWND hwnd, UINT msg);
 

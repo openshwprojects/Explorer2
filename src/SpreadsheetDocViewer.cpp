@@ -1,4 +1,5 @@
 #include "SpreadsheetDocViewer.h"
+#include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
 #include <algorithm>
@@ -55,407 +56,124 @@ static int ExcelCellRefToColIndex(std::string_view cellRef, int* outRowIdx = nul
     return std::max(0, col - 1);
 }
 
-static bool ParseCsvOrTsv(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
-    out.kind = OfficeFileKind::CsvTable;
-    out.isSpreadsheet = true;
-
-    std::wstring text;
-    if (raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
-        size_t wlen = (raw.size() - 2) / 2;
-        text.resize(wlen);
-        std::memcpy(text.data(), raw.data() + 2, wlen * 2);
-    } else {
-        size_t start = (raw.size() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) ? 3 : 0;
-        text = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(raw.data() + start), raw.size() - start));
-    }
-
-    // Auto-detect delimiter from first line outside quotes
-    wchar_t delim = (extLower == L".tsv") ? L'\t' : L',';
-    if (extLower != L".tsv") {
-        int commas = 0, semis = 0, tabs = 0, pipes = 0;
-        bool inQ = false;
-        for (size_t i = 0; i < std::min<size_t>(text.size(), 2048); ++i) {
-            wchar_t c = text[i];
-            if (c == L'"') inQ = !inQ;
-            else if (!inQ) {
-                if (c == L'\n') break;
-                if (c == L',') ++commas;
-                else if (c == L';') ++semis;
-                else if (c == L'\t') ++tabs;
-                else if (c == L'|') ++pipes;
-            }
-        }
-        int best = commas;
-        if (semis > best) { best = semis; delim = L';'; }
-        if (tabs > best)  { best = tabs;  delim = L'\t'; }
-        if (pipes > best) { best = pipes; delim = L'|'; }
-    }
-
-    out.formatTitle = (delim == L'\t') ? L"TSV Table (Tab-Separated)"
-                    : ((delim == L';') ? L"CSV Table (Semicolon ;)" : L"CSV Table (Comma ,)");
-
-    SpreadsheetSheet sheet;
-    sheet.name = L"CSV";
-    std::vector<std::wstring> curRow;
-    std::wstring curCell;
-    bool inQuotes = false;
-
-    for (size_t i = 0; i < text.size(); ++i) {
-        wchar_t c = text[i];
-        if (inQuotes) {
-            if (c == L'"') {
-                if (i + 1 < text.size() && text[i + 1] == L'"') {
-                    curCell.push_back(L'"');
-                    ++i;
-                } else {
-                    inQuotes = false;
-                }
-            } else {
-                curCell.push_back(c);
-            }
-        } else {
-            if (c == L'"' && curCell.empty()) {
-                inQuotes = true;
-            } else if (c == delim) {
-                curRow.push_back(std::move(curCell));
-                curCell.clear();
-            } else if (c == L'\r' || c == L'\n') {
-                if (c == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') ++i;
-                curRow.push_back(std::move(curCell));
-                curCell.clear();
-                if (!curRow.empty() && !(curRow.size() == 1 && curRow[0].empty())) {
-                    sheet.maxCols = std::max(sheet.maxCols, curRow.size());
-                    sheet.rows.push_back(std::move(curRow));
-                }
-                curRow.clear();
-                if (sheet.rows.size() >= 10000) break;
-            } else {
-                curCell.push_back(c);
-            }
-        }
-    }
-    if (!curCell.empty() || !curRow.empty()) {
-        curRow.push_back(std::move(curCell));
-        sheet.maxCols = std::max(sheet.maxCols, curRow.size());
-        sheet.rows.push_back(std::move(curRow));
-    }
-
-    if (sheet.rows.empty()) {
-        sheet.rows.push_back({ L"" });
-        sheet.maxCols = 1;
-    }
-    out.sheets.push_back(std::move(sheet));
-    out.valid = true;
-    return true;
-}
-
-static bool ParseExcelXlsx(const std::wstring& fullPath, ParsedOfficeDocument& out) {
-    out.kind = OfficeFileKind::ExcelXlsx;
-    out.isSpreadsheet = true;
-    out.formatTitle = L"Microsoft Excel Workbook (.xlsx)";
-
-    std::vector<ZipDeflate::ArchiveItemMeta> zipEntries;
-    if (!ZipDeflate::ListZipEntriesFromFile(fullPath, zipEntries)) return false;
-
-    // 1. Read xl/sharedStrings.xml if present
-    std::vector<std::wstring> sharedStrings;
-    std::vector<uint8_t> ssBytes;
-    if (ZipDeflate::ExtractZipFileByName(fullPath, L"xl/sharedStrings.xml", ssBytes) && !ssBytes.empty()) {
-        std::string_view sv(reinterpret_cast<const char*>(ssBytes.data()), ssBytes.size());
-        size_t pos = 0;
-        while ((pos = sv.find("<si", pos)) != std::string_view::npos) {
-            size_t endSi = sv.find("</si>", pos);
-            if (endSi == std::string_view::npos) break;
-            std::string_view siBlk = sv.substr(pos, endSi - pos);
-            std::wstring combined;
-            size_t tPos = 0;
-            while ((tPos = siBlk.find("<t", tPos)) != std::string_view::npos) {
-                size_t gt = siBlk.find('>', tPos);
-                if (gt == std::string_view::npos || siBlk[gt - 1] == '/') { tPos += 2; continue; }
-                size_t endT = siBlk.find("</t>", gt);
-                if (endT == std::string_view::npos) break;
-                combined += DecodeXmlEntities(PathUtils::Utf8ToWide(siBlk.substr(gt + 1, endT - (gt + 1))));
-                tPos = endT + 4;
-            }
-            sharedStrings.push_back(std::move(combined));
-            pos = endSi + 5;
-        }
-    }
-
-    // 2. Read sheet names from xl/workbook.xml
-    std::vector<std::wstring> sheetNames;
-    std::vector<uint8_t> wbBytes;
-    if (ZipDeflate::ExtractZipFileByName(fullPath, L"xl/workbook.xml", wbBytes) && !wbBytes.empty()) {
-        std::string_view sv(reinterpret_cast<const char*>(wbBytes.data()), wbBytes.size());
-        size_t pos = 0;
-        while ((pos = sv.find("<sheet ", pos)) != std::string_view::npos) {
-            size_t gt = sv.find('>', pos);
-            if (gt == std::string_view::npos) break;
-            std::string_view tag = sv.substr(pos, gt - pos);
-            size_t nmPos = tag.find("name=\"");
-            if (nmPos != std::string_view::npos) {
-                nmPos += 6;
-                size_t endQ = tag.find('"', nmPos);
-                if (endQ != std::string_view::npos) {
-                    sheetNames.push_back(DecodeXmlEntities(PathUtils::Utf8ToWide(tag.substr(nmPos, endQ - nmPos))));
-                }
-            }
-            pos = gt + 1;
-        }
-    }
-
-    // 3. Parse worksheets xl/worksheets/sheet1.xml .. sheetN.xml
-    for (int sIdx = 1; sIdx <= 16; ++sIdx) {
-        wchar_t relPath[64] = {};
-        swprintf_s(relPath, L"xl/worksheets/sheet%d.xml", sIdx);
-        std::vector<uint8_t> shBytes;
-        if (!ZipDeflate::ExtractZipFileByName(fullPath, relPath, shBytes) || shBytes.empty()) {
-            if (sIdx == 1) continue;
-            break;
-        }
-
-        SpreadsheetSheet sheet;
-        sheet.name = (static_cast<size_t>(sIdx - 1) < sheetNames.size())
-            ? sheetNames[sIdx - 1]
-            : (L"Sheet" + std::to_wstring(sIdx));
-
-        std::string_view sv(reinterpret_cast<const char*>(shBytes.data()), shBytes.size());
-        size_t rPos = 0;
-        while ((rPos = sv.find("<row", rPos)) != std::string_view::npos) {
-            size_t rGt = sv.find('>', rPos);
-            if (rGt == std::string_view::npos) break;
-            if (sv[rGt - 1] == '/') { rPos = rGt + 1; continue; }
-            size_t endRow = sv.find("</row>", rGt);
-            if (endRow == std::string_view::npos) break;
-            std::string_view rowBlk = sv.substr(rGt + 1, endRow - (rGt + 1));
-
-            std::vector<std::wstring> rowCells;
-            size_t cPos = 0;
-            while ((cPos = rowBlk.find("<c", cPos)) != std::string_view::npos) {
-                size_t cGt = rowBlk.find('>', cPos);
-                if (cGt == std::string_view::npos) break;
-                std::string_view cTag = rowBlk.substr(cPos, cGt - cPos + 1);
-                bool selfClosing = (cGt > cPos && rowBlk[cGt - 1] == '/');
-                size_t endC = selfClosing ? cGt : rowBlk.find("</c>", cGt);
-                if (endC == std::string_view::npos) break;
-                std::string_view cBody = selfClosing ? std::string_view{} : rowBlk.substr(cGt + 1, endC - (cGt + 1));
-
-                int colIdx = static_cast<int>(rowCells.size());
-                size_t refPos = cTag.find("r=\"");
-                if (refPos != std::string_view::npos) {
-                    refPos += 3;
-                    size_t refEnd = cTag.find('"', refPos);
-                    if (refEnd != std::string_view::npos) {
-                        colIdx = ExcelCellRefToColIndex(cTag.substr(refPos, refEnd - refPos));
-                    }
-                }
-                bool isSharedStr = (cTag.find("t=\"s\"") != std::string_view::npos);
-                bool isInlineStr = (cTag.find("t=\"inlineStr\"") != std::string_view::npos || cTag.find("t=\"str\"") != std::string_view::npos);
-
-                std::wstring cellVal;
-                if (isInlineStr) {
-                    size_t tOpen = cBody.find("<t");
-                    if (tOpen != std::string_view::npos) {
-                        size_t tGt = cBody.find('>', tOpen);
-                        size_t tEnd = cBody.find("</t>", tGt);
-                        if (tGt != std::string_view::npos && tEnd != std::string_view::npos) {
-                            cellVal = DecodeXmlEntities(PathUtils::Utf8ToWide(cBody.substr(tGt + 1, tEnd - (tGt + 1))));
-                        }
-                    }
-                }
-                if (cellVal.empty()) {
-                    size_t vOpen = cBody.find("<v>");
-                    size_t vEnd = cBody.find("</v>", vOpen);
-                    if (vOpen != std::string_view::npos && vEnd != std::string_view::npos) {
-                        std::string_view rawV = cBody.substr(vOpen + 3, vEnd - (vOpen + 3));
-                        if (isSharedStr) {
-                            int ssIdx = std::atoi(std::string(rawV).c_str());
-                            if (ssIdx >= 0 && static_cast<size_t>(ssIdx) < sharedStrings.size()) {
-                                cellVal = sharedStrings[ssIdx];
-                            }
-                        } else {
-                            cellVal = DecodeXmlEntities(PathUtils::Utf8ToWide(rawV));
-                        }
-                    }
-                }
-
-                if (colIdx >= 0 && colIdx < 256) {
-                    if (static_cast<size_t>(colIdx) >= rowCells.size()) {
-                        rowCells.resize(static_cast<size_t>(colIdx) + 1);
-                    }
-                    rowCells[colIdx] = std::move(cellVal);
-                }
-                cPos = selfClosing ? (cGt + 1) : (endC + 4);
-            }
-
-            if (!rowCells.empty()) {
-                sheet.maxCols = std::max(sheet.maxCols, rowCells.size());
-                sheet.rows.push_back(std::move(rowCells));
-            }
-            rPos = endRow + 6;
-            if (sheet.rows.size() >= 10000) break;
-        }
-
-        if (!sheet.rows.empty()) {
-            out.sheets.push_back(std::move(sheet));
-        }
-    }
-
-    out.valid = !out.sheets.empty();
-    return out.valid;
-}
-
-static bool ParseWordDocx(const std::wstring& fullPath, ParsedOfficeDocument& out) {
-    out.kind = OfficeFileKind::WordDocx;
-    out.isSpreadsheet = false;
-    out.formatTitle = L"Microsoft Word Document (.docx)";
-
-    std::vector<uint8_t> docBytes;
-    if (!ZipDeflate::ExtractZipFileByName(fullPath, L"word/document.xml", docBytes) &&
-        !ZipDeflate::ExtractZipFileByName(fullPath, L"content.xml", docBytes)) {
-        return false;
-    }
-
-    std::string_view sv(reinterpret_cast<const char*>(docBytes.data()), docBytes.size());
-    size_t pPos = 0;
-    while ((pPos = sv.find("<w:p", pPos)) != std::string_view::npos) {
-        char after = (pPos + 4 < sv.size()) ? sv[pPos + 4] : ' ';
-        if (after != '>' && after != ' ' && after != '/') {
-            pPos += 4;
-            continue;
-        }
-        size_t pGt = sv.find('>', pPos);
-        if (pGt == std::string_view::npos) break;
-        if (sv[pGt - 1] == '/') { pPos = pGt + 1; continue; }
-        size_t endP = sv.find("</w:p>", pGt);
-        if (endP == std::string_view::npos) break;
-        std::string_view pBlk = sv.substr(pGt + 1, endP - (pGt + 1));
-
-        DocParagraph para;
-        if (pBlk.find("Heading1") != std::string_view::npos || pBlk.find("heading 1") != std::string_view::npos || pBlk.find("Title") != std::string_view::npos) {
-            para.headingLevel = 1;
-        } else if (pBlk.find("Heading2") != std::string_view::npos || pBlk.find("heading 2") != std::string_view::npos) {
-            para.headingLevel = 2;
-        } else if (pBlk.find("Heading3") != std::string_view::npos) {
-            para.headingLevel = 3;
-        }
-        if (pBlk.find("<w:numPr>") != std::string_view::npos) {
-            para.isBullet = true;
-        }
-
-        size_t tPos = 0;
-        while ((tPos = pBlk.find("<w:t", tPos)) != std::string_view::npos) {
-            size_t tGt = pBlk.find('>', tPos);
-            if (tGt == std::string_view::npos) break;
-            if (pBlk[tGt - 1] == '/') { tPos = tGt + 1; continue; }
-            size_t endT = pBlk.find("</w:t>", tGt);
-            if (endT == std::string_view::npos) break;
-            para.text += DecodeXmlEntities(PathUtils::Utf8ToWide(pBlk.substr(tGt + 1, endT - (tGt + 1))));
-            tPos = endT + 6;
-        }
-
-        if (!para.text.empty()) {
-            out.charCount += para.text.size();
-            bool inWord = false;
-            for (wchar_t ch : para.text) {
-                if (ch > L' ') {
-                    if (!inWord) { ++out.wordCount; inWord = true; }
-                } else {
-                    inWord = false;
-                }
-            }
-            out.paragraphs.push_back(std::move(para));
-        }
-        pPos = endP + 6;
-    }
-
-    if (out.paragraphs.empty()) {
-        out.paragraphs.push_back({ L"(Pusty dokument Word .docx / Empty Word document)", 0, false, false });
-    }
-    out.valid = true;
-    return true;
-}
-
-static bool ParseRtfDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    out.kind = OfficeFileKind::RichTextRtf;
-    out.isSpreadsheet = false;
-    out.formatTitle = L"Rich Text Document (.rtf)";
-
-    std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
-    std::string curLine;
-    int braceDepth = 0;
-    int skipDepth = -1;
-
-    auto flushPara = [&]() {
-        if (!curLine.empty()) {
-            std::wstring w = PathUtils::Utf8ToWide(curLine);
-            out.charCount += w.size();
-            bool inW = false;
-            for (wchar_t c : w) {
-                if (c > L' ') { if (!inW) { ++out.wordCount; inW = true; } }
-                else inW = false;
-            }
-            out.paragraphs.push_back({ std::move(w), 0, false, false });
-            curLine.clear();
-        }
-    };
-
-    for (size_t i = 0; i < sv.size(); ++i) {
-        char c = sv[i];
-        if (c == '{') {
-            ++braceDepth;
-            if (i + 2 < sv.size() && sv[i + 1] == '\\' && sv[i + 2] == '*') {
-                if (skipDepth < 0) skipDepth = braceDepth;
-            }
-            continue;
-        }
-        if (c == '}') {
-            if (braceDepth == skipDepth) skipDepth = -1;
-            --braceDepth;
-            continue;
-        }
-        if (skipDepth >= 0) continue;
-
-        if (c == '\\') {
-            if (i + 1 < sv.size() && (sv[i + 1] == '\\' || sv[i + 1] == '{' || sv[i + 1] == '}')) {
-                curLine.push_back(sv[++i]);
-                continue;
-            }
-            size_t kwStart = ++i;
-            while (i < sv.size() && ((sv[i] >= 'a' && sv[i] <= 'z') || (sv[i] >= 'A' && sv[i] <= 'Z'))) ++i;
-            std::string_view kw = sv.substr(kwStart, i - kwStart);
-            while (i < sv.size() && ((sv[i] >= '0' && sv[i] <= '9') || sv[i] == '-')) ++i;
-            if (i < sv.size() && sv[i] == ' ') ++i;
-            --i;
-
-            if (kw == "fonttbl" || kw == "colortbl" || kw == "stylesheet" || kw == "info" || kw == "pict") {
-                skipDepth = braceDepth;
-            } else if (kw == "par" || kw == "line") {
-                flushPara();
-            } else if (kw == "tab") {
-                curLine += "    ";
-            }
-            continue;
-        }
-        if (c != '\r' && c != '\n') {
-            curLine.push_back(c);
-        }
-    }
-    flushPara();
-    out.valid = !out.paragraphs.empty();
-    return out.valid;
-}
+#include "formats/CsvTsv.h"
+#include "formats/ExcelXlsxOds.h"
+#include "formats/WordDocxOdt.h"
+#include "formats/Rtf.h"
+#include "formats/PowerPointPptxOdp.h"
+#include "formats/Epub.h"
+#include "formats/Fb2.h"
+#include "formats/Sqlite.h"
+#include "formats/Dbf.h"
+#include "formats/Dif.h"
+#include "formats/Sylk.h"
 
 } // namespace
 
+#include "formats/Parquet.h"
+#include "formats/Avro.h"
+#include "formats/Bson.h"
+#include "formats/Ics.h"
+#include "formats/Vcf.h"
+#include "formats/Srt.h"
+#include "formats/Vtt.h"
+#include "formats/Ass.h"
+#include "formats/Gpx.h"
+#include "formats/Kml.h"
+#include "formats/GeoJson.h"
+#include "formats/OpenStreetMap.h"
+#include "formats/GarminTcx.h"
+#include "formats/BibTex.h"
+#include "formats/RisCitation.h"
+#include "formats/WekaArff.h"
+#include "formats/MatrixMarket.h"
+#include "formats/NdJson.h"
+#include "formats/HttpArchiveHar.h"
+#include "formats/LibPcap.h"
+#include "formats/BitTorrent.h"
+#include "formats/CueSheet.h"
+#include "formats/PlaylistM3u.h"
+#include "formats/MidiFile.h"
+#include "formats/AudioContainer.h"
+#include "formats/BioMedicalEdf.h"
+#include "formats/ElfBinary.h"
+#include "formats/WebAssemblyWasm.h"
+#include "formats/NmeaGpsLog.h"
+#include "formats/IgcFlightLog.h"
+#include "formats/GpsTrackMap.h"
+#include "formats/ExtendedSysSec100.h"
+#include "formats/ExtendedAiData100.h"
+#include "formats/ExtendedGeoSci100.h"
+#include "formats/ExtendedMediaDoc100.h"
+#include "formats/ExtendedDocs200.h"
+#include <shellapi.h>
+
 bool SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(const std::wstring& extLower) {
-    return extLower == L".csv"  || extLower == L".tsv"  || extLower == L".psv"  ||
-           extLower == L".xlsx" || extLower == L".xlsm" || extLower == L".xls"  ||
-           extLower == L".ods"  || extLower == L".docx" || extLower == L".docm" ||
-           extLower == L".odt"  || extLower == L".rtf";
+    return extLower == L".csv"     || extLower == L".tsv"     || extLower == L".psv"  ||
+           extLower == L".xlsx"    || extLower == L".xlsm"    || extLower == L".xls"  ||
+           extLower == L".ods"     || extLower == L".docx"    || extLower == L".docm" ||
+           extLower == L".odt"     || extLower == L".rtf"     || extLower == L".pptx" ||
+           extLower == L".ppsx"    || extLower == L".odp"     || extLower == L".epub" ||
+           extLower == L".fb2"     || extLower == L".sqlite"  || extLower == L".sqlite3" ||
+           extLower == L".db"      || extLower == L".dbf"     || extLower == L".dif"  ||
+           extLower == L".slk"     || extLower == L".sylk"    || extLower == L".parquet" ||
+           extLower == L".avro"    || extLower == L".bson"    || extLower == L".ics"  ||
+           extLower == L".ical"    || extLower == L".vcf"     || extLower == L".vcard" ||
+           extLower == L".srt"     || extLower == L".vtt"     || extLower == L".ass"  ||
+           extLower == L".ssa"     || extLower == L".gpx"     || extLower == L".kml"  ||
+           extLower == L".geojson" || extLower == L".osm"     || extLower == L".tcx"  ||
+           extLower == L".bib"     || extLower == L".ris"     || extLower == L".arff" ||
+           extLower == L".mtx"     || extLower == L".ndjson"  || extLower == L".jsonl" ||
+           extLower == L".har"     || extLower == L".pcap"    || extLower == L".torrent" ||
+           extLower == L".cue"     || extLower == L".m3u"     || extLower == L".m3u8" ||
+           extLower == L".pls"     || extLower == L".mid"     || extLower == L".midi" ||
+           extLower == L".wav"     || extLower == L".flac"    || extLower == L".aiff" ||
+           extLower == L".edf"     || extLower == L".elf"     || extLower == L".wasm" ||
+           extLower == L".nmea"    || extLower == L".igc"     ||
+           extLower == L".exe"     || extLower == L".dll"     || extLower == L".sys"  || extLower == L".ocx"  ||
+           extLower == L".lnk"     || extLower == L".pf"      || extLower == L".evtx" || extLower == L".dmp"  ||
+           extLower == L".mdmp"    || extLower == L".class"   || extLower == L".dex"  || extLower == L".macho"||
+           extLower == L".dylib"   || extLower == L".crt"     || extLower == L".cer"  || extLower == L".pem"  ||
+           extLower == L".der"     || extLower == L".csr"     || extLower == L".p12"  || extLower == L".pfx"  ||
+           extLower == L".kdbx"    || extLower == L".pcapng"  || extLower == L".uf2"  ||
+           extLower == L".onnx"    || extLower == L".tflite"  || extLower == L".pt"   || extLower == L".pth"  ||
+           extLower == L".ckpt"    || extLower == L".npy"     || extLower == L".npz"  || extLower == L".h5"   ||
+           extLower == L".hdf5"    || extLower == L".mat"     || extLower == L".feather" || extLower == L".arrow" ||
+           extLower == L".ipc"     || extLower == L".orc"     || extLower == L".duckdb"  || extLower == L".msgpack" ||
+           extLower == L".mpk"     || extLower == L".cbor"    || extLower == L".ipynb"   || extLower == L".sav"  ||
+           extLower == L".dta"     || extLower == L".sas7bdat"|| extLower == L".rds"  ||
+           extLower == L".shp"     || extLower == L".shx"     || extLower == L".gpkg" || extLower == L".kmz"  ||
+           extLower == L".cdf"     || extLower == L".grib"    || extLower == L".grib2"|| extLower == L".nii"  ||
+           extLower == L".ogg"     || extLower == L".opus"    || extLower == L".spx"  || extLower == L".mp3"  ||
+           extLower == L".mod"     || extLower == L".xm"      || extLower == L".it"   || extLower == L".s3m"  ||
+           extLower == L".sf2"     || extLower == L".sfz"     || extLower == L".gp"   || extLower == L".gp5"  ||
+           extLower == L".mscz"    || extLower == L".als"     || extLower == L".flp"  || extLower == L".rpp"  ||
+           extLower == L".edl"     || extLower == L".fcpxml"  || extLower == L".otio" || extLower == L".sub"  ||
+           extLower == L".idx"     || extLower == L".sup"     || extLower == L".eml"  || extLower == L".mbox" ||
+           extLower == L".msg"     || extLower == L".mobi"    || extLower == L".azw3" || extLower == L".djvu" ||
+           extLower == L".chm"     ||
+           extLower == L".accdb"   || extLower == L".mdb"     || extLower == L".rdb"  || extLower == L".sst"  ||
+           extLower == L".ldb"     || extLower == L".mbtiles" || extLower == L".pmtiles" || extLower == L".pb" ||
+           extLower == L".pbf"     || extLower == L".tfstate" || extLower == L".sarif"|| extLower == L".spdx" ||
+           extLower == L".cdx"     || extLower == L".gpg"     || extLower == L".pgp"  || extLower == L".sig"  ||
+           extLower == L".jks"     || extLower == L".cat"     || extLower == L".hiv"  || extLower == L".etl"  ||
+           extLower == L".pol"     || extLower == L".sid"     || extLower == L".nsf"  || extLower == L".spc"  ||
+           extLower == L".vgm"     || extLower == L".musicxml"|| extLower == L".mxl"  || extLower == L".xmp"  ||
+           extLower == L".uasset"  || extLower == L".umap"    || extLower == L".prefab"|| extLower == L".unity"||
+           extLower == L".pages"   || extLower == L".numbers" || extLower == L".key"  || extLower == L".vsdx";
 }
 
-bool SpreadsheetDocViewer::InspectOfficeFile(const std::wstring& fullPath, ParsedOfficeDocument& outDoc) {
+static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc);
+
+bool SpreadsheetDocViewer::InspectOfficeFile(const std::wstring& fullPath, ParsedOfficeDocument& outDoc) try {
+    bool ok = InspectOfficeFileRaw(fullPath, outDoc);
+    if (ok && outDoc.valid) {
+        Formats::ExtractGeoTrackFromSheets(outDoc);
+    }
+    return ok;
+} E2_READER_CATCH(L"Document reader", fullPath, { outDoc = ParsedOfficeDocument(); return false; })
+
+static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc) {
     outDoc = ParsedOfficeDocument{};
     outDoc.filePath = fullPath;
     std::wstring ext = PathUtils::GetExtension(fullPath);
@@ -466,12 +184,70 @@ bool SpreadsheetDocViewer::InspectOfficeFile(const std::wstring& fullPath, Parse
     if (ext == L".docx" || ext == L".docm" || ext == L".odt") {
         return ParseWordDocx(fullPath, outDoc);
     }
+    if (ext == L".pptx" || ext == L".ppsx" || ext == L".odp") {
+        return ParsePowerPointPptx(fullPath, ext, outDoc);
+    }
+    if (ext == L".epub") {
+        return ParseEpubDocument(fullPath, outDoc);
+    }
 
     std::vector<uint8_t> raw;
     if (!PathUtils::ReadFileBytes(fullPath, 32 * 1024 * 1024, raw) || raw.empty()) {
         return false;
     }
 
+    if (ext == L".parquet") return Formats::ParseApacheParquet(raw, outDoc);
+    if (ext == L".avro")    return Formats::ParseApacheAvro(raw, outDoc);
+    if (ext == L".bson")    return Formats::ParseBsonDocument(raw, outDoc);
+    if (ext == L".ics" || ext == L".ical")   return Formats::ParseICalendar(raw, outDoc);
+    if (ext == L".vcf" || ext == L".vcard")  return Formats::ParseVCard(raw, outDoc);
+    if (ext == L".srt")     return Formats::ParseSubRipSrt(raw, outDoc);
+    if (ext == L".vtt")     return Formats::ParseWebVtt(raw, outDoc);
+    if (ext == L".ass" || ext == L".ssa")    return Formats::ParseSubStationAss(raw, outDoc);
+    if (ext == L".gpx")     return Formats::ParseGpxTrack(raw, outDoc);
+    if (ext == L".kml")     return Formats::ParseKmlGeography(raw, outDoc);
+    if (ext == L".geojson") return Formats::ParseGeoJsonDoc(raw, outDoc);
+    if (ext == L".osm")     return Formats::ParseOpenStreetMapDoc(raw, outDoc);
+    if (ext == L".tcx")     return Formats::ParseGarminTcxDoc(raw, outDoc);
+    if (ext == L".bib")     return Formats::ParseBibTexDoc(raw, outDoc);
+    if (ext == L".ris")     return Formats::ParseRisCitationDoc(raw, outDoc);
+    if (ext == L".arff")    return Formats::ParseWekaArffDoc(raw, outDoc);
+    if (ext == L".mtx")     return Formats::ParseMatrixMarketDoc(raw, outDoc);
+    if (ext == L".ndjson" || ext == L".jsonl") return Formats::ParseNdJsonDoc(raw, outDoc);
+    if (ext == L".har")     return Formats::ParseHttpArchiveHarDoc(raw, outDoc);
+    if (ext == L".pcap")    return Formats::ParseLibPcapDoc(raw, outDoc);
+    if (ext == L".torrent") return Formats::ParseBitTorrentDoc(raw, outDoc);
+    if (ext == L".cue")     return Formats::ParseCueSheetDoc(raw, outDoc);
+    if (ext == L".m3u" || ext == L".m3u8" || ext == L".pls") return Formats::ParsePlaylistM3uDoc(raw, outDoc);
+    if (ext == L".mid" || ext == L".midi") return Formats::ParseMidiFileDoc(raw, outDoc);
+    if (ext == L".wav" || ext == L".flac" || ext == L".aiff") return Formats::ParseAudioContainerDoc(raw, outDoc);
+    if (ext == L".edf")     return Formats::ParseBioMedicalEdfDoc(raw, outDoc);
+    if (ext == L".elf")     return Formats::ParseElfBinaryDoc(raw, outDoc);
+    if (ext == L".wasm")    return Formats::ParseWebAssemblyWasmDoc(raw, outDoc);
+    if (ext == L".nmea")    return Formats::ParseNmeaGpsLogDoc(raw, outDoc);
+    if (ext == L".igc")     return Formats::ParseIgcFlightLogDoc(raw, outDoc);
+    if (Formats::ParseExtendedSysSecDoc(raw, ext, outDoc))  return true;
+    if (Formats::ParseExtendedAiDataDoc(raw, ext, outDoc))  return true;
+    if (Formats::ParseExtendedGeoSciDoc(raw, ext, outDoc))  return true;
+    if (Formats::ParseExtendedMediaDoc(raw, ext, outDoc))   return true;
+    if (Formats::ParseExtendedDocs200(raw, ext, outDoc))    return true;
+
+    if (ext == L".fb2") {
+        return ParseFb2Document(raw, outDoc);
+    }
+    if (ext == L".sqlite" || ext == L".sqlite3" || ext == L".db" ||
+        (raw.size() >= 16 && std::memcmp(raw.data(), "SQLite format 3\0", 16) == 0)) {
+        return ParseSqliteDatabase(raw, outDoc);
+    }
+    if (ext == L".dbf") {
+        return ParseDbfDatabase(raw, outDoc);
+    }
+    if (ext == L".dif") {
+        return ParseDifSpreadsheet(raw, outDoc);
+    }
+    if (ext == L".slk" || ext == L".sylk") {
+        return ParseSylkSpreadsheet(raw, outDoc);
+    }
     if (ext == L".rtf" || (raw.size() >= 5 && std::memcmp(raw.data(), "{\\rtf", 5) == 0)) {
         return ParseRtfDocument(raw, outDoc);
     }
@@ -544,6 +320,12 @@ void SpreadsheetDocViewer::LoadFile(const std::wstring& fullPath, bool forceRelo
     if (!forceReload && m_currentPath == fullPath && !m_currentPath.empty()) {
         return;
     }
+    ParsedOfficeDocument doc;
+    InspectOfficeFile(fullPath, doc);
+    ShowLoadedDocument(fullPath, std::move(doc));
+}
+
+void SpreadsheetDocViewer::ShowLoadedDocument(const std::wstring& fullPath, ParsedOfficeDocument&& doc) {
     m_currentPath = fullPath;
     m_activeSheetIdx = 0;
     m_selectedRow = 0;
@@ -552,7 +334,12 @@ void SpreadsheetDocViewer::LoadFile(const std::wstring& fullPath, bool forceRelo
     m_topRow = 0;
     m_leftCol = 0;
     m_docScrollY = 0.0f;
-    InspectOfficeFile(fullPath, m_doc);
+    m_mapZoom = 1.0f;
+    m_mapPanX = 0.0f;
+    m_mapPanY = 0.0f;
+    m_mapDragging = false;
+    m_doc = std::move(doc);
+    m_showMapView = m_doc.hasGeoTrack;
     RecomputeColumnStats(0);
 }
 
@@ -630,7 +417,7 @@ void SpreadsheetDocViewer::Draw(
     IDWriteTextFormat* fmtBold,
     const D2D1_RECT_F& rect,
     Lang lang,
-    D2D1_POINT_2F /*mousePt*/)
+    D2D1_POINT_2F mousePt)
 {
     const bool pl = (lang == Lang::PL);
     m_toolbarHits.clear();
@@ -653,10 +440,20 @@ void SpreadsheetDocViewer::Draw(
     };
 
     if (m_doc.isSpreadsheet) {
+        if (m_doc.hasGeoTrack) {
+            addBtn(BTN_TOGGLE_MAP_VIEW, pl ? 104.0f : 98.0f,
+                m_showMapView ? (pl ? L"\xD83D\xDDFA Mapa GPS" : L"\xD83D\xDDFA GPS Map")
+                              : (pl ? L"\xD83D\xDCCA Tabela" : L"\xD83D\xDCCA Table"),
+                m_showMapView);
+            addBtn(BTN_OPEN_OSM_WEB, pl ? 124.0f : 118.0f, pl ? L"\xD83C\xDF0D OpenStreetMap" : L"\xD83C\xDF0D OpenStreetMap");
+            if (m_showMapView) {
+                addBtn(BTN_RESET_MAP_CAM, pl ? 72.0f : 68.0f, pl ? L"\xD83C\xDFAF Reset" : L"\xD83C\xDFAF Fit");
+            }
+        }
         for (size_t s = 0; s < std::min<size_t>(m_doc.sheets.size(), 5); ++s) {
             std::wstring sName = L"\xD83D\xDCCA " + m_doc.sheets[s].name;
             float sw = std::clamp(static_cast<float>(sName.size()) * 7.5f + 16.0f, 64.0f, 120.0f);
-            addBtn(BTN_SHEET_BASE + static_cast<int>(s), sw, sName.c_str(), static_cast<int>(s) == m_activeSheetIdx);
+            addBtn(BTN_SHEET_BASE + static_cast<int>(s), sw, sName.c_str(), !m_showMapView && static_cast<int>(s) == m_activeSheetIdx);
         }
         addBtn(BTN_SORT_ASC_DESC, pl ? 78.0f : 72.0f, pl ? L"\x21C5 Sortuj kol." : L"\x21C5 Sort Col", m_sortedCol >= 0);
         addBtn(BTN_COPY_CELL,     pl ? 82.0f : 76.0f, pl ? L"Kopiuj kom." : L"Copy Cell");
@@ -667,7 +464,11 @@ void SpreadsheetDocViewer::Draw(
 
     D2D1_RECT_F bodyR = D2D1::RectF(rect.left, tbR.bottom, rect.right, std::max(tbR.bottom + 20.0f, rect.bottom - statusH));
 
-    if (m_doc.isSpreadsheet && !m_doc.sheets.empty()) {
+    if (m_doc.isSpreadsheet && m_doc.hasGeoTrack && m_showMapView) {
+        m_gridBodyRect = bodyR;
+        Formats::DrawGpsMapAndElevationView(rt, brush, fmtRegular, fmtSmall, fmtBold,
+            bodyR, m_doc, m_mapZoom, m_mapPanX, m_mapPanY, m_selectedRow, mousePt, pl);
+    } else if (m_doc.isSpreadsheet && !m_doc.sheets.empty()) {
         const auto& sheet = m_doc.sheets[std::clamp(m_activeSheetIdx, 0, static_cast<int>(m_doc.sheets.size()) - 1)];
 
         // Formula / Active Cell Inspector Strip (24px)
@@ -858,7 +659,27 @@ bool SpreadsheetDocViewer::OnMouseDown(float x, float y, bool rightButton, Lang 
 
     for (const auto& hit : m_toolbarHits) {
         if (PathUtils::PtInRectF(x, y, hit.rect)) {
+            if (hit.id == BTN_TOGGLE_MAP_VIEW) {
+                m_showMapView = !m_showMapView;
+                return true;
+            }
+            if (hit.id == BTN_RESET_MAP_CAM) {
+                m_mapZoom = 1.0f;
+                m_mapPanX = 0.0f;
+                m_mapPanY = 0.0f;
+                return true;
+            }
+            if (hit.id == BTN_OPEN_OSM_WEB && !m_doc.geoPoints.empty()) {
+                double cLat = m_doc.geoPoints[m_doc.geoPoints.size() / 2].lat;
+                double cLon = m_doc.geoPoints[m_doc.geoPoints.size() / 2].lon;
+                wchar_t url[256] = {};
+                swprintf_s(url, L"https://www.openstreetmap.org/?mlat=%.6f&mlon=%.6f#map=14/%.6f/%.6f", cLat, cLon, cLat, cLon);
+                ShellExecuteW(m_parentHwnd, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+                if (outStatusToast) *outStatusToast = pl ? L"\xD83C\xDF0D Otwarto trasę w OpenStreetMap" : L"\xD83C\xDF0D Opened track in OpenStreetMap";
+                return true;
+            }
             if (hit.id >= BTN_SHEET_BASE && hit.id < BTN_SHEET_BASE + 32) {
+                m_showMapView = false;
                 m_activeSheetIdx = hit.id - BTN_SHEET_BASE;
                 m_topRow = 0;
                 m_leftCol = 0;
@@ -903,6 +724,13 @@ bool SpreadsheetDocViewer::OnMouseDown(float x, float y, bool rightButton, Lang 
         }
     }
 
+    if (m_doc.isSpreadsheet && m_doc.hasGeoTrack && m_showMapView && PathUtils::PtInRectF(x, y, m_gridBodyRect)) {
+        m_mapDragging = true;
+        m_mapDragStartX = x - m_mapPanX;
+        m_mapDragStartY = y - m_mapPanY;
+        return true;
+    }
+
     if (m_doc.isSpreadsheet && !m_doc.sheets.empty()) {
         if (PathUtils::PtInRectF(x, y, m_colHeaderRect)) {
             int c = static_cast<int>((x - m_colHeaderRect.left) / 108.0f);
@@ -931,6 +759,11 @@ bool SpreadsheetDocViewer::OnMouseDown(float x, float y, bool rightButton, Lang 
 }
 
 bool SpreadsheetDocViewer::OnMouseMove(float x, float y) {
+    if (m_mapDragging) {
+        m_mapPanX = x - m_mapDragStartX;
+        m_mapPanY = y - m_mapDragStartY;
+        return true;
+    }
     int newHov = 0;
     for (const auto& hit : m_toolbarHits) {
         if (PathUtils::PtInRectF(x, y, hit.rect)) {
@@ -946,6 +779,10 @@ bool SpreadsheetDocViewer::OnMouseMove(float x, float y) {
 }
 
 bool SpreadsheetDocViewer::OnMouseUp() {
+    if (m_mapDragging) {
+        m_mapDragging = false;
+        return true;
+    }
     return false;
 }
 
@@ -954,6 +791,11 @@ bool SpreadsheetDocViewer::OnMouseWheel(short delta, float x, float y) {
     int notches = delta / WHEEL_DELTA;
     if (notches == 0) notches = (delta > 0) ? 1 : -1;
 
+    if (m_doc.isSpreadsheet && m_doc.hasGeoTrack && m_showMapView) {
+        float factor = (notches > 0) ? 1.22f : (1.0f / 1.22f);
+        m_mapZoom = std::clamp(m_mapZoom * factor, 0.25f, 30.0f);
+        return true;
+    }
     if (m_doc.isSpreadsheet && !m_doc.sheets.empty()) {
         const auto& sh = m_doc.sheets[m_activeSheetIdx];
         if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {

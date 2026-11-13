@@ -1,0 +1,3 @@
+{"event":"boot","service":"Explorer2","latency_ms":4,"status":"ok"}
+{"event":"open_dir","service":"VFS","latency_ms":1,"status":"cached"}
+{"event":"decode_3d","service":"Model3DViewer","latency_ms":6,"status":"ok"}

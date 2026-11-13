@@ -1,0 +1,17 @@
+entity STM32F407_JTAG is
+  generic (PHYSICAL_PIN_MAP : string := "LQFP100");
+  port (
+    JTDI   : in    bit;
+    JTMS   : in    bit;
+    JTCK   : in    bit;
+    JTRST  : in    bit;
+    JTDO   : out   bit;
+    PA0    : inout bit;
+    PA1    : inout bit;
+    PB0    : inout bit;
+    PC13   : inout bit;
+    VDD    : linkage bit;
+    VSS    : linkage bit
+  );
+  attribute BOUNDARY_LENGTH of STM32F407_JTAG : entity is 24;
+end STM32F407_JTAG;

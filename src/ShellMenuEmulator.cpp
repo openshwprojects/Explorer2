@@ -1,4 +1,5 @@
 #include "ShellMenuEmulator.h"
+#include "ThreadUtils.h"
 #include "ImageFormatLoader.h"
 #include "PathUtils.h"
 #include <wrl/client.h>
@@ -128,14 +129,20 @@ void ShellMenuEmulator::AttachMenuBitmap(HMENU hMenu, UINT itemIdOrPos, bool byP
 }
 
 ShellMenuEmulator::ShellMenuEmulator() = default;
-ShellMenuEmulator::~ShellMenuEmulator() = default;
+
+ShellMenuEmulator::~ShellMenuEmulator() {
+    // The scan fills this object in, so the object must not go away under it. It reads the registry and
+    // one folder, which takes a moment at most.
+    JoinServingCom(m_scanThread);
+}
 
 void ShellMenuEmulator::InitializeAsync() {
-    std::thread([this]() {
+    if (m_scanThread.joinable()) m_scanThread.join();      // a scan started earlier finishes first
+    m_scanThread = std::thread([this]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         ScanStartupData();
         CoUninitialize();
-    }).detach();
+    });
 }
 
 void ShellMenuEmulator::ScanStartupData() {

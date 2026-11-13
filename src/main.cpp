@@ -1,5 +1,7 @@
 #include "ExplorerApp.h"
+#include "AppLog.h"
 #include "Monitoring.h"
+#include "PdfViewer.h"
 #include "SelfTestSuite.h"
 #include <objbase.h>
 #include <shellapi.h>
@@ -25,7 +27,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
             }
             LocalFree(argv);
         }
+        // A test that takes the process down must not go unnoticed: the crash record goes next to the report
+        const std::wstring crashRecord = reportFile + L".crash.txt";
+        DeleteFileW(crashRecord.c_str());
+        Explorer2::AppLog::SetCrashRecordFile(crashRecord);
+        Explorer2::AppLog::InstallCrashHandler();
         int code = Explorer2::SelfTestSuite::RunStageTests(stage, reportFile);
+        Explorer2::PdfViewer::ReleaseRenderer();
+        CoUninitialize();
+        return code;
+    }
+
+    // Robustness diagnostics: `Explorer2.exe --inspect-files <listFile> <resultFile>` runs the file readers on every
+    // file named in the list and records what each of them did (see SelfTestSuite.h and tools/fuzz_samples.py)
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--inspect-files")) {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(lpCmdLine, &argc);
+        int code = 2;
+        if (argv) {
+            for (int i = 0; i + 2 < argc; ++i) {
+                if (wcscmp(argv[i], L"--inspect-files") == 0) {
+                    code = Explorer2::SelfTestSuite::InspectFiles(argv[i + 1], argv[i + 2]);
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
         CoUninitialize();
         return code;
     }
@@ -79,6 +106,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
     }
     app.reset();
 
+    // Unload what was only loaded on demand while the process is still whole (see PdfViewer::ReleaseRenderer)
+    Explorer2::PdfViewer::ReleaseRenderer();
     CoUninitialize();
     return exitCode;
 }

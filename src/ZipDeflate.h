@@ -62,6 +62,20 @@ bool ListZipEntriesFromMemory(
     size_t dataLen,
     std::vector<ArchiveItemMeta>& outEntries);
 
+bool ExtractZipEntryFromMemory(
+    const uint8_t* data,
+    size_t dataLen,
+    const ArchiveItemMeta& entry,
+    std::vector<uint8_t>& outBytes,
+    size_t maxOutputBytes = 64 * 1024 * 1024);
+
+bool ExtractZipEntryFromMemory(
+    const uint8_t* data,
+    size_t dataLen,
+    const char* nameSubstr,
+    std::vector<uint8_t>& outBytes,
+    size_t maxOutputBytes = 64 * 1024 * 1024);
+
 // Extracts a specific entry by its ArchiveItemMeta or by case-insensitive inner path (e.g. L"xl/sharedStrings.xml")
 bool ExtractZipEntryFromFile(
     const std::wstring& zipFilePath,

@@ -2,10 +2,15 @@
 #include "Types.h"
 #include "Localization.h"
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace Explorer2 {
+
+// Progress & cooperative pause/cancel callback for chunked FTP transfers:
+// receives bytes transferred in latest chunk; return false to abort immediately.
+using FtpTransferProgressFn = std::function<bool(uint64_t chunkBytes)>;
 
 struct FtpUrlInfo {
     bool valid = false;
@@ -20,6 +25,12 @@ struct FtpUrlInfo {
 struct FtpBookmark {
     std::wstring name;
     std::wstring url;
+    std::wstring host;
+    std::wstring user;
+    std::wstring password;
+    uint16_t port = 21;
+    bool useFtps = false;
+    bool fromFileZilla = false;
 };
 
 class FtpClient {
@@ -56,19 +67,42 @@ public:
         std::vector<FileEntry>& outEntries,
         std::wstring* outError = nullptr);
 
+    static bool ProbeFtpItemInfo(
+        const std::wstring& ftpUrl,
+        bool& outIsDirectory,
+        uint64_t& outSize,
+        FILETIME* outWriteTime = nullptr);
+
     static bool DownloadFtpFileToLocal(
         const std::wstring& ftpFileUrl,
         const std::wstring& localDestPath,
         std::wstring* outError = nullptr);
 
+    static bool DownloadFtpFileToLocalEx(
+        const std::wstring& ftpFileUrl,
+        const std::wstring& localDestPath,
+        const FtpTransferProgressFn& onChunk,
+        std::wstring* outError = nullptr);
+
+    // Downloads an FTP file into the temp folder (once: a copy that is there already is used again).
+    // keepGoing, when given, is asked as the data comes in; false stops the download. The copy gets its
+    // name only when it is complete, so a download that was stopped or broke off is never taken for one.
     static bool DownloadFtpFileToTempCache(
         const std::wstring& ftpFileUrl,
-        std::wstring& outTempFilePath);
+        std::wstring& outTempFilePath,
+        const std::function<bool()>& keepGoing = {});
 
     static bool UploadLocalFileToFtp(
         const std::wstring& localSrcPath,
         const std::wstring& ftpTargetDirUrl,
         std::wstring* outError = nullptr);
+
+    static bool UploadLocalFileToFtpEx(
+        const std::wstring& localSrcPath,
+        const std::wstring& ftpTargetDirUrl,
+        const FtpTransferProgressFn& onChunk,
+        std::wstring* outError = nullptr,
+        const std::wstring& remoteFileNameOverride = L"");
 
     static bool CreateFtpDirectory(
         const std::wstring& ftpDirUrl,
@@ -79,16 +113,35 @@ public:
         bool isDirectory,
         std::wstring* outError = nullptr);
 
+    static bool RenameFtpItem(
+        const std::wstring& oldFtpUrl,
+        const std::wstring& newName,
+        std::wstring& outNewFtpUrl,
+        std::wstring* outError = nullptr);
+
+    static bool UploadLocalTreeToFtp(
+        const std::wstring& localSrcPath,
+        const std::wstring& ftpTargetDirUrl,
+        std::wstring* outError = nullptr);
+
+    static bool DownloadFtpTreeToLocal(
+        const std::wstring& ftpItemUrl,
+        bool isDirectory,
+        const std::wstring& localTargetDir,
+        std::wstring* outError = nullptr);
+
     // Mock / In-Memory Virtual FTP Host registration (used for deterministic offline self-tests
     // and instant local demonstration without requiring an external internet FTP server)
     static void RegisterMockFtpListing(const std::wstring& hostAndPath, const std::string& rawListingText);
     static void RegisterMockFtpFileContent(const std::wstring& ftpFileUrl, const std::vector<uint8_t>& content);
     static void ClearMockFtpData();
 
-    // FTP Bookmarks persistence (%LOCALAPPDATA%\Explorer2\ftp_bookmarks.ini)
+    // FTP Bookmarks persistence (%LOCALAPPDATA%\Explorer2\ftp_bookmarks.ini) + FileZilla auto-import (%APPDATA%\FileZilla)
     static std::wstring DefaultBookmarksPath();
+    static std::vector<FtpBookmark> ImportFileZillaSites(const std::wstring& customFileZillaDir = L"");
     static std::vector<FtpBookmark> LoadBookmarks(const std::wstring& iniPath = L"");
     static bool SaveBookmarks(const std::vector<FtpBookmark>& bookmarks, const std::wstring& iniPath = L"");
+    static void InvalidateListingCache();
 };
 
 } // namespace Explorer2

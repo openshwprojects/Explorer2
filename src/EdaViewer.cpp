@@ -1,5 +1,7 @@
 #include "EdaViewer.h"
+#include "ReaderGuard.h"
 #include "PathUtils.h"
+#include "ZipDeflate.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -216,635 +218,30 @@ struct EaglePkgDef {
     float minX = -1.5f, minY = -1.0f, maxX = 1.5f, maxY = 1.0f;
 };
 
-static bool ParseEagleXml(std::string_view xml, const std::wstring& ext, ParsedEdaBoard& out) {
-    bool isSch = (ext == L".sch") || (xml.find("<schematic") != std::string_view::npos);
-    out.kind = isSch ? EdaDocKind::EagleSch : EdaDocKind::EagleBrd;
-    out.formatTitle = isSch ? L"Eagle XML Schematic (.sch)" : L"Eagle XML Board (.brd)";
-
-    std::unordered_map<std::string, EaglePkgDef> pkgMap;
-    std::unordered_map<std::string, std::wstring> schPartValues;
-    std::string currentPkgName;
-    bool inPackage = false;
-
-    size_t pos = 0;
-    while (pos < xml.size()) {
-        size_t lt = xml.find('<', pos);
-        if (lt == std::string_view::npos) break;
-        size_t gt = xml.find('>', lt + 1);
-        if (gt == std::string_view::npos) break;
-        std::string_view tag = xml.substr(lt + 1, gt - lt - 1);
-        pos = gt + 1;
-
-        if (tag.empty() || tag[0] == '?' || tag[0] == '!') continue;
-
-        if (tag.rfind("/package", 0) == 0) {
-            inPackage = false;
-            currentPkgName.clear();
-            continue;
-        }
-        if (tag.rfind("package ", 0) == 0) {
-            std::string_view nameSv;
-            if (GetXmlAttr(tag, "name", nameSv)) {
-                currentPkgName = std::string(nameSv);
-                inPackage = true;
-            }
-            continue;
-        }
-
-        if (inPackage && !currentPkgName.empty()) {
-            auto& pkg = pkgMap[currentPkgName];
-            if (tag.rfind("smd ", 0) == 0) {
-                EdaPadPrim p;
-                p.x = GetXmlFloat(tag, "x");
-                p.y = GetXmlFloat(tag, "y");
-                p.w = GetXmlFloat(tag, "dx", 1.0f);
-                p.h = GetXmlFloat(tag, "dy", 1.0f);
-                int lyr = GetXmlInt(tag, "layer", 1);
-                p.layer = (lyr == 16) ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
-                p.shape = 1;
-                std::string_view nm;
-                if (GetXmlAttr(tag, "name", nm)) p.pinName = PathUtils::Utf8ToWide(nm);
-                pkg.localPads.push_back(p);
-                pkg.minX = std::min(pkg.minX, p.x - p.w * 0.5f);
-                pkg.maxX = std::max(pkg.maxX, p.x + p.w * 0.5f);
-                pkg.minY = std::min(pkg.minY, p.y - p.h * 0.5f);
-                pkg.maxY = std::max(pkg.maxY, p.y + p.h * 0.5f);
-            } else if (tag.rfind("pad ", 0) == 0) {
-                EdaPadPrim p;
-                p.x = GetXmlFloat(tag, "x");
-                p.y = GetXmlFloat(tag, "y");
-                p.drill = GetXmlFloat(tag, "drill", 0.8f);
-                float diam = GetXmlFloat(tag, "diameter", p.drill * 1.75f);
-                if (diam <= 0.01f) diam = p.drill * 1.75f;
-                p.w = diam;
-                p.h = diam;
-                p.layer = EdaLayerId::PadsThrough;
-                p.shape = 0;
-                std::string_view nm;
-                if (GetXmlAttr(tag, "name", nm)) p.pinName = PathUtils::Utf8ToWide(nm);
-                pkg.localPads.push_back(p);
-                pkg.minX = std::min(pkg.minX, p.x - diam * 0.5f);
-                pkg.maxX = std::max(pkg.maxX, p.x + diam * 0.5f);
-                pkg.minY = std::min(pkg.minY, p.y - diam * 0.5f);
-                pkg.maxY = std::max(pkg.maxY, p.y + diam * 0.5f);
-            } else if (tag.rfind("wire ", 0) == 0) {
-                EdaTraceSeg seg;
-                seg.x1 = GetXmlFloat(tag, "x1");
-                seg.y1 = GetXmlFloat(tag, "y1");
-                seg.x2 = GetXmlFloat(tag, "x2");
-                seg.y2 = GetXmlFloat(tag, "y2");
-                seg.width = std::max(0.12f, GetXmlFloat(tag, "width", 0.15f));
-                seg.layer = EdaLayerId::TopSilk;
-                pkg.localSilk.push_back(seg);
-                pkg.minX = std::min({ pkg.minX, seg.x1, seg.x2 });
-                pkg.maxX = std::max({ pkg.maxX, seg.x1, seg.x2 });
-                pkg.minY = std::min({ pkg.minY, seg.y1, seg.y2 });
-                pkg.maxY = std::max({ pkg.maxY, seg.y1, seg.y2 });
-            }
-            continue;
-        }
-
-        if (tag.rfind("wire ", 0) == 0) {
-            int lyr = GetXmlInt(tag, "layer", isSch ? 91 : 1);
-            // Skip documentation/unrouted layers unless relevant
-            if (!isSch && (lyr == 19 || lyr >= 100)) continue;
-            EdaTraceSeg seg;
-            seg.x1 = GetXmlFloat(tag, "x1");
-            seg.y1 = GetXmlFloat(tag, "y1");
-            seg.x2 = GetXmlFloat(tag, "x2");
-            seg.y2 = GetXmlFloat(tag, "y2");
-            seg.width = std::max(0.15f, GetXmlFloat(tag, "width", 0.25f));
-            seg.layer = MapEagleLayer(lyr, isSch);
-            out.traces.push_back(seg);
-        } else if (tag.rfind("via ", 0) == 0 || tag.rfind("hole ", 0) == 0) {
-            EdaViaPrim v;
-            v.x = GetXmlFloat(tag, "x");
-            v.y = GetXmlFloat(tag, "y");
-            v.drill = GetXmlFloat(tag, "drill", 0.5f);
-            v.diameter = GetXmlFloat(tag, "diameter", v.drill * 1.8f);
-            if (v.diameter <= v.drill) v.diameter = v.drill * 1.8f;
-            out.vias.push_back(v);
-        } else if (tag.rfind("circle ", 0) == 0) {
-            EdaCirclePrim c;
-            c.cx = GetXmlFloat(tag, "x");
-            c.cy = GetXmlFloat(tag, "y");
-            c.radius = GetXmlFloat(tag, "radius", 1.0f);
-            c.width = std::max(0.15f, GetXmlFloat(tag, "width", 0.2f));
-            c.layer = MapEagleLayer(GetXmlInt(tag, "layer", 21), isSch);
-            out.circles.push_back(c);
-        } else if (tag.rfind("signal ", 0) == 0 || tag.rfind("net ", 0) == 0) {
-            ++out.netCount;
-        } else if (tag.rfind("part ", 0) == 0 && isSch) {
-            std::string_view nm, val, dev;
-            if (GetXmlAttr(tag, "name", nm)) {
-                GetXmlAttr(tag, "value", val);
-                if (val.empty()) GetXmlAttr(tag, "deviceset", dev);
-                schPartValues[std::string(nm)] = PathUtils::Utf8ToWide(val.empty() ? dev : val);
-            }
-        } else if (tag.rfind("instance ", 0) == 0 && isSch) {
-            std::string_view partSv;
-            if (GetXmlAttr(tag, "part", partSv)) {
-                EdaComponent3D comp;
-                comp.refDes = PathUtils::Utf8ToWide(partSv);
-                auto it = schPartValues.find(std::string(partSv));
-                if (it != schPartValues.end()) comp.value = it->second;
-                comp.x = GetXmlFloat(tag, "x");
-                comp.y = GetXmlFloat(tag, "y");
-                comp.widthMm = 6.0f;
-                comp.lengthMm = 4.0f;
-                out.components.push_back(comp);
-                out.labels.push_back({ comp.x, comp.y, 1.5f, EdaLayerId::SchLabel, comp.refDes + (comp.value.empty() ? L"" : (L":" + comp.value)) });
-            }
-        } else if (tag.rfind("element ", 0) == 0 && !isSch) {
-            std::string_view nameSv, pkgSv, valSv, rotSv;
-            GetXmlAttr(tag, "name", nameSv);
-            GetXmlAttr(tag, "package", pkgSv);
-            GetXmlAttr(tag, "value", valSv);
-            GetXmlAttr(tag, "rot", rotSv);
-
-            EdaComponent3D comp;
-            comp.refDes = PathUtils::Utf8ToWide(nameSv);
-            comp.footprint = PathUtils::Utf8ToWide(pkgSv);
-            comp.value = PathUtils::Utf8ToWide(valSv);
-            comp.x = GetXmlFloat(tag, "x");
-            comp.y = GetXmlFloat(tag, "y");
-
-            if (!rotSv.empty()) {
-                if (rotSv.find('M') != std::string_view::npos) comp.bottomSide = true;
-                size_t rPos = rotSv.find('R');
-                if (rPos != std::string_view::npos && rPos + 1 < rotSv.size()) {
-                    char rbuf[16] = {};
-                    std::memcpy(rbuf, rotSv.data() + rPos + 1, std::min<size_t>(15, rotSv.size() - rPos - 1));
-                    comp.rotDeg = std::strtof(rbuf, nullptr);
-                }
-            }
-
-            float rad = comp.rotDeg * 3.14159265f / 180.0f;
-            float cs = std::cos(rad);
-            float sn = std::sin(rad);
-            float mirX = comp.bottomSide ? -1.0f : 1.0f;
-
-            auto pkgIt = pkgMap.find(std::string(pkgSv));
-            if (pkgIt != pkgMap.end()) {
-                const auto& pkg = pkgIt->second;
-                comp.widthMm = std::max(1.2f, pkg.maxX - pkg.minX);
-                comp.lengthMm = std::max(1.0f, pkg.maxY - pkg.minY);
-                comp.pinCount = static_cast<int>(pkg.localPads.size());
-
-                for (const auto& lp : pkg.localPads) {
-                    EdaPadPrim bp = lp;
-                    float lx = lp.x * mirX;
-                    float ly = lp.y;
-                    bp.x = comp.x + (lx * cs - ly * sn);
-                    bp.y = comp.y + (lx * sn + ly * cs);
-                    bp.rotDeg = comp.rotDeg;
-                    if (comp.bottomSide && bp.layer == EdaLayerId::TopCopper) {
-                        bp.layer = EdaLayerId::BottomCopper;
-                    }
-                    out.pads.push_back(bp);
-                }
-                for (const auto& ls : pkg.localSilk) {
-                    EdaTraceSeg bs = ls;
-                    float x1 = ls.x1 * mirX, y1 = ls.y1;
-                    float x2 = ls.x2 * mirX, y2 = ls.y2;
-                    bs.x1 = comp.x + (x1 * cs - y1 * sn);
-                    bs.y1 = comp.y + (x1 * sn + y1 * cs);
-                    bs.x2 = comp.x + (x2 * cs - y2 * sn);
-                    bs.y2 = comp.y + (x2 * sn + y2 * cs);
-                    bs.layer = comp.bottomSide ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk;
-                    out.traces.push_back(bs);
-                }
-            }
-
-            comp.category = ClassifyComponent(comp.refDes, comp.footprint, comp.widthMm, comp.lengthMm, comp.heightMm, comp.pinCount);
-            out.labels.push_back({ comp.x, comp.y, 1.1f, comp.bottomSide ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk, comp.refDes });
-            out.components.push_back(std::move(comp));
-        }
-    }
-
-    FinalizeBoardBounds(out);
-    out.valid = (!out.traces.empty() || !out.pads.empty() || !out.components.empty() || !out.vias.empty());
-    return out.valid;
-}
-
-// Fast S-expression helpers for KiCad (.kicad_pcb, .kicad_sch, .kicad_mod)
-static size_t FindMatchingParen(std::string_view sv, size_t openPos) {
-    int depth = 0;
-    bool inQuotes = false;
-    for (size_t i = openPos; i < sv.size(); ++i) {
-        char c = sv[i];
-        if (c == '"' && (i == 0 || sv[i - 1] != '\\')) {
-            inQuotes = !inQuotes;
-        } else if (!inQuotes) {
-            if (c == '(') ++depth;
-            else if (c == ')') {
-                --depth;
-                if (depth == 0) return i;
-            }
-        }
-    }
-    return std::string_view::npos;
-}
-
-static bool ExtractSExprFloats(std::string_view block, std::string_view key, float& f1, float& f2, float* f3 = nullptr) {
-    size_t pos = block.find(key);
-    if (pos == std::string_view::npos) return false;
-    pos += key.size();
-    char buf[96] = {};
-    size_t end = block.find(')', pos);
-    if (end == std::string_view::npos) return false;
-    size_t len = std::min<size_t>(end - pos, 95);
-    std::memcpy(buf, block.data() + pos, len);
-    char* p = buf;
-    char* next = nullptr;
-    f1 = std::strtof(p, &next);
-    if (next == p) return false;
-    p = next;
-    f2 = std::strtof(p, &next);
-    if (f3 && next != p) {
-        p = next;
-        *f3 = std::strtof(p, &next);
-    }
-    return true;
-}
-
-static std::string ExtractSExprQuotedOrAtom(std::string_view block, std::string_view prefix) {
-    size_t pos = block.find(prefix);
-    if (pos == std::string_view::npos) return "";
-    pos += prefix.size();
-    while (pos < block.size() && (block[pos] == ' ' || block[pos] == '\t')) ++pos;
-    if (pos >= block.size()) return "";
-    if (block[pos] == '"') {
-        ++pos;
-        size_t endQ = block.find('"', pos);
-        if (endQ == std::string_view::npos) return "";
-        return std::string(block.substr(pos, endQ - pos));
-    }
-    size_t endA = pos;
-    while (endA < block.size() && block[endA] != ' ' && block[endA] != ')' && block[endA] != '\r' && block[endA] != '\n') {
-        ++endA;
-    }
-    return std::string(block.substr(pos, endA - pos));
-}
-
-static EdaLayerId MapKiCadLayer(std::string_view lyr) {
-    if (lyr.find("F.Cu") != std::string_view::npos || lyr.find("*.Cu") != std::string_view::npos) return EdaLayerId::TopCopper;
-    if (lyr.find("B.Cu") != std::string_view::npos) return EdaLayerId::BottomCopper;
-    if (lyr.find("Edge.Cuts") != std::string_view::npos) return EdaLayerId::EdgeCuts;
-    if (lyr.find("B.Silk") != std::string_view::npos || lyr.find("B.Fab") != std::string_view::npos) return EdaLayerId::BottomSilk;
-    if (lyr.find(".Cu") != std::string_view::npos) return EdaLayerId::InnerCopper;
-    return EdaLayerId::TopSilk;
-}
-
-static bool ParseKiCadSExpr(std::string_view txt, const std::wstring& ext, ParsedEdaBoard& out) {
-    bool isSch = (ext == L".kicad_sch") || (txt.find("(kicad_sch") != std::string_view::npos);
-    out.kind = isSch ? EdaDocKind::KiCadSch : EdaDocKind::KiCadPcb;
-    out.formatTitle = isSch ? L"KiCad Schematic (.kicad_sch)" : L"KiCad PCB Layout (.kicad_pcb)";
-
-    size_t pos = 0;
-    while (pos < txt.size()) {
-        size_t openP = txt.find('(', pos);
-        if (openP == std::string_view::npos || openP + 2 >= txt.size()) break;
-
-        size_t kwEnd = openP + 1;
-        while (kwEnd < txt.size() && txt[kwEnd] > ' ' && txt[kwEnd] != '(' && txt[kwEnd] != ')') ++kwEnd;
-        std::string_view kw = txt.substr(openP + 1, kwEnd - (openP + 1));
-
-        if (kw == "segment" || kw == "gr_line" || kw == "gr_rect") {
-            size_t closeP = FindMatchingParen(txt, openP);
-            if (closeP == std::string_view::npos) break;
-            std::string_view blk = txt.substr(openP, closeP - openP + 1);
-            float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f, w = 0.25f, dummy = 0.0f;
-            if (ExtractSExprFloats(blk, "(start ", x1, y1) && ExtractSExprFloats(blk, "(end ", x2, y2)) {
-                ExtractSExprFloats(blk, "(width ", w, dummy);
-                if (w <= 0.01f) ExtractSExprFloats(blk, "(stroke (width ", w, dummy);
-                std::string lyr = ExtractSExprQuotedOrAtom(blk, "(layer ");
-                EdaLayerId lid = MapKiCadLayer(lyr);
-                if (kw == "gr_rect") {
-                    out.traces.push_back({ x1, -y1, x2, -y1, std::max(0.15f, w), lid, 0 });
-                    out.traces.push_back({ x2, -y1, x2, -y2, std::max(0.15f, w), lid, 0 });
-                    out.traces.push_back({ x2, -y2, x1, -y2, std::max(0.15f, w), lid, 0 });
-                    out.traces.push_back({ x1, -y2, x1, -y1, std::max(0.15f, w), lid, 0 });
-                } else {
-                    out.traces.push_back({ x1, -y1, x2, -y2, std::max(0.15f, w), lid, 0 });
-                }
-            }
-            pos = closeP + 1;
-            continue;
-        }
-
-        if (kw == "via") {
-            size_t closeP = FindMatchingParen(txt, openP);
-            if (closeP == std::string_view::npos) break;
-            std::string_view blk = txt.substr(openP, closeP - openP + 1);
-            float vx = 0.0f, vy = 0.0f, sz = 0.8f, dr = 0.4f, dummy = 0.0f;
-            if (ExtractSExprFloats(blk, "(at ", vx, vy)) {
-                ExtractSExprFloats(blk, "(size ", sz, dummy);
-                ExtractSExprFloats(blk, "(drill ", dr, dummy);
-                out.vias.push_back({ vx, -vy, std::max(0.4f, sz), std::max(0.2f, dr), 0 });
-            }
-            pos = closeP + 1;
-            continue;
-        }
-
-        if (kw == "net") {
-            size_t closeP = FindMatchingParen(txt, openP);
-            if (closeP == std::string_view::npos) break;
-            ++out.netCount;
-            pos = closeP + 1;
-            continue;
-        }
-
-        if (kw == "footprint" || kw == "module") {
-            size_t closeP = FindMatchingParen(txt, openP);
-            if (closeP == std::string_view::npos) break;
-            std::string_view blk = txt.substr(openP, closeP - openP + 1);
-
-            EdaComponent3D comp;
-            std::string pkgName = ExtractSExprQuotedOrAtom(blk, kw == "footprint" ? "(footprint " : "(module ");
-            size_t colon = pkgName.find(':');
-            if (colon != std::string::npos) pkgName = pkgName.substr(colon + 1);
-            comp.footprint = PathUtils::Utf8ToWide(pkgName);
-
-            float fx = 0.0f, fy = 0.0f, frot = 0.0f;
-            ExtractSExprFloats(blk, "(at ", fx, fy, &frot);
-            comp.x = fx;
-            comp.y = -fy;
-            comp.rotDeg = frot;
-
-            std::string lyr = ExtractSExprQuotedOrAtom(blk, "(layer ");
-            comp.bottomSide = (lyr.find("B.Cu") != std::string::npos);
-
-            // Reference & Value from either (fp_text reference "U1") or KiCad 8 (property "Reference" "U1")
-            std::string refStr = ExtractSExprQuotedOrAtom(blk, "(fp_text reference ");
-            if (refStr.empty()) refStr = ExtractSExprQuotedOrAtom(blk, "(property \"Reference\" ");
-            std::string valStr = ExtractSExprQuotedOrAtom(blk, "(fp_text value ");
-            if (valStr.empty()) valStr = ExtractSExprQuotedOrAtom(blk, "(property \"Value\" ");
-            comp.refDes = PathUtils::Utf8ToWide(refStr.empty() ? "U?" : refStr);
-            comp.value = PathUtils::Utf8ToWide(valStr);
-
-            float rad = comp.rotDeg * 3.14159265f / 180.0f;
-            float cs = std::cos(rad);
-            float sn = std::sin(rad);
-            float minPx = 1e9f, minPy = 1e9f, maxPx = -1e9f, maxPy = -1e9f;
-
-            // Scan inner pads and silkscreen lines inside the footprint
-            size_t subPos = 1 + kw.size();
-            while (subPos < blk.size()) {
-                size_t subOpen = blk.find('(', subPos);
-                if (subOpen == std::string_view::npos || subOpen + 2 >= blk.size()) break;
-                size_t subKwEnd = subOpen + 1;
-                while (subKwEnd < blk.size() && blk[subKwEnd] > ' ' && blk[subKwEnd] != '(' && blk[subKwEnd] != ')') ++subKwEnd;
-                std::string_view subKw = blk.substr(subOpen + 1, subKwEnd - (subOpen + 1));
-
-                if (subKw == "pad") {
-                    size_t subClose = FindMatchingParen(blk, subOpen);
-                    if (subClose == std::string_view::npos) break;
-                    std::string_view padBlk = blk.substr(subOpen, subClose - subOpen + 1);
-                    std::string pinNm = ExtractSExprQuotedOrAtom(padBlk, "(pad ");
-                    float px = 0.0f, py = 0.0f, prot = 0.0f, pw = 1.0f, ph = 1.0f, dr = 0.0f, dummy = 0.0f;
-                    if (ExtractSExprFloats(padBlk, "(at ", px, py, &prot)) {
-                        ExtractSExprFloats(padBlk, "(size ", pw, ph);
-                        ExtractSExprFloats(padBlk, "(drill ", dr, dummy);
-                        float ly = -py;
-                        float bx = comp.x + (px * cs - ly * sn);
-                        float by = comp.y + (px * sn + ly * cs);
-                        EdaPadPrim pad;
-                        pad.x = bx;
-                        pad.y = by;
-                        pad.w = std::max(0.2f, pw);
-                        pad.h = std::max(0.2f, ph);
-                        pad.drill = dr;
-                        pad.rotDeg = prot;
-                        pad.pinName = PathUtils::Utf8ToWide(pinNm);
-                        pad.shape = (padBlk.find(" circle ") != std::string_view::npos) ? 0 : 1;
-                        if (padBlk.find("thru_hole") != std::string_view::npos || dr > 0.05f) {
-                            pad.layer = EdaLayerId::PadsThrough;
-                        } else {
-                            pad.layer = comp.bottomSide ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
-                        }
-                        out.pads.push_back(pad);
-                        ++comp.pinCount;
-                        minPx = std::min(minPx, px - pw * 0.5f);
-                        maxPx = std::max(maxPx, px + pw * 0.5f);
-                        minPy = std::min(minPy, ly - ph * 0.5f);
-                        maxPy = std::max(maxPy, ly + ph * 0.5f);
-                    }
-                    subPos = subClose + 1;
-                    continue;
-                } else if (subKw == "fp_line") {
-                    size_t subClose = FindMatchingParen(blk, subOpen);
-                    if (subClose == std::string_view::npos) break;
-                    std::string_view lnBlk = blk.substr(subOpen, subClose - subOpen + 1);
-                    float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
-                    if (ExtractSExprFloats(lnBlk, "(start ", x1, y1) && ExtractSExprFloats(lnBlk, "(end ", x2, y2)) {
-                        float ly1 = -y1, ly2 = -y2;
-                        float bx1 = comp.x + (x1 * cs - ly1 * sn);
-                        float by1 = comp.y + (x1 * sn + ly1 * cs);
-                        float bx2 = comp.x + (x2 * cs - ly2 * sn);
-                        float by2 = comp.y + (x2 * sn + ly2 * cs);
-                        out.traces.push_back({ bx1, by1, bx2, by2, 0.15f, comp.bottomSide ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk, 0 });
-                        minPx = std::min({ minPx, x1, x2 });
-                        maxPx = std::max({ maxPx, x1, x2 });
-                        minPy = std::min({ minPy, ly1, ly2 });
-                        maxPy = std::max({ maxPy, ly1, ly2 });
-                    }
-                    subPos = subClose + 1;
-                    continue;
-                }
-                subPos = subKwEnd;
-            }
-
-            if (minPx < maxPx && minPy < maxPy) {
-                comp.widthMm = std::clamp(maxPx - minPx, 1.0f, 40.0f);
-                comp.lengthMm = std::clamp(maxPy - minPy, 0.8f, 40.0f);
-            }
-            comp.category = ClassifyComponent(comp.refDes, comp.footprint, comp.widthMm, comp.lengthMm, comp.heightMm, comp.pinCount);
-            out.labels.push_back({ comp.x, comp.y, 1.0f, comp.bottomSide ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk, comp.refDes });
-            out.components.push_back(std::move(comp));
-
-            pos = closeP + 1;
-            continue;
-        }
-
-        if (isSch && (kw == "wire" || kw == "bus")) {
-            size_t closeP = FindMatchingParen(txt, openP);
-            if (closeP == std::string_view::npos) break;
-            std::string_view blk = txt.substr(openP, closeP - openP + 1);
-            size_t xy1Pos = blk.find("(xy ");
-            if (xy1Pos != std::string_view::npos) {
-                float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
-                if (ExtractSExprFloats(blk.substr(xy1Pos), "(xy ", x1, y1)) {
-                    size_t xy2Pos = blk.find("(xy ", xy1Pos + 4);
-                    if (xy2Pos != std::string_view::npos && ExtractSExprFloats(blk.substr(xy2Pos), "(xy ", x2, y2)) {
-                        out.traces.push_back({ x1, -y1, x2, -y2, kw == "bus" ? 0.5f : 0.25f, EdaLayerId::SchWire, 0 });
-                    }
-                }
-            }
-            pos = closeP + 1;
-            continue;
-        }
-
-        if (isSch && kw == "symbol" && openP > 10) {
-            size_t closeP = FindMatchingParen(txt, openP);
-            if (closeP == std::string_view::npos) break;
-            std::string_view blk = txt.substr(openP, closeP - openP + 1);
-            if (blk.find("(lib_id ") != std::string_view::npos) {
-                float sx = 0.0f, sy = 0.0f, srot = 0.0f;
-                if (ExtractSExprFloats(blk, "(at ", sx, sy, &srot)) {
-                    std::string refStr = ExtractSExprQuotedOrAtom(blk, "(property \"Reference\" ");
-                    std::string valStr = ExtractSExprQuotedOrAtom(blk, "(property \"Value\" ");
-                    std::string libStr = ExtractSExprQuotedOrAtom(blk, "(lib_id ");
-                    EdaComponent3D comp;
-                    comp.refDes = PathUtils::Utf8ToWide(refStr.empty() ? "SYM" : refStr);
-                    comp.value = PathUtils::Utf8ToWide(valStr);
-                    comp.footprint = PathUtils::Utf8ToWide(libStr);
-                    comp.x = sx;
-                    comp.y = -sy;
-                    comp.rotDeg = srot;
-                    comp.widthMm = 7.62f;
-                    comp.lengthMm = 5.08f;
-                    // Draw symbol box on schematic
-                    float hw = 3.81f, hh = 2.54f;
-                    out.traces.push_back({ comp.x - hw, comp.y - hh, comp.x + hw, comp.y - hh, 0.3f, EdaLayerId::SchSymbol, 0 });
-                    out.traces.push_back({ comp.x + hw, comp.y - hh, comp.x + hw, comp.y + hh, 0.3f, EdaLayerId::SchSymbol, 0 });
-                    out.traces.push_back({ comp.x + hw, comp.y + hh, comp.x - hw, comp.y + hh, 0.3f, EdaLayerId::SchSymbol, 0 });
-                    out.traces.push_back({ comp.x - hw, comp.y + hh, comp.x - hw, comp.y - hh, 0.3f, EdaLayerId::SchSymbol, 0 });
-                    out.labels.push_back({ comp.x, comp.y, 1.27f, EdaLayerId::SchLabel, comp.refDes + (comp.value.empty() ? L"" : (L" (" + comp.value + L")")) });
-                    out.components.push_back(std::move(comp));
-                }
-            }
-            pos = closeP + 1;
-            continue;
-        }
-
-        pos = kwEnd;
-    }
-
-    FinalizeBoardBounds(out);
-    out.valid = (!out.traces.empty() || !out.pads.empty() || !out.components.empty() || !out.vias.empty());
-    return out.valid;
-}
-
-static bool ParseGerberOrDrill(std::string_view txt, const std::wstring& ext, ParsedEdaBoard& out) {
-    bool isDrill = (ext == L".drl" || ext == L".xln" || txt.rfind("M48", 0) == 0);
-    out.kind = isDrill ? EdaDocKind::ExcellonDrill : EdaDocKind::GerberLayer;
-    out.formatTitle = isDrill ? L"Excellon NC Drill (.drl)" : (L"Gerber RS-274X (" + PathUtils::ToUpper(ext) + L")");
-
-    EdaLayerId defaultLayer = EdaLayerId::TopCopper;
-    if (ext == L".gbl" || ext == L".gbs" || ext == L".gbo") defaultLayer = EdaLayerId::BottomCopper;
-    else if (ext == L".gto" || ext == L".gts") defaultLayer = EdaLayerId::TopSilk;
-    else if (ext == L".gm1" || ext == L".gko" || ext == L".oln") defaultLayer = EdaLayerId::EdgeCuts;
-
-    double coordScale = 0.0001; // Default 2.4 format or 10^-4
-    bool metric = true;
-    float curX = 0.0f, curY = 0.0f;
-    float curApertureDiam = 0.25f;
-    std::unordered_map<int, float> apertures;
-
-    size_t lineStart = 0;
-    while (lineStart < txt.size()) {
-        size_t lineEnd = txt.find_first_of("\r\n*", lineStart);
-        if (lineEnd == std::string_view::npos) lineEnd = txt.size();
-        std::string_view ln = txt.substr(lineStart, lineEnd - lineStart);
-        lineStart = (lineEnd < txt.size() && txt[lineEnd] == '*') ? (lineEnd + 1) : (lineEnd + 1);
-        while (lineStart < txt.size() && (txt[lineStart] == '\r' || txt[lineStart] == '\n' || txt[lineStart] == '%')) ++lineStart;
-
-        if (ln.empty()) continue;
-
-        if (ln.find("MOIN") != std::string_view::npos || ln == "INCH") {
-            metric = false;
-            continue;
-        }
-        if (ln.find("MOMM") != std::string_view::npos || ln == "METRIC") {
-            metric = true;
-            continue;
-        }
-        size_t fsPos = ln.find("FSLAX");
-        if (fsPos != std::string_view::npos && fsPos + 7 < ln.size()) {
-            int decDigits = ln[fsPos + 6] - '0';
-            if (decDigits >= 1 && decDigits <= 6) {
-                coordScale = std::pow(10.0, -decDigits);
-            }
-            continue;
-        }
-        if (ln.rfind("ADD", 0) == 0 && ln.size() > 5) {
-            int dCode = std::atoi(std::string(ln.substr(3)).c_str());
-            size_t comma = ln.find(',');
-            if (dCode >= 10 && comma != std::string_view::npos) {
-                float diam = std::strtof(std::string(ln.substr(comma + 1)).c_str(), nullptr);
-                if (!metric) diam *= 25.4f;
-                apertures[dCode] = std::max(0.08f, diam);
-            }
-            continue;
-        }
-        if (ln[0] == 'T' && ln.size() >= 2 && ln[1] >= '0' && ln[1] <= '9') {
-            int tCode = std::atoi(std::string(ln.substr(1)).c_str());
-            size_t cPos = ln.find('C');
-            if (cPos != std::string_view::npos) {
-                float diam = std::strtof(std::string(ln.substr(cPos + 1)).c_str(), nullptr);
-                if (!metric) diam *= 25.4f;
-                apertures[tCode] = std::max(0.15f, diam);
-                curApertureDiam = apertures[tCode];
-            } else if (apertures.count(tCode)) {
-                curApertureDiam = apertures[tCode];
-            }
-            continue;
-        }
-        if ((ln[0] == 'D' || (ln.rfind("G54D", 0) == 0)) && ln.find('X') == std::string_view::npos && ln.find('Y') == std::string_view::npos) {
-            size_t dPos = ln.find('D');
-            int dCode = std::atoi(std::string(ln.substr(dPos + 1)).c_str());
-            if (dCode >= 10 && apertures.count(dCode)) {
-                curApertureDiam = apertures[dCode];
-            }
-            continue;
-        }
-
-        // Coordinate command: X...Y...D01 / D02 / D03
-        size_t xPos = ln.find('X');
-        size_t yPos = ln.find('Y');
-        if (xPos != std::string_view::npos || yPos != std::string_view::npos) {
-            float nx = curX, ny = curY;
-            auto parseCoord = [&](size_t p) -> float {
-                std::string s;
-                for (size_t i = p + 1; i < ln.size(); ++i) {
-                    char c = ln[i];
-                    if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.') s.push_back(c);
-                    else break;
-                }
-                if (s.empty()) return 0.0f;
-                double v = std::strtod(s.c_str(), nullptr);
-                if (s.find('.') == std::string::npos && !isDrill) {
-                    v *= coordScale;
-                } else if (s.find('.') == std::string::npos && isDrill) {
-                    v *= 0.001;
-                }
-                if (!metric) v *= 25.4;
-                return static_cast<float>(v);
-            };
-            if (xPos != std::string_view::npos) nx = parseCoord(xPos);
-            if (yPos != std::string_view::npos) ny = parseCoord(yPos);
-
-            if (isDrill || ln.find("D03") != std::string_view::npos || ln.find("D3") != std::string_view::npos) {
-                if (isDrill) {
-                    out.vias.push_back({ nx, ny, curApertureDiam * 1.4f, curApertureDiam, 0 });
-                } else {
-                    out.pads.push_back({ nx, ny, curApertureDiam, curApertureDiam, 0.0f, 0.0f, 0, defaultLayer, L"", L"" });
-                }
-            } else if (ln.find("D01") != std::string_view::npos || ln.find("D1") != std::string_view::npos) {
-                out.traces.push_back({ curX, curY, nx, ny, std::max(0.12f, curApertureDiam), defaultLayer, 0 });
-            }
-            curX = nx;
-            curY = ny;
-        }
-    }
-
-    FinalizeBoardBounds(out);
-    out.valid = (!out.traces.empty() || !out.pads.empty() || !out.vias.empty());
-    return out.valid;
-}
+#include "formats/EagleXml.h"
+#include "formats/KiCadSExpr.h"
+#include "formats/GerberDrill.h"
+#include "formats/KiCadLegacySch.h"
+#include "formats/AutoCadDxf.h"
 
 } // namespace
+
+#include "formats/LtspiceAsc.h"
+#include "formats/SpecctraDsn.h"
+#include "formats/IpcD356.h"
+#include "formats/IntelHex.h"
+#include "formats/MotorolaSrec.h"
+#include "formats/SpiceNetlist.h"
+#include "formats/HpglPlot.h"
+#include "formats/VerilogVcd.h"
+#include "formats/TouchstoneSnp.h"
+#include "formats/AsicLef.h"
+#include "formats/AsicDef.h"
+#include "formats/GdsiiStream.h"
+#include "formats/JtagBsdl.h"
+#include "formats/CmsisSvd.h"
+#include "formats/ExtendedEda100.h"
+#include "formats/ExtendedEda200.h"
 
 EdaViewer::~EdaViewer() {
     Shutdown();
@@ -865,10 +262,34 @@ bool EdaViewer::IsEdaExtension(const std::wstring& extLower) {
            extLower == L".gbr"       || extLower == L".ger"       || extLower == L".gtl"       ||
            extLower == L".gbl"       || extLower == L".gts"       || extLower == L".gbs"       ||
            extLower == L".gto"       || extLower == L".gbo"       || extLower == L".gm1"       ||
-           extLower == L".gko"       || extLower == L".drl"       || extLower == L".xln";
+           extLower == L".gko"       || extLower == L".drl"       || extLower == L".xln"       ||
+           extLower == L".dxf"       || extLower == L".asc"       || extLower == L".dsn"       ||
+           extLower == L".d356"      || extLower == L".ipc"       || extLower == L".hex"       ||
+           extLower == L".ihex"      || extLower == L".srec"      || extLower == L".s19"       ||
+           extLower == L".mot"       || extLower == L".cir"       || extLower == L".spice"     ||
+           extLower == L".sp"        || extLower == L".net"       || extLower == L".hpgl"      ||
+           extLower == L".plt"       || extLower == L".vcd"       || extLower == L".s1p"       ||
+           extLower == L".s2p"       || extLower == L".lef"       || extLower == L".def"       ||
+           extLower == L".gds"       || extLower == L".gds2"      || extLower == L".bsdl"      ||
+           extLower == L".svd"       || extLower == L".odb"       || extLower == L".ipc2581"   ||
+           extLower == L".cvg"       || extLower == L".pcbdoc"    || extLower == L".schdoc"    ||
+           extLower == L".blf"       || extLower == L".can"       || extLower == L".dbc"       ||
+           extLower == L".fst"       || extLower == L".ghw"       || extLower == L".bit"       ||
+           extLower == L".rpd"       || extLower == L".dfu"       || extLower == L".ufd"       ||
+           extLower == L".edid"      || extLower == L".spd"       ||
+           extLower == L".kicad_sym" || extLower == L".ses"       || extLower == L".pos"       ||
+           extLower == L".cpl"       || extLower == L".mnt"       || extLower == L".ibs"       ||
+           extLower == L".s3p"       || extLower == L".s4p"       || extLower == L".s8p"       ||
+           extLower == L".oas"       || extLower == L".xdc"       || extLower == L".sdc"       ||
+           extLower == L".qsf"       || extLower == L".jed"       || extLower == L".svf"       ||
+           extLower == L".xsvf"      || extLower == L".sof"       || extLower == L".pof"       ||
+           extLower == L".sr"        || extLower == L".sal"       || extLower == L".wfm"       ||
+           extLower == L".isf"       || extLower == L".mf4"       || extLower == L".mdf"       ||
+           extLower == L".ldf"       || extLower == L".arxml"     || extLower == L".eds"       ||
+           extLower == L".dcf"       || extLower == L".gsdml"     || extLower == L".l5x";
 }
 
-bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& outBoard) {
+bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& outBoard) try {
     outBoard = ParsedEdaBoard{};
     outBoard.filePath = fullPath;
 
@@ -879,6 +300,47 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
 
     std::wstring ext = PathUtils::GetExtension(fullPath);
     std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
+
+    if (ext == L".dxf") {
+        return ParseAutoCadDxf(sv, outBoard);
+    }
+
+    // Modular EDA & Firmware formats (Format15 .. Format20)
+    {
+        bool okMod = false;
+        if (ext == L".asc") okMod = Formats::ParseLtspiceAsc(sv, outBoard);
+        else if (ext == L".dsn") okMod = Formats::ParseSpecctraDsn(sv, outBoard);
+        else if (ext == L".d356" || ext == L".ipc") okMod = Formats::ParseIpcD356(sv, outBoard);
+        else if (ext == L".hex" || ext == L".ihex") okMod = Formats::ParseIntelHexBoard(sv, outBoard);
+        else if (ext == L".srec" || ext == L".s19" || ext == L".mot") okMod = Formats::ParseMotorolaSrecBoard(sv, outBoard);
+        else if (ext == L".cir" || ext == L".spice" || ext == L".sp" || ext == L".net") okMod = Formats::ParseSpiceNetlistBoard(sv, outBoard);
+        else if (ext == L".hpgl" || ext == L".plt") okMod = Formats::ParseHpglPlotterBoard(sv, outBoard);
+        else if (ext == L".vcd") okMod = Formats::ParseVerilogVcdWaveforms(sv, outBoard);
+        else if (ext == L".s1p" || ext == L".s2p") okMod = Formats::ParseTouchstoneSnpBoard(sv, outBoard);
+        else if (ext == L".lef") okMod = Formats::ParseAsicLefBoard(sv, outBoard);
+        else if (ext == L".def") okMod = Formats::ParseAsicDefBoard(sv, outBoard);
+        else if (ext == L".gds" || ext == L".gds2") okMod = Formats::ParseGdsiiStreamBoard(raw.data(), raw.size(), outBoard);
+        else if (ext == L".bsdl") okMod = Formats::ParseJtagBsdlBoard(sv, outBoard);
+        else if (ext == L".svd") okMod = Formats::ParseCmsisSvdBoard(sv, outBoard);
+        else if (ext == L".odb" || ext == L".ipc2581" || ext == L".cvg") okMod = Formats::ParseOdbOrIpc2581Board(sv, ext, outBoard);
+        else if (ext == L".pcbdoc" || ext == L".schdoc") okMod = Formats::ParseAltiumDocBoard(raw.data(), raw.size(), ext, outBoard);
+        else if (ext == L".dbc" || ext == L".blf" || ext == L".can") okMod = Formats::ParseVectorCanBoard(sv, ext, outBoard);
+        else if (ext == L".fst" || ext == L".ghw" || ext == L".bit" || ext == L".rpd" ||
+                 ext == L".dfu" || ext == L".ufd" || ext == L".edid" || ext == L".spd")
+            okMod = Formats::ParseHardwareBinBoard(raw.data(), raw.size(), ext, outBoard);
+        else
+            okMod = Formats::ParseExtendedEda200(raw.data(), raw.size(), ext, outBoard);
+        if (!okMod && ext == L".asc") okMod = Formats::ParseVectorCanBoard(sv, ext, outBoard);
+        if (okMod) {
+            FinalizeBoardBounds(outBoard);
+            outBoard.valid = true;
+            return true;
+        }
+    }
+
+    if (sv.rfind("EESchema Schematic", 0) == 0) {
+        return ParseKiCadLegacySch(sv, outBoard);
+    }
 
     if (ext == L".kicad_pcb" || ext == L".kicad_sch" || ext == L".kicad_mod" ||
         sv.find("(kicad_pcb") != std::string_view::npos ||
@@ -933,7 +395,7 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
     }
 
     return ParseGerberOrDrill(sv, ext, outBoard);
-}
+} E2_READER_CATCH(L"Board reader", fullPath, { outBoard = ParsedEdaBoard(); return false; })
 
 void EdaViewer::Clear() {
     m_currentPath.clear();
@@ -959,10 +421,16 @@ void EdaViewer::LoadFile(const std::wstring& fullPath, bool forceReload) {
     if (!forceReload && m_currentPath == fullPath && !m_currentPath.empty()) {
         return;
     }
+    ParsedEdaBoard board;
+    InspectEdaFile(fullPath, board);
+    ShowLoadedBoard(fullPath, std::move(board));
+}
+
+void EdaViewer::ShowLoadedBoard(const std::wstring& fullPath, ParsedEdaBoard&& board) {
     m_currentPath = fullPath;
     m_selectedCompIdx = -1;
     m_bomScrollY = 0.0f;
-    InspectEdaFile(fullPath, m_board);
+    m_board = std::move(board);
     Fit2DView();
     Reset3DCamera();
 

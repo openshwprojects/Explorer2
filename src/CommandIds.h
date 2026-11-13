@@ -229,14 +229,19 @@ enum CommandId : int {
     CMD_CTX_OPEN_WITH_DIALOG = 225,
     CMD_CTX_UNPIN_QUICK = 226,
     CMD_CTX_EXPAND_COLLAPSE = 227,
+    CMD_CTX_OPEN_ARCHIVE_HERE = 228,
 
-    // Sort By Submenu
+    // Sort By & Group By Submenus
     CMD_SORT_NAME = 240,
     CMD_SORT_DATE = 241,
     CMD_SORT_TYPE = 242,
     CMD_SORT_SIZE = 243,
     CMD_SORT_ASC = 244,
     CMD_SORT_DESC = 245,
+    CMD_GROUP_NONE = 246,
+    CMD_GROUP_NAME = 247,
+    CMD_GROUP_DATE = 248,
+    CMD_GROUP_TYPE = 249,
 
     // New Submenu
     CMD_NEW_FOLDER_CTX = 250,
@@ -244,6 +249,7 @@ enum CommandId : int {
     CMD_NEW_BMP_FILE = 252,
     CMD_NEW_PY_FILE = 253,
     CMD_NEW_MD_FILE = 254,
+    CMD_GROUP_SIZE = 255,
 
     // Dynamic Range Bases for Emulated Submenus
     CMD_BASE_7ZIP = 300,          // 301..310
@@ -331,8 +337,61 @@ enum CommandId : int {
     CMD_FTP_BOOKMARKS_MENU   = 891,
     CMD_FTP_DISCONNECT       = 892,
 
+    // Hardware Pro: USB TreeView & COM Ports Inspector
+    CMD_HW_SUB_USB_COM           = 893,
+    CMD_HW_SELECT_USB_NODE       = 894,
+    CMD_HW_SELECT_COM_PORT       = 895,
+    CMD_HW_TOGGLE_USB_NODE       = 896,
+    CMD_HW_TOGGLE_USB_INTERFACES = 897,
+    CMD_HW_REFRESH_USB_COM       = 898,
+    CMD_HW_COPY_TEXT             = 899,
+
     CMD_BASE_RECENT_DIRS     = 900, // 900..949
-    CMD_BASE_FTP_BOOKMARKS   = 950  // 950..989
+    CMD_BASE_FTP_BOOKMARKS   = 950, // 950..989
+
+    // Phase 1-5 Extended Commands
+    CMD_HOME_EASY_ACCESS     = 990,
+    CMD_HELP_SHORTCUTS       = 991,
+    CMD_OPEN_SETTINGS_INI    = 992,
+    CMD_TAB_NEW              = 993,
+    CMD_TAB_CLOSE            = 994,
+    CMD_TAB_NEXT             = 995,
+    CMD_TAB_PREV             = 996,
+    CMD_BATCH_RENAME         = 997,
+    CMD_SEARCH_DUPLICATES    = 998,
+    CMD_TOGGLE_THEME         = 999,
+    CMD_VIEWER_COMPARE       = 1000,
+    CMD_VIEWER_HISTOGRAM     = 1001,
+    CMD_VIEWER_SLIDESHOW     = 1002,
+
+    // CopyHandler-grade Transfer Engine & Queue ("Transfery")
+    CMD_TAB_TRANSFERS            = 1010,
+    CMD_XFER_PAUSE_RESUME_ACTIVE = 1011,
+    CMD_XFER_CANCEL_ACTIVE       = 1012,
+    CMD_XFER_PAUSE_ALL           = 1013,
+    CMD_XFER_RESUME_ALL          = 1014,
+    CMD_XFER_RETRY_ALL_FAILED    = 1015,
+    CMD_XFER_CLEAR_FINISHED      = 1016,
+    CMD_XFER_CYCLE_QUEUE_MODE    = 1017,
+    CMD_XFER_CYCLE_CONFLICT      = 1018,
+    CMD_XFER_CYCLE_BUFFER        = 1019,
+    CMD_XFER_CYCLE_WORKERS       = 1020,
+    CMD_XFER_CYCLE_VERIFY        = 1021,
+    CMD_XFER_TOGGLE_PARTFILE     = 1022,
+    CMD_XFER_TOGGLE_UNBUFFERED   = 1023,
+    CMD_XFER_CYCLE_SPEED_LIMIT   = 1024,
+    CMD_XFER_SELECT_JOB          = 1025,
+    CMD_XFER_JOB_PAUSE_RESUME    = 1026,
+    CMD_XFER_JOB_FORCE_START     = 1027,
+    CMD_XFER_JOB_BUMP_TOP        = 1028,
+    CMD_XFER_JOB_RETRY_FAILED    = 1029,
+    CMD_XFER_JOB_CANCEL_REMOVE   = 1030,
+    CMD_XFER_JOB_CYCLE_CONFLICT  = 1031,
+    CMD_XFER_JOB_OPEN_DST        = 1032,
+    CMD_XFER_NEW_TRANSFER_DLG    = 1033,
+    CMD_CTX_PASTE_VERIFIED       = 1034,
+    CMD_CTX_PASTE_NEXT_TO        = 1035,     // item menu: paste into the folder the item is in
+    CMD_CTX_PASTE_INTO_FOLDER    = 1036      // item menu on a folder: paste into that folder
 };
 
 // Layout constants (in DIPs / pixels)

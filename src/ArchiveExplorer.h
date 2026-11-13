@@ -79,9 +79,14 @@ public:
         const std::wstring& innerPath,
         std::wstring& outTempFilePath);
 
+    // Unpacks a whole archive into a folder. Nothing that is already there is replaced: an entry whose name
+    // is taken is written as "name (2).ext" (`outKeptExisting` counts those). An entry that would land outside
+    // the folder ("..", an absolute path) is refused (`outRefused`).
     static bool ExtractEntireArchiveToFolder(
         const std::wstring& archivePath,
-        const std::wstring& destFolderPath);
+        const std::wstring& destFolderPath,
+        size_t* outKeptExisting = nullptr,
+        size_t* outRefused = nullptr);
 
     // Right-Side File Content Pane UI methods
     void Initialize(HWND parentHwnd);
@@ -90,11 +95,27 @@ public:
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
     void Clear();
 
-    // If the user double-clicked a file inside the archive to preview it in FileContentPane
-    std::wstring TakePendingPreviewFilePath() {
-        std::wstring out = std::move(m_pendingPreviewTempFile);
-        m_pendingPreviewTempFile.clear();
-        return out;
+    // The table of contents of an archive read on another thread (EnumerateArchiveFolder of its root) goes
+    // into the view, which then shows what LoadFile would have shown.
+    void ShowLoadedArchive(const std::wstring& fullPath, ArchiveSummaryInfo&& summary, std::vector<ArchiveItemEntry>&& rootItems);
+    bool IsShowing(const std::wstring& fullPath) const { return !m_archivePath.empty() && m_archivePath == fullPath; }
+    const std::wstring& LoadedPath() const { return m_archivePath; }
+    size_t EntryCount() const { return m_summary.entries.size(); }
+
+    // A file inside the archive was double-clicked: the preview pane shows it. It is not unpacked here, as
+    // that can take seconds; the pane has it unpacked on its worker thread.
+    struct PreviewEntryRequest {
+        std::wstring archivePath;
+        std::wstring innerPath;     // path inside the archive, with forward slashes
+        std::wstring name;
+        uint64_t size = 0;
+    };
+    bool TakePendingPreviewEntry(PreviewEntryRequest& out) {
+        if (!m_hasPendingPreviewEntry) return false;
+        out = std::move(m_pendingPreviewEntry);
+        m_pendingPreviewEntry = {};
+        m_hasPendingPreviewEntry = false;
+        return true;
     }
 
     // If the user clicked "[Otwórz w eksploratorze ➔]" to browse the archive in the main pane
@@ -102,6 +123,29 @@ public:
         std::wstring out = std::move(m_pendingNavigateArchivePath);
         m_pendingNavigateArchivePath.clear();
         return out;
+    }
+
+    // Runs an external archive tool (7z.exe, UnRAR.exe, tar.exe) without a window and waits for it.
+    // timeoutMs = INFINITE waits for as long as the tool takes. A tool that is still running when its time
+    // is up is ended, and the caller is told so: it must never be left working unseen on files the caller
+    // is about to read, hand to another tool or report on.
+    enum class ToolRun { Succeeded, Failed, TimedOut };
+    static ToolRun RunToolAndWait(const std::wstring& exePath, const std::wstring& args, DWORD timeoutMs);
+
+    // If the user clicked one of the "Extract" buttons: what to unpack and where to. Unpacking can take
+    // minutes, so the pane only records the wish; its owner runs ExtractEntireArchiveToFolder on a worker
+    // thread and reports the outcome.
+    struct ExtractRequest {
+        std::wstring archivePath;
+        std::wstring targetFolder;
+        bool toSubfolder = false;
+    };
+    bool TakePendingExtract(ExtractRequest& out) {
+        if (!m_hasPendingExtract) return false;
+        out = std::move(m_pendingExtract);
+        m_pendingExtract = {};
+        m_hasPendingExtract = false;
+        return true;
     }
 
     void Draw(
@@ -155,8 +199,11 @@ private:
     float m_scrollDragOffset = 0.0f;
     std::vector<HitRect> m_toolbarHits;
 
-    std::wstring m_pendingPreviewTempFile;
+    PreviewEntryRequest m_pendingPreviewEntry;
+    bool m_hasPendingPreviewEntry = false;
     std::wstring m_pendingNavigateArchivePath;
+    ExtractRequest m_pendingExtract;
+    bool m_hasPendingExtract = false;
 };
 
 } // namespace Explorer2

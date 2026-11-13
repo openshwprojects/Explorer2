@@ -1,7 +1,11 @@
 #include "FileEngine.h"
+#include "ThreadUtils.h"
+#include <chrono>
+#include "AppLog.h"
 #include "ArchiveExplorer.h"
 #include "FtpClient.h"
 #include "PathUtils.h"
+#include "TransferManager.h"
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -47,25 +51,26 @@ static std::wstring GetMappedNetworkDriveLabel(wchar_t driveLetter, Lang lang) {
 void FileEngine::ProbeNetworkDriveAsync(wchar_t driveLetter) {
     wchar_t dl = static_cast<wchar_t>(towupper(driveLetter));
     {
-        std::lock_guard<std::mutex> lk(m_netDriveMutex);
-        auto it = m_netDrives.find(dl);
-        if (it != m_netDrives.end() && it->second.probed) {
+        std::lock_guard<std::mutex> lk(m_net->mutex);
+        auto it = m_net->drives.find(dl);
+        if (it != m_net->drives.end() && it->second.probed) {
             return;
         }
-        m_netDrives[dl] = { true, false, 0 };
+        m_net->drives[dl] = { true, false, 0, 0 };
     }
 
+    // The thread works on the shared block only, never on the engine itself (see NetDriveState)
     HWND notifyHwnd = m_notifyHwnd;
-    std::thread([this, dl, notifyHwnd]() {
+    std::thread([state = m_net, dl, notifyHwnd]() {
         wchar_t rootPath[] = { dl, L':', L'\\', L'\0' };
         ULARGE_INTEGER freeBytes = {}, totalBytes = {};
         BOOL ok = GetDiskFreeSpaceExW(rootPath, &freeBytes, &totalBytes, nullptr);
-        if (!m_running) return;
+        if (!state->wanted) return;
         {
-            std::lock_guard<std::mutex> lk(m_netDriveMutex);
-            m_netDrives[dl] = { true, ok != FALSE, ok ? totalBytes.QuadPart : 0ULL };
+            std::lock_guard<std::mutex> lk(state->mutex);
+            state->drives[dl] = { true, ok != FALSE, ok ? totalBytes.QuadPart : 0ULL, ok ? freeBytes.QuadPart : 0ULL };
         }
-        if (ok && notifyHwnd && m_running) {
+        if (ok && notifyHwnd && state->wanted) {
             PostMessageW(notifyHwnd, WM_APP_FOLDER_SIZE_UPDATED, 0, 0);
         }
     }).detach();
@@ -74,14 +79,27 @@ void FileEngine::ProbeNetworkDriveAsync(wchar_t driveLetter) {
 bool FileEngine::IsDriveOffline(const std::wstring& path, Lang lang, std::wstring* outDisplayName) {
     if (path.size() < 2 || path[1] != L':') return false;
     wchar_t dl = static_cast<wchar_t>(towupper(path[0]));
+    if (dl < L'A' || dl > L'Z') return false;
+
+    static UINT s_cachedDriveTypes[26] = {};
+    int idx = dl - L'A';
+    UINT dtype = s_cachedDriveTypes[idx];
     wchar_t rootPath[] = { dl, L':', L'\\', L'\0' };
-    UINT dtype = GetDriveTypeW(rootPath);
+    if (dtype == 0) {
+        dtype = GetDriveTypeW(rootPath);
+        if (dtype == DRIVE_FIXED || dtype == DRIVE_REMOTE || dtype == DRIVE_CDROM) {
+            s_cachedDriveTypes[idx] = dtype;
+        }
+    }
+    if (dtype == DRIVE_FIXED) {
+        return false; // Fixed internal SSDs/HDDs are online; skip synchronous volume query
+    }
     if (dtype == DRIVE_REMOTE) {
         if (outDisplayName) *outDisplayName = GetMappedNetworkDriveLabel(dl, lang);
         ProbeNetworkDriveAsync(dl);
-        std::lock_guard<std::mutex> lk(m_netDriveMutex);
-        auto it = m_netDrives.find(dl);
-        return (it == m_netDrives.end()) || !it->second.online;
+        std::lock_guard<std::mutex> lk(m_net->mutex);
+        auto it = m_net->drives.find(dl);
+        return (it == m_net->drives.end()) || !it->second.online;
     }
     if (dtype == DRIVE_CDROM) {
         wchar_t volName[MAX_PATH] = {};
@@ -95,17 +113,70 @@ bool FileEngine::IsDriveOffline(const std::wstring& path, Lang lang, std::wstrin
     return false;
 }
 
-#ifndef FILE_DISPOSITION_DELETE
-#define FILE_DISPOSITION_DELETE                         0x00000001
-#define FILE_DISPOSITION_POSIX_SEMANTICS                0x00000002
-#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK      0x00000004
-#define FILE_DISPOSITION_ON_CLOSE                       0x00000008
-#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE      0x00000010
-#endif
+namespace {
 
-struct MY_FILE_DISPOSITION_INFO_EX {
-    DWORD Flags;
+struct GlobalExtIconCache {
+    std::mutex mtx;
+    std::unordered_map<std::wstring, int> map;
+
+    // The icon, if it was looked up before. Never blocks for long.
+    bool TryGet(const std::wstring& extLower, int& outIndex) {
+        const std::wstring key = (extLower.empty() || extLower == L".") ? L"__NO_EXT__" : extLower;
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = map.find(key);
+        if (it == map.end()) return false;
+        outIndex = it->second;
+        return true;
+    }
+
+    // The icon; looks it up in the registry the first time (several milliseconds)
+    int Resolve(const std::wstring& extLower) {
+        std::wstring key = (extLower.empty() || extLower == L".") ? L"__NO_EXT__" : extLower;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            auto it = map.find(key);
+            if (it != map.end()) return it->second;
+        }
+
+        int resolved = 0;
+        if (extLower == L".exe" || extLower == L".com" || extLower == L".scr") {
+            SHSTOCKICONINFO ssii = {};
+            ssii.cbSize = sizeof(ssii);
+            if (SUCCEEDED(SHGetStockIconInfo(SIID_APPLICATION, SHGSI_SYSICONINDEX, &ssii)) && ssii.iSysImageIndex > 0) {
+                resolved = ssii.iSysImageIndex;
+            } else {
+                SHFILEINFOW sfi = {};
+                if (SHGetFileInfoW(L"app.exe", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES)) {
+                    resolved = sfi.iIcon;
+                }
+            }
+        } else {
+            std::wstring dummyName = (extLower.empty() || extLower == L".") ? L"file" : (L"file" + extLower);
+            SHFILEINFOW sfi = {};
+            if (SHGetFileInfoW(dummyName.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES)) {
+                resolved = sfi.iIcon;
+            }
+        }
+
+        std::lock_guard<std::mutex> lk(mtx);
+        map[key] = resolved;
+        return resolved;
+    }
+
 };
+
+// Types looked up as soon as the icon worker starts, before any folder asks for them
+const wchar_t* const kCommonIconExts[] = {
+    L".exe", L".dll", L".lnk", L".msi", L".txt", L".log", L".cpp", L".h", L".rc", L".json", L".xml", L".pdf",
+    L".zip", L".jpg", L".png", L".gif", L".mp4", L".mp3", L".docx", L".xlsx", L".html", L".url", L".bat"
+};
+
+GlobalExtIconCache& GetGlobalExtIconCache() {
+    static GlobalExtIconCache s_cache;
+    return s_cache;
+}
+
+} // namespace
 
 FileEngine::FileEngine() = default;
 
@@ -116,29 +187,140 @@ FileEngine::~FileEngine() {
 void FileEngine::Initialize(HWND notifyHwnd) {
     m_notifyHwnd = notifyHwnd;
     m_running = true;
+    m_net->wanted = true;
+    m_folderIconIndex = 3;
+    m_watcherWakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-    SHFILEINFOW sfi = {};
-    if (SHGetFileInfoW(L"Folder", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi),
-                       SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON)) {
-        m_folderIconIndex = sfi.iIcon;
+    // The generic icon is needed at once (it stands in for types still being looked up); the common types
+    // are looked up by the worker
+    m_genericIconIndex = GetGlobalExtIconCache().Resolve(L"");
+    for (const wchar_t* ext : kCommonIconExts) {
+        int known = 0;
+        if (!GetGlobalExtIconCache().TryGet(ext, known)) QueueExtIconLookup(ext);
     }
+    m_extIconThread = std::thread(&FileEngine::ExtIconWorkerLoop, this);
 
-    m_deleteThread = std::thread(&FileEngine::DeleteWorkerLoop, this);
     for (int i = 0; i < 4; ++i) {
         m_sizeThreads.emplace_back(&FileEngine::FolderSizeWorkerLoop, this);
     }
     m_searchThread = std::thread(&FileEngine::SearchWorkerLoop, this);
+    m_watcherThread = std::thread(&FileEngine::DirWatcherWorkerLoop, this);
+}
+
+void FileEngine::QueueExtIconLookup(const std::wstring& extLower) {
+    {
+        std::lock_guard<std::mutex> lk(m_extIconMutex);
+        if (!m_extIconQueued.insert(extLower).second) return;      // already waiting
+        m_extIconQueue.push_back(extLower);
+    }
+    m_extIconCv.notify_all();
+}
+
+void FileEngine::ExtIconWorkerLoop() {
+    // The shell wants COM on a thread that asks it for icons
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    int sinceNotify = 0;
+    for (;;) {
+        std::wstring ext;
+        {
+            std::unique_lock<std::mutex> lk(m_extIconMutex);
+            m_extIconCv.wait(lk, [this]() { return !m_running || !m_extIconQueue.empty(); });
+            if (!m_running) break;
+            ext = std::move(m_extIconQueue.front());
+            m_extIconQueue.pop_front();
+            m_extIconBusy = true;
+        }
+
+        const int icon = GetGlobalExtIconCache().Resolve(ext);
+        {
+            // Listings made from now on get the real icon
+            std::lock_guard<std::mutex> lk(m_extMutex);
+            const std::wstring base = ext.empty() ? std::wstring(L"__NO_EXT__") : ext;
+            for (const wchar_t* suffix : { L"_PL", L"_EN" }) {
+                auto it = m_extCache.find(base + suffix);
+                if (it != m_extCache.end()) {
+                    it->second.sysIconIndex = icon;
+                    it->second.iconPending = false;
+                }
+            }
+        }
+
+        bool queueEmpty = false;
+        {
+            std::lock_guard<std::mutex> lk(m_extIconMutex);
+            m_extIconQueued.erase(ext);
+            queueEmpty = m_extIconQueue.empty();
+        }
+
+        // One message per batch: when the queue has run empty, and every 16 types during a long batch.
+        // Posted before the lookup counts as finished, so that whoever waits for the lookups
+        // (WaitUntilIconsResolved) finds the message already there.
+        ++sinceNotify;
+        if ((queueEmpty || sinceNotify >= 16) && m_notifyHwnd && m_running && !m_extIconNotifyPending.exchange(true)) {
+            if (!PostMessageW(m_notifyHwnd, WM_APP_EXT_ICONS_READY, 0, 0)) m_extIconNotifyPending.store(false);
+            sinceNotify = 0;
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_extIconMutex);
+            m_extIconBusy = false;
+        }
+        m_extIconCv.notify_all();
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+}
+
+bool FileEngine::RefreshIconIndices(std::vector<FileEntry>& entries) const {
+    bool changed = false;
+    for (FileEntry& e : entries) {
+        // Only entries that still show the stand-in icon; drives, folders and FTP or archive entries with an
+        // icon of their own are left alone
+        if (e.isDirectory || e.isDrive || e.sysIconIndex != m_genericIconIndex) continue;
+        int icon = 0;
+        if (GetGlobalExtIconCache().TryGet(e.ext, icon) && icon != e.sysIconIndex) {
+            e.sysIconIndex = icon;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+bool FileEngine::IsTypeIconKnown(const std::wstring& extLower) {
+    int icon = 0;
+    return GetGlobalExtIconCache().TryGet(extLower, icon);
+}
+
+bool FileEngine::WaitUntilIconsResolved(unsigned int timeoutMs) {
+    std::unique_lock<std::mutex> lk(m_extIconMutex);
+    return m_extIconCv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                                [this]() { return !m_running || (m_extIconQueue.empty() && !m_extIconBusy); });
 }
 
 void FileEngine::Shutdown() {
+    m_net->wanted = false;      // drive probes that are still under way drop their answers
     if (m_running.exchange(false)) {
+        {
+            // Taken first, so that the icon worker is either not waiting yet or gets the wake-up
+            std::lock_guard<std::mutex> lock(m_extIconMutex);
+        }
+        m_extIconCv.notify_all();
+        JoinServingCom(m_extIconThread);        // it may be inside a shell call (see ThreadUtils.h)
         m_sizeGeneration.fetch_add(1);
         m_searchGeneration.fetch_add(1);
-        m_deleteCv.notify_all();
+        m_watcherGeneration.fetch_add(1);
+        if (m_watcherWakeEvent) {
+            SetEvent(m_watcherWakeEvent);
+        }
         m_sizeCv.notify_all();
         m_searchCv.notify_all();
-        if (m_deleteThread.joinable()) {
-            m_deleteThread.join();
+        m_watcherCv.notify_all();
+        {
+            // Taking the mutex first means the sweep thread is either not waiting yet (and will see that
+            // the engine is stopping) or already waiting (and gets this wake-up)
+            std::lock_guard<std::mutex> lock(m_undoMutex);
+        }
+        m_undoSweepCv.notify_all();
+        if (m_undoSweepThread.joinable()) {
+            m_undoSweepThread.join();
         }
         for (auto& t : m_sizeThreads) {
             if (t.joinable()) t.join();
@@ -147,11 +329,147 @@ void FileEngine::Shutdown() {
         if (m_searchThread.joinable()) {
             m_searchThread.join();
         }
+        if (m_watcherThread.joinable()) {
+            m_watcherThread.join();
+        }
+        if (m_watcherWakeEvent) {
+            CloseHandle(m_watcherWakeEvent);
+            m_watcherWakeEvent = nullptr;
+        }
         CleanupAllUndoStaging();
     }
 }
 
-const FileEngine::ExtTypeInfo& FileEngine::GetExtensionInfo(const std::wstring& extLower, bool isDir, Lang lang) {
+void FileEngine::WatchDirectory(const std::wstring& dirPath) {
+    std::wstring clean = PathUtils::TrimTrailingSlashes(dirPath);
+    if (clean == L"THIS_PC" || FtpClient::IsFtpPath(clean) || ArchiveExplorer::IsVirtualArchivePath(clean)) {
+        clean.clear();
+    } else if (!clean.empty()) {
+        DWORD attrs = GetFileAttributesW(clean.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            clean.clear();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_watcherMutex);
+        if (_wcsicmp(m_watchedDir.c_str(), clean.c_str()) == 0) {
+            return;
+        }
+        m_watchedDir = clean;
+        m_watcherGeneration.fetch_add(1);
+    }
+    if (m_watcherWakeEvent) {
+        SetEvent(m_watcherWakeEvent);
+    }
+    m_watcherCv.notify_all();
+}
+
+void FileEngine::DirWatcherWorkerLoop() {
+    alignas(DWORD) BYTE notifyBuf[16384] = {};
+    uint64_t seenGen = 0;
+
+    while (m_running) {
+        std::wstring watchDir;
+        {
+            std::unique_lock<std::mutex> lk(m_watcherMutex);
+            m_watcherCv.wait(lk, [&]() {
+                return !m_running || (m_watcherGeneration.load() != seenGen && !m_watchedDir.empty()) ||
+                       (!m_watchedDir.empty() && m_watcherGeneration.load() == seenGen);
+            });
+            if (!m_running) break;
+            seenGen = m_watcherGeneration.load();
+            watchDir = m_watchedDir;
+            if (m_watcherWakeEvent) ResetEvent(m_watcherWakeEvent);
+        }
+
+        if (watchDir.empty()) {
+            std::unique_lock<std::mutex> lk(m_watcherMutex);
+            m_watcherCv.wait(lk, [&]() { return !m_running || m_watcherGeneration.load() != seenGen; });
+            continue;
+        }
+
+        std::wstring openPath = (watchDir.size() == 2 && watchDir[1] == L':') ? (watchDir + L"\\") : watchDir;
+        HANDLE hDir = CreateFileW(
+            openPath.c_str(),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+            nullptr);
+
+        if (hDir == INVALID_HANDLE_VALUE) {
+            // Wait until directory changes or shutdown
+            std::unique_lock<std::mutex> lk(m_watcherMutex);
+            m_watcherCv.wait(lk, [&]() { return !m_running || m_watcherGeneration.load() != seenGen; });
+            continue;
+        }
+
+        HANDLE hIoEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!hIoEvent) {
+            CloseHandle(hDir);
+            continue;
+        }
+
+        while (m_running && m_watcherGeneration.load() == seenGen) {
+            OVERLAPPED ov = {};
+            ov.hEvent = hIoEvent;
+            DWORD bytesReturned = 0;
+            BOOL ok = ReadDirectoryChangesW(
+                hDir,
+                notifyBuf,
+                sizeof(notifyBuf),
+                FALSE,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                &bytesReturned,
+                &ov,
+                nullptr);
+
+            if (!ok && GetLastError() != ERROR_IO_PENDING) {
+                break;
+            }
+
+            HANDLE handles[2] = { m_watcherWakeEvent, hIoEvent };
+            DWORD waitRes = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            if (waitRes == WAIT_OBJECT_0 || !m_running || m_watcherGeneration.load() != seenGen) {
+                CancelIo(hDir);
+                GetOverlappedResult(hDir, &ov, &bytesReturned, TRUE);
+                break;
+            }
+
+            if (waitRes == WAIT_OBJECT_0 + 1) {
+                DWORD transferred = 0;
+                if (GetOverlappedResult(hDir, &ov, &transferred, FALSE) && transferred > 0) {
+                    bool relevantChange = false;
+                    const BYTE* ptr = notifyBuf;
+                    for (;;) {
+                        const auto* fni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(ptr);
+                        std::wstring changedName(fni->FileName, fni->FileNameLength / sizeof(wchar_t));
+                        if (_wcsicmp(changedName.c_str(), L".explorer2_undo") != 0 &&
+                            changedName.rfind(L".explorer2_undo\\", 0) != 0) {
+                            relevantChange = true;
+                        }
+                        if (fni->NextEntryOffset == 0) break;
+                        ptr += fni->NextEntryOffset;
+                    }
+
+                    if (relevantChange) {
+                        // Coalesce burst writes over a 250ms window before notifying UI
+                        if (WaitForSingleObject(m_watcherWakeEvent, 250) == WAIT_TIMEOUT &&
+                            m_running && m_watcherGeneration.load() == seenGen && m_notifyHwnd) {
+                            PostMessageW(m_notifyHwnd, WM_APP_DIR_CHANGED, 0, 0);
+                        }
+                    }
+                }
+            }
+        }
+
+        CloseHandle(hIoEvent);
+        CloseHandle(hDir);
+    }
+}
+
+FileEngine::ExtTypeInfo FileEngine::GetExtensionInfo(const std::wstring& extLower, bool isDir, Lang lang) {
     std::lock_guard<std::mutex> lock(m_extMutex);
     const Strings& s = GetStrings(lang);
 
@@ -166,22 +484,73 @@ const FileEngine::ExtTypeInfo& FileEngine::GetExtensionInfo(const std::wstring& 
         return m_extCache.emplace(key, std::move(info)).first->second;
     }
 
-    std::wstring key = extLower.empty() ? L"__NO_EXT__" : extLower;
+    std::wstring key = (extLower.empty() ? L"__NO_EXT__" : extLower) + ((lang == Lang::PL) ? L"_PL" : L"_EN");
     auto it = m_extCache.find(key);
     if (it != m_extCache.end()) {
         return it->second;
     }
 
     ExtTypeInfo info;
-    SHFILEINFOW sfi = {};
-    std::wstring dummyName = extLower.empty() ? L"file" : (L"file" + extLower);
-    if (SHGetFileInfoW(dummyName.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
-                       SHGFI_USEFILEATTRIBUTES | SHGFI_TYPENAME | SHGFI_SYSICONINDEX | SHGFI_SMALLICON)) {
-        info.typeName = sfi.szTypeName[0] ? sfi.szTypeName : s.typeFile;
-        info.sysIconIndex = sfi.iIcon;
+    int knownIcon = 0;
+    if (GetGlobalExtIconCache().TryGet(extLower, knownIcon)) {
+        info.sysIconIndex = knownIcon;
+    } else if (m_running) {
+        // Not looked up yet: the generic icon for now, the real one from the worker (see RefreshIconIndices).
+        // m_running is true only between Initialize, which starts the worker before any other thread that
+        // lists folders, and Shutdown, which clears it before it stops the worker.
+        info.sysIconIndex = m_genericIconIndex;
+        info.iconPending = true;
+        QueueExtIconLookup(extLower);
     } else {
+        info.sysIconIndex = GetGlobalExtIconCache().Resolve(extLower);     // no worker (not initialized)
+    }
+    const bool pl = (lang == Lang::PL);
+    if (extLower.empty() || extLower == L".") {
         info.typeName = s.typeFile;
-        info.sysIconIndex = 0;
+    } else if (extLower == L".pdf") {
+        info.typeName = pl ? L"Dokument PDF" : L"PDF Document";
+    } else if (extLower == L".zip" || extLower == L".rar" || extLower == L".7z" || extLower == L".tar" || extLower == L".gz" || extLower == L".tgz") {
+        std::wstring up = extLower.substr(1);
+        for (auto& c : up) c = static_cast<wchar_t>(towupper(c));
+        info.typeName = (pl ? L"Archiwum " : L"Archive ") + up;
+    } else if (extLower == L".py") {
+        info.typeName = L"Python Source File";
+    } else if (extLower == L".cpp" || extLower == L".cc" || extLower == L".cxx") {
+        info.typeName = L"C++ Source File";
+    } else if (extLower == L".h" || extLower == L".hpp") {
+        info.typeName = L"C/C++ Header File";
+    } else if (extLower == L".json") {
+        info.typeName = L"JSON Source File";
+    } else if (extLower == L".yaml" || extLower == L".yml") {
+        info.typeName = L"YAML Source File";
+    } else if (extLower == L".xml") {
+        info.typeName = pl ? L"Dokument XML" : L"XML Document";
+    } else if (extLower == L".pptx" || extLower == L".ppsx" || extLower == L".odp") {
+        info.typeName = pl ? L"Prezentacja multimedialna" : L"Slide Presentation";
+    } else if (extLower == L".epub" || extLower == L".fb2") {
+        info.typeName = pl ? L"Książka elektroniczna (eBook)" : L"eBook Document";
+    } else if (extLower == L".sqlite" || extLower == L".sqlite3" || extLower == L".db") {
+        info.typeName = pl ? L"Baza danych SQLite 3" : L"SQLite 3 Database";
+    } else if (extLower == L".dbf") {
+        info.typeName = pl ? L"Tabela bazy dBASE (.dbf)" : L"dBASE Database Table (.dbf)";
+    } else if (extLower == L".dds") {
+        info.typeName = pl ? L"Tekstura DirectDraw Surface (.dds)" : L"DirectDraw Surface Texture (.dds)";
+    } else if (extLower == L".svg") {
+        info.typeName = pl ? L"Grafika wektorowa SVG" : L"SVG Vector Graphic";
+    } else if (extLower == L".dxf") {
+        info.typeName = pl ? L"Rysunek CAD AutoCAD (.dxf)" : L"AutoCAD DXF Drawing (.dxf)";
+    } else if (extLower == L".vtk") {
+        info.typeName = pl ? L"Siatka 3D VTK (.vtk)" : L"VTK 3D Mesh (.vtk)";
+    } else if (extLower == L".exe" || extLower == L".msi") {
+        info.typeName = pl ? L"Aplikacja" : L"Application";
+    } else if (extLower == L".dll") {
+        info.typeName = pl ? L"Rozszerzenie aplikacji (DLL)" : L"Application Extension (DLL)";
+    } else if (extLower == L".lnk") {
+        info.typeName = pl ? L"Skrót" : L"Shortcut";
+    } else {
+        std::wstring up = extLower.substr(1);
+        for (auto& c : up) c = static_cast<wchar_t>(towupper(c));
+        info.typeName = pl ? (L"Plik " + up) : (up + L" File");
     }
 
     return m_extCache.emplace(key, std::move(info)).first->second;
@@ -221,9 +590,9 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
                     bool online = false;
                     uint64_t netTotal = 0;
                     {
-                        std::lock_guard<std::mutex> lk(m_netDriveMutex);
-                        auto it = m_netDrives.find(dlChar);
-                        if (it != m_netDrives.end()) {
+                        std::lock_guard<std::mutex> lk(m_net->mutex);
+                        auto it = m_net->drives.find(dlChar);
+                        if (it != m_net->drives.end()) {
                             online = it->second.online;
                             netTotal = it->second.totalBytes;
                         }
@@ -279,11 +648,44 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
                 results.push_back(std::move(entry));
             }
         }
+
+        // Append FileZilla / saved FTP & FTPS servers under Ten komputer
+        auto ftpSites = FtpClient::LoadBookmarks();
+        for (const auto& bm : ftpSites) {
+            if (bm.url.empty()) continue;
+            FileEntry entry;
+            entry.name = L"[FTP] " + bm.name;
+            entry.displayName = entry.name;
+            entry.fullPath = bm.url;
+            entry.normKey = PathUtils::ToLower(bm.url);
+            entry.isDirectory = true;
+            entry.isDrive = true;
+            entry.isNetworkDrive = true;
+            entry.sizeStr = bm.useFtps ? L"FTPS" : L"FTP/TLS";
+            if (bm.fromFileZilla) {
+                entry.typeName = (lang == Lang::PL) ? L"Serwer FTP / FTPS (FileZilla)" : L"FTP / FTPS Server (FileZilla)";
+            } else {
+                entry.typeName = (lang == Lang::PL) ? L"Serwer FTP / FTPS" : L"FTP / FTPS Server";
+            }
+            results.push_back(std::move(entry));
+        }
+
         return results;
     }
 
     if (FtpClient::IsFtpPath(dirPath)) {
         FtpClient::EnumerateFtpDirectory(dirPath, showHidden, showExtensions, lang, results, nullptr);
+        std::wstring lastExt = L"__INIT__";
+        ExtTypeInfo lastExtInfo = {};
+        for (auto& entry : results) {
+            if (!entry.isDirectory && entry.sysIconIndex <= 0) {
+                if (entry.ext != lastExt) {
+                    lastExt = entry.ext;
+                    lastExtInfo = GetExtensionInfo(entry.ext, false, lang);
+                }
+                entry.sysIconIndex = lastExtInfo.sysIconIndex;
+            }
+        }
         return results;
     }
 
@@ -291,27 +693,39 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
 
     std::wstring cleanDir = PathUtils::TrimTrailingSlashes(dirPath);
     std::wstring prefix = PathUtils::EnsureTrailingSlash(cleanDir);
+    std::wstring normDirPrefix = PathUtils::NormalizePathKey(cleanDir);
+    if (!normDirPrefix.empty() && normDirPrefix.back() != L'\\') {
+        normDirPrefix.push_back(L'\\');
+    }
     std::wstring searchPattern = prefix + L"*";
 
     WIN32_FIND_DATAW ffd;
-    HANDLE hFind = FindFirstFileExW(
-        searchPattern.c_str(),
-        FindExInfoBasic,
-        &ffd,
-        FindExSearchNameMatch,
-        nullptr,
-        FIND_FIRST_EX_LARGE_FETCH);
+    HANDLE hFind = INVALID_HANDLE_VALUE;
+    // Fast-path: if cleanDir is a virtual archive path, skip the failed kernel FindFirstFileExW
+    if (!ArchiveExplorer::IsVirtualArchivePath(cleanDir)) {
+        hFind = FindFirstFileExW(
+            searchPattern.c_str(),
+            FindExInfoBasic,
+            &ffd,
+            FindExSearchNameMatch,
+            nullptr,
+            FIND_FIRST_EX_LARGE_FETCH);
+    }
 
     if (hFind == INVALID_HANDLE_VALUE) {
         std::wstring arcFile, innerDir;
         if (ArchiveExplorer::SplitVirtualArchivePath(cleanDir, arcFile, innerDir)) {
             std::vector<ArchiveItemEntry> arcChildren;
             if (ArchiveExplorer::EnumerateArchiveFolder(arcFile, innerDir, arcChildren)) {
+                results.reserve(arcChildren.size());
+                const ExtTypeInfo& dirExtInfo = GetExtensionInfo(L"", true, lang);
+                std::wstring lastExt = L"__INIT__";
+                ExtTypeInfo lastExtInfo = {};
                 for (const auto& ac : arcChildren) {
                     FileEntry entry;
                     entry.name = ac.name;
                     entry.fullPath = prefix + ac.name;
-                    entry.normKey = PathUtils::NormalizePathKey(entry.fullPath);
+                    entry.normKey = normDirPrefix + PathUtils::ToLower(ac.name);
                     entry.isDirectory = ac.isDirectory;
                     entry.size = ac.uncompressedSize;
                     if (!entry.isDirectory) {
@@ -321,9 +735,17 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
                         entry.isImage = IsImageExtension(entry.ext);
                         entry.isVideo = IsVideoExtension(entry.ext);
                         entry.isAudio = IsAudioExtension(entry.ext);
+                        if (entry.ext != lastExt) {
+                            lastExt = entry.ext;
+                            lastExtInfo = GetExtensionInfo(entry.ext, false, lang);
+                        }
+                        entry.typeName = lastExtInfo.typeName;
+                        entry.sysIconIndex = lastExtInfo.sysIconIndex;
                     } else {
                         entry.displayName = entry.name;
                         if (entry.size > 0) entry.sizeStr = FormatSizeKB(entry.size);
+                        entry.typeName = dirExtInfo.typeName;
+                        entry.sysIconIndex = dirExtInfo.sysIconIndex;
                     }
                     if (ac.dosDate != 0) {
                         FILETIME localFt = {}, utcFt = {};
@@ -333,15 +755,16 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
                             entry.dateStr = FormatFileTime(utcFt);
                         }
                     }
-                    const ExtTypeInfo& extInfo = GetExtensionInfo(entry.ext, entry.isDirectory, lang);
-                    entry.typeName = extInfo.typeName;
-                    entry.sysIconIndex = extInfo.sysIconIndex;
                     results.push_back(std::move(entry));
                 }
             }
         }
         return results;
     }
+
+    const ExtTypeInfo& dirExtInfo = GetExtensionInfo(L"", true, lang);
+    std::wstring lastExt = L"__INIT__";
+    ExtTypeInfo lastExtInfo = {};
 
     do {
         const wchar_t* fileName = ffd.cFileName;
@@ -360,7 +783,7 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
         FileEntry entry;
         entry.name = fileName;
         entry.fullPath = prefix + entry.name;
-        entry.normKey = PathUtils::NormalizePathKey(entry.fullPath);
+        entry.normKey = normDirPrefix + PathUtils::ToLower(entry.name);
         entry.attributes = ffd.dwFileAttributes;
         entry.isDirectory = (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         entry.isHidden = isHidden;
@@ -383,13 +806,18 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
             entry.isImage = IsImageExtension(entry.ext);
             entry.isVideo = IsVideoExtension(entry.ext);
             entry.isAudio = IsAudioExtension(entry.ext);
+
+            if (entry.ext != lastExt) {
+                lastExt = entry.ext;
+                lastExtInfo = GetExtensionInfo(entry.ext, false, lang);
+            }
+            entry.typeName = lastExtInfo.typeName;
+            entry.sysIconIndex = lastExtInfo.sysIconIndex;
         } else {
             entry.displayName = entry.name;
+            entry.typeName = dirExtInfo.typeName;
+            entry.sysIconIndex = dirExtInfo.sysIconIndex;
         }
-
-        const ExtTypeInfo& extInfo = GetExtensionInfo(entry.ext, entry.isDirectory, lang);
-        entry.typeName = extInfo.typeName;
-        entry.sysIconIndex = extInfo.sysIconIndex;
 
         results.push_back(std::move(entry));
     } while (FindNextFileW(hFind, &ffd));
@@ -457,10 +885,6 @@ std::vector<std::pair<std::wstring, std::wstring>> FileEngine::GetDefaultQuickAc
     addKnown(FOLDERID_Downloads, s.navDownloads);
     addKnown(FOLDERID_Documents, s.navDocuments);
     addKnown(FOLDERID_Pictures, s.navPictures);
-
-    if (GetFileAttributesW(L"W:\\Fooocus_Advanced") != INVALID_FILE_ATTRIBUTES) {
-        list.emplace_back(L"Fooocus_Advanced", L"W:\\Fooocus_Advanced");
-    }
     return list;
 }
 
@@ -548,17 +972,51 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
             driveNode.hasChildren = true;
             driveNode.isExpanded = false;
 
+            auto formatDriveTreeBadge = [](uint64_t usedBytes, uint64_t totalBytes) -> std::wstring {
+                if (totalBytes == 0) return L"";
+                wchar_t buf[64] = {};
+                if (totalBytes >= (1ULL << 40)) {
+                    double uTb = static_cast<double>(usedBytes) / static_cast<double>(1ULL << 40);
+                    double tTb = static_cast<double>(totalBytes) / static_cast<double>(1ULL << 40);
+                    swprintf_s(buf, L"%.1f / %.1f TB", uTb, tTb);
+                } else if (totalBytes >= (10ULL << 30)) {
+                    uint64_t uGb = (usedBytes + (1ULL << 29)) >> 30;
+                    uint64_t tGb = (totalBytes + (1ULL << 29)) >> 30;
+                    swprintf_s(buf, L"%llu / %llu GB", static_cast<unsigned long long>(uGb), static_cast<unsigned long long>(tGb));
+                } else if (totalBytes >= (1ULL << 30)) {
+                    double uGb = static_cast<double>(usedBytes) / static_cast<double>(1ULL << 30);
+                    double tGb = static_cast<double>(totalBytes) / static_cast<double>(1ULL << 30);
+                    swprintf_s(buf, L"%.1f / %.1f GB", uGb, tGb);
+                } else {
+                    uint64_t uMb = (usedBytes + (1ULL << 19)) >> 20;
+                    uint64_t tMb = (totalBytes + (1ULL << 19)) >> 20;
+                    swprintf_s(buf, L"%llu / %llu MB", static_cast<unsigned long long>(uMb), static_cast<unsigned long long>(tMb));
+                }
+                return buf;
+            };
+
             if (dtype == DRIVE_REMOTE) {
                 driveNode.isNetworkDrive = true;
                 driveNode.label = GetMappedNetworkDriveLabel(dlChar, lang);
                 ProbeNetworkDriveAsync(dlChar);
                 bool online = false;
+                uint64_t netTotal = 0, netFree = 0;
                 {
-                    std::lock_guard<std::mutex> lk(m_netDriveMutex);
-                    auto it = m_netDrives.find(dlChar);
-                    if (it != m_netDrives.end()) online = it->second.online;
+                    std::lock_guard<std::mutex> lk(m_net->mutex);
+                    auto it = m_net->drives.find(dlChar);
+                    if (it != m_net->drives.end()) {
+                        online = it->second.online;
+                        netTotal = it->second.totalBytes;
+                        netFree = it->second.freeBytes;
+                    }
                 }
                 driveNode.isOffline = !online;
+                if (online && netTotal > 0) {
+                    driveNode.totalBytes = netTotal;
+                    driveNode.freeBytes = netFree;
+                    driveNode.size = (netTotal >= netFree) ? (netTotal - netFree) : 0;
+                    driveNode.sizeStr = formatDriveTreeBadge(driveNode.size, driveNode.totalBytes);
+                }
             } else if (dtype == DRIVE_CDROM) {
                 driveNode.isOpticalDrive = true;
                 wchar_t volName[MAX_PATH] = {};
@@ -567,6 +1025,15 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
                 driveNode.label = (volOk && volName[0])
                     ? (std::wstring(volName) + L" (" + driveLetter + L")")
                     : ((lang == Lang::PL ? L"Stacja dysków BD-ROM (" : L"BD-ROM Drive (") + driveLetter + L")");
+                if (volOk) {
+                    ULARGE_INTEGER freeB = {}, totalB = {};
+                    if (GetDiskFreeSpaceExW(rootPath, &freeB, &totalB, nullptr) && totalB.QuadPart > 0) {
+                        driveNode.totalBytes = totalB.QuadPart;
+                        driveNode.freeBytes = freeB.QuadPart;
+                        driveNode.size = (totalB.QuadPart >= freeB.QuadPart) ? (totalB.QuadPart - freeB.QuadPart) : 0;
+                        driveNode.sizeStr = formatDriveTreeBadge(driveNode.size, driveNode.totalBytes);
+                    }
+                }
             } else {
                 wchar_t volName[MAX_PATH] = {};
                 BOOL volOk = GetVolumeInformationW(rootPath, volName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
@@ -576,11 +1043,52 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
                 } else {
                     driveNode.label = (lang == Lang::PL ? L"Dysk lokalny (" : L"Local Disk (") + driveLetter + L")";
                 }
+                if (volOk) {
+                    ULARGE_INTEGER freeB = {}, totalB = {};
+                    if (GetDiskFreeSpaceExW(rootPath, &freeB, &totalB, nullptr) && totalB.QuadPart > 0) {
+                        driveNode.totalBytes = totalB.QuadPart;
+                        driveNode.freeBytes = freeB.QuadPart;
+                        driveNode.size = (totalB.QuadPart >= freeB.QuadPart) ? (totalB.QuadPart - freeB.QuadPart) : 0;
+                        driveNode.sizeStr = formatDriveTreeBadge(driveNode.size, driveNode.totalBytes);
+                    }
+                }
             }
             nodes.push_back(std::move(driveNode));
         }
     }
 
+    // FTP / FileZilla (FTPS) section under Ten komputer
+    {
+        auto ftpSites = FtpClient::LoadBookmarks();
+        TreeNode ftpGroup;
+        ftpGroup.label = (lang == Lang::PL) ? L"FTP / FileZilla (FTPS)" : L"FTP / FileZilla (FTPS)";
+        ftpGroup.path = L"THIS_PC";
+        ftpGroup.normKey = L"__HEADER_FTP__";
+        ftpGroup.indent = 1;
+        ftpGroup.isFtpNode = true;
+        ftpGroup.hasChildren = !ftpSites.empty();
+        ftpGroup.isExpanded = true;
+        if (!ftpSites.empty()) {
+            ftpGroup.sizeStr = std::to_wstring(ftpSites.size()) + (lang == Lang::PL ? L" serw." : L" srv.");
+        }
+        nodes.push_back(std::move(ftpGroup));
+
+        for (const auto& bm : ftpSites) {
+            if (bm.url.empty()) continue;
+            TreeNode ftpNode;
+            ftpNode.label = bm.name;
+            ftpNode.path = bm.url;
+            ftpNode.normKey = PathUtils::ToLower(bm.url);
+            ftpNode.indent = 2;
+            ftpNode.isFtpNode = true;
+            ftpNode.hasChildren = true;
+            ftpNode.isExpanded = false;
+            ftpNode.sizeStr = bm.useFtps ? L"FTPS" : L"FTP/TLS";
+            nodes.push_back(std::move(ftpNode));
+        }
+    }
+
+    SyncTreeNodeSizes(nodes);
     return nodes;
 }
 
@@ -591,6 +1099,28 @@ std::vector<TreeNode> FileEngine::EnumerateSubfoldersForTree(
 {
     std::vector<TreeNode> subNodes;
     if (parentPath.empty() || parentPath == L"THIS_PC") return subNodes;
+
+    if (FtpClient::IsFtpPath(parentPath)) {
+        std::vector<FileEntry> ftpEntries;
+        if (FtpClient::EnumerateFtpDirectory(parentPath, false, true, Lang::PL, ftpEntries, nullptr)) {
+            for (const auto& e : ftpEntries) {
+                if (!e.isDirectory) continue;
+                TreeNode child;
+                child.label = e.name;
+                child.path = e.fullPath;
+                child.normKey = PathUtils::ToLower(e.fullPath);
+                child.indent = childIndent;
+                child.isFtpNode = true;
+                child.hasChildren = true;
+                child.isExpanded = false;
+                subNodes.push_back(std::move(child));
+            }
+            std::sort(subNodes.begin(), subNodes.end(), [](const TreeNode& a, const TreeNode& b) {
+                return StrCmpLogicalW(a.label.c_str(), b.label.c_str()) < 0;
+            });
+        }
+        return subNodes;
+    }
 
     std::wstring prefix = PathUtils::EnsureTrailingSlash(PathUtils::TrimTrailingSlashes(parentPath));
     std::wstring pattern = prefix + L"*";
@@ -632,6 +1162,27 @@ std::vector<TreeNode> FileEngine::EnumerateSubfoldersForTree(
     return subNodes;
 }
 
+namespace {
+
+const wchar_t kUndoLockName[] = L"session.lock";
+
+// "s_<pid>_<tick>": the folder in which one running Explorer2 keeps its undo copies
+bool IsUndoSessionDirName(const wchar_t* name) {
+    return name[0] == L's' && name[1] == L'_' && iswdigit(name[2]) != 0;
+}
+
+// "undo_<n>_<name>" directly in the staging folder: how copies were kept before each session had a folder
+// of its own. Nothing writes there any more, so whatever is found is left over.
+bool IsLegacyUndoCopyName(const wchar_t* name) {
+    return wcsncmp(name, L"undo_", 5) == 0 && iswdigit(name[5]) != 0;
+}
+
+uint64_t FileTimeToU64(const FILETIME& ft) {
+    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+} // namespace
+
 std::wstring FileEngine::GetUndoStagingDirForPath(const std::wstring& path) {
     if (path.size() >= 2 && path[1] == L':') {
         std::wstring root = path.substr(0, 2) + L"\\";
@@ -640,31 +1191,183 @@ std::wstring FileEngine::GetUndoStagingDirForPath(const std::wstring& path) {
     return L"";
 }
 
-void FileEngine::EnqueueDelete(const std::vector<std::wstring>& paths, bool permanent) {
+// Returns this session's folder inside one staging folder, creating both on first use.
+// Returns "" when undo copies cannot be kept there; the delete itself is not affected by that.
+std::wstring FileEngine::EnsureUndoSessionDir(const std::wstring& stagingRoot) {
+    if (stagingRoot.empty()) return L"";
+
+    std::wstring sessionDir;
+    {
+        std::lock_guard<std::mutex> lock(m_undoMutex);
+        auto it = m_undoSessions.find(stagingRoot);
+        if (it != m_undoSessions.end()) {
+            const DWORD attrs = GetFileAttributesW(it->second.dir.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return it->second.dir;
+            // The folder was removed behind our back: start a new one
+            if (it->second.lock != INVALID_HANDLE_VALUE) CloseHandle(it->second.lock);
+            m_undoSessions.erase(it);
+        }
+
+        const DWORD rootAttrs = GetFileAttributesW(stagingRoot.c_str());
+        if (rootAttrs == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryW(stagingRoot.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return L"";
+            SetFileAttributesW(stagingRoot.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+        } else if (!(rootAttrs & FILE_ATTRIBUTE_DIRECTORY) || (rootAttrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            return L"";   // not a plain folder: nothing is ever written through a link
+        }
+
+        wchar_t leaf[64] = {};
+        swprintf_s(leaf, L"\\s_%lu_%llx", GetCurrentProcessId(), static_cast<unsigned long long>(GetTickCount64()));
+        UndoSession session;
+        session.dir = stagingRoot + leaf;
+        if (!CreateDirectoryW(session.dir.c_str(), nullptr)) return L"";
+
+        // The lock file is how a later start tells a live session from an abandoned one: nobody else can
+        // delete it while this handle is open, and Windows removes it when the process ends, however it ends.
+        session.lock = CreateFileW((session.dir + L"\\" + kUndoLockName).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (session.lock == INVALID_HANDLE_VALUE) {
+            // Without a lock a later start would take these copies for leftovers, so keep none here
+            RemoveDirectoryW(session.dir.c_str());
+            return L"";
+        }
+        sessionDir = session.dir;
+        m_undoSessions.emplace(stagingRoot, std::move(session));
+    }
+
+    QueueUndoSweep(stagingRoot);   // first use of this drive in this run: clear what earlier sessions left on it
+    return sessionDir;
+}
+
+void FileEngine::QueueUndoSweep(const std::wstring& stagingRoot) {
+    if (stagingRoot.empty() || !m_running) return;
+    {
+        std::lock_guard<std::mutex> lock(m_undoMutex);
+        if (!m_undoSweepRequested.insert(stagingRoot).second) return;   // once per folder and run
+        m_undoSweepQueue.push_back(stagingRoot);
+        if (!m_undoSweepThread.joinable()) {
+            m_undoSweepThread = std::thread(&FileEngine::UndoSweepWorkerLoop, this);
+        }
+    }
+    m_undoSweepCv.notify_one();
+}
+
+void FileEngine::StartUndoStagingSweep() {
+    wchar_t drives[512] = {};
+    const DWORD len = GetLogicalDriveStringsW(static_cast<DWORD>(std::size(drives) - 1), drives);
+    if (len == 0 || len >= std::size(drives)) return;
+    for (const wchar_t* d = drives; *d; d += wcslen(d) + 1) {
+        // Only disks that are always there. A removable or network drive is swept when it is first used,
+        // so that starting the app never waits for a drive that is asleep or missing.
+        if (GetDriveTypeW(d) == DRIVE_FIXED) QueueUndoSweep(GetUndoStagingDirForPath(d));
+    }
+}
+
+void FileEngine::UndoSweepWorkerLoop() {
+    SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, nullptr);
+    while (m_running) {
+        std::wstring root;
+        std::wstring ownDir;
+        {
+            std::unique_lock<std::mutex> lock(m_undoMutex);
+            m_undoSweepCv.wait(lock, [this]() { return !m_running || !m_undoSweepQueue.empty(); });
+            if (!m_running) break;
+            root = std::move(m_undoSweepQueue.front());
+            m_undoSweepQueue.pop_front();
+            auto it = m_undoSessions.find(root);
+            if (it != m_undoSessions.end()) ownDir = it->second.dir;
+        }
+        const size_t removed = SweepStaleUndoStaging(root, ownDir, 15, &m_running);
+        if (removed > 0) {
+            AppLog::Info(L"Delete", L"Removed " + std::to_wstring(removed) +
+                                    L" leftover undo item(s) of earlier sessions from " + root);
+        }
+    }
+}
+
+size_t FileEngine::SweepStaleUndoStaging(const std::wstring& stagingRoot, const std::wstring& ownSessionDir,
+                                         unsigned minAgeSeconds, const std::atomic<bool>* keepRunning) {
+    const DWORD rootAttrs = GetFileAttributesW(stagingRoot.c_str());
+    if (rootAttrs == INVALID_FILE_ATTRIBUTES || !(rootAttrs & FILE_ATTRIBUTE_DIRECTORY) ||
+        (rootAttrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return 0;   // absent, or not a plain folder: never clean up through a link
+    }
+
+    struct Candidate {
+        std::wstring path;
+        bool isSession = false;
+    };
+    std::vector<Candidate> candidates;
+    FILETIME nowFt = {};
+    GetSystemTimeAsFileTime(&nowFt);
+    const uint64_t now = FileTimeToU64(nowFt);
+    const uint64_t minAge = static_cast<uint64_t>(minAgeSeconds) * 10000000ULL;
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = FindFirstFileExW((stagingRoot + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    if (hFind == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;   // a link is never ours
+        const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        std::wstring full = stagingRoot + L"\\" + fd.cFileName;
+        if (isDir && IsUndoSessionDirName(fd.cFileName)) {
+            if (!ownSessionDir.empty() && lstrcmpiW(full.c_str(), ownSessionDir.c_str()) == 0) continue;
+            const uint64_t created = FileTimeToU64(fd.ftCreationTime);
+            if (now >= created && (now - created) < minAge) continue;       // may be a session that is just starting
+            candidates.push_back({ std::move(full), true });
+        } else if (!isDir && IsLegacyUndoCopyName(fd.cFileName)) {
+            candidates.push_back({ std::move(full), false });
+        }
+        // Anything else was not put here by Explorer2 and stays
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+
+    size_t removed = 0;
+    for (const auto& c : candidates) {
+        if (keepRunning && !keepRunning->load()) break;
+        if (c.isSession) {
+            // Abandoned means: the lock file is gone (its owner ended) or can be deleted (nobody holds it).
+            // Any other answer, such as "in use" or "access denied", is treated as a live session.
+            const std::wstring lockPath = c.path + L"\\" + kUndoLockName;
+            if (GetFileAttributesW(lockPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                if (!DeleteFileW(lockPath.c_str())) continue;
+            } else {
+                const DWORD err = GetLastError();
+                if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) continue;
+            }
+        }
+        if (DeletePathPermanently(c.path)) ++removed;
+    }
+
+    RemoveDirectoryW(stagingRoot.c_str());   // goes only once nothing at all is left in it
+    return removed;
+}
+
+void FileEngine::BeginDelete(const std::vector<std::wstring>& paths, bool permanent) {
     if (paths.empty()) return;
 
     if (!permanent) {
         UndoDeleteBatch batch;
         static std::atomic<uint64_t> s_undoCounter{ 1 };
+        std::wstring lastRoot;
+        std::wstring lastSessionDir;
 
         for (const auto& origPath : paths) {
             DWORD attrs = GetFileAttributesW(origPath.c_str());
             if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                std::wstring stagingDir = GetUndoStagingDirForPath(origPath);
-                if (!stagingDir.empty()) {
-                    if (GetFileAttributesW(stagingDir.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                        if (CreateDirectoryW(stagingDir.c_str(), nullptr)) {
-                            SetFileAttributesW(stagingDir.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
-                            std::lock_guard<std::mutex> lock(m_undoMutex);
-                            m_stagingDirsCreated.push_back(stagingDir);
-                        }
-                    }
-                    uint64_t id = s_undoCounter.fetch_add(1);
-                    std::wstring baseName = PathUtils::GetFileName(origPath);
-                    std::wstring backupPath = stagingDir + L"\\undo_" + std::to_wstring(id) + L"_" + baseName;
-                    if (CreateHardLinkW(backupPath.c_str(), origPath.c_str(), nullptr)) {
-                        batch.originalToTrashPaths.push_back({ origPath, backupPath });
-                    }
+                const std::wstring stagingRoot = GetUndoStagingDirForPath(origPath);
+                if (stagingRoot.empty()) continue;
+                if (stagingRoot != lastRoot) {
+                    lastRoot = stagingRoot;
+                    lastSessionDir = EnsureUndoSessionDir(stagingRoot);
+                }
+                if (lastSessionDir.empty()) continue;   // no undo copies on this drive; the delete goes ahead anyway
+
+                uint64_t id = s_undoCounter.fetch_add(1);
+                std::wstring baseName = PathUtils::GetFileName(origPath);
+                std::wstring backupPath = lastSessionDir + L"\\undo_" + std::to_wstring(id) + L"_" + baseName;
+                if (CreateHardLinkW(backupPath.c_str(), origPath.c_str(), nullptr)) {
+                    batch.originalToTrashPaths.push_back({ origPath, backupPath });
                 }
             }
         }
@@ -681,29 +1384,14 @@ void FileEngine::EnqueueDelete(const std::vector<std::wstring>& paths, bool perm
         }
     }
 
-    {
-        // Hide the items from listings until the background thread has really removed them
-        std::lock_guard<std::mutex> stateLock(m_deleteStateMutex);
-        for (const auto& p : paths) m_pendingDeleteKeys.insert(PathUtils::NormalizePathKey(p));
-        ++m_activeDeleteBatches;
-    }
-    {
-        std::lock_guard<std::mutex> lock(m_deleteMutex);
-        m_deleteQueue.push_back(DeleteTask{ paths, permanent });
-    }
-    m_deleteCv.notify_one();
+    // Hide the items from listings until the delete job has really removed them
+    std::lock_guard<std::mutex> stateLock(m_deleteStateMutex);
+    for (const auto& p : paths) m_pendingDeleteKeys.insert(PathUtils::NormalizePathKey(p));
 }
 
-std::vector<DeleteFailure> FileEngine::TakeDeleteFailures() {
-    std::lock_guard<std::mutex> lock(m_deleteStateMutex);
-    std::vector<DeleteFailure> out;
-    out.swap(m_deleteFailures);
-    return out;
-}
-
-size_t FileEngine::PendingDeleteBatches() const {
-    std::lock_guard<std::mutex> lock(m_deleteStateMutex);
-    return m_activeDeleteBatches;
+void FileEngine::EndDelete(const std::vector<std::wstring>& paths) {
+    std::lock_guard<std::mutex> stateLock(m_deleteStateMutex);
+    for (const auto& p : paths) m_pendingDeleteKeys.erase(PathUtils::NormalizePathKey(p));
 }
 
 void FileEngine::AddPendingHiddenPath(const std::wstring& path) {
@@ -725,11 +1413,50 @@ bool FileEngine::UndoLastDelete(std::wstring& outRestoredDir) {
         m_undoStack.pop_back();
     }
 
+    // Two names of one and the same file on disk (hard links)?
+    auto isSameFile = [](const std::wstring& a, const std::wstring& b) {
+        BY_HANDLE_FILE_INFORMATION ia = {}, ib = {};
+        bool same = false;
+        HANDLE ha = CreateFileW(a.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        HANDLE hb = CreateFileW(b.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (ha != INVALID_HANDLE_VALUE && hb != INVALID_HANDLE_VALUE &&
+            GetFileInformationByHandle(ha, &ia) && GetFileInformationByHandle(hb, &ib)) {
+            same = ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+                   ia.nFileIndexHigh == ib.nFileIndexHigh && ia.nFileIndexLow == ib.nFileIndexLow;
+        }
+        if (ha != INVALID_HANDLE_VALUE) CloseHandle(ha);
+        if (hb != INVALID_HANDLE_VALUE) CloseHandle(hb);
+        return same;
+    };
+
     bool anyRestored = false;
     for (const auto& pair : batch.originalToTrashPaths) {
         const std::wstring& origPath = pair.first;
         const std::wstring& backupPath = pair.second;
-        if (MoveFileExW(backupPath.c_str(), origPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+
+        // Something may be in the old place by now. It is never replaced. If it is the very file that was to
+        // be deleted (the delete did not go through), only the spare name is dropped; if it is a different
+        // file, the deleted one comes back next to it as "name (restored).ext".
+        bool restored = MoveFileExW(backupPath.c_str(), origPath.c_str(), MOVEFILE_COPY_ALLOWED) != FALSE;
+        if (!restored) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS) {
+                if (isSameFile(backupPath, origPath)) {
+                    restored = DeleteFileW(backupPath.c_str()) != FALSE;
+                } else {
+                    const size_t slash = origPath.find_last_of(L'\\');
+                    size_t dot = origPath.find_last_of(L'.');
+                    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot <= slash + 1)) dot = origPath.size();
+                    for (int n = 1; n < 100 && !restored; ++n) {
+                        const std::wstring tag = (n == 1) ? std::wstring(L" (restored)") : (L" (restored " + std::to_wstring(n) + L")");
+                        const std::wstring target = origPath.substr(0, dot) + tag + origPath.substr(dot);
+                        restored = MoveFileExW(backupPath.c_str(), target.c_str(), MOVEFILE_COPY_ALLOWED) != FALSE;
+                        if (!restored && GetLastError() != ERROR_ALREADY_EXISTS && GetLastError() != ERROR_FILE_EXISTS) break;
+                    }
+                }
+            }
+        }
+        if (restored) {
             anyRestored = true;
             if (outRestoredDir.empty()) {
                 outRestoredDir = PathUtils::GetParentPath(origPath);
@@ -739,18 +1466,23 @@ bool FileEngine::UndoLastDelete(std::wstring& outRestoredDir) {
     return anyRestored;
 }
 
+// Normal exit: this session's undo copies go, together with its folder in every staging folder it used
 void FileEngine::CleanupAllUndoStaging() {
-    std::lock_guard<std::mutex> lock(m_undoMutex);
-    for (const auto& batch : m_undoStack) {
-        for (const auto& pair : batch.originalToTrashPaths) {
-            DeletePathPermanently(pair.second);
+    std::unordered_map<std::wstring, UndoSession> sessions;
+    {
+        std::lock_guard<std::mutex> lock(m_undoMutex);
+        m_undoStack.clear();
+        sessions.swap(m_undoSessions);
+    }
+    for (auto& entry : sessions) {
+        UndoSession& session = entry.second;
+        if (session.lock != INVALID_HANDLE_VALUE) {
+            CloseHandle(session.lock);   // the lock file goes with its handle
+            session.lock = INVALID_HANDLE_VALUE;
         }
+        DeletePathPermanently(session.dir);
+        RemoveDirectoryW(entry.first.c_str());   // succeeds only when no other session keeps copies there
     }
-    m_undoStack.clear();
-    for (const auto& dir : m_stagingDirsCreated) {
-        RemoveDirectoryW(dir.c_str());
-    }
-    m_stagingDirsCreated.clear();
 }
 
 namespace {
@@ -770,144 +1502,15 @@ bool IsTransientDeleteError(DWORD e) {
 
 } // namespace
 
+// Small synchronous deletes (undo staging, a source after an FTP upload) go through the same delete engine
+// as the queued jobs, so there is exactly one implementation of "remove this from disk".
 bool FileEngine::DeletePathPermanently(const std::wstring& path, std::vector<DeleteFailure>* failures) {
-    const std::wstring ext = ToExtendedPath(path);
-    auto fail = [&](DWORD err) {
-        if (failures) failures->push_back({ path, err });
-        return false;
-    };
-
-    DWORD attrs = GetFileAttributesW(ext.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
-        DWORD e = GetLastError();
-        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return true;   // already gone
-        return fail(e);
+    std::vector<TransferFileError> errors;
+    const bool ok = TransferManager::DeleteTreeNow(path, failures ? &errors : nullptr);
+    if (failures) {
+        for (const auto& e : errors) failures->push_back({ e.srcPath, e.win32Error });
     }
-
-    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
-        bool childrenOk = true;
-        // Never descend into junctions / symlinked folders: remove the link itself, not the target's contents
-        if (!(attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
-            std::wstring pattern = PathUtils::EnsureTrailingSlash(ext) + L"*";
-            WIN32_FIND_DATAW ffd;
-            HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &ffd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    if (ffd.cFileName[0] == L'.' &&
-                        (ffd.cFileName[1] == L'\0' || (ffd.cFileName[1] == L'.' && ffd.cFileName[2] == L'\0'))) {
-                        continue;
-                    }
-                    std::wstring child = PathUtils::EnsureTrailingSlash(path) + ffd.cFileName;
-                    if (!DeletePathPermanently(child, failures)) childrenOk = false;
-                } while (FindNextFileW(hFind, &ffd));
-                FindClose(hFind);
-            } else {
-                DWORD e = GetLastError();
-                if (e != ERROR_FILE_NOT_FOUND) return fail(e);   // cannot even list it (permissions)
-            }
-        }
-        if (!childrenOk) return false;   // the failing children were already reported; the folder cannot be removed
-
-        if (attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
-            SetFileAttributesW(ext.c_str(), FILE_ATTRIBUTE_NORMAL);
-        }
-        DWORD err = 0;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            if (RemoveDirectoryW(ext.c_str())) return true;
-            err = GetLastError();
-            if (attempt < 2 && IsTransientDeleteError(err)) Sleep(120); else break;   // AV / indexer may hold it briefly
-        }
-        return fail(err);
-    }
-
-    DWORD err = 0;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        HANDLE hFile = CreateFileW(
-            ext.c_str(),
-            DELETE | FILE_WRITE_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT,
-            nullptr);
-
-        if (hFile != INVALID_HANDLE_VALUE) {
-            MY_FILE_DISPOSITION_INFO_EX dispEx = {};
-            dispEx.Flags = FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
-            BOOL ok = SetFileInformationByHandle(hFile, static_cast<FILE_INFO_BY_HANDLE_CLASS>(21), &dispEx, sizeof(dispEx));
-            if (!ok) {
-                FILE_DISPOSITION_INFO disp = { TRUE };
-                ok = SetFileInformationByHandle(hFile, FileDispositionInfo, &disp, sizeof(disp));
-            }
-            DWORD setErr = ok ? 0 : GetLastError();
-            CloseHandle(hFile);
-            if (ok) return true;
-            err = setErr;
-        } else {
-            err = GetLastError();
-        }
-
-        if (attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)) {
-            SetFileAttributesW(ext.c_str(), FILE_ATTRIBUTE_NORMAL);
-        }
-        if (DeleteFileW(ext.c_str())) return true;
-        err = GetLastError();
-        if (attempt < 2 && IsTransientDeleteError(err)) Sleep(120); else break;
-    }
-    return fail(err);
-}
-
-void FileEngine::DeleteWorkerLoop() {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-
-    while (m_running) {
-        DeleteTask task;
-        {
-            std::unique_lock<std::mutex> lock(m_deleteMutex);
-            m_deleteCv.wait(lock, [this]() { return !m_running || !m_deleteQueue.empty(); });
-            if (!m_running && m_deleteQueue.empty()) break;
-            task = std::move(m_deleteQueue.front());
-            m_deleteQueue.pop_front();
-        }
-
-        std::vector<DeleteFailure> failures;
-        if (task.permanent) {
-            for (const auto& p : task.paths) {
-                DeletePathPermanently(p, &failures);
-            }
-        } else {
-            std::vector<wchar_t> buf;
-            for (const auto& p : task.paths) {
-                buf.insert(buf.end(), p.begin(), p.end());
-                buf.push_back(L'\0');
-            }
-            buf.push_back(L'\0');
-
-            SHFILEOPSTRUCTW fileOp = {};
-            fileOp.wFunc = FO_DELETE;
-            fileOp.pFrom = buf.data();
-            fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
-            SHFileOperationW(&fileOp);
-
-            // The shell API reports its own legacy codes; verify by checking what is still there
-            for (const auto& p : task.paths) {
-                if (GetFileAttributesW(ToExtendedPath(p).c_str()) != INVALID_FILE_ATTRIBUTES) failures.push_back({ p, 0 });
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> stateLock(m_deleteStateMutex);
-            for (const auto& p : task.paths) m_pendingDeleteKeys.erase(PathUtils::NormalizePathKey(p));
-            if (m_activeDeleteBatches > 0) --m_activeDeleteBatches;
-            for (auto& f : failures) m_deleteFailures.push_back(std::move(f));
-        }
-
-        if (m_notifyHwnd) {
-            PostMessageW(m_notifyHwnd, WM_APP_DELETE_DONE, task.permanent ? 1 : 0, 0);
-        }
-    }
-
-    CoUninitialize();
+    return ok;
 }
 
 bool FileEngine::CopyFilesToClipboard(HWND hwnd, const std::vector<std::wstring>& paths, bool isCut) {
@@ -963,36 +1566,58 @@ bool FileEngine::CopyFilesToClipboard(HWND hwnd, const std::vector<std::wstring>
     return true;
 }
 
-bool FileEngine::PasteFilesFromClipboard(HWND hwnd, const std::wstring& targetDir, bool& outWasCut) {
-    outWasCut = false;
-    if (targetDir.empty() || targetDir == L"THIS_PC") return false;
+bool FileEngine::ReadFilesFromClipboard(HWND hwnd, std::vector<std::wstring>& outPaths, bool& outIsMove) {
+    outPaths.clear();
+    outIsMove = false;
     if (!OpenClipboard(hwnd)) return false;
 
-    bool isMove = false;
     UINT cfDropEffect = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
     HANDLE hEffect = GetClipboardData(cfDropEffect);
     if (hEffect) {
         DWORD* pEffect = static_cast<DWORD*>(GlobalLock(hEffect));
         if (pEffect) {
-            isMove = (*pEffect & DROPEFFECT_MOVE) != 0;
+            outIsMove = ((*pEffect & DROPEFFECT_MOVE) != 0) && ((*pEffect & DROPEFFECT_COPY) == 0);
             GlobalUnlock(hEffect);
         }
     }
 
     HDROP hDrop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
-    std::vector<std::wstring> srcPaths;
     if (hDrop) {
         UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+        outPaths.reserve(count);
         for (UINT i = 0; i < count; ++i) {
             UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
             std::wstring path(len, L'\0');
             DragQueryFileW(hDrop, i, path.data(), len + 1);
-            srcPaths.push_back(std::move(path));
+            if (!path.empty()) outPaths.push_back(std::move(path));
         }
     }
     CloseClipboard();
+    return !outPaths.empty();
+}
 
-    if (srcPaths.empty()) return false;
+bool FileEngine::PasteFilesFromClipboard(HWND hwnd, const std::wstring& targetDir, bool& outWasCut) {
+    outWasCut = false;
+    if (targetDir.empty() || targetDir == L"THIS_PC") return false;
+
+    bool isMove = false;
+    std::vector<std::wstring> srcPaths;
+    if (!ReadFilesFromClipboard(hwnd, srcPaths, isMove)) return false;
+
+    if (FtpClient::IsFtpPath(targetDir)) {
+        bool allOk = true;
+        for (const auto& p : srcPaths) {
+            if (!FtpClient::IsFtpPath(p)) {
+                if (FtpClient::UploadLocalTreeToFtp(p, targetDir, nullptr)) {
+                    if (isMove) DeletePathPermanently(p, nullptr);
+                } else {
+                    allOk = false;
+                }
+            }
+        }
+        outWasCut = isMove;
+        return allOk;
+    }
 
     std::vector<wchar_t> fromBuf;
     for (const auto& p : srcPaths) {
@@ -1252,6 +1877,11 @@ bool MergeDirectoriesRecursive(const std::wstring& srcDir, const std::wstring& d
 bool FileEngine::RenameFileOrFolder(const std::wstring& oldPath, const std::wstring& newName, std::wstring& outNewPath, DWORD* outError) {
     if (outError) *outError = 0;
     if (newName.empty()) { if (outError) *outError = ERROR_INVALID_NAME; return false; }
+    if (FtpClient::IsFtpPath(oldPath)) {
+        bool ok = FtpClient::RenameFtpItem(oldPath, newName, outNewPath, nullptr);
+        if (!ok && outError) *outError = ERROR_ACCESS_DENIED;
+        return ok;
+    }
     std::wstring parent = PathUtils::GetParentPath(oldPath);
     if (parent.empty()) { if (outError) *outError = ERROR_BAD_PATHNAME; return false; }
 
@@ -1366,6 +1996,72 @@ void FileEngine::SyncDirectorySizes(std::vector<FileEntry>& entries) {
             item.sizeStr = L"...";
         }
     }
+}
+
+void FileEngine::SyncTreeNodeSizes(std::vector<TreeNode>& treeNodes) {
+    // 1. Update network drive capacities if background probe completed
+    {
+        std::lock_guard<std::mutex> lk(m_net->mutex);
+        for (auto& node : treeNodes) {
+            if (!node.isDrive || !node.isNetworkDrive || node.path.empty()) continue;
+            wchar_t dl = static_cast<wchar_t>(towupper(node.path[0]));
+            auto it = m_net->drives.find(dl);
+            if (it != m_net->drives.end() && it->second.probed) {
+                node.isOffline = !it->second.online;
+                if (it->second.online && it->second.totalBytes > 0) {
+                    node.totalBytes = it->second.totalBytes;
+                    node.freeBytes = it->second.freeBytes;
+                    node.size = (node.totalBytes >= node.freeBytes) ? (node.totalBytes - node.freeBytes) : 0;
+                    wchar_t buf[64] = {};
+                    if (node.totalBytes >= (1ULL << 40)) {
+                        double uTb = static_cast<double>(node.size) / static_cast<double>(1ULL << 40);
+                        double tTb = static_cast<double>(node.totalBytes) / static_cast<double>(1ULL << 40);
+                        swprintf_s(buf, L"%.1f / %.1f TB", uTb, tTb);
+                    } else {
+                        uint64_t uGb = (node.size + (1ULL << 29)) >> 30;
+                        uint64_t tGb = (node.totalBytes + (1ULL << 29)) >> 30;
+                        swprintf_s(buf, L"%llu / %llu GB", static_cast<unsigned long long>(uGb), static_cast<unsigned long long>(tGb));
+                    }
+                    node.sizeStr = buf;
+                }
+            }
+        }
+    }
+
+    // 2. Sync folder sizes from m_folderSizeCache onto folder tree nodes
+    std::lock_guard<std::mutex> lock(m_sizeMutex);
+    for (auto& node : treeNodes) {
+        if (node.isHeader || node.isDrive || node.isFtpNode || node.normKey.empty()) continue;
+        auto it = m_folderSizeCache.find(node.normKey);
+        if (it != m_folderSizeCache.end()) {
+            node.size = it->second;
+            node.sizeStr = FormatSizeDetailed(it->second);
+        } else if (m_folderSizeInFlight.find(node.normKey) != m_folderSizeInFlight.end()) {
+            node.sizeStr = L"...";
+        }
+    }
+}
+
+void FileEngine::RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, bool forceRefresh) {
+    uint64_t gen = m_sizeGeneration.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(m_sizeMutex);
+        for (const auto& node : treeNodes) {
+            if (node.isHeader || node.isDrive || node.isFtpNode || node.isOffline || node.normKey.empty() || node.path.empty()) continue;
+            // Skip massive cloud sync roots (Dropbox / OneDrive at indent 0) during automatic background tree sizing
+            // so the 4 folder-size worker threads remain immediately available for active directory browsing!
+            if (!forceRefresh && node.indent == 0 && !node.isQuickAccess) continue;
+            if (!forceRefresh && m_folderSizeCache.find(node.normKey) != m_folderSizeCache.end()) {
+                continue;
+            }
+            if (m_folderSizeInFlight.find(node.normKey) != m_folderSizeInFlight.end()) {
+                continue;
+            }
+            m_folderSizeInFlight[node.normKey] = true;
+            m_sizeQueue.push_back(FolderSizeTask{ node.path, node.normKey, gen });
+        }
+    }
+    m_sizeCv.notify_all();
 }
 
 bool FileEngine::GetFolderTreemapChildren(const std::wstring& normKey, std::vector<TreemapChildNode>& outChildren) const {
@@ -1664,31 +2360,109 @@ bool FileContentContainsText(const std::wstring& filePath, const std::wstring& n
                                nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
-    // Convert needleLower to narrow UTF-8/ASCII lowercase for ultra-fast scan
-    std::string asciiNeedle;
-    asciiNeedle.reserve(needleLower.size());
-    for (wchar_t wc : needleLower) {
-        asciiNeedle.push_back(static_cast<char>(towlower(wc) & 0xFF));
+    // Convert needleLower to UTF-8 using WideCharToMultiByte so Polish/Unicode characters work properly
+    std::string utf8Needle;
+    int u8Len = WideCharToMultiByte(CP_UTF8, 0, needleLower.c_str(), static_cast<int>(needleLower.size()), nullptr, 0, nullptr, nullptr);
+    if (u8Len > 0) {
+        utf8Needle.resize(static_cast<size_t>(u8Len));
+        WideCharToMultiByte(CP_UTF8, 0, needleLower.c_str(), static_cast<int>(needleLower.size()), utf8Needle.data(), u8Len, nullptr, nullptr);
+        for (char& c : utf8Needle) {
+            if (c >= 'A' && c <= 'Z') c += ('a' - 'A');
+        }
     }
 
-    char buf[32768];
+    // Fast path for PNG AI Prompt / Metadata chunks (tEXt / iTXt)
+    std::wstring ext = PathUtils::GetExtension(filePath);
+    if (ext == L".png") {
+        uint8_t sig[8] = {};
+        DWORD got = 0;
+        if (ReadFile(hFile, sig, 8, &got, nullptr) && got == 8 &&
+            sig[0] == 0x89 && sig[1] == 'P' && sig[2] == 'N' && sig[3] == 'G')
+        {
+            bool foundInPng = false;
+            for (int cIdx = 0; cIdx < 64; ++cIdx) {
+                uint8_t hdr[8] = {};
+                if (!ReadFile(hFile, hdr, 8, &got, nullptr) || got != 8) break;
+                uint32_t len = (static_cast<uint32_t>(hdr[0]) << 24) |
+                               (static_cast<uint32_t>(hdr[1]) << 16) |
+                               (static_cast<uint32_t>(hdr[2]) << 8) |
+                               static_cast<uint32_t>(hdr[3]);
+                char type[5] = { static_cast<char>(hdr[4]), static_cast<char>(hdr[5]), static_cast<char>(hdr[6]), static_cast<char>(hdr[7]), '\0' };
+                if (std::strcmp(type, "IEND") == 0) break;
+                if ((std::strcmp(type, "tEXt") == 0 || std::strcmp(type, "iTXt") == 0) && len > 0 && len <= 1048576) {
+                    std::vector<char> cbuf(len);
+                    if (!ReadFile(hFile, cbuf.data(), len, &got, nullptr) || got != len) break;
+                    for (char& ch : cbuf) {
+                        if (ch >= 'A' && ch <= 'Z') ch += ('a' - 'A');
+                    }
+                    if (!utf8Needle.empty() && cbuf.size() >= utf8Needle.size()) {
+                        if (std::search(cbuf.begin(), cbuf.end(), utf8Needle.begin(), utf8Needle.end()) != cbuf.end()) {
+                            foundInPng = true;
+                            break;
+                        }
+                    }
+                    LARGE_INTEGER skipCrc = {};
+                    skipCrc.QuadPart = 4;
+                    SetFilePointerEx(hFile, skipCrc, nullptr, FILE_CURRENT);
+                } else {
+                    LARGE_INTEGER skip = {};
+                    skip.QuadPart = static_cast<LONGLONG>(len) + 4;
+                    if (!SetFilePointerEx(hFile, skip, nullptr, FILE_CURRENT)) break;
+                }
+            }
+            CloseHandle(hFile);
+            return foundInPng;
+        }
+        LARGE_INTEGER zero = {};
+        SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN);
+    }
+
+    constexpr size_t kChunkSize = 32768;
+    size_t maxOverlap = std::max(utf8Needle.size(), needleLower.size() * sizeof(wchar_t));
+    if (maxOverlap > 512) maxOverlap = 512;
+
+    std::vector<char> windowBuf;
+    windowBuf.reserve(kChunkSize + maxOverlap);
+    char readBuf[kChunkSize];
     DWORD bytesRead = 0;
     DWORD totalRead = 0;
     constexpr DWORD kMaxScanBytes = 4 * 1024 * 1024; // Up to 4 MB per text file
     bool found = false;
 
-    while (totalRead < kMaxScanBytes && ReadFile(hFile, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
+    while (totalRead < kMaxScanBytes && ReadFile(hFile, readBuf, sizeof(readBuf), &bytesRead, nullptr) && bytesRead > 0) {
         totalRead += bytesRead;
-        for (DWORD i = 0; i < bytesRead; ++i) {
-            char c = buf[i];
-            if (c >= 'A' && c <= 'Z') buf[i] = c + ('a' - 'A');
-        }
-        if (bytesRead >= asciiNeedle.size()) {
-            auto it = std::search(buf, buf + bytesRead, asciiNeedle.begin(), asciiNeedle.end());
-            if (it != buf + bytesRead) {
+        windowBuf.insert(windowBuf.end(), readBuf, readBuf + bytesRead);
+
+        // 1. Check UTF-8 / ASCII match
+        if (!utf8Needle.empty() && windowBuf.size() >= utf8Needle.size()) {
+            auto it = std::search(windowBuf.begin(), windowBuf.end(), utf8Needle.begin(), utf8Needle.end(),
+                [](char a, char b) {
+                    if (a >= 'A' && a <= 'Z') a += ('a' - 'A');
+                    return a == b;
+                });
+            if (it != windowBuf.end()) {
                 found = true;
                 break;
             }
+        }
+
+        // 2. Check UTF-16LE match
+        size_t wCount = windowBuf.size() / sizeof(wchar_t);
+        if (wCount >= needleLower.size()) {
+            const wchar_t* wPtr = reinterpret_cast<const wchar_t*>(windowBuf.data());
+            auto wit = std::search(wPtr, wPtr + wCount, needleLower.begin(), needleLower.end(),
+                [](wchar_t a, wchar_t b) {
+                    return static_cast<wchar_t>(towlower(a)) == b;
+                });
+            if (wit != wPtr + wCount) {
+                found = true;
+                break;
+            }
+        }
+
+        // Keep overlap tail for next chunk boundary
+        if (windowBuf.size() > maxOverlap) {
+            windowBuf.erase(windowBuf.begin(), windowBuf.end() - static_cast<ptrdiff_t>(maxOverlap));
         }
     }
     CloseHandle(hFile);
@@ -1736,9 +2510,12 @@ bool FileEngine::IsSearchRunning() const {
 
 void FileEngine::SyncSearchResults(std::vector<FileEntry>& outResults, SearchProgressInfo& outProgress) {
     m_searchNotifyPending.store(false, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(m_searchMutex);
-    outResults = m_searchAccumResults;
-    outProgress = m_searchProgress;
+    {
+        std::lock_guard<std::mutex> lock(m_searchMutex);
+        outResults = m_searchAccumResults;
+        outProgress = m_searchProgress;
+    }
+    RefreshIconIndices(outResults);     // results found before their type's icon was known
 }
 
 void FileEngine::SearchWorkerLoop() {

@@ -115,8 +115,8 @@ bool BackupManager::LoadJobs(const std::wstring& iniPathIn) {
         BackupJob j1;
         j1.id = 1;
         j1.name = L"Kopia robocza projektu (przyrostowa)";
-        j1.sourcePath = L"W:\\GIT\\Explorer2\\src";
-        j1.targetPath = L"D:\\Backups\\Explorer2_src";
+        j1.sourcePath = L"C:\\Projects\\MyProject";
+        j1.targetPath = L"D:\\Backups\\MyProject";
         j1.scheduleMinutes = 60;
         j1.whenTargetAvailable = true;
         j1.useRclone = false;

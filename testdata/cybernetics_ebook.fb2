@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+  <description>
+    <title-info>
+      <genre>sci_fi</genre>
+      <author><first-name>Jan</first-name><last-name>Przykladowy</last-name></author>
+      <book-title>Architektura Systemow Cybernetycznych</book-title>
+      <lang>pl</lang>
+    </title-info>
+  </description>
+  <body>
+    <section>
+      <title><p>Rozdzial I: Wprowadzenie do Telemetrii</p></title>
+      <p>Systemy czasu rzeczywistego wymagaja deterministycznego odczytu strumieni danych wejsciowych.</p>
+      <p>Kazdy wezel sieciowy raportuje stan buforow oraz opoznienia transmisji pakietow.</p>
+    </section>
+  </body>
+</FictionBook>
