@@ -4,9 +4,15 @@
 #include "ZipDeflate.h"
 #include <wincodec.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
+#include <map>
+#include <string_view>
+#include <unordered_map>
 
 namespace Explorer2 {
 
@@ -16,6 +22,17 @@ constexpr uint32_t kMaxRasterDimension = 16384;
 
 inline uint16_t ReadU16LE(const uint8_t* p) {
     return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
+}
+
+inline uint32_t ReadU32LE(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+inline uint64_t ReadU64LE(const uint8_t* p) {
+    return static_cast<uint64_t>(ReadU32LE(p)) | (static_cast<uint64_t>(ReadU32LE(p + 4)) << 32);
 }
 
 inline uint16_t ReadU16BE(const uint8_t* p) {
@@ -96,6 +113,592 @@ void DownscaleIfRequested(uint32_t maxDimension, ExtendedImageInfo& info) {
     info.height = dstH;
     info.bgraPixels = std::move(scaled);
 }
+
+namespace GpuTex {
+
+inline float HalfToFloat(uint16_t h) {
+    uint32_t sign = (static_cast<uint32_t>(h >> 15) & 0x0001u);
+    uint32_t exp  = (static_cast<uint32_t>(h >> 10) & 0x001Fu);
+    uint32_t mant = static_cast<uint32_t>(h & 0x03FFu);
+    uint32_t f = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign << 31;
+        } else {
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                --exp;
+            }
+            ++exp;
+            mant &= ~0x0400u;
+            f = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = (sign << 31) | 0x7F800000u | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float out = 0.0f;
+    std::memcpy(&out, &f, 4);
+    return out;
+}
+
+inline float ReadF32LE(const uint8_t* p) {
+    uint32_t u = ReadU32LE(p);
+    float f = 0.0f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+inline void ConvertFloatRgbaToBgra(
+    const float* rgba,
+    uint32_t w,
+    uint32_t h,
+    bool forceHdrToneMap,
+    std::vector<uint8_t>& outBgra)
+{
+    size_t count = static_cast<size_t>(w) * h;
+    outBgra.resize(count * 4);
+    bool isHdr = forceHdrToneMap;
+    if (!isHdr) {
+        for (size_t i = 0; i < count; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                float v = rgba[i * 4 + c];
+                if (std::isfinite(v) && v > 1.02f) {
+                    isHdr = true;
+                    break;
+                }
+            }
+            if (isHdr) break;
+        }
+    }
+
+    auto mapCh = [isHdr](float v) -> uint8_t {
+        if (!std::isfinite(v)) return (v > 0.0f) ? 255 : 0;
+        if (v <= 0.0f) return 0;
+        if (isHdr) {
+            float mapped = v / (1.0f + v);
+            return static_cast<uint8_t>(std::clamp(std::pow(mapped, 1.0f / 2.2f) * 255.0f + 0.5f, 0.0f, 255.0f));
+        }
+        return static_cast<uint8_t>(std::clamp(v * 255.0f + 0.5f, 0.0f, 255.0f));
+    };
+
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t r = mapCh(rgba[i * 4 + 0]);
+        uint8_t g = mapCh(rgba[i * 4 + 1]);
+        uint8_t b = mapCh(rgba[i * 4 + 2]);
+        float af = rgba[i * 4 + 3];
+        uint8_t a = (!std::isfinite(af)) ? 255 : static_cast<uint8_t>(std::clamp(af * 255.0f + 0.5f, 0.0f, 255.0f));
+        WritePremulBGRA(&outBgra[i * 4], r, g, b, a);
+    }
+}
+
+inline void UnpackRgb565(uint16_t c, uint8_t& r, uint8_t& g, uint8_t& b) {
+    r = static_cast<uint8_t>(((c >> 11) & 31u) * 255u / 31u);
+    g = static_cast<uint8_t>(((c >> 5)  & 63u) * 255u / 63u);
+    b = static_cast<uint8_t>((c         & 31u) * 255u / 31u);
+}
+
+// Decodes an 8-byte BC1 / DXT1 block into 16 RGBA8 pixels (row-major 4x4).
+// If allowDegenerate3Color is true (standard BC1/DXT1), c0 <= c1 uses 3-color + transparent/black mode;
+// if opaqueAlpha is true (RGB DXT1), alpha is forced to 255 even in c0 <= c1 mode.
+inline void DecodeBC1Block(const uint8_t* block, uint8_t outRgba[64], bool allowDegenerate3Color = true, bool opaqueAlpha = false) {
+    uint16_t c0 = ReadU16LE(block);
+    uint16_t c1 = ReadU16LE(block + 2);
+    uint32_t bits = ReadU32LE(block + 4);
+
+    uint8_t r[4], g[4], b[4], a[4] = { 255, 255, 255, 255 };
+    UnpackRgb565(c0, r[0], g[0], b[0]);
+    UnpackRgb565(c1, r[1], g[1], b[1]);
+    if (c0 > c1 || !allowDegenerate3Color) {
+        r[2] = static_cast<uint8_t>((2u * r[0] + r[1] + 1u) / 3u);
+        g[2] = static_cast<uint8_t>((2u * g[0] + g[1] + 1u) / 3u);
+        b[2] = static_cast<uint8_t>((2u * b[0] + b[1] + 1u) / 3u);
+        r[3] = static_cast<uint8_t>((r[0] + 2u * r[1] + 1u) / 3u);
+        g[3] = static_cast<uint8_t>((g[0] + 2u * g[1] + 1u) / 3u);
+        b[3] = static_cast<uint8_t>((b[0] + 2u * b[1] + 1u) / 3u);
+    } else {
+        r[2] = static_cast<uint8_t>((static_cast<uint32_t>(r[0]) + r[1]) / 2u);
+        g[2] = static_cast<uint8_t>((static_cast<uint32_t>(g[0]) + g[1]) / 2u);
+        b[2] = static_cast<uint8_t>((static_cast<uint32_t>(b[0]) + b[1]) / 2u);
+        r[3] = g[3] = b[3] = 0;
+        a[3] = opaqueAlpha ? 255 : 0;
+    }
+
+    for (int i = 0; i < 16; ++i) {
+        uint32_t code = (bits >> (2 * i)) & 3u;
+        outRgba[i * 4 + 0] = r[code];
+        outRgba[i * 4 + 1] = g[code];
+        outRgba[i * 4 + 2] = b[code];
+        outRgba[i * 4 + 3] = a[code];
+    }
+}
+
+// Decodes an 8-byte BC4 (RGTC1) single-channel block into 16 8-bit values.
+inline void DecodeBC4ChannelBlock(const uint8_t* block, uint8_t outCh[16], bool isSNorm = false) {
+    uint8_t lut[8] = {};
+    if (!isSNorm) {
+        uint8_t e0 = block[0];
+        uint8_t e1 = block[1];
+        lut[0] = e0;
+        lut[1] = e1;
+        if (e0 > e1) {
+            for (int i = 1; i <= 6; ++i) {
+                lut[i + 1] = static_cast<uint8_t>(((7 - i) * e0 + i * e1 + 3) / 7);
+            }
+        } else {
+            for (int i = 1; i <= 4; ++i) {
+                lut[i + 1] = static_cast<uint8_t>(((5 - i) * e0 + i * e1 + 2) / 5);
+            }
+            lut[6] = 0;
+            lut[7] = 255;
+        }
+    } else {
+        int e0 = static_cast<int8_t>(block[0]);
+        int e1 = static_cast<int8_t>(block[1]);
+        auto toU8 = [](int s) -> uint8_t {
+            int clamped = std::clamp(s, -127, 127);
+            return static_cast<uint8_t>(((clamped + 127) * 255 + 127) / 254);
+        };
+        lut[0] = toU8(e0);
+        lut[1] = toU8(e1);
+        if (e0 > e1) {
+            for (int i = 1; i <= 6; ++i) {
+                lut[i + 1] = toU8(((7 - i) * e0 + i * e1) / 7);
+            }
+        } else {
+            for (int i = 1; i <= 4; ++i) {
+                lut[i + 1] = toU8(((5 - i) * e0 + i * e1) / 5);
+            }
+            lut[6] = 0;
+            lut[7] = 255;
+        }
+    }
+
+    uint64_t idxBits = 0;
+    for (int i = 0; i < 6; ++i) {
+        idxBits |= (static_cast<uint64_t>(block[2 + i]) << (8 * i));
+    }
+    for (int i = 0; i < 16; ++i) {
+        outCh[i] = lut[(idxBits >> (3 * i)) & 7u];
+    }
+}
+
+inline void DecodeBC2Block(const uint8_t* block, uint8_t outRgba[64]) {
+    DecodeBC1Block(block + 8, outRgba, false, false);
+    for (int i = 0; i < 8; ++i) {
+        uint8_t v = block[i];
+        outRgba[(i * 2 + 0) * 4 + 3] = static_cast<uint8_t>((v & 0x0Fu) * 17u);
+        outRgba[(i * 2 + 1) * 4 + 3] = static_cast<uint8_t>((v >> 4) * 17u);
+    }
+}
+
+inline void DecodeBC3Block(const uint8_t* block, uint8_t outRgba[64]) {
+    uint8_t alphas[16];
+    DecodeBC4ChannelBlock(block, alphas, false);
+    DecodeBC1Block(block + 8, outRgba, false, false);
+    for (int i = 0; i < 16; ++i) {
+        outRgba[i * 4 + 3] = alphas[i];
+    }
+}
+
+inline void DecodeBC4Block(const uint8_t* block, uint8_t outRgba[64], bool isSNorm = false) {
+    uint8_t ch[16];
+    DecodeBC4ChannelBlock(block, ch, isSNorm);
+    for (int i = 0; i < 16; ++i) {
+        outRgba[i * 4 + 0] = ch[i];
+        outRgba[i * 4 + 1] = ch[i];
+        outRgba[i * 4 + 2] = ch[i];
+        outRgba[i * 4 + 3] = 255;
+    }
+}
+
+inline void DecodeBC5Block(const uint8_t* block, uint8_t outRgba[64], bool isSNorm = false) {
+    uint8_t rCh[16], gCh[16];
+    DecodeBC4ChannelBlock(block, rCh, isSNorm);
+    DecodeBC4ChannelBlock(block + 8, gCh, isSNorm);
+    for (int i = 0; i < 16; ++i) {
+        float nx = (static_cast<float>(rCh[i]) / 255.0f) * 2.0f - 1.0f;
+        float ny = (static_cast<float>(gCh[i]) / 255.0f) * 2.0f - 1.0f;
+        float nz = std::sqrt(std::max(0.0f, 1.0f - nx * nx - ny * ny));
+        uint8_t b = static_cast<uint8_t>(std::clamp((nz * 0.5f + 0.5f) * 255.0f + 0.5f, 0.0f, 255.0f));
+        outRgba[i * 4 + 0] = rCh[i];
+        outRgba[i * 4 + 1] = gCh[i];
+        outRgba[i * 4 + 2] = b;
+        outRgba[i * 4 + 3] = 255;
+    }
+}
+
+// Khronos / Direct3D BC7 (BPTC UNORM) 16-byte block decoder supporting all 8 modes (0..7).
+inline void DecodeBC7Block(const uint8_t* block, uint8_t outRgba[64]) {
+    if (block[0] == 0) {
+        std::memset(outRgba, 0, 64);
+        return;
+    }
+    int mode = 0;
+    while (mode < 8 && ((block[0] >> mode) & 1) == 0) ++mode;
+    if (mode >= 8) {
+        std::memset(outRgba, 0, 64);
+        return;
+    }
+
+    struct ModeDesc {
+        uint8_t subsets;
+        uint8_t partBits;
+        uint8_t rotBits;
+        uint8_t idxModeBits;
+        uint8_t colorBits;
+        uint8_t alphaBits;
+        uint8_t epPbits;     // 1 = per-endpoint P-bit, 2 = per-subset shared P-bit
+        uint8_t idxBits0;
+        uint8_t idxBits1;
+    };
+    static const ModeDesc kModes[8] = {
+        { 3, 4, 0, 0, 4, 0, 1, 3, 0 }, // Mode 0
+        { 2, 6, 0, 0, 6, 0, 2, 3, 0 }, // Mode 1
+        { 3, 6, 0, 0, 5, 0, 0, 2, 0 }, // Mode 2
+        { 2, 6, 0, 0, 7, 0, 1, 2, 0 }, // Mode 3
+        { 1, 0, 2, 1, 5, 6, 0, 2, 3 }, // Mode 4
+        { 1, 0, 2, 0, 7, 8, 0, 2, 2 }, // Mode 5
+        { 1, 0, 0, 0, 7, 7, 1, 4, 0 }, // Mode 6
+        { 2, 6, 0, 0, 5, 5, 1, 2, 0 }  // Mode 7
+    };
+    static const uint16_t kPart2[64] = {
+        0xCCCC,0x8888,0xEEEE,0xECC8,0xC880,0xFEEC,0xFEC8,0xEC80,
+        0xC800,0xFFEC,0xFE80,0xE800,0xFFE8,0xFF00,0xFFF0,0xF000,
+        0xF710,0x008E,0x7100,0x08CE,0x008C,0x7310,0x3100,0x8CCE,
+        0x088C,0x3110,0x6666,0x366C,0x17E8,0x0FF0,0x718E,0x399C,
+        0xAAAA,0xF0F0,0x5A5A,0x33CC,0x3C3C,0x55AA,0x9696,0xA55A,
+        0x73CE,0x13C8,0x324C,0x3BDC,0x6996,0xC33C,0x9966,0x0660,
+        0x0272,0x04E4,0x4E40,0x2720,0xC936,0x936C,0x39C6,0x639C,
+        0x9336,0x9CC6,0x817E,0xE718,0xCCF0,0x0FCC,0x7744,0xEE22
+    };
+    static const uint8_t kAnc2[64] = {
+        15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15,
+        15, 2, 8, 2, 2, 8, 8,15,  2, 8, 2, 2, 8, 8, 2, 2,
+        15,15, 6, 8, 2, 8,15,15,  2, 8, 2, 2, 2,15,15, 6,
+         6, 2, 6, 8,15,15, 2, 2, 15,15,15,15,15, 2, 2,15
+    };
+    static const uint32_t kPart3[64] = {
+        0xAA685050,0x6A5A5040,0x5A5A4200,0x5450A0A8,0xA5A50000,0xA0A05050,0x5555A0A0,0x5A5A5050,
+        0xAA550000,0xAA555500,0xAAAA5500,0x90909090,0x94949494,0xA4A4A4A4,0xA9A59450,0x2A0A4250,
+        0xA5945040,0x0A425054,0xA5A5A500,0x55A0A0A0,0xA8A85454,0x6A6A4040,0xA4A45000,0x1A1A0500,
+        0x0050A4A4,0xAAA59090,0x14696914,0x69691400,0xA08585A0,0xAA821414,0x50A4A450,0x6A5A0200,
+        0xA9A58000,0x5090A0A8,0xA8A09050,0x24242424,0x00AA5500,0x24924924,0x24499224,0x50A50A50,
+        0x500AA550,0xAAAA4444,0x66660000,0xA5A0A5A0,0x50A050A0,0x69286928,0x44AAAA44,0x66666600,
+        0xAA444444,0x54A854A8,0x95809580,0x96969600,0xA85454A8,0x80959580,0xAA141414,0x96960000,
+        0xAAAA1414,0xA05050A0,0xA0A5A5A0,0x96000000,0x40804080,0xA9A8A9A8,0xAAAAAA44,0x2A4A5254
+    };
+    static const uint8_t kAnc3a[64] = {
+         3, 3,15,15, 8, 3,15,15,  8, 8, 6, 6, 6, 5, 3, 3,
+         3, 3, 8,15, 3, 3, 6,10,  5, 8, 8, 6, 8, 5,15,15,
+         8,15, 3, 5, 6,10, 8,15, 15, 3,15, 5,15,15,15,15,
+         3,15, 5, 5, 5, 8, 5,10,  5,10, 8,13,15,12, 3, 3
+    };
+    static const uint8_t kAnc3b[64] = {
+        15, 8, 8, 3,15,15, 3, 8, 15,15,15,15,15,15,15, 8,
+        15, 8,15, 3,15, 8,15, 8,  3,15, 6,10,15,15,10, 8,
+        15, 3,15,10,10, 8, 9,10,  6,15, 8,15, 3, 6, 6, 8,
+        15, 3,15,15,15,15,15,15, 15,15,15,15, 3,15,15, 8
+    };
+    static const uint8_t kW2[4]  = { 0, 21, 43, 64 };
+    static const uint8_t kW3[8]  = { 0, 9, 18, 27, 37, 46, 55, 64 };
+    static const uint8_t kW4[16] = { 0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64 };
+
+    uint64_t lo = ReadU64LE(block);
+    uint64_t hi = ReadU64LE(block + 8);
+    int bitPos = mode + 1;
+    auto rdBits = [&](int n) -> uint32_t {
+        if (n <= 0 || bitPos >= 128) return 0;
+        uint32_t out = 0;
+        for (int i = 0; i < n && bitPos < 128; ++i, ++bitPos) {
+            uint32_t bit = (bitPos < 64) ? static_cast<uint32_t>((lo >> bitPos) & 1u)
+                                         : static_cast<uint32_t>((hi >> (bitPos - 64)) & 1u);
+            out |= (bit << i);
+        }
+        return out;
+    };
+
+    const ModeDesc& md = kModes[mode];
+    uint32_t part = rdBits(md.partBits);
+    uint32_t rot  = rdBits(md.rotBits);
+    uint32_t idxMode = rdBits(md.idxModeBits);
+
+    int numEp = md.subsets * 2;
+    uint8_t ep[6][4] = {};
+    for (int c = 0; c < 3; ++c) {
+        for (int e = 0; e < numEp; ++e) ep[e][c] = static_cast<uint8_t>(rdBits(md.colorBits));
+    }
+    if (md.alphaBits > 0) {
+        for (int e = 0; e < numEp; ++e) ep[e][3] = static_cast<uint8_t>(rdBits(md.alphaBits));
+    }
+    uint8_t pbits[6] = {};
+    if (md.epPbits == 1) {
+        for (int e = 0; e < numEp; ++e) pbits[e] = static_cast<uint8_t>(rdBits(1));
+    } else if (md.epPbits == 2) {
+        for (int s = 0; s < md.subsets; ++s) {
+            uint8_t pb = static_cast<uint8_t>(rdBits(1));
+            pbits[s * 2 + 0] = pb;
+            pbits[s * 2 + 1] = pb;
+        }
+    }
+
+    int cPrec = md.colorBits + (md.epPbits ? 1 : 0);
+    int aPrec = md.alphaBits + ((md.alphaBits > 0 && md.epPbits) ? 1 : 0);
+    auto expandBits = [](uint32_t v, int prec) -> uint8_t {
+        v <<= (8 - prec);
+        return static_cast<uint8_t>(v | (v >> prec));
+    };
+    for (int e = 0; e < numEp; ++e) {
+        for (int c = 0; c < 3; ++c) {
+            uint32_t v = md.epPbits ? ((static_cast<uint32_t>(ep[e][c]) << 1) | pbits[e]) : ep[e][c];
+            ep[e][c] = expandBits(v, cPrec);
+        }
+        if (md.alphaBits > 0) {
+            uint32_t v = md.epPbits ? ((static_cast<uint32_t>(ep[e][3]) << 1) | pbits[e]) : ep[e][3];
+            ep[e][3] = expandBits(v, aPrec);
+        } else {
+            ep[e][3] = 255;
+        }
+    }
+
+    uint8_t subsetOf[16] = {};
+    int anc1 = -1, anc2 = -1;
+    if (md.subsets == 2) {
+        for (int i = 0; i < 16; ++i) subsetOf[i] = static_cast<uint8_t>((kPart2[part & 63] >> i) & 1u);
+        anc1 = kAnc2[part & 63];
+    } else if (md.subsets == 3) {
+        for (int i = 0; i < 16; ++i) subsetOf[i] = static_cast<uint8_t>((kPart3[part & 63] >> (2 * i)) & 3u);
+        anc1 = kAnc3a[part & 63];
+        anc2 = kAnc3b[part & 63];
+    }
+
+    uint8_t idx0[16] = {}, idx1[16] = {};
+    for (int i = 0; i < 16; ++i) {
+        bool isAnchor = (i == 0 || i == anc1 || i == anc2);
+        idx0[i] = static_cast<uint8_t>(rdBits(md.idxBits0 - (isAnchor ? 1 : 0)));
+    }
+    if (md.idxBits1 > 0) {
+        for (int i = 0; i < 16; ++i) {
+            idx1[i] = static_cast<uint8_t>(rdBits(md.idxBits1 - (i == 0 ? 1 : 0)));
+        }
+    }
+
+    auto weightOf = [&](uint8_t idx, uint8_t bits) -> uint8_t {
+        if (bits == 2) return kW2[idx & 3];
+        if (bits == 3) return kW3[idx & 7];
+        return kW4[idx & 15];
+    };
+
+    for (int i = 0; i < 16; ++i) {
+        int s = subsetOf[i];
+        const uint8_t* e0 = ep[s * 2 + 0];
+        const uint8_t* e1 = ep[s * 2 + 1];
+        uint8_t wc = 0, wa = 0;
+        if (md.idxBits1 == 0) {
+            wc = wa = weightOf(idx0[i], md.idxBits0);
+        } else if (idxMode == 0) {
+            wc = weightOf(idx0[i], md.idxBits0);
+            wa = weightOf(idx1[i], md.idxBits1);
+        } else {
+            wc = weightOf(idx1[i], md.idxBits1);
+            wa = weightOf(idx0[i], md.idxBits0);
+        }
+        uint8_t ch[4];
+        for (int c = 0; c < 3; ++c) {
+            ch[c] = static_cast<uint8_t>(((64 - wc) * e0[c] + wc * e1[c] + 32) >> 6);
+        }
+        ch[3] = static_cast<uint8_t>(((64 - wa) * e0[3] + wa * e1[3] + 32) >> 6);
+        if (rot == 1) std::swap(ch[3], ch[0]);
+        else if (rot == 2) std::swap(ch[3], ch[1]);
+        else if (rot == 3) std::swap(ch[3], ch[2]);
+        outRgba[i * 4 + 0] = ch[0];
+        outRgba[i * 4 + 1] = ch[1];
+        outRgba[i * 4 + 2] = ch[2];
+        outRgba[i * 4 + 3] = ch[3];
+    }
+}
+
+// Decodes an 8-byte ETC1 or ETC2 RGB8 block into 16 RGBA8 pixels (row-major 4x4).
+inline void DecodeETC2RgbBlock(const uint8_t* ptr, uint8_t outRgba[64], bool allowEtc2Modes) {
+    static const int kEtcMod[8][4] = {
+        { 2, 8, -2, -8 }, { 5, 17, -5, -17 }, { 9, 29, -9, -29 }, { 13, 42, -13, -42 },
+        { 18, 60, -18, -60 }, { 24, 80, -24, -80 }, { 33, 106, -33, -106 }, { 47, 183, -47, -183 }
+    };
+    static const int kEtc2Dist[8] = { 3, 6, 11, 16, 23, 32, 41, 64 };
+
+    bool diffBit = (ptr[3] & 2) != 0;
+    bool flipBit = (ptr[3] & 1) != 0;
+    uint16_t msb = ReadU16BE(ptr + 4);
+    uint16_t lsb = ReadU16BE(ptr + 6);
+
+    if (diffBit && allowEtc2Modes) {
+        auto s3 = [](int v) { return (v >= 4) ? (v - 8) : v; };
+        int sumR = ((ptr[0] >> 3) & 31) + s3(ptr[0] & 7);
+        int sumG = ((ptr[1] >> 3) & 31) + s3(ptr[1] & 7);
+        int sumB = ((ptr[2] >> 3) & 31) + s3(ptr[2] & 7);
+
+        if (sumR < 0 || sumR > 31) {
+            // ETC2 T-mode
+            int r1 = (((ptr[0] >> 1) & 0xC) | (ptr[0] & 0x3)) * 17;
+            int g1 = ((ptr[1] >> 4) & 0xF) * 17;
+            int b1 = (ptr[1] & 0xF) * 17;
+            int r2 = ((ptr[2] >> 4) & 0xF) * 17;
+            int g2 = (ptr[2] & 0xF) * 17;
+            int b2 = ((ptr[3] >> 4) & 0xF) * 17;
+            int d  = kEtc2Dist[((ptr[3] >> 1) & 0x6) | (ptr[3] & 0x1)];
+            int pr[4] = { r1, std::clamp(r2 + d, 0, 255), r2, std::clamp(r2 - d, 0, 255) };
+            int pg[4] = { g1, std::clamp(g2 + d, 0, 255), g2, std::clamp(g2 - d, 0, 255) };
+            int pb[4] = { b1, std::clamp(b2 + d, 0, 255), b2, std::clamp(b2 - d, 0, 255) };
+            for (int py = 0; py < 4; ++py) {
+                for (int px = 0; px < 4; ++px) {
+                    int bitIdx = px * 4 + py;
+                    int idx = (((msb >> bitIdx) & 1) << 1) | ((lsb >> bitIdx) & 1);
+                    int di = (py * 4 + px) * 4;
+                    outRgba[di + 0] = static_cast<uint8_t>(pr[idx]);
+                    outRgba[di + 1] = static_cast<uint8_t>(pg[idx]);
+                    outRgba[di + 2] = static_cast<uint8_t>(pb[idx]);
+                    outRgba[di + 3] = 255;
+                }
+            }
+            return;
+        }
+        if (sumG < 0 || sumG > 31) {
+            // ETC2 H-mode
+            int r1 = ((ptr[0] >> 3) & 0xF) * 17;
+            int g1 = (((ptr[0] & 0x7) << 1) | ((ptr[1] >> 4) & 1)) * 17;
+            int b1 = ((ptr[1] & 0x8) | ((ptr[1] & 0x3) << 1) | ((ptr[2] >> 7) & 1)) * 17;
+            int r2 = ((ptr[2] >> 3) & 0xF) * 17;
+            int g2 = (((ptr[2] & 0x7) << 1) | ((ptr[3] >> 7) & 1)) * 17;
+            int b2 = ((ptr[3] >> 3) & 0xF) * 17;
+            uint32_t v1 = (static_cast<uint32_t>(r1) << 16) | (static_cast<uint32_t>(g1) << 8) | static_cast<uint32_t>(b1);
+            uint32_t v2 = (static_cast<uint32_t>(r2) << 16) | (static_cast<uint32_t>(g2) << 8) | static_cast<uint32_t>(b2);
+            int d = kEtc2Dist[(ptr[3] & 4) | ((ptr[3] & 1) << 1) | (v1 >= v2 ? 1 : 0)];
+            int pr[4] = { std::clamp(r1 + d, 0, 255), std::clamp(r1 - d, 0, 255), std::clamp(r2 + d, 0, 255), std::clamp(r2 - d, 0, 255) };
+            int pg[4] = { std::clamp(g1 + d, 0, 255), std::clamp(g1 - d, 0, 255), std::clamp(g2 + d, 0, 255), std::clamp(g2 - d, 0, 255) };
+            int pb[4] = { std::clamp(b1 + d, 0, 255), std::clamp(b1 - d, 0, 255), std::clamp(b2 + d, 0, 255), std::clamp(b2 - d, 0, 255) };
+            for (int py = 0; py < 4; ++py) {
+                for (int px = 0; px < 4; ++px) {
+                    int bitIdx = px * 4 + py;
+                    int idx = (((msb >> bitIdx) & 1) << 1) | ((lsb >> bitIdx) & 1);
+                    int di = (py * 4 + px) * 4;
+                    outRgba[di + 0] = static_cast<uint8_t>(pr[idx]);
+                    outRgba[di + 1] = static_cast<uint8_t>(pg[idx]);
+                    outRgba[di + 2] = static_cast<uint8_t>(pb[idx]);
+                    outRgba[di + 3] = 255;
+                }
+            }
+            return;
+        }
+        if (sumB < 0 || sumB > 31) {
+            // ETC2 Planar mode
+            uint64_t u = ReadU64BE(ptr);
+            auto exp6 = [](uint64_t v) { int x = static_cast<int>(v & 0x3Fu); return (x << 2) | (x >> 4); };
+            auto exp7 = [](uint64_t v) { int x = static_cast<int>(v & 0x7Fu); return (x << 1) | (x >> 6); };
+            int ro = exp6(u >> 57);
+            int go = exp7((((u >> 56) & 1u) << 6) | ((u >> 49) & 0x3Fu));
+            int bo = exp6((((u >> 48) & 1u) << 5) | (((u >> 43) & 3u) << 3) | ((u >> 39) & 7u));
+            int rh = exp6((((u >> 34) & 0x1Fu) << 1) | ((u >> 32) & 1u));
+            int gh = exp7(u >> 25);
+            int bh = exp6(u >> 19);
+            int rv = exp6(u >> 13);
+            int gv = exp7(u >> 6);
+            int bv = exp6(u);
+            for (int py = 0; py < 4; ++py) {
+                for (int px = 0; px < 4; ++px) {
+                    int di = (py * 4 + px) * 4;
+                    outRgba[di + 0] = static_cast<uint8_t>(std::clamp((px * (rh - ro) + py * (rv - ro) + 4 * ro + 2) >> 2, 0, 255));
+                    outRgba[di + 1] = static_cast<uint8_t>(std::clamp((px * (gh - go) + py * (gv - go) + 4 * go + 2) >> 2, 0, 255));
+                    outRgba[di + 2] = static_cast<uint8_t>(std::clamp((px * (bh - bo) + py * (bv - bo) + 4 * bo + 2) >> 2, 0, 255));
+                    outRgba[di + 3] = 255;
+                }
+            }
+            return;
+        }
+    }
+
+    int r1, g1, b1, r2, g2, b2;
+    if (diffBit) {
+        auto s3 = [](int v) { return (v >= 4) ? (v - 8) : v; };
+        int br1 = (ptr[0] >> 3) & 31, bg1 = (ptr[1] >> 3) & 31, bb1 = (ptr[2] >> 3) & 31;
+        int br2 = std::clamp(br1 + s3(ptr[0] & 7), 0, 31);
+        int bg2 = std::clamp(bg1 + s3(ptr[1] & 7), 0, 31);
+        int bb2 = std::clamp(bb1 + s3(ptr[2] & 7), 0, 31);
+        r1 = (br1 << 3) | (br1 >> 2); g1 = (bg1 << 3) | (bg1 >> 2); b1 = (bb1 << 3) | (bb1 >> 2);
+        r2 = (br2 << 3) | (br2 >> 2); g2 = (bg2 << 3) | (bg2 >> 2); b2 = (bb2 << 3) | (bb2 >> 2);
+    } else {
+        r1 = ((ptr[0] & 0xF0) | (ptr[0] >> 4)); r2 = ((ptr[0] & 0x0F) | ((ptr[0] & 0x0F) << 4));
+        g1 = ((ptr[1] & 0xF0) | (ptr[1] >> 4)); g2 = ((ptr[1] & 0x0F) | ((ptr[1] & 0x0F) << 4));
+        b1 = ((ptr[2] & 0xF0) | (ptr[2] >> 4)); b2 = ((ptr[2] & 0x0F) | ((ptr[2] & 0x0F) << 4));
+    }
+    int cw1 = (ptr[3] >> 5) & 7, cw2 = (ptr[3] >> 2) & 7;
+    for (int py = 0; py < 4; ++py) {
+        for (int px = 0; px < 4; ++px) {
+            int bitIdx = px * 4 + py;
+            int idx = (((msb >> bitIdx) & 1) << 1) | ((lsb >> bitIdx) & 1);
+            bool sub2 = flipBit ? (py >= 2) : (px >= 2);
+            int mod = kEtcMod[sub2 ? cw2 : cw1][idx];
+            int di = (py * 4 + px) * 4;
+            outRgba[di + 0] = static_cast<uint8_t>(std::clamp((sub2 ? r2 : r1) + mod, 0, 255));
+            outRgba[di + 1] = static_cast<uint8_t>(std::clamp((sub2 ? g2 : g1) + mod, 0, 255));
+            outRgba[di + 2] = static_cast<uint8_t>(std::clamp((sub2 ? b2 : b1) + mod, 0, 255));
+            outRgba[di + 3] = 255;
+        }
+    }
+}
+
+inline void DecodeETC1Block(const uint8_t* block, uint8_t outRgba[64]) {
+    DecodeETC2RgbBlock(block, outRgba, false);
+}
+
+inline void DecodeETC2Block(const uint8_t* block, uint8_t outRgba[64], bool hasEacAlpha) {
+    if (!hasEacAlpha) {
+        DecodeETC2RgbBlock(block, outRgba, true);
+        return;
+    }
+    static const int kEacMod[16][8] = {
+        {-3,-6,-9,-15,2,5,8,14}, {-3,-7,-10,-13,2,6,9,12}, {-2,-5,-8,-13,1,4,7,12}, {-2,-4,-6,-13,1,3,5,12},
+        {-3,-6,-8,-12,2,5,7,11}, {-3,-7,-9,-11,2,6,8,10}, {-4,-7,-8,-11,3,6,7,10}, {-3,-5,-8,-11,2,4,7,10},
+        {-2,-6,-8,-10,1,5,7,9},  {-2,-5,-8,-10,1,4,7,9},  {-2,-4,-8,-10,1,3,7,9},  {-2,-5,-7,-10,1,4,6,9},
+        {-3,-4,-7,-10,2,3,6,9},  {-1,-2,-3,-10,0,1,2,9},  {-4,-6,-8,-9,3,5,7,8},   {-3,-5,-7,-9,2,4,6,8}
+    };
+    DecodeETC2RgbBlock(block + 8, outRgba, true);
+    int base = block[0];
+    int mult = (block[1] >> 4) & 0xF;
+    int tbl  = block[1] & 0xF;
+    uint64_t bits48 = 0;
+    for (int i = 0; i < 6; ++i) bits48 = (bits48 << 8) | block[2 + i];
+    for (int py = 0; py < 4; ++py) {
+        for (int px = 0; px < 4; ++px) {
+            int pixIdx = px * 4 + py;
+            int code = static_cast<int>((bits48 >> (45 - 3 * pixIdx)) & 7u);
+            int a = std::clamp(base + kEacMod[tbl][code] * mult, 0, 255);
+            outRgba[(py * 4 + px) * 4 + 3] = static_cast<uint8_t>(a);
+        }
+    }
+}
+
+inline void BlitBlock4x4RgbaToPremulBgra(
+    const uint8_t blockRgba[64],
+    uint32_t bx,
+    uint32_t by,
+    uint32_t imgW,
+    uint32_t imgH,
+    std::vector<uint8_t>& dstBgra)
+{
+    for (uint32_t py = 0; py < 4; ++py) {
+        uint32_t dy = by * 4 + py;
+        if (dy >= imgH) continue;
+        for (uint32_t px = 0; px < 4; ++px) {
+            uint32_t dx = bx * 4 + px;
+            if (dx >= imgW) continue;
+            const uint8_t* s = &blockRgba[(py * 4 + px) * 4];
+            WritePremulBGRA(&dstBgra[(static_cast<size_t>(dy) * imgW + dx) * 4], s[0], s[1], s[2], s[3]);
+        }
+    }
+}
+
+} // namespace GpuTex
 
 #include "formats/Tga.h"
 #include "formats/Psd.h"
@@ -211,6 +814,8 @@ try {
         ok = Formats::DecodeKTX(data, size, outInfo);
     } else if (size >= 12 && data[0] == 0xAB && std::memcmp(data + 1, "KTX 20", 6) == 0) {
         ok = Formats::DecodeKTX2OrBasis(data, size, extLower, outInfo);
+    } else if (size >= 77 && data[0] == 's' && data[1] == 'B' && ReadU16LE(data + 4) >= 77) {
+        ok = Formats::DecodeKTX2OrBasis(data, size, L".basis", outInfo);
     } else if (size >= 32 && data[0] == 0x76 && data[1] == 0x2F && data[2] == 0x31 && data[3] == 0x01) {
         ok = Formats::DecodeOpenEXR(data, size, outInfo);
     } else if (size >= 24 && std::memcmp(data, "CSFCHUNK", 8) == 0) {
@@ -269,7 +874,7 @@ try {
         ok = Formats::DecodePKM(data, size, outInfo);
     } else if (extLower == L".astc" || (size >= 16 && data[0] == 0x13 && data[1] == 0xAB && data[2] == 0xA1 && data[3] == 0x5C)) {
         ok = Formats::DecodeASTC(data, size, outInfo);
-    } else if (extLower == L".pvr" || (size >= 52 && std::memcmp(data, "PVR\x03", 4) == 0)) {
+    } else if (extLower == L".pvr" || (size >= 52 && (std::memcmp(data, "PVR\x03", 4) == 0 || std::memcmp(data + 44, "PVR!", 4) == 0))) {
         ok = Formats::DecodePVR(data, size, outInfo);
     } else if (extLower == L".iff" || extLower == L".ilbm" || extLower == L".lbm" || (size >= 12 && std::memcmp(data, "FORM", 4) == 0)) {
         ok = Formats::DecodeILBM(data, size, outInfo);
@@ -301,9 +906,10 @@ try {
         ok = Formats::DecodeAseprite(data, size, outInfo);
     } else if (extLower == L".icns") {
         ok = Formats::DecodeAppleICNS(data, size, outInfo);
-    } else if (extLower == L".jxl" || extLower == L".bpg") {
+    } else if (extLower == L".jxl" || extLower == L".bpg" || (size >= 8 && std::memcmp(data, "BPG\xFB", 4) == 0) ||
+               (size >= 12 && std::memcmp(data, "\x00\x00\x00\x0CJXL \x0D\x0A\x87\x0A", 12) == 0)) {
         ok = Formats::DecodeJxlOrBpg(data, size, extLower, outInfo);
-    } else if (extLower == L".blp" || extLower == L".utx") {
+    } else if (extLower == L".blp" || extLower == L".utx" || (size >= 36 && ReadU32LE(data) == 0x9E2A83C1u)) {
         ok = Formats::DecodeBlpOrUtx(data, size, extLower, outInfo);
     } else if (extLower == L".dpx" || extLower == L".cin") {
         ok = Formats::DecodeDpxOrCineon(data, size, extLower, outInfo);
@@ -311,8 +917,11 @@ try {
         ok = Formats::DecodeColorLutCube(data, size, extLower, outInfo);
     } else if (extLower == L".ies") {
         ok = Formats::DecodePhotometricIES(data, size, extLower, outInfo);
-    } else if (extLower == L".ttf" || extLower == L".otf" || extLower == L".woff" || extLower == L".woff2") {
+    } else if (extLower == L".ttf" || extLower == L".otf" || extLower == L".woff" || extLower == L".woff2" ||
+               (size >= 44 && std::memcmp(data, "wOFF", 4) == 0) || (size >= 48 && std::memcmp(data, "wOF2", 4) == 0)) {
         ok = Formats::DecodeFontSpecimen(data, size, extLower, outInfo);
+    } else if (size >= 12 && std::memcmp(data, "8BPT", 4) == 0) {
+        ok = Formats::DecodeAbrOrPat(data, size, L".pat", outInfo);
     } else {
         ok = Formats::DecodeExtendedImages200(data, size, extLower, outInfo);
     }

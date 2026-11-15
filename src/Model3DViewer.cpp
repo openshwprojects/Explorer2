@@ -2,13 +2,22 @@
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
+#include "Ole2Compound.h"
 #include <unordered_map>
+#include <map>
+#include <set>
+#include <sstream>
+#include <cstdio>
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <string_view>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
+#include <array>
+#include <functional>
+#include <numeric>
 #include <thread>
 
 namespace Explorer2 {
@@ -87,7 +96,8 @@ bool Model3DViewer::Is3DModelExtension(const std::wstring& extLower) {
            extLower == L".blend" || extLower == L".3ds"   || extLower == L".dae"   ||
            extLower == L".gltf"  || extLower == L".glb"   || extLower == L".3mf"   ||
            extLower == L".fbx"   || extLower == L".ase"   || extLower == L".step"  ||
-           extLower == L".stp"   || extLower == L".iges"  || extLower == L".igs"   ||
+           extLower == L".stp"   || extLower == L".p21"   || extLower == L".iges"  ||
+           extLower == L".igs"   ||
            extLower == L".vtk"   || extLower == L".amf"   || extLower == L".x3d"   ||
            extLower == L".wrl"   || extLower == L".scad"  || extLower == L".pcd"   ||
            extLower == L".xyz"   || extLower == L".pts"   || extLower == L".gcode" ||
@@ -291,7 +301,7 @@ try {
         else if (ext == L".scad") parsedMod = Formats::ParseOpenScadMesh(sv, mesh);
         else if (ext == L".pcd")  parsedMod = Formats::ParsePcdPointCloud(buf.data(), buf.size(), mesh);
         else if (ext == L".xyz" || ext == L".pts") parsedMod = Formats::ParseXyzPointCloud(sv, mesh);
-        else if (ext == L".step" || ext == L".stp") parsedMod = Formats::ParseStepCadMesh(sv, mesh);
+        else if (ext == L".step" || ext == L".stp" || ext == L".p21") parsedMod = Formats::ParseStepCadMesh(sv, mesh);
         else if (ext == L".iges" || ext == L".igs") parsedMod = Formats::ParseIgesCadMesh(sv, mesh);
         else if (ext == L".gcode" || ext == L".nc") parsedMod = Formats::ParseGcodeToolpathMesh(sv, mesh);
         else if (ext == L".pdb") parsedMod = Formats::ParseProteinPdbMesh(sv, mesh);

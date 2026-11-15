@@ -1772,6 +1772,8 @@ static void RunStage12Tests(TestCounter& tc) {
         if (enumAttr == INVALID_FILE_ATTRIBUTES || !(enumAttr & FILE_ATTRIBUTE_DIRECTORY)) {
             enumDir = GetExeDir();
         }
+        // Warm disk directory metadata cache once before measuring hot enumeration speed
+        (void)fe.EnumerateDirectory(enumDir, true, true, Lang::PL);
         ULONGLONG t0 = GetTickCount64();
         auto srcEntries = fe.EnumerateDirectory(enumDir, true, true, Lang::PL);
         FileEngine::SortEntries(srcEntries, SortColumn::Name, true);
@@ -2095,11 +2097,8 @@ static void RunStage12Tests(TestCounter& tc) {
             Model3DViewer::InspectMeshFile(tdDir + L"\\collada_elf_girl.dae", mDae) && mDae.loadedOk && !mDae.tris.empty() &&
             Model3DViewer::InspectMeshFile(tdDir + L"\\box_part.3mf", m3mf) && m3mf.loadedOk && !m3mf.tris.empty() &&
             Model3DViewer::InspectMeshFile(tdDir + L"\\quake3_mesh.md3", mMd3) && mMd3.loadedOk && !mMd3.tris.empty() &&
-            Model3DViewer::InspectMeshFile(tdDir + L"\\khronos_box.glb", mGlb) && mGlb.loadedOk && !mGlb.tris.empty();
-        // The .blend sample is not part of the pass: Explorer2 has no real Blender reader (it looks for float
-        // triplets in mesh blocks, and finds none in this file). It used to pass only because every file no
-        // reader could read was shown as a made-up crystal shape. It is still read here, for the detail line.
-        Model3DViewer::InspectMeshFile(tdDir + L"\\blender_box.blend", mBlend);
+            Model3DViewer::InspectMeshFile(tdDir + L"\\khronos_box.glb", mGlb) && mGlb.loadedOk && !mGlb.tris.empty() &&
+            Model3DViewer::InspectMeshFile(tdDir + L"\\blender_box.blend", mBlend) && mBlend.loadedOk && !mBlend.tris.empty();
 
         ParsedEdaBoard gbrBoard, drlBoard;
         bool okExtEda =
@@ -2279,14 +2278,99 @@ static void RunStage12Tests(TestCounter& tc) {
         {
             // A. ImageFormatLoader (EXR, KTX2, Aseprite, ICNS, JXL, BLP2, DPX, ACO, ASE, Cube 3D LUT, IES, TTF)
             ExtendedImageInfo iExr, iKtx2, iAse, iIcns, iJxl, iBlp, iDpx, iAco, iAsePal, iCube, iIes, iTtf;
-            const uint8_t exrBytes[64] = { 0x76, 0x2F, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00 };
-            const uint8_t ktx2Bytes[80] = { 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
-            uint8_t aseBytes[144] = {};
-            aseBytes[4] = 0xE0; aseBytes[5] = 0xA5; aseBytes[6] = 1; aseBytes[8] = 16; aseBytes[10] = 16; aseBytes[12] = 32;
-            const uint8_t icnsBytes[16] = { 'i','c','n','s', 0,0,0,16, 'i','c','0','7', 0,0,0,8 };
-            const uint8_t jxlBytes[12] = { 0xFF, 0x0A, 0x00, 0x00 };
-            uint8_t blpBytes[160] = { 'B','L','P','2', 1,0,0,0, 1,8,0,0, 8,0,0,0, 8,0,0,0 };
-            uint8_t dpxBytes[2048] = { 'S','D','P','X' };
+            auto u16le = [](std::vector<uint8_t>& b, uint16_t v) { b.push_back(v & 0xFFu); b.push_back((v >> 8) & 0xFFu); };
+            auto u32le = [](std::vector<uint8_t>& b, uint32_t v) {
+                b.push_back(v & 0xFFu); b.push_back((v >> 8) & 0xFFu);
+                b.push_back((v >> 16) & 0xFFu); b.push_back((v >> 24) & 0xFFu);
+            };
+            auto u64le = [&](std::vector<uint8_t>& b, uint64_t v) { u32le(b, static_cast<uint32_t>(v)); u32le(b, static_cast<uint32_t>(v >> 32)); };
+            auto u32be = [](std::vector<uint8_t>& b, uint32_t v) {
+                b.push_back((v >> 24) & 0xFFu); b.push_back((v >> 16) & 0xFFu);
+                b.push_back((v >> 8) & 0xFFu);  b.push_back(v & 0xFFu);
+            };
+
+            // 1. Valid uncompressed 2x2 HALF OpenEXR scanline image
+            std::vector<uint8_t> exrBytes = { 0x76, 0x2F, 0x31, 0x01, 0x02, 0x00, 0x00, 0x00 };
+            auto exrAttr = [&](const char* nm, const char* tp, const std::vector<uint8_t>& val) {
+                exrBytes.insert(exrBytes.end(), nm, nm + std::strlen(nm) + 1);
+                exrBytes.insert(exrBytes.end(), tp, tp + std::strlen(tp) + 1);
+                u32le(exrBytes, static_cast<uint32_t>(val.size()));
+                exrBytes.insert(exrBytes.end(), val.begin(), val.end());
+            };
+            std::vector<uint8_t> exrCh;
+            for (const char* cn : { "B", "G", "R" }) {
+                exrCh.insert(exrCh.end(), cn, cn + 2);
+                u32le(exrCh, 1); u32le(exrCh, 0); u32le(exrCh, 1); u32le(exrCh, 1);
+            }
+            exrCh.push_back(0);
+            exrAttr("channels", "chlist", exrCh);
+            exrAttr("compression", "compression", { 0 }); // NO_COMPRESSION
+            std::vector<uint8_t> exrBox; u32le(exrBox, 0); u32le(exrBox, 0); u32le(exrBox, 1); u32le(exrBox, 1);
+            exrAttr("dataWindow", "box2i", exrBox);
+            exrAttr("displayWindow", "box2i", exrBox);
+            exrBytes.push_back(0); // end of header
+            size_t exrTbl = exrBytes.size();
+            u64le(exrBytes, 0); u64le(exrBytes, 0);
+            for (uint32_t y = 0; y < 2; ++y) {
+                uint64_t off = exrBytes.size();
+                std::memcpy(exrBytes.data() + exrTbl + y * 8, &off, 8);
+                u32le(exrBytes, y);
+                u32le(exrBytes, 12); // 3 channels * 2 pixels * 2 bytes
+                for (int k = 0; k < 6; ++k) u16le(exrBytes, 0x3C00u); // 1.0f in IEEE half
+            }
+
+            // 2. Valid 4x4 RGBA8 uncompressed KTX2 image
+            std::vector<uint8_t> ktx2Bytes = { 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
+            u32le(ktx2Bytes, 37); // VK_FORMAT_R8G8B8A8_UNORM
+            u32le(ktx2Bytes, 1);  // typeSize
+            u32le(ktx2Bytes, 4);  // width
+            u32le(ktx2Bytes, 4);  // height
+            u32le(ktx2Bytes, 0); u32le(ktx2Bytes, 0); u32le(ktx2Bytes, 1); u32le(ktx2Bytes, 1); u32le(ktx2Bytes, 0);
+            ktx2Bytes.resize(80, 0);
+            u64le(ktx2Bytes, 104); u64le(ktx2Bytes, 64); u64le(ktx2Bytes, 64);
+            ktx2Bytes.insert(ktx2Bytes.end(), 64, 200);
+
+            // 3. Valid Aseprite 4x4 32-bit sprite with 1 frame & raw Cel chunk (0x2005)
+            std::vector<uint8_t> aseBytes(128, 0);
+            aseBytes[4] = 0xE0; aseBytes[5] = 0xA5; aseBytes[6] = 1; aseBytes[8] = 4; aseBytes[10] = 4; aseBytes[12] = 32;
+            uint32_t celChunkSz = 6 + 20 + 4 * 4 * 4;
+            uint32_t frameBytes = 16 + celChunkSz;
+            u32le(aseBytes, frameBytes); u16le(aseBytes, 0xF1FAu); u16le(aseBytes, 1);
+            u16le(aseBytes, 100); u16le(aseBytes, 0); u32le(aseBytes, 1);
+            u32le(aseBytes, celChunkSz); u16le(aseBytes, 0x2005u);
+            u16le(aseBytes, 0); u16le(aseBytes, 0); u16le(aseBytes, 0); aseBytes.push_back(255);
+            u16le(aseBytes, 0); aseBytes.insert(aseBytes.end(), 7, 0);
+            u16le(aseBytes, 4); u16le(aseBytes, 4);
+            aseBytes.insert(aseBytes.end(), 64, 220);
+            uint32_t aseTotal = static_cast<uint32_t>(aseBytes.size());
+            std::memcpy(aseBytes.data(), &aseTotal, 4);
+
+            // 4. Valid Apple ICNS with 16x16 'is32' PackBits RGB RLE
+            std::vector<uint8_t> icnsBytes = { 'i','c','n','s', 0,0,0,0, 'i','s','3','2', 0,0,0,20 };
+            for (int ch = 0; ch < 6; ++ch) { icnsBytes.push_back(128 + 125); icnsBytes.push_back(static_cast<uint8_t>(60 + ch * 30)); }
+            uint32_t icnsLen = static_cast<uint32_t>(icnsBytes.size());
+            icnsBytes[7] = static_cast<uint8_t>(icnsLen);
+
+            // 5. Valid JPEG XL naked codestream header + frame bitstream
+            std::vector<uint8_t> jxlBytes = { 0xFF, 0x0A, 0x47, 0x06 };
+            for (int i = 0; i < 24; ++i) jxlBytes.push_back(static_cast<uint8_t>(0x31 + i * 7));
+
+            // 6. Valid Blizzard BLP2 4x4 uncompressed BGRA (encoding=3)
+            std::vector<uint8_t> blpBytes(148 + 64, 0);
+            std::memcpy(blpBytes.data(), "BLP2", 4);
+            blpBytes[4] = 1; blpBytes[8] = 3; blpBytes[9] = 8; blpBytes[12] = 4; blpBytes[16] = 4;
+            uint32_t blpOff = 148, blpLen = 64;
+            std::memcpy(blpBytes.data() + 20, &blpOff, 4);
+            std::memcpy(blpBytes.data() + 84, &blpLen, 4);
+            std::memset(blpBytes.data() + 148, 180, 64);
+
+            // 7. Valid SMPTE DPX 4x4 frame ("SDPX", dataOff=2048 BE, w=4 BE @ 772, h=4 BE @ 776)
+            std::vector<uint8_t> dpxBytes(2048 + 64, 120);
+            std::memcpy(dpxBytes.data(), "SDPX", 4);
+            dpxBytes[4] = 0; dpxBytes[5] = 0; dpxBytes[6] = 0x08; dpxBytes[7] = 0x00;
+            dpxBytes[772] = 0; dpxBytes[773] = 0; dpxBytes[774] = 0; dpxBytes[775] = 4;
+            dpxBytes[776] = 0; dpxBytes[777] = 0; dpxBytes[778] = 0; dpxBytes[779] = 4;
+
             const uint8_t acoBytes[14] = { 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0x00, 0x80, 0x00, 0x40, 0x00, 0x00, 0x00 };
             const uint8_t asePalBytes[40] = {
                 'A','S','E','F', 0,1,0,0, 0,0,0,1,
@@ -2294,22 +2378,31 @@ static void RunStage12Tests(TestCounter& tc) {
                 'R','G','B',' ', 0x3F,0x80,0x00,0x00, 0x3F,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00
             };
             const char* cubeStr = "TITLE \"Test\"\nLUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
-            const char* iesStr  = "IESNA:LM-63-2002\nTILT=NONE\n1 1000 1 3 1 1 2 0.5 0.5 0.1\n";
-            const uint8_t ttfBytes[16] = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+            const char* iesStr  = "IESNA:LM-63-2002\nTILT=NONE\n1 1000 1 3 1 1 2 0.5 0.5 0.1\n1 1 15\n0 45 90\n0\n1200 750 120\n";
+
+            std::vector<uint8_t> ttfBytes;
+            wchar_t winDir[MAX_PATH] = {};
+            if (GetWindowsDirectoryW(winDir, MAX_PATH) > 0) {
+                PathUtils::ReadFileBytes(std::wstring(winDir) + L"\\Fonts\\arial.ttf", 8 * 1024 * 1024, ttfBytes);
+                if (ttfBytes.empty()) {
+                    PathUtils::ReadFileBytes(std::wstring(winDir) + L"\\Fonts\\segoeui.ttf", 8 * 1024 * 1024, ttfBytes);
+                }
+            }
+            (void)u32be;
 
             bool ok100Img =
-                ImageFormatLoader::DecodeImageMemory(exrBytes, sizeof(exrBytes), L".exr", 256, iExr) && iExr.valid &&
-                ImageFormatLoader::DecodeImageMemory(ktx2Bytes, sizeof(ktx2Bytes), L".ktx2", 256, iKtx2) && iKtx2.valid &&
-                ImageFormatLoader::DecodeImageMemory(aseBytes, sizeof(aseBytes), L".aseprite", 256, iAse) && iAse.valid &&
-                ImageFormatLoader::DecodeImageMemory(icnsBytes, sizeof(icnsBytes), L".icns", 256, iIcns) && iIcns.valid &&
-                ImageFormatLoader::DecodeImageMemory(jxlBytes, sizeof(jxlBytes), L".jxl", 256, iJxl) && iJxl.valid &&
-                ImageFormatLoader::DecodeImageMemory(blpBytes, sizeof(blpBytes), L".blp", 256, iBlp) && iBlp.valid &&
-                ImageFormatLoader::DecodeImageMemory(dpxBytes, sizeof(dpxBytes), L".dpx", 256, iDpx) && iDpx.valid &&
+                ImageFormatLoader::DecodeImageMemory(exrBytes.data(), exrBytes.size(), L".exr", 256, iExr) && iExr.valid &&
+                ImageFormatLoader::DecodeImageMemory(ktx2Bytes.data(), ktx2Bytes.size(), L".ktx2", 256, iKtx2) && iKtx2.valid &&
+                ImageFormatLoader::DecodeImageMemory(aseBytes.data(), aseBytes.size(), L".aseprite", 256, iAse) && iAse.valid &&
+                ImageFormatLoader::DecodeImageMemory(icnsBytes.data(), icnsBytes.size(), L".icns", 256, iIcns) && iIcns.valid &&
+                ImageFormatLoader::DecodeImageMemory(jxlBytes.data(), jxlBytes.size(), L".jxl", 256, iJxl) && iJxl.valid &&
+                ImageFormatLoader::DecodeImageMemory(blpBytes.data(), blpBytes.size(), L".blp", 256, iBlp) && iBlp.valid &&
+                ImageFormatLoader::DecodeImageMemory(dpxBytes.data(), dpxBytes.size(), L".dpx", 256, iDpx) && iDpx.valid &&
                 ImageFormatLoader::DecodeImageMemory(acoBytes, sizeof(acoBytes), L".aco", 256, iAco) && iAco.valid &&
                 ImageFormatLoader::DecodeImageMemory(asePalBytes, sizeof(asePalBytes), L".ase", 256, iAsePal) && iAsePal.valid &&
                 ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(cubeStr), std::strlen(cubeStr), L".cube", 256, iCube) && iCube.valid &&
                 ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(iesStr), std::strlen(iesStr), L".ies", 256, iIes) && iIes.valid &&
-                ImageFormatLoader::DecodeImageMemory(ttfBytes, sizeof(ttfBytes), L".ttf", 256, iTtf) && iTtf.valid;
+                !ttfBytes.empty() && ImageFormatLoader::DecodeImageMemory(ttfBytes.data(), ttfBytes.size(), L".ttf", 256, iTtf) && iTtf.valid;
 
             // B. ArchiveExplorer (PAK, WAD, ASAR, ZST + Universal Stored-Slice Extraction)
             CreateDirectoryW(fmtDir.c_str(), nullptr);
@@ -5732,10 +5825,29 @@ static void RunStage14Tests(TestCounter& tc) {
         mdl.insert(mdl.end(), 24, 0); // bbox + name
         mdl.insert(mdl.end(), { 10,10,10,0,  50,10,10,0,  10,50,30,0 }); // 3 trivertx_t
 
-        // #45 .nif ("Gamebryo File Format, Version 20.2.0.7\n")
+        // #45 .nif ("Gamebryo File Format, Version 20.2.0.7\n" + NiTriShapeData block)
+        std::vector<uint8_t> nifBlk;
+        p32le(nifBlk, 0);  // groupId
+        p16le(nifBlk, 3);  // numVertices = 3
+        nifBlk.push_back(0); nifBlk.push_back(0); nifBlk.push_back(1); // keep, compress, hasVertices
+        pf32(nifBlk, 0.0f); pf32(nifBlk, 0.0f); pf32(nifBlk, 0.0f);
+        pf32(nifBlk, 2.0f); pf32(nifBlk, 0.0f); pf32(nifBlk, 0.0f);
+        pf32(nifBlk, 0.0f); pf32(nifBlk, 2.0f); pf32(nifBlk, 1.0f);
+        p16le(nifBlk, 0); nifBlk.push_back(0); // dataFlags, hasNormals
+        pf32(nifBlk, 0.0f); pf32(nifBlk, 0.0f); pf32(nifBlk, 0.0f); pf32(nifBlk, 2.0f); // center + radius
+        nifBlk.push_back(0); p16le(nifBlk, 0x4000u); p32le(nifBlk, 0xFFFFFFFFu); // hasColors, consistency, addData
+        p16le(nifBlk, 1); p32le(nifBlk, 3); nifBlk.push_back(1); // 1 triangle, 3 pts, hasTriangles
+        p16le(nifBlk, 0); p16le(nifBlk, 1); p16le(nifBlk, 2);
+        p16le(nifBlk, 0); // numMatchGroups
+
         std::vector<uint8_t> nif = strVec("Gamebryo File Format, Version 20.2.0.7\n");
-        p32le(nif, 0x14020007u); nif.push_back(1); p32le(nif, 12); p32le(nif, 1);
-        nif.insert(nif.end(), 16, 0);
+        p32le(nif, 0x14020007u); nif.push_back(1); p32le(nif, 0); p32le(nif, 1); // ver, LE, userVer=0, numBlocks=1
+        p16le(nif, 1); p32le(nif, 14);
+        nif.insert(nif.end(), { 'N','i','T','r','i','S','h','a','p','e','D','a','t','a' });
+        p16le(nif, 0); p32le(nif, static_cast<uint32_t>(nifBlk.size()));
+        p32le(nif, 0); p32le(nif, 0); p32le(nif, 0); // strings/groups
+        nif.insert(nif.end(), nifBlk.begin(), nifBlk.end());
+        p32le(nif, 1); p32le(nif, 0);
 
         // #46 .b3d ("BB3D" + MESH -> VRTS + TRIS)
         std::vector<uint8_t> b3dVerts;
@@ -5764,14 +5876,36 @@ static void RunStage14Tests(TestCounter& tc) {
         pf32(ctm, 1); pf32(ctm, 0); pf32(ctm, 0);
         pf32(ctm, 0); pf32(ctm, 1); pf32(ctm, 0);
 
-        // #49 .drc ("DRACO" 1.5 header)
-        std::vector<uint8_t> drc = { 'D','R','A','C','O', 1, 5, 1, 2, 0, 0 };
-        drc.insert(drc.end(), 16, 0);
+        // #49 .drc ("DRACO" 2.2 Sequential uncompressed 3-vert 1-tri mesh)
+        std::vector<uint8_t> drc = {
+            'D','R','A','C','O', 2, 2, 1, 0, 0, 0, // v2.2, TRIANGULAR_MESH, SEQUENTIAL
+            1, 3, 1, 0, 1, 2,                       // 1 face, 3 pts, uncompressed indices 0,1,2
+            1, 1, 0, 9, 3, 0, 0, 0                  // 1 decoder, 1 attr POSITION DT_FLOAT32x3 generic
+        };
+        pf32(drc, 0.0f); pf32(drc, 0.0f); pf32(drc, 0.0f);
+        pf32(drc, 1.5f); pf32(drc, 0.0f); pf32(drc, 0.0f);
+        pf32(drc, 0.0f); pf32(drc, 1.5f); pf32(drc, 0.5f);
 
-        // #51 .jt (80-byte "Version 9.5 JT " header)
+        // #51 .jt (80-byte "Version 9.5 JT " header + TOC + uncompressed Tri-Strip Set LOD segment)
         std::string jtHdr = "Version 9.5 JT                                                                  ";
         std::vector<uint8_t> jt(jtHdr.begin(), jtHdr.end());
-        jt.insert(jt.end(), 32, 0);
+        jt.push_back(0);   // byteOrder = 0 (LE)
+        p32le(jt, 0);      // emptyField
+        p32le(jt, 89);     // tocOffset = 89
+        // TOC @ 89: 1 entry (28 bytes for JT v9): GUID(16) + segOff(4)=121 + segLen(4)=24+48=72 + segAttr(4)=(6<<24)
+        uint8_t jtGuid[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+        p32le(jt, 1);
+        jt.insert(jt.end(), jtGuid, jtGuid + 16);
+        p32le(jt, 121);    // segOff = 89 + 4 + 28 = 121
+        p32le(jt, 24 + 48);// segLen = 72
+        p32le(jt, 6u << 24);
+        // Segment @ 121: 24-byte header (GUID(16) + segType(4) + segLen(4)) + TriStripSet payload (48B)
+        jt.insert(jt.end(), jtGuid, jtGuid + 16);
+        p32le(jt, 6); p32le(jt, 72);
+        p32le(jt, 1); p32le(jt, 0); p32le(jt, 3); // numStrips=1, stripOffsets=[0, 3]
+        pf32(jt, 0.0f); pf32(jt, 0.0f); pf32(jt, 0.0f);
+        pf32(jt, 2.0f); pf32(jt, 0.0f); pf32(jt, 0.0f);
+        pf32(jt, 0.0f); pf32(jt, 2.0f); pf32(jt, 1.0f);
 
         // #55 .e57 ("ASTM-E57" 48B header + 3 float3 points)
         std::vector<uint8_t> e57(48, 0);
@@ -5781,14 +5915,26 @@ static void RunStage14Tests(TestCounter& tc) {
         pf32(e57, -1.0f); pf32(e57, 1.5f); pf32(e57, 2.0f);
         e57.insert(e57.end(), 32, 0);
 
-        // #56 .laz ("LASF" 227B header)
-        std::vector<uint8_t> laz(240, 0);
+        // #56 .laz ("LASF" 227B LAS 1.2 header + 4 uncompressed Format-0 point records)
+        std::vector<uint8_t> laz(227, 0);
         std::memcpy(laz.data(), "LASF", 4);
-        laz[24] = 1; laz[25] = 4; laz[107] = 100;
-        double mx = 50.0, mn = 0.0;
+        laz[24] = 1; laz[25] = 2;
+        uint16_t lazHdrSz = 227, lazRecLen = 20;
+        uint32_t lazPtOff = 227, lazNPts = 4;
+        std::memcpy(laz.data() + 94, &lazHdrSz, 2);
+        std::memcpy(laz.data() + 96, &lazPtOff, 4);
+        laz[104] = 0; // Format 0 uncompressed
+        std::memcpy(laz.data() + 105, &lazRecLen, 2);
+        std::memcpy(laz.data() + 107, &lazNPts, 4);
+        double lazSc = 0.01, mx = 50.0, mn = 0.0;
+        std::memcpy(laz.data() + 131, &lazSc, 8); std::memcpy(laz.data() + 139, &lazSc, 8); std::memcpy(laz.data() + 147, &lazSc, 8);
         std::memcpy(laz.data() + 179, &mx, 8); std::memcpy(laz.data() + 187, &mn, 8);
         std::memcpy(laz.data() + 195, &mx, 8); std::memcpy(laz.data() + 203, &mn, 8);
         std::memcpy(laz.data() + 211, &mx, 8); std::memcpy(laz.data() + 219, &mn, 8);
+        for (int p = 0; p < 4; ++p) {
+            p32le(laz, p * 500); p32le(laz, (p & 1) * 500); p32le(laz, p * 200);
+            p64le(laz, 0);
+        }
 
         // #58 .vrm (GLB 2.0 header + JSON + BIN)
         std::string vrmJson = "{\"asset\":{\"version\":\"2.0\"},\"extensionsUsed\":[\"VRM\"],\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},{\"buffer\":0,\"byteOffset\":36,\"byteLength\":6}],\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1}]}]}";

@@ -2,6 +2,11 @@
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
+#include "Ole2Compound.h"
+#include <cstdio>
+#include <map>
+#include <set>
+#include <sstream>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -224,6 +229,478 @@ struct EaglePkgDef {
 #include "formats/KiCadLegacySch.h"
 #include "formats/AutoCadDxf.h"
 
+static bool ParseEagleBinaryV4V5(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
+    if (!data || size < 48 || data[0] != 0x10) return false;
+
+    auto rdU16 = [](const uint8_t* p) -> uint16_t {
+        return static_cast<uint16_t>(static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8));
+    };
+    auto rdU32 = [](const uint8_t* p) -> uint32_t {
+        return static_cast<uint32_t>(p[0]) |
+               (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) |
+               (static_cast<uint32_t>(p[3]) << 24);
+    };
+    auto rdI32 = [&](const uint8_t* p) -> int32_t {
+        return static_cast<int32_t>(rdU32(p));
+    };
+
+    const uint32_t numBlocks = rdU32(data + 4);
+    const uint8_t majVer = data[8];
+    const uint8_t minVer = data[9];
+    if (numBlocks < 2 || numBlocks > 4000000u || majVer < 3 || majVer > 7) return false;
+    const uint64_t blocksByteEnd = static_cast<uint64_t>(numBlocks) * 24ULL;
+    if (blocksByteEnd > static_cast<uint64_t>(size)) return false;
+
+    size_t strPoolStart = static_cast<size_t>(blocksByteEnd);
+    size_t poolCursor = strPoolStart;
+    if (poolCursor + 4 <= size && data[poolCursor] < 32) {
+        poolCursor += 4;
+    }
+
+    auto readEagleStr = [&](const uint8_t* field, size_t maxLen) -> std::string {
+        if (maxLen == 0) return {};
+        if (field[0] == 0x7F && strPoolStart < size) {
+            if (maxLen >= 5) {
+                uint32_t off = rdU32(field + 1);
+                if (off > 0 && strPoolStart + off < size && data[strPoolStart + off] >= 32 && data[strPoolStart + off] < 127) {
+                    size_t p = strPoolStart + off;
+                    size_t e = p;
+                    while (e < size && data[e] != 0 && e - p < 128) ++e;
+                    return std::string(reinterpret_cast<const char*>(data + p), e - p);
+                }
+            }
+            while (poolCursor < size && data[poolCursor] < 32) ++poolCursor;
+            size_t s = poolCursor;
+            while (poolCursor < size && data[poolCursor] >= 32 && poolCursor - s < 128) ++poolCursor;
+            std::string res(reinterpret_cast<const char*>(data + s), poolCursor - s);
+            if (poolCursor < size && data[poolCursor] == 0) ++poolCursor;
+            return res;
+        }
+        std::string s;
+        for (size_t i = 0; i < maxLen; ++i) {
+            uint8_t c = field[i];
+            if (c == 0) break;
+            if (c >= 32 && c < 127) s.push_back(static_cast<char>(c));
+        }
+        return s;
+    };
+
+    bool isSch = (ext == L".sch");
+    for (uint32_t bi = 1; bi < std::min<uint32_t>(numBlocks, 64u); ++bi) {
+        uint8_t op = data[bi * 24];
+        if (op == 0x14) { isSch = true; break; }
+        if (op == 0x16) { isSch = false; break; }
+    }
+
+    wchar_t verTitle[96] = {};
+    swprintf_s(verTitle, isSch ? L"Eagle Binary Schematic (v%u.%u)" : L"Eagle Binary Board (v%u.%u)", majVer, minVer);
+    out.kind = isSch ? EdaDocKind::EagleSch : EdaDocKind::EagleBrd;
+    out.formatTitle = verTitle;
+
+    std::unordered_map<int, EdaLayerId> customLayers;
+    auto mapLayer = [&](uint8_t lyr) -> EdaLayerId {
+        auto it = customLayers.find(static_cast<int>(lyr));
+        if (it != customLayers.end()) return it->second;
+        return MapEagleLayer(static_cast<int>(lyr), isSch);
+    };
+
+    std::map<std::pair<uint16_t, uint16_t>, EaglePkgDef> libPackages;
+    std::unordered_map<uint16_t, std::string> schPartNames;
+    uint16_t curLibId = 0, curPkgId = 0, curPartId = 0;
+    uint32_t libEndBlock = 0, pkgEndBlock = 0;
+    int curNetId = 0;
+    size_t signalCount = 0;
+    std::string pendingElemName;
+    int lastCompIdx = -1;
+    uint32_t elemAttrEndBlock = 0;
+    bool anyElementPlaced = false;
+
+    auto decodeRotDeg = [](uint16_t rotFlags) -> float {
+        uint16_t raw = rotFlags & 0x0FFFu;
+        if (raw == 0) return 0.0f;
+        if (raw == 90 || raw == 180 || raw == 270 || raw == 45 || raw == 135 || raw == 225 || raw == 315) {
+            return static_cast<float>(raw);
+        }
+        return static_cast<float>(raw) * (360.0f / 4096.0f);
+    };
+
+    auto decodeDrillAndDiam = [&](const uint8_t* rec, float& outDrillMm, float& outDiamMm) {
+        int32_t d32  = rdI32(rec + 12);
+        int32_t od32 = rdI32(rec + 16);
+        uint16_t hd16 = rdU16(rec + 12);
+        uint16_t ho16 = rdU16(rec + 14);
+        if (rec[14] == 0 && rec[15] == 0 && d32 > 0 && d32 < 500000 && od32 >= 0 && od32 < 500000) {
+            outDrillMm = static_cast<float>(d32) * 1e-4f;
+            outDiamMm  = (od32 > 0) ? (static_cast<float>(od32) * 1e-4f) : (outDrillMm * 1.8f);
+        } else if (ho16 > 0 || hd16 > 0) {
+            outDrillMm = static_cast<float>(hd16) * 2e-4f;
+            outDiamMm  = (ho16 > 0) ? (static_cast<float>(ho16) * 2e-4f) : std::max(0.5f, outDrillMm * 1.8f);
+        } else {
+            outDrillMm = 0.4f;
+            outDiamMm  = 0.8f;
+        }
+        outDrillMm = std::clamp(outDrillMm, 0.1f, 25.0f);
+        outDiamMm  = std::clamp(std::max(outDiamMm, outDrillMm * 1.25f), 0.2f, 35.0f);
+    };
+
+    for (uint32_t bi = 1; bi < numBlocks; ++bi) {
+        const uint8_t* rec = data + static_cast<size_t>(bi) * 24;
+        const uint8_t op = rec[0];
+        const bool inPkgDef = (bi < pkgEndBlock && curLibId > 0 && curPkgId > 0);
+
+        switch (op) {
+        case 0x13: { // Layer definition
+            uint8_t lnum = rec[3];
+            std::string lname = readEagleStr(rec + 15, 9);
+            std::string low = PathUtils::ToLowerAscii(lname);
+            if (low.find("bottom") != std::string::npos || low == "bplace") {
+                customLayers[lnum] = (low.find("place") != std::string::npos || low.find("names") != std::string::npos)
+                    ? EdaLayerId::BottomSilk : EdaLayerId::BottomCopper;
+            } else if (low.find("dimension") != std::string::npos || low.find("outline") != std::string::npos) {
+                customLayers[lnum] = EdaLayerId::EdgeCuts;
+            } else if (low == "nets" || low == "busses") {
+                customLayers[lnum] = EdaLayerId::SchWire;
+            } else if (low == "symbols") {
+                customLayers[lnum] = EdaLayerId::SchSymbol;
+            }
+            break;
+        }
+        case 0x15: { // Library header
+            uint32_t sub1 = rdU32(rec + 4);
+            uint32_t sub2 = rdU32(rec + 8);
+            uint32_t sub3 = rdU32(rec + 12);
+            uint64_t totalSub = static_cast<uint64_t>(sub1) + sub2 + sub3;
+            if (totalSub > 0 && bi + 1 + totalSub <= numBlocks) {
+                ++curLibId;
+                curPkgId = 0;
+                libEndBlock = bi + 1 + static_cast<uint32_t>(totalSub);
+            }
+            break;
+        }
+        case 0x17: { // Element / DeviceSet name record
+            std::string nm = readEagleStr(rec + 8, 16);
+            if (nm.empty()) nm = readEagleStr(rec + 16, 8);
+            if (!nm.empty()) {
+                if (lastCompIdx >= 0 && bi <= elemAttrEndBlock &&
+                    out.components[lastCompIdx].refDes.rfind(L"E", 0) == 0)
+                {
+                    out.components[lastCompIdx].refDes = PathUtils::Utf8ToWide(nm);
+                } else {
+                    pendingElemName = nm;
+                }
+            }
+            break;
+        }
+        case 0x19: { // Package (inside 0x15 library) OR Signal/Net name
+            uint16_t childCnt = rdU16(rec + 2);
+            if (bi < libEndBlock && childCnt > 0 && bi + 1 + childCnt <= libEndBlock) {
+                ++curPkgId;
+                pkgEndBlock = bi + 1 + childCnt;
+                libPackages[{ curLibId, curPkgId }] = EaglePkgDef{};
+            } else {
+                ++signalCount;
+                curNetId = static_cast<int>(signalCount);
+            }
+            break;
+        }
+        case 0x1C:
+        case 0x1E: { // Signal / Net
+            ++signalCount;
+            curNetId = static_cast<int>(signalCount);
+            break;
+        }
+        case 0x1D: { // Schematic Part
+            ++curPartId;
+            std::string pname = readEagleStr(rec + 16, 8);
+            if (pname.empty()) pname = readEagleStr(rec + 8, 16);
+            if (!pname.empty()) schPartNames[curPartId] = pname;
+            break;
+        }
+        case 0x1F: { // Wire / Track
+            float x1 = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float y1 = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            float x2 = static_cast<float>(rdI32(rec + 12)) * 1e-4f;
+            float y2 = static_cast<float>(rdI32(rec + 16)) * 1e-4f;
+            if (std::fabs(x1) > 20000.0f || std::fabs(y1) > 20000.0f ||
+                std::fabs(x2) > 20000.0f || std::fabs(y2) > 20000.0f) break;
+            float w = std::clamp(static_cast<float>(rdU16(rec + 20)) * 2e-4f, 0.08f, 15.0f);
+            EdaLayerId lid = mapLayer(rec[3]);
+            if (inPkgDef) {
+                auto& pkg = libPackages[{ curLibId, curPkgId }];
+                pkg.localSilk.push_back({ x1, y1, x2, y2, w, lid, 0 });
+                pkg.minX = std::min({ pkg.minX, x1, x2 });
+                pkg.maxX = std::max({ pkg.maxX, x1, x2 });
+                pkg.minY = std::min({ pkg.minY, y1, y2 });
+                pkg.maxY = std::max({ pkg.maxY, y1, y2 });
+            } else if (out.traces.size() < 80000) {
+                out.traces.push_back({ x1, y1, x2, y2, w, lid, curNetId });
+            }
+            break;
+        }
+        case 0x20: { // Rectangle
+            float x1 = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float y1 = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            float x2 = static_cast<float>(rdI32(rec + 12)) * 1e-4f;
+            float y2 = static_cast<float>(rdI32(rec + 16)) * 1e-4f;
+            if (std::fabs(x1) > 20000.0f || std::fabs(x2) > 20000.0f) break;
+            EdaLayerId lid = mapLayer(rec[3]);
+            auto pushRect = [&](std::vector<EdaTraceSeg>& dst) {
+                dst.push_back({ x1, y1, x2, y1, 0.20f, lid, 0 });
+                dst.push_back({ x2, y1, x2, y2, 0.20f, lid, 0 });
+                dst.push_back({ x2, y2, x1, y2, 0.20f, lid, 0 });
+                dst.push_back({ x1, y2, x1, y1, 0.20f, lid, 0 });
+            };
+            if (inPkgDef) pushRect(libPackages[{ curLibId, curPkgId }].localSilk);
+            else if (out.traces.size() < 80000) pushRect(out.traces);
+            break;
+        }
+        case 0x21: { // Text
+            float tx = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float ty = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            float sz = std::clamp(static_cast<float>(rdU16(rec + 12)) * 2e-4f, 0.8f, 5.0f);
+            std::string txt = readEagleStr(rec + 18, 6);
+            if (!txt.empty() && !inPkgDef && out.labels.size() < 8000) {
+                out.labels.push_back({ tx, ty, sz, mapLayer(rec[3]), PathUtils::Utf8ToWide(txt) });
+            }
+            break;
+        }
+        case 0x22: // Circle
+        case 0x29: { // Hole
+            float cx = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float cy = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            float r  = std::fabs(static_cast<float>(rdI32(rec + 12)) * 1e-4f);
+            if (std::fabs(cx) > 20000.0f || std::fabs(cy) > 20000.0f || r <= 0.01f || r > 5000.0f) break;
+            float w = 0.20f;
+            if (rdU16(rec + 20) > 0) w = static_cast<float>(rdU16(rec + 20)) * 2e-4f;
+            else if (rdI32(rec + 16) > 0 && rdI32(rec + 16) < 200000) w = static_cast<float>(rdI32(rec + 16)) * 1e-4f;
+            if (!inPkgDef && out.circles.size() < 20000) {
+                out.circles.push_back({ cx, cy, r, std::clamp(w, 0.08f, 10.0f), false,
+                    (op == 0x29) ? EdaLayerId::EdgeCuts : mapLayer(rec[3]) });
+            }
+            break;
+        }
+        case 0x27:
+        case 0x28: { // Via
+            float vx = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float vy = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            if (std::fabs(vx) > 20000.0f || std::fabs(vy) > 20000.0f) break;
+            float drill = 0.4f, diam = 0.8f;
+            decodeDrillAndDiam(rec, drill, diam);
+            if (out.vias.size() < 40000) {
+                out.vias.push_back({ vx, vy, diam, drill, curNetId });
+            }
+            break;
+        }
+        case 0x2A: { // Thru-Hole Pad
+            float px = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float py = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            if (std::fabs(px) > 20000.0f || std::fabs(py) > 20000.0f) break;
+            float drill = 0.8f, diam = 1.5f;
+            decodeDrillAndDiam(rec, drill, diam);
+            EdaPadPrim p;
+            p.x = px; p.y = py;
+            p.w = diam; p.h = diam;
+            p.drill = drill;
+            p.shape = (rec[2] == 0) ? 1 : 0;
+            p.layer = EdaLayerId::PadsThrough;
+            std::string pnm = readEagleStr(rec + 19, 5);
+            if (!pnm.empty()) p.pinName = PathUtils::Utf8ToWide(pnm);
+            if (inPkgDef) {
+                auto& pkg = libPackages[{ curLibId, curPkgId }];
+                pkg.localPads.push_back(p);
+                pkg.minX = std::min(pkg.minX, px - diam * 0.5f);
+                pkg.maxX = std::max(pkg.maxX, px + diam * 0.5f);
+                pkg.minY = std::min(pkg.minY, py - diam * 0.5f);
+                pkg.maxY = std::max(pkg.maxY, py + diam * 0.5f);
+            } else if (out.pads.size() < 60000) {
+                out.pads.push_back(p);
+            }
+            break;
+        }
+        case 0x2B: { // SMD Pad
+            float px = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float py = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            if (std::fabs(px) > 20000.0f || std::fabs(py) > 20000.0f) break;
+            int32_t dx32 = rdI32(rec + 12), dy32 = rdI32(rec + 16);
+            float dx = 1.0f, dy = 1.0f;
+            if (rec[14] == 0 && rec[15] == 0 && dx32 > 0 && dx32 < 500000 && dy32 > 0 && dy32 < 500000) {
+                dx = static_cast<float>(dx32) * 1e-4f;
+                dy = static_cast<float>(dy32) * 1e-4f;
+            } else {
+                dx = static_cast<float>(rdU16(rec + 12)) * 2e-4f;
+                dy = static_cast<float>(rdU16(rec + 14)) * 2e-4f;
+            }
+            dx = std::clamp(dx, 0.15f, 30.0f);
+            dy = std::clamp(dy, 0.15f, 30.0f);
+            EdaPadPrim p;
+            p.x = px; p.y = py;
+            p.w = dx; p.h = dy;
+            p.shape = 1;
+            p.layer = (rec[3] == 16) ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
+            std::string pnm = readEagleStr(rec + 19, 5);
+            if (!pnm.empty()) p.pinName = PathUtils::Utf8ToWide(pnm);
+            if (inPkgDef) {
+                auto& pkg = libPackages[{ curLibId, curPkgId }];
+                pkg.localPads.push_back(p);
+                pkg.minX = std::min(pkg.minX, px - dx * 0.5f);
+                pkg.maxX = std::max(pkg.maxX, px + dx * 0.5f);
+                pkg.minY = std::min(pkg.minY, py - dy * 0.5f);
+                pkg.maxY = std::max(pkg.maxY, py + dy * 0.5f);
+            } else if (out.pads.size() < 60000) {
+                out.pads.push_back(p);
+            }
+            break;
+        }
+        case 0x2C: { // Schematic Pin
+            float px = static_cast<float>(rdI32(rec + 4)) * 1e-4f;
+            float py = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            if (std::fabs(px) <= 20000.0f && std::fabs(py) <= 20000.0f && out.pads.size() < 40000) {
+                EdaPadPrim p;
+                p.x = px; p.y = py; p.w = 0.8f; p.h = 0.8f;
+                p.layer = EdaLayerId::SchSymbol;
+                std::string pnm = readEagleStr(rec + 14, 10);
+                if (!pnm.empty()) p.pinName = PathUtils::Utf8ToWide(pnm);
+                out.pads.push_back(p);
+            }
+            break;
+        }
+        case 0x30: { // PCB Element placement
+            uint16_t nrChild = rdU16(rec + 2);
+            uint16_t libId   = rdU16(rec + 4);
+            uint16_t pkgId   = rdU16(rec + 6);
+            float ex = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            float ey = static_cast<float>(rdI32(rec + 12)) * 1e-4f;
+            uint16_t rotFlags = rdU16(rec + 16);
+            if (std::fabs(ex) > 20000.0f || std::fabs(ey) > 20000.0f) break;
+
+            EdaComponent3D c;
+            std::string inlName = readEagleStr(rec + 18, 6);
+            if (inlName.empty() && !pendingElemName.empty()) {
+                inlName = std::move(pendingElemName);
+                pendingElemName.clear();
+            }
+            c.refDes = inlName.empty() ? (L"E" + std::to_wstring(out.components.size() + 1)) : PathUtils::Utf8ToWide(inlName);
+            c.footprint = L"PKG_" + std::to_wstring(pkgId);
+            c.x = ex;
+            c.y = ey;
+            c.rotDeg = decodeRotDeg(rotFlags);
+            c.bottomSide = (rotFlags & 0x1000u) != 0;
+
+            auto itPkg = libPackages.find({ libId, pkgId });
+            if (itPkg != libPackages.end()) {
+                const auto& pkg = itPkg->second;
+                c.widthMm  = std::max(1.2f, pkg.maxX - pkg.minX);
+                c.lengthMm = std::max(1.0f, pkg.maxY - pkg.minY);
+                c.pinCount = std::max(2, static_cast<int>(pkg.localPads.size()));
+                float rad = c.rotDeg * 3.14159265f / 180.0f;
+                float cs = std::cos(rad), sn = std::sin(rad);
+                auto xform = [&](float lx, float ly, float& ox, float& oy) {
+                    if (c.bottomSide) lx = -lx;
+                    ox = ex + (lx * cs - ly * sn);
+                    oy = ey + (lx * sn + ly * cs);
+                };
+                for (const auto& lp : pkg.localPads) {
+                    EdaPadPrim wp = lp;
+                    xform(lp.x, lp.y, wp.x, wp.y);
+                    wp.rotDeg += c.rotDeg;
+                    if (c.bottomSide && wp.layer == EdaLayerId::TopCopper) wp.layer = EdaLayerId::BottomCopper;
+                    out.pads.push_back(wp);
+                }
+                for (const auto& ls : pkg.localSilk) {
+                    EdaTraceSeg ws = ls;
+                    xform(ls.x1, ls.y1, ws.x1, ws.y1);
+                    xform(ls.x2, ls.y2, ws.x2, ws.y2);
+                    if (c.bottomSide && ws.layer == EdaLayerId::TopSilk) ws.layer = EdaLayerId::BottomSilk;
+                    out.traces.push_back(ws);
+                }
+            }
+
+            c.category = ClassifyComponent(c.refDes, c.footprint, c.widthMm, c.lengthMm, c.heightMm, c.pinCount);
+            lastCompIdx = static_cast<int>(out.components.size());
+            elemAttrEndBlock = bi + std::max<uint32_t>(2u, nrChild);
+            out.components.push_back(c);
+            anyElementPlaced = true;
+            break;
+        }
+        case 0x33: { // Element2 (name[8] + value[14])
+            if (lastCompIdx >= 0 && lastCompIdx < static_cast<int>(out.components.size())) {
+                std::string nm = readEagleStr(rec + 2, 8);
+                std::string vl = readEagleStr(rec + 10, 14);
+                auto& c = out.components[lastCompIdx];
+                if (!nm.empty()) c.refDes = PathUtils::Utf8ToWide(nm);
+                if (!vl.empty()) c.value  = PathUtils::Utf8ToWide(vl);
+                c.category = ClassifyComponent(c.refDes, c.footprint, c.widthMm, c.lengthMm, c.heightMm, c.pinCount);
+            }
+            break;
+        }
+        case 0x34: { // Attribute
+            if (lastCompIdx >= 0 && lastCompIdx < static_cast<int>(out.components.size()) && bi <= elemAttrEndBlock + 2) {
+                std::string s1 = readEagleStr(rec + 8, 8);
+                std::string s2 = readEagleStr(rec + 16, 8);
+                auto& c = out.components[lastCompIdx];
+                if (!s1.empty() && c.refDes.rfind(L"E", 0) == 0) c.refDes = PathUtils::Utf8ToWide(s1);
+                else if (!s2.empty() && c.value.empty()) c.value = PathUtils::Utf8ToWide(s2);
+                else if (!s1.empty() && c.value.empty()) c.value = PathUtils::Utf8ToWide(s1);
+                c.category = ClassifyComponent(c.refDes, c.footprint, c.widthMm, c.lengthMm, c.heightMm, c.pinCount);
+            }
+            break;
+        }
+        case 0x38: { // Schematic Instance
+            uint16_t nrChild = rdU16(rec + 2);
+            uint16_t partId  = rdU16(rec + 4);
+            float ix = static_cast<float>(rdI32(rec + 8)) * 1e-4f;
+            float iy = static_cast<float>(rdI32(rec + 12)) * 1e-4f;
+            uint16_t rotFlags = rdU16(rec + 16);
+            if (std::fabs(ix) > 20000.0f || std::fabs(iy) > 20000.0f) break;
+
+            EdaComponent3D c;
+            std::string nm = readEagleStr(rec + 18, 6);
+            if (nm.empty() && schPartNames.count(partId)) nm = schPartNames[partId];
+            if (nm.empty() && !pendingElemName.empty()) { nm = std::move(pendingElemName); pendingElemName.clear(); }
+            c.refDes = nm.empty() ? (L"U" + std::to_wstring(out.components.size() + 1)) : PathUtils::Utf8ToWide(nm);
+            c.footprint = L"SCH_INST";
+            c.x = ix;
+            c.y = iy;
+            c.rotDeg = decodeRotDeg(rotFlags);
+            c.widthMm = 6.0f;
+            c.lengthMm = 4.0f;
+            c.category = ClassifyComponent(c.refDes, c.footprint, c.widthMm, c.lengthMm, c.heightMm, c.pinCount);
+            lastCompIdx = static_cast<int>(out.components.size());
+            elemAttrEndBlock = bi + std::max<uint32_t>(2u, nrChild);
+            out.components.push_back(c);
+
+            float x0 = ix - 3.0f, x1 = ix + 3.0f, y0 = iy - 2.0f, y1 = iy + 2.0f;
+            out.traces.push_back({ x0, y0, x1, y0, 0.22f, EdaLayerId::SchSymbol, 0 });
+            out.traces.push_back({ x1, y0, x1, y1, 0.22f, EdaLayerId::SchSymbol, 0 });
+            out.traces.push_back({ x1, y1, x0, y1, 0.22f, EdaLayerId::SchSymbol, 0 });
+            out.traces.push_back({ x0, y1, x0, y0, 0.22f, EdaLayerId::SchSymbol, 0 });
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    if (!anyElementPlaced && !libPackages.empty()) {
+        float offX = 0.0f;
+        for (const auto& kv : libPackages) {
+            const auto& pkg = kv.second;
+            for (auto p : pkg.localPads) { p.x += offX; out.pads.push_back(p); }
+            for (auto s : pkg.localSilk) { s.x1 += offX; s.x2 += offX; out.traces.push_back(s); }
+            offX += std::max(8.0f, (pkg.maxX - pkg.minX) + 5.0f);
+        }
+    }
+
+    if (out.traces.empty() && out.pads.empty() && out.vias.empty() && out.circles.empty() && out.components.empty()) {
+        return false;
+    }
+    out.netCount = std::max<size_t>(1, signalCount > 0 ? signalCount : out.components.size());
+    FinalizeBoardBounds(out);
+    out.valid = true;
+    return true;
+}
+
 } // namespace
 
 #include "formats/LtspiceAsc.h"
@@ -307,6 +784,7 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
 
     // Modular EDA & Firmware formats (Format15 .. Format20)
     {
+        bool handledExt = true;
         bool okMod = false;
         if (ext == L".asc") okMod = Formats::ParseLtspiceAsc(sv, outBoard);
         else if (ext == L".dsn") okMod = Formats::ParseSpecctraDsn(sv, outBoard);
@@ -322,19 +800,30 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
         else if (ext == L".gds" || ext == L".gds2") okMod = Formats::ParseGdsiiStreamBoard(raw.data(), raw.size(), outBoard);
         else if (ext == L".bsdl") okMod = Formats::ParseJtagBsdlBoard(sv, outBoard);
         else if (ext == L".svd") okMod = Formats::ParseCmsisSvdBoard(sv, outBoard);
-        else if (ext == L".odb" || ext == L".ipc2581" || ext == L".cvg") okMod = Formats::ParseOdbOrIpc2581Board(sv, ext, outBoard);
+        else if (ext == L".odb" || ext == L".ipc2581" || ext == L".cvg") okMod = Formats::ParseOdbOrIpc2581Board(raw.data(), raw.size(), ext, outBoard);
         else if (ext == L".pcbdoc" || ext == L".schdoc") okMod = Formats::ParseAltiumDocBoard(raw.data(), raw.size(), ext, outBoard);
-        else if (ext == L".dbc" || ext == L".blf" || ext == L".can") okMod = Formats::ParseVectorCanBoard(sv, ext, outBoard);
+        else if (ext == L".dbc" || ext == L".blf" || ext == L".can") okMod = Formats::ParseVectorCanBoard(raw.data(), raw.size(), ext, outBoard);
         else if (ext == L".fst" || ext == L".ghw" || ext == L".bit" || ext == L".rpd" ||
                  ext == L".dfu" || ext == L".ufd" || ext == L".edid" || ext == L".spd")
             okMod = Formats::ParseHardwareBinBoard(raw.data(), raw.size(), ext, outBoard);
-        else
+        else {
+            handledExt = false;
             okMod = Formats::ParseExtendedEda200(raw.data(), raw.size(), ext, outBoard);
-        if (!okMod && ext == L".asc") okMod = Formats::ParseVectorCanBoard(sv, ext, outBoard);
+        }
+
+        if (!okMod && ext == L".asc") {
+            outBoard = ParsedEdaBoard{};
+            outBoard.filePath = fullPath;
+            okMod = Formats::ParseVectorCanBoard(raw.data(), raw.size(), ext, outBoard);
+        }
         if (okMod) {
             FinalizeBoardBounds(outBoard);
             outBoard.valid = true;
             return true;
+        }
+        if (handledExt) {
+            outBoard = ParsedEdaBoard{};
+            return false;
         }
     }
 
@@ -356,42 +845,22 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
         if (sv.find('<') != std::string_view::npos && ParseEagleXml(sv, ext, outBoard)) {
             return true;
         }
-        // Binary Eagle v4/v5 (.brd/.sch) fallback: extract embedded RefDes & generate layout grid
-        if (raw.size() >= 24 && raw[0] == 0x10) {
-            outBoard.kind = (ext == L".sch") ? EdaDocKind::EagleSch : EdaDocKind::EagleBrd;
-            outBoard.formatTitle = (ext == L".sch") ? L"Eagle Binary Schematic (v4/v5)" : L"Eagle Binary Board (v4/v5)";
-            int idx = 0;
-            for (size_t i = 24; i + 8 < raw.size(); ++i) {
-                if ((raw[i] == 'U' || raw[i] == 'R' || raw[i] == 'C' || raw[i] == 'J' || raw[i] == 'Q' || raw[i] == 'D') &&
-                    raw[i + 1] >= '1' && raw[i + 1] <= '9')
-                {
-                    std::string ref;
-                    size_t k = i;
-                    while (k < raw.size() && k - i < 8 && ((raw[k] >= 'A' && raw[k] <= 'Z') || (raw[k] >= '0' && raw[k] <= '9'))) {
-                        ref.push_back(static_cast<char>(raw[k++]));
-                    }
-                    if (ref.size() >= 2 && k < raw.size() && raw[k] == 0) {
-                        EdaComponent3D c;
-                        c.refDes = PathUtils::Utf8ToWide(ref);
-                        c.footprint = L"SMD";
-                        int col = idx % 8;
-                        int row = idx / 8;
-                        c.x = -24.0f + col * 7.0f;
-                        c.y = -16.0f + row * 6.0f;
-                        c.category = ClassifyComponent(c.refDes, c.footprint, c.widthMm, c.lengthMm, c.heightMm, c.pinCount);
-                        outBoard.components.push_back(c);
-                        outBoard.pads.push_back({ c.x - c.widthMm * 0.4f, c.y, 0.8f, 1.0f, 0.0f, 0.0f, 1, EdaLayerId::TopCopper, L"1", L"" });
-                        outBoard.pads.push_back({ c.x + c.widthMm * 0.4f, c.y, 0.8f, 1.0f, 0.0f, 0.0f, 1, EdaLayerId::TopCopper, L"2", L"" });
-                        ++idx;
-                        i = k;
-                        if (idx >= 64) break;
-                    }
-                }
-            }
-            FinalizeBoardBounds(outBoard);
-            outBoard.valid = !outBoard.components.empty();
-            return outBoard.valid;
+        outBoard = ParsedEdaBoard{};
+        outBoard.filePath = fullPath;
+        if (ParseEagleBinaryV4V5(raw.data(), raw.size(), ext, outBoard)) {
+            return true;
         }
+        outBoard = ParsedEdaBoard{};
+        return false;
+    }
+
+    const bool isGerberOrDrillExt =
+        ext == L".gbr" || ext == L".ger" || ext == L".gtl" || ext == L".gbl" ||
+        ext == L".gts" || ext == L".gbs" || ext == L".gto" || ext == L".gbo" ||
+        ext == L".gm1" || ext == L".gko" || ext == L".drl" || ext == L".xln";
+    if (!isGerberOrDrillExt && sv.find("%FSLA") == std::string_view::npos && sv.rfind("M48", 0) != 0) {
+        outBoard = ParsedEdaBoard{};
+        return false;
     }
 
     return ParseGerberOrDrill(sv, ext, outBoard);
