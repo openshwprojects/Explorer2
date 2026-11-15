@@ -3,6 +3,11 @@
 #include "PathUtils.h"
 #include "ZipDeflate.h"
 #include <wincodec.h>
+#include <dwrite_3.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#include <mferror.h>
 #include <algorithm>
 #include <array>
 #include <cmath>

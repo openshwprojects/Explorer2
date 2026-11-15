@@ -2416,9 +2416,44 @@ static void RunStage12Tests(TestCounter& tc) {
             uint32_t icnsLen = static_cast<uint32_t>(icnsBytes.size());
             icnsBytes[7] = static_cast<uint8_t>(icnsLen);
 
-            // 5. Valid JPEG XL naked codestream header + frame bitstream
-            std::vector<uint8_t> jxlBytes = { 0xFF, 0x0A, 0x47, 0x06 };
-            for (int i = 0; i < 24; ++i) jxlBytes.push_back(static_cast<uint8_t>(0x31 + i * 7));
+            // 5. Valid JPEG XL naked Modular lossless 4x4 RGB codestream (ISO/IEC 18181-1)
+            std::vector<uint8_t> jxlBytes = []() {
+                struct LsbW {
+                    std::vector<uint8_t> b; uint32_t cur = 0, used = 0;
+                    void Put(uint32_t v, uint32_t n) {
+                        for (uint32_t i = 0; i < n; ++i) {
+                            cur |= (((v >> i) & 1u) << used);
+                            if (++used == 8u) { b.push_back(static_cast<uint8_t>(cur)); cur = 0; used = 0; }
+                        }
+                    }
+                    void Align() { if (used > 0u) { b.push_back(static_cast<uint8_t>(cur)); cur = 0; used = 0; } }
+                } lf, cs;
+                lf.Put(1u, 1u); lf.Put(0u, 1u); lf.Put(0u, 1u); lf.Put(1u, 1u); lf.Put(0u, 2u); // LfGlobal defaults, 0 transforms
+                lf.Put(0u, 1u); lf.Put(1u, 1u); lf.Put(0u, 2u); lf.Put(1u, 1u); // MA tree: 1 cluster, prefix
+                lf.Put(4u, 4u); lf.Put(0u, 3u); lf.Put(0u, 3u); lf.Put(0u, 1u); // Zero predictor single-leaf
+                lf.Put(0u, 1u); lf.Put(1u, 1u); lf.Put(0u, 4u); // Local hist: prefix, splitExp=0
+                lf.Put(1u, 1u); lf.Put(3u, 4u); lf.Put(7u, 3u); lf.Put(0u, 2u); // alphaSize=16, complex prefix
+                lf.Put(0u, 2u); lf.Put(0u, 2u); lf.Put(0u, 2u); lf.Put(7u, 4u); lf.Put(7u, 4u); lf.Put(0xFFFFu, 16u);
+                const int32_t chVal[3] = { 210, 95, 45 };
+                for (int c = 0; c < 3; ++c) {
+                    uint32_t u = static_cast<uint32_t>(2 * chVal[c]);
+                    uint32_t k = 0u; while ((1u << (k + 1u)) <= u) ++k;
+                    uint32_t tok = 1u + k, rev = 0u;
+                    for (uint32_t bi = 0; bi < 4u; ++bi) rev = (rev << 1u) | ((tok >> bi) & 1u);
+                    for (int px = 0; px < 16; ++px) { lf.Put(rev, 4u); lf.Put(u & ((1u << k) - 1u), k); }
+                }
+                lf.Align();
+                cs.Put(0xFFu, 8u); cs.Put(0x0Au, 8u);
+                cs.Put(0u, 1u); cs.Put(0u, 2u); cs.Put(3u, 9u); cs.Put(0u, 3u); cs.Put(0u, 2u); cs.Put(3u, 9u); // 4x4
+                cs.Put(0u, 1u); cs.Put(0u, 1u); cs.Put(0u, 1u); cs.Put(0u, 2u); cs.Put(1u, 1u); cs.Put(0u, 2u);
+                cs.Put(0u, 1u); cs.Put(1u, 1u); cs.Put(0u, 2u); cs.Put(1u, 1u); cs.Align();
+                cs.Put(0u, 1u); cs.Put(0u, 2u); cs.Put(1u, 1u); cs.Put(0u, 2u); cs.Put(0u, 1u); cs.Put(0u, 2u);
+                cs.Put(1u, 2u); cs.Put(0u, 2u); cs.Put(0u, 1u); cs.Put(0u, 2u); cs.Put(1u, 1u); cs.Put(0u, 2u);
+                cs.Put(1u, 1u); cs.Put(0u, 2u); cs.Align();
+                cs.Put(0u, 1u); cs.Put(0u, 2u); cs.Put(static_cast<uint32_t>(lf.b.size()), 10u); cs.Align();
+                cs.b.insert(cs.b.end(), lf.b.begin(), lf.b.end());
+                return cs.b;
+            }();
 
             // 6. Valid Blizzard BLP2 4x4 uncompressed BGRA (encoding=3)
             std::vector<uint8_t> blpBytes(148 + 64, 0);
@@ -6018,13 +6053,55 @@ static void RunStage14Tests(TestCounter& tc) {
         pf32(jt, 2.0f); pf32(jt, 0.0f); pf32(jt, 0.0f);
         pf32(jt, 0.0f); pf32(jt, 2.0f); pf32(jt, 1.0f);
 
-        // #55 .e57 ("ASTM-E57" 48B header + 3 float3 points)
-        std::vector<uint8_t> e57(48, 0);
-        std::memcpy(e57.data(), "ASTM-E57", 8);
-        e57[8] = 1; e57[24] = 96; e57[40] = 0; e57[41] = 4; // pageSize = 1024
-        pf32(e57, 1.0f); pf32(e57, 2.0f); pf32(e57, 0.5f);
-        pf32(e57, -1.0f); pf32(e57, 1.5f); pf32(e57, 2.0f);
-        e57.insert(e57.end(), 32, 0);
+        // #55 .e57 (Authentic ASTM E2807 1024B CRC32C-paged scan with CompressedVectorSection + DataPacket + XML)
+        std::vector<uint8_t> e57;
+        {
+            std::string e57Xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                "<e57Root type=\"Structure\" xmlns=\"http://www.astm.org/COMMIT/E57/2010-e57-v1.0\">"
+                "<data3D type=\"Vector\" allowHeterogeneousChildren=\"1\"><vectorChild type=\"Structure\">"
+                "<points type=\"CompressedVector\" fileOffset=\"48\" recordCount=\"3\">"
+                "<prototype type=\"Structure\">"
+                "<cartesianX type=\"Float\" precision=\"single\"/>"
+                "<cartesianY type=\"Float\" precision=\"single\"/>"
+                "<cartesianZ type=\"Float\" precision=\"single\"/>"
+                "</prototype></points></vectorChild></data3D></e57Root>";
+            // DataPacket (12B header+lengths + 36B planar floats = 48B -> lenMinus1 = 47)
+            std::vector<uint8_t> pkt;
+            pkt.push_back(1); pkt.push_back(0); p16le(pkt, 47); p16le(pkt, 3);
+            p16le(pkt, 12); p16le(pkt, 12); p16le(pkt, 12);
+            pf32(pkt, 1.0f); pf32(pkt, -1.0f); pf32(pkt, 2.0f); // X[0..2]
+            pf32(pkt, 2.0f); pf32(pkt,  1.5f); pf32(pkt, 0.0f); // Y[0..2]
+            pf32(pkt, 0.5f); pf32(pkt,  2.0f); pf32(pkt, 1.2f); // Z[0..2]
+
+            std::vector<uint8_t> logPg;
+            logPg.insert(logPg.end(), { 'A','S','T','M','-','E','5','7' });
+            p32le(logPg, 1); p32le(logPg, 0);
+            p64le(logPg, 1024ULL); // filePhysicalLength = 1 page (1024B)
+            uint64_t xmlOff = 48ULL + 32ULL + pkt.size();
+            p64le(logPg, xmlOff);
+            p64le(logPg, static_cast<uint64_t>(e57Xml.size()));
+            p64le(logPg, 1024ULL);
+            // CompressedVectorSection @ 48 (32B)
+            logPg.push_back(1); logPg.insert(logPg.end(), 7, 0);
+            p64le(logPg, 32ULL + pkt.size());
+            p64le(logPg, 80ULL);
+            p64le(logPg, 0ULL);
+            logPg.insert(logPg.end(), pkt.begin(), pkt.end());
+            logPg.insert(logPg.end(), e57Xml.begin(), e57Xml.end());
+            logPg.resize(1020, 0);
+            uint32_t crc = 0xFFFFFFFFu;
+            for (uint8_t b : logPg) {
+                crc ^= b;
+                for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+            }
+            crc = ~crc;
+            e57 = std::move(logPg);
+            e57.push_back(static_cast<uint8_t>((crc >> 24) & 0xFFu));
+            e57.push_back(static_cast<uint8_t>((crc >> 16) & 0xFFu));
+            e57.push_back(static_cast<uint8_t>((crc >>  8) & 0xFFu));
+            e57.push_back(static_cast<uint8_t>(crc & 0xFFu));
+        }
 
         // #56 .laz ("LASF" 227B LAS 1.2 header + 4 uncompressed Format-0 point records)
         std::vector<uint8_t> laz(227, 0);
@@ -6080,8 +6157,37 @@ static void RunStage14Tests(TestCounter& tc) {
             { L".3dxml", strVec("<Model_3dxml><Positions>0 0 0 1 0 0 0 1 0</Positions><Faces><Face triangles=\"0 1 2\"/></Faces></Model_3dxml>") },
             { L".jt",    jt },
             { L".brep",  strVec("DBRep_DrawableShape\nTriangulations 1\n3 1 0 0.01\n0 0 0 1 0 0 0 1 0\n1 2 3\n") },
-            { L".sat",   strVec("700 0 1 0\nACIS 7.0\npoint $-1 0 0 0 #\npoint $-1 10 0 0 #\npoint $-1 0 10 5 #\n") },
-            { L".x_t",   strVec("SCH_1000\npoint 1 2 3\npoint 4 5 6\npoint 0 5 2\n") },
+            { L".sat",   strVec(
+                "700 0 1 0\n@13 Explorer2Test @8 ACIS 7.0 @4 2026\n1 1e-06 1e-10\n"
+                "-0 body $-1 $1 $-1 $-1 #\n"
+                "-1 lump $-1 $-1 $2 $0 #\n"
+                "-2 shell $-1 $-1 $-1 $3 $-1 $1 #\n"
+                "-3 face $-1 $-1 $4 $2 $-1 $5 forward single #\n"
+                "-4 loop $-1 $-1 $7 $3 #\n"
+                "-5 plane-surface $-1 0 0 0 0 0 1 1 0 0 forward_v I I I I #\n"
+                "-6 straight-curve $-1 0 0 0 1 0 0 I I #\n"
+                "-7 coedge $-1 $8 $9 $-1 $10 forward $4 #\n"
+                "-8 coedge $-1 $9 $7 $-1 $11 forward $4 #\n"
+                "-9 coedge $-1 $7 $8 $-1 $12 forward $4 #\n"
+                "-10 edge $-1 $13 $14 $-1 $6 forward #\n"
+                "-11 edge $-1 $14 $15 $-1 $6 forward #\n"
+                "-12 edge $-1 $15 $13 $-1 $6 forward #\n"
+                "-13 vertex $-1 $-1 $16 #\n"
+                "-14 vertex $-1 $-1 $17 #\n"
+                "-15 vertex $-1 $-1 $18 #\n"
+                "-16 point $-1 0 0 0 #\n"
+                "-17 point $-1 10 0 0 #\n"
+                "-18 point $-1 0 10 5 #\n"
+                "End-of-ACIS-data\n") },
+            { L".x_t",   strVec(
+                "**PART1;MC=WIN64;\nSCH_3300002_33000;\n**END_OF_HEADER**\n"
+                "body 1 $2 ?;\nshell 2 $10;\n"
+                "point 30 0.0 0.0 0.0;\npoint 31 6.0 0.0 0.0;\npoint 32 0.0 8.0 2.0;\n"
+                "vertex 40 $30;\nvertex 41 $31;\nvertex 42 $32;\n"
+                "line 50 0.0 0.0 0.0 1.0 0.0 0.0;\nplane 60 0.0 0.0 0.0 0.0 0.0 1.0;\n"
+                "edge 70 $40 $41 $50 +;\nedge 71 $41 $42 $50 +;\nedge 72 $42 $40 $50 +;\n"
+                "fin 80 $81 $70 +;\nfin 81 $82 $71 +;\nfin 82 $80 $72 +;\n"
+                "loop 20 $10 $80;\nface 10 ? $20 $60 +;\n**END_OF_PART**\n") },
             { L".e57",   e57 },
             { L".laz",   laz },
             { L".urdf",  strVec("<robot name=\"arm\"><link name=\"base\"><visual><geometry><box size=\"0.5 0.5 0.2\"/></geometry></visual></link></robot>") },
@@ -6132,11 +6238,22 @@ static void RunStage14Tests(TestCounter& tc) {
             { "logic-1-1", srSamples }
         });
 
-        // #72 .sal (Saleae Logic 2 ZIP with meta.json + digital-0.bin)
-        std::string salMeta = "{\"name\":\"SPI\",\"channels\":[{\"name\":\"SCLK\"},{\"name\":\"MISO\"}]}";
+        // #72 .sal (Saleae Logic 2 ZIP with meta.json + authentic <SALEAE> v0 digital-0.bin)
+        std::string salMeta = "{\"name\":\"SPI\",\"channels\":[{\"type\":\"Digital\",\"index\":0,\"name\":\"SCLK\"}]}";
+        std::vector<uint8_t> salDig0(44 + 4 * 8, 0);
+        {
+            std::memcpy(salDig0.data(), "<SALEAE>", 8);
+            double tBeg = 0.0, tEnd = 0.001;
+            uint64_t nTr = 4;
+            std::memcpy(salDig0.data() + 20, &tBeg, 8);
+            std::memcpy(salDig0.data() + 28, &tEnd, 8);
+            std::memcpy(salDig0.data() + 36, &nTr, 8);
+            const double edges[4] = { 0.0001, 0.0003, 0.0006, 0.0008 };
+            std::memcpy(salDig0.data() + 44, edges, sizeof(edges));
+        }
         std::vector<uint8_t> salZip = BuildStoreZipForTest({
             { "meta.json", std::vector<uint8_t>(salMeta.begin(), salMeta.end()) },
-            { "digital-0.bin", { 0,1,0,1,1,0,1,0,0,1,1,1,0,0,1,0 } }
+            { "digital-0.bin", salDig0 }
         });
 
         // #73 .wfm (Tektronix WFM#003 binary with LE marker + INT16 curve buffer)

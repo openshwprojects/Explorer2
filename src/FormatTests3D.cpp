@@ -703,14 +703,157 @@ static std::vector<uint8_t> BuildSyntheticUsdc(
     return w.buf;
 }
 
-// Builds a binary ACIS (.sab) file with "ACIS BinaryFile" header and 0x13 TAG_POSITION records.
-static std::vector<uint8_t> BuildSyntheticSab(const std::vector<Vec3f>& positions) {
+// Builds a genuine binary ACIS (.sab) B-Rep solid (body -> lump -> shell -> face -> loop -> coedge -> edge -> vertex -> point).
+static std::vector<uint8_t> BuildSyntheticSabBRep(
+    const std::vector<Vec3f>& verts,
+    const std::vector<std::vector<int32_t>>& faceLoops)
+{
+    struct UndirEdge { int32_t u, v; };
+    std::vector<UndirEdge> edges;
+    auto findOrAddEdge = [&](int32_t a, int32_t b) -> int32_t {
+        int32_t lo = std::min(a, b), hi = std::max(a, b);
+        for (size_t i = 0; i < edges.size(); ++i) {
+            if (edges[i].u == lo && edges[i].v == hi) return static_cast<int32_t>(i);
+        }
+        edges.push_back({ lo, hi });
+        return static_cast<int32_t>(edges.size() - 1);
+    };
+    for (const auto& poly : faceLoops) {
+        for (size_t k = 0; k < poly.size(); ++k) {
+            findOrAddEdge(poly[k], poly[(k + 1) % poly.size()]);
+        }
+    }
+
+    const int32_t nV = static_cast<int32_t>(verts.size());
+    const int32_t nE = static_cast<int32_t>(edges.size());
+    const int32_t nF = static_cast<int32_t>(faceLoops.size());
+    const int32_t idxPtBase   = 3;
+    const int32_t idxVtBase   = 3 + nV;
+    const int32_t idxCurve    = 3 + 2 * nV;
+    const int32_t idxEdgeBase = idxCurve + 1;
+
+    struct FaceRecPlan {
+        int32_t surfId;
+        int32_t loopId;
+        int32_t faceId;
+        int32_t ceBase;
+    };
+    std::vector<FaceRecPlan> plans(static_cast<size_t>(nF));
+    int32_t curIdx = idxEdgeBase + nE;
+    for (int32_t f = 0; f < nF; ++f) {
+        plans[static_cast<size_t>(f)].surfId = curIdx++;
+        plans[static_cast<size_t>(f)].loopId = curIdx++;
+        plans[static_cast<size_t>(f)].faceId = curIdx++;
+        plans[static_cast<size_t>(f)].ceBase = curIdx;
+        curIdx += static_cast<int32_t>(faceLoops[static_cast<size_t>(f)].size());
+    }
+    const int32_t totalRecs = curIdx;
+
     ByteWriter w;
     w.Bytes("ACIS BinaryFile", 15);
-    w.I32LE(700); // version
+    w.I32LE(700);
+    w.I32LE(totalRecs);
+    w.I32LE(totalRecs);
+    w.I32LE(0);
+
+    auto writeStrTag = [&](const char* s) {
+        w.U8(0x07);
+        uint8_t n = static_cast<uint8_t>(std::strlen(s));
+        w.U8(n);
+        w.Bytes(s, n);
+    };
+    auto wIdent = [&](const char* s) {
+        w.U8(0x0D);
+        uint8_t n = static_cast<uint8_t>(std::strlen(s));
+        w.U8(n);
+        w.Bytes(s, n);
+    };
+    auto wSubIdent = [&](const char* s) {
+        w.U8(0x0E);
+        uint8_t n = static_cast<uint8_t>(std::strlen(s));
+        w.U8(n);
+        w.Bytes(s, n);
+    };
+    auto wPtr = [&](int32_t ref) { w.U8(0x0C); w.I32LE(ref); };
+    auto wPos = [&](double x, double y, double z) { w.U8(0x13); w.F64LE(x); w.F64LE(y); w.F64LE(z); };
+    auto wVec = [&](double x, double y, double z) { w.U8(0x14); w.F64LE(x); w.F64LE(y); w.F64LE(z); };
+    auto wTerm = [&]() { w.U8(0x11); };
+
+    writeStrTag("Explorer2Test");
+    writeStrTag("ACIS 7.0");
+    writeStrTag("2026");
+    w.U8(0x06); w.F64LE(1.0);
+    w.U8(0x06); w.F64LE(1e-6);
+    w.U8(0x06); w.F64LE(1e-10);
+
+    // 0: body, 1: lump, 2: shell
+    wIdent("body");  wPtr(-1); wPtr(1); wPtr(-1); wPtr(-1); wTerm();
+    wIdent("lump");  wPtr(-1); wPtr(-1); wPtr(2); wPtr(0);  wTerm();
+    wIdent("shell"); wPtr(-1); wPtr(-1); wPtr(-1); wPtr(nF > 0 ? plans[0].faceId : -1); wPtr(-1); wPtr(1); wTerm();
+
+    // points & vertices
+    for (int32_t i = 0; i < nV; ++i) {
+        wIdent("point"); wPtr(-1); wPos(verts[static_cast<size_t>(i)].x, verts[static_cast<size_t>(i)].y, verts[static_cast<size_t>(i)].z); wTerm();
+    }
+    for (int32_t i = 0; i < nV; ++i) {
+        wIdent("vertex"); wPtr(-1); wPtr(-1); wPtr(idxPtBase + i); wTerm();
+    }
+
+    // shared straight-curve + topological edges
+    wIdent("straight"); wSubIdent("curve"); wPtr(-1); wPos(0.0, 0.0, 0.0); wVec(1.0, 0.0, 0.0); wTerm();
+    for (int32_t e = 0; e < nE; ++e) {
+        wIdent("edge"); wPtr(-1);
+        wPtr(idxVtBase + edges[static_cast<size_t>(e)].u);
+        wPtr(idxVtBase + edges[static_cast<size_t>(e)].v);
+        wPtr(-1); wPtr(idxCurve); wIdent("forward"); wTerm();
+    }
+
+    // per-face plane-surface, loop, face, and circular coedges
+    for (int32_t f = 0; f < nF; ++f) {
+        const auto& poly = faceLoops[static_cast<size_t>(f)];
+        const auto& pl = plans[static_cast<size_t>(f)];
+        Vec3f p0 = verts[static_cast<size_t>(poly[0])];
+        Vec3f p1 = verts[static_cast<size_t>(poly[1])];
+        Vec3f p2 = verts[static_cast<size_t>(poly[2])];
+        double ux = p1.x - p0.x, uy = p1.y - p0.y, uz = p1.z - p0.z;
+        double vx = p2.x - p0.x, vy = p2.y - p0.y, vz = p2.z - p0.z;
+        double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        double nL = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (nL > 1e-12) { nx /= nL; ny /= nL; nz /= nL; } else { nx = 0.0; ny = 0.0; nz = 1.0; }
+
+        wIdent("plane"); wSubIdent("surface"); wPtr(-1); wPos(p0.x, p0.y, p0.z); wVec(nx, ny, nz); wTerm();
+        wIdent("loop");  wPtr(-1); wPtr(-1); wPtr(pl.ceBase); wPtr(pl.faceId); wTerm();
+        wIdent("face");  wPtr(-1); wPtr(f + 1 < nF ? plans[static_cast<size_t>(f + 1)].faceId : -1);
+        wPtr(pl.loopId); wPtr(2); wPtr(-1); wPtr(pl.surfId); wIdent("forward"); wIdent("single"); wTerm();
+
+        int32_t m = static_cast<int32_t>(poly.size());
+        for (int32_t k = 0; k < m; ++k) {
+            int32_t u = poly[static_cast<size_t>(k)];
+            int32_t v = poly[static_cast<size_t>((k + 1) % m)];
+            int32_t eIdx = findOrAddEdge(u, v);
+            bool fwd = (u < v);
+            wIdent("coedge"); wPtr(-1);
+            wPtr(pl.ceBase + ((k + 1) % m));
+            wPtr(pl.ceBase + ((k + m - 1) % m));
+            wPtr(-1);
+            wPtr(idxEdgeBase + eIdx);
+            wIdent(fwd ? "forward" : "reversed");
+            wPtr(pl.loopId);
+            wTerm();
+        }
+    }
+    wIdent("End-of-ACIS-data");
+    return w.buf;
+}
+
+// Builds a bare disconnected point-only .sab file (zero edges/faces) to verify zero-cheat rejection.
+static std::vector<uint8_t> BuildSyntheticSabBarePoints(const std::vector<Vec3f>& positions) {
+    ByteWriter w;
+    w.Bytes("ACIS BinaryFile", 15);
+    w.I32LE(700);
     w.I32LE(static_cast<int32_t>(positions.size()));
     w.I32LE(static_cast<int32_t>(positions.size()));
-    w.I32LE(0);   // flags
+    w.I32LE(0);
     auto writeStrTag = [&](const char* s) {
         w.U8(0x07);
         uint8_t n = static_cast<uint8_t>(std::strlen(s));
@@ -725,11 +868,398 @@ static std::vector<uint8_t> BuildSyntheticSab(const std::vector<Vec3f>& position
     w.U8(0x06); w.F64LE(1e-10);
     for (const auto& p : positions) {
         w.U8(0x0D); w.U8(5); w.Bytes("point", 5);
-        w.U8(0x13); // TAG_POSITION (3 doubles)
+        w.U8(0x0C); w.I32LE(-1);
+        w.U8(0x13);
         w.F64LE(p.x); w.F64LE(p.y); w.F64LE(p.z);
-        w.U8(0x11); // '#' terminator
+        w.U8(0x11);
     }
     return w.buf;
+}
+
+// Castagnoli CRC32C (polynomial 0x82F63B78) for ASTM E2807 .e57 1024-byte physical pages.
+static uint32_t TfCalcCrc32C(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+static std::vector<uint8_t> FinalizeE57LogicalToPhysicalPages(
+    const std::vector<uint8_t>& cvAndPackets,
+    const std::string& xmlText)
+{
+    const size_t kPageSize = 1024;
+    const size_t kUsable   = 1020;
+    auto logToPhys = [&](uint64_t logOff) -> uint64_t {
+        return (logOff / kUsable) * kPageSize + (logOff % kUsable);
+    };
+
+    ByteWriter logW;
+    logW.Bytes("ASTM-E57", 8);
+    logW.U32LE(1); // major
+    logW.U32LE(0); // minor
+    logW.U64LE(0); // filePhysicalLength placeholder (+16)
+    logW.U64LE(0); // xmlPhysicalOffset placeholder (+24)
+    logW.U64LE(xmlText.size()); // xmlLogicalLength (+32)
+    logW.U64LE(kPageSize);      // pageSize (+40)
+
+    logW.Bytes(cvAndPackets.data(), cvAndPackets.size());
+    uint64_t xmlLogOff = logW.buf.size();
+    logW.Bytes(xmlText.data(), xmlText.size());
+
+    size_t numPages = (logW.buf.size() + kUsable - 1) / kUsable;
+    if (numPages == 0) numPages = 1;
+    logW.buf.resize(numPages * kUsable, 0);
+
+    uint64_t filePhysLen = static_cast<uint64_t>(numPages * kPageSize);
+    uint64_t xmlPhysOff  = logToPhys(xmlLogOff);
+    for (int i = 0; i < 8; ++i) {
+        logW.buf[16 + i] = static_cast<uint8_t>((filePhysLen >> (i * 8)) & 0xFFu);
+        logW.buf[24 + i] = static_cast<uint8_t>((xmlPhysOff  >> (i * 8)) & 0xFFu);
+    }
+
+    std::vector<uint8_t> phys(numPages * kPageSize, 0);
+    for (size_t p = 0; p < numPages; ++p) {
+        std::memcpy(phys.data() + p * kPageSize, logW.buf.data() + p * kUsable, kUsable);
+        uint32_t crc = TfCalcCrc32C(phys.data() + p * kPageSize, kUsable);
+        phys[p * kPageSize + kUsable + 0] = static_cast<uint8_t>((crc >> 24) & 0xFFu);
+        phys[p * kPageSize + kUsable + 1] = static_cast<uint8_t>((crc >> 16) & 0xFFu);
+        phys[p * kPageSize + kUsable + 2] = static_cast<uint8_t>((crc >>  8) & 0xFFu);
+        phys[p * kPageSize + kUsable + 3] = static_cast<uint8_t>(crc & 0xFFu);
+    }
+    return phys;
+}
+
+static std::vector<uint8_t> BuildSyntheticE57Float32(const std::vector<Vec3f>& pts) {
+    ByteWriter sx, sy, sz;
+    for (const auto& p : pts) {
+        sx.F32LE(p.x);
+        sy.F32LE(p.y);
+        sz.F32LE(p.z);
+    }
+    ByteWriter pkt;
+    pkt.U8(1); // DataPacket
+    pkt.U8(0); // flags
+    pkt.U16LE(0); // lengthMinus1 placeholder
+    pkt.U16LE(3); // 3 bytestreams
+    pkt.U16LE(static_cast<uint16_t>(sx.buf.size()));
+    pkt.U16LE(static_cast<uint16_t>(sy.buf.size()));
+    pkt.U16LE(static_cast<uint16_t>(sz.buf.size()));
+    pkt.Bytes(sx.buf.data(), sx.buf.size());
+    pkt.Bytes(sy.buf.data(), sy.buf.size());
+    pkt.Bytes(sz.buf.data(), sz.buf.size());
+    pkt.Pad4();
+    uint16_t lenMinus1 = static_cast<uint16_t>(pkt.buf.size() - 1);
+    pkt.buf[2] = static_cast<uint8_t>(lenMinus1 & 0xFFu);
+    pkt.buf[3] = static_cast<uint8_t>((lenMinus1 >> 8) & 0xFFu);
+
+    ByteWriter cv;
+    cv.U8(1); // CompressedVectorSection (sectionId == 1)
+    for (int i = 0; i < 7; ++i) cv.U8(0);
+    cv.U64LE(32ULL + pkt.buf.size()); // sectionLogicalLength
+    cv.U64LE(80ULL);                  // dataPhysicalOffset (logical 80 == physical 80 on page 0)
+    cv.U64LE(0ULL);                   // indexPhysicalOffset
+    cv.Bytes(pkt.buf.data(), pkt.buf.size());
+
+    std::string xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<e57Root type=\"Structure\" xmlns=\"http://www.astm.org/COMMIT/E57/2010-e57-v1.0\">\n"
+        "  <data3D type=\"Vector\" allowHeterogeneousChildren=\"1\">\n"
+        "    <vectorChild type=\"Structure\">\n"
+        "      <points type=\"CompressedVector\" fileOffset=\"48\" recordCount=\"" + std::to_string(pts.size()) + "\">\n"
+        "        <prototype type=\"Structure\">\n"
+        "          <cartesianX type=\"Float\" precision=\"single\"/>\n"
+        "          <cartesianY type=\"Float\" precision=\"single\"/>\n"
+        "          <cartesianZ type=\"Float\" precision=\"single\"/>\n"
+        "        </prototype>\n"
+        "      </points>\n"
+        "    </vectorChild>\n"
+        "  </data3D>\n"
+        "</e57Root>\n";
+    return FinalizeE57LogicalToPhysicalPages(cv.buf, xml);
+}
+
+static std::vector<uint8_t> BuildSyntheticE57ScaledPose(
+    const std::vector<Vec3f>& pts,
+    const std::vector<uint8_t>& invalidFlags,
+    double transX, double transY, double transZ)
+{
+    struct LsbBitPacker {
+        std::vector<uint8_t> buf;
+        uint32_t bitPos = 0;
+        void Put(uint64_t val, uint32_t nBits) {
+            for (uint32_t b = 0; b < nBits; ++b) {
+                if ((bitPos & 7u) == 0) buf.push_back(0);
+                if ((val >> b) & 1ULL) buf.back() |= static_cast<uint8_t>(1u << (bitPos & 7u));
+                ++bitPos;
+            }
+        }
+    };
+    // ScaledInteger in [-10000, 10000] -> range = 20000 -> bitWidth = 15 bits, scale = 0.01
+    // Integer cartesianInvalidState in [0, 2] -> range = 2 -> bitWidth = 2 bits
+    LsbBitPacker bx, by, bz, bInv;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        int64_t qx = std::clamp<int64_t>(std::llround(pts[i].x * 100.0), -10000, 10000);
+        int64_t qy = std::clamp<int64_t>(std::llround(pts[i].y * 100.0), -10000, 10000);
+        int64_t qz = std::clamp<int64_t>(std::llround(pts[i].z * 100.0), -10000, 10000);
+        bx.Put(static_cast<uint64_t>(qx - (-10000)), 15);
+        by.Put(static_cast<uint64_t>(qy - (-10000)), 15);
+        bz.Put(static_cast<uint64_t>(qz - (-10000)), 15);
+        bInv.Put((i < invalidFlags.size() && invalidFlags[i] != 0) ? 1ULL : 0ULL, 2);
+    }
+
+    ByteWriter pkt;
+    pkt.U8(1);
+    pkt.U8(0);
+    pkt.U16LE(0);
+    pkt.U16LE(4); // 4 bytestreams
+    pkt.U16LE(static_cast<uint16_t>(bx.buf.size()));
+    pkt.U16LE(static_cast<uint16_t>(by.buf.size()));
+    pkt.U16LE(static_cast<uint16_t>(bz.buf.size()));
+    pkt.U16LE(static_cast<uint16_t>(bInv.buf.size()));
+    pkt.Bytes(bx.buf.data(), bx.buf.size());
+    pkt.Bytes(by.buf.data(), by.buf.size());
+    pkt.Bytes(bz.buf.data(), bz.buf.size());
+    pkt.Bytes(bInv.buf.data(), bInv.buf.size());
+    pkt.Pad4();
+    uint16_t lenMinus1 = static_cast<uint16_t>(pkt.buf.size() - 1);
+    pkt.buf[2] = static_cast<uint8_t>(lenMinus1 & 0xFFu);
+    pkt.buf[3] = static_cast<uint8_t>((lenMinus1 >> 8) & 0xFFu);
+
+    ByteWriter cv;
+    cv.U8(1);
+    for (int i = 0; i < 7; ++i) cv.U8(0);
+    cv.U64LE(32ULL + pkt.buf.size());
+    cv.U64LE(80ULL);
+    cv.U64LE(0ULL);
+    cv.Bytes(pkt.buf.data(), pkt.buf.size());
+
+    char xmlBuf[2048];
+    std::snprintf(xmlBuf, sizeof(xmlBuf),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<e57Root type=\"Structure\" xmlns=\"http://www.astm.org/COMMIT/E57/2010-e57-v1.0\">\n"
+        "  <data3D type=\"Vector\" allowHeterogeneousChildren=\"1\">\n"
+        "    <vectorChild type=\"Structure\">\n"
+        "      <pose type=\"Structure\">\n"
+        "        <rotation type=\"Structure\"><w type=\"Float\">1.0</w><x type=\"Float\"/></rotation>\n"
+        "        <translation type=\"Structure\"><x type=\"Float\">%.2f</x><y type=\"Float\">%.2f</y><z type=\"Float\">%.2f</z></translation>\n"
+        "      </pose>\n"
+        "      <points type=\"CompressedVector\" fileOffset=\"48\" recordCount=\"%zu\">\n"
+        "        <prototype type=\"Structure\">\n"
+        "          <cartesianX type=\"ScaledInteger\" minimum=\"-10000\" maximum=\"10000\" scale=\"0.01\" offset=\"0\"/>\n"
+        "          <cartesianY type=\"ScaledInteger\" minimum=\"-10000\" maximum=\"10000\" scale=\"0.01\" offset=\"0\"/>\n"
+        "          <cartesianZ type=\"ScaledInteger\" minimum=\"-10000\" maximum=\"10000\" scale=\"0.01\" offset=\"0\"/>\n"
+        "          <cartesianInvalidState type=\"Integer\" minimum=\"0\" maximum=\"2\"/>\n"
+        "        </prototype>\n"
+        "      </points>\n"
+        "    </vectorChild>\n"
+        "  </data3D>\n"
+        "</e57Root>\n",
+        transX, transY, transZ, pts.size());
+    return FinalizeE57LogicalToPhysicalPages(cv.buf, std::string(xmlBuf));
+}
+
+// Builds a GoldSrc v10 StudioMDL (.mdl) with 2 hierarchical mstudiobone_t bones and per-vertex bone skinning.
+static std::vector<uint8_t> BuildSyntheticGoldSrcMdl10(float bone1OffsetX) {
+    std::vector<uint8_t> buf(820, 0);
+    auto wrU32 = [&](size_t off, uint32_t v) { std::memcpy(buf.data() + off, &v, 4); };
+    auto wrI32 = [&](size_t off, int32_t v)  { std::memcpy(buf.data() + off, &v, 4); };
+    auto wrI16 = [&](size_t off, int16_t v)  { std::memcpy(buf.data() + off, &v, 2); };
+    auto wrU16 = [&](size_t off, uint16_t v) { std::memcpy(buf.data() + off, &v, 2); };
+    auto wrF32 = [&](size_t off, float v)    { std::memcpy(buf.data() + off, &v, 4); };
+
+    std::memcpy(buf.data(), "IDST", 4);
+    wrU32(4, 10);   // version 10 (GoldSrc)
+    wrU32(72, static_cast<uint32_t>(buf.size()));
+    wrU32(140, 2);  // numBones
+    wrU32(144, 244);// boneIndex
+    wrU32(204, 1);  // numBodyparts
+    wrU32(208, 468);// bodypartIndex (244 + 2 * 112)
+
+    // Bone 0 at 244: parent = -1, pos = (0, 0, 10)
+    wrI32(244 + 32, -1);
+    wrF32(244 + 64, 0.0f); wrF32(244 + 68, 0.0f); wrF32(244 + 72, 10.0f);
+    // Bone 1 at 356: parent = 0, pos = (bone1OffsetX, 0, 0)
+    wrI32(356 + 32, 0);
+    wrF32(356 + 64, bone1OffsetX); wrF32(356 + 68, 0.0f); wrF32(356 + 72, 0.0f);
+
+    // Bodypart at 468 (76B)
+    wrU32(468 + 64, 1);   // numModels
+    wrU32(468 + 72, 544); // modelIndex
+
+    // Submodel at 544 (112B)
+    wrU32(544 + 72, 1);   // numMesh
+    wrU32(544 + 76, 656); // meshIndex
+    wrU32(544 + 80, 5);   // numVerts
+    wrU32(544 + 84, 676); // vertInfoIndex
+    wrU32(544 + 88, 684); // vertIndex
+
+    // Mesh at 656 (20B)
+    wrU32(656 + 4, 744);  // triIndex
+
+    // vertInfo[5] at 676: base 4 verts on bone 0, apex vert 4 on bone 1
+    buf[676] = 0; buf[677] = 0; buf[678] = 0; buf[679] = 0; buf[680] = 1;
+
+    // 5 local vertices at 684 (60B)
+    const float vLocal[5][3] = {
+        { -2.0f, -2.0f, 0.0f }, {  2.0f, -2.0f, 0.0f },
+        {  2.0f,  2.0f, 0.0f }, { -2.0f,  2.0f, 0.0f },
+        {  0.0f,  0.0f, 5.0f }
+    };
+    for (size_t i = 0; i < 5; ++i) {
+        wrF32(684 + i * 12 + 0, vLocal[i][0]);
+        wrF32(684 + i * 12 + 4, vLocal[i][1]);
+        wrF32(684 + i * 12 + 8, vLocal[i][2]);
+    }
+
+    // triverts at 744: fan -4 (0,3,2,1 -> 2 tris) + fan -5 (4,0,1,2,3 -> 3 tris) + strip 3 (4,3,0 -> 1 tri) + 0
+    size_t tp = 744;
+    auto emitCmd = [&](int16_t cmd, std::initializer_list<uint16_t> idxs) {
+        wrI16(tp, cmd); tp += 2;
+        for (uint16_t vi : idxs) {
+            wrU16(tp + 0, vi); wrU16(tp + 2, 0); wrU16(tp + 4, 0); wrU16(tp + 6, 0);
+            tp += 8;
+        }
+    };
+    emitCmd(-4, { 0, 3, 2, 1 });
+    emitCmd(-6, { 4, 0, 1, 2, 3, 0 });
+    wrI16(tp, 0);
+    return buf;
+}
+
+// Builds matched Valve Source Engine v48 (.mdl + .vvd with fixup table + .dx90.vtx) byte buffers.
+struct SourceV48Buffers {
+    std::vector<uint8_t> mdl;
+    std::vector<uint8_t> vvd;
+    std::vector<uint8_t> vtx;
+};
+
+static SourceV48Buffers BuildSyntheticSourceV48Set(
+    const std::vector<Vec3f>& verts,
+    const std::vector<std::array<uint16_t, 3>>& tris,
+    uint32_t mdlCheck,
+    uint32_t vvdCheck,
+    uint32_t vtxCheck)
+{
+    SourceV48Buffers out;
+    const int32_t nV = static_cast<int32_t>(verts.size());
+    const int32_t nI = static_cast<int32_t>(tris.size() * 3);
+
+    // 1. .mdl (968 bytes: header + 2 bones + 1 bodypart + 1 model + 1 mesh)
+    out.mdl.assign(968, 0);
+    auto mdlU32 = [&](size_t off, uint32_t v) { std::memcpy(out.mdl.data() + off, &v, 4); };
+    auto mdlI32 = [&](size_t off, int32_t v)  { std::memcpy(out.mdl.data() + off, &v, 4); };
+    auto mdlF32 = [&](size_t off, float v)    { std::memcpy(out.mdl.data() + off, &v, 4); };
+    std::memcpy(out.mdl.data(), "IDST", 4);
+    mdlU32(4, 48);
+    mdlU32(8, mdlCheck);
+    mdlU32(76, static_cast<uint32_t>(out.mdl.size()));
+    mdlU32(156, 2);   // numBones
+    mdlU32(160, 256); // boneIdx
+    mdlI32(232, 1);   // numBodyParts
+    mdlI32(236, 688); // bodyPartOffset (256 + 2 * 216)
+
+    // 2 mstudiobone_t (216B each at 256)
+    mdlI32(256 + 4, -1); mdlF32(256 + 56, 1.0f);
+    mdlI32(472 + 4,  0); mdlF32(472 + 40, 14.0f); mdlF32(472 + 56, 1.0f);
+
+    // mstudiobodyparts_t at 688 (16B) -> mstudiomodel_t at 704 (148B) -> mstudiomesh_t at 852 (116B)
+    mdlI32(688 + 4,  1);
+    mdlI32(688 + 12, 16);
+    mdlI32(704 + 72, 1);
+    mdlI32(704 + 76, 148);
+    mdlI32(704 + 80, nV);
+    mdlI32(704 + 84, 0);
+    mdlI32(852 + 8,  nV);
+    mdlI32(852 + 12, 0);
+
+    // 2. .vvd ("IDSV" v4 with 2-entry vertexFileFixup_t table swapping first 2 and remaining vertices)
+    int32_t split = std::min<int32_t>(2, nV);
+    int32_t rem   = nV - split;
+    out.vvd.assign(static_cast<size_t>(88 + nV * 48), 0);
+    auto vvdI32 = [&](size_t off, int32_t v)  { std::memcpy(out.vvd.data() + off, &v, 4); };
+    auto vvdU32 = [&](size_t off, uint32_t v) { std::memcpy(out.vvd.data() + off, &v, 4); };
+    auto vvdF32 = [&](size_t off, float v)    { std::memcpy(out.vvd.data() + off, &v, 4); };
+    std::memcpy(out.vvd.data(), "IDSV", 4);
+    vvdI32(4, 4);
+    vvdU32(8, vvdCheck);
+    vvdI32(12, 1);  // numLODs
+    vvdI32(16, nV); // numLODVerts[0]
+    vvdI32(48, 2);  // numFixups
+    vvdI32(52, 64); // fixupTableStart
+    vvdI32(56, 88); // vertexDataStart
+    // Fixup 0: lod=0, src=rem, cnt=split -> logical [0..split-1]
+    vvdI32(64 + 0, 0); vvdI32(64 + 4, rem); vvdI32(64 + 8, split);
+    // Fixup 1: lod=0, src=0,   cnt=rem   -> logical [split..nV-1]
+    vvdI32(76 + 0, 0); vvdI32(76 + 4, 0);   vvdI32(76 + 8, rem);
+
+    auto putPhysVvdVert = [&](int32_t physIdx, Vec3f p) {
+        size_t vo = 88 + static_cast<size_t>(physIdx) * 48;
+        vvdF32(vo + 0, 1.0f);
+        out.vvd[vo + 15] = 1;
+        vvdF32(vo + 16, p.x);
+        vvdF32(vo + 20, p.y);
+        vvdF32(vo + 24, p.z);
+        vvdF32(vo + 36, 1.0f);
+    };
+    for (int32_t i = 0; i < rem; ++i)   putPhysVvdVert(i, verts[static_cast<size_t>(split + i)]);
+    for (int32_t i = 0; i < split; ++i) putPhysVvdVert(rem + i, verts[static_cast<size_t>(i)]);
+
+    // 3. .dx90.vtx (OptimizedModel::FileHeader_t v7, packed 1-byte structs)
+    ByteWriter vw;
+    vw.I32LE(7);          // version
+    vw.I32LE(16);         // vertCacheSize
+    vw.U16LE(3);          // maxBonesPerStrip
+    vw.U16LE(3);          // maxBonesPerTri
+    vw.I32LE(3);          // maxBonesPerVert
+    vw.U32LE(vtxCheck);   // checkSum (+16)
+    vw.I32LE(1);          // numLODs
+    vw.I32LE(0);          // materialReplacementListOffset
+    vw.I32LE(1);          // numBodyParts (+28)
+    vw.I32LE(36);         // bodyPartOffset (+32)
+
+    // BodyPartHeader_t (8B at 36) -> ModelHeader_t (8B at 44) -> ModelLODHeader_t (12B at 52) -> MeshHeader_t (9B at 64)
+    vw.I32LE(1); vw.I32LE(8);
+    vw.I32LE(1); vw.I32LE(8);
+    vw.I32LE(1); vw.I32LE(12); vw.F32LE(0.0f);
+    vw.I32LE(1); vw.I32LE(9); vw.U8(0);
+
+    // StripGroupHeader_t (25B at 73)
+    int32_t vertRel  = 25;
+    int32_t idxRel   = vertRel + nV * 9;
+    int32_t stripRel = idxRel  + nI * 2;
+    vw.I32LE(nV);       vw.I32LE(vertRel);
+    vw.I32LE(nI);       vw.I32LE(idxRel);
+    vw.I32LE(1);        vw.I32LE(stripRel);
+    vw.U8(0);
+
+    // Vertex_t[nV] (9B each)
+    for (int32_t v = 0; v < nV; ++v) {
+        vw.U8(0); vw.U8(0); vw.U8(0); // boneWeightIdx
+        vw.U8(1);                     // numBones
+        vw.U16LE(static_cast<uint16_t>(v)); // origMeshVertID (+4)
+        vw.U8(0); vw.U8(0); vw.U8(0); // boneID
+    }
+    // uint16_t indices[nI]
+    for (const auto& t : tris) {
+        vw.U16LE(t[0]); vw.U16LE(t[1]); vw.U16LE(t[2]);
+    }
+    // StripHeader_t (27B)
+    vw.I32LE(nI); // numIndices
+    vw.I32LE(0);  // indexOffset
+    vw.I32LE(nV); // numVerts
+    vw.I32LE(0);  // vertOffset
+    vw.U16LE(1);  // numBones
+    vw.U8(0x01);  // STRIP_IS_TRILIST (+18)
+    vw.I32LE(0);  // numBoneStateChanges
+    vw.I32LE(0);  // boneStateChangeOffset
+
+    out.vtx = std::move(vw.buf);
+    return out;
 }
 
 // Builds an OpenCTM v5 RAW (.ctm) file.
@@ -1440,13 +1970,21 @@ void RunFormatTests3D(TestCounter& tc) {
     // 11. Binary ACIS (.sab), OpenCTM RAW (.ctm), and Uncompressed LAS (.laz)
     // ========================================================================
     {
-        auto sabA = BuildSyntheticSab({ {0,0,0}, {10,0,0}, {5,8,0} });
-        auto sabB = BuildSyntheticSab({ {0,0,0}, {2,0,0}, {2,2,0}, {0,2,0}, {1,1,9} });
+        auto sabA = BuildSyntheticSabBRep(
+            { {0,0,0}, {10,0,0}, {0,8,0}, {0,0,6} },
+            { {0,2,1}, {0,1,3}, {1,2,3}, {2,0,3} });
+        auto sabB = BuildSyntheticSabBRep(
+            { {0,0,0}, {4,0,0}, {4,4,0}, {0,4,0}, {2,2,9} },
+            { {0,3,2,1}, {0,1,4}, {1,2,4}, {2,3,4}, {3,0,4} });
         LoadedMesh3D mSabA, mSabB;
-        bool okSabA = Model3DViewer::InspectMeshFile(writeBytes(L"tri_wire.sab", sabA), mSabA);
-        bool okSabB = Model3DViewer::InspectMeshFile(writeBytes(L"tall_wire.sab", sabB), mSabB);
-        tc.Record(okSabA && okSabB && HashMeshGeometry(mSabA) != HashMeshGeometry(mSabB),
-                  L"Stage15.3D.SAB.BinaryAcisDistinct");
+        bool okSabA = Model3DViewer::InspectMeshFile(writeBytes(L"tet_solid.sab", sabA), mSabA);
+        bool okSabB = Model3DViewer::InspectMeshFile(writeBytes(L"pyr_solid.sab", sabB), mSabB);
+        tc.Record(okSabA && okSabB &&
+                  mSabA.rawVertexCount == 4 && mSabA.rawTriangleCount == 4 &&
+                  mSabB.rawVertexCount == 5 && mSabB.rawTriangleCount == 6 &&
+                  HashMeshGeometry(mSabA) != HashMeshGeometry(mSabB),
+                  L"Stage15.3D.SAB.BinaryAcisDistinct",
+                  L"trisA=" + std::to_wstring(mSabA.rawTriangleCount) + L" trisB=" + std::to_wstring(mSabB.rawTriangleCount));
 
         auto ctmA = BuildSyntheticCtmRaw(
             { {0,0,0}, {4,0,0}, {0,3,0}, {0,0,2} },
@@ -1881,6 +2419,276 @@ void RunFormatTests3D(TestCounter& tc) {
     }
 
     // ========================================================================
+    // 17. Spatial ACIS (.sat) & Siemens Parasolid XT (.x_t) B-Rep Solids
+    // ========================================================================
+    {
+        // ACIS .sat #1: Planar face with inner hole loop + body transform (scale=2, translate=(10,-5,3)) -> 8 verts, 8 tris
+        const char* satDrilledXf =
+            "700 0 1 0\n"
+            "@13 Explorer2Test @8 ACIS 7.0 @4 2026\n"
+            "1 9.9999999999999995e-007 1e-010\n"
+            "-0 body $-1 $2 $-1 $1 #\n"
+            "-1 transform $-1 1 0 0 0 1 0 0 0 1 10 -5 3 2 rotate_f reflect_f shear_f #\n"
+            "-2 lump $-1 $-1 $3 $0 #\n"
+            "-3 shell $-1 $-1 $-1 $4 $-1 $2 #\n"
+            "-4 face $-1 $-1 $5 $3 $-1 $7 forward single #\n"
+            "-5 loop $-1 $6 $10 $4 #\n"
+            "-6 loop $-1 $-1 $14 $4 #\n"
+            "-7 plane-surface $-1 0 0 0 0 0 1 1 0 0 forward_v I I I I #\n"
+            "-8 straight-curve $-1 0 0 0 1 0 0 I I #\n"
+            "-10 coedge $-1 $11 $13 $-1 $34 forward $5 #\n"
+            "-11 coedge $-1 $12 $10 $-1 $35 forward $5 #\n"
+            "-12 coedge $-1 $13 $11 $-1 $36 forward $5 #\n"
+            "-13 coedge $-1 $10 $12 $-1 $37 forward $5 #\n"
+            "-14 coedge $-1 $15 $17 $-1 $38 forward $6 #\n"
+            "-15 coedge $-1 $16 $14 $-1 $39 forward $6 #\n"
+            "-16 coedge $-1 $17 $15 $-1 $40 forward $6 #\n"
+            "-17 coedge $-1 $14 $16 $-1 $41 forward $6 #\n"
+            "-18 vertex $-1 $-1 $26 #\n"
+            "-19 vertex $-1 $-1 $27 #\n"
+            "-20 vertex $-1 $-1 $28 #\n"
+            "-21 vertex $-1 $-1 $29 #\n"
+            "-22 vertex $-1 $-1 $30 #\n"
+            "-23 vertex $-1 $-1 $31 #\n"
+            "-24 vertex $-1 $-1 $32 #\n"
+            "-25 vertex $-1 $-1 $33 #\n"
+            "-26 point $-1 -5 -5 0 #\n"
+            "-27 point $-1 5 -5 0 #\n"
+            "-28 point $-1 5 5 0 #\n"
+            "-29 point $-1 -5 5 0 #\n"
+            "-30 point $-1 -2 -2 0 #\n"
+            "-31 point $-1 -2 2 0 #\n"
+            "-32 point $-1 2 2 0 #\n"
+            "-33 point $-1 2 -2 0 #\n"
+            "-34 edge $-1 $18 $19 $-1 $8 forward #\n"
+            "-35 edge $-1 $19 $20 $-1 $8 forward #\n"
+            "-36 edge $-1 $20 $21 $-1 $8 forward #\n"
+            "-37 edge $-1 $21 $18 $-1 $8 forward #\n"
+            "-38 edge $-1 $22 $23 $-1 $8 forward #\n"
+            "-39 edge $-1 $23 $24 $-1 $8 forward #\n"
+            "-40 edge $-1 $24 $25 $-1 $8 forward #\n"
+            "-41 edge $-1 $25 $22 $-1 $8 forward #\n"
+            "End-of-ACIS-data\n";
+
+        // ACIS .sat #2: Closed solid cylinder (cone-surface wall + 2 plane-surface caps + 2 ellipse-curve circles)
+        const char* satCylinder =
+            "700 0 1 0\n"
+            "@13 Explorer2Test @8 ACIS 7.0 @4 2026\n"
+            "1 9.9999999999999995e-007 1e-010\n"
+            "-0 body $-1 $1 $-1 $-1 #\n"
+            "-1 lump $-1 $-1 $2 $0 #\n"
+            "-2 shell $-1 $-1 $-1 $3 $-1 $1 #\n"
+            "-3 face $-1 $4 $6 $2 $-1 $10 reversed single #\n"
+            "-4 face $-1 $5 $7 $2 $-1 $11 forward single #\n"
+            "-5 face $-1 $-1 $8 $2 $-1 $12 forward single #\n"
+            "-6 loop $-1 $-1 $15 $3 #\n"
+            "-7 loop $-1 $-1 $16 $4 #\n"
+            "-8 loop $-1 $9 $17 $5 #\n"
+            "-9 loop $-1 $-1 $18 $5 #\n"
+            "-10 plane-surface $-1 0 0 0 0 0 1 1 0 0 forward_v I I I I #\n"
+            "-11 plane-surface $-1 0 0 12 0 0 1 1 0 0 forward_v I I I I #\n"
+            "-12 cone-surface $-1 0 0 0 0 0 1 4 0 0 1 0 1 forward_v I I I I #\n"
+            "-13 ellipse-curve $-1 0 0 0 0 0 1 4 0 0 1 I I #\n"
+            "-14 ellipse-curve $-1 0 0 12 0 0 1 4 0 0 1 I I #\n"
+            "-15 coedge $-1 $15 $15 $-1 $19 reversed $6 #\n"
+            "-16 coedge $-1 $16 $16 $-1 $20 forward $7 #\n"
+            "-17 coedge $-1 $17 $17 $-1 $19 forward $8 #\n"
+            "-18 coedge $-1 $18 $18 $-1 $20 reversed $9 #\n"
+            "-19 edge $-1 $21 $21 $15 $13 forward #\n"
+            "-20 edge $-1 $22 $22 $16 $14 forward #\n"
+            "-21 vertex $-1 $19 $23 #\n"
+            "-22 vertex $-1 $20 $24 #\n"
+            "-23 point $-1 4 0 0 #\n"
+            "-24 point $-1 4 0 12 #\n"
+            "End-of-ACIS-data\n";
+
+        LoadedMesh3D mSatA, mSatB;
+        bool okSatA = Model3DViewer::InspectMeshFile(writeText(L"drilled_plate_xf.sat", satDrilledXf), mSatA);
+        bool okSatB = Model3DViewer::InspectMeshFile(writeText(L"solid_cyl.sat", satCylinder), mSatB);
+        tc.Record(okSatA && okSatB &&
+                  mSatA.rawVertexCount == 8 && mSatA.rawTriangleCount == 8 &&
+                  std::fabs(mSatA.bboxSize.x - 20.0f) < 0.05f &&
+                  mSatB.rawVertexCount == 48 && mSatB.rawTriangleCount == 92 &&
+                  HashMeshGeometry(mSatA) != HashMeshGeometry(mSatB),
+                  L"Stage15.3D.SAT.BRepHoleTransformAndCylinder",
+                  L"trisA=" + std::to_wstring(mSatA.rawTriangleCount) + L" trisB=" + std::to_wstring(mSatB.rawTriangleCount));
+
+        // Parasolid XT (.x_t) #1: 4-face B-Rep tetrahedron -> 4 verts, 4 tris
+        const char* xtTetra =
+            "**PART1;MC=WIN64;\n"
+            "SCH_3300002_33000;\n"
+            "**END_OF_HEADER**\n"
+            "body 1 $2 ?;\n"
+            "shell 2 $10;\n"
+            "point 30 0.0 0.0 0.0;\n"
+            "point 31 6.0 0.0 0.0;\n"
+            "point 32 0.0 8.0 0.0;\n"
+            "point 33 0.0 0.0 10.0;\n"
+            "vertex 40 $30;\n"
+            "vertex 41 $31;\n"
+            "vertex 42 $32;\n"
+            "vertex 43 $33;\n"
+            "line 50 0.0 0.0 0.0 1.0 0.0 0.0;\n"
+            "plane 60 0.0 0.0 0.0 0.0 0.0 -1.0;\n"
+            "plane 61 0.0 0.0 0.0 0.0 -1.0 0.0;\n"
+            "plane 62 0.0 0.0 0.0 -1.0 0.0 0.0;\n"
+            "plane 63 6.0 0.0 0.0 0.64 0.48 0.6;\n"
+            "edge 70 $40 $41 $50 +;\n"
+            "edge 71 $41 $42 $50 +;\n"
+            "edge 72 $42 $40 $50 +;\n"
+            "edge 73 $40 $43 $50 +;\n"
+            "edge 74 $41 $43 $50 +;\n"
+            "edge 75 $42 $43 $50 +;\n"
+            "fin 80 $81 $70 -;\n"
+            "fin 81 $82 $72 -;\n"
+            "fin 82 $80 $71 -;\n"
+            "loop 20 $10 $80;\n"
+            "face 10 $11 $20 $60 +;\n"
+            "fin 83 $84 $70 +;\n"
+            "fin 84 $85 $74 +;\n"
+            "fin 85 $83 $73 -;\n"
+            "loop 21 $11 $83;\n"
+            "face 11 $12 $21 $61 +;\n"
+            "fin 86 $87 $72 +;\n"
+            "fin 87 $88 $73 +;\n"
+            "fin 88 $86 $75 -;\n"
+            "loop 22 $12 $86;\n"
+            "face 12 $13 $22 $62 +;\n"
+            "fin 89 $90 $71 +;\n"
+            "fin 90 $91 $75 +;\n"
+            "fin 91 $89 $74 -;\n"
+            "loop 23 $13 $89;\n"
+            "face 13 ? $23 $63 +;\n"
+            "**END_OF_PART**\n";
+
+        // Parasolid XT (.x_t) #2: Capped cylinder (cylinder surface + 2 planes + 2 circles) -> 48 verts, 92 tris
+        const char* xtCylinder =
+            "**PART1;MC=WIN64;\n"
+            "SCH_3300002_33000;\n"
+            "**END_OF_HEADER**\n"
+            "body 1 $2 ?;\n"
+            "shell 2 $10;\n"
+            "point 30 3.0 0.0 0.0;\n"
+            "point 31 3.0 0.0 9.0;\n"
+            "vertex 40 $30;\n"
+            "vertex 41 $31;\n"
+            "circle 50 0.0 0.0 0.0 0.0 0.0 1.0 1.0 0.0 0.0 3.0;\n"
+            "circle 51 0.0 0.0 9.0 0.0 0.0 1.0 1.0 0.0 0.0 3.0;\n"
+            "plane 60 0.0 0.0 0.0 0.0 0.0 -1.0;\n"
+            "plane 61 0.0 0.0 9.0 0.0 0.0 1.0;\n"
+            "cylinder 62 0.0 0.0 0.0 0.0 0.0 1.0 3.0;\n"
+            "edge 70 $40 $40 $50 +;\n"
+            "edge 71 $41 $41 $51 +;\n"
+            "fin 80 $80 $70 -;\n"
+            "loop 20 $10 $80;\n"
+            "face 10 $11 $20 $60 +;\n"
+            "fin 81 $81 $71 +;\n"
+            "loop 21 $11 $81;\n"
+            "face 11 $12 $21 $61 +;\n"
+            "fin 82 $82 $70 +;\n"
+            "fin 83 $83 $71 -;\n"
+            "loop 22 $12 $82 $23;\n"
+            "loop 23 $12 $83 ?;\n"
+            "face 12 ? $22 $62 +;\n"
+            "**END_OF_PART**\n";
+
+        LoadedMesh3D mXtA, mXtB;
+        bool okXtA = Model3DViewer::InspectMeshFile(writeText(L"pk_tetra.x_t", xtTetra), mXtA);
+        bool okXtB = Model3DViewer::InspectMeshFile(writeText(L"pk_cyl.x_t", xtCylinder), mXtB);
+        tc.Record(okXtA && okXtB &&
+                  mXtA.rawVertexCount == 4 && mXtA.rawTriangleCount == 4 &&
+                  mXtB.rawVertexCount == 48 && mXtB.rawTriangleCount == 92 &&
+                  HashMeshGeometry(mXtA) != HashMeshGeometry(mXtB),
+                  L"Stage15.3D.ParasolidXT.PKTopologyDistinct",
+                  L"trisA=" + std::to_wstring(mXtA.rawTriangleCount) + L" trisB=" + std::to_wstring(mXtB.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 18. ASTM E2807 (.e57): Multi-page CRC32C Float32 & 15-bit ScaledInteger + Pose + InvalidState
+    // ========================================================================
+    {
+        std::vector<Vec3f> pts120;
+        pts120.reserve(120);
+        for (int i = 0; i < 120; ++i) {
+            float ang = static_cast<float>(i) * 0.25f;
+            pts120.push_back({ 6.0f * std::cos(ang), 6.0f * std::sin(ang), static_cast<float>(i) * 0.15f });
+        }
+        auto e57Float = BuildSyntheticE57Float32(pts120);
+
+        // 10 ScaledInteger records where 2 have cartesianInvalidState=1 -> exactly 8 valid points survive!
+        std::vector<Vec3f> pts10 = {
+            { -4.0f, -3.0f,  0.0f }, {  4.0f, -3.0f,  0.0f },
+            {  4.0f,  3.0f,  0.0f }, { -4.0f,  3.0f,  0.0f },
+            { -4.0f, -3.0f, 12.0f }, {  4.0f, -3.0f, 12.0f },
+            {  4.0f,  3.0f, 12.0f }, { -4.0f,  3.0f, 12.0f },
+            { 95.0f, 95.0f, 95.0f }, // invalid #1 (must be filtered out!)
+            {-95.0f,-95.0f,-95.0f }  // invalid #2 (must be filtered out!)
+        };
+        std::vector<uint8_t> inv10 = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1 };
+        auto e57Scaled = BuildSyntheticE57ScaledPose(pts10, inv10, 25.0, -10.0, 5.0);
+
+        LoadedMesh3D mE57A, mE57B;
+        bool okE57A = Model3DViewer::InspectMeshFile(writeBytes(L"scan_paged_f32.e57", e57Float), mE57A);
+        bool okE57B = Model3DViewer::InspectMeshFile(writeBytes(L"scan_scaled_pose.e57", e57Scaled), mE57B);
+        tc.Record(okE57A && okE57B && e57Float.size() >= 2048 &&
+                  mE57A.rawVertexCount == 120 * 4 && mE57A.rawTriangleCount == 120 * 4 &&
+                  mE57B.rawVertexCount == 8 * 4 && mE57B.rawTriangleCount == 8 * 4 &&
+                  mE57B.bboxSize.x < 12.0f && // proves invalid +/-95 outliers were skipped!
+                  HashMeshGeometry(mE57A) != HashMeshGeometry(mE57B),
+                  L"Stage15.3D.E57.PagedCrc32cFloatAndScaledInt",
+                  L"trisA=" + std::to_wstring(mE57A.rawTriangleCount) + L" trisB=" + std::to_wstring(mE57B.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 19. Valve GoldSrc (.mdl v10) & Source Engine (.mdl v48 + .vvd + .dx90.vtx)
+    // ========================================================================
+    {
+        auto gsCompact   = BuildSyntheticGoldSrcMdl10(0.0f);
+        auto gsStretched = BuildSyntheticGoldSrcMdl10(32.0f);
+        LoadedMesh3D mGsA, mGsB;
+        bool okGsA = Model3DViewer::InspectMeshFile(writeBytes(L"goldsrc_compact.mdl", gsCompact), mGsA);
+        bool okGsB = Model3DViewer::InspectMeshFile(writeBytes(L"goldsrc_stretched.mdl", gsStretched), mGsB);
+        tc.Record(okGsA && okGsB &&
+                  mGsA.rawVertexCount == 5 && mGsA.rawTriangleCount == 6 &&
+                  mGsB.rawVertexCount == 5 && mGsB.rawTriangleCount == 6 &&
+                  mGsA.bboxSize.x < 6.0f && mGsB.bboxSize.x > 30.0f &&
+                  HashMeshGeometry(mGsA) != HashMeshGeometry(mGsB),
+                  L"Stage15.3D.MDL.GoldSrcV10BoneTransform");
+
+        auto srcSetA = BuildSyntheticSourceV48Set(
+            { {0,0,0}, {6,0,0}, {0,5,0}, {0,0,8} },
+            { {{0,1,2}}, {{0,3,1}}, {{1,3,2}}, {{2,3,0}} },
+            0x12345678u, 0x12345678u, 0x12345678u);
+        writeBytes(L"src_tet.vvd", srcSetA.vvd);
+        writeBytes(L"src_tet.dx90.vtx", srcSetA.vtx);
+        std::wstring srcTetMdlPath = writeBytes(L"src_tet.mdl", srcSetA.mdl);
+
+        auto srcSetB = BuildSyntheticSourceV48Set(
+            { {-3,-3,0}, {3,-3,0}, {3,3,0}, {-3,3,0}, {0,0,10} },
+            { {{0,2,1}}, {{0,3,2}}, {{0,1,4}}, {{1,2,4}}, {{2,3,4}}, {{3,0,4}} },
+            0x22334455u, 0x22334455u, 0x22334455u);
+        writeBytes(L"src_pyr.vvd", srcSetB.vvd);
+        writeBytes(L"src_pyr.dx90.vtx", srcSetB.vtx);
+        std::wstring srcPyrMdlPath = writeBytes(L"src_pyr.mdl", srcSetB.mdl);
+
+        // Standalone .mdl without .vvd/.vtx on disk -> falls back cleanly to mstudiobone_t skeleton
+        std::wstring srcSkelOnlyPath = writeBytes(L"src_skel_only.mdl", srcSetA.mdl);
+
+        LoadedMesh3D mSrcA, mSrcB, mSrcSkel;
+        bool okSrcA    = Model3DViewer::InspectMeshFile(srcTetMdlPath, mSrcA);
+        bool okSrcB    = Model3DViewer::InspectMeshFile(srcPyrMdlPath, mSrcB);
+        bool okSrcSkel = Model3DViewer::InspectMeshFile(srcSkelOnlyPath, mSrcSkel);
+        tc.Record(okSrcA && okSrcB && okSrcSkel &&
+                  mSrcA.rawVertexCount == 4 && mSrcA.rawTriangleCount == 4 &&
+                  mSrcB.rawVertexCount == 5 && mSrcB.rawTriangleCount == 6 &&
+                  mSrcSkel.rawTriangleCount >= 16 &&
+                  HashMeshGeometry(mSrcA) != HashMeshGeometry(mSrcB) &&
+                  HashMeshGeometry(mSrcA) != HashMeshGeometry(mSrcSkel),
+                  L"Stage15.3D.MDL.SourceV48VvdVtxAndBoneFallback",
+                  L"trisA=" + std::to_wstring(mSrcA.rawTriangleCount) + L" trisB=" + std::to_wstring(mSrcB.rawTriangleCount));
+    }
+
+    // ========================================================================
     // 12. Negative / Zero-Cheat Tests (corrupt / encrypted / header-only -> false)
     // ========================================================================
     {
@@ -1976,6 +2784,64 @@ void RunFormatTests3D(TestCounter& tc) {
         // .amf ZIP without valid <amf>/<object> geometry must be rejected
         auto badAmfZip = BuildTestZipArchive({ { "broken.amf", "<?xml version=\"1.0\"?><amf><metadata/></amf>", true } });
         assertRejected(L"Stage15.3D.Reject.EmptyZipAMF", writeBytes(L"empty_zip.amf", badAmfZip));
+
+        // Disconnected bare point soup in .sat, .sab, and .x_t must NEVER be connected sequentially
+        const char* barePtsSat =
+            "700 0 1 0\n"
+            "@13 Explorer2Test @8 ACIS 7.0 @4 2026\n"
+            "1 9.9999999999999995e-007 1e-010\n"
+            "-0 point $-1 0 0 0 #\n"
+            "-1 point $-1 10 0 0 #\n"
+            "-2 point $-1 5 8 0 #\n"
+            "-3 point $-1 5 4 9 #\n"
+            "End-of-ACIS-data\n";
+        assertRejected(L"Stage15.3D.Reject.BarePointsSAT", writeText(L"bare_points_only.sat", barePtsSat));
+
+        auto barePtsSab = BuildSyntheticSabBarePoints({ {0,0,0}, {10,0,0}, {5,8,0}, {5,4,9} });
+        assertRejected(L"Stage15.3D.Reject.BarePointsSAB", writeBytes(L"bare_points_only.sab", barePtsSab));
+
+        const char* barePtsXt =
+            "**PART1;MC=WIN64;\nSCH_3300002_33000;\n**END_OF_HEADER**\n"
+            "point 1 0.0 0.0 0.0;\npoint 2 5.0 0.0 0.0;\npoint 3 0.0 5.0 0.0;\n"
+            "**END_OF_PART**\n";
+        assertRejected(L"Stage15.3D.Reject.BarePointsXT", writeText(L"bare_points_only.x_t", barePtsXt));
+
+        // Binary Parasolid .x_b transmit without decodable XT text schema must be rejected
+        std::vector<uint8_t> binXb = { 'P','S', 0x00, 0x01, 0x02, 'S','C','H','_','B','I','N', 0x00, 0xFF, 0x13, 0x37 };
+        for (float f : { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f }) {
+            uint8_t fb[4]; std::memcpy(fb, &f, 4); binXb.insert(binXb.end(), fb, fb + 4);
+        }
+        assertRejected(L"Stage15.3D.Reject.BinaryGarbageXB", writeBytes(L"binary_blob.x_b", binXb));
+
+        // Fake .e57 with raw float32 bytes at offset 48/64 (old byte-scraper cheat) & corrupt CRC32C page must be rejected
+        ByteWriter fakeE57;
+        fakeE57.Bytes("ASTM-E57", 8);
+        fakeE57.U32LE(1); fakeE57.U32LE(0);
+        fakeE57.U64LE(1024); fakeE57.U64LE(512); fakeE57.U64LE(128); fakeE57.U64LE(1024);
+        while (fakeE57.buf.size() < 1024) fakeE57.F32LE(3.5f);
+        assertRejected(L"Stage15.3D.Reject.RawFloatsFakeE57", writeBytes(L"raw_float_cheat.e57", fakeE57.buf));
+
+        auto corruptCrcE57 = BuildSyntheticE57Float32({
+            {0,0,0}, {2,0,0}, {0,2,0}, {0,0,2}, {1,1,1}, {-2,0,1}
+        });
+        corruptCrcE57[120] ^= 0x40u; // corrupt payload byte without updating page Castagnoli CRC32C
+        assertRejected(L"Stage15.3D.Reject.CorruptCrcE57", writeBytes(L"corrupt_crc.e57", corruptCrcE57));
+
+        // Source Engine .mdl with mismatched .vvd checksum & 0-bone header-only .mdl must be rejected
+        auto badSrcSet = BuildSyntheticSourceV48Set(
+            { {0,0,0}, {4,0,0}, {0,4,0}, {0,0,4} },
+            { {{0,1,2}}, {{0,3,1}}, {{1,3,2}}, {{2,3,0}} },
+            0x12345678u, 0xDEADBEEFu, 0x12345678u);
+        writeBytes(L"bad_chk.vvd", badSrcSet.vvd);
+        writeBytes(L"bad_chk.dx90.vtx", badSrcSet.vtx);
+        assertRejected(L"Stage15.3D.Reject.MismatchedChecksumSourceMDL", writeBytes(L"bad_chk.mdl", badSrcSet.mdl));
+
+        std::vector<uint8_t> hdrOnlyMdl(256, 0);
+        std::memcpy(hdrOnlyMdl.data(), "IDST", 4);
+        uint32_t v48 = 48, len256 = 256;
+        std::memcpy(hdrOnlyMdl.data() + 4, &v48, 4);
+        std::memcpy(hdrOnlyMdl.data() + 76, &len256, 4);
+        assertRejected(L"Stage15.3D.Reject.HeaderOnlySourceMDL", writeBytes(L"empty_v48.mdl", hdrOnlyMdl));
     }
 
     for (const auto& f : createdFiles) {

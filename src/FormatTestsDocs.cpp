@@ -2204,6 +2204,36 @@ void RunFormatTestsDocs(TestCounter& tc) {
         bool bsOk = SpreadsheetDocViewer::InspectOfficeFile(tdDir + L"\\config_document.bson", bs);
         tc.Record(bsOk && bs.valid && !bs.sheets.empty() && DocContains(bs, L"Explorer2"),
             L"DocsA.TestData.ConfigDocumentBson");
+
+        std::wstring repoXlsx = tdDir + L"\\spreadsheet_workbook.xlsx";
+        if (GetFileAttributesW(repoXlsx.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            ParsedOfficeDocument xlsxFix;
+            bool xOk = SpreadsheetDocViewer::InspectOfficeFile(repoXlsx, xlsxFix) &&
+                       xlsxFix.valid && xlsxFix.isSpreadsheet &&
+                       !xlsxFix.sheets.empty() && !xlsxFix.sheets[0].rows.empty();
+            tc.Record(xOk, L"DocsA.TestData.SpreadsheetWorkbookXlsx",
+                L"sheets=" + std::to_wstring(xlsxFix.sheets.size()));
+        }
+
+        std::wstring repoOds = tdDir + L"\\calc_spreadsheet.ods";
+        if (GetFileAttributesW(repoOds.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            ParsedOfficeDocument odsFix;
+            bool oOk = SpreadsheetDocViewer::InspectOfficeFile(repoOds, odsFix) &&
+                       odsFix.valid && odsFix.isSpreadsheet &&
+                       odsFix.formatTitle == L"OpenDocument Spreadsheet (.ods)" &&
+                       !odsFix.sheets.empty();
+            bool noTrailingBloat = oOk;
+            for (const auto& sh : odsFix.sheets) {
+                if (sh.rows.empty() || sh.rows.size() >= 500 || sh.maxCols == 0 || sh.maxCols >= 64) {
+                    noTrailingBloat = false;
+                }
+            }
+            tc.Record(noTrailingBloat, L"DocsA.TestData.CalcSpreadsheetOdsNoTrailingBloat",
+                odsFix.sheets.empty()
+                    ? L"sheets=0"
+                    : (L"rows=" + std::to_wstring(odsFix.sheets[0].rows.size()) +
+                       L" maxCols=" + std::to_wstring(odsFix.sheets[0].maxCols)));
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -2786,6 +2816,274 @@ void RunFormatTestsDocs(TestCounter& tc) {
                     HashParsedDoc(mbDocA) != HashParsedDoc(mbDocB) &&
                     InspectFails(mbNonMbtiles) && InspectFails(mbBad);
         tc.Record(mbOk, L"DocsA.MbTiles.SqliteBTreeMetadataAndTiles");
+    }
+
+    // ------------------------------------------------------------------------
+    // 14. Group D Batch 2: ECMA-376 Excel (.xlsx) & OASIS Calc (.ods)
+    // ------------------------------------------------------------------------
+    {
+        auto strBytes = [](std::string_view sv) -> std::vector<uint8_t> {
+            return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(sv.data()),
+                                        reinterpret_cast<const uint8_t*>(sv.data()) + sv.size());
+        };
+
+        // A. ECMA-376 OpenXML (.xlsx): custom workbook.xml.rels paths, <rPh> furigana stripping,
+        //    styles.xml built-in + custom Date / Percent formats, 1900 vs date1904="1" serials,
+        //    t="b", t="str", t="e", t="d", t="inlineStr" multi-<r><t>, formula <f> fallback, sparse rows/cols.
+        const std::string wbRelsA =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            "<Relationship Id=\"rIdRev\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/revenue_q4.xml\"/>"
+            "<Relationship Id=\"rIdOps\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"/xl/worksheets/ops_2026.xml\"/>"
+            "<Relationship Id=\"rIdSS\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>"
+            "<Relationship Id=\"rIdSt\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
+            "</Relationships>";
+
+        const std::string wbXmlA =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            "<workbookPr date1904=\"0\"/>"
+            "<sheets>"
+            "<sheet name=\"Q4 &amp; Revenue\" sheetId=\"1\" r:id=\"rIdRev\"/>"
+            "<x:sheet r:id=\"rIdOps\" sheetId=\"2\" name=\"Ops_2026\"/>"
+            "</sheets>"
+            "</workbook>";
+
+        // Shared string 0 has East Asian <rPh> furigana ("トウキョウ" = \xE3\x83\x88\xE3\x82\xA6\xE3\x82\xAD\xE3\x83\xA7\xE3\x82\xA6)
+        // which MUST be stripped before concatenating <t> runs!
+        const std::string sharedStringsA =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"2\" uniqueCount=\"2\">"
+            "<si><t>Tokyo </t><t>HQ</t><rPh sb=\"0\" eb=\"5\"><t>\xE3\x83\x88\xE3\x82\xA6\xE3\x82\xAD\xE3\x83\xA7\xE3\x82\xA6</t></rPh></si>"
+            "<si><r><t>Ops&#10;Ready &amp; &#x2605;</t></r></si>"
+            "</sst>";
+
+        const std::string stylesXmlA =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+            "<numFmts count=\"2\">"
+            "<numFmt numFmtId=\"164\" formatCode=\"[$-409]yyyy\\-mm\\-dd;@\"/>"
+            "<numFmt numFmtId=\"165\" formatCode=\"0.0%\"/>"
+            "</numFmts>"
+            "<cellXfs count=\"5\">"
+            "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/>"
+            "<xf numFmtId=\"14\" fontId=\"0\" fillId=\"0\" borderId=\"0\" applyNumberFormat=\"1\"/>"
+            "<xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" applyNumberFormat=\"1\"/>"
+            "<xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"0\" applyNumberFormat=\"1\"/>"
+            "<xf numFmtId=\"165\" fontId=\"0\" fillId=\"0\" borderId=\"0\" applyNumberFormat=\"1\"/>"
+            "</cellXfs>"
+            "</styleSheet>";
+
+        // 45658 in 1900 date system == 2025-01-01; 60 == 1900-02-29 (Lotus leap-day compatibility)
+        const std::string sheetRevXml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+            "<sheetData>"
+            "<row r=\"1\">"
+            "<c r=\"A1\" t=\"s\"><v>0</v></c>"
+            "<c r=\"B1\" s=\"1\"><v>45658</v></c>"
+            "<c r=\"C1\" s=\"2\"><v>60</v></c>"
+            "<c r=\"D1\" s=\"3\"><v>0.425</v></c>"
+            "<c r=\"E1\" s=\"4\"><v>0.875</v></c>"
+            "</row>"
+            "<row r=\"4\">"
+            "<c r=\"A4\" t=\"b\"><v>1</v></c>"
+            "<c r=\"B4\" t=\"str\"><v>CachedFormula_OK</v></c>"
+            "<c r=\"C4\" t=\"inlineStr\"><is><r><t>Multi</t></r><r><t>Run_Inline</t></r><rPh><t>FURIGANA_NOPE</t></rPh></is></c>"
+            "<c r=\"D4\" t=\"e\"><v>#DIV/0!</v></c>"
+            "<c r=\"F4\"><f>SUM(D1:E1)</f></c>"
+            "</row>"
+            "</sheetData>"
+            "</worksheet>";
+
+        const std::string sheetOpsXml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+            "<sheetData>"
+            "<row r=\"1\">"
+            "<c r=\"A1\" t=\"s\"><v>1</v></c>"
+            "<c r=\"B1\" t=\"d\"><v>2026-05-20</v></c>"
+            "</row>"
+            "</sheetData>"
+            "</worksheet>";
+
+        std::wstring xlsxPathA = tmp.Write(L"custom_rels_a.xlsx", MakeZipStoreArchive({
+            { "xl/_rels/workbook.xml.rels", strBytes(wbRelsA) },
+            { "xl/workbook.xml",            strBytes(wbXmlA) },
+            { "xl/sharedStrings.xml",       strBytes(sharedStringsA) },
+            { "xl/styles.xml",              strBytes(stylesXmlA) },
+            { "xl/worksheets/revenue_q4.xml", strBytes(sheetRevXml) },
+            { "xl/worksheets/ops_2026.xml",   strBytes(sheetOpsXml) },
+        }));
+
+        // Workbook B uses date1904="1" (serial 0 == 1904-01-01, serial 44196 == 2025-01-01) and numFmtId=9 (0%)
+        const std::string wbRelsB =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            "<Relationship Id=\"rIdMac\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/mac_1904.xml\"/>"
+            "<Relationship Id=\"rIdSt\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
+            "</Relationships>";
+        const std::string wbXmlB =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            "<workbookPr date1904=\"1\"/>"
+            "<sheets><sheet name=\"Mac1904\" sheetId=\"1\" r:id=\"rIdMac\"/></sheets>"
+            "</workbook>";
+        const std::string stylesXmlB =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+            "<cellXfs count=\"3\">"
+            "<xf numFmtId=\"0\"/><xf numFmtId=\"14\" applyNumberFormat=\"1\"/><xf numFmtId=\"9\" applyNumberFormat=\"1\"/>"
+            "</cellXfs></styleSheet>";
+        const std::string sheetMacXml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+            "<sheetData><row r=\"1\">"
+            "<c r=\"A1\" s=\"1\"><v>0</v></c>"
+            "<c r=\"B1\" s=\"1\"><v>44196</v></c>"
+            "<c r=\"C1\" t=\"b\"><v>0</v></c>"
+            "<c r=\"D1\" s=\"2\"><v>0.75</v></c>"
+            "</row></sheetData></worksheet>";
+
+        std::wstring xlsxPathB = tmp.Write(L"date1904_b.xlsx", MakeZipStoreArchive({
+            { "xl/_rels/workbook.xml.rels", strBytes(wbRelsB) },
+            { "xl/workbook.xml",            strBytes(wbXmlB) },
+            { "xl/styles.xml",              strBytes(stylesXmlB) },
+            { "xl/worksheets/mac_1904.xml", strBytes(sheetMacXml) },
+        }));
+
+        std::wstring xlsxBad = tmp.Write(L"bad.xlsx", kGarbage);
+        std::wstring xlsxWrongZip = tmp.Write(L"unrelated.xlsx", MakeZipStoreArchive({
+            { "readme.txt", strBytes("Not an OpenXML workbook") }
+        }));
+
+        ParsedOfficeDocument xDocA, xDocB;
+        bool xlsxOk = SpreadsheetDocViewer::InspectOfficeFile(xlsxPathA, xDocA) &&
+                      SpreadsheetDocViewer::InspectOfficeFile(xlsxPathB, xDocB) &&
+                      xDocA.valid && xDocB.valid &&
+                      xDocA.sheets.size() == 2 &&
+                      xDocA.sheets[0].name == L"Q4 & Revenue" &&
+                      xDocA.sheets[1].name == L"Ops_2026" &&
+                      xDocA.sheets[0].rows.size() == 4 && // row 1 + 2 gap rows (r=2,3) + row 4
+                      xDocA.sheets[0].rows[0].size() == 5 &&
+                      xDocA.sheets[0].rows[0][0] == L"Tokyo HQ" &&
+                      !DocContains(xDocA, L"\x30C8\x30A6\x30AD\x30E7\x30A6") &&
+                      !DocContains(xDocA, L"FURIGANA_NOPE") &&
+                      xDocA.sheets[0].rows[0][1] == L"2025-01-01" &&
+                      xDocA.sheets[0].rows[0][2] == L"1900-02-29" &&
+                      xDocA.sheets[0].rows[0][3] == L"42.50%" &&
+                      xDocA.sheets[0].rows[0][4] == L"87.5%" &&
+                      xDocA.sheets[0].rows[3].size() == 6 &&
+                      xDocA.sheets[0].rows[3][0] == L"TRUE" &&
+                      xDocA.sheets[0].rows[3][1] == L"CachedFormula_OK" &&
+                      xDocA.sheets[0].rows[3][2] == L"MultiRun_Inline" &&
+                      xDocA.sheets[0].rows[3][3] == L"#DIV/0!" &&
+                      xDocA.sheets[0].rows[3][4].empty() &&
+                      xDocA.sheets[0].rows[3][5] == L"=SUM(D1:E1)" &&
+                      SheetContains(xDocA, L"Ops_2026", L"Ops\nReady & \x2605") &&
+                      SheetContains(xDocA, L"Ops_2026", L"2026-05-20") &&
+                      xDocB.sheets.size() == 1 &&
+                      xDocB.sheets[0].rows[0][0] == L"1904-01-01" &&
+                      xDocB.sheets[0].rows[0][1] == L"2025-01-01" &&
+                      xDocB.sheets[0].rows[0][2] == L"FALSE" &&
+                      xDocB.sheets[0].rows[0][3] == L"75%" &&
+                      HashParsedDoc(xDocA) != HashParsedDoc(xDocB) &&
+                      InspectFails(xlsxBad) && InspectFails(xlsxWrongZip);
+        tc.Record(xlsxOk, L"DocsA.ExcelXlsx.RelsFuriganaStyles1904AndCellTypes");
+
+        // B. OASIS OpenDocument Spreadsheet (.ods): 1024 trailing empty column guard, 1048575 trailing empty row guard,
+        //    number-columns-repeated gap & value repeat, covered-table-cell alignment, <text:s text:c="3"/>, multi-<text:p>,
+        //    office:value / office:boolean-value fallbacks, and corrupt/wrong-mimetype ZIP rejection.
+        const std::string odsMime = "application/vnd.oasis.opendocument.spreadsheet";
+        const std::string odsXmlA =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+            "xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" "
+            "xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">"
+            "<office:body><office:spreadsheet>"
+            "<table:table table:name=\"Calc_Matrix\">"
+            "<table:table-row>"
+            "<table:table-cell office:value-type=\"string\"><text:p>Item<text:s text:c=\"3\"/>Code</text:p></table:table-cell>"
+            "<table:covered-table-cell table:number-columns-repeated=\"2\"/>"
+            "<table:table-cell office:value-type=\"string\"><text:p>Alpha</text:p><text:p>Beta</text:p></table:table-cell>"
+            "<table:table-cell table:number-columns-repeated=\"1024\"/>"
+            "</table:table-row>"
+            "<table:table-row table:number-rows-repeated=\"2\">"
+            "<table:table-cell table:number-columns-repeated=\"1024\"/>"
+            "</table:table-row>"
+            "<table:table-row>"
+            "<table:table-cell table:number-columns-repeated=\"2\" office:value-type=\"string\"><text:p>REP</text:p></table:table-cell>"
+            "<table:table-cell table:number-columns-repeated=\"2\"/>"
+            "<table:table-cell office:value-type=\"float\" office:value=\"98.75\"/>"
+            "<table:table-cell office:value-type=\"boolean\" office:boolean-value=\"true\"/>"
+            "<table:table-cell table:number-columns-repeated=\"1024\"/>"
+            "</table:table-row>"
+            "<table:table-row table:number-rows-repeated=\"1048572\">"
+            "<table:table-cell table:number-columns-repeated=\"1024\"/>"
+            "</table:table-row>"
+            "</table:table>"
+            "</office:spreadsheet></office:body></office:document-content>";
+
+        const std::string odsXmlB =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<office:document-content xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+            "xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" "
+            "xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\">"
+            "<office:body><office:spreadsheet>"
+            "<table:table table:name=\"Lab_Summary\">"
+            "<table:table-row>"
+            "<table:table-cell office:value-type=\"date\" office:date-value=\"2026-09-01\"/>"
+            "<table:table-cell office:value-type=\"string\"><text:p>Calibrated</text:p></table:table-cell>"
+            "<table:table-cell table:number-columns-repeated=\"1024\"/>"
+            "</table:table-row>"
+            "<table:table-row table:number-rows-repeated=\"1048575\"/>"
+            "</table:table>"
+            "</office:spreadsheet></office:body></office:document-content>";
+
+        std::wstring odsPathA = tmp.Write(L"matrix_a.ods", MakeZipStoreArchive({
+            { "mimetype",    strBytes(odsMime) },
+            { "content.xml", strBytes(odsXmlA) },
+        }));
+        std::wstring odsPathB = tmp.Write(L"summary_b.ods", MakeZipStoreArchive({
+            { "mimetype",    strBytes(odsMime) },
+            { "content.xml", strBytes(odsXmlB) },
+        }));
+        std::wstring odsBad = tmp.Write(L"bad.ods", kGarbage);
+        std::wstring odsWrongMime = tmp.Write(L"wrong_mime.ods", MakeZipStoreArchive({
+            { "mimetype",    strBytes("application/epub+zip") },
+            { "content.xml", strBytes(odsXmlA) },
+        }));
+
+        ParsedOfficeDocument oDocA, oDocB;
+        bool odsOk = SpreadsheetDocViewer::InspectOfficeFile(odsPathA, oDocA) &&
+                     SpreadsheetDocViewer::InspectOfficeFile(odsPathB, oDocB) &&
+                     oDocA.valid && oDocB.valid &&
+                     oDocA.formatTitle == L"OpenDocument Spreadsheet (.ods)" &&
+                     oDocA.sheets.size() == 1 &&
+                     oDocA.sheets[0].name == L"Calc_Matrix" &&
+                     oDocA.sheets[0].rows.size() == 4 && // Trailing 1048572 empty rows NOT materialized!
+                     oDocA.sheets[0].maxCols == 6 &&     // Trailing 1024 empty cols NOT materialized!
+                     oDocA.sheets[0].rows[0].size() == 4 &&
+                     oDocA.sheets[0].rows[0][0] == L"Item   Code" &&
+                     oDocA.sheets[0].rows[0][1].empty() &&
+                     oDocA.sheets[0].rows[0][2].empty() &&
+                     oDocA.sheets[0].rows[0][3] == L"Alpha\nBeta" &&
+                     oDocA.sheets[0].rows[1].empty() &&
+                     oDocA.sheets[0].rows[2].empty() &&
+                     oDocA.sheets[0].rows[3].size() == 6 &&
+                     oDocA.sheets[0].rows[3][0] == L"REP" &&
+                     oDocA.sheets[0].rows[3][1] == L"REP" &&
+                     oDocA.sheets[0].rows[3][2].empty() &&
+                     oDocA.sheets[0].rows[3][3].empty() &&
+                     oDocA.sheets[0].rows[3][4] == L"98.75" &&
+                     oDocA.sheets[0].rows[3][5] == L"TRUE" &&
+                     SheetContains(oDocB, L"Lab_Summary", L"2026-09-01") &&
+                     SheetContains(oDocB, L"Lab_Summary", L"Calibrated") &&
+                     HashParsedDoc(oDocA) != HashParsedDoc(oDocB) &&
+                     InspectFails(odsBad) && InspectFails(odsWrongMime);
+        tc.Record(odsOk, L"DocsA.CalcOds.TrailingRepeatGuardsCoveredCellsAndRichText");
     }
 
     tmp.Cleanup();

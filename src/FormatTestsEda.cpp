@@ -1908,6 +1908,254 @@ void RunFormatTestsEda(TestCounter& tc) {
             L" isfTraces=" + std::to_wstring(bIsf.traces.size()));
     }
 
+    // ------------------------------------------------------------------------
+    // 11. Xilinx XAPP503 Binary JTAG (.xsvf) & IEEE 1149.1 ASCII (.svf)
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+        auto appendBE32 = [](std::vector<uint8_t>& v, uint32_t x) {
+            uint8_t b[4] = {};
+            PutU32BE(b, x);
+            v.insert(v.end(), b, b + 4);
+        };
+        auto appendBE16 = [](std::vector<uint8_t>& v, uint16_t x) {
+            uint8_t b[2] = {};
+            PutU16BE(b, x);
+            v.insert(v.end(), b, b + 2);
+        };
+
+        // Program A: XCOMMENT + XSTATE + XENDIR + XENDDR + XREPEAT + XSIR + XSDRSIZE + XTDOMASK + XSDRTDO + XRUNTEST + XCOMPLETE
+        std::vector<uint8_t> xsvfA;
+        xsvfA.push_back(0x16u); // XCOMMENT
+        const char* cmtA = "XC7A35T_IDCODE_SCAN";
+        xsvfA.insert(xsvfA.end(), cmtA, cmtA + std::strlen(cmtA) + 1);
+        xsvfA.insert(xsvfA.end(), { 0x12u, 0x00u }); // XSTATE Test-Logic-Reset
+        xsvfA.insert(xsvfA.end(), { 0x12u, 0x01u }); // XSTATE Run-Test/Idle
+        xsvfA.insert(xsvfA.end(), { 0x13u, 0x00u }); // XENDIR Idle
+        xsvfA.insert(xsvfA.end(), { 0x14u, 0x00u }); // XENDDR Idle
+        xsvfA.insert(xsvfA.end(), { 0x07u, 0x20u }); // XREPEAT 32
+        xsvfA.insert(xsvfA.end(), { 0x02u, 0x06u, 0x09u }); // XSIR 6-bit IDCODE (0x09)
+        xsvfA.push_back(0x08u); appendBE32(xsvfA, 32u);     // XSDRSIZE 32 bits
+        xsvfA.insert(xsvfA.end(), { 0x01u, 0x0Fu, 0xFFu, 0xFFu, 0xFFu }); // XTDOMASK
+        xsvfA.insert(xsvfA.end(), { 0x09u,
+                                    0x00u, 0x00u, 0x00u, 0x00u,           // XSDRTDO TDI
+                                    0x03u, 0x62u, 0xD0u, 0x93u });        // XSDRTDO TDO expected
+        xsvfA.push_back(0x04u); appendBE32(xsvfA, 4u);      // XRUNTEST 4 clocks
+        xsvfA.push_back(0x00u);                             // XCOMPLETE
+
+        // Program B: XCOMMENT + XSTATE + XSIR2 + XSDRSIZE + XTDOMASK + XSDRB/XSDRC/XSDRE + XSETSDRMASKS + XSDRINC + XWAIT + XCOMPLETE
+        std::vector<uint8_t> xsvfB;
+        xsvfB.push_back(0x16u); // XCOMMENT
+        const char* cmtB = "ZYNQ_CFG_BURST";
+        xsvfB.insert(xsvfB.end(), cmtB, cmtB + std::strlen(cmtB) + 1);
+        xsvfB.insert(xsvfB.end(), { 0x12u, 0x00u, 0x12u, 0x01u });
+        xsvfB.push_back(0x15u); appendBE16(xsvfB, 12u); xsvfB.insert(xsvfB.end(), { 0x0Au, 0x53u }); // XSIR2 12-bit
+        xsvfB.push_back(0x08u); appendBE32(xsvfB, 16u); // XSDRSIZE 16 bits
+        xsvfB.insert(xsvfB.end(), { 0x01u, 0xFFu, 0xFFu }); // XTDOMASK
+        xsvfB.insert(xsvfB.end(), { 0x0Cu, 0xAAu, 0x55u }); // XSDRB
+        xsvfB.insert(xsvfB.end(), { 0x0Du, 0xF0u, 0x0Fu }); // XSDRC
+        xsvfB.insert(xsvfB.end(), { 0x0Eu, 0x3Cu, 0xC3u }); // XSDRE
+        xsvfB.insert(xsvfB.end(), { 0x0Au, 0x00u, 0xFFu, 0x00u, 0x0Fu }); // XSETSDRMASKS (dataMaskOnes = 4 -> 1B per inc)
+        xsvfB.insert(xsvfB.end(), { 0x0Bu, 0x12u, 0x30u, 0x02u, 0x05u, 0x0Au }); // XSDRINC (2 increments x 1B)
+        xsvfB.insert(xsvfB.end(), { 0x17u, 0x01u, 0x01u }); appendBE32(xsvfB, 100u); // XWAIT
+        xsvfB.push_back(0x00u); // XCOMPLETE
+
+        ParsedEdaBoard bxA, bxB, bSvf, badX1, badX2, badX3, badX4, badX5, badX6, badSvf;
+        bool okXA = WriteAndInspect(dir + L"\\fpga_idcode.xsvf", xsvfA.data(), xsvfA.size(), bxA);
+        bool okXB = WriteAndInspect(dir + L"\\zynq_burst.xsvf",  xsvfB.data(), xsvfB.size(), bxB);
+
+        const std::string validSvf =
+            "! IEEE 1149.1 SVF\n"
+            "TRST OFF;\n"
+            "ENDIR IDLE;\n"
+            "ENDDR IDLE;\n"
+            "STATE RESET IDLE;\n"
+            "SIR 6 TDI (09);\n"
+            "SDR 32 TDI (00000000) TDO (0362D093) MASK (0FFFFFFF);\n"
+            "RUNTEST IDLE 4 TCK;\n";
+        bool okSvf = WriteAndInspect(dir + L"\\scan.svf", validSvf.data(), validSvf.size(), bSvf);
+
+        // Strict negative rejection: ASCII text, random garbage, unknown opcode 0x05, truncated operand, unterminated XCOMMENT, invalid XSTATE
+        const char* asciiNonXsvf = "HELLO WORLD THIS IS NOT XSVF BYTECODE";
+        const uint8_t randBytes[16] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x99, 0x42, 0x77, 0x88, 0x31, 0x64 };
+        const uint8_t unknownOp[]   = { 0x12u, 0x01u, 0x05u, 0x00u };
+        const uint8_t truncSdr[]    = { 0x08u, 0x00u, 0x00u, 0x00u, 0x20u, 0x09u, 0xAAu, 0xBBu };
+        const uint8_t untermCmt[]   = { 0x16u, 'N', 'O', '_', 'N', 'U', 'L' };
+        const uint8_t badTapSt[]    = { 0x12u, 0x1Fu, 0x00u };
+
+        bool rejXsvf = !WriteAndInspect(dir + L"\\ascii.xsvf",   asciiNonXsvf, std::strlen(asciiNonXsvf), badX1) &&
+                       !WriteAndInspect(dir + L"\\random.xsvf",  randBytes, sizeof(randBytes), badX2) &&
+                       !WriteAndInspect(dir + L"\\bad_op.xsvf",  unknownOp, sizeof(unknownOp), badX3) &&
+                       !WriteAndInspect(dir + L"\\trunc.xsvf",   truncSdr, sizeof(truncSdr), badX4) &&
+                       !WriteAndInspect(dir + L"\\unterm.xsvf",  untermCmt, sizeof(untermCmt), badX5) &&
+                       !WriteAndInspect(dir + L"\\bad_st.xsvf",  badTapSt, sizeof(badTapSt), badX6) &&
+                       !WriteAndInspect(dir + L"\\garbage.svf",  asciiNonXsvf, std::strlen(asciiNonXsvf), badSvf);
+
+        bool passXsvf = okXA && okXB && okSvf &&
+                        bxA.netCount == 4 && bxB.netCount == 4 && bSvf.netCount == 4 &&
+                        hasLabelSubstr(bxA, L"TCK") && hasLabelSubstr(bxA, L"TMS") &&
+                        hasLabelSubstr(bxA, L"TDI") && hasLabelSubstr(bxA, L"TDO") &&
+                        hasLabelSubstr(bxA, L"XC7A35T_IDCODE_SCAN") &&
+                        hasLabelSubstr(bxB, L"ZYNQ_CFG_BURST") &&
+                        bxA.traces.size() > 80 && bxB.traces.size() > 80 &&
+                        HashEdaGeometry(bxA) != HashEdaGeometry(bxB) &&
+                        rejXsvf;
+
+        tc.Record(passXsvf, L"Stage15.Eda.XilinxXsvf_Xapp503BytecodeAnd4LaneJtag",
+            L"xsvfATraces=" + std::to_wstring(bxA.traces.size()) +
+            L" xsvfBTraces=" + std::to_wstring(bxB.traces.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 12. Saleae Logic 2 Capture (.sal — Multi-Channel Digital & Analog <SALEAE>)
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        auto buildSalDigitalV0 = [](uint32_t initState, double beginT, double endT, const std::vector<double>& trans) -> std::string {
+            std::vector<uint8_t> buf(44 + trans.size() * 8, 0);
+            std::memcpy(buf.data(), "<SALEAE>", 8);
+            PutI32LE(buf.data() + 8, 0);  // version = 0
+            PutI32LE(buf.data() + 12, 0); // type = 0 (digital)
+            PutU32LE(buf.data() + 16, initState);
+            std::memcpy(buf.data() + 20, &beginT, 8);
+            std::memcpy(buf.data() + 28, &endT, 8);
+            uint64_t nt = static_cast<uint64_t>(trans.size());
+            PutU32LE(buf.data() + 36, static_cast<uint32_t>(nt & 0xFFFFFFFFULL));
+            PutU32LE(buf.data() + 40, static_cast<uint32_t>(nt >> 32));
+            for (size_t i = 0; i < trans.size(); ++i) {
+                std::memcpy(buf.data() + 44 + i * 8, &trans[i], 8);
+            }
+            return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+        };
+
+        auto buildSalAnalogV0 = [](double beginT, uint64_t sampleRate, uint64_t downsample, const std::vector<float>& samples) -> std::string {
+            std::vector<uint8_t> buf(48 + samples.size() * 4, 0);
+            std::memcpy(buf.data(), "<SALEAE>", 8);
+            PutI32LE(buf.data() + 8, 0);  // version = 0
+            PutI32LE(buf.data() + 12, 1); // type = 1 (analog)
+            std::memcpy(buf.data() + 16, &beginT, 8);
+            PutU32LE(buf.data() + 24, static_cast<uint32_t>(sampleRate & 0xFFFFFFFFULL));
+            PutU32LE(buf.data() + 28, static_cast<uint32_t>(sampleRate >> 32));
+            PutU32LE(buf.data() + 32, static_cast<uint32_t>(downsample & 0xFFFFFFFFULL));
+            PutU32LE(buf.data() + 36, static_cast<uint32_t>(downsample >> 32));
+            uint64_t ns = static_cast<uint64_t>(samples.size());
+            PutU32LE(buf.data() + 40, static_cast<uint32_t>(ns & 0xFFFFFFFFULL));
+            PutU32LE(buf.data() + 44, static_cast<uint32_t>(ns >> 32));
+            for (size_t i = 0; i < samples.size(); ++i) {
+                std::memcpy(buf.data() + 48 + i * 4, &samples[i], 4);
+            }
+            return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+        };
+
+        // Capture A: 3 digital channels (SCK clock, MOSI data, idle-high CS_N with 0 transitions) + 1 analog sine wave (3.3V rail)
+        std::vector<double> sckEdges;
+        for (int i = 1; i <= 16; ++i) sckEdges.push_back(i * 0.00005);
+        std::vector<double> mosiEdges = { 0.00008, 0.00022, 0.00038, 0.00055, 0.00071, 0.00088 };
+        std::vector<float> vddSine(64);
+        for (size_t i = 0; i < vddSine.size(); ++i) {
+            vddSine[i] = 3.30f + 0.25f * static_cast<float>(std::sin(static_cast<double>(i) * 0.22));
+        }
+
+        const std::string metaJsonA =
+            "{\"version\":16,\"data\":{\"sampleRate\":{\"digital\":10000000,\"analog\":1250000},\"channels\":["
+            "{\"type\":\"Digital\",\"index\":0,\"name\":\"SPI_SCK\"},"
+            "{\"type\":\"Digital\",\"index\":1,\"name\":\"SPI_MOSI\"},"
+            "{\"type\":\"Digital\",\"index\":2,\"name\":\"SPI_CS_N\"},"
+            "{\"type\":\"Analog\",\"index\":0,\"name\":\"VDD_3V3\"}"
+            "]}}";
+
+        auto salZipA = BuildStoredZip({
+            { "meta.json",     metaJsonA },
+            { "digital-2.bin", buildSalDigitalV0(1u, 0.0, 0.001, {}) }, // unsorted order + 0 transitions valid header
+            { "digital-0.bin", buildSalDigitalV0(0u, 0.0, 0.001, sckEdges) },
+            { "digital-1.bin", buildSalDigitalV0(0u, 0.0, 0.001, mosiEdges) },
+            { "analog-0.bin",  buildSalAnalogV0(0.0, 64000ULL, 1ULL, vddSine) },
+        });
+
+        // Capture B: 1 digital UART channel (rowsSettings style meta.json) + 2 analog channels (ramp + cosine)
+        std::vector<double> uartEdges = { 0.00010, 0.00020, 0.00040, 0.00050, 0.00080, 0.00090 };
+        std::vector<float> anaRamp(48), anaCos(48);
+        for (size_t i = 0; i < 48; ++i) {
+            anaRamp[i] = -2.50f + 5.00f * (static_cast<float>(i) / 47.0f);
+            anaCos[i]  = 2.50f + 2.50f * static_cast<float>(std::cos(static_cast<double>(i) * 0.18));
+        }
+        const std::string metaJsonB =
+            "{\"rowsSettings\":["
+            "{\"name\":\"UART_TX\",\"channel\":{\"category\":\"Hardware\",\"type\":\"Digital\",\"deviceChannel\":0}},"
+            "{\"name\":\"DAC_RAMP\",\"channel\":{\"category\":\"Hardware\",\"type\":\"Analog\",\"deviceChannel\":0}},"
+            "{\"name\":\"REF_COS\",\"channel\":{\"category\":\"Hardware\",\"type\":\"Analog\",\"deviceChannel\":1}}"
+            "]}";
+
+        auto salZipB = BuildStoredZip({
+            { "meta.json",     metaJsonB },
+            { "digital-0.bin", buildSalDigitalV0(1u, 0.0, 0.0012, uartEdges) },
+            { "analog-0.bin",  buildSalAnalogV0(0.0, 40000ULL, 1ULL, anaRamp) },
+            { "analog-1.bin",  buildSalAnalogV0(0.0, 40000ULL, 1ULL, anaCos) },
+        });
+
+        // Strict negative cases: meta.json-only ZIP, missing <SALEAE> magic, wrong type field, truncated digital, truncated analog, non-ZIP
+        auto salMetaOnly = BuildStoredZip({ { "meta.json", metaJsonA } });
+
+        std::string badMagicDig = buildSalDigitalV0(0u, 0.0, 0.001, sckEdges);
+        std::memcpy(badMagicDig.data(), "NOT_SAL!", 8);
+        auto salBadMagic = BuildStoredZip({ { "meta.json", metaJsonA }, { "digital-0.bin", badMagicDig } });
+
+        std::string wrongTypeDig = buildSalDigitalV0(0u, 0.0, 0.001, sckEdges);
+        PutI32LE(reinterpret_cast<uint8_t*>(wrongTypeDig.data()) + 12, 1); // analog type inside digital-0.bin
+        auto salWrongType = BuildStoredZip({ { "digital-0.bin", wrongTypeDig } });
+
+        std::string truncDig = buildSalDigitalV0(0u, 0.0, 0.001, sckEdges);
+        truncDig.resize(52); // claims 16 transitions (44 + 128B), truncated at 52B
+        auto salTruncDig = BuildStoredZip({ { "digital-0.bin", truncDig } });
+
+        std::string truncAna = buildSalAnalogV0(0.0, 64000ULL, 1ULL, vddSine);
+        truncAna.resize(64); // claims 64 float32 samples (48 + 256B), truncated at 64B
+        auto salTruncAna = BuildStoredZip({ { "analog-0.bin", truncAna } });
+
+        ParsedEdaBoard bsA, bsB, badS1, badS2, badS3, badS4, badS5, badS6;
+        bool okSalA = WriteAndInspect(dir + L"\\spi_mixed.sal", salZipA.data(), salZipA.size(), bsA);
+        bool okSalB = WriteAndInspect(dir + L"\\uart_dual_ana.sal", salZipB.data(), salZipB.size(), bsB);
+
+        const uint8_t rawNonZip[32] = { '<', 'S', 'A', 'L', 'E', 'A', 'E', '>', 0, 0, 0, 0 };
+        bool rejSal = !WriteAndInspect(dir + L"\\meta_only.sal",  salMetaOnly.data(), salMetaOnly.size(), badS1) &&
+                      !WriteAndInspect(dir + L"\\bad_magic.sal",  salBadMagic.data(), salBadMagic.size(), badS2) &&
+                      !WriteAndInspect(dir + L"\\wrong_type.sal", salWrongType.data(), salWrongType.size(), badS3) &&
+                      !WriteAndInspect(dir + L"\\trunc_dig.sal",  salTruncDig.data(), salTruncDig.size(), badS4) &&
+                      !WriteAndInspect(dir + L"\\trunc_ana.sal",  salTruncAna.data(), salTruncAna.size(), badS5) &&
+                      !WriteAndInspect(dir + L"\\not_zip.sal",    rawNonZip, sizeof(rawNonZip), badS6);
+
+        bool passSal = okSalA && okSalB &&
+                       bsA.netCount == 4 && bsB.netCount == 3 &&
+                       bsA.formatTitle.find(L"3D, 1A") != std::wstring::npos &&
+                       bsB.formatTitle.find(L"1D, 2A") != std::wstring::npos &&
+                       hasLabelSubstr(bsA, L"D0:SPI_SCK") &&
+                       hasLabelSubstr(bsA, L"D1:SPI_MOSI") &&
+                       hasLabelSubstr(bsA, L"D2:SPI_CS_N") &&
+                       hasLabelSubstr(bsA, L"A0:VDD_3V3") &&
+                       hasLabelSubstr(bsA, L"V]") &&
+                       hasLabelSubstr(bsB, L"D0:UART_TX") &&
+                       hasLabelSubstr(bsB, L"A0:DAC_RAMP") &&
+                       hasLabelSubstr(bsB, L"A1:REF_COS") &&
+                       bsA.traces.size() > 80 && bsB.traces.size() > 80 &&
+                       HashEdaGeometry(bsA) != HashEdaGeometry(bsB) &&
+                       rejSal;
+
+        tc.Record(passSal, L"Stage15.Eda.SaleaeLogic2_MultiChannelDigitalAndAnalogSal",
+            L"salATraces=" + std::to_wstring(bsA.traces.size()) +
+            L" salBTraces=" + std::to_wstring(bsB.traces.size()));
+    }
+
     RemoveDirectoryW(dir.c_str());
 }
 

@@ -504,6 +504,381 @@ inline bool ParseInterQuakeIqm(const uint8_t* data, size_t size, LoadedMesh3D& m
 // ============================================================================
 // #44. Quake Alias ("IDPO") & Valve GoldSrc / Source StudioMDL (.mdl — "IDST")
 // ============================================================================
+namespace DetailValveMdl200 {
+
+struct BoneMat3x4 {
+    float m[3][4] = {
+        { 1.0f, 0.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f, 0.0f },
+        { 0.0f, 0.0f, 1.0f, 0.0f }
+    };
+};
+
+inline BoneMat3x4 ConcatBoneMat(const BoneMat3x4& a, const BoneMat3x4& b) {
+    BoneMat3x4 out = {};
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            out.m[r][c] = a.m[r][0] * b.m[0][c] + a.m[r][1] * b.m[1][c] + a.m[r][2] * b.m[2][c];
+        }
+        out.m[r][3] = a.m[r][0] * b.m[0][3] + a.m[r][1] * b.m[1][3] + a.m[r][2] * b.m[2][3] + a.m[r][3];
+    }
+    return out;
+}
+
+inline BoneMat3x4 GoldSrcEulerPosToMat(float px, float py, float pz, float rx, float ry, float rz) {
+    float sr = std::sin(rx * 0.5f), cr = std::cos(rx * 0.5f);
+    float sp = std::sin(ry * 0.5f), cp = std::cos(ry * 0.5f);
+    float sy = std::sin(rz * 0.5f), cy = std::cos(rz * 0.5f);
+
+    float qx = sr * cp * cy - cr * sp * sy;
+    float qy = cr * sp * cy + sr * cp * sy;
+    float qz = cr * cp * sy - sr * sp * cy;
+    float qw = cr * cp * cy + sr * sp * sy;
+
+    BoneMat3x4 loc = {};
+    loc.m[0][0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+    loc.m[0][1] = 2.0f * (qx * qy - qw * qz);
+    loc.m[0][2] = 2.0f * (qx * qz + qw * qy);
+    loc.m[0][3] = px;
+
+    loc.m[1][0] = 2.0f * (qx * qy + qw * qz);
+    loc.m[1][1] = 1.0f - 2.0f * (qx * qx + qz * qz);
+    loc.m[1][2] = 2.0f * (qy * qz - qw * qx);
+    loc.m[1][3] = py;
+
+    loc.m[2][0] = 2.0f * (qx * qz - qw * qy);
+    loc.m[2][1] = 2.0f * (qy * qz + qw * qx);
+    loc.m[2][2] = 1.0f - 2.0f * (qx * qx + qy * qy);
+    loc.m[2][3] = pz;
+    return loc;
+}
+
+inline bool ReadSiblingBytes(const std::wstring& path, std::vector<uint8_t>& out, uint64_t maxCap = 64ULL * 1024ULL * 1024ULL) {
+    out.clear();
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li = {};
+    if (!GetFileSizeEx(h, &li) || li.QuadPart <= 0 || static_cast<uint64_t>(li.QuadPart) > maxCap) {
+        CloseHandle(h);
+        return false;
+    }
+    size_t sz = static_cast<size_t>(li.QuadPart);
+    out.resize(sz);
+    DWORD rd = 0;
+    BOOL ok = ReadFile(h, out.data(), static_cast<DWORD>(sz), &rd, nullptr);
+    CloseHandle(h);
+    if (!ok || rd != static_cast<DWORD>(sz)) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+inline int32_t RdI32LE(const uint8_t* p) {
+    return static_cast<int32_t>(Detail3D200::RdU32LE(p));
+}
+
+inline bool AssembleSourceVvdVtxMesh(
+    const uint8_t* mdl, size_t mdlSize,
+    const uint8_t* vvd, size_t vvdSize,
+    const uint8_t* vtx, size_t vtxSize,
+    uint32_t ver,
+    LoadedMesh3D& mesh)
+{
+    if (mdlSize < 244 || vvdSize < 64 || vtxSize < 36) return false;
+    uint32_t mdlChecksum = Detail3D200::RdU32LE(mdl + 8);
+
+    // 1. Validate & decode .vvd (vertexFileHeader_t: "IDSV", version == 4)
+    if (std::memcmp(vvd, "IDSV", 4) != 0) return false;
+    if (RdI32LE(vvd + 4) != 4) return false;
+    uint32_t vvdChecksum = Detail3D200::RdU32LE(vvd + 8);
+    if (vvdChecksum != mdlChecksum) return false;
+
+    int32_t numLODs       = RdI32LE(vvd + 12);
+    int32_t numLOD0Verts  = RdI32LE(vvd + 16);
+    int32_t numFixups     = RdI32LE(vvd + 48);
+    int32_t fixupOff      = RdI32LE(vvd + 52);
+    int32_t vertDataOff   = RdI32LE(vvd + 56);
+    if (numLODs < 1 || numLODs > 8 || numLOD0Verts < 3 || numLOD0Verts > 2000000) return false;
+    if (vertDataOff < 64 || static_cast<size_t>(vertDataOff) > vvdSize) return false;
+
+    std::vector<Vec3f> lod0Verts;
+    lod0Verts.reserve(static_cast<size_t>(numLOD0Verts));
+
+    auto readVvdVertAt = [&](size_t idx) -> Vec3f {
+        const uint8_t* vp = vvd + static_cast<size_t>(vertDataOff) + idx * 48;
+        float x = Detail3D200::RdF32LE(vp + 16);
+        float y = Detail3D200::RdF32LE(vp + 20);
+        float z = Detail3D200::RdF32LE(vp + 24);
+        return { x, z, -y };
+    };
+
+    if (numFixups == 0) {
+        if (static_cast<uint64_t>(vertDataOff) + static_cast<uint64_t>(numLOD0Verts) * 48ULL > vvdSize) return false;
+        for (int32_t i = 0; i < numLOD0Verts; ++i) {
+            lod0Verts.push_back(readVvdVertAt(static_cast<size_t>(i)));
+        }
+    } else {
+        if (numFixups < 0 || numFixups > 65536 || fixupOff < 64 ||
+            static_cast<uint64_t>(fixupOff) + static_cast<uint64_t>(numFixups) * 12ULL > vvdSize)
+        {
+            return false;
+        }
+        for (int32_t f = 0; f < numFixups; ++f) {
+            const uint8_t* fp = vvd + static_cast<size_t>(fixupOff) + static_cast<size_t>(f) * 12;
+            int32_t lod     = RdI32LE(fp + 0);
+            int32_t srcVert = RdI32LE(fp + 4);
+            int32_t cnt     = RdI32LE(fp + 8);
+            if (srcVert < 0 || cnt < 0 || cnt > 2000000) return false;
+            if (static_cast<uint64_t>(vertDataOff) + (static_cast<uint64_t>(srcVert) + static_cast<uint64_t>(cnt)) * 48ULL > vvdSize) {
+                return false;
+            }
+            if (lod >= 0) {
+                if (lod0Verts.size() + static_cast<size_t>(cnt) > 2000000) return false;
+                for (int32_t k = 0; k < cnt; ++k) {
+                    lod0Verts.push_back(readVvdVertAt(static_cast<size_t>(srcVert + k)));
+                }
+            }
+        }
+    }
+    if (lod0Verts.size() < 3) return false;
+
+    // 2. Validate .vtx (OptimizedModel::FileHeader_t: version == 7, 36 bytes)
+    if (RdI32LE(vtx + 0) != 7) return false;
+    uint32_t vtxChecksum = Detail3D200::RdU32LE(vtx + 16);
+    if (vtxChecksum != mdlChecksum) return false;
+
+    int32_t vtxNumLODs  = RdI32LE(vtx + 20);
+    int32_t vtxNumBp    = RdI32LE(vtx + 28);
+    int32_t vtxBpOff    = RdI32LE(vtx + 32);
+    int32_t mdlNumBp    = RdI32LE(mdl + 232);
+    int32_t mdlBpOff    = RdI32LE(mdl + 236);
+    if (vtxNumLODs < 1 || vtxNumLODs > 8) return false;
+    if (mdlNumBp <= 0 || mdlNumBp > 256 || vtxNumBp != mdlNumBp) return false;
+    if (mdlBpOff < 240 || static_cast<uint64_t>(mdlBpOff) + static_cast<uint64_t>(mdlNumBp) * 16ULL > mdlSize) return false;
+    if (vtxBpOff < 36  || static_cast<uint64_t>(vtxBpOff) + static_cast<uint64_t>(vtxNumBp) * 8ULL  > vtxSize) return false;
+
+    auto checkedRel = [](size_t base, int32_t rel, size_t limit, size_t& out) -> bool {
+        int64_t v = static_cast<int64_t>(base) + static_cast<int64_t>(rel);
+        if (v < 0 || static_cast<uint64_t>(v) > limit) return false;
+        out = static_cast<size_t>(v);
+        return true;
+    };
+
+    mesh.vertices = std::move(lod0Verts);
+    const size_t totalVvdVerts = mesh.vertices.size();
+
+    for (int32_t bp = 0; bp < mdlNumBp; ++bp) {
+        size_t mdlBpPos = static_cast<size_t>(mdlBpOff) + static_cast<size_t>(bp) * 16;
+        size_t vtxBpPos = static_cast<size_t>(vtxBpOff) + static_cast<size_t>(bp) * 8;
+
+        int32_t mdlNumModels = RdI32LE(mdl + mdlBpPos + 4);
+        int32_t mdlModelRel  = RdI32LE(mdl + mdlBpPos + 12);
+        int32_t vtxNumModels = RdI32LE(vtx + vtxBpPos + 0);
+        int32_t vtxModelRel  = RdI32LE(vtx + vtxBpPos + 4);
+        if (mdlNumModels < 0 || mdlNumModels > 256 || vtxNumModels != mdlNumModels) {
+            mesh.vertices.clear(); mesh.tris.clear();
+            return false;
+        }
+        if (mdlNumModels == 0) continue;
+
+        size_t mdlModelsBase = 0, vtxModelsBase = 0;
+        if (!checkedRel(mdlBpPos, mdlModelRel, mdlSize, mdlModelsBase) ||
+            mdlModelsBase + static_cast<uint64_t>(mdlNumModels) * 148ULL > mdlSize ||
+            !checkedRel(vtxBpPos, vtxModelRel, vtxSize, vtxModelsBase) ||
+            vtxModelsBase + static_cast<uint64_t>(vtxNumModels) * 8ULL > vtxSize)
+        {
+            mesh.vertices.clear(); mesh.tris.clear();
+            return false;
+        }
+
+        for (int32_t mi = 0; mi < mdlNumModels; ++mi) {
+            size_t mdlMdlPos = mdlModelsBase + static_cast<size_t>(mi) * 148;
+            size_t vtxMdlPos = vtxModelsBase + static_cast<size_t>(mi) * 8;
+
+            int32_t numMeshes   = RdI32LE(mdl + mdlMdlPos + 72);
+            int32_t mdlMeshRel  = RdI32LE(mdl + mdlMdlPos + 76);
+            int32_t mdlNumVerts = RdI32LE(mdl + mdlMdlPos + 80);
+            int32_t mdlVertIdx  = RdI32LE(mdl + mdlMdlPos + 84);
+            if (numMeshes <= 0 || mdlNumVerts <= 0) continue;
+            if (numMeshes > 1024 || mdlVertIdx < 0) {
+                mesh.vertices.clear(); mesh.tris.clear();
+                return false;
+            }
+
+            size_t modelBaseVert = ((mdlVertIdx % 48) == 0)
+                ? static_cast<size_t>(mdlVertIdx / 48)
+                : static_cast<size_t>(mdlVertIdx);
+
+            int32_t mNumLODs  = RdI32LE(vtx + vtxMdlPos + 0);
+            int32_t mLodRel   = RdI32LE(vtx + vtxMdlPos + 4);
+            size_t vtxLod0Pos = 0;
+            if (mNumLODs < 1 || !checkedRel(vtxMdlPos, mLodRel, vtxSize, vtxLod0Pos) || vtxLod0Pos + 12 > vtxSize) {
+                mesh.vertices.clear(); mesh.tris.clear();
+                return false;
+            }
+
+            int32_t vtxNumMeshes = RdI32LE(vtx + vtxLod0Pos + 0);
+            int32_t vtxMeshRel   = RdI32LE(vtx + vtxLod0Pos + 4);
+            size_t mdlMeshesBase = 0, vtxMeshesBase = 0;
+            if (vtxNumMeshes != numMeshes ||
+                !checkedRel(mdlMdlPos, mdlMeshRel, mdlSize, mdlMeshesBase) ||
+                mdlMeshesBase + static_cast<uint64_t>(numMeshes) * 116ULL > mdlSize ||
+                !checkedRel(vtxLod0Pos, vtxMeshRel, vtxSize, vtxMeshesBase) ||
+                vtxMeshesBase + static_cast<uint64_t>(numMeshes) * 9ULL > vtxSize)
+            {
+                mesh.vertices.clear(); mesh.tris.clear();
+                return false;
+            }
+
+            for (int32_t m = 0; m < numMeshes; ++m) {
+                size_t mdlMeshPos = mdlMeshesBase + static_cast<size_t>(m) * 116;
+                size_t vtxMeshPos = vtxMeshesBase + static_cast<size_t>(m) * 9;
+
+                int32_t meshNumVerts   = RdI32LE(mdl + mdlMeshPos + 8);
+                int32_t meshVertOffset = RdI32LE(mdl + mdlMeshPos + 12);
+                int32_t numStripGroups = RdI32LE(vtx + vtxMeshPos + 0);
+                int32_t sgHeaderRel    = RdI32LE(vtx + vtxMeshPos + 4);
+                if (meshNumVerts <= 0 || meshVertOffset < 0 || numStripGroups < 0 || numStripGroups > 4096) {
+                    mesh.vertices.clear(); mesh.tris.clear();
+                    return false;
+                }
+                if (numStripGroups == 0) continue;
+
+                size_t sgBase = 0;
+                if (!checkedRel(vtxMeshPos, sgHeaderRel, vtxSize, sgBase) || sgBase + 25 > vtxSize) {
+                    mesh.vertices.clear(); mesh.tris.clear();
+                    return false;
+                }
+
+                auto validateSgStride = [&](size_t stride) -> bool {
+                    if (sgBase + static_cast<uint64_t>(numStripGroups) * stride > vtxSize) return false;
+                    for (int32_t sg = 0; sg < numStripGroups; ++sg) {
+                        size_t p = sgBase + static_cast<size_t>(sg) * stride;
+                        int32_t nv = RdI32LE(vtx + p + 0), vo = RdI32LE(vtx + p + 4);
+                        int32_t ni = RdI32LE(vtx + p + 8), io = RdI32LE(vtx + p + 12);
+                        int32_t ns = RdI32LE(vtx + p + 16), so = RdI32LE(vtx + p + 20);
+                        if (nv <= 0 || ni < 3 || ns <= 0 || nv > 500000 || ni > 2000000 || ns > 65536) return false;
+                        size_t va = 0, ia = 0, sa = 0;
+                        if (!checkedRel(p, vo, vtxSize, va) || va + static_cast<uint64_t>(nv) * 9ULL > vtxSize) return false;
+                        if (!checkedRel(p, io, vtxSize, ia) || ia + static_cast<uint64_t>(ni) * 2ULL > vtxSize) return false;
+                        if (!checkedRel(p, so, vtxSize, sa) || sa + static_cast<uint64_t>(ns) * 27ULL > vtxSize) return false;
+                    }
+                    return true;
+                };
+
+                int32_t sg0Vo = RdI32LE(vtx + sgBase + 4);
+                int32_t sg0Io = RdI32LE(vtx + sgBase + 12);
+                int32_t sg0So = RdI32LE(vtx + sgBase + 20);
+                int32_t minSubOff = std::min({ sg0Vo, sg0Io, sg0So });
+                size_t sgStride = 25;
+                if (ver >= 49 && minSubOff >= numStripGroups * 33 && validateSgStride(33)) {
+                    sgStride = 33;
+                } else if (!validateSgStride(25)) {
+                    if (validateSgStride(33)) sgStride = 33;
+                    else { mesh.vertices.clear(); mesh.tris.clear(); return false; }
+                }
+
+                for (int32_t sg = 0; sg < numStripGroups; ++sg) {
+                    size_t sgPos = sgBase + static_cast<size_t>(sg) * sgStride;
+                    int32_t sgNumVerts  = RdI32LE(vtx + sgPos + 0);
+                    int32_t sgVertRel   = RdI32LE(vtx + sgPos + 4);
+                    int32_t sgNumIdx    = RdI32LE(vtx + sgPos + 8);
+                    int32_t sgIdxRel    = RdI32LE(vtx + sgPos + 12);
+                    int32_t sgNumStrips = RdI32LE(vtx + sgPos + 16);
+                    int32_t sgStripRel  = RdI32LE(vtx + sgPos + 20);
+
+                    size_t sgVertBase = sgPos + static_cast<size_t>(sgVertRel);
+                    size_t sgIdxBase  = sgPos + static_cast<size_t>(sgIdxRel);
+                    size_t sgStrBase  = sgPos + static_cast<size_t>(sgStripRel);
+
+                    auto validateStripStride = [&](size_t stStride) -> bool {
+                        if (sgStrBase + static_cast<uint64_t>(sgNumStrips) * stStride > vtxSize) return false;
+                        for (int32_t st = 0; st < sgNumStrips; ++st) {
+                            size_t sp = sgStrBase + static_cast<size_t>(st) * stStride;
+                            int32_t sni = RdI32LE(vtx + sp + 0);
+                            int32_t sio = RdI32LE(vtx + sp + 4);
+                            uint8_t flg = vtx[sp + 18];
+                            if (sni < 0 || sio < 0 || sio + sni > sgNumIdx) return false;
+                            if (sni > 0 && (flg & 0x03u) == 0) return false;
+                        }
+                        return true;
+                    };
+
+                    size_t stripStride = 27;
+                    if (sgStride == 33 && validateStripStride(35)) {
+                        stripStride = 35;
+                    } else if (!validateStripStride(27)) {
+                        if (validateStripStride(35)) stripStride = 35;
+                        else { mesh.vertices.clear(); mesh.tris.clear(); return false; }
+                    }
+
+                    auto resolveStripIdx = [&](int32_t elemIdx, uint32_t& outVvdIdx) -> bool {
+                        uint16_t sgVertIdx = Detail3D200::RdU16LE(vtx + sgIdxBase + static_cast<size_t>(elemIdx) * 2);
+                        if (sgVertIdx >= static_cast<uint32_t>(sgNumVerts)) return false;
+                        uint16_t origVert = Detail3D200::RdU16LE(vtx + sgVertBase + static_cast<size_t>(sgVertIdx) * 9 + 4);
+                        if (origVert >= static_cast<uint32_t>(meshNumVerts)) return false;
+                        size_t finalIdx = modelBaseVert + static_cast<size_t>(meshVertOffset) + static_cast<size_t>(origVert);
+                        if (finalIdx >= totalVvdVerts) return false;
+                        outVvdIdx = static_cast<uint32_t>(finalIdx);
+                        return true;
+                    };
+
+                    for (int32_t st = 0; st < sgNumStrips; ++st) {
+                        size_t sp = sgStrBase + static_cast<size_t>(st) * stripStride;
+                        int32_t stNumIdx   = RdI32LE(vtx + sp + 0);
+                        int32_t stIdxStart = RdI32LE(vtx + sp + 4);
+                        uint8_t stFlags    = vtx[sp + 18];
+
+                        if ((stFlags & 0x01u) != 0) { // STRIP_IS_TRILIST
+                            for (int32_t k = 0; k + 2 < stNumIdx; k += 3) {
+                                uint32_t i0 = 0, i1 = 0, i2 = 0;
+                                if (!resolveStripIdx(stIdxStart + k + 0, i0) ||
+                                    !resolveStripIdx(stIdxStart + k + 1, i1) ||
+                                    !resolveStripIdx(stIdxStart + k + 2, i2))
+                                {
+                                    mesh.vertices.clear(); mesh.tris.clear();
+                                    return false;
+                                }
+                                if (i0 != i1 && i1 != i2 && i0 != i2) {
+                                    mesh.tris.push_back({ i0, i2, i1, {} });
+                                }
+                            }
+                        } else if ((stFlags & 0x02u) != 0) { // STRIP_IS_TRISTRIP
+                            for (int32_t k = 0; k + 2 < stNumIdx; ++k) {
+                                uint32_t i0 = 0, i1 = 0, i2 = 0;
+                                if (!resolveStripIdx(stIdxStart + k + 0, i0) ||
+                                    !resolveStripIdx(stIdxStart + k + 1, i1) ||
+                                    !resolveStripIdx(stIdxStart + k + 2, i2))
+                                {
+                                    mesh.vertices.clear(); mesh.tris.clear();
+                                    return false;
+                                }
+                                if (i0 != i1 && i1 != i2 && i0 != i2) {
+                                    if (k & 1) mesh.tris.push_back({ i0, i1, i2, {} });
+                                    else       mesh.tris.push_back({ i0, i2, i1, {} });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (mesh.vertices.empty() || mesh.tris.empty()) {
+        mesh.vertices.clear();
+        mesh.tris.clear();
+        return false;
+    }
+    mesh.formatName = L"Valve Source Engine Model v" + std::to_wstring(ver) + L" (.mdl+.vvd+.vtx)";
+    return true;
+}
+
+} // namespace DetailValveMdl200
+
 inline bool ParseQuakeOrSourceMdl(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     // Quake 1 Alias MDL: "IDPO" + version 6 (84-byte header)
     if (size >= 84 && std::memcmp(data, "IDPO", 4) == 0 && Detail3D200::RdU32LE(data + 4) == 6) {
@@ -566,51 +941,115 @@ inline bool ParseQuakeOrSourceMdl(const uint8_t* data, size_t size, LoadedMesh3D
         mesh.formatName = L"Valve StudioMDL v" + std::to_wstring(ver) + L" (.mdl)";
 
         if (ver == 10) {
+            uint32_t hdrLen = Detail3D200::RdU32LE(data + 72);
+            if (hdrLen > 0 && (hdrLen < 244 || hdrLen > size)) return false;
+
+            // Decode GoldSrc mstudiobone_t[numBones] (112 bytes each at boneIndex)
+            uint32_t numBones = Detail3D200::RdU32LE(data + 140);
+            uint32_t boneIdx  = Detail3D200::RdU32LE(data + 144);
+            std::vector<DetailValveMdl200::BoneMat3x4> worldBones;
+            if (numBones > 0) {
+                if (numBones > 256 || boneIdx < 244 || boneIdx + static_cast<uint64_t>(numBones) * 112ULL > size) {
+                    return false;
+                }
+                std::vector<DetailValveMdl200::BoneMat3x4> localBones(numBones);
+                std::vector<int32_t> parents(numBones, -1);
+                for (uint32_t b = 0; b < numBones; ++b) {
+                    const uint8_t* bp = data + boneIdx + static_cast<size_t>(b) * 112;
+                    int32_t parent = DetailValveMdl200::RdI32LE(bp + 32);
+                    if (parent < -1 || parent >= static_cast<int32_t>(numBones) || parent == static_cast<int32_t>(b)) {
+                        return false;
+                    }
+                    parents[b] = parent;
+                    float px = Detail3D200::RdF32LE(bp + 64);
+                    float py = Detail3D200::RdF32LE(bp + 68);
+                    float pz = Detail3D200::RdF32LE(bp + 72);
+                    float rx = Detail3D200::RdF32LE(bp + 76);
+                    float ry = Detail3D200::RdF32LE(bp + 80);
+                    float rz = Detail3D200::RdF32LE(bp + 84);
+                    localBones[b] = DetailValveMdl200::GoldSrcEulerPosToMat(px, py, pz, rx, ry, rz);
+                }
+                worldBones.resize(numBones);
+                std::vector<uint8_t> state(numBones, 0); // 0=unvisited, 1=visiting, 2=done
+                auto solveWorld = [&](auto& self, uint32_t b) -> bool {
+                    if (state[b] == 2) return true;
+                    if (state[b] == 1) return false; // cycle
+                    state[b] = 1;
+                    int32_t p = parents[b];
+                    if (p >= 0) {
+                        if (!self(self, static_cast<uint32_t>(p))) return false;
+                        worldBones[b] = DetailValveMdl200::ConcatBoneMat(worldBones[static_cast<size_t>(p)], localBones[b]);
+                    } else {
+                        worldBones[b] = localBones[b];
+                    }
+                    state[b] = 2;
+                    return true;
+                };
+                for (uint32_t b = 0; b < numBones; ++b) {
+                    if (!solveWorld(solveWorld, b)) return false;
+                }
+            }
+
             uint32_t numBodyparts = Detail3D200::RdU32LE(data + 204);
             uint32_t bodypartIdx  = Detail3D200::RdU32LE(data + 208);
-            if (numBodyparts > 0 && numBodyparts <= 64 && bodypartIdx + static_cast<uint64_t>(numBodyparts) * 76 <= size) {
-                for (uint32_t b = 0; b < numBodyparts; ++b) {
-                    const uint8_t* bp = data + bodypartIdx + b * 76;
-                    uint32_t numModels = Detail3D200::RdU32LE(bp + 64);
-                    uint32_t modelIdx  = Detail3D200::RdU32LE(bp + 72);
-                    for (uint32_t mi = 0; mi < numModels && mi < 32 && modelIdx + (mi + 1) * 112 <= size; ++mi) {
-                        const uint8_t* mdl = data + modelIdx + mi * 112;
-                        uint32_t numMesh  = Detail3D200::RdU32LE(mdl + 72);
-                        uint32_t meshIdx  = Detail3D200::RdU32LE(mdl + 76);
-                        uint32_t numVerts = Detail3D200::RdU32LE(mdl + 80);
-                        uint32_t vertIdx  = Detail3D200::RdU32LE(mdl + 88);
-                        if (numVerts > 0 && numVerts <= 65536 && vertIdx + static_cast<uint64_t>(numVerts) * 12 <= size) {
-                            uint32_t vBase = static_cast<uint32_t>(mesh.vertices.size());
-                            for (uint32_t v = 0; v < numVerts; ++v) {
-                                const uint8_t* vp = data + vertIdx + v * 12;
-                                mesh.vertices.push_back({
-                                    Detail3D200::RdF32LE(vp + 0),
-                                    Detail3D200::RdF32LE(vp + 8),
-                                    Detail3D200::RdF32LE(vp + 4)
-                                });
+            if (numBodyparts == 0 || numBodyparts > 64 || bodypartIdx + static_cast<uint64_t>(numBodyparts) * 76ULL > size) {
+                return false;
+            }
+            for (uint32_t b = 0; b < numBodyparts; ++b) {
+                const uint8_t* bp = data + bodypartIdx + static_cast<size_t>(b) * 76;
+                uint32_t numModels = Detail3D200::RdU32LE(bp + 64);
+                uint32_t modelIdx  = Detail3D200::RdU32LE(bp + 72);
+                for (uint32_t mi = 0; mi < numModels && mi < 32 && modelIdx + static_cast<uint64_t>(mi + 1) * 112ULL <= size; ++mi) {
+                    const uint8_t* mdl = data + modelIdx + static_cast<size_t>(mi) * 112;
+                    uint32_t numMesh     = Detail3D200::RdU32LE(mdl + 72);
+                    uint32_t meshIdx     = Detail3D200::RdU32LE(mdl + 76);
+                    uint32_t numVerts    = Detail3D200::RdU32LE(mdl + 80);
+                    uint32_t vertInfoIdx = Detail3D200::RdU32LE(mdl + 84);
+                    uint32_t vertIdx     = Detail3D200::RdU32LE(mdl + 88);
+                    if (numVerts > 0 && numVerts <= 65536 && vertIdx + static_cast<uint64_t>(numVerts) * 12ULL <= size) {
+                        bool hasVertBones = (!worldBones.empty() && vertInfoIdx > 0 &&
+                                             vertInfoIdx + static_cast<uint64_t>(numVerts) <= size);
+                        uint32_t vBase = static_cast<uint32_t>(mesh.vertices.size());
+                        for (uint32_t v = 0; v < numVerts; ++v) {
+                            const uint8_t* vp = data + vertIdx + static_cast<size_t>(v) * 12;
+                            float lx = Detail3D200::RdF32LE(vp + 0);
+                            float ly = Detail3D200::RdF32LE(vp + 4);
+                            float lz = Detail3D200::RdF32LE(vp + 8);
+                            if (hasVertBones) {
+                                uint8_t bId = data[vertInfoIdx + v];
+                                if (bId < worldBones.size()) {
+                                    const auto& wb = worldBones[bId];
+                                    float wx = wb.m[0][0] * lx + wb.m[0][1] * ly + wb.m[0][2] * lz + wb.m[0][3];
+                                    float wy = wb.m[1][0] * lx + wb.m[1][1] * ly + wb.m[1][2] * lz + wb.m[1][3];
+                                    float wz = wb.m[2][0] * lx + wb.m[2][1] * ly + wb.m[2][2] * lz + wb.m[2][3];
+                                    lx = wx; ly = wy; lz = wz;
+                                }
                             }
-                            for (uint32_t m = 0; m < numMesh && meshIdx + (m + 1) * 20 <= size; ++m) {
-                                uint32_t triIdx = Detail3D200::RdU32LE(data + meshIdx + m * 20 + 4);
-                                size_t tp = triIdx;
-                                while (tp + 2 <= size) {
-                                    int16_t cmd = static_cast<int16_t>(Detail3D200::RdU16LE(data + tp)); tp += 2;
-                                    if (cmd == 0) break;
-                                    bool isFan = (cmd < 0);
-                                    int cnt = std::abs(static_cast<int>(cmd));
-                                    if (tp + static_cast<size_t>(cnt) * 8 > size) break;
-                                    std::vector<uint32_t> strip(static_cast<size_t>(cnt));
-                                    for (int k = 0; k < cnt; ++k) {
-                                        strip[static_cast<size_t>(k)] = vBase + Detail3D200::RdU16LE(data + tp + static_cast<size_t>(k) * 8);
-                                    }
-                                    tp += static_cast<size_t>(cnt) * 8;
-                                    for (int k = 0; k + 2 < cnt; ++k) {
-                                        uint32_t a = strip[static_cast<size_t>(isFan ? 0 : k)];
-                                        uint32_t bIdx = strip[static_cast<size_t>(k + 1)];
-                                        uint32_t c = strip[static_cast<size_t>(k + 2)];
-                                        if (a < mesh.vertices.size() && bIdx < mesh.vertices.size() && c < mesh.vertices.size()) {
-                                            if (!isFan && (k & 1)) mesh.tris.push_back({ bIdx, a, c, {} });
-                                            else mesh.tris.push_back({ a, bIdx, c, {} });
-                                        }
+                            mesh.vertices.push_back({ lx, lz, -ly });
+                        }
+                        for (uint32_t m = 0; m < numMesh && meshIdx + static_cast<uint64_t>(m + 1) * 20ULL <= size; ++m) {
+                            uint32_t triIdx = Detail3D200::RdU32LE(data + meshIdx + static_cast<size_t>(m) * 20 + 4);
+                            size_t tp = triIdx;
+                            while (tp + 2 <= size) {
+                                int16_t cmd = static_cast<int16_t>(Detail3D200::RdU16LE(data + tp)); tp += 2;
+                                if (cmd == 0) break;
+                                bool isFan = (cmd < 0);
+                                int cnt = std::abs(static_cast<int>(cmd));
+                                if (tp + static_cast<size_t>(cnt) * 8 > size) break;
+                                std::vector<uint32_t> strip(static_cast<size_t>(cnt));
+                                for (int k = 0; k < cnt; ++k) {
+                                    strip[static_cast<size_t>(k)] = vBase + Detail3D200::RdU16LE(data + tp + static_cast<size_t>(k) * 8);
+                                }
+                                tp += static_cast<size_t>(cnt) * 8;
+                                for (int k = 0; k + 2 < cnt; ++k) {
+                                    uint32_t a = strip[static_cast<size_t>(isFan ? 0 : k)];
+                                    uint32_t bIdx = strip[static_cast<size_t>(k + 1)];
+                                    uint32_t c = strip[static_cast<size_t>(k + 2)];
+                                    if (a < mesh.vertices.size() && bIdx < mesh.vertices.size() && c < mesh.vertices.size() &&
+                                        a != bIdx && bIdx != c && a != c)
+                                    {
+                                        if (!isFan && (k & 1)) mesh.tris.push_back({ bIdx, a, c, {} });
+                                        else                   mesh.tris.push_back({ a, bIdx, c, {} });
                                     }
                                 }
                             }
@@ -621,71 +1060,127 @@ inline bool ParseQuakeOrSourceMdl(const uint8_t* data, size_t size, LoadedMesh3D
             return !mesh.vertices.empty() && !mesh.tris.empty();
         }
 
-        // Source Engine v44–v49: decode real mstudiobone_t skeleton hierarchy if present
-        if (ver >= 44 && ver <= 49 && size >= 400) {
-            uint32_t numBones = Detail3D200::RdU32LE(data + 156);
-            uint32_t boneIdx  = Detail3D200::RdU32LE(data + 160);
-            if (numBones >= 2 && numBones <= 512 && boneIdx >= 244 &&
-                boneIdx + static_cast<uint64_t>(numBones) * 216 <= size)
-            {
-                struct BoneXform { float m[3][4]; };
-                std::vector<BoneXform> world(numBones);
-                std::vector<int32_t> parents(numBones, -1);
-                std::vector<Vec3f> joints(numBones);
-                for (uint32_t b = 0; b < numBones; ++b) {
-                    const uint8_t* bp = data + boneIdx + static_cast<size_t>(b) * 216;
-                    int32_t parent = static_cast<int32_t>(Detail3D200::RdU32LE(bp + 4));
-                    parents[b] = parent;
-                    float px = Detail3D200::RdF32LE(bp + 32);
-                    float py = Detail3D200::RdF32LE(bp + 36);
-                    float pz = Detail3D200::RdF32LE(bp + 40);
-                    float qx = Detail3D200::RdF32LE(bp + 44);
-                    float qy = Detail3D200::RdF32LE(bp + 48);
-                    float qz = Detail3D200::RdF32LE(bp + 52);
-                    float qw = Detail3D200::RdF32LE(bp + 56);
+        // Source Engine v44–v49: full .mdl + .vvd + .vtx triangle mesh assembly, with skeleton fallback ONLY when siblings absent
+        if (ver >= 44 && ver <= 49) {
+            uint32_t hdrLen = Detail3D200::RdU32LE(data + 76);
+            if (hdrLen < 244 || hdrLen > size) return false;
 
-                    BoneXform loc = {};
-                    loc.m[0][0] = 1.0f - 2.0f * (qy * qy + qz * qz);
-                    loc.m[0][1] = 2.0f * (qx * qy - qw * qz);
-                    loc.m[0][2] = 2.0f * (qx * qz + qw * qy);
-                    loc.m[0][3] = px;
-                    loc.m[1][0] = 2.0f * (qx * qy + qw * qz);
-                    loc.m[1][1] = 1.0f - 2.0f * (qx * qx + qz * qz);
-                    loc.m[1][2] = 2.0f * (qy * qz - qw * qx);
-                    loc.m[1][3] = py;
-                    loc.m[2][0] = 2.0f * (qx * qz - qw * qy);
-                    loc.m[2][1] = 2.0f * (qy * qz + qw * qx);
-                    loc.m[2][2] = 1.0f - 2.0f * (qx * qx + qy * qy);
-                    loc.m[2][3] = pz;
+            if (!mesh.filePath.empty()) {
+                size_t lastSep = mesh.filePath.find_last_of(L"\\/");
+                size_t lastDot = mesh.filePath.find_last_of(L'.');
+                std::wstring stem = (lastDot != std::wstring::npos && (lastSep == std::wstring::npos || lastDot > lastSep))
+                    ? mesh.filePath.substr(0, lastDot)
+                    : mesh.filePath;
 
-                    if (parent >= 0 && static_cast<uint32_t>(parent) < b) {
-                        const BoneXform& pw = world[static_cast<size_t>(parent)];
-                        BoneXform cw = {};
-                        for (int r = 0; r < 3; ++r) {
-                            for (int c = 0; c < 3; ++c) {
-                                cw.m[r][c] = pw.m[r][0] * loc.m[0][c] + pw.m[r][1] * loc.m[1][c] + pw.m[r][2] * loc.m[2][c];
-                            }
-                            cw.m[r][3] = pw.m[r][0] * loc.m[0][3] + pw.m[r][1] * loc.m[1][3] + pw.m[r][2] * loc.m[2][3] + pw.m[r][3];
-                        }
-                        world[b] = cw;
-                    } else {
-                        world[b] = loc;
+                std::wstring vvdPath = stem + L".vvd";
+                bool hasVvdOnDisk = (GetFileAttributesW(vvdPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+                static constexpr const wchar_t* kVtxSuffixes[] = {
+                    L".dx90.vtx", L".dx80.vtx", L".sw.vtx", L".vtx"
+                };
+                std::wstring vtxPath;
+                for (const wchar_t* sfx : kVtxSuffixes) {
+                    std::wstring cand = stem + sfx;
+                    if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        vtxPath = std::move(cand);
+                        break;
                     }
-                    joints[b] = { world[b].m[0][3], world[b].m[2][3], -world[b].m[1][3] };
                 }
-                float span = Detail3D200::ComputePointCloudSpan(joints);
-                if (span > 1e-3f) {
-                    float r = span * 0.015f;
+                bool hasVtxOnDisk = !vtxPath.empty();
+
+                if (hasVvdOnDisk && hasVtxOnDisk) {
+                    std::vector<uint8_t> vvdBytes, vtxBytes;
+                    if (!DetailValveMdl200::ReadSiblingBytes(vvdPath, vvdBytes) ||
+                        !DetailValveMdl200::ReadSiblingBytes(vtxPath, vtxBytes))
+                    {
+                        return false;
+                    }
+                    return DetailValveMdl200::AssembleSourceVvdVtxMesh(
+                        data, size, vvdBytes.data(), vvdBytes.size(), vtxBytes.data(), vtxBytes.size(), ver, mesh);
+                }
+                // If one sibling exists on disk and is corrupt, reject rather than hiding corruption
+                if (hasVvdOnDisk) {
+                    std::vector<uint8_t> vvdBytes;
+                    if (!DetailValveMdl200::ReadSiblingBytes(vvdPath, vvdBytes) || vvdBytes.size() < 64 ||
+                        std::memcmp(vvdBytes.data(), "IDSV", 4) != 0 ||
+                        DetailValveMdl200::RdI32LE(vvdBytes.data() + 4) != 4 ||
+                        Detail3D200::RdU32LE(vvdBytes.data() + 8) != Detail3D200::RdU32LE(data + 8))
+                    {
+                        return false;
+                    }
+                }
+                if (hasVtxOnDisk) {
+                    std::vector<uint8_t> vtxBytes;
+                    if (!DetailValveMdl200::ReadSiblingBytes(vtxPath, vtxBytes) || vtxBytes.size() < 36 ||
+                        DetailValveMdl200::RdI32LE(vtxBytes.data()) != 7 ||
+                        Detail3D200::RdU32LE(vtxBytes.data() + 16) != Detail3D200::RdU32LE(data + 8))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            // Fallback when sibling .vvd/.vtx files are absent: decode mstudiobone_t skeleton hierarchy
+            if (size >= 400) {
+                uint32_t numBones = Detail3D200::RdU32LE(data + 156);
+                uint32_t boneIdx  = Detail3D200::RdU32LE(data + 160);
+                if (numBones >= 2 && numBones <= 512 && boneIdx >= 244 &&
+                    boneIdx + static_cast<uint64_t>(numBones) * 216ULL <= size)
+                {
+                    std::vector<DetailValveMdl200::BoneMat3x4> world(numBones);
+                    std::vector<int32_t> parents(numBones, -1);
+                    std::vector<Vec3f> joints(numBones);
                     for (uint32_t b = 0; b < numBones; ++b) {
-                        Detail3D200::AddOctaSphere(mesh, joints[b].x, joints[b].y, joints[b].z, r * 1.3f);
-                        if (parents[b] >= 0 && static_cast<uint32_t>(parents[b]) < numBones) {
-                            Detail3D200::AddStrut3D(mesh, joints[static_cast<size_t>(parents[b])], joints[b], r * 0.7f);
+                        const uint8_t* bp = data + boneIdx + static_cast<size_t>(b) * 216;
+                        int32_t parent = DetailValveMdl200::RdI32LE(bp + 4);
+                        if (parent < -1 || parent >= static_cast<int32_t>(numBones) || parent == static_cast<int32_t>(b)) {
+                            return false;
+                        }
+                        parents[b] = parent;
+                        float px = Detail3D200::RdF32LE(bp + 32);
+                        float py = Detail3D200::RdF32LE(bp + 36);
+                        float pz = Detail3D200::RdF32LE(bp + 40);
+                        float qx = Detail3D200::RdF32LE(bp + 44);
+                        float qy = Detail3D200::RdF32LE(bp + 48);
+                        float qz = Detail3D200::RdF32LE(bp + 52);
+                        float qw = Detail3D200::RdF32LE(bp + 56);
+
+                        DetailValveMdl200::BoneMat3x4 loc = {};
+                        loc.m[0][0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+                        loc.m[0][1] = 2.0f * (qx * qy - qw * qz);
+                        loc.m[0][2] = 2.0f * (qx * qz + qw * qy);
+                        loc.m[0][3] = px;
+                        loc.m[1][0] = 2.0f * (qx * qy + qw * qz);
+                        loc.m[1][1] = 1.0f - 2.0f * (qx * qx + qz * qz);
+                        loc.m[1][2] = 2.0f * (qy * qz - qw * qx);
+                        loc.m[1][3] = py;
+                        loc.m[2][0] = 2.0f * (qx * qz - qw * qy);
+                        loc.m[2][1] = 2.0f * (qy * qz + qw * qx);
+                        loc.m[2][2] = 1.0f - 2.0f * (qx * qx + qy * qy);
+                        loc.m[2][3] = pz;
+
+                        if (parent >= 0 && static_cast<uint32_t>(parent) < b) {
+                            world[b] = DetailValveMdl200::ConcatBoneMat(world[static_cast<size_t>(parent)], loc);
+                        } else {
+                            world[b] = loc;
+                        }
+                        joints[b] = { world[b].m[0][3], world[b].m[2][3], -world[b].m[1][3] };
+                    }
+                    float span = Detail3D200::ComputePointCloudSpan(joints);
+                    if (span > 1e-3f) {
+                        float r = span * 0.015f;
+                        for (uint32_t b = 0; b < numBones; ++b) {
+                            Detail3D200::AddOctaSphere(mesh, joints[b].x, joints[b].y, joints[b].z, r * 1.3f);
+                            if (parents[b] >= 0 && static_cast<uint32_t>(parents[b]) < numBones) {
+                                Detail3D200::AddStrut3D(mesh, joints[static_cast<size_t>(parents[b])], joints[b], r * 0.7f);
+                            }
                         }
                     }
                 }
             }
+            return !mesh.vertices.empty() && !mesh.tris.empty();
         }
-        return !mesh.vertices.empty() && !mesh.tris.empty();
+        return false;
     }
     return false;
 }
@@ -1803,209 +2298,2101 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
 
     // #53 & #54. Spatial ACIS (.sat / .sab) & Siemens Parasolid XT (.x_t / .x_b)
     if (ext == L".sat" || ext == L".sab" || ext == L".x_t" || ext == L".x_b") {
-        // Binary ACIS (.sab — "ACIS BinaryFile" / "ASM BinaryFile ")
-        if (ext == L".sab" || (size >= 19 && (std::memcmp(data, "ACIS BinaryFile", 15) == 0 ||
-                                              std::memcmp(data, "ASM BinaryFile", 14) == 0)))
-        {
-            if (size < 31 || (std::memcmp(data, "ACIS BinaryFile", 15) != 0 &&
-                              std::memcmp(data, "ASM BinaryFile", 14) != 0))
-            {
-                return false;
+        struct CadVec3 {
+            double x = 0.0, y = 0.0, z = 0.0;
+        };
+        auto vAdd = [](CadVec3 a, CadVec3 b) -> CadVec3 { return { a.x + b.x, a.y + b.y, a.z + b.z }; };
+        auto vSub = [](CadVec3 a, CadVec3 b) -> CadVec3 { return { a.x - b.x, a.y - b.y, a.z - b.z }; };
+        auto vMul = [](CadVec3 a, double s)  -> CadVec3 { return { a.x * s, a.y * s, a.z * s }; };
+        auto vDot = [](CadVec3 a, CadVec3 b) -> double  { return a.x * b.x + a.y * b.y + a.z * b.z; };
+        auto vCross = [](CadVec3 a, CadVec3 b) -> CadVec3 {
+            return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+        };
+        auto vLen = [&](CadVec3 a) -> double { return std::sqrt(vDot(a, a)); };
+        auto vNorm = [&](CadVec3 a) -> CadVec3 {
+            double L = vLen(a);
+            return (L > 1e-12) ? CadVec3{ a.x / L, a.y / L, a.z / L } : CadVec3{ 0.0, 0.0, 1.0 };
+        };
+        auto vDist = [&](CadVec3 a, CadVec3 b) -> double { return vLen(vSub(a, b)); };
+
+        struct CadXform {
+            double r[9] = { 1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0 };
+            double t[3] = { 0.0, 0.0, 0.0 };
+            double scale = 1.0;
+            bool valid = false;
+        };
+        auto applyXfPt = [](const CadXform& xf, CadVec3 p) -> CadVec3 {
+            if (!xf.valid) return p;
+            double s = xf.scale;
+            return {
+                s * (xf.r[0] * p.x + xf.r[1] * p.y + xf.r[2] * p.z) + xf.t[0],
+                s * (xf.r[3] * p.x + xf.r[4] * p.y + xf.r[5] * p.z) + xf.t[1],
+                s * (xf.r[6] * p.x + xf.r[7] * p.y + xf.r[8] * p.z) + xf.t[2]
+            };
+        };
+        auto applyXfDir = [&](const CadXform& xf, CadVec3 d) -> CadVec3 {
+            if (!xf.valid) return d;
+            return vNorm({
+                xf.r[0] * d.x + xf.r[1] * d.y + xf.r[2] * d.z,
+                xf.r[3] * d.x + xf.r[4] * d.y + xf.r[5] * d.z,
+                xf.r[6] * d.x + xf.r[7] * d.y + xf.r[8] * d.z
+            });
+        };
+
+        enum class SurfKind { Unknown, Plane, CylinderCone, Sphere, Torus };
+        struct BRepSurf {
+            SurfKind kind = SurfKind::Unknown;
+            CadVec3 origin;
+            CadVec3 normal = { 0.0, 0.0, 1.0 };
+            CadVec3 uAxis  = { 1.0, 0.0, 0.0 };
+            double radius1 = 0.0;
+            double radius2 = 0.0;
+            double ratio   = 1.0;
+        };
+
+        enum class CurveKind { Straight, Ellipse, Spline };
+        struct BRepCurve {
+            CurveKind kind = CurveKind::Straight;
+            CadVec3 origin;
+            CadVec3 normal    = { 0.0, 0.0, 1.0 };
+            CadVec3 majorAxis = { 1.0, 0.0, 0.0 };
+            double ratio      = 1.0;
+            std::vector<CadVec3> ctrlPts;
+        };
+
+        struct BRepEdge {
+            int32_t startVert = -1;
+            int32_t endVert   = -1;
+            int32_t curveId   = -1;
+            int32_t bodyId    = -1;
+            bool reversed     = false;
+        };
+
+        struct BRepCoedge {
+            int32_t nextCoedge = -1;
+            int32_t prevCoedge = -1;
+            int32_t edgeId     = -1;
+            int32_t headVert   = -1;
+            bool reversed      = false;
+        };
+
+        struct BRepLoop {
+            int32_t nextLoop    = -1;
+            int32_t firstCoedge = -1;
+            int32_t ownerFace   = -1;
+            std::vector<int32_t> directEdges;
+        };
+
+        struct BRepFace {
+            int32_t nextFace  = -1;
+            int32_t firstLoop = -1;
+            int32_t surfaceId = -1;
+            int32_t bodyId    = -1;
+            bool reversed     = false;
+            std::vector<int32_t> loopIds;
+        };
+
+        struct BRepGraph {
+            std::unordered_map<int32_t, CadVec3>    points;
+            std::unordered_map<int32_t, int32_t>    vertexToPoint;
+            std::unordered_map<int32_t, BRepCurve>  curves;
+            std::unordered_map<int32_t, BRepSurf>   surfaces;
+            std::unordered_map<int32_t, BRepEdge>   edges;
+            std::unordered_map<int32_t, BRepCoedge> coedges;
+            std::unordered_map<int32_t, BRepLoop>   loops;
+            std::unordered_map<int32_t, BRepFace>   faces;
+            std::unordered_map<int32_t, CadXform>   bodyTransforms;
+            std::vector<int32_t> faceOrder;
+            std::vector<int32_t> edgeOrder;
+        };
+
+        // Shared B-Rep Topology -> Triangle Mesh / Wireframe Evaluator
+        auto evaluateBRepGraph = [&](const BRepGraph& g) -> bool {
+            if (g.faces.empty() && g.edges.empty()) return false;
+
+            auto getVertPt = [&](int32_t vertId, CadVec3& outPt) -> bool {
+                if (vertId < 0) return false;
+                auto vit = g.vertexToPoint.find(vertId);
+                if (vit == g.vertexToPoint.end()) return false;
+                auto pit = g.points.find(vit->second);
+                if (pit == g.points.end()) return false;
+                outPt = pit->second;
+                return true;
+            };
+
+            auto getBodyXf = [&](int32_t bodyId) -> CadXform {
+                auto it = g.bodyTransforms.find(bodyId);
+                return (it != g.bodyTransforms.end()) ? it->second : CadXform{};
+            };
+
+            // Discretize an oriented edge traversal from vStart -> vEnd along curve
+            auto sampleEdgePoints = [&](const BRepEdge& ed, int32_t vStart, int32_t vEnd, bool coedgeForward) -> std::vector<CadVec3> {
+                std::vector<CadVec3> poly;
+                CadVec3 p0{}, p1{};
+                bool hasP0 = getVertPt(vStart, p0);
+                bool hasP1 = getVertPt(vEnd,   p1);
+
+                auto cit = g.curves.find(ed.curveId);
+                if (cit != g.curves.end() && cit->second.kind == CurveKind::Ellipse) {
+                    const BRepCurve& c = cit->second;
+                    double rMaj = vLen(c.majorAxis);
+                    double nLen = vLen(c.normal);
+                    double ratio = std::fabs(c.ratio);
+                    if (rMaj > 1e-9 && nLen > 1e-9 && ratio > 1e-6) {
+                        CadVec3 nUnit = vNorm(c.normal);
+                        CadVec3 uUnit = vMul(c.majorAxis, 1.0 / rMaj);
+                        CadVec3 vUnit = vNorm(vCross(nUnit, uUnit));
+                        double rMin = rMaj * ratio;
+                        auto evalEll = [&](double ang) -> CadVec3 {
+                            return vAdd(c.origin, vAdd(vMul(uUnit, rMaj * std::cos(ang)), vMul(vUnit, rMin * std::sin(ang))));
+                        };
+                        auto angleOf = [&](CadVec3 pt) -> double {
+                            CadVec3 d = vSub(pt, c.origin);
+                            return std::atan2(vDot(d, vUnit) / rMin, vDot(d, uUnit) / rMaj);
+                        };
+                        const double kPi = 3.14159265358979323846;
+                        bool edgeForward = !ed.reversed;
+                        double dirSign = (coedgeForward == edgeForward) ? 1.0 : -1.0;
+
+                        bool isClosedFull = (!hasP0 && !hasP1) ||
+                                            (hasP0 && hasP1 && (vStart == vEnd || vDist(p0, p1) < 1e-5 * rMaj));
+                        if (isClosedFull) {
+                            double t0 = hasP0 ? angleOf(p0) : 0.0;
+                            const int segs = 24;
+                            poly.reserve(static_cast<size_t>(segs) + 1);
+                            for (int k = 0; k <= segs; ++k) {
+                                if (k == 0 && hasP0) poly.push_back(p0);
+                                else if (k == segs && hasP0) poly.push_back(p0);
+                                else poly.push_back(evalEll(t0 + dirSign * (2.0 * kPi * k) / segs));
+                            }
+                            return poly;
+                        }
+                        if (hasP0 && hasP1) {
+                            double t0 = angleOf(p0);
+                            double t1 = angleOf(p1);
+                            double sweep = t1 - t0;
+                            if (dirSign > 0.0) {
+                                while (sweep <= 1e-7) sweep += 2.0 * kPi;
+                                while (sweep > 2.0 * kPi + 1e-5) sweep -= 2.0 * kPi;
+                            } else {
+                                while (sweep >= -1e-7) sweep -= 2.0 * kPi;
+                                while (sweep < -2.0 * kPi - 1e-5) sweep += 2.0 * kPi;
+                            }
+                            int segs = std::clamp(static_cast<int>(std::ceil(std::fabs(sweep) / (2.0 * kPi / 24.0))), 3, 32);
+                            poly.reserve(static_cast<size_t>(segs) + 1);
+                            poly.push_back(p0);
+                            for (int k = 1; k < segs; ++k) {
+                                poly.push_back(evalEll(t0 + sweep * (static_cast<double>(k) / segs)));
+                            }
+                            poly.push_back(p1);
+                            return poly;
+                        }
+                    }
+                } else if (cit != g.curves.end() && cit->second.kind == CurveKind::Spline && !cit->second.ctrlPts.empty()) {
+                    const auto& cp = cit->second.ctrlPts;
+                    bool forwardAlongCurve = (coedgeForward == !ed.reversed);
+                    if (hasP0) poly.push_back(p0);
+                    if (forwardAlongCurve) {
+                        for (const auto& q : cp) poly.push_back(q);
+                    } else {
+                        for (size_t i = cp.size(); i > 0; --i) poly.push_back(cp[i - 1]);
+                    }
+                    if (hasP1) poly.push_back(p1);
+                    if (poly.size() >= 2) return poly;
+                }
+
+                if (hasP0 && hasP1) {
+                    poly.push_back(p0);
+                    poly.push_back(p1);
+                }
+                return poly;
+            };
+
+            // Spatial vertex welder so B-Rep solids share clean topological vertices
+            double globalSpan = 1.0;
+            if (!g.points.empty()) {
+                auto it0 = g.points.begin();
+                CadVec3 mn = it0->second, mx = it0->second;
+                for (const auto& kv : g.points) {
+                    mn.x = std::min(mn.x, kv.second.x); mn.y = std::min(mn.y, kv.second.y); mn.z = std::min(mn.z, kv.second.z);
+                    mx.x = std::max(mx.x, kv.second.x); mx.y = std::max(mx.y, kv.second.y); mx.z = std::max(mx.z, kv.second.z);
+                }
+                globalSpan = std::max({ mx.x - mn.x, mx.y - mn.y, mx.z - mn.z, 1e-4 });
             }
+            const double invWeldCell = 1.0 / (globalSpan * 1e-5);
+            struct WeldKey {
+                int64_t x, y, z;
+                bool operator==(const WeldKey& o) const { return x == o.x && y == o.y && z == o.z; }
+            };
+            struct WeldHash {
+                size_t operator()(const WeldKey& k) const {
+                    uint64_t h = static_cast<uint64_t>(k.x) * 11400714819323198485ull;
+                    h ^= static_cast<uint64_t>(k.y) * 14029467366897019727ull + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+                    h ^= static_cast<uint64_t>(k.z) * 1609587929392839161ull  + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+                    return static_cast<size_t>(h);
+                }
+            };
+            std::unordered_map<WeldKey, uint32_t, WeldHash> weldedVerts;
+            auto emitVertex = [&](CadVec3 p) -> uint32_t {
+                WeldKey key{
+                    static_cast<int64_t>(std::llround(p.x * invWeldCell)),
+                    static_cast<int64_t>(std::llround(p.y * invWeldCell)),
+                    static_cast<int64_t>(std::llround(p.z * invWeldCell))
+                };
+                auto it = weldedVerts.find(key);
+                if (it != weldedVerts.end()) return it->second;
+                uint32_t idx = static_cast<uint32_t>(mesh.vertices.size());
+                mesh.vertices.push_back({
+                    static_cast<float>(p.x),
+                    static_cast<float>(p.y),
+                    static_cast<float>(p.z)
+                });
+                weldedVerts.emplace(key, idx);
+                return idx;
+            };
+
+            struct Poly2DVert {
+                double u = 0.0;
+                double v = 0.0;
+                uint32_t vIdx = 0;
+            };
+
+            auto signedArea2D = [](const std::vector<Poly2DVert>& p) -> double {
+                double a = 0.0;
+                size_t n = p.size();
+                for (size_t i = 0; i < n; ++i) {
+                    size_t j = (i + 1) % n;
+                    a += p[i].u * p[j].v - p[j].u * p[i].v;
+                }
+                return 0.5 * a;
+            };
+
+            auto pointInPoly2D = [](double u, double v, const std::vector<Poly2DVert>& poly) -> bool {
+                bool inside = false;
+                size_t n = poly.size();
+                for (size_t i = 0, j = n - 1; i < n; j = i++) {
+                    double ui = poly[i].u, vi = poly[i].v;
+                    double uj = poly[j].u, vj = poly[j].v;
+                    if (((vi > v) != (vj > v)) &&
+                        (u < (uj - ui) * (v - vi) / (vj - vi) + ui))
+                    {
+                        inside = !inside;
+                    }
+                }
+                return inside;
+            };
+
+            auto cross2D = [](Poly2DVert a, Poly2DVert b, Poly2DVert c) -> double {
+                return (b.u - a.u) * (c.v - a.v) - (b.v - a.v) * (c.u - a.u);
+            };
+
+            // Merge CW holes into CCW outer polygon via horizontal +u ray bridge cuts, then ear-clip
+            auto triangulateOuterWithHoles = [&](
+                std::vector<Poly2DVert> outer,
+                std::vector<std::vector<Poly2DVert>> holes,
+                bool flipWinding)
+            {
+                if (outer.size() < 3) return;
+                double minU = outer[0].u, maxU = outer[0].u;
+                double minV = outer[0].v, maxV = outer[0].v;
+                for (const auto& q : outer) {
+                    minU = std::min(minU, q.u); maxU = std::max(maxU, q.u);
+                    minV = std::min(minV, q.v); maxV = std::max(maxV, q.v);
+                }
+                double spanUV = std::max({ maxU - minU, maxV - minV, 1e-9 });
+                double polyScale2 = spanUV * spanUV;
+
+                auto same2D = [&](Poly2DVert a, Poly2DVert b) -> bool {
+                    double du = a.u - b.u, dv = a.v - b.v;
+                    return (du * du + dv * dv) <= 1e-18 * polyScale2;
+                };
+                auto ptInTri2D = [&](Poly2DVert p, Poly2DVert a, Poly2DVert b, Poly2DVert c) -> bool {
+                    double eps = -1e-11 * polyScale2;
+                    return (cross2D(a, b, p) >= eps && cross2D(b, c, p) >= eps && cross2D(c, a, p) >= eps);
+                };
+
+                if (signedArea2D(outer) < 0.0) std::reverse(outer.begin(), outer.end());
+                for (auto& h : holes) {
+                    if (signedArea2D(h) > 0.0) std::reverse(h.begin(), h.end());
+                }
+
+                // Sort holes by rightmost u descending (Eberly bridge ordering)
+                std::sort(holes.begin(), holes.end(), [](const auto& a, const auto& b) {
+                    double maxA = a[0].u, maxB = b[0].u;
+                    for (const auto& q : a) maxA = std::max(maxA, q.u);
+                    for (const auto& q : b) maxB = std::max(maxB, q.u);
+                    return maxA > maxB;
+                });
+
+                const double linEps = 1e-9 * spanUV;
+                for (const auto& hole : holes) {
+                    if (hole.size() < 3) continue;
+                    size_t hm = 0;
+                    for (size_t i = 1; i < hole.size(); ++i) {
+                        if (hole[i].u > hole[hm].u || (hole[i].u == hole[hm].u && hole[i].v < hole[hm].v)) hm = i;
+                    }
+                    const Poly2DVert M = hole[hm];
+
+                    double bestIx = 1e300;
+                    int bestEdge = -1;
+                    size_t on = outer.size();
+                    for (size_t i = 0; i < on; ++i) {
+                        const Poly2DVert& A = outer[i];
+                        const Poly2DVert& B = outer[(i + 1) % on];
+                        if ((A.v <= M.v && M.v < B.v) || (B.v <= M.v && M.v < A.v)) {
+                            double t = (M.v - A.v) / (B.v - A.v);
+                            double ix = A.u + t * (B.u - A.u);
+                            if (ix >= M.u - linEps && ix < bestIx) {
+                                bestIx = ix;
+                                bestEdge = static_cast<int>(i);
+                            }
+                        }
+                    }
+
+                    size_t bridgeIdx = 0;
+                    if (bestEdge >= 0) {
+                        size_t i0 = static_cast<size_t>(bestEdge);
+                        size_t i1 = (i0 + 1) % on;
+                        if (std::hypot(outer[i0].u - bestIx, outer[i0].v - M.v) < linEps) {
+                            bridgeIdx = i0;
+                        } else if (std::hypot(outer[i1].u - bestIx, outer[i1].v - M.v) < linEps) {
+                            bridgeIdx = i1;
+                        } else {
+                            size_t cand = (outer[i0].u >= outer[i1].u) ? i0 : i1;
+                            Poly2DVert I{ bestIx, M.v, 0 };
+                            Poly2DVert P = outer[cand];
+                            Poly2DVert tA = M, tB = I, tC = P;
+                            if (cross2D(tA, tB, tC) < 0.0) std::swap(tB, tC);
+
+                            double bestSlope = 1e300;
+                            double bestDist  = 1e300;
+                            bridgeIdx = cand;
+                            for (size_t k = 0; k < on; ++k) {
+                                const Poly2DVert& R = outer[k];
+                                if (same2D(R, P) || R.u < M.u - linEps) continue;
+                                // Check if R is a reflex vertex inside search triangle (M, I, P)
+                                const Poly2DVert& rPrev = outer[(k + on - 1) % on];
+                                const Poly2DVert& rNext = outer[(k + 1) % on];
+                                if (cross2D(rPrev, R, rNext) <= 1e-11 * polyScale2 && ptInTri2D(R, tA, tB, tC)) {
+                                    double dx = std::max(0.0, R.u - M.u);
+                                    double dy = std::fabs(R.v - M.v);
+                                    double dist = std::hypot(dx, dy);
+                                    double slope = (dx > 1e-12 * spanUV) ? (dy / dx) : 1e200;
+                                    if (slope < bestSlope - 1e-11 || (std::fabs(slope - bestSlope) <= 1e-11 && dist < bestDist)) {
+                                        bestSlope = slope;
+                                        bestDist  = dist;
+                                        bridgeIdx = k;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        double bestD = 1e300;
+                        for (size_t k = 0; k < on; ++k) {
+                            double d = std::hypot(outer[k].u - M.u, outer[k].v - M.v);
+                            if (d < bestD) { bestD = d; bridgeIdx = k; }
+                        }
+                    }
+
+                    std::vector<Poly2DVert> merged;
+                    merged.reserve(outer.size() + hole.size() + 2);
+                    for (size_t i = 0; i <= bridgeIdx; ++i) merged.push_back(outer[i]);
+                    for (size_t k = 0; k < hole.size(); ++k) merged.push_back(hole[(hm + k) % hole.size()]);
+                    merged.push_back(hole[hm]);
+                    merged.push_back(outer[bridgeIdx]);
+                    for (size_t i = bridgeIdx + 1; i < outer.size(); ++i) merged.push_back(outer[i]);
+                    outer = std::move(merged);
+                }
+
+                // Ear-clipping with bridge-vertex coincidence handling & recovery
+                std::vector<Poly2DVert> work = std::move(outer);
+                size_t guard = work.size() * work.size() + 64;
+                while (work.size() >= 3 && guard-- > 0) {
+                    size_t wn = work.size();
+                    if (wn == 3) {
+                        uint32_t a = work[0].vIdx, b = work[1].vIdx, c = work[2].vIdx;
+                        if (a != b && b != c && a != c) {
+                            if (flipWinding) mesh.tris.push_back({ a, c, b, {} });
+                            else             mesh.tris.push_back({ a, b, c, {} });
+                        }
+                        break;
+                    }
+
+                    // Remove any adjacent zero-length collapsed edges first
+                    bool removedDup = false;
+                    for (size_t i = 0; i < wn; ++i) {
+                        size_t ni = (i + 1) % wn;
+                        if (same2D(work[i], work[ni])) {
+                            work.erase(work.begin() + static_cast<std::ptrdiff_t>(ni));
+                            removedDup = true;
+                            break;
+                        }
+                    }
+                    if (removedDup) continue;
+
+                    int earIdx = -1;
+                    for (int pass = 0; pass < 2 && earIdx < 0; ++pass) {
+                        double areaEps = (pass == 0) ? (1e-11 * polyScale2) : (-1e-9 * polyScale2);
+                        for (size_t i = 0; i < wn; ++i) {
+                            const Poly2DVert& A = work[(i + wn - 1) % wn];
+                            const Poly2DVert& B = work[i];
+                            const Poly2DVert& C = work[(i + 1) % wn];
+                            double cr = cross2D(A, B, C);
+                            if (cr <= areaEps) continue;
+                            bool blocked = false;
+                            if (pass == 0) {
+                                for (size_t k = 0; k < wn; ++k) {
+                                    if (k == i || k == (i + wn - 1) % wn || k == (i + 1) % wn) continue;
+                                    const Poly2DVert& P = work[k];
+                                    if (same2D(P, A) || same2D(P, B) || same2D(P, C)) continue;
+                                    if (ptInTri2D(P, A, B, C)) { blocked = true; break; }
+                                }
+                            }
+                            if (!blocked) {
+                                earIdx = static_cast<int>(i);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (earIdx < 0) earIdx = 0;
+                    size_t ei = static_cast<size_t>(earIdx);
+                    uint32_t a = work[(ei + wn - 1) % wn].vIdx;
+                    uint32_t b = work[ei].vIdx;
+                    uint32_t c = work[(ei + 1) % wn].vIdx;
+                    if (a != b && b != c && a != c) {
+                        if (flipWinding) mesh.tris.push_back({ a, c, b, {} });
+                        else             mesh.tris.push_back({ a, b, c, {} });
+                    }
+                    work.erase(work.begin() + static_cast<std::ptrdiff_t>(ei));
+                }
+            };
+
+            // Reconstruct & triangulate every B-Rep face
+            const double kPi = 3.14159265358979323846;
+            for (int32_t faceId : g.faceOrder) {
+                auto fit = g.faces.find(faceId);
+                if (fit == g.faces.end()) continue;
+                const BRepFace& face = fit->second;
+                CadXform xf = getBodyXf(face.bodyId);
+
+                const BRepSurf* surf = nullptr;
+                auto sit = g.surfaces.find(face.surfaceId);
+                if (sit != g.surfaces.end()) surf = &sit->second;
+
+                // Collect all loops on this face
+                std::vector<int32_t> loopList = face.loopIds;
+                if (loopList.empty() && face.firstLoop >= 0) {
+                    int32_t curL = face.firstLoop;
+                    std::set<int32_t> seenL;
+                    while (curL >= 0 && seenL.insert(curL).second && seenL.size() <= 512) {
+                        loopList.push_back(curL);
+                        auto lit = g.loops.find(curL);
+                        if (lit == g.loops.end()) break;
+                        curL = lit->second.nextLoop;
+                    }
+                }
+
+                // Build 3D polylines for each loop
+                std::vector<std::vector<CadVec3>> loops3D;
+                for (int32_t lid : loopList) {
+                    auto lit = g.loops.find(lid);
+                    if (lit == g.loops.end()) continue;
+                    const BRepLoop& lp = lit->second;
+                    std::vector<CadVec3> rawLoop;
+
+                    if (lp.firstCoedge >= 0) {
+                        std::vector<int32_t> ceChain;
+                        int32_t curCe = lp.firstCoedge;
+                        std::set<int32_t> seenCe;
+                        while (curCe >= 0 && seenCe.insert(curCe).second && ceChain.size() < 4096) {
+                            ceChain.push_back(curCe);
+                            auto ceIt = g.coedges.find(curCe);
+                            if (ceIt == g.coedges.end()) break;
+                            int32_t nxt = ceIt->second.nextCoedge;
+                            if (nxt == lp.firstCoedge) break;
+                            curCe = nxt;
+                        }
+
+                        for (size_t ci = 0; ci < ceChain.size(); ++ci) {
+                            const BRepCoedge& ce = g.coedges.at(ceChain[ci]);
+                            auto edIt = g.edges.find(ce.edgeId);
+                            if (edIt == g.edges.end()) continue;
+                            const BRepEdge& ed = edIt->second;
+
+                            bool ceFwd = !ce.reversed;
+                            int32_t vStart = ceFwd ? ed.startVert : ed.endVert;
+                            int32_t vEnd   = ceFwd ? ed.endVert   : ed.startVert;
+                            // Parasolid PK fin head-vertex fallback when edge doesn't store direct vertex refs
+                            if (vStart < 0 && vEnd < 0 && ce.headVert >= 0 && !ceChain.empty()) {
+                                const BRepCoedge& prevCe = g.coedges.at(ceChain[(ci + ceChain.size() - 1) % ceChain.size()]);
+                                vStart = prevCe.headVert;
+                                vEnd   = ce.headVert;
+                            }
+
+                            auto segPts = sampleEdgePoints(ed, vStart, vEnd, ceFwd);
+                            for (const auto& sp : segPts) {
+                                CadVec3 wp = applyXfPt(xf, sp);
+                                if (rawLoop.empty() || vDist(rawLoop.back(), wp) > globalSpan * 1e-6) {
+                                    rawLoop.push_back(wp);
+                                }
+                            }
+                        }
+                    } else if (!lp.directEdges.empty()) {
+                        for (int32_t eid : lp.directEdges) {
+                            auto edIt = g.edges.find(eid);
+                            if (edIt == g.edges.end()) continue;
+                            const BRepEdge& ed = edIt->second;
+                            auto segPts = sampleEdgePoints(ed, ed.startVert, ed.endVert, true);
+                            if (!rawLoop.empty() && segPts.size() >= 2) {
+                                CadVec3 wFirst = applyXfPt(xf, segPts.front());
+                                CadVec3 wLast  = applyXfPt(xf, segPts.back());
+                                if (vDist(rawLoop.back(), wLast) < vDist(rawLoop.back(), wFirst)) {
+                                    std::reverse(segPts.begin(), segPts.end());
+                                }
+                            }
+                            for (const auto& sp : segPts) {
+                                CadVec3 wp = applyXfPt(xf, sp);
+                                if (rawLoop.empty() || vDist(rawLoop.back(), wp) > globalSpan * 1e-6) {
+                                    rawLoop.push_back(wp);
+                                }
+                            }
+                        }
+                    }
+
+                    if (rawLoop.size() >= 2 && vDist(rawLoop.front(), rawLoop.back()) <= globalSpan * 1e-5) {
+                        rawLoop.pop_back();
+                    }
+                    if (rawLoop.size() >= 3) {
+                        loops3D.push_back(std::move(rawLoop));
+                    }
+                }
+
+                // Untrimmed closed analytic Sphere / Torus faces (no boundary loops)
+                if (loops3D.empty() && surf != nullptr) {
+                    if (surf->kind == SurfKind::Sphere && surf->radius1 > 1e-9) {
+                        CadVec3 center = applyXfPt(xf, surf->origin);
+                        double rad = surf->radius1 * (xf.valid ? std::fabs(xf.scale) : 1.0);
+                        const int nLat = 16, nLon = 24;
+                        std::vector<std::vector<uint32_t>> grid(nLat + 1, std::vector<uint32_t>(nLon));
+                        for (int i = 0; i <= nLat; ++i) {
+                            double phi = -0.5 * kPi + kPi * (static_cast<double>(i) / nLat);
+                            double cp = std::cos(phi), sp = std::sin(phi);
+                            for (int j = 0; j < nLon; ++j) {
+                                double th = 2.0 * kPi * (static_cast<double>(j) / nLon);
+                                CadVec3 p{
+                                    center.x + rad * cp * std::cos(th),
+                                    center.y + rad * cp * std::sin(th),
+                                    center.z + rad * sp
+                                };
+                                grid[static_cast<size_t>(i)][static_cast<size_t>(j)] = emitVertex(p);
+                            }
+                        }
+                        for (int i = 0; i < nLat; ++i) {
+                            for (int j = 0; j < nLon; ++j) {
+                                int nj = (j + 1) % nLon;
+                                uint32_t a = grid[static_cast<size_t>(i)][static_cast<size_t>(j)];
+                                uint32_t b = grid[static_cast<size_t>(i)][static_cast<size_t>(nj)];
+                                uint32_t c = grid[static_cast<size_t>(i + 1)][static_cast<size_t>(nj)];
+                                uint32_t d = grid[static_cast<size_t>(i + 1)][static_cast<size_t>(j)];
+                                if (a != b && b != c && a != c) {
+                                    if (face.reversed) mesh.tris.push_back({ a, c, b, {} });
+                                    else               mesh.tris.push_back({ a, b, c, {} });
+                                }
+                                if (a != c && c != d && a != d) {
+                                    if (face.reversed) mesh.tris.push_back({ a, d, c, {} });
+                                    else               mesh.tris.push_back({ a, c, d, {} });
+                                }
+                            }
+                        }
+                    } else if (surf->kind == SurfKind::Torus && surf->radius1 > 1e-9 && std::fabs(surf->radius2) > 1e-9) {
+                        CadVec3 center = applyXfPt(xf, surf->origin);
+                        CadVec3 axis   = applyXfDir(xf, surf->normal);
+                        CadVec3 ref    = (std::fabs(axis.z) < 0.9) ? CadVec3{ 0, 0, 1 } : CadVec3{ 1, 0, 0 };
+                        CadVec3 uAx    = vNorm(vCross(ref, axis));
+                        CadVec3 vAx    = vNorm(vCross(axis, uAx));
+                        double rMaj = surf->radius1 * (xf.valid ? std::fabs(xf.scale) : 1.0);
+                        double rMin = std::fabs(surf->radius2) * (xf.valid ? std::fabs(xf.scale) : 1.0);
+                        const int nMaj = 24, nMin = 16;
+                        std::vector<std::vector<uint32_t>> grid(nMaj, std::vector<uint32_t>(nMin));
+                        for (int i = 0; i < nMaj; ++i) {
+                            double u = 2.0 * kPi * (static_cast<double>(i) / nMaj);
+                            CadVec3 radDir = vAdd(vMul(uAx, std::cos(u)), vMul(vAx, std::sin(u)));
+                            for (int j = 0; j < nMin; ++j) {
+                                double v = 2.0 * kPi * (static_cast<double>(j) / nMin);
+                                CadVec3 p = vAdd(center, vAdd(vMul(radDir, rMaj + rMin * std::cos(v)), vMul(axis, rMin * std::sin(v))));
+                                grid[static_cast<size_t>(i)][static_cast<size_t>(j)] = emitVertex(p);
+                            }
+                        }
+                        for (int i = 0; i < nMaj; ++i) {
+                            int ni = (i + 1) % nMaj;
+                            for (int j = 0; j < nMin; ++j) {
+                                int nj = (j + 1) % nMin;
+                                uint32_t a = grid[static_cast<size_t>(i)][static_cast<size_t>(j)];
+                                uint32_t b = grid[static_cast<size_t>(ni)][static_cast<size_t>(j)];
+                                uint32_t c = grid[static_cast<size_t>(ni)][static_cast<size_t>(nj)];
+                                uint32_t d = grid[static_cast<size_t>(i)][static_cast<size_t>(nj)];
+                                if (face.reversed) {
+                                    mesh.tris.push_back({ a, c, b, {} });
+                                    mesh.tris.push_back({ a, d, c, {} });
+                                } else {
+                                    mesh.tris.push_back({ a, b, c, {} });
+                                    mesh.tris.push_back({ a, c, d, {} });
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (loops3D.empty()) continue;
+
+                // Cylindrical / Conical surface unwrap in (theta, axial_h)
+                if (surf != nullptr && surf->kind == SurfKind::CylinderCone && vLen(surf->normal) > 1e-9) {
+                    CadVec3 cOrig = applyXfPt(xf, surf->origin);
+                    CadVec3 cAxis = applyXfDir(xf, surf->normal);
+                    CadVec3 uHint = (vLen(surf->uAxis) > 1e-9) ? applyXfDir(xf, surf->uAxis)
+                                  : ((std::fabs(cAxis.z) < 0.9) ? CadVec3{ 0, 0, 1 } : CadVec3{ 1, 0, 0 });
+                    uHint = vSub(uHint, vMul(cAxis, vDot(uHint, cAxis)));
+                    if (vLen(uHint) < 1e-9) uHint = (std::fabs(cAxis.x) < 0.9) ? CadVec3{ 1, 0, 0 } : CadVec3{ 0, 1, 0 };
+                    CadVec3 u0 = vNorm(uHint);
+                    CadVec3 v0 = vNorm(vCross(cAxis, u0));
+
+                    struct UnwrappedCylLoop {
+                        std::vector<Poly2DVert> pts;
+                        double sweep = 0.0;
+                        double meanH = 0.0;
+                    };
+                    std::vector<UnwrappedCylLoop> cylLoops;
+                    for (const auto& lp3 : loops3D) {
+                        UnwrappedCylLoop ul;
+                        double prevTh = 0.0;
+                        double sumH = 0.0;
+                        for (size_t k = 0; k < lp3.size(); ++k) {
+                            CadVec3 d = vSub(lp3[k], cOrig);
+                            double h = vDot(d, cAxis);
+                            double th = std::atan2(vDot(d, v0), vDot(d, u0));
+                            if (k > 0) {
+                                while (th - prevTh >  kPi) th -= 2.0 * kPi;
+                                while (th - prevTh < -kPi) th += 2.0 * kPi;
+                            }
+                            prevTh = th;
+                            sumH += h;
+                            ul.pts.push_back({ th, h, emitVertex(lp3[k]) });
+                        }
+                        // Check closing delta to detect full 2*pi coaxial circle loops vs closed (theta,h) patches
+                        CadVec3 d0 = vSub(lp3[0], cOrig);
+                        double thClose = std::atan2(vDot(d0, v0), vDot(d0, u0));
+                        while (thClose - prevTh >  kPi) thClose -= 2.0 * kPi;
+                        while (thClose - prevTh < -kPi) thClose += 2.0 * kPi;
+                        ul.sweep = thClose - ul.pts.front().u;
+                        ul.meanH = sumH / static_cast<double>(lp3.size());
+                        cylLoops.push_back(std::move(ul));
+                    }
+
+                    // Case 1: Seamless periodic cylinder/cone with 2 full-circle coaxial boundary loops
+                    std::vector<size_t> fullCircleIdx;
+                    std::vector<std::vector<Poly2DVert>> wallHoles;
+                    for (size_t li = 0; li < cylLoops.size(); ++li) {
+                        if (std::fabs(cylLoops[li].sweep) > 1.5 * kPi) fullCircleIdx.push_back(li);
+                        else wallHoles.push_back(cylLoops[li].pts);
+                    }
+                    if (fullCircleIdx.size() == 2) {
+                        size_t iLow  = fullCircleIdx[0];
+                        size_t iHigh = fullCircleIdx[1];
+                        if (cylLoops[iLow].meanH > cylLoops[iHigh].meanH) std::swap(iLow, iHigh);
+                        const auto& lpLow  = loops3D[iLow];
+                        const auto& lpHigh = loops3D[iHigh];
+
+                        // Sort each coaxial ring by exact angle theta in [-pi, pi) so wall triangles share watertight cap vertices
+                        auto buildSortedRing = [&](const std::vector<CadVec3>& ring) -> std::vector<Poly2DVert> {
+                            std::vector<Poly2DVert> out;
+                            out.reserve(ring.size() + 1);
+                            for (const auto& pt : ring) {
+                                CadVec3 d = vSub(pt, cOrig);
+                                double th = std::atan2(vDot(d, v0), vDot(d, u0));
+                                double h  = vDot(d, cAxis);
+                                out.push_back({ th, h, emitVertex(pt) });
+                            }
+                            std::sort(out.begin(), out.end(), [](const Poly2DVert& a, const Poly2DVert& b) {
+                                return a.u < b.u;
+                            });
+                            return out;
+                        };
+
+                        auto rLow  = buildSortedRing(lpLow);
+                        auto rHigh = buildSortedRing(lpHigh);
+                        if (rLow.size() >= 3 && rHigh.size() >= 3) {
+                            double thBase = rLow.front().u;
+                            // Shift rHigh angles into [thBase, thBase + 2*pi) and re-sort so seams align
+                            for (auto& q : rHigh) {
+                                while (q.u <  thBase - 1e-9)            q.u += 2.0 * kPi;
+                                while (q.u >= thBase + 2.0 * kPi - 1e-9) q.u -= 2.0 * kPi;
+                            }
+                            std::sort(rHigh.begin(), rHigh.end(), [](const Poly2DVert& a, const Poly2DVert& b) {
+                                return a.u < b.u;
+                            });
+
+                            std::vector<Poly2DVert> rectOuter;
+                            rectOuter.reserve(rLow.size() + rHigh.size() + 2);
+                            for (const auto& q : rLow) rectOuter.push_back(q);
+                            rectOuter.push_back({ rLow.front().u + 2.0 * kPi, rLow.front().v, rLow.front().vIdx });
+                            rectOuter.push_back({ rHigh.front().u + 2.0 * kPi, rHigh.front().v, rHigh.front().vIdx });
+                            for (size_t k = rHigh.size(); k > 0; --k) rectOuter.push_back(rHigh[k - 1]);
+
+                            // Normalize any wall hole theta centers into [thBase, thBase + 2*pi)
+                            for (auto& wh : wallHoles) {
+                                double cTh = 0.0;
+                                for (const auto& q : wh) cTh += q.u;
+                                cTh /= static_cast<double>(wh.size());
+                                double shift = 0.0;
+                                while (cTh + shift <  thBase)             shift += 2.0 * kPi;
+                                while (cTh + shift >= thBase + 2.0 * kPi) shift -= 2.0 * kPi;
+                                for (auto& q : wh) q.u += shift;
+                            }
+                            triangulateOuterWithHoles(std::move(rectOuter), std::move(wallHoles), face.reversed);
+                            continue;
+                        }
+                    }
+
+                    // Case 2: Bounded cylinder/cone patch(es) with seam or partial angular span
+                    size_t outerIdx = 0;
+                    double bestAbsArea = -1.0;
+                    for (size_t li = 0; li < cylLoops.size(); ++li) {
+                        double aa = std::fabs(signedArea2D(cylLoops[li].pts));
+                        if (aa > bestAbsArea) { bestAbsArea = aa; outerIdx = li; }
+                    }
+                    if (bestAbsArea > 1e-10) {
+                        std::vector<std::vector<Poly2DVert>> holes2D;
+                        for (size_t li = 0; li < cylLoops.size(); ++li) {
+                            if (li != outerIdx) holes2D.push_back(cylLoops[li].pts);
+                        }
+                        triangulateOuterWithHoles(cylLoops[outerIdx].pts, std::move(holes2D), face.reversed);
+                        continue;
+                    }
+                }
+
+                // Planar (or general curved) face: determine target 3D normal & tangent basis (uBasis, vBasis, nBasis)
+                CadVec3 nBasis = { 0.0, 0.0, 0.0 };
+                if (surf != nullptr && surf->kind == SurfKind::Plane && vLen(surf->normal) > 1e-9) {
+                    nBasis = applyXfDir(xf, surf->normal);
+                    if (face.reversed) nBasis = vMul(nBasis, -1.0);
+                } else {
+                    // Newell's method on the largest-perimeter loop
+                    size_t bestL = 0;
+                    for (size_t li = 1; li < loops3D.size(); ++li) {
+                        if (loops3D[li].size() > loops3D[bestL].size()) bestL = li;
+                    }
+                    const auto& lp = loops3D[bestL];
+                    CadVec3 nw{};
+                    for (size_t i = 0; i < lp.size(); ++i) {
+                        const CadVec3& c0 = lp[i];
+                        const CadVec3& c1 = lp[(i + 1) % lp.size()];
+                        nw.x += (c0.y - c1.y) * (c0.z + c1.z);
+                        nw.y += (c0.z - c1.z) * (c0.x + c1.x);
+                        nw.z += (c0.x - c1.x) * (c0.y + c1.y);
+                    }
+                    if (vLen(nw) < 1e-12) continue;
+                    nBasis = vNorm(nw);
+                    if (face.reversed) nBasis = vMul(nBasis, -1.0);
+                }
+
+                CadVec3 refAx = (std::fabs(nBasis.z) < 0.9) ? CadVec3{ 0.0, 0.0, 1.0 } : CadVec3{ 1.0, 0.0, 0.0 };
+                CadVec3 uBasis = vNorm(vCross(refAx, nBasis));
+                CadVec3 vBasis = vNorm(vCross(nBasis, uBasis)); // right-handed: uBasis x vBasis == +nBasis
+
+                CadVec3 origin3D = loops3D[0][0];
+                struct ProjectedLoop {
+                    std::vector<Poly2DVert> pts;
+                    double absArea = 0.0;
+                };
+                std::vector<ProjectedLoop> projLoops;
+                for (const auto& lp3 : loops3D) {
+                    ProjectedLoop pl;
+                    pl.pts.reserve(lp3.size());
+                    for (const auto& p3 : lp3) {
+                        CadVec3 rel = vSub(p3, origin3D);
+                        pl.pts.push_back({ vDot(rel, uBasis), vDot(rel, vBasis), emitVertex(p3) });
+                    }
+                    pl.absArea = std::fabs(signedArea2D(pl.pts));
+                    if (pl.pts.size() >= 3 && pl.absArea > 1e-12) {
+                        projLoops.push_back(std::move(pl));
+                    }
+                }
+                if (projLoops.empty()) continue;
+
+                // Sort projected loops by descending area so outer islands precede inner holes
+                std::sort(projLoops.begin(), projLoops.end(), [](const ProjectedLoop& a, const ProjectedLoop& b) {
+                    return a.absArea > b.absArea;
+                });
+
+                // Group inner hole loops into their enclosing outer island
+                std::vector<int> parentIsland(projLoops.size(), -1);
+                for (size_t i = 1; i < projLoops.size(); ++i) {
+                    for (size_t j = i; j > 0; --j) {
+                        size_t cand = j - 1;
+                        if (parentIsland[cand] == -1 &&
+                            pointInPoly2D(projLoops[i].pts[0].u, projLoops[i].pts[0].v, projLoops[cand].pts))
+                        {
+                            parentIsland[i] = static_cast<int>(cand);
+                            break;
+                        }
+                    }
+                }
+
+                for (size_t i = 0; i < projLoops.size(); ++i) {
+                    if (parentIsland[i] != -1) continue;
+                    std::vector<std::vector<Poly2DVert>> myHoles;
+                    for (size_t k = i + 1; k < projLoops.size(); ++k) {
+                        if (parentIsland[k] == static_cast<int>(i)) {
+                            myHoles.push_back(projLoops[k].pts);
+                        }
+                    }
+                    // Since uBasis x vBasis == +nBasis (which already accounts for face.reversed), CCW in 2D == outward 3D!
+                    triangulateOuterWithHoles(projLoops[i].pts, std::move(myHoles), false);
+                }
+            }
+
+            // Pure wireframe B-Rep fallback (wire-body / topological edges without faces):
+            // NEVER connect bare point soup — emit struts ONLY along genuine topological edge records!
+            if (mesh.tris.empty() && !g.edges.empty()) {
+                std::vector<std::vector<Vec3f>> edgePolylines;
+                std::vector<Vec3f> allWirePts;
+                for (int32_t eid : g.edgeOrder) {
+                    auto eit = g.edges.find(eid);
+                    if (eit == g.edges.end()) continue;
+                    const BRepEdge& ed = eit->second;
+                    auto segPts = sampleEdgePoints(ed, ed.startVert, ed.endVert, true);
+                    if (segPts.size() < 2) continue;
+                    CadXform xf = getBodyXf(ed.bodyId);
+                    std::vector<Vec3f> wPoly;
+                    wPoly.reserve(segPts.size());
+                    for (const auto& sp : segPts) {
+                        CadVec3 wp = applyXfPt(xf, sp);
+                        Vec3f vf{ static_cast<float>(wp.x), static_cast<float>(wp.y), static_cast<float>(wp.z) };
+                        wPoly.push_back(vf);
+                        allWirePts.push_back(vf);
+                    }
+                    edgePolylines.push_back(std::move(wPoly));
+                }
+                if (!edgePolylines.empty() && allWirePts.size() >= 2) {
+                    float span = Detail3D200::ComputePointCloudSpan(allWirePts);
+                    float strutR = std::max(1e-4f, span * 0.016f);
+                    for (const auto& wp : edgePolylines) {
+                        for (size_t i = 0; i + 1 < wp.size(); ++i) {
+                            Detail3D200::AddStrut3D(mesh, wp[i], wp[i + 1], strutR);
+                        }
+                    }
+                }
+            }
+
+            return !mesh.vertices.empty() && !mesh.tris.empty();
+        };
+
+        // Shared ACIS Raw Entity Record -> BRepGraph builder (used by BOTH .sat and .sab!)
+        struct AcisRawRec {
+            std::string type;
+            std::vector<int32_t> ptrs;
+            std::vector<double> nums;
+            std::vector<std::string> words;
+            std::vector<double> subNums;
+        };
+
+        auto buildAcisGraphAndTriangulate = [&](const std::vector<AcisRawRec>& recs) -> bool {
+            if (recs.empty()) return false;
+            const int32_t nRecs = static_cast<int32_t>(recs.size());
+            auto validRef = [&](int32_t r) -> bool { return r >= 0 && r < nRecs && !recs[static_cast<size_t>(r)].type.empty(); };
+            auto findRefByType = [&](const AcisRawRec& rc, const char* want, size_t startSlot = 0) -> int32_t {
+                for (size_t i = startSlot; i < rc.ptrs.size(); ++i) {
+                    int32_t r = rc.ptrs[i];
+                    if (validRef(r) && recs[static_cast<size_t>(r)].type == want) return r;
+                }
+                return -1;
+            };
+            auto findRefBySuffix = [&](const AcisRawRec& rc, const char* suffix, size_t startSlot = 0) -> int32_t {
+                size_t slen = std::strlen(suffix);
+                for (size_t i = startSlot; i < rc.ptrs.size(); ++i) {
+                    int32_t r = rc.ptrs[i];
+                    if (!validRef(r)) continue;
+                    const std::string& t = recs[static_cast<size_t>(r)].type;
+                    if (t.size() >= slen && t.compare(t.size() - slen, slen, suffix) == 0) return r;
+                }
+                return -1;
+            };
+            auto hasWord = [](const AcisRawRec& rc, const char* w) -> bool {
+                for (const auto& s : rc.words) if (s == w) return true;
+                return false;
+            };
+            auto ptrSkipAttrib = [&](const AcisRawRec& rc) -> size_t {
+                if (!rc.ptrs.empty()) {
+                    int32_t r0 = rc.ptrs[0];
+                    if (r0 < 0 || (validRef(r0) && recs[static_cast<size_t>(r0)].type.find("attrib") != std::string::npos)) {
+                        return 1;
+                    }
+                }
+                return 0;
+            };
+
+            // Detect ACIS 7.0+ leading integer entity IDs on topology records (absent in ACIS <= 6.0 and .sab nums)
+            bool hasLeadingEntId = false;
+            for (const auto& rc : recs) {
+                if ((rc.type == "face" || rc.type == "loop" || rc.type == "lump" || rc.type == "shell") && !rc.nums.empty()) {
+                    hasLeadingEntId = true;
+                    break;
+                }
+            }
+
+            BRepGraph g;
+            std::unordered_map<int32_t, int32_t> lumpNext, lumpShell, lumpBody;
+            std::unordered_map<int32_t, int32_t> shellNext, shellSubshell, shellFace, shellWire, shellLump;
+            std::unordered_map<int32_t, int32_t> subshellNext, subshellChild, subshellFace;
+            std::unordered_map<int32_t, int32_t> wireNext, wireCoedge;
+            std::vector<int32_t> bodyIds;
+
+            for (int32_t idx = 0; idx < nRecs; ++idx) {
+                const AcisRawRec& rc = recs[static_cast<size_t>(idx)];
+                const std::string& tp = rc.type;
+                if (tp.empty()) continue;
+
+                if (tp == "point") {
+                    if (rc.nums.size() >= 3) {
+                        size_t n = rc.nums.size();
+                        g.points[idx] = { rc.nums[n - 3], rc.nums[n - 2], rc.nums[n - 1] };
+                    }
+                } else if (tp == "vertex") {
+                    int32_t ptRef = findRefByType(rc, "point", 0);
+                    size_t pBase = ptrSkipAttrib(rc);
+                    if (ptRef < 0 && rc.ptrs.size() >= pBase + 2) ptRef = rc.ptrs[pBase + 1];
+                    if (ptRef >= 0) g.vertexToPoint[idx] = ptRef;
+                } else if (tp == "transform") {
+                    size_t base = (hasLeadingEntId || rc.nums.size() == 14) ? 1 : 0;
+                    if (rc.nums.size() >= base + 12) {
+                        CadXform xf;
+                        for (int i = 0; i < 9; ++i) xf.r[i] = rc.nums[base + static_cast<size_t>(i)];
+                        xf.t[0] = rc.nums[base + 9];
+                        xf.t[1] = rc.nums[base + 10];
+                        xf.t[2] = rc.nums[base + 11];
+                        xf.scale = (rc.nums.size() >= base + 13) ? rc.nums[base + 12] : 1.0;
+                        if (!std::isfinite(xf.scale) || std::fabs(xf.scale) < 1e-12) xf.scale = 1.0;
+                        xf.valid = true;
+                        g.bodyTransforms[-1000000 - idx] = xf; // temporary transform table keyed by transform id
+                    }
+                } else if (tp == "straight-curve") {
+                    BRepCurve c;
+                    c.kind = CurveKind::Straight;
+                    size_t base = (hasLeadingEntId || rc.nums.size() == 7 || rc.nums.size() == 9) ? 1 : 0;
+                    if (rc.nums.size() >= base + 6) {
+                        c.origin = { rc.nums[base + 0], rc.nums[base + 1], rc.nums[base + 2] };
+                        c.normal = { rc.nums[base + 3], rc.nums[base + 4], rc.nums[base + 5] };
+                    }
+                    g.curves[idx] = std::move(c);
+                } else if (tp == "ellipse-curve") {
+                    BRepCurve c;
+                    c.kind = CurveKind::Ellipse;
+                    size_t base = (hasLeadingEntId || rc.nums.size() == 11 || rc.nums.size() == 13) ? 1 : 0;
+                    if (rc.nums.size() >= base + 10) {
+                        c.origin    = { rc.nums[base + 0], rc.nums[base + 1], rc.nums[base + 2] };
+                        c.normal    = { rc.nums[base + 3], rc.nums[base + 4], rc.nums[base + 5] };
+                        c.majorAxis = { rc.nums[base + 6], rc.nums[base + 7], rc.nums[base + 8] };
+                        c.ratio     = rc.nums[base + 9];
+                    }
+                    g.curves[idx] = std::move(c);
+                } else if (tp.find("intcurve") != std::string::npos || tp.find("spline") != std::string::npos) {
+                    if (tp.find("curve") != std::string::npos) {
+                        BRepCurve c;
+                        c.kind = CurveKind::Spline;
+                        if (rc.subNums.size() >= 9) {
+                            size_t rem3 = rc.subNums.size() % 3;
+                            for (size_t k = rem3; k + 2 < rc.subNums.size() && c.ctrlPts.size() < 64; k += 3) {
+                                c.ctrlPts.push_back({ rc.subNums[k], rc.subNums[k + 1], rc.subNums[k + 2] });
+                            }
+                        }
+                        g.curves[idx] = std::move(c);
+                    }
+                } else if (tp == "plane-surface") {
+                    BRepSurf s;
+                    s.kind = SurfKind::Plane;
+                    size_t base = (hasLeadingEntId || rc.nums.size() == 7 || rc.nums.size() == 10) ? 1 : 0;
+                    if (rc.nums.size() >= base + 6) {
+                        s.origin = { rc.nums[base + 0], rc.nums[base + 1], rc.nums[base + 2] };
+                        s.normal = { rc.nums[base + 3], rc.nums[base + 4], rc.nums[base + 5] };
+                        if (rc.nums.size() >= base + 9) {
+                            s.uAxis = { rc.nums[base + 6], rc.nums[base + 7], rc.nums[base + 8] };
+                        }
+                    }
+                    g.surfaces[idx] = s;
+                } else if (tp == "cone-surface") {
+                    BRepSurf s;
+                    s.kind = SurfKind::CylinderCone;
+                    size_t base = (hasLeadingEntId || rc.nums.size() == 11 || rc.nums.size() == 14) ? 1 : 0;
+                    if (rc.nums.size() >= base + 10) {
+                        s.origin  = { rc.nums[base + 0], rc.nums[base + 1], rc.nums[base + 2] };
+                        s.normal  = { rc.nums[base + 3], rc.nums[base + 4], rc.nums[base + 5] };
+                        s.uAxis   = { rc.nums[base + 6], rc.nums[base + 7], rc.nums[base + 8] };
+                        s.radius1 = vLen(s.uAxis);
+                        s.ratio   = rc.nums[base + 9];
+                    }
+                    g.surfaces[idx] = s;
+                } else if (tp == "sphere-surface") {
+                    BRepSurf s;
+                    s.kind = SurfKind::Sphere;
+                    size_t base = (hasLeadingEntId || rc.nums.size() == 5 || rc.nums.size() == 11) ? 1 : 0;
+                    if (rc.nums.size() >= base + 4) {
+                        s.origin  = { rc.nums[base + 0], rc.nums[base + 1], rc.nums[base + 2] };
+                        s.radius1 = std::fabs(rc.nums[base + 3]);
+                    }
+                    g.surfaces[idx] = s;
+                } else if (tp == "torus-surface") {
+                    BRepSurf s;
+                    s.kind = SurfKind::Torus;
+                    size_t base = (hasLeadingEntId || rc.nums.size() == 9 || rc.nums.size() == 12) ? 1 : 0;
+                    if (rc.nums.size() >= base + 8) {
+                        s.origin  = { rc.nums[base + 0], rc.nums[base + 1], rc.nums[base + 2] };
+                        s.normal  = { rc.nums[base + 3], rc.nums[base + 4], rc.nums[base + 5] };
+                        s.radius1 = std::fabs(rc.nums[base + 6]);
+                        s.radius2 = rc.nums[base + 7];
+                    }
+                    g.surfaces[idx] = s;
+                } else if (tp == "edge") {
+                    BRepEdge ed;
+                    std::vector<int32_t> vRefs;
+                    for (int32_t r : rc.ptrs) {
+                        if (validRef(r) && recs[static_cast<size_t>(r)].type == "vertex") vRefs.push_back(r);
+                    }
+                    if (vRefs.size() >= 2) { ed.startVert = vRefs[0]; ed.endVert = vRefs[1]; }
+                    else if (vRefs.size() == 1) { ed.startVert = vRefs[0]; ed.endVert = vRefs[0]; }
+                    ed.curveId = findRefBySuffix(rc, "-curve", 0);
+                    ed.reversed = hasWord(rc, "reversed");
+                    g.edges[idx] = ed;
+                    g.edgeOrder.push_back(idx);
+                } else if (tp == "coedge") {
+                    BRepCoedge ce;
+                    size_t pBase = ptrSkipAttrib(rc);
+                    if (rc.ptrs.size() > pBase)     ce.nextCoedge = rc.ptrs[pBase];
+                    if (rc.ptrs.size() > pBase + 1) ce.prevCoedge = rc.ptrs[pBase + 1];
+                    ce.edgeId = findRefByType(rc, "edge", 0);
+                    ce.reversed = hasWord(rc, "reversed");
+                    g.coedges[idx] = ce;
+                } else if (tp == "loop") {
+                    BRepLoop lp;
+                    lp.nextLoop    = findRefByType(rc, "loop", 0);
+                    lp.firstCoedge = findRefByType(rc, "coedge", 0);
+                    lp.ownerFace   = findRefByType(rc, "face", 0);
+                    g.loops[idx] = lp;
+                } else if (tp == "face") {
+                    BRepFace fc;
+                    fc.nextFace  = findRefByType(rc, "face", 0);
+                    fc.firstLoop = findRefByType(rc, "loop", 0);
+                    fc.surfaceId = findRefBySuffix(rc, "-surface", 0);
+                    fc.reversed  = hasWord(rc, "reversed");
+                    g.faces[idx] = fc;
+                    g.faceOrder.push_back(idx);
+                } else if (tp == "body") {
+                    bodyIds.push_back(idx);
+                } else if (tp == "lump") {
+                    lumpNext[idx]  = findRefByType(rc, "lump", 0);
+                    lumpShell[idx] = findRefByType(rc, "shell", 0);
+                    lumpBody[idx]  = findRefByType(rc, "body", 0);
+                } else if (tp == "shell") {
+                    shellNext[idx]     = findRefByType(rc, "shell", 0);
+                    shellSubshell[idx] = findRefByType(rc, "subshell", 0);
+                    shellFace[idx]     = findRefByType(rc, "face", 0);
+                    shellWire[idx]     = findRefByType(rc, "wire", 0);
+                    shellLump[idx]     = findRefByType(rc, "lump", 0);
+                } else if (tp == "subshell") {
+                    subshellNext[idx]  = findRefByType(rc, "subshell", 2);
+                    subshellChild[idx] = findRefByType(rc, "subshell", 3);
+                    subshellFace[idx]  = findRefByType(rc, "face", 0);
+                } else if (tp == "wire") {
+                    wireNext[idx]   = findRefByType(rc, "wire", 0);
+                    wireCoedge[idx] = findRefByType(rc, "coedge", 0);
+                }
+            }
+
+            // Link all loops to their owning faces (both via face.firstLoop->nextLoop and loop.ownerFace)
+            for (auto& kv : g.faces) {
+                BRepFace& fc = kv.second;
+                int32_t curL = fc.firstLoop;
+                std::set<int32_t> seen;
+                while (curL >= 0 && seen.insert(curL).second && seen.size() <= 512) {
+                    fc.loopIds.push_back(curL);
+                    auto lit = g.loops.find(curL);
+                    if (lit == g.loops.end()) break;
+                    curL = lit->second.nextLoop;
+                }
+            }
+            for (const auto& kv : g.loops) {
+                if (kv.second.ownerFace >= 0) {
+                    auto fit = g.faces.find(kv.second.ownerFace);
+                    if (fit != g.faces.end()) {
+                        auto& lids = fit->second.loopIds;
+                        if (std::find(lids.begin(), lids.end(), kv.first) == lids.end()) {
+                            lids.push_back(kv.first);
+                        }
+                    }
+                }
+            }
+
+            // Propagate body transforms down to faces and wireframe edges
+            auto assignFaceChainBody = [&](int32_t firstF, int32_t bId) {
+                int32_t f = firstF;
+                std::set<int32_t> seen;
+                while (f >= 0 && seen.insert(f).second && seen.size() <= 65536) {
+                    auto fit = g.faces.find(f);
+                    if (fit == g.faces.end()) break;
+                    fit->second.bodyId = bId;
+                    f = fit->second.nextFace;
+                }
+            };
+            auto assignWireChainBody = [&](int32_t firstW, int32_t bId) {
+                int32_t w = firstW;
+                std::set<int32_t> seenW;
+                while (w >= 0 && seenW.insert(w).second && seenW.size() <= 4096) {
+                    int32_t ce0 = wireCoedge.count(w) ? wireCoedge[w] : -1;
+                    int32_t ce = ce0;
+                    std::set<int32_t> seenCe;
+                    while (ce >= 0 && seenCe.insert(ce).second && seenCe.size() <= 8192) {
+                        auto cit = g.coedges.find(ce);
+                        if (cit == g.coedges.end()) break;
+                        auto eit = g.edges.find(cit->second.edgeId);
+                        if (eit != g.edges.end()) eit->second.bodyId = bId;
+                        ce = cit->second.nextCoedge;
+                        if (ce == ce0) break;
+                    }
+                    w = wireNext.count(w) ? wireNext[w] : -1;
+                }
+            };
+            auto assignSubshellBody = [&](auto& self, int32_t ss, int32_t bId, int depth) -> void {
+                if (ss < 0 || depth > 64) return;
+                if (subshellFace.count(ss)) assignFaceChainBody(subshellFace[ss], bId);
+                if (subshellChild.count(ss)) self(self, subshellChild[ss], bId, depth + 1);
+                if (subshellNext.count(ss))  self(self, subshellNext[ss],  bId, depth + 1);
+            };
+            auto assignShellChainBody = [&](int32_t firstSh, int32_t bId) {
+                int32_t sh = firstSh;
+                std::set<int32_t> seenSh;
+                while (sh >= 0 && seenSh.insert(sh).second && seenSh.size() <= 4096) {
+                    if (shellFace.count(sh))     assignFaceChainBody(shellFace[sh], bId);
+                    if (shellSubshell.count(sh)) assignSubshellBody(assignSubshellBody, shellSubshell[sh], bId, 0);
+                    if (shellWire.count(sh))     assignWireChainBody(shellWire[sh], bId);
+                    sh = shellNext.count(sh) ? shellNext[sh] : -1;
+                }
+            };
+
+            for (int32_t bId : bodyIds) {
+                const AcisRawRec& brc = recs[static_cast<size_t>(bId)];
+                int32_t xfRef = findRefByType(brc, "transform", 0);
+                if (xfRef >= 0) {
+                    auto xit = g.bodyTransforms.find(-1000000 - xfRef);
+                    if (xit != g.bodyTransforms.end()) g.bodyTransforms[bId] = xit->second;
+                }
+                int32_t lmp = findRefByType(brc, "lump", 0);
+                std::set<int32_t> seenLmp;
+                while (lmp >= 0 && seenLmp.insert(lmp).second && seenLmp.size() <= 4096) {
+                    if (lumpShell.count(lmp)) assignShellChainBody(lumpShell[lmp], bId);
+                    lmp = lumpNext.count(lmp) ? lumpNext[lmp] : -1;
+                }
+                int32_t directSh = findRefByType(brc, "shell", 0);
+                if (directSh >= 0) assignShellChainBody(directSh, bId);
+                int32_t wr = findRefByType(brc, "wire", 0);
+                if (wr >= 0) assignWireChainBody(wr, bId);
+            }
+            // Also propagate upward from lump.owner_body if lump wasn't reached downward
+            for (const auto& kv : lumpBody) {
+                if (kv.second >= 0 && lumpShell.count(kv.first)) {
+                    assignShellChainBody(lumpShell[kv.first], kv.second);
+                }
+            }
+            // Propagate face.bodyId to edges referenced by face loops
+            for (const auto& kv : g.faces) {
+                if (kv.second.bodyId < 0) continue;
+                for (int32_t lid : kv.second.loopIds) {
+                    auto lit = g.loops.find(lid);
+                    if (lit == g.loops.end() || lit->second.firstCoedge < 0) continue;
+                    int32_t ce0 = lit->second.firstCoedge, ce = ce0;
+                    std::set<int32_t> seenCe;
+                    while (ce >= 0 && seenCe.insert(ce).second && seenCe.size() <= 4096) {
+                        auto cit = g.coedges.find(ce);
+                        if (cit == g.coedges.end()) break;
+                        auto eit = g.edges.find(cit->second.edgeId);
+                        if (eit != g.edges.end() && eit->second.bodyId < 0) eit->second.bodyId = kv.second.bodyId;
+                        ce = cit->second.nextCoedge;
+                        if (ce == ce0) break;
+                    }
+                }
+            }
+
+            return evaluateBRepGraph(g);
+        };
+
+        // 1. Spatial ACIS Binary (.sab — "ACIS BinaryFile" / "ASM BinaryFile ")
+        bool hasSabMagic = (size >= 15 && (std::memcmp(data, "ACIS BinaryFile", 15) == 0 ||
+                                           std::memcmp(data, "ASM BinaryFile", 14) == 0));
+        if (ext == L".sab" || hasSabMagic) {
+            if (!hasSabMagic || size < 31) return false;
+            size_t magicLen = (std::memcmp(data, "ACIS BinaryFile", 15) == 0 ||
+                              (size >= 15 && std::memcmp(data, "ASM BinaryFile ", 15) == 0)) ? 15 : 14;
+            if (magicLen + 16 > size) return false;
+
+            int32_t acisVer     = static_cast<int32_t>(Detail3D200::RdU32LE(data + magicLen + 0));
+            int32_t numRecords  = static_cast<int32_t>(Detail3D200::RdU32LE(data + magicLen + 4));
+            int32_t numEntities = static_cast<int32_t>(Detail3D200::RdU32LE(data + magicLen + 8));
+            (void)numEntities;
+            if (acisVer < 100 || acisVer > 99999 || numRecords < 0) return false;
             mesh.formatName = L"Spatial ACIS Binary Solid (.sab)";
 
-            // Skip 15-byte magic + 16-byte binary header (version, numRecords, numEntities, flags)
-            size_t p = 31;
-            std::vector<Vec3f> pts;
-            std::vector<std::pair<int32_t, int32_t>> edgeVertRefs;
-            std::vector<int32_t> vertPointRefs;
-            std::string curEntityType;
-            std::vector<int32_t> curPtrs;
-            std::vector<double> curDoubles;
-            int headerStringsRemaining = 3;
-            int headerDoublesRemaining = 3; // units, resabs, resnor
-            bool inHeader = true;
-
             auto isIdentBytes = [&](size_t off, uint8_t len) -> bool {
-                if (len == 0 || len > 40 || off + len > size) return false;
+                if (len == 0 || len > 48 || off + len > size) return false;
                 for (uint8_t i = 0; i < len; ++i) {
                     uint8_t c = data[off + i];
-                    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+                    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                              (c >= '0' && c <= '9') || c == '-' || c == '_';
                     if (!ok) return false;
                 }
                 return true;
             };
 
-            while (p < size && pts.size() < 32000) {
+            size_t p = magicLen + 16;
+            int headerStringsRem = 3;
+            int headerDoublesRem = 3;
+            bool inHeader = true;
+
+            std::vector<AcisRawRec> recs;
+            AcisRawRec cur;
+            int32_t nextSeqIdx = 0;
+            int32_t explicitIdx = -1;
+            int braceDepth = 0;
+
+            while (p < size && recs.size() < 200000) {
                 uint8_t tag = data[p++];
-                if (tag == 0x02) { // char
+                if (tag == 0x02) { // TAG_CHAR
                     if (p + 1 > size) break;
                     p += 1;
-                } else if (tag == 0x03) { // short
+                } else if (tag == 0x03) { // TAG_SHORT
                     if (p + 2 > size) break;
                     p += 2;
-                } else if (tag == 0x04) { // int32
+                } else if (tag == 0x04) { // TAG_LONG (int32)
                     if (p + 4 > size) break;
+                    int32_t iv = static_cast<int32_t>(Detail3D200::RdU32LE(data + p));
                     p += 4;
-                } else if (tag == 0x05) { // float32
+                    if (!inHeader && cur.type.empty() && braceDepth == 0) {
+                        explicitIdx = (iv < 0) ? -iv : iv;
+                    }
+                } else if (tag == 0x05) { // TAG_FLOAT
                     if (p + 4 > size) break;
-                    if (!inHeader) curDoubles.push_back(Detail3D200::RdF32LE(data + p));
+                    double dv = static_cast<double>(Detail3D200::RdF32LE(data + p));
                     p += 4;
-                } else if (tag == 0x06) { // IEEE-754 double (standard ACIS tag 6)
+                    if (!inHeader) {
+                        if (braceDepth == 0) cur.nums.push_back(dv);
+                        else                 cur.subNums.push_back(dv);
+                    }
+                } else if (tag == 0x06) { // TAG_DOUBLE
                     if (p + 8 > size) break;
                     double dv = Detail3D200::RdF64LE(data + p);
                     p += 8;
                     if (inHeader) {
-                        if (--headerDoublesRemaining <= 0 && headerStringsRemaining <= 0) inHeader = false;
+                        if (--headerDoublesRem <= 0 && headerStringsRem <= 0) inHeader = false;
                     } else {
-                        curDoubles.push_back(dv);
+                        if (braceDepth == 0) cur.nums.push_back(dv);
+                        else                 cur.subNums.push_back(dv);
                     }
-                } else if (tag == 0x07) { // UTF8_U8 string
+                } else if (tag == 0x07) { // TAG_UTF8_U8
                     if (p >= size) break;
                     uint8_t slen = data[p++];
                     if (p + slen > size) break;
+                    std::string s(reinterpret_cast<const char*>(data + p), slen);
                     p += slen;
-                    if (inHeader && headerStringsRemaining > 0) --headerStringsRemaining;
-                } else if (tag == 0x08) { // UTF8_U16 string
+                    if (inHeader) {
+                        if (headerStringsRem > 0) --headerStringsRem;
+                        if (headerDoublesRem <= 0 && headerStringsRem <= 0) inHeader = false;
+                    } else if (braceDepth == 0 && (s == "forward" || s == "reversed")) {
+                        cur.words.push_back(std::move(s));
+                    }
+                } else if (tag == 0x08) { // TAG_UTF8_U16
                     if (p + 2 > size) break;
                     uint16_t slen = Detail3D200::RdU16LE(data + p); p += 2;
                     if (p + slen > size) break;
                     p += slen;
-                } else if (tag == 0x09) { // UTF8_U32 string
+                    if (inHeader && headerStringsRem > 0) --headerStringsRem;
+                } else if (tag == 0x09) { // TAG_UTF8_U32
                     if (p + 4 > size) break;
                     uint32_t slen = Detail3D200::RdU32LE(data + p); p += 4;
                     if (slen > 1000000 || p + slen > size) break;
                     p += slen;
-                } else if (tag == 0x0A || tag == 0x0B || tag == 0x0F || tag == 0x10) {
-                    // TRUE / FALSE / SUBTYPE_OPEN / SUBTYPE_CLOSE
-                } else if (tag == 0x0C) { // POINTER ($idx)
+                    if (inHeader && headerStringsRem > 0) --headerStringsRem;
+                } else if (tag == 0x0A) { // TAG_TRUE (ACIS logical true: "forward" on face/coedge/edge)
+                    if (!inHeader && braceDepth == 0 &&
+                        (cur.type == "face" || cur.type == "coedge" || cur.type == "edge"))
+                    {
+                        bool hasSense = false;
+                        for (const auto& w : cur.words) if (w == "forward" || w == "reversed") hasSense = true;
+                        if (!hasSense) cur.words.push_back("forward");
+                    }
+                } else if (tag == 0x0B) { // TAG_FALSE (ACIS logical false: "reversed" on face/coedge/edge)
+                    if (!inHeader && braceDepth == 0 &&
+                        (cur.type == "face" || cur.type == "coedge" || cur.type == "edge"))
+                    {
+                        bool hasSense = false;
+                        for (const auto& w : cur.words) if (w == "forward" || w == "reversed") hasSense = true;
+                        if (!hasSense) cur.words.push_back("reversed");
+                    }
+                } else if (tag == 0x0C) { // TAG_POINTER ($idx)
                     if (p + 4 > size) break;
                     int32_t ref = static_cast<int32_t>(Detail3D200::RdU32LE(data + p));
                     p += 4;
                     inHeader = false;
-                    curPtrs.push_back(ref);
-                } else if (tag == 0x0D) {
-                    // Either standard ACIS IDENT (u8 len + identifier) OR custom double (8B)
+                    if (braceDepth == 0) cur.ptrs.push_back(ref);
+                } else if (tag == 0x0D) { // TAG_IDENT
                     if (p < size && isIdentBytes(p + 1, data[p])) {
                         uint8_t slen = data[p++];
                         std::string id(reinterpret_cast<const char*>(data + p), slen);
                         p += slen;
+                        if (id == "End-of-ACIS-data" || id == "End-of-ASM-data") break;
                         inHeader = false;
-                        if (curEntityType.empty()) curEntityType = id;
+                        if (braceDepth == 0) {
+                            if (cur.type.empty()) cur.type = std::move(id);
+                            else cur.words.push_back(std::move(id));
+                        }
                     } else if (p + 8 <= size) {
                         double dv = Detail3D200::RdF64LE(data + p);
                         p += 8;
                         if (inHeader) {
-                            if (--headerDoublesRemaining <= 0 && headerStringsRemaining <= 0) inHeader = false;
+                            if (--headerDoublesRem <= 0 && headerStringsRem <= 0) inHeader = false;
+                        } else if (braceDepth == 0) {
+                            cur.nums.push_back(dv);
                         } else {
-                            curDoubles.push_back(dv);
+                            cur.subNums.push_back(dv);
                         }
                     } else {
                         break;
                     }
-                } else if (tag == 0x0E) { // SUBIDENT
+                } else if (tag == 0x0E) { // TAG_SUBIDENT
                     if (p >= size) break;
                     uint8_t slen = data[p++];
                     if (p + slen > size) break;
                     std::string sub(reinterpret_cast<const char*>(data + p), slen);
                     p += slen;
-                    if (!curEntityType.empty()) curEntityType += "-" + sub;
-                } else if (tag == 0x11) { // '#' Record terminator
+                    if (braceDepth == 0 && !cur.type.empty()) cur.type += "-" + sub;
+                } else if (tag == 0x0F) { // TAG_SUBTYPE_OPEN '{'
+                    ++braceDepth;
+                } else if (tag == 0x10) { // TAG_SUBTYPE_CLOSE '}'
+                    if (braceDepth > 0) --braceDepth;
+                } else if (tag == 0x11) { // TAG_TERMINATOR '#'
                     inHeader = false;
-                    if (curEntityType == "point" && curDoubles.size() >= 3) {
-                        size_t n = curDoubles.size();
-                        pts.push_back({
-                            static_cast<float>(curDoubles[n - 3]),
-                            static_cast<float>(curDoubles[n - 2]),
-                            static_cast<float>(curDoubles[n - 1])
-                        });
+                    braceDepth = 0;
+                    if (!cur.type.empty()) {
+                        int32_t idx = (explicitIdx >= 0 && explicitIdx < 200000) ? explicitIdx : nextSeqIdx;
+                        nextSeqIdx = std::max(nextSeqIdx, idx + 1);
+                        if (static_cast<size_t>(idx) >= recs.size()) recs.resize(static_cast<size_t>(idx) + 1);
+                        recs[static_cast<size_t>(idx)] = std::move(cur);
                     }
-                    curEntityType.clear();
-                    curPtrs.clear();
-                    curDoubles.clear();
-                } else if (tag == 0x13) { // TAG_POSITION: 3 IEEE-754 doubles (x, y, z)
+                    cur = AcisRawRec{};
+                    explicitIdx = -1;
+                } else if (tag == 0x13 || tag == 0x14) { // TAG_POSITION / TAG_VECTOR (3 IEEE-754 doubles)
                     if (p + 24 > size) break;
                     inHeader = false;
-                    float x = static_cast<float>(Detail3D200::RdF64LE(data + p + 0));
-                    float y = static_cast<float>(Detail3D200::RdF64LE(data + p + 8));
-                    float z = static_cast<float>(Detail3D200::RdF64LE(data + p + 16));
+                    double d0 = Detail3D200::RdF64LE(data + p + 0);
+                    double d1 = Detail3D200::RdF64LE(data + p + 8);
+                    double d2 = Detail3D200::RdF64LE(data + p + 16);
                     p += 24;
-                    pts.push_back({ x, y, z });
-                } else if (tag == 0x14) { // TAG_VECTOR: 3 IEEE-754 doubles (dx, dy, dz)
-                    if (p + 24 > size) break;
-                    p += 24;
-                } else if (tag == 0x15) { // ENUM
+                    if (braceDepth == 0) {
+                        cur.nums.push_back(d0); cur.nums.push_back(d1); cur.nums.push_back(d2);
+                    } else {
+                        cur.subNums.push_back(d0); cur.subNums.push_back(d1); cur.subNums.push_back(d2);
+                    }
+                } else if (tag == 0x15) { // TAG_ENUM
                     if (p >= size) break;
-                    uint8_t slen = data[p++];
-                    if (p + slen > size) break;
-                    p += slen;
+                    if (isIdentBytes(p + 1, data[p])) {
+                        uint8_t slen = data[p++];
+                        std::string en(reinterpret_cast<const char*>(data + p), slen);
+                        p += slen;
+                        if (!inHeader && braceDepth == 0) cur.words.push_back(std::move(en));
+                    } else if (p + 4 <= size) {
+                        p += 4;
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
             }
-            (void)edgeVertRefs; (void)vertPointRefs;
-            if (pts.size() < 2) return false;
-            float r = Detail3D200::ComputePointCloudSpan(pts) * 0.025f;
-            for (size_t i = 0; i < pts.size(); ++i) {
-                Detail3D200::AddOctaSphere(mesh, pts[i].x, pts[i].y, pts[i].z, r * 1.2f);
-                Detail3D200::AddStrut3D(mesh, pts[i], pts[(i + 1) % pts.size()], r * 0.6f);
+            return buildAcisGraphAndTriangulate(recs);
+        }
+
+        // 2. Spatial ACIS ASCII (.sat)
+        if (ext == L".sat") {
+            // Reject binary / NUL-containing files
+            for (size_t i = 0; i < std::min<size_t>(size, 512); ++i) {
+                if (data[i] == 0) return false;
             }
-            return !mesh.vertices.empty() && !mesh.tris.empty();
-        }
+            size_t pos = 0;
+            auto skipWs = [&]() {
+                while (pos < sv.size() && (sv[pos] == ' ' || sv[pos] == '\t' || sv[pos] == '\r' || sv[pos] == '\n')) ++pos;
+            };
+            skipWs();
+            if (pos >= sv.size()) return false;
 
-        if (ext == L".x_b") {
-            // Parasolid binary transmit requires proprietary schema tables; reject if not text XT
-            if (sv.find("SCH_") == std::string_view::npos && sv.find("point") == std::string_view::npos) return false;
-        }
-
-        bool isAcis = (ext == L".sat");
-        if (isAcis && sv.find("ACIS") == std::string_view::npos && sv.find("body ") == std::string_view::npos &&
-            !(sv.size() >= 4 && sv[0] >= '1' && sv[0] <= '9'))
-        {
-            return false;
-        }
-        if (!isAcis && sv.find("SCH_") == std::string_view::npos && sv.find("PART") == std::string_view::npos &&
-            sv.find("point") == std::string_view::npos)
-        {
-            return false;
-        }
-
-        mesh.formatName = isAcis ? L"Spatial ACIS Solid Model (.sat)" : L"Siemens Parasolid XT Solid (.x_t)";
-        std::vector<Vec3f> pts;
-        size_t pos = 0;
-        while (pos < sv.size() && pts.size() < 8000) {
-            size_t eol = sv.find('\n', pos);
-            if (eol == std::string_view::npos) eol = sv.size();
-            std::string_view ln = sv.substr(pos, eol - pos);
-            pos = eol + 1;
-            size_t kw = ln.find("point ");
-            if (kw != std::string_view::npos) {
-                std::string tail(ln.substr(kw + 6));
-                const char* p = tail.c_str();
-                std::vector<float> nums;
-                while (*p) {
-                    if (*p == '$') { ++p; while (*p && *p != ' ' && *p != '\t') ++p; continue; }
-                    if ((*p >= '0' && *p <= '9') || *p == '-' || *p == '+' || *p == '.') {
-                        char* ep = nullptr;
-                        float v = std::strtof(p, &ep);
-                        if (ep != p) { nums.push_back(v); p = ep; continue; }
+            // Validate ACIS ASCII header: either "<version 100..9999> <numRec> <numEnt> <flags>" OR "ACIS ..." / "ASM ..."
+            bool validHeader = false;
+            if (sv[pos] >= '1' && sv[pos] <= '9') {
+                const char* hs = sv.data() + pos;
+                char* e1 = nullptr; long verInt = std::strtol(hs, &e1, 10);
+                char* e2 = nullptr; long nRec   = (e1 != hs) ? std::strtol(e1, &e2, 10) : -1;
+                char* e3 = nullptr; long nEnt   = (e2 != e1) ? std::strtol(e2, &e3, 10) : -1;
+                char* e4 = nullptr; long hFlg   = (e3 != e2) ? std::strtol(e3, &e4, 10) : -1;
+                (void)nEnt; (void)hFlg;
+                if (e4 != e3 && verInt >= 100 && verInt <= 99999 && nRec >= 0) {
+                    validHeader = true;
+                    // Advance past header line 1 (counts), plus optional line 2 (product strings) & line 3 (units/tolerances)
+                    size_t nl1 = sv.find('\n', static_cast<size_t>(e4 - sv.data()));
+                    pos = (nl1 == std::string_view::npos) ? sv.size() : (nl1 + 1);
+                    for (int hLine = 0; hLine < 2 && pos < sv.size(); ++hLine) {
+                        size_t nl = sv.find('\n', pos);
+                        std::string_view hSv = sv.substr(pos, (nl == std::string_view::npos ? sv.size() : nl) - pos);
+                        if (hSv.find('#') != std::string_view::npos || hSv.find('$') != std::string_view::npos) break;
+                        pos = (nl == std::string_view::npos) ? sv.size() : (nl + 1);
                     }
-                    ++p;
                 }
-                if (nums.size() >= 3) {
-                    size_t n = nums.size();
-                    pts.push_back({ nums[n - 3], nums[n - 2], nums[n - 1] });
+            } else if (sv.substr(pos, 4) == "ACIS" || sv.substr(pos, 3) == "ASM") {
+                validHeader = true;
+                size_t nl = sv.find('\n', pos);
+                pos = (nl == std::string_view::npos) ? sv.size() : (nl + 1);
+                // Skip optional unit/tolerance header line if it does not contain '#'
+                skipWs();
+                size_t nl2 = sv.find('\n', pos);
+                std::string_view l2 = sv.substr(pos, (nl2 == std::string_view::npos ? sv.size() : nl2) - pos);
+                if (l2.find('#') == std::string_view::npos && l2.find('$') == std::string_view::npos) {
+                    pos = (nl2 == std::string_view::npos) ? sv.size() : (nl2 + 1);
                 }
             }
+            if (!validHeader || sv.find('#', pos) == std::string_view::npos) return false;
+
+            mesh.formatName = L"Spatial ACIS Solid Model (.sat)";
+
+            std::vector<AcisRawRec> recs;
+            AcisRawRec cur;
+            int32_t nextSeqIdx = 0;
+            int32_t explicitIdx = -1;
+            bool atRecordStart = true;
+            int braceDepth = 0;
+
+            auto isAcisWordChar = [](char c) -> bool {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '-' || c == '_';
+            };
+
+            while (pos < sv.size() && recs.size() < 200000) {
+                skipWs();
+                if (pos >= sv.size()) break;
+                char ch = sv[pos];
+
+                if (ch == '#') {
+                    ++pos;
+                    braceDepth = 0;
+                    if (!cur.type.empty()) {
+                        int32_t idx = (explicitIdx >= 0 && explicitIdx < 200000) ? explicitIdx : nextSeqIdx;
+                        nextSeqIdx = std::max(nextSeqIdx, idx + 1);
+                        if (static_cast<size_t>(idx) >= recs.size()) recs.resize(static_cast<size_t>(idx) + 1);
+                        recs[static_cast<size_t>(idx)] = std::move(cur);
+                    }
+                    cur = AcisRawRec{};
+                    explicitIdx = -1;
+                    atRecordStart = true;
+                    continue;
+                }
+                if (ch == '{') { ++braceDepth; ++pos; continue; }
+                if (ch == '}') { if (braceDepth > 0) --braceDepth; ++pos; continue; }
+
+                // Counted string literal: @<len> <chars>
+                if (ch == '@') {
+                    ++pos;
+                    const char* sp = sv.data() + pos;
+                    char* ep = nullptr;
+                    long slen = std::strtol(sp, &ep, 10);
+                    if (ep != sp && slen >= 0) {
+                        pos = static_cast<size_t>(ep - sv.data());
+                        if (pos < sv.size() && (sv[pos] == ' ' || sv[pos] == '\t')) ++pos;
+                        size_t adv = std::min<size_t>(static_cast<size_t>(slen), sv.size() - pos);
+                        std::string lit(sv.substr(pos, adv));
+                        pos += adv;
+                        if (braceDepth == 0 && (lit == "forward" || lit == "reversed")) {
+                            cur.words.push_back(std::move(lit));
+                        }
+                        atRecordStart = false;
+                        continue;
+                    }
+                }
+
+                // Entity pointer reference: $<int>
+                if (ch == '$') {
+                    ++pos;
+                    const char* sp = sv.data() + pos;
+                    char* ep = nullptr;
+                    long ref = std::strtol(sp, &ep, 10);
+                    if (ep != sp) {
+                        pos = static_cast<size_t>(ep - sv.data());
+                        if (braceDepth == 0) cur.ptrs.push_back(static_cast<int32_t>(ref));
+                    }
+                    atRecordStart = false;
+                    continue;
+                }
+
+                // Explicit "-<idx>" record number at start of record (e.g. "-0 body ...", "-12 face ...")
+                if (atRecordStart && braceDepth == 0 && ch == '-' && pos + 1 < sv.size() &&
+                    sv[pos + 1] >= '0' && sv[pos + 1] <= '9')
+                {
+                    const char* sp = sv.data() + pos + 1;
+                    char* ep = nullptr;
+                    long rIdx = std::strtol(sp, &ep, 10);
+                    if (ep != sp && (ep == sv.data() + sv.size() || *ep == ' ' || *ep == '\t' || *ep == '\r' || *ep == '\n')) {
+                        explicitIdx = static_cast<int32_t>(rIdx);
+                        pos = static_cast<size_t>(ep - sv.data());
+                        atRecordStart = false;
+                        continue;
+                    }
+                }
+
+                // Number token (float / int)
+                if ((ch >= '0' && ch <= '9') || ch == '-' || ch == '+' || ch == '.') {
+                    const char* sp = sv.data() + pos;
+                    char* ep = nullptr;
+                    double dv = std::strtod(sp, &ep);
+                    if (ep != sp && (ep == sv.data() + sv.size() || !isAcisWordChar(*ep))) {
+                        pos = static_cast<size_t>(ep - sv.data());
+                        if (std::isfinite(dv)) {
+                            if (braceDepth == 0) cur.nums.push_back(dv);
+                            else                 cur.subNums.push_back(dv);
+                        }
+                        atRecordStart = false;
+                        continue;
+                    }
+                }
+
+                // Identifier / keyword token
+                if (isAcisWordChar(ch)) {
+                    size_t start = pos;
+                    while (pos < sv.size() && isAcisWordChar(sv[pos])) ++pos;
+                    std::string tok(sv.substr(start, pos - start));
+                    if (tok == "End-of-ACIS-data" || tok == "End-of-ASM-data") break;
+                    if (braceDepth == 0) {
+                        if (cur.type.empty()) cur.type = std::move(tok);
+                        else cur.words.push_back(std::move(tok));
+                    }
+                    atRecordStart = false;
+                    continue;
+                }
+
+                ++pos;
+            }
+            return buildAcisGraphAndTriangulate(recs);
         }
 
-        if (pts.size() < 2) return false;
-        float r = Detail3D200::ComputePointCloudSpan(pts) * 0.025f;
-        for (size_t i = 0; i < pts.size(); ++i) {
-            Detail3D200::AddOctaSphere(mesh, pts[i].x, pts[i].y, pts[i].z, r * 1.2f);
-            Detail3D200::AddStrut3D(mesh, pts[i], pts[(i + 1) % pts.size()], r * 0.6f);
+        // 3. Siemens Parasolid XT Text (.x_t) & Binary (.x_b)
+        {
+            // Reject binary Parasolid (.x_b / binary PS transmit) strictly — never scrape point soup!
+            for (size_t i = 0; i < std::min<size_t>(size, 1024); ++i) {
+                if (data[i] == 0) return false;
+            }
+            if (ext == L".x_b") {
+                if (sv.find("SCH_") == std::string_view::npos ||
+                    (sv.find("**END_OF_HEADER**") == std::string_view::npos && sv.find("PART") == std::string_view::npos))
+                {
+                    return false;
+                }
+            }
+
+            // Locate start of XT body after optional **END_OF_HEADER** preamble
+            size_t bodyStart = 0;
+            size_t eoh = sv.find("**END_OF_HEADER**");
+            if (eoh != std::string_view::npos) {
+                size_t nl = sv.find('\n', eoh);
+                bodyStart = (nl == std::string_view::npos) ? sv.size() : (nl + 1);
+            }
+
+            // Validate Parasolid XT transmit markers
+            bool hasXtSchema = (eoh != std::string_view::npos) ||
+                               (sv.find("SCH_") != std::string_view::npos) ||
+                               (sv.find("PS_") != std::string_view::npos) ||
+                               (sv.find("PARASOLID") != std::string_view::npos) ||
+                               (sv.find("TRANSMIT") != std::string_view::npos);
+            if (!hasXtSchema) return false;
+
+            mesh.formatName = L"Siemens Parasolid XT Solid (.x_t)";
+
+            auto isPkEntityKeyword = [](std::string_view w) -> bool {
+                return w == "assembly" || w == "instance" || w == "body" || w == "transform" ||
+                       w == "region"   || w == "shell"    || w == "face" || w == "loop"      ||
+                       w == "fin"      || w == "halfedge" || w == "edge" || w == "vertex"    ||
+                       w == "point"    || w == "line"     || w == "straight" || w == "circle"||
+                       w == "ellipse"  || w == "b_curve"  || w == "intersection" ||
+                       w == "plane"    || w == "cylinder" || w == "cyl"  || w == "cone"      ||
+                       w == "sphere"   || w == "torus"    || w == "b_surface" ||
+                       w == "att_def"  || w == "attrib"   || w == "field_names" ||
+                       w == "pointer_lis_block" || w == "int_lis_block" || w == "real_lis_block";
+            };
+
+            struct PkTok {
+                enum Kind { Word, Int, Real, Ref, SensePos, SenseNeg, Sep } kind = Word;
+                std::string text;
+                int32_t iVal = 0;
+                double dVal = 0.0;
+                bool lineStart = false;
+            };
+
+            std::vector<PkTok> toks;
+            size_t p = bodyStart;
+            bool atLineStart = true;
+            while (p < sv.size() && toks.size() < 500000) {
+                char c = sv[p];
+                if (c == '\r' || c == '\n') { atLineStart = true; ++p; continue; }
+                if (c == ' ' || c == '\t' || c == ',' || c == '(' || c == ')') { ++p; continue; }
+                if (c == ';' || c == '#') {
+                    // '#<digits>' is an entity ref; standalone '#' or ';' is a record separator
+                    if (c == '#' && p + 1 < sv.size() && ((sv[p + 1] >= '0' && sv[p + 1] <= '9') || sv[p + 1] == '-')) {
+                        const char* sp = sv.data() + p + 1;
+                        char* ep = nullptr;
+                        long rv = std::strtol(sp, &ep, 10);
+                        if (ep != sp) {
+                            toks.push_back({ PkTok::Ref, {}, static_cast<int32_t>(rv), 0.0, atLineStart });
+                            atLineStart = false;
+                            p = static_cast<size_t>(ep - sv.data());
+                            continue;
+                        }
+                    }
+                    toks.push_back({ PkTok::Sep, ";", 0, 0.0, atLineStart });
+                    atLineStart = true;
+                    ++p;
+                    continue;
+                }
+                // Stop at Parasolid end-of-part trailer
+                if (c == '*' && sv.substr(p, 15) == "**END_OF_PART**") break;
+
+                // Quoted string '...' or "..."
+                if (c == '\'' || c == '"') {
+                    char q = c; ++p;
+                    while (p < sv.size() && sv[p] != q) ++p;
+                    if (p < sv.size()) ++p;
+                    atLineStart = false;
+                    continue;
+                }
+
+                // Parasolid counted string T<len>:<chars>
+                if ((c == 'T' || c == 'U') && p + 2 < sv.size() && sv[p + 1] >= '0' && sv[p + 1] <= '9') {
+                    const char* sp = sv.data() + p + 1;
+                    char* ep = nullptr;
+                    long slen = std::strtol(sp, &ep, 10);
+                    if (ep != sp && ep < sv.data() + sv.size() && *ep == ':' && slen >= 0) {
+                        p = static_cast<size_t>((ep + 1) - sv.data());
+                        size_t adv = std::min<size_t>(static_cast<size_t>(slen), sv.size() - p);
+                        p += adv;
+                        atLineStart = false;
+                        continue;
+                    }
+                }
+
+                // Explicit pointer ref $<int> or @<int>
+                if ((c == '$' || c == '@') && p + 1 < sv.size() &&
+                    ((sv[p + 1] >= '0' && sv[p + 1] <= '9') || sv[p + 1] == '-'))
+                {
+                    const char* sp = sv.data() + p + 1;
+                    char* ep = nullptr;
+                    long rv = std::strtol(sp, &ep, 10);
+                    if (ep != sp) {
+                        toks.push_back({ PkTok::Ref, {}, static_cast<int32_t>(rv), 0.0, atLineStart });
+                        atLineStart = false;
+                        p = static_cast<size_t>(ep - sv.data());
+                        continue;
+                    }
+                }
+
+                // '?' null pointer
+                if (c == '?') {
+                    toks.push_back({ PkTok::Ref, "?", -1, 0.0, atLineStart });
+                    atLineStart = false;
+                    ++p;
+                    continue;
+                }
+
+                // '=' assignment token (for "<id> = <keyword> ...")
+                if (c == '=') {
+                    toks.push_back({ PkTok::Word, "=", 0, 0.0, atLineStart });
+                    atLineStart = false;
+                    ++p;
+                    continue;
+                }
+
+                // Standalone '+' or '-' sense token vs signed number
+                if ((c == '+' || c == '-') &&
+                    (p + 1 >= sv.size() || !((sv[p + 1] >= '0' && sv[p + 1] <= '9') || sv[p + 1] == '.')))
+                {
+                    toks.push_back({ (c == '+') ? PkTok::SensePos : PkTok::SenseNeg, std::string(1, c), 0, 0.0, atLineStart });
+                    atLineStart = false;
+                    ++p;
+                    continue;
+                }
+
+                // Number (Int vs Real)
+                if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.') {
+                    const char* sp = sv.data() + p;
+                    char* epD = nullptr;
+                    double dv = std::strtod(sp, &epD);
+                    if (epD != sp) {
+                        std::string_view rawNum(sp, static_cast<size_t>(epD - sp));
+                        bool isFloat = (rawNum.find('.') != std::string_view::npos ||
+                                        rawNum.find('e') != std::string_view::npos ||
+                                        rawNum.find('E') != std::string_view::npos);
+                        if (!isFloat && dv >= -2147483648.0 && dv <= 2147483647.0) {
+                            toks.push_back({ PkTok::Int, std::string(rawNum), static_cast<int32_t>(dv), dv, atLineStart });
+                        } else {
+                            toks.push_back({ PkTok::Real, std::string(rawNum), 0, std::isfinite(dv) ? dv : 0.0, atLineStart });
+                        }
+                        atLineStart = false;
+                        p = static_cast<size_t>(epD - sv.data());
+                        continue;
+                    }
+                }
+
+                // Identifier / .T. / .F.
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '.') {
+                    size_t s0 = p;
+                    while (p < sv.size() && ((sv[p] >= 'a' && sv[p] <= 'z') || (sv[p] >= 'A' && sv[p] <= 'Z') ||
+                                             (sv[p] >= '0' && sv[p] <= '9') || sv[p] == '_' || sv[p] == '.' || sv[p] == '-'))
+                    {
+                        ++p;
+                    }
+                    std::string w(sv.substr(s0, p - s0));
+                    for (char& chL : w) if (chL >= 'A' && chL <= 'Z') chL = static_cast<char>(chL - 'A' + 'a');
+                    if (w == "forward" || w == ".t.") {
+                        toks.push_back({ PkTok::SensePos, w, 0, 0.0, atLineStart });
+                    } else if (w == "reversed" || w == ".f.") {
+                        toks.push_back({ PkTok::SenseNeg, w, 0, 0.0, atLineStart });
+                    } else if (w == "file_end") {
+                        break;
+                    } else {
+                        toks.push_back({ PkTok::Word, std::move(w), 0, 0.0, atLineStart });
+                    }
+                    atLineStart = false;
+                    continue;
+                }
+
+                ++p;
+            }
+
+            // Segment token stream into PK entity records:
+            // Supports BOTH "<keyword> <id> ..." AND "[#|$]<id> = <keyword> ..."
+            struct PkEntityRec {
+                int32_t id = -1;
+                std::string type;
+                std::vector<int32_t> refs;
+                std::vector<double> nums;
+                bool hasSenseNeg = false;
+                bool hasSensePos = false;
+            };
+
+            auto matchRecHeader = [&](size_t ti, int32_t& outId, std::string& outType, size_t& outAdvance) -> bool {
+                if (ti >= toks.size() || !toks[ti].lineStart) return false;
+                // Form A: <keyword> <positive_id_or_ref>
+                if (toks[ti].kind == PkTok::Word && isPkEntityKeyword(toks[ti].text) && ti + 1 < toks.size()) {
+                    const PkTok& t1 = toks[ti + 1];
+                    if ((t1.kind == PkTok::Int || t1.kind == PkTok::Ref) && t1.iVal >= 0) {
+                        outType = toks[ti].text;
+                        outId = t1.iVal;
+                        outAdvance = 2;
+                        return true;
+                    }
+                }
+                // Form B: <id_or_ref> = <keyword>
+                if ((toks[ti].kind == PkTok::Int || toks[ti].kind == PkTok::Ref) && toks[ti].iVal >= 0 &&
+                    ti + 2 < toks.size() && toks[ti + 1].kind == PkTok::Word && toks[ti + 1].text == "=" &&
+                    toks[ti + 2].kind == PkTok::Word && isPkEntityKeyword(toks[ti + 2].text))
+                {
+                    outId = toks[ti].iVal;
+                    outType = toks[ti + 2].text;
+                    outAdvance = 3;
+                    return true;
+                }
+                return false;
+            };
+
+            std::unordered_map<int32_t, PkEntityRec> pkMap;
+            std::vector<int32_t> pkOrder;
+            size_t ti = 0;
+            while (ti < toks.size()) {
+                int32_t recId = -1;
+                std::string recType;
+                size_t adv = 0;
+                if (!matchRecHeader(ti, recId, recType, adv)) {
+                    ++ti;
+                    continue;
+                }
+                ti += adv;
+                PkEntityRec rec;
+                rec.id = recId;
+                rec.type = std::move(recType);
+
+                while (ti < toks.size()) {
+                    if (toks[ti].kind == PkTok::Sep) { ++ti; break; }
+                    int32_t nextId = -1; std::string nextType; size_t nextAdv = 0;
+                    if (matchRecHeader(ti, nextId, nextType, nextAdv)) break;
+
+                    const PkTok& tk = toks[ti++];
+                    if (tk.kind == PkTok::Ref) {
+                        rec.refs.push_back(tk.iVal);
+                    } else if (tk.kind == PkTok::Int) {
+                        rec.refs.push_back(tk.iVal);
+                        rec.nums.push_back(tk.dVal);
+                    } else if (tk.kind == PkTok::Real) {
+                        rec.nums.push_back(tk.dVal);
+                    } else if (tk.kind == PkTok::SenseNeg) {
+                        if (!rec.hasSensePos) rec.hasSenseNeg = true;
+                    } else if (tk.kind == PkTok::SensePos) {
+                        if (!rec.hasSenseNeg) rec.hasSensePos = true;
+                    }
+                }
+                pkMap[rec.id] = std::move(rec);
+                pkOrder.push_back(recId);
+            }
+
+            if (pkMap.empty()) return false;
+
+            auto refHasType = [&](int32_t r, const char* t1, const char* t2 = nullptr) -> bool {
+                if (r < 0) return false;
+                auto it = pkMap.find(r);
+                if (it == pkMap.end()) return false;
+                if (it->second.type == t1) return true;
+                return (t2 != nullptr && it->second.type == t2);
+            };
+            auto firstRefOf = [&](const PkEntityRec& rc, const char* t1, const char* t2 = nullptr) -> int32_t {
+                for (int32_t r : rc.refs) {
+                    if (r != rc.id && refHasType(r, t1, t2)) return r;
+                }
+                return -1;
+            };
+
+            BRepGraph g;
+            std::unordered_map<int32_t, CadXform> pkTransforms;
+            for (int32_t id : pkOrder) {
+                const PkEntityRec& rc = pkMap.at(id);
+                const std::string& tp = rc.type;
+
+                if (tp == "point") {
+                    if (rc.nums.size() >= 3) {
+                        size_t n = rc.nums.size();
+                        g.points[id] = { rc.nums[n - 3], rc.nums[n - 2], rc.nums[n - 1] };
+                    }
+                } else if (tp == "vertex") {
+                    int32_t ptRef = firstRefOf(rc, "point");
+                    if (ptRef >= 0) g.vertexToPoint[id] = ptRef;
+                } else if (tp == "transform") {
+                    if (rc.nums.size() >= 12) {
+                        size_t n = rc.nums.size();
+                        size_t base = (n >= 13) ? (n - 13) : (n - 12);
+                        CadXform xf;
+                        for (int i = 0; i < 9; ++i) xf.r[i] = rc.nums[base + static_cast<size_t>(i)];
+                        xf.t[0] = rc.nums[base + 9];
+                        xf.t[1] = rc.nums[base + 10];
+                        xf.t[2] = rc.nums[base + 11];
+                        xf.scale = (n >= 13) ? rc.nums[base + 12] : 1.0;
+                        if (!std::isfinite(xf.scale) || std::fabs(xf.scale) < 1e-12) xf.scale = 1.0;
+                        xf.valid = true;
+                        pkTransforms[id] = xf;
+                    }
+                } else if (tp == "line" || tp == "straight") {
+                    BRepCurve c;
+                    c.kind = CurveKind::Straight;
+                    if (rc.nums.size() >= 6) {
+                        size_t b = rc.nums.size() - 6;
+                        c.origin = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        c.normal = { rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] };
+                    }
+                    g.curves[id] = std::move(c);
+                } else if (tp == "circle") {
+                    BRepCurve c;
+                    c.kind = CurveKind::Ellipse;
+                    c.ratio = 1.0;
+                    if (rc.nums.size() >= 10) {
+                        size_t b = rc.nums.size() - 10;
+                        c.origin = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        c.normal = { rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] };
+                        CadVec3 xAx = vNorm({ rc.nums[b + 6], rc.nums[b + 7], rc.nums[b + 8] });
+                        double rad = std::fabs(rc.nums[b + 9]);
+                        c.majorAxis = vMul(xAx, rad);
+                    } else if (rc.nums.size() >= 7) {
+                        size_t b = rc.nums.size() - 7;
+                        c.origin = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        c.normal = vNorm({ rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] });
+                        double rad = std::fabs(rc.nums[b + 6]);
+                        CadVec3 ref = (std::fabs(c.normal.z) < 0.9) ? CadVec3{ 0, 0, 1 } : CadVec3{ 1, 0, 0 };
+                        c.majorAxis = vMul(vNorm(vCross(ref, c.normal)), rad);
+                    }
+                    g.curves[id] = std::move(c);
+                } else if (tp == "ellipse") {
+                    BRepCurve c;
+                    c.kind = CurveKind::Ellipse;
+                    if (rc.nums.size() >= 11) {
+                        size_t b = rc.nums.size() - 11;
+                        c.origin = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        c.normal = { rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] };
+                        CadVec3 xAx = vNorm({ rc.nums[b + 6], rc.nums[b + 7], rc.nums[b + 8] });
+                        double rMaj = std::fabs(rc.nums[b + 9]);
+                        double rMin = std::fabs(rc.nums[b + 10]);
+                        c.majorAxis = vMul(xAx, rMaj);
+                        c.ratio = (rMaj > 1e-9) ? (rMin / rMaj) : 1.0;
+                    }
+                    g.curves[id] = std::move(c);
+                } else if (tp == "plane") {
+                    BRepSurf s;
+                    s.kind = SurfKind::Plane;
+                    if (rc.nums.size() >= 9) {
+                        size_t b = rc.nums.size() - 9;
+                        s.origin = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        s.normal = { rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] };
+                        s.uAxis  = { rc.nums[b + 6], rc.nums[b + 7], rc.nums[b + 8] };
+                    } else if (rc.nums.size() >= 6) {
+                        size_t b = rc.nums.size() - 6;
+                        s.origin = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        s.normal = { rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] };
+                    }
+                    g.surfaces[id] = s;
+                } else if (tp == "cylinder" || tp == "cyl" || tp == "cone") {
+                    BRepSurf s;
+                    s.kind = SurfKind::CylinderCone;
+                    if (rc.nums.size() >= 7) {
+                        // First 6 reals of cylinder/cone after links: origin(3), axis(3), radius(1)
+                        size_t b = (rc.nums.size() >= 10) ? (rc.nums.size() - 10) : (rc.nums.size() - 7);
+                        s.origin  = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        s.normal  = { rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] };
+                        s.radius1 = std::fabs(rc.nums[b + 6]);
+                    }
+                    g.surfaces[id] = s;
+                } else if (tp == "sphere") {
+                    BRepSurf s;
+                    s.kind = SurfKind::Sphere;
+                    if (rc.nums.size() >= 4) {
+                        size_t b = (rc.nums.size() >= 10) ? (rc.nums.size() - 10) : (rc.nums.size() - 4);
+                        s.origin  = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        s.radius1 = std::fabs(rc.nums[b + 3]);
+                    }
+                    g.surfaces[id] = s;
+                } else if (tp == "torus") {
+                    BRepSurf s;
+                    s.kind = SurfKind::Torus;
+                    if (rc.nums.size() >= 8) {
+                        size_t b = rc.nums.size() - 8;
+                        s.origin  = { rc.nums[b + 0], rc.nums[b + 1], rc.nums[b + 2] };
+                        s.normal  = { rc.nums[b + 3], rc.nums[b + 4], rc.nums[b + 5] };
+                        s.radius1 = std::fabs(rc.nums[b + 6]);
+                        s.radius2 = std::fabs(rc.nums[b + 7]);
+                    }
+                    g.surfaces[id] = s;
+                }
+            }
+
+            // Second pass: topology entities (edges, fins, loops, faces, bodies)
+            for (int32_t id : pkOrder) {
+                const PkEntityRec& rc = pkMap.at(id);
+                const std::string& tp = rc.type;
+
+                if (tp == "edge") {
+                    BRepEdge ed;
+                    std::vector<int32_t> vRefs;
+                    for (int32_t r : rc.refs) {
+                        if (refHasType(r, "vertex")) vRefs.push_back(r);
+                        else if (ed.curveId < 0 && g.curves.count(r)) ed.curveId = r;
+                        else if (ed.bodyId < 0 && refHasType(r, "body")) ed.bodyId = r;
+                    }
+                    if (vRefs.size() >= 2) { ed.startVert = vRefs[0]; ed.endVert = vRefs[1]; }
+                    else if (vRefs.size() == 1) { ed.startVert = vRefs[0]; ed.endVert = vRefs[0]; }
+                    ed.reversed = rc.hasSenseNeg;
+                    g.edges[id] = ed;
+                    g.edgeOrder.push_back(id);
+                } else if (tp == "fin" || tp == "halfedge") {
+                    BRepCoedge ce;
+                    ce.nextCoedge = firstRefOf(rc, "fin", "halfedge");
+                    ce.edgeId     = firstRefOf(rc, "edge");
+                    ce.headVert   = firstRefOf(rc, "vertex");
+                    ce.reversed   = rc.hasSenseNeg;
+                    g.coedges[id] = ce;
+                } else if (tp == "loop") {
+                    BRepLoop lp;
+                    lp.ownerFace   = firstRefOf(rc, "face");
+                    lp.firstCoedge = firstRefOf(rc, "fin", "halfedge");
+                    lp.nextLoop    = firstRefOf(rc, "loop");
+                    if (lp.firstCoedge < 0) {
+                        for (int32_t r : rc.refs) {
+                            if (refHasType(r, "edge")) lp.directEdges.push_back(r);
+                        }
+                    }
+                    g.loops[id] = std::move(lp);
+                } else if (tp == "face") {
+                    BRepFace fc;
+                    fc.nextFace = firstRefOf(rc, "face");
+                    fc.firstLoop = firstRefOf(rc, "loop");
+                    for (int32_t r : rc.refs) {
+                        if (fc.surfaceId < 0 && g.surfaces.count(r)) fc.surfaceId = r;
+                        if (fc.bodyId < 0 && refHasType(r, "body")) fc.bodyId = r;
+                    }
+                    fc.reversed = rc.hasSenseNeg;
+                    g.faces[id] = std::move(fc);
+                    g.faceOrder.push_back(id);
+                } else if (tp == "body") {
+                    int32_t xfRef = firstRefOf(rc, "transform");
+                    if (xfRef >= 0 && pkTransforms.count(xfRef)) {
+                        g.bodyTransforms[id] = pkTransforms[xfRef];
+                    }
+                }
+            }
+
+            // Link loops <-> faces bidirectionally
+            for (auto& kv : g.faces) {
+                BRepFace& fc = kv.second;
+                int32_t curL = fc.firstLoop;
+                std::set<int32_t> seen;
+                while (curL >= 0 && seen.insert(curL).second && seen.size() <= 512) {
+                    fc.loopIds.push_back(curL);
+                    auto lit = g.loops.find(curL);
+                    if (lit == g.loops.end()) break;
+                    curL = lit->second.nextLoop;
+                }
+            }
+            for (const auto& kv : g.loops) {
+                if (kv.second.ownerFace >= 0) {
+                    auto fit = g.faces.find(kv.second.ownerFace);
+                    if (fit != g.faces.end()) {
+                        auto& lids = fit->second.loopIds;
+                        if (std::find(lids.begin(), lids.end(), kv.first) == lids.end()) {
+                            lids.push_back(kv.first);
+                        }
+                    }
+                }
+                // Populate edge start/end vertices from PK fin ring when edge only pointed to fins
+                if (kv.second.firstCoedge >= 0) {
+                    std::vector<int32_t> ring;
+                    int32_t cur = kv.second.firstCoedge;
+                    std::set<int32_t> seen;
+                    while (cur >= 0 && seen.insert(cur).second && ring.size() < 4096) {
+                        ring.push_back(cur);
+                        auto cit = g.coedges.find(cur);
+                        if (cit == g.coedges.end()) break;
+                        cur = cit->second.nextCoedge;
+                        if (cur == kv.second.firstCoedge) break;
+                    }
+                    for (size_t i = 0; i < ring.size(); ++i) {
+                        const BRepCoedge& ce = g.coedges.at(ring[i]);
+                        const BRepCoedge& pv = g.coedges.at(ring[(i + ring.size() - 1) % ring.size()]);
+                        if (ce.headVert >= 0 && pv.headVert >= 0 && ce.edgeId >= 0) {
+                            auto eit = g.edges.find(ce.edgeId);
+                            if (eit != g.edges.end() && eit->second.startVert < 0 && eit->second.endVert < 0) {
+                                if (!ce.reversed) { eit->second.startVert = pv.headVert; eit->second.endVert = ce.headVert; }
+                                else              { eit->second.startVert = ce.headVert; eit->second.endVert = pv.headVert; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return evaluateBRepGraph(g);
         }
-        return !mesh.vertices.empty() && !mesh.tris.empty();
     }
     return false;
 }
@@ -2014,40 +4401,550 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
 // #55–#60. ASTM E57 (.e57), LASzip (.laz), ROS URDF (.urdf), VRoid (.vrm),
 //          Crystallography (.cif), Tripos Sybyl (.mol2) & GROMACS (.gro)
 // ============================================================================
+namespace DetailE57_200 {
+
+inline const std::array<uint32_t, 256>& Crc32CTable() {
+    static const std::array<uint32_t, 256> tbl = []() {
+        std::array<uint32_t, 256> t = {};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int b = 0; b < 8; ++b) {
+                c = (c >> 1) ^ (0x82F63B78u & (0u - (c & 1u)));
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+    return tbl;
+}
+
+inline uint32_t CalcCrc32C(const uint8_t* buf, size_t len) {
+    const auto& tbl = Crc32CTable();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc = tbl[(crc ^ buf[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+inline std::string_view XmlAttr(std::string_view tag, std::string_view attrName) {
+    size_t pos = 0;
+    while (pos < tag.size()) {
+        size_t hit = tag.find(attrName, pos);
+        if (hit == std::string_view::npos) return {};
+        bool leftOk = (hit == 0) || tag[hit - 1] == ' ' || tag[hit - 1] == '\t' ||
+                      tag[hit - 1] == '\r' || tag[hit - 1] == '\n' || tag[hit - 1] == ':';
+        size_t eq = hit + attrName.size();
+        while (eq < tag.size() && (tag[eq] == ' ' || tag[eq] == '\t')) ++eq;
+        if (leftOk && eq < tag.size() && tag[eq] == '=') {
+            size_t q0 = eq + 1;
+            while (q0 < tag.size() && (tag[q0] == ' ' || tag[q0] == '\t')) ++q0;
+            if (q0 < tag.size() && (tag[q0] == '"' || tag[q0] == '\'')) {
+                char qc = tag[q0++];
+                size_t q1 = tag.find(qc, q0);
+                if (q1 != std::string_view::npos) return tag.substr(q0, q1 - q0);
+            }
+        }
+        pos = hit + attrName.size();
+    }
+    return {};
+}
+
+inline double XmlChildFloat(std::string_view scope, std::string_view localName, double defVal) {
+    size_t p = 0;
+    while (p < scope.size()) {
+        size_t lt = scope.find('<', p);
+        if (lt == std::string_view::npos || lt + 1 >= scope.size()) break;
+        if (scope[lt + 1] == '/' || scope[lt + 1] == '!' || scope[lt + 1] == '?') { p = lt + 2; continue; }
+        size_t gt = scope.find('>', lt + 1);
+        if (gt == std::string_view::npos) break;
+        std::string_view openTag = scope.substr(lt + 1, gt - lt - 1);
+        size_t nameEnd = openTag.find_first_of(" \t\r\n/");
+        std::string_view qName = (nameEnd == std::string_view::npos) ? openTag : openTag.substr(0, nameEnd);
+        size_t colon = qName.rfind(':');
+        std::string_view base = (colon == std::string_view::npos) ? qName : qName.substr(colon + 1);
+        if (base == localName) {
+            if (!openTag.empty() && openTag.back() == '/') return 0.0; // E57 XML self-closing Float tag == 0.0!
+            size_t closeLt = scope.find('<', gt + 1);
+            if (closeLt == std::string_view::npos) return defVal;
+            std::string txt(scope.substr(gt + 1, closeLt - gt - 1));
+            char* ep = nullptr;
+            double v = std::strtod(txt.c_str(), &ep);
+            return (ep != txt.c_str() && std::isfinite(v)) ? v : 0.0;
+        }
+        p = gt + 1;
+    }
+    return defVal;
+}
+
+struct E57FieldDesc {
+    std::string name;
+    enum Kind { Float32, Float64, Integer, ScaledInteger } kind = Float32;
+    uint32_t bitWidth = 32;
+    int64_t minimum = 0;
+    int64_t maximum = 0;
+    double scale = 1.0;
+    double offset = 0.0;
+};
+
+struct E57BitStream {
+    std::vector<uint8_t> bytes;
+    size_t bitPos = 0;
+
+    size_t AvailBits() const {
+        size_t total = bytes.size() * 8;
+        return (total > bitPos) ? (total - bitPos) : 0;
+    }
+
+    void Append(const uint8_t* src, size_t len) {
+        if (bitPos >= 65536) {
+            size_t dropBytes = bitPos >> 3;
+            bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(dropBytes));
+            bitPos &= 7u;
+        }
+        bytes.insert(bytes.end(), src, src + len);
+    }
+
+    uint64_t ReadBitsLSB(uint32_t nBits) {
+        if (nBits == 0) return 0;
+        if (nBits == 32 && (bitPos & 7u) == 0) {
+            uint32_t v = Detail3D200::RdU32LE(bytes.data() + (bitPos >> 3));
+            bitPos += 32;
+            return v;
+        }
+        if (nBits == 64 && (bitPos & 7u) == 0) {
+            uint64_t v = Detail3D200::RdU64LE(bytes.data() + (bitPos >> 3));
+            bitPos += 64;
+            return v;
+        }
+        uint64_t out = 0;
+        for (uint32_t b = 0; b < nBits; ++b) {
+            size_t bp = bitPos + b;
+            uint64_t bit = (bytes[bp >> 3] >> (bp & 7u)) & 1u;
+            out |= (bit << b);
+        }
+        bitPos += nBits;
+        return out;
+    }
+};
+
+} // namespace DetailE57_200
+
 inline bool ParseSciRoboChem200(const uint8_t* data, size_t size, const std::wstring& ext, LoadedMesh3D& mesh) {
     std::string_view sv(reinterpret_cast<const char*>(data), size);
 
-    // #55. ASTM E57 3D Laser Scan — 48-byte header starting with "ASTM-E57"
+    // #55. ASTM E2807 3D Laser Scan (.e57 — Paged CRC32C + XML + CompressedVectorSection Decoder)
     if (ext == L".e57" || (size >= 48 && std::memcmp(data, "ASTM-E57", 8) == 0)) {
         if (size < 48 || std::memcmp(data, "ASTM-E57", 8) != 0) return false;
-        mesh.formatName = L"ASTM E57 3D LiDAR Point Cloud (.e57)";
-        uint64_t xmlPhysOff = Detail3D200::RdU64LE(data + 24);
-        uint64_t pageSize   = Detail3D200::RdU64LE(data + 40);
-        if (pageSize == 0) pageSize = 1024;
-        if (xmlPhysOff <= 48 || xmlPhysOff > size) return false;
 
-        size_t dataEnd = static_cast<size_t>(xmlPhysOff);
-        std::vector<Vec3f> pts;
-        // Skip 16-byte CompressedVectorSection header at offset 48 if present (sectionId == 1)
-        size_t startOff = (dataEnd >= 64 && data[48] == 1) ? 64 : 48;
-        for (size_t p = startOff; p + 12 <= dataEnd && pts.size() < 8000; p += 12) {
-            if (pageSize >= 64 && (p % pageSize) >= (pageSize - 4)) {
-                p = ((p / pageSize) + 1) * static_cast<size_t>(pageSize) - 12;
-                continue;
+        uint32_t majVer      = Detail3D200::RdU32LE(data + 8);
+        uint32_t minVer      = Detail3D200::RdU32LE(data + 12);
+        (void)minVer;
+        uint64_t filePhysLen = Detail3D200::RdU64LE(data + 16);
+        uint64_t xmlPhysOff  = Detail3D200::RdU64LE(data + 24);
+        uint64_t xmlLogLen   = Detail3D200::RdU64LE(data + 32);
+        uint64_t pageSize    = Detail3D200::RdU64LE(data + 40);
+
+        if (majVer == 0 || majVer > 2) return false;
+        if (pageSize < 64 || pageSize > 65536 || (pageSize % 4u) != 0) return false;
+        const size_t ps     = static_cast<size_t>(pageSize);
+        const size_t usable = ps - 4;
+
+        // Validate physical file length (allowing exact 64MB viewer read cap if file exceeds 64MB)
+        const size_t kViewerReadCap = 64ULL * 1024ULL * 1024ULL;
+        if (filePhysLen < pageSize) return false;
+        if (size < kViewerReadCap && filePhysLen > size) return false;
+        const size_t effSize = static_cast<size_t>(std::min<uint64_t>(size, filePhysLen));
+        if (effSize < ps) return false;
+
+        if (xmlPhysOff < 48 || xmlPhysOff >= effSize || (xmlPhysOff % ps) >= usable) return false;
+        if (xmlLogLen == 0 || xmlLogLen > 32ULL * 1024ULL * 1024ULL) return false;
+
+        // Cached per-page Castagnoli CRC32C verifier
+        std::vector<uint8_t> pageCrcState(effSize / ps + 1, 0); // 0=unchecked, 1=valid, 2=invalid
+        auto verifyPage = [&](size_t pageIdx) -> bool {
+            if (pageIdx >= pageCrcState.size()) return false;
+            if (pageCrcState[pageIdx] != 0) return pageCrcState[pageIdx] == 1;
+            size_t pageStart = pageIdx * ps;
+            if (pageStart + ps > effSize) {
+                pageCrcState[pageIdx] = 2;
+                return false;
             }
-            float x = Detail3D200::RdF32LE(data + p + 0);
-            float y = Detail3D200::RdF32LE(data + p + 4);
-            float z = Detail3D200::RdF32LE(data + p + 8);
-            if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
-                std::fabs(x) < 1e5f && std::fabs(y) < 1e5f && std::fabs(z) < 1e5f &&
-                (std::fabs(x) + std::fabs(y) + std::fabs(z)) > 1e-5f)
+            uint32_t expected = DetailE57_200::CalcCrc32C(data + pageStart, usable);
+            uint32_t storedBE = Detail3D200::RdU32BE(data + pageStart + usable);
+            uint32_t storedLE = Detail3D200::RdU32LE(data + pageStart + usable);
+            bool ok = (storedBE == expected || storedLE == expected);
+            pageCrcState[pageIdx] = ok ? 1 : 2;
+            return ok;
+        };
+
+        if (!verifyPage(0)) return false;
+
+        auto physToLogical = [&](uint64_t physOff, uint64_t& outLogOff) -> bool {
+            if (physOff >= effSize || (physOff % ps) >= usable) return false;
+            outLogOff = (physOff / ps) * usable + (physOff % ps);
+            return true;
+        };
+
+        auto readLogicalBytes = [&](uint64_t logOff, size_t len, uint8_t* dst) -> bool {
+            size_t done = 0;
+            uint64_t curLog = logOff;
+            while (done < len) {
+                size_t pageIdx   = static_cast<size_t>(curLog / usable);
+                size_t offInPage = static_cast<size_t>(curLog % usable);
+                if (!verifyPage(pageIdx)) return false;
+                size_t chunk = std::min<size_t>(len - done, usable - offInPage);
+                std::memcpy(dst + done, data + pageIdx * ps + offInPage, chunk);
+                done   += chunk;
+                curLog += chunk;
+            }
+            return true;
+        };
+
+        // Extract and verify logical XML section
+        uint64_t xmlLogOff = 0;
+        if (!physToLogical(xmlPhysOff, xmlLogOff)) return false;
+        std::string xmlStr(static_cast<size_t>(xmlLogLen), '\0');
+        if (!readLogicalBytes(xmlLogOff, static_cast<size_t>(xmlLogLen), reinterpret_cast<uint8_t*>(xmlStr.data()))) {
+            return false;
+        }
+        std::string_view xmlSv(xmlStr);
+        if (xmlSv.find("e57Root") == std::string_view::npos || xmlSv.find("data3D") == std::string_view::npos) {
+            return false;
+        }
+
+        mesh.formatName = L"ASTM E57 3D LiDAR Point Cloud (.e57)";
+
+        size_t d3Start = xmlSv.find("data3D");
+        size_t d3End   = xmlSv.rfind("data3D");
+        if (d3Start == std::string_view::npos || d3End <= d3Start) return false;
+        std::string_view data3DScope = xmlSv.substr(d3Start, d3End - d3Start);
+
+        // Split into per-scan scopes (<vectorChild ...>...</vectorChild>, or entire data3DScope if single flat scan)
+        std::vector<std::string_view> scanScopes;
+        {
+            size_t sp = 0;
+            while (sp < data3DScope.size()) {
+                size_t vcOpen = data3DScope.find("<vectorChild", sp);
+                if (vcOpen == std::string_view::npos) break;
+                // Find matching </vectorChild> accounting for nested <vectorChild> (e.g. indexBounds/grouping)
+                size_t cur = vcOpen + 12;
+                int depth = 1;
+                while (cur < data3DScope.size() && depth > 0) {
+                    size_t nextLt = data3DScope.find('<', cur);
+                    if (nextLt == std::string_view::npos) break;
+                    if (data3DScope.substr(nextLt, 13) == "</vectorChild") {
+                        --depth;
+                        size_t gt = data3DScope.find('>', nextLt + 13);
+                        cur = (gt == std::string_view::npos) ? data3DScope.size() : (gt + 1);
+                    } else if (data3DScope.substr(nextLt, 12) == "<vectorChild") {
+                        size_t gt = data3DScope.find('>', nextLt + 12);
+                        if (gt != std::string_view::npos && data3DScope[gt - 1] != '/') ++depth;
+                        cur = (gt == std::string_view::npos) ? data3DScope.size() : (gt + 1);
+                    } else {
+                        cur = nextLt + 1;
+                    }
+                }
+                scanScopes.push_back(data3DScope.substr(vcOpen, cur - vcOpen));
+                sp = cur;
+            }
+            if (scanScopes.empty()) scanScopes.push_back(data3DScope);
+        }
+
+        std::vector<Vec3f> allPts;
+        const size_t kMaxTotalPts = 25000;
+
+        for (std::string_view scanSv : scanScopes) {
+            if (allPts.size() >= kMaxTotalPts) break;
+
+            // 1. Parse optional <pose> (<rotation> quaternion w,x,y,z + <translation> x,y,z)
+            double qw = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
+            double tx = 0.0, ty = 0.0, tz = 0.0;
+            size_t poseOpen = scanSv.find("<pose");
+            if (poseOpen != std::string_view::npos) {
+                size_t poseClose = scanSv.find("</pose>", poseOpen);
+                if (poseClose != std::string_view::npos) {
+                    std::string_view poseSv = scanSv.substr(poseOpen, poseClose - poseOpen);
+                    size_t rotOpen = poseSv.find("<rotation"), rotClose = poseSv.find("</rotation>", rotOpen == std::string_view::npos ? 0 : rotOpen);
+                    if (rotOpen != std::string_view::npos && rotClose != std::string_view::npos) {
+                        std::string_view rotSv = poseSv.substr(rotOpen + 9, rotClose - rotOpen - 9);
+                        qw = DetailE57_200::XmlChildFloat(rotSv, "w", 1.0);
+                        qx = DetailE57_200::XmlChildFloat(rotSv, "x", 0.0);
+                        qy = DetailE57_200::XmlChildFloat(rotSv, "y", 0.0);
+                        qz = DetailE57_200::XmlChildFloat(rotSv, "z", 0.0);
+                        double qn = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+                        if (qn > 1e-12) { qw /= qn; qx /= qn; qy /= qn; qz /= qn; }
+                        else { qw = 1.0; qx = qy = qz = 0.0; }
+                    }
+                    size_t trOpen = poseSv.find("<translation"), trClose = poseSv.find("</translation>", trOpen == std::string_view::npos ? 0 : trOpen);
+                    if (trOpen != std::string_view::npos && trClose != std::string_view::npos) {
+                        std::string_view trSv = poseSv.substr(trOpen + 12, trClose - trOpen - 12);
+                        tx = DetailE57_200::XmlChildFloat(trSv, "x", 0.0);
+                        ty = DetailE57_200::XmlChildFloat(trSv, "y", 0.0);
+                        tz = DetailE57_200::XmlChildFloat(trSv, "z", 0.0);
+                    }
+                }
+            }
+
+            double r00 = 1.0 - 2.0 * (qy * qy + qz * qz), r01 = 2.0 * (qx * qy - qw * qz), r02 = 2.0 * (qx * qz + qw * qy);
+            double r10 = 2.0 * (qx * qy + qw * qz), r11 = 1.0 - 2.0 * (qx * qx + qz * qz), r12 = 2.0 * (qy * qz - qw * qx);
+            double r20 = 2.0 * (qx * qz - qw * qy), r21 = 2.0 * (qy * qz + qw * qx), r22 = 1.0 - 2.0 * (qx * qx + qy * qy);
+
+            // 2. Locate <points type="CompressedVector" fileOffset="..." recordCount="...">
+            size_t ptsOpen = std::string_view::npos;
             {
-                pts.push_back({ x, z, -y });
+                size_t search = 0;
+                while (search < scanSv.size()) {
+                    size_t cand = scanSv.find("<points", search);
+                    if (cand == std::string_view::npos) break;
+                    char nextC = (cand + 7 < scanSv.size()) ? scanSv[cand + 7] : '\0';
+                    if (nextC == ' ' || nextC == '\t' || nextC == '\r' || nextC == '\n' || nextC == '>') {
+                        ptsOpen = cand;
+                        break;
+                    }
+                    search = cand + 7;
+                }
+            }
+            if (ptsOpen == std::string_view::npos) continue;
+            size_t ptsTagGt = scanSv.find('>', ptsOpen);
+            size_t ptsClose = scanSv.find("</points>", ptsOpen);
+            if (ptsTagGt == std::string_view::npos || ptsClose == std::string_view::npos || ptsClose <= ptsTagGt) return false;
+
+            std::string_view ptsOpenTag = scanSv.substr(ptsOpen, ptsTagGt - ptsOpen + 1);
+            std::string_view ptsType    = DetailE57_200::XmlAttr(ptsOpenTag, "type");
+            std::string_view fileOffSv  = DetailE57_200::XmlAttr(ptsOpenTag, "fileOffset");
+            std::string_view recCntSv   = DetailE57_200::XmlAttr(ptsOpenTag, "recordCount");
+            if (ptsType != "CompressedVector" || fileOffSv.empty() || recCntSv.empty()) return false;
+
+            char* ep1 = nullptr;
+            uint64_t cvPhysOff = std::strtoull(std::string(fileOffSv).c_str(), &ep1, 10);
+            char* ep2 = nullptr;
+            uint64_t recordCount = std::strtoull(std::string(recCntSv).c_str(), &ep2, 10);
+            if (cvPhysOff < 48 || recordCount == 0 || recordCount > 500000000ULL) return false;
+
+            // 3. Parse <prototype> field descriptors in exact declaration order
+            std::string_view ptsBody = scanSv.substr(ptsTagGt + 1, ptsClose - ptsTagGt - 1);
+            size_t protoOpen = ptsBody.find("<prototype");
+            size_t protoClose = ptsBody.find("</prototype>", protoOpen == std::string_view::npos ? 0 : protoOpen);
+            if (protoOpen == std::string_view::npos || protoClose == std::string_view::npos) return false;
+            size_t protoGt = ptsBody.find('>', protoOpen);
+            if (protoGt == std::string_view::npos || protoGt >= protoClose) return false;
+            std::string_view protoBody = ptsBody.substr(protoGt + 1, protoClose - protoGt - 1);
+
+            std::vector<DetailE57_200::E57FieldDesc> fields;
+            int idxCartX = -1, idxCartY = -1, idxCartZ = -1, idxCartInv = -1;
+            int idxSphR  = -1, idxSphAz = -1, idxSphEl = -1, idxSphInv  = -1;
+
+            size_t fp = 0;
+            while (fp < protoBody.size()) {
+                size_t lt = protoBody.find('<', fp);
+                if (lt == std::string_view::npos || lt + 1 >= protoBody.size()) break;
+                if (protoBody[lt + 1] == '/' || protoBody[lt + 1] == '!' || protoBody[lt + 1] == '?') {
+                    size_t gtSkip = protoBody.find('>', lt + 2);
+                    if (gtSkip == std::string_view::npos) break;
+                    fp = gtSkip + 1;
+                    continue;
+                }
+                size_t gt = protoBody.find('>', lt + 1);
+                if (gt == std::string_view::npos) return false;
+                std::string_view fTag = protoBody.substr(lt + 1, gt - lt - 1);
+                bool selfClosing = (!fTag.empty() && fTag.back() == '/');
+
+                size_t nmEnd = fTag.find_first_of(" \t\r\n/");
+                std::string_view qName = (nmEnd == std::string_view::npos) ? fTag : fTag.substr(0, nmEnd);
+                size_t colon = qName.rfind(':');
+                std::string fieldName(colon == std::string_view::npos ? qName : qName.substr(colon + 1));
+
+                std::string_view fType = DetailE57_200::XmlAttr(fTag, "type");
+                DetailE57_200::E57FieldDesc fd;
+                fd.name = fieldName;
+
+                auto parseAttrI64 = [&](std::string_view key, int64_t defV) -> int64_t {
+                    std::string_view s = DetailE57_200::XmlAttr(fTag, key);
+                    if (s.empty()) return defV;
+                    return std::strtoll(std::string(s).c_str(), nullptr, 10);
+                };
+                auto parseAttrF64 = [&](std::string_view key, double defV) -> double {
+                    std::string_view s = DetailE57_200::XmlAttr(fTag, key);
+                    if (s.empty()) return defV;
+                    double v = std::strtod(std::string(s).c_str(), nullptr);
+                    return std::isfinite(v) ? v : defV;
+                };
+
+                if (fType == "Float") {
+                    std::string_view prec = DetailE57_200::XmlAttr(fTag, "precision");
+                    if (prec == "single") { fd.kind = DetailE57_200::E57FieldDesc::Float32; fd.bitWidth = 32; }
+                    else                  { fd.kind = DetailE57_200::E57FieldDesc::Float64; fd.bitWidth = 64; }
+                } else if (fType == "Integer" || fType == "ScaledInteger") {
+                    fd.minimum = parseAttrI64("minimum", -2147483648LL);
+                    fd.maximum = parseAttrI64("maximum",  2147483647LL);
+                    if (fd.maximum < fd.minimum) return false;
+                    uint64_t range = static_cast<uint64_t>(fd.maximum) - static_cast<uint64_t>(fd.minimum);
+                    uint32_t bits = 0;
+                    if (range == 0xFFFFFFFFFFFFFFFFULL) {
+                        bits = 64;
+                    } else if (range > 0) {
+                        bits = 1;
+                        while (bits < 64 && (range >> bits) != 0) ++bits;
+                    }
+                    fd.bitWidth = bits;
+                    if (fType == "ScaledInteger") {
+                        fd.kind   = DetailE57_200::E57FieldDesc::ScaledInteger;
+                        fd.scale  = parseAttrF64("scale",  1.0);
+                        fd.offset = parseAttrF64("offset", 0.0);
+                    } else {
+                        fd.kind = DetailE57_200::E57FieldDesc::Integer;
+                    }
+                } else {
+                    return false;
+                }
+
+                int curFieldIdx = static_cast<int>(fields.size());
+                if (fieldName == "cartesianX")            idxCartX   = curFieldIdx;
+                else if (fieldName == "cartesianY")       idxCartY   = curFieldIdx;
+                else if (fieldName == "cartesianZ")       idxCartZ   = curFieldIdx;
+                else if (fieldName == "cartesianInvalidState") idxCartInv = curFieldIdx;
+                else if (fieldName == "sphericalRange")   idxSphR    = curFieldIdx;
+                else if (fieldName == "sphericalAzimuth") idxSphAz   = curFieldIdx;
+                else if (fieldName == "sphericalElevation") idxSphEl = curFieldIdx;
+                else if (fieldName == "sphericalInvalidState") idxSphInv = curFieldIdx;
+
+                fields.push_back(std::move(fd));
+
+                if (!selfClosing) {
+                    std::string closePat = "</" + std::string(qName) + ">";
+                    size_t cPos = protoBody.find(closePat, gt + 1);
+                    fp = (cPos == std::string_view::npos) ? (gt + 1) : (cPos + closePat.size());
+                } else {
+                    fp = gt + 1;
+                }
+            }
+
+            bool hasCartesian = (idxCartX >= 0 && idxCartY >= 0 && idxCartZ >= 0);
+            bool hasSpherical = (idxSphR >= 0 && idxSphAz >= 0 && idxSphEl >= 0);
+            if (fields.empty() || (!hasCartesian && !hasSpherical)) return false;
+
+            // 4. Seek to CompressedVectorSection (32 logical bytes)
+            uint64_t secLogOff = 0;
+            if (!physToLogical(cvPhysOff, secLogOff)) return false;
+            uint8_t secHdr[32] = {};
+            if (!readLogicalBytes(secLogOff, 32, secHdr)) return false;
+            if (secHdr[0] != 1) return false; // sectionId == 1 (CompressedVectorSection)
+
+            uint64_t secLogLen   = Detail3D200::RdU64LE(secHdr + 8);
+            uint64_t dataPhysOff = Detail3D200::RdU64LE(secHdr + 16);
+            uint64_t pktLogPos   = 0;
+            if (secLogLen < 32 || !physToLogical(dataPhysOff, pktLogPos)) return false;
+            uint64_t secLogEnd = secLogOff + secLogLen;
+            if (pktLogPos < secLogOff + 32 || pktLogPos >= secLogEnd) return false;
+
+            // 5. Iterate DataPackets & unpack planar bitstreams
+            const size_t nFields = fields.size();
+            std::vector<DetailE57_200::E57BitStream> streams(nFields);
+            std::vector<double> recVals(nFields, 0.0);
+            std::vector<uint8_t> pktBuf;
+            uint64_t decodedCount = 0;
+            uint64_t subsampleStep = std::max<uint64_t>(1, recordCount / kMaxTotalPts);
+
+            while (decodedCount < recordCount && pktLogPos + 4 <= secLogEnd && allPts.size() < kMaxTotalPts) {
+                uint8_t pktHdr[4] = {};
+                if (!readLogicalBytes(pktLogPos, 4, pktHdr)) return false;
+                uint8_t pktType = pktHdr[0];
+                size_t pktLen   = static_cast<size_t>(Detail3D200::RdU16LE(pktHdr + 2)) + 1;
+                if (pktLogPos + pktLen > secLogEnd) return false;
+
+                pktBuf.resize(pktLen);
+                if (!readLogicalBytes(pktLogPos, pktLen, pktBuf.data())) return false;
+
+                if (pktType == 1) { // DataPacket
+                    if (pktLen < 6 + nFields * 2) return false;
+                    uint16_t bsCount = Detail3D200::RdU16LE(pktBuf.data() + 4);
+                    if (bsCount != nFields) return false;
+
+                    size_t payCursor = 6 + nFields * 2;
+                    for (size_t f = 0; f < nFields; ++f) {
+                        uint16_t bsLen = Detail3D200::RdU16LE(pktBuf.data() + 6 + f * 2);
+                        if (payCursor + bsLen > pktLen) return false;
+                        if (bsLen > 0) streams[f].Append(pktBuf.data() + payCursor, bsLen);
+                        payCursor += bsLen;
+                    }
+
+                    // Extract all complete records currently available across all streams
+                    while (decodedCount < recordCount && allPts.size() < kMaxTotalPts) {
+                        bool ready = true;
+                        for (size_t f = 0; f < nFields; ++f) {
+                            if (fields[f].bitWidth > 0 && streams[f].AvailBits() < fields[f].bitWidth) {
+                                ready = false;
+                                break;
+                            }
+                        }
+                        if (!ready) break;
+
+                        bool finiteOk = true;
+                        for (size_t f = 0; f < nFields; ++f) {
+                            const auto& fd = fields[f];
+                            uint64_t rawBits = streams[f].ReadBitsLSB(fd.bitWidth);
+                            if (fd.kind == DetailE57_200::E57FieldDesc::Float32) {
+                                uint32_t u32 = static_cast<uint32_t>(rawBits);
+                                float fv = 0.0f;
+                                std::memcpy(&fv, &u32, 4);
+                                if (!std::isfinite(fv)) finiteOk = false;
+                                recVals[f] = static_cast<double>(fv);
+                            } else if (fd.kind == DetailE57_200::E57FieldDesc::Float64) {
+                                double dv = 0.0;
+                                std::memcpy(&dv, &rawBits, 8);
+                                if (!std::isfinite(dv)) finiteOk = false;
+                                recVals[f] = dv;
+                            } else if (fd.kind == DetailE57_200::E57FieldDesc::Integer) {
+                                int64_t iv = static_cast<int64_t>(static_cast<uint64_t>(fd.minimum) + rawBits);
+                                recVals[f] = static_cast<double>(iv);
+                            } else { // ScaledInteger
+                                int64_t iv = static_cast<int64_t>(static_cast<uint64_t>(fd.minimum) + rawBits);
+                                recVals[f] = static_cast<double>(iv) * fd.scale + fd.offset;
+                            }
+                        }
+
+                        uint64_t recIdx = decodedCount++;
+                        if (!finiteOk || (recIdx % subsampleStep) != 0) continue;
+
+                        double lx = 0.0, ly = 0.0, lz = 0.0;
+                        if (hasCartesian) {
+                            if (idxCartInv >= 0 && std::llround(recVals[static_cast<size_t>(idxCartInv)]) != 0) continue;
+                            lx = recVals[static_cast<size_t>(idxCartX)];
+                            ly = recVals[static_cast<size_t>(idxCartY)];
+                            lz = recVals[static_cast<size_t>(idxCartZ)];
+                        } else {
+                            if (idxSphInv >= 0 && std::llround(recVals[static_cast<size_t>(idxSphInv)]) != 0) continue;
+                            double rng = recVals[static_cast<size_t>(idxSphR)];
+                            double az  = recVals[static_cast<size_t>(idxSphAz)];
+                            double el  = recVals[static_cast<size_t>(idxSphEl)];
+                            lx = rng * std::cos(el) * std::cos(az);
+                            ly = rng * std::cos(el) * std::sin(az);
+                            lz = rng * std::sin(el);
+                        }
+
+                        double wx = r00 * lx + r01 * ly + r02 * lz + tx;
+                        double wy = r10 * lx + r11 * ly + r12 * lz + ty;
+                        double wz = r20 * lx + r21 * ly + r22 * lz + tz;
+                        if (std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz)) {
+                            allPts.push_back({
+                                static_cast<float>(wx),
+                                static_cast<float>(wz),
+                                static_cast<float>(-wy)
+                            });
+                        }
+                    }
+                } else if (pktType != 0 && pktType != 2) {
+                    return false;
+                }
+
+                pktLogPos += (static_cast<uint64_t>(pktLen) + 3ULL) & ~3ULL;
             }
         }
-        if (pts.empty()) return false;
-        float r = Detail3D200::ComputePointCloudSpan(pts) * 0.018f;
-        for (const auto& pt : pts) Detail3D200::AddPointTetra(mesh, pt, r);
+
+        if (allPts.empty()) return false;
+        float r = Detail3D200::ComputePointCloudSpan(allPts) * 0.018f;
+        for (const auto& pt : allPts) Detail3D200::AddPointTetra(mesh, pt, r);
         return !mesh.vertices.empty() && !mesh.tris.empty();
     }
 

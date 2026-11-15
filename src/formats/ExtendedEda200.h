@@ -22,6 +22,215 @@ inline uint64_t RdU64LE(const uint8_t* p) {
     return static_cast<uint64_t>(RdU32LE(p)) |
            (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
 }
+inline uint16_t RdU16BE(const uint8_t* p) {
+    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+inline uint32_t RdU32BE(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+struct JtagBitCycle {
+    uint8_t tms = 0;
+    uint8_t tdi = 0;
+    uint8_t tdo = 0;
+    bool hasTdo = false;
+};
+
+struct JtagTapTracker {
+    static constexpr size_t kMaxVisualCycles = 96;
+    // IEEE 1149.1 TAP next-state table indexed by XAPP503 state encoding (0x00..0x0F) and TMS (0 or 1)
+    static constexpr uint8_t kNextTap[16][2] = {
+        { 0x01, 0x00 }, // 0x00 Test-Logic-Reset
+        { 0x01, 0x02 }, // 0x01 Run-Test/Idle
+        { 0x03, 0x09 }, // 0x02 Select-DR-Scan
+        { 0x04, 0x05 }, // 0x03 Capture-DR
+        { 0x04, 0x05 }, // 0x04 Shift-DR
+        { 0x06, 0x08 }, // 0x05 Exit1-DR
+        { 0x06, 0x07 }, // 0x06 Pause-DR
+        { 0x04, 0x08 }, // 0x07 Exit2-DR
+        { 0x01, 0x02 }, // 0x08 Update-DR
+        { 0x0A, 0x00 }, // 0x09 Select-IR-Scan
+        { 0x0B, 0x0C }, // 0x0A Capture-IR
+        { 0x0B, 0x0C }, // 0x0B Shift-IR
+        { 0x0D, 0x0F }, // 0x0C Exit1-IR
+        { 0x0D, 0x0E }, // 0x0D Pause-IR
+        { 0x0B, 0x0F }, // 0x0E Exit2-IR
+        { 0x01, 0x02 }, // 0x0F Update-IR
+    };
+
+    uint8_t curState = 0x00;
+    std::vector<JtagBitCycle> cycles;
+
+    void PushClock(uint8_t tms, uint8_t tdi = 0, uint8_t tdo = 0, bool hasTdo = false) {
+        if (cycles.size() < kMaxVisualCycles) {
+            cycles.push_back({ static_cast<uint8_t>(tms & 1u), static_cast<uint8_t>(tdi & 1u), static_cast<uint8_t>(tdo & 1u), hasTdo });
+        }
+        if (curState < 16u) {
+            curState = kNextTap[curState][tms & 1u];
+        }
+    }
+
+    void StepTo(uint8_t target, bool forceClockIfSame) {
+        if (target > 0x0Fu) return;
+        if (curState == target) {
+            if (forceClockIfSame) {
+                if (target == 0x00u) PushClock(1);
+                else if (target == 0x01u || target == 0x04u || target == 0x06u || target == 0x0Bu || target == 0x0Du) PushClock(0);
+            }
+            return;
+        }
+        int prevSt[16];
+        uint8_t prevTms[16] = {};
+        for (int i = 0; i < 16; ++i) prevSt[i] = -1;
+        uint8_t q[16] = {};
+        int qh = 0, qt = 0;
+        q[qt++] = curState;
+        prevSt[curState] = static_cast<int>(curState);
+        while (qh < qt) {
+            uint8_t u = q[qh++];
+            if (u == target) break;
+            for (uint8_t tms = 0; tms <= 1u; ++tms) {
+                uint8_t v = kNextTap[u][tms];
+                if (prevSt[v] < 0) {
+                    prevSt[v] = static_cast<int>(u);
+                    prevTms[v] = tms;
+                    q[qt++] = v;
+                }
+            }
+        }
+        if (prevSt[target] < 0) return;
+        uint8_t path[16] = {};
+        int plen = 0;
+        uint8_t cur = target;
+        while (cur != curState && plen < 16) {
+            path[plen++] = prevTms[cur];
+            cur = static_cast<uint8_t>(prevSt[cur]);
+        }
+        for (int i = plen - 1; i >= 0; --i) {
+            PushClock(path[i]);
+        }
+    }
+
+    void EmitIdleClocks(uint32_t count, uint8_t waitState = 0x01u) {
+        StepTo(waitState, false);
+        uint32_t vis = std::min<uint32_t>(count, 8u);
+        uint8_t holdTms = (waitState == 0x00u) ? 1u : 0u;
+        for (uint32_t i = 0; i < vis; ++i) {
+            PushClock(holdTms);
+        }
+    }
+
+    void ShiftBytesBE(
+        uint8_t shiftState,
+        uint8_t endState,
+        uint32_t numBits,
+        const uint8_t* tdiBytes,
+        const uint8_t* tdoBytes,
+        const std::vector<uint8_t>* tdoMask,
+        bool exitOnLast)
+    {
+        if (numBits == 0u) return;
+        StepTo(shiftState, false);
+        const size_t nb = (static_cast<size_t>(numBits) + 7u) / 8u;
+        const uint32_t emitLimit = (cycles.size() < kMaxVisualCycles)
+            ? static_cast<uint32_t>(std::min<size_t>(static_cast<size_t>(numBits), kMaxVisualCycles - cycles.size()))
+            : 0u;
+
+        for (uint32_t b = 0; b < emitLimit; ++b) {
+            bool isLast = exitOnLast && (b + 1u == numBits);
+            size_t byteIdx = nb - 1u - static_cast<size_t>(b / 8u);
+            int bitShift = static_cast<int>(b & 7u);
+            uint8_t tdiBit = (tdiBytes != nullptr) ? static_cast<uint8_t>((tdiBytes[byteIdx] >> bitShift) & 1u) : 0u;
+            bool careTdo = (tdoBytes != nullptr);
+            if (careTdo && tdoMask != nullptr && tdoMask->size() == nb) {
+                careTdo = ((((*tdoMask)[byteIdx] >> bitShift) & 1u) != 0u);
+            }
+            uint8_t tdoBit = (tdoBytes != nullptr) ? static_cast<uint8_t>((tdoBytes[byteIdx] >> bitShift) & 1u) : 0u;
+            cycles.push_back({ static_cast<uint8_t>(isLast ? 1u : 0u), tdiBit, tdoBit, careTdo });
+        }
+
+        if (exitOnLast) {
+            curState = kNextTap[shiftState][1];
+            StepTo(endState, false);
+        } else {
+            curState = shiftState;
+        }
+    }
+};
+
+inline void DrawGraticule(ParsedEdaBoard& out, float x0, float y0, float w, float h, int nx = 10, int ny = 8) {
+    DetailEda100::AddRectOutline(out, x0 + w * 0.5f, y0 + h * 0.5f, w, h, EdaLayerId::EdgeCuts, 0.35f);
+    for (int i = 1; i < nx; ++i) {
+        float x = x0 + (w * i) / nx;
+        out.traces.push_back({ x, y0, x, y0 + h, 0.08f, EdaLayerId::BottomSilk, 0 });
+    }
+    for (int j = 1; j < ny; ++j) {
+        float y = y0 + (h * j) / ny;
+        out.traces.push_back({ x0, y, x0 + w, y, 0.08f, EdaLayerId::BottomSilk, 0 });
+    }
+}
+
+inline void RenderJtag4LaneWaveforms(
+    ParsedEdaBoard& out,
+    const std::vector<JtagBitCycle>& cycles,
+    const std::wstring& summaryLabel)
+{
+    DrawGraticule(out, -40.0f, -20.0f, 80.0f, 40.0f, 16, 4);
+    out.labels.push_back({ -46.5f,  14.0f, 1.15f, EdaLayerId::TopSilk, L"TCK" });
+    out.labels.push_back({ -46.5f,   5.0f, 1.15f, EdaLayerId::TopSilk, L"TMS" });
+    out.labels.push_back({ -46.5f,  -5.0f, 1.15f, EdaLayerId::TopSilk, L"TDI" });
+    out.labels.push_back({ -46.5f, -14.0f, 1.15f, EdaLayerId::TopSilk, L"TDO" });
+    if (!summaryLabel.empty()) {
+        out.labels.push_back({ -39.0f, 21.6f, 1.05f, EdaLayerId::TopSilk, summaryLabel });
+    }
+
+    const int n = static_cast<int>(std::min<size_t>(cycles.size(), JtagTapTracker::kMaxVisualCycles));
+    if (n <= 0) return;
+    const float step = 76.0f / static_cast<float>(n);
+
+    for (int i = 0; i < n; ++i) {
+        const float x0 = -38.0f + static_cast<float>(i) * step;
+        const float xm = x0 + step * 0.5f;
+        const float x1 = x0 + step;
+
+        // Lane 1: TCK clock pulse
+        out.traces.push_back({ x0, 12.2f, x0, 15.8f, 0.22f, EdaLayerId::TopSilk, 1 });
+        out.traces.push_back({ x0, 15.8f, xm, 15.8f, 0.22f, EdaLayerId::TopSilk, 1 });
+        out.traces.push_back({ xm, 15.8f, xm, 12.2f, 0.22f, EdaLayerId::TopSilk, 1 });
+        out.traces.push_back({ xm, 12.2f, x1, 12.2f, 0.22f, EdaLayerId::TopSilk, 1 });
+
+        // Lane 2: TMS state control
+        const float yTms = cycles[static_cast<size_t>(i)].tms ? 6.8f : 3.2f;
+        if (i > 0) {
+            const float yPrev = cycles[static_cast<size_t>(i - 1)].tms ? 6.8f : 3.2f;
+            if (yPrev != yTms) out.traces.push_back({ x0, yPrev, x0, yTms, 0.28f, EdaLayerId::InnerCopper, 2 });
+        }
+        out.traces.push_back({ x0, yTms, x1, yTms, 0.28f, EdaLayerId::InnerCopper, 2 });
+
+        // Lane 3: TDI scan-in data
+        const float yTdi = cycles[static_cast<size_t>(i)].tdi ? -3.2f : -6.8f;
+        if (i > 0) {
+            const float yPrev = cycles[static_cast<size_t>(i - 1)].tdi ? -3.2f : -6.8f;
+            if (yPrev != yTdi) out.traces.push_back({ x0, yPrev, x0, yTdi, 0.28f, EdaLayerId::TopCopper, 3 });
+        }
+        out.traces.push_back({ x0, yTdi, x1, yTdi, 0.28f, EdaLayerId::TopCopper, 3 });
+
+        // Lane 4: TDO expected scan-out (high/low when care bit active, mid-rail high-Z when masked/unused)
+        const auto& cyc = cycles[static_cast<size_t>(i)];
+        const float yTdo = cyc.hasTdo ? (cyc.tdo ? -12.2f : -15.8f) : -14.0f;
+        const float wTdo = cyc.hasTdo ? 0.28f : 0.14f;
+        if (i > 0) {
+            const auto& prevCyc = cycles[static_cast<size_t>(i - 1)];
+            const float yPrev = prevCyc.hasTdo ? (prevCyc.tdo ? -12.2f : -15.8f) : -14.0f;
+            if (yPrev != yTdo) out.traces.push_back({ x0, yPrev, x0, yTdo, 0.24f, EdaLayerId::BottomCopper, 4 });
+        }
+        out.traces.push_back({ x0, yTdo, x1, yTdo, wTdo, EdaLayerId::BottomCopper, 4 });
+    }
+    out.netCount = 4;
+}
 
 inline uint64_t ReadOasisVarUInt(const uint8_t* data, size_t size, size_t& pos) {
     uint64_t val = 0;
@@ -40,18 +249,6 @@ inline int64_t ReadOasisVarSInt(const uint8_t* data, size_t size, size_t& pos) {
     bool neg = (u & 1ULL) != 0;
     int64_t mag = static_cast<int64_t>(u >> 1);
     return neg ? -mag : mag;
-}
-
-inline void DrawGraticule(ParsedEdaBoard& out, float x0, float y0, float w, float h, int nx = 10, int ny = 8) {
-    DetailEda100::AddRectOutline(out, x0 + w * 0.5f, y0 + h * 0.5f, w, h, EdaLayerId::EdgeCuts, 0.35f);
-    for (int i = 1; i < nx; ++i) {
-        float x = x0 + (w * i) / nx;
-        out.traces.push_back({ x, y0, x, y0 + h, 0.08f, EdaLayerId::BottomSilk, 0 });
-    }
-    for (int j = 1; j < ny; ++j) {
-        float y = y0 + (h * j) / ny;
-        out.traces.push_back({ x0, y, x0 + w, y, 0.08f, EdaLayerId::BottomSilk, 0 });
-    }
 }
 
 // Parse BGA pin coordinate like "A1", "B12", "AA14" into (row, col)
@@ -1260,60 +1457,391 @@ inline bool ParseFpgaPldJtag200(const uint8_t* data, size_t size, const std::wst
         return true;
     }
 
-    // #70. JTAG Serial Vector Format (.svf / .xsvf)
-    if (ext == L".svf" || ext == L".xsvf") {
-        if (ext == L".svf" && sv.find("SDR") == std::string_view::npos && sv.find("SIR") == std::string_view::npos &&
-            sv.find("STATE") == std::string_view::npos)
-        {
-            return false;
+    // #70a. IEEE 1149.1 ASCII JTAG Serial Vector Format (.svf)
+    if (ext == L".svf") {
+        if (size == 0) return false;
+        size_t binProbe = std::min<size_t>(size, 4096);
+        for (size_t i = 0; i < binProbe; ++i) {
+            if (data[i] == 0u) return false;
         }
-        out.kind = EdaDocKind::KiCadSch;
-        out.formatTitle = (ext == L".xsvf") ? L"Compact Binary JTAG Scan Vector (.xsvf)" : L"IEEE 1149.1 JTAG Serial Vector (.svf)";
-        DetailEda200::DrawGraticule(out, -40.0f, -20.0f, 80.0f, 40.0f, 16, 4);
-        out.labels.push_back({ -46.0f, 14.0f, 1.2f, EdaLayerId::TopSilk, L"TCK" });
-        out.labels.push_back({ -46.0f,  5.0f, 1.2f, EdaLayerId::TopSilk, L"TMS" });
-        out.labels.push_back({ -46.0f, -5.0f, 1.2f, EdaLayerId::TopSilk, L"TDI" });
-        out.labels.push_back({ -46.0f,-14.0f, 1.2f, EdaLayerId::TopSilk, L"TDO" });
 
-        // Extract hex digits from first TDI (...) vector to draw real scan-chain bit transitions!
-        std::vector<int> tdiBits;
-        size_t tdiP = sv.find("TDI");
-        if (tdiP != std::string_view::npos) {
-            size_t lp = sv.find('(', tdiP), rp = sv.find(')', tdiP);
-            if (lp != std::string_view::npos && rp != std::string_view::npos && rp > lp) {
-                for (size_t k = lp + 1; k < rp && tdiBits.size() < 64; ++k) {
-                    char ch = sv[k];
-                    int nib = (ch >= '0' && ch <= '9') ? (ch - '0') :
-                              (ch >= 'A' && ch <= 'F') ? (ch - 'A' + 10) :
-                              (ch >= 'a' && ch <= 'f') ? (ch - 'a' + 10) : -1;
-                    if (nib >= 0) {
-                        for (int b = 3; b >= 0; --b) tdiBits.push_back((nib >> b) & 1);
+        // Strip '!' and '//' comments while preserving statement boundaries (';')
+        std::string cleanSvf;
+        cleanSvf.reserve(std::min<size_t>(size, 524288));
+        for (size_t i = 0; i < size && cleanSvf.size() < 524288; ++i) {
+            char c = sv[i];
+            if (c == '!' || (c == '/' && i + 1 < size && sv[i + 1] == '/')) {
+                while (i < size && sv[i] != '\n') ++i;
+                cleanSvf.push_back(' ');
+            } else {
+                cleanSvf.push_back((c >= 'a' && c <= 'z') ? static_cast<char>(c - ('a' - 'A')) : c);
+            }
+        }
+
+        auto mapSvfState = [](std::string_view tok, uint8_t& outSt) -> bool {
+            if (tok == "RESET")     { outSt = 0x00u; return true; }
+            if (tok == "IDLE")      { outSt = 0x01u; return true; }
+            if (tok == "DRSELECT")  { outSt = 0x02u; return true; }
+            if (tok == "DRCAPTURE") { outSt = 0x03u; return true; }
+            if (tok == "DRSHIFT")   { outSt = 0x04u; return true; }
+            if (tok == "DREXIT1")   { outSt = 0x05u; return true; }
+            if (tok == "DRPAUSE")   { outSt = 0x06u; return true; }
+            if (tok == "DREXIT2")   { outSt = 0x07u; return true; }
+            if (tok == "DRUPDATE")  { outSt = 0x08u; return true; }
+            if (tok == "IRSELECT")  { outSt = 0x09u; return true; }
+            if (tok == "IRCAPTURE") { outSt = 0x0Au; return true; }
+            if (tok == "IRSHIFT")   { outSt = 0x0Bu; return true; }
+            if (tok == "IREXIT1")   { outSt = 0x0Cu; return true; }
+            if (tok == "IRPAUSE")   { outSt = 0x0Du; return true; }
+            if (tok == "IREXIT2")   { outSt = 0x0Eu; return true; }
+            if (tok == "IRUPDATE")  { outSt = 0x0Fu; return true; }
+            return false;
+        };
+
+        auto parseParenHexBE = [](std::string_view stmt, std::string_view kw, uint32_t numBits, std::vector<uint8_t>& outBe) -> bool {
+            size_t kp = 0;
+            while ((kp = stmt.find(kw, kp)) != std::string_view::npos) {
+                bool leftOk = (kp == 0) || !isalnum(static_cast<unsigned char>(stmt[kp - 1]));
+                size_t afterKw = kp + kw.size();
+                bool rightOk = (afterKw >= stmt.size()) || !isalnum(static_cast<unsigned char>(stmt[afterKw]));
+                if (leftOk && rightOk) {
+                    size_t lp = stmt.find('(', afterKw);
+                    size_t rp = (lp != std::string_view::npos) ? stmt.find(')', lp + 1) : std::string_view::npos;
+                    if (lp != std::string_view::npos && rp != std::string_view::npos && rp > lp) {
+                        std::vector<uint8_t> nibs;
+                        for (size_t k = lp + 1; k < rp; ++k) {
+                            char ch = stmt[k];
+                            int nib = (ch >= '0' && ch <= '9') ? (ch - '0') :
+                                      (ch >= 'A' && ch <= 'F') ? (ch - 'A' + 10) : -1;
+                            if (nib >= 0) nibs.push_back(static_cast<uint8_t>(nib));
+                        }
+                        const size_t nb = (static_cast<size_t>(numBits) + 7u) / 8u;
+                        outBe.assign(nb, 0u);
+                        for (size_t g = 0; g < nibs.size() && (g / 2u) < nb; ++g) {
+                            uint8_t nib = nibs[nibs.size() - 1u - g];
+                            size_t byteIdx = nb - 1u - (g / 2u);
+                            if ((g & 1u) == 0u) outBe[byteIdx] |= nib;
+                            else outBe[byteIdx] |= static_cast<uint8_t>(nib << 4);
+                        }
+                        return true;
                     }
                 }
+                kp = afterKw;
             }
-        }
-        if (tdiBits.empty()) {
-            for (size_t k = 0; k < std::min<size_t>(size, 8); ++k)
-                for (int b = 7; b >= 0; --b) tdiBits.push_back((data[k] >> b) & 1);
+            return false;
+        };
+
+        DetailEda200::JtagTapTracker tap;
+        uint8_t svfEndIr = 0x01u; // IDLE
+        uint8_t svfEndDr = 0x01u; // IDLE
+        size_t validSvfCmds = 0;
+        uint64_t totalShiftedBits = 0;
+        uint32_t lastSirBits = 0, lastSdrBits = 0;
+        std::vector<uint8_t> stickySirTdi, stickySdrTdi;
+
+        size_t sPos = 0;
+        while (sPos < cleanSvf.size()) {
+            size_t semi = cleanSvf.find(';', sPos);
+            if (semi == std::string::npos) break;
+            std::string_view stmt(cleanSvf.data() + sPos, semi - sPos);
+            sPos = semi + 1;
+
+            // Tokenize leading keyword and whitespace-separated words
+            std::vector<std::string_view> toks;
+            size_t tp = 0;
+            while (tp < stmt.size() && toks.size() < 32) {
+                while (tp < stmt.size() && (stmt[tp] == ' ' || stmt[tp] == '\t' || stmt[tp] == '\r' || stmt[tp] == '\n')) ++tp;
+                if (tp >= stmt.size()) break;
+                if (stmt[tp] == '(') {
+                    size_t rp = stmt.find(')', tp + 1);
+                    if (rp == std::string_view::npos) break;
+                    tp = rp + 1;
+                    continue;
+                }
+                size_t te = tp;
+                while (te < stmt.size() && stmt[te] != ' ' && stmt[te] != '\t' && stmt[te] != '\r' && stmt[te] != '\n' && stmt[te] != '(') ++te;
+                toks.push_back(stmt.substr(tp, te - tp));
+                tp = te;
+            }
+            if (toks.empty()) continue;
+
+            std::string_view cmd = toks[0];
+            if (cmd == "SIR" || cmd == "SDR") {
+                if (toks.size() < 2) continue;
+                uint64_t bits = 0;
+                bool numOk = !toks[1].empty();
+                for (char c : toks[1]) {
+                    if (c < '0' || c > '9') { numOk = false; break; }
+                    bits = bits * 10ULL + static_cast<uint64_t>(c - '0');
+                    if (bits > 16777216ULL) { numOk = false; break; }
+                }
+                if (!numOk || bits == 0ULL) continue;
+                uint32_t nb32 = static_cast<uint32_t>(bits);
+                const size_t nBytes = (static_cast<size_t>(nb32) + 7u) / 8u;
+
+                std::vector<uint8_t> tdiBe, tdoBe, maskBe;
+                bool hasTdi = parseParenHexBE(stmt, "TDI", nb32, tdiBe);
+                bool hasTdo = parseParenHexBE(stmt, "TDO", nb32, tdoBe);
+                bool hasMask = parseParenHexBE(stmt, "MASK", nb32, maskBe);
+
+                if (cmd == "SIR") {
+                    if (hasTdi) { stickySirTdi = tdiBe; lastSirBits = nb32; }
+                    else if (lastSirBits == nb32 && stickySirTdi.size() == nBytes) tdiBe = stickySirTdi;
+                    else tdiBe.assign(nBytes, 0u);
+                    tap.ShiftBytesBE(0x0Bu, svfEndIr, nb32, tdiBe.data(),
+                        hasTdo ? tdoBe.data() : nullptr, hasMask ? &maskBe : nullptr, true);
+                } else {
+                    if (hasTdi) { stickySdrTdi = tdiBe; lastSdrBits = nb32; }
+                    else if (lastSdrBits == nb32 && stickySdrTdi.size() == nBytes) tdiBe = stickySdrTdi;
+                    else tdiBe.assign(nBytes, 0u);
+                    tap.ShiftBytesBE(0x04u, svfEndDr, nb32, tdiBe.data(),
+                        hasTdo ? tdoBe.data() : nullptr, hasMask ? &maskBe : nullptr, true);
+                }
+                totalShiftedBits += nb32;
+                ++validSvfCmds;
+            } else if (cmd == "STATE") {
+                bool anySt = false;
+                for (size_t i = 1; i < toks.size(); ++i) {
+                    uint8_t st = 0;
+                    if (mapSvfState(toks[i], st)) {
+                        tap.StepTo(st, true);
+                        anySt = true;
+                    }
+                }
+                if (anySt) ++validSvfCmds;
+            } else if (cmd == "ENDIR" && toks.size() >= 2) {
+                uint8_t st = 0;
+                if (mapSvfState(toks[1], st)) { svfEndIr = st; ++validSvfCmds; }
+            } else if (cmd == "ENDDR" && toks.size() >= 2) {
+                uint8_t st = 0;
+                if (mapSvfState(toks[1], st)) { svfEndDr = st; ++validSvfCmds; }
+            } else if (cmd == "RUNTEST" && toks.size() >= 2) {
+                uint8_t runSt = 0x01u;
+                size_t idx = 1;
+                if (mapSvfState(toks[idx], runSt)) ++idx;
+                uint32_t clks = 4u;
+                if (idx < toks.size()) {
+                    char* ep = nullptr;
+                    std::string ns(toks[idx]);
+                    unsigned long v = std::strtoul(ns.c_str(), &ep, 10);
+                    if (ep != ns.c_str() && v > 0UL) clks = static_cast<uint32_t>(std::min<unsigned long>(v, 8UL));
+                }
+                tap.EmitIdleClocks(clks, runSt);
+                ++validSvfCmds;
+            } else if (cmd == "TRST" || cmd == "FREQUENCY" || cmd == "HIR" || cmd == "HDR" ||
+                       cmd == "TIR" || cmd == "TDR" || cmd == "PIO" || cmd == "PIOMAP")
+            {
+                if (cmd == "TRST") tap.StepTo(0x00u, true);
+                ++validSvfCmds;
+            }
         }
 
-        int n = std::min<int>(32, static_cast<int>(tdiBits.size()));
-        float step = 76.0f / std::max(1, n);
-        for (int i = 0; i < n; ++i) {
-            float x0 = -38.0f + i * step, xm = x0 + step * 0.5f, x1 = x0 + step;
-            // TCK clock wave
-            out.traces.push_back({ x0, 12.0f, x0, 16.0f, 0.25f, EdaLayerId::TopSilk, 1 });
-            out.traces.push_back({ x0, 16.0f, xm, 16.0f, 0.25f, EdaLayerId::TopSilk, 1 });
-            out.traces.push_back({ xm, 16.0f, xm, 12.0f, 0.25f, EdaLayerId::TopSilk, 1 });
-            out.traces.push_back({ xm, 12.0f, x1, 12.0f, 0.25f, EdaLayerId::TopSilk, 1 });
-            // TDI data wave
-            float yCur = tdiBits[i] ? -3.0f : -7.0f;
-            if (i > 0) {
-                float yPrev = tdiBits[i - 1] ? -3.0f : -7.0f;
-                if (yPrev != yCur) out.traces.push_back({ x0, yPrev, x0, yCur, 0.30f, EdaLayerId::TopCopper, 2 });
+        if (validSvfCmds == 0 || tap.cycles.empty()) return false;
+
+        out.kind = EdaDocKind::KiCadSch;
+        out.formatTitle = L"IEEE 1149.1 JTAG Serial Vector (.svf)";
+        DetailEda200::RenderJtag4LaneWaveforms(out, tap.cycles,
+            L"IEEE 1149.1 SVF (" + std::to_wstring(validSvfCmds) + L" cmds, " + std::to_wstring(totalShiftedBits) + L" bits)");
+        return true;
+    }
+
+    // #70b. Xilinx XAPP503 Binary JTAG Scan Vector (.xsvf)
+    if (ext == L".xsvf") {
+        if (size == 0) return false;
+
+        auto bytesForBits = [](uint32_t bits) -> size_t {
+            return (static_cast<size_t>(bits) + 7u) / 8u;
+        };
+        auto popcntByte = [](uint8_t v) -> uint32_t {
+            v = static_cast<uint8_t>((v & 0x55u) + ((v >> 1) & 0x55u));
+            v = static_cast<uint8_t>((v & 0x33u) + ((v >> 2) & 0x33u));
+            return static_cast<uint32_t>((v + (v >> 4)) & 0x0Fu);
+        };
+
+        DetailEda200::JtagTapTracker tap;
+        uint32_t xsdrSizeBits = 0;
+        uint8_t xrepeat = 32;
+        uint8_t xendir = 0; // 0 = Run-Test/Idle (0x01), 1 = Pause-IR (0x0D)
+        uint8_t xenddr = 0; // 0 = Run-Test/Idle (0x01), 1 = Pause-DR (0x06)
+        uint32_t dataMaskOnes = 0;
+        std::vector<uint8_t> tdoMask;
+        size_t shiftOrStateCmds = 0;
+        size_t totalOpcodes = 0;
+        uint64_t totalShiftedBits = 0;
+        std::string firstComment;
+
+        size_t pos = 0;
+        while (pos < size) {
+            uint8_t op = data[pos++];
+            ++totalOpcodes;
+
+            if (op == 0x00u) { // XCOMPLETE — clean end of XAPP503 stream
+                break;
+            } else if (op == 0x01u) { // XTDOMASK
+                size_t nb = bytesForBits(xsdrSizeBits);
+                if (nb > size - pos) return false;
+                tdoMask.assign(data + pos, data + pos + nb);
+                pos += nb;
+            } else if (op == 0x02u) { // XSIR (1B lengthBits + TDI)
+                if (1u > size - pos) return false;
+                uint8_t lenBits = data[pos++];
+                if (lenBits == 0u) return false;
+                size_t nb = bytesForBits(lenBits);
+                if (nb > size - pos) return false;
+                tap.ShiftBytesBE(0x0Bu, xendir ? 0x0Du : 0x01u, lenBits, data + pos, nullptr, nullptr, true);
+                pos += nb;
+                totalShiftedBits += lenBits;
+                ++shiftOrStateCmds;
+            } else if (op == 0x03u) { // XSDR
+                if (xsdrSizeBits == 0u) return false;
+                size_t nb = bytesForBits(xsdrSizeBits);
+                if (nb > size - pos) return false;
+                tap.ShiftBytesBE(0x04u, xenddr ? 0x06u : 0x01u, xsdrSizeBits, data + pos, nullptr, nullptr, true);
+                pos += nb;
+                totalShiftedBits += xsdrSizeBits;
+                ++shiftOrStateCmds;
+            } else if (op == 0x04u) { // XRUNTEST (4B uint32 BE)
+                if (4u > size - pos) return false;
+                uint32_t runClks = DetailEda200::RdU32BE(data + pos);
+                pos += 4u;
+                if (runClks > 0u) {
+                    tap.EmitIdleClocks(runClks, 0x01u);
+                }
+            } else if (op == 0x07u) { // XREPEAT (1B)
+                if (1u > size - pos) return false;
+                xrepeat = data[pos++];
+                (void)xrepeat;
+            } else if (op == 0x08u) { // XSDRSIZE (4B uint32 BE)
+                if (4u > size - pos) return false;
+                xsdrSizeBits = DetailEda200::RdU32BE(data + pos);
+                pos += 4u;
+                if (xsdrSizeBits > 16777216u) return false;
+            } else if (op == 0x09u) { // XSDRTDO (TDI + TDO expected)
+                if (xsdrSizeBits == 0u) return false;
+                size_t nb = bytesForBits(xsdrSizeBits);
+                if (nb > (size - pos) / 2u) return false;
+                tap.ShiftBytesBE(0x04u, xenddr ? 0x06u : 0x01u, xsdrSizeBits,
+                    data + pos, data + pos + nb, &tdoMask, true);
+                pos += nb * 2u;
+                totalShiftedBits += xsdrSizeBits;
+                ++shiftOrStateCmds;
+            } else if (op == 0x0Au) { // XSETSDRMASKS (addrMask + dataMask)
+                size_t nb = bytesForBits(xsdrSizeBits);
+                if (nb > (size - pos) / 2u) return false;
+                const uint8_t* dMask = data + pos + nb;
+                dataMaskOnes = 0;
+                for (size_t i = 0; i < nb; ++i) {
+                    uint8_t mb = dMask[i];
+                    if (i == 0 && (xsdrSizeBits & 7u) != 0u) {
+                        mb &= static_cast<uint8_t>((1u << (xsdrSizeBits & 7u)) - 1u);
+                    }
+                    dataMaskOnes += popcntByte(mb);
+                }
+                pos += nb * 2u;
+            } else if (op == 0x0Bu) { // XSDRINC (startVal + 1B numTimes + numTimes * bytes(dataMaskOnes))
+                if (xsdrSizeBits == 0u) return false;
+                size_t nb = bytesForBits(xsdrSizeBits);
+                if (nb + 1u > size - pos) return false;
+                const uint8_t* startVal = data + pos;
+                pos += nb;
+                uint8_t numTimes = data[pos++];
+                size_t incBytes = bytesForBits(dataMaskOnes);
+                if (incBytes > 0u && static_cast<size_t>(numTimes) > (size - pos) / incBytes) return false;
+                tap.ShiftBytesBE(0x04u, xenddr ? 0x06u : 0x01u, xsdrSizeBits, startVal, nullptr, nullptr, true);
+                pos += static_cast<size_t>(numTimes) * incBytes;
+                totalShiftedBits += static_cast<uint64_t>(xsdrSizeBits) * (1ULL + static_cast<uint64_t>(numTimes));
+                ++shiftOrStateCmds;
+            } else if (op == 0x0Cu || op == 0x0Du || op == 0x0Eu) { // XSDRB, XSDRC, XSDRE
+                if (xsdrSizeBits == 0u) return false;
+                size_t nb = bytesForBits(xsdrSizeBits);
+                if (nb > size - pos) return false;
+                bool exitOnLast = (op == 0x0Eu);
+                tap.ShiftBytesBE(0x04u, xenddr ? 0x06u : 0x01u, xsdrSizeBits, data + pos, nullptr, nullptr, exitOnLast);
+                pos += nb;
+                totalShiftedBits += xsdrSizeBits;
+                ++shiftOrStateCmds;
+            } else if (op == 0x0Fu || op == 0x10u || op == 0x11u) { // XSDRTDOB, XSDRTDOC, XSDRTDOE
+                if (xsdrSizeBits == 0u) return false;
+                size_t nb = bytesForBits(xsdrSizeBits);
+                if (nb > (size - pos) / 2u) return false;
+                bool exitOnLast = (op == 0x11u);
+                tap.ShiftBytesBE(0x04u, xenddr ? 0x06u : 0x01u, xsdrSizeBits,
+                    data + pos, data + pos + nb, &tdoMask, exitOnLast);
+                pos += nb * 2u;
+                totalShiftedBits += xsdrSizeBits;
+                ++shiftOrStateCmds;
+            } else if (op == 0x12u) { // XSTATE (1B TAP state 0x00..0x0F)
+                if (1u > size - pos) return false;
+                uint8_t st = data[pos++];
+                if (st > 0x0Fu) return false;
+                tap.StepTo(st, true);
+                ++shiftOrStateCmds;
+            } else if (op == 0x13u) { // XENDIR (1B: 0 or 1)
+                if (1u > size - pos) return false;
+                uint8_t v = data[pos++];
+                if (v > 1u) return false;
+                xendir = v;
+            } else if (op == 0x14u) { // XENDDR (1B: 0 or 1)
+                if (1u > size - pos) return false;
+                uint8_t v = data[pos++];
+                if (v > 1u) return false;
+                xenddr = v;
+            } else if (op == 0x15u) { // XSIR2 (2B uint16 BE lengthBits + TDI)
+                if (2u > size - pos) return false;
+                uint16_t lenBits = DetailEda200::RdU16BE(data + pos);
+                pos += 2u;
+                if (lenBits == 0u) return false;
+                size_t nb = bytesForBits(lenBits);
+                if (nb > size - pos) return false;
+                tap.ShiftBytesBE(0x0Bu, xendir ? 0x0Du : 0x01u, lenBits, data + pos, nullptr, nullptr, true);
+                pos += nb;
+                totalShiftedBits += lenBits;
+                ++shiftOrStateCmds;
+            } else if (op == 0x16u) { // XCOMMENT (NUL-terminated ASCII string)
+                size_t nulPos = pos;
+                while (nulPos < size && data[nulPos] != 0u) ++nulPos;
+                if (nulPos >= size) return false;
+                if (firstComment.empty() && nulPos > pos) {
+                    size_t take = std::min<size_t>(nulPos - pos, 48u);
+                    firstComment.assign(reinterpret_cast<const char*>(data + pos), take);
+                }
+                pos = nulPos + 1u;
+            } else if (op == 0x17u) { // XWAIT (1B waitState + 1B endState + 4B uint32 BE waitTimeUs)
+                if (6u > size - pos) return false;
+                uint8_t waitSt = data[pos];
+                uint8_t endSt  = data[pos + 1];
+                uint32_t waitUs = DetailEda200::RdU32BE(data + pos + 2);
+                pos += 6u;
+                if (waitSt > 0x0Fu || endSt > 0x0Fu) return false;
+                tap.EmitIdleClocks(waitUs > 0u ? 4u : 1u, waitSt);
+                tap.StepTo(endSt, false);
+                ++shiftOrStateCmds;
+            } else if (op == 0x18u) { // XWAITSTATE (Lattice/ispVM: 1B waitState + 1B endState + 4B clocks + 4B usec)
+                if (10u > size - pos) return false;
+                uint8_t waitSt = data[pos];
+                uint8_t endSt  = data[pos + 1];
+                uint32_t clks  = DetailEda200::RdU32BE(data + pos + 2);
+                pos += 10u;
+                if (waitSt > 0x0Fu || endSt > 0x0Fu) return false;
+                tap.EmitIdleClocks(std::max<uint32_t>(clks, 1u), waitSt);
+                tap.StepTo(endSt, false);
+                ++shiftOrStateCmds;
+            } else {
+                // Unknown or reserved opcode (0x05, 0x06, >= 0x19) -> strictly reject
+                return false;
             }
-            out.traces.push_back({ x0, yCur, x1, yCur, 0.30f, EdaLayerId::TopCopper, 2 });
         }
+
+        if (shiftOrStateCmds == 0 || tap.cycles.empty()) return false;
+
+        out.kind = EdaDocKind::KiCadSch;
+        out.formatTitle = L"Xilinx XAPP503 Binary JTAG Scan Vector (.xsvf)";
+        std::wstring summary = L"XAPP503 XSVF (" + std::to_wstring(totalOpcodes) + L" ops, " +
+                               std::to_wstring(totalShiftedBits) + L" bits)";
+        if (!firstComment.empty()) {
+            summary += L" - " + PathUtils::Utf8ToWide(firstComment);
+        }
+        DetailEda200::RenderJtag4LaneWaveforms(out, tap.cycles, summary);
         return true;
     }
 
@@ -1494,49 +2022,565 @@ inline bool ParseLogicScopeAutoPlc200(const uint8_t* data, size_t size, const st
         return true;
     }
 
-    // #72. Saleae Logic 2 Capture (.sal — ZIP with meta.json + digital-0.bin "<SALEAE>")
+    // #72. Saleae Logic 2 Capture (.sal — ZIP with optional meta.json + digital-<N>.bin & analog-<N>.bin "<SALEAE>")
     if (ext == L".sal") {
-        if (size < 4 || data[0] != 'P' || data[1] != 'K') return false;
-        std::vector<uint8_t> metaJson, dig0;
-        ZipDeflate::ExtractZipEntryFromMemory(data, size, "meta.json", metaJson);
-        ZipDeflate::ExtractZipEntryFromMemory(data, size, "digital-0.bin", dig0);
-        if (metaJson.empty() && dig0.empty()) return false;
+        if (size < 22 || data[0] != 'P' || data[1] != 'K') return false;
+
+        std::vector<ZipDeflate::ArchiveItemMeta> zEntries;
+        if (!ZipDeflate::ListZipEntriesFromMemory(data, size, zEntries) || zEntries.empty()) {
+            return false;
+        }
+
+        auto wideToUtf8Local = [](std::wstring_view w) -> std::string {
+            std::string outS;
+            outS.reserve(w.size());
+            for (size_t i = 0; i < w.size(); ++i) {
+                uint32_t cp = static_cast<uint16_t>(w[i]);
+                if (cp >= 0xD800u && cp <= 0xDBFFu && i + 1 < w.size()) {
+                    uint32_t lo = static_cast<uint16_t>(w[i + 1]);
+                    if (lo >= 0xDC00u && lo <= 0xDFFFu) {
+                        cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u));
+                        ++i;
+                    }
+                }
+                if (cp < 0x80u) {
+                    outS.push_back(static_cast<char>(cp));
+                } else if (cp < 0x800u) {
+                    outS.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+                    outS.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+                } else if (cp < 0x10000u) {
+                    outS.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+                    outS.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+                    outS.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+                } else {
+                    outS.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+                    outS.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+                    outS.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+                    outS.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+                }
+            }
+            return outS;
+        };
+
+        auto metaEntryUtf8 = [&](const auto& item) -> std::string {
+            if constexpr (requires { item.relativePath; }) {
+                if constexpr (requires { std::string_view(item.relativePath); }) return std::string(std::string_view(item.relativePath));
+                else return wideToUtf8Local(item.relativePath);
+            } else if constexpr (requires { item.name; }) {
+                if constexpr (requires { std::string_view(item.name); }) return std::string(std::string_view(item.name));
+                else return wideToUtf8Local(item.name);
+            } else if constexpr (requires { item.path; }) {
+                if constexpr (requires { std::string_view(item.path); }) return std::string(std::string_view(item.path));
+                else return wideToUtf8Local(item.path);
+            } else if constexpr (requires { item.fileName; }) {
+                if constexpr (requires { std::string_view(item.fileName); }) return std::string(std::string_view(item.fileName));
+                else return wideToUtf8Local(item.fileName);
+            } else {
+                return {};
+            }
+        };
+
+        struct SalFileEntry {
+            int chIdx = 0;
+            std::string entryName;
+        };
+        std::string metaEntryName;
+        std::vector<SalFileEntry> digFiles;
+        std::vector<SalFileEntry> anaFiles;
+
+        auto parseChNum = [](std::string_view s, int& outIdx) -> bool {
+            if (s.empty() || s.size() > 4) return false;
+            int val = 0;
+            for (char c : s) {
+                if (c < '0' || c > '9') return false;
+                val = val * 10 + (c - '0');
+            }
+            outIdx = val;
+            return val >= 0 && val <= 1024;
+        };
+
+        for (const auto& ze : zEntries) {
+            std::string fullName = metaEntryUtf8(ze);
+            if (fullName.empty()) continue;
+            size_t sl = fullName.find_last_of("/\\");
+            std::string_view base = (sl == std::string::npos) ? std::string_view(fullName) : std::string_view(fullName).substr(sl + 1);
+            if (base.empty()) continue;
+
+            std::string baseLower(base);
+            for (char& c : baseLower) {
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+            }
+
+            if (baseLower == "meta.json") {
+                metaEntryName = fullName;
+            } else if (baseLower.size() > 12 && baseLower.rfind("digital-", 0) == 0 && baseLower.substr(baseLower.size() - 4) == ".bin") {
+                int idx = 0;
+                if (!parseChNum(std::string_view(baseLower).substr(8, baseLower.size() - 12), idx)) return false;
+                digFiles.push_back({ idx, fullName });
+            } else if (baseLower.size() > 11 && baseLower.rfind("analog-", 0) == 0 && baseLower.substr(baseLower.size() - 4) == ".bin") {
+                int idx = 0;
+                if (!parseChNum(std::string_view(baseLower).substr(7, baseLower.size() - 11), idx)) return false;
+                anaFiles.push_back({ idx, fullName });
+            }
+        }
+
+        // Strictly reject .sal ZIPs without any digital-*.bin or analog-*.bin channel streams
+        if (digFiles.empty() && anaFiles.empty()) return false;
+
+        auto sortAndDedup = [](std::vector<SalFileEntry>& vec) {
+            std::sort(vec.begin(), vec.end(), [](const SalFileEntry& a, const SalFileEntry& b) {
+                return a.chIdx < b.chIdx;
+            });
+            vec.erase(std::unique(vec.begin(), vec.end(), [](const SalFileEntry& a, const SalFileEntry& b) {
+                return a.chIdx == b.chIdx;
+            }), vec.end());
+        };
+        sortAndDedup(digFiles);
+        sortAndDedup(anaFiles);
+
+        // Parse optional meta.json for custom channel names and sample rates
+        std::wstring digCustomNames[64];
+        std::wstring anaCustomNames[64];
+        std::wstring anyCustomNames[64];
+        uint64_t metaDigitalRateHz = 0;
+
+        if (!metaEntryName.empty()) {
+            std::vector<uint8_t> metaBytes;
+            if (ZipDeflate::ExtractZipEntryFromMemory(data, size, metaEntryName.c_str(), metaBytes) && !metaBytes.empty()) {
+                std::string_view msv(reinterpret_cast<const char*>(metaBytes.data()), metaBytes.size());
+
+                auto extractJsonStr = [](std::string_view obj, std::string_view key, std::string& outVal) -> bool {
+                    size_t pos = 0;
+                    while (pos < obj.size()) {
+                        size_t q = obj.find('"', pos);
+                        if (q == std::string_view::npos || q + key.size() + 1 >= obj.size()) return false;
+                        if (obj.substr(q + 1, key.size()) == key && obj[q + 1 + key.size()] == '"') {
+                            size_t p = q + 2 + key.size();
+                            while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
+                            if (p < obj.size() && obj[p] == ':') {
+                                ++p;
+                                while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
+                                if (p < obj.size() && obj[p] == '"') {
+                                    ++p;
+                                    std::string res;
+                                    while (p < obj.size() && obj[p] != '"') {
+                                        if (obj[p] == '\\' && p + 1 < obj.size()) ++p;
+                                        res.push_back(obj[p++]);
+                                    }
+                                    outVal = std::move(res);
+                                    return true;
+                                }
+                            }
+                        }
+                        pos = q + 1;
+                    }
+                    return false;
+                };
+
+                auto extractJsonInt = [](std::string_view obj, std::string_view key, int64_t& outVal) -> bool {
+                    size_t pos = 0;
+                    while (pos < obj.size()) {
+                        size_t q = obj.find('"', pos);
+                        if (q == std::string_view::npos || q + key.size() + 1 >= obj.size()) return false;
+                        if (obj.substr(q + 1, key.size()) == key && obj[q + 1 + key.size()] == '"') {
+                            size_t p = q + 2 + key.size();
+                            while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
+                            if (p < obj.size() && obj[p] == ':') {
+                                ++p;
+                                while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
+                                if (p < obj.size() && ((obj[p] >= '0' && obj[p] <= '9') || obj[p] == '-')) {
+                                    bool neg = (obj[p] == '-');
+                                    if (neg) ++p;
+                                    if (p >= obj.size() || obj[p] < '0' || obj[p] > '9') return false;
+                                    int64_t v = 0;
+                                    while (p < obj.size() && obj[p] >= '0' && obj[p] <= '9') {
+                                        v = v * 10 + (obj[p++] - '0');
+                                    }
+                                    outVal = neg ? -v : v;
+                                    return true;
+                                }
+                            }
+                        }
+                        pos = q + 1;
+                    }
+                    return false;
+                };
+
+                int64_t srVal = 0;
+                if (extractJsonInt(msv, "digital", srVal) && srVal > 0) {
+                    metaDigitalRateHz = static_cast<uint64_t>(srVal);
+                } else if (extractJsonInt(msv, "sampleRate", srVal) && srVal > 0) {
+                    metaDigitalRateHz = static_cast<uint64_t>(srVal);
+                }
+
+                // Scan shallow JSON objects { ... } containing "name" + channel index
+                bool inQuote = false;
+                for (size_t i = 0; i < msv.size(); ++i) {
+                    char c = msv[i];
+                    if (c == '"' && (i == 0 || msv[i - 1] != '\\')) {
+                        inQuote = !inQuote;
+                        continue;
+                    }
+                    if (inQuote || c != '{') continue;
+
+                    int depth = 1;
+                    int nestedObjs = 0;
+                    bool qInner = false;
+                    size_t j = i + 1;
+                    for (; j < msv.size() && (j - i) <= 1024; ++j) {
+                        char cj = msv[j];
+                        if (cj == '"' && msv[j - 1] != '\\') {
+                            qInner = !qInner;
+                            continue;
+                        }
+                        if (qInner) continue;
+                        if (cj == '{') { ++depth; ++nestedObjs; }
+                        else if (cj == '}') {
+                            --depth;
+                            if (depth == 0) break;
+                        }
+                    }
+                    if (depth != 0 || nestedObjs > 1) continue;
+
+                    std::string_view obj = msv.substr(i, j - i + 1);
+                    std::string nmStr;
+                    if (!extractJsonStr(obj, "name", nmStr) || nmStr.empty()) continue;
+
+                    int64_t chIdx64 = -1;
+                    if (!extractJsonInt(obj, "index", chIdx64)) {
+                        if (!extractJsonInt(obj, "deviceChannel", chIdx64)) {
+                            extractJsonInt(obj, "channel", chIdx64);
+                        }
+                    }
+                    if (chIdx64 < 0 || chIdx64 >= 64) continue;
+
+                    int kind = -1; // 0 = digital, 1 = analog
+                    std::string typeStr;
+                    if (extractJsonStr(obj, "type", typeStr)) {
+                        for (char& tc : typeStr) {
+                            if (tc >= 'A' && tc <= 'Z') tc = static_cast<char>(tc + ('a' - 'A'));
+                        }
+                        if (typeStr.find("analog") != std::string::npos || typeStr == "1") kind = 1;
+                        else if (typeStr.find("digital") != std::string::npos || typeStr == "0") kind = 0;
+                    }
+                    if (kind < 0) {
+                        size_t ctxStart = (i > 200) ? (i - 200) : 0;
+                        std::string ctxLower(msv.substr(ctxStart, i - ctxStart));
+                        for (char& tc : ctxLower) {
+                            if (tc >= 'A' && tc <= 'Z') tc = static_cast<char>(tc + ('a' - 'A'));
+                        }
+                        size_t pAna = ctxLower.rfind("analog");
+                        size_t pDig = ctxLower.rfind("digital");
+                        if (pAna != std::string::npos && (pDig == std::string::npos || pAna > pDig)) kind = 1;
+                        else if (pDig != std::string::npos) kind = 0;
+                    }
+
+                    std::wstring wName = PathUtils::Utf8ToWide(nmStr);
+                    if (kind == 0) digCustomNames[chIdx64] = wName;
+                    else if (kind == 1) anaCustomNames[chIdx64] = wName;
+                    else anyCustomNames[chIdx64] = wName;
+                }
+            }
+        }
+
+        // Decode digital-<N>.bin channels ("<SALEAE>", version 0/1, type == 0)
+        struct SalDigitalChannel {
+            int chIdx = 0;
+            std::wstring label;
+            uint32_t initialState = 0;
+            double beginTime = 0.0;
+            double endTime = 0.0;
+            uint64_t numTransitions = 0;
+            std::vector<std::pair<double, uint8_t>> edges; // (timestamp, stateAfterEdge)
+        };
+        struct SalAnalogChannel {
+            int chIdx = 0;
+            std::wstring label;
+            double beginTime = 0.0;
+            double endTime = 0.0;
+            uint64_t sampleRate = 0;
+            uint64_t downsample = 1;
+            uint64_t numSamples = 0;
+            float vMin = 0.0f;
+            float vMax = 0.0f;
+            std::vector<float> samples;
+        };
+
+        std::vector<SalDigitalChannel> digChannels;
+        std::vector<SalAnalogChannel> anaChannels;
+
+        for (const auto& df : digFiles) {
+            std::vector<uint8_t> dig;
+            if (!ZipDeflate::ExtractZipEntryFromMemory(data, size, df.entryName.c_str(), dig)) return false;
+            if (dig.size() < 44u || std::memcmp(dig.data(), "<SALEAE>", 8) != 0) return false;
+
+            int32_t ver  = static_cast<int32_t>(DetailEda200::RdU32LE(dig.data() + 8));
+            int32_t type = static_cast<int32_t>(DetailEda200::RdU32LE(dig.data() + 12));
+            if (type != 0 || (ver != 0 && ver != 1)) return false;
+
+            auto tryParseChunkHeader = [&](size_t hdrOff, uint32_t& outInit, double& outBegin, double& outEnd, uint64_t& outTrans, size_t& outDataOff) -> bool {
+                if (hdrOff + 28u > dig.size()) return false;
+                uint32_t initRaw = DetailEda200::RdU32LE(dig.data() + hdrOff);
+                if (initRaw > 1u) return false;
+                double bt = 0.0, et = 0.0;
+                std::memcpy(&bt, dig.data() + hdrOff + 4u, 8);
+                std::memcpy(&et, dig.data() + hdrOff + 12u, 8);
+                if (!std::isfinite(bt) || !std::isfinite(et) || bt > et) return false;
+                uint64_t nt = DetailEda200::RdU64LE(dig.data() + hdrOff + 20u);
+                size_t dataOff = hdrOff + 28u;
+                if (nt > (dig.size() - dataOff) / 8u) return false;
+                outInit = initRaw;
+                outBegin = bt;
+                outEnd = et;
+                outTrans = nt;
+                outDataOff = dataOff;
+                return true;
+            };
+
+            uint32_t initState = 0;
+            double bTime = 0.0, eTime = 0.0;
+            uint64_t nTrans = 0;
+            size_t transOff = 44u;
+
+            if (ver == 0) {
+                if (!tryParseChunkHeader(16u, initState, bTime, eTime, nTrans, transOff)) return false;
+            } else {
+                // Version 1: either direct chunk header at +16 or uint64 numChunks at +16 followed by chunk header at +24
+                if (!tryParseChunkHeader(16u, initState, bTime, eTime, nTrans, transOff)) {
+                    if (dig.size() < 52u) return false;
+                    uint64_t numChunks = DetailEda200::RdU64LE(dig.data() + 16u);
+                    if (numChunks == 0ULL || numChunks > 65536ULL) return false;
+                    if (!tryParseChunkHeader(24u, initState, bTime, eTime, nTrans, transOff)) return false;
+                }
+            }
+
+            SalDigitalChannel ch;
+            ch.chIdx = df.chIdx;
+            ch.initialState = initState & 1u;
+            ch.beginTime = bTime;
+            ch.endTime = eTime;
+            ch.numTransitions = nTrans;
+
+            std::wstring baseLbl = L"D" + std::to_wstring(df.chIdx);
+            if (df.chIdx >= 0 && df.chIdx < 64) {
+                const std::wstring& cname = !digCustomNames[df.chIdx].empty() ? digCustomNames[df.chIdx] : anyCustomNames[df.chIdx];
+                if (!cname.empty() && cname != baseLbl) baseLbl += L":" + cname;
+            }
+            ch.label = std::move(baseLbl);
+
+            const uint64_t maxEdges = 512ULL;
+            const uint64_t step = (nTrans > maxEdges) ? std::max<uint64_t>(1ULL, nTrans / maxEdges) : 1ULL;
+            ch.edges.reserve(static_cast<size_t>(std::min<uint64_t>(nTrans, maxEdges + 2ULL)));
+
+            for (uint64_t t = 0; t < nTrans; t += step) {
+                double ts = 0.0;
+                std::memcpy(&ts, dig.data() + transOff + static_cast<size_t>(t) * 8u, 8);
+                if (!std::isfinite(ts)) return false;
+                // After transition index t (0-based), state is initialState ^ ((t + 1) & 1)
+                uint8_t stAfter = static_cast<uint8_t>((ch.initialState ^ static_cast<uint32_t>((t + 1ULL) & 1ULL)) & 1u);
+                ch.edges.push_back({ ts, stAfter });
+                if (ts < ch.beginTime) ch.beginTime = ts;
+                if (ts > ch.endTime) ch.endTime = ts;
+            }
+
+            if (digChannels.size() < 16u) {
+                digChannels.push_back(std::move(ch));
+            }
+        }
+
+        // Decode analog-<N>.bin channels ("<SALEAE>", version 0/1, type == 1)
+        for (const auto& af : anaFiles) {
+            std::vector<uint8_t> ana;
+            if (!ZipDeflate::ExtractZipEntryFromMemory(data, size, af.entryName.c_str(), ana)) return false;
+            if (ana.size() < 48u || std::memcmp(ana.data(), "<SALEAE>", 8) != 0) return false;
+
+            int32_t ver  = static_cast<int32_t>(DetailEda200::RdU32LE(ana.data() + 8));
+            int32_t type = static_cast<int32_t>(DetailEda200::RdU32LE(ana.data() + 12));
+            if (type != 1 || (ver != 0 && ver != 1)) return false;
+
+            double bTime = 0.0;
+            std::memcpy(&bTime, ana.data() + 16u, 8);
+            uint64_t sRate = DetailEda200::RdU64LE(ana.data() + 24u);
+            uint64_t down  = DetailEda200::RdU64LE(ana.data() + 32u);
+            uint64_t nSamp = DetailEda200::RdU64LE(ana.data() + 40u);
+
+            if (!std::isfinite(bTime) || sRate == 0ULL || nSamp == 0ULL) return false;
+            if (nSamp > (ana.size() - 48u) / 4u) return false;
+
+            double effRate = static_cast<double>(sRate) / static_cast<double>(std::max<uint64_t>(1ULL, down));
+            if (!std::isfinite(effRate) || effRate <= 0.0) return false;
+
+            SalAnalogChannel ch;
+            ch.chIdx = af.chIdx;
+            ch.beginTime = bTime;
+            ch.sampleRate = sRate;
+            ch.downsample = std::max<uint64_t>(1ULL, down);
+            ch.numSamples = nSamp;
+            ch.endTime = bTime + ((nSamp > 1ULL) ? (static_cast<double>(nSamp - 1ULL) / effRate) : (1.0 / effRate));
+
+            std::wstring baseLbl = L"A" + std::to_wstring(af.chIdx);
+            if (af.chIdx >= 0 && af.chIdx < 64) {
+                const std::wstring& cname = !anaCustomNames[af.chIdx].empty() ? anaCustomNames[af.chIdx]
+                                          : (digFiles.empty() ? anyCustomNames[af.chIdx] : std::wstring{});
+                if (!cname.empty() && cname != baseLbl) baseLbl += L":" + cname;
+            }
+            ch.label = std::move(baseLbl);
+
+            const size_t maxPlotPts = 512u;
+            const uint64_t step = (nSamp > maxPlotPts) ? std::max<uint64_t>(1ULL, (nSamp - 1ULL) / (maxPlotPts - 1ULL)) : 1ULL;
+            ch.samples.reserve(static_cast<size_t>(std::min<uint64_t>(nSamp, static_cast<uint64_t>(maxPlotPts) + 2ULL)));
+
+            float vMin =  1e30f;
+            float vMax = -1e30f;
+            for (uint64_t s = 0; s < nSamp && ch.samples.size() < maxPlotPts; s += step) {
+                float fv = 0.0f;
+                std::memcpy(&fv, ana.data() + 48u + static_cast<size_t>(s) * 4u, 4);
+                if (!std::isfinite(fv)) return false;
+                vMin = std::min(vMin, fv);
+                vMax = std::max(vMax, fv);
+                ch.samples.push_back(fv);
+            }
+            if (nSamp > 1ULL) {
+                float lastFv = 0.0f;
+                std::memcpy(&lastFv, ana.data() + 48u + static_cast<size_t>(nSamp - 1ULL) * 4u, 4);
+                if (!std::isfinite(lastFv)) return false;
+                vMin = std::min(vMin, lastFv);
+                vMax = std::max(vMax, lastFv);
+                if (ch.samples.back() != lastFv && ch.samples.size() < maxPlotPts + 1u) {
+                    ch.samples.push_back(lastFv);
+                }
+            }
+            ch.vMin = (vMin <= vMax) ? vMin : 0.0f;
+            ch.vMax = (vMin <= vMax) ? vMax : 0.0f;
+
+            if (digChannels.size() + anaChannels.size() < 16u) {
+                anaChannels.push_back(std::move(ch));
+            }
+        }
+
+        const size_t totalCh = digChannels.size() + anaChannels.size();
+        if (totalCh == 0u) return false;
+
+        // Compute unified global [globalTMin, globalTMax] time window across all digital & analog channels
+        double globalTMin =  1e300;
+        double globalTMax = -1e300;
+        for (const auto& dc : digChannels) {
+            globalTMin = std::min(globalTMin, dc.beginTime);
+            globalTMax = std::max(globalTMax, dc.endTime);
+        }
+        for (const auto& ac : anaChannels) {
+            globalTMin = std::min(globalTMin, ac.beginTime);
+            globalTMax = std::max(globalTMax, ac.endTime);
+        }
+        if (!std::isfinite(globalTMin) || !std::isfinite(globalTMax)) {
+            globalTMin = 0.0;
+            globalTMax = 1.0;
+        }
+        double globalSpan = globalTMax - globalTMin;
+        if (!(globalSpan > 1e-12)) globalSpan = 1.0;
+
+        auto mapTimeToX = [&](double t) -> float {
+            double u = std::clamp((t - globalTMin) / globalSpan, 0.0, 1.0);
+            return -38.0f + static_cast<float>(u * 76.0);
+        };
 
         out.kind = EdaDocKind::KiCadSch;
-        out.formatTitle = L"Saleae Logic 2 Digital Capture (.sal)";
-        DetailEda200::DrawGraticule(out, -40.0f, -20.0f, 80.0f, 40.0f, 16, 4);
-        out.labels.push_back({ -47.0f, 0.0f, 1.1f, EdaLayerId::TopSilk, L"CH0" });
+        out.netCount = static_cast<int>(totalCh);
+        out.formatTitle = L"Saleae Logic 2 Capture (.sal - " +
+                          std::to_wstring(digChannels.size()) + L"D, " +
+                          std::to_wstring(anaChannels.size()) + L"A)";
 
-        // Saleae digital-0.bin starts with "<SALEAE>" (8 bytes) + version(4) + type(4) + initialState(4) + beginTime(8) + endTime(8) + numTransitions(8) + double[]
-        std::vector<double> trans;
-        uint32_t initState = 0;
-        if (dig0.size() >= 44 && std::memcmp(dig0.data(), "<SALEAE>", 8) == 0) {
-            initState = DetailEda200::RdU32LE(dig0.data() + 16) & 1u;
-            uint64_t nTrans = DetailEda200::RdU64LE(dig0.data() + 36);
-            for (uint64_t t = 0; t < nTrans && 44 + (t + 1) * 8 <= dig0.size() && t < 512; ++t) {
-                double ts = 0.0;
-                std::memcpy(&ts, dig0.data() + 44 + t * 8, 8);
-                if (std::isfinite(ts)) trans.push_back(ts);
-            }
+        DetailEda200::DrawGraticule(out, -40.0f, -24.0f, 80.0f, 48.0f, 16, 8);
+
+        std::wstring hdrSummary = L"Saleae Logic 2 (" + std::to_wstring(digChannels.size()) + L" digital, " +
+                                  std::to_wstring(anaChannels.size()) + L" analog";
+        if (metaDigitalRateHz > 0ULL) {
+            hdrSummary += L", " + std::to_wstring(metaDigitalRateHz) + L" Hz";
         }
-        if (!trans.empty()) {
-            double t0 = trans.front(), tSpan = std::max(1e-9, trans.back() - t0);
-            float prevX = -38.0f;
-            int state = static_cast<int>(initState);
-            for (double ts : trans) {
-                float tx = -38.0f + static_cast<float>((ts - t0) / tSpan) * 76.0f;
-                float yOld = state ? 8.0f : -8.0f;
-                float yNew = state ? -8.0f : 8.0f;
-                out.traces.push_back({ prevX, yOld, tx, yOld, 0.32f, EdaLayerId::TopCopper, 1 });
-                out.traces.push_back({ tx, yOld, tx, yNew, 0.32f, EdaLayerId::TopCopper, 1 });
-                state ^= 1;
+        hdrSummary += L")";
+        out.labels.push_back({ -39.0f, 25.5f, 1.05f, EdaLayerId::TopSilk, hdrSummary });
+
+        const float laneStep = 44.0f / static_cast<float>(totalCh);
+        const float halfAmp  = std::min(laneStep * 0.36f, 6.5f);
+        size_t laneIdx = 0;
+
+        // Render stacked digital waveforms
+        for (const auto& dc : digChannels) {
+            const float centerY = 22.0f - (static_cast<float>(laneIdx) + 0.5f) * laneStep;
+            const EdaLayerId lid = (laneIdx & 1u) ? EdaLayerId::InnerCopper : EdaLayerId::TopCopper;
+            const int netId = static_cast<int>(laneIdx + 1u);
+
+            out.labels.push_back({ -49.5f, centerY, 0.95f, EdaLayerId::TopSilk, dc.label });
+
+            float prevX = mapTimeToX(dc.beginTime);
+            uint8_t curState = static_cast<uint8_t>(dc.initialState & 1u);
+
+            for (const auto& edge : dc.edges) {
+                float tx = mapTimeToX(edge.first);
+                float yOld = centerY + (curState ? halfAmp : -halfAmp);
+                float yNew = centerY + (edge.second ? halfAmp : -halfAmp);
+                if (tx > prevX) {
+                    out.traces.push_back({ prevX, yOld, tx, yOld, 0.28f, lid, netId });
+                }
+                if (yOld != yNew) {
+                    out.traces.push_back({ tx, yOld, tx, yNew, 0.28f, lid, netId });
+                }
+                curState = edge.second;
                 prevX = tx;
             }
-            out.traces.push_back({ prevX, state ? 8.0f : -8.0f, 38.0f, state ? 8.0f : -8.0f, 0.32f, EdaLayerId::TopCopper, 1 });
-        } else {
-            out.traces.push_back({ -38.0f, 0.0f, 38.0f, 0.0f, 0.32f, EdaLayerId::TopCopper, 1 });
+
+            float endX = std::max(prevX + 0.4f, mapTimeToX(dc.endTime));
+            endX = std::min(endX, 38.0f);
+            float yFinal = centerY + (curState ? halfAmp : -halfAmp);
+            if (endX > prevX) {
+                out.traces.push_back({ prevX, yFinal, endX, yFinal, 0.28f, lid, netId });
+            } else if (dc.edges.empty()) {
+                out.traces.push_back({ -38.0f, yFinal, 38.0f, yFinal, 0.28f, lid, netId });
+            }
+            ++laneIdx;
         }
-        return true;
+
+        // Render stacked analog oscilloscope waveforms
+        for (const auto& ac : anaChannels) {
+            const float centerY = 22.0f - (static_cast<float>(laneIdx) + 0.5f) * laneStep;
+            const EdaLayerId lid = EdaLayerId::BottomCopper;
+            const int netId = static_cast<int>(laneIdx + 1u);
+
+            out.labels.push_back({ -49.5f, centerY, 0.95f, EdaLayerId::TopSilk, ac.label });
+
+            wchar_t vRangeBuf[64] = {};
+            swprintf_s(vRangeBuf, L"[%.2f..%.2fV]", static_cast<double>(ac.vMin), static_cast<double>(ac.vMax));
+            out.labels.push_back({ 40.6f, centerY, 0.85f, EdaLayerId::TopSilk, vRangeBuf });
+
+            const float vSpan = ac.vMax - ac.vMin;
+            auto mapVoltToY = [&](float v) -> float {
+                if (vSpan <= 1e-6f) return centerY;
+                float norm = (v - ac.vMin) / vSpan; // 0..1
+                return centerY + (norm * 2.0f - 1.0f) * halfAmp;
+            };
+
+            const size_t nPts = ac.samples.size();
+            if (nPts == 1u) {
+                float x0 = mapTimeToX(ac.beginTime);
+                float x1 = std::max(x0 + 1.0f, mapTimeToX(ac.endTime));
+                float y0 = mapVoltToY(ac.samples[0]);
+                out.traces.push_back({ x0, y0, std::min(x1, 38.0f), y0, 0.26f, lid, netId });
+            } else if (nPts >= 2u) {
+                const double chSpan = ac.endTime - ac.beginTime;
+                for (size_t i = 1u; i < nPts; ++i) {
+                    double t0 = ac.beginTime + chSpan * (static_cast<double>(i - 1u) / static_cast<double>(nPts - 1u));
+                    double t1 = ac.beginTime + chSpan * (static_cast<double>(i) / static_cast<double>(nPts - 1u));
+                    float x0 = mapTimeToX(t0);
+                    float x1 = mapTimeToX(t1);
+                    float y0 = mapVoltToY(ac.samples[i - 1u]);
+                    float y1 = mapVoltToY(ac.samples[i]);
+                    out.traces.push_back({ x0, y0, x1, y1, 0.26f, lid, netId });
+                }
+            }
+            ++laneIdx;
+        }
+
+        return !out.traces.empty();
     }
 
     // #73. Tektronix / Rigol Digital Oscilloscope Waveform (.wfm / .isf)

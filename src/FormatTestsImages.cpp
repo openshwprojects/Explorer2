@@ -532,35 +532,280 @@ std::vector<uint8_t> BuildKtx2Fixture(bool zlibRgba8) {
     return f;
 }
 
-std::vector<uint8_t> BuildBasisFixture(uint8_t seed) {
-    // 77-byte basis_file_header + 23-byte basis_slice_desc + 64-byte slice payload
+uint16_t ComputeBasisCrc16(const uint8_t* ptr, size_t len) {
+    uint32_t crc = 0xFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        uint32_t x = ((crc >> 8) ^ ptr[i]) & 0xFFu;
+        x ^= (x >> 4);
+        crc = ((crc << 8) ^ (x << 12) ^ (x << 5) ^ x) & 0xFFFFu;
+    }
+    return static_cast<uint16_t>(~crc & 0xFFFFu);
+}
+
+struct TestLsbBitWriter {
+    std::vector<uint8_t> bytes;
+    uint32_t cur = 0;
+    uint32_t used = 0;
+
+    void PutBits(uint32_t val, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i) {
+            cur |= (((val >> i) & 1u) << used);
+            if (++used == 8u) {
+                bytes.push_back(static_cast<uint8_t>(cur));
+                cur = 0u;
+                used = 0u;
+            }
+        }
+    }
+
+    void AlignToByteZero() {
+        if (used != 0u) {
+            bytes.push_back(static_cast<uint8_t>(cur));
+            cur = 0u;
+            used = 0u;
+        }
+    }
+};
+
+// Build a genuine 8x8 (2x2 blocks) Khronos Basis Universal cUASTC4x4 (.basis) texture
+// exercising Mode 8 (solid RGBA32), Mode 5 (RGB8 interpolated), Mode 14 (RGBA8 interpolated), and Mode 15 (LA8).
+std::vector<uint8_t> BuildBasisFixture(bool variantB) {
+    auto finishBlock16 = [](TestLsbBitWriter& bw) -> std::vector<uint8_t> {
+        bw.AlignToByteZero();
+        bw.bytes.resize(16, 0u);
+        return bw.bytes;
+    };
+
+    std::vector<uint8_t> sliceData;
+    sliceData.reserve(64);
+
+    // Block (0,0): Mode 8 (0x17, 5 bits) Void-Extent Solid RGBA32
+    {
+        TestLsbBitWriter bw;
+        bw.PutBits(0x17u, 5u);
+        if (!variantB) {
+            bw.PutBits(230u, 8u); bw.PutBits(40u, 8u); bw.PutBits(25u, 8u); bw.PutBits(255u, 8u);
+        } else {
+            bw.PutBits(20u, 8u); bw.PutBits(210u, 8u); bw.PutBits(140u, 8u); bw.PutBits(255u, 8u);
+        }
+        auto blk = finishBlock16(bw);
+        sliceData.insert(sliceData.end(), blk.begin(), blk.end());
+    }
+
+    // Block (1,0): Mode 5 (0x0B, 5 bits + 15 hint bits + 6x8-bit RGB endpoints + 3-bit weights)
+    {
+        TestLsbBitWriter bw;
+        bw.PutBits(0x0Bu, 5u);
+        bw.PutBits(0u, 15u);
+        uint8_t ep[6] = { 10, 250, 80, 220, 240, 30 };
+        if (variantB) {
+            uint8_t epB[6] = { 220, 40, 30, 240, 190, 250 };
+            std::memcpy(ep, epB, 6);
+        }
+        for (int i = 0; i < 6; ++i) bw.PutBits(ep[i], 8u);
+        bw.PutBits(0u, 2u); // anchor 0 -> weight 0 (exact e0 at (4,0))
+        for (uint32_t i = 1; i < 15u; ++i) bw.PutBits(i & 7u, 3u);
+        bw.PutBits(7u, 3u); // texel 15 -> weight 64 (exact e1 at (7,3))
+        auto blk = finishBlock16(bw);
+        sliceData.insert(sliceData.end(), blk.begin(), blk.end());
+    }
+
+    // Block (0,1): Mode 14 (0x0D, 5 bits + 23 hint bits + 8x8-bit RGBA endpoints + 2-bit weights)
+    {
+        TestLsbBitWriter bw;
+        bw.PutBits(0x0Du, 5u);
+        bw.PutBits(0u, 23u);
+        uint8_t ep[8] = { 200, 40, 100, 200, 40, 100, 128, 255 };
+        if (variantB) {
+            uint8_t epB[8] = { 60, 220, 140, 180, 220, 50, 128, 255 };
+            std::memcpy(ep, epB, 8);
+        }
+        for (int i = 0; i < 8; ++i) bw.PutBits(ep[i], 8u);
+        bw.PutBits(0u, 1u); // anchor 0 -> weight 0 (exact e0 with alpha=128 at (0,4))
+        for (uint32_t i = 1; i < 15u; ++i) bw.PutBits(i & 3u, 2u);
+        bw.PutBits(3u, 2u); // texel 15 -> weight 64
+        auto blk = finishBlock16(bw);
+        sliceData.insert(sliceData.end(), blk.begin(), blk.end());
+    }
+
+    // Block (1,1): Mode 15 (0x05, 7 bits + 23 hint bits + 4x8-bit LA endpoints + 4-bit weights)
+    {
+        TestLsbBitWriter bw;
+        bw.PutBits(0x05u, 7u);
+        bw.PutBits(0u, 23u);
+        uint8_t ep[4] = { static_cast<uint8_t>(variantB ? 210 : 30),
+                          static_cast<uint8_t>(variantB ? 45  : 230), 255, 255 };
+        for (int i = 0; i < 4; ++i) bw.PutBits(ep[i], 8u);
+        bw.PutBits(0u, 3u); // anchor 0 -> weight 0
+        for (uint32_t i = 1; i < 15u; ++i) bw.PutBits(i & 15u, 4u);
+        bw.PutBits(15u, 4u); // texel 15 -> weight 64 (exact e1_L at (7,7))
+        auto blk = finishBlock16(bw);
+        sliceData.insert(sliceData.end(), blk.begin(), blk.end());
+    }
+
+    uint16_t sliceCrc = ComputeBasisCrc16(sliceData.data(), sliceData.size());
+    std::vector<uint8_t> sd;
+    PushU24LE(sd, 0);   // m_image_index
+    sd.push_back(0);    // m_level_index
+    sd.push_back(0);    // m_flags
+    PushU16LE(sd, 8);   // m_orig_width
+    PushU16LE(sd, 8);   // m_orig_height
+    PushU16LE(sd, 2);   // m_num_blocks_x
+    PushU16LE(sd, 2);   // m_num_blocks_y
+    PushU32LE(sd, 100); // m_file_ofs = 77 + 23
+    PushU32LE(sd, static_cast<uint32_t>(sliceData.size()));
+    PushU16LE(sd, sliceCrc);
+
     std::vector<uint8_t> f(77, 0);
     f[0] = 's'; f[1] = 'B';
     f[2] = 0x13; f[3] = 0x00; // m_version
     f[4] = 77;   f[5] = 0;    // m_header_size = 77
-    f[8] = 87;                // m_data_size
-    f[14] = 1;                // m_total_slices = 1
-    f[17] = 1;                // m_total_images = 1
-    f[20] = 0;                // m_tex_format = ETC1S
-    f[65] = 77;               // m_slice_desc_file_ofs = 77
+    uint32_t dataSize = static_cast<uint32_t>(sd.size() + sliceData.size());
+    f[8]  = static_cast<uint8_t>(dataSize & 0xFFu);
+    f[9]  = static_cast<uint8_t>((dataSize >> 8) & 0xFFu);
+    f[10] = static_cast<uint8_t>((dataSize >> 16) & 0xFFu);
+    f[11] = static_cast<uint8_t>((dataSize >> 24) & 0xFFu);
+    f[14] = 1;  // m_total_slices = 1
+    f[17] = 1;  // m_total_images = 1
+    f[20] = 1;  // m_tex_format = cUASTC4x4
+    f[65] = 77; // m_slice_desc_file_ofs = 77
 
-    // 23-byte basis_slice_desc at offset 77
-    std::vector<uint8_t> sd;
-    PushU24LE(sd, 0);  // m_image_index
-    sd.push_back(0);   // m_level_index
-    sd.push_back(0);   // m_flags
-    PushU16LE(sd, 16); // m_orig_width
-    PushU16LE(sd, 16); // m_orig_height
-    PushU16LE(sd, 4);  // m_num_blocks_x
-    PushU16LE(sd, 4);  // m_num_blocks_y
-    PushU32LE(sd, 100);// m_file_ofs = 100
-    PushU32LE(sd, 64); // m_file_size = 64
-    PushU16LE(sd, 0);  // m_slice_data_crc16
     f.insert(f.end(), sd.begin(), sd.end());
+    f.insert(f.end(), sliceData.begin(), sliceData.end());
 
-    for (uint32_t i = 0; i < 64; ++i) {
-        f.push_back(static_cast<uint8_t>((seed * 53u) ^ (i * 29u + seed)));
+    uint16_t dataCrc = ComputeBasisCrc16(f.data() + 77, dataSize);
+    f[12] = static_cast<uint8_t>(dataCrc & 0xFFu);
+    f[13] = static_cast<uint8_t>((dataCrc >> 8) & 0xFFu);
+    uint16_t hdrCrc = ComputeBasisCrc16(f.data() + 8, 77 - 8);
+    f[6] = static_cast<uint8_t>(hdrCrc & 0xFFu);
+    f[7] = static_cast<uint8_t>((hdrCrc >> 8) & 0xFFu);
+    return f;
+}
+
+// Build a genuine 8x8 (2x2 blocks) Basis Universal cETC1S (.basis) texture with canonical Huffman codebooks & slice stream
+std::vector<uint8_t> BuildBasisEtc1sFixture() {
+    auto writeHuff1Bit = [](TestLsbBitWriter& bw, const std::vector<uint8_t>& codeSizes) {
+        if (codeSizes.empty()) {
+            bw.PutBits(0u, 14u);
+            return;
+        }
+        bw.PutBits(static_cast<uint32_t>(codeSizes.size()), 14u);
+        bw.PutBits(19u, 5u); // kClOrder[4]=0 -> len 1 ('0'), kClOrder[18]=1 -> len 1 ('1')
+        for (uint32_t i = 0; i < 19u; ++i) {
+            bw.PutBits((i == 4u || i == 18u) ? 1u : 0u, 3u);
+        }
+        for (uint8_t cs : codeSizes) {
+            bw.PutBits(cs ? 1u : 0u, 1u);
+        }
+    };
+
+    // 1. Endpoint codebook (numEndpoints = 2: Gold {28,28,4} inten 0, Cyan-Blue {2,20,29} inten 1)
+    TestLsbBitWriter epBw;
+    {
+        std::vector<uint8_t> cd0(26, 0), cd1(21, 0), cd2(25, 0), idl(2, 1);
+        cd0[25] = 1;               // single sym 25 -> '0'
+        cd1[12] = 1; cd1[20] = 1;  // sym 12 -> '0', sym 20 -> '1'
+        cd2[6]  = 1; cd2[24] = 1;  // sym 6  -> '0', sym 24 -> '1'
+        writeHuff1Bit(epBw, cd0);
+        writeHuff1Bit(epBw, cd1);
+        writeHuff1Bit(epBw, cd2);
+        writeHuff1Bit(epBw, idl);
+        epBw.PutBits(0u, 1u); // grayscale = 0
+        // Endpoint 0 from {16,16,16}, prevInten=0: dInten=0 ('0'), dR=12 ('0'->28), dG=12 ('0'->28), dB=20 ('1'->4)
+        epBw.PutBits(0u, 1u); epBw.PutBits(0u, 1u); epBw.PutBits(0u, 1u); epBw.PutBits(1u, 1u);
+        // Endpoint 1 from {28,28,4}, prevInten=0: dInten=1 ('1'), dR=6 ('0'->2), dG=24 ('1'->20), dB=25 ('0'->29)
+        epBw.PutBits(1u, 1u); epBw.PutBits(0u, 1u); epBw.PutBits(1u, 1u); epBw.PutBits(0u, 1u);
+        epBw.PutBits(0u, 16u);
+        epBw.AlignToByteZero();
     }
+
+    // 2. Selector codebook (numSelectors = 2, rawPal = 1)
+    TestLsbBitWriter selBw;
+    {
+        selBw.PutBits(0u, 1u); // globalPal = 0
+        selBw.PutBits(0u, 1u); // hybridPal = 0
+        selBw.PutBits(1u, 1u); // rawPal = 1
+        for (int j = 0; j < 4; ++j) selBw.PutBits(0xAAu, 8u); // Selector 0: idx 2 (+2 for inten 0)
+        for (int j = 0; j < 4; ++j) selBw.PutBits(0xFFu, 8u); // Selector 1: idx 3 (+17 for inten 1)
+        selBw.AlignToByteZero();
+    }
+
+    // 3. Huffman tables
+    TestLsbBitWriter tblBw;
+    {
+        std::vector<uint8_t> epPred(96, 0), dEp(2, 1), selMdl(2, 1), emptyTbl;
+        epPred[95] = 1; // 95 = 3 | (3<<2) | (1<<4) | (1<<6): row 0 delta, row 1 upper-endpoint prediction!
+        writeHuff1Bit(tblBw, epPred);
+        writeHuff1Bit(tblBw, dEp);
+        writeHuff1Bit(tblBw, selMdl);
+        writeHuff1Bit(tblBw, emptyTbl);
+        tblBw.PutBits(0u, 13u); // selectorHistoryBufSize = 0
+        tblBw.PutBits(0u, 16u);
+        tblBw.AlignToByteZero();
+    }
+
+    // 4. Slice bitstream (2x2 blocks = 8x8)
+    TestLsbBitWriter slBw;
+    {
+        slBw.PutBits(0u, 1u); // predBits = 95
+        slBw.PutBits(0u, 1u); slBw.PutBits(0u, 1u); // (0,0): delta=0 -> ep0, sel=0
+        slBw.PutBits(1u, 1u); slBw.PutBits(1u, 1u); // (1,0): delta=1 -> ep1, sel=1
+        slBw.PutBits(0u, 1u);                       // (0,1): pred=1 (upper=ep0), sel=0
+        slBw.PutBits(1u, 1u);                       // (1,1): pred=1 (upper=ep1), sel=1
+        slBw.PutBits(0u, 24u);
+        slBw.AlignToByteZero();
+    }
+
+    uint32_t sliceDescOfs = 77u;
+    uint32_t epOfs   = sliceDescOfs + 23u;
+    uint32_t selOfs  = epOfs  + static_cast<uint32_t>(epBw.bytes.size());
+    uint32_t tblOfs  = selOfs + static_cast<uint32_t>(selBw.bytes.size());
+    uint32_t slOfs   = tblOfs + static_cast<uint32_t>(tblBw.bytes.size());
+
+    uint16_t sliceCrc = ComputeBasisCrc16(slBw.bytes.data(), slBw.bytes.size());
+    std::vector<uint8_t> sd;
+    PushU24LE(sd, 0);
+    sd.push_back(0);
+    sd.push_back(0);
+    PushU16LE(sd, 8);
+    PushU16LE(sd, 8);
+    PushU16LE(sd, 2);
+    PushU16LE(sd, 2);
+    PushU32LE(sd, slOfs);
+    PushU32LE(sd, static_cast<uint32_t>(slBw.bytes.size()));
+    PushU16LE(sd, sliceCrc);
+
+    std::vector<uint8_t> f(77, 0);
+    f[0] = 's'; f[1] = 'B';
+    f[2] = 0x13; f[3] = 0x00;
+    f[4] = 77;   f[5] = 0;
+    f[14] = 1;
+    f[17] = 1;
+    f[20] = 0; // cETC1S
+    auto wr16 = [&](size_t o, uint16_t v) { f[o] = static_cast<uint8_t>(v & 0xFFu); f[o + 1] = static_cast<uint8_t>(v >> 8); };
+    auto wr24 = [&](size_t o, uint32_t v) { f[o] = static_cast<uint8_t>(v & 0xFFu); f[o + 1] = static_cast<uint8_t>((v >> 8) & 0xFFu); f[o + 2] = static_cast<uint8_t>((v >> 16) & 0xFFu); };
+    auto wr32 = [&](size_t o, uint32_t v) { f[o] = static_cast<uint8_t>(v & 0xFFu); f[o + 1] = static_cast<uint8_t>((v >> 8) & 0xFFu); f[o + 2] = static_cast<uint8_t>((v >> 16) & 0xFFu); f[o + 3] = static_cast<uint8_t>((v >> 24) & 0xFFu); };
+
+    wr16(39, 2u); // numEndpoints
+    wr32(41, epOfs);
+    wr24(45, static_cast<uint32_t>(epBw.bytes.size()));
+    wr16(48, 2u); // numSelectors
+    wr32(50, selOfs);
+    wr24(54, static_cast<uint32_t>(selBw.bytes.size()));
+    wr32(57, tblOfs);
+    wr32(61, static_cast<uint32_t>(tblBw.bytes.size()));
+    wr32(65, sliceDescOfs);
+
+    f.insert(f.end(), sd.begin(), sd.end());
+    f.insert(f.end(), epBw.bytes.begin(), epBw.bytes.end());
+    f.insert(f.end(), selBw.bytes.begin(), selBw.bytes.end());
+    f.insert(f.end(), tblBw.bytes.begin(), tblBw.bytes.end());
+    f.insert(f.end(), slBw.bytes.begin(), slBw.bytes.end());
+
+    uint32_t dataSize = static_cast<uint32_t>(f.size() - 77u);
+    wr32(8, dataSize);
+    wr16(12, ComputeBasisCrc16(f.data() + 77u, dataSize));
+    wr16(6,  ComputeBasisCrc16(f.data() + 8u, 77u - 8u));
     return f;
 }
 
@@ -1031,81 +1276,628 @@ std::vector<uint8_t> BuildWoffFromSfnt(const std::vector<uint8_t>& sfnt) {
     return woff;
 }
 
-std::vector<uint8_t> BuildWoff2Fixture(uint8_t seed, uint32_t glyfOrigSize) {
+uint32_t BitRevN(uint32_t v, uint32_t n) {
+    uint32_t r = 0u;
+    for (uint32_t i = 0; i < n; ++i) {
+        r = (r << 1u) | ((v >> i) & 1u);
+    }
+    return r;
+}
+
+void PushUIntBase128(std::vector<uint8_t>& out, uint32_t v) {
+    uint8_t buf[5] = {};
+    int n = 0;
+    do {
+        buf[n++] = static_cast<uint8_t>(v & 0x7Fu);
+        v >>= 7u;
+    } while (v != 0u);
+    for (int i = n - 1; i >= 0; --i) {
+        out.push_back(static_cast<uint8_t>(buf[i] | (i > 0 ? 0x80u : 0x00u)));
+    }
+}
+
+// RFC 7932 Brotli encoder using uncompressed meta-blocks + final empty meta-block
+std::vector<uint8_t> CompressBrotliUncompressed(const std::vector<uint8_t>& raw) {
+    TestLsbBitWriter bw;
+    bw.PutBits(0u, 1u); // WBITS = 16
+    size_t pos = 0u;
+    while (pos < raw.size()) {
+        size_t chunk = std::min<size_t>(raw.size() - pos, 65536u);
+        bw.PutBits(0u, 1u); // ISLAST = 0
+        bw.PutBits(0u, 2u); // MNIBBLES = 4 (16-bit mlen - 1)
+        bw.PutBits(static_cast<uint32_t>(chunk - 1u), 16u);
+        bw.PutBits(1u, 1u); // ISUNCOMPRESSED = 1
+        bw.AlignToByteZero();
+        bw.bytes.insert(bw.bytes.end(), raw.begin() + pos, raw.begin() + pos + chunk);
+        pos += chunk;
+    }
+    bw.PutBits(1u, 1u); // ISLAST = 1
+    bw.PutBits(1u, 1u); // ISLASTEMPTY = 1
+    bw.AlignToByteZero();
+    return bw.bytes;
+}
+
+// RFC 7932 Brotli encoder using a genuine canonical-Huffman compressed meta-block
+std::vector<uint8_t> CompressBrotliHuffman(const std::vector<uint8_t>& raw) {
+    if (raw.empty() || raw.size() > 65536u) {
+        return CompressBrotliUncompressed(raw);
+    }
+    static constexpr uint32_t kInsBase[24] = {
+        0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98,
+        130, 194, 322, 578, 1090, 2114, 6210, 22594
+    };
+    static constexpr uint8_t kInsExtra[24] = {
+        0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5,
+        6, 7, 8, 9, 10, 12, 14, 24
+    };
+    const uint32_t mlen = static_cast<uint32_t>(raw.size());
+    uint32_t insCode = 0u;
+    for (uint32_t i = 0; i < 24u; ++i) {
+        if (mlen >= kInsBase[i]) insCode = i;
+    }
+    uint32_t iacSym = (insCode < 8u)  ? (128u + (insCode << 3u)) :
+                      ((insCode < 16u) ? (256u + ((insCode - 8u) << 3u)) :
+                                         (448u + ((insCode - 16u) << 3u)));
+
+    TestLsbBitWriter bw;
+    bw.PutBits(0u, 1u); // WBITS = 16
+    bw.PutBits(1u, 1u); // ISLAST = 1
+    bw.PutBits(0u, 1u); // ISLASTEMPTY = 0
+    bw.PutBits(0u, 2u); // MNIBBLES = 4
+    bw.PutBits(mlen - 1u, 16u);
+    bw.PutBits(0u, 3u); // NBLTYPESL/I/D = 1
+    bw.PutBits(0u, 2u); // NPOSTFIX = 0
+    bw.PutBits(0u, 4u); // NDIRECT = 0
+    bw.PutBits(0u, 2u); // ctxModes[0] = 0
+    bw.PutBits(0u, 1u); // NTREESL = 1
+    bw.PutBits(0u, 1u); // NTREESD = 1
+
+    // Complex prefix code for 256 literals all of length 8 (clLengths[16]=1, clLengths[8]=1 -> Kraft space=0)
+    bw.PutBits(0u, 2u); // hskip = 0
+    for (int i = 0; i < 8; ++i) bw.PutBits(0u, 2u); // syms 1,2,3,4,0,5,17,6 -> len 0
+    bw.PutBits(7u, 4u); // sym 16 -> len 1
+    bw.PutBits(0u, 2u); // sym 7  -> len 0
+    bw.PutBits(7u, 4u); // sym 8  -> len 1 (Kraft sum = 16+16 = 32)
+    for (int s = 0; s < 256; ++s) bw.PutBits(0u, 1u); // '0' -> codeLenSym 8 for all 256 literals
+
+    // Simple 1-symbol prefix codes for InsertAndCopy (iacSym) and Distance (0)
+    bw.PutBits(1u, 2u); bw.PutBits(0u, 2u); bw.PutBits(iacSym, 10u);
+    bw.PutBits(1u, 2u); bw.PutBits(0u, 2u); bw.PutBits(0u, 6u);
+
+    // Emit insert extra bits (copyCode == 0 has 0 extra bits) followed by canonical 8-bit literals
+    bw.PutBits(mlen - kInsBase[insCode], kInsExtra[insCode]);
+    for (uint8_t b : raw) {
+        bw.PutBits(BitRevN(b, 8u), 8u);
+    }
+    bw.AlignToByteZero();
+    return bw.bytes;
+}
+
+// Wrap a valid SFNT .ttf into a spec-compliant WOFF 2.0 ('wOF2') container
+std::vector<uint8_t> BuildWoff2FromSfnt(const std::vector<uint8_t>& sfnt, bool useHuffmanBrotli) {
+    static const char kWoff2KnownTags[63][5] = {
+        "cmap","head","hhea","hmtx","maxp","name","OS/2","post","cvt ","fpgm","glyf","loca","prep","CFF ","VORG","EBDT",
+        "EBLC","gasp","hdmx","kern","LTSH","PCLT","VDMX","vhea","vmtx","BASE","GDEF","GPOS","GSUB","EBSC","JSTF","MATH",
+        "CBDT","CBLC","COLR","CPAL","SVG ","sbix","acnt","avar","bdat","bloc","bsln","cvar","fdsc","feat","fmtx","fvar",
+        "gvar","hsty","just","lcar","mort","morx","opbd","prop","trak","Zapf","Silf","Glat","Gloc","Feat","Sill"
+    };
+
+    uint16_t numTables = static_cast<uint16_t>((sfnt[4] << 8) | sfnt[5]);
+    std::vector<uint8_t> dirBytes;
+    std::vector<uint8_t> rawConcat;
+
+    for (uint16_t i = 0; i < numTables; ++i) {
+        const uint8_t* srec = sfnt.data() + 12u + static_cast<size_t>(i) * 16u;
+        uint32_t off = (static_cast<uint32_t>(srec[8]) << 24)  | (static_cast<uint32_t>(srec[9]) << 16) |
+                       (static_cast<uint32_t>(srec[10]) << 8)  | static_cast<uint32_t>(srec[11]);
+        uint32_t len = (static_cast<uint32_t>(srec[12]) << 24) | (static_cast<uint32_t>(srec[13]) << 16) |
+                       (static_cast<uint32_t>(srec[14]) << 8)  | static_cast<uint32_t>(srec[15]);
+
+        uint8_t tagIdx = 63u;
+        for (uint8_t k = 0; k < 63u; ++k) {
+            if (std::memcmp(srec, kWoff2KnownTags[k], 4) == 0) {
+                tagIdx = k;
+                break;
+            }
+        }
+        bool isGlyfOrLoca = (std::memcmp(srec, "glyf", 4) == 0 || std::memcmp(srec, "loca", 4) == 0);
+        uint8_t flags = static_cast<uint8_t>((isGlyfOrLoca ? (3u << 6u) : 0u) | tagIdx);
+        dirBytes.push_back(flags);
+        if (tagIdx == 63u) {
+            dirBytes.insert(dirBytes.end(), srec, srec + 4);
+        }
+        PushUIntBase128(dirBytes, len);
+        rawConcat.insert(rawConcat.end(), sfnt.begin() + off, sfnt.begin() + off + len);
+    }
+
+    std::vector<uint8_t> comp = useHuffmanBrotli
+        ? CompressBrotliHuffman(rawConcat)
+        : CompressBrotliUncompressed(rawConcat);
+
     std::vector<uint8_t> f(48, 0);
     std::memcpy(f.data(), "wOF2", 4);
-    f[5] = 0x01;              // flavor = 0x00010000
-    f[13] = 3;                // numTables = 3 (head, cmap, glyf)
-    PushU32BE(f, 0); f.resize(48, 0);
-    f[18] = 0x10;             // totalSfntSize = 4096
-    f[23] = 32;               // totalCompressedSize = 32
+    std::memcpy(f.data() + 4, sfnt.data(), 4); // flavor
+    f[12] = sfnt[4];
+    f[13] = sfnt[5]; // numTables
+    uint32_t totalSfnt = static_cast<uint32_t>(sfnt.size());
+    f[16] = static_cast<uint8_t>((totalSfnt >> 24) & 0xFFu);
+    f[17] = static_cast<uint8_t>((totalSfnt >> 16) & 0xFFu);
+    f[18] = static_cast<uint8_t>((totalSfnt >> 8) & 0xFFu);
+    f[19] = static_cast<uint8_t>(totalSfnt & 0xFFu);
+    uint32_t compSize = static_cast<uint32_t>(comp.size());
+    f[20] = static_cast<uint8_t>((compSize >> 24) & 0xFFu);
+    f[21] = static_cast<uint8_t>((compSize >> 16) & 0xFFu);
+    f[22] = static_cast<uint8_t>((compSize >> 8) & 0xFFu);
+    f[23] = static_cast<uint8_t>(compSize & 0xFFu);
 
-    auto pushBase128 = [&](uint32_t v) {
-        if (v < 128) f.push_back(static_cast<uint8_t>(v));
-        else {
-            f.push_back(static_cast<uint8_t>(0x80u | ((v >> 7) & 0x7Fu)));
-            f.push_back(static_cast<uint8_t>(v & 0x7Fu));
-        }
-    };
-    // Table 0: head (tagIdx=1, xformVer=0 => untransformed)
-    f.push_back(1);
-    pushBase128(54);
-    // Table 1: cmap (tagIdx=0, xformVer=0 => untransformed)
-    f.push_back(0);
-    pushBase128(120 + seed);
-    // Table 2: glyf (tagIdx=10, xformVer=0 => transformed, so origLen + xformLen!)
-    f.push_back(10);
-    pushBase128(glyfOrigSize);
-    pushBase128(glyfOrigSize / 2);
+    f.insert(f.end(), dirBytes.begin(), dirBytes.end());
+    f.insert(f.end(), comp.begin(), comp.end());
+    while ((f.size() & 3u) != 0u) f.push_back(0u);
 
-    // 32-byte compressed Brotli payload
-    for (uint32_t i = 0; i < 32; ++i) {
-        f.push_back(static_cast<uint8_t>((seed * 41u) + i * 13u));
-    }
-    uint32_t len = static_cast<uint32_t>(f.size());
-    f[8] = static_cast<uint8_t>((len >> 24) & 0xFFu);
-    f[9] = static_cast<uint8_t>((len >> 16) & 0xFFu);
-    f[10] = static_cast<uint8_t>((len >> 8) & 0xFFu);
-    f[11] = static_cast<uint8_t>(len & 0xFFu);
+    uint32_t totalLen = static_cast<uint32_t>(f.size());
+    f[8]  = static_cast<uint8_t>((totalLen >> 24) & 0xFFu);
+    f[9]  = static_cast<uint8_t>((totalLen >> 16) & 0xFFu);
+    f[10] = static_cast<uint8_t>((totalLen >> 8) & 0xFFu);
+    f[11] = static_cast<uint8_t>(totalLen & 0xFFu);
     return f;
 }
 
-std::vector<uint8_t> BuildJxlBoxedFixture(uint8_t div8HMinus1, uint8_t seed) {
-    // Naked codestream: 0xFF 0x0A + SizeHeader(isSmall=1, ysize=(div8HMinus1+1)*8, ratio=1 => 1:1) + allDefaultMeta=1 + default_m=1
-    std::vector<uint8_t> cs = { 0xFF, 0x0A };
-    uint32_t bits = 1u | (static_cast<uint32_t>(div8HMinus1 & 0x1Fu) << 1) | (1u << 6) | (1u << 9) | (1u << 10);
-    cs.push_back(static_cast<uint8_t>(bits & 0xFFu));
-    cs.push_back(static_cast<uint8_t>((bits >> 8) & 0xFFu));
-    // Frame header + TOC + group bitstream payload
-    for (int i = 0; i < 24; ++i) {
-        cs.push_back(static_cast<uint8_t>((seed * 37u) ^ (i * 19u + 0x21u)));
+// Build a genuine ISO/IEC 18181-1 JPEG XL Modular (encoding == 1) lossless codestream
+std::vector<uint8_t> BuildJxlModularCodestream(
+    uint32_t w, uint32_t h, bool hasAlpha, bool useRctYCoCg, bool useGradPred)
+{
+    const uint32_t numCh = hasAlpha ? 4u : 3u;
+    std::vector<std::vector<int32_t>> ch(numCh, std::vector<int32_t>(static_cast<size_t>(w) * h, 0));
+
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            size_t idx = static_cast<size_t>(y) * w + x;
+            int32_t r = 0, g = 0, b = 0, a = 255;
+            if (!hasAlpha) {
+                bool right = (x >= w / 2u);
+                bool bot   = (y >= h / 2u);
+                if (!right && !bot)      { r = 220; g = 40;  b = 30;  }
+                else if (right && !bot)  { r = 30;  g = 195; b = 75;  }
+                else if (!right && bot)  { r = 35;  g = 95;  b = 235; }
+                else                     { r = 240; g = 205; b = 45;  }
+            } else {
+                if (y < h / 2u) { r = 20;  g = 180; b = 220; a = 255; }
+                else            { r = 200; g = 60;  b = 120; a = 128; }
+            }
+            if (useRctYCoCg) {
+                int32_t co = r - b;
+                int32_t t  = b + (co >> 1);
+                int32_t cg = g - t;
+                int32_t yv = t + (cg >> 1);
+                ch[0][idx] = yv;
+                ch[1][idx] = co;
+                ch[2][idx] = cg;
+            } else {
+                ch[0][idx] = r;
+                ch[1][idx] = g;
+                ch[2][idx] = b;
+            }
+            if (hasAlpha) ch[3][idx] = a;
+        }
     }
 
-    // Wrap in ISOBMFF container: 'JXL ' signature box + 'ftyp' box + 'jxlc' box
+    // Build LfGlobal Modular section bitstream
+    TestLsbBitWriter lf;
+    lf.PutBits(1u, 1u); // lf_dequant_default = 1
+    lf.PutBits(0u, 1u); // has_global_tree = 0
+    lf.PutBits(0u, 1u); // gm_use_global_tree = 0
+    lf.PutBits(1u, 1u); // wp_all_default = 1
+    if (useRctYCoCg) {
+        lf.PutBits(1u, 2u); // nb_transforms = 1 (sel=1)
+        lf.PutBits(0u, 2u); // trId = 0 (RCT)
+        lf.PutBits(0u, 2u); lf.PutBits(0u, 3u); // beginC = 0
+        lf.PutBits(0u, 2u); // rctType = 6 (YCoCg, sel=0)
+    } else {
+        lf.PutBits(0u, 2u); // nb_transforms = 0 (sel=0)
+    }
+
+    // Local MA tree (1 leaf: predictor = 0 Zero or 5 Gradient)
+    lf.PutBits(0u, 1u); // lz77 = 0
+    lf.PutBits(1u, 1u); // simpleCluster = 1
+    lf.PutBits(0u, 2u); // nbits = 0 -> 1 cluster across all 6 contexts
+    lf.PutBits(1u, 1u); // usePrefixCode = 1
+    lf.PutBits(4u, 4u); lf.PutBits(0u, 3u); lf.PutBits(0u, 3u); // splitExp = 4, msb = 0, lsb = 0
+    if (!useGradPred) {
+        lf.PutBits(0u, 1u); // alphaSize = 1 -> 0-bit single-symbol tree (all 5 leaf fields = 0)
+    } else {
+        lf.PutBits(1u, 1u); lf.PutBits(2u, 4u); lf.PutBits(1u, 2u); // alphaSize = 6
+        lf.PutBits(1u, 2u); lf.PutBits(1u, 2u); // simple 2-symbol prefix code
+        lf.PutBits(0u, 3u); lf.PutBits(5u, 3u); // sym0 = 0 ('0'), sym1 = 5 ('1')
+        // Leaf fields: prop=0 ('0'), pred=5 ('1'), offset=0 ('0'), mulLog=0 ('0'), mulBits=0 ('0')
+        lf.PutBits(0u, 1u); lf.PutBits(1u, 1u); lf.PutBits(0u, 1u); lf.PutBits(0u, 1u); lf.PutBits(0u, 1u);
+    }
+
+    // Local Histograms (1 context, splitExp = 0, 16 tokens all of Huffman length 4)
+    lf.PutBits(0u, 1u); // lz77 = 0
+    lf.PutBits(1u, 1u); // usePrefixCode = 1
+    lf.PutBits(0u, 4u); // splitExp = 0 (msbBits=0, lsbBits=0)
+    lf.PutBits(1u, 1u); lf.PutBits(3u, 4u); lf.PutBits(7u, 3u); // alphaSize = 16
+    lf.PutBits(0u, 2u); // complex prefix code (hskip = 0)
+    lf.PutBits(0u, 2u); lf.PutBits(0u, 2u); lf.PutBits(0u, 2u); // syms 1, 2, 3 -> len 0
+    lf.PutBits(7u, 4u); // sym 4 -> len 1
+    lf.PutBits(7u, 4u); // sym 0 -> len 1 (Kraft sum = 32)
+    lf.PutBits(0xFFFFu, 16u); // 16 x '1' -> lengths[0..15] = 4
+
+    for (uint32_t ci = 0; ci < numCh; ++ci) {
+        const auto& px = ch[ci];
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                size_t idx = static_cast<size_t>(y) * w + x;
+                int64_t predVal = 0;
+                if (useGradPred) {
+                    int64_t W  = (x > 0u) ? px[idx - 1u] : (y > 0u ? px[idx - w] : 0);
+                    int64_t N  = (y > 0u) ? px[idx - w] : W;
+                    int64_t NW = (x > 0u && y > 0u) ? px[idx - w - 1u] : W;
+                    predVal = std::clamp<int64_t>(W + N - NW, std::min(W, N), std::max(W, N));
+                }
+                int32_t r = px[idx] - static_cast<int32_t>(predVal);
+                uint32_t u = (r < 0) ? static_cast<uint32_t>(-2 * r - 1) : static_cast<uint32_t>(2 * r);
+                if (u == 0u) {
+                    lf.PutBits(0u, 4u);
+                } else {
+                    uint32_t k = 0u;
+                    while ((1u << (k + 1u)) <= u) ++k;
+                    uint32_t tok = 1u + k;
+                    lf.PutBits(BitRevN(tok, 4u), 4u);
+                    lf.PutBits(u & ((1u << k) - 1u), k);
+                }
+            }
+        }
+    }
+    lf.AlignToByteZero();
+
+    // Assemble main codestream header + FrameHeader + TOC + LfGlobal bytes
+    TestLsbBitWriter cs;
+    cs.PutBits(0xFFu, 8u);
+    cs.PutBits(0x0Au, 8u);
+
+    // SizeHeader (div8 = 0, explicit 9-bit h-1 and w-1)
+    cs.PutBits(0u, 1u);
+    cs.PutBits(0u, 2u); cs.PutBits(h - 1u, 9u);
+    cs.PutBits(0u, 3u); // ratio = 0
+    cs.PutBits(0u, 2u); cs.PutBits(w - 1u, 9u);
+
+    // ImageMetadata (8-bit integer, xybEncoded = 0, sRGB ceAllDefault = 1, default_m = 1)
+    cs.PutBits(0u, 1u); // all_default = 0
+    cs.PutBits(0u, 1u); // extra_fields = 0
+    cs.PutBits(0u, 1u); // bit_depth.fp = 0
+    cs.PutBits(0u, 2u); // bits_per_sample = 8 (sel=0)
+    cs.PutBits(1u, 1u); // modular_16_bit_buffer_sufficient = 1
+    if (hasAlpha) {
+        cs.PutBits(1u, 2u); // num_extra_channels = 1 (sel=1)
+        cs.PutBits(1u, 1u); // d_alpha = 1 (default 8-bit straight alpha)
+    } else {
+        cs.PutBits(0u, 2u); // num_extra_channels = 0
+    }
+    cs.PutBits(0u, 1u); // xyb_encoded = 0
+    cs.PutBits(1u, 1u); // ColourEncoding.all_default = 1 (sRGB)
+    cs.PutBits(0u, 2u); // extensions = 0 (U64)
+    cs.PutBits(1u, 1u); // default_m = 1
+    cs.AlignToByteZero();
+
+    // FrameHeader (RegularFrame, encoding = 1 kModular, 256x256 single group)
+    cs.PutBits(0u, 1u); // all_default = 0
+    cs.PutBits(0u, 2u); // frame_type = 0 (RegularFrame)
+    cs.PutBits(1u, 1u); // encoding = 1 (kModular)
+    cs.PutBits(0u, 2u); // flags = 0 (U64)
+    cs.PutBits(0u, 1u); // do_ycbcr = 0
+    cs.PutBits(0u, 2u); // upsampling = 1
+    if (hasAlpha) cs.PutBits(0u, 2u); // ec_upsampling = 1
+    cs.PutBits(1u, 2u); // group_size_shift = 1 (256x256)
+    cs.PutBits(0u, 2u); // num_passes = 1
+    cs.PutBits(0u, 1u); // have_crop = 0
+    cs.PutBits(0u, 2u); // blend_mode = 0
+    if (hasAlpha) cs.PutBits(0u, 2u); // ec_blend_mode = 0
+    cs.PutBits(1u, 1u); // is_last = 1
+    cs.PutBits(0u, 2u); // name_len = 0
+    cs.PutBits(1u, 1u); // restoration_filter.all_default = 1
+    cs.PutBits(0u, 2u); // extensions = 0 (U64)
+    cs.AlignToByteZero();
+
+    // TOC (1 entry)
+    cs.PutBits(0u, 1u); // permuted = 0
+    uint32_t tocLen = static_cast<uint32_t>(lf.bytes.size());
+    if (tocLen < 1024u) {
+        cs.PutBits(0u, 2u);
+        cs.PutBits(tocLen, 10u);
+    } else {
+        cs.PutBits(1u, 2u);
+        cs.PutBits(tocLen - 1024u, 14u);
+    }
+    cs.AlignToByteZero();
+    cs.bytes.insert(cs.bytes.end(), lf.bytes.begin(), lf.bytes.end());
+    return cs.bytes;
+}
+
+std::vector<uint8_t> WrapJxlIsobmff(const std::vector<uint8_t>& cs) {
     std::vector<uint8_t> box = {
         0x00, 0x00, 0x00, 0x0C, 'J', 'X', 'L', ' ', 0x0D, 0x0A, 0x87, 0x0A,
         0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p', 'j', 'x', 'l', ' ', 0, 0, 0, 0, 'j', 'x', 'l', ' '
     };
-    PushU32BE(box, static_cast<uint32_t>(8 + cs.size()));
+    PushU32BE(box, static_cast<uint32_t>(8u + cs.size()));
     box.insert(box.end(), { 'j', 'x', 'l', 'c' });
     box.insert(box.end(), cs.begin(), cs.end());
     return box;
 }
 
-std::vector<uint8_t> BuildBpgFixture(uint8_t width, uint8_t height, uint8_t seed) {
+std::vector<uint8_t> WrapJxlPartialBoxes(const std::vector<uint8_t>& cs, bool markLast) {
+    std::vector<uint8_t> box = {
+        0x00, 0x00, 0x00, 0x0C, 'J', 'X', 'L', ' ', 0x0D, 0x0A, 0x87, 0x0A,
+        0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p', 'j', 'x', 'l', ' ', 0, 0, 0, 0, 'j', 'x', 'l', ' '
+    };
+    size_t p1 = cs.size() / 3u;
+    size_t p2 = (cs.size() * 2u) / 3u;
+    const size_t bounds[4] = { 0u, p1, p2, cs.size() };
+    for (uint32_t seq = 0; seq < 3u; ++seq) {
+        size_t segLen = bounds[seq + 1u] - bounds[seq];
+        PushU32BE(box, static_cast<uint32_t>(12u + segLen));
+        box.insert(box.end(), { 'j', 'x', 'l', 'p' });
+        uint32_t seqWord = seq | ((seq == 2u && markLast) ? 0x80000000u : 0u);
+        PushU32BE(box, seqWord);
+        box.insert(box.end(), cs.begin() + bounds[seq], cs.begin() + bounds[seq + 1u]);
+    }
+    return box;
+}
+
+std::vector<uint8_t> WrapJxlBrob(const std::vector<uint8_t>& cs) {
+    std::vector<uint8_t> box = {
+        0x00, 0x00, 0x00, 0x0C, 'J', 'X', 'L', ' ', 0x0D, 0x0A, 0x87, 0x0A,
+        0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p', 'j', 'x', 'l', ' ', 0, 0, 0, 0, 'j', 'x', 'l', ' '
+    };
+    std::vector<uint8_t> brCs = CompressBrotliHuffman(cs);
+    PushU32BE(box, static_cast<uint32_t>(12u + brCs.size()));
+    box.insert(box.end(), { 'b', 'r', 'o', 'b', 'j', 'x', 'l', 'c' });
+    box.insert(box.end(), brCs.begin(), brCs.end());
+    return box;
+}
+
+struct TestMsbBitWriter {
+    std::vector<uint8_t> bytes;
+    uint8_t cur = 0;
+    uint32_t used = 0;
+
+    void PutBit(uint32_t bit) {
+        cur = static_cast<uint8_t>((cur << 1u) | (bit & 1u));
+        if (++used == 8u) {
+            bytes.push_back(cur);
+            cur = 0u;
+            used = 0u;
+        }
+    }
+
+    void PutBits(uint32_t v, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i) {
+            PutBit((v >> (n - 1u - i)) & 1u);
+        }
+    }
+
+    void PutUe(uint32_t v) {
+        uint32_t codeNum = v + 1u;
+        uint32_t bits = 0u;
+        uint32_t tmp = codeNum;
+        while (tmp > 1u) { tmp >>= 1u; ++bits; }
+        for (uint32_t i = 0; i < bits; ++i) PutBit(0u);
+        PutBits(codeNum, bits + 1u);
+    }
+
+    void AlignZero() {
+        while (used != 0u) PutBit(0u);
+    }
+
+    void PutRbspTrailing() {
+        PutBit(1u);
+        AlignZero();
+    }
+};
+
+struct TestHevcCabacCtx {
+    uint8_t state = 0;
+    uint8_t mps = 1;
+};
+
+struct TestHevcCabacSegment {
+    uint64_t low = 0;
+    uint32_t range = 510;
+    uint32_t numShifts = 0;
+
+    void Renorm() {
+        while (range < 256u) {
+            range <<= 1u;
+            low <<= 1u;
+            ++numShifts;
+        }
+    }
+
+    void EncodeDecision(TestHevcCabacCtx& ctx, uint32_t bin) {
+        static constexpr uint8_t kRangeTabLps[64][4] = {
+            {128,176,208,240},{128,167,197,227},{128,158,187,216},{123,150,178,205},
+            {116,142,169,195},{111,135,160,185},{105,128,152,175},{100,122,144,166},
+            { 95,116,137,158},{ 90,110,130,150},{ 85,104,123,142},{ 81, 99,117,135},
+            { 77, 94,111,128},{ 73, 89,105,122},{ 69, 85,100,116},{ 66, 80, 95,110},
+            { 62, 76, 90,104},{ 59, 72, 86, 99},{ 56, 69, 81, 94},{ 53, 65, 77, 89},
+            { 51, 62, 73, 85},{ 48, 59, 69, 80},{ 46, 56, 66, 76},{ 43, 53, 63, 72},
+            { 41, 50, 59, 69},{ 39, 48, 56, 65},{ 37, 45, 54, 62},{ 35, 43, 51, 59},
+            { 33, 41, 48, 56},{ 32, 39, 46, 53},{ 30, 37, 43, 50},{ 29, 35, 41, 48},
+            { 27, 33, 39, 45},{ 26, 31, 37, 43},{ 24, 30, 35, 41},{ 23, 28, 33, 39},
+            { 22, 27, 32, 37},{ 21, 26, 30, 35},{ 20, 24, 29, 33},{ 19, 23, 27, 31},
+            { 18, 22, 26, 30},{ 17, 21, 25, 28},{ 16, 20, 23, 27},{ 15, 19, 22, 25},
+            { 14, 18, 21, 24},{ 14, 17, 20, 23},{ 13, 16, 19, 22},{ 12, 15, 18, 21},
+            { 12, 14, 17, 20},{ 11, 14, 16, 19},{ 11, 13, 15, 18},{ 10, 12, 15, 17},
+            { 10, 12, 14, 16},{  9, 11, 13, 15},{  9, 11, 12, 14},{  8, 10, 12, 14},
+            {  8,  9, 11, 13},{  7,  9, 11, 12},{  7,  9, 10, 12},{  7,  8, 10, 11},
+            {  6,  8,  9, 11},{  6,  7,  9, 10},{  6,  7,  8,  9},{  2,  2,  2,  2}
+        };
+        static constexpr uint8_t kTransIdxLps[64] = {
+             0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9,11,11,12,
+            13,13,15,15,16,16,18,18,19,19,21,21,22,22,23,24,
+            24,25,26,26,27,27,28,29,29,30,30,30,31,32,32,33,
+            33,33,34,34,35,35,35,36,36,36,37,37,37,38,38,63
+        };
+        uint32_t qIdx = (range >> 6u) & 3u;
+        uint32_t lps = kRangeTabLps[ctx.state][qIdx];
+        range -= lps;
+        if (bin != ctx.mps) {
+            low += range;
+            range = lps;
+            if (ctx.state == 0u) ctx.mps = 1u - ctx.mps;
+            ctx.state = kTransIdxLps[ctx.state];
+        } else {
+            if (ctx.state < 62u) ++ctx.state;
+        }
+        Renorm();
+    }
+
+    void EncodeTerminate(uint32_t bin) {
+        range -= 2u;
+        if (bin != 0u) {
+            low += range;
+            range = 2u;
+        }
+        Renorm();
+    }
+
+    void FlushToWriter(TestMsbBitWriter& w, bool rbspStopAfter) const {
+        uint64_t val = (low + 128ull) >> 7u;
+        uint32_t totalBits = numShifts + 2u;
+        for (uint32_t i = 0; i < totalBits; ++i) {
+            w.PutBit(static_cast<uint32_t>((val >> (totalBits - 1u - i)) & 1ull));
+        }
+        if (rbspStopAfter) {
+            w.PutRbspTrailing();
+        } else {
+            w.AlignZero(); // pcm_alignment_zero_bit
+        }
+    }
+};
+
+void AppendTestAnnexBNal(std::vector<uint8_t>& dst, uint8_t nalType, const std::vector<uint8_t>& rbsp) {
+    dst.push_back(0x00u);
+    dst.push_back(0x00u);
+    dst.push_back(0x00u);
+    dst.push_back(0x01u);
+    dst.push_back(static_cast<uint8_t>((nalType & 0x3Fu) << 1u));
+    dst.push_back(0x01u);
+    uint32_t zeros = 0u;
+    for (uint8_t b : rbsp) {
+        if (zeros >= 2u && b <= 0x03u) {
+            dst.push_back(0x03u);
+            zeros = 0u;
+        }
+        dst.push_back(b);
+        zeros = (b == 0u) ? (zeros + 1u) : 0u;
+    }
+}
+
+// Build a genuine BPG (Fabrice Bellard HEVC Intra I_PCM + CABAC + PPS + MSPS) image
+std::vector<uint8_t> BuildBpgFixture(uint32_t width, uint32_t height, bool useYcbcr) {
+    // 1. BPG HEVC mini-SPS (chroma_format_idc = 3 4:4:4, 8x8 CTBs, pcm_enabled_flag = 1)
+    TestMsbBitWriter msps;
+    msps.PutUe(3u);  // chroma_format_idc = 3 (4:4:4)
+    msps.PutBit(0u); // separate_colour_plane_flag = 0
+    for (int i = 0; i < 8; ++i) msps.PutUe(0u); // bdLuma=0, bdChroma=0, poc=0, minCb=0 (8), diffCb=0, minTb=0, diffTb=0, trDepth=0
+    msps.PutBit(0u); // scaling_list = 0
+    msps.PutBit(0u); // amp = 0
+    msps.PutBit(0u); // sao = 0
+    msps.PutBit(1u); // pcm_enabled_flag = 1
+    msps.PutBits(7u, 4u); // pcm_bd_luma_minus1 = 7
+    msps.PutBits(7u, 4u); // pcm_bd_chroma_minus1 = 7
+    msps.PutUe(0u);       // log2_min_pcm_cb_minus3 = 0 (8)
+    msps.PutUe(0u);       // log2_diff_max_min_pcm_cb = 0
+    msps.PutBit(1u);      // pcm_loop_filter_disabled = 1
+    msps.PutBit(0u);      // strong_intra_smoothing = 0
+    msps.PutBit(0u);      // sps_extension_present = 0
+    msps.PutRbspTrailing();
+
+    // 2. HEVC PPS (NAL 34, SliceQpY = 26)
+    TestMsbBitWriter pps;
+    pps.PutUe(0u); pps.PutUe(0u); // pps_id=0, sps_id=0
+    pps.PutBit(0u); pps.PutBit(0u); pps.PutBits(0u, 3u); // dep_slice=0, output_flag=0, extra_bits=0
+    pps.PutBit(0u); pps.PutBit(0u); // sign_hiding=0, cabac_init=0
+    pps.PutUe(0u); pps.PutUe(0u);   // ref_l0=0, ref_l1=0
+    pps.PutUe(0u);                  // init_qp_minus26 = 0 (se(v)=0)
+    pps.PutBit(0u); pps.PutBit(0u); pps.PutBit(0u); // constrained=0, tr_skip=0, cu_qp_delta=0
+    pps.PutUe(0u); pps.PutUe(0u);   // cb/cr_qp_offset = 0
+    for (int i = 0; i < 10; ++i) pps.PutBit(0u); // chroma_qp..lists_mod = 0
+    pps.PutUe(0u);  // parallel_merge_minus2 = 0
+    pps.PutBit(0u); // slice_hdr_ext = 0
+    pps.PutRbspTrailing();
+
+    // 3. HEVC IDR_W_RADL Slice (NAL 19, slice_type = 2 Intra, CABAC + 8x8 I_PCM CUs)
+    TestMsbBitWriter slice;
+    slice.PutBit(1u); // first_slice_segment_in_pic_flag = 1
+    slice.PutBit(0u); // no_output_of_prior_pics_flag = 0
+    slice.PutUe(0u);  // slice_pic_parameter_set_id = 0
+    slice.PutUe(2u);  // slice_type = 2 (I-slice)
+    slice.PutUe(0u);  // slice_qp_delta = 0 (se(v)=0 -> SliceQpY = 26)
+    slice.PutRbspTrailing(); // byte_alignment()
+
+    const uint32_t ctbW = width / 8u;
+    const uint32_t ctbH = height / 8u;
+    const uint32_t numCtbs = ctbW * ctbH;
+    TestHevcCabacCtx ctxPartMode{ 0u, 1u }; // initVal=184 at SliceQpY=26 -> pre=64 -> mps=1, state=0
+
+    for (uint32_t ctbIdx = 0; ctbIdx < numCtbs; ++ctbIdx) {
+        TestHevcCabacSegment seg;
+        if (ctbIdx > 0u) {
+            seg.EncodeTerminate(0u); // end_of_slice_segment_flag = 0 for previous CTU
+        }
+        seg.EncodeDecision(ctxPartMode, 1u); // part_mode = PART_2Nx2N (1)
+        seg.EncodeTerminate(1u);             // pcm_flag = 1
+        seg.FlushToWriter(slice, false);
+
+        uint32_t x0 = (ctbIdx % ctbW) * 8u;
+        uint32_t y0 = (ctbIdx / ctbW) * 8u;
+        uint8_t p0[64], p1[64], p2[64];
+        for (uint32_t py = 0; py < 8u; ++py) {
+            for (uint32_t px = 0; px < 8u; ++px) {
+                uint32_t x = x0 + px, y = y0 + py;
+                size_t k = py * 8u + px;
+                if (!useYcbcr) {
+                    // BPG_CS_RGB stores GBR planes (plane0=G, plane1=B, plane2=R); quadrant (1,0) is pure 0,0,0 to exercise 00 00 03 RBSP escaping!
+                    uint8_t r = 0, g = 0, b = 0;
+                    if (x < 8u && y < 8u)        { r = 235; g = 45;  b = 25;  }
+                    else if (x >= 8u && y < 8u)  { r = 0;   g = 0;   b = 0;   }
+                    else if (x < 8u && y >= 8u)  { r = 35;  g = 210; b = 95;  }
+                    else                         { r = 45;  g = 110; b = 245; }
+                    p0[k] = g; p1[k] = b; p2[k] = r;
+                } else {
+                    if (x < width / 2u) { p0[k] = 180; p1[k] = 60;  p2[k] = 200; }
+                    else                { p0[k] = 110; p1[k] = 200; p2[k] = 70;  }
+                }
+            }
+        }
+        slice.bytes.insert(slice.bytes.end(), p0, p0 + 64);
+        slice.bytes.insert(slice.bytes.end(), p1, p1 + 64);
+        slice.bytes.insert(slice.bytes.end(), p2, p2 + 64);
+    }
+
+    // Final CABAC segment after last CTU's pcm_sample(): end_of_slice_segment_flag = 1 + RBSP stop bit
+    {
+        TestHevcCabacSegment eosSeg;
+        eosSeg.EncodeTerminate(1u);
+        eosSeg.FlushToWriter(slice, true);
+    }
+
+    std::vector<uint8_t> picData;
+    PushUIntBase128(picData, static_cast<uint32_t>(msps.bytes.size()));
+    picData.insert(picData.end(), msps.bytes.begin(), msps.bytes.end());
+    AppendTestAnnexBNal(picData, 34u, pps.bytes);
+    AppendTestAnnexBNal(picData, 19u, slice.bytes);
+
     std::vector<uint8_t> b = {
         'B', 'P', 'G', 0xFB,
-        0x60, // pixFmt=3 (4:4:4), alpha1=0, bitDepthMinus8=0
-        0x10, // colorSpace=1 (RGB), ext=0
-        width,
-        height,
-        32    // picture_data_length = 32
+        0x60u, // pixFmt=3 (4:4:4), alpha1=0, bitDepthMinus8=0
+        static_cast<uint8_t>(useYcbcr ? 0x00u : 0x10u) // colorSpace: 0=YCbCr BT.601 full-range, 1=RGB (GBR)
     };
-    // Simulated HEVC intra NAL + slice bytes
-    b.insert(b.end(), { 0x00, 0x00, 0x01, 0x26, 0x01 }); // NAL type 19 (IDR_W_RADL)
-    while (b.size() < 9 + 32) {
-        b.push_back(static_cast<uint8_t>((seed * 59u) + static_cast<uint8_t>(b.size() * 23u)));
-    }
+    PushUIntBase128(b, width);
+    PushUIntBase128(b, height);
+    PushUIntBase128(b, static_cast<uint32_t>(picData.size()));
+    b.insert(b.end(), picData.begin(), picData.end());
     return b;
 }
 
@@ -1591,15 +2383,65 @@ void RunFormatTestsImages(TestCounter& tc) {
         verifyPair(L"Stage15.Images.KhronosKTX1_Dxt5AndEtc2", L"a.ktx", ktxA, L"b.ktx", ktxB, L".ktx", 60);
     }
 
-    // 8. Khronos KTX 2.0 (.ktx2) & Basis Universal (.basis)
+    // 8. Khronos KTX 2.0 (.ktx2) & Basis Universal (.basis UASTC 4x4 + ETC1S + negative CRC/mode checks)
     {
         auto ktx2A = BuildKtx2Fixture(false);
         auto ktx2B = BuildKtx2Fixture(true);
         verifyPair(L"Stage15.Images.KhronosKTX2_Bc1AndZlib", L"a.ktx2", ktx2A, L"b.ktx2", ktx2B, L".ktx2", 96);
 
-        auto basisA = BuildBasisFixture(0x17);
-        auto basisB = BuildBasisFixture(0x9C);
-        verifyPair(L"Stage15.Images.BasisUniversal", L"a.basis", basisA, L"b.basis", basisB, L".basis", 90);
+        auto basisUastcA = BuildBasisFixture(false);
+        auto basisUastcB = BuildBasisFixture(true);
+        verifyPair(L"Stage15.Images.BasisUniversal_Uastc4x4", L"a.basis", basisUastcA, L"b.basis", basisUastcB, L".basis", 90);
+
+        auto basisEtc1s = BuildBasisEtc1sFixture();
+        ExtendedImageInfo uInfo, eInfo;
+        bool uOk = ImageFormatLoader::DecodeImageMemory(basisUastcA.data(), basisUastcA.size(), L".basis", 0, uInfo) &&
+                   uInfo.valid && uInfo.width == 8 && uInfo.height == 8 && uInfo.bgraPixels.size() == 256;
+        bool eOk = ImageFormatLoader::DecodeImageMemory(basisEtc1s.data(), basisEtc1s.size(), L".basis", 0, eInfo) &&
+                   eInfo.valid && eInfo.width == 8 && eInfo.height == 8 && eInfo.bgraPixels.size() == 256;
+
+        bool pxExact = false;
+        if (uOk && eOk) {
+            auto chkPx = [](const std::vector<uint8_t>& px, uint32_t x, uint32_t y, int expR, int expG, int expB, int expA, int tol = 0) {
+                size_t o = (static_cast<size_t>(y) * 8u + x) * 4u;
+                return std::abs(static_cast<int>(px[o + 0]) - expB) <= tol &&
+                       std::abs(static_cast<int>(px[o + 1]) - expG) <= tol &&
+                       std::abs(static_cast<int>(px[o + 2]) - expR) <= tol &&
+                       std::abs(static_cast<int>(px[o + 3]) - expA) <= tol;
+            };
+            // UASTC: (0,0)=Mode 8 RGBA(230,40,25,255), (4,0)=Mode 5 e0 RGB(10,80,240), (7,3)=Mode 5 e1 RGB(250,220,30),
+            //        (0,4)=Mode 14 premul RGBA(200,100,40,128)->(100,50,20,128), (7,7)=Mode 15 LA(230,255)
+            bool uPx = chkPx(uInfo.bgraPixels, 0, 0, 230, 40,  25,  255) &&
+                       chkPx(uInfo.bgraPixels, 4, 0, 10,  80,  240, 255) &&
+                       chkPx(uInfo.bgraPixels, 7, 3, 250, 220, 30,  255) &&
+                       chkPx(uInfo.bgraPixels, 0, 4, 100, 50,  20,  128, 1) &&
+                       chkPx(uInfo.bgraPixels, 7, 7, 230, 230, 230, 255);
+            // ETC1S: (0,0) & (0,4) upper-pred -> Gold RGB(233,233,35); (4,0) & (4,4) upper-pred -> Cyan RGB(33,182,255)
+            bool ePx = chkPx(eInfo.bgraPixels, 0, 0, 233, 233, 35,  255) &&
+                       chkPx(eInfo.bgraPixels, 0, 4, 233, 233, 35,  255) &&
+                       chkPx(eInfo.bgraPixels, 4, 0, 33,  182, 255, 255) &&
+                       chkPx(eInfo.bgraPixels, 4, 4, 33,  182, 255, 255);
+            pxExact = uPx && ePx;
+        }
+
+        // Negative checks: corrupt slice CRC16, reserved UASTC Mode 19 (0x45), and codebook-less ETC1S must fail
+        auto badCrcBasis = basisUastcA;
+        badCrcBasis.back() ^= 0x55u; // Invalidates sliceCrc16 & dataCrc16
+        auto badMode19Basis = basisUastcA;
+        badMode19Basis[100] = 0x45u; // Reserved UASTC Mode 19
+        badMode19Basis[6] = badMode19Basis[7] = 0u;
+        badMode19Basis[12] = badMode19Basis[13] = 0u;
+        badMode19Basis[77 + 21] = badMode19Basis[77 + 22] = 0u;
+
+        std::vector<uint8_t> fakeEtc1s = basisUastcA;
+        fakeEtc1s[20] = 0u; // cETC1S with zero endpoint/selector codebooks (old cheat format!)
+        fakeEtc1s[6] = fakeEtc1s[7] = fakeEtc1s[12] = fakeEtc1s[13] = 0u;
+
+        ExtendedImageInfo rejInfo;
+        bool rejOk = !ImageFormatLoader::DecodeImageMemory(badCrcBasis.data(), badCrcBasis.size(), L".basis", 0, rejInfo) &&
+                     !ImageFormatLoader::DecodeImageMemory(badMode19Basis.data(), badMode19Basis.size(), L".basis", 0, rejInfo) &&
+                     !ImageFormatLoader::DecodeImageMemory(fakeEtc1s.data(), fakeEtc1s.size(), L".basis", 0, rejInfo);
+        tc.Record(uOk && eOk && pxExact && rejOk, L"Stage15.Images.BasisUniversal_Etc1sAndRejectCorrupt");
     }
 
     // 9. PowerVR Texture (.pvr): PVRTC 4bpp bilinear modulation vs DXT1
@@ -1633,9 +2475,44 @@ void RunFormatTestsImages(TestCounter& tc) {
         auto woffB = BuildWoffFromSfnt(ttfB);
         verifyPair(L"Stage15.Images.WebFontWOFF_ZlibSfnt", L"a.woff", woffA, L"b.woff", woffB, L".woff", 40);
 
-        auto woff2A = BuildWoff2Fixture(0x11, 1400);
-        auto woff2B = BuildWoff2Fixture(0x73, 3800);
+        auto woff2A = BuildWoff2FromSfnt(ttfA, false); // Uncompressed RFC 7932 Brotli meta-block
+        auto woff2B = BuildWoff2FromSfnt(ttfB, true);  // Canonical-Huffman RFC 7932 Brotli meta-block
         verifyPair(L"Stage15.Images.WebFontWOFF2_UIntBase128", L"a.woff2", woff2A, L"b.woff2", woff2B, L".woff2", 52);
+
+        // Verify unpacked WOFF2 renders real 640x400 glyph specimen ink (NOT old 520x300 bar chart) & rejects corrupt Brotli
+        ExtendedImageInfo wf2Info;
+        bool wf2Ok = ImageFormatLoader::DecodeImageMemory(woff2B.data(), woff2B.size(), L".woff2", 0, wf2Info) &&
+                     wf2Info.valid && wf2Info.width == 640 && wf2Info.height == 400 &&
+                     wf2Info.bgraPixels.size() == 640u * 400u * 4u;
+        size_t glyphInkPixels = 0u;
+        if (wf2Ok) {
+            for (uint32_t y = 50; y < 390; ++y) {
+                for (uint32_t x = 10; x < 630; ++x) {
+                    const uint8_t* p = &wf2Info.bgraPixels[(static_cast<size_t>(y) * 640u + x) * 4u];
+                    if (p[2] < 100u && p[1] < 110u) ++glyphInkPixels; // Dark glyph ink over parchment RGB(250,250,247)
+                }
+            }
+        }
+        auto badWoff2 = woff2B;
+        uint32_t wf2CompLen = (static_cast<uint32_t>(badWoff2[20]) << 24) |
+                              (static_cast<uint32_t>(badWoff2[21]) << 16) |
+                              (static_cast<uint32_t>(badWoff2[22]) << 8)  |
+                               static_cast<uint32_t>(badWoff2[23]);
+        // Locate start of Brotli stream (8 tables x 2-3 bytes dir = 65 bytes -> offset 65) and inject reserved invalid WBITS (0x11)
+        size_t brotliStart = 48u;
+        for (int ti = 0; ti < 8; ++ti) {
+            ++brotliStart; // flags
+            while (brotliStart < badWoff2.size() && (badWoff2[brotliStart++] & 0x80u) != 0u) {}
+        }
+        if (brotliStart + 4u <= badWoff2.size() && wf2CompLen >= 4u) {
+            badWoff2[brotliStart + 0u] = 0x11u; // Reserved invalid RFC 7932 WBITS pattern
+            badWoff2[brotliStart + 1u] = 0xFFu;
+            badWoff2[brotliStart + 2u] = 0xFFu;
+            badWoff2[brotliStart + 3u] = 0xFFu;
+        }
+        ExtendedImageInfo badWf2Info;
+        bool wf2Rej = !ImageFormatLoader::DecodeImageMemory(badWoff2.data(), badWoff2.size(), L".woff2", 0, badWf2Info);
+        tc.Record(wf2Ok && glyphInkPixels > 200u && wf2Rej, L"Stage15.Images.WebFontWOFF2_GlyphsAndRejectCorrupt");
 
         // Also test real system fonts via Win32 GDI AddFontMemResourceEx when available
         const wchar_t* sysA = L"C:\\Windows\\Fonts\\arial.ttf";
@@ -1652,15 +2529,89 @@ void RunFormatTestsImages(TestCounter& tc) {
         }
     }
 
-    // 13. JPEG XL (.jxl ISOBMFF + bare container rejection) & BPG (.bpg)
+    // 13. JPEG XL (.jxl Modular bare + ISOBMFF jxlc + jxlp + brob + VarDCT/container rejection) & BPG (.bpg HEVC I_PCM + rejection)
     {
-        auto jxlA = BuildJxlBoxedFixture(7,  0x25); // 64x64
-        auto jxlB = BuildJxlBoxedFixture(15, 0x9E); // 128x128
-        verifyPair(L"Stage15.Images.JpegXL_IsobmffCodestream", L"a.jxl", jxlA, L"b.jxl", jxlB, L".jxl", 12);
+        auto jxlCsRgb  = BuildJxlModularCodestream(16, 16, false, true,  true);  // 16x16 RGB + YCoCg RCT + Gradient predictor
+        auto jxlCsRgba = BuildJxlModularCodestream(24, 16, true,  false, false); // 24x16 RGBA (alpha=128 bottom half)
+        auto jxlA      = WrapJxlIsobmff(jxlCsRgb);
+        verifyPair(L"Stage15.Images.JpegXL_IsobmffAndBareModular", L"a.jxl", jxlA, L"b.jxl", jxlCsRgba, L".jxl", 36);
 
-        auto bpgA = BuildBpgFixture(32, 32, 0x19);
-        auto bpgB = BuildBpgFixture(48, 32, 0xA7);
-        verifyPair(L"Stage15.Images.BPG_HeaderAndSlice", L"a.bpg", bpgA, L"b.bpg", bpgB, L".bpg", 8);
+        auto jxlPartial = WrapJxlPartialBoxes(jxlCsRgb, true);
+        auto jxlBrob    = WrapJxlBrob(jxlCsRgb);
+        ExtendedImageInfo infoJxlA, infoJxlP, infoJxlBrob, infoJxlRgba;
+        bool jxlAllOk =
+            ImageFormatLoader::DecodeImageMemory(jxlA.data(), jxlA.size(), L".jxl", 0, infoJxlA) &&
+            ImageFormatLoader::DecodeImageMemory(jxlPartial.data(), jxlPartial.size(), L".jxl", 0, infoJxlP) &&
+            ImageFormatLoader::DecodeImageMemory(jxlBrob.data(), jxlBrob.size(), L".jxl", 0, infoJxlBrob) &&
+            ImageFormatLoader::DecodeImageMemory(jxlCsRgba.data(), jxlCsRgba.size(), L".jxl", 0, infoJxlRgba) &&
+            infoJxlA.width == 16 && infoJxlA.height == 16 &&
+            infoJxlRgba.width == 24 && infoJxlRgba.height == 16 &&
+            infoJxlA.bgraPixels == infoJxlP.bgraPixels &&
+            infoJxlA.bgraPixels == infoJxlBrob.bgraPixels;
+
+        bool jxlPxExact = false;
+        if (jxlAllOk) {
+            auto chkJxl = [](const ExtendedImageInfo& inf, uint32_t x, uint32_t y, int r, int g, int b, int a, int tol = 0) {
+                size_t o = (static_cast<size_t>(y) * inf.width + x) * 4u;
+                return std::abs(static_cast<int>(inf.bgraPixels[o + 0]) - b) <= tol &&
+                       std::abs(static_cast<int>(inf.bgraPixels[o + 1]) - g) <= tol &&
+                       std::abs(static_cast<int>(inf.bgraPixels[o + 2]) - r) <= tol &&
+                       std::abs(static_cast<int>(inf.bgraPixels[o + 3]) - a) <= tol;
+            };
+            jxlPxExact = chkJxl(infoJxlA,    2,  2,  220, 40,  30,  255) &&
+                         chkJxl(infoJxlA,    12, 2,  30,  195, 75,  255) &&
+                         chkJxl(infoJxlA,    2,  12, 35,  95,  235, 255) &&
+                         chkJxl(infoJxlA,    12, 12, 240, 205, 45,  255) &&
+                         chkJxl(infoJxlRgba, 4,  2,  20,  180, 220, 255) &&
+                         chkJxl(infoJxlRgba, 4,  12, 100, 30,  60,  128, 1);
+        }
+
+        // Negative JXL checks: bare container without jxlc/jxlp, unfinished jxlp sequence, and fake VarDCT garbage
+        std::vector<uint8_t> bareJxlBox = {
+            0x00, 0x00, 0x00, 0x0C, 'J', 'X', 'L', ' ', 0x0D, 0x0A, 0x87, 0x0A,
+            0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p', 'j', 'x', 'l', ' ', 0, 0, 0, 0, 'j', 'x', 'l', ' '
+        };
+        auto unfinishedJxlp = WrapJxlPartialBoxes(jxlCsRgb, false);
+        std::vector<uint8_t> fakeVarDct = { 0xFF, 0x0A, 0x4F, 0x06, 0x01, 0x99, 0xAA, 0x55, 0xDE, 0xAD }; // fhAllDefault=1 + garbage
+        ExtendedImageInfo badJxl;
+        bool jxlRej = !ImageFormatLoader::DecodeImageMemory(bareJxlBox.data(), bareJxlBox.size(), L".jxl", 0, badJxl) &&
+                      !ImageFormatLoader::DecodeImageMemory(unfinishedJxlp.data(), unfinishedJxlp.size(), L".jxl", 0, badJxl) &&
+                      !ImageFormatLoader::DecodeImageMemory(fakeVarDct.data(), fakeVarDct.size(), L".jxl", 0, badJxl);
+        tc.Record(jxlAllOk && jxlPxExact && jxlRej, L"Stage15.Images.JpegXL_JxlpBrobAlphaAndRejectFake");
+
+        auto bpgRgb   = BuildBpgFixture(16, 16, false); // 16x16 BPG_CS_RGB (GBR I_PCM + 00 00 03 RBSP escaping)
+        auto bpgYcbcr = BuildBpgFixture(24, 16, true);  // 24x16 BPG_CS_YCbCr full-range I_PCM
+        verifyPair(L"Stage15.Images.BPG_HevcIntraPcmRgbAndYCbCr", L"a.bpg", bpgRgb, L"b.bpg", bpgYcbcr, L".bpg", 16);
+
+        ExtendedImageInfo bpgInfo;
+        bool bpgOk = ImageFormatLoader::DecodeImageMemory(bpgRgb.data(), bpgRgb.size(), L".bpg", 0, bpgInfo) &&
+                     bpgInfo.valid && bpgInfo.width == 16 && bpgInfo.height == 16 && bpgInfo.bgraPixels.size() == 1024;
+        bool bpgPxExact = false;
+        if (bpgOk) {
+            auto chkBpg = [&](uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b) {
+                size_t o = (static_cast<size_t>(y) * 16u + x) * 4u;
+                return bpgInfo.bgraPixels[o + 0] == b && bpgInfo.bgraPixels[o + 1] == g &&
+                       bpgInfo.bgraPixels[o + 2] == r && bpgInfo.bgraPixels[o + 3] == 255u;
+            };
+            bpgPxExact = chkBpg(2,  2,  235, 45,  25) &&
+                         chkBpg(12, 2,  0,   0,   0)  && // Confirms 00 00 03 emulation-prevention unescaping!
+                         chkBpg(2,  12, 35,  210, 95) &&
+                         chkBpg(12, 12, 45,  110, 245);
+        }
+
+        // Negative BPG checks: missing PPS (old fake NAL-19-only cheat) and corrupt CABAC ivlOffset >= 510
+        std::vector<uint8_t> fakeNoPpsBpg = {
+            'B', 'P', 'G', 0xFB, 0x60, 0x10, 16, 16, 16,
+            0x04, 0x30, 0x00, 0x00, 0x80, // MSPS
+            0x00, 0x00, 0x01, 0x26, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x11
+        };
+        auto badCabacBpg = bpgRgb;
+        badCabacBpg[badCabacBpg.size() - 2u] = 0xFFu; // ivlOffset = 511 -> invalid CABAC engine init!
+        badCabacBpg[badCabacBpg.size() - 1u] = 0xFFu;
+        ExtendedImageInfo badBpgInfo;
+        bool bpgRej = !ImageFormatLoader::DecodeImageMemory(fakeNoPpsBpg.data(), fakeNoPpsBpg.size(), L".bpg", 0, badBpgInfo) &&
+                      !ImageFormatLoader::DecodeImageMemory(badCabacBpg.data(), badCabacBpg.size(), L".bpg", 0, badBpgInfo);
+        tc.Record(bpgOk && bpgPxExact && bpgRej, L"Stage15.Images.BPG_ExactPixelsAndRejectCorrupt");
     }
 
     // 14. DICOM PS3.5 / PS3.10 (.dcm): Undefined-Length SQ + Signed 12-bit CT HU VOI Window vs RLE Lossless
@@ -1736,6 +2687,499 @@ void RunFormatTestsImages(TestCounter& tc) {
                              sampleAni.valid && sampleAni.width > 0 && sampleAni.height > 0;
             tc.Record(okRepoAni, L"Stage15.Images.RepoTestData.ANI");
         }
+    }
+
+    // 16. Camera RAW & Adobe DNG (#4): SubIFDs 12-bit Packed CFA, Zlib-Tiled DNG, Lossless JPEG SOF3 CR2 & Fujifilm RAF CFA
+    {
+        auto appendIfdEntryLE = [](std::vector<uint8_t>& buf, uint16_t tag, uint16_t type, uint32_t count, uint32_t valOrOff) {
+            PushU16LE(buf, tag);
+            PushU16LE(buf, type);
+            PushU32LE(buf, count);
+            PushU32LE(buf, valOrOff);
+        };
+
+        // A. DNG with IFD0 -> SubIFDs (0x014A) -> 16x16 12-bit MSB-packed RGGB CFA (saturated Red)
+        std::vector<uint8_t> dngSubIfd;
+        {
+            const uint32_t w = 16, h = 16;
+            std::vector<uint16_t> samples(w * h);
+            for (uint32_t y = 0; y < h; ++y) {
+                for (uint32_t x = 0; x < w; ++x) {
+                    bool isR = ((y & 1u) == 0u) && ((x & 1u) == 0u);
+                    samples[y * w + x] = isR ? 3900u : 128u;
+                }
+            }
+            // Pack 12-bit MSB-first samples (2 pixels -> 3 bytes)
+            std::vector<uint8_t> packed12;
+            for (size_t i = 0; i < samples.size(); i += 2) {
+                uint16_t s0 = samples[i] & 0x0FFFu;
+                uint16_t s1 = samples[i + 1] & 0x0FFFu;
+                packed12.push_back(static_cast<uint8_t>(s0 >> 4));
+                packed12.push_back(static_cast<uint8_t>(((s0 & 0x0Fu) << 4) | (s1 >> 8)));
+                packed12.push_back(static_cast<uint8_t>(s1 & 0xFFu));
+            }
+
+            dngSubIfd = { 'I', 'I', 42, 0, 8, 0, 0, 0 }; // IFD0 at 8
+            // IFD0: 2 entries (NewSubfileType=1 thumbnail placeholder without strips, SubIFDs=0x014A -> offset 38)
+            PushU16LE(dngSubIfd, 2);
+            appendIfdEntryLE(dngSubIfd, 0x00FE, 4, 1, 1u);
+            appendIfdEntryLE(dngSubIfd, 0x014A, 4, 1, 38u);
+            PushU32LE(dngSubIfd, 0); // nextIFD = 0 (offset 38 next)
+
+            // SubIFD at offset 38: 12 entries (sorted ascending by tag) -> 2 + 12*12 + 4 = 150 bytes -> ends at 188
+            uint32_t stripOff = 188u;
+            uint32_t stripLen = static_cast<uint32_t>(packed12.size());
+            PushU16LE(dngSubIfd, 12);
+            appendIfdEntryLE(dngSubIfd, 0x00FE, 4, 1, 0u);          // NewSubfileType = 0 (Full-res RAW)
+            appendIfdEntryLE(dngSubIfd, 0x0100, 4, 1, w);           // ImageWidth = 16
+            appendIfdEntryLE(dngSubIfd, 0x0101, 4, 1, h);           // ImageLength = 16
+            appendIfdEntryLE(dngSubIfd, 0x0102, 3, 1, 12u);         // BitsPerSample = 12
+            appendIfdEntryLE(dngSubIfd, 0x0103, 3, 1, 1u);          // Compression = 1 (Uncompressed)
+            appendIfdEntryLE(dngSubIfd, 0x0106, 3, 1, 32803u);      // Photometric = CFA
+            appendIfdEntryLE(dngSubIfd, 0x0111, 4, 1, stripOff);    // StripOffsets
+            appendIfdEntryLE(dngSubIfd, 0x0115, 3, 1, 1u);          // SamplesPerPixel = 1
+            appendIfdEntryLE(dngSubIfd, 0x0117, 4, 1, stripLen);    // StripByteCounts
+            appendIfdEntryLE(dngSubIfd, 0x828D, 3, 2, 0x00020002u); // CFARepeatPatternDim = 2x2
+            appendIfdEntryLE(dngSubIfd, 0x828E, 1, 4, 0x02010100u); // CFAPattern = {0=R, 1=G, 1=G, 2=B}
+            appendIfdEntryLE(dngSubIfd, 0xC61D, 4, 1, 4095u);       // WhiteLevel = 4095
+            PushU32LE(dngSubIfd, 0);
+            dngSubIfd.insert(dngSubIfd.end(), packed12.begin(), packed12.end());
+        }
+
+        // B. Tiled (8x8 tiles, 2x2 grid) Zlib-compressed (Compression=8) 16-bit RGGB CFA DNG (saturated Blue)
+        std::vector<uint8_t> dngTiledZlib;
+        {
+            const uint32_t w = 16, h = 16, tw = 8, th = 8;
+            std::vector<std::vector<uint8_t>> zTiles(4);
+            for (uint32_t ty = 0; ty < 2; ++ty) {
+                for (uint32_t tx = 0; tx < 2; ++tx) {
+                    std::vector<uint8_t> rawTile;
+                    for (uint32_t y = 0; y < th; ++y) {
+                        for (uint32_t x = 0; x < tw; ++x) {
+                            bool isB = ((y & 1u) == 1u) && ((x & 1u) == 1u);
+                            PushU16LE(rawTile, isB ? 58000u : 1200u);
+                        }
+                    }
+                    zTiles[ty * 2 + tx] = CompressZlibFixed(rawTile);
+                }
+            }
+
+            dngTiledZlib = { 'I', 'I', 42, 0, 8, 0, 0, 0 };
+            // IFD0 at 8: 12 entries -> 2 + 12*12 + 4 = 150 bytes -> offset 158
+            // TileOffsets array (4*4=16B) at 158..173, TileByteCounts array (4*4=16B) at 174..189, tiles start at 190
+            uint32_t tileOffTbl = 158u;
+            uint32_t tileCntTbl = 174u;
+            uint32_t curOff = 190u;
+            uint32_t tOffs[4] = {}, tLens[4] = {};
+            for (int i = 0; i < 4; ++i) {
+                tOffs[i] = curOff;
+                tLens[i] = static_cast<uint32_t>(zTiles[i].size());
+                curOff += tLens[i];
+            }
+            PushU16LE(dngTiledZlib, 12);
+            appendIfdEntryLE(dngTiledZlib, 0x00FE, 4, 1, 0u);
+            appendIfdEntryLE(dngTiledZlib, 0x0100, 4, 1, w);
+            appendIfdEntryLE(dngTiledZlib, 0x0101, 4, 1, h);
+            appendIfdEntryLE(dngTiledZlib, 0x0102, 3, 1, 16u);         // 16-bit
+            appendIfdEntryLE(dngTiledZlib, 0x0103, 3, 1, 8u);          // Compression = 8 (Adobe Deflate/Zlib)
+            appendIfdEntryLE(dngTiledZlib, 0x0106, 3, 1, 32803u);      // CFA
+            appendIfdEntryLE(dngTiledZlib, 0x0115, 3, 1, 1u);
+            appendIfdEntryLE(dngTiledZlib, 0x0142, 4, 1, tw);          // TileWidth = 8
+            appendIfdEntryLE(dngTiledZlib, 0x0143, 4, 1, th);          // TileLength = 8
+            appendIfdEntryLE(dngTiledZlib, 0x0144, 4, 4, tileOffTbl);  // TileOffsets[4]
+            appendIfdEntryLE(dngTiledZlib, 0x0145, 4, 4, tileCntTbl);  // TileByteCounts[4]
+            appendIfdEntryLE(dngTiledZlib, 0x828E, 1, 4, 0x02010100u); // RGGB
+            PushU32LE(dngTiledZlib, 0);
+            for (int i = 0; i < 4; ++i) PushU32LE(dngTiledZlib, tOffs[i]);
+            for (int i = 0; i < 4; ++i) PushU32LE(dngTiledZlib, tLens[i]);
+            for (int i = 0; i < 4; ++i) dngTiledZlib.insert(dngTiledZlib.end(), zTiles[i].begin(), zTiles[i].end());
+        }
+
+        verifyPair(L"Stage15.Images.CameraRAW_DngSubIfd12BitAndTiledZlib",
+                   L"subifd12.dng", dngSubIfd, L"tiled_zlib.dng", dngTiledZlib, L".dng", 64);
+
+        // C. ITU-T T.81 Lossless JPEG (SOF3 0xFFC3, 4-component 12-bit Bayer quad) CR2/DNG + Fujifilm RAF Raw CFA
+        std::vector<uint8_t> cr2Ljpeg;
+        {
+            // Build 4-component 8x8 quad (= 16x16 CFA) Lossless JPEG SOF3 stream (Green-dominant: R=200, G=3800, B=200)
+            std::vector<uint8_t> lj = { 0xFF, 0xD8 };
+            // DHT (0xFFC4): Th=0, counts[0]=1 (ssss=0 -> '0'), counts[1]=1 (ssss=11 -> '10')
+            lj.insert(lj.end(), { 0xFF, 0xC4, 0x00, 21, 0x00 });
+            lj.push_back(1); lj.push_back(1);
+            for (int i = 2; i < 16; ++i) lj.push_back(0);
+            lj.push_back(0);  // code '0'  -> ssss = 0 (diff = 0)
+            lj.push_back(11); // code '10' -> ssss = 11 (11-bit diff)
+
+            // SOF3 (0xFFC3): P=12, Y=8, X=8, Nf=4 (2x2 Bayer quad components 1..4)
+            lj.insert(lj.end(), {
+                0xFF, 0xC3, 0x00, 20, 12, 0x00, 8, 0x00, 8, 4,
+                1, 0x11, 0,  2, 0x11, 0,  3, 0x11, 0,  4, 0x11, 0
+            });
+            // SOS (0xFFDA): Ns=4, Predictor Ss=1, Se=0, Pt=0
+            lj.insert(lj.end(), {
+                0xFF, 0xDA, 0x00, 14, 4,
+                1, 0x00,  2, 0x00,  3, 0x00,  4, 0x00,
+                1, 0, 0
+            });
+
+            // Entropy bitstream (MSB-first with 0xFF00 byte-stuffing):
+            // First MCU (0,0) initPred=2048:
+            //   Comp0 (R=200):  diff=-1848 -> ssss=11 ('10'), v = -1848 + 2047 = 199 (11 bits)
+            //   Comp1 (G1=3800):diff=+1752 -> ssss=11 ('10'), v = 1752 (11 bits)
+            //   Comp2 (G2=3800):diff=+1752 -> ssss=11 ('10'), v = 1752 (11 bits)
+            //   Comp3 (B=200):  diff=-1848 -> ssss=11 ('10'), v = 199  (11 bits)
+            // Remaining 63 MCUs * 4 comps = 252 samples: all diff=0 -> '0'
+            uint32_t bitAcc = 0; int bitUsed = 0;
+            auto emitMsb = [&](uint32_t val, int n) {
+                for (int b = n - 1; b >= 0; --b) {
+                    bitAcc = (bitAcc << 1) | ((val >> b) & 1u);
+                    if (++bitUsed == 8) {
+                        lj.push_back(static_cast<uint8_t>(bitAcc));
+                        if ((bitAcc & 0xFFu) == 0xFFu) lj.push_back(0x00u);
+                        bitAcc = 0; bitUsed = 0;
+                    }
+                }
+            };
+            const uint32_t mcu0Vals[4] = { 199u, 1752u, 1752u, 199u };
+            for (int c = 0; c < 4; ++c) {
+                emitMsb(0b10u, 2);
+                emitMsb(mcu0Vals[c], 11);
+            }
+            for (int rem = 0; rem < 63 * 4; ++rem) emitMsb(0u, 1);
+            if (bitUsed > 0) emitMsb((1u << (8 - bitUsed)) - 1u, 8 - bitUsed);
+            lj.insert(lj.end(), { 0xFF, 0xD9 });
+
+            cr2Ljpeg = { 'I', 'I', 42, 0, 16, 0, 0, 0, 'C', 'R', 2, 0, 16, 0, 0, 0 }; // Canon CR2 header, IFD0 at 16
+            // 11 entries -> 2 + 11*12 + 4 = 138 bytes -> strip at 154
+            uint32_t sOff = 154u, sLen = static_cast<uint32_t>(lj.size());
+            PushU16LE(cr2Ljpeg, 11);
+            appendIfdEntryLE(cr2Ljpeg, 0x00FE, 4, 1, 0u);
+            appendIfdEntryLE(cr2Ljpeg, 0x0100, 4, 1, 16u);
+            appendIfdEntryLE(cr2Ljpeg, 0x0101, 4, 1, 16u);
+            appendIfdEntryLE(cr2Ljpeg, 0x0102, 3, 1, 12u);
+            appendIfdEntryLE(cr2Ljpeg, 0x0103, 3, 1, 7u);           // Compression = 7 (Lossless JPEG)
+            appendIfdEntryLE(cr2Ljpeg, 0x0106, 3, 1, 32803u);       // CFA
+            appendIfdEntryLE(cr2Ljpeg, 0x0111, 4, 1, sOff);
+            appendIfdEntryLE(cr2Ljpeg, 0x0115, 3, 1, 1u);
+            appendIfdEntryLE(cr2Ljpeg, 0x0117, 4, 1, sLen);
+            appendIfdEntryLE(cr2Ljpeg, 0x828D, 3, 2, 0x00020002u);
+            appendIfdEntryLE(cr2Ljpeg, 0x828E, 1, 4, 0x02010100u);
+            PushU32LE(cr2Ljpeg, 0);
+            cr2Ljpeg.insert(cr2Ljpeg.end(), lj.begin(), lj.end());
+        }
+
+        // Fujifilm .raf with raw CFA directory (0x5C->108) + 16x16 16-bit BE RGGB CFA at 120 (no embedded JPEG)
+        std::vector<uint8_t> rafCfa(108, 0);
+        std::memcpy(rafCfa.data(), "FUJIFILMCCD-RAW 0201", 20);
+        rafCfa[95]  = 108u; // cfaHdrOff = 108 BE
+        rafCfa[103] = 120u; // cfaDataOff = 120 BE
+        rafCfa[106] = 0x02; rafCfa[107] = 0x00; // cfaDataLen = 512 BE
+        PushU32BE(rafCfa, 1u);      // numRecs = 1
+        PushU16BE(rafCfa, 0x0100u); // tag 0x0100 = raw dimensions
+        PushU16BE(rafCfa, 4u);      // len = 4
+        PushU16BE(rafCfa, 16u);     // rawH = 16
+        PushU16BE(rafCfa, 16u);     // rawW = 16
+        for (uint32_t y = 0; y < 16; ++y) {
+            for (uint32_t x = 0; x < 16; ++x) {
+                bool isR = ((y & 1u) == 0u) && ((x & 1u) == 0u);
+                PushU16BE(rafCfa, isR ? 0x0E55u : 0x0155u); // Low byte 0x55 ensures BE < 16384 < LE
+            }
+        }
+
+        ExtendedImageInfo iSubRed, iTileBlue, iCr2Grn, iRafRed;
+        bool rawPosOk =
+            ImageFormatLoader::DecodeImageMemory(dngSubIfd.data(), dngSubIfd.size(), L".dng", 0, iSubRed) &&
+            ImageFormatLoader::DecodeImageMemory(dngTiledZlib.data(), dngTiledZlib.size(), L".dng", 0, iTileBlue) &&
+            ImageFormatLoader::DecodeImageMemory(cr2Ljpeg.data(), cr2Ljpeg.size(), L".cr2", 0, iCr2Grn) &&
+            ImageFormatLoader::DecodeImageMemory(rafCfa.data(), rafCfa.size(), L".raf", 0, iRafRed) &&
+            iSubRed.width == 16 && iTileBlue.width == 16 && iCr2Grn.width == 16 && iRafRed.width == 16;
+
+        bool cfaColorOk = false;
+        if (rawPosOk) {
+            size_t cOff = (8u * 16u + 8u) * 4u; // Center pixel (8,8) BGRA
+            bool redDom  = iSubRed.bgraPixels[cOff + 2] > iSubRed.bgraPixels[cOff + 0] + 80u;
+            bool blueDom = iTileBlue.bgraPixels[cOff + 0] > iTileBlue.bgraPixels[cOff + 2] + 80u;
+            bool grnDom  = iCr2Grn.bgraPixels[cOff + 1] > iCr2Grn.bgraPixels[cOff + 2] + 80u &&
+                           iCr2Grn.bgraPixels[cOff + 1] > iCr2Grn.bgraPixels[cOff + 0] + 80u;
+            bool rafRed  = iRafRed.bgraPixels[cOff + 2] > iRafRed.bgraPixels[cOff + 0] + 80u;
+            cfaColorOk = redDom && blueDom && grnDom && rafRed;
+        }
+
+        // Negative RAW checks: 0-entry TIFF IFD, empty-mdat CR3, and offset-zero RAF must strictly fail (no fake card!)
+        std::vector<uint8_t> emptyTiffRaw = { 'I', 'I', 42, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        std::vector<uint8_t> emptyCr3 = {
+            0,0,0,24, 'f','t','y','p', 'c','r','x',' ', 0,0,0,1, 'c','r','x',' ', 'i','s','o','m',
+            0,0,0,16, 'm','d','a','t', 0,0,0,0, 0,0,0,0
+        };
+        std::vector<uint8_t> emptyRaf(128, 0);
+        std::memcpy(emptyRaf.data(), "FUJIFILMCCD-RAW 0201", 20);
+        ExtendedImageInfo badRaw;
+        bool rawRej = !ImageFormatLoader::DecodeImageMemory(emptyTiffRaw.data(), emptyTiffRaw.size(), L".dng", 0, badRaw) &&
+                      !ImageFormatLoader::DecodeImageMemory(emptyTiffRaw.data(), emptyTiffRaw.size(), L".nef", 0, badRaw) &&
+                      !ImageFormatLoader::DecodeImageMemory(emptyCr3.data(), emptyCr3.size(), L".cr3", 0, badRaw) &&
+                      !ImageFormatLoader::DecodeImageMemory(emptyRaf.data(), emptyRaf.size(), L".raf", 0, badRaw);
+        tc.Record(rawPosOk && cfaColorOk && rawRej, L"Stage15.Images.CameraRAW_LosslessJpegRafAndRejectFakeCard");
+    }
+
+    // 17. Vector PostScript / Illustrator (#5a — .eps DOS Binary & Bézier PS, .ai /FlateDecode PDF & Badge Rejection)
+    {
+        std::string psBody =
+            "%!PS-Adobe-3.0 EPSF-3.0\n"
+            "%%BoundingBox: 0 0 200 200\n"
+            "0.90 0.12 0.15 setrgbcolor\n"
+            "newpath 20 20 moveto 180 20 lineto 180 180 20 180 20 100 curveto closepath fill\n"
+            "0.10 0.25 0.85 setrgbcolor 6 setlinewidth 30 30 140 140 rectstroke\n"
+            "%%EOF\n";
+        // DOS Binary EPS header (C5 D0 D3 C6 + PS offset=30 + PS length)
+        std::vector<uint8_t> dosEps(30, 0);
+        dosEps[0] = 0xC5; dosEps[1] = 0xD0; dosEps[2] = 0xD3; dosEps[3] = 0xC6;
+        uint32_t psOff = 30u, psLen = static_cast<uint32_t>(psBody.size());
+        std::memcpy(dosEps.data() + 4, &psOff, 4);
+        std::memcpy(dosEps.data() + 8, &psLen, 4);
+        dosEps.insert(dosEps.end(), psBody.begin(), psBody.end());
+
+        // PDF-based Illustrator .ai with Zlib /FlateDecode content stream
+        std::string pdfCmds =
+            "0.12 0.78 0.35 rg\n"
+            "20 20 160 160 re f\n"
+            "0.85 0.20 0.60 RG 5 w\n"
+            "30 100 m 80 180 120 20 170 100 c S\n";
+        std::vector<uint8_t> pdfRaw(pdfCmds.begin(), pdfCmds.end());
+        std::vector<uint8_t> pdfZlib = CompressZlibFixed(pdfRaw);
+        std::string aiHdr =
+            "%PDF-1.5\n"
+            "1 0 obj << /Type /Page /MediaBox [0 0 200 200] /Contents 2 0 R >> endobj\n"
+            "2 0 obj << /Filter /FlateDecode /Length " + std::to_string(pdfZlib.size()) + " >>\nstream\n";
+        std::string aiTail = "\nendstream\nendobj\n%%EOF\n";
+        std::vector<uint8_t> aiPdf(aiHdr.begin(), aiHdr.end());
+        aiPdf.insert(aiPdf.end(), pdfZlib.begin(), pdfZlib.end());
+        aiPdf.insert(aiPdf.end(), aiTail.begin(), aiTail.end());
+
+        verifyPair(L"Stage15.Images.VectorEpsDosAndAiFlatePdf",
+                   L"dos.eps", dosEps, L"flate.ai", aiPdf, L".ai", 24);
+
+        const char* emptyEps = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 100 100\n%%EOF\n";
+        const char* emptyAi  = "%PDF-1.5\n1 0 obj << /Type /Catalog >> endobj\n%%EOF\n";
+        ExtendedImageInfo badVec;
+        bool vecRej = !ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(emptyEps), std::strlen(emptyEps), L".eps", 0, badVec) &&
+                      !ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(emptyAi), std::strlen(emptyAi), L".ai", 0, badVec);
+        tc.Record(vecRej, L"Stage15.Images.VectorEpsAi_RejectEmptyNoBadgeCard");
+    }
+
+    // 18. CorelDRAW & Affinity Suite (#5b — .cdr RIFF 'DISP' DIB vs ZIP, .afphoto Zlib 'Thmb' & Badge Rejection)
+    {
+        auto buildDib24 = [](uint32_t w, uint32_t h, uint8_t r, uint8_t g, uint8_t b) {
+            std::vector<uint8_t> dib;
+            uint32_t stride = ((w * 24u + 31u) / 32u) * 4u;
+            PushU32LE(dib, 40u);
+            PushU32LE(dib, w);
+            PushU32LE(dib, h);
+            PushU16LE(dib, 1u);
+            PushU16LE(dib, 24u);
+            PushU32LE(dib, 0u);
+            PushU32LE(dib, stride * h);
+            PushU32LE(dib, 2835u); PushU32LE(dib, 2835u);
+            PushU32LE(dib, 0u); PushU32LE(dib, 0u);
+            for (uint32_t y = 0; y < h; ++y) {
+                size_t rowStart = dib.size();
+                for (uint32_t x = 0; x < w; ++x) {
+                    dib.push_back(static_cast<uint8_t>(b ^ (x * 4u)));
+                    dib.push_back(g);
+                    dib.push_back(r);
+                }
+                while (dib.size() - rowStart < stride) dib.push_back(0u);
+            }
+            return dib;
+        };
+
+        // Classic RIFF 'CDRv' with 'DISP' chunk ([CF_DIB=8:4B] + 16x16 24bpp DIB)
+        std::vector<uint8_t> dibRed = buildDib24(16, 16, 230, 45, 35);
+        std::vector<uint8_t> cdrRiff = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'C', 'D', 'R', 'v', 'D', 'I', 'S', 'P' };
+        PushU32LE(cdrRiff, static_cast<uint32_t>(4u + dibRed.size()));
+        PushU32LE(cdrRiff, 8u); // CF_DIB
+        cdrRiff.insert(cdrRiff.end(), dibRed.begin(), dibRed.end());
+        uint32_t riffBodySz = static_cast<uint32_t>(cdrRiff.size() - 8u);
+        std::memcpy(cdrRiff.data() + 4, &riffBodySz, 4);
+
+        // Modern ZIP .cdr containing stored metadata/thumbnails/thumbnail.bmp
+        std::vector<uint8_t> dibBlue = buildDib24(16, 16, 30, 95, 235);
+        std::vector<uint8_t> bmpBlue(14u + dibBlue.size(), 0);
+        bmpBlue[0] = 'B'; bmpBlue[1] = 'M';
+        uint32_t bmpSz = static_cast<uint32_t>(bmpBlue.size()), bmpOff = 54u;
+        std::memcpy(bmpBlue.data() + 2, &bmpSz, 4);
+        std::memcpy(bmpBlue.data() + 10, &bmpOff, 4);
+        std::memcpy(bmpBlue.data() + 14, dibBlue.data(), dibBlue.size());
+
+        auto wrapSingleStoredZip = [](const char* entryName, const std::vector<uint8_t>& payload) {
+            uint16_t fnLen = static_cast<uint16_t>(std::strlen(entryName));
+            uint32_t sz = static_cast<uint32_t>(payload.size());
+            uint32_t crc = 0xFFFFFFFFu;
+            for (uint8_t b : payload) {
+                crc ^= b;
+                for (int k = 0; k < 8; ++k) crc = (crc & 1u) ? ((crc >> 1u) ^ 0xEDB88320u) : (crc >> 1u);
+            }
+            crc = ~crc;
+            std::vector<uint8_t> z;
+            PushU32LE(z, 0x04034B50u); PushU16LE(z, 20u); PushU16LE(z, 0u); PushU16LE(z, 0u);
+            PushU16LE(z, 0u); PushU16LE(z, 0u); PushU32LE(z, crc); PushU32LE(z, sz); PushU32LE(z, sz);
+            PushU16LE(z, fnLen); PushU16LE(z, 0u);
+            z.insert(z.end(), entryName, entryName + fnLen);
+            z.insert(z.end(), payload.begin(), payload.end());
+            uint32_t cdOff = static_cast<uint32_t>(z.size());
+            PushU32LE(z, 0x02014B50u); PushU16LE(z, 20u); PushU16LE(z, 20u); PushU16LE(z, 0u); PushU16LE(z, 0u);
+            PushU16LE(z, 0u); PushU16LE(z, 0u); PushU32LE(z, crc); PushU32LE(z, sz); PushU32LE(z, sz);
+            PushU16LE(z, fnLen); PushU16LE(z, 0u); PushU16LE(z, 0u); PushU16LE(z, 0u); PushU16LE(z, 0u);
+            PushU32LE(z, 0u); PushU32LE(z, 0u);
+            z.insert(z.end(), entryName, entryName + fnLen);
+            uint32_t cdSize = static_cast<uint32_t>(z.size()) - cdOff;
+            PushU32LE(z, 0x06054B50u); PushU16LE(z, 0u); PushU16LE(z, 0u);
+            PushU16LE(z, 1u); PushU16LE(z, 1u); PushU32LE(z, cdSize); PushU32LE(z, cdOff); PushU16LE(z, 0u);
+            return z;
+        };
+        std::vector<uint8_t> cdrZip = wrapSingleStoredZip("metadata/thumbnails/thumbnail.bmp", bmpBlue);
+        verifyPair(L"Stage15.Images.CorelCdr_RiffDispAndZipThumb",
+                   L"riff.cdr", cdrRiff, L"zip.cdr", cdrZip, L".cdr", 20);
+
+        // Affinity .afphoto with 00 FF 4B 41 magic + Zlib-compressed 'Thmb' BMP stream
+        std::vector<uint8_t> zThumbBmp = CompressZlibFixed(bmpBlue);
+        std::vector<uint8_t> afThmb = { 0x00, 0xFF, 0x4B, 0x41, 0x08, 0x00, 0x00, 0x00, 'T', 'h', 'm', 'b', 0, 0, 0, 0 };
+        afThmb.insert(afThmb.end(), zThumbBmp.begin(), zThumbBmp.end());
+
+        ExtendedImageInfo afInfo, badCdrAff;
+        bool afOk = ImageFormatLoader::DecodeImageMemory(afThmb.data(), afThmb.size(), L".afphoto", 0, afInfo) &&
+                    afInfo.valid && afInfo.width == 16 && afInfo.height == 16;
+        std::vector<uint8_t> emptyRiffCdr = { 'R', 'I', 'F', 'F', 12, 0, 0, 0, 'C', 'D', 'R', 'v', 'J', 'U', 'N', 'K', 0, 0, 0, 0 };
+        std::vector<uint8_t> emptyAfPhoto = { 0x00, 0xFF, 0x4B, 0x41, 0x01, 0x02, 0x03, 0x04, 'N', 'O', 'N', 'E', 0, 0, 0, 0 };
+        bool cdrAffRej = !ImageFormatLoader::DecodeImageMemory(emptyRiffCdr.data(), emptyRiffCdr.size(), L".cdr", 0, badCdrAff) &&
+                         !ImageFormatLoader::DecodeImageMemory(emptyAfPhoto.data(), emptyAfPhoto.size(), L".afphoto", 0, badCdrAff);
+        tc.Record(afOk && cdrAffRej, L"Stage15.Images.AffinityZlibThmbAndRejectFakeCard");
+    }
+
+    // 19. ISO/IEC 8632 Computer Graphics Metafile (#5c — Part 3 Binary vs Part 4 Clear-Text & Empty Rejection)
+    {
+        auto appendCgmCmd = [](std::vector<uint8_t>& out, uint16_t cls, uint16_t eid, const std::vector<uint8_t>& pay) {
+            uint16_t hdr = static_cast<uint16_t>((cls << 12) | (eid << 5) | (pay.size() & 0x1Fu));
+            PushU16BE(out, hdr);
+            out.insert(out.end(), pay.begin(), pay.end());
+            if (pay.size() & 1u) out.push_back(0u);
+        };
+        std::vector<uint8_t> cgmBin;
+        appendCgmCmd(cgmBin, 0, 1, { 3, 'B', 'I', 'N' });                  // BEGIN METAFILE
+        appendCgmCmd(cgmBin, 0, 3, {});                                    // BEGIN PICTURE
+        appendCgmCmd(cgmBin, 2, 2, { 0x00, 0x01 });                        // COLOUR SELECTION MODE = direct RGB
+        appendCgmCmd(cgmBin, 2, 6, { 0, 0, 0, 0, 0x03, 0xE8, 0x03, 0xE8 });// VDC EXTENT (0,0)-(1000,1000)
+        appendCgmCmd(cgmBin, 0, 4, {});                                    // BEGIN PICTURE BODY
+        appendCgmCmd(cgmBin, 5, 22, { 0x00, 0x01 });                       // INTERIOR STYLE = SOLID
+        appendCgmCmd(cgmBin, 5, 23, { 220, 30, 40 });                      // FILL COLOUR = Crimson Red
+        // POLYGON (cls=4, eid=7): rectangle (100,100)-(900,900) covering center
+        appendCgmCmd(cgmBin, 4, 7, {
+            0x00, 100, 0x00, 100,
+            0x03, 0x84, 0x00, 100,
+            0x03, 0x84, 0x03, 0x84,
+            0x00, 100, 0x03, 0x84
+        });
+        appendCgmCmd(cgmBin, 0, 5, {});                                    // END PICTURE
+        appendCgmCmd(cgmBin, 0, 2, {});                                    // END METAFILE
+
+        std::string cgmTxtStr =
+            "BEGMF 'CLEAR_TEXT_CGM';\n"
+            "BEGPIC 'P1';\n"
+            "COLRMODE DIRECT;\n"
+            "VDCEXT (0,0) (1000,1000);\n"
+            "BEGPICBODY;\n"
+            "INTSTYLE SOLID;\n"
+            "FILLCOLR 25 195 75;\n"
+            "CIRCLE (500,500) 380;\n"
+            "ENDPIC;\n"
+            "ENDMF;\n";
+        std::vector<uint8_t> cgmTxt(cgmTxtStr.begin(), cgmTxtStr.end());
+
+        verifyPair(L"Stage15.Images.Cgm_BinaryAndClearText",
+                   L"bin.cgm", cgmBin, L"txt.cgm", cgmTxt, L".cgm", 6);
+
+        ExtendedImageInfo iBin, iTxt, badCgm;
+        bool cgmColorsOk =
+            ImageFormatLoader::DecodeImageMemory(cgmBin.data(), cgmBin.size(), L".cgm", 0, iBin) &&
+            ImageFormatLoader::DecodeImageMemory(cgmTxt.data(), cgmTxt.size(), L".cgm", 0, iTxt);
+        if (cgmColorsOk) {
+            size_t cBin = (static_cast<size_t>(iBin.height / 2u) * iBin.width + (iBin.width / 2u)) * 4u;
+            size_t cTxt = (static_cast<size_t>(iTxt.height / 2u) * iTxt.width + (iTxt.width / 2u)) * 4u;
+            cgmColorsOk = (iBin.bgraPixels[cBin + 2] == 220u && iBin.bgraPixels[cBin + 1] == 30u) &&
+                          (iTxt.bgraPixels[cTxt + 1] == 195u && iTxt.bgraPixels[cTxt + 2] == 25u);
+        }
+        std::vector<uint8_t> emptyBinCgm = { 0x00, 0x20, 0x00, 0x40, 0x00, 0x00 };
+        const char* emptyTxtCgm = "BEGMF 'EMPTY'; BEGPIC 'P'; BEGPICBODY; ENDPIC; ENDMF;";
+        bool cgmRej = !ImageFormatLoader::DecodeImageMemory(emptyBinCgm.data(), emptyBinCgm.size(), L".cgm", 0, badCgm) &&
+                      !ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(emptyTxtCgm), std::strlen(emptyTxtCgm), L".cgm", 0, badCgm);
+        tc.Record(cgmColorsOk && cgmRej, L"Stage15.Images.Cgm_CenterColorsAndRejectEmpty");
+    }
+
+    // 20. Adobe Photoshop Brush Set (#5d — .abr v1 Raw Sampled vs v6.2 8BIMsamp PackBits RLE & No 3-Circle Fallback)
+    {
+        // ABR v1 sampled brush (16x16 raw 8-bit cross pattern)
+        std::vector<uint8_t> abrV1;
+        PushU16BE(abrV1, 1u); // version = 1
+        PushU16BE(abrV1, 1u); // count = 1
+        PushU16BE(abrV1, 2u); // type = 2 (Sampled brush)
+        PushU32BE(abrV1, 6u + 9u + 19u + 256u); // bsize = 290
+        abrV1.insert(abrV1.end(), 6, 0u); // misc(4) + spacing(2)
+        abrV1.push_back(1u); // antialias
+        PushU16BE(abrV1, 0u); PushU16BE(abrV1, 0u); PushU16BE(abrV1, 16u); PushU16BE(abrV1, 16u); // shortBounds
+        PushU32BE(abrV1, 0u); PushU32BE(abrV1, 0u); PushU32BE(abrV1, 16u); PushU32BE(abrV1, 16u); // longBounds
+        PushU16BE(abrV1, 8u); // depth = 8
+        abrV1.push_back(0u);  // comp = 0 (raw)
+        for (uint32_t y = 0; y < 16; ++y) {
+            for (uint32_t x = 0; x < 16; ++x) {
+                bool onCross = (x >= 6 && x <= 9) || (y >= 6 && y <= 9);
+                abrV1.push_back(onCross ? 255u : 0u);
+            }
+        }
+
+        // ABR v6.2 '8BIMsamp' brush (301-byte header + 16*2B row byte counts + PackBits RLE rows)
+        std::vector<uint8_t> sampRec(301, 0);
+        sampRec[0] = 36u; // Pascal UUID length
+        PushU32BE(sampRec, 0u);  // top = 0
+        PushU32BE(sampRec, 0u);  // left = 0
+        PushU32BE(sampRec, 16u); // bottom = 16
+        PushU32BE(sampRec, 16u); // right = 16
+        PushU16BE(sampRec, 8u);  // depth = 8
+        sampRec.push_back(1u);   // comp = 1 (PackBits RLE)
+        std::vector<std::vector<uint8_t>> rleRows(16);
+        for (uint32_t y = 0; y < 16; ++y) {
+            if (y < 4 || y >= 12) {
+                // 16 zeros -> PackBits repeat run: n = 1 - 16 = -15 (0xF1), val = 0x00
+                rleRows[y] = { 0xF1u, 0x00u };
+            } else {
+                // 4 zeros (-3=0xFD, 0x00) + 8 opaque (-7=0xF9, 0xDC) + 4 zeros (0xFD, 0x00)
+                rleRows[y] = { 0xFDu, 0x00u, 0xF9u, 0xDCu, 0xFDu, 0x00u };
+            }
+            PushU16BE(sampRec, static_cast<uint16_t>(rleRows[y].size()));
+        }
+        for (const auto& rr : rleRows) sampRec.insert(sampRec.end(), rr.begin(), rr.end());
+
+        std::vector<uint8_t> abrV62;
+        PushU16BE(abrV62, 6u); // version = 6
+        PushU16BE(abrV62, 2u); // subVersion = 2
+        abrV62.insert(abrV62.end(), { '8', 'B', 'I', 'M', 's', 'a', 'm', 'p' });
+        uint32_t sampPayloadLen = static_cast<uint32_t>(4u + ((sampRec.size() + 3u) & ~3u));
+        PushU32BE(abrV62, sampPayloadLen);
+        PushU32BE(abrV62, static_cast<uint32_t>(sampRec.size()));
+        abrV62.insert(abrV62.end(), sampRec.begin(), sampRec.end());
+        while ((abrV62.size() - 16u) < sampPayloadLen) abrV62.push_back(0u);
+
+        verifyPair(L"Stage15.Images.PhotoshopAbr_V1RawAndV62PackBits",
+                   L"v1.abr", abrV1, L"v62.abr", abrV62, L".abr", 20);
+
+        // Computed-only v1 (type=1, 0 sampled bitmaps) and invalid version (ver=99) must strictly fail!
+        std::vector<uint8_t> computedOnlyAbr = {
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0E,
+            0,0,0,0, 0,25, 0,32, 0,100, 0,0, 0,1
+        };
+        std::vector<uint8_t> badVerAbr = { 0x00, 99, 0x00, 0x02, '8', 'B', 'I', 'M', 's', 'a', 'm', 'p', 0, 0, 0, 0 };
+        ExtendedImageInfo badAbr;
+        bool abrRej = !ImageFormatLoader::DecodeImageMemory(computedOnlyAbr.data(), computedOnlyAbr.size(), L".abr", 0, badAbr) &&
+                      !ImageFormatLoader::DecodeImageMemory(badVerAbr.data(), badVerAbr.size(), L".abr", 0, badAbr);
+        tc.Record(abrRej, L"Stage15.Images.PhotoshopAbr_RejectComputedOnlyNoCircles");
     }
 }
 
