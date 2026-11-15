@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 
 if ([string]::IsNullOrWhiteSpace($OutHeader)) {
     $OutHeader = Join-Path $RepoRoot "build\version_gen.h"
@@ -153,3 +154,6 @@ if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT)) {
 }
 
 Write-Host "Explorer2 version: $fullVer [PE FILEVERSION $fileVer]"
+Write-Host "::notice title=Explorer2 Version::$fullVer [PE $fileVer]"
+$global:LASTEXITCODE = 0
+exit 0

@@ -26,6 +26,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -49,6 +52,7 @@ jobs:
           E2_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
           & .\tools\gen_version.ps1
+          $global:LASTEXITCODE = 0
 
       - name: Configure MSVC x64 toolchain
         uses: ilammy/msvc-dev-cmd@v1
@@ -65,6 +69,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path .\Explorer2.exe)) {
+              Write-Host "::error title=Build Missing::Explorer2.exe was not produced by build.bat"
               throw "Explorer2.exe was not produced by build.bat"
           }
           $p = Start-Process -FilePath .\Explorer2.exe -ArgumentList '--version','build\cli_version.txt' -NoNewWindow -PassThru
@@ -75,6 +80,7 @@ jobs:
           }
           $p.WaitForExit()
           if ($p.ExitCode -ne 0 -or -not (Test-Path build\cli_version.txt)) {
+              Write-Host "::error title=Version Check Failed::ExitCode=$($p.ExitCode)"
               throw "Explorer2.exe --version failed with exit code $($p.ExitCode)"
           }
           $cliVer = (Get-Content build\cli_version.txt -Raw).Trim()
@@ -83,8 +89,10 @@ jobs:
           Write-Host "FileVersion : $($vi.FileVersion)"
           Write-Host "ProductVer  : $($vi.ProductVersion)"
           if ([string]::IsNullOrWhiteSpace($vi.FileVersion)) {
+              Write-Host "::error title=PE VersionInfo Missing::VS_VERSION_INFO resource missing"
               throw "PE VS_VERSION_INFO resource missing from Explorer2.exe"
           }
+          $global:LASTEXITCODE = 0
 
       - name: Run built-in self-test suite
         id: selftest
@@ -96,28 +104,36 @@ jobs:
           $null = $p.Handle
           if (-not $p.WaitForExit(300000)) {
               taskkill /PID $p.Id /T /F | Out-Null
+              Write-Host "::error title=Self-Test Timeout::Self-test suite timed out after 300s"
               throw "Self-test suite timed out after 300s"
           }
           $p.WaitForExit()
           $exitCode = $p.ExitCode
           if (Test-Path $crash) {
+              $crashTxt = (Get-Content $crash -Raw).Trim()
               Write-Host "=== CRASH RECORD ==="
-              Get-Content $crash
+              Write-Host $crashTxt
+              Write-Host "::error title=Self-Test Crash::$($crashTxt -replace '\r?\n',' | ')"
           }
           if (Test-Path $report) {
               $lines = Get-Content $report
               $fails = $lines | Where-Object { $_ -match '^\[FAIL\]' }
               if ($fails) {
                   Write-Host "=== FAILED TESTS ==="
-                  $fails | ForEach-Object { Write-Host $_ }
+                  foreach ($f in $fails) {
+                      Write-Host $f
+                      Write-Host "::error title=Self-Test Failure::$f"
+                  }
               }
               $summary = $lines | Select-Object -Last 1
               Write-Host $summary
+              Write-Host "::notice title=Self-Tests::$summary"
               Add-Content -Path $env:GITHUB_OUTPUT -Value "summary=$summary"
           }
           if ($exitCode -ne 0) {
               throw "Explorer2 self-test suite failed with exit code $exitCode"
           }
+          $global:LASTEXITCODE = 0
 
       - name: Ensure Inno Setup 6 is installed
         shell: pwsh
@@ -129,7 +145,9 @@ jobs:
           if (-not $iscc) {
               Write-Host "Installing Inno Setup via Chocolatey..."
               choco install innosetup -y --no-progress
+              if ($LASTEXITCODE -ne 0) { throw "Chocolatey innosetup install failed" }
           }
+          $global:LASTEXITCODE = 0
 
       - name: Build Windows Installer, Portable ZIP & Checksums
         shell: cmd
@@ -165,6 +183,7 @@ jobs:
               }
           }
           $md -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          $global:LASTEXITCODE = 0
 
       - name: Upload Build & Installer Artifacts
         uses: actions/upload-artifact@v4
@@ -179,7 +198,7 @@ jobs:
       - name: Publish GitHub Release
         if: >-
           github.event_name != 'pull_request' &&
-          !contains(github.event.head_commit.message || '', '[skip release]') &&
+          !contains(github.event.head_commit.message, '[skip release]') &&
           (github.event_name != 'workflow_dispatch' || inputs.publish_release == true || inputs.publish_release == 'true')
         uses: softprops/action-gh-release@v2
         with:
