@@ -832,7 +832,7 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
         return ParseSqliteDatabase(raw, outDoc, /*isGeoPackage=*/true);
     }
     if (ext == L".sqlite" || ext == L".sqlite3" || ext == L".db" ||
-        (raw.size() >= 16 && std::memcmp(raw.data(), "SQLite format 3\0", 16) == 0)) {
+        (ext != L".mbtiles" && raw.size() >= 16 && std::memcmp(raw.data(), "SQLite format 3\0", 16) == 0)) {
         return ParseSqliteDatabase(raw, outDoc);
     }
     if (ext == L".dbf") {

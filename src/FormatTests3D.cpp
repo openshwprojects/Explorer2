@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
 
 namespace Explorer2::SelfTestSuite {
@@ -784,6 +785,289 @@ static std::vector<uint8_t> BuildSyntheticLasOrLaz(const std::vector<Vec3f>& pts
     return w.buf;
 }
 
+static std::string TfBase64Encode(const uint8_t* data, size_t len) {
+    static constexpr char kLut[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t b0 = data[i];
+        uint32_t b1 = (i + 1 < len) ? data[i + 1] : 0u;
+        uint32_t b2 = (i + 2 < len) ? data[i + 2] : 0u;
+        uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push_back(kLut[(triple >> 18) & 0x3Fu]);
+        out.push_back(kLut[(triple >> 12) & 0x3Fu]);
+        out.push_back((i + 1 < len) ? kLut[(triple >> 6) & 0x3Fu] : '=');
+        out.push_back((i + 2 < len) ? kLut[triple & 0x3Fu] : '=');
+    }
+    return out;
+}
+
+static uint32_t TfCrc32(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+static std::vector<uint8_t> TfDeflateFixedHuffman(const uint8_t* src, size_t len) {
+    std::vector<uint8_t> out;
+    out.reserve(len + 16);
+    uint8_t curByte = 0;
+    int bitPos = 0;
+    auto putBit = [&](uint32_t b) {
+        if (b & 1u) curByte |= static_cast<uint8_t>(1u << bitPos);
+        if (++bitPos == 8) {
+            out.push_back(curByte);
+            curByte = 0;
+            bitPos = 0;
+        }
+    };
+    auto putMsb = [&](uint32_t code, int nBits) {
+        for (int i = nBits - 1; i >= 0; --i) {
+            putBit((code >> i) & 1u);
+        }
+    };
+    // BFINAL = 1, BTYPE = 01 (Fixed Huffman)
+    putBit(1);
+    putBit(1);
+    putBit(0);
+    for (size_t i = 0; i < len; ++i) {
+        uint32_t sym = src[i];
+        if (sym <= 143u) putMsb(0x30u + sym, 8);
+        else             putMsb(0x190u + (sym - 144u), 9);
+    }
+    putMsb(0x00u, 7); // End-of-block (256)
+    if (bitPos > 0) out.push_back(curByte);
+    return out;
+}
+
+struct TestZipFileEntry {
+    std::string path;
+    std::string content;
+    bool deflate = false;
+};
+
+static std::vector<uint8_t> BuildTestZipArchive(const std::vector<TestZipFileEntry>& files) {
+    ByteWriter w;
+    struct CdRec {
+        std::string name;
+        uint16_t method = 0;
+        uint32_t crc = 0;
+        uint32_t compSz = 0;
+        uint32_t uncompSz = 0;
+        uint32_t localOff = 0;
+    };
+    std::vector<CdRec> cds;
+
+    for (const auto& f : files) {
+        const auto* rawPtr = reinterpret_cast<const uint8_t*>(f.content.data());
+        size_t rawLen = f.content.size();
+        uint32_t crc = TfCrc32(rawPtr, rawLen);
+        std::vector<uint8_t> payload;
+        uint16_t method = 0;
+        if (f.deflate) {
+            method = 8;
+            payload = TfDeflateFixedHuffman(rawPtr, rawLen);
+        } else {
+            payload.assign(rawPtr, rawPtr + rawLen);
+        }
+
+        CdRec cd;
+        cd.name = f.path;
+        cd.method = method;
+        cd.crc = crc;
+        cd.compSz = static_cast<uint32_t>(payload.size());
+        cd.uncompSz = static_cast<uint32_t>(rawLen);
+        cd.localOff = static_cast<uint32_t>(w.buf.size());
+        cds.push_back(cd);
+
+        w.U32LE(0x04034B50u);
+        w.U16LE(20); // version needed
+        w.U16LE(0);  // flags
+        w.U16LE(method);
+        w.U16LE(0); w.U16LE(0); // time/date
+        w.U32LE(crc);
+        w.U32LE(cd.compSz);
+        w.U32LE(cd.uncompSz);
+        w.U16LE(static_cast<uint16_t>(f.path.size()));
+        w.U16LE(0); // extra len
+        w.Bytes(f.path.data(), f.path.size());
+        w.Bytes(payload.data(), payload.size());
+    }
+
+    uint32_t cdStart = static_cast<uint32_t>(w.buf.size());
+    for (const auto& cd : cds) {
+        w.U32LE(0x02014B50u);
+        w.U16LE(20);
+        w.U16LE(20);
+        w.U16LE(0);
+        w.U16LE(cd.method);
+        w.U16LE(0); w.U16LE(0);
+        w.U32LE(cd.crc);
+        w.U32LE(cd.compSz);
+        w.U32LE(cd.uncompSz);
+        w.U16LE(static_cast<uint16_t>(cd.name.size()));
+        w.U16LE(0); w.U16LE(0); w.U16LE(0); w.U16LE(0);
+        w.U32LE(0);
+        w.U32LE(cd.localOff);
+        w.Bytes(cd.name.data(), cd.name.size());
+    }
+    uint32_t cdSize = static_cast<uint32_t>(w.buf.size()) - cdStart;
+
+    w.U32LE(0x06054B50u);
+    w.U16LE(0); w.U16LE(0);
+    w.U16LE(static_cast<uint16_t>(cds.size()));
+    w.U16LE(static_cast<uint16_t>(cds.size()));
+    w.U32LE(cdSize);
+    w.U32LE(cdStart);
+    w.U16LE(0);
+    return w.buf;
+}
+
+// Builds a glTF 2.0 binary (.glb / .vrm) whose BIN chunk starts with a 32-byte non-geometry PNG header
+// + USHORT indices first, followed by byteStride=24 interleaved vertex records, instantiated via a 2-node hierarchy.
+static std::vector<uint8_t> BuildStridedGlb20(
+    const std::vector<Vec3f>& verts,
+    const std::vector<std::array<uint16_t, 3>>& tris,
+    float scaleX, float scaleY, float scaleZ,
+    float transX, float transY, float transZ)
+{
+    ByteWriter bin;
+    // 32 bytes of non-geometry PNG header / NaN float traps at offset 0 (defeats raw BIN float scrapers!)
+    const uint8_t fakePng[32] = {
+        0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A,
+        0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0x00, 0xC0, 0x7F, 0xDE, 0xAD, 0xBE, 0xEF,
+        0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
+    };
+    bin.Bytes(fakePng, 32);
+
+    size_t idxByteOff = bin.buf.size();
+    for (const auto& t : tris) {
+        bin.U16LE(t[0]);
+        bin.U16LE(t[1]);
+        bin.U16LE(t[2]);
+    }
+    size_t idxByteLen = bin.buf.size() - idxByteOff;
+    bin.Pad4();
+
+    // Interleaved 24-byte vertex records: 12B POSITION + 12B dummy normal/UV attributes
+    size_t posViewOff = bin.buf.size();
+    const size_t stride = 24;
+    for (const auto& v : verts) {
+        bin.F32LE(v.x);
+        bin.F32LE(v.y);
+        bin.F32LE(v.z);
+        bin.F32LE(99999.0f);
+        bin.F32LE(-88888.0f);
+        bin.F32LE(77777.0f);
+    }
+    size_t posViewLen = bin.buf.size() - posViewOff;
+    bin.Pad4();
+
+    char jsonBuf[2048];
+    std::snprintf(jsonBuf, sizeof(jsonBuf),
+        "{"
+        "\"asset\":{\"version\":\"2.0\"},"
+        "\"scene\":0,"
+        "\"scenes\":[{\"nodes\":[0]}],"
+        "\"nodes\":["
+          "{\"translation\":[%.3f,%.3f,%.3f],\"children\":[1]},"
+          "{\"scale\":[%.3f,%.3f,%.3f],\"mesh\":0}"
+        "],"
+        "\"buffers\":[{\"byteLength\":%zu}],"
+        "\"bufferViews\":["
+          "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu},"
+          "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":%zu,\"byteStride\":%zu}"
+        "],"
+        "\"accessors\":["
+          "{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5123,\"count\":%zu,\"type\":\"SCALAR\"},"
+          "{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5126,\"count\":%zu,\"type\":\"VEC3\"}"
+        "],"
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":1},\"indices\":0,\"mode\":4}]}]"
+        "}",
+        transX, transY, transZ,
+        scaleX, scaleY, scaleZ,
+        bin.buf.size(),
+        idxByteOff, idxByteLen,
+        posViewOff, posViewLen, stride,
+        tris.size() * 3,
+        verts.size());
+
+    std::string jsonStr(jsonBuf);
+    while ((jsonStr.size() & 3u) != 0) jsonStr.push_back(' ');
+
+    ByteWriter glb;
+    uint32_t totalLen = static_cast<uint32_t>(12 + 8 + jsonStr.size() + 8 + bin.buf.size());
+    glb.U32LE(0x46546C67u); // "glTF"
+    glb.U32LE(2u);
+    glb.U32LE(totalLen);
+    glb.U32LE(static_cast<uint32_t>(jsonStr.size()));
+    glb.U32LE(0x4E4F534Au); // "JSON"
+    glb.Bytes(jsonStr.data(), jsonStr.size());
+    glb.U32LE(static_cast<uint32_t>(bin.buf.size()));
+    glb.U32LE(0x004E4942u); // "BIN\0"
+    glb.Bytes(bin.buf.data(), bin.buf.size());
+    return glb.buf;
+}
+
+struct IgesDocBuilder {
+    std::vector<std::string> dLines;
+    std::vector<std::string> pLines;
+
+    static std::string Pad80(std::string s, char sec, int seq) {
+        if (s.size() > 72) s.resize(72);
+        while (s.size() < 72) s.push_back(' ');
+        char tail[16];
+        std::snprintf(tail, sizeof(tail), "%c%7d", sec, seq);
+        s.append(tail, 8);
+        return s;
+    }
+
+    int AddEntity(int entType, std::string paramBody, int xformDe = 0, int formNum = 0) {
+        int deSeq = static_cast<int>(dLines.size()) + 1;
+        int pStart = static_cast<int>(pLines.size()) + 1;
+        if (paramBody.empty() || paramBody.back() != ';') paramBody.push_back(';');
+
+        int lineCnt = 0;
+        for (size_t pos = 0; pos < paramBody.size(); pos += 64) {
+            std::string chunk = paramBody.substr(pos, std::min<size_t>(64, paramBody.size() - pos));
+            while (chunk.size() < 64) chunk.push_back(' ');
+            char ptrPart[16];
+            std::snprintf(ptrPart, sizeof(ptrPart), "%8d", deSeq);
+            chunk.append(ptrPart, 8);
+            int pSeq = static_cast<int>(pLines.size()) + 1;
+            pLines.push_back(Pad80(chunk, 'P', pSeq));
+            ++lineCnt;
+        }
+
+        char d1[80], d2[80];
+        std::snprintf(d1, sizeof(d1), "%8d%8d%8d%8d%8d%8d%8d%8d00000000",
+                      entType, pStart, 0, 0, 0, 0, xformDe, 0);
+        std::snprintf(d2, sizeof(d2), "%8d%8d%8d%8d%8d%8s%8s%8s%8d",
+                      entType, 0, 0, lineCnt, formNum, "", "", "", 0);
+        dLines.push_back(Pad80(std::string(d1, 72), 'D', deSeq));
+        dLines.push_back(Pad80(std::string(d2, 72), 'D', deSeq + 1));
+        return deSeq;
+    }
+
+    std::string Finish() const {
+        std::string out;
+        out += Pad80("Synthetic IGES 5.3 Test Model", 'S', 1) + "\n";
+        out += Pad80("1H,,1H;,7HTestCAD,11Htest53.iges,9HExplorer2,9H5.3,32,38,6,308,15,,1.0;", 'G', 1) + "\n";
+        for (const auto& d : dLines) out += d + "\n";
+        for (const auto& p : pLines) out += p + "\n";
+        char term[80];
+        std::snprintf(term, sizeof(term), "S%7dG%7dD%7zuP%7zu", 1, 1, dLines.size(), pLines.size());
+        out += Pad80(term, 'T', 1) + "\n";
+        return out;
+    }
+};
+
 } // namespace
 
 void RunFormatTests3D(TestCounter& tc) {
@@ -1186,6 +1470,417 @@ void RunFormatTests3D(TestCounter& tc) {
     }
 
     // ========================================================================
+    // 13. glTF 2.0 (.glb, .gltf, .vrm): BIN offset/stride, external .bin, base64 quantized strip, sparse, nodes
+    // ========================================================================
+    {
+        LoadedMesh3D mKhrBox;
+        bool okKhrBox = Model3DViewer::InspectMeshFile(tdDir + L"\\khronos_box.glb", mKhrBox);
+        tc.Record(okKhrBox && mKhrBox.loadedOk && mKhrBox.rawVertexCount == 24 && mKhrBox.rawTriangleCount == 12,
+                  L"Stage15.3D.GLTF.KhronosBoxRepo",
+                  L"verts=" + std::to_wstring(mKhrBox.rawVertexCount) + L" tris=" + std::to_wstring(mKhrBox.rawTriangleCount));
+
+        auto glbA = BuildStridedGlb20(
+            { {0,0,0}, {2,0,0}, {0,3,0}, {0,0,4} },
+            { {{0,1,2}}, {{0,1,3}}, {{1,2,3}}, {{2,0,3}} },
+            1.0f, 2.0f, 1.0f,  10.0f, -5.0f, 3.0f);
+        auto glbB = BuildStridedGlb20(
+            { {-1,0,-1}, {1,0,-1}, {1,0,1}, {-1,0,1}, {0,5,0} },
+            { {{0,2,1}}, {{0,3,2}}, {{0,1,4}}, {{1,2,4}}, {{2,3,4}}, {{3,0,4}} },
+            3.0f, 1.0f, 0.5f, -4.0f, 8.0f, 0.0f);
+        LoadedMesh3D mGlbA, mGlbB;
+        bool okGlbA = Model3DViewer::InspectMeshFile(writeBytes(L"png_strided_tet.glb", glbA), mGlbA);
+        bool okGlbB = Model3DViewer::InspectMeshFile(writeBytes(L"png_strided_pyr.glb", glbB), mGlbB);
+        tc.Record(okGlbA && okGlbB &&
+                  mGlbA.rawVertexCount == 4 && mGlbA.rawTriangleCount == 4 &&
+                  mGlbB.rawVertexCount == 5 && mGlbB.rawTriangleCount == 6 &&
+                  HashMeshGeometry(mGlbA) != HashMeshGeometry(mGlbB),
+                  L"Stage15.3D.GLTF.StridedPngPrefixSceneDistinct");
+
+        // External sibling .bin + sparse POSITION override on vertex 3
+        ByteWriter extBin;
+        const Vec3f baseTet[4] = { {0,0,0}, {4,0,0}, {0,4,0}, {0,0,0.1f} };
+        for (const auto& v : baseTet) { extBin.F32LE(v.x); extBin.F32LE(v.y); extBin.F32LE(v.z); }
+        size_t idxOff = extBin.buf.size();
+        const uint16_t tetIdx[12] = { 0,1,2, 0,1,3, 1,2,3, 2,0,3 };
+        for (uint16_t idx : tetIdx) extBin.U16LE(idx);
+        extBin.Pad4();
+        size_t spIdxOff = extBin.buf.size();
+        extBin.U16LE(3); // replace vertex 3 via sparse accessor
+        extBin.Pad4();
+        size_t spValOff = extBin.buf.size();
+        extBin.F32LE(0.0f); extBin.F32LE(0.0f); extBin.F32LE(9.0f);
+        writeBytes(L"gltf_ext_buf.bin", extBin.buf);
+
+        char extGltfJson[2048];
+        std::snprintf(extGltfJson, sizeof(extGltfJson),
+            "{"
+            "\"asset\":{\"version\":\"2.0\"},"
+            "\"buffers\":[{\"uri\":\"gltf_ext_buf.bin\",\"byteLength\":%zu}],"
+            "\"bufferViews\":["
+              "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":48},"
+              "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":24},"
+              "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":2},"
+              "{\"buffer\":0,\"byteOffset\":%zu,\"byteLength\":12}"
+            "],"
+            "\"accessors\":["
+              "{\"bufferView\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\","
+               "\"sparse\":{\"count\":1,"
+                 "\"indices\":{\"bufferView\":2,\"componentType\":5123},"
+                 "\"values\":{\"bufferView\":3}}},"
+              "{\"bufferView\":1,\"componentType\":5123,\"count\":12,\"type\":\"SCALAR\"}"
+            "],"
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1}]}]"
+            "}",
+            extBin.buf.size(), idxOff, spIdxOff, spValOff);
+
+        // Base64 data: URI .gltf with quantized SHORT (5122, normalized=true) + TRIANGLE_STRIP (mode=5)
+        ByteWriter qBin;
+        const int16_t qVerts[5][4] = {
+            {     0,     0,     0, 0 },
+            { 32767,     0,     0, 0 },
+            {     0, 16384,     0, 0 },
+            { 32767, 16384,  8192, 0 },
+            { 16384, 32767, 24576, 0 }
+        };
+        for (const auto& qv : qVerts) {
+            qBin.U16LE(static_cast<uint16_t>(qv[0]));
+            qBin.U16LE(static_cast<uint16_t>(qv[1]));
+            qBin.U16LE(static_cast<uint16_t>(qv[2]));
+            qBin.U16LE(static_cast<uint16_t>(qv[3])); // 8-byte aligned stride
+        }
+        std::string b64Uri = "data:application/octet-stream;base64," + TfBase64Encode(qBin.buf.data(), qBin.buf.size());
+        std::string stripGltf =
+            "{\"asset\":{\"version\":\"2.0\"},"
+            "\"buffers\":[{\"uri\":\"" + b64Uri + "\",\"byteLength\":" + std::to_string(qBin.buf.size()) + "}],"
+            "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":" + std::to_string(qBin.buf.size()) + ",\"byteStride\":8}],"
+            "\"accessors\":[{\"bufferView\":0,\"componentType\":5122,\"normalized\":true,\"count\":5,\"type\":\"VEC3\"}],"
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"mode\":5}]}]}";
+
+        LoadedMesh3D mExtGltf, mStripGltf;
+        bool okExt = Model3DViewer::InspectMeshFile(writeText(L"ext_sparse.gltf", extGltfJson), mExtGltf);
+        bool okStrip = Model3DViewer::InspectMeshFile(writeText(L"quant_strip.gltf", stripGltf.c_str()), mStripGltf);
+        tc.Record(okExt && okStrip &&
+                  mExtGltf.rawVertexCount == 4 && mExtGltf.rawTriangleCount == 4 &&
+                  mExtGltf.bboxSize.z > 8.5f && // proves sparse substitution elevated z from 0.1 to 9.0!
+                  mStripGltf.rawVertexCount == 5 && mStripGltf.rawTriangleCount == 3 &&
+                  HashMeshGeometry(mExtGltf) != HashMeshGeometry(mStripGltf),
+                  L"Stage15.3D.GLTF.ExternalBinSparseAndQuantizedStrip");
+
+        // .vrm multi-node humanoid avatar distinctness
+        auto vrmA = BuildStridedGlb20(
+            { {-1,0,-1}, {1,0,-1}, {1,0,1}, {-1,0,1}, {0,6,0} },
+            { {{0,2,1}}, {{0,3,2}}, {{0,1,4}}, {{1,2,4}}, {{2,3,4}}, {{3,0,4}} },
+            0.6f, 2.5f, 0.6f, 0.0f, 1.2f, 0.0f);
+        auto vrmB = BuildStridedGlb20(
+            { {-2,0,0}, {2,0,0}, {0,2,0}, {0,1,3} },
+            { {{0,1,2}}, {{0,1,3}}, {{1,2,3}}, {{2,0,3}} },
+            2.4f, 0.8f, 1.5f, 0.0f, 0.5f, 0.0f);
+        LoadedMesh3D mVrmA, mVrmB;
+        bool okVrmA = Model3DViewer::InspectMeshFile(writeBytes(L"avatar_tall.vrm", vrmA), mVrmA);
+        bool okVrmB = Model3DViewer::InspectMeshFile(writeBytes(L"avatar_wide.vrm", vrmB), mVrmB);
+        tc.Record(okVrmA && okVrmB &&
+                  mVrmA.formatName == L"VRoid / glTF Humanoid Avatar (.vrm)" &&
+                  mVrmA.rawVertexCount == 5 && mVrmB.rawVertexCount == 4 &&
+                  HashMeshGeometry(mVrmA) != HashMeshGeometry(mVrmB),
+                  L"Stage15.3D.VRM.MultiNodeAvatarDistinct");
+    }
+
+    // ========================================================================
+    // 14. COLLADA (.dae): Elf Girl repo + non-position float_array first + polylist stride + skin controller + matrix
+    // ========================================================================
+    {
+        LoadedMesh3D mElf;
+        bool okElf = Model3DViewer::InspectMeshFile(tdDir + L"\\collada_elf_girl.dae", mElf);
+        tc.Record(okElf && mElf.loadedOk && mElf.rawVertexCount == 7599 && mElf.rawTriangleCount == 14208,
+                  L"Stage15.3D.DAE.ElfGirlRepo",
+                  L"verts=" + std::to_wstring(mElf.rawVertexCount) + L" tris=" + std::to_wstring(mElf.rawTriangleCount));
+
+        auto buildComplexDae = [](float matScaleX, float matTransZ) -> std::string {
+            char buf[4096];
+            std::snprintf(buf, sizeof(buf),
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                "<COLLADA xmlns=\"http://www.collada.org/2005/11/COLLADASchema\" version=\"1.4.1\">\n"
+                "  <asset><unit name=\"meter\" meter=\"1\"/><up_axis>Z_UP</up_axis></asset>\n"
+                "  <library_geometries>\n"
+                "    <geometry id=\"base-geom\">\n"
+                "      <mesh>\n"
+                "        <source id=\"first-normals\">\n"
+                "          <float_array id=\"norm-arr\" count=\"6\">0 0 1 0 1 0</float_array>\n"
+                "          <technique_common><accessor source=\"#norm-arr\" count=\"2\" stride=\"3\"/></technique_common>\n"
+                "        </source>\n"
+                "        <source id=\"second-uvs\">\n"
+                "          <float_array id=\"uv-arr\" count=\"4\">0.1 0.2 0.8 0.9</float_array>\n"
+                "          <technique_common><accessor source=\"#uv-arr\" count=\"2\" stride=\"2\"/></technique_common>\n"
+                "        </source>\n"
+                "        <source id=\"real-positions\">\n"
+                "          <float_array id=\"pos-arr\" count=\"15\">0 0 0  4 0 0  4 4 0  0 4 0  2 2 5</float_array>\n"
+                "          <technique_common><accessor source=\"#pos-arr\" count=\"5\" stride=\"3\"/></technique_common>\n"
+                "        </source>\n"
+                "        <vertices id=\"base-verts\"><input semantic=\"POSITION\" source=\"#real-positions\"/></vertices>\n"
+                "        <polylist count=\"2\">\n"
+                "          <input semantic=\"NORMAL\" source=\"#first-normals\" offset=\"0\"/>\n"
+                "          <input semantic=\"VERTEX\" source=\"#base-verts\" offset=\"1\"/>\n"
+                "          <input semantic=\"TEXCOORD\" source=\"#second-uvs\" offset=\"2\"/>\n"
+                "          <vcount>4 3</vcount>\n"
+                "          <p>0 0 0  0 1 1  0 2 0  0 3 1   1 0 0  1 1 1  1 4 0</p>\n"
+                "        </polylist>\n"
+                "      </mesh>\n"
+                "    </geometry>\n"
+                "    <geometry id=\"rig-geom\">\n"
+                "      <mesh>\n"
+                "        <source id=\"rig-pos\">\n"
+                "          <float_array id=\"rig-arr\" count=\"12\">0 0 0  2 0 0  2 2 0  0 2 3</float_array>\n"
+                "          <technique_common><accessor source=\"#rig-arr\" count=\"4\" stride=\"3\"/></technique_common>\n"
+                "        </source>\n"
+                "        <vertices id=\"rig-verts\"><input semantic=\"POSITION\" source=\"#rig-pos\"/></vertices>\n"
+                "        <triangles count=\"2\">\n"
+                "          <input semantic=\"VERTEX\" source=\"#rig-verts\" offset=\"0\"/>\n"
+                "          <p>0 1 2  0 2 3</p>\n"
+                "        </triangles>\n"
+                "      </mesh>\n"
+                "    </geometry>\n"
+                "  </library_geometries>\n"
+                "  <library_controllers>\n"
+                "    <controller id=\"skin-ctrl\">\n"
+                "      <skin source=\"#rig-geom\">\n"
+                "        <bind_shape_matrix>1 0 0 6  0 1 0 0  0 0 1 0  0 0 0 1</bind_shape_matrix>\n"
+                "      </skin>\n"
+                "    </controller>\n"
+                "  </library_controllers>\n"
+                "  <library_visual_scenes>\n"
+                "    <visual_scene id=\"MainScene\">\n"
+                "      <node id=\"RootNode\">\n"
+                "        <matrix>%.3f 0 0 0  0 1 0 0  0 0 1 %.3f  0 0 0 1</matrix>\n"
+                "        <instance_geometry url=\"#base-geom\"/>\n"
+                "        <node id=\"ChildRig\"><translate>0 0 4</translate><instance_controller url=\"#skin-ctrl\"/></node>\n"
+                "      </node>\n"
+                "    </visual_scene>\n"
+                "  </library_visual_scenes>\n"
+                "  <scene><instance_visual_scene url=\"#MainScene\"/></scene>\n"
+                "</COLLADA>\n",
+                matScaleX, matTransZ);
+            return std::string(buf);
+        };
+
+        std::string daeA = buildComplexDae(1.0f, 0.0f);
+        std::string daeB = buildComplexDae(3.5f, 12.0f);
+        LoadedMesh3D mDaeA, mDaeB;
+        bool okDaeA = Model3DViewer::InspectMeshFile(writeText(L"polylist_skin_a.dae", daeA.c_str()), mDaeA);
+        bool okDaeB = Model3DViewer::InspectMeshFile(writeText(L"polylist_skin_b.dae", daeB.c_str()), mDaeB);
+        tc.Record(okDaeA && okDaeB &&
+                  mDaeA.rawVertexCount == 9 && mDaeA.rawTriangleCount == 5 &&
+                  mDaeB.rawVertexCount == 9 && mDaeB.rawTriangleCount == 5 &&
+                  HashMeshGeometry(mDaeA) != HashMeshGeometry(mDaeB),
+                  L"Stage15.3D.DAE.MultiGeomPolylistSkinAndMatrix");
+    }
+
+    // ========================================================================
+    // 15. IGES 5.3 (.iges): sample.iges + NURBS Surface (128) + NURBS Curve (126) + Transform (124)
+    // ========================================================================
+    {
+        LoadedMesh3D mSampleIges;
+        bool okSampleIges = Model3DViewer::InspectMeshFile(tdDir + L"\\sample.iges", mSampleIges);
+        tc.Record(okSampleIges && mSampleIges.loadedOk && mSampleIges.rawTriangleCount == 30,
+                  L"Stage15.3D.IGES.SampleUnbridgedLines",
+                  L"tris=" + std::to_wstring(mSampleIges.rawTriangleCount));
+
+        // Dome: biquadratic Rational B-Spline Surface (128) translated by Entity 124 to (+100, +200, +300).
+        // If header ints (K=2, M=2, PROP=0) leaked as XYZ points, bboxSize would exceed 200 instead of ~10x8x10!
+        IgesDocBuilder igesDome;
+        int xfDe = igesDome.AddEntity(124, "124,1.0,0.0,0.0,100.0,0.0,1.0,0.0,200.0,0.0,0.0,1.0,300.0");
+        igesDome.AddEntity(128,
+            "128,2,2,2,2,0,0,0,0,0,"
+            "0.0,0.0,0.0,1.0,1.0,1.0,"
+            "0.0,0.0,0.0,1.0,1.0,1.0,"
+            "1.0,1.0,1.0,1.0,2.5,1.0,1.0,1.0,1.0,"
+            "0.0,0.0,0.0, 5.0,0.0,2.0, 10.0,0.0,0.0,"
+            "0.0,5.0,2.0, 5.0,5.0,8.0, 10.0,5.0,2.0,"
+            "0.0,10.0,0.0, 5.0,10.0,2.0, 10.0,10.0,0.0,"
+            "0.0,1.0,0.0,1.0",
+            xfDe);
+
+        // Saddle + NURBS Curve (126) with Fortran D-exponent notation
+        IgesDocBuilder igesSaddle;
+        igesSaddle.AddEntity(128,
+            "128,2,2,2,2,0,0,1,0,0,"
+            "0.0,0.0,0.0,1.0,1.0,1.0,"
+            "0.0,0.0,0.0,1.0,1.0,1.0,"
+            "1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,"
+            "-15.0,-5.0,4.0, 0.0,-5.0,-3.0, 15.0,-5.0,4.0,"
+            "-15.0,0.0,-2.0, 0.0,0.0,0.0, 15.0,0.0,-2.0,"
+            "-15.0,5.0,4.0, 0.0,5.0,-3.0, 15.0,5.0,4.0,"
+            "0.0,1.0,0.0,1.0");
+        igesSaddle.AddEntity(126,
+            "126,2,2,0,0,0,0,"
+            "0.0,0.0,0.0,1.0,1.0,1.0,"
+            "1.0,1.5D+00,1.0,"
+            "-15.0,0.0,4.0, 0.0,0.0,1.2D+01, 15.0,0.0,4.0,"
+            "0.0,1.0");
+
+        std::string domeTxt = igesDome.Finish();
+        std::string saddleTxt = igesSaddle.Finish();
+        LoadedMesh3D mDome, mSaddle;
+        bool okDome = Model3DViewer::InspectMeshFile(writeText(L"nurbs_dome_128.iges", domeTxt.c_str()), mDome);
+        bool okSaddle = Model3DViewer::InspectMeshFile(writeText(L"nurbs_saddle_128_126.iges", saddleTxt.c_str()), mSaddle);
+        tc.Record(okDome && okSaddle &&
+                  mDome.rawTriangleCount >= 400 &&
+                  mDome.bboxSize.x > 8.0f && mDome.bboxSize.x < 12.0f &&
+                  mDome.bboxSize.y > 3.5f && mDome.bboxSize.y < 10.0f &&
+                  mDome.bboxSize.z > 8.0f && mDome.bboxSize.z < 12.0f &&
+                  HashMeshGeometry(mDome) != HashMeshGeometry(mSaddle),
+                  L"Stage15.3D.IGES.Nurbs128SurfaceAnd126CurveDistinct",
+                  L"domeTris=" + std::to_wstring(mDome.rawTriangleCount) +
+                  L" domeSpanX=" + std::to_wstring(mDome.bboxSize.x));
+    }
+
+    // ========================================================================
+    // 16. 3MF (.3mf) & AMF (.amf): Sub-model components, 3x4 build transforms, constellations & PK-ZIP AMF
+    // ========================================================================
+    {
+        const char* subPartModel =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\">\n"
+            "  <resources>\n"
+            "    <object id=\"10\" type=\"model\">\n"
+            "      <mesh>\n"
+            "        <vertices>\n"
+            "          <vertex x=\"-1\" y=\"-1\" z=\"0\"/>\n"
+            "          <vertex x=\"1\" y=\"-1\" z=\"0\"/>\n"
+            "          <vertex x=\"1\" y=\"1\" z=\"0\"/>\n"
+            "          <vertex x=\"-1\" y=\"1\" z=\"0\"/>\n"
+            "          <vertex x=\"0\" y=\"0\" z=\"3\"/>\n"
+            "        </vertices>\n"
+            "        <triangles>\n"
+            "          <triangle v1=\"0\" v2=\"2\" v3=\"1\"/>\n"
+            "          <triangle v1=\"0\" v2=\"3\" v3=\"2\"/>\n"
+            "          <triangle v1=\"0\" v2=\"1\" v3=\"4\"/>\n"
+            "          <triangle v1=\"1\" v2=\"2\" v3=\"4\"/>\n"
+            "          <triangle v1=\"2\" v2=\"3\" v3=\"4\"/>\n"
+            "          <triangle v1=\"3\" v2=\"0\" v3=\"4\"/>\n"
+            "        </triangles>\n"
+            "      </mesh>\n"
+            "    </object>\n"
+            "  </resources>\n"
+            "  <build/>\n"
+            "</model>\n";
+
+        auto makeRoot3Mf = [](const char* item2Transform) -> std::string {
+            return std::string(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<model unit=\"millimeter\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\""
+                " xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\">\n"
+                "  <resources>\n"
+                "    <object id=\"1\" type=\"model\">\n"
+                "      <mesh>\n"
+                "        <vertices>\n"
+                "          <vertex x=\"0\" y=\"0\" z=\"0\"/>\n"
+                "          <vertex x=\"2\" y=\"0\" z=\"0\"/>\n"
+                "          <vertex x=\"0\" y=\"2\" z=\"0\"/>\n"
+                "          <vertex x=\"0\" y=\"0\" z=\"2\"/>\n"
+                "        </vertices>\n"
+                "        <triangles>\n"
+                "          <triangle v1=\"0\" v2=\"2\" v3=\"1\"/>\n"
+                "          <triangle v1=\"0\" v2=\"1\" v3=\"3\"/>\n"
+                "          <triangle v1=\"1\" v2=\"2\" v3=\"3\"/>\n"
+                "          <triangle v1=\"2\" v2=\"0\" v3=\"3\"/>\n"
+                "        </triangles>\n"
+                "      </mesh>\n"
+                "    </object>\n"
+                "    <object id=\"2\" type=\"model\">\n"
+                "      <components>\n"
+                "        <component objectid=\"10\" p:path=\"/3D/Objects/subpart.model\" transform=\"1 0 0 0 1 0 0 0 1 0 0 2\"/>\n"
+                "      </components>\n"
+                "    </object>\n"
+                "  </resources>\n"
+                "  <build>\n"
+                "    <item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 -5 0 0\"/>\n"
+                "    <item objectid=\"2\" transform=\"") + item2Transform + "\"/>\n"
+                "  </build>\n"
+                "</model>\n";
+        };
+
+        auto zip3mfA = BuildTestZipArchive({
+            { "3D/3dmodel.model", makeRoot3Mf("1 0 0 0 1 0 0 0 1 8 0 0"), false },
+            { "3D/Objects/subpart.model", subPartModel, false }
+        });
+        auto zip3mfB = BuildTestZipArchive({
+            { "3D/3dmodel.model", makeRoot3Mf("2 0 0 0 2 0 0 0 3 25 10 0"), true },
+            { "3D/Objects/subpart.model", subPartModel, true }
+        });
+        LoadedMesh3D m3mfA, m3mfB;
+        bool ok3mfA = Model3DViewer::InspectMeshFile(writeBytes(L"assembly_a.3mf", zip3mfA), m3mfA);
+        bool ok3mfB = Model3DViewer::InspectMeshFile(writeBytes(L"assembly_b.3mf", zip3mfB), m3mfB);
+        tc.Record(ok3mfA && ok3mfB &&
+                  m3mfA.rawVertexCount == 9 && m3mfA.rawTriangleCount == 10 &&
+                  m3mfB.rawVertexCount == 9 && m3mfB.rawTriangleCount == 10 &&
+                  HashMeshGeometry(m3mfA) != HashMeshGeometry(m3mfB),
+                  L"Stage15.3D.3MF.SubmodelComponentsAndBuildTransforms");
+
+        // Multi-object AMF (uncompressed XML vs PK-ZIP Deflate compressed)
+        auto makeAmfXml = [](float dx2, float rz2) -> std::string {
+            char buf[4096];
+            std::snprintf(buf, sizeof(buf),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<amf unit=\"millimeter\" version=\"1.1\">\n"
+                "  <object id=\"1\">\n"
+                "    <mesh>\n"
+                "      <vertices>\n"
+                "        <vertex><coordinates><x>0</x><y>0</y><z>0</z></coordinates></vertex>\n"
+                "        <vertex><coordinates><x>3</x><y>0</y><z>0</z></coordinates></vertex>\n"
+                "        <vertex><coordinates><x>0</x><y>3</y><z>0</z></coordinates></vertex>\n"
+                "        <vertex><coordinates><x>0</x><y>0</y><z>3</z></coordinates></vertex>\n"
+                "      </vertices>\n"
+                "      <volume>\n"
+                "        <triangle><v1>0</v1><v2>2</v2><v3>1</v3></triangle>\n"
+                "        <triangle><v1>0</v1><v2>1</v2><v3>3</v3></triangle>\n"
+                "        <triangle><v1>1</v1><v2>2</v2><v3>3</v3></triangle>\n"
+                "        <triangle><v1>2</v1><v2>0</v2><v3>3</v3></triangle>\n"
+                "      </volume>\n"
+                "    </mesh>\n"
+                "  </object>\n"
+                "  <object id=\"2\">\n"
+                "    <mesh>\n"
+                "      <vertices>\n"
+                "        <vertex><coordinates><x>-1</x><y>-1</y><z>0</z></coordinates></vertex>\n"
+                "        <vertex><coordinates><x>1</x><y>-1</y><z>0</z></coordinates></vertex>\n"
+                "        <vertex><coordinates><x>1</x><y>1</y><z>0</z></coordinates></vertex>\n"
+                "        <vertex><coordinates><x>-1</x><y>1</y><z>0</z></coordinates></vertex>\n"
+                "        <vertex><coordinates><x>0</x><y>0</y><z>4</z></coordinates></vertex>\n"
+                "      </vertices>\n"
+                "      <volume>\n"
+                "        <triangle><v1>0</v1><v2>2</v2><v3>1</v3></triangle>\n"
+                "        <triangle><v1>0</v1><v2>3</v2><v3>2</v3></triangle>\n"
+                "        <triangle><v1>0</v1><v2>1</v2><v3>4</v3></triangle>\n"
+                "        <triangle><v1>1</v1><v2>2</v2><v3>4</v3></triangle>\n"
+                "        <triangle><v1>2</v1><v2>3</v2><v3>4</v3></triangle>\n"
+                "        <triangle><v1>3</v1><v2>0</v2><v3>4</v3></triangle>\n"
+                "      </volume>\n"
+                "    </mesh>\n"
+                "  </object>\n"
+                "  <constellation id=\"100\">\n"
+                "    <instance objectid=\"1\" deltax=\"-4\" deltay=\"0\" deltaz=\"0\"/>\n"
+                "    <instance objectid=\"2\" deltax=\"%.2f\" rz=\"%.2f\"><deltaz>2.5</deltaz></instance>\n"
+                "  </constellation>\n"
+                "</amf>\n",
+                dx2, rz2);
+            return std::string(buf);
+        };
+
+        std::string amfXmlPlain = makeAmfXml(6.0f, 0.0f);
+        auto amfZipDeflated = BuildTestZipArchive({
+            { "plate_build.amf", makeAmfXml(24.0f, 45.0f), true }
+        });
+        LoadedMesh3D mAmfPlain, mAmfZip;
+        bool okAmfPlain = Model3DViewer::InspectMeshFile(writeText(L"constel_plain.amf", amfXmlPlain.c_str()), mAmfPlain);
+        bool okAmfZip   = Model3DViewer::InspectMeshFile(writeBytes(L"constel_deflate.amf", amfZipDeflated), mAmfZip);
+        tc.Record(okAmfPlain && okAmfZip &&
+                  mAmfPlain.rawVertexCount == 9 && mAmfPlain.rawTriangleCount == 10 &&
+                  mAmfZip.rawVertexCount == 9 && mAmfZip.rawTriangleCount == 10 &&
+                  HashMeshGeometry(mAmfPlain) != HashMeshGeometry(mAmfZip),
+                  L"Stage15.3D.AMF.ConstellationAndCompressedZip");
+    }
+
+    // ========================================================================
     // 12. Negative / Zero-Cheat Tests (corrupt / encrypted / header-only -> false)
     // ========================================================================
     {
@@ -1235,6 +1930,52 @@ void RunFormatTests3D(TestCounter& tc) {
         std::vector<uint8_t> ctmMg1(40, 0);
         std::memcpy(ctmMg1.data(), "OCTM\x05\x00\x00\x00MG1\x00", 12);
         assertRejected(L"Stage15.3D.Reject.NoTorusKnotCTM", writeBytes(L"mg1_stub.ctm", ctmMg1));
+
+        // JSON-less GLB (BIN chunk only -> must be rejected, never scraped as raw floats!)
+        ByteWriter jsonLessGlb;
+        jsonLessGlb.U32LE(0x46546C67u); // "glTF"
+        jsonLessGlb.U32LE(2u);
+        jsonLessGlb.U32LE(12u + 8u + 36u);
+        jsonLessGlb.U32LE(36u);
+        jsonLessGlb.U32LE(0x004E4942u); // "BIN\0" as chunk 0 without JSON
+        const float rawTri[9] = { 0,0,0, 1,0,0, 0,1,0 };
+        for (float f : rawTri) jsonLessGlb.F32LE(f);
+        assertRejected(L"Stage15.3D.Reject.JsonLessGLB", writeBytes(L"no_json_chunk.glb", jsonLessGlb.buf));
+
+        // Path-traversal .gltf URI must be rejected
+        const char* traversalGltf =
+            "{\"asset\":{\"version\":\"2.0\"},"
+            "\"buffers\":[{\"uri\":\"../outside.bin\",\"byteLength\":36}],"
+            "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36}],"
+            "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+        assertRejected(L"Stage15.3D.Reject.PathTraversalGLTF", writeText(L"traversal.gltf", traversalGltf));
+
+        // Truncated/corrupt .vrm must be rejected
+        ByteWriter badVrm;
+        badVrm.U32LE(0x46546C67u);
+        badVrm.U32LE(2u);
+        badVrm.U32LE(64u);
+        badVrm.U32LE(200u); // chunk length exceeds total length
+        badVrm.U32LE(0x4E4F534Au);
+        assertRejected(L"Stage15.3D.Reject.CorruptVRM", writeBytes(L"truncated.vrm", badVrm.buf));
+
+        // Non-COLLADA XML containing <float_array> must be rejected
+        assertRejected(L"Stage15.3D.Reject.NonColladaDAE",
+                       writeText(L"fake_svg.dae", "<?xml version=\"1.0\"?><svg><float_array>0 0 0 1 0 0 0 1 0</float_array></svg>"));
+
+        // Header-only IGES with zero geometry entities must be rejected
+        IgesDocBuilder emptyIges;
+        std::string emptyIgesTxt = emptyIges.Finish();
+        assertRejected(L"Stage15.3D.Reject.HeaderOnlyIGES", writeText(L"header_only.iges", emptyIgesTxt.c_str()));
+
+        // .3mf ZIP without any .model XML must be rejected
+        auto bad3mfZip = BuildTestZipArchive({ { "readme.txt", "no model here", false } });
+        assertRejected(L"Stage15.3D.Reject.ModelLess3MF", writeBytes(L"no_model.3mf", bad3mfZip));
+
+        // .amf ZIP without valid <amf>/<object> geometry must be rejected
+        auto badAmfZip = BuildTestZipArchive({ { "broken.amf", "<?xml version=\"1.0\"?><amf><metadata/></amf>", true } });
+        assertRejected(L"Stage15.3D.Reject.EmptyZipAMF", writeBytes(L"empty_zip.amf", badAmfZip));
     }
 
     for (const auto& f : createdFiles) {

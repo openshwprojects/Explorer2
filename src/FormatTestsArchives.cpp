@@ -9,6 +9,7 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace Explorer2::SelfTestSuite {
@@ -1863,6 +1864,490 @@ std::vector<uint8_t> BuildWindowsWim(const std::wstring& imageName, const std::w
     return wim;
 }
 
+// ============================================================================
+// 9. UnityFS AssetBundle, Blizzard MPQ, RPG Maker RGSS, SquashFS 4.0 & EROFS Builders
+// ============================================================================
+std::vector<uint8_t> EncodeRawLz4Block(const uint8_t* raw, size_t len) {
+    std::vector<uint8_t> blk;
+    size_t pos = 0;
+    size_t anchor = 0;
+    while (pos + 5 <= len) {
+        size_t bestLen = 0, bestDist = 0;
+        size_t maxBack = std::min<size_t>(pos, 8192);
+        for (size_t d = 1; d <= maxBack; ++d) {
+            size_t m = 0;
+            size_t maxM = (len - pos > 5) ? (len - pos - 5) : 0;
+            while (m < maxM && raw[pos + m] == raw[pos - d + m]) ++m;
+            if (m >= 4 && m > bestLen) { bestLen = m; bestDist = d; if (bestLen >= 64) break; }
+        }
+        if (bestLen >= 4) {
+            size_t litLen = pos - anchor;
+            size_t mCode = bestLen - 4;
+            uint8_t tok = static_cast<uint8_t>((std::min<size_t>(litLen, 15) << 4) | std::min<size_t>(mCode, 15));
+            blk.push_back(tok);
+            if (litLen >= 15) {
+                size_t rem = litLen - 15;
+                while (rem >= 255) { blk.push_back(255); rem -= 255; }
+                blk.push_back(static_cast<uint8_t>(rem));
+            }
+            blk.insert(blk.end(), raw + anchor, raw + pos);
+            PushU16LE(blk, static_cast<uint16_t>(bestDist));
+            if (mCode >= 15) {
+                size_t rem = mCode - 15;
+                while (rem >= 255) { blk.push_back(255); rem -= 255; }
+                blk.push_back(static_cast<uint8_t>(rem));
+            }
+            pos += bestLen;
+            anchor = pos;
+        } else {
+            ++pos;
+        }
+    }
+    size_t tailLit = len - anchor;
+    uint8_t tok = static_cast<uint8_t>(std::min<size_t>(tailLit, 15) << 4);
+    blk.push_back(tok);
+    if (tailLit >= 15) {
+        size_t rem = tailLit - 15;
+        while (rem >= 255) { blk.push_back(255); rem -= 255; }
+        blk.push_back(static_cast<uint8_t>(rem));
+    }
+    blk.insert(blk.end(), raw + anchor, raw + len);
+    return blk;
+}
+
+std::vector<uint8_t> BuildUnityFsBundle(
+    uint32_t fmtVer,
+    const std::string& engineVer,
+    size_t maxBlockUncomp,
+    const std::vector<std::pair<std::string, std::string>>& files)
+{
+    std::vector<uint8_t> uncompAll;
+    for (const auto& kv : files) {
+        uncompAll.insert(uncompAll.end(), kv.second.begin(), kv.second.end());
+    }
+
+    struct BlkRec { uint32_t uSz; uint32_t cSz; uint16_t flags; std::vector<uint8_t> comp; };
+    std::vector<BlkRec> blks;
+    for (size_t off = 0; off < uncompAll.size(); off += maxBlockUncomp) {
+        size_t chunk = std::min<size_t>(maxBlockUncomp, uncompAll.size() - off);
+        auto c = EncodeRawLz4Block(uncompAll.data() + off, chunk);
+        blks.push_back({ static_cast<uint32_t>(chunk), static_cast<uint32_t>(c.size()), 0x0003u, std::move(c) });
+    }
+
+    std::vector<uint8_t> infoRaw(16, 0); // 16-byte uncompressedDataHash
+    PushU32BE(infoRaw, static_cast<uint32_t>(blks.size()));
+    for (const auto& b : blks) {
+        PushU32BE(infoRaw, b.uSz);
+        PushU32BE(infoRaw, b.cSz);
+        PushU16BE(infoRaw, b.flags);
+    }
+    PushU32BE(infoRaw, static_cast<uint32_t>(files.size()));
+    uint64_t nOff = 0;
+    for (const auto& kv : files) {
+        PushU64BE(infoRaw, nOff);
+        PushU64BE(infoRaw, kv.second.size());
+        PushU32BE(infoRaw, 0x00000004u);
+        infoRaw.insert(infoRaw.end(), kv.first.begin(), kv.first.end());
+        infoRaw.push_back(0);
+        nOff += kv.second.size();
+    }
+
+    auto infoComp = EncodeRawLz4Block(infoRaw.data(), infoRaw.size());
+
+    std::vector<uint8_t> out = { 'U','n','i','t','y','F','S', 0 };
+    PushU32BE(out, fmtVer);
+    const char* pVer = "5.x.x";
+    out.insert(out.end(), pVer, pVer + 6);
+    out.insert(out.end(), engineVer.begin(), engineVer.end());
+    out.push_back(0);
+
+    size_t bundleSzPos = out.size();
+    PushU64BE(out, 0ULL); // patched below
+    PushU32BE(out, static_cast<uint32_t>(infoComp.size()));
+    PushU32BE(out, static_cast<uint32_t>(infoRaw.size()));
+    uint32_t flags = 0x00000043u | ((fmtVer >= 7) ? 0x00000200u : 0u); // LZ4HC blocksInfo + combined dir
+    PushU32BE(out, flags);
+
+    if (fmtVer >= 7) {
+        while ((out.size() & 15u) != 0) out.push_back(0);
+    }
+    out.insert(out.end(), infoComp.begin(), infoComp.end());
+    if ((flags & 0x200u) != 0) {
+        while ((out.size() & 15u) != 0) out.push_back(0);
+    }
+    for (const auto& b : blks) {
+        out.insert(out.end(), b.comp.begin(), b.comp.end());
+    }
+    PutU64BE(out.data() + bundleSzPos, out.size());
+    return out;
+}
+
+std::vector<uint8_t> BuildBlizzardMpqTestArchive(
+    const std::string& block0FileBody,
+    const std::string& block1FileBody)
+{
+    uint32_t cryptTbl[0x500] = {};
+    uint32_t seed = 0x00100001u;
+    for (uint32_t idx1 = 0; idx1 < 0x100u; ++idx1) {
+        uint32_t idx2 = idx1;
+        for (int i = 0; i < 5; ++i, idx2 += 0x100u) {
+            seed = (seed * 125u + 3u) % 0x2AAAABu;
+            uint32_t t1 = (seed & 0xFFFFu) << 16;
+            seed = (seed * 125u + 3u) % 0x2AAAABu;
+            uint32_t t2 = (seed & 0xFFFFu);
+            cryptTbl[idx2] = t1 | t2;
+        }
+    }
+    auto mpqHash = [&](const std::string& s, uint32_t hashType) -> uint32_t {
+        uint32_t s1 = 0x7FED7FEDu, s2 = 0xEEEEEEEEu;
+        for (char rc : s) {
+            char c = (rc == '/') ? '\\' : rc;
+            uint8_t ch = static_cast<uint8_t>(toupper(static_cast<unsigned char>(c)));
+            s1 = cryptTbl[hashType + ch] ^ (s1 + s2);
+            s2 = ch + s1 + s2 + (s2 << 5) + 3u;
+        }
+        return s1;
+    };
+    auto mpqEncryptBytes = [&](uint8_t* buf, size_t byteLen, uint32_t k1) {
+        uint32_t k2 = 0xEEEEEEEEu;
+        size_t dwords = byteLen / 4u;
+        for (size_t i = 0; i < dwords; ++i) {
+            k2 += cryptTbl[0x400u + (k1 & 0xFFu)];
+            uint32_t plain = static_cast<uint32_t>(buf[i * 4u + 0]) |
+                             (static_cast<uint32_t>(buf[i * 4u + 1]) << 8) |
+                             (static_cast<uint32_t>(buf[i * 4u + 2]) << 16) |
+                             (static_cast<uint32_t>(buf[i * 4u + 3]) << 24);
+            uint32_t enc = plain ^ (k1 + k2);
+            k1 = ((~k1 << 0x15) + 0x11111111u) | (k1 >> 0x0B);
+            k2 = plain + k2 + (k2 << 5) + 3u;
+            PutU32LE(buf + i * 4u, enc);
+        }
+    };
+
+    const uint32_t sectorSize = 512u; // secShift = 0
+    std::vector<uint8_t> mpq(32, 0);
+
+    auto packMpqMultiSector = [&](const std::string& plainBaseName, const std::string& body, bool fixKey, uint32_t& outRelPos, uint32_t& outCSz, uint32_t& outFlags) {
+        outRelPos = static_cast<uint32_t>(mpq.size());
+        uint32_t fSz = static_cast<uint32_t>(body.size());
+        uint32_t fileKey = mpqHash(plainBaseName, 0x300u);
+        if (fixKey) fileKey = (fileKey + outRelPos) ^ fSz;
+
+        uint32_t numSecs = (fSz + sectorSize - 1u) / sectorSize;
+        size_t tblBytes = static_cast<size_t>(numSecs + 1u) * 4u;
+        std::vector<uint32_t> secOffs(numSecs + 1u, 0);
+        std::vector<std::vector<uint8_t>> encSectors;
+        uint32_t curOff = static_cast<uint32_t>(tblBytes);
+        for (uint32_t s = 0; s < numSecs; ++s) {
+            secOffs[s] = curOff;
+            size_t sPos = static_cast<size_t>(s) * sectorSize;
+            size_t sLen = std::min<size_t>(sectorSize, fSz - sPos);
+            auto z = CompressZlib(reinterpret_cast<const uint8_t*>(body.data() + sPos), sLen);
+            std::vector<uint8_t> sec;
+            if (1u + z.size() < sLen) {
+                sec.push_back(0x02u); // MPQ_COMPRESSION_ZLIB
+                sec.insert(sec.end(), z.begin(), z.end());
+            } else {
+                sec.assign(body.begin() + static_cast<ptrdiff_t>(sPos), body.begin() + static_cast<ptrdiff_t>(sPos + sLen));
+            }
+            mpqEncryptBytes(sec.data(), sec.size(), fileKey + s);
+            curOff += static_cast<uint32_t>(sec.size());
+            encSectors.push_back(std::move(sec));
+        }
+        secOffs[numSecs] = curOff;
+
+        std::vector<uint8_t> tbl(tblBytes, 0);
+        for (uint32_t s = 0; s <= numSecs; ++s) PutU32LE(tbl.data() + s * 4u, secOffs[s]);
+        mpqEncryptBytes(tbl.data(), tbl.size(), fileKey - 1u);
+
+        mpq.insert(mpq.end(), tbl.begin(), tbl.end());
+        for (const auto& es : encSectors) mpq.insert(mpq.end(), es.begin(), es.end());
+        outCSz = curOff;
+        outFlags = 0x80000000u | 0x00000200u | 0x00010000u | (fixKey ? 0x00020000u : 0u);
+    };
+
+    // Block 0: "Units\\Knight.mdx", Block 1: "Scripts\\war3map.j", Block 2: "(listfile)"
+    // Note (listfile) lists Scripts\war3map.j FIRST -> non-sequential block mapping (1 then 0)!
+    uint32_t b0Pos = 0, b0CSz = 0, b0Flg = 0;
+    uint32_t b1Pos = 0, b1CSz = 0, b1Flg = 0;
+    uint32_t b2Pos = 0, b2CSz = 0, b2Flg = 0;
+    std::string listfileText = "Scripts\\war3map.j\r\nUnits\\Knight.mdx\r\n";
+
+    packMpqMultiSector("Knight.mdx", block0FileBody, true,  b0Pos, b0CSz, b0Flg);
+    packMpqMultiSector("war3map.j",  block1FileBody, false, b1Pos, b1CSz, b1Flg);
+    packMpqMultiSector("(listfile)", listfileText,   false, b2Pos, b2CSz, b2Flg);
+
+    const uint32_t hashCount = 16u;
+    std::vector<uint8_t> htBytes(hashCount * 16u, 0xFFu);
+    auto insertHash = [&](const std::string& fullName, uint32_t blockIdx) {
+        uint32_t start = mpqHash(fullName, 0x000u) % hashCount;
+        uint32_t nA    = mpqHash(fullName, 0x100u);
+        uint32_t nB    = mpqHash(fullName, 0x200u);
+        for (uint32_t step = 0; step < hashCount; ++step) {
+            uint32_t slot = (start + step) % hashCount;
+            uint8_t* p = htBytes.data() + slot * 16u;
+            if (p[12] == 0xFFu && p[13] == 0xFFu && p[14] == 0xFFu && p[15] == 0xFFu) {
+                PutU32LE(p + 0, nA);
+                PutU32LE(p + 4, nB);
+                PutU32LE(p + 8, 0u);
+                PutU32LE(p + 12, blockIdx);
+                return;
+            }
+        }
+    };
+    insertHash("Units\\Knight.mdx", 0u);
+    insertHash("Scripts\\war3map.j", 1u);
+    insertHash("(listfile)", 2u);
+    mpqEncryptBytes(htBytes.data(), htBytes.size(), mpqHash("(hash table)", 0x300u));
+
+    std::vector<uint8_t> btBytes(3u * 16u, 0);
+    auto putBlock = [&](uint32_t idx, uint32_t fPos, uint32_t cSz, uint32_t fSz, uint32_t flg) {
+        uint8_t* p = btBytes.data() + idx * 16u;
+        PutU32LE(p + 0, fPos);
+        PutU32LE(p + 4, cSz);
+        PutU32LE(p + 8, fSz);
+        PutU32LE(p + 12, flg);
+    };
+    putBlock(0u, b0Pos, b0CSz, static_cast<uint32_t>(block0FileBody.size()), b0Flg);
+    putBlock(1u, b1Pos, b1CSz, static_cast<uint32_t>(block1FileBody.size()), b1Flg);
+    putBlock(2u, b2Pos, b2CSz, static_cast<uint32_t>(listfileText.size()),   b2Flg);
+    mpqEncryptBytes(btBytes.data(), btBytes.size(), mpqHash("(block table)", 0x300u));
+
+    uint32_t htPos = static_cast<uint32_t>(mpq.size());
+    mpq.insert(mpq.end(), htBytes.begin(), htBytes.end());
+    uint32_t btPos = static_cast<uint32_t>(mpq.size());
+    mpq.insert(mpq.end(), btBytes.begin(), btBytes.end());
+
+    std::memcpy(mpq.data() + 0, "MPQ\x1A", 4);
+    PutU32LE(mpq.data() + 4,  32u);
+    PutU32LE(mpq.data() + 8,  static_cast<uint32_t>(mpq.size()));
+    PutU16LE(mpq.data() + 12, 0u); // v1
+    PutU16LE(mpq.data() + 14, 0u); // sectorSize = 512
+    PutU32LE(mpq.data() + 16, htPos);
+    PutU32LE(mpq.data() + 20, btPos);
+    PutU32LE(mpq.data() + 24, hashCount);
+    PutU32LE(mpq.data() + 28, 3u);
+    return mpq;
+}
+
+std::vector<uint8_t> BuildRpgMakerRgss3a(const std::vector<std::pair<std::string, std::string>>& files) {
+    const uint32_t rawSeed = 0x13572468u;
+    const uint32_t masterKey = rawSeed * 9u + 3u;
+    std::vector<uint8_t> out = { 'R','G','S','S','A','D', 0, 3 };
+    PushU32LE(out, rawSeed);
+
+    // Compute exact TOC byte size: each entry is 16 + nameLen, followed by 16-byte sentinel (fOff == 0)
+    size_t tocEnd = 12 + 16;
+    for (const auto& kv : files) tocEnd += 16 + kv.first.size();
+
+    std::vector<uint8_t> payloads;
+    for (size_t idx = 0; idx < files.size(); ++idx) {
+        const auto& kv = files[idx];
+        uint32_t fOff   = static_cast<uint32_t>(tocEnd + payloads.size());
+        uint32_t fSize  = static_cast<uint32_t>(kv.second.size());
+        uint32_t subKey = 0xA5A50001u + static_cast<uint32_t>(idx) * 0x11111111u;
+        uint32_t nLen   = static_cast<uint32_t>(kv.first.size());
+
+        PushU32LE(out, fOff   ^ masterKey);
+        PushU32LE(out, fSize  ^ masterKey);
+        PushU32LE(out, subKey ^ masterKey);
+        PushU32LE(out, nLen   ^ masterKey);
+        for (uint32_t i = 0; i < nLen; ++i) {
+            out.push_back(static_cast<uint8_t>(kv.first[i] ^ ((masterKey >> (8u * (i & 3u))) & 0xFFu)));
+        }
+
+        uint32_t curKey = subKey;
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            payloads.push_back(static_cast<uint8_t>(static_cast<uint8_t>(kv.second[i]) ^ ((curKey >> (8u * (i & 3u))) & 0xFFu)));
+            if ((i & 3u) == 3u) curKey = curKey * 7u + 3u;
+        }
+    }
+    // End-of-TOC sentinel (fOff == 0 => encrypted = 0 ^ masterKey)
+    PushU32LE(out, 0u ^ masterKey);
+    PushU32LE(out, 0u ^ masterKey);
+    PushU32LE(out, 0u ^ masterKey);
+    PushU32LE(out, 0u ^ masterKey);
+    out.insert(out.end(), payloads.begin(), payloads.end());
+    return out;
+}
+
+std::vector<uint8_t> BuildRpgMakerRgssV1(const std::vector<std::pair<std::string, std::string>>& files) {
+    std::vector<uint8_t> out = { 'R','G','S','S','A','D', 0, 1 };
+    uint32_t key = 0xDEADCAFEu;
+    for (const auto& kv : files) {
+        uint32_t nLen = static_cast<uint32_t>(kv.first.size());
+        PushU32LE(out, nLen ^ key);
+        key = key * 7u + 3u;
+        for (uint32_t i = 0; i < nLen; ++i) {
+            out.push_back(static_cast<uint8_t>(static_cast<uint8_t>(kv.first[i]) ^ (key & 0xFFu)));
+            key = key * 7u + 3u;
+        }
+        uint32_t fSize = static_cast<uint32_t>(kv.second.size());
+        PushU32LE(out, fSize ^ key);
+        key = key * 7u + 3u;
+
+        uint32_t curKey = key;
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            out.push_back(static_cast<uint8_t>(static_cast<uint8_t>(kv.second[i]) ^ ((curKey >> (8u * (i & 3u))) & 0xFFu)));
+            if ((i & 3u) == 3u) curKey = curKey * 7u + 3u;
+        }
+    }
+    return out;
+}
+
+std::vector<uint8_t> BuildSquashFs4ZlibImage(const std::string& readmeBody, const std::string& etcConfBody) {
+    auto zFile1 = CompressZlib(reinterpret_cast<const uint8_t*>(readmeBody.data()), readmeBody.size());
+    auto zFile2 = CompressZlib(reinterpret_cast<const uint8_t*>(etcConfBody.data()), etcConfBody.size());
+    const uint32_t dataOff1 = 96u;
+    const uint32_t dataOff2 = 96u + static_cast<uint32_t>(zFile1.size());
+
+    auto buildDirBlob = [](uint32_t baseIno, const std::vector<std::tuple<uint16_t, int16_t, uint16_t, std::string>>& ents) {
+        std::vector<uint8_t> d;
+        PushU32LE(d, static_cast<uint32_t>(ents.size() - 1u));
+        PushU32LE(d, 0u); // start_block = 0
+        PushU32LE(d, baseIno);
+        for (const auto& t : ents) {
+            PushU16LE(d, std::get<0>(t)); // inode inner offset
+            PushU16LE(d, static_cast<uint16_t>(std::get<1>(t)));
+            PushU16LE(d, std::get<2>(t)); // type (1=dir, 2=reg)
+            const std::string& nm = std::get<3>(t);
+            PushU16LE(d, static_cast<uint16_t>(nm.size() - 1u));
+            d.insert(d.end(), nm.begin(), nm.end());
+        }
+        return d;
+    };
+
+    // Inode offsets inside inodeMetaRaw: 0=rootDir(32B), 32=readme.txt(36B), 68=etcDir(32B), 100=config.ini(36B)
+    auto rootDirRaw = buildDirBlob(2u, { { 68u, 1, 1u, "etc" }, { 32u, 0, 2u, "readme.txt" } });
+    auto etcDirRaw  = buildDirBlob(4u, { { 100u, 0, 2u, "config.ini" } });
+
+    std::vector<uint8_t> inodeRaw;
+    auto pushDirInode = [&](uint32_t inoNum, uint16_t rawDirLen, uint16_t dirInnerOff, uint32_t parentIno) {
+        size_t s = inodeRaw.size();
+        inodeRaw.resize(s + 32, 0);
+        PutU16LE(inodeRaw.data() + s + 0, 1u); // basic dir
+        PutU16LE(inodeRaw.data() + s + 2, 0755u);
+        PutU32LE(inodeRaw.data() + s + 12, inoNum);
+        PutU32LE(inodeRaw.data() + s + 16, 0u); // start_block = 0
+        PutU32LE(inodeRaw.data() + s + 20, 2u);
+        PutU16LE(inodeRaw.data() + s + 24, static_cast<uint16_t>(rawDirLen + 3u));
+        PutU16LE(inodeRaw.data() + s + 26, dirInnerOff);
+        PutU32LE(inodeRaw.data() + s + 28, parentIno);
+    };
+    auto pushRegInode = [&](uint32_t inoNum, uint32_t blocksStart, uint32_t fSize, uint32_t zBlkSz) {
+        size_t s = inodeRaw.size();
+        inodeRaw.resize(s + 36, 0);
+        PutU16LE(inodeRaw.data() + s + 0, 2u); // basic file
+        PutU16LE(inodeRaw.data() + s + 2, 0644u);
+        PutU32LE(inodeRaw.data() + s + 12, inoNum);
+        PutU32LE(inodeRaw.data() + s + 16, blocksStart);
+        PutU32LE(inodeRaw.data() + s + 20, 0xFFFFFFFFu); // no fragment
+        PutU32LE(inodeRaw.data() + s + 24, 0u);
+        PutU32LE(inodeRaw.data() + s + 28, fSize);
+        PutU32LE(inodeRaw.data() + s + 32, zBlkSz); // compressed block size (bit 24 == 0)
+    };
+
+    pushDirInode(1u, static_cast<uint16_t>(rootDirRaw.size()), 0u, 1u);
+    pushRegInode(2u, dataOff1, static_cast<uint32_t>(readmeBody.size()), static_cast<uint32_t>(zFile1.size()));
+    pushDirInode(3u, static_cast<uint16_t>(etcDirRaw.size()), static_cast<uint16_t>(rootDirRaw.size()), 1u);
+    pushRegInode(4u, dataOff2, static_cast<uint32_t>(etcConfBody.size()), static_cast<uint32_t>(zFile2.size()));
+
+    std::vector<uint8_t> dirRaw = rootDirRaw;
+    dirRaw.insert(dirRaw.end(), etcDirRaw.begin(), etcDirRaw.end());
+
+    // Zlib-compressed metadata blocks: bit 15 (0x8000) is CLEAR!
+    auto zInodeMeta = CompressZlib(inodeRaw.data(), inodeRaw.size());
+    auto zDirMeta   = CompressZlib(dirRaw.data(), dirRaw.size());
+
+    std::vector<uint8_t> img(96, 0);
+    img.insert(img.end(), zFile1.begin(), zFile1.end());
+    img.insert(img.end(), zFile2.begin(), zFile2.end());
+
+    uint64_t inodeTblStart = img.size();
+    PushU16LE(img, static_cast<uint16_t>(zInodeMeta.size() & 0x7FFFu));
+    img.insert(img.end(), zInodeMeta.begin(), zInodeMeta.end());
+
+    uint64_t dirTblStart = img.size();
+    PushU16LE(img, static_cast<uint16_t>(zDirMeta.size() & 0x7FFFu));
+    img.insert(img.end(), zDirMeta.begin(), zDirMeta.end());
+
+    std::memcpy(img.data() + 0, "hsqs", 4);
+    PutU32LE(img.data() + 4,  4u);     // inodes
+    PutU32LE(img.data() + 12, 4096u);  // block_size
+    PutU32LE(img.data() + 16, 0u);     // fragments
+    PutU16LE(img.data() + 20, 1u);     // comp_id = 1 (zlib)
+    PutU16LE(img.data() + 22, 12u);    // block_log = 12
+    PutU16LE(img.data() + 28, 4u);     // s_major = 4
+    PutU16LE(img.data() + 30, 0u);     // s_minor = 0
+    PutU64LE(img.data() + 32, 0ULL);   // root_inode = (0 << 16) | 0
+    PutU64LE(img.data() + 40, img.size());
+    PutU64LE(img.data() + 48, UINT64_MAX);
+    PutU64LE(img.data() + 56, UINT64_MAX);
+    PutU64LE(img.data() + 64, inodeTblStart);
+    PutU64LE(img.data() + 72, dirTblStart);
+    PutU64LE(img.data() + 80, UINT64_MAX);
+    PutU64LE(img.data() + 88, UINT64_MAX);
+    return img;
+}
+
+std::vector<uint8_t> BuildErofsTestImage(const std::string& bootPlain, const std::string& inlineMultiBody) {
+    // 5 x 4096B blocks = 20480 bytes (inlineMultiBody must be > 4096 and < 4300 bytes)
+    const size_t blkSz = 4096u;
+    std::vector<uint8_t> img(5u * blkSz, 0);
+
+    // Superblock @ 1024
+    uint8_t* sb = img.data() + 1024;
+    PutU32LE(sb + 0,  0xE0F5E1E2u);
+    sb[12] = 12u; // 4096B blocks
+    PutU16LE(sb + 14, 0u); // root_nid = 0
+    PutU64LE(sb + 16, 4ULL);
+    PutU32LE(sb + 36, 5u); // 5 blocks
+    PutU32LE(sb + 40, 1u); // meta_blkaddr = 1 (byte 4096)
+    std::memcpy(sb + 64, "EROFS_STAGE15", 13);
+
+    // NID 0 @ 4096 + 0: compact root dir (FLAT_PLAIN at block 2)
+    uint8_t* n0 = img.data() + 4096 + 0 * 32;
+    PutU16LE(n0 + 0, 0u);        // COMPACT | FLAT_PLAIN
+    PutU16LE(n0 + 4, 0040755u);  // S_IFDIR
+    PutU32LE(n0 + 8, 48u);       // 2 dirents + names
+    PutU32LE(n0 + 16, 2u);       // raw_blkaddr = 2
+
+    // Block 2 @ 8192: root dirents ("boot.cfg" -> nid 4, "etc" -> nid 2)
+    uint8_t* rd = img.data() + 2 * blkSz;
+    PutU64LE(rd + 0,  4ULL); PutU16LE(rd + 8,  24u); rd[10] = 1u;
+    PutU64LE(rd + 12, 2ULL); PutU16LE(rd + 20, 32u); rd[22] = 2u;
+    std::memcpy(rd + 24, "boot.cfg", 8);
+    std::memcpy(rd + 32, "etc", 3);
+
+    // NID 2 @ 4096 + 64: compact "etc" dir (FLAT_INLINE dirents right at +32!)
+    uint8_t* n2 = img.data() + 4096 + 2 * 32;
+    PutU16LE(n2 + 0, (2u << 1) | 0u); // COMPACT | FLAT_INLINE
+    PutU16LE(n2 + 4, 0040755u);
+    PutU32LE(n2 + 8, 23u); // 12B dirent + 11B "inline.conf"
+    uint8_t* ed = n2 + 32;
+    PutU64LE(ed + 0, 8ULL); PutU16LE(ed + 8, 12u); ed[10] = 1u;
+    std::memcpy(ed + 12, "inline.conf", 11);
+
+    // NID 4 @ 4096 + 128: compact "boot.cfg" reg file (FLAT_PLAIN at block 3)
+    uint8_t* n4 = img.data() + 4096 + 4 * 32;
+    PutU16LE(n4 + 0, 0u); // COMPACT | FLAT_PLAIN
+    PutU16LE(n4 + 4, 0100644u);
+    PutU32LE(n4 + 8, static_cast<uint32_t>(bootPlain.size()));
+    PutU32LE(n4 + 16, 3u); // raw_blkaddr = 3
+    std::memcpy(img.data() + 3 * blkSz, bootPlain.data(), bootPlain.size());
+
+    // NID 8 @ 4096 + 256: extended 64B "etc/inline.conf" reg file (FLAT_INLINE: 4096B @ block 4 + tail inline @ +64!)
+    uint8_t* n8 = img.data() + 4096 + 8 * 32;
+    PutU16LE(n8 + 0, (2u << 1) | 1u); // EXTENDED | FLAT_INLINE
+    PutU16LE(n8 + 4, 0100644u);
+    PutU64LE(n8 + 8, inlineMultiBody.size());
+    PutU32LE(n8 + 16, 4u); // raw_blkaddr = 4
+    std::memcpy(img.data() + 4 * blkSz, inlineMultiBody.data(), blkSz);
+    std::memcpy(n8 + 64, inlineMultiBody.data() + blkSz, inlineMultiBody.size() - blkSz);
+
+    return img;
+}
+
 } // namespace
 
 // ============================================================================
@@ -2256,7 +2741,186 @@ void RunFormatTestsArchives(TestCounter& tc) {
     }
 
     // ------------------------------------------------------------------------
-    // Test 15.9: Corrupt / Truncated Archive & Stream Safety (Zero Crashes, Zero ReaderGuard Stops)
+    // Test 15.9: UnityFS v6 & v7 AssetBundles (.bundle) with LZ4 blocksInfo,
+    //            Multi-StorageBlock Spanning Files, and Corrupt/Empty Rejection
+    // ------------------------------------------------------------------------
+    {
+        std::string u1Hdr = "UnityFS v6 Header Asset — small metadata node!";
+        std::string u1Big =
+            "UnityFS v6 Multi-Block Asset Payload! Repeating shader bytecode block AAAA_BBBB_CCCC_DDDD "
+            "spanning across three distinct LZ4-compressed StorageBlocks (chunk=64B) for slice verification!";
+        std::string u2Mesh =
+            "UnityFS v7 16-Byte Aligned Bundle Mesh Stream — vertex/index buffer payload 0123456789ABCDEF "
+            "0123456789ABCDEF spanning multiple LZ4 storage blocks cleanly!";
+
+        auto bun1 = BuildUnityFsBundle(6u, "2020.3.48f1", 64u, {
+            { "CAB-1111/manifest.txt", u1Hdr },
+            { "CAB-1111/CAB-1111.resS", u1Big }
+        });
+        auto bun2 = BuildUnityFsBundle(7u, "2022.3.20f1", 64u, {
+            { "CAB-9999/mesh_stream.bin", u2Mesh }
+        });
+
+        std::wstring bp1 = baseDir + L"\\assets_v6.bundle";
+        std::wstring bp2 = baseDir + L"\\assets_v7.bundle";
+        std::wstring bpBad = baseDir + L"\\corrupt_empty.bundle";
+        PathUtils::WriteFileBytes(bp1, bun1.data(), bun1.size());
+        PathUtils::WriteFileBytes(bp2, bun2.data(), bun2.size());
+
+        // Corrupt UnityFS header with invalid blocksInfo -> MUST return false (no fake CAB-SerializedAssets.assets!)
+        std::vector<uint8_t> badBun = { 'U','n','i','t','y','F','S',0, 0,0,0,7, '5','.','x',0, '2','0','2','2',0 };
+        badBun.resize(64, 0xFFu);
+        PathUtils::WriteFileBytes(bpBad, badBun.data(), badBun.size());
+
+        ArchiveSummaryInfo us1, us2, usBad;
+        std::vector<uint8_t> uo1a, uo1b, uo2;
+        bool okU1 = ArchiveExplorer::InspectArchiveFile(bp1, us1) && us1.valid && us1.entries.size() == 2 &&
+                    FindEntryCI(us1, L"CAB-SerializedAssets.assets") == nullptr &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(bp1, L"CAB-1111/manifest.txt", uo1a) && BytesMatchStr(uo1a, u1Hdr) &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(bp1, L"CAB-1111/CAB-1111.resS", uo1b) && BytesMatchStr(uo1b, u1Big);
+        bool okU2 = ArchiveExplorer::InspectArchiveFile(bp2, us2) && us2.valid && us2.entries.size() == 1 &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(bp2, L"CAB-9999/mesh_stream.bin", uo2) && BytesMatchStr(uo2, u2Mesh);
+        bool rejBadU = !ArchiveExplorer::InspectArchiveFile(bpBad, usBad) &&
+                       FindEntryCI(usBad, L"CAB-SerializedAssets.assets") == nullptr;
+
+        tc.Record(okU1 && okU2 && rejBadU,
+            L"Stage15.Archives.UnityFS_LZ4BlocksInfo_MultiStorageBlock_And_NoFakeFallback",
+            L"v6=" + std::to_wstring(okU1) + L", v7=" + std::to_wstring(okU2) + L", rejBad=" + std::to_wstring(rejBadU));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.10: Blizzard MoPaQ (.mpq) with Storm-Encrypted Hash & Block Tables,
+    //             Non-Sequential (listfile) Mapping, and Zlib+Encrypted Multi-Sector Files
+    // ------------------------------------------------------------------------
+    {
+        std::string knightMdx;
+        while (knightMdx.size() < 740) knightMdx += "MDLX_VERS_800_KNIGHT_GEOMETRY_CHUNK_";
+        std::string war3MapJ;
+        while (war3MapJ.size() < 860) war3MapJ += "function main takes nothing returns nothing // JASS script line\r\n";
+
+        auto mpqBytes = BuildBlizzardMpqTestArchive(knightMdx, war3MapJ);
+        std::wstring mpqPath = baseDir + L"\\war3_patch.mpq";
+        PathUtils::WriteFileBytes(mpqPath, mpqBytes.data(), mpqBytes.size());
+
+        ArchiveSummaryInfo ms;
+        std::vector<uint8_t> outKnight, outJass;
+        bool okInspect = ArchiveExplorer::InspectArchiveFile(mpqPath, ms) && ms.valid && ms.entries.size() == 2 &&
+                         FindEntryCI(ms, L"(listfile)") == nullptr &&
+                         FindEntryCI(ms, L"Units/Knight.mdx") != nullptr &&
+                         FindEntryCI(ms, L"Units/Knight.mdx")->uncompressedSize == knightMdx.size() &&
+                         FindEntryCI(ms, L"Scripts/war3map.j") != nullptr &&
+                         FindEntryCI(ms, L"Scripts/war3map.j")->uncompressedSize == war3MapJ.size();
+        bool okExtract = ArchiveExplorer::ExtractSingleEntryToMemory(mpqPath, L"Units/Knight.mdx", outKnight) &&
+                         BytesMatchStr(outKnight, knightMdx) &&
+                         ArchiveExplorer::ExtractSingleEntryToMemory(mpqPath, L"Scripts/war3map.j", outJass) &&
+                         BytesMatchStr(outJass, war3MapJ);
+
+        tc.Record(okInspect && okExtract,
+            L"Stage15.Archives.BlizzardMPQ_StormHashBlockTables_ZlibEncryptedMultiSector",
+            L"inspect=" + std::to_wstring(okInspect) + L", extract=" + std::to_wstring(okExtract));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.11: RPG Maker Encrypted Archives (.rgss3a v3 & .rgssad v1)
+    //             Multi-Dword Rolling XOR Stream Decryption
+    // ------------------------------------------------------------------------
+    {
+        std::string rvActors = "Marshal.4.8 RPG::Actor table payload spanning > 16 dwords for key*7+3 stream advance check!";
+        std::string rvBgm    = "OggS_VX_Ace_Encrypted_Audio_Stream_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ!";
+        std::string rxSys    = "RPG Maker XP v1 RGSSAD System.rxdata rolling 0xDEADCAFE stream decryption verification!";
+        std::string rxLogo   = "PNG_MOCK_HEADER_89504E47_MULTI_DWORD_RGSS_V1_DECRYPTED_EXACTLY!";
+
+        auto rgss3 = BuildRpgMakerRgss3a({ { "Data\\Actors.rvdata2", rvActors }, { "Audio\\BGM\\Field.ogg", rvBgm } });
+        auto rgss1 = BuildRpgMakerRgssV1({ { "Data\\System.rxdata", rxSys }, { "Graphics\\Titles\\Logo.png", rxLogo } });
+
+        std::wstring p3 = baseDir + L"\\Game.rgss3a";
+        std::wstring p1 = baseDir + L"\\Game.rgssad";
+        PathUtils::WriteFileBytes(p3, rgss3.data(), rgss3.size());
+        PathUtils::WriteFileBytes(p1, rgss1.data(), rgss1.size());
+
+        ArchiveSummaryInfo s3, s1;
+        std::vector<uint8_t> o3a, o3b, o1a, o1b;
+        bool ok3 = ArchiveExplorer::InspectArchiveFile(p3, s3) && s3.valid && s3.entries.size() == 2 &&
+                   ArchiveExplorer::ExtractSingleEntryToMemory(p3, L"Data/Actors.rvdata2", o3a) && BytesMatchStr(o3a, rvActors) &&
+                   ArchiveExplorer::ExtractSingleEntryToMemory(p3, L"Audio/BGM/Field.ogg", o3b) && BytesMatchStr(o3b, rvBgm);
+        bool ok1 = ArchiveExplorer::InspectArchiveFile(p1, s1) && s1.valid && s1.entries.size() == 2 &&
+                   ArchiveExplorer::ExtractSingleEntryToMemory(p1, L"Data/System.rxdata", o1a) && BytesMatchStr(o1a, rxSys) &&
+                   ArchiveExplorer::ExtractSingleEntryToMemory(p1, L"Graphics/Titles/Logo.png", o1b) && BytesMatchStr(o1b, rxLogo);
+
+        tc.Record(ok3 && ok1,
+            L"Stage15.Archives.RpgMaker_RGSS3A_And_RGSSAD_StreamDecryption",
+            L"rgss3a=" + std::to_wstring(ok3) + L", rgssad=" + std::to_wstring(ok1));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.12: Linux SquashFS 4.0 (Zlib Metadata + Nested Dir + Zlib Data) &
+    //             Linux EROFS (Root + Subdir + FLAT_PLAIN & Extended FLAT_INLINE)
+    // ------------------------------------------------------------------------
+    {
+        std::string sqReadme = "SquashFS 4.0 Root File — Zlib compressed data & Zlib compressed metadata blocks!\n";
+        std::string sqConf   = "[service]\nmode = production\nthreads = 16\ndescription = Nested SquashFS file\n";
+        auto sqImg = BuildSquashFs4ZlibImage(sqReadme, sqConf);
+
+        std::wstring sqPath = baseDir + L"\\rootfs.squashfs";
+        std::wstring sqStubPath = baseDir + L"\\stub_only.squashfs";
+        PathUtils::WriteFileBytes(sqPath, sqImg.data(), sqImg.size());
+
+        // Header-only "hsqs" stub (96B) -> MUST be rejected without fake "squashfs-root (...)"!
+        std::vector<uint8_t> sqStub(96, 0);
+        std::memcpy(sqStub.data(), "hsqs", 4);
+        PutU32LE(sqStub.data() + 4, 5u);
+        PutU32LE(sqStub.data() + 12, 4096u);
+        PutU16LE(sqStub.data() + 20, 1u);
+        PutU16LE(sqStub.data() + 28, 4u);
+        PathUtils::WriteFileBytes(sqStubPath, sqStub.data(), sqStub.size());
+
+        ArchiveSummaryInfo sqSum, sqBadSum;
+        std::vector<uint8_t> sqOut1, sqOut2;
+        bool okSq = ArchiveExplorer::InspectArchiveFile(sqPath, sqSum) && sqSum.valid &&
+                    FindEntryCI(sqSum, L"readme.txt") != nullptr &&
+                    FindEntryCI(sqSum, L"readme.txt")->uncompressedSize == sqReadme.size() &&
+                    FindEntryCI(sqSum, L"etc/config.ini") != nullptr &&
+                    FindEntryCI(sqSum, L"etc/config.ini")->uncompressedSize == sqConf.size() &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(sqPath, L"readme.txt", sqOut1) && BytesMatchStr(sqOut1, sqReadme) &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(sqPath, L"etc/config.ini", sqOut2) && BytesMatchStr(sqOut2, sqConf);
+        bool rejSqStub = !ArchiveExplorer::InspectArchiveFile(sqStubPath, sqBadSum) && sqBadSum.entries.empty();
+
+        std::string erBoot = "console=ttyS0,115200 root=/dev/vda ro quiet\n";
+        std::string erInline(4096, 'E');
+        erInline.replace(0, 24, "EROFS_FULL_BLOCK_HEADER:");
+        erInline += "::INLINE_TAIL_PAYLOAD_AFTER_EXTENDED_64B_INODE!";
+        auto erImg = BuildErofsTestImage(erBoot, erInline);
+
+        std::wstring erPath = baseDir + L"\\system.erofs";
+        std::wstring erStubPath = baseDir + L"\\empty_sb.erofs";
+        PathUtils::WriteFileBytes(erPath, erImg.data(), erImg.size());
+
+        // Empty EROFS superblock -> MUST be rejected without fake "erofs_root (...)"!
+        std::vector<uint8_t> erStub(2048, 0);
+        PutU32LE(erStub.data() + 1024, 0xE0F5E1E2u);
+        erStub[1024 + 12] = 12u;
+        PutU32LE(erStub.data() + 1024 + 36, 1u);
+        PathUtils::WriteFileBytes(erStubPath, erStub.data(), erStub.size());
+
+        ArchiveSummaryInfo erSum, erBadSum;
+        std::vector<uint8_t> erOut1, erOut2;
+        bool okEr = ArchiveExplorer::InspectArchiveFile(erPath, erSum) && erSum.valid &&
+                    FindEntryCI(erSum, L"boot.cfg") != nullptr &&
+                    FindEntryCI(erSum, L"boot.cfg")->uncompressedSize == erBoot.size() &&
+                    FindEntryCI(erSum, L"etc/inline.conf") != nullptr &&
+                    FindEntryCI(erSum, L"etc/inline.conf")->uncompressedSize == erInline.size() &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(erPath, L"boot.cfg", erOut1) && BytesMatchStr(erOut1, erBoot) &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(erPath, L"etc/inline.conf", erOut2) && BytesMatchStr(erOut2, erInline);
+        bool rejErStub = !ArchiveExplorer::InspectArchiveFile(erStubPath, erBadSum) && erBadSum.entries.empty();
+
+        tc.Record(okSq && rejSqStub && okEr && rejErStub,
+            L"Stage15.Archives.LinuxFS_SquashFS4Zlib_And_EROFS_PlainAndInline",
+            L"sqfs=" + std::to_wstring(okSq) + L", rejSq=" + std::to_wstring(rejSqStub) +
+            L", erofs=" + std::to_wstring(okEr) + L", rejEr=" + std::to_wstring(rejErStub));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.13: Corrupt / Truncated Archive & Stream Safety (Zero Crashes, Zero ReaderGuard Stops)
     // ------------------------------------------------------------------------
     {
         struct BadSample { const wchar_t* name; std::vector<uint8_t> bytes; };
@@ -2269,7 +2933,11 @@ void RunFormatTestsArchives(TestCounter& tc) {
             { L"bad.bsa",    { 'B','S','A',0, 104,0,0,0, 36,0,0,0, 0xFF,0,0,0, 99,99,0,0 } },
             { L"bad.ba2",    { 'B','T','D','X', 1,0,0,0, 'G','N','R','L', 99,99,0,0, 0xFF,0xFF,0,0,0,0,0,0 } },
             { L"bad.rpm",    { 0xED,0xAB,0xEE,0xDB, 3,0, 0,0,0,0 } },
-            { L"bad.vhd",    { 'c','o','n','e','c','t','i','x', 0,0,0,2 } }
+            { L"bad.vhd",    { 'c','o','n','e','c','t','i','x', 0,0,0,2 } },
+            { L"bad.bundle", { 'U','n','i','t','y','F','S',0, 0,0,0,7, '5',0,'2',0, 0,0,0,0,0,0,1,0, 0,0,1,0, 0,0,2,0, 0,0,0,0x43 } },
+            { L"bad.mpq",    { 'M','P','Q',0x1A, 32,0,0,0, 64,0,0,0, 0,0,0,0, 99,0,0,0, 99,0,0,0, 16,0,0,0, 8,0,0,0 } },
+            { L"bad.rgss3a", { 'R','G','S','S','A','D',0,3, 1,2,3,4, 0xFF,0xFF,0xFF,0xFF } },
+            { L"bad.squashfs", { 'h','s','q','s', 1,0,0,0, 0,0,0,0, 0,16,0,0 } }
         };
         for (const auto& b : bads) {
             std::wstring p = baseDir + L"\\" + b.name;

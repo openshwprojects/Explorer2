@@ -1109,6 +1109,320 @@ std::vector<uint8_t> BuildBpgFixture(uint8_t width, uint8_t height, uint8_t seed
     return b;
 }
 
+void AppendDcmShortTag(std::vector<uint8_t>& d, uint16_t grp, uint16_t elem, const char vr[2], const void* pay, uint16_t len) {
+    PushU16LE(d, grp);
+    PushU16LE(d, elem);
+    d.push_back(static_cast<uint8_t>(vr[0]));
+    d.push_back(static_cast<uint8_t>(vr[1]));
+    uint16_t padded = static_cast<uint16_t>(len + (len & 1u));
+    PushU16LE(d, padded);
+    const auto* u = static_cast<const uint8_t*>(pay);
+    if (len > 0) d.insert(d.end(), u, u + len);
+    if (len & 1u) d.push_back((vr[0] == 'U' && vr[1] == 'I') ? 0u : static_cast<uint8_t>(' '));
+}
+
+void AppendDcmUS(std::vector<uint8_t>& d, uint16_t grp, uint16_t elem, uint16_t val) {
+    uint8_t b[2] = { static_cast<uint8_t>(val & 0xFFu), static_cast<uint8_t>(val >> 8) };
+    AppendDcmShortTag(d, grp, elem, "US", b, 2);
+}
+
+void AppendDcmStr(std::vector<uint8_t>& d, uint16_t grp, uint16_t elem, const char vr[2], const char* s) {
+    AppendDcmShortTag(d, grp, elem, vr, s, static_cast<uint16_t>(std::strlen(s)));
+}
+
+void AppendDcmLongTag(std::vector<uint8_t>& d, uint16_t grp, uint16_t elem, const char vr[2], uint32_t len) {
+    PushU16LE(d, grp);
+    PushU16LE(d, elem);
+    d.push_back(static_cast<uint8_t>(vr[0]));
+    d.push_back(static_cast<uint8_t>(vr[1]));
+    PushU16LE(d, 0);
+    PushU32LE(d, len);
+}
+
+// PackBits RLE encoder for DICOM RLE Lossless byte planes
+std::vector<uint8_t> EncodeDicomPackBits(const std::vector<uint8_t>& raw) {
+    std::vector<uint8_t> out;
+    size_t i = 0;
+    while (i < raw.size()) {
+        size_t run = 1;
+        while (i + run < raw.size() && run < 128 && raw[i + run] == raw[i]) ++run;
+        if (run >= 3) {
+            out.push_back(static_cast<uint8_t>(static_cast<int8_t>(1 - static_cast<int>(run))));
+            out.push_back(raw[i]);
+            i += run;
+        } else {
+            size_t start = i;
+            size_t lit = 0;
+            while (i < raw.size() && lit < 128) {
+                if (i + 2 < raw.size() && raw[i] == raw[i + 1] && raw[i] == raw[i + 2]) break;
+                ++i;
+                ++lit;
+            }
+            out.push_back(static_cast<uint8_t>(lit - 1));
+            out.insert(out.end(), raw.begin() + start, raw.begin() + start + lit);
+        }
+    }
+    if (out.size() & 1u) out.push_back(0x80u); // Even byte length pad (PackBits noop)
+    return out;
+}
+
+// Clinical CT slice with Undefined-Length SQ before (0028,*), signed 12-bit PixelRepresentation=1, RescaleIntercept=-1024, Window=40/400
+std::vector<uint8_t> BuildDicomCtSqFixture() {
+    std::vector<uint8_t> f(128, 0);
+    f.insert(f.end(), { 'D', 'I', 'C', 'M' });
+
+    AppendDcmStr(f, 0x0002, 0x0010, "UI", "1.2.840.10008.1.2.1"); // Explicit VR LE
+
+    // Undefined-Length ReferencedImageSequence (0008,1140) with Undefined-Length Item
+    AppendDcmLongTag(f, 0x0008, 0x1140, "SQ", 0xFFFFFFFFu);
+    PushU16LE(f, 0xFFFEu); PushU16LE(f, 0xE000u); PushU32LE(f, 0xFFFFFFFFu); // Item start
+    AppendDcmStr(f, 0x0008, 0x1150, "UI", "1.2.840.10008.5.1.4.1.1.2");
+    AppendDcmStr(f, 0x0008, 0x1155, "UI", "1.2.840.113619.2.55.3.99");
+    PushU16LE(f, 0xFFFEu); PushU16LE(f, 0xE00Du); PushU32LE(f, 0u);          // Item Delimitation
+    PushU16LE(f, 0xFFFEu); PushU16LE(f, 0xE0DDu); PushU32LE(f, 0u);          // Sequence Delimitation
+
+    AppendDcmUS(f, 0x0028, 0x0002, 1);   // SamplesPerPixel = 1
+    AppendDcmStr(f, 0x0028, 0x0004, "CS", "MONOCHROME2");
+    AppendDcmUS(f, 0x0028, 0x0010, 8);   // Rows = 8
+    AppendDcmUS(f, 0x0028, 0x0011, 8);   // Columns = 8
+    AppendDcmUS(f, 0x0028, 0x0100, 16);  // BitsAllocated = 16
+    AppendDcmUS(f, 0x0028, 0x0101, 12);  // BitsStored = 12
+    AppendDcmUS(f, 0x0028, 0x0102, 11);  // HighBit = 11
+    AppendDcmUS(f, 0x0028, 0x0103, 1);   // PixelRepresentation = 1 (signed two's complement)
+    AppendDcmStr(f, 0x0028, 0x1050, "DS", "40");
+    AppendDcmStr(f, 0x0028, 0x1051, "DS", "400");
+    AppendDcmStr(f, 0x0028, 0x1052, "DS", "-1024");
+    AppendDcmStr(f, 0x0028, 0x1053, "DS", "1");
+
+    std::vector<int16_t> samples(64, 1024); // 1024 - 1024 = 0 HU
+    samples[0] = -1000; // Negative 12-bit signed (-1000 -> -2024 HU -> dark 0, NOT bright white!)
+    samples[1] = 24;    // 24 - 1024 = -1000 HU (CT air -> dark 0!)
+    samples[4 * 8 + 4] = 1064; // 1064 - 1024 = +40 HU (exact WindowCenter -> mid-gray ~128)
+    samples[7 * 8 + 7] = 1524; // 1524 - 1024 = +500 HU (cortical bone -> bright white 255)
+    for (int i = 2; i < 64; ++i) {
+        if (i != (4 * 8 + 4) && i != (7 * 8 + 7)) {
+            samples[static_cast<size_t>(i)] = static_cast<int16_t>(900 + i * 5);
+        }
+    }
+
+    AppendDcmLongTag(f, 0x7FE0, 0x0010, "OW", 128u);
+    for (int16_t s : samples) {
+        PushU16LE(f, static_cast<uint16_t>(s));
+    }
+    return f;
+}
+
+// Encapsulated RLE Lossless (1.2.840.10008.1.2.5) 16-bit 8x8 DICOM image
+std::vector<uint8_t> BuildDicomRleLosslessFixture() {
+    std::vector<uint8_t> f(128, 0);
+    f.insert(f.end(), { 'D', 'I', 'C', 'M' });
+
+    AppendDcmStr(f, 0x0002, 0x0010, "UI", "1.2.840.10008.1.2.5"); // RLE Lossless
+    AppendDcmUS(f, 0x0028, 0x0002, 1);
+    AppendDcmStr(f, 0x0028, 0x0004, "CS", "MONOCHROME2");
+    AppendDcmUS(f, 0x0028, 0x0010, 8);
+    AppendDcmUS(f, 0x0028, 0x0011, 8);
+    AppendDcmUS(f, 0x0028, 0x0100, 16);
+    AppendDcmUS(f, 0x0028, 0x0101, 16);
+    AppendDcmUS(f, 0x0028, 0x0102, 15);
+    AppendDcmUS(f, 0x0028, 0x0103, 0);
+    AppendDcmStr(f, 0x0028, 0x1050, "DS", "2000");
+    AppendDcmStr(f, 0x0028, 0x1051, "DS", "2000");
+
+    std::vector<uint8_t> msbPlane(64);
+    std::vector<uint8_t> lsbPlane(64);
+    for (size_t i = 0; i < 64; ++i) {
+        uint16_t v = (i < 16) ? 800u : static_cast<uint16_t>(1100u + i * 32u);
+        msbPlane[i] = static_cast<uint8_t>(v >> 8);
+        lsbPlane[i] = static_cast<uint8_t>(v & 0xFFu);
+    }
+    std::vector<uint8_t> rleSeg0 = EncodeDicomPackBits(msbPlane);
+    std::vector<uint8_t> rleSeg1 = EncodeDicomPackBits(lsbPlane);
+
+    std::vector<uint8_t> rleFrag(64, 0);
+    PushU32LE(rleFrag, 0); rleFrag.resize(64, 0);
+    // 64-byte RLE Header: numSegments=2, offset0=64, offset1=64+rleSeg0.size()
+    rleFrag[0] = 2;
+    uint32_t off0 = 64u;
+    uint32_t off1 = 64u + static_cast<uint32_t>(rleSeg0.size());
+    std::memcpy(rleFrag.data() + 4, &off0, 4);
+    std::memcpy(rleFrag.data() + 8, &off1, 4);
+    rleFrag.insert(rleFrag.end(), rleSeg0.begin(), rleSeg0.end());
+    rleFrag.insert(rleFrag.end(), rleSeg1.begin(), rleSeg1.end());
+
+    // Encapsulated PixelData (7FE0,0010) OB with Undefined Length
+    AppendDcmLongTag(f, 0x7FE0, 0x0010, "OB", 0xFFFFFFFFu);
+    PushU16LE(f, 0xFFFEu); PushU16LE(f, 0xE000u); PushU32LE(f, 0u); // Empty BOT
+    PushU16LE(f, 0xFFFEu); PushU16LE(f, 0xE000u); PushU32LE(f, static_cast<uint32_t>(rleFrag.size()));
+    f.insert(f.end(), rleFrag.begin(), rleFrag.end());
+    PushU16LE(f, 0xFFFEu); PushU16LE(f, 0xE0DDu); PushU32LE(f, 0u); // Sequence Delimitation
+    return f;
+}
+
+// Build a 16x16 4bpp paletted CUR icon payload with 1bpp AND transparency mask
+std::vector<uint8_t> BuildAniCur4BppPayload(uint8_t rCol, uint8_t gCol, uint8_t bCol, bool transparentCorners) {
+    const uint32_t w = 16, h = 16;
+    std::vector<uint8_t> dib;
+    PushU32LE(dib, 40u);        // biSize
+    PushU32LE(dib, w);          // biWidth
+    PushU32LE(dib, h * 2u);     // biHeight = 2 * h (XOR + AND)
+    PushU16LE(dib, 1u);         // biPlanes
+    PushU16LE(dib, 4u);         // biBitCount = 4bpp
+    PushU32LE(dib, 0u);         // BI_RGB
+    PushU32LE(dib, 0u);         // biSizeImage
+    PushU32LE(dib, 0u); PushU32LE(dib, 0u);
+    PushU32LE(dib, 16u);        // biClrUsed = 16
+    PushU32LE(dib, 0u);
+
+    // 16-entry RGBQUAD palette: idx 0 = black, idx 1 = primary color, idx 2 = secondary accent
+    for (int i = 0; i < 16; ++i) {
+        if (i == 1) {
+            dib.insert(dib.end(), { bCol, gCol, rCol, 0u });
+        } else if (i == 2) {
+            dib.insert(dib.end(), { static_cast<uint8_t>(255u - bCol), static_cast<uint8_t>(gCol / 2u), rCol, 0u });
+        } else {
+            dib.insert(dib.end(), { 0u, 0u, 0u, 0u });
+        }
+    }
+
+    // Bottom-up 4bpp XOR rows (stride = ((16 * 4 + 31)/32)*4 = 8 bytes/row)
+    for (uint32_t row = 0; row < h; ++row) {
+        for (uint32_t bx = 0; bx < 8; ++bx) {
+            uint8_t idx0 = ((row + bx) & 1u) ? 1u : 2u;
+            uint8_t idx1 = 1u;
+            if (row == 7u && bx == 4u) { idx0 = 1u; idx1 = 1u; } // Ensure center (8,8) uses palette idx 1
+            dib.push_back(static_cast<uint8_t>((idx0 << 4) | idx1));
+        }
+    }
+
+    // Bottom-up 1bpp AND mask rows (stride = ((16 + 31)/32)*4 = 4 bytes/row)
+    for (uint32_t row = 0; row < h; ++row) {
+        uint32_t topY = h - 1u - row;
+        uint8_t b0 = 0u, b1 = 0u;
+        for (uint32_t x = 0; x < 16; ++x) {
+            bool transp = transparentCorners && ((x < 2u || x >= 14u) && (topY < 2u || topY >= 14u));
+            if (transp) {
+                if (x < 8u) b0 |= static_cast<uint8_t>(1u << (7u - x));
+                else b1 |= static_cast<uint8_t>(1u << (15u - x));
+            }
+        }
+        dib.insert(dib.end(), { b0, b1, 0u, 0u });
+    }
+
+    std::vector<uint8_t> cur;
+    PushU16LE(cur, 0u); // reserved
+    PushU16LE(cur, 2u); // type = 2 (CUR)
+    PushU16LE(cur, 1u); // count = 1
+    cur.push_back(static_cast<uint8_t>(w));
+    cur.push_back(static_cast<uint8_t>(h));
+    cur.push_back(16u);
+    cur.push_back(0u);
+    PushU16LE(cur, 8u); // hotspotX
+    PushU16LE(cur, 8u); // hotspotY
+    PushU32LE(cur, static_cast<uint32_t>(dib.size()));
+    PushU32LE(cur, 22u);
+    cur.insert(cur.end(), dib.begin(), dib.end());
+    return cur;
+}
+
+// RIFF ACON with LIST 'fram' -> 2 x 4bpp CUR frames + 'seq ' selecting Frame 1
+std::vector<uint8_t> BuildAniSeqFixture() {
+    auto frame0Red   = BuildAniCur4BppPayload(250u, 15u, 15u, false);
+    auto frame1Green = BuildAniCur4BppPayload(10u, 230u, 20u, true);
+
+    auto appendChunk = [](std::vector<uint8_t>& dst, const char id[4], const std::vector<uint8_t>& pay) {
+        dst.insert(dst.end(), id, id + 4);
+        PushU32LE(dst, static_cast<uint32_t>(pay.size()));
+        dst.insert(dst.end(), pay.begin(), pay.end());
+        if (pay.size() & 1u) dst.push_back(0u);
+    };
+
+    std::vector<uint8_t> anih;
+    PushU32LE(anih, 36u); // cbSize
+    PushU32LE(anih, 2u);  // cFrames = 2
+    PushU32LE(anih, 2u);  // cSteps = 2
+    PushU32LE(anih, 16u); // cx = 16
+    PushU32LE(anih, 16u); // cy = 16
+    PushU32LE(anih, 4u);  // cBitCount
+    PushU32LE(anih, 1u);  // cPlanes
+    PushU32LE(anih, 6u);  // jiffRate
+    PushU32LE(anih, 3u);  // AF_ICON | AF_SEQUENCE
+
+    std::vector<uint8_t> seq;
+    PushU32LE(seq, 1u); // Step 0 -> Frame 1 (green + transparent corners!)
+    PushU32LE(seq, 0u); // Step 1 -> Frame 0 (red)
+
+    std::vector<uint8_t> framBody = { 'f', 'r', 'a', 'm' };
+    appendChunk(framBody, "icon", frame0Red);
+    appendChunk(framBody, "icon", frame1Green);
+
+    std::vector<uint8_t> body = { 'A', 'C', 'O', 'N' };
+    appendChunk(body, "anih", anih);
+    appendChunk(body, "seq ", seq);
+    appendChunk(body, "LIST", framBody);
+
+    std::vector<uint8_t> riff = { 'R', 'I', 'F', 'F' };
+    PushU32LE(riff, static_cast<uint32_t>(body.size()));
+    riff.insert(riff.end(), body.begin(), body.end());
+    return riff;
+}
+
+// RIFF ACON with 24bpp BGR ICO frame inside LIST 'fram'
+std::vector<uint8_t> BuildAni24BppFixture() {
+    const uint32_t w = 16, h = 16;
+    std::vector<uint8_t> dib;
+    PushU32LE(dib, 40u);
+    PushU32LE(dib, w);
+    PushU32LE(dib, h * 2u);
+    PushU16LE(dib, 1u);
+    PushU16LE(dib, 24u); // 24bpp BGR
+    PushU32LE(dib, 0u);
+    PushU32LE(dib, 0u);
+    PushU32LE(dib, 0u); PushU32LE(dib, 0u);
+    PushU32LE(dib, 0u); PushU32LE(dib, 0u);
+
+    // 24bpp row stride = ((16 * 24 + 31)/32)*4 = 48 bytes
+    for (uint32_t row = 0; row < h; ++row) {
+        for (uint32_t x = 0; x < w; ++x) {
+            dib.push_back(static_cast<uint8_t>(220u - x * 8u)); // B
+            dib.push_back(static_cast<uint8_t>(40u + row * 10u)); // G
+            dib.push_back(static_cast<uint8_t>(30u + x * 12u)); // R
+        }
+    }
+    // Opaque 1bpp AND mask (4 bytes/row)
+    dib.insert(dib.end(), h * 4u, 0u);
+
+    std::vector<uint8_t> ico;
+    PushU16LE(ico, 0u);
+    PushU16LE(ico, 1u); // type = 1 (ICO)
+    PushU16LE(ico, 1u);
+    ico.push_back(16u); ico.push_back(16u); ico.push_back(0u); ico.push_back(0u);
+    PushU16LE(ico, 1u); PushU16LE(ico, 24u);
+    PushU32LE(ico, static_cast<uint32_t>(dib.size()));
+    PushU32LE(ico, 22u);
+    ico.insert(ico.end(), dib.begin(), dib.end());
+
+    std::vector<uint8_t> anih(36, 0);
+    anih[0] = 36; anih[4] = 1; anih[8] = 1; anih[12] = 16; anih[16] = 16; anih[20] = 24; anih[24] = 1; anih[28] = 6; anih[32] = 1;
+
+    std::vector<uint8_t> fram = { 'f', 'r', 'a', 'm', 'i', 'c', 'o', 'n' };
+    PushU32LE(fram, static_cast<uint32_t>(ico.size()));
+    fram.insert(fram.end(), ico.begin(), ico.end());
+    if (ico.size() & 1u) fram.push_back(0u);
+
+    std::vector<uint8_t> body = { 'A', 'C', 'O', 'N', 'a', 'n', 'i', 'h' };
+    PushU32LE(body, 36u);
+    body.insert(body.end(), anih.begin(), anih.end());
+    body.insert(body.end(), { 'L', 'I', 'S', 'T' });
+    PushU32LE(body, static_cast<uint32_t>(fram.size()));
+    body.insert(body.end(), fram.begin(), fram.end());
+
+    std::vector<uint8_t> riff = { 'R', 'I', 'F', 'F' };
+    PushU32LE(riff, static_cast<uint32_t>(body.size()));
+    riff.insert(riff.end(), body.begin(), body.end());
+    return riff;
+}
+
 } // namespace
 
 void RunFormatTestsImages(TestCounter& tc) {
@@ -1347,6 +1661,81 @@ void RunFormatTestsImages(TestCounter& tc) {
         auto bpgA = BuildBpgFixture(32, 32, 0x19);
         auto bpgB = BuildBpgFixture(48, 32, 0xA7);
         verifyPair(L"Stage15.Images.BPG_HeaderAndSlice", L"a.bpg", bpgA, L"b.bpg", bpgB, L".bpg", 8);
+    }
+
+    // 14. DICOM PS3.5 / PS3.10 (.dcm): Undefined-Length SQ + Signed 12-bit CT HU VOI Window vs RLE Lossless
+    {
+        auto dcmCt  = BuildDicomCtSqFixture();
+        auto dcmRle = BuildDicomRleLosslessFixture();
+        verifyPair(L"Stage15.Images.DICOM_CtSqVoiAndRleLossless", L"ct_sq.dcm", dcmCt, L"rle.dcm", dcmRle, L".dcm", 220);
+
+        ExtendedImageInfo ctInfo;
+        bool decOk = ImageFormatLoader::DecodeImageMemory(dcmCt.data(), dcmCt.size(), L".dcm", 0, ctInfo) &&
+                     ctInfo.valid && ctInfo.width == 8 && ctInfo.height == 8 && ctInfo.bgraPixels.size() == 256;
+        bool voiAccurate = false;
+        if (decOk) {
+            uint8_t airNeg = ctInfo.bgraPixels[0 * 4];              // stored -1000 -> dark 0 (NOT white 255!)
+            uint8_t airHu  = ctInfo.bgraPixels[1 * 4];              // stored 24 (-1000 HU) -> dark 0
+            uint8_t midTis = ctInfo.bgraPixels[(4 * 8 + 4) * 4];    // +40 HU at WindowCenter=40 -> mid-gray ~128
+            uint8_t bone   = ctInfo.bgraPixels[(7 * 8 + 7) * 4];    // +500 HU > 240 -> white 255
+            voiAccurate = (airNeg == 0u) && (airHu == 0u) && (midTis >= 120u && midTis <= 136u) && (bone == 255u);
+        }
+
+        // Header-only DICOM with rows/cols but missing (7FE0,0010) PixelData must fail
+        std::vector<uint8_t> hdrOnlyDcm(128, 0);
+        hdrOnlyDcm.insert(hdrOnlyDcm.end(), { 'D', 'I', 'C', 'M' });
+        AppendDcmUS(hdrOnlyDcm, 0x0028, 0x0010, 8);
+        AppendDcmUS(hdrOnlyDcm, 0x0028, 0x0011, 8);
+        ExtendedImageInfo badDcm;
+        bool rejectedHdrOnly = !ImageFormatLoader::DecodeImageMemory(hdrOnlyDcm.data(), hdrOnlyDcm.size(), L".dcm", 0, badDcm);
+        tc.Record(decOk && voiAccurate && rejectedHdrOnly, L"Stage15.Images.DICOM_SignedCtAirAndHeaderReject");
+
+        std::wstring repoDcm = TestDataDir() + L"\\sample.dcm";
+        if (GetFileAttributesW(repoDcm.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            ExtendedImageInfo sampleDcm;
+            bool okRepoDcm = ImageFormatLoader::DecodeImageFile(repoDcm, 0, sampleDcm) &&
+                             sampleDcm.valid && sampleDcm.width > 0 && sampleDcm.height > 0;
+            tc.Record(okRepoDcm, L"Stage15.Images.RepoTestData.DICOM");
+        }
+    }
+
+    // 15. Windows Animated Cursor (.ani): LIST 'fram' + 'seq ' 4bpp CUR + AND Mask vs 24bpp ICO & Zero-Frame Rejection
+    {
+        auto aniSeq = BuildAniSeqFixture();
+        auto ani24  = BuildAni24BppFixture();
+        verifyPair(L"Stage15.Images.WindowsANI_Seq4BppAnd24Bpp", L"seq4.ani", aniSeq, L"ico24.ani", ani24, L".ani", 68);
+
+        ExtendedImageInfo seqInfo;
+        bool seqOk = ImageFormatLoader::DecodeImageMemory(aniSeq.data(), aniSeq.size(), L".ani", 0, seqInfo) &&
+                     seqInfo.valid && seqInfo.width == 16 && seqInfo.height == 16 && seqInfo.bgraPixels.size() == 1024;
+        bool frameAndMaskOk = false;
+        if (seqOk) {
+            // Corner (0,0) must be transparent (alpha == 0) via 1bpp AND mask
+            uint8_t cornerAlpha = seqInfo.bgraPixels[3];
+            // Center (8,8) must match Frame 1 Green (B=20, G=230, R=10, A=255), NOT Frame 0 Red and NOT solid gray 240!
+            size_t cOff = (8u * 16u + 8u) * 4u;
+            frameAndMaskOk = (cornerAlpha == 0u) &&
+                             (seqInfo.bgraPixels[cOff + 0] == 20u) &&
+                             (seqInfo.bgraPixels[cOff + 1] == 230u) &&
+                             (seqInfo.bgraPixels[cOff + 2] == 10u) &&
+                             (seqInfo.bgraPixels[cOff + 3] == 255u);
+        }
+
+        // anih-only .ani with 0 icon frames must strictly return false (proving solid-gray 240 fallback is gone!)
+        std::vector<uint8_t> anihOnly = { 'R','I','F','F', 48,0,0,0, 'A','C','O','N', 'a','n','i','h', 36,0,0,0 };
+        anihOnly.resize(12 + 8 + 36, 0);
+        anihOnly[20] = 36; anihOnly[24] = 1; anihOnly[28] = 1; anihOnly[32] = 32; anihOnly[36] = 32;
+        ExtendedImageInfo emptyAniInfo;
+        bool rejectedZeroFrames = !ImageFormatLoader::DecodeImageMemory(anihOnly.data(), anihOnly.size(), L".ani", 0, emptyAniInfo);
+        tc.Record(seqOk && frameAndMaskOk && rejectedZeroFrames, L"Stage15.Images.WindowsANI_SeqMaskAndRejectEmpty");
+
+        std::wstring repoAni = TestDataDir() + L"\\sample.ani";
+        if (GetFileAttributesW(repoAni.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            ExtendedImageInfo sampleAni;
+            bool okRepoAni = ImageFormatLoader::DecodeImageFile(repoAni, 0, sampleAni) &&
+                             sampleAni.valid && sampleAni.width > 0 && sampleAni.height > 0;
+            tc.Record(okRepoAni, L"Stage15.Images.RepoTestData.ANI");
+        }
     }
 }
 

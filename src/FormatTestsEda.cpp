@@ -1583,6 +1583,331 @@ void RunFormatTestsEda(TestCounter& tc) {
             L" | " + mA.formatTitle + L" vs " + mB.formatTitle);
     }
 
+    // ------------------------------------------------------------------------
+    // 8. SEMI P39 OASIS (.oas): START offset-flag=0 (12 varuints), POLYGON + CIRCLE
+    //    + 2D repetition vs Deflate CBLOCK (recId=34) RECTANGLE + PATH + empty/garbage rejection
+    // ------------------------------------------------------------------------
+    {
+        auto appendOasisSInt = [](std::vector<uint8_t>& b, int64_t v) {
+            uint64_t u = (v < 0) ? ((static_cast<uint64_t>(-v) << 1) | 1ULL) : (static_cast<uint64_t>(v) << 1);
+            AppendULeb128(b, u);
+        };
+        auto appendOasisStr = [](std::vector<uint8_t>& b, const std::string& s) {
+            AppendULeb128(b, s.size());
+            b.insert(b.end(), s.begin(), s.end());
+        };
+        auto compressRawDeflateFixed = [](const std::vector<uint8_t>& raw) -> std::vector<uint8_t> {
+            std::vector<uint8_t> out;
+            uint32_t bitBuf = 0;
+            int bitCnt = 0;
+            auto wrBits = [&](uint32_t val, int n) {
+                bitBuf |= (val << bitCnt);
+                bitCnt += n;
+                while (bitCnt >= 8) {
+                    out.push_back(static_cast<uint8_t>(bitBuf & 0xFFu));
+                    bitBuf >>= 8;
+                    bitCnt -= 8;
+                }
+            };
+            auto wrHuff = [&](uint32_t code, int n) {
+                for (int i = n - 1; i >= 0; --i) wrBits((code >> i) & 1u, 1);
+            };
+            wrBits(1u, 1); // BFINAL = 1
+            wrBits(1u, 2); // BTYPE = 01 (Fixed Huffman)
+            for (uint8_t sym : raw) {
+                if (sym <= 143u) wrHuff(0x30u + sym, 8);
+                else wrHuff(0x190u + (sym - 144u), 9);
+            }
+            wrHuff(0u, 7); // End-of-block (256)
+            if (bitCnt > 0) out.push_back(static_cast<uint8_t>(bitBuf & 0xFFu));
+            return out;
+        };
+
+        // Layout A: START with offset-flag=0 (12 table flag/offset varuints!), CELLNAME + LAYERNAME + PROPERTY,
+        //           POLYGON (Manhattan H-first point-list + 2x2 grid repetition) + CIRCLE
+        std::vector<uint8_t> oasA;
+        {
+            const char* magic = "%SEMI-OASIS\r\n";
+            oasA.insert(oasA.end(), magic, magic + 13);
+            oasA.push_back(1u); // START
+            appendOasisStr(oasA, "1.0");
+            AppendULeb128(oasA, 0);    // oasis-real type 0: positive integer
+            AppendULeb128(oasA, 1000); // 1000 dbu/um
+            AppendULeb128(oasA, 0);    // offset-flag == 0 -> 12 varuints follow inside START!
+            for (int k = 0; k < 12; ++k) AppendULeb128(oasA, 0);
+
+            // CELLNAME (recId=3, implicit ref 0)
+            oasA.push_back(3u);
+            appendOasisStr(oasA, "CORE_TOP");
+
+            // LAYERNAME (recId=11): "M1", exact layer 1 (type 3), exact datatype 0 (type 3)
+            oasA.push_back(11u);
+            appendOasisStr(oasA, "M1");
+            AppendULeb128(oasA, 3); AppendULeb128(oasA, 1);
+            AppendULeb128(oasA, 3); AppendULeb128(oasA, 0);
+
+            // PROPERTY (recId=28): UUUU=1 value, V=0, C=1, T=0, S=0 => (1<<4)|0x04 = 0x14
+            oasA.push_back(28u);
+            oasA.push_back(0x14u);
+            appendOasisStr(oasA, "TECH_NODE");
+            AppendULeb128(oasA, 8);  // prop-value type 8 = varuint
+            AppendULeb128(oasA, 28); // 28nm
+
+            // CELL (recId=13, refNum=0)
+            oasA.push_back(13u);
+            AppendULeb128(oasA, 0);
+
+            // POLYGON (recId=21): info = L(0x01)|D(0x02)|P(0x20)|X(0x10)|Y(0x08)|R(0x04) = 0x3F
+            oasA.push_back(21u);
+            oasA.push_back(0x3Fu);
+            AppendULeb128(oasA, 1); // layer 1
+            AppendULeb128(oasA, 0); // datatype 0
+            AppendULeb128(oasA, 0); // point-list type 0: Manhattan H-first
+            AppendULeb128(oasA, 5); // 5 explicit deltas (6-vertex L-polygon)
+            appendOasisSInt(oasA, 20000);
+            appendOasisSInt(oasA, 15000);
+            appendOasisSInt(oasA, -8000);
+            appendOasisSInt(oasA, 10000);
+            appendOasisSInt(oasA, -12000);
+            appendOasisSInt(oasA, 0); // X = 0
+            appendOasisSInt(oasA, 0); // Y = 0
+            // Repetition type 1: (xDim+2) x (yDim+2) = 2x2 grid, spacing 35000 dbu
+            AppendULeb128(oasA, 1);
+            AppendULeb128(oasA, 0);
+            AppendULeb128(oasA, 0);
+            AppendULeb128(oasA, 35000);
+            AppendULeb128(oasA, 35000);
+
+            // CIRCLE (recId=26): info = L(0x01)|D(0x02)|r(0x20)|X(0x10)|Y(0x08) = 0x3B
+            oasA.push_back(26u);
+            oasA.push_back(0x3Bu);
+            AppendULeb128(oasA, 2);     // layer 2
+            AppendULeb128(oasA, 0);     // datatype 0
+            AppendULeb128(oasA, 6000);  // radius = 6 um
+            appendOasisSInt(oasA, 10000);
+            appendOasisSInt(oasA, 10000);
+
+            // END (recId=2)
+            oasA.push_back(2u);
+            appendOasisStr(oasA, "");
+            AppendULeb128(oasA, 0);
+        }
+
+        // Layout B: START with IEEE float32 unit & offset-flag=1 + Deflate CBLOCK (recId=34) with RECTANGLE + PATH
+        std::vector<uint8_t> oasB;
+        {
+            const char* magic = "%SEMI-OASIS\r\n";
+            oasB.insert(oasB.end(), magic, magic + 13);
+            oasB.push_back(1u); // START
+            appendOasisStr(oasB, "1.0");
+            AppendULeb128(oasB, 6); // oasis-real type 6: IEEE 754 float32 LE
+            float unitF = 1000.0f;
+            uint8_t fbytes[4] = {};
+            std::memcpy(fbytes, &unitF, 4);
+            oasB.insert(oasB.end(), fbytes, fbytes + 4);
+            AppendULeb128(oasB, 1); // offset-flag == 1 (table offsets in END, not START)
+
+            std::vector<uint8_t> inner;
+            // CELL by inline name (recId=14)
+            inner.push_back(14u);
+            appendOasisStr(inner, "CBLOCK_CELL");
+
+            // RECTANGLE (recId=20): info = W(0x40)|H(0x20)|X(0x10)|Y(0x08)|D(0x02)|L(0x01) = 0x7B
+            inner.push_back(20u);
+            inner.push_back(0x7Bu);
+            AppendULeb128(inner, 1);
+            AppendULeb128(inner, 0);
+            AppendULeb128(inner, 42000);
+            AppendULeb128(inner, 24000);
+            appendOasisSInt(inner, 4000);
+            appendOasisSInt(inner, 6000);
+
+            // PATH (recId=22): info = halfW(0x40)|P(0x20)|X(0x10)|Y(0x08)|D(0x02)|L(0x01) = 0x7B
+            inner.push_back(22u);
+            inner.push_back(0x7Bu);
+            AppendULeb128(inner, 2);
+            AppendULeb128(inner, 0);
+            AppendULeb128(inner, 1500); // half-width = 1.5 um -> width = 3.0 um
+            AppendULeb128(inner, 0);    // Manhattan H-first
+            AppendULeb128(inner, 2);    // 2 deltas (3 vertices)
+            appendOasisSInt(inner, 55000);
+            appendOasisSInt(inner, 32000);
+            appendOasisSInt(inner, 0);
+            appendOasisSInt(inner, 0);
+
+            std::vector<uint8_t> compInner = compressRawDeflateFixed(inner);
+            oasB.push_back(34u); // CBLOCK
+            AppendULeb128(oasB, 0); // comp-type 0 = RFC 1951 raw Deflate
+            AppendULeb128(oasB, inner.size());
+            AppendULeb128(oasB, compInner.size());
+            oasB.insert(oasB.end(), compInner.begin(), compInner.end());
+
+            oasB.push_back(2u); // END
+            for (int k = 0; k < 12; ++k) AppendULeb128(oasB, 0);
+            appendOasisStr(oasB, "");
+            AppendULeb128(oasB, 0);
+        }
+
+        // Empty START+END OASIS (must NOT synthesize fake 4x4 checkerboard!)
+        std::vector<uint8_t> oasEmpty;
+        {
+            const char* magic = "%SEMI-OASIS\r\n";
+            oasEmpty.insert(oasEmpty.end(), magic, magic + 13);
+            oasEmpty.push_back(1u);
+            appendOasisStr(oasEmpty, "1.0");
+            AppendULeb128(oasEmpty, 0);
+            AppendULeb128(oasEmpty, 1000);
+            AppendULeb128(oasEmpty, 1);
+            oasEmpty.push_back(2u);
+            for (int k = 0; k < 12; ++k) AppendULeb128(oasEmpty, 0);
+            appendOasisStr(oasEmpty, "");
+            AppendULeb128(oasEmpty, 0);
+        }
+
+        ParsedEdaBoard bOasA, bOasB, bOasEmpty, bOasGarbage;
+        bool okOasA = WriteAndInspect(dir + L"\\layout_a.oas", oasA.data(), oasA.size(), bOasA);
+        bool okOasB = WriteAndInspect(dir + L"\\layout_b.oas", oasB.data(), oasB.size(), bOasB);
+        bool rejEmpty = !WriteAndInspect(dir + L"\\empty.oas", oasEmpty.data(), oasEmpty.size(), bOasEmpty);
+        const char* badOas = "NOT A SEMI P39 OASIS STREAM";
+        bool rejGarbage = !WriteAndInspect(dir + L"\\garbage.oas", badOas, std::strlen(badOas), bOasGarbage);
+
+        // Layout A has 2x2 * 6 polygon edges = 24 traces + 1 circle; Layout B has 4 rect edges + 2 path segments = 6 traces, 0 circles
+        bool passOas = okOasA && okOasB &&
+                       bOasA.traces.size() >= 24 && bOasA.circles.size() == 1 &&
+                       bOasB.traces.size() >= 6 && bOasB.circles.empty() &&
+                       HashEdaGeometry(bOasA) != HashEdaGeometry(bOasB) &&
+                       rejEmpty && rejGarbage;
+
+        tc.Record(passOas, L"Stage15.Eda.SemiOasis_StartOffsets_Repetition_And_DeflateCBlock",
+            L"oasATraces=" + std::to_wstring(bOasA.traces.size()) +
+            L" oasBTraces=" + std::to_wstring(bOasB.traces.size()) +
+            L" rejEmpty=" + std::to_wstring(rejEmpty));
+    }
+
+    // ------------------------------------------------------------------------
+    // 9. Intel / Altera FPGA Bitstream (.sof / .pof): Packet Directory + Real Sector Density
+    // ------------------------------------------------------------------------
+    {
+        auto buildAlteraSof = [](bool isPof, const std::string& devPart, const std::vector<uint8_t>& sramPayload) {
+            std::vector<uint8_t> out;
+            const char* m = isPof ? "POF" : "SOF";
+            out.push_back(static_cast<uint8_t>(m[0]));
+            out.push_back(static_cast<uint8_t>(m[1]));
+            out.push_back(static_cast<uint8_t>(m[2]));
+            out.push_back(0u);
+            uint8_t cnt[4] = {};
+            PutU32LE(cnt, 3u);
+            out.insert(out.end(), cnt, cnt + 4);
+
+            auto appendPkt = [&](uint16_t tag, const void* ptr, uint32_t len) {
+                uint8_t hdr[6] = {};
+                PutU16LE(hdr + 0, tag);
+                PutU32LE(hdr + 2, len);
+                out.insert(out.end(), hdr, hdr + 6);
+                const auto* bp = static_cast<const uint8_t*>(ptr);
+                out.insert(out.end(), bp, bp + len);
+            };
+            const std::string tool = "Quartus Prime Version 23.1.0";
+            appendPkt(1u, tool.data(), static_cast<uint32_t>(tool.size() + 1));
+            appendPkt(2u, devPart.data(), static_cast<uint32_t>(devPart.size() + 1));
+            appendPkt(6u, sramPayload.data(), static_cast<uint32_t>(sramPayload.size()));
+            return out;
+        };
+
+        std::vector<uint8_t> cfgSparse(128, 0x00u);
+        for (size_t i = 0; i < 32; ++i) cfgSparse[i] = 0x15u; // Only top sectors configured
+
+        std::vector<uint8_t> cfgDense(576, 0xFFu);
+        for (size_t i = 0; i < cfgDense.size(); ++i) cfgDense[i] = (i % 3 == 0) ? 0xFFu : 0x7Eu;
+
+        std::vector<uint8_t> cfgPof(256, 0xFFu); // In Flash POF, 0xFF = erased, 0x00 = programmed!
+        for (size_t i = 64; i < 192; ++i) cfgPof[i] = 0x03u;
+
+        auto sof1 = buildAlteraSof(false, "EP4CE22F17C6", cfgSparse);
+        auto sof2 = buildAlteraSof(false, "5CSEMA5F31C6", cfgDense);
+        auto pof1 = buildAlteraSof(true,  "10M50DAF484",  cfgPof);
+
+        ParsedEdaBoard s1, s2, p1, badSof1, badSof2;
+        bool okS1 = WriteAndInspect(dir + L"\\cyclone4.sof", sof1.data(), sof1.size(), s1);
+        bool okS2 = WriteAndInspect(dir + L"\\cyclone5.sof", sof2.data(), sof2.size(), s2);
+        bool okP1 = WriteAndInspect(dir + L"\\max10.pof",    pof1.data(), pof1.size(), p1);
+
+        const uint8_t nonAltera[64] = { 'B', 'A', 'D', '!', 1, 0, 0, 0, 2, 0, 8, 0, 0, 0 };
+        std::vector<uint8_t> truncSof = { 'S', 'O', 'F', 0, 2, 0, 0, 0, 2, 0, 0xFF, 0x0F, 0, 0, 'E', 'P' };
+        bool rejSofGarbage = !WriteAndInspect(dir + L"\\garbage.sof", nonAltera, sizeof(nonAltera), badSof1);
+        bool rejSofTrunc   = !WriteAndInspect(dir + L"\\trunc.sof", truncSof.data(), truncSof.size(), badSof2);
+
+        bool passSof = okS1 && okS2 && okP1 &&
+                       s1.formatTitle.find(L"EP4CE22F17C6") != std::wstring::npos &&
+                       s2.formatTitle.find(L"5CSEMA5F31C6") != std::wstring::npos &&
+                       p1.formatTitle.find(L"10M50DAF484") != std::wstring::npos &&
+                       s2.pads.size() > s1.pads.size() &&
+                       HashEdaGeometry(s1) != HashEdaGeometry(s2) &&
+                       HashEdaGeometry(s1) != HashEdaGeometry(p1) &&
+                       rejSofGarbage && rejSofTrunc;
+
+        tc.Record(passSof, L"Stage15.Eda.AlteraBitstream_SofAndPof_PacketFloorplan",
+            L"sofPads=" + std::to_wstring(s1.pads.size()) + L"/" + std::to_wstring(s2.pads.size()) +
+            L" pofPads=" + std::to_wstring(p1.pads.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 10. Digital Oscilloscope Waveforms: Tektronix :WFM#003 INT16 & Tektronix .isf MSB
+    // ------------------------------------------------------------------------
+    {
+        // Build Tektronix WFM#003 (838B header + 128 x INT16 sine capture)
+        std::vector<uint8_t> wfm(838 + 128 * 2, 0);
+        wfm[0] = 0x0Fu; wfm[1] = 0x0Fu; // Little-endian marker
+        std::memcpy(wfm.data() + 2, ":WFM#003", 8);
+        wfm[10] = 4u;
+        PutU32LE(wfm.data() + 11, static_cast<uint32_t>(wfm.size() - 15));
+        wfm[15] = 2u; // 2 bytes per point (INT16)
+        PutU32LE(wfm.data() + 16, 838u); // byteOffsetToBeginningOfCurveBuffer
+        double dimScale = 0.001; // 1 mV / LSB
+        double dimOff   = 0.0;
+        std::memcpy(wfm.data() + 168, &dimScale, 8);
+        std::memcpy(wfm.data() + 176, &dimOff, 8);
+        PutI32LE(wfm.data() + 240, 0); // EXPLICIT_INT16
+        PutU32LE(wfm.data() + (838 - 30) + 14, 0u);   // dataStartOffset
+        PutU32LE(wfm.data() + (838 - 30) + 18, 256u); // postchargeStartOffset
+        for (int i = 0; i < 128; ++i) {
+            int16_t sv = static_cast<int16_t>(std::llround(2500.0 * std::sin(i * 0.15)));
+            PutU16LE(wfm.data() + 838 + i * 2, static_cast<uint16_t>(sv));
+        }
+
+        // Build Tektronix ISF (BYT_NR 2; BYT_OR MSB; CURVE #3128 + 64 MSB INT16 ramp/step samples)
+        std::string isfHdr = ":WFMPRE:BYT_NR 2;BN_FMT RI;BYT_OR MSB;NR_PT 64;YMULT 0.005;YOFF 0.0;YZERO 0.0;:CURVE #3128";
+        std::vector<uint8_t> isf(isfHdr.begin(), isfHdr.end());
+        for (int i = 0; i < 64; ++i) {
+            int16_t rv = static_cast<int16_t>((i < 32) ? (-1200 + i * 80) : (1200 - (i - 32) * 40));
+            uint8_t be2[2] = {};
+            PutU16BE(be2, static_cast<uint16_t>(rv));
+            isf.push_back(be2[0]);
+            isf.push_back(be2[1]);
+        }
+
+        ParsedEdaBoard bWfm, bIsf, badWfm, badIsf;
+        bool okWfm = WriteAndInspect(dir + L"\\ch1_sine.wfm", wfm.data(), wfm.size(), bWfm);
+        bool okIsf = WriteAndInspect(dir + L"\\ch2_ramp.isf", isf.data(), isf.size(), bIsf);
+
+        std::vector<uint8_t> randGarbage(900, 0x37u);
+        const char* txtGarbage = "Random text file with numbers 10, 20, 30 that is not an oscilloscope capture";
+        bool rejWfm = !WriteAndInspect(dir + L"\\bad.wfm", randGarbage.data(), randGarbage.size(), badWfm);
+        bool rejIsf = !WriteAndInspect(dir + L"\\bad.isf", txtGarbage, std::strlen(txtGarbage), badIsf);
+
+        bool passScope = okWfm && okIsf &&
+                         bWfm.formatTitle.find(L"WFM#003") != std::wstring::npos &&
+                         bIsf.formatTitle.find(L"ISF") != std::wstring::npos &&
+                         bWfm.traces.size() > 100 &&
+                         bIsf.traces.size() > 50 &&
+                         HashEdaGeometry(bWfm) != HashEdaGeometry(bIsf) &&
+                         rejWfm && rejIsf;
+
+        tc.Record(passScope, L"Stage15.Eda.Oscilloscope_TekWfm003_And_IsfMsb",
+            L"wfmTraces=" + std::to_wstring(bWfm.traces.size()) +
+            L" isfTraces=" + std::to_wstring(bIsf.traces.size()));
+    }
+
     RemoveDirectoryW(dir.c_str());
 }
 

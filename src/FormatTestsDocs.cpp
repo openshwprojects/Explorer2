@@ -1909,6 +1909,265 @@ static std::vector<uint8_t> BuildNifti1Volume(bool gzipWrap, std::string_view de
     return gzipWrap ? MakeGzipStored(nii) : nii;
 }
 
+// 26. Microsoft Access Jet4/ACE (.accdb) & Jet3.5 (.mdb) Multi-Page Databases
+struct SynthJetCol {
+    uint8_t type;
+    uint16_t colId;
+    uint16_t varIdx;
+    uint16_t displayIdx;
+    bool isFixed;
+    uint16_t fixedOff;
+    uint16_t colLen;
+    std::string name;
+};
+
+static void WriteJet4TdefPage(uint8_t* pg, uint8_t tblType, uint16_t numVarCols, const std::vector<SynthJetCol>& cols) {
+    pg[0] = 0x02u;
+    pg[1] = 0x01u;
+    PutU32LE(pg + 4, 0u);
+    PutU32LE(pg + 16, 2u);
+    pg[40] = tblType;
+    PutU16LE(pg + 41, static_cast<uint16_t>(cols.size()));
+    PutU16LE(pg + 43, numVarCols);
+    PutU16LE(pg + 45, static_cast<uint16_t>(cols.size()));
+    PutU32LE(pg + 47, 0u);
+    PutU32LE(pg + 51, 0u);
+
+    size_t pos = 63u;
+    for (const auto& c : cols) {
+        uint8_t* cb = pg + pos;
+        cb[0] = c.type;
+        PutU16LE(cb + 5, c.colId);
+        PutU16LE(cb + 7, c.varIdx);
+        PutU16LE(cb + 9, c.displayIdx);
+        cb[15] = c.isFixed ? 0x01u : 0x02u;
+        PutU16LE(cb + 21, c.fixedOff);
+        PutU16LE(cb + 23, c.colLen);
+        pos += 25u;
+    }
+    for (const auto& c : cols) {
+        PutU16LE(pg + pos, static_cast<uint16_t>(c.name.size() * 2u));
+        pos += 2u;
+        for (char ch : c.name) {
+            PutU16LE(pg + pos, static_cast<uint16_t>(static_cast<uint8_t>(ch)));
+            pos += 2u;
+        }
+    }
+    PutU32LE(pg + 8, static_cast<uint32_t>(pos));
+}
+
+static void WriteJet4DataPage(uint8_t* pg, uint32_t ownerTdefPg, const std::vector<std::vector<uint8_t>>& rows) {
+    pg[0] = 0x01u;
+    pg[1] = 0x01u;
+    PutU32LE(pg + 4, ownerTdefPg);
+    PutU16LE(pg + 12, static_cast<uint16_t>(rows.size()));
+    size_t curEnd = 4096u;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        curEnd -= rows[i].size();
+        std::memcpy(pg + curEnd, rows[i].data(), rows[i].size());
+        PutU16LE(pg + 14u + i * 2u, static_cast<uint16_t>(curEnd));
+    }
+}
+
+static std::vector<uint8_t> BuildJet4AceAccdb(
+    std::string_view userTableName,
+    int32_t id0, double reading0, std::string_view loc0, int32_t batch0,
+    int32_t id1, double reading1, std::string_view loc1)
+{
+    std::vector<uint8_t> db(6 * 4096, 0);
+    db[0] = 0x00u; db[1] = 0x01u;
+    std::memcpy(db.data() + 4, "Standard ACE DB", 15);
+    PutU32LE(db.data() + 0x14, 2u); // ACE 12+
+
+    // Page 2: MSysObjects TDEF (Id LONG, Type INT16, Flags LONG, Name TEXT)
+    WriteJet4TdefPage(db.data() + 2 * 4096, 0x4Eu, 1u, {
+        { 0x04u, 0u, 0u, 0u, true,  0u, 4u,   "Id"    },
+        { 0x03u, 1u, 0u, 1u, true,  4u, 2u,   "Type"  },
+        { 0x04u, 2u, 0u, 2u, true,  6u, 4u,   "Flags" },
+        { 0x0Au, 3u, 0u, 3u, false, 0u, 255u, "Name"  }
+    });
+
+    // Page 3: MSysObjects DATA mapping Id=4 -> userTableName (Type=1, Flags=0)
+    std::vector<uint8_t> catRow;
+    AppendU16LE(catRow, 4u); // 4 cols
+    AppendI32LE(catRow, 4);  // Id = TDEF page 4
+    AppendU16LE(catRow, 1u); // Type = 1 (local table)
+    AppendI32LE(catRow, 0);  // Flags = 0
+    uint16_t catVar0 = static_cast<uint16_t>(catRow.size());
+    AppendU8(catRow, 0xFFu); AppendU8(catRow, 0xFEu); // Jet4 compressed Unicode prefix
+    AppendStr(catRow, userTableName);
+    uint16_t catEod = static_cast<uint16_t>(catRow.size());
+    AppendU16LE(catRow, catEod);
+    AppendU16LE(catRow, catVar0);
+    AppendU16LE(catRow, 1u);   // numVarCols = 1
+    AppendU8(catRow, 0x0Fu);   // null bitmap: all 4 columns non-null
+    WriteJet4DataPage(db.data() + 3 * 4096, 2u, { catRow });
+
+    // Page 4: User Table TDEF (SensorId LONG, Reading DOUBLE, Active BOOL, Location TEXT, BatchCode LONG)
+    WriteJet4TdefPage(db.data() + 4 * 4096, 0x53u, 1u, {
+        { 0x04u, 0u, 0u, 0u, true,  0u,  4u,   "SensorId"  },
+        { 0x07u, 1u, 0u, 1u, true,  4u,  8u,   "Reading"   },
+        { 0x01u, 2u, 0u, 2u, true,  0u,  1u,   "Active"    },
+        { 0x0Au, 3u, 0u, 3u, false, 0u,  128u, "Location"  },
+        { 0x04u, 4u, 0u, 4u, true,  12u, 4u,   "BatchCode" }
+    });
+
+    auto makeUserRow = [](int32_t sid, double rd, bool active, std::string_view loc, int32_t batch, bool batchNotNull) {
+        std::vector<uint8_t> r;
+        AppendU16LE(r, 5u); // 5 cols
+        AppendI32LE(r, sid);
+        AppendF64LE(r, rd);
+        AppendI32LE(r, batch);
+        uint16_t v0 = static_cast<uint16_t>(r.size());
+        AppendU8(r, 0xFFu); AppendU8(r, 0xFEu);
+        AppendStr(r, loc);
+        uint16_t eod = static_cast<uint16_t>(r.size());
+        AppendU16LE(r, eod);
+        AppendU16LE(r, v0);
+        AppendU16LE(r, 1u);
+        uint8_t bmp = 0x01u | 0x02u | (active ? 0x04u : 0x00u) | 0x08u | (batchNotNull ? 0x10u : 0x00u);
+        AppendU8(r, bmp);
+        return r;
+    };
+
+    // Page 5: User Table DATA (Row 0 has Active=TRUE & non-null BatchCode; Row 1 has Active=FALSE & NULL BatchCode)
+    WriteJet4DataPage(db.data() + 5 * 4096, 4u, {
+        makeUserRow(id0, reading0, true,  loc0, batch0, true),
+        makeUserRow(id1, reading1, false, loc1, 0,      false)
+    });
+    return db;
+}
+
+static std::vector<uint8_t> BuildJet35Mdb(std::string_view tableName, int32_t codeVal, std::string_view labelVal) {
+    std::vector<uint8_t> db(4 * 2048, 0); // 4 x 2KB pages
+    db[0] = 0x00u; db[1] = 0x01u;
+    std::memcpy(db.data() + 4, "Standard Jet DB", 15);
+    PutU32LE(db.data() + 0x14, 0u); // Jet 3.5 (2048B pages)
+
+    // Page 3: User Table TDEF (Jet3 43B header + 2 x 18B cols + 1B-prefixed ASCII names)
+    uint8_t* tpg = db.data() + 3 * 2048;
+    tpg[0] = 0x02u; tpg[1] = 0x01u;
+    PutU32LE(tpg + 12, 1u); // num_rows
+    tpg[20] = 0x53u;        // 'S' user table
+    PutU16LE(tpg + 21, 2u); // max_cols
+    PutU16LE(tpg + 23, 1u); // num_var_cols
+    PutU16LE(tpg + 25, 2u); // num_cols
+    PutU32LE(tpg + 31, 0u); // num_real_idx
+
+    // Col 0: Code (LONG 0x04, fixed @ 0, 4B), Col 1: Label (TEXT 0x0A, varIdx 0)
+    uint8_t* c0 = tpg + 43;
+    c0[0] = 0x04u; PutU16LE(c0 + 1, 0u); PutU16LE(c0 + 5, 0u); c0[13] = 0x01u; PutU16LE(c0 + 14, 0u); PutU16LE(c0 + 16, 4u);
+    uint8_t* c1 = tpg + 43 + 18;
+    c1[0] = 0x0Au; PutU16LE(c1 + 1, 1u); PutU16LE(c1 + 3, 0u); PutU16LE(c1 + 5, 1u); c1[13] = 0x02u; PutU16LE(c1 + 16, 64u);
+
+    size_t np = 43 + 36;
+    tpg[np++] = 4u; std::memcpy(tpg + np, "Code", 4); np += 4;
+    tpg[np++] = 5u; std::memcpy(tpg + np, "Label", 5); np += 5;
+    PutU32LE(tpg + 8, static_cast<uint32_t>(np));
+
+    // Page 2: MSysObjects TDEF + Page 1: MSysObjects DATA + User Table DATA
+    uint8_t* mpg = db.data() + 2 * 2048;
+    mpg[0] = 0x02u; mpg[1] = 0x01u; mpg[20] = 0x4Eu;
+    PutU16LE(mpg + 21, 2u); PutU16LE(mpg + 23, 1u); PutU16LE(mpg + 25, 2u);
+    uint8_t* mc0 = mpg + 43;
+    mc0[0] = 0x04u; PutU16LE(mc0 + 1, 0u); PutU16LE(mc0 + 5, 0u); mc0[13] = 0x01u; PutU16LE(mc0 + 14, 0u); PutU16LE(mc0 + 16, 4u);
+    uint8_t* mc1 = mpg + 43 + 18;
+    mc1[0] = 0x0Au; PutU16LE(mc1 + 1, 1u); PutU16LE(mc1 + 3, 0u); PutU16LE(mc1 + 5, 1u); mc1[13] = 0x02u; PutU16LE(mc1 + 16, 64u);
+    size_t mnp = 43 + 36;
+    mpg[mnp++] = 2u; std::memcpy(mpg + mnp, "Id", 2); mnp += 2;
+    mpg[mnp++] = 4u; std::memcpy(mpg + mnp, "Name", 4); mnp += 4;
+    PutU32LE(mpg + 8, static_cast<uint32_t>(mnp));
+
+    auto writeJet3RowPage = [](uint8_t* dpg, uint32_t ownerTdef, int32_t iVal, std::string_view sVal) {
+        std::vector<uint8_t> r;
+        AppendU8(r, 2u); // 2 cols (1B in Jet3)
+        AppendI32LE(r, iVal);
+        uint8_t v0 = static_cast<uint8_t>(r.size());
+        AppendStr(r, sVal);
+        uint8_t eod = static_cast<uint8_t>(r.size());
+        AppendU8(r, eod);
+        AppendU8(r, v0);
+        AppendU8(r, 1u); // numVar = 1
+        AppendU8(r, 0x03u); // null bitmap
+
+        dpg[0] = 0x01u; dpg[1] = 0x01u;
+        PutU32LE(dpg + 4, ownerTdef);
+        PutU16LE(dpg + 8, 1u);
+        size_t start = 2048u - r.size();
+        std::memcpy(dpg + start, r.data(), r.size());
+        PutU16LE(dpg + 10, static_cast<uint16_t>(start));
+    };
+
+    db.resize(5 * 2048, 0);
+    writeJet3RowPage(db.data() + 1 * 2048, 2u, 3, tableName);
+    writeJet3RowPage(db.data() + 4 * 2048, 3u, codeVal, labelVal);
+    return db;
+}
+
+// 27. Mapbox MBTiles SQLite3 B-Tree Database (.mbtiles)
+static std::vector<uint8_t> BuildMbTilesDb(
+    std::string_view tsName,
+    std::string_view fmtStr,
+    std::string_view boundsStr, // may be empty to test TMS tile -> WGS84 derivation!
+    std::string_view centerStr,
+    int16_t z0, int16_t x0, int16_t y0,
+    int16_t z1, int16_t x1, int16_t y1)
+{
+    std::vector<uint8_t> db(3 * 4096, 0);
+    std::memcpy(db.data(), "SQLite format 3\0", 16);
+    PutU16BE(db.data() + 16, 4096);
+    db[18] = 1; db[19] = 1; db[21] = 64; db[22] = 32; db[23] = 32;
+    PutU32BE(db.data() + 28, 3);
+    PutU32BE(db.data() + 40, 1);
+    PutU32BE(db.data() + 44, 4);
+    PutU32BE(db.data() + 56, 1); // UTF-8
+    std::memcpy(db.data() + 68, "MPBX", 4);
+
+    auto textCol = [](std::string_view s) -> std::pair<uint64_t, std::vector<uint8_t>> {
+        return { 13ULL + 2ULL * s.size(), std::vector<uint8_t>(s.begin(), s.end()) };
+    };
+    auto int16Col = [](int16_t v) -> std::pair<uint64_t, std::vector<uint8_t>> {
+        uint16_t u = static_cast<uint16_t>(v);
+        return { 2ULL, { static_cast<uint8_t>(u >> 8), static_cast<uint8_t>(u & 0xFFu) } };
+    };
+    auto blobCol = [](const std::vector<uint8_t>& b) -> std::pair<uint64_t, std::vector<uint8_t>> {
+        return { 12ULL + 2ULL * b.size(), b };
+    };
+
+    // Page 1: sqlite_master -> metadata (rootpage=2) & tiles (rootpage=3)
+    std::vector<uint8_t> mMeta = MakeSqliteRecord({
+        textCol("table"), textCol("metadata"), textCol("metadata"), { 1ULL, { 2 } },
+        textCol("CREATE TABLE metadata (name TEXT, value TEXT)")
+    });
+    std::vector<uint8_t> mTiles = MakeSqliteRecord({
+        textCol("table"), textCol("tiles"), textCol("tiles"), { 1ULL, { 3 } },
+        textCol("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
+    });
+    WriteSqliteLeafPageCells(db.data(), 100, { { 1, mMeta }, { 2, mTiles } });
+
+    // Page 2: metadata rows
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> metaCells;
+    uint64_t rid = 1;
+    metaCells.push_back({ rid++, MakeSqliteRecord({ textCol("name"), textCol(tsName) }) });
+    metaCells.push_back({ rid++, MakeSqliteRecord({ textCol("format"), textCol(fmtStr) }) });
+    metaCells.push_back({ rid++, MakeSqliteRecord({ textCol("minzoom"), textCol("4") }) });
+    metaCells.push_back({ rid++, MakeSqliteRecord({ textCol("maxzoom"), textCol("12") }) });
+    if (!boundsStr.empty()) {
+        metaCells.push_back({ rid++, MakeSqliteRecord({ textCol("bounds"), textCol(boundsStr) }) });
+    }
+    if (!centerStr.empty()) {
+        metaCells.push_back({ rid++, MakeSqliteRecord({ textCol("center"), textCol(centerStr) }) });
+    }
+    WriteSqliteLeafPageCells(db.data() + 4096, 0, metaCells);
+
+    // Page 3: tiles rows
+    std::vector<uint8_t> fakePng = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
+    std::vector<uint8_t> t0 = MakeSqliteRecord({ int16Col(z0), int16Col(x0), int16Col(y0), blobCol(fakePng) });
+    std::vector<uint8_t> t1 = MakeSqliteRecord({ int16Col(z1), int16Col(x1), int16Col(y1), blobCol(fakePng) });
+    WriteSqliteLeafPageCells(db.data() + 8192, 0, { { 1, t0 }, { 2, t1 } });
+    return db;
+}
+
 } // namespace
 
 // ============================================================================
@@ -2389,6 +2648,144 @@ void RunFormatTestsDocs(TestCounter& tc) {
                   !SheetContains(niiA, L"NIfTI_Center_Slice", L"NaN") &&
                   HashParsedDoc(niiA) != HashParsedDoc(niiB) && InspectFails(niBad),
             L"DocsA.Nifti.RawAndGzipVoxelVolumes");
+    }
+
+    // ------------------------------------------------------------------------
+    // 10. OpenDocument Text (.odt) vs Word (.docx), Access (.accdb/.mdb), MBTiles (.mbtiles)
+    // ------------------------------------------------------------------------
+    {
+        // A. OpenDocument Text (.odt) — Headings, <text:s text:c="N"/>, Lists, Tables, Numeric XML Entities
+        const std::string odtMime = "application/vnd.oasis.opendocument.text";
+        const std::string odtXmlA =
+            R"(<?xml version="1.0" encoding="UTF-8"?>)"
+            R"(<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">)"
+            R"(<office:body><office:text>)"
+            R"(<text:h text:outline-level="1">Odyssey Flight Plan</text:h>)"
+            R"(<text:p>Telemetry:<text:s text:c="3"/>Nominal &amp; &#x26A1; Ready</text:p>)"
+            R"(<text:list><text:list-item><text:p>Gimbal Actuator Verified</text:p></text:list-item></text:list>)"
+            R"(<table:table><table:table-row>)"
+            R"(<table:table-cell><text:p>Orbit</text:p></table:table-cell>)"
+            R"(<table:table-cell><text:p>408 km</text:p></table:table-cell>)"
+            R"(</table:table-row></table:table>)"
+            R"(</office:text></office:body></office:document-content>)";
+        const std::string odtXmlB =
+            R"(<?xml version="1.0" encoding="UTF-8"?>)"
+            R"(<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">)"
+            R"(<office:body><office:text>)"
+            R"(<text:h text:outline-level="2">Bathymetry Expedition</text:h>)"
+            R"(<text:p>Depth:<text:tab/>&#916; = 10928 m</text:p>)"
+            R"(<table:table><table:table-row>)"
+            R"(<table:table-cell><text:p>Trench</text:p></table:table-cell>)"
+            R"(<table:table-cell><text:p>Mariana</text:p></table:table-cell>)"
+            R"(</table:table-row></table:table>)"
+            R"(</office:text></office:body></office:document-content>)";
+
+        std::wstring odtA = tmp.Write(L"plan_a.odt", MakeZipStoreArchive({
+            { "mimetype", std::vector<uint8_t>(odtMime.begin(), odtMime.end()) },
+            { "content.xml", std::vector<uint8_t>(odtXmlA.begin(), odtXmlA.end()) }
+        }));
+        std::wstring odtB = tmp.Write(L"dive_b.odt", MakeZipStoreArchive({
+            { "mimetype", std::vector<uint8_t>(odtMime.begin(), odtMime.end()) },
+            { "content.xml", std::vector<uint8_t>(odtXmlB.begin(), odtXmlB.end()) }
+        }));
+        std::wstring odtBad = tmp.Write(L"bad.odt", kGarbage);
+        std::wstring odtWrongZip = tmp.Write(L"unrelated.odt", MakeZipStoreArchive({
+            { "readme.txt", { 'n', 'o', 't', '_', 'o', 'd', 'f' } }
+        }));
+
+        ParsedOfficeDocument odDocA, odDocB;
+        bool odtOk = SpreadsheetDocViewer::InspectOfficeFile(odtA, odDocA) &&
+                     SpreadsheetDocViewer::InspectOfficeFile(odtB, odDocB) &&
+                     odDocA.valid && odDocB.valid &&
+                     odDocA.formatTitle == L"OpenDocument Text (.odt)" &&
+                     odDocB.formatTitle == L"OpenDocument Text (.odt)" &&
+                     !DocContains(odDocA, L"Empty Word document") &&
+                     !DocContains(odDocA, L"Pusty dokument") &&
+                     odDocA.paragraphs.size() == 4 &&
+                     odDocA.paragraphs[0].headingLevel == 1 &&
+                     odDocA.paragraphs[0].text == L"Odyssey Flight Plan" &&
+                     odDocA.paragraphs[1].text == L"Telemetry:   Nominal & \x26A1 Ready" &&
+                     odDocA.paragraphs[2].isBullet &&
+                     odDocA.paragraphs[2].text == L"Gimbal Actuator Verified" &&
+                     odDocA.paragraphs[3].text == L"Orbit | 408 km" &&
+                     DocContains(odDocB, L"Bathymetry Expedition") &&
+                     DocContains(odDocB, L"Trench | Mariana") &&
+                     HashParsedDoc(odDocA) != HashParsedDoc(odDocB) &&
+                     InspectFails(odtBad) && InspectFails(odtWrongZip);
+        tc.Record(odtOk, L"DocsA.OdfWriterOdt.ContentXmlParagraphsAndTables");
+
+        std::wstring repoOdt = tdDir + L"\\writer_document.odt";
+        if (GetFileAttributesW(repoOdt.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            ParsedOfficeDocument repoOdtDoc;
+            bool okRepo = SpreadsheetDocViewer::InspectOfficeFile(repoOdt, repoOdtDoc) &&
+                          repoOdtDoc.valid &&
+                          repoOdtDoc.formatTitle == L"OpenDocument Text (.odt)" &&
+                          !DocContains(repoOdtDoc, L"Empty Word document") &&
+                          !repoOdtDoc.paragraphs.empty();
+            tc.Record(okRepo, L"DocsA.TestData.WriterDocumentOdt");
+        }
+
+        // B. Microsoft Access (.accdb Jet4/ACE & .mdb Jet3.5) — MSysObjects + TDEF + Typed DATA Rows + Null Bitmap
+        std::wstring accA = tmp.Write(L"plant_a.accdb",
+            BuildJet4AceAccdb("Sensors", 501, 73.25, "BoilerRoom_North", 9100, 502, -14.5, "ChillerBay_West"));
+        std::wstring accB = tmp.Write(L"warehouse_b.accdb",
+            BuildJet4AceAccdb("Inventory", 801, 1499.75, "Aisle_Alpha", 4200, 802, 24.5, "LoadingDock_South"));
+        std::wstring mdbC = tmp.Write(L"legacy97.mdb",
+            BuildJet35Mdb("LegacyParts", 309, "brass_valve_97"));
+
+        // 1-page header-only .accdb with zero TDEF pages must strictly fail
+        std::vector<uint8_t> hdrOnlyAccdb(4096, 0);
+        hdrOnlyAccdb[1] = 0x01u;
+        std::memcpy(hdrOnlyAccdb.data() + 4, "Standard ACE DB", 15);
+        PutU32LE(hdrOnlyAccdb.data() + 0x14, 2u);
+        std::wstring accHdrOnly = tmp.Write(L"header_only.accdb", hdrOnlyAccdb);
+        std::wstring accBad = tmp.Write(L"bad.accdb", kGarbage);
+
+        ParsedOfficeDocument acDocA, acDocB, mdbDocC;
+        bool accOk = SpreadsheetDocViewer::InspectOfficeFile(accA, acDocA) &&
+                     SpreadsheetDocViewer::InspectOfficeFile(accB, acDocB) &&
+                     SpreadsheetDocViewer::InspectOfficeFile(mdbC, mdbDocC) &&
+                     acDocA.valid && acDocB.valid && mdbDocC.valid &&
+                     SheetContains(acDocA, L"Sensors", L"501") &&
+                     SheetContains(acDocA, L"Sensors", L"73.25") &&
+                     SheetContains(acDocA, L"Sensors", L"TRUE") &&
+                     SheetContains(acDocA, L"Sensors", L"FALSE") &&
+                     SheetContains(acDocA, L"Sensors", L"BoilerRoom_North") &&
+                     SheetContains(acDocA, L"Sensors", L"9100") &&
+                     SheetContains(acDocA, L"Sensors", L"NULL") &&
+                     SheetContains(acDocB, L"Inventory", L"Aisle_Alpha") &&
+                     SheetContains(acDocB, L"Inventory", L"1499.75") &&
+                     SheetContains(mdbDocC, L"LegacyParts", L"309") &&
+                     SheetContains(mdbDocC, L"LegacyParts", L"brass_valve_97") &&
+                     HashParsedDoc(acDocA) != HashParsedDoc(acDocB) &&
+                     InspectFails(accHdrOnly) && InspectFails(accBad);
+        tc.Record(accOk, L"DocsA.AccessDb.Jet4AceAndJet3TdefDataPages");
+
+        // C. Mapbox MBTiles (.mbtiles) — Real SQLite3 B-Tree metadata + tiles Tables + TMS Geo Bounds
+        std::wstring mbA = tmp.Write(L"prague.mbtiles",
+            BuildMbTilesDb("Prague_Basemap", "pbf", "14.22,49.94,14.70,50.18", "14.42,50.08,11", 8, 138, 168, 8, 138, 169));
+        std::wstring mbB = tmp.Write(L"tokyo_tms_derived.mbtiles",
+            BuildMbTilesDb("Tokyo_Harbor_Raster", "png", "", "", 8, 227, 155, 8, 227, 156));
+        std::wstring mbNonMbtiles = tmp.Write(L"not_map.mbtiles",
+            BuildSqliteBtreeDb("thermocouples", "probe_1", 21.0, "probe_2", 22.0));
+        std::wstring mbBad = tmp.Write(L"bad.mbtiles", kGarbage);
+
+        ParsedOfficeDocument mbDocA, mbDocB;
+        bool mbOk = SpreadsheetDocViewer::InspectOfficeFile(mbA, mbDocA) &&
+                    SpreadsheetDocViewer::InspectOfficeFile(mbB, mbDocB) &&
+                    mbDocA.valid && mbDocB.valid &&
+                    mbDocA.hasGeoTrack && mbDocB.hasGeoTrack &&
+                    !mbDocA.geoPoints.empty() && !mbDocB.geoPoints.empty() &&
+                    std::fabs(mbDocA.geoPoints[0].lat - 49.94) < 1e-3 &&
+                    std::fabs(mbDocA.geoPoints[0].lon - 14.22) < 1e-3 &&
+                    mbDocB.geoPoints[0].lon > 130.0 && // Derived from TMS tile x=227 at z=8 (~139.2E Tokyo)
+                    SheetContains(mbDocA, L"metadata", L"Prague_Basemap") &&
+                    SheetContains(mbDocA, L"tiles", L"138") &&
+                    SheetContains(mbDocB, L"metadata", L"Tokyo_Harbor_Raster") &&
+                    SheetContains(mbDocB, L"tiles", L"227") &&
+                    HashParsedDoc(mbDocA) != HashParsedDoc(mbDocB) &&
+                    InspectFails(mbNonMbtiles) && InspectFails(mbBad);
+        tc.Record(mbOk, L"DocsA.MbTiles.SqliteBTreeMetadataAndTiles");
     }
 
     tmp.Cleanup();

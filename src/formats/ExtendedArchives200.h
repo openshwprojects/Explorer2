@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 
 namespace Explorer2::Formats {
@@ -53,7 +54,7 @@ inline std::wstring NormPath(std::wstring p) {
     }
     while (!p.empty() && p.front() == L'/') p.erase(p.begin());
     while (!p.empty() && p.back() == L'/') p.pop_back();
-    if (p.rfind(L"./", 0) == 0) p.erase(0, 2);
+    while (p.rfind(L"./", 0) == 0) p.erase(0, 2);
     return p;
 }
 
@@ -62,23 +63,24 @@ inline std::wstring BaseName(const std::wstring& p) {
     return (s == std::wstring::npos) ? p : p.substr(s + 1);
 }
 
-// Fast native LZ4 raw block decompressor (used by UnityFS .bundle TOC blocks)
+// Fast native LZ4 raw block decompressor (exact known uncompressed length)
 inline bool DecompressLz4RawBlock(const uint8_t* src, size_t srcLen, size_t uncompLen, std::vector<uint8_t>& out) {
-    if (uncompLen > 64 * 1024 * 1024) return false;
+    if (uncompLen > 128 * 1024 * 1024) return false;
     out.clear();
     out.reserve(uncompLen);
     size_t sp = 0;
     while (sp < srcLen && out.size() < uncompLen) {
         uint8_t token = src[sp++];
-        size_t litLen = (token >> 4) & 0x0F;
+        size_t litLen = (token >> 4) & 0x0Fu;
         if (litLen == 15) {
             while (sp < srcLen) {
                 uint8_t s = src[sp++];
                 litLen += s;
+                if (litLen > uncompLen) return false;
                 if (s != 255) break;
             }
         }
-        if (sp + litLen > srcLen) return false;
+        if (sp + litLen > srcLen || out.size() + litLen > uncompLen) return false;
         out.insert(out.end(), src + sp, src + sp + litLen);
         sp += litLen;
         if (sp >= srcLen || out.size() >= uncompLen) break;
@@ -88,20 +90,66 @@ inline bool DecompressLz4RawBlock(const uint8_t* src, size_t srcLen, size_t unco
         sp += 2;
         if (offset == 0 || offset > out.size()) return false;
 
-        size_t matchLen = (token & 0x0F) + 4;
-        if ((token & 0x0F) == 15) {
+        size_t matchLen = (token & 0x0Fu) + 4;
+        if ((token & 0x0Fu) == 15) {
             while (sp < srcLen) {
                 uint8_t s = src[sp++];
                 matchLen += s;
+                if (matchLen > uncompLen) return false;
                 if (s != 255) break;
             }
         }
+        if (out.size() + matchLen > uncompLen) return false;
         size_t matchPos = out.size() - offset;
-        for (size_t i = 0; i < matchLen && out.size() < uncompLen; ++i) {
+        for (size_t i = 0; i < matchLen; ++i) {
             out.push_back(out[matchPos + i]);
         }
     }
     return (out.size() == uncompLen);
+}
+
+// LZ4 raw block decompressor bounded by maxOut when exact uncompressed size is not stored in header (e.g. SquashFS LZ4)
+inline bool DecompressLz4RawBlockBounded(const uint8_t* src, size_t srcLen, size_t maxOut, std::vector<uint8_t>& out) {
+    out.clear();
+    size_t sp = 0;
+    while (sp < srcLen) {
+        uint8_t token = src[sp++];
+        size_t litLen = (token >> 4) & 0x0Fu;
+        if (litLen == 15) {
+            uint8_t s = 0;
+            do {
+                if (sp >= srcLen) return false;
+                s = src[sp++];
+                litLen += s;
+                if (litLen > maxOut) return false;
+            } while (s == 255);
+        }
+        if (sp + litLen > srcLen || out.size() + litLen > maxOut) return false;
+        out.insert(out.end(), src + sp, src + sp + litLen);
+        sp += litLen;
+        if (sp == srcLen) return true;
+
+        if (sp + 2 > srcLen) return false;
+        uint16_t offset = RdU16LE(src + sp);
+        sp += 2;
+        if (offset == 0 || offset > out.size()) return false;
+
+        size_t matchLen = (token & 0x0Fu) + 4;
+        if ((token & 0x0Fu) == 15) {
+            uint8_t s = 0;
+            do {
+                if (sp >= srcLen) return false;
+                s = src[sp++];
+                matchLen += s;
+                if (matchLen > maxOut) return false;
+            } while (s == 255);
+        }
+        if (out.size() + matchLen > maxOut) return false;
+        for (size_t i = 0; i < matchLen; ++i) {
+            out.push_back(out[out.size() - offset]);
+        }
+    }
+    return true;
 }
 
 // ============================================================================
@@ -203,26 +251,63 @@ inline bool ParseUnityPackageFromMemory(
 // ============================================================================
 // #22. UnityFS AssetBundle (.bundle / .unity3d — "UnityFS\0")
 // ============================================================================
-inline bool ParseUnityFsBundle(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+inline bool DecompressUnityBlock(
+    const uint8_t* src,
+    size_t compLen,
+    size_t uncompLen,
+    uint32_t compMode,
+    std::vector<uint8_t>& out)
+{
+    if (uncompLen > 256 * 1024 * 1024) return false;
+    if (compMode == 0) {
+        if (compLen != uncompLen) return false;
+        out.assign(src, src + compLen);
+        return true;
+    }
+    if (compMode == 1) { // LZMA1: 5-byte props [propsByte:1][dictSize:4LE] + raw stream
+        if (compLen < 5) return false;
+        uint8_t propsByte = src[0];
+        uint32_t dictSize = RdU32LE(src + 1);
+        return StreamCodecs::DecompressLzma1(
+            propsByte, dictSize, src + 5, compLen - 5, out,
+            static_cast<uint64_t>(uncompLen), true, std::max<size_t>(uncompLen + 64, 1024));
+    }
+    if (compMode == 2 || compMode == 3) { // LZ4 / LZ4HC raw block
+        return DecompressLz4RawBlock(src, compLen, uncompLen, out);
+    }
+    return false;
+}
+
+inline bool ParseOrExtractUnityFsBundle(
+    const uint8_t* data,
+    size_t size,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetPath,
+    std::vector<uint8_t>* outExtractedBytes)
+{
     if (size < 32 || std::memcmp(data, "UnityFS\0", 8) != 0) return false;
-    outInfo.formatName = L"UnityFS AssetBundle";
+    if (outInfo) outInfo->formatName = L"UnityFS AssetBundle";
 
     size_t pos = 8;
     if (pos + 4 > size) return false;
     uint32_t fmtVer = RdU32BE(data + pos); pos += 4;
+    if (fmtVer == 0 || fmtVer > 32) return false;
 
-    auto readCString = [&]() -> std::string {
+    auto readCString = [&](bool& ok) -> std::string {
         size_t s = pos;
         while (pos < size && data[pos] != 0) ++pos;
+        if (pos >= size) { ok = false; return {}; }
         std::string r(reinterpret_cast<const char*>(data + s), pos - s);
-        if (pos < size) ++pos;
+        ++pos;
         return r;
     };
-    std::string playerVer = readCString();
-    std::string engineVer = readCString();
+    bool strOk = true;
+    std::string playerVer = readCString(strOk);
+    std::string engineVer = readCString(strOk);
     (void)playerVer;
-    if (!engineVer.empty()) {
-        outInfo.formatName = L"UnityFS Bundle (" + PathUtils::Utf8ToWide(engineVer) + L")";
+    if (!strOk) return false;
+    if (outInfo && !engineVer.empty()) {
+        outInfo->formatName = L"UnityFS Bundle (" + PathUtils::Utf8ToWide(engineVer) + L")";
     }
 
     if (pos + 20 > size) return false;
@@ -230,70 +315,190 @@ inline bool ParseUnityFsBundle(const uint8_t* data, size_t size, ArchiveSummaryI
     uint32_t compInfoSz = RdU32BE(data + pos); pos += 4;
     uint32_t uncompSz   = RdU32BE(data + pos); pos += 4;
     uint32_t flags      = RdU32BE(data + pos); pos += 4;
-    (void)bundleSz;
 
     if (fmtVer >= 7) {
-        pos = (pos + 15u) & ~15u; // 16-byte alignment in UnityFS v7+
+        pos = (pos + 15u) & ~size_t(15u); // 16-byte alignment after 20-byte header in UnityFS v7+
     }
 
-    size_t infoPos = (flags & 0x80u) ? (size >= compInfoSz ? size - compInfoSz : size) : pos;
-    size_t dataStart = (flags & 0x80u) ? pos : (pos + compInfoSz);
-    if ((flags & 0x200u) != 0) dataStart = (dataStart + 15u) & ~15u;
+    if (compInfoSz == 0 || uncompSz < 24 || uncompSz > 64 * 1024 * 1024) return false;
+
+    size_t infoPos = 0;
+    size_t dataStart = 0;
+    if ((flags & 0x80u) != 0) {
+        size_t bundleEnd = (bundleSz > 0 && bundleSz <= size) ? static_cast<size_t>(bundleSz) : size;
+        if (compInfoSz > bundleEnd || pos > bundleEnd - compInfoSz) return false;
+        infoPos = bundleEnd - compInfoSz;
+        dataStart = pos;
+    } else {
+        if (pos > size || compInfoSz > size - pos) return false;
+        infoPos = pos;
+        dataStart = pos + compInfoSz;
+    }
+    if ((flags & 0x200u) != 0) {
+        dataStart = (dataStart + 15u) & ~size_t(15u);
+    }
+    if (infoPos + compInfoSz > size || dataStart > size) return false;
 
     std::vector<uint8_t> blocksInfo;
     uint32_t compMode = flags & 0x3Fu;
-    if (infoPos + compInfoSz <= size && uncompSz > 0 && uncompSz <= 16 * 1024 * 1024) {
-        if (compMode == 0 && compInfoSz == uncompSz) {
-            blocksInfo.assign(data + infoPos, data + infoPos + compInfoSz);
-        } else if (compMode == 2 || compMode == 3) { // LZ4 / LZ4HC
-            DecompressLz4RawBlock(data + infoPos, compInfoSz, uncompSz, blocksInfo);
-        }
+    if (!DecompressUnityBlock(data + infoPos, compInfoSz, uncompSz, compMode, blocksInfo) ||
+        blocksInfo.size() != uncompSz || blocksInfo.size() < 24)
+    {
+        return false;
     }
 
-    if (blocksInfo.size() >= 24) {
-        size_t bp = 16; // skip 16-byte uncompressedDataHash
-        uint32_t blockCount = RdU32BE(blocksInfo.data() + bp); bp += 4;
-        bp += static_cast<size_t>(blockCount) * 10; // [uncomp:4][comp:4][flags:2]
-        if (bp + 4 <= blocksInfo.size()) {
-            uint32_t nodeCount = RdU32BE(blocksInfo.data() + bp); bp += 4;
-            for (uint32_t n = 0; n < nodeCount && bp + 20 <= blocksInfo.size() && n < 8192; ++n) {
-                uint64_t nOff   = RdU64BE(blocksInfo.data() + bp); bp += 8;
-                uint64_t nSize  = RdU64BE(blocksInfo.data() + bp); bp += 8;
-                uint32_t nFlags = RdU32BE(blocksInfo.data() + bp); bp += 4;
-                (void)nFlags;
-                size_t ns = bp;
-                while (bp < blocksInfo.size() && blocksInfo[bp] != 0) ++bp;
-                std::string nodeName(reinterpret_cast<const char*>(blocksInfo.data() + ns), bp - ns);
-                if (bp < blocksInfo.size()) ++bp;
-                if (!nodeName.empty()) {
-                    ArchiveItemEntry item;
-                    item.pathInArchive = NormPath(PathUtils::Utf8ToWide(nodeName));
-                    item.name = BaseName(item.pathInArchive);
-                    item.uncompressedSize = nSize;
-                    item.compressedSize = nSize;
-                    if (compMode == 0 && dataStart + nOff + nSize <= size) {
-                        item.rawDataOffset = dataStart + nOff;
-                        item.compressionMethod = 0;
-                    } else {
-                        item.compressionMethod = static_cast<uint16_t>(compMode);
-                    }
-                    outInfo.entries.push_back(std::move(item));
+    struct UnityStorageBlock {
+        uint32_t uncompSize = 0;
+        uint32_t compSize = 0;
+        uint16_t blkFlags = 0;
+        uint64_t uncompStart = 0;
+        size_t   compFileOff = 0;
+    };
+
+    size_t bp = 16; // skip 16-byte uncompressedDataHash
+    uint32_t blockCount = RdU32BE(blocksInfo.data() + bp); bp += 4;
+    if (blockCount == 0 || blockCount > 500000 ||
+        bp + static_cast<size_t>(blockCount) * 10u + 4u > blocksInfo.size())
+    {
+        return false;
+    }
+
+    std::vector<UnityStorageBlock> blocks;
+    blocks.reserve(std::min<uint32_t>(blockCount, 16384u));
+    uint64_t totalUncomp = 0;
+    size_t curCompOff = dataStart;
+    for (uint32_t b = 0; b < blockCount; ++b) {
+        UnityStorageBlock sb;
+        sb.uncompSize  = RdU32BE(blocksInfo.data() + bp + 0);
+        sb.compSize    = RdU32BE(blocksInfo.data() + bp + 4);
+        sb.blkFlags    = RdU16BE(blocksInfo.data() + bp + 8);
+        bp += 10;
+        if (curCompOff > size || sb.compSize > size - curCompOff) return false;
+        sb.uncompStart = totalUncomp;
+        sb.compFileOff = curCompOff;
+        totalUncomp += sb.uncompSize;
+        curCompOff += sb.compSize;
+        blocks.push_back(sb);
+    }
+
+    uint32_t nodeCount = RdU32BE(blocksInfo.data() + bp); bp += 4;
+    if (nodeCount == 0 || nodeCount > 100000) return false;
+
+    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+
+    for (uint32_t n = 0; n < nodeCount && n < 32768u; ++n) {
+        if (bp + 21 > blocksInfo.size()) return false;
+        uint64_t nOff   = RdU64BE(blocksInfo.data() + bp + 0);
+        uint64_t nSize  = RdU64BE(blocksInfo.data() + bp + 8);
+        uint32_t nFlags = RdU32BE(blocksInfo.data() + bp + 16);
+        (void)nFlags;
+        bp += 20;
+
+        size_t ns = bp;
+        while (bp < blocksInfo.size() && blocksInfo[bp] != 0) ++bp;
+        if (bp >= blocksInfo.size()) return false;
+        std::string nodeName(reinterpret_cast<const char*>(blocksInfo.data() + ns), bp - ns);
+        ++bp;
+
+        if (nodeName.empty()) continue;
+        if (nOff > totalUncomp || nSize > totalUncomp - nOff) return false;
+
+        std::wstring normP = NormPath(PathUtils::Utf8ToWide(nodeName));
+        if (normP.empty()) continue;
+
+        if (extractTargetPath && outExtractedBytes) {
+            if (_wcsicmp(normP.c_str(), wantNorm.c_str()) == 0) {
+                if (nSize == 0) {
+                    outExtractedBytes->clear();
+                    return true;
                 }
+                if (nSize > 256 * 1024 * 1024) return false;
+                outExtractedBytes->resize(static_cast<size_t>(nSize));
+                uint64_t nEnd = nOff + nSize;
+                uint64_t written = 0;
+                std::vector<uint8_t> blkBuf;
+                for (const auto& sb : blocks) {
+                    if (sb.uncompSize == 0) continue;
+                    uint64_t bStart = sb.uncompStart;
+                    uint64_t bEnd   = bStart + sb.uncompSize;
+                    if (bEnd <= nOff) continue;
+                    if (bStart >= nEnd) break;
+
+                    uint64_t ovStart = std::max(nOff, bStart);
+                    uint64_t ovEnd   = std::min(nEnd, bEnd);
+                    size_t copyLen   = static_cast<size_t>(ovEnd - ovStart);
+                    size_t dstOff    = static_cast<size_t>(ovStart - nOff);
+                    size_t srcInner  = static_cast<size_t>(ovStart - bStart);
+
+                    uint32_t blkComp = sb.blkFlags & 0x3Fu;
+                    if (blkComp == 0) {
+                        if (sb.compSize != sb.uncompSize) return false;
+                        std::memcpy(outExtractedBytes->data() + dstOff, data + sb.compFileOff + srcInner, copyLen);
+                    } else {
+                        if (!DecompressUnityBlock(data + sb.compFileOff, sb.compSize, sb.uncompSize, blkComp, blkBuf) ||
+                            blkBuf.size() != sb.uncompSize)
+                        {
+                            return false;
+                        }
+                        std::memcpy(outExtractedBytes->data() + dstOff, blkBuf.data() + srcInner, copyLen);
+                    }
+                    written += copyLen;
+                }
+                return (written == nSize);
             }
+            continue;
+        }
+
+        if (outInfo) {
+            uint64_t nEnd = nOff + nSize;
+            bool allRaw = true;
+            uint16_t firstComp = 0;
+            size_t rawStartOff = 0;
+            bool sawFirst = false;
+            uint64_t estCompSz = 0;
+            for (const auto& sb : blocks) {
+                if (sb.uncompSize == 0) continue;
+                uint64_t bStart = sb.uncompStart;
+                uint64_t bEnd   = bStart + sb.uncompSize;
+                if (bEnd <= nOff && nSize > 0) continue;
+                if (bStart > nEnd || (bStart == nEnd && nSize > 0)) break;
+                uint32_t blkComp = sb.blkFlags & 0x3Fu;
+                if (!sawFirst) {
+                    sawFirst = true;
+                    firstComp = static_cast<uint16_t>(blkComp);
+                    if (blkComp == 0 && nOff >= bStart) {
+                        rawStartOff = sb.compFileOff + static_cast<size_t>(nOff - bStart);
+                    }
+                }
+                if (blkComp != 0) allRaw = false;
+                uint64_t ov = (nSize == 0) ? 0ULL : (std::min(nEnd, bEnd) - std::max(nOff, bStart));
+                estCompSz += (sb.uncompSize > 0) ? ((ov * sb.compSize) / sb.uncompSize) : 0ULL;
+                if (nSize == 0) break;
+            }
+
+            ArchiveItemEntry item;
+            item.pathInArchive = std::move(normP);
+            item.name = BaseName(item.pathInArchive);
+            item.uncompressedSize = nSize;
+            item.compressedSize = allRaw ? nSize : (estCompSz > 0 ? estCompSz : nSize);
+            if (allRaw && sawFirst && rawStartOff + nSize <= size) {
+                item.rawDataOffset = rawStartOff;
+                item.compressionMethod = 0;
+            } else {
+                item.compressionMethod = (firstComp != 0) ? firstComp : 2;
+            }
+            outInfo->entries.push_back(std::move(item));
         }
     }
 
-    if (outInfo.entries.empty()) {
-        ArchiveItemEntry fallback;
-        fallback.pathInArchive = L"CAB-SerializedAssets.assets";
-        fallback.name = fallback.pathInArchive;
-        fallback.uncompressedSize = size - std::min(size, pos);
-        fallback.compressedSize = fallback.uncompressedSize;
-        fallback.compressionMethod = static_cast<uint16_t>(compMode);
-        outInfo.entries.push_back(std::move(fallback));
-    }
-    outInfo.valid = true;
+    if (extractTargetPath) return false;
+    if (!outInfo || outInfo->entries.empty()) return false;
+    outInfo->valid = true;
     return true;
+}
+
+inline bool ParseUnityFsBundle(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+    return ParseOrExtractUnityFsBundle(data, size, &outInfo, nullptr, nullptr);
 }
 
 // ============================================================================
@@ -355,49 +560,89 @@ inline bool ParseGodotPck(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
 // ============================================================================
 // #24. RPG Maker Encrypted Archive (.rgss3a / .rgss2a / .rgssad — "RGSSAD\0")
 // ============================================================================
-inline bool ParseRpgMakerRgss(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+inline void DecryptRgssStream(const uint8_t* src, size_t len, uint32_t subKey, std::vector<uint8_t>& outBytes) {
+    outBytes.resize(len);
+    uint32_t curKey = subKey;
+    for (size_t i = 0; i < len; ++i) {
+        outBytes[i] = static_cast<uint8_t>(src[i] ^ ((curKey >> (8u * (i & 3u))) & 0xFFu));
+        if ((i & 3u) == 3u) {
+            curKey = curKey * 7u + 3u;
+        }
+    }
+}
+
+inline bool ParseOrExtractRpgMakerRgss(
+    const uint8_t* data,
+    size_t size,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetPath,
+    std::vector<uint8_t>* outExtractedBytes)
+{
     if (size < 12 || std::memcmp(data, "RGSSAD\0", 7) != 0) return false;
     uint8_t ver = data[7];
     if (ver != 1 && ver != 2 && ver != 3) return false;
-    outInfo.formatName = (ver == 3) ? L"RPG Maker VX Ace Archive (.rgss3a)" : L"RPG Maker Archive (.rgssad)";
+    if (outInfo) {
+        outInfo->formatName = (ver == 3) ? L"RPG Maker VX Ace Archive (.rgss3a)" : L"RPG Maker Archive (.rgssad)";
+    }
+
+    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
 
     if (ver == 3) {
-        uint32_t key = RdU32LE(data + 8) * 9u + 3u;
+        uint32_t masterKey = RdU32LE(data + 8) * 9u + 3u;
         size_t pos = 12;
-        while (pos + 16 <= size && outInfo.entries.size() < 30000) {
-            uint32_t fOff    = RdU32LE(data + pos + 0) ^ key;
-            uint32_t fSize   = RdU32LE(data + pos + 4) ^ key;
-            uint32_t subKey  = RdU32LE(data + pos + 8) ^ key;
-            uint32_t nameLen = RdU32LE(data + pos + 12) ^ key;
+        size_t count = 0;
+        while (pos + 16 <= size && count < 30000) {
+            uint32_t fOff    = RdU32LE(data + pos + 0) ^ masterKey;
+            uint32_t fSize   = RdU32LE(data + pos + 4) ^ masterKey;
+            uint32_t subKey  = RdU32LE(data + pos + 8) ^ masterKey;
+            uint32_t nameLen = RdU32LE(data + pos + 12) ^ masterKey;
             pos += 16;
-            (void)subKey;
             if (fOff == 0) break;
             if (nameLen == 0 || nameLen > 1024 || pos + nameLen > size) break;
+            if (static_cast<uint64_t>(fOff) + static_cast<uint64_t>(fSize) > size) break;
+
             std::string decName(nameLen, '\0');
             for (uint32_t i = 0; i < nameLen; ++i) {
-                decName[i] = static_cast<char>(data[pos + i] ^ ((key >> (8 * (i & 3))) & 0xFF));
+                decName[i] = static_cast<char>(data[pos + i] ^ ((masterKey >> (8u * (i & 3u))) & 0xFFu));
             }
             pos += nameLen;
-            ArchiveItemEntry item;
-            item.pathInArchive = NormPath(PathUtils::Utf8ToWide(decName));
-            item.name = BaseName(item.pathInArchive);
-            item.uncompressedSize = fSize;
-            item.compressedSize = fSize;
-            item.rawDataOffset = fOff;
-            item.compressionMethod = 99; // XOR stream
-            outInfo.entries.push_back(std::move(item));
+
+            std::wstring normP = NormPath(PathUtils::Utf8ToWide(decName));
+            if (normP.empty()) continue;
+            ++count;
+
+            if (extractTargetPath && outExtractedBytes) {
+                if (_wcsicmp(normP.c_str(), wantNorm.c_str()) == 0) {
+                    if (fSize > 256 * 1024 * 1024) return false;
+                    DecryptRgssStream(data + fOff, fSize, subKey, *outExtractedBytes);
+                    return true;
+                }
+                continue;
+            }
+
+            if (outInfo) {
+                ArchiveItemEntry item;
+                item.pathInArchive = std::move(normP);
+                item.name = BaseName(item.pathInArchive);
+                item.uncompressedSize = fSize;
+                item.compressedSize = fSize;
+                item.rawDataOffset = fOff;
+                item.compressionMethod = 99; // XOR stream cipher
+                outInfo->entries.push_back(std::move(item));
+            }
         }
     } else {
         uint32_t key = 0xDEADCAFEu;
         size_t pos = 8;
-        while (pos + 4 <= size && outInfo.entries.size() < 30000) {
+        size_t count = 0;
+        while (pos + 4 <= size && count < 30000) {
             uint32_t nameLen = RdU32LE(data + pos) ^ key;
             key = key * 7u + 3u;
             pos += 4;
             if (nameLen == 0 || nameLen > 1024 || pos + nameLen + 4 > size) break;
             std::string decName(nameLen, '\0');
             for (uint32_t i = 0; i < nameLen; ++i) {
-                decName[i] = static_cast<char>(data[pos + i] ^ (key & 0xFF));
+                decName[i] = static_cast<char>(data[pos + i] ^ (key & 0xFFu));
                 key = key * 7u + 3u;
             }
             pos += nameLen;
@@ -406,28 +651,54 @@ inline bool ParseRpgMakerRgss(const uint8_t* data, size_t size, ArchiveSummaryIn
             pos += 4;
             if (pos + fSize > size) break;
 
-            ArchiveItemEntry item;
-            item.pathInArchive = NormPath(PathUtils::Utf8ToWide(decName));
-            item.name = BaseName(item.pathInArchive);
-            item.uncompressedSize = fSize;
-            item.compressedSize = fSize;
-            item.rawDataOffset = pos;
-            item.compressionMethod = 99;
-            outInfo.entries.push_back(std::move(item));
+            uint32_t subKey = key; // Initial per-file stream key in RGSS v1/v2
+            std::wstring normP = NormPath(PathUtils::Utf8ToWide(decName));
+            if (!normP.empty()) {
+                ++count;
+                if (extractTargetPath && outExtractedBytes) {
+                    if (_wcsicmp(normP.c_str(), wantNorm.c_str()) == 0) {
+                        if (fSize > 256 * 1024 * 1024) return false;
+                        DecryptRgssStream(data + pos, fSize, subKey, *outExtractedBytes);
+                        return true;
+                    }
+                } else if (outInfo) {
+                    ArchiveItemEntry item;
+                    item.pathInArchive = std::move(normP);
+                    item.name = BaseName(item.pathInArchive);
+                    item.uncompressedSize = fSize;
+                    item.compressedSize = fSize;
+                    item.rawDataOffset = pos;
+                    item.compressionMethod = 99;
+                    outInfo->entries.push_back(std::move(item));
+                }
+            }
             pos += fSize;
         }
     }
-    outInfo.valid = !outInfo.entries.empty();
-    return outInfo.valid;
+
+    if (extractTargetPath) return false;
+    if (!outInfo || outInfo->entries.empty()) return false;
+    outInfo->valid = true;
+    return true;
+}
+
+inline bool ParseRpgMakerRgss(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+    return ParseOrExtractRpgMakerRgss(data, size, &outInfo, nullptr, nullptr);
 }
 
 // ============================================================================
 // #25. KiriKiri Visual Novel Archive (.xp3 — "XP3\r\n \n\x1A\x8B\x67\x01")
 // ============================================================================
-inline bool ParseKiriKiriXp3(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+inline bool ParseOrExtractKiriKiriXp3(
+    const uint8_t* data,
+    size_t size,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetPath,
+    std::vector<uint8_t>* outExtractedBytes)
+{
     static const uint8_t kXp3Sig[11] = { 'X','P','3','\r','\n',' ','\n',0x1A,0x8B,0x67,0x01 };
     if (size < 28 || std::memcmp(data, kXp3Sig, 11) != 0) return false;
-    outInfo.formatName = L"KiriKiri XP3 Archive (.xp3)";
+    if (outInfo) outInfo->formatName = L"KiriKiri XP3 Archive (.xp3)";
 
     uint64_t idxOff = RdU64LE(data + 11);
     if (idxOff + 9 <= size && data[idxOff] == 0x80) {
@@ -458,8 +729,17 @@ inline bool ParseKiriKiriXp3(const uint8_t* data, size_t size, ArchiveSummaryInf
         idxLen = static_cast<size_t>(rawSz);
     }
 
+    struct Xp3Seg {
+        uint32_t flags = 0;
+        uint64_t start = 0;
+        uint64_t origSz = 0;
+        uint64_t compSz = 0;
+    };
+
+    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
     size_t p = 0;
-    while (p + 12 <= idxLen && outInfo.entries.size() < 40000) {
+    size_t count = 0;
+    while (p + 12 <= idxLen && count < 40000) {
         uint64_t chunkSz = RdU64LE(idxPtr + p + 4);
         if (chunkSz > idxLen - p - 12) break;
         if (std::memcmp(idxPtr + p, "File", 4) == 0) {
@@ -467,6 +747,7 @@ inline bool ParseKiriKiriXp3(const uint8_t* data, size_t size, ArchiveSummaryInf
             std::wstring fname;
             uint64_t origSz = 0, compSz = 0, rawStart = 0;
             bool segCompressed = false;
+            std::vector<Xp3Seg> segs;
             while (sp + 12 <= send) {
                 uint64_t subSz = RdU64LE(idxPtr + sp + 4);
                 if (subSz > send - sp - 12) break;
@@ -482,52 +763,120 @@ inline bool ParseKiriKiriXp3(const uint8_t* data, size_t size, ArchiveSummaryInf
                         }
                     }
                 } else if (std::memcmp(idxPtr + sp, "segm", 4) == 0 && subSz >= 28) {
-                    uint32_t segFlags = RdU32LE(sub + 0);
-                    segCompressed = (segFlags & 0x07) != 0;
-                    rawStart = RdU64LE(sub + 4);
-                    if (origSz == 0) origSz = RdU64LE(sub + 12);
-                    if (compSz == 0) compSz = RdU64LE(sub + 20);
+                    size_t numSegs = static_cast<size_t>(subSz / 28);
+                    for (size_t s = 0; s < numSegs; ++s) {
+                        const uint8_t* se = sub + s * 28;
+                        Xp3Seg seg;
+                        seg.flags  = RdU32LE(se + 0);
+                        seg.start  = RdU64LE(se + 4);
+                        seg.origSz = RdU64LE(se + 12);
+                        seg.compSz = RdU64LE(se + 20);
+                        if (s == 0) {
+                            rawStart = seg.start;
+                            if (origSz == 0) origSz = seg.origSz;
+                            if (compSz == 0) compSz = seg.compSz;
+                        }
+                        if ((seg.flags & 0x07u) != 0 || segs.size() > 0) {
+                            if ((seg.flags & 0x07u) != 0) segCompressed = true;
+                        }
+                        segs.push_back(seg);
+                    }
+                    if (segs.size() > 1) segCompressed = true;
                 }
                 sp += 12 + static_cast<size_t>(subSz);
             }
-            if (!fname.empty()) {
-                ArchiveItemEntry item;
-                item.pathInArchive = NormPath(fname);
-                item.name = BaseName(item.pathInArchive);
-                item.uncompressedSize = origSz;
-                item.compressedSize = compSz;
-                item.rawDataOffset = rawStart;
-                item.compressionMethod = segCompressed ? 8 : 0;
-                outInfo.entries.push_back(std::move(item));
+            std::wstring normP = NormPath(fname);
+            if (!normP.empty()) {
+                ++count;
+                if (extractTargetPath && outExtractedBytes) {
+                    if (_wcsicmp(normP.c_str(), wantNorm.c_str()) == 0) {
+                        if (segs.empty() || origSz > 256 * 1024 * 1024) return false;
+                        outExtractedBytes->clear();
+                        outExtractedBytes->reserve(static_cast<size_t>(origSz));
+                        std::vector<uint8_t> segOut;
+                        for (const auto& seg : segs) {
+                            if ((seg.flags & 0x07u) != 0) {
+                                if (seg.start + seg.compSz > size || seg.origSz > 256 * 1024 * 1024) return false;
+                                if (!ZipDeflate::InflateZlib(data + seg.start, static_cast<size_t>(seg.compSz), segOut, static_cast<size_t>(seg.origSz) + 64) &&
+                                    !ZipDeflate::InflateRaw(data + seg.start, static_cast<size_t>(seg.compSz), segOut, static_cast<size_t>(seg.origSz) + 64))
+                                {
+                                    return false;
+                                }
+                                outExtractedBytes->insert(outExtractedBytes->end(), segOut.begin(), segOut.end());
+                            } else {
+                                if (seg.start + seg.origSz > size) return false;
+                                outExtractedBytes->insert(outExtractedBytes->end(), data + seg.start, data + seg.start + static_cast<size_t>(seg.origSz));
+                            }
+                        }
+                        return true;
+                    }
+                } else if (outInfo) {
+                    ArchiveItemEntry item;
+                    item.pathInArchive = std::move(normP);
+                    item.name = BaseName(item.pathInArchive);
+                    item.uncompressedSize = origSz;
+                    item.compressedSize = compSz;
+                    item.rawDataOffset = rawStart;
+                    item.compressionMethod = segCompressed ? 8 : 0;
+                    outInfo->entries.push_back(std::move(item));
+                }
             }
         }
         p += 12 + static_cast<size_t>(chunkSz);
     }
-    outInfo.valid = !outInfo.entries.empty();
-    return outInfo.valid;
+
+    if (extractTargetPath) return false;
+    if (!outInfo || outInfo->entries.empty()) return false;
+    outInfo->valid = true;
+    return true;
+}
+
+inline bool ParseKiriKiriXp3(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+    return ParseOrExtractKiriKiriXp3(data, size, &outInfo, nullptr, nullptr);
 }
 
 // ============================================================================
-// #26. Blizzard MoPaQ Archive (.mpq — "MPQ\x1A")
+// #26. Blizzard MoPaQ Archive (.mpq — "MPQ\x1A" / "MPQ\x1B")
 // ============================================================================
-inline bool ParseBlizzardMpq(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    if (size < 32 || std::memcmp(data, "MPQ\x1A", 4) != 0) return false;
-    outInfo.formatName = L"Blizzard MoPaQ Archive (.mpq)";
-
-    uint32_t hdrSz       = RdU32LE(data + 4);
-    uint32_t blockTblPos = RdU32LE(data + 20);
-    uint32_t blockCount  = RdU32LE(data + 28);
-    (void)hdrSz;
-    if (blockCount == 0 || blockCount > 100000 || blockTblPos + static_cast<uint64_t>(blockCount) * 16 > size) {
-        return false;
+inline bool ParseOrExtractBlizzardMpq(
+    const uint8_t* data,
+    size_t size,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetPath,
+    std::vector<uint8_t>* outExtractedBytes)
+{
+    if (size < 32) return false;
+    size_t mpqOff = SIZE_MAX;
+    if (std::memcmp(data, "MPQ\x1A", 4) == 0) {
+        mpqOff = 0;
+    } else if (std::memcmp(data, "MPQ\x1B", 4) == 0 && size >= 16) {
+        uint32_t hdrOff = RdU32LE(data + 8);
+        if (static_cast<uint64_t>(hdrOff) + 32ULL <= size && std::memcmp(data + hdrOff, "MPQ\x1A", 4) == 0) {
+            mpqOff = hdrOff;
+        }
     }
+    if (mpqOff == SIZE_MAX || mpqOff + 32 > size) return false;
+    if (outInfo) outInfo->formatName = L"Blizzard MoPaQ Archive (.mpq)";
 
-    // Build Storm MPQ encryption table to decrypt block table if encrypted (key = HashString("(block table)", 0x300))
+    const uint8_t* mpqHdr   = data + mpqOff;
+    uint32_t hdrSz          = RdU32LE(mpqHdr + 4);
+    uint16_t secShift       = RdU16LE(mpqHdr + 14);
+    uint32_t hashTblRelPos  = RdU32LE(mpqHdr + 16);
+    uint32_t blockTblRelPos = RdU32LE(mpqHdr + 20);
+    uint32_t hashTblCount   = RdU32LE(mpqHdr + 24);
+    uint32_t blockCount     = RdU32LE(mpqHdr + 28);
+
+    if (hdrSz < 32 || secShift > 15 || blockCount == 0 || blockCount > 100000) return false;
+    uint64_t absBlockTblPos = mpqOff + static_cast<uint64_t>(blockTblRelPos);
+    if (absBlockTblPos + static_cast<uint64_t>(blockCount) * 16ULL > size) return false;
+    const uint32_t sectorSize = 512u << secShift;
+
+    // Build Storm MPQ encryption & hash lookup table
     uint32_t cryptTbl[0x500] = {};
     uint32_t seed = 0x00100001u;
-    for (uint32_t idx1 = 0; idx1 < 0x100; ++idx1) {
+    for (uint32_t idx1 = 0; idx1 < 0x100u; ++idx1) {
         uint32_t idx2 = idx1;
-        for (int i = 0; i < 5; ++i, idx2 += 0x100) {
+        for (int i = 0; i < 5; ++i, idx2 += 0x100u) {
             seed = (seed * 125u + 3u) % 0x2AAAABu;
             uint32_t t1 = (seed & 0xFFFFu) << 16;
             seed = (seed * 125u + 3u) % 0x2AAAABu;
@@ -535,83 +884,393 @@ inline bool ParseBlizzardMpq(const uint8_t* data, size_t size, ArchiveSummaryInf
             cryptTbl[idx2] = t1 | t2;
         }
     }
-    auto mpqHash = [&](const char* str, uint32_t hashType) -> uint32_t {
+
+    auto mpqHashEx = [&](std::string_view sv, uint32_t hashType, bool slashToBackslash) -> uint32_t {
         uint32_t s1 = 0x7FED7FEDu, s2 = 0xEEEEEEEEu;
-        while (*str) {
-            uint8_t ch = static_cast<uint8_t>(toupper(static_cast<unsigned char>(*str++)));
+        for (char rawCh : sv) {
+            char c = (slashToBackslash && rawCh == '/') ? '\\' : rawCh;
+            uint8_t ch = static_cast<uint8_t>(toupper(static_cast<unsigned char>(c)));
             s1 = cryptTbl[hashType + ch] ^ (s1 + s2);
             s2 = ch + s1 + s2 + (s2 << 5) + 3u;
         }
         return s1;
     };
 
-    std::vector<uint32_t> btWords(blockCount * 4);
-    std::memcpy(btWords.data(), data + blockTblPos, btWords.size() * 4);
-
-    // Check if unencrypted first; if filePos looks encrypted (> size), decrypt with "(block table)" key!
-    if (btWords[0] > size) {
-        uint32_t k1 = mpqHash("(block table)", 0x300), k2 = 0xEEEEEEEEu;
-        for (size_t i = 0; i < btWords.size(); ++i) {
-            k2 += cryptTbl[0x400 + (k1 & 0xFF)];
-            uint32_t plain = btWords[i] ^ (k1 + k2);
+    auto mpqDecryptWords = [&](uint32_t* words, size_t dwordCount, uint32_t k1) {
+        uint32_t k2 = 0xEEEEEEEEu;
+        for (size_t i = 0; i < dwordCount; ++i) {
+            k2 += cryptTbl[0x400u + (k1 & 0xFFu)];
+            uint32_t plain = words[i] ^ (k1 + k2);
             k1 = ((~k1 << 0x15) + 0x11111111u) | (k1 >> 0x0B);
             k2 = plain + k2 + (k2 << 5) + 3u;
-            btWords[i] = plain;
+            words[i] = plain;
+        }
+    };
+
+    auto mpqDecryptBytes = [&](uint8_t* buf, size_t byteLen, uint32_t k1) {
+        uint32_t k2 = 0xEEEEEEEEu;
+        size_t dwords = byteLen / 4u;
+        for (size_t i = 0; i < dwords; ++i) {
+            k2 += cryptTbl[0x400u + (k1 & 0xFFu)];
+            uint32_t enc = RdU32LE(buf + i * 4u);
+            uint32_t plain = enc ^ (k1 + k2);
+            k1 = ((~k1 << 0x15) + 0x11111111u) | (k1 >> 0x0B);
+            k2 = plain + k2 + (k2 << 5) + 3u;
+            buf[i * 4u + 0] = static_cast<uint8_t>(plain & 0xFFu);
+            buf[i * 4u + 1] = static_cast<uint8_t>((plain >> 8) & 0xFFu);
+            buf[i * 4u + 2] = static_cast<uint8_t>((plain >> 16) & 0xFFu);
+            buf[i * 4u + 3] = static_cast<uint8_t>((plain >> 24) & 0xFFu);
+        }
+    };
+
+    // Read & validate/decrypt Block Table (detecting unencrypted synthetic vs Storm-encrypted "(block table)")
+    std::vector<uint32_t> rawBt(static_cast<size_t>(blockCount) * 4u);
+    for (size_t i = 0; i < rawBt.size(); ++i) {
+        rawBt[i] = RdU32LE(data + static_cast<size_t>(absBlockTblPos) + i * 4u);
+    }
+    std::vector<uint32_t> decBt = rawBt;
+    mpqDecryptWords(decBt.data(), decBt.size(), mpqHashEx("(block table)", 0x300u, false));
+
+    auto isBlockTableValid = [&](const std::vector<uint32_t>& bt) -> bool {
+        uint32_t validExisting = 0;
+        for (uint32_t i = 0; i < blockCount; ++i) {
+            uint32_t fRel = bt[i * 4u + 0];
+            uint32_t cSz  = bt[i * 4u + 1];
+            uint32_t fSz  = bt[i * 4u + 2];
+            uint32_t flg  = bt[i * 4u + 3];
+            if ((flg & 0x80000000u) == 0) continue;
+            if (mpqOff + static_cast<uint64_t>(fRel) + static_cast<uint64_t>(cSz) > size) return false;
+            if (fSz > 1024ULL * 1024ULL * 1024ULL) return false;
+            ++validExisting;
+        }
+        return validExisting > 0;
+    };
+
+    bool decBtOk = isBlockTableValid(decBt);
+    bool rawBtOk = isBlockTableValid(rawBt);
+    if (!decBtOk && !rawBtOk) return false;
+    const std::vector<uint32_t>& btWords = decBtOk ? decBt : rawBt;
+
+    // Read & validate/decrypt Hash Table if present
+    uint64_t absHashTblPos = mpqOff + static_cast<uint64_t>(hashTblRelPos);
+    bool hasHashTable = (hashTblCount > 0 && hashTblCount <= 262144u &&
+                         absHashTblPos + static_cast<uint64_t>(hashTblCount) * 16ULL <= size);
+    std::vector<uint32_t> htWords;
+    if (hasHashTable) {
+        std::vector<uint32_t> rawHt(static_cast<size_t>(hashTblCount) * 4u);
+        for (size_t i = 0; i < rawHt.size(); ++i) {
+            rawHt[i] = RdU32LE(data + static_cast<size_t>(absHashTblPos) + i * 4u);
+        }
+        std::vector<uint32_t> decHt = rawHt;
+        mpqDecryptWords(decHt.data(), decHt.size(), mpqHashEx("(hash table)", 0x300u, false));
+
+        auto isHashTableValid = [&](const std::vector<uint32_t>& ht, uint32_t& outUsed) -> bool {
+            outUsed = 0;
+            for (uint32_t i = 0; i < hashTblCount; ++i) {
+                uint32_t bIdx = ht[i * 4u + 3u];
+                if (bIdx == 0xFFFFFFFFu || bIdx == 0xFFFFFFFEu) continue;
+                if (bIdx >= blockCount) return false;
+                ++outUsed;
+            }
+            return true;
+        };
+        uint32_t decUsed = 0, rawUsed = 0;
+        bool decHtOk = isHashTableValid(decHt, decUsed);
+        bool rawHtOk = isHashTableValid(rawHt, rawUsed);
+        if (decHtOk && (decUsed > 0 || !rawHtOk)) {
+            htWords = std::move(decHt);
+        } else if (rawHtOk) {
+            htWords = std::move(rawHt);
+        } else {
+            hasHashTable = false;
         }
     }
 
-    // Try extracting embedded plain-text (listfile) lines if present
-    std::vector<std::string> listNames;
-    for (uint32_t i = 0; i < blockCount; ++i) {
-        uint32_t fPos = btWords[i * 4 + 0];
-        uint32_t cSz  = btWords[i * 4 + 1];
-        uint32_t fSz  = btWords[i * 4 + 2];
-        uint32_t flg  = btWords[i * 4 + 3];
-        if ((flg & 0x80000000u) && cSz == fSz && fSz > 4 && fSz < 1024 * 1024 && fPos + fSz <= size) {
-            std::string_view sv(reinterpret_cast<const char*>(data + fPos), fSz);
-            if (sv.find('\\') != std::string_view::npos || sv.find('.') != std::string_view::npos) {
-                bool printable = true;
-                for (size_t c = 0; c < std::min<size_t>(fSz, 64); ++c) {
-                    uint8_t b = static_cast<uint8_t>(sv[c]);
-                    if (b < 9 || (b > 13 && b < 32) || b > 126) { printable = false; break; }
+    auto lookupMpqHash = [&](std::string_view filePath) -> int32_t {
+        if (!hasHashTable || htWords.empty()) return -1;
+        for (int pass = 0; pass < 2; ++pass) {
+            bool normSlash = (pass == 0);
+            if (pass == 1 && filePath.find('/') == std::string_view::npos) break;
+            uint32_t startIdx = mpqHashEx(filePath, 0x000u, normSlash) % hashTblCount;
+            uint32_t nameA    = mpqHashEx(filePath, 0x100u, normSlash);
+            uint32_t nameB    = mpqHashEx(filePath, 0x200u, normSlash);
+            for (uint32_t step = 0; step < hashTblCount; ++step) {
+                uint32_t idx = (startIdx + step) % hashTblCount;
+                uint32_t bIdx = htWords[idx * 4u + 3u];
+                if (bIdx == 0xFFFFFFFFu) break;
+                if (bIdx == 0xFFFFFFFEu) continue;
+                if (htWords[idx * 4u + 0u] == nameA && htWords[idx * 4u + 1u] == nameB && bIdx < blockCount) {
+                    return static_cast<int32_t>(bIdx);
                 }
-                if (printable && sv.find('\n') != std::string_view::npos) {
-                    size_t lp = 0;
-                    while (lp < sv.size()) {
-                        size_t le = sv.find_first_of("\r\n", lp);
-                        if (le == std::string_view::npos) le = sv.size();
-                        if (le > lp) listNames.emplace_back(sv.substr(lp, le - lp));
-                        lp = le + 1;
+            }
+        }
+        return -1;
+    };
+
+    constexpr uint32_t kMpqImplode    = 0x00000100u;
+    constexpr uint32_t kMpqCompress   = 0x00000200u;
+    constexpr uint32_t kMpqEncrypted  = 0x00010000u;
+    constexpr uint32_t kMpqFixKey     = 0x00020000u;
+    constexpr uint32_t kMpqSingleUnit = 0x01000000u;
+    constexpr uint32_t kMpqDeleteMark = 0x02000000u;
+    constexpr uint32_t kMpqSectorCrc  = 0x04000000u;
+    constexpr uint32_t kMpqExists     = 0x80000000u;
+
+    auto decompressMpqSector = [&](const uint8_t* secPtr, size_t secCompLen, size_t secUncompLen, uint32_t flg, std::vector<uint8_t>& secOut) -> bool {
+        if (secCompLen == secUncompLen || (flg & (kMpqCompress | kMpqImplode)) == 0) {
+            if (secCompLen < secUncompLen) return false;
+            secOut.assign(secPtr, secPtr + secUncompLen);
+            return true;
+        }
+        if ((flg & kMpqCompress) == 0 || secCompLen < 2) return false;
+        uint8_t compMask = secPtr[0];
+        const uint8_t* payload = secPtr + 1;
+        size_t payloadLen = secCompLen - 1;
+        if (compMask == 0x00u) {
+            if (payloadLen != secUncompLen) return false;
+            secOut.assign(payload, payload + payloadLen);
+            return true;
+        }
+        if ((compMask & 0x02u) != 0) { // Zlib
+            if (!ZipDeflate::InflateZlib(payload, payloadLen, secOut, secUncompLen + 64) &&
+                !ZipDeflate::InflateRaw(payload, payloadLen, secOut, secUncompLen + 64))
+            {
+                return false;
+            }
+            return secOut.size() == secUncompLen;
+        }
+        if ((compMask & 0x10u) != 0) { // BZip2
+            if (!StreamCodecs::DecompressBzip2Stream(payload, payloadLen, secOut, secUncompLen + 64)) return false;
+            return secOut.size() == secUncompLen;
+        }
+        if (compMask == 0x12u) { // LZMA
+            if (payloadLen >= 5 &&
+                StreamCodecs::DecompressLzma1(payload[0], RdU32LE(payload + 1), payload + 5, payloadLen - 5, secOut, secUncompLen, true, secUncompLen + 64) &&
+                secOut.size() == secUncompLen)
+            {
+                return true;
+            }
+            if (payloadLen >= 6 && payload[0] == 0 &&
+                StreamCodecs::DecompressLzma1(payload[1], RdU32LE(payload + 2), payload + 6, payloadLen - 6, secOut, secUncompLen, true, secUncompLen + 64) &&
+                secOut.size() == secUncompLen)
+            {
+                return true;
+            }
+            return false;
+        }
+        return false;
+    };
+
+    auto extractMpqBlock = [&](uint32_t blockIdx, std::string_view fileNameForKey, std::vector<uint8_t>& outBuf) -> bool {
+        if (blockIdx >= blockCount) return false;
+        uint32_t fRelPos = btWords[blockIdx * 4u + 0u];
+        uint32_t cSz     = btWords[blockIdx * 4u + 1u];
+        uint32_t fSz     = btWords[blockIdx * 4u + 2u];
+        uint32_t flg     = btWords[blockIdx * 4u + 3u];
+        if ((flg & kMpqExists) == 0 || (flg & kMpqDeleteMark) != 0) return false;
+        uint64_t absFilePos = mpqOff + static_cast<uint64_t>(fRelPos);
+        if (absFilePos + static_cast<uint64_t>(cSz) > size || fSz > 256 * 1024 * 1024) return false;
+        if (fSz == 0) {
+            outBuf.clear();
+            return true;
+        }
+
+        uint32_t fileKey = 0;
+        if ((flg & kMpqEncrypted) != 0) {
+            if (fileNameForKey.empty()) return false;
+            size_t lastSep = fileNameForKey.find_last_of("\\/");
+            std::string_view plainBase = (lastSep == std::string_view::npos) ? fileNameForKey : fileNameForKey.substr(lastSep + 1);
+            fileKey = mpqHashEx(plainBase, 0x300u, false);
+            if ((flg & kMpqFixKey) != 0) {
+                fileKey = (fileKey + fRelPos) ^ fSz;
+            }
+        }
+
+        const uint8_t* fData = data + static_cast<size_t>(absFilePos);
+        if ((flg & kMpqSingleUnit) != 0) {
+            std::vector<uint8_t> rawUnit(fData, fData + cSz);
+            if ((flg & kMpqEncrypted) != 0) {
+                mpqDecryptBytes(rawUnit.data(), rawUnit.size(), fileKey);
+            }
+            return decompressMpqSector(rawUnit.data(), rawUnit.size(), fSz, flg, outBuf);
+        }
+
+        if ((flg & (kMpqCompress | kMpqImplode)) == 0) {
+            if (cSz < fSz) return false;
+            outBuf.assign(fData, fData + fSz);
+            if ((flg & kMpqEncrypted) != 0) {
+                uint32_t numSecs = (fSz + sectorSize - 1u) / sectorSize;
+                for (uint32_t s = 0; s < numSecs; ++s) {
+                    size_t sOff = static_cast<size_t>(s) * sectorSize;
+                    size_t sLen = std::min<size_t>(sectorSize, fSz - sOff);
+                    mpqDecryptBytes(outBuf.data() + sOff, sLen, fileKey + s);
+                }
+            }
+            return true;
+        }
+
+        uint32_t numSectors = (fSz + sectorSize - 1u) / sectorSize;
+        uint32_t numOffsets = numSectors + 1u + ((flg & kMpqSectorCrc) ? 1u : 0u);
+        size_t tblBytes = static_cast<size_t>(numOffsets) * 4u;
+        if (tblBytes > cSz) return false;
+
+        std::vector<uint8_t> tblBuf(fData, fData + tblBytes);
+        if ((flg & kMpqEncrypted) != 0) {
+            mpqDecryptBytes(tblBuf.data(), tblBytes, fileKey - 1u);
+        }
+        std::vector<uint32_t> secOffsets(numSectors + 1u);
+        for (uint32_t s = 0; s <= numSectors; ++s) {
+            secOffsets[s] = RdU32LE(tblBuf.data() + static_cast<size_t>(s) * 4u);
+        }
+        size_t minExpectedOff0 = static_cast<size_t>(numSectors + 1u) * 4u;
+        if (secOffsets[0] != tblBytes && secOffsets[0] != minExpectedOff0) return false;
+
+        outBuf.clear();
+        outBuf.reserve(fSz);
+        std::vector<uint8_t> secRaw, secDec;
+        for (uint32_t s = 0; s < numSectors; ++s) {
+            uint32_t sStart = secOffsets[s];
+            uint32_t sEnd   = secOffsets[s + 1u];
+            if (sStart > sEnd || sEnd > cSz) return false;
+            size_t sCompLen   = sEnd - sStart;
+            size_t sUncompLen = std::min<size_t>(sectorSize, fSz - outBuf.size());
+            secRaw.assign(fData + sStart, fData + sEnd);
+            if ((flg & kMpqEncrypted) != 0) {
+                mpqDecryptBytes(secRaw.data(), secRaw.size(), fileKey + s);
+            }
+            if (!decompressMpqSector(secRaw.data(), sCompLen, sUncompLen, flg, secDec)) return false;
+            outBuf.insert(outBuf.end(), secDec.begin(), secDec.end());
+        }
+        return outBuf.size() == fSz;
+    };
+
+    int32_t lfBlock   = lookupMpqHash("(listfile)");
+    int32_t attrBlock = lookupMpqHash("(attributes)");
+    int32_t sigBlock  = lookupMpqHash("(signature)");
+    int32_t udatBlock = lookupMpqHash("(user data)");
+
+    std::vector<std::string> listNames;
+    auto parseListfileBytes = [&](std::string_view sv) {
+        size_t lp = 0;
+        while (lp < sv.size() && listNames.size() < 100000) {
+            size_t le = sv.find_first_of("\r\n;", lp);
+            if (le == std::string_view::npos) le = sv.size();
+            std::string_view line = sv.substr(lp, le - lp);
+            while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.remove_suffix(1);
+            if (!line.empty()) listNames.emplace_back(line);
+            lp = le + 1;
+        }
+    };
+
+    if (lfBlock >= 0) {
+        std::vector<uint8_t> lfBytes;
+        if (extractMpqBlock(static_cast<uint32_t>(lfBlock), "(listfile)", lfBytes) && !lfBytes.empty()) {
+            parseListfileBytes(std::string_view(reinterpret_cast<const char*>(lfBytes.data()), lfBytes.size()));
+        }
+    } else if (!hasHashTable) {
+        for (uint32_t i = 0; i < blockCount; ++i) {
+            uint32_t fRel = btWords[i * 4u + 0u];
+            uint32_t cSz  = btWords[i * 4u + 1u];
+            uint32_t fSz  = btWords[i * 4u + 2u];
+            uint32_t flg  = btWords[i * 4u + 3u];
+            uint64_t absP = mpqOff + static_cast<uint64_t>(fRel);
+            if ((flg & kMpqExists) && cSz == fSz && fSz > 4 && fSz < 1024 * 1024 && absP + fSz <= size) {
+                std::string_view sv(reinterpret_cast<const char*>(data + static_cast<size_t>(absP)), fSz);
+                if ((sv.find('\\') != std::string_view::npos || sv.find('.') != std::string_view::npos) &&
+                    sv.find('\n') != std::string_view::npos)
+                {
+                    bool printable = true;
+                    for (size_t c = 0; c < std::min<size_t>(fSz, 64); ++c) {
+                        uint8_t b = static_cast<uint8_t>(sv[c]);
+                        if (b < 9 || (b > 13 && b < 32) || b > 126) { printable = false; break; }
                     }
-                    break;
+                    if (printable) {
+                        parseListfileBytes(sv);
+                        lfBlock = static_cast<int32_t>(i);
+                        break;
+                    }
                 }
             }
         }
     }
 
+    std::vector<std::string> blockToName(blockCount);
+    if (hasHashTable) {
+        for (const std::string& nm : listNames) {
+            if (_stricmp(nm.c_str(), "(listfile)") == 0 ||
+                _stricmp(nm.c_str(), "(attributes)") == 0 ||
+                _stricmp(nm.c_str(), "(signature)") == 0 ||
+                _stricmp(nm.c_str(), "(user data)") == 0)
+            {
+                continue;
+            }
+            int32_t bIdx = lookupMpqHash(nm);
+            if (bIdx >= 0 && static_cast<uint32_t>(bIdx) < blockCount && blockToName[static_cast<size_t>(bIdx)].empty()) {
+                blockToName[static_cast<size_t>(bIdx)] = nm;
+            }
+        }
+    } else {
+        size_t nameCursor = 0;
+        for (uint32_t i = 0; i < blockCount && nameCursor < listNames.size(); ++i) {
+            if (static_cast<int32_t>(i) == lfBlock) continue;
+            blockToName[i] = listNames[nameCursor++];
+        }
+    }
+
+    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+
     for (uint32_t i = 0; i < blockCount; ++i) {
-        uint32_t fPos = btWords[i * 4 + 0];
-        uint32_t cSz  = btWords[i * 4 + 1];
-        uint32_t fSz  = btWords[i * 4 + 2];
-        uint32_t flg  = btWords[i * 4 + 3];
-        if ((flg & 0x80000000u) == 0 || fPos >= size) continue; // MPQ_FILE_EXISTS
-        ArchiveItemEntry item;
-        if (i < listNames.size() && !listNames[i].empty()) {
-            item.pathInArchive = NormPath(PathUtils::Utf8ToWide(listNames[i]));
+        if (static_cast<int32_t>(i) == lfBlock ||
+            static_cast<int32_t>(i) == attrBlock ||
+            static_cast<int32_t>(i) == sigBlock ||
+            static_cast<int32_t>(i) == udatBlock)
+        {
+            continue;
+        }
+        uint32_t fRelPos = btWords[i * 4u + 0u];
+        uint32_t cSz     = btWords[i * 4u + 1u];
+        uint32_t fSz     = btWords[i * 4u + 2u];
+        uint32_t flg     = btWords[i * 4u + 3u];
+        uint64_t absP    = mpqOff + static_cast<uint64_t>(fRelPos);
+        if ((flg & kMpqExists) == 0 || (flg & kMpqDeleteMark) != 0 || absP + cSz > size) continue;
+
+        std::wstring displayPath;
+        if (!blockToName[i].empty()) {
+            displayPath = NormPath(PathUtils::Utf8ToWide(blockToName[i]));
         } else {
             wchar_t nb[64] = {};
             swprintf_s(nb, L"Files/Block_%04u.dat", i);
-            item.pathInArchive = nb;
+            displayPath = nb;
         }
-        item.name = BaseName(item.pathInArchive);
-        item.compressedSize = cSz;
-        item.uncompressedSize = fSz;
-        item.rawDataOffset = fPos;
-        item.compressionMethod = ((flg & 0x0000FF00u) == 0 && cSz == fSz) ? 0 : 8;
-        outInfo.entries.push_back(std::move(item));
+
+        if (extractTargetPath && outExtractedBytes) {
+            if (_wcsicmp(displayPath.c_str(), wantNorm.c_str()) == 0) {
+                return extractMpqBlock(i, blockToName[i], *outExtractedBytes);
+            }
+            continue;
+        }
+
+        if (outInfo) {
+            ArchiveItemEntry item;
+            item.pathInArchive = std::move(displayPath);
+            item.name = BaseName(item.pathInArchive);
+            item.compressedSize = cSz;
+            item.uncompressedSize = fSz;
+            item.rawDataOffset = absP;
+            item.compressionMethod = (((flg & (kMpqCompress | kMpqImplode | kMpqEncrypted)) == 0) && cSz == fSz) ? 0 : 8;
+            outInfo->entries.push_back(std::move(item));
+        }
     }
-    outInfo.valid = !outInfo.entries.empty();
-    return outInfo.valid;
+
+    if (extractTargetPath) return false;
+    if (!outInfo || outInfo->entries.empty()) return false;
+    outInfo->valid = true;
+    return true;
+}
+
+inline bool ParseBlizzardMpq(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+    return ParseOrExtractBlizzardMpq(data, size, &outInfo, nullptr, nullptr);
 }
 
 // ============================================================================
@@ -789,137 +1448,604 @@ inline bool ParseScsPrismArchive(const uint8_t* data, size_t size, ArchiveSummar
 // ============================================================================
 // #31 & #32. Linux SquashFS (.squashfs / .snap / .appimage) & EROFS (.erofs)
 // ============================================================================
-inline bool ParseSquashFsOrErofs(const uint8_t* data, size_t size, const std::wstring& extLower, ArchiveSummaryInfo& outInfo) {
-    // Search offset 0 (or ELF trailer up to 4 MB for .appimage) for "hsqs" (0x73717368)
+inline bool DecompressSqfsChunk(
+    const uint8_t* src,
+    size_t compLen,
+    size_t maxOut,
+    uint16_t compId,
+    std::vector<uint8_t>& out)
+{
+    if (compLen == 0 || maxOut > 256 * 1024 * 1024) return false;
+    if (compId == 1) { // Zlib / Deflate
+        return ZipDeflate::InflateZlib(src, compLen, out, maxOut + 64) ||
+               ZipDeflate::InflateRaw(src, compLen, out, maxOut + 64);
+    }
+    if (compId == 2) { // LZMA1
+        if (compLen >= 13) {
+            uint64_t hdrUncomp = RdU64LE(src + 5);
+            bool hasSz = (hdrUncomp != UINT64_MAX);
+            if (!hasSz || hdrUncomp <= maxOut) {
+                if (StreamCodecs::DecompressLzma1(src[0], RdU32LE(src + 1), src + 13, compLen - 13, out, hdrUncomp, hasSz, maxOut + 64)) {
+                    return true;
+                }
+            }
+        }
+        if (compLen >= 5) {
+            return StreamCodecs::DecompressLzma1(src[0], RdU32LE(src + 1), src + 5, compLen - 5, out, maxOut, false, maxOut + 64);
+        }
+        return false;
+    }
+    if (compId == 4) { // XZ
+        return StreamCodecs::DecompressXzStream(src, compLen, out, maxOut + 64);
+    }
+    if (compId == 5) { // LZ4
+        if (compLen >= 4 && RdU32LE(src) == 0x184D2204u) {
+            return StreamCodecs::DecompressLz4Frame(src, compLen, out, maxOut + 64);
+        }
+        return DecompressLz4RawBlockBounded(src, compLen, maxOut, out);
+    }
+    if (compId == 6) { // Zstd
+        return StreamCodecs::DecompressZstdFrame(src, compLen, out, maxOut + 64);
+    }
+    return false;
+}
+
+inline bool ParseOrExtractSquashFsOrErofs(
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& extLower,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetPath,
+    std::vector<uint8_t>* outExtractedBytes)
+{
+    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+
+    // Search offset 0 (or ELF trailer up to 4 MB for .appimage/.snap/.squashfs) for SquashFS 4.0 "hsqs"
     size_t sqOff = SIZE_MAX;
-    if (size >= 96 && std::memcmp(data, "hsqs", 4) == 0) {
+    if (size >= 96 && std::memcmp(data, "hsqs", 4) == 0 && RdU16LE(data + 28) == 4) {
         sqOff = 0;
     } else if (extLower == L".appimage" || extLower == L".snap" || extLower == L".squashfs") {
         size_t scanLim = std::min<size_t>(size, 4 * 1024 * 1024);
         for (size_t i = 0; i + 96 <= scanLim; i += 4) {
             if (data[i] == 'h' && data[i + 1] == 's' && data[i + 2] == 'q' && data[i + 3] == 's') {
                 uint16_t maj = RdU16LE(data + i + 28);
-                if (maj == 4) { sqOff = i; break; }
+                uint32_t bs  = RdU32LE(data + i + 12);
+                if (maj == 4 && bs >= 4096 && bs <= 1048576 && (bs & (bs - 1u)) == 0) {
+                    sqOff = i;
+                    break;
+                }
             }
         }
     }
 
     if (sqOff != SIZE_MAX && sqOff + 96 <= size) {
-        const uint8_t* sb = data + sqOff;
-        uint32_t inodes   = RdU32LE(sb + 4);
-        uint32_t blkSize  = RdU32LE(sb + 12);
-        uint16_t compId   = RdU16LE(sb + 20);
-        uint64_t bytesUsed= RdU64LE(sb + 40);
-        uint64_t dirTbl   = RdU64LE(sb + 72);
-        (void)blkSize;
+        const uint8_t* sb       = data + sqOff;
+        uint32_t inodes         = RdU32LE(sb + 4);
+        uint32_t blkSize        = RdU32LE(sb + 12);
+        uint32_t fragCount      = RdU32LE(sb + 16);
+        uint16_t compId         = RdU16LE(sb + 20);
+        uint16_t sMajor         = RdU16LE(sb + 28);
+        uint64_t rootInodeRef   = RdU64LE(sb + 32);
+        uint64_t inodeTblStart  = RdU64LE(sb + 64);
+        uint64_t dirTblStart    = RdU64LE(sb + 72);
+        uint64_t fragTblStart   = RdU64LE(sb + 80);
 
-        const wchar_t* compName = (compId == 1) ? L"gzip" : (compId == 4) ? L"xz" : (compId == 5) ? L"lz4" : (compId == 6) ? L"zstd" : L"raw";
-        outInfo.formatName = std::wstring(extLower == L".appimage" ? L"Linux AppImage (SquashFS/" :
-                                          extLower == L".snap"     ? L"Ubuntu Snap (SquashFS/" : L"Linux SquashFS (") + compName + L")";
+        if (sMajor != 4 || inodes == 0 || blkSize < 4096 || blkSize > 1048576 || (blkSize & (blkSize - 1u)) != 0) {
+            return false;
+        }
+        if (inodeTblStart < 96 || dirTblStart < 96 ||
+            sqOff + inodeTblStart >= size || sqOff + dirTblStart >= size)
+        {
+            return false;
+        }
 
-        // Walk uncompressed directory table metadata blocks if bit 15 (0x8000 = uncompressed) is set!
-        size_t dp = sqOff + static_cast<size_t>(dirTbl);
-        while (dp + 14 <= size && outInfo.entries.size() < 4096) {
-            uint16_t mhdr = RdU16LE(data + dp);
-            bool uncomp = (mhdr & 0x8000u) != 0;
-            uint16_t mlen = mhdr & 0x7FFFu;
-            if (!uncomp || mlen < 12 || dp + 2 + mlen > size) break;
+        if (outInfo) {
+            const wchar_t* compName =
+                (compId == 1) ? L"gzip" :
+                (compId == 2) ? L"lzma" :
+                (compId == 4) ? L"xz" :
+                (compId == 5) ? L"lz4" :
+                (compId == 6) ? L"zstd" : L"raw";
+            outInfo->formatName = std::wstring(
+                extLower == L".appimage" ? L"Linux AppImage (SquashFS/" :
+                extLower == L".snap"     ? L"Ubuntu Snap (SquashFS/" : L"Linux SquashFS (") + compName + L")";
+        }
 
-            size_t mp = dp + 2, mend = dp + 2 + mlen;
-            while (mp + 12 <= mend) {
-                uint32_t countMinus1 = RdU32LE(data + mp + 0);
-                mp += 12; // squashfs_dir_header: [count:4][start_block:4][inode_number:4]
-                if (countMinus1 > 256) { mp = mend; break; }
-                for (uint32_t e = 0; e <= countMinus1 && mp + 8 <= mend; ++e) {
-                    uint16_t itype = RdU16LE(data + mp + 4);
-                    uint16_t nszMinus1 = RdU16LE(data + mp + 6);
-                    mp += 8;
-                    size_t nlen = static_cast<size_t>(nszMinus1) + 1;
-                    if (mp + nlen > mend) break;
-                    std::string ename(reinterpret_cast<const char*>(data + mp), nlen);
-                    mp += nlen;
-                    ArchiveItemEntry item;
-                    item.pathInArchive = NormPath(PathUtils::Utf8ToWide(ename));
-                    item.name = item.pathInArchive;
-                    item.isDirectory = (itype == 1 || itype == 8);
-                    item.uncompressedSize = item.isDirectory ? 0 : 4096;
-                    item.compressedSize = item.uncompressedSize;
-                    item.compressionMethod = compId;
-                    outInfo.entries.push_back(std::move(item));
+        struct SqfsMetaCacheEntry {
+            std::vector<uint8_t> bytes;
+            size_t nextAbsPos = 0;
+        };
+        std::unordered_map<uint64_t, SqfsMetaCacheEntry> metaCache;
+
+        auto getMetaBlock = [&](uint64_t absPos) -> const SqfsMetaCacheEntry* {
+            auto it = metaCache.find(absPos);
+            if (it != metaCache.end()) return &it->second;
+            if (metaCache.size() >= 512) metaCache.clear();
+            if (absPos + 2 > size) return nullptr;
+            uint16_t hdr = RdU16LE(data + static_cast<size_t>(absPos));
+            bool isUncomp = (hdr & 0x8000u) != 0;
+            size_t cLen = hdr & 0x7FFFu;
+            if (cLen == 0 || absPos + 2 + cLen > size) return nullptr;
+
+            SqfsMetaCacheEntry entry;
+            if (isUncomp) {
+                if (cLen > 8192) return nullptr;
+                entry.bytes.assign(
+                    data + static_cast<size_t>(absPos) + 2,
+                    data + static_cast<size_t>(absPos) + 2 + cLen);
+            } else {
+                if (!DecompressSqfsChunk(data + static_cast<size_t>(absPos) + 2, cLen, 8192, compId, entry.bytes) ||
+                    entry.bytes.empty() || entry.bytes.size() > 8192)
+                {
+                    return nullptr;
                 }
             }
-            break;
-        }
+            entry.nextAbsPos = static_cast<size_t>(absPos) + 2 + cLen;
+            auto res = metaCache.emplace(absPos, std::move(entry));
+            return &res.first->second;
+        };
 
-        if (outInfo.entries.empty()) {
-            ArchiveItemEntry summary;
-            summary.pathInArchive = L"squashfs-root (" + std::to_wstring(inodes) + L" inodes)";
-            summary.name = summary.pathInArchive;
-            summary.uncompressedSize = bytesUsed;
-            summary.compressedSize = bytesUsed;
-            summary.compressionMethod = compId;
-            outInfo.entries.push_back(std::move(summary));
+        auto readSqfsMetaBytes = [&](uint64_t tableRelStart, uint64_t metaBlkRelOff, size_t innerOff, size_t wantLen, std::vector<uint8_t>& outBuf) -> bool {
+            outBuf.clear();
+            if (wantLen == 0) return true;
+            if (wantLen > 16 * 1024 * 1024) return false;
+            uint64_t curAbs = sqOff + tableRelStart + metaBlkRelOff;
+            if (curAbs < sqOff || curAbs >= size) return false;
+
+            outBuf.reserve(wantLen);
+            size_t skip = innerOff;
+            size_t hops = 0;
+            while (outBuf.size() < wantLen && hops++ < 4096) {
+                const SqfsMetaCacheEntry* blk = getMetaBlock(curAbs);
+                if (!blk || blk->bytes.empty()) return false;
+                if (skip >= blk->bytes.size()) {
+                    skip -= blk->bytes.size();
+                    curAbs = blk->nextAbsPos;
+                    continue;
+                }
+                size_t avail = blk->bytes.size() - skip;
+                size_t take  = std::min<size_t>(avail, wantLen - outBuf.size());
+                outBuf.insert(outBuf.end(), blk->bytes.data() + skip, blk->bytes.data() + skip + take);
+                skip = 0;
+                curAbs = blk->nextAbsPos;
+            }
+            return outBuf.size() == wantLen;
+        };
+
+        auto extractSqfsFile = [&](uint16_t itype, uint64_t blkOff, size_t inOff, uint64_t blocksStart,
+                                   uint64_t fileSize, uint32_t fragIdx, uint32_t fragOff, std::vector<uint8_t>& fileOut) -> bool
+        {
+            if (fileSize == 0) {
+                fileOut.clear();
+                return true;
+            }
+            if (fileSize > 256 * 1024 * 1024) return false;
+
+            bool hasFrag = (fragIdx != 0xFFFFFFFFu);
+            uint64_t numBlocks64 = hasFrag ? (fileSize / blkSize) : ((fileSize + blkSize - 1ULL) / blkSize);
+            if (numBlocks64 > 262144ULL) return false;
+            size_t numBlocks = static_cast<size_t>(numBlocks64);
+            size_t hdrLen = (itype == 2) ? 32u : 56u;
+
+            std::vector<uint8_t> ibuf;
+            if (!readSqfsMetaBytes(inodeTblStart, blkOff, inOff, hdrLen + numBlocks * 4u, ibuf)) {
+                return false;
+            }
+
+            fileOut.clear();
+            fileOut.reserve(static_cast<size_t>(fileSize));
+            uint64_t curDataAbs = sqOff + blocksStart;
+            std::vector<uint8_t> chunkBuf;
+
+            for (size_t b = 0; b < numBlocks; ++b) {
+                uint32_t rawBSz = RdU32LE(ibuf.data() + hdrLen + b * 4u);
+                size_t expectLen = std::min<size_t>(blkSize, static_cast<size_t>(fileSize) - fileOut.size());
+                if (rawBSz == 0) { // Sparse zero block
+                    fileOut.insert(fileOut.end(), expectLen, 0);
+                } else {
+                    bool blkUncomp = (rawBSz & (1u << 24)) != 0;
+                    uint32_t cSz = rawBSz & 0x00FFFFFFu;
+                    if (cSz == 0 || curDataAbs + cSz > size) return false;
+                    if (blkUncomp) {
+                        if (cSz < expectLen) return false;
+                        fileOut.insert(fileOut.end(),
+                            data + static_cast<size_t>(curDataAbs),
+                            data + static_cast<size_t>(curDataAbs) + expectLen);
+                    } else {
+                        if (!DecompressSqfsChunk(data + static_cast<size_t>(curDataAbs), cSz, blkSize, compId, chunkBuf) ||
+                            chunkBuf.size() < expectLen)
+                        {
+                            return false;
+                        }
+                        fileOut.insert(fileOut.end(), chunkBuf.begin(), chunkBuf.begin() + static_cast<ptrdiff_t>(expectLen));
+                    }
+                    curDataAbs += cSz;
+                }
+            }
+
+            if (fileOut.size() < fileSize) {
+                if (!hasFrag || fragIdx >= fragCount || fragTblStart == UINT64_MAX) return false;
+                size_t tailLen = static_cast<size_t>(fileSize) - fileOut.size();
+                uint32_t ptrIdx = fragIdx / 512u;
+                uint32_t subIdx = fragIdx % 512u;
+                uint64_t ptrAbs = sqOff + fragTblStart + static_cast<uint64_t>(ptrIdx) * 8ULL;
+                if (ptrAbs + 8 > size) return false;
+                uint64_t fragMetaRelOff = RdU64LE(data + static_cast<size_t>(ptrAbs));
+
+                std::vector<uint8_t> fragEnt;
+                if (!readSqfsMetaBytes(0, fragMetaRelOff, static_cast<size_t>(subIdx) * 16u, 16u, fragEnt)) {
+                    return false;
+                }
+                uint64_t fragStartBlk = RdU64LE(fragEnt.data() + 0);
+                uint32_t fragRawSz    = RdU32LE(fragEnt.data() + 8);
+                bool fragUncomp       = (fragRawSz & (1u << 24)) != 0;
+                uint32_t fragCSz      = fragRawSz & 0x00FFFFFFu;
+                uint64_t fragDataAbs  = sqOff + fragStartBlk;
+                if (fragCSz == 0 || fragDataAbs + fragCSz > size) return false;
+
+                if (fragUncomp) {
+                    if (static_cast<uint64_t>(fragOff) + tailLen > fragCSz) return false;
+                    const uint8_t* fp = data + static_cast<size_t>(fragDataAbs) + fragOff;
+                    fileOut.insert(fileOut.end(), fp, fp + tailLen);
+                } else {
+                    if (!DecompressSqfsChunk(data + static_cast<size_t>(fragDataAbs), fragCSz, blkSize, compId, chunkBuf) ||
+                        static_cast<uint64_t>(fragOff) + tailLen > chunkBuf.size())
+                    {
+                        return false;
+                    }
+                    fileOut.insert(fileOut.end(),
+                        chunkBuf.begin() + static_cast<ptrdiff_t>(fragOff),
+                        chunkBuf.begin() + static_cast<ptrdiff_t>(fragOff + tailLen));
+                }
+            }
+            return fileOut.size() == fileSize;
+        };
+
+        std::unordered_set<uint64_t> visitedDirs;
+        size_t totalListed = 0;
+        bool extractedOk = false;
+
+        auto walkSqfsDir = [&](auto& self, uint64_t dirRef, const std::wstring& prefix, int depth) -> bool {
+            if (depth > 32 || totalListed >= 50000) return true;
+            if (!visitedDirs.insert(dirRef).second) return true;
+
+            uint64_t dBlkOff = dirRef >> 16;
+            size_t   dInOff  = static_cast<size_t>(dirRef & 0xFFFFu);
+            std::vector<uint8_t> dHdr;
+            if (!readSqfsMetaBytes(inodeTblStart, dBlkOff, dInOff, 32u, dHdr)) return false;
+
+            uint16_t dType = RdU16LE(dHdr.data() + 0);
+            uint32_t dirBlkStart = 0;
+            uint32_t dirRawSz = 0;
+            uint16_t dirInnerOff = 0;
+            if (dType == 1) {
+                dirBlkStart = RdU32LE(dHdr.data() + 16);
+                dirRawSz    = RdU16LE(dHdr.data() + 24);
+                dirInnerOff = RdU16LE(dHdr.data() + 26);
+            } else if (dType == 8) {
+                if (!readSqfsMetaBytes(inodeTblStart, dBlkOff, dInOff, 40u, dHdr)) return false;
+                dirRawSz    = RdU32LE(dHdr.data() + 20);
+                dirBlkStart = RdU32LE(dHdr.data() + 24);
+                dirInnerOff = RdU16LE(dHdr.data() + 34);
+            } else {
+                return false;
+            }
+
+            if (dirRawSz <= 3) return true; // Empty directory
+            size_t dirByteLen = dirRawSz - 3u;
+            if (dirByteLen > 8 * 1024 * 1024) return false;
+
+            std::vector<uint8_t> dirData;
+            if (!readSqfsMetaBytes(dirTblStart, dirBlkStart, dirInnerOff, dirByteLen, dirData)) return false;
+
+            size_t dp = 0;
+            while (dp + 12 <= dirData.size() && totalListed < 50000) {
+                uint32_t countMinus1 = RdU32LE(dirData.data() + dp + 0);
+                uint32_t hdrStartBlk = RdU32LE(dirData.data() + dp + 4);
+                dp += 12;
+                if (countMinus1 >= 8192u) return false;
+
+                for (uint32_t idx = 0; idx <= countMinus1; ++idx) {
+                    if (dp + 8 > dirData.size()) return false;
+                    uint16_t entOff      = RdU16LE(dirData.data() + dp + 0);
+                    uint16_t entType     = RdU16LE(dirData.data() + dp + 4);
+                    uint16_t nameMinus1  = RdU16LE(dirData.data() + dp + 6);
+                    dp += 8;
+                    size_t nameLen = static_cast<size_t>(nameMinus1) + 1u;
+                    if (dp + nameLen > dirData.size()) return false;
+                    std::string childUtf8(reinterpret_cast<const char*>(dirData.data() + dp), nameLen);
+                    dp += nameLen;
+                    if (childUtf8.empty() || childUtf8 == "." || childUtf8 == "..") continue;
+
+                    std::wstring childW = PathUtils::Utf8ToWide(childUtf8);
+                    std::wstring fullP  = NormPath(prefix.empty() ? childW : (prefix + L"/" + childW));
+                    if (fullP.empty()) continue;
+
+                    uint64_t childRef = (static_cast<uint64_t>(hdrStartBlk) << 16) | entOff;
+                    uint64_t cBlkOff  = childRef >> 16;
+                    size_t   cInOff   = static_cast<size_t>(childRef & 0xFFFFu);
+
+                    std::vector<uint8_t> cBase;
+                    if (!readSqfsMetaBytes(inodeTblStart, cBlkOff, cInOff, 16u, cBase)) continue;
+                    uint16_t cType = RdU16LE(cBase.data() + 0);
+                    bool isDir = (cType == 1 || cType == 8 || entType == 1 || entType == 8);
+
+                    if (isDir) {
+                        if (outInfo && !extractTargetPath) {
+                            ArchiveItemEntry item;
+                            item.pathInArchive = fullP;
+                            item.name = BaseName(fullP);
+                            item.isDirectory = true;
+                            item.compressionMethod = 0;
+                            outInfo->entries.push_back(std::move(item));
+                            ++totalListed;
+                        }
+                        if (cType == 1 || cType == 8) {
+                            self(self, childRef, fullP, depth + 1);
+                            if (extractedOk) return true;
+                        }
+                        continue;
+                    }
+
+                    if (cType == 2 || cType == 9) {
+                        size_t needHdr = (cType == 2) ? 32u : 56u;
+                        std::vector<uint8_t> fHdr;
+                        if (!readSqfsMetaBytes(inodeTblStart, cBlkOff, cInOff, needHdr, fHdr)) continue;
+
+                        uint64_t blocksStart = 0, fileSize = 0;
+                        uint32_t fragIdx = 0xFFFFFFFFu, fragOff = 0;
+                        if (cType == 2) {
+                            blocksStart = RdU32LE(fHdr.data() + 16);
+                            fragIdx     = RdU32LE(fHdr.data() + 20);
+                            fragOff     = RdU32LE(fHdr.data() + 24);
+                            fileSize    = RdU32LE(fHdr.data() + 28);
+                        } else {
+                            blocksStart = RdU64LE(fHdr.data() + 16);
+                            fileSize    = RdU64LE(fHdr.data() + 24);
+                            fragIdx     = RdU32LE(fHdr.data() + 44);
+                            fragOff     = RdU32LE(fHdr.data() + 48);
+                        }
+
+                        if (extractTargetPath && outExtractedBytes) {
+                            if (_wcsicmp(fullP.c_str(), wantNorm.c_str()) == 0) {
+                                extractedOk = extractSqfsFile(cType, cBlkOff, cInOff, blocksStart, fileSize, fragIdx, fragOff, *outExtractedBytes);
+                                return extractedOk;
+                            }
+                        } else if (outInfo) {
+                            ArchiveItemEntry item;
+                            item.pathInArchive = fullP;
+                            item.name = BaseName(fullP);
+                            item.isDirectory = false;
+                            item.uncompressedSize = fileSize;
+                            item.compressedSize = fileSize;
+                            item.compressionMethod = (compId != 0) ? compId : 1;
+                            outInfo->entries.push_back(std::move(item));
+                            ++totalListed;
+                        }
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (!walkSqfsDir(walkSqfsDir, rootInodeRef, L"", 0)) {
+            if (extractTargetPath) return false;
         }
-        outInfo.valid = true;
+        if (extractTargetPath) return extractedOk;
+        if (!outInfo || outInfo->entries.empty()) return false;
+        outInfo->valid = true;
         return true;
     }
 
     // #32. Linux EROFS — Superblock magic 0xE0F5E1E2 at offset 1024
     if (size >= 1152 && RdU32LE(data + 1024) == 0xE0F5E1E2u) {
         const uint8_t* sb = data + 1024;
-        uint8_t blkBits   = sb[12];
+        uint8_t  blkBits  = sb[12];
         uint16_t rootNid  = RdU16LE(sb + 14);
-        uint64_t inos     = RdU64LE(sb + 16);
         uint32_t blocks   = RdU32LE(sb + 36);
         uint32_t metaBlk  = RdU32LE(sb + 40);
-        std::string volName(reinterpret_cast<const char*>(sb + 48), strnlen(reinterpret_cast<const char*>(sb + 48), 16));
-        outInfo.formatName = L"Linux EROFS Image" + (volName.empty() ? L"" : (L" (" + PathUtils::Utf8ToWide(volName) + L")"));
 
-        size_t blkSz = (blkBits >= 9 && blkBits <= 16) ? (size_t(1) << blkBits) : 4096;
-        size_t rootInodeOff = static_cast<size_t>(metaBlk) * blkSz + static_cast<size_t>(rootNid) * 32;
-        if (rootInodeOff + 32 <= size) {
-            uint16_t iFormat = RdU16LE(data + rootInodeOff);
-            size_t inodeHdrSz = ((iFormat & 1u) != 0) ? 64 : 32;
-            uint32_t rawBlkAddr = RdU32LE(data + rootInodeOff + ((inodeHdrSz == 64) ? 20 : 16));
-            uint16_t dataLayout = (iFormat >> 1) & 0x07u;
-            size_t dirDataOff = (dataLayout == 2) ? (rootInodeOff + inodeHdrSz) : (static_cast<size_t>(rawBlkAddr) * blkSz);
-            if (dirDataOff + 12 <= size) {
-                uint16_t firstNameOff = RdU16LE(data + dirDataOff + 8);
-                if (firstNameOff >= 12 && firstNameOff <= blkSz && (firstNameOff % 12) == 0 && dirDataOff + firstNameOff <= size) {
-                    size_t numDirents = firstNameOff / 12;
-                    for (size_t d = 0; d < numDirents && d < 2048; ++d) {
-                        uint16_t nOff = RdU16LE(data + dirDataOff + d * 12 + 8);
-                        uint8_t fType = data[dirDataOff + d * 12 + 10];
-                        uint16_t nextOff = (d + 1 < numDirents)
-                            ? RdU16LE(data + dirDataOff + (d + 1) * 12 + 8)
-                            : static_cast<uint16_t>(std::min<size_t>(blkSz, size - dirDataOff));
-                        if (nOff < nextOff && dirDataOff + nextOff <= size) {
-                            std::string dn(reinterpret_cast<const char*>(data + dirDataOff + nOff),
-                                           strnlen(reinterpret_cast<const char*>(data + dirDataOff + nOff), nextOff - nOff));
-                            if (!dn.empty() && dn != "." && dn != "..") {
-                                ArchiveItemEntry item;
-                                item.pathInArchive = PathUtils::Utf8ToWide(dn);
-                                item.name = item.pathInArchive;
-                                item.isDirectory = (fType == 2);
-                                outInfo.entries.push_back(std::move(item));
-                            }
+        if (blkBits < 9 || blkBits > 16 || blocks == 0) return false;
+        const size_t blkSz = size_t(1) << blkBits;
+
+        if (outInfo) {
+            auto readPrintableVol = [&](size_t off) -> std::string {
+                size_t len = strnlen(reinterpret_cast<const char*>(sb + off), 16);
+                if (len == 0) return {};
+                for (size_t i = 0; i < len; ++i) {
+                    uint8_t ch = sb[off + i];
+                    if (ch < 32 || ch > 126) return {};
+                }
+                return std::string(reinterpret_cast<const char*>(sb + off), len);
+            };
+            std::string volName = readPrintableVol(64);
+            if (volName.empty()) volName = readPrintableVol(48);
+            outInfo->formatName = L"Linux EROFS Image" + (volName.empty() ? L"" : (L" (" + PathUtils::Utf8ToWide(volName) + L")"));
+        }
+
+        struct ErofsInodeInfo {
+            size_t   inodeOff = 0;
+            size_t   inodeHdrSz = 32;
+            size_t   xattrBytes = 0;
+            uint16_t dataLayout = 0;
+            uint16_t iMode = 0;
+            uint64_t iSize = 0;
+            uint32_t rawBlkAddr = 0;
+        };
+
+        auto readErofsInode = [&](uint64_t nid, ErofsInodeInfo& inf) -> bool {
+            uint64_t off64 = static_cast<uint64_t>(metaBlk) * blkSz + nid * 32ULL;
+            if (off64 + 32ULL > size) return false;
+            inf.inodeOff = static_cast<size_t>(off64);
+            uint16_t iFormat    = RdU16LE(data + inf.inodeOff + 0);
+            uint16_t xattrCount = RdU16LE(data + inf.inodeOff + 2);
+            inf.iMode           = RdU16LE(data + inf.inodeOff + 4);
+            if ((inf.iMode & 0170000u) == 0) return false;
+
+            bool isExt = (iFormat & 1u) != 0;
+            inf.inodeHdrSz = isExt ? 64u : 32u;
+            if (inf.inodeOff + inf.inodeHdrSz > size) return false;
+
+            inf.dataLayout = (iFormat >> 1) & 0x07u;
+            inf.xattrBytes = (xattrCount > 0) ? (12u + static_cast<size_t>(xattrCount - 1u) * 4u) : 0u;
+            if (!isExt) {
+                inf.iSize      = RdU32LE(data + inf.inodeOff + 8);
+                inf.rawBlkAddr = RdU32LE(data + inf.inodeOff + 16);
+            } else {
+                inf.iSize      = RdU64LE(data + inf.inodeOff + 8);
+                uint32_t u16Addr = RdU32LE(data + inf.inodeOff + 16);
+                uint32_t u20Addr = RdU32LE(data + inf.inodeOff + 20);
+                inf.rawBlkAddr = (u16Addr != 0 && u16Addr != 0xFFFFFFFFu) ? u16Addr : u20Addr;
+            }
+            return true;
+        };
+
+        auto readErofsData = [&](const ErofsInodeInfo& inf, std::vector<uint8_t>& outBuf) -> bool {
+            if (inf.iSize == 0) {
+                outBuf.clear();
+                return true;
+            }
+            if (inf.iSize > 256 * 1024 * 1024) return false;
+            if (inf.dataLayout == 0) { // EROFS_INODE_FLAT_PLAIN
+                uint64_t startOff = static_cast<uint64_t>(inf.rawBlkAddr) * blkSz;
+                if (startOff + inf.iSize > size) return false;
+                outBuf.assign(
+                    data + static_cast<size_t>(startOff),
+                    data + static_cast<size_t>(startOff + inf.iSize));
+                return true;
+            }
+            if (inf.dataLayout == 2) { // EROFS_INODE_FLAT_INLINE
+                size_t fullBytes = static_cast<size_t>((inf.iSize / blkSz) * blkSz);
+                size_t tailBytes = static_cast<size_t>(inf.iSize % blkSz);
+                outBuf.clear();
+                outBuf.reserve(static_cast<size_t>(inf.iSize));
+                if (fullBytes > 0) {
+                    uint64_t startOff = static_cast<uint64_t>(inf.rawBlkAddr) * blkSz;
+                    if (startOff + fullBytes > size) return false;
+                    outBuf.insert(outBuf.end(),
+                        data + static_cast<size_t>(startOff),
+                        data + static_cast<size_t>(startOff) + fullBytes);
+                }
+                if (tailBytes > 0) {
+                    uint64_t inlineOff = static_cast<uint64_t>(inf.inodeOff) + inf.inodeHdrSz + inf.xattrBytes;
+                    if (inlineOff + tailBytes > size) return false;
+                    outBuf.insert(outBuf.end(),
+                        data + static_cast<size_t>(inlineOff),
+                        data + static_cast<size_t>(inlineOff) + tailBytes);
+                }
+                return true;
+            }
+            return false;
+        };
+
+        std::unordered_set<uint64_t> visitedNids;
+        size_t totalListed = 0;
+        bool extractedOk = false;
+
+        auto walkErofsDir = [&](auto& self, uint64_t dirNid, const std::wstring& prefix, int depth) -> bool {
+            if (depth > 32 || totalListed >= 50000) return true;
+            if (!visitedNids.insert(dirNid).second) return true;
+
+            ErofsInodeInfo dInf;
+            if (!readErofsInode(dirNid, dInf)) return false;
+            if ((dInf.iMode & 0170000u) != 0040000u || dInf.iSize < 12) return false;
+
+            std::vector<uint8_t> dirBytes;
+            if (!readErofsData(dInf, dirBytes) || dirBytes.size() < 12) return false;
+
+            for (size_t blkOff = 0; blkOff < dirBytes.size(); blkOff += blkSz) {
+                size_t chunkLen = std::min<size_t>(blkSz, dirBytes.size() - blkOff);
+                if (chunkLen < 12) break;
+                const uint8_t* blk = dirBytes.data() + blkOff;
+                uint16_t firstNameOff = RdU16LE(blk + 8);
+                if (firstNameOff < 12 || firstNameOff > chunkLen || (firstNameOff % 12u) != 0) break;
+                size_t numDirents = firstNameOff / 12u;
+
+                for (size_t d = 0; d < numDirents && totalListed < 50000; ++d) {
+                    uint64_t childNid = RdU64LE(blk + d * 12u + 0u);
+                    uint16_t nOff     = RdU16LE(blk + d * 12u + 8u);
+                    uint8_t  fType    = blk[d * 12u + 10u];
+                    uint16_t nextOff  = (d + 1 < numDirents)
+                        ? RdU16LE(blk + (d + 1) * 12u + 8u)
+                        : static_cast<uint16_t>(chunkLen);
+                    if (nOff >= nextOff || nextOff > chunkLen) continue;
+
+                    std::string dn(reinterpret_cast<const char*>(blk + nOff),
+                                   strnlen(reinterpret_cast<const char*>(blk + nOff), nextOff - nOff));
+                    if (dn.empty() || dn == "." || dn == "..") continue;
+
+                    std::wstring wName = PathUtils::Utf8ToWide(dn);
+                    std::wstring fullP = NormPath(prefix.empty() ? wName : (prefix + L"/" + wName));
+                    if (fullP.empty()) continue;
+
+                    ErofsInodeInfo cInf;
+                    bool hasInode = readErofsInode(childNid, cInf);
+                    bool isDir = hasInode ? ((cInf.iMode & 0170000u) == 0040000u) : (fType == 2);
+
+                    if (isDir) {
+                        if (outInfo && !extractTargetPath) {
+                            ArchiveItemEntry item;
+                            item.pathInArchive = fullP;
+                            item.name = BaseName(fullP);
+                            item.isDirectory = true;
+                            item.compressionMethod = 0;
+                            outInfo->entries.push_back(std::move(item));
+                            ++totalListed;
                         }
+                        if (hasInode) {
+                            self(self, childNid, fullP, depth + 1);
+                            if (extractedOk) return true;
+                        }
+                        continue;
+                    }
+
+                    if (!hasInode) continue;
+
+                    if (extractTargetPath && outExtractedBytes) {
+                        if (_wcsicmp(fullP.c_str(), wantNorm.c_str()) == 0) {
+                            extractedOk = readErofsData(cInf, *outExtractedBytes);
+                            return extractedOk;
+                        }
+                    } else if (outInfo) {
+                        ArchiveItemEntry item;
+                        item.pathInArchive = fullP;
+                        item.name = BaseName(fullP);
+                        item.isDirectory = false;
+                        item.uncompressedSize = cInf.iSize;
+                        item.compressedSize = cInf.iSize;
+                        if (cInf.dataLayout == 0 && static_cast<uint64_t>(cInf.rawBlkAddr) * blkSz + cInf.iSize <= size) {
+                            item.rawDataOffset = static_cast<uint64_t>(cInf.rawBlkAddr) * blkSz;
+                            item.compressionMethod = 0;
+                        } else if (cInf.dataLayout == 2 && cInf.iSize < blkSz &&
+                                   cInf.inodeOff + cInf.inodeHdrSz + cInf.xattrBytes + cInf.iSize <= size)
+                        {
+                            item.rawDataOffset = cInf.inodeOff + cInf.inodeHdrSz + cInf.xattrBytes;
+                            item.compressionMethod = 0;
+                        } else {
+                            item.compressionMethod = 2; // Multi-block + inline tail handled by ExtractExtendedArchive200Entry
+                        }
+                        outInfo->entries.push_back(std::move(item));
+                        ++totalListed;
                     }
                 }
             }
+            return true;
+        };
+
+        if (!walkErofsDir(walkErofsDir, rootNid, L"", 0)) {
+            if (extractTargetPath) return false;
         }
-        if (outInfo.entries.empty()) {
-            ArchiveItemEntry e;
-            e.pathInArchive = L"erofs_root (" + std::to_wstring(inos) + L" inodes)";
-            e.name = e.pathInArchive;
-            e.uncompressedSize = static_cast<uint64_t>(blocks) * blkSz;
-            e.compressedSize = e.uncompressedSize;
-            outInfo.entries.push_back(std::move(e));
-        }
-        outInfo.valid = true;
+        if (extractTargetPath) return extractedOk;
+        if (!outInfo || outInfo->entries.empty()) return false;
+        outInfo->valid = true;
         return true;
     }
+
     return false;
+}
+
+inline bool ParseSquashFsOrErofs(const uint8_t* data, size_t size, const std::wstring& extLower, ArchiveSummaryInfo& outInfo) {
+    return ParseOrExtractSquashFsOrErofs(data, size, extLower, &outInfo, nullptr, nullptr);
 }
 
 // ============================================================================
@@ -1347,6 +2473,132 @@ inline bool InspectExtendedArchive200(
         DetailArc200::ParseUnixCoffAr(data, size, extLower, outInfo)) return true;
     if (DetailArc200::ParseXarPkg(data, size, extLower, outInfo)) return true;
     if (DetailArc200::ParseLzhArjAce(data, size, extLower, outInfo)) return true;
+    return false;
+}
+
+inline bool ExtractExtendedArchive200Entry(
+    const std::wstring& archivePath,
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& extLower,
+    const std::wstring& normTarget,
+    std::vector<uint8_t>& outBytes)
+{
+    (void)archivePath;
+    if (!data || size < 4 || normTarget.empty()) return false;
+
+    std::wstring want = DetailArc200::NormPath(normTarget);
+    if (want.empty()) return false;
+
+    // 1. UnityPackage (.unitypackage)
+    if (extLower == L".unitypackage") {
+        ArchiveSummaryInfo dummy;
+        if (DetailArc200::ParseUnityPackageFromMemory(data, size, dummy, &want, &outBytes)) {
+            return true;
+        }
+    }
+
+    // 2. UnityFS AssetBundle (.bundle / .unity3d)
+    if (size >= 32 && std::memcmp(data, "UnityFS\0", 8) == 0) {
+        return DetailArc200::ParseOrExtractUnityFsBundle(data, size, nullptr, &want, &outBytes);
+    }
+
+    // 3. RPG Maker Encrypted Archives (.rgssad / .rgss2a / .rgss3a)
+    if (size >= 12 && std::memcmp(data, "RGSSAD\0", 7) == 0) {
+        return DetailArc200::ParseOrExtractRpgMakerRgss(data, size, nullptr, &want, &outBytes);
+    }
+
+    // 4. KiriKiri Visual Novel Archive (.xp3 — raw & zlib multi-segment)
+    static const uint8_t kXp3Sig[11] = { 'X','P','3','\r','\n',' ','\n',0x1A,0x8B,0x67,0x01 };
+    if (size >= 28 && std::memcmp(data, kXp3Sig, 11) == 0) {
+        return DetailArc200::ParseOrExtractKiriKiriXp3(data, size, nullptr, &want, &outBytes);
+    }
+
+    // 5. Blizzard MoPaQ Archive (.mpq — MPQ\x1A & MPQ\x1B, Storm cipher + Zlib/BZip2/LZMA sectors)
+    if (size >= 32 && (std::memcmp(data, "MPQ\x1A", 4) == 0 || std::memcmp(data, "MPQ\x1B", 4) == 0)) {
+        return DetailArc200::ParseOrExtractBlizzardMpq(data, size, nullptr, &want, &outBytes);
+    }
+
+    // 6. SCS Software Prism3D HashFS (.scs — raw & zlib)
+    if (size >= 20 && std::memcmp(data, "SCS#", 4) == 0) {
+        ArchiveSummaryInfo info;
+        if (DetailArc200::ParseScsPrismArchive(data, size, info)) {
+            for (const auto& e : info.entries) {
+                if (!e.isDirectory && _wcsicmp(e.pathInArchive.c_str(), want.c_str()) == 0) {
+                    if (e.rawDataOffset + e.compressedSize > size || e.uncompressedSize > 256 * 1024 * 1024) return false;
+                    if (e.compressionMethod == 0) {
+                        if (e.rawDataOffset + e.uncompressedSize > size) return false;
+                        outBytes.assign(
+                            data + static_cast<size_t>(e.rawDataOffset),
+                            data + static_cast<size_t>(e.rawDataOffset + e.uncompressedSize));
+                        return true;
+                    }
+                    if (e.compressionMethod == 8) {
+                        return ZipDeflate::InflateZlib(
+                                   data + static_cast<size_t>(e.rawDataOffset),
+                                   static_cast<size_t>(e.compressedSize),
+                                   outBytes,
+                                   static_cast<size_t>(e.uncompressedSize) + 64) ||
+                               ZipDeflate::InflateRaw(
+                                   data + static_cast<size_t>(e.rawDataOffset),
+                                   static_cast<size_t>(e.compressedSize),
+                                   outBytes,
+                                   static_cast<size_t>(e.uncompressedSize) + 64);
+                    }
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    // 7. Linux SquashFS (.squashfs / .snap / .appimage) & Linux EROFS (.erofs)
+    if ((size >= 96 && std::memcmp(data, "hsqs", 4) == 0) ||
+        (size >= 1152 && DetailArc200::RdU32LE(data + 1024) == 0xE0F5E1E2u) ||
+        extLower == L".squashfs" || extLower == L".snap" || extLower == L".appimage" || extLower == L".erofs")
+    {
+        if (DetailArc200::ParseOrExtractSquashFsOrErofs(data, size, extLower, nullptr, &want, &outBytes)) {
+            return true;
+        }
+    }
+
+    // 8. macOS eXtensible Archive (.xar / .pkg — raw, zlib, bzip2, xz)
+    if (size >= 28 && std::memcmp(data, "xar!", 4) == 0) {
+        ArchiveSummaryInfo info;
+        if (DetailArc200::ParseXarPkg(data, size, extLower, info)) {
+            for (const auto& e : info.entries) {
+                if (!e.isDirectory && _wcsicmp(e.pathInArchive.c_str(), want.c_str()) == 0) {
+                    if (e.rawDataOffset + e.compressedSize > size || e.uncompressedSize > 256 * 1024 * 1024) return false;
+                    const uint8_t* p = data + static_cast<size_t>(e.rawDataOffset);
+                    size_t cLen = static_cast<size_t>(e.compressedSize);
+                    size_t uLen = static_cast<size_t>(e.uncompressedSize);
+                    if (e.compressionMethod == 0) {
+                        if (e.rawDataOffset + uLen > size) return false;
+                        outBytes.assign(p, p + uLen);
+                        return true;
+                    }
+                    if (cLen >= 3 && std::memcmp(p, "BZh", 3) == 0) {
+                        return StreamCodecs::DecompressBzip2Stream(p, cLen, outBytes, uLen + 64);
+                    }
+                    if (cLen >= 6 && std::memcmp(p, "\xFD" "7zXZ\0", 6) == 0) {
+                        return StreamCodecs::DecompressXzStream(p, cLen, outBytes, uLen + 64);
+                    }
+                    if (ZipDeflate::InflateZlib(p, cLen, outBytes, uLen + 64) ||
+                        ZipDeflate::InflateRaw(p, cLen, outBytes, uLen + 64))
+                    {
+                        return true;
+                    }
+                    if (cLen == uLen) {
+                        outBytes.assign(p, p + uLen);
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
     return false;
 }
 

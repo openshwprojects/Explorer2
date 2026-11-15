@@ -23,6 +23,9 @@
 namespace Explorer2 {
 
 #include "formats/Amf.h"
+#include "formats/ThreeMf.h"
+#include "formats/ColladaDae.h"
+#include "formats/Glb.h"
 #include "formats/X3d.h"
 #include "formats/Wrl.h"
 #include "formats/Scad.h"
@@ -273,9 +276,40 @@ try {
     #include "formats/Md3.h"
     #include "formats/Autodesk3ds.h"
     #include "formats/Blender.h"
-    #include "formats/Glb.h"
-    #include "formats/ThreeMf.h"
-    #include "formats/ColladaDae.h"
+    if (ext == L".glb" || ext == L".gltf") {
+        if (Formats::ParseGltfOrGlbMesh(buf.data(), buf.size(), fullPath, ext, mesh)) {
+            FinalizeMeshBoundsAndNormals(mesh);
+            if (mesh.loadedOk) return mesh;
+        }
+        LoadedMesh3D unreadable;
+        unreadable.filePath = fullPath;
+        unreadable.formatName = (ext == L".gltf") ? L"JSON glTF 2.0 (.gltf)" : L"Binary glTF 2.0 (.glb)";
+        unreadable.statusMessage = L"Nie udało się odczytać modelu glTF 2.0";
+        return unreadable;
+    }
+    if (ext == L".3mf") {
+        if (Formats::ParseThreeMfMesh(buf.data(), buf.size(), fullPath, mesh)) {
+            FinalizeMeshBoundsAndNormals(mesh);
+            if (mesh.loadedOk) return mesh;
+        }
+        LoadedMesh3D unreadable;
+        unreadable.filePath = fullPath;
+        unreadable.formatName = L"3D Manufacturing Format (.3mf)";
+        unreadable.statusMessage = L"Nie udało się odczytać modelu 3MF";
+        return unreadable;
+    }
+    if (ext == L".dae") {
+        std::string_view daeSv(reinterpret_cast<const char*>(buf.data()), buf.size());
+        if (Formats::ParseColladaDaeMesh(daeSv, mesh)) {
+            FinalizeMeshBoundsAndNormals(mesh);
+            if (mesh.loadedOk) return mesh;
+        }
+        LoadedMesh3D unreadable;
+        unreadable.filePath = fullPath;
+        unreadable.formatName = L"COLLADA 3D (.dae)";
+        unreadable.statusMessage = L"Nie udało się odczytać modelu COLLADA";
+        return unreadable;
+    }
     #include "formats/Vtk.h"
 
     // 11b. Autodesk FBX, binary and text (formats/Fbx.h)
@@ -295,7 +329,7 @@ try {
     {
         std::string_view sv(reinterpret_cast<const char*>(buf.data()), buf.size());
         bool parsedMod = false;
-        if (ext == L".amf")  parsedMod = Formats::ParseAmfMesh(sv, mesh);
+        if (ext == L".amf")  parsedMod = Formats::ParseAmfMesh(buf.data(), buf.size(), mesh);
         else if (ext == L".x3d")  parsedMod = Formats::ParseX3dMesh(sv, mesh);
         else if (ext == L".wrl")  parsedMod = Formats::ParseWrlMesh(sv, mesh);
         else if (ext == L".scad") parsedMod = Formats::ParseOpenScadMesh(sv, mesh);

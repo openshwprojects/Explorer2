@@ -5703,17 +5703,63 @@ static void RunStage14Tests(TestCounter& tc) {
         p32le(scs, 0); p32le(scs, 0); p32le(scs, 4); p32le(scs, 4);
         scs.insert(scs.end(), {'S','C','S','1'});
 
-        // #31 .squashfs ("hsqs" superblock)
-        std::vector<uint8_t> sqfs(128, 0);
-        std::memcpy(sqfs.data(), "hsqs", 4);
-        sqfs[4] = 3; sqfs[12] = 0; sqfs[13] = 0x10; sqfs[20] = 1; sqfs[28] = 4; sqfs[40] = 128; sqfs[72] = 96;
+        // #31 .squashfs (SquashFS 4.0 superblock + uncompressed inode/dir metadata + 1 file)
+        std::vector<uint8_t> sqfs(96, 0);
+        {
+            auto put16 = [](uint8_t* p, uint16_t v) { p[0] = v & 0xFFu; p[1] = (v >> 8) & 0xFFu; };
+            auto put32 = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
+            auto put64 = [](uint8_t* p, uint64_t v) { std::memcpy(p, &v, 8); };
+            const char* body = "HELLO\n";
+            sqfs.insert(sqfs.end(), body, body + 6); // raw file block @ 96
 
-        // #32 .erofs (0xE0F5E1E2 @ 1024)
-        std::vector<uint8_t> erofs(1200, 0);
-        uint32_t emag = 0xE0F5E1E2u;
-        std::memcpy(erofs.data() + 1024, &emag, 4);
-        erofs[1024 + 12] = 12; erofs[1024 + 16] = 5; erofs[1024 + 36] = 2;
-        std::memcpy(erofs.data() + 1024 + 48, "system_a", 8);
+            std::vector<uint8_t> dirRaw;
+            p32le(dirRaw, 0); p32le(dirRaw, 0); p32le(dirRaw, 2); // count-1=0, start=0, baseIno=2
+            p16le(dirRaw, 32); p16le(dirRaw, 0); p16le(dirRaw, 2); p16le(dirRaw, 5);
+            dirRaw.insert(dirRaw.end(), { 'h','i','.','t','x','t' });
+
+            std::vector<uint8_t> inoRaw(68, 0);
+            put16(inoRaw.data() + 0, 1); put16(inoRaw.data() + 2, 0755); put32(inoRaw.data() + 12, 1);
+            put32(inoRaw.data() + 20, 2); put16(inoRaw.data() + 24, static_cast<uint16_t>(dirRaw.size() + 3));
+            put32(inoRaw.data() + 28, 1);
+            put16(inoRaw.data() + 32, 2); put16(inoRaw.data() + 34, 0644); put32(inoRaw.data() + 44, 2);
+            put32(inoRaw.data() + 48, 96); put32(inoRaw.data() + 52, 0xFFFFFFFFu);
+            put32(inoRaw.data() + 60, 6); put32(inoRaw.data() + 64, 6u | (1u << 24)); // uncompressed block
+
+            uint64_t inoTbl = sqfs.size();
+            p16le(sqfs, static_cast<uint16_t>(0x8000u | inoRaw.size()));
+            sqfs.insert(sqfs.end(), inoRaw.begin(), inoRaw.end());
+            uint64_t dirTbl = sqfs.size();
+            p16le(sqfs, static_cast<uint16_t>(0x8000u | dirRaw.size()));
+            sqfs.insert(sqfs.end(), dirRaw.begin(), dirRaw.end());
+
+            std::memcpy(sqfs.data(), "hsqs", 4);
+            put32(sqfs.data() + 4, 2); put32(sqfs.data() + 12, 4096);
+            put16(sqfs.data() + 20, 1); put16(sqfs.data() + 22, 12); put16(sqfs.data() + 28, 4);
+            put64(sqfs.data() + 32, 0); put64(sqfs.data() + 40, sqfs.size());
+            put64(sqfs.data() + 64, inoTbl); put64(sqfs.data() + 72, dirTbl);
+            put64(sqfs.data() + 80, UINT64_MAX); put64(sqfs.data() + 88, UINT64_MAX);
+        }
+
+        // #32 .erofs (0xE0F5E1E2 @ 1024 + compact root dir + child file inode)
+        std::vector<uint8_t> erofs(3 * 4096, 0);
+        {
+            auto put16 = [](uint8_t* p, uint16_t v) { p[0] = v & 0xFFu; p[1] = (v >> 8) & 0xFFu; };
+            auto put32 = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
+            auto put64 = [](uint8_t* p, uint64_t v) { std::memcpy(p, &v, 8); };
+            uint8_t* sb = erofs.data() + 1024;
+            put32(sb + 0, 0xE0F5E1E2u); sb[12] = 12; put16(sb + 14, 0);
+            put64(sb + 16, 2); put32(sb + 36, 3); put32(sb + 40, 1); // meta_blkaddr = 1
+            std::memcpy(sb + 64, "system_a", 8);
+
+            uint8_t* n0 = erofs.data() + 4096; // NID 0: compact FLAT_INLINE root dir
+            put16(n0 + 0, 2u << 1); put16(n0 + 4, 0040755u); put32(n0 + 8, 19);
+            put64(n0 + 32, 2ULL); put16(n0 + 40, 12); n0[42] = 1;
+            std::memcpy(n0 + 44, "init.rc", 7);
+
+            uint8_t* n2 = erofs.data() + 4096 + 2 * 32; // NID 2: compact FLAT_PLAIN reg file @ blk 2
+            put16(n2 + 0, 0); put16(n2 + 4, 0100644u); put32(n2 + 8, 7); put32(n2 + 16, 2);
+            std::memcpy(erofs.data() + 2 * 4096, "on boot", 7);
+        }
 
         // #33 .cpio ("070701" newc)
         auto buildCpioEntry = [](const char* name, const char* body) {
@@ -6070,12 +6116,13 @@ static void RunStage14Tests(TestCounter& tc) {
     {
         auto strVec = [](const char* s) { return std::vector<uint8_t>(s, s + std::strlen(s)); };
 
-        // #66 .oas ("%SEMI-OASIS\r\n" + START + CELL + RECTANGLE)
+        // #66 .oas ("%SEMI-OASIS\r\n" + START + CELL + RECTANGLE + END)
         std::vector<uint8_t> oas = strVec("%SEMI-OASIS\r\n");
-        oas.insert(oas.end(), { 1, '1','.','0', 100, 0 }); // START
-        oas.insert(oas.end(), { 14, 3, 'T','O','P' });     // CELL "TOP"
-        oas.insert(oas.end(), { 20, 0xFF, 1, 0, 40, 20, 0, 0 }); // RECTANGLE layer=1 w=40 h=20 x=0 y=0
-        oas.push_back(2); // END
+        oas.insert(oas.end(), { 1, 3, '1','.','0', 0, 0xE8, 0x07, 1 }); // START: ver="1.0", unit=1000, offset-flag=1
+        oas.insert(oas.end(), { 14, 3, 'T','O','P' });                  // CELL "TOP"
+        oas.insert(oas.end(), { 20, 0x7B, 1, 0, 40, 20, 0, 0 });        // RECTANGLE L|D|W|H|X|Y: layer=1 w=40 h=20 x=0 y=0
+        oas.push_back(2);                                               // END + 12 zero table offsets + pad + scheme
+        oas.insert(oas.end(), 14, 0);
 
         // #71 .sr (Sigrok ZIP with metadata + logic-1-1)
         std::string srMeta = "[device 1]\ncapturefile=logic-1\ntotal probes=4\nsamplerate=1 MHz\nprobe1=CLK\nprobe2=MOSI\n";
@@ -6092,10 +6139,24 @@ static void RunStage14Tests(TestCounter& tc) {
             { "digital-0.bin", { 0,1,0,1,1,0,1,0,0,1,1,1,0,0,1,0 } }
         });
 
-        // #73 .wfm (Tektronix WFM#003 binary)
-        std::vector<uint8_t> wfm(900, 0);
-        std::memcpy(wfm.data(), ":WFM#003", 8);
-        for (int i = 0; i < 64; ++i) wfm[838 + i] = static_cast<uint8_t>(128 + (i % 16) * 4);
+        // #73 .wfm (Tektronix WFM#003 binary with LE marker + INT16 curve buffer)
+        std::vector<uint8_t> wfm(838 + 64 * 2, 0);
+        {
+            wfm[0] = 0x0F; wfm[1] = 0x0F;
+            std::memcpy(wfm.data() + 2, ":WFM#003", 8);
+            wfm[10] = 4;
+            uint32_t rem = static_cast<uint32_t>(wfm.size() - 15), cOff = 838, postOff = 128;
+            std::memcpy(wfm.data() + 11, &rem, 4);
+            wfm[15] = 2; // INT16
+            std::memcpy(wfm.data() + 16, &cOff, 4);
+            double dScale = 0.001;
+            std::memcpy(wfm.data() + 168, &dScale, 8);
+            std::memcpy(wfm.data() + (838 - 30) + 18, &postOff, 4);
+            for (int i = 0; i < 64; ++i) {
+                int16_t sv = static_cast<int16_t>((i % 16) * 200 - 1500);
+                std::memcpy(wfm.data() + 838 + i * 2, &sv, 2);
+            }
+        }
 
         // #74 .mf4 (ASAM MDF 4.x "MDF     " 64B ID + "##HD" block)
         std::vector<uint8_t> mf4(168, 0);
@@ -6103,9 +6164,13 @@ static void RunStage14Tests(TestCounter& tc) {
         std::memcpy(mf4.data() + 64, "##HD", 4);
         mf4[64 + 8] = 104;
 
-        // #80 .sof (Intel/Altera SRAM Object File)
-        std::vector<uint8_t> sof(128, 0x5A);
-        std::memcpy(sof.data(), "SOF\0EP4CE22F17C6\0", 17);
+        // #80 .sof (Intel/Altera SRAM Object File packet directory + bitstream)
+        std::vector<uint8_t> sof = { 'S','O','F',0 };
+        p32le(sof, 2); // 2 packets
+        p16le(sof, 2); p32le(sof, 13);
+        sof.insert(sof.end(), "EP4CE22F17C6", "EP4CE22F17C6" + 13);
+        p16le(sof, 6); p32le(sof, 64);
+        for (int i = 0; i < 64; ++i) sof.push_back(static_cast<uint8_t>((i * 37 + 0x5A) & 0xFFu));
 
         struct EdaCase { const wchar_t* ext; std::vector<uint8_t> bytes; };
         std::vector<EdaCase> ecases = {
@@ -6156,11 +6221,52 @@ static void RunStage14Tests(TestCounter& tc) {
     {
         auto strVec = [](const char* s) { return std::vector<uint8_t>(s, s + std::strlen(s)); };
 
-        // #81 .accdb (Microsoft Access ACE header)
-        std::vector<uint8_t> accdb(4096, 0);
+        // #81 .accdb (Microsoft Access ACE 4KB multi-page DB: MSysObjects + user TDEF + DATA rows)
+        std::vector<uint8_t> accdb(6 * 4096, 0);
         accdb[0] = 0x00; accdb[1] = 0x01;
         std::memcpy(accdb.data() + 4, "Standard ACE DB", 15);
-        accdb[0x14] = 2;
+        accdb[0x14] = 2; // ACE 12+
+        {
+            auto put16 = [](uint8_t* p, uint16_t v) { p[0] = v & 0xFFu; p[1] = (v >> 8) & 0xFFu; };
+            auto put32 = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
+            // Page 4: User table TDEF (2 cols: Id LONG fixed, Label TEXT var)
+            uint8_t* ut = accdb.data() + 4 * 4096;
+            ut[0] = 0x02; ut[1] = 0x01; put32(ut + 16, 2);
+            ut[40] = 0x53; // 'S' user table
+            put16(ut + 41, 2); put16(ut + 43, 1); put16(ut + 45, 2);
+            uint8_t* c0 = ut + 63;
+            c0[0] = 0x04; put16(c0 + 5, 0); put16(c0 + 9, 0); c0[15] = 0x01; put16(c0 + 21, 0); put16(c0 + 23, 4);
+            uint8_t* c1 = ut + 63 + 25;
+            c1[0] = 0x0A; put16(c1 + 5, 1); put16(c1 + 7, 0); put16(c1 + 9, 1); c1[15] = 0x02; put16(c1 + 23, 64);
+            size_t np = 63 + 50;
+            auto wrName = [&](const char* nm) {
+                size_t len = std::strlen(nm);
+                put16(ut + np, static_cast<uint16_t>(len * 2)); np += 2;
+                for (size_t i = 0; i < len; ++i) { put16(ut + np, static_cast<uint8_t>(nm[i])); np += 2; }
+            };
+            wrName("Id"); wrName("Label");
+            put32(ut + 8, static_cast<uint32_t>(np));
+
+            // Page 5: User table DATA (2 rows owned by TDEF page 4)
+            uint8_t* ud = accdb.data() + 5 * 4096;
+            ud[0] = 0x01; ud[1] = 0x01; put32(ud + 4, 4); put16(ud + 12, 2);
+            size_t curEnd = 4096;
+            const char* labels[2] = { "Node_Alpha", "Node_Beta" };
+            for (int rIdx = 0; rIdx < 2; ++rIdx) {
+                std::vector<uint8_t> r;
+                p16le(r, 2);
+                p32le(r, 100 + rIdx);
+                uint16_t v0 = static_cast<uint16_t>(r.size());
+                r.push_back(0xFF); r.push_back(0xFE);
+                r.insert(r.end(), labels[rIdx], labels[rIdx] + std::strlen(labels[rIdx]));
+                uint16_t eod = static_cast<uint16_t>(r.size());
+                p16le(r, eod); p16le(r, v0); p16le(r, 1);
+                r.push_back(0x03); // null bitmap: both columns non-null
+                curEnd -= r.size();
+                std::memcpy(ud + curEnd, r.data(), r.size());
+                put16(ud + 14 + rIdx * 2, static_cast<uint16_t>(curEnd));
+            }
+        }
 
         // #82 .rdb (Redis v0009 snapshot with AUX + DB 0 + key "user:1" = "Alice")
         std::vector<uint8_t> rdb = { 'R','E','D','I','S','0','0','0','9',

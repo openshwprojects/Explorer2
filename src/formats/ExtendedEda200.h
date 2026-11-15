@@ -449,51 +449,655 @@ inline bool ParseIbisTouchstoneOasis(const uint8_t* data, size_t size, const std
         out.kind = EdaDocKind::KiCadPcb;
         out.formatTitle = L"SEMI P39 OASIS Silicon IC Mask (.oas)";
 
-        size_t pos = 13;
-        int64_t modX = 0, modY = 0;
-        uint64_t modW = 100, modH = 100, modLayer = 1;
-        while (pos < size && out.traces.size() < 20000) {
-            uint8_t recId = data[pos++];
-            if (recId == 0) continue; // PAD
-            if (recId == 2) break;    // END record
-            if (recId == 1) {         // START: version string + unit real + offset-flag
-                uint64_t slen = DetailEda200::ReadOasisVarUInt(data, size, pos);
-                pos += static_cast<size_t>(slen);
-                continue;
-            }
-            if (recId == 13 || recId == 14) { // CELL
-                if (recId == 13) DetailEda200::ReadOasisVarUInt(data, size, pos);
-                else {
-                    uint64_t slen = DetailEda200::ReadOasisVarUInt(data, size, pos);
-                    pos += static_cast<size_t>(slen);
-                }
-                continue;
-            }
-            if (recId == 20 && pos < size) { // RECTANGLE
-                uint8_t info = data[pos++];
-                if (info & 0x01u) modLayer = DetailEda200::ReadOasisVarUInt(data, size, pos);
-                if (info & 0x02u) DetailEda200::ReadOasisVarUInt(data, size, pos); // datatype
-                if (info & 0x40u) modW = DetailEda200::ReadOasisVarUInt(data, size, pos);
-                if (info & 0x20u) modH = (info & 0x80u) ? modW : DetailEda200::ReadOasisVarUInt(data, size, pos);
-                else if (info & 0x80u) modH = modW;
-                if (info & 0x10u) modX = DetailEda200::ReadOasisVarSInt(data, size, pos);
-                if (info & 0x08u) modY = DetailEda200::ReadOasisVarSInt(data, size, pos);
-                if (info & 0x04u) DetailEda200::ReadOasisVarUInt(data, size, pos); // repetition
+        struct OasisPt { int64_t x = 0, y = 0; };
+        struct OasisShape {
+            uint8_t kind = 0; // 1=rect, 2=poly, 3=path, 4=circle, 5=text, 6=place
+            uint64_t layer = 0;
+            int64_t x = 0, y = 0;
+            uint64_t w = 0, h = 0;
+            std::vector<OasisPt> pts; // relative to (x, y)
+            std::string str;
+            double mag = 1.0, deg = 0.0;
+            bool flip = false;
+            std::vector<OasisPt> repOffsets; // includes (0,0)
+        };
+        struct OasisCell {
+            std::string name;
+            std::vector<OasisShape> shapes;
+        };
+        struct OasisModal {
+            bool xyAbs = true;
+            uint64_t layer = 0, datatype = 0, textLayer = 0, textType = 0;
+            int64_t geomX = 0, geomY = 0, textX = 0, textY = 0, placeX = 0, placeY = 0;
+            uint64_t rectW = 0, rectH = 0, circleR = 0, pathHalfW = 0;
+            int64_t pathStartExt = 0, pathEndExt = 0;
+            uint64_t ctrapType = 0, trapW = 0, trapH = 0;
+            std::vector<OasisPt> polyPts, pathPts;
+            std::vector<OasisPt> modalRep = { { 0, 0 } };
+            std::string textStr, placeCell;
+        };
 
-                float s = 0.05f;
-                float fw = std::max(0.5f, modW * s), fh = std::max(0.5f, modH * s);
-                float fx = modX * s + fw * 0.5f, fy = modY * s + fh * 0.5f;
-                EdaLayerId lid = (modLayer == 1) ? EdaLayerId::TopCopper : ((modLayer == 2) ? EdaLayerId::BottomCopper : EdaLayerId::InnerCopper);
-                DetailEda100::AddRectOutline(out, fx, fy, fw, fh, lid, 0.25f);
-            } else {
-                break; // Stop cleanly if complex CBLOCK encountered
+        struct OasisParser {
+            bool ok = true;
+            bool sawStart = false;
+            bool stopStream = false;
+            double unit = 1000.0;
+            uint64_t nextCellRef = 0, nextTextRef = 0;
+            std::vector<std::pair<uint64_t, std::string>> cellNames;
+            std::vector<std::pair<uint64_t, std::string>> textStrings;
+            std::vector<OasisCell> cells;
+            OasisModal mod;
+
+            uint8_t RdByte(const uint8_t* b, size_t n, size_t& p) {
+                if (p >= n) { ok = false; return 0; }
+                return b[p++];
+            }
+            uint64_t RdU(const uint8_t* b, size_t n, size_t& p) {
+                uint64_t v = 0;
+                int sh = 0;
+                while (p < n && sh < 64) {
+                    uint8_t c = b[p++];
+                    v |= static_cast<uint64_t>(c & 0x7Fu) << sh;
+                    if ((c & 0x80u) == 0) return v;
+                    sh += 7;
+                }
+                ok = false;
+                return 0;
+            }
+            int64_t RdS(const uint8_t* b, size_t n, size_t& p) {
+                uint64_t u = RdU(b, n, p);
+                int64_t m = static_cast<int64_t>(u >> 1);
+                return (u & 1ULL) ? -m : m;
+            }
+            std::string RdStr(const uint8_t* b, size_t n, size_t& p) {
+                uint64_t len = RdU(b, n, p);
+                if (!ok || len > n - p || len > 1048576ULL) { ok = false; return {}; }
+                std::string s(reinterpret_cast<const char*>(b + p), static_cast<size_t>(len));
+                p += static_cast<size_t>(len);
+                return s;
+            }
+            double RdReal(const uint8_t* b, size_t n, size_t& p) {
+                uint64_t tp = RdU(b, n, p);
+                if (!ok) return 1.0;
+                switch (tp) {
+                case 0: return static_cast<double>(RdU(b, n, p));
+                case 1: return -static_cast<double>(RdU(b, n, p));
+                case 2: { uint64_t d = RdU(b, n, p); return (d != 0) ? (1.0 / static_cast<double>(d)) : 1.0; }
+                case 3: { uint64_t d = RdU(b, n, p); return (d != 0) ? (-1.0 / static_cast<double>(d)) : -1.0; }
+                case 4: {
+                    uint64_t num = RdU(b, n, p), den = RdU(b, n, p);
+                    return (den != 0) ? (static_cast<double>(num) / static_cast<double>(den)) : 1.0;
+                }
+                case 5: {
+                    uint64_t num = RdU(b, n, p), den = RdU(b, n, p);
+                    return (den != 0) ? (-static_cast<double>(num) / static_cast<double>(den)) : -1.0;
+                }
+                case 6: {
+                    if (p + 4 > n) { ok = false; return 1.0; }
+                    uint32_t bits = DetailEda200::RdU32LE(b + p); p += 4;
+                    float fv = 1.0f; std::memcpy(&fv, &bits, 4);
+                    return static_cast<double>(fv);
+                }
+                case 7: {
+                    if (p + 8 > n) { ok = false; return 1.0; }
+                    uint64_t bits = DetailEda200::RdU64LE(b + p); p += 8;
+                    double dv = 1.0; std::memcpy(&dv, &bits, 8);
+                    return dv;
+                }
+                default: ok = false; return 1.0;
+                }
+            }
+            void SkipInterval(const uint8_t* b, size_t n, size_t& p) {
+                uint64_t it = RdU(b, n, p);
+                if (it == 0) return;
+                if (it >= 1 && it <= 3) { RdU(b, n, p); return; }
+                if (it == 4) { RdU(b, n, p); RdU(b, n, p); return; }
+                ok = false;
+            }
+            OasisPt DirMag(uint64_t dir, int64_t mag) {
+                switch (dir & 7ULL) {
+                case 0: return {  mag,    0 }; // E
+                case 1: return {    0,  mag }; // N
+                case 2: return { -mag,    0 }; // W
+                case 3: return {    0, -mag }; // S
+                case 4: return {  mag,  mag }; // NE
+                case 5: return { -mag,  mag }; // NW
+                case 6: return { -mag, -mag }; // SW
+                default:return {  mag, -mag }; // SE
+                }
+            }
+            OasisPt RdGDelta(const uint8_t* b, size_t n, size_t& p) {
+                uint64_t u = RdU(b, n, p);
+                if ((u & 1ULL) == 0) {
+                    return DirMag((u >> 1) & 7ULL, static_cast<int64_t>(u >> 4));
+                }
+                int64_t xm = static_cast<int64_t>(u >> 2);
+                int64_t dx = (u & 2ULL) ? -xm : xm;
+                int64_t dy = RdS(b, n, p);
+                return { dx, dy };
+            }
+            void RdPointList(const uint8_t* b, size_t n, size_t& p, bool isPoly, std::vector<OasisPt>& outPts) {
+                uint64_t ptype = RdU(b, n, p);
+                uint64_t vcnt = RdU(b, n, p);
+                if (!ok || ptype > 5 || vcnt == 0 || vcnt > 65536ULL) { ok = false; return; }
+                outPts.clear();
+                outPts.reserve(static_cast<size_t>(vcnt) + 2);
+                outPts.push_back({ 0, 0 });
+                int64_t cx = 0, cy = 0;
+                int64_t prevDx = 0, prevDy = 0;
+                for (uint64_t i = 0; i < vcnt && ok; ++i) {
+                    int64_t dx = 0, dy = 0;
+                    if (ptype == 0) {
+                        int64_t d = RdS(b, n, p);
+                        if ((i & 1ULL) == 0) dx = d; else dy = d;
+                    } else if (ptype == 1) {
+                        int64_t d = RdS(b, n, p);
+                        if ((i & 1ULL) == 0) dy = d; else dx = d;
+                    } else if (ptype == 2) {
+                        uint64_t u = RdU(b, n, p);
+                        OasisPt dm = DirMag(u & 3ULL, static_cast<int64_t>(u >> 2));
+                        dx = dm.x; dy = dm.y;
+                    } else if (ptype == 3) {
+                        uint64_t u = RdU(b, n, p);
+                        OasisPt dm = DirMag(u & 7ULL, static_cast<int64_t>(u >> 3));
+                        dx = dm.x; dy = dm.y;
+                    } else if (ptype == 4) {
+                        OasisPt dm = RdGDelta(b, n, p);
+                        dx = dm.x; dy = dm.y;
+                    } else {
+                        OasisPt dm = RdGDelta(b, n, p);
+                        prevDx += dm.x; prevDy += dm.y;
+                        dx = prevDx; dy = prevDy;
+                    }
+                    cx += dx; cy += dy;
+                    outPts.push_back({ cx, cy });
+                }
+                if (isPoly && (ptype == 0 || ptype == 1) && cx != 0 && cy != 0) {
+                    bool nextIsHoriz = (ptype == 0) ? ((vcnt & 1ULL) == 0) : ((vcnt & 1ULL) != 0);
+                    if (nextIsHoriz) outPts.push_back({ 0, cy });
+                    else outPts.push_back({ cx, 0 });
+                }
+            }
+            void RdRepetition(const uint8_t* b, size_t n, size_t& p, std::vector<OasisPt>& rep) {
+                uint64_t rtype = RdU(b, n, p);
+                if (!ok) return;
+                if (rtype == 0) return; // reuse modalRep
+                rep.clear();
+                constexpr size_t kMaxRep = 512;
+                if (rtype == 1) {
+                    uint64_t xd = RdU(b, n, p) + 2ULL;
+                    uint64_t yd = RdU(b, n, p) + 2ULL;
+                    int64_t xs = static_cast<int64_t>(RdU(b, n, p));
+                    int64_t ys = static_cast<int64_t>(RdU(b, n, p));
+                    for (uint64_t iy = 0; iy < yd && rep.size() < kMaxRep; ++iy)
+                        for (uint64_t ix = 0; ix < xd && rep.size() < kMaxRep; ++ix)
+                            rep.push_back({ static_cast<int64_t>(ix) * xs, static_cast<int64_t>(iy) * ys });
+                } else if (rtype == 2) {
+                    uint64_t xd = RdU(b, n, p) + 2ULL;
+                    int64_t xs = static_cast<int64_t>(RdU(b, n, p));
+                    for (uint64_t ix = 0; ix < xd && rep.size() < kMaxRep; ++ix)
+                        rep.push_back({ static_cast<int64_t>(ix) * xs, 0 });
+                } else if (rtype == 3) {
+                    uint64_t yd = RdU(b, n, p) + 2ULL;
+                    int64_t ys = static_cast<int64_t>(RdU(b, n, p));
+                    for (uint64_t iy = 0; iy < yd && rep.size() < kMaxRep; ++iy)
+                        rep.push_back({ 0, static_cast<int64_t>(iy) * ys });
+                } else if (rtype >= 4 && rtype <= 7) {
+                    bool isX = (rtype == 4 || rtype == 5);
+                    bool hasGrid = (rtype == 5 || rtype == 7);
+                    uint64_t dim = RdU(b, n, p) + 2ULL;
+                    int64_t gf = hasGrid ? static_cast<int64_t>(RdU(b, n, p)) : 1;
+                    if (dim > 65536ULL) { ok = false; return; }
+                    int64_t acc = 0;
+                    rep.push_back({ 0, 0 });
+                    for (uint64_t i = 1; i < dim && ok; ++i) {
+                        acc += static_cast<int64_t>(RdU(b, n, p)) * gf;
+                        if (rep.size() < kMaxRep) rep.push_back(isX ? OasisPt{ acc, 0 } : OasisPt{ 0, acc });
+                    }
+                } else if (rtype == 8) {
+                    uint64_t nd = RdU(b, n, p) + 2ULL;
+                    uint64_t md = RdU(b, n, p) + 2ULL;
+                    OasisPt nv = RdGDelta(b, n, p);
+                    OasisPt mv = RdGDelta(b, n, p);
+                    for (uint64_t im = 0; im < md && rep.size() < kMaxRep; ++im)
+                        for (uint64_t in = 0; in < nd && rep.size() < kMaxRep; ++in)
+                            rep.push_back({ static_cast<int64_t>(in) * nv.x + static_cast<int64_t>(im) * mv.x,
+                                            static_cast<int64_t>(in) * nv.y + static_cast<int64_t>(im) * mv.y });
+                } else if (rtype == 9) {
+                    uint64_t dim = RdU(b, n, p) + 2ULL;
+                    OasisPt dv = RdGDelta(b, n, p);
+                    for (uint64_t i = 0; i < dim && rep.size() < kMaxRep; ++i)
+                        rep.push_back({ static_cast<int64_t>(i) * dv.x, static_cast<int64_t>(i) * dv.y });
+                } else if (rtype == 10 || rtype == 11) {
+                    uint64_t cnt = RdU(b, n, p) + 2ULL;
+                    int64_t gf = (rtype == 11) ? static_cast<int64_t>(RdU(b, n, p)) : 1;
+                    if (cnt > 65536ULL) { ok = false; return; }
+                    int64_t ax = 0, ay = 0;
+                    rep.push_back({ 0, 0 });
+                    for (uint64_t i = 1; i < cnt && ok; ++i) {
+                        OasisPt dv = RdGDelta(b, n, p);
+                        ax += dv.x * gf; ay += dv.y * gf;
+                        if (rep.size() < kMaxRep) rep.push_back({ ax, ay });
+                    }
+                } else {
+                    ok = false;
+                }
+                if (rep.empty()) rep.push_back({ 0, 0 });
+            }
+            std::string LookupMap(const std::vector<std::pair<uint64_t, std::string>>& tbl, uint64_t ref, const char* pfx) {
+                for (const auto& kv : tbl) if (kv.first == ref) return kv.second;
+                return std::string(pfx) + std::to_string(ref);
+            }
+            void SkipPropValue(const uint8_t* b, size_t n, size_t& p) {
+                uint64_t vt = RdU(b, n, p);
+                if (!ok) return;
+                if (vt <= 3 || vt == 8 || vt == 13 || vt == 14 || vt == 15) { RdU(b, n, p); }
+                else if (vt == 4 || vt == 5) { RdU(b, n, p); RdU(b, n, p); }
+                else if (vt == 6) { if (p + 4 > n) ok = false; else p += 4; }
+                else if (vt == 7) { if (p + 8 > n) ok = false; else p += 8; }
+                else if (vt == 9) { RdS(b, n, p); }
+                else if (vt >= 10 && vt <= 12) { RdStr(b, n, p); }
+                else { ok = false; }
+            }
+
+            void ParseStream(const uint8_t* b, size_t n, size_t startPos, int depth) {
+                size_t p = startPos;
+                while (p < n && ok && !stopStream && cells.size() < 4096) {
+                    uint8_t recId = b[p++];
+                    if (recId == 0 || recId == 29) continue; // PAD / repeat PROPERTY
+                    if (recId == 2) { stopStream = true; break; } // END
+                    if (recId == 1) { // START
+                        std::string ver = RdStr(b, n, p);
+                        double u = RdReal(b, n, p);
+                        uint64_t offFlag = RdU(b, n, p);
+                        if (!ok || ver.empty() || ver[0] != '1' || !(u > 0.0) || !std::isfinite(u)) {
+                            ok = false; break;
+                        }
+                        unit = u;
+                        if (offFlag == 0) {
+                            for (int k = 0; k < 12 && ok; ++k) RdU(b, n, p);
+                        }
+                        sawStart = true;
+                        continue;
+                    }
+                    if (recId == 3) { cellNames.push_back({ nextCellRef++, RdStr(b, n, p) }); continue; }
+                    if (recId == 4) { std::string s = RdStr(b, n, p); uint64_t r = RdU(b, n, p); cellNames.push_back({ r, s }); continue; }
+                    if (recId == 5) { textStrings.push_back({ nextTextRef++, RdStr(b, n, p) }); continue; }
+                    if (recId == 6) { std::string s = RdStr(b, n, p); uint64_t r = RdU(b, n, p); textStrings.push_back({ r, s }); continue; }
+                    if (recId == 7 || recId == 9) { RdStr(b, n, p); continue; }
+                    if (recId == 8 || recId == 10) { RdStr(b, n, p); RdU(b, n, p); continue; }
+                    if (recId == 11 || recId == 12) { RdStr(b, n, p); SkipInterval(b, n, p); SkipInterval(b, n, p); continue; }
+                    if (recId == 13 || recId == 14) { // CELL
+                        std::string cname = (recId == 13) ? LookupMap(cellNames, RdU(b, n, p), "CELL_") : RdStr(b, n, p);
+                        cells.push_back({ std::move(cname), {} });
+                        mod = OasisModal{};
+                        continue;
+                    }
+                    if (recId == 15) { mod.xyAbs = true; continue; }
+                    if (recId == 16) { mod.xyAbs = false; continue; }
+                    if (recId == 28) { // PROPERTY
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x04u) {
+                            if (info & 0x02u) RdU(b, n, p);
+                            else RdStr(b, n, p);
+                        }
+                        if ((info & 0x08u) == 0) {
+                            uint64_t cnt = (info >> 4) & 0x0Fu;
+                            if (cnt == 15ULL) cnt = RdU(b, n, p);
+                            if (cnt > 65536ULL) { ok = false; break; }
+                            for (uint64_t k = 0; k < cnt && ok; ++k) SkipPropValue(b, n, p);
+                        }
+                        continue;
+                    }
+                    if (recId == 30) { RdU(b, n, p); RdStr(b, n, p); continue; }
+                    if (recId == 31) { RdU(b, n, p); RdStr(b, n, p); RdU(b, n, p); continue; }
+                    if (recId == 32) { RdU(b, n, p); RdStr(b, n, p); continue; }
+                    if (recId == 33) {
+                        uint8_t info = RdByte(b, n, p);
+                        RdU(b, n, p);
+                        if (info & 0x01u) mod.layer = RdU(b, n, p);
+                        if (info & 0x02u) mod.datatype = RdU(b, n, p);
+                        RdStr(b, n, p);
+                        if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.geomX = mod.xyAbs ? d : (mod.geomX + d); }
+                        if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.geomY = mod.xyAbs ? d : (mod.geomY + d); }
+                        if (info & 0x04u) RdRepetition(b, n, p, mod.modalRep);
+                        continue;
+                    }
+                    if (recId == 34) { // CBLOCK (RFC 1951 raw Deflate)
+                        uint64_t compType = RdU(b, n, p);
+                        uint64_t uncompSz = RdU(b, n, p);
+                        uint64_t compSz   = RdU(b, n, p);
+                        if (!ok || depth > 3 || compType != 0 || compSz > n - p || uncompSz > 32 * 1024 * 1024ULL) {
+                            ok = false; break;
+                        }
+                        std::vector<uint8_t> cblockBuf;
+                        if (!ZipDeflate::InflateRaw(b + p, static_cast<size_t>(compSz), cblockBuf, static_cast<size_t>(uncompSz) + 64)) {
+                            ok = false; break;
+                        }
+                        p += static_cast<size_t>(compSz);
+                        ParseStream(cblockBuf.data(), cblockBuf.size(), 0, depth + 1);
+                        continue;
+                    }
+
+                    if (cells.empty()) cells.push_back({ "TOP", {} });
+                    auto& curShapes = cells.back().shapes;
+
+                    if (recId == 17 || recId == 18) { // PLACEMENT
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x80u) {
+                            mod.placeCell = (info & 0x40u) ? LookupMap(cellNames, RdU(b, n, p), "CELL_") : RdStr(b, n, p);
+                        }
+                        double mag = 1.0, deg = 0.0;
+                        bool flip = (info & 0x01u) != 0;
+                        bool hasRep = false;
+                        if (recId == 17) {
+                            deg = static_cast<double>(((info >> 1) & 3u) * 90u);
+                            if (info & 0x20u) { int64_t d = RdS(b, n, p); mod.placeX = mod.xyAbs ? d : (mod.placeX + d); }
+                            if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.placeY = mod.xyAbs ? d : (mod.placeY + d); }
+                            hasRep = (info & 0x08u) != 0;
+                        } else {
+                            if (info & 0x20u) mag = RdReal(b, n, p);
+                            if (info & 0x10u) deg = RdReal(b, n, p);
+                            if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.placeX = mod.xyAbs ? d : (mod.placeX + d); }
+                            if (info & 0x04u) { int64_t d = RdS(b, n, p); mod.placeY = mod.xyAbs ? d : (mod.placeY + d); }
+                            hasRep = (info & 0x02u) != 0;
+                        }
+                        std::vector<OasisPt> reps = { { 0, 0 } };
+                        if (hasRep) { RdRepetition(b, n, p, mod.modalRep); reps = mod.modalRep; }
+                        if (ok && curShapes.size() < 16384) {
+                            OasisShape sh;
+                            sh.kind = 6;
+                            sh.x = mod.placeX; sh.y = mod.placeY;
+                            sh.str = mod.placeCell;
+                            sh.mag = mag; sh.deg = deg; sh.flip = flip;
+                            sh.repOffsets = std::move(reps);
+                            curShapes.push_back(std::move(sh));
+                        }
+                    } else if (recId == 19) { // TEXT
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x40u) {
+                            mod.textStr = (info & 0x20u) ? LookupMap(textStrings, RdU(b, n, p), "TXT_") : RdStr(b, n, p);
+                        }
+                        if (info & 0x01u) mod.textLayer = RdU(b, n, p);
+                        if (info & 0x02u) mod.textType  = RdU(b, n, p);
+                        if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.textX = mod.xyAbs ? d : (mod.textX + d); }
+                        if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.textY = mod.xyAbs ? d : (mod.textY + d); }
+                        std::vector<OasisPt> reps = { { 0, 0 } };
+                        if (info & 0x04u) { RdRepetition(b, n, p, mod.modalRep); reps = mod.modalRep; }
+                        if (ok && !mod.textStr.empty() && curShapes.size() < 16384) {
+                            OasisShape sh;
+                            sh.kind = 5;
+                            sh.layer = mod.textLayer;
+                            sh.x = mod.textX; sh.y = mod.textY;
+                            sh.str = mod.textStr;
+                            sh.repOffsets = std::move(reps);
+                            curShapes.push_back(std::move(sh));
+                        }
+                    } else if (recId == 20) { // RECTANGLE
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x01u) mod.layer    = RdU(b, n, p);
+                        if (info & 0x02u) mod.datatype = RdU(b, n, p);
+                        if (info & 0x40u) mod.rectW    = RdU(b, n, p);
+                        if (info & 0x80u) mod.rectH    = mod.rectW;
+                        else if (info & 0x20u) mod.rectH = RdU(b, n, p);
+                        if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.geomX = mod.xyAbs ? d : (mod.geomX + d); }
+                        if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.geomY = mod.xyAbs ? d : (mod.geomY + d); }
+                        std::vector<OasisPt> reps = { { 0, 0 } };
+                        if (info & 0x04u) { RdRepetition(b, n, p, mod.modalRep); reps = mod.modalRep; }
+                        if (ok && curShapes.size() < 16384) {
+                            OasisShape sh;
+                            sh.kind = 1; sh.layer = mod.layer;
+                            sh.x = mod.geomX; sh.y = mod.geomY;
+                            sh.w = mod.rectW; sh.h = mod.rectH;
+                            sh.repOffsets = std::move(reps);
+                            curShapes.push_back(std::move(sh));
+                        }
+                    } else if (recId == 21) { // POLYGON
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x01u) mod.layer    = RdU(b, n, p);
+                        if (info & 0x02u) mod.datatype = RdU(b, n, p);
+                        if (info & 0x20u) RdPointList(b, n, p, true, mod.polyPts);
+                        if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.geomX = mod.xyAbs ? d : (mod.geomX + d); }
+                        if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.geomY = mod.xyAbs ? d : (mod.geomY + d); }
+                        std::vector<OasisPt> reps = { { 0, 0 } };
+                        if (info & 0x04u) { RdRepetition(b, n, p, mod.modalRep); reps = mod.modalRep; }
+                        if (ok && mod.polyPts.size() >= 3 && curShapes.size() < 16384) {
+                            OasisShape sh;
+                            sh.kind = 2; sh.layer = mod.layer;
+                            sh.x = mod.geomX; sh.y = mod.geomY;
+                            sh.pts = mod.polyPts;
+                            sh.repOffsets = std::move(reps);
+                            curShapes.push_back(std::move(sh));
+                        }
+                    } else if (recId == 22) { // PATH
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x01u) mod.layer     = RdU(b, n, p);
+                        if (info & 0x02u) mod.datatype  = RdU(b, n, p);
+                        if (info & 0x40u) mod.pathHalfW = RdU(b, n, p);
+                        if (info & 0x80u) {
+                            uint8_t es = RdByte(b, n, p);
+                            uint8_t sSch = (es >> 2) & 3u, eSch = es & 3u;
+                            if (sSch == 3u) mod.pathStartExt = RdS(b, n, p);
+                            else if (sSch == 1u) mod.pathStartExt = 0;
+                            else if (sSch == 2u) mod.pathStartExt = static_cast<int64_t>(mod.pathHalfW);
+                            if (eSch == 3u) mod.pathEndExt = RdS(b, n, p);
+                            else if (eSch == 1u) mod.pathEndExt = 0;
+                            else if (eSch == 2u) mod.pathEndExt = static_cast<int64_t>(mod.pathHalfW);
+                        }
+                        if (info & 0x20u) RdPointList(b, n, p, false, mod.pathPts);
+                        if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.geomX = mod.xyAbs ? d : (mod.geomX + d); }
+                        if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.geomY = mod.xyAbs ? d : (mod.geomY + d); }
+                        std::vector<OasisPt> reps = { { 0, 0 } };
+                        if (info & 0x04u) { RdRepetition(b, n, p, mod.modalRep); reps = mod.modalRep; }
+                        if (ok && mod.pathPts.size() >= 2 && curShapes.size() < 16384) {
+                            OasisShape sh;
+                            sh.kind = 3; sh.layer = mod.layer;
+                            sh.x = mod.geomX; sh.y = mod.geomY;
+                            sh.w = mod.pathHalfW * 2ULL;
+                            sh.pts = mod.pathPts;
+                            sh.repOffsets = std::move(reps);
+                            curShapes.push_back(std::move(sh));
+                        }
+                    } else if (recId == 23 || recId == 24 || recId == 25) { // TRAPEZOID / CTRAPEZOID
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x01u) mod.layer    = RdU(b, n, p);
+                        if (info & 0x02u) mod.datatype = RdU(b, n, p);
+                        int64_t da = 0, db = 0;
+                        bool vert = false;
+                        if (recId == 25) {
+                            if (info & 0x80u) mod.ctrapType = RdU(b, n, p);
+                            if (info & 0x40u) mod.trapW = RdU(b, n, p);
+                            if (info & 0x20u) mod.trapH = RdU(b, n, p);
+                            if (mod.ctrapType >= 16 && mod.ctrapType <= 19) mod.trapH = mod.trapW;
+                            else if (mod.ctrapType >= 20 && mod.ctrapType <= 23) mod.trapW = mod.trapH;
+                            else if (mod.ctrapType == 24) mod.trapH = mod.trapW;
+                        } else {
+                            vert = (info & 0x80u) != 0;
+                            if (info & 0x40u) mod.trapW = RdU(b, n, p);
+                            if (info & 0x20u) mod.trapH = RdU(b, n, p);
+                            da = RdS(b, n, p);
+                            if (recId == 23) db = RdS(b, n, p);
+                        }
+                        if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.geomX = mod.xyAbs ? d : (mod.geomX + d); }
+                        if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.geomY = mod.xyAbs ? d : (mod.geomY + d); }
+                        std::vector<OasisPt> reps = { { 0, 0 } };
+                        if (info & 0x04u) { RdRepetition(b, n, p, mod.modalRep); reps = mod.modalRep; }
+                        if (ok && curShapes.size() < 16384) {
+                            int64_t tw = static_cast<int64_t>(mod.trapW), th = static_cast<int64_t>(mod.trapH);
+                            OasisShape sh;
+                            sh.kind = 2; sh.layer = mod.layer;
+                            sh.x = mod.geomX; sh.y = mod.geomY;
+                            if (recId == 25) {
+                                sh.pts = { { 0, 0 }, { tw, 0 }, { tw, th }, { 0, th } };
+                            } else if (!vert) {
+                                int64_t x0b = std::max<int64_t>(0, -da), x0t = std::max<int64_t>(0, da);
+                                int64_t x1b = tw - std::max<int64_t>(0, db), x1t = tw + std::min<int64_t>(0, db);
+                                sh.pts = { { x0b, 0 }, { x1b, 0 }, { x1t, th }, { x0t, th } };
+                            } else {
+                                int64_t y0l = std::max<int64_t>(0, -da), y0r = std::max<int64_t>(0, da);
+                                int64_t y1l = th - std::max<int64_t>(0, db), y1r = th + std::min<int64_t>(0, db);
+                                sh.pts = { { 0, y0l }, { tw, y0r }, { tw, y1r }, { 0, y1l } };
+                            }
+                            sh.repOffsets = std::move(reps);
+                            curShapes.push_back(std::move(sh));
+                        }
+                    } else if (recId == 26) { // CIRCLE
+                        uint8_t info = RdByte(b, n, p);
+                        if (info & 0x01u) mod.layer    = RdU(b, n, p);
+                        if (info & 0x02u) mod.datatype = RdU(b, n, p);
+                        if (info & 0x20u) mod.circleR  = RdU(b, n, p);
+                        if (info & 0x10u) { int64_t d = RdS(b, n, p); mod.geomX = mod.xyAbs ? d : (mod.geomX + d); }
+                        if (info & 0x08u) { int64_t d = RdS(b, n, p); mod.geomY = mod.xyAbs ? d : (mod.geomY + d); }
+                        std::vector<OasisPt> reps = { { 0, 0 } };
+                        if (info & 0x04u) { RdRepetition(b, n, p, mod.modalRep); reps = mod.modalRep; }
+                        if (ok && mod.circleR > 0 && curShapes.size() < 16384) {
+                            OasisShape sh;
+                            sh.kind = 4; sh.layer = mod.layer;
+                            sh.x = mod.geomX; sh.y = mod.geomY;
+                            sh.w = mod.circleR;
+                            sh.repOffsets = std::move(reps);
+                            curShapes.push_back(std::move(sh));
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        };
+
+        OasisParser parser;
+        parser.ParseStream(data, size, 13, 0);
+        if (!parser.ok || !parser.sawStart || parser.cells.empty()) return false;
+
+        double toUm = 1.0 / parser.unit;
+        auto mapLayer = [](uint64_t lyr) -> EdaLayerId {
+            switch (lyr & 3ULL) {
+            case 1: return EdaLayerId::TopCopper;
+            case 2: return EdaLayerId::BottomCopper;
+            case 3: return EdaLayerId::TopSilk;
+            default: return EdaLayerId::InnerCopper;
+            }
+        };
+        auto findCellIdx = [&](const std::string& nm) -> int {
+            for (size_t i = 0; i < parser.cells.size(); ++i) {
+                if (parser.cells[i].name == nm) return static_cast<int>(i);
+            }
+            return -1;
+        };
+
+        // Determine root cells (cells not instantiated via PLACEMENT by any other cell)
+        std::vector<bool> referenced(parser.cells.size(), false);
+        for (const auto& c : parser.cells) {
+            for (const auto& s : c.shapes) {
+                if (s.kind == 6) {
+                    int idx = findCellIdx(s.str);
+                    if (idx >= 0) referenced[static_cast<size_t>(idx)] = true;
+                }
             }
         }
-        if (out.traces.empty()) {
-            DetailEda100::AddRectOutline(out, 0, 0, 30, 30, EdaLayerId::EdgeCuts, 0.35f);
-            for (int r = 0; r < 4; ++r)
-                for (int c = 0; c < 4; ++c)
-                    DetailEda100::AddRectOutline(out, -9.0f + c * 6.0f, -9.0f + r * 6.0f, 4.2f, 4.2f, (r & 1) ? EdaLayerId::TopCopper : EdaLayerId::BottomCopper, 0.25f);
+
+        struct EmitCtx {
+            const OasisParser& P;
+            ParsedEdaBoard& out;
+            double toUm;
+            void EmitCell(int cellIdx, double oxUm, double oyUm, double scale, double rotDeg, bool flipY, int depth) {
+                if (depth > 8 || out.traces.size() >= 25000) return;
+                const auto& cell = P.cells[static_cast<size_t>(cellIdx)];
+                double rad = rotDeg * 3.14159265358979323846 / 180.0;
+                double cs = std::cos(rad), sn = std::sin(rad);
+                auto xform = [&](double lxUm, double lyUm) -> std::pair<float, float> {
+                    double sy = flipY ? -lyUm : lyUm;
+                    double sx = lxUm * scale, syy = sy * scale;
+                    double rx = oxUm + sx * cs - syy * sn;
+                    double ry = oyUm + sx * sn + syy * cs;
+                    return { static_cast<float>(rx), static_cast<float>(ry) };
+                };
+                auto mapL = [](uint64_t lyr) -> EdaLayerId {
+                    switch (lyr & 3ULL) {
+                    case 1: return EdaLayerId::TopCopper;
+                    case 2: return EdaLayerId::BottomCopper;
+                    case 3: return EdaLayerId::TopSilk;
+                    default: return EdaLayerId::InnerCopper;
+                    }
+                };
+
+                for (const auto& sh : cell.shapes) {
+                    if (out.traces.size() >= 25000) break;
+                    EdaLayerId lid = mapL(sh.layer);
+                    for (const auto& ro : sh.repOffsets) {
+                        if (out.traces.size() >= 25000) break;
+                        double bx = static_cast<double>(sh.x + ro.x) * toUm;
+                        double by = static_cast<double>(sh.y + ro.y) * toUm;
+                        if (sh.kind == 1) { // RECTANGLE
+                            double rw = static_cast<double>(sh.w) * toUm;
+                            double rh = static_cast<double>(sh.h) * toUm;
+                            if (rw <= 0.0 && rh <= 0.0) continue;
+                            auto p0 = xform(bx, by);
+                            auto p1 = xform(bx + rw, by);
+                            auto p2 = xform(bx + rw, by + rh);
+                            auto p3 = xform(bx, by + rh);
+                            out.traces.push_back({ p0.first, p0.second, p1.first, p1.second, 0.18f, lid, static_cast<int>(sh.layer + 1) });
+                            out.traces.push_back({ p1.first, p1.second, p2.first, p2.second, 0.18f, lid, static_cast<int>(sh.layer + 1) });
+                            out.traces.push_back({ p2.first, p2.second, p3.first, p3.second, 0.18f, lid, static_cast<int>(sh.layer + 1) });
+                            out.traces.push_back({ p3.first, p3.second, p0.first, p0.second, 0.18f, lid, static_cast<int>(sh.layer + 1) });
+                        } else if (sh.kind == 2 && sh.pts.size() >= 3) { // POLYGON / TRAPEZOID
+                            size_t m = sh.pts.size();
+                            for (size_t k = 0; k < m; ++k) {
+                                size_t kn = (k + 1) % m;
+                                auto a = xform(bx + static_cast<double>(sh.pts[k].x) * toUm, by + static_cast<double>(sh.pts[k].y) * toUm);
+                                auto b = xform(bx + static_cast<double>(sh.pts[kn].x) * toUm, by + static_cast<double>(sh.pts[kn].y) * toUm);
+                                out.traces.push_back({ a.first, a.second, b.first, b.second, 0.18f, lid, static_cast<int>(sh.layer + 1) });
+                            }
+                        } else if (sh.kind == 3 && sh.pts.size() >= 2) { // PATH
+                            float pw = std::clamp(static_cast<float>(static_cast<double>(sh.w) * toUm * scale), 0.12f, 4.0f);
+                            for (size_t k = 1; k < sh.pts.size(); ++k) {
+                                auto a = xform(bx + static_cast<double>(sh.pts[k - 1].x) * toUm, by + static_cast<double>(sh.pts[k - 1].y) * toUm);
+                                auto b = xform(bx + static_cast<double>(sh.pts[k].x) * toUm,     by + static_cast<double>(sh.pts[k].y) * toUm);
+                                out.traces.push_back({ a.first, a.second, b.first, b.second, pw, lid, static_cast<int>(sh.layer + 1) });
+                            }
+                        } else if (sh.kind == 4 && out.circles.size() < 8192) { // CIRCLE
+                            auto c = xform(bx, by);
+                            float r = std::max(0.05f, static_cast<float>(static_cast<double>(sh.w) * toUm * scale));
+                            out.circles.push_back({ c.first, c.second, r, std::min(0.20f, r * 0.35f), false, lid });
+                        } else if (sh.kind == 5 && out.labels.size() < 4096) { // TEXT
+                            auto c = xform(bx, by);
+                            out.labels.push_back({ c.first, c.second, 0.85f, EdaLayerId::TopSilk, PathUtils::Utf8ToWide(sh.str) });
+                        } else if (sh.kind == 6) { // PLACEMENT
+                            auto c = xform(bx, by);
+                            int subIdx = -1;
+                            for (size_t ci = 0; ci < P.cells.size(); ++ci) {
+                                if (P.cells[ci].name == sh.str) { subIdx = static_cast<int>(ci); break; }
+                            }
+                            if (subIdx >= 0 && subIdx != cellIdx) {
+                                EmitCell(subIdx, c.first, c.second, scale * sh.mag, rotDeg + sh.deg, flipY ^ sh.flip, depth + 1);
+                            } else if (out.pads.size() < 4096) {
+                                std::wstring wnm = PathUtils::Utf8ToWide(sh.str);
+                                float sz = static_cast<float>(2.0 * sh.mag * scale);
+                                out.pads.push_back({ c.first, c.second, sz, sz, static_cast<float>(rotDeg + sh.deg), 0.0f, 0, EdaLayerId::TopSilk, wnm, wnm });
+                                out.labels.push_back({ c.first, c.second, 0.7f, EdaLayerId::TopSilk, wnm });
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        (void)mapLayer;
+        EmitCtx emitter{ parser, out, toUm };
+        bool anyRoot = false;
+        for (size_t i = 0; i < parser.cells.size(); ++i) {
+            if (!referenced[i]) {
+                anyRoot = true;
+                emitter.EmitCell(static_cast<int>(i), 0.0, 0.0, 1.0, 0.0, false, 0);
+            }
+        }
+        if (!anyRoot) {
+            emitter.EmitCell(0, 0.0, 0.0, 1.0, 0.0, false, 0);
+        }
+
+        if (out.traces.empty() && out.circles.empty() && out.pads.empty() && out.labels.empty()) {
+            return false;
         }
         return true;
     }
@@ -715,32 +1319,121 @@ inline bool ParseFpgaPldJtag200(const uint8_t* data, size_t size, const std::wst
 
     // #80. Intel/Altera FPGA SRAM/PROM Bitstream (.sof / .pof)
     if (ext == L".sof" || ext == L".pof") {
-        if (size < 16) return false;
+        if (size < 14) return false;
+        bool isSofMagic = (std::memcmp(data, "SOF\0", 4) == 0);
+        bool isPofMagic = (std::memcmp(data, "POF\0", 4) == 0);
+        if (!isSofMagic && !isPofMagic) return false;
+
+        uint32_t packetCount = DetailEda200::RdU32LE(data + 4);
+        if (packetCount == 0 || packetCount > 4096) return false;
+
+        std::string devStr;
+        std::string creatorStr;
+        std::vector<uint8_t> cfgBytes;
+        size_t p = 8;
+        for (uint32_t pk = 0; pk < packetCount; ++pk) {
+            if (p + 6 > size) return false;
+            uint16_t tag  = DetailEda200::RdU16LE(data + p);
+            uint32_t plen = DetailEda200::RdU32LE(data + p + 2);
+            p += 6;
+            if (plen > size - p) return false;
+
+            const uint8_t* pay = data + p;
+            auto extractCleanAscii = [](const uint8_t* b, size_t n) -> std::string {
+                size_t s = 0;
+                while (s < n && (b[s] == 0 || b[s] == ' ' || b[s] == '\t')) ++s;
+                size_t e = s;
+                while (e < n && b[e] >= 32 && b[e] <= 126) ++e;
+                while (e > s && b[e - 1] == ' ') --e;
+                return (e > s) ? std::string(reinterpret_cast<const char*>(b + s), e - s) : std::string{};
+            };
+
+            if (tag == 1 && creatorStr.empty() && plen > 0 && plen <= 512) {
+                creatorStr = extractCleanAscii(pay, plen);
+            } else if (tag == 2 && devStr.empty() && plen > 0 && plen <= 256) {
+                devStr = extractCleanAscii(pay, plen);
+            } else if (plen >= 16) {
+                if (cfgBytes.size() < 4 * 1024 * 1024) {
+                    size_t take = std::min<size_t>(plen, 4 * 1024 * 1024 - cfgBytes.size());
+                    cfgBytes.insert(cfgBytes.end(), pay, pay + take);
+                }
+            }
+            if (devStr.empty() && tag != 1 && plen >= 4 && plen <= 64) {
+                std::string cand = extractCleanAscii(pay, plen);
+                if (cand.size() >= 4 && isalnum(static_cast<unsigned char>(cand[0]))) devStr = cand;
+            }
+            p += plen;
+        }
+
+        if (cfgBytes.size() < 16) return false;
+        if (devStr.empty()) devStr = isPofMagic ? "Altera_POF" : "Altera_SOF";
+
         out.kind = EdaDocKind::KiCadPcb;
-        // Extract printable FPGA device / Quartus string from header
-        std::string devStr = "Altera/Intel FPGA";
-        for (size_t i = 0; i + 6 < std::min<size_t>(size, 4096); ++i) {
-            if ((data[i] == 'E' && data[i + 1] == 'P') ||
-                std::memcmp(data + i, "5CE", 3) == 0 ||
-                std::memcmp(data + i, "10CL", 4) == 0 ||
-                std::memcmp(data + i, "10M", 3) == 0 ||
-                std::memcmp(data + i, "AGF", 3) == 0)
-            {
-                size_t k = i;
-                while (k < size && k - i < 24 && data[k] >= 33 && data[k] <= 126) ++k;
-                if (k - i >= 5) { devStr.assign(reinterpret_cast<const char*>(data + i), k - i); break; }
+        std::wstring wDev = PathUtils::Utf8ToWide(devStr);
+        out.formatTitle = (isPofMagic ? L"Intel/Altera POF Flash Bitstream (" : L"Intel/Altera SOF FPGA Bitstream (") + wDev + L")";
+
+        int side = std::clamp(static_cast<int>(std::sqrt(static_cast<double>(cfgBytes.size()) / 4.0)), 4, 16);
+        int cols = side, rows = side;
+        int numSec = cols * rows;
+        float pitch = 2.8f;
+        float pkgW = cols * pitch + 5.0f, pkgH = rows * pitch + 5.0f;
+        DetailEda100::AddRectOutline(out, 0.0f, 0.0f, pkgW, pkgH, EdaLayerId::EdgeCuts, 0.42f);
+
+        auto popcnt8 = [](uint8_t v) -> int {
+            v = static_cast<uint8_t>((v & 0x55u) + ((v >> 1) & 0x55u));
+            v = static_cast<uint8_t>((v & 0x33u) + ((v >> 2) & 0x33u));
+            return static_cast<int>((v + (v >> 4)) & 0x0Fu);
+        };
+
+        std::vector<float> secDensity(static_cast<size_t>(numSec), 0.0f);
+        for (int s = 0; s < numSec; ++s) {
+            size_t b0 = (static_cast<size_t>(s) * cfgBytes.size()) / static_cast<size_t>(numSec);
+            size_t b1 = (static_cast<size_t>(s + 1) * cfgBytes.size()) / static_cast<size_t>(numSec);
+            if (b1 <= b0) continue;
+            size_t activeBits = 0;
+            for (size_t i = b0; i < b1; ++i) {
+                uint8_t bv = isPofMagic ? static_cast<uint8_t>(~cfgBytes[i]) : cfgBytes[i];
+                activeBits += static_cast<size_t>(popcnt8(bv));
+            }
+            secDensity[static_cast<size_t>(s)] = static_cast<float>(activeBits) / static_cast<float>((b1 - b0) * 8u);
+        }
+
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                float sx = (c - (cols - 1) * 0.5f) * pitch;
+                float sy = ((rows - 1) * 0.5f - r) * pitch;
+                float dens = secDensity[static_cast<size_t>(r * cols + c)];
+                if (dens <= 0.0f) continue;
+
+                float padSz = 0.75f + dens * 1.55f;
+                EdaLayerId lid = (dens >= 0.55f) ? EdaLayerId::TopCopper :
+                                 (dens >= 0.20f) ? EdaLayerId::InnerCopper : EdaLayerId::BottomCopper;
+                std::wstring sName = L"S" + std::to_wstring(r) + L"_" + std::to_wstring(c);
+                out.pads.push_back({ sx, sy, padSz, padSz, 0.0f, 0.0f, 1, lid, sName, L"CFG" });
+
+                if (c + 1 < cols && secDensity[static_cast<size_t>(r * cols + c + 1)] > 0.0f) {
+                    float nx = ((c + 1) - (cols - 1) * 0.5f) * pitch;
+                    out.traces.push_back({ sx, sy, nx, sy, 0.12f + dens * 0.22f, lid, r + 1 });
+                }
+                if (r + 1 < rows && secDensity[static_cast<size_t>((r + 1) * cols + c)] > 0.0f) {
+                    float ny = ((rows - 1) * 0.5f - (r + 1)) * pitch;
+                    out.traces.push_back({ sx, sy, sx, ny, 0.12f + dens * 0.22f, lid, r + 1 });
+                }
             }
         }
-        out.formatTitle = L"Intel/Altera FPGA Bitstream (" + PathUtils::Utf8ToWide(devStr) + L")";
-        DetailEda100::AddRectOutline(out, 0.0f, 0.0f, 44.0f, 44.0f, EdaLayerId::EdgeCuts, 0.45f);
-        for (int r = 0; r < 6; ++r) {
-            for (int c = 0; c < 6; ++c) {
-                float x = -15.0f + c * 6.0f, y = -15.0f + r * 6.0f;
-                EdaLayerId lid = (c == 2 || c == 3) ? EdaLayerId::InnerCopper : EdaLayerId::TopCopper; // DSP/M20K columns vs LABs
-                DetailEda100::AddRectOutline(out, x, y, 4.6f, 4.6f, lid, 0.25f);
-            }
-        }
-        out.labels.push_back({ -16.0f, 24.0f, 1.3f, EdaLayerId::TopSilk, PathUtils::Utf8ToWide(devStr) });
+
+        EdaComponent3D die;
+        die.refDes = L"U1_FPGA";
+        die.value = wDev;
+        die.footprint = isPofMagic ? L"CFM_FLASH" : L"FPGA_DIE";
+        die.widthMm = cols * pitch;
+        die.lengthMm = rows * pitch;
+        die.heightMm = 1.6f;
+        die.category = EdaPartCategory::IC_Package;
+        out.components.push_back(std::move(die));
+
+        out.labels.push_back({ -pkgW * 0.46f, pkgH * 0.5f + 2.0f, 1.25f, EdaLayerId::TopSilk,
+            wDev + L" (" + std::to_wstring(packetCount) + L" pkts, " + std::to_wstring(cfgBytes.size()) + L" B)" });
         return true;
     }
 
@@ -849,48 +1542,251 @@ inline bool ParseLogicScopeAutoPlc200(const uint8_t* data, size_t size, const st
     // #73. Tektronix / Rigol Digital Oscilloscope Waveform (.wfm / .isf)
     if (ext == L".wfm" || ext == L".isf") {
         if (size < 16) return false;
-        out.kind = EdaDocKind::KiCadSch;
-        out.formatTitle = (ext == L".isf") ? L"Tektronix ISF Oscilloscope Trace (.isf)" : L"Digital Oscilloscope Waveform (.wfm)";
-        DetailEda200::DrawGraticule(out, -40.0f, -25.0f, 80.0f, 50.0f, 10, 8);
 
         std::vector<float> samples;
-        size_t curveP = sv.find("CURVE #");
-        if (curveP == std::string_view::npos) curveP = sv.find("CURV #");
-        if (curveP != std::string_view::npos) {
-            size_t hash = sv.find('#', curveP);
-            if (hash + 2 < size && data[hash + 1] >= '1' && data[hash + 1] <= '9') {
-                int ndig = data[hash + 1] - '0';
-                if (hash + 2 + ndig <= size) {
-                    size_t byteCnt = std::strtoul(std::string(sv.substr(hash + 2, ndig)).c_str(), nullptr, 10);
-                    size_t sOff = hash + 2 + ndig;
-                    size_t avail = std::min(byteCnt, size - sOff);
-                    for (size_t i = 0; i < avail && samples.size() < 1024; ++i) {
-                        samples.push_back(static_cast<float>(static_cast<int8_t>(data[sOff + i])));
+        std::wstring fmtTitle;
+        std::wstring metaLabel;
+
+        // 1. Tektronix Binary WFM (0x0F0F LE / 0xF0F0 BE + ":WFM#001" / ":WFM#002" / ":WFM#003")
+        bool isTekLe = (size >= 780 && data[0] == 0x0Fu && data[1] == 0x0Fu);
+        bool isTekBe = (size >= 780 && data[0] == 0xF0u && data[1] == 0xF0u);
+        if ((isTekLe || isTekBe) && std::memcmp(data + 2, ":WFM#00", 7) == 0 &&
+            (data[9] == '1' || data[9] == '2' || data[9] == '3'))
+        {
+            int wfmVer = data[9] - '0';
+            size_t minHdr = (wfmVer == 3) ? 838u : 780u;
+            if (size < minHdr) return false;
+            bool be = isTekBe;
+
+            auto rdU16 = [&](size_t o) -> uint16_t {
+                return be ? static_cast<uint16_t>((static_cast<uint16_t>(data[o]) << 8) | data[o + 1])
+                          : DetailEda200::RdU16LE(data + o);
+            };
+            auto rdU32 = [&](size_t o) -> uint32_t {
+                return be ? ((static_cast<uint32_t>(data[o]) << 24) |
+                             (static_cast<uint32_t>(data[o + 1]) << 16) |
+                             (static_cast<uint32_t>(data[o + 2]) << 8) |
+                             static_cast<uint32_t>(data[o + 3]))
+                          : DetailEda200::RdU32LE(data + o);
+            };
+            auto rdU64 = [&](size_t o) -> uint64_t {
+                return be ? ((static_cast<uint64_t>(rdU32(o)) << 32) | rdU32(o + 4))
+                          : DetailEda200::RdU64LE(data + o);
+            };
+            auto rdF64 = [&](size_t o) -> double {
+                uint64_t bits = rdU64(o);
+                double dv = 0.0;
+                std::memcpy(&dv, &bits, 8);
+                return dv;
+            };
+
+            uint8_t bpp = data[15];
+            uint32_t curveBufOff = rdU32(16);
+            if ((bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8) || curveBufOff < minHdr || curveBufOff >= size) {
+                return false;
+            }
+
+            size_t ed1 = (wfmVer == 1) ? 154u : 168u;
+            double dimScale  = rdF64(ed1 + 0);
+            double dimOffset = rdF64(ed1 + 8);
+            int32_t expFmt   = static_cast<int32_t>(rdU32(ed1 + 72));
+            if (!std::isfinite(dimScale) || std::fabs(dimScale) < 1e-18 || std::fabs(dimScale) > 1e12) dimScale = 1.0;
+            if (!std::isfinite(dimOffset) || std::fabs(dimOffset) > 1e12) dimOffset = 0.0;
+
+            size_t sStart = curveBufOff;
+            size_t sEnd   = size;
+            size_t cobj   = curveBufOff - 30u;
+            uint32_t dStartOff = rdU32(cobj + 14);
+            uint32_t dPostOff  = rdU32(cobj + 18);
+            if (dPostOff > dStartOff && curveBufOff + static_cast<size_t>(dPostOff) <= size &&
+                (dPostOff - dStartOff) >= static_cast<uint32_t>(bpp) * 2u)
+            {
+                sStart = curveBufOff + static_cast<size_t>(dStartOff);
+                sEnd   = curveBufOff + static_cast<size_t>(dPostOff);
+            }
+
+            size_t totalPts = (sEnd - sStart) / bpp;
+            if (totalPts < 2) return false;
+            size_t stepPts = std::max<size_t>(1, totalPts / 1024);
+            samples.reserve(std::min<size_t>(totalPts, 1025));
+
+            for (size_t idx = 0; idx < totalPts && samples.size() < 1024; idx += stepPts) {
+                size_t off = sStart + idx * bpp;
+                double raw = 0.0;
+                if (bpp == 1) {
+                    raw = (expFmt == 7) ? static_cast<double>(data[off]) : static_cast<double>(static_cast<int8_t>(data[off]));
+                } else if (bpp == 2) {
+                    uint16_t u = rdU16(off);
+                    raw = static_cast<double>(static_cast<int16_t>(u));
+                } else if (bpp == 4) {
+                    uint32_t u = rdU32(off);
+                    if (expFmt == 4) {
+                        float fv = 0.0f; std::memcpy(&fv, &u, 4);
+                        raw = std::isfinite(fv) ? static_cast<double>(fv) : 0.0;
+                    } else if (expFmt == 2) {
+                        raw = static_cast<double>(u);
+                    } else {
+                        raw = static_cast<double>(static_cast<int32_t>(u));
+                    }
+                } else {
+                    uint64_t u = rdU64(off);
+                    if (expFmt == 5 || expFmt == 6) {
+                        double dv = 0.0; std::memcpy(&dv, &u, 8);
+                        raw = std::isfinite(dv) ? dv : 0.0;
+                    } else {
+                        raw = static_cast<double>(static_cast<int64_t>(u));
                     }
                 }
+                samples.push_back(static_cast<float>(raw * dimScale + dimOffset));
             }
+            fmtTitle = L"Tektronix WFM#00" + std::to_wstring(wfmVer) + L" Oscilloscope Waveform (.wfm)";
+            metaLabel = L"Tek WFM#00" + std::to_wstring(wfmVer) + L" (" + std::to_wstring(totalPts) + L" pts)";
         }
-        if (samples.empty()) {
-            // Binary WFM: sample payload after header (skip 838 bytes if Tek WFM#003, else 64 bytes)
-            size_t hdrSkip = (size > 900 && sv.find("WFM#") != std::string_view::npos) ? 838 : std::min<size_t>(size / 2, 64);
-            size_t step = std::max<size_t>(1, (size - hdrSkip) / 512);
-            for (size_t i = hdrSkip; i < size && samples.size() < 512; i += step) {
-                samples.push_back(static_cast<float>(static_cast<int8_t>(data[i])));
+        // 2. Rigol Binary WFM (0xA5 0xA5 header magic)
+        else if (ext == L".wfm" && size >= 260 && data[0] == 0xA5u && data[1] == 0xA5u) {
+            size_t dataOff = 256u;
+            uint32_t candPts = DetailEda200::RdU32LE(data + 28);
+            size_t avail = size - dataOff;
+            size_t totalPts = (candPts >= 2 && candPts <= avail) ? static_cast<size_t>(candPts) : avail;
+            if (totalPts < 2) return false;
+
+            float vScale = 1.0f;
+            uint32_t vsRaw = DetailEda200::RdU32LE(data + 36);
+            if (vsRaw >= 100u && vsRaw <= 50000000u) {
+                vScale = static_cast<float>(vsRaw) * 1e-6f / 25.0f; // Rigol uV/div -> V/LSB
             }
+            size_t stepPts = std::max<size_t>(1, totalPts / 1024);
+            for (size_t i = 0; i < totalPts && samples.size() < 1024; i += stepPts) {
+                int adc = static_cast<int>(data[dataOff + i]) - 128;
+                samples.push_back(static_cast<float>(adc) * vScale);
+            }
+            fmtTitle = L"Rigol Digital Oscilloscope Waveform (.wfm)";
+            metaLabel = L"Rigol WFM (" + std::to_wstring(totalPts) + L" pts)";
+        }
+        // 3. Tektronix ISF (Internal Save Format: WFMPRE / BYT_NR + CURVE #...)
+        else {
+            size_t hdrScan = std::min<size_t>(size, 4096);
+            std::string upHdr(reinterpret_cast<const char*>(data), hdrScan);
+            for (char& c : upHdr) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+
+            bool hasIsfPre = (upHdr.find("BYT_N") != std::string::npos ||
+                              upHdr.find(":WFMP") != std::string::npos ||
+                              upHdr.find("WFMPRE") != std::string::npos);
+            size_t curvePos = upHdr.find("CURVE");
+            size_t kwLen = 5;
+            if (curvePos == std::string::npos) { curvePos = upHdr.find("CURV"); kwLen = 4; }
+            if (!hasIsfPre || curvePos == std::string::npos) return false;
+
+            std::string pre = upHdr.substr(0, curvePos);
+            auto parseTagF = [&](const char* tag, double defVal) -> double {
+                size_t tp = pre.find(tag);
+                if (tp == std::string::npos) return defVal;
+                tp += std::strlen(tag);
+                while (tp < pre.size() && (pre[tp] == ' ' || pre[tp] == '\t' || pre[tp] == ':')) ++tp;
+                char* ep = nullptr;
+                double v = std::strtod(pre.c_str() + tp, &ep);
+                return (ep != pre.c_str() + tp && std::isfinite(v)) ? v : defVal;
+            };
+
+            int bytNr = static_cast<int>(parseTagF("BYT_NR", parseTagF("BYT_N", 1.0)));
+            if (bytNr != 1 && bytNr != 2 && bytNr != 4) bytNr = 1;
+            bool msbFirst = (pre.find("LSB") == std::string::npos); // MSB is Tektronix ISF default
+            bool isUnsigned = (pre.find("BN_FMT RP") != std::string::npos || pre.find("BN_F RP") != std::string::npos);
+            bool isFloat    = (pre.find("BN_FMT FP") != std::string::npos || pre.find("BN_F FP") != std::string::npos);
+            double ymult = parseTagF("YMULT", parseTagF("YMU", 1.0));
+            double yoff  = parseTagF("YOFF",  parseTagF("YOF", 0.0));
+            double yzero = parseTagF("YZERO", parseTagF("YZE", 0.0));
+            if (std::fabs(ymult) < 1e-18) ymult = 1.0;
+
+            size_t cp = curvePos + kwLen;
+            while (cp < size && (data[cp] == ' ' || data[cp] == '\t')) ++cp;
+            if (cp >= size) return false;
+
+            if (data[cp] == '#') {
+                if (cp + 2 > size || data[cp + 1] < '0' || data[cp + 1] > '9') return false;
+                int ndig = data[cp + 1] - '0';
+                size_t sOff = 0, byteCnt = 0;
+                if (ndig == 0) {
+                    sOff = cp + 2;
+                    byteCnt = size - sOff;
+                } else {
+                    if (cp + 2 + static_cast<size_t>(ndig) > size) return false;
+                    for (int d = 0; d < ndig; ++d) {
+                        uint8_t ch = data[cp + 2 + d];
+                        if (ch < '0' || ch > '9') return false;
+                        byteCnt = byteCnt * 10u + static_cast<size_t>(ch - '0');
+                    }
+                    sOff = cp + 2 + static_cast<size_t>(ndig);
+                }
+                if (sOff >= size) return false;
+                size_t avail = std::min<size_t>(byteCnt, size - sOff);
+                size_t totalPts = avail / static_cast<size_t>(bytNr);
+                if (totalPts < 2) return false;
+                size_t stepPts = std::max<size_t>(1, totalPts / 1024);
+                for (size_t idx = 0; idx < totalPts && samples.size() < 1024; idx += stepPts) {
+                    size_t o = sOff + idx * static_cast<size_t>(bytNr);
+                    double raw = 0.0;
+                    if (bytNr == 1) {
+                        raw = isUnsigned ? static_cast<double>(data[o]) : static_cast<double>(static_cast<int8_t>(data[o]));
+                    } else if (bytNr == 2) {
+                        uint16_t u = msbFirst ? static_cast<uint16_t>((static_cast<uint16_t>(data[o]) << 8) | data[o + 1])
+                                              : DetailEda200::RdU16LE(data + o);
+                        raw = isUnsigned ? static_cast<double>(u) : static_cast<double>(static_cast<int16_t>(u));
+                    } else {
+                        uint32_t u = msbFirst ? ((static_cast<uint32_t>(data[o]) << 24) |
+                                                 (static_cast<uint32_t>(data[o + 1]) << 16) |
+                                                 (static_cast<uint32_t>(data[o + 2]) << 8) |
+                                                 static_cast<uint32_t>(data[o + 3]))
+                                              : DetailEda200::RdU32LE(data + o);
+                        if (isFloat) {
+                            float fv = 0.0f; std::memcpy(&fv, &u, 4);
+                            raw = std::isfinite(fv) ? static_cast<double>(fv) : 0.0;
+                        } else {
+                            raw = isUnsigned ? static_cast<double>(u) : static_cast<double>(static_cast<int32_t>(u));
+                        }
+                    }
+                    samples.push_back(static_cast<float>((raw - yoff) * ymult + yzero));
+                }
+            } else {
+                // ASCII CURVE values
+                std::string asc(reinterpret_cast<const char*>(data + cp), std::min<size_t>(size - cp, 65536));
+                const char* ap = asc.c_str();
+                while (*ap && samples.size() < 1024) {
+                    while (*ap == ' ' || *ap == '\t' || *ap == ',' || *ap == '\r' || *ap == '\n') ++ap;
+                    if (!*ap || *ap == ';') break;
+                    char* ep = nullptr;
+                    double raw = std::strtod(ap, &ep);
+                    if (ep == ap) break;
+                    if (std::isfinite(raw)) samples.push_back(static_cast<float>((raw - yoff) * ymult + yzero));
+                    ap = ep;
+                }
+            }
+            fmtTitle = L"Tektronix ISF Oscilloscope Trace (.isf)";
+            metaLabel = L"Tek ISF (" + std::to_wstring(samples.size()) + L" pts)";
         }
 
-        if (samples.size() >= 2) {
-            float mn = samples[0], mx = samples[0];
-            for (float v : samples) { mn = std::min(mn, v); mx = std::max(mx, v); }
-            float span = std::max(1.0f, mx - mn);
-            for (size_t i = 1; i < samples.size(); ++i) {
-                float x0 = -39.0f + (static_cast<float>(i - 1) / (samples.size() - 1)) * 78.0f;
-                float x1 = -39.0f + (static_cast<float>(i)     / (samples.size() - 1)) * 78.0f;
-                float y0 = -20.0f + ((samples[i - 1] - mn) / span) * 40.0f;
-                float y1 = -20.0f + ((samples[i]     - mn) / span) * 40.0f;
-                out.traces.push_back({ x0, y0, x1, y1, 0.30f, EdaLayerId::TopSilk, 1 });
-            }
+        if (samples.size() < 2) return false;
+
+        out.kind = EdaDocKind::KiCadSch;
+        out.formatTitle = fmtTitle;
+        DetailEda200::DrawGraticule(out, -40.0f, -25.0f, 80.0f, 50.0f, 10, 8);
+
+        float mn = samples[0], mx = samples[0];
+        for (float v : samples) { mn = std::min(mn, v); mx = std::max(mx, v); }
+        float span = std::max(1e-6f, mx - mn);
+
+        // Zero-volt ground reference indicator on graticule
+        float yZeroLine = std::clamp(-20.0f + ((0.0f - mn) / span) * 40.0f, -24.0f, 24.0f);
+        out.traces.push_back({ -40.0f, yZeroLine, -38.5f, yZeroLine, 0.28f, EdaLayerId::InnerCopper, 2 });
+
+        for (size_t i = 1; i < samples.size(); ++i) {
+            float x0 = -39.0f + (static_cast<float>(i - 1) / static_cast<float>(samples.size() - 1)) * 78.0f;
+            float x1 = -39.0f + (static_cast<float>(i)     / static_cast<float>(samples.size() - 1)) * 78.0f;
+            float y0 = -20.0f + ((samples[i - 1] - mn) / span) * 40.0f;
+            float y1 = -20.0f + ((samples[i]     - mn) / span) * 40.0f;
+            out.traces.push_back({ x0, y0, x1, y1, 0.30f, EdaLayerId::TopCopper, 1 });
         }
+        out.labels.push_back({ -39.0f, 26.8f, 1.15f, EdaLayerId::TopSilk, metaLabel });
         return true;
     }
 

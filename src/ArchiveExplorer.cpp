@@ -4013,6 +4013,9 @@ try {
     if (Formats::ExtractExtendedArchive100Entry(archivePath, data, size, extLower, normTarget, outBytes)) {
         return true;
     }
+    if (Formats::ExtractExtendedArchive200Entry(archivePath, data, size, extLower, normTarget, outBytes)) {
+        return true;
+    }
 
     // 7. TAR / TAR.GZ / OVA
     if (extLower == L".tar" || extLower == L".ova" || extLower == L".tgz" ||
