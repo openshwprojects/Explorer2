@@ -14,13 +14,24 @@ call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul
 :toolchain_ready
 
 if not exist build mkdir build
+if not "%E2_SKIP_GEN_VERSION%"=="1" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\gen_version.ps1" >nul 2>&1
+)
+set "E2_VER_RC="
+set "E2_VER_CL="
+if exist build\version_gen.h (
+    set "E2_VER_RC=/i build /i src /d E2_HAS_GENERATED_VERSION"
+    set "E2_VER_CL=/Ibuild /DE2_HAS_GENERATED_VERSION"
+) else (
+    set "E2_VER_RC=/i src"
+)
 del /Q build\Explorer2.running*.bak >nul 2>&1
 if exist Explorer2.exe move /Y Explorer2.exe build\Explorer2.running.%RANDOM%_%TIME:~6,2%.bak >nul 2>&1
 
-rc.exe /nologo /fo build\Explorer2.res src\Explorer2.rc
+rc.exe /nologo %E2_VER_RC% /fo build\Explorer2.res src\Explorer2.rc
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
-cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 ^
+cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\main.cpp ^
     src\FileEngine.cpp ^
     src\ImageFormatLoader.cpp ^
@@ -57,7 +68,7 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 ^
     /Fo:build\ ^
     /Fe:Explorer2.exe ^
     /link /SUBSYSTEM:WINDOWS build\Explorer2.res ^
-    user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib WindowsApp.lib Shcore.lib crypt32.lib setupapi.lib
+    user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib WindowsApp.lib Shcore.lib crypt32.lib setupapi.lib version.lib
 
 if %ERRORLEVEL% EQU 0 (
     del /Q build\Explorer2_v6.running*.bak >nul 2>&1

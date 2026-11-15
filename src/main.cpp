@@ -3,13 +3,43 @@
 #include "Monitoring.h"
 #include "PdfViewer.h"
 #include "SelfTestSuite.h"
+#include "Version.h"
 #include <objbase.h>
 #include <shellapi.h>
 #include <cwchar>
+#include <cstring>
 #include <memory>
+#include <string>
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    // Version query: `Explorer2.exe --version [outFile]` writes UTF-8 version string and exits immediately
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--version")) {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        std::wstring outFile;
+        if (argv) {
+            for (int i = 1; i < argc; ++i) {
+                if (wcscmp(argv[i], L"--version") == 0 && i + 1 < argc) {
+                    outFile = argv[i + 1];
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
+        if (!outFile.empty()) {
+            const std::string verLine = std::string("Explorer2 ") + E2_VERSION_FULL_STR + " [" + E2_VERSION_FILE_STR + "]\r\n";
+            HANDLE f = CreateFileW(outFile.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                WriteFile(f, verLine.data(), static_cast<DWORD>(verLine.size()), &written, nullptr);
+                CloseHandle(f);
+            }
+        }
+        CoUninitialize();
+        return 0;
+    }
 
     // Automated self-test runner: `Explorer2.exe --self-test <stage> <reportFile>`
     if (lpCmdLine && wcsstr(lpCmdLine, L"--self-test")) {
@@ -92,11 +122,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
     std::wstring initialPath;
     if (lpCmdLine && *lpCmdLine) {
         int argc = 0;
-        LPWSTR* argv = CommandLineToArgvW(lpCmdLine, &argc);
-        if (argv && argc > 0) {
-            initialPath = argv[0];
-            LocalFree(argv);
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv && argc > 1) {
+            initialPath = argv[1];
+            // Windows Explorer drive-root shell verb ("C:\") escapes the closing quote into a trailing '"'
+            while (!initialPath.empty() && (initialPath.back() == L'"' || initialPath.back() == L' ')) {
+                initialPath.pop_back();
+            }
+            if (initialPath.size() == 2 && initialPath[1] == L':') {
+                initialPath.push_back(L'\\');
+            }
         }
+        if (argv) LocalFree(argv);
     }
 
     auto app = std::make_unique<Explorer2::ExplorerApp>();

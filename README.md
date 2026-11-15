@@ -1,10 +1,17 @@
 # Explorer2
 
+[![Build & Release](https://github.com/openshwprojects/Explorer2/actions/workflows/build.yml/badge.svg)](https://github.com/openshwprojects/Explorer2/actions/workflows/build.yml)
+[![Latest Release](https://img.shields.io/github/v/release/openshwprojects/Explorer2?label=release)](https://github.com/openshwprojects/Explorer2/releases/latest)
+
 A native file manager for Windows, written in C++20 on plain Win32, Direct2D and DirectWrite.
 
 Explorer2 has no third-party library dependencies. The file views, the previewers and every
 file-format reader live in this repository and build into a single `Explorer2.exe`.
 The interface is available in Polish and English.
+
+Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.zip` and
+`SHA256SUMS.txt`) are built automatically by GitHub Actions on every push and published on the
+[Releases](https://github.com/openshwprojects/Explorer2/releases) page.
 
 ## Features
 
@@ -64,8 +71,17 @@ Requirements: Windows 10 or 11 (x64) and Visual Studio 2022, or its Build Tools,
 build.bat
 ```
 
-The script locates Visual Studio through `vswhere`, compiles everything in `src/` and writes
-`Explorer2.exe` to the repository root. Intermediate files go to `build/`.
+The script locates Visual Studio through `vswhere`, stamps version metadata from `VERSION` and Git
+into `build/version_gen.h`, compiles everything in `src/` and writes `Explorer2.exe` to the
+repository root. Intermediate files go to `build/`.
+
+To also package the Windows Setup installer (`Explorer2-Setup-<ver>-x64.exe`, requires
+[Inno Setup 6](https://jrsoftware.org/isinfo.php)), standalone versioned `.exe`, portable `.zip`
+and `SHA256SUMS.txt` into `dist/`:
+
+```bat
+build_installer.bat
+```
 
 ## Running
 
@@ -75,6 +91,7 @@ Explorer2.exe [folder]
 
 | Option | Purpose |
 | --- | --- |
+| `--version <file>` | Write the application version and PE file version to `<file>` and exit |
 | `--self-test <stage> [report]` | Run the built-in tests and exit (see [Self-tests](#self-tests)) |
 | `--dump-hw <file>` | Write a hardware, SMART and thermal diagnostics dump to a file and exit |
 | `--inspect-files <list> <result>` | Run the file readers on every file named in a list and record what each did (used by `tools/fuzz_samples.py`) |
@@ -132,7 +149,7 @@ $p = Start-Process .\Explorer2.exe -ArgumentList '--self-test','all','build\self
 $p.ExitCode
 ```
 
-`<stage>` is `all`, a stage number (`1` to `10`, `12`, `13` or `14`), or `100x`, which repeats
+`<stage>` is `all`, a stage number (`1` to `10`, `12`, `13`, `14` or `15`), or `100x`, which repeats
 stages 1 to 10 a hundred times.
 
 The tests read sample files from `testdata/`, which must sit next to the executable or in the
@@ -165,9 +182,12 @@ them at your own files:
 | `src/` | Application sources |
 | `src/formats/` | File-format readers, one header per format family |
 | `res/` | Application icon |
+| `installer/` | Inno Setup 6 Windows x64 installer definition (`Explorer2.iss`) |
 | `testdata/` | Sample files for the self-tests, with their sources and licences |
-| `tools/` | Scripts: `make_samples.py` regenerates the self-made samples, `fuzz_samples.py` is the damaged-file test |
+| `tools/` | Scripts: `gen_version.ps1` generates version headers, `make_samples.py` regenerates the self-made samples, `fuzz_samples.py` is the damaged-file test |
+| `VERSION` | Base semantic version (`MAJOR.MINOR.PATCH`) |
 | `build.bat` | Build script |
+| `build_installer.bat` | Builds `Explorer2.exe`, Setup installer, portable ZIP and `SHA256SUMS.txt` into `dist/` |
 
 ## License
 

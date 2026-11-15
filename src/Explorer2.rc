@@ -1,1 +1,33 @@
+#include <winver.h>
+#include "Version.h"
+
 101 ICON "res\\Explorer2.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    E2_VERSION_MAJOR,E2_VERSION_MINOR,E2_VERSION_PATCH,E2_VERSION_BUILD
+ PRODUCTVERSION E2_VERSION_MAJOR,E2_VERSION_MINOR,E2_VERSION_PATCH,E2_VERSION_BUILD
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "openshwprojects\0"
+            VALUE "FileDescription",  "Explorer2 - Native File Manager for Windows\0"
+            VALUE "FileVersion",      E2_VERSION_FILE_STR "\0"
+            VALUE "InternalName",     "Explorer2\0"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Explorer2 authors (GPL-3.0)\0"
+            VALUE "OriginalFilename", "Explorer2.exe\0"
+            VALUE "ProductName",      "Explorer2\0"
+            VALUE "ProductVersion",   E2_VERSION_FULL_STR "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

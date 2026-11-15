@@ -1,0 +1,202 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: 'Optional semantic version override (e.g. 1.2.0)'
+        required: false
+        type: string
+      publish_release:
+        description: 'Create/update GitHub Release with EXE & Installer'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 EXE & Installer
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version metadata
+        id: version
+        shell: pwsh
+        env:
+          E2_VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          & .\tools\gen_version.ps1
+
+      - name: Configure MSVC x64 toolchain
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile Explorer2.exe
+        shell: cmd
+        env:
+          E2_SKIP_GEN_VERSION: "1"
+        run: call build.bat
+
+      - name: Verify executable & PE version info
+        shell: pwsh
+        run: |
+          if (-not (Test-Path .\Explorer2.exe)) {
+              throw "Explorer2.exe was not produced by build.bat"
+          }
+          $p = Start-Process -FilePath .\Explorer2.exe -ArgumentList '--version','build\cli_version.txt' -NoNewWindow -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(30000)) {
+              taskkill /PID $p.Id /T /F | Out-Null
+              throw "Explorer2.exe --version timed out"
+          }
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0 -or -not (Test-Path build\cli_version.txt)) {
+              throw "Explorer2.exe --version failed with exit code $($p.ExitCode)"
+          }
+          $cliVer = (Get-Content build\cli_version.txt -Raw).Trim()
+          $vi = (Get-Item .\Explorer2.exe).VersionInfo
+          Write-Host "CLI Version : $cliVer"
+          Write-Host "FileVersion : $($vi.FileVersion)"
+          Write-Host "ProductVer  : $($vi.ProductVersion)"
+          if ([string]::IsNullOrWhiteSpace($vi.FileVersion)) {
+              throw "PE VS_VERSION_INFO resource missing from Explorer2.exe"
+          }
+
+      - name: Run built-in self-test suite
+        id: selftest
+        shell: pwsh
+        run: |
+          $report = "build\selftest_report.txt"
+          $crash  = "$report.crash.txt"
+          $p = Start-Process -FilePath .\Explorer2.exe -ArgumentList '--self-test','all',$report -NoNewWindow -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(300000)) {
+              taskkill /PID $p.Id /T /F | Out-Null
+              throw "Self-test suite timed out after 300s"
+          }
+          $p.WaitForExit()
+          $exitCode = $p.ExitCode
+          if (Test-Path $crash) {
+              Write-Host "=== CRASH RECORD ==="
+              Get-Content $crash
+          }
+          if (Test-Path $report) {
+              $lines = Get-Content $report
+              $fails = $lines | Where-Object { $_ -match '^\[FAIL\]' }
+              if ($fails) {
+                  Write-Host "=== FAILED TESTS ==="
+                  $fails | ForEach-Object { Write-Host $_ }
+              }
+              $summary = $lines | Select-Object -Last 1
+              Write-Host $summary
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "summary=$summary"
+          }
+          if ($exitCode -ne 0) {
+              throw "Explorer2 self-test suite failed with exit code $exitCode"
+          }
+
+      - name: Ensure Inno Setup 6 is installed
+        shell: pwsh
+        run: |
+          $iscc = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+              Write-Host "Installing Inno Setup via Chocolatey..."
+              choco install innosetup -y --no-progress
+          }
+
+      - name: Build Windows Installer, Portable ZIP & Checksums
+        shell: cmd
+        env:
+          E2_SKIP_BUILD: "1"
+          E2_SKIP_GEN_VERSION: "1"
+        run: call build_installer.bat
+
+      - name: Write GitHub Job Summary
+        if: always()
+        shell: pwsh
+        env:
+          E2_SEMVER: ${{ steps.version.outputs.semver }}
+          E2_FILEVER: ${{ steps.version.outputs.file_version }}
+          E2_FULLVER: ${{ steps.version.outputs.full_version }}
+          E2_TESTSUM: ${{ steps.selftest.outputs.summary }}
+        run: |
+          $md = @()
+          $md += "## Explorer2 Build ``v$env:E2_SEMVER``"
+          $md += ""
+          $md += "- **Version:** ``$env:E2_FULLVER``"
+          $md += "- **PE FileVersion:** ``$env:E2_FILEVER``"
+          if ($env:E2_TESTSUM) { $md += "- **Self-Tests:** ``$env:E2_TESTSUM``" }
+          $md += ""
+          if (Test-Path dist) {
+              $md += "### Generated Release Files"
+              $md += "| File | Size | SHA-256 |"
+              $md += "| --- | ---: | --- |"
+              Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
+                  $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                  $kb = "{0:N1} KB" -f ($_.Length / 1KB)
+                  $md += "| ``$($_.Name)`` | $kb | ``$hash`` |"
+              }
+          }
+          $md -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload Build & Installer Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Explorer2-${{ steps.version.outputs.semver }}-win-x64
+          path: |
+            dist/*
+            build/selftest_report.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: >-
+          github.event_name != 'pull_request' &&
+          !contains(github.event.head_commit.message || '', '[skip release]') &&
+          (github.event_name != 'workflow_dispatch' || inputs.publish_release == true || inputs.publish_release == 'true')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Explorer2 ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ### Downloads (Windows 10 / 11 x64)
+            - **Installer (Recommended):** `Explorer2-Setup-${{ steps.version.outputs.semver }}-x64.exe` — Installs Explorer2 with Start Menu shortcut, optional Desktop icon, and optional *"Open in Explorer2"* folder context menu (per-user or system-wide).
+            - **Standalone Executable:** `Explorer2-${{ steps.version.outputs.semver }}-x64.exe` — Single-file native portable executable (no installation or third-party runtime needed).
+            - **Portable Archive:** `Explorer2-${{ steps.version.outputs.semver }}-portable-x64.zip` — Portable ZIP with `Explorer2.exe`, `LICENSE`, and `README.md`.
+            - **Checksums:** `SHA256SUMS.txt`
+
+            **PE FileVersion:** `${{ steps.version.outputs.file_version }}` (`${{ steps.version.outputs.sha }}`)
+          files: |
+            dist/Explorer2-Setup-${{ steps.version.outputs.semver }}-x64.exe
+            dist/Explorer2-${{ steps.version.outputs.semver }}-x64.exe
+            dist/Explorer2-${{ steps.version.outputs.semver }}-portable-x64.zip
+            dist/SHA256SUMS.txt

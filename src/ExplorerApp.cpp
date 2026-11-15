@@ -2,6 +2,7 @@
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
+#include "Version.h"
 #include <windowsx.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -142,7 +143,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     {
         wchar_t exe[MAX_PATH] = {};
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        AppLog::Info(L"App", std::wstring(L"Explorer2 started  (pid ") + std::to_wstring(GetCurrentProcessId()) + L")  exe: " + exe);
+        AppLog::Info(L"App", std::wstring(L"Explorer2 v") + E2_VERSION_FULL_WSTR + L" started  (pid " + std::to_wstring(GetCurrentProcessId()) + L")  exe: " + exe);
         AppLog::Info(L"App", std::wstring(L"Start folder: ") + (initialPath.empty() ? L"(default)" : initialPath) + L"   log file: " + AppLog::FilePath());
     }
 
@@ -5604,7 +5605,9 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     }
     case CMD_HELP_SHORTCUTS: {
         const bool pl = (m_lang == Lang::PL);
-        const wchar_t* title = pl ? L"Explorer2 PRO — Skróty klawiszowe i funkcje" : L"Explorer2 PRO — Keyboard Shortcuts & Features";
+        const std::wstring titleStr = std::wstring(L"Explorer2 v") + E2_VERSION_FULL_WSTR +
+                                      (pl ? L" — Skróty klawiszowe i funkcje" : L" — Keyboard Shortcuts & Features");
+        const wchar_t* title = titleStr.c_str();
         const wchar_t* body = pl
             ? L"NAWIGACJA I KARTY:\n"
               L"  \x2022 Ctrl + T / Środkowy przycisk myszy  — Nowa karta folderu\n"
