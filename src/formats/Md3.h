@@ -1,12 +1,16 @@
 #pragma once
     // 6. Quake III MD3 Parser (.md3 - magic "IDP3" 0x33504449, version 15)
+    // Header: ident, version, name[64], flags (72), frames (76), tags (80), surfaces (84), skins (88),
+    // then the offsets of frames (92), tags (96), surfaces (100) and the end (104). A surface: ident,
+    // name[64], flags (68), frames (72), shaders (76), vertices (80), triangles (84), then the offsets of
+    // triangles (88), shaders (92), texture coordinates (96), vertices (100) and the end (104).
     if (ext == L".md3" || (buf.size() >= 108 && std::memcmp(buf.data(), "IDP3", 4) == 0)) {
         if (buf.size() >= 108 && std::memcmp(buf.data(), "IDP3", 4) == 0) {
             int32_t version = 0, numFrames = 0, numSurfaces = 0, ofsSurfaces = 0;
             std::memcpy(&version, buf.data() + 4, 4);
-            std::memcpy(&numFrames, buf.data() + 72, 4);
-            std::memcpy(&numSurfaces, buf.data() + 80, 4);
-            std::memcpy(&ofsSurfaces, buf.data() + 96, 4);
+            std::memcpy(&numFrames, buf.data() + 76, 4);
+            std::memcpy(&numSurfaces, buf.data() + 84, 4);
+            std::memcpy(&ofsSurfaces, buf.data() + 100, 4);
             if (numSurfaces > 0 && ofsSurfaces >= 108 && static_cast<size_t>(ofsSurfaces) < buf.size()) {
                 mesh.formatName = L"Quake III Model (.md3)";
                 mesh.animFrameCount = static_cast<size_t>(std::max(1, numFrames));
@@ -15,9 +19,9 @@
                     const uint8_t* sp = buf.data() + surfOff;
                     if (std::memcmp(sp, "IDP3", 4) != 0) break;
                     int32_t sVerts = 0, sTris = 0, ofsTris = 0, ofsXyz = 0, ofsEnd = 0;
-                    std::memcpy(&sVerts, sp + 76, 4);
-                    std::memcpy(&sTris,  sp + 80, 4);
-                    std::memcpy(&ofsTris, sp + 84, 4);
+                    std::memcpy(&sVerts, sp + 80, 4);
+                    std::memcpy(&sTris,  sp + 84, 4);
+                    std::memcpy(&ofsTris, sp + 88, 4);
                     std::memcpy(&ofsXyz,  sp + 100, 4);
                     std::memcpy(&ofsEnd,  sp + 104, 4);
                     if (sVerts > 0 && sTris > 0 &&

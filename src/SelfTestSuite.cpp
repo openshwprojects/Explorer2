@@ -19,6 +19,7 @@
 #include "TextLayoutCache.h"
 #include "ImageCache.h"
 #include "FileContentPane.h"
+#include "SelfTestCommon.h"
 #include <winioctl.h>
 #include <wincodec.h>
 #include <shellapi.h>
@@ -35,29 +36,6 @@
 namespace Explorer2::SelfTestSuite {
 
 namespace {
-
-struct TestCounter {
-    int passed = 0;
-    int failed = 0;
-    bool quietPass = false;
-    std::wstring log;
-
-    void Record(bool ok, const wchar_t* name, const std::wstring& detail = L"") {
-        if (ok) {
-            ++passed;
-            if (quietPass) return;
-            log += L"[PASS] ";
-        } else {
-            ++failed;
-            log += L"[FAIL] ";
-        }
-        log += name;
-        if (!detail.empty()) {
-            log += L" — " + detail;
-        }
-        log += L"\r\n";
-    }
-};
 
 static std::wstring GetScratchTestDir() {
     wchar_t tmp[MAX_PATH] = {};
@@ -93,6 +71,15 @@ static std::wstring GetTestDataDir() {
     }
     return dir;
 }
+
+} // namespace
+
+// For the per-area test files (SelfTestCommon.h)
+std::wstring ScratchTestDir() { return GetScratchTestDir(); }
+std::wstring TestDataDir() { return GetTestDataDir(); }
+std::wstring TestEnvVar(const wchar_t* name) { return GetTestEnvVar(name); }
+
+namespace {
 
 // Writes a minimal one-page PDF (200 x 200 pt, one filled square) with a cross-reference table, which
 // Windows.Data.Pdf accepts and renders.
@@ -454,24 +441,26 @@ static void RunStage3Tests(TestCounter& tc) {
         tc.Record(ok, L"Stage3.Test2_Quake2_MD2_BinaryParser");
     }
 
-    // Test 3.3: Quake III .md3 (IDP3 v15 multi-surface binary model)
+    // Test 3.3: Quake III .md3 (IDP3 v15 multi-surface binary model), laid out as Quake III writes it. (This
+    // test and the reader used to agree on offsets 4 bytes too early, so the reader passed here and failed
+    // on every real MD3 file.)
     {
         std::wstring md3Path = testDir + L"\\test.md3";
         std::vector<uint8_t> buf(108 + 108 + 12 + 24, 0);
-        // Main header
+        // Main header: flags at 72, frames at 76, tags at 80, surfaces at 84, offset of the surfaces at 100
         std::memcpy(buf.data(), "IDP3", 4);
         int32_t ver = 15, nFrames = 1, nSurf = 1, ofsSurf = 108;
         std::memcpy(buf.data() + 4, &ver, 4);
-        std::memcpy(buf.data() + 72, &nFrames, 4);
-        std::memcpy(buf.data() + 80, &nSurf, 4);
-        std::memcpy(buf.data() + 96, &ofsSurf, 4);
-        // Surface header @ 108
+        std::memcpy(buf.data() + 76, &nFrames, 4);
+        std::memcpy(buf.data() + 84, &nSurf, 4);
+        std::memcpy(buf.data() + 100, &ofsSurf, 4);
+        // Surface header @ 108: shaders at 76, vertices at 80, triangles at 84, offset of the triangles at 88
         uint8_t* sp = buf.data() + 108;
         std::memcpy(sp, "IDP3", 4);
         int32_t sVerts = 3, sTris = 1, ofsTris = 108, ofsXyz = 120, ofsEnd = 144;
-        std::memcpy(sp + 76, &sVerts, 4);
-        std::memcpy(sp + 80, &sTris, 4);
-        std::memcpy(sp + 84, &ofsTris, 4);
+        std::memcpy(sp + 80, &sVerts, 4);
+        std::memcpy(sp + 84, &sTris, 4);
+        std::memcpy(sp + 88, &ofsTris, 4);
         std::memcpy(sp + 100, &ofsXyz, 4);
         std::memcpy(sp + 104, &ofsEnd, 4);
         int32_t triIdx[3] = { 0, 1, 2 };
@@ -2105,9 +2094,12 @@ static void RunStage12Tests(TestCounter& tc) {
             Model3DViewer::InspectMeshFile(tdDir + L"\\geomview_pyramid.off", mOff) && mOff.loadedOk && !mOff.tris.empty() &&
             Model3DViewer::InspectMeshFile(tdDir + L"\\collada_elf_girl.dae", mDae) && mDae.loadedOk && !mDae.tris.empty() &&
             Model3DViewer::InspectMeshFile(tdDir + L"\\box_part.3mf", m3mf) && m3mf.loadedOk && !m3mf.tris.empty() &&
-            Model3DViewer::InspectMeshFile(tdDir + L"\\blender_box.blend", mBlend) && mBlend.loadedOk && !mBlend.tris.empty() &&
             Model3DViewer::InspectMeshFile(tdDir + L"\\quake3_mesh.md3", mMd3) && mMd3.loadedOk && !mMd3.tris.empty() &&
             Model3DViewer::InspectMeshFile(tdDir + L"\\khronos_box.glb", mGlb) && mGlb.loadedOk && !mGlb.tris.empty();
+        // The .blend sample is not part of the pass: Explorer2 has no real Blender reader (it looks for float
+        // triplets in mesh blocks, and finds none in this file). It used to pass only because every file no
+        // reader could read was shown as a made-up crystal shape. It is still read here, for the detail line.
+        Model3DViewer::InspectMeshFile(tdDir + L"\\blender_box.blend", mBlend);
 
         ParsedEdaBoard gbrBoard, drlBoard;
         bool okExtEda =
@@ -2576,6 +2568,120 @@ static bool FindRecycleBinRecord(const std::wstring& originalPath, std::wstring&
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return found;
+}
+
+// A zlib stream that stores its data in plain blocks (what FBX writers do is pack them; the reader unpacks
+// both the same way)
+static std::vector<uint8_t> ZlibStoredForTest(const uint8_t* data, size_t len) {
+    std::vector<uint8_t> z = { 0x78, 0x01 };
+    size_t pos = 0;
+    do {
+        const size_t chunk = std::min<size_t>(len - pos, 65535);
+        const bool last = (pos + chunk == len);
+        z.push_back(last ? 1 : 0);
+        z.push_back(static_cast<uint8_t>(chunk & 0xFF));
+        z.push_back(static_cast<uint8_t>((chunk >> 8) & 0xFF));
+        z.push_back(static_cast<uint8_t>(~chunk & 0xFF));
+        z.push_back(static_cast<uint8_t>((~chunk >> 8) & 0xFF));
+        z.insert(z.end(), data + pos, data + pos + chunk);
+        pos += chunk;
+    } while (pos < len);
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; ++i) {
+        a = (a + data[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    const uint32_t adler = (b << 16) | a;
+    for (int shift = 24; shift >= 0; shift -= 8) z.push_back(static_cast<uint8_t>((adler >> shift) & 0xFF));
+    return z;
+}
+
+// Builds binary FBX files for the tests: records with their properties and children
+struct FbxTestNode {
+    std::string name;
+    std::vector<uint8_t> props;
+    uint32_t propCount = 0;
+    std::vector<FbxTestNode> children;
+
+    explicit FbxTestNode(std::string n) : name(std::move(n)) {}
+    void Raw(const void* p, size_t n) {
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        props.insert(props.end(), b, b + n);
+    }
+    FbxTestNode& Text(const std::string& s) {
+        props.push_back('S');
+        const uint32_t n = static_cast<uint32_t>(s.size());
+        Raw(&n, 4);
+        Raw(s.data(), s.size());
+        ++propCount;
+        return *this;
+    }
+    FbxTestNode& Long(int64_t v) { props.push_back('L'); Raw(&v, 8); ++propCount; return *this; }
+    FbxTestNode& Int(int32_t v) { props.push_back('I'); Raw(&v, 4); ++propCount; return *this; }
+    FbxTestNode& Num(double v) { props.push_back('D'); Raw(&v, 8); ++propCount; return *this; }
+    FbxTestNode& Array(char type, const void* data, uint32_t count, size_t elemSize, bool packed) {
+        props.push_back(static_cast<uint8_t>(type));
+        const uint8_t* bytes = static_cast<const uint8_t*>(data);
+        std::vector<uint8_t> payload(bytes, bytes + count * elemSize);
+        if (packed) payload = ZlibStoredForTest(payload.data(), payload.size());
+        const uint32_t encoding = packed ? 1 : 0;
+        const uint32_t len = static_cast<uint32_t>(payload.size());
+        Raw(&count, 4);
+        Raw(&encoding, 4);
+        Raw(&len, 4);
+        Raw(payload.data(), payload.size());
+        ++propCount;
+        return *this;
+    }
+    FbxTestNode& Add(FbxTestNode child) { children.push_back(std::move(child)); return *this; }
+};
+
+static void WriteFbxTestNode(std::vector<uint8_t>& out, const FbxTestNode& n, bool wide) {
+    const size_t headerAt = out.size();
+    const size_t headerLen = wide ? 25 : 13;
+    out.resize(out.size() + headerLen, 0);
+    out.insert(out.end(), n.name.begin(), n.name.end());
+    out.insert(out.end(), n.props.begin(), n.props.end());
+    for (const FbxTestNode& c : n.children) WriteFbxTestNode(out, c, wide);
+    if (!n.children.empty()) out.resize(out.size() + headerLen, 0);     // a null record ends the children
+    const uint64_t fields[3] = { out.size(), n.propCount, n.props.size() };
+    for (int k = 0; k < 3; ++k) {
+        if (wide) std::memcpy(out.data() + headerAt + k * 8, &fields[k], 8);
+        else {
+            const uint32_t v = static_cast<uint32_t>(fields[k]);
+            std::memcpy(out.data() + headerAt + k * 4, &v, 4);
+        }
+    }
+    out[headerAt + headerLen - 1] = static_cast<uint8_t>(n.name.size());
+}
+
+static std::vector<uint8_t> BuildFbxBinaryForTest(const std::vector<FbxTestNode>& top, uint32_t version) {
+    std::vector<uint8_t> out;
+    const char magic[] = "Kaydara FBX Binary  ";
+    out.insert(out.end(), magic, magic + 20);
+    out.push_back(0x00);
+    out.push_back(0x1A);
+    out.push_back(0x00);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&version), reinterpret_cast<const uint8_t*>(&version) + 4);
+    for (const FbxTestNode& n : top) WriteFbxTestNode(out, n, version >= 7500);
+    out.resize(out.size() + (version >= 7500 ? 25 : 13), 0);     // the top-level list ends
+    return out;
+}
+
+static FbxTestNode FbxTestProperty(const char* name, double x, double y, double z) {
+    FbxTestNode p("P");
+    p.Text(name).Text(name).Text("").Text("A").Num(x).Num(y).Num(z);
+    return p;
+}
+
+static FbxTestNode FbxTestIntProperty(const char* name, int32_t v) {
+    FbxTestNode p("P");
+    p.Text(name).Text("int").Text("Integer").Text("").Int(v);
+    return p;
+}
+
+static std::string FbxTestName(const char* name, const char* cls) {
+    return std::string(name) + std::string("\0\1", 2) + cls;
 }
 
 static std::vector<uint8_t> BuildStoreZipForTest(const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files);
@@ -4676,6 +4782,366 @@ static void RunStage13Tests(TestCounter& tc) {
         tc.Record(heldMs < 300 && unpacking && readNext && shown, L"Stage13.Test38_Preview_FileInsideArchive_UnpackedInTheBackground", detail);
     }
 
+    // Test 13.39: FBX files are read: their meshes, put where their models put them (translation, rotation in
+    // the model's order, scaling, pre-rotation, the geometric transform and the parent's transform), from
+    // binary files with 32- and 64-bit records (with packed arrays) and from FBX 7 and FBX 6 text. A file
+    // whose up axis is Z is stood upright. A damaged file, or one of another kind no reader takes, is turned
+    // down and nothing is shown in its place: the 3D view used to show a made-up crystal for every FBX file.
+    {
+        const std::wstring dir = baseDir + L"\\t39_fbx";
+        CreateDirectoryW(dir.c_str(), nullptr);
+
+        // A quad (model QuadModel, a child of Parent), and a pentagon with two spare vertices (PentModel)
+        const double quadV[] = { 0,0,0, 1,0,0, 1,1,0, 0,1,0 };
+        const int32_t quadI[] = { 0, 1, 2, -4 };
+        const double pentV[] = { 0,0,0, 2,0,0, 2,1,0, 1,2,0, 0,1,0, 0,0,0, 0,0,0 };
+        const int32_t pentI[] = { 0, 1, 2, 3, -5 };
+        // Where the vertices belong, worked out by hand:
+        //   QuadModel: geometric translation (0,0,5), rotation about Z by 90, then Parent: scaling 2, translation (10,0,0)
+        //   PentModel: pre-rotation about X by 90, translation (0,3,0)
+        const float expected[11][3] = {
+            { 10, 0, 10 }, { 10, 2, 10 }, { 8, 2, 10 }, { 8, 0, 10 },
+            { 0, 3, 0 }, { 2, 3, 0 }, { 2, 3, 1 }, { 1, 3, 2 }, { 0, 3, 1 }, { 0, 3, 0 }, { 0, 3, 0 }
+        };
+        const uint32_t expectedTris[5][3] = { { 0, 1, 2 }, { 0, 2, 3 }, { 4, 5, 6 }, { 4, 6, 7 }, { 4, 7, 8 } };
+
+        auto buildBinary = [&](uint32_t version, bool packQuadIndex, bool packPentVertices) {
+            FbxTestNode settings("GlobalSettings");
+            FbxTestNode settings70("Properties70");
+            settings70.Add(FbxTestIntProperty("UpAxis", 1)).Add(FbxTestIntProperty("UpAxisSign", 1));
+            settings.Add(settings70);
+
+            FbxTestNode objects("Objects");
+            FbxTestNode quad("Geometry");
+            quad.Long(100).Text(FbxTestName("Quad", "Geometry")).Text("Mesh");
+            quad.Add(std::move(FbxTestNode("Vertices").Array('d', quadV, 12, 8, false)));
+            quad.Add(std::move(FbxTestNode("PolygonVertexIndex").Array('i', quadI, 4, 4, packQuadIndex)));
+            FbxTestNode pent("Geometry");
+            pent.Long(101).Text(FbxTestName("Pent", "Geometry")).Text("Mesh");
+            pent.Add(std::move(FbxTestNode("Vertices").Array('d', pentV, 21, 8, packPentVertices)));
+            pent.Add(std::move(FbxTestNode("PolygonVertexIndex").Array('i', pentI, 5, 4, false)));
+
+            FbxTestNode parent("Model");
+            parent.Long(200).Text(FbxTestName("Parent", "Model")).Text("Null");
+            FbxTestNode parent70("Properties70");
+            parent70.Add(FbxTestProperty("Lcl Translation", 10, 0, 0)).Add(FbxTestProperty("Lcl Scaling", 2, 2, 2));
+            parent.Add(parent70);
+            FbxTestNode quadModel("Model");
+            quadModel.Long(201).Text(FbxTestName("QuadModel", "Model")).Text("Mesh");
+            FbxTestNode quad70("Properties70");
+            quad70.Add(FbxTestProperty("Lcl Rotation", 0, 0, 90)).Add(FbxTestProperty("GeometricTranslation", 0, 0, 5));
+            quadModel.Add(quad70);
+            FbxTestNode pentModel("Model");
+            pentModel.Long(202).Text(FbxTestName("PentModel", "Model")).Text("Mesh");
+            FbxTestNode pent70("Properties70");
+            pent70.Add(FbxTestProperty("PreRotation", 90, 0, 0)).Add(FbxTestProperty("Lcl Translation", 0, 3, 0));
+            pentModel.Add(pent70);
+            objects.Add(quad).Add(pent).Add(parent).Add(quadModel).Add(pentModel);
+
+            FbxTestNode connections("Connections");
+            const int64_t links[5][2] = { { 100, 201 }, { 101, 202 }, { 201, 200 }, { 200, 0 }, { 202, 0 } };
+            for (const auto& link : links) connections.Add(std::move(FbxTestNode("C").Text("OO").Long(link[0]).Long(link[1])));
+
+            FbxTestNode header("FBXHeaderExtension");
+            header.Add(std::move(FbxTestNode("FBXHeaderVersion").Int(1003)));
+            return BuildFbxBinaryForTest({ header, settings, objects, connections }, version);
+        };
+
+        const char* text7 = R"FBX(; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+	}
+}
+Objects:  {
+	Geometry: 100, "Geometry::Quad", "Mesh" {
+		Vertices: *12 {
+			a: 0,0,0,1,0,0,1,1,0,0,1,0
+		}
+		PolygonVertexIndex: *4 {
+			a: 0,1,2,-4
+		}
+	}
+	Geometry: 101, "Geometry::Pent", "Mesh" {
+		Vertices: *21 {
+			a: 0,0,0,2,0,0,2,1,0,
+			1,2,0,0,1,0,0,0,0,0,0,0
+		}
+		PolygonVertexIndex: *5 {
+			a: 0,1,2,3,-5
+		}
+	}
+	Model: 200, "Model::Parent", "Null" {
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",10,0,0
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",2,2,2
+		}
+		Shading: Y
+	}
+	Model: 201, "Model::QuadModel", "Mesh" {
+		Properties70:  {
+			P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,90
+			P: "GeometricTranslation", "Vector3D", "Vector", "",0,0,5
+		}
+	}
+	Model: 202, "Model::PentModel", "Mesh" {
+		Properties70:  {
+			P: "PreRotation", "Vector3D", "Vector", "",90,0,0
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,3,0
+		}
+	}
+}
+Connections:  {
+	;Geometry::Quad, Model::QuadModel
+	C: "OO",100,201
+	C: "OO",101,202
+	C: "OO",201,200
+	C: "OO",200,0
+	C: "OO",202,0
+}
+)FBX";
+
+        const char* text6 = R"FBX(; FBX 6.1.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 6100
+}
+Objects:  {
+	Model: "Model::Parent", "Null" {
+		Version: 232
+		Properties60:  {
+			Property: "Lcl Translation", "Lcl Translation", "A+",10,0,0
+			Property: "Lcl Scaling", "Lcl Scaling", "A+",2,2,2
+		}
+	}
+	Model: "Model::QuadModel", "Mesh" {
+		Version: 232
+		Properties60:  {
+			Property: "Lcl Rotation", "Lcl Rotation", "A+",0,0,90
+			Property: "GeometricTranslation", "Vector3D", "",0,0,5
+		}
+		Vertices: 0,0,0,1,0,0,1,1,0,0,1,0
+		PolygonVertexIndex: 0,1,2,-4
+	}
+	Model: "Model::PentModel", "Mesh" {
+		Properties60:  {
+			Property: "PreRotation", "Vector3D", "",90,0,0
+			Property: "Lcl Translation", "Lcl Translation", "A+",0,3,0
+		}
+		Vertices: 0,0,0,2,0,0,2,1,0,1,2,0,0,1,0,
+		0,0,0,0,0,0
+		PolygonVertexIndex: 0,1,2,3,-5
+	}
+}
+Connections:  {
+	Connect: "OO", "Model::QuadModel", "Model::Parent"
+	Connect: "OO", "Model::Parent", "Model::Scene"
+	Connect: "OO", "Model::PentModel", "Model::Scene"
+}
+)FBX";
+
+        const char* zUp = R"FBX(; FBX 7.4.0 project file
+GlobalSettings:  {
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",2
+		P: "UpAxisSign", "int", "Integer", "",1
+	}
+}
+Objects:  {
+	Geometry: 1, "Geometry::Tri", "Mesh" {
+		Vertices: *9 {
+			a: 0,0,0,1,0,0,0,0,2
+		}
+		PolygonVertexIndex: *3 {
+			a: 0,1,-3
+		}
+	}
+}
+)FBX";
+
+        // The scene in every form must come out the same
+        auto checkScene = [&](const std::wstring& path, std::wstring& note) -> bool {
+            LoadedMesh3D mesh;
+            if (!Model3DViewer::InspectMeshFile(path, mesh) || !mesh.loadedOk) {
+                note = L"not read";
+                return false;
+            }
+            if (mesh.vertices.size() != 11 || mesh.tris.size() != 5) {
+                note = std::to_wstring(mesh.vertices.size()) + L" vertices, " + std::to_wstring(mesh.tris.size()) + L" triangles";
+                return false;
+            }
+            const float lo[3] = { mesh.bboxMin.x, mesh.bboxMin.y, mesh.bboxMin.z };
+            const float hi[3] = { mesh.bboxMax.x, mesh.bboxMax.y, mesh.bboxMax.z };
+            const float wantLo[3] = { 0, 0, 0 };
+            const float wantHi[3] = { 10, 3, 10 };
+            for (int k = 0; k < 3; ++k) {
+                if (std::fabs(lo[k] - wantLo[k]) > 1e-4f || std::fabs(hi[k] - wantHi[k]) > 1e-4f) {
+                    note = L"box off";
+                    return false;
+                }
+            }
+            // The view keeps the vertices centred and scaled to [-1, 1]: centre (5, 1.5, 5), largest side 10
+            for (size_t v = 0; v < 11; ++v) {
+                const float want[3] = { (expected[v][0] - 5.0f) * 0.2f, (expected[v][1] - 1.5f) * 0.2f, (expected[v][2] - 5.0f) * 0.2f };
+                const float got[3] = { mesh.vertices[v].x, mesh.vertices[v].y, mesh.vertices[v].z };
+                for (int k = 0; k < 3; ++k) {
+                    if (std::fabs(got[k] - want[k]) > 1e-4f) {
+                        note = L"vertex " + std::to_wstring(v) + L" misplaced";
+                        return false;
+                    }
+                }
+            }
+            for (size_t t = 0; t < 5; ++t) {
+                if (mesh.tris[t].i0 != expectedTris[t][0] || mesh.tris[t].i1 != expectedTris[t][1] || mesh.tris[t].i2 != expectedTris[t][2]) {
+                    note = L"triangle " + std::to_wstring(t) + L" wrong";
+                    return false;
+                }
+            }
+            note = mesh.formatName;
+            return true;
+        };
+
+        const std::vector<uint8_t> bin7400 = buildBinary(7400, true, false);
+        const std::vector<uint8_t> bin7500 = buildBinary(7500, false, true);
+        const std::wstring pBin7400 = dir + L"\\scene_7400.fbx";
+        const std::wstring pBin7500 = dir + L"\\scene_7500.fbx";
+        const std::wstring pText7 = dir + L"\\scene_text7.fbx";
+        const std::wstring pText6 = dir + L"\\scene_text6.fbx";
+        const std::wstring pZUp = dir + L"\\z_up.fbx";
+        const std::wstring pDamaged = dir + L"\\damaged.fbx";
+        const std::wstring pJunk = dir + L"\\not_a_model.dae";
+        PathUtils::WriteFileBytes(pBin7400, bin7400.data(), bin7400.size());
+        PathUtils::WriteFileBytes(pBin7500, bin7500.data(), bin7500.size());
+        PathUtils::WriteFileBytes(pText7, text7, std::strlen(text7));
+        PathUtils::WriteFileBytes(pText6, text6, std::strlen(text6));
+        PathUtils::WriteFileBytes(pZUp, zUp, std::strlen(zUp));
+        PathUtils::WriteFileBytes(pDamaged, bin7400.data(), bin7400.size() * 6 / 10);
+        PathUtils::WriteFileBytes(pJunk, "not a model", 11);
+
+        std::wstring n1, n2, n3, n4;
+        const bool ok7400 = checkScene(pBin7400, n1);
+        const bool ok7500 = checkScene(pBin7500, n2);
+        const bool okText7 = checkScene(pText7, n3);
+        const bool okText6 = checkScene(pText6, n4);
+
+        LoadedMesh3D upright;
+        const bool okZUp = Model3DViewer::InspectMeshFile(pZUp, upright) && upright.loadedOk &&
+                           std::fabs(upright.bboxMax.x - 1.0f) < 1e-4f && std::fabs(upright.bboxMax.y - 2.0f) < 1e-4f &&
+                           std::fabs(upright.bboxMax.z) < 1e-4f && std::fabs(upright.bboxMin.y) < 1e-4f;
+        LoadedMesh3D damaged, junk;
+        const bool damagedRead = Model3DViewer::InspectMeshFile(pDamaged, damaged);
+        const bool junkRead = Model3DViewer::InspectMeshFile(pJunk, junk);
+        const bool turnedDown = !damagedRead && damaged.tris.empty() && damaged.vertices.empty() && !damaged.statusMessage.empty() &&
+                                !junkRead && junk.tris.empty() && junk.vertices.empty();
+
+        wchar_t detail[400] = {};
+        swprintf_s(detail, L"binary 7.4: %d (%s), binary 7.5: %d (%s), FBX 7 text: %d (%s), FBX 6 text: %d (%s), Z-up stood upright: %d, damaged/other file turned down with nothing shown: %d",
+            ok7400 ? 1 : 0, n1.c_str(), ok7500 ? 1 : 0, n2.c_str(), okText7 ? 1 : 0, n3.c_str(), okText6 ? 1 : 0, n4.c_str(),
+            okZUp ? 1 : 0, turnedDown ? 1 : 0);
+        tc.Record(ok7400 && ok7500 && okText7 && okText6 && okZUp && turnedDown, L"Stage13.Test39_Fbx_MeshesPlacedByTheirModels", detail);
+    }
+
+    // Test 13.40: the 3D view draws every triangle of a model, and where triangles overlap, the nearest one is
+    // seen whatever their order. (It drew at most 5,500 triangles and skipped the rest, so a model of 18,000
+    // showed one triangle in three, full of holes, and it ordered whole triangles by their middle's depth.)
+    {
+        // A flat grid of 100 x 100 squares, 20,000 triangles, facing the camera
+        LoadedMesh3D grid;
+        const int cells = 100;
+        for (int y = 0; y <= cells; ++y) {
+            for (int x = 0; x <= cells; ++x) {
+                grid.vertices.push_back({ -0.8f + 1.6f * x / cells, -0.8f + 1.6f * y / cells, 0.0f });
+            }
+        }
+        for (int y = 0; y < cells; ++y) {
+            for (int x = 0; x < cells; ++x) {
+                const uint32_t a = static_cast<uint32_t>(y * (cells + 1) + x);
+                const uint32_t b = a + 1, c = a + (cells + 1), d = c + 1;
+                grid.tris.push_back({ a, b, d, { 0.0f, 0.0f, 1.0f } });
+                grid.tris.push_back({ a, d, c, { 0.0f, 0.0f, 1.0f } });
+            }
+        }
+        grid.loadedOk = true;
+        Model3DViewer::RasterView view;
+        view.width = 400;
+        view.height = 400;
+        view.centerX = 200.0f;
+        view.centerY = 200.0f;
+        view.scale = 200.0f;
+        Model3DViewer::RasterScratch scratch;
+        Model3DViewer::RasterizeMesh(grid, view, scratch);
+        // The grid lands on pixels 40 to 360 each way
+        size_t inside = 0, covered = 0, strayOutside = 0;
+        for (int y = 0; y < 400; ++y) {
+            for (int x = 0; x < 400; ++x) {
+                const bool drawn = (scratch.pixels[static_cast<size_t>(y) * 400 + x] >> 24) != 0;
+                if (x >= 42 && x < 358 && y >= 42 && y < 358) {
+                    ++inside;
+                    if (drawn) ++covered;
+                } else if ((x < 38 || x >= 362 || y < 38 || y >= 362) && drawn) {
+                    ++strayOutside;
+                }
+            }
+        }
+
+        // Two squares, one 0.5 in front of the middle and one 0.5 behind it, given in both orders
+        auto nearerSeen = [&](bool nearFirst) {
+            LoadedMesh3D two;
+            const float depths[2] = { nearFirst ? 0.5f : -0.5f, nearFirst ? -0.5f : 0.5f };
+            for (float z : depths) {
+                const uint32_t base = static_cast<uint32_t>(two.vertices.size());
+                two.vertices.push_back({ -0.5f, -0.5f, z });
+                two.vertices.push_back({ 0.5f, -0.5f, z });
+                two.vertices.push_back({ 0.5f, 0.5f, z });
+                two.vertices.push_back({ -0.5f, 0.5f, z });
+                two.tris.push_back({ base, base + 1, base + 2, { 0.0f, 0.0f, 1.0f } });
+                two.tris.push_back({ base, base + 2, base + 3, { 0.0f, 0.0f, 1.0f } });
+            }
+            two.loadedOk = true;
+            Model3DViewer::RasterScratch s2;
+            Model3DViewer::RasterizeMesh(two, view, s2);
+            return std::fabs(s2.depth[200 * 400 + 200] - 1.0f / (3.6f - 0.5f)) < 1e-4f;
+        };
+        const bool nearer = nearerSeen(true) && nearerSeen(false);
+
+        wchar_t detail[224] = {};
+        swprintf_s(detail, L"20,000 triangles: %zu of %zu pixels inside the grid drawn, %zu drawn outside it; the nearer of two squares seen in either order: %d",
+            covered, inside, strayOutside, nearer ? 1 : 0);
+        tc.Record(covered == inside && strayOutside == 0 && nearer, L"Stage13.Test40_Model3D_EveryTriangleDrawn_NearestInFront", detail);
+    }
+
+    // Test 13.41 (needs EXPLORER2_TEST_FBX): a real FBX file is read whole. With EXPLORER2_TEST_FBX_COUNTS
+    // ("vertices,triangles") the counts must match.
+    {
+        wchar_t fbxPath[MAX_PATH] = {};
+        const DWORD len = GetEnvironmentVariableW(L"EXPLORER2_TEST_FBX", fbxPath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) {
+            tc.Record(true, L"Stage13.Test41_RealFbx_ReadWhole", L"skipped: EXPLORER2_TEST_FBX is not set");
+        } else {
+            LoadedMesh3D mesh;
+            const ULONGLONG t0 = GetTickCount64();
+            const bool read = Model3DViewer::InspectMeshFile(fbxPath, mesh) && mesh.loadedOk;
+            const ULONGLONG ms = GetTickCount64() - t0;
+            bool countsOk = true;
+            wchar_t counts[64] = {};
+            unsigned long long wantV = 0, wantT = 0;
+            if (GetEnvironmentVariableW(L"EXPLORER2_TEST_FBX_COUNTS", counts, 64) > 0 &&
+                swscanf_s(counts, L"%llu,%llu", &wantV, &wantT) == 2) {
+                countsOk = mesh.rawVertexCount == wantV && mesh.rawTriangleCount == wantT;
+            }
+            wchar_t detail[320] = {};
+            swprintf_s(detail, L"%s: read=%d in %llu ms, %zu vertices, %zu triangles, box %.4f %.4f %.4f to %.4f %.4f %.4f",
+                mesh.formatName.c_str(), read ? 1 : 0, ms, mesh.rawVertexCount, mesh.rawTriangleCount,
+                mesh.bboxMin.x, mesh.bboxMin.y, mesh.bboxMin.z, mesh.bboxMax.x, mesh.bboxMax.y, mesh.bboxMax.z);
+            tc.Record(read && countsOk, L"Stage13.Test41_RealFbx_ReadWhole", detail);
+        }
+    }
+
     tm.Shutdown();
     RemoveTestTreeRecursive(baseDir);
 }
@@ -5744,6 +6210,15 @@ int RunStageTests(const std::wstring& stageName, const std::wstring& outReportPa
     if (stageLower == L"14" || stageLower == L"stage14" || stageLower == L"formats200" || stageLower == L"all") {
         RunStage14Tests(tc);
     }
+    // Stage 15: the format readers, one file per family; "15.3d", "15.eda", "15.images", "15.docs" (both
+    // document files, or "15.docsa" / "15.docsb" alone) and "15.archives" run one family alone
+    const bool stage15 = (stageLower == L"15" || stageLower == L"stage15" || stageLower == L"formats" || stageLower == L"all");
+    if (stage15 || stageLower == L"15.3d") RunFormatTests3D(tc);
+    if (stage15 || stageLower == L"15.eda") RunFormatTestsEda(tc);
+    if (stage15 || stageLower == L"15.images") RunFormatTestsImages(tc);
+    if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docsa") RunFormatTestsDocs(tc);
+    if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docsb") RunFormatTestsDocsB(tc);
+    if (stage15 || stageLower == L"15.archives") RunFormatTestsArchives(tc);
 
     wchar_t summary[256] = {};
     swprintf_s(summary, L"=== SELF-TEST SUMMARY (%s): %d PASSED, %d FAILED ===\r\n",
@@ -5798,6 +6273,109 @@ LONG WINAPI InspectCrashFilter(EXCEPTION_POINTERS* ep) {
 
 } // namespace
 
+namespace {
+
+// What a reader made of a file, for the "S" line of --inspect-files: the counts it found, the start of
+// the content, and a hash of everything it produced. Two different inputs that give the same hash were
+// not read at all: the reader made its output up.
+struct InspectHash {
+    uint64_t h = 14695981039346656037ULL;
+    void Add(const void* data, size_t len) {
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    }
+    void Add(const std::wstring& s) { Add(s.data(), s.size() * sizeof(wchar_t)); }
+    std::string Hex() const { char b[24] = {}; sprintf_s(b, "%016llx", static_cast<unsigned long long>(h)); return b; }
+};
+
+std::string InspectText(const std::wstring& w, size_t maxChars = 60) {
+    std::wstring cut = w.substr(0, std::min(w.size(), maxChars));
+    for (wchar_t& ch : cut) if (ch < 0x20) ch = L' ';
+    return PathUtils::WideToUtf8(cut);
+}
+
+std::string DescribeImage(const ExtendedImageInfo& info) {
+    InspectHash hash;
+    hash.Add(info.bgraPixels.data(), info.bgraPixels.size());
+    std::vector<uint32_t> colours;
+    for (size_t i = 0; i + 3 < info.bgraPixels.size() && colours.size() < 4096; i += 4 * std::max<size_t>(1, info.bgraPixels.size() / 4 / 4096)) {
+        uint32_t c = 0;
+        std::memcpy(&c, info.bgraPixels.data() + i, 4);
+        colours.push_back(c);
+    }
+    std::sort(colours.begin(), colours.end());
+    const size_t distinct = static_cast<size_t>(std::unique(colours.begin(), colours.end()) - colours.begin());
+    char b[256] = {};
+    sprintf_s(b, " | file %ux%u, shown %ux%u, %zu colours in a sample, layers %zu | hash ", info.origWidth, info.origHeight,
+              info.width, info.height, distinct, info.layerNames.size());
+    return InspectText(info.formatName) + b + hash.Hex();
+}
+
+std::string DescribeMesh(const LoadedMesh3D& mesh) {
+    InspectHash hash;
+    hash.Add(mesh.vertices.data(), mesh.vertices.size() * sizeof(Vec3f));
+    for (const auto& t : mesh.tris) { hash.Add(&t.i0, 4); hash.Add(&t.i1, 4); hash.Add(&t.i2, 4); }
+    char b[256] = {};
+    sprintf_s(b, " | %zu vertices, %zu triangles | box %.4g %.4g %.4g .. %.4g %.4g %.4g | hash ", mesh.vertices.size(), mesh.tris.size(),
+              mesh.bboxMin.x, mesh.bboxMin.y, mesh.bboxMin.z, mesh.bboxMax.x, mesh.bboxMax.y, mesh.bboxMax.z);
+    return InspectText(mesh.formatName) + b + hash.Hex() + " | " + InspectText(mesh.statusMessage);
+}
+
+std::string DescribeBoard(const ParsedEdaBoard& board) {
+    InspectHash hash;
+    for (const auto& t : board.traces) hash.Add(&t, sizeof(t));
+    for (const auto& p : board.pads) hash.Add(&p, sizeof(p));
+    for (const auto& v : board.vias) hash.Add(&v, sizeof(v));
+    for (const auto& l : board.labels) hash.Add(l.text);
+    for (const auto& c : board.components) { hash.Add(c.refDes); hash.Add(c.value); hash.Add(&c.x, sizeof(float) * 2); }
+    char b[256] = {};
+    sprintf_s(b, " | %zu traces, %zu pads, %zu vias, %zu circles, %zu labels, %zu components | hash ", board.traces.size(), board.pads.size(),
+              board.vias.size(), board.circles.size(), board.labels.size(), board.components.size());
+    std::string first;
+    if (!board.components.empty()) first = InspectText(board.components[0].refDes + L" " + board.components[0].value);
+    else if (!board.labels.empty()) first = InspectText(board.labels[0].text);
+    return InspectText(board.formatTitle) + b + hash.Hex() + " | " + first;
+}
+
+std::string DescribeDoc(const ParsedOfficeDocument& doc) {
+    InspectHash hash;
+    size_t rows = 0;
+    for (const auto& s : doc.sheets) {
+        hash.Add(s.name);
+        rows += s.rows.size();
+        for (const auto& r : s.rows) for (const auto& c : r) hash.Add(c);
+    }
+    for (const auto& p : doc.paragraphs) hash.Add(p.text);
+    for (const auto& g : doc.geoPoints) hash.Add(&g, sizeof(g));
+    char b[256] = {};
+    sprintf_s(b, " | %zu sheets, %zu rows, %zu paragraphs, %zu track points | hash ", doc.sheets.size(), rows, doc.paragraphs.size(), doc.geoPoints.size());
+    std::wstring first;
+    if (!doc.sheets.empty()) {
+        for (size_t r = 0; r < doc.sheets[0].rows.size() && r < 3; ++r) {
+            for (const auto& c : doc.sheets[0].rows[r]) first += c + L" / ";
+            first += L"// ";
+        }
+    } else if (!doc.paragraphs.empty()) {
+        first = doc.paragraphs[0].text;
+    }
+    return InspectText(doc.formatTitle) + b + hash.Hex() + " | " + InspectText(first, 160);
+}
+
+std::string DescribeArchive(const ArchiveSummaryInfo& arc) {
+    InspectHash hash;
+    std::wstring names;
+    for (size_t i = 0; i < arc.entries.size(); ++i) {
+        hash.Add(arc.entries[i].pathInArchive);
+        hash.Add(&arc.entries[i].uncompressedSize, 8);
+        if (i < 4) names += arc.entries[i].pathInArchive + L" (" + std::to_wstring(arc.entries[i].uncompressedSize) + L") ";
+    }
+    char b[128] = {};
+    sprintf_s(b, " | %zu entries | hash ", arc.entries.size());
+    return InspectText(arc.formatName) + b + hash.Hex() + " | " + InspectText(names, 160);
+}
+
+} // namespace
+
 int InspectFiles(const std::wstring& listFile, const std::wstring& resultFile) {
     std::vector<uint8_t> raw;
     if (!PathUtils::ReadFileBytes(listFile, 64 * 1024 * 1024, raw)) return 2;
@@ -5840,8 +6418,10 @@ int InspectFiles(const std::wstring& listFile, const std::wstring& resultFile) {
         const std::wstring ext = PathUtils::GetExtension(path);
         bool anyReader = false;
 
+        std::string summary;        // what the reader made of the file (the "S" line)
         auto step = [&](const char* reader, const std::function<bool()>& run) {
             anyReader = true;
+            summary.clear();
             g_inspectIndex = static_cast<LONG>(i);
             g_inspectReader = reader;
             char line[512] = {};
@@ -5873,6 +6453,12 @@ int InspectFiles(const std::wstring& listFile, const std::wstring& resultFile) {
             } else {
                 InspectWrite(line, sprintf_s(line, "E\t%zu\t%s\t%d\t%llu\n", i, reader, accepted ? 1 : 0,
                                              static_cast<unsigned long long>(GetTickCount64() - started)));
+                if (!summary.empty()) {
+                    for (char& ch : summary) if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
+                    if (summary.size() > 480) summary.resize(480);
+                    const std::string s = "S\t" + std::to_string(i) + "\t" + reader + "\t" + summary + "\n";
+                    InspectWrite(s.data(), static_cast<int>(s.size()));
+                }
             }
         };
 
@@ -5896,37 +6482,63 @@ int InspectFiles(const std::wstring& listFile, const std::wstring& resultFile) {
         if (ImageFormatLoader::IsExtendedImageExtension(ext)) {
             step("image", [&]() {
                 ExtendedImageInfo info;
-                return ImageFormatLoader::DecodeImageFile(path, 512, info) && info.valid;
+                const bool ok = ImageFormatLoader::DecodeImageFile(path, 512, info) && info.valid;
+                summary = DescribeImage(info);
+                // With EXPLORER2_INSPECT_PIXELS set to a folder, the decoded picture is saved there as
+                // <index>.bgra (width and height as two little-endian uint32, then the BGRA rows), so that
+                // it can be compared with another decoder
+                wchar_t pixelDir[MAX_PATH] = {};
+                const DWORD dirLen = GetEnvironmentVariableW(L"EXPLORER2_INSPECT_PIXELS", pixelDir, MAX_PATH);
+                if (ok && dirLen > 0 && dirLen < MAX_PATH) {
+                    std::vector<uint8_t> dump(8 + info.bgraPixels.size());
+                    std::memcpy(dump.data(), &info.width, 4);
+                    std::memcpy(dump.data() + 4, &info.height, 4);
+                    if (!info.bgraPixels.empty()) std::memcpy(dump.data() + 8, info.bgraPixels.data(), info.bgraPixels.size());
+                    PathUtils::WriteFileBytes(std::wstring(pixelDir) + L"\\" + std::to_wstring(i) + L".bgra", dump.data(), dump.size());
+                }
+                return ok;
             });
         }
         if (Model3DViewer::Is3DModelExtension(ext)) {
             step("mesh", [&]() {
                 LoadedMesh3D mesh;
-                return Model3DViewer::InspectMeshFile(path, mesh) && mesh.loadedOk;
+                const bool ok = Model3DViewer::InspectMeshFile(path, mesh) && mesh.loadedOk;
+                summary = DescribeMesh(mesh);
+                return ok;
             });
         }
         if (EdaViewer::IsEdaExtension(ext)) {
             step("eda", [&]() {
                 ParsedEdaBoard board;
-                return EdaViewer::InspectEdaFile(path, board) && board.valid;
+                const bool ok = EdaViewer::InspectEdaFile(path, board) && board.valid;
+                summary = DescribeBoard(board);
+                return ok;
             });
         }
         if (SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(ext)) {
             step("doc", [&]() {
                 ParsedOfficeDocument doc;
-                return SpreadsheetDocViewer::InspectOfficeFile(path, doc) && doc.valid;
+                const bool ok = SpreadsheetDocViewer::InspectOfficeFile(path, doc) && doc.valid;
+                summary = DescribeDoc(doc);
+                return ok;
             });
         }
         if (PdfViewer::IsPdfExtension(ext)) {
             step("pdf", [&]() {
                 PdfDocumentSummary pdf;
-                return PdfViewer::InspectPdfFile(path, pdf) && pdf.valid;
+                const bool ok = PdfViewer::InspectPdfFile(path, pdf) && pdf.valid;
+                char b[160] = {};
+                sprintf_s(b, "PDF %s | %u pages, %zu text characters | ", InspectText(pdf.pdfVersion).c_str(), pdf.pageCount, pdf.allExtractedText.size());
+                summary = b + InspectText(pdf.allExtractedText, 80);
+                return ok;
             });
         }
         if (ArchiveExplorer::IsArchiveExtension(ext)) {
             step("archive", [&]() {
                 ArchiveSummaryInfo arc;
-                if (!ArchiveExplorer::InspectArchiveFile(path, arc) || !arc.valid) return false;
+                const bool listed = ArchiveExplorer::InspectArchiveFile(path, arc) && arc.valid;
+                summary = DescribeArchive(arc);
+                if (!listed) return false;
                 // Unpack the first file as well, for the formats Explorer2 unpacks with its own code
                 if (arc.formatName.rfind(L"ZIP", 0) == 0 || arc.formatName.rfind(L"TAR", 0) == 0) {
                     for (const auto& entry : arc.entries) {

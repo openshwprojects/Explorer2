@@ -3,6 +3,7 @@
 #include "Localization.h"
 #include <d2d1.h>
 #include <dwrite.h>
+#include <wrl/client.h>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -80,6 +81,27 @@ public:
     bool OnMouseUp();
     bool OnMouseWheel(short delta, float x, float y);
 
+    // Draws a mesh into a picture with a depth buffer: every triangle is drawn, and where triangles overlap
+    // the nearest one is seen. The picture is BGRA, premultiplied; pixels the model does not cover stay
+    // transparent. The camera is the view's: turned by yaw, then pitch, seen from 3.6 units away.
+    struct RasterView {
+        int width = 0;              // picture size, pixels
+        int height = 0;
+        float centerX = 0.0f;       // where the model's centre lands, pixels
+        float centerY = 0.0f;
+        float scale = 1.0f;         // pixels per model unit
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+        RenderMode3D mode = RenderMode3D::Shaded;
+        size_t maxTriangles = 0;    // 0: all of them
+    };
+    struct RasterScratch {
+        std::vector<uint32_t> pixels;
+        std::vector<float> depth;   // 1 / distance from the camera, 0 where nothing is
+        std::vector<float> sx, sy, iw;
+    };
+    static void RasterizeMesh(const LoadedMesh3D& mesh, const RasterView& view, RasterScratch& scratch);
+
 private:
     void ResetCamera();
     static LoadedMesh3D ParseMeshFromDisk(const std::wstring& fullPath, uint64_t generation, const std::atomic<uint64_t>* activeGen);
@@ -130,6 +152,20 @@ private:
 
     int m_hoverBtnId = 0;
     std::vector<ToolbarHit> m_toolbarHits;
+
+    // The picture of the model (RasterizeMesh) and what it was drawn for: a repaint of the window that
+    // changes nothing here shows the same picture again without drawing it anew
+    RasterScratch m_raster;
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> m_rasterBitmap;
+    ID2D1RenderTarget* m_rasterTarget = nullptr;
+    UINT32 m_rasterW = 0;
+    UINT32 m_rasterH = 0;
+    struct RasterKey {
+        uint64_t generation = 0;
+        const void* meshData = nullptr;
+        size_t triCount = 0;
+        RasterView view;
+    } m_rasterKey;
 };
 
 } // namespace Explorer2

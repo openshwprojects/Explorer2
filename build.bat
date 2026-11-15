@@ -46,6 +46,12 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 ^
     src\FtpClient.cpp ^
     src\FileContentPane.cpp ^
     src\SelfTestSuite.cpp ^
+    src\FormatTests3D.cpp ^
+    src\FormatTestsEda.cpp ^
+    src\FormatTestsImages.cpp ^
+    src\FormatTestsDocs.cpp ^
+    src\FormatTestsDocsB.cpp ^
+    src\FormatTestsArchives.cpp ^
     src\ExplorerApp.cpp ^
     src\ExplorerAppRender.cpp ^
     /Fo:build\ ^

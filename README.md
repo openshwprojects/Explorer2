@@ -47,7 +47,7 @@ code in [`src/formats/`](src/formats), one header per format family. A sample of
 | Area | Examples |
 | --- | --- |
 | Images | TGA, PSD, XCF, DDS, HDR, Netpbm, PCX, QOI, SVG, KTX, FITS |
-| 3D models | OBJ, STL, PLY, 3DS, MD2, MD3, GLB, COLLADA, Blender, 3MF, VTK |
+| 3D models | OBJ, STL, PLY, 3DS, FBX, MD2, MD3, GLB, COLLADA, Blender, 3MF, VTK |
 | Electronics and CAD | KiCad, Eagle, Gerber, Excellon, DXF, Specctra DSN, Intel HEX, GDSII |
 | Documents and data | CSV, XLSX, ODS, DOCX, ODT, RTF, PPTX, EPUB, FB2, PDF, SQLite, DBF |
 | Archives | ZIP, TAR, gzip, RAR4, RAR5, 7z |
@@ -147,13 +147,16 @@ of the samples and has every file reader read them. A reader has to cope with a 
 turn it down; a crash, an escaped exception or a reader that never returns is reported together
 with the file that caused it.
 
-Two tests need large private archives. They are skipped unless you point them at your own files:
+Three tests need private files: two large archives and an FBX model. They are skipped unless you point
+them at your own files:
 
 | Variable | Value |
 | --- | --- |
 | `EXPLORER2_TEST_RAR5` | Path to a large RAR5 archive |
 | `EXPLORER2_TEST_RAR5_FILES` | Optional: the number of files that archive must list |
 | `EXPLORER2_TEST_IMAGE_RAR` | Path to an archive whose first image is a PNG |
+| `EXPLORER2_TEST_FBX` | Path to an FBX model |
+| `EXPLORER2_TEST_FBX_COUNTS` | Optional: `vertices,triangles` that model must come out with |
 
 ## Repository layout
 

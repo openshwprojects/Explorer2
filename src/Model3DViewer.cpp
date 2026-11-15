@@ -4,7 +4,9 @@
 #include "ZipDeflate.h"
 #include <unordered_map>
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <string_view>
 #include <cstring>
 #include <cstdlib>
 #include <thread>
@@ -31,6 +33,7 @@ namespace Explorer2 {
 #include "formats/MagicaVox.h"
 #include "formats/Extended3D100.h"
 #include "formats/Extended3D200.h"
+#include "formats/Fbx.h"
 
 static D2D1_COLOR_F M3DColor(uint32_t rgb, float a = 1.0f) {
     return D2D1::ColorF(
@@ -237,7 +240,8 @@ try {
     LARGE_INTEGER liSize = {};
     GetFileSizeEx(hFile, &liSize);
     uint64_t fileSize = static_cast<uint64_t>(std::max<LONGLONG>(0, liSize.QuadPart));
-    size_t maxRead = static_cast<size_t>(std::min<uint64_t>(fileSize, 64ULL * 1024ULL * 1024ULL)); // Cap at 64 MB
+    const uint64_t readCap = (ext == L".fbx") ? 256ULL * 1024ULL * 1024ULL : 64ULL * 1024ULL * 1024ULL;
+    size_t maxRead = static_cast<size_t>(std::min<uint64_t>(fileSize, readCap));
     std::vector<uint8_t> buf(maxRead);
     DWORD bytesRead = 0;
     if (maxRead > 0) {
@@ -263,6 +267,19 @@ try {
     #include "formats/ThreeMf.h"
     #include "formats/ColladaDae.h"
     #include "formats/Vtk.h"
+
+    // 11b. Autodesk FBX, binary and text (formats/Fbx.h)
+    if (ext == L".fbx") {
+        if (Formats::ParseFbxMesh(buf.data(), buf.size(), mesh)) {
+            FinalizeMeshBoundsAndNormals(mesh);
+            if (mesh.loadedOk) return mesh;
+        }
+        LoadedMesh3D unreadable;
+        unreadable.filePath = fullPath;
+        unreadable.formatName = L"Autodesk FBX";
+        unreadable.statusMessage = L"Nie udało się odczytać siatki z tego pliku FBX";
+        return unreadable;
+    }
 
     // 11c. Modular 3D & Point Cloud Formats (.amf, .x3d, .wrl, .scad, .pcd, .xyz / .pts, + Extended 100)
     {
@@ -301,26 +318,178 @@ try {
         }
     }
 
-    // 12. Fallback for container 3D formats (.glb, .gltf, .fbx, .3mf, .blend) -> Build preview geodesic crystal mesh + metadata
+    // 12. No reader could read the file. Nothing is shown in its place (this used to be a made-up crystal
+    // shape, which looked like the model): the view says that the file could not be read.
+    LoadedMesh3D unreadable;
+    unreadable.filePath = fullPath;
     std::wstring extUp = (ext.size() > 1) ? ext.substr(1) : ext;
     for (wchar_t& ch : extUp) ch = static_cast<wchar_t>(towupper(ch));
-    mesh.formatName = extUp + L" 3D Asset";
-    mesh.statusMessage = L"Kontener 3D (" + mesh.formatName + L") — podgląd orientacji 3D";
-    const float t = (1.0f + std::sqrt(5.0f)) * 0.5f;
-    mesh.vertices = {
-        {-1,  t,  0}, { 1,  t,  0}, {-1, -t,  0}, { 1, -t,  0},
-        { 0, -1,  t}, { 0,  1,  t}, { 0, -1, -t}, { 0,  1, -t},
-        { t,  0, -1}, { t,  0,  1}, {-t,  0, -1}, {-t,  0,  1}
-    };
-    mesh.tris = {
-        {0,11,5,{}}, {0,5,1,{}}, {0,1,7,{}}, {0,7,10,{}}, {0,10,11,{}},
-        {1,5,9,{}}, {5,11,4,{}}, {11,10,2,{}}, {10,7,6,{}}, {7,1,8,{}},
-        {3,9,4,{}}, {3,4,2,{}}, {3,2,6,{}}, {3,6,8,{}}, {3,8,9,{}},
-        {4,9,5,{}}, {2,4,11,{}}, {6,2,10,{}}, {8,6,7,{}}, {9,8,1,{}}
-    };
-    FinalizeMeshBoundsAndNormals(mesh);
-    return mesh;
+    unreadable.formatName = extUp.empty() ? std::wstring(L"3D") : extUp;
+    unreadable.statusMessage = L"Nie udało się odczytać modelu 3D z tego pliku";
+    return unreadable;
 } E2_READER_CATCH(L"3D model reader", fullPath, { LoadedMesh3D unreadable; unreadable.filePath = fullPath; return unreadable; })
+
+namespace {
+
+// Fills a triangle into the picture where it is nearer than what is there (edge functions, depth = 1/distance,
+// which is linear on screen). Both windings are filled.
+void FillTriangleZ(Model3DViewer::RasterScratch& s, int W, int H, uint32_t a, uint32_t b, uint32_t c, uint32_t color) {
+    float x0 = s.sx[a], y0 = s.sy[a], z0 = s.iw[a];
+    float x1 = s.sx[b], y1 = s.sy[b], z1 = s.iw[b];
+    float x2 = s.sx[c], y2 = s.sy[c], z2 = s.iw[c];
+    float area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+    if (std::fabs(area) < 1e-6f) return;
+    if (area < 0.0f) {
+        std::swap(x1, x2);
+        std::swap(y1, y2);
+        std::swap(z1, z2);
+        area = -area;
+    }
+    const int minX = std::max(0, static_cast<int>(std::floor(std::min({ x0, x1, x2 }))));
+    const int maxX = std::min(W - 1, static_cast<int>(std::ceil(std::max({ x0, x1, x2 }))));
+    const int minY = std::max(0, static_cast<int>(std::floor(std::min({ y0, y1, y2 }))));
+    const int maxY = std::min(H - 1, static_cast<int>(std::ceil(std::max({ y0, y1, y2 }))));
+    if (minX > maxX || minY > maxY) return;
+    const float invArea = 1.0f / area;
+    const float d0 = -(y2 - y1), d1 = -(y0 - y2), d2 = -(y1 - y0);     // change per pixel to the right
+    // A pixel centre that lies on an edge two triangles share is drawn by both (the depth test picks one),
+    // so rounding never opens a gap between them
+    const float t0 = -1e-3f * (std::fabs(x2 - x1) + std::fabs(y2 - y1));
+    const float t1 = -1e-3f * (std::fabs(x0 - x2) + std::fabs(y0 - y2));
+    const float t2 = -1e-3f * (std::fabs(x1 - x0) + std::fabs(y1 - y0));
+    const float px0 = static_cast<float>(minX) + 0.5f;
+    for (int y = minY; y <= maxY; ++y) {
+        const float py = static_cast<float>(y) + 0.5f;
+        float w0 = (x2 - x1) * (py - y1) - (y2 - y1) * (px0 - x1);     // weight of vertex 0 (times area)
+        float w1 = (x0 - x2) * (py - y2) - (y0 - y2) * (px0 - x2);
+        float w2 = (x1 - x0) * (py - y0) - (y1 - y0) * (px0 - x0);
+        size_t idx = static_cast<size_t>(y) * static_cast<size_t>(W) + static_cast<size_t>(minX);
+        for (int x = minX; x <= maxX; ++x, ++idx, w0 += d0, w1 += d1, w2 += d2) {
+            if (w0 < t0 || w1 < t1 || w2 < t2) continue;
+            const float z = (w0 * z0 + w1 * z1 + w2 * z2) * invArea;
+            if (z > s.depth[idx]) {
+                s.depth[idx] = z;
+                s.pixels[idx] = color;
+            }
+        }
+    }
+}
+
+// Lays a colour over a premultiplied pixel ("source over")
+inline void BlendPixel(uint32_t& dst, uint32_t rgb, float alpha) {
+    const float keep = 1.0f - alpha;
+    const float da = static_cast<float>(dst >> 24), dr = static_cast<float>((dst >> 16) & 0xFF);
+    const float dg = static_cast<float>((dst >> 8) & 0xFF), db = static_cast<float>(dst & 0xFF);
+    const uint32_t oa = static_cast<uint32_t>(std::min(255.0f, alpha * 255.0f + da * keep + 0.5f));
+    const uint32_t orr = static_cast<uint32_t>(std::min(255.0f, static_cast<float>((rgb >> 16) & 0xFF) * alpha + dr * keep + 0.5f));
+    const uint32_t og = static_cast<uint32_t>(std::min(255.0f, static_cast<float>((rgb >> 8) & 0xFF) * alpha + dg * keep + 0.5f));
+    const uint32_t ob = static_cast<uint32_t>(std::min(255.0f, static_cast<float>(rgb & 0xFF) * alpha + db * keep + 0.5f));
+    dst = (oa << 24) | (orr << 16) | (og << 8) | ob;
+}
+
+// An edge of the wireframe. With depthTest only where it is not behind the surface drawn there.
+void DrawEdgeZ(Model3DViewer::RasterScratch& s, int W, int H, uint32_t a, uint32_t b, uint32_t rgb, float alpha, bool depthTest) {
+    const float x0 = s.sx[a], y0 = s.sy[a], z0 = s.iw[a];
+    const float x1 = s.sx[b], y1 = s.sy[b], z1 = s.iw[b];
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float len = std::max(std::fabs(dx), std::fabs(dy));
+    if (len > 16384.0f) return;
+    const int steps = static_cast<int>(std::ceil(len));
+    for (int k = 0; k <= steps; ++k) {
+        const float t = (steps > 0) ? static_cast<float>(k) / static_cast<float>(steps) : 0.0f;
+        const int x = static_cast<int>(std::floor(x0 + dx * t));
+        const int y = static_cast<int>(std::floor(y0 + dy * t));
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        const size_t idx = static_cast<size_t>(y) * static_cast<size_t>(W) + static_cast<size_t>(x);
+        if (depthTest && (z0 + (z1 - z0) * t) < s.depth[idx] * 0.995f) continue;
+        BlendPixel(s.pixels[idx], rgb, alpha);
+    }
+}
+
+} // namespace
+
+void Model3DViewer::RasterizeMesh(const LoadedMesh3D& mesh, const RasterView& view, RasterScratch& s) {
+    const int W = std::max(0, view.width);
+    const int H = std::max(0, view.height);
+    const size_t pixelCount = static_cast<size_t>(W) * static_cast<size_t>(H);
+    s.pixels.assign(pixelCount, 0u);
+    s.depth.assign(pixelCount, 0.0f);
+    const auto& verts = mesh.vertices;
+    const auto& tris = mesh.tris;
+    if (pixelCount == 0 || verts.empty() || tris.empty()) return;
+
+    // Every vertex is projected once, as project3D in Draw does it
+    const float cosY = std::cos(view.yaw), sinY = std::sin(view.yaw);
+    const float cosP = std::cos(view.pitch), sinP = std::sin(view.pitch);
+    const float camDist = 3.6f;
+    s.sx.resize(verts.size());
+    s.sy.resize(verts.size());
+    s.iw.resize(verts.size());
+    for (size_t i = 0; i < verts.size(); ++i) {
+        const Vec3f& p = verts[i];
+        const float rx =  p.x * cosY + p.z * sinY;
+        const float rz = -p.x * sinY + p.z * cosY;
+        const float ry =  p.y * cosP - rz * sinP;
+        const float fz =  p.y * sinP + rz * cosP;
+        const float denom = camDist - fz;
+        if (denom < 0.25f) {        // too near the camera, or behind it
+            s.iw[i] = 0.0f;
+            continue;
+        }
+        const float inv = 1.0f / denom;
+        const float persp = camDist * inv * view.scale;
+        s.sx[i] = view.centerX + rx * persp;
+        s.sy[i] = view.centerY - ry * persp;
+        s.iw[i] = inv;
+    }
+
+    const size_t stride = (view.maxTriangles > 0 && tris.size() > view.maxTriangles)
+        ? (tris.size() + view.maxTriangles - 1) / view.maxTriangles : 1;
+    const size_t vCount = verts.size();
+    auto usable = [&](const MeshTriangle& t) {
+        return t.i0 < vCount && t.i1 < vCount && t.i2 < vCount &&
+               s.iw[t.i0] > 0.0f && s.iw[t.i1] > 0.0f && s.iw[t.i2] > 0.0f;
+    };
+
+    if (view.mode != RenderMode3D::Wireframe) {
+        // Studio lighting: a key light, a fill light and a rim, on both sides of every face
+        const Vec3f keyLight  = VecNormalize({  0.45f,  0.75f,  0.50f });
+        const Vec3f fillLight = VecNormalize({ -0.60f, -0.25f,  0.40f });
+        for (size_t ti = 0; ti < tris.size(); ti += stride) {
+            const MeshTriangle& t = tris[ti];
+            if (!usable(t)) continue;
+            const Vec3f& n = t.normal;
+            const float rnx =  n.x * cosY + n.z * sinY;
+            const float rnz = -n.x * sinY + n.z * cosY;
+            const float rny =  n.y * cosP - rnz * sinP;
+            const float fnz =  n.y * sinP + rnz * cosP;
+            Vec3f camN = { rnx, rny, fnz };
+            if (camN.z < 0.0f) {
+                camN.x = -camN.x; camN.y = -camN.y; camN.z = -camN.z;
+            }
+            const float ndotl1 = std::max(0.0f, VecDot(camN, keyLight));
+            const float ndotl2 = std::max(0.0f, VecDot(camN, fillLight));
+            const float rim    = std::pow(1.0f - std::clamp(camN.z, 0.0f, 1.0f), 2.2f) * 0.25f;
+            const float shade  = std::clamp(0.24f + ndotl1 * 0.62f + ndotl2 * 0.20f + rim, 0.15f, 1.0f);
+            const uint32_t r = static_cast<uint32_t>(std::clamp(70.0f  * shade + rim * 90.0f,  0.0f, 255.0f));
+            const uint32_t g = static_cast<uint32_t>(std::clamp(152.0f * shade + rim * 100.0f, 0.0f, 255.0f));
+            const uint32_t b = static_cast<uint32_t>(std::clamp(235.0f * shade + rim * 110.0f, 0.0f, 255.0f));
+            FillTriangleZ(s, W, H, t.i0, t.i1, t.i2, 0xFF000000u | (r << 16) | (g << 8) | b);
+        }
+    }
+    if (view.mode != RenderMode3D::Shaded) {
+        const bool seeThrough = (view.mode == RenderMode3D::Wireframe);
+        const uint32_t rgb = seeThrough ? 0x58A6FFu : 0x0D1117u;
+        const float alpha = seeThrough ? 0.78f : 0.42f;
+        for (size_t ti = 0; ti < tris.size(); ti += stride) {
+            const MeshTriangle& t = tris[ti];
+            if (!usable(t)) continue;
+            DrawEdgeZ(s, W, H, t.i0, t.i1, rgb, alpha, !seeThrough);
+            DrawEdgeZ(s, W, H, t.i1, t.i2, rgb, alpha, !seeThrough);
+            DrawEdgeZ(s, W, H, t.i2, t.i0, rgb, alpha, !seeThrough);
+        }
+    }
+}
 
 void Model3DViewer::Draw(
     ID2D1RenderTarget* rt,
@@ -425,6 +594,7 @@ void Model3DViewer::Draw(
     Vec3f bboxSz = {};
     std::wstring fmtName;
     bool isLoading = m_load->loading.load();
+    bool unreadable = false;
 
     {
         std::lock_guard<std::mutex> lk(m_load->mutex);
@@ -432,100 +602,77 @@ void Model3DViewer::Draw(
         rawT = m_load->mesh.rawTriangleCount;
         bboxSz = m_load->mesh.bboxSize;
         fmtName = m_load->mesh.formatName;
+        unreadable = !isLoading && !m_load->mesh.loadedOk && !m_load->mesh.filePath.empty();
 
         if (!isLoading && m_load->mesh.loadedOk && !m_load->mesh.tris.empty() && !m_load->mesh.vertices.empty()) {
-            const auto& verts = m_load->mesh.vertices;
-            const auto& tris = m_load->mesh.tris;
+            // The model is drawn by RasterizeMesh into a picture with a depth buffer: every triangle, the
+            // nearest in front. At rest the picture has twice the pixels each way and is smoothed as it is
+            // shown; a large model that is moving is drawn with fewer pixels and triangles, to stay fluid.
+            float dpiX = 96.0f, dpiY = 96.0f;
+            rt->GetDpi(&dpiX, &dpiY);
+            const float pxPerDip = std::max(0.5f, dpiX / 96.0f);
+            const bool moving = m_draggingOrbit || m_draggingPan || m_autoRotate;
+            const size_t triCount = m_load->mesh.tris.size();
+            float res = pxPerDip;
+            const float basePixels = vpW * vpH * pxPerDip * pxPerDip;
+            if (!moving && basePixels * 4.0f <= 5.0e6f) res *= 2.0f;
+            else if (moving && triCount > 250000) res *= 0.5f;
 
-            // Adaptive triangle budget so even 100k+ triangle STLs orbit smoothly at 60 FPS
-            size_t maxRenderTris = (m_draggingOrbit || m_draggingPan || m_autoRotate) ? 2800 : 5500;
-            size_t stride = std::max<size_t>(1, tris.size() / maxRenderTris);
+            RasterView view;
+            view.width = std::max(1, static_cast<int>(std::ceil(vpW * res)));
+            view.height = std::max(1, static_cast<int>(std::ceil(vpH * res)));
+            view.centerX = (cx - m_viewportRect.left) * res;
+            view.centerY = (cy - m_viewportRect.top) * res;
+            view.scale = scale * res;
+            view.yaw = m_yaw;
+            view.pitch = m_pitch;
+            view.mode = m_renderMode;
+            view.maxTriangles = moving ? 400000 : 0;
 
-            struct ProjectedTri {
-                D2D1_POINT_2F p0, p1, p2;
-                float depth = 0.0f;
-                uint32_t fillColor = 0x58A6FF;
-            };
-            std::vector<ProjectedTri> drawList;
-            drawList.reserve(tris.size() / stride + 1);
-
-            const Vec3f keyLight  = VecNormalize({  0.45f,  0.75f,  0.50f });
-            const Vec3f fillLight = VecNormalize({ -0.60f, -0.25f,  0.40f });
-
-            for (size_t ti = 0; ti < tris.size(); ti += stride) {
-                const auto& t = tris[ti];
-                if (t.i0 >= verts.size() || t.i1 >= verts.size() || t.i2 >= verts.size()) continue;
-
-                float x0, y0, z0, x1, y1, z1, x2, y2, z2;
-                if (!project3D(verts[t.i0], x0, y0, z0)) continue;
-                if (!project3D(verts[t.i1], x1, y1, z1)) continue;
-                if (!project3D(verts[t.i2], x2, y2, z2)) continue;
-
-                // Rotate normal into camera space for studio lighting
-                const Vec3f& n = t.normal;
-                float rnx =  n.x * cosY + n.z * sinY;
-                float rnz = -n.x * sinY + n.z * cosY;
-                float rny =  n.y * cosP - rnz * sinP;
-                float fnz =  n.y * sinP + rnz * cosP;
-                Vec3f camN = { rnx, rny, fnz };
-                if (camN.z < 0.0f) {
-                    camN.x = -camN.x; camN.y = -camN.y; camN.z = -camN.z;
-                }
-
-                float ndotl1 = std::max(0.0f, VecDot(camN, keyLight));
-                float ndotl2 = std::max(0.0f, VecDot(camN, fillLight));
-                float rim    = std::pow(1.0f - std::clamp(camN.z, 0.0f, 1.0f), 2.2f) * 0.25f;
-                float shade  = std::clamp(0.24f + ndotl1 * 0.62f + ndotl2 * 0.20f + rim, 0.15f, 1.0f);
-
-                uint32_t r = static_cast<uint32_t>(std::clamp(70.0f  * shade + rim * 90.0f,  0.0f, 255.0f));
-                uint32_t g = static_cast<uint32_t>(std::clamp(152.0f * shade + rim * 100.0f, 0.0f, 255.0f));
-                uint32_t b = static_cast<uint32_t>(std::clamp(235.0f * shade + rim * 110.0f, 0.0f, 255.0f));
-
-                drawList.push_back({
-                    D2D1::Point2F(x0, y0),
-                    D2D1::Point2F(x1, y1),
-                    D2D1::Point2F(x2, y2),
-                    (z0 + z1 + z2) * (1.0f / 3.0f),
-                    (r << 16) | (g << 8) | b
-                });
-            }
-
-            // Painter's algorithm sort (back-to-front)
-            std::sort(drawList.begin(), drawList.end(), [](const ProjectedTri& a, const ProjectedTri& b) {
-                return a.depth < b.depth;
-            });
-
-            bool drawFill = (m_renderMode != RenderMode3D::Wireframe) && (m_d2dFactory != nullptr);
-            bool drawWire = (m_renderMode != RenderMode3D::Shaded) || (m_d2dFactory == nullptr);
-
-            for (const auto& pt : drawList) {
-                if (drawFill) {
-                    ID2D1PathGeometry* path = nullptr;
-                    if (SUCCEEDED(m_d2dFactory->CreatePathGeometry(&path)) && path) {
-                        ID2D1GeometrySink* sink = nullptr;
-                        if (SUCCEEDED(path->Open(&sink)) && sink) {
-                            sink->BeginFigure(pt.p0, D2D1_FIGURE_BEGIN_FILLED);
-                            sink->AddLine(pt.p1);
-                            sink->AddLine(pt.p2);
-                            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-                            sink->Close();
-                            sink->Release();
-                            brush->SetColor(M3DColor(pt.fillColor, 0.96f));
-                            rt->FillGeometry(path, brush);
-                        }
-                        path->Release();
+            const UINT32 w = static_cast<UINT32>(view.width);
+            const UINT32 h = static_cast<UINT32>(view.height);
+            const uint64_t generation = m_load->generation.load();
+            const bool sameView = m_rasterBitmap && m_rasterTarget == rt && m_rasterW == w && m_rasterH == h &&
+                m_rasterKey.generation == generation &&
+                m_rasterKey.meshData == m_load->mesh.vertices.data() && m_rasterKey.triCount == triCount &&
+                m_rasterKey.view.centerX == view.centerX && m_rasterKey.view.centerY == view.centerY &&
+                m_rasterKey.view.scale == view.scale && m_rasterKey.view.yaw == view.yaw &&
+                m_rasterKey.view.pitch == view.pitch && m_rasterKey.view.mode == view.mode &&
+                m_rasterKey.view.maxTriangles == view.maxTriangles;
+            if (!sameView) {
+                RasterizeMesh(m_load->mesh, view, m_raster);
+                if (!m_rasterBitmap || m_rasterTarget != rt || m_rasterW != w || m_rasterH != h) {
+                    m_rasterBitmap.Reset();
+                    m_rasterTarget = nullptr;
+                    const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+                    if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(w, h), m_raster.pixels.data(), w * 4, &props, &m_rasterBitmap))) {
+                        m_rasterTarget = rt;
+                        m_rasterW = w;
+                        m_rasterH = h;
                     }
+                } else {
+                    m_rasterBitmap->CopyFromMemory(nullptr, m_raster.pixels.data(), w * 4);
                 }
-                if (drawWire) {
-                    brush->SetColor((m_renderMode == RenderMode3D::Wireframe)
-                        ? M3DColor(0x58A6FF, 0.78f)
-                        : M3DColor(0x0D1117, 0.42f));
-                    rt->DrawLine(pt.p0, pt.p1, brush, 0.75f);
-                    rt->DrawLine(pt.p1, pt.p2, brush, 0.75f);
-                    rt->DrawLine(pt.p2, pt.p0, brush, 0.75f);
-                }
+                m_rasterKey.generation = generation;
+                m_rasterKey.meshData = m_load->mesh.vertices.data();
+                m_rasterKey.triCount = triCount;
+                m_rasterKey.view = view;
+            }
+            if (m_rasterBitmap) {
+                rt->DrawBitmap(m_rasterBitmap.Get(), m_viewportRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             }
         }
+    }
+
+    if (unreadable) {
+        const wchar_t* msg = pl ? L"Nie udało się odczytać modelu 3D z tego pliku."
+                                : L"Could not read a 3D model from this file.";
+        brush->SetColor(M3DColor(0xE2E8F0));
+        fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        rt->DrawTextW(msg, static_cast<UINT32>(wcslen(msg)), fmtRegular,
+            D2D1::RectF(m_viewportRect.left + 16.0f, m_viewportRect.top + vpH * 0.42f, m_viewportRect.right - 16.0f, m_viewportRect.bottom), brush);
+        fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
     if (isLoading) {
