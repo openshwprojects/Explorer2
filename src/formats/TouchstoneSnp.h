@@ -20,6 +20,9 @@ inline bool ParseTouchstoneSnpBoard(std::string_view sv, ParsedEdaBoard& out) {
     std::vector<double> rawNums;
     rawNums.reserve(1024);
     bool stopMatrix = false;
+    bool isTsV2 = false;
+    bool inNetworkData = false;
+    bool twoPortOrder12_21 = false;
 
     size_t pos = 0;
     while (pos < sv.size() && !stopMatrix) {
@@ -38,12 +41,21 @@ inline bool ParseTouchstoneSnpBoard(std::string_view sv, ParsedEdaBoard& out) {
 
         if (ln[0] == '[') {
             std::string low = PathUtils::ToLowerAscii(ln);
-            if (low.rfind("[number of ports]", 0) == 0) {
+            if (low.rfind("[version]", 0) == 0) {
+                isTsV2 = true;
+            } else if (low.rfind("[number of ports]", 0) == 0) {
+                isTsV2 = true;
                 size_t rb = low.find(']');
                 if (rb != std::string::npos) {
                     int np = std::atoi(low.c_str() + rb + 1);
                     if (np == 1 || np == 2) numPorts = np;
                 }
+            } else if (low.rfind("[two-port data order]", 0) == 0) {
+                isTsV2 = true;
+                if (low.find("12_21") != std::string::npos) twoPortOrder12_21 = true;
+            } else if (low.rfind("[network data]", 0) == 0) {
+                isTsV2 = true;
+                inNetworkData = true;
             } else if (low.rfind("[noise data]", 0) == 0 || low.rfind("[end]", 0) == 0) {
                 stopMatrix = true;
             }
@@ -82,6 +94,9 @@ inline bool ParseTouchstoneSnpBoard(std::string_view sv, ParsedEdaBoard& out) {
             }
             continue;
         }
+
+        // In Touchstone 2.0, ignore multi-line [Reference] numbers prior to [Network Data]
+        if (isTsV2 && !inNetworkData) continue;
 
         // Parse floating-point tokens (supporting multi-line wrapped .s2p records)
         std::string lnStr(ln);
@@ -136,7 +151,8 @@ inline bool ParseTouchstoneSnpBoard(std::string_view sv, ParsedEdaBoard& out) {
         pt.freq = f;
         pt.s11Db = pairToDb(rawNums[i + 1], rawNums[i + 2]);
         if (numPorts == 2) {
-            pt.s21Db = pairToDb(rawNums[i + 3], rawNums[i + 4]);
+            size_t s21Off = twoPortOrder12_21 ? 5u : 3u;
+            pt.s21Db = pairToDb(rawNums[i + s21Off], rawNums[i + s21Off + 1u]);
         }
         pts.push_back(pt);
     }

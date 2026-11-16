@@ -792,7 +792,10 @@ bool EdaViewer::IsLikelyOdbPlusPlusTgz(const std::wstring& fullPath) {
 bool EdaViewer::IsLikelyLibertyOrEdaSdfFile(const std::wstring& fullPath, const std::wstring& extLower) {
     std::vector<uint8_t> hdr;
     if (!PathUtils::ReadFileBytes(fullPath, 8192, hdr) || hdr.size() < 16) return false;
-    if (extLower == L".lib") return Formats::IsLikelyLibertyLibBytes(hdr.data(), hdr.size());
+    if (extLower == L".lib") {
+        return Formats::IsLikelyLibertyLibBytes(hdr.data(), hdr.size()) ||
+               IsLikelyKiCadLegacySymLibBytes(hdr.data(), hdr.size());
+    }
     if (extLower == L".sdf") return Formats::IsLikelyIeeeSdfBytes(hdr.data(), hdr.size());
     return false;
 }
@@ -885,8 +888,8 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
         }
     }
 
-    if (sv.rfind("EESchema Schematic", 0) == 0) {
-        return ParseKiCadLegacySch(sv, outBoard);
+    if (DetailKiCadLegacy::StripUtf8BomView(sv).rfind("EESchema Schematic", 0) == 0) {
+        return ParseKiCadLegacySch(sv, fullPath, outBoard);
     }
 
     if (ext == L".kicad_pcb" || ext == L".kicad_sch" || ext == L".kicad_mod" ||

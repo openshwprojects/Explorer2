@@ -1492,7 +1492,8 @@ inline bool ParseGateNetlistOrTdmsFile(const uint8_t* data, size_t size, const s
         return ParseBlifNetlistBoard(sv, out);
     }
     if (ext == L".lib") {
-        return ParseLibertyLibBoard(sv, out);
+        if (ParseLibertyLibBoard(sv, out)) return true;
+        return ParseKiCadLegacySymLibBoard(sv, out);
     }
     if (ext == L".sdf") {
         return ParseIeee1497SdfBoard(sv, out);

@@ -2932,6 +2932,623 @@ void RunFormatTestsEda(TestCounter& tc) {
             L" kiPads=" + std::to_wstring(bKiS.pads.size()));
     }
 
+    // ------------------------------------------------------------------------
+    // 17. ARM CMSIS-SVD (.svd): CPU/NVIC, derivedFrom, dim Arrays, Clusters & Bitfields
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        const std::string validSvd =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+            "<device schemaVersion=\"1.3\">\n"
+            "  <name>STM32H743</name>\n"
+            "  <cpu>\n"
+            "    <name>CM7</name>\n"
+            "    <fpuPresent>1</fpuPresent>\n"
+            "    <mpuPresent>1</mpuPresent>\n"
+            "    <icachePresent>1</icachePresent>\n"
+            "    <nvicPrioBits>4</nvicPrioBits>\n"
+            "  </cpu>\n"
+            "  <peripherals>\n"
+            "    <peripheral>\n"
+            "      <name>RCC</name>\n"
+            "      <baseAddress>0x58024400</baseAddress>\n"
+            "      <interrupt><name>RCC_IRQ</name><value>5</value></interrupt>\n"
+            "      <registers>\n"
+            "        <register>\n"
+            "          <name>CR</name>\n"
+            "          <addressOffset>0x00</addressOffset>\n"
+            "          <size>32</size>\n"
+            "          <fields>\n"
+            "            <field><name>HSION</name><bitOffset>0</bitOffset><bitWidth>1</bitWidth></field>\n"
+            "            <field><name>HSIKERON</name><lsb>1</lsb><msb>1</msb></field>\n"
+            "            <field><name>PLL1ON</name><bitRange>[24:24]</bitRange></field>\n"
+            "          </fields>\n"
+            "        </register>\n"
+            "      </registers>\n"
+            "    </peripheral>\n"
+            "    <peripheral>\n"
+            "      <name>GPIOA</name>\n"
+            "      <baseAddress>0x58020000</baseAddress>\n"
+            "      <registers>\n"
+            "        <cluster>\n"
+            "          <name>PORT</name>\n"
+            "          <addressOffset>0x00</addressOffset>\n"
+            "          <register>\n"
+            "            <dim>2</dim><dimIncrement>0x04</dimIncrement><dimIndex>0,1</dimIndex>\n"
+            "            <name>CFG%s</name><addressOffset>0x00</addressOffset><size>32</size>\n"
+            "            <fields><field><name>MODE</name><bitRange>[3:0]</bitRange></field></fields>\n"
+            "          </register>\n"
+            "        </cluster>\n"
+            "      </registers>\n"
+            "    </peripheral>\n"
+            "    <peripheral derivedFrom=\"GPIOA\">\n"
+            "      <dim>2</dim><dimIncrement>0x0400</dimIncrement><dimIndex>B,C</dimIndex>\n"
+            "      <name>GPIO%s</name>\n"
+            "      <baseAddress>0x58020400</baseAddress>\n"
+            "    </peripheral>\n"
+            "  </peripherals>\n"
+            "</device>\n";
+
+        const char* emptySvd   = "<?xml version=\"1.0\"?><device><name>EmptyMcu</name><peripherals></peripherals></device>";
+        const char* genericXml = "<?xml version=\"1.0\"?><catalog><book id=\"1\"><name>NotAnMcu</name></book></catalog>";
+
+        ParsedEdaBoard bSvd, badSvd1, badSvd2;
+        bool okSvd  = WriteAndInspect(dir + L"\\stm32h743.svd", validSvd.data(), validSvd.size(), bSvd);
+        bool rejSvd = !WriteAndInspect(dir + L"\\empty.svd", emptySvd, std::strlen(emptySvd), badSvd1) &&
+                      !WriteAndInspect(dir + L"\\book.svd", genericXml, std::strlen(genericXml), badSvd2);
+
+        // Expect CPU + 4 peripherals (RCC, GPIOA, GPIOB, GPIOC) = >= 5 components, bitfield labels & IRQ label
+        bool passSvd = okSvd && rejSvd &&
+                       bSvd.components.size() >= 5u &&
+                       hasLabelSubstr(bSvd, L"STM32H743") &&
+                       hasLabelSubstr(bSvd, L"CM7") &&
+                       hasLabelSubstr(bSvd, L"GPIOB") &&
+                       hasLabelSubstr(bSvd, L"GPIOC") &&
+                       hasLabelSubstr(bSvd, L"PLL1ON") &&
+                       hasLabelSubstr(bSvd, L"RCC_IRQ");
+
+        tc.Record(passSvd, L"Stage15.Eda.CmsisSvd_CpuNvicDerivedFromDimAndBitfields",
+            L"svdComps=" + std::to_wstring(bSvd.components.size()) +
+            L" svdPads=" + std::to_wstring(bSvd.pads.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 18. KiCad .kicad_sym (extends/arc/polyline), Specctra .ses, & Pick-and-Place .pos/.cpl
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        const std::string validKiSym =
+            "(kicad_symbol_lib (version 20220914) (generator kicad_symbol_editor)\n"
+            "  (symbol \"DRV8301\" (in_bom yes) (on_board yes)\n"
+            "    (property \"Reference\" \"U\" (at 0 10.16 0))\n"
+            "    (property \"Value\" \"DRV8301\" (at 0 -10.16 0))\n"
+            "    (symbol \"DRV8301_0_1\"\n"
+            "      (rectangle (start -7.62 7.62) (end 7.62 -7.62) (stroke (width 0.254)))\n"
+            "      (polyline (pts (xy -3.0 2.0) (xy 0.0 0.0) (xy -3.0 -2.0)) (stroke (width 0.2)))\n"
+            "      (arc (start 1.0 -2.0) (mid 3.0 0.0) (end 1.0 2.0) (stroke (width 0.2))))\n"
+            "    (symbol \"DRV8301_1_1\"\n"
+            "      (pin input inverted_clock (at -10.16 2.54 0) (length 2.54) (name \"SCLK\") (number \"1\"))\n"
+            "      (pin bidirectional line (at -10.16 -2.54 0) (length 2.54) (name \"SDIO\") (number \"2\"))\n"
+            "      (pin output line (at 10.16 0 180) (length 2.54) (name \"GH_A\") (number \"3\"))))\n"
+            "  (symbol \"DRV8303\" (extends \"DRV8301\")\n"
+            "    (property \"Value\" \"DRV8303\" (at 0 -10.16 0)))\n"
+            ")\n";
+        const char* emptyKiSym = "(kicad_symbol_lib (version 20220914) (generator kicad_symbol_editor))\n";
+
+        const std::string validSes =
+            "(session \"motor_ctrl.ses\"\n"
+            "  (base_design \"motor_ctrl.dsn\")\n"
+            "  (placement\n"
+            "    (resolution mil 10)\n"
+            "    (component \"LQFP-48\" (place U1 5000 4000 front 90))\n"
+            "    (component \"C_0603\"  (place C4 9500 4200 back 180)))\n"
+            "  (routes\n"
+            "    (resolution mil 10)\n"
+            "    (library_out\n"
+            "      (padstack \"Via30_15\" (shape (circle F.Cu 300)) (shape (circle B.Cu 300))))\n"
+            "    (network_out\n"
+            "      (net VCC_3V3\n"
+            "        (via \"Via30_15\" 7000 4000)\n"
+            "        (wire (path F.Cu 120 5000 4000 7000 4000))\n"
+            "        (wire (path B.Cu 120 7000 4000 9500 4200)))\n"
+            "      (net SPI_SCK\n"
+            "        (wire (path F.Cu 80 5000 4500 8800 4500)))))\n"
+            ")\n";
+        const char* emptySes = "(session \"empty.ses\" (base_design \"none.dsn\"))\n";
+
+        const std::string validPos =
+            "### Module positions - created on 2026-11-16 ###\n"
+            "## Unit = mil, Angle = deg.\n"
+            "Designator,Comment,Package,Mid X,Mid Y,Rotation,Layer\n"
+            "U1,\"STM32G431, Cortex-M4\",LQFP-32,1000.0,800.0,45.0,top\n"
+            "Q1,\"BSS138, N-MOS\",SOT-23,1600.0,950.0,90.0,top\n"
+            "C1,\"100nF, X7R\",C_0603,1250.0,600.0,180.0,bottom\n";
+        const char* prosePos = "Quarterly revenue,Region,Notes\nNorth,East,No PCB coordinates here\n";
+
+        ParsedEdaBoard bSym, badSym, bSes, badSes, bPos, badPos;
+        bool okSym  = WriteAndInspect(dir + L"\\gate_drv.kicad_sym", validKiSym.data(), validKiSym.size(), bSym);
+        bool rejSym = !WriteAndInspect(dir + L"\\empty.kicad_sym", emptyKiSym, std::strlen(emptyKiSym), badSym);
+        bool okSes  = WriteAndInspect(dir + L"\\routed.ses", validSes.data(), validSes.size(), bSes);
+        bool rejSes = !WriteAndInspect(dir + L"\\empty.ses", emptySes, std::strlen(emptySes), badSes);
+        bool okPos  = WriteAndInspect(dir + L"\\pnp_jlcpcb.cpl", validPos.data(), validPos.size(), bPos);
+        bool rejPos = !WriteAndInspect(dir + L"\\prose.pos", prosePos, std::strlen(prosePos), badPos);
+
+        bool passItem18b = okSym && rejSym &&
+                           bSym.components.size() == 2u && bSym.pads.size() == 6u && !bSym.circles.empty() &&
+                           hasLabelSubstr(bSym, L"DRV8303") &&
+                           okSes && rejSes &&
+                           bSes.components.size() == 2u && bSes.vias.size() == 1u && bSes.netCount == 2u &&
+                           okPos && rejPos &&
+                           bPos.components.size() == 3u && bPos.pads.size() >= 37u &&
+                           std::fabs(bPos.components[0].x - 25.4f) < 0.15f;
+
+        tc.Record(passItem18b, L"Stage15.Eda.KiCadSym_SpecctraSes_PickAndPlacePosCpl",
+            L"symPads=" + std::to_wstring(bSym.pads.size()) +
+            L" sesVias=" + std::to_wstring(bSes.vias.size()) +
+            L" posPads=" + std::to_wstring(bPos.pads.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 19. IBIS Buffer Model v6 (.ibs) & Touchstone 2.0 Differential 4-Port (.s4p)
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        const std::string validIbs =
+            "[IBIS Ver]      6.1\n"
+            "[File Name]     xc7k_io.ibs\n"
+            "[Component]     XC7K325T_FFG900\n"
+            "[Manufacturer]  AMD Xilinx\n"
+            "[Package]\n"
+            "R_pkg           45.0m     30.0m     65.0m\n"
+            "L_pkg           1.8nH     1.2nH     2.5nH\n"
+            "C_pkg           0.65pF    0.45pF    0.90pF\n"
+            "[Pin]  signal_name  model_name   R_pin   L_pin   C_pin\n"
+            "A1     TX_P         LVCMOS33_F   42.0m   1.5n    0.6p\n"
+            "A2     TX_N         LVCMOS33_F   44.0m   1.6n    0.6p\n"
+            "A3     GND          GND          NA      NA      NA\n"
+            "A4     VCCO         POWER        NA      NA      NA\n"
+            "[Model]         LVCMOS33_F\n"
+            "Model_type      I/O\n"
+            "Vinl = 0.8V\n"
+            "Vinh = 2.0V\n"
+            "C_comp          3.2pF     2.5pF     4.1pF\n"
+            "[Pulldown]\n"
+            "-3.30   -85.0mA   -60.0mA   -110.0mA\n"
+            " 0.00     0.0mA     0.0mA      0.0mA\n"
+            " 1.65    34.0mA    24.0mA     46.0mA\n"
+            " 3.30    52.0mA    38.0mA     68.0mA\n"
+            "[Pullup]\n"
+            "-3.30    82.0mA    58.0mA    105.0mA\n"
+            " 0.00     0.0mA     0.0mA      0.0mA\n"
+            " 1.65   -31.0mA   -22.0mA    -42.0mA\n"
+            " 3.30   -48.0mA   -35.0mA    -64.0mA\n"
+            "[Rising Waveform]\n"
+            "R_fixture = 50.0\n"
+            "V_fixture = 0.0\n"
+            "0.00nS   0.02V   0.01V   0.03V\n"
+            "0.35nS   0.95V   0.70V   1.20V\n"
+            "0.70nS   2.45V   2.05V   2.75V\n"
+            "1.20nS   3.26V   3.10V   3.32V\n"
+            "[Falling Waveform]\n"
+            "R_fixture = 50.0\n"
+            "V_fixture = 3.3\n"
+            "0.00nS   3.28V   3.12V   3.33V\n"
+            "0.40nS   1.85V   2.15V   1.45V\n"
+            "0.85nS   0.25V   0.45V   0.12V\n"
+            "1.20nS   0.03V   0.06V   0.01V\n"
+            "[End]\n";
+        const char* emptyIbs = "[IBIS Ver] 5.0\n[Component] EmptyShell\n[End]\n";
+
+        // Touchstone 2.0 4-port PCIe channel (.s4p) with tab-delimited option line & [Network Data]
+        const std::string validS4p =
+            "! PCIe Gen4 Differential Pair (Port 1-3 = Lane+, Port 2-4 = Lane-)\n"
+            "[Version] 2.0\n"
+            "#\tGHz\tS\tMA\tR\t50\n"
+            "[Number of Ports] 4\n"
+            "[Number of Frequencies] 3\n"
+            "[Network Data]\n"
+            "1.0   0.08 -20  0.02 90  0.91 -35  0.03 140\n"
+            "      0.02  90  0.08 -22 0.03 140  0.90 -36\n"
+            "      0.91 -35  0.03 140 0.09 -25  0.02  88\n"
+            "      0.03 140  0.90 -36 0.02  88  0.09 -24\n"
+            "5.0   0.18 -75  0.04 40  0.74 -130 0.05  60\n"
+            "      0.04  40  0.19 -77 0.05  60  0.73 -132\n"
+            "      0.74 -130 0.05  60 0.18 -78  0.04  42\n"
+            "      0.05  60  0.73 -132 0.04 42  0.19 -79\n"
+            "10.0  0.32 -140 0.07 -10 0.52  110 0.08 -25\n"
+            "      0.07 -10  0.33 -142 0.08 -25 0.51  108\n"
+            "      0.52  110 0.08 -25 0.31 -144 0.07 -12\n"
+            "      0.08 -25  0.51  108 0.07 -12 0.32 -145\n"
+            "[End]\n";
+
+        ParsedEdaBoard bIbs, badIbs, bS4p;
+        bool okIbs  = WriteAndInspect(dir + L"\\xc7k_io.ibs", validIbs.data(), validIbs.size(), bIbs);
+        bool rejIbs = !WriteAndInspect(dir + L"\\empty.ibs", emptyIbs, std::strlen(emptyIbs), badIbs);
+        bool okS4p  = WriteAndInspect(dir + L"\\pcie_ch.s4p", validS4p.data(), validS4p.size(), bS4p);
+
+        bool passItem19b = okIbs && rejIbs &&
+                           bIbs.pads.size() == 4u && bIbs.traces.size() >= 25u &&
+                           hasLabelSubstr(bIbs, L"XC7K325T_FFG900") &&
+                           hasLabelSubstr(bIbs, L"V-I") && hasLabelSubstr(bIbs, L"V-T") &&
+                           okS4p && bS4p.traces.size() >= 16u &&
+                           hasLabelSubstr(bS4p, L"SDD21") && hasLabelSubstr(bS4p, L"SDD11");
+
+        tc.Record(passItem19b, L"Stage15.Eda.IbisViVtPinout_And_TouchstoneS4pDifferential",
+            L"ibsTr=" + std::to_wstring(bIbs.traces.size()) +
+            L" s4pTr=" + std::to_wstring(bS4p.traces.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 20. KiCad Legacy Schematic (.sch) & EESchema-LIBRARY (.lib) Matrix Transforms
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        const std::string customSymLib =
+            "EESchema-LIBRARY Version 2.4\n"
+            "#encoding utf-8\n"
+            "DEF STM32F030 U 0 40 Y Y 1 F N\n"
+            "F0 \"U\" 0 250 50 H V C CNN\n"
+            "F1 \"STM32F030\" 0 -250 50 H V C CNN\n"
+            "DRAW\n"
+            "S -200 200 200 -200 0 1 10 f\n"
+            "C -140 140 25 0 1 6 N\n"
+            "P 3 0 1 6 -200 50 -160 0 -200 -50 N\n"
+            "X NRST 1 -350 100 150 R 50 50 1 1 I\n"
+            "X PA0 2 -350 -100 150 R 50 50 1 1 B\n"
+            "X SPI_MOSI 3 350 0 150 L 50 50 1 1 O\n"
+            "ENDDRAW\n"
+            "ENDDEF\n"
+            "#End Library\n";
+
+        const std::string legacySch =
+            "EESchema Schematic File Version 4\n"
+            "EELAYER 30 0\n"
+            "EELAYER END\n"
+            "$Descr A4 11693 8268\n"
+            "Title \"STM32 Sensor Node\"\n"
+            "Rev \"B\"\n"
+            "$EndDescr\n"
+            "$Comp\n"
+            "L custom_mcu:STM32F030 U1\n"
+            "U 1 1 61A01234\n"
+            "P 4000 3500\n"
+            "F 0 \"U1\" H 4000 3800 50  0000 C CNN\n"
+            "F 1 \"STM32F030F4\" H 4000 3200 50  0000 C CNN\n"
+            "F 2 \"Package_SO:TSSOP-20\" H 4000 3100 50  0001 C CNN\n"
+            "\t1    4000 3500\n"
+            "\t0    1    1    0\n"
+            "$EndComp\n"
+            "$Comp\n"
+            "L Device:R R1\n"
+            "U 1 1 61A01235\n"
+            "P 2800 3500\n"
+            "F 0 \"R1\" H 2800 3650 50  0000 C CNN\n"
+            "F 1 \"10k\" H 2800 3350 50  0000 C CNN\n"
+            "\t1    2800 3500\n"
+            "\t1    0    0    -1\n"
+            "$EndComp\n"
+            "$Comp\n"
+            "L power:GND #PWR01\n"
+            "U 1 1 61A01236\n"
+            "P 2800 4200\n"
+            "F 0 \"#PWR01\" H 2800 4200 50  0001 C CNN\n"
+            "F 1 \"GND\" H 2800 4100 50  0000 C CNN\n"
+            "\t1    2800 4200\n"
+            "\t1    0    0    -1\n"
+            "$EndComp\n"
+            "Wire Wire Line\n"
+            "\t2800 3650 2800 4200\n"
+            "Connection ~ 2800 3650\n"
+            "NoConn ~ 4000 3850\n"
+            "Text GLabel 4500 3500 2    50   Output ~ 0\n"
+            "SPI_MOSI\n"
+            "$Sheet\n"
+            "S 5600 3000 1200 900\n"
+            "F0 \"PowerStage\" 60\n"
+            "F1 \"power_stage.sch\" 60\n"
+            "F2 \"VIN_12V\" I L 5600 3300 50\n"
+            "$EndSheet\n"
+            "$EndSCHEMATC\n";
+
+        const std::wstring libPath = dir + L"\\custom_mcu-cache.lib";
+        const std::wstring schPath = dir + L"\\sensor_node.sch";
+        PathUtils::WriteFileBytes(libPath, customSymLib.data(), customSymLib.size());
+        PathUtils::WriteFileBytes(schPath, legacySch.data(), legacySch.size());
+
+        ParsedEdaBoard bLegLib, bLegSch, badLegSch;
+        bool isLikelyLib = EdaViewer::IsLikelyLibertyOrEdaSdfFile(libPath, L".lib");
+        bool okLegLib = EdaViewer::InspectEdaFile(libPath, bLegLib) && bLegLib.valid;
+        bool okLegSch = EdaViewer::InspectEdaFile(schPath, bLegSch) && bLegSch.valid;
+        DeleteFileW(schPath.c_str());
+        DeleteFileW(libPath.c_str());
+
+        const char* badSchTxt = "Random text file not an EESchema or Eagle schematic\n";
+        bool rejLegSch = !WriteAndInspect(dir + L"\\garbage.sch", badSchTxt, std::strlen(badSchTxt), badLegSch);
+
+        // U1 + R1 + Sheet (Power symbol #PWR01 excluded from BOM components!) => 3 components, U1 resolved from companion .lib with 3 pins + R1 2 pins + Sheet 1 pin = 6 pads
+        bool passLeg = isLikelyLib && okLegLib && okLegSch && rejLegSch &&
+                       bLegLib.components.size() == 1u && bLegLib.pads.size() == 3u &&
+                       bLegSch.components.size() == 3u && bLegSch.pads.size() >= 6u &&
+                       bLegSch.vias.size() == 1u &&
+                       hasLabelSubstr(bLegSch, L"STM32 Sensor Node") &&
+                       hasLabelSubstr(bLegSch, L"SPI_MOSI") &&
+                       hasLabelSubstr(bLegSch, L"PowerStage");
+
+        tc.Record(passLeg, L"Stage15.Eda.KiCadLegacySchMatrix_And_SymLib",
+            L"schComps=" + std::to_wstring(bLegSch.components.size()) +
+            L" schPads=" + std::to_wstring(bLegSch.pads.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 21. FPGA .rpd Sync Framing, Real Cadence OrCAD Binary (.dsn/.olb), & Full HP-GL/2 (.hpgl/.plt)
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        // A) FPGA .rpd: Altera Active Serial LSb-reversed (32x 0xFF + 0x56 + payload) & Xilinx SPI bit-reversed (0x5599AA66 + IDCODE)
+        std::vector<uint8_t> alteraRpd(512, 0xFFu);
+        alteraRpd[32] = 0x56u; // Bit-reversed 0x6A Altera AS header marker
+        for (size_t i = 33; i < 320; ++i) alteraRpd[i] = static_cast<uint8_t>((i * 37u) ^ 0x5Au);
+
+        auto bitRev8 = [](uint8_t x) -> uint8_t {
+            x = static_cast<uint8_t>(((x & 0xF0u) >> 4) | ((x & 0x0Fu) << 4));
+            x = static_cast<uint8_t>(((x & 0xCCu) >> 2) | ((x & 0x33u) << 2));
+            x = static_cast<uint8_t>(((x & 0xAAu) >> 1) | ((x & 0x55u) << 1));
+            return x;
+        };
+        auto pushRevWord = [&](std::vector<uint8_t>& v, uint32_t w) {
+            v.push_back(bitRev8(static_cast<uint8_t>((w >> 24) & 0xFFu)));
+            v.push_back(bitRev8(static_cast<uint8_t>((w >> 16) & 0xFFu)));
+            v.push_back(bitRev8(static_cast<uint8_t>((w >> 8)  & 0xFFu)));
+            v.push_back(bitRev8(static_cast<uint8_t>(w & 0xFFu)));
+        };
+        std::vector<uint8_t> xilinxRpd(24, 0xFFu);
+        pushRevWord(xilinxRpd, 0xAA995566u); // -> 0x5599AA66 on SPI flash!
+        pushRevWord(xilinxRpd, 0x20000000u); // Type-1 NOOP
+        pushRevWord(xilinxRpd, 0x30018001u); // Type-1 Write IDCODE (reg 12, cnt 1)
+        pushRevWord(xilinxRpd, 0x0362D093u); // Artix-7 IDCODE
+        pushRevWord(xilinxRpd, 0x30004040u); // Type-1 Write FDRI (reg 2, 64 words)
+        for (int i = 0; i < 64; ++i) pushRevWord(xilinxRpd, 0x12345678u ^ static_cast<uint32_t>(i * 0x01030507u));
+
+        std::vector<uint8_t> randomNoiseRpd(256);
+        for (size_t i = 0; i < randomNoiseRpd.size(); ++i) randomNoiseRpd[i] = static_cast<uint8_t>(0x37u + (i % 13u));
+        const char* proseRpd = "This is a plain text document renamed to .rpd and must not be accepted as FPGA flash data!\n";
+
+        ParsedEdaBoard bAltRpd, bXilRpd, badRpd1, badRpd2;
+        bool okAltRpd = WriteAndInspect(dir + L"\\cyclone_as.rpd", alteraRpd.data(), alteraRpd.size(), bAltRpd);
+        bool okXilRpd = WriteAndInspect(dir + L"\\artix7_spi.rpd", xilinxRpd.data(), xilinxRpd.size(), bXilRpd);
+        bool rejRpd   = !WriteAndInspect(dir + L"\\noise.rpd", randomNoiseRpd.data(), randomNoiseRpd.size(), badRpd1) &&
+                        !WriteAndInspect(dir + L"\\prose.rpd", proseRpd, std::strlen(proseRpd), badRpd2);
+
+        // B) Real Cadence OrCAD Capture v17.4 Binary OLE2 (.dsn with Library + Cache LibraryPart + Page FutureData prefix chains)
+        auto appendOrCadStrZero = [](std::vector<uint8_t>& v, const std::string& s) {
+            uint8_t l2[2] = {};
+            PutU16LE(l2, static_cast<uint16_t>(s.size()));
+            v.insert(v.end(), l2, l2 + 2);
+            v.insert(v.end(), s.begin(), s.end());
+            v.push_back(0u);
+        };
+        auto wrapOrCadStruct = [](uint8_t typeId, const std::vector<std::pair<uint32_t, uint32_t>>& props, const std::vector<uint8_t>& body) {
+            std::vector<uint8_t> shortPfx;
+            shortPfx.push_back(typeId);
+            uint8_t pc[2] = {};
+            PutU16LE(pc, props.empty() ? static_cast<uint16_t>(0u) : static_cast<uint16_t>(props.size()));
+            shortPfx.insert(shortPfx.end(), pc, pc + 2);
+            for (const auto& [ni, vi] : props) {
+                uint8_t kv[8] = {};
+                PutU32LE(kv + 0, ni);
+                PutU32LE(kv + 4, vi);
+                shortPfx.insert(shortPfx.end(), kv, kv + 8);
+            }
+            std::vector<uint8_t> out(9);
+            out[0] = typeId;
+            PutU32LE(out.data() + 1, static_cast<uint32_t>(shortPfx.size() + body.size()));
+            PutU32LE(out.data() + 5, 0u);
+            out.insert(out.end(), shortPfx.begin(), shortPfx.end());
+            out.insert(out.end(), body.begin(), body.end());
+            return out;
+        };
+
+        // Build OrCAD "Library" stream (32B "OrCAD Windows Design" + header + 1 font + someLen=24 + 8 partFields + 152B PageSettings + strLst)
+        std::vector<uint8_t> orcLib(32, 0x20u);
+        std::memcpy(orcLib.data(), "OrCAD Windows Design", 20);
+        orcLib[20] = 0u;
+        {
+            uint8_t hdr[16] = { 3,0, 2,0,  0,0,0,0,  0,0,0,0,  0,0,0,0 };
+            orcLib.insert(orcLib.end(), hdr, hdr + 16);
+            uint8_t fl[2] = { 1, 0 }; // textFontLen = 1 -> 0 LOGFONTAs
+            orcLib.insert(orcLib.end(), fl, fl + 2);
+            uint8_t sl[2] = { 24, 0 };
+            orcLib.insert(orcLib.end(), sl, sl + 2);
+            orcLib.insert(orcLib.end(), 24 * 2 + 8, 0u);
+            for (int i = 0; i < 8; ++i) appendOrCadStrZero(orcLib, "");
+            orcLib.insert(orcLib.end(), 152, 0u); // PageSettings
+            uint8_t cnt4[4] = { 2, 0, 0, 0 };     // strLst: [0]="Value", [1]="ADS1115"
+            orcLib.insert(orcLib.end(), cnt4, cnt4 + 4);
+            appendOrCadStrZero(orcLib, "Value");
+            appendOrCadStrZero(orcLib, "ADS1115");
+            orcLib.push_back(0); orcLib.push_back(0); // aliasLstLen = 0
+        }
+
+        // Build OrCAD "Cache" stream containing LibraryPart (typeId=24) "ADS1115.Normal" with Rect(40,40) + 3 SymbolPinScalar(26)
+        std::vector<uint8_t> orcCache = { 0,0,0,0 };
+        {
+            std::vector<uint8_t> lpBody;
+            appendOrCadStrZero(lpBody, "ADS1115.Normal");
+            appendOrCadStrZero(lpBody, "ANALOG.OLB");
+            lpBody.insert(lpBody.end(), 4, 0u);
+            uint8_t np[2] = { 1, 0 }; // 1 primitive: Rect (40, 40)
+            lpBody.insert(lpBody.end(), np, np + 2);
+            lpBody.push_back(40u); lpBody.push_back(40u);
+            uint8_t rectBuf[24] = {};
+            PutU32LE(rectBuf + 0, 24u);
+            PutI32LE(rectBuf + 8,  0);  PutI32LE(rectBuf + 12, 0);
+            PutI32LE(rectBuf + 16, 40); PutI32LE(rectBuf + 20, 30);
+            lpBody.insert(lpBody.end(), rectBuf, rectBuf + 24);
+
+            uint8_t nPins[2] = { 3, 0 };
+            lpBody.insert(lpBody.end(), nPins, nPins + 2);
+            auto addSymPin = [&](const char* nm, int32_t sx, int32_t sy, int32_t hx, int32_t hy) {
+                std::vector<uint8_t> pb;
+                appendOrCadStrZero(pb, nm);
+                uint8_t coords[28] = {};
+                PutI32LE(coords + 0, sx); PutI32LE(coords + 4, sy);
+                PutI32LE(coords + 8, hx); PutI32LE(coords + 12, hy);
+                pb.insert(pb.end(), coords, coords + 28);
+                auto wrapped = wrapOrCadStruct(26u, {}, pb);
+                lpBody.insert(lpBody.end(), wrapped.begin(), wrapped.end());
+            };
+            addSymPin("AIN0", 0, 10, -10, 10);
+            addSymPin("AIN1", 0, 20, -10, 20);
+            addSymPin("SDA",  40, 15, 50, 15);
+
+            uint8_t z2[2] = { 0, 0 }; // 0 display props
+            lpBody.insert(lpBody.end(), z2, z2 + 2);
+            auto lpStruct = wrapOrCadStruct(24u, {}, lpBody);
+            orcCache.insert(orcCache.end(), lpStruct.begin(), lpStruct.end());
+        }
+
+        // Build OrCAD "Views/SCHEMATIC1/Pages/PAGE1" stream (Structure::Page == 10)
+        std::vector<uint8_t> orcPage;
+        {
+            std::vector<uint8_t> pgBody;
+            appendOrCadStrZero(pgBody, "ADC_FRONTEND");
+            appendOrCadStrZero(pgBody, "A");
+            std::vector<uint8_t> pset(152, 0u);
+            PutU32LE(pset.data() + 24, 9700u); // width in mils
+            PutU32LE(pset.data() + 28, 7200u); // height in mils
+            PutU32LE(pset.data() + 32, 10u);   // pinToPin = 10
+            pgBody.insert(pgBody.end(), pset.begin(), pset.end());
+
+            auto pushU16 = [&](uint16_t v) { uint8_t b2[2]; PutU16LE(b2, v); pgBody.insert(pgBody.end(), b2, b2 + 2); };
+            pushU16(0); pushU16(0); pushU16(0); // TitleBlocks=0, T0x34=0, T0x35=0
+            pushU16(1); // 1 net mapping
+            appendOrCadStrZero(pgBody, "I2C_SDA");
+            uint8_t nid[4] = { 1,0,0,0 };
+            pgBody.insert(pgBody.end(), nid, nid + 4);
+
+            // 2 WireScalar (typeId=20) with an Alias (typeId=49) on wire 0
+            pushU16(2);
+            {
+                std::vector<uint8_t> wb(29, 0u);
+                PutU32LE(wb.data() + 4, 1u);
+                PutI32LE(wb.data() + 12, 150); PutI32LE(wb.data() + 16, 115);
+                PutI32LE(wb.data() + 20, 220); PutI32LE(wb.data() + 24, 115);
+                uint8_t na[2] = { 1, 0 };
+                wb.insert(wb.end(), na, na + 2);
+                std::vector<uint8_t> ab(20, 0u);
+                PutI32LE(ab.data() + 0, 170); PutI32LE(ab.data() + 4, 115);
+                appendOrCadStrZero(ab, "I2C_SDA");
+                auto aSt = wrapOrCadStruct(49u, {}, ab);
+                wb.insert(wb.end(), aSt.begin(), aSt.end());
+                wb.insert(wb.end(), 10, 0u); // 0 dispProps + lineWidth/Style
+                auto wSt = wrapOrCadStruct(20u, {}, wb);
+                pgBody.insert(pgBody.end(), wSt.begin(), wSt.end());
+            }
+            {
+                std::vector<uint8_t> wb(29 + 12, 0u);
+                PutU32LE(wb.data() + 4, 2u);
+                PutI32LE(wb.data() + 12, 50); PutI32LE(wb.data() + 16, 110);
+                PutI32LE(wb.data() + 20, 90); PutI32LE(wb.data() + 24, 110);
+                auto wSt = wrapOrCadStruct(20u, {}, wb);
+                pgBody.insert(pgBody.end(), wSt.begin(), wSt.end());
+            }
+
+            // 1 PlacedInstance (typeId=13) referencing "ADS1115.Normal" at (100, 100) with prop (0="Value" -> 1="ADS1115")
+            pushU16(1);
+            {
+                std::vector<uint8_t> ib(8, 0u);
+                appendOrCadStrZero(ib, "ADS1115.Normal");
+                uint8_t tail1[22] = {};
+                PutU16LE(tail1 + 12, 100u); // locX
+                PutU16LE(tail1 + 14, 100u); // locY
+                ib.insert(ib.end(), tail1, tail1 + 22); // dbId(4)+unk(8)+locX(2)+locY(2)+flags(4)+nDisp(2=0)
+                ib.push_back(0u);
+                appendOrCadStrZero(ib, "U3");
+                ib.insert(ib.end(), 16, 0u); // unk(14)+nT10(2=0)
+                appendOrCadStrZero(ib, "ADS1115");
+                ib.insert(ib.end(), 2, 0u);
+                auto iSt = wrapOrCadStruct(13u, { { 0u, 1u } }, ib);
+                pgBody.insert(pgBody.end(), iSt.begin(), iSt.end());
+            }
+
+            // Remaining counts = 0 (Ports, Globals, OffPage, ERC, BusEntries, GraphicInsts, len10, len11)
+            for (int z = 0; z < 8; ++z) pushU16(0);
+            orcPage = wrapOrCadStruct(10u, {}, pgBody);
+        }
+
+        auto realOrcOle = BuildOle2CompoundFile({
+            { L"Library",                      orcLib   },
+            { L"Cache",                        orcCache },
+            { L"Views/SCHEMATIC1/Pages/PAGE1", orcPage  }
+        });
+
+        ParsedEdaBoard bRealOrc;
+        bool okRealOrc = WriteAndInspect(dir + L"\\real_orcad_v17.dsn", realOrcOle.data(), realOrcOle.size(), bRealOrc);
+
+        // C) HP-GL/2 (.hpgl/.plt): IP/SC scaling, AA arc, EA/RA rect, PM/FP polygon, DT+LB with embedded "PU"/"CI" text, & prose rejection
+        const std::string validHpgl =
+            "IN;IP0,0,4000,4000;SC0,100,0,100;\n"
+            "WU0;PW0.35,1;SP1;\n"
+            "PA10,10;PD50,10,50,40;\n"
+            "AA50,55,180;\n"
+            "EA85,85;\n"
+            "SP2;PU20,70;SI0.25,0.35;DT#;LBTOP_COPPER_PU100,200_CI50#;\n"
+            "SP3;PU60,20;PM0;PD80,20,70,40;PM2;FP;\n";
+        const char* prosePlt =
+            "Project schedule and parts delivery notes for the Paris office.\n"
+            "Please pack clean items carefully before Tuesday.\n";
+
+        ParsedEdaBoard bHpgl, badHpgl;
+        bool okHpgl  = WriteAndInspect(dir + L"\\fab_plot.plt", validHpgl.data(), validHpgl.size(), bHpgl);
+        bool rejHpgl = !WriteAndInspect(dir + L"\\notes.plt", prosePlt, std::strlen(prosePlt), badHpgl);
+
+        bool passItem21 = okAltRpd && okXilRpd && rejRpd &&
+                          bAltRpd.formatTitle.find(L"Altera AS") != std::wstring::npos &&
+                          bXilRpd.formatTitle.find(L"Xilinx") != std::wstring::npos &&
+                          hasLabelSubstr(bXilRpd, L"0x0362D093") &&
+                          HashEdaGeometry(bAltRpd) != HashEdaGeometry(bXilRpd) &&
+                          okRealOrc && bRealOrc.components.size() == 1u && bRealOrc.pads.size() == 3u &&
+                          hasLabelSubstr(bRealOrc, L"U3 (ADS1115)") &&
+                          hasLabelSubstr(bRealOrc, L"I2C_SDA") &&
+                          okHpgl && rejHpgl &&
+                          bHpgl.netCount == 3u && bHpgl.traces.size() >= 20u &&
+                          hasLabelSubstr(bHpgl, L"TOP_COPPER_PU100,200_CI50");
+
+        tc.Record(passItem21, L"Stage15.Eda.FpgaRpdSync_RealOrCadBin_And_Hpgl2Full",
+            L"orcPads=" + std::to_wstring(bRealOrc.pads.size()) +
+            L" hpglTr=" + std::to_wstring(bHpgl.traces.size()));
+    }
+
     RemoveDirectoryW(dir.c_str());
     RunFormatTestsEdaBatch70(tc);
 }

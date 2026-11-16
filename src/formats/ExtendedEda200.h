@@ -284,213 +284,1087 @@ inline bool ParseBgaBallCoord(std::string_view pin, int& outRow, int& outCol) {
 // ============================================================================
 // #61, #62, #63. KiCad Symbol (.kicad_sym), Specctra Route (.ses), Pick & Place (.pos/.cpl/.mnt)
 // ============================================================================
-inline bool ParseKiCadSymSesPos(std::string_view sv, const std::wstring& ext, ParsedEdaBoard& out) {
-    // #61. KiCad v6–v8 Schematic Symbol Library (.kicad_sym)
-    if (ext == L".kicad_sym" || sv.find("(kicad_symbol_lib") != std::string_view::npos) {
-        if (sv.find("(kicad_symbol_lib") == std::string_view::npos && sv.find("(symbol ") == std::string_view::npos) return false;
-        out.kind = EdaDocKind::KiCadSch;
-        out.formatTitle = L"KiCad Schematic Symbol Library (.kicad_sym)";
+namespace DetailKiCadSymSesPos {
 
-        size_t pos = 0;
-        int symIdx = 0;
-        float symOffX = 0.0f;
-        while (pos < sv.size() && out.traces.size() < 12000) {
-            size_t eol = sv.find('\n', pos);
-            if (eol == std::string_view::npos) eol = sv.size();
-            std::string_view ln = sv.substr(pos, eol - pos);
-            pos = eol + 1;
+inline std::string LowerAsciiSymSes(std::string_view sv) {
+    std::string s(sv);
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
 
-            if (ln.find("(symbol \"") != std::string_view::npos && ln.find("_0_") == std::string_view::npos &&
-                ln.find("_1_") == std::string_view::npos)
-            {
-                size_t q1 = ln.find('"') + 1;
-                size_t q2 = ln.find('"', q1);
-                if (q2 != std::string_view::npos) {
-                    symOffX = symIdx * 36.0f;
-                    out.labels.push_back({ symOffX, 16.0f, 1.5f, EdaLayerId::SchLabel, PathUtils::Utf8ToWide(ln.substr(q1, q2 - q1)) });
-                    ++symIdx;
-                }
-            } else if (ln.find("(rectangle") != std::string_view::npos) {
-                size_t blkEnd = sv.find("))", pos);
-                std::string blk(sv.substr(pos - ln.size() - 1, std::min<size_t>(256, (blkEnd == std::string_view::npos ? sv.size() : blkEnd) - (pos - ln.size() - 1))));
-                float x1 = -8, y1 = -10, x2 = 8, y2 = 10;
-                size_t st = blk.find("(start "), en = blk.find("(end ");
-                if (st != std::string::npos) sscanf_s(blk.c_str() + st + 7, "%f %f", &x1, &y1);
-                if (en != std::string::npos) sscanf_s(blk.c_str() + en + 5, "%f %f", &x2, &y2);
-                DetailEda100::AddRectOutline(out, symOffX + (x1 + x2) * 0.5f, (y1 + y2) * 0.5f, std::fabs(x2 - x1), std::fabs(y2 - y1), EdaLayerId::SchSymbol, 0.35f);
-            } else if (ln.find("(pin ") != std::string_view::npos) {
-                size_t pinEnd = sv.find("\n    )", pos);
-                std::string blk(sv.substr(pos - ln.size() - 1, std::min<size_t>(384, (pinEnd == std::string_view::npos ? sv.size() : pinEnd) - (pos - ln.size() - 1))));
-                float px = -12.7f, py = 0.0f, rot = 0.0f, plen = 2.54f;
-                size_t atP = blk.find("(at ");
-                if (atP != std::string::npos) sscanf_s(blk.c_str() + atP + 4, "%f %f %f", &px, &py, &rot);
-                size_t lnP = blk.find("(length ");
-                if (lnP != std::string::npos) sscanf_s(blk.c_str() + lnP + 8, "%f", &plen);
+inline void TessellateKiCad3PtArc(
+    float x1, float y1, float xm, float ym, float x2, float y2,
+    std::vector<std::pair<float, float>>& outPts)
+{
+    outPts.clear();
+    double d = 2.0 * (static_cast<double>(x1) * (ym - y2) +
+                      static_cast<double>(xm) * (y2 - y1) +
+                      static_cast<double>(x2) * (y1 - ym));
+    if (std::fabs(d) < 1e-7) {
+        outPts.push_back({ x1, y1 });
+        outPts.push_back({ x2, y2 });
+        return;
+    }
+    double s1 = static_cast<double>(x1) * x1 + static_cast<double>(y1) * y1;
+    double sm = static_cast<double>(xm) * xm + static_cast<double>(ym) * ym;
+    double s2 = static_cast<double>(x2) * x2 + static_cast<double>(y2) * y2;
+    double cx = (s1 * (ym - y2) + sm * (y2 - y1) + s2 * (y1 - ym)) / d;
+    double cy = (s1 * (x2 - xm) + sm * (x1 - x2) + s2 * (xm - x1)) / d;
+    double r  = std::hypot(x1 - cx, y1 - cy);
+    if (r < 1e-4 || r > 1e5) {
+        outPts.push_back({ x1, y1 });
+        outPts.push_back({ x2, y2 });
+        return;
+    }
 
-                float rad = rot * 3.14159265f / 180.0f;
-                float ex = px + plen * std::cos(rad), ey = py + plen * std::sin(rad);
-                out.traces.push_back({ symOffX + px, py, symOffX + ex, ey, 0.25f, EdaLayerId::SchWire, 1 });
-                out.circles.push_back({ symOffX + px, py, 0.45f, 0.2f, false, EdaLayerId::SchSymbol });
+    const double twoPi = 6.2831853071795864769;
+    double a1 = std::atan2(y1 - cy, x1 - cx);
+    double am = std::atan2(ym - cy, xm - cx);
+    double a2 = std::atan2(y2 - cy, x2 - cx);
 
-                size_t nmP = blk.find("(name \"");
-                if (nmP != std::string::npos) {
-                    size_t q1 = nmP + 7, q2 = blk.find('"', q1);
-                    if (q2 != std::string::npos && q2 > q1) {
-                        std::string pName = blk.substr(q1, q2 - q1);
-                        if (pName != "~") out.labels.push_back({ symOffX + ex, ey, 1.0f, EdaLayerId::SchLabel, PathUtils::Utf8ToWide(pName) });
+    auto normCcw = [&](double a) {
+        double da = std::fmod(a - a1, twoPi);
+        if (da < 0.0) da += twoPi;
+        return da;
+    };
+    double dm = normCcw(am);
+    double d2 = normCcw(a2);
+    double sweep = (dm <= d2) ? d2 : (d2 - twoPi);
+
+    int segs = std::clamp(static_cast<int>(std::ceil(std::fabs(sweep) / (twoPi / 24.0))), 4, 32);
+    for (int i = 0; i <= segs; ++i) {
+        double ang = a1 + sweep * (static_cast<double>(i) / static_cast<double>(segs));
+        outPts.push_back({ static_cast<float>(cx + r * std::cos(ang)),
+                           static_cast<float>(cy + r * std::sin(ang)) });
+    }
+}
+
+struct KiSymPin {
+    float x = 0.0f, y = 0.0f, angleDeg = 0.0f, length = 2.54f;
+    std::string shape; // line, inverted, clock, inverted_clock, input_low, output_low, non_logic
+    std::string name;
+    std::string number;
+    int unit = 0, style = 0;
+    bool hidden = false;
+};
+
+struct KiSymSeg {
+    float x1 = 0, y1 = 0, x2 = 0, y2 = 0, w = 0.25f;
+    int unit = 0, style = 0;
+};
+
+struct KiSymCirc {
+    float cx = 0, cy = 0, r = 1.0f, w = 0.25f;
+    int unit = 0, style = 0;
+};
+
+struct KiSymTxt {
+    float x = 0, y = 0;
+    std::string text;
+    int unit = 0, style = 0;
+};
+
+struct KiSymEntry {
+    std::string name;
+    std::string extendsName;
+    std::string refPrefix = "U";
+    std::string valueStr;
+    std::string footprintStr;
+    bool hidePinNames = false;
+    bool hidePinNums  = false;
+    std::vector<KiSymSeg> segs;
+    std::vector<KiSymCirc> circs;
+    std::vector<KiSymPin> pins;
+    std::vector<KiSymTxt> texts;
+};
+
+inline void ParseKiSymUnitSuffix(std::string_view subName, int& outUnit, int& outStyle) {
+    outUnit = 0;
+    outStyle = 0;
+    size_t u2 = subName.rfind('_');
+    if (u2 == std::string_view::npos || u2 == 0 || u2 + 1 >= subName.size()) return;
+    size_t u1 = subName.rfind('_', u2 - 1);
+    if (u1 == std::string_view::npos || u1 + 1 >= u2) return;
+    bool okDigits = true;
+    for (size_t i = u1 + 1; i < u2; ++i) if (!std::isdigit(static_cast<unsigned char>(subName[i]))) okDigits = false;
+    for (size_t i = u2 + 1; i < subName.size(); ++i) if (!std::isdigit(static_cast<unsigned char>(subName[i]))) okDigits = false;
+    if (!okDigits) return;
+    outUnit  = std::atoi(std::string(subName.substr(u1 + 1, u2 - u1 - 1)).c_str());
+    outStyle = std::atoi(std::string(subName.substr(u2 + 1)).c_str());
+}
+
+inline float ExtractStrokeWidthMm(const DetailSpecctra::SNode& primNode, float defW = 0.254f) {
+    for (size_t i = 1; i < primNode.list.size(); ++i) {
+        const auto& c = primNode.list[i];
+        std::string_view k = DetailSpecctra::HeadKey(c);
+        if (k == "stroke") {
+            for (size_t j = 1; j < c.list.size(); ++j) {
+                if (DetailSpecctra::HeadKey(c.list[j]) == "width" && c.list[j].list.size() >= 2) {
+                    double v = 0.0;
+                    if (DetailSpecctra::AtomFloat(c.list[j].list[1], v) && v > 0.0) {
+                        return std::clamp(static_cast<float>(v), 0.14f, 1.5f);
                     }
                 }
             }
+        } else if (k == "width" && c.list.size() >= 2) {
+            double v = 0.0;
+            if (DetailSpecctra::AtomFloat(c.list[1], v) && v > 0.0) {
+                return std::clamp(static_cast<float>(v), 0.14f, 1.5f);
+            }
         }
-        if (out.traces.empty()) {
-            DetailEda100::AddRectOutline(out, 0.0f, 0.0f, 16.0f, 20.0f, EdaLayerId::SchSymbol, 0.35f);
+    }
+    return defW;
+}
+
+inline bool ExtractPairXY(const DetailSpecctra::SNode& parent, std::string_view key, float& outX, float& outY, float* outThird = nullptr) {
+    for (size_t i = 1; i < parent.list.size(); ++i) {
+        const auto& c = parent.list[i];
+        if (DetailSpecctra::HeadKey(c) == key && c.list.size() >= 3) {
+            double vx = 0.0, vy = 0.0;
+            if (DetailSpecctra::AtomFloat(c.list[1], vx) && DetailSpecctra::AtomFloat(c.list[2], vy)) {
+                outX = static_cast<float>(vx);
+                outY = static_cast<float>(vy);
+                if (outThird && c.list.size() >= 4) {
+                    double vz = 0.0;
+                    if (DetailSpecctra::AtomFloat(c.list[3], vz)) *outThird = static_cast<float>(vz);
+                }
+                return true;
+            }
         }
+    }
+    return false;
+}
+
+inline void ParseKiSymPrimitives(const DetailSpecctra::SNode& container, int unit, int style, KiSymEntry& dst) {
+    for (size_t i = 1; i < container.list.size(); ++i) {
+        const auto& ch = container.list[i];
+        std::string_view k = DetailSpecctra::HeadKey(ch);
+        if (k == "symbol" && ch.list.size() >= 2 && !ch.list[1].isList) {
+            int subU = unit, subS = style;
+            ParseKiSymUnitSuffix(ch.list[1].atom, subU, subS);
+            ParseKiSymPrimitives(ch, subU, subS, dst);
+        } else if (k == "extends" && ch.list.size() >= 2 && !ch.list[1].isList) {
+            dst.extendsName = ch.list[1].atom;
+        } else if (k == "pin_names") {
+            for (size_t j = 1; j < ch.list.size(); ++j) {
+                if (!ch.list[j].isList && ch.list[j].atom == "hide") dst.hidePinNames = true;
+                else if (DetailSpecctra::HeadKey(ch.list[j]) == "hide" &&
+                         (ch.list[j].list.size() < 2 || ch.list[j].list[1].atom != "no")) dst.hidePinNames = true;
+            }
+        } else if (k == "pin_numbers") {
+            for (size_t j = 1; j < ch.list.size(); ++j) {
+                if (!ch.list[j].isList && ch.list[j].atom == "hide") dst.hidePinNums = true;
+                else if (DetailSpecctra::HeadKey(ch.list[j]) == "hide" &&
+                         (ch.list[j].list.size() < 2 || ch.list[j].list[1].atom != "no")) dst.hidePinNums = true;
+            }
+        } else if (k == "property" && ch.list.size() >= 3 && !ch.list[1].isList && !ch.list[2].isList) {
+            const std::string& pk = ch.list[1].atom;
+            const std::string& pv = ch.list[2].atom;
+            if (pk == "Reference" && !pv.empty()) dst.refPrefix = pv;
+            else if (pk == "Value" && !pv.empty()) dst.valueStr = pv;
+            else if (pk == "Footprint" && !pv.empty()) dst.footprintStr = pv;
+        } else if (k == "rectangle") {
+            float x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            if (ExtractPairXY(ch, "start", x1, y1) && ExtractPairXY(ch, "end", x2, y2)) {
+                float w = ExtractStrokeWidthMm(ch, 0.254f);
+                dst.segs.push_back({ x1, y1, x2, y1, w, unit, style });
+                dst.segs.push_back({ x2, y1, x2, y2, w, unit, style });
+                dst.segs.push_back({ x2, y2, x1, y2, w, unit, style });
+                dst.segs.push_back({ x1, y2, x1, y1, w, unit, style });
+            }
+        } else if (k == "polyline" || k == "bezier") {
+            float w = ExtractStrokeWidthMm(ch, 0.254f);
+            std::vector<std::pair<float, float>> pts;
+            for (size_t j = 1; j < ch.list.size(); ++j) {
+                if (DetailSpecctra::HeadKey(ch.list[j]) == "pts") {
+                    const auto& ptsNode = ch.list[j];
+                    for (size_t m = 1; m < ptsNode.list.size(); ++m) {
+                        const auto& xy = ptsNode.list[m];
+                        if (DetailSpecctra::HeadKey(xy) == "xy" && xy.list.size() >= 3) {
+                            double vx = 0.0, vy = 0.0;
+                            if (DetailSpecctra::AtomFloat(xy.list[1], vx) && DetailSpecctra::AtomFloat(xy.list[2], vy)) {
+                                pts.push_back({ static_cast<float>(vx), static_cast<float>(vy) });
+                            }
+                        }
+                    }
+                }
+            }
+            if (k == "bezier" && pts.size() == 4) {
+                std::pair<float, float> prev = pts[0];
+                for (int s = 1; s <= 12; ++s) {
+                    float t = static_cast<float>(s) / 12.0f;
+                    float u = 1.0f - t;
+                    float bx = u*u*u*pts[0].first + 3*u*u*t*pts[1].first + 3*u*t*t*pts[2].first + t*t*t*pts[3].first;
+                    float by = u*u*u*pts[0].second + 3*u*u*t*pts[1].second + 3*u*t*t*pts[2].second + t*t*t*pts[3].second;
+                    dst.segs.push_back({ prev.first, prev.second, bx, by, w, unit, style });
+                    prev = { bx, by };
+                }
+            } else {
+                for (size_t s = 1; s < pts.size(); ++s) {
+                    dst.segs.push_back({ pts[s - 1].first, pts[s - 1].second, pts[s].first, pts[s].second, w, unit, style });
+                }
+            }
+        } else if (k == "circle") {
+            float cx = 0, cy = 0;
+            if (ExtractPairXY(ch, "center", cx, cy)) {
+                float r = 1.0f;
+                for (size_t j = 1; j < ch.list.size(); ++j) {
+                    if (DetailSpecctra::HeadKey(ch.list[j]) == "radius" && ch.list[j].list.size() >= 2) {
+                        double rv = 0.0;
+                        if (DetailSpecctra::AtomFloat(ch.list[j].list[1], rv) && rv > 0.02) r = static_cast<float>(rv);
+                    }
+                }
+                dst.circs.push_back({ cx, cy, r, ExtractStrokeWidthMm(ch, 0.254f), unit, style });
+            }
+        } else if (k == "arc") {
+            float x1 = 0, y1 = 0, xm = 0, ym = 0, x2 = 0, y2 = 0;
+            if (ExtractPairXY(ch, "start", x1, y1) && ExtractPairXY(ch, "mid", xm, ym) && ExtractPairXY(ch, "end", x2, y2)) {
+                float w = ExtractStrokeWidthMm(ch, 0.254f);
+                std::vector<std::pair<float, float>> arcPts;
+                TessellateKiCad3PtArc(x1, y1, xm, ym, x2, y2, arcPts);
+                for (size_t s = 1; s < arcPts.size(); ++s) {
+                    dst.segs.push_back({ arcPts[s - 1].first, arcPts[s - 1].second, arcPts[s].first, arcPts[s].second, w, unit, style });
+                }
+            }
+        } else if (k == "text" && ch.list.size() >= 2 && !ch.list[1].isList) {
+            float tx = 0, ty = 0;
+            if (!ch.list[1].atom.empty() && ExtractPairXY(ch, "at", tx, ty)) {
+                dst.texts.push_back({ tx, ty, ch.list[1].atom, unit, style });
+            }
+        } else if (k == "pin" && ch.list.size() >= 4) {
+            KiSymPin pin;
+            pin.unit = unit;
+            pin.style = style;
+            if (ch.list.size() >= 3 && !ch.list[2].isList) pin.shape = ch.list[2].atom;
+            ExtractPairXY(ch, "at", pin.x, pin.y, &pin.angleDeg);
+            for (size_t j = 1; j < ch.list.size(); ++j) {
+                const auto& sub = ch.list[j];
+                if (!sub.isList && sub.atom == "hide") pin.hidden = true;
+                std::string_view sk = DetailSpecctra::HeadKey(sub);
+                if (sk == "hide" && (sub.list.size() < 2 || sub.list[1].atom != "no")) pin.hidden = true;
+                else if (sk == "length" && sub.list.size() >= 2) {
+                    double lv = 0.0;
+                    if (DetailSpecctra::AtomFloat(sub.list[1], lv)) pin.length = std::max(0.0f, static_cast<float>(lv));
+                } else if (sk == "name" && sub.list.size() >= 2 && !sub.list[1].isList) {
+                    pin.name = sub.list[1].atom;
+                } else if (sk == "number" && sub.list.size() >= 2 && !sub.list[1].isList) {
+                    pin.number = sub.list[1].atom;
+                }
+            }
+            dst.pins.push_back(std::move(pin));
+        }
+    }
+}
+
+// Split a CSV or whitespace Pick-and-Place line while honoring double-quoted strings containing commas/spaces
+inline std::vector<std::string> SplitPickAndPlaceRow(std::string_view ln, bool csvDelimited) {
+    std::vector<std::string> out;
+    if (csvDelimited) {
+        char sep = (ln.find(',') != std::string_view::npos) ? ',' : ((ln.find(';') != std::string_view::npos) ? ';' : '\t');
+        size_t i = 0;
+        while (i <= ln.size()) {
+            while (i < ln.size() && (ln[i] == ' ' || (sep != '\t' && ln[i] == '\t'))) ++i;
+            std::string cell;
+            if (i < ln.size() && ln[i] == '"') {
+                ++i;
+                while (i < ln.size()) {
+                    if (ln[i] == '"') {
+                        if (i + 1 < ln.size() && ln[i + 1] == '"') { cell.push_back('"'); i += 2; }
+                        else { ++i; break; }
+                    } else {
+                        cell.push_back(ln[i++]);
+                    }
+                }
+                while (i < ln.size() && ln[i] != sep) ++i;
+            } else {
+                size_t e = ln.find(sep, i);
+                if (e == std::string_view::npos) e = ln.size();
+                cell.assign(ln.data() + i, e - i);
+                i = e;
+            }
+            while (!cell.empty() && static_cast<unsigned char>(cell.back()) <= 0x20u) cell.pop_back();
+            while (!cell.empty() && static_cast<unsigned char>(cell.front()) <= 0x20u) cell.erase(cell.begin());
+            out.push_back(std::move(cell));
+            if (i >= ln.size()) break;
+            ++i; // consume separator
+        }
+        return out;
+    }
+
+    size_t i = 0;
+    while (i < ln.size()) {
+        while (i < ln.size() && static_cast<unsigned char>(ln[i]) <= 0x20u) ++i;
+        if (i >= ln.size()) break;
+        std::string tok;
+        if (ln[i] == '"') {
+            ++i;
+            while (i < ln.size() && ln[i] != '"') tok.push_back(ln[i++]);
+            if (i < ln.size()) ++i;
+        } else {
+            while (i < ln.size() && static_cast<unsigned char>(ln[i]) > 0x20u) tok.push_back(ln[i++]);
+        }
+        out.push_back(std::move(tok));
+    }
+    return out;
+}
+
+inline bool ParsePnpCoordTokenMm(std::string_view raw, float defaultUnitToMm, float& outMm) {
+    std::string s(raw);
+    while (!s.empty() && (static_cast<unsigned char>(s.front()) <= 0x20u || s.front() == '"')) s.erase(s.begin());
+    while (!s.empty() && (static_cast<unsigned char>(s.back()) <= 0x20u || s.back() == '"')) s.pop_back();
+    if (s.empty()) return false;
+
+    char* endp = nullptr;
+    double val = std::strtod(s.c_str(), &endp);
+    if (!endp || endp == s.c_str() || !std::isfinite(val)) return false;
+
+    std::string unit = LowerAsciiSymSes(endp);
+    while (!unit.empty() && static_cast<unsigned char>(unit.front()) <= 0x20u) unit.erase(unit.begin());
+
+    double scale = defaultUnitToMm;
+    if (unit.empty()) {
+        scale = defaultUnitToMm;
+    } else if (unit == "mm") {
+        scale = 1.0;
+    } else if (unit == "mil" || unit == "mils" || unit == "th") {
+        scale = 0.0254;
+    } else if (unit == "in" || unit == "inch" || unit == "inches") {
+        scale = 25.4;
+    } else if (unit == "um") {
+        scale = 0.001;
+    } else {
+        return false; // Reject non-coordinate tokens like "100nF" or "10k"!
+    }
+
+    outMm = static_cast<float>(val * scale);
+    return std::fabs(outMm) < 50000.0f;
+}
+
+inline bool LooksLikeValidRefDes(const std::string& ref) {
+    if (ref.empty() || ref.size() > 24) return false;
+    if (!std::isalpha(static_cast<unsigned char>(ref[0])) && ref[0] != '#') return false;
+    bool hasDigitOrShort = false;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        unsigned char uc = static_cast<unsigned char>(ref[i]);
+        if (std::isdigit(uc) || ref[i] == '?') hasDigitOrShort = true;
+        else if (!std::isalnum(uc) && ref[i] != '_' && ref[i] != '-' && ref[i] != '#') return false;
+    }
+    return hasDigitOrShort || ref.size() <= 4;
+}
+
+inline int ExtractTrailingPinCount(const std::string& pkgUpper, int defPins) {
+    size_t xPos = pkgUpper.find('X');
+    if (xPos != std::string::npos && xPos > 0 && xPos + 1 < pkgUpper.size() &&
+        std::isdigit(static_cast<unsigned char>(pkgUpper[xPos - 1])) &&
+        std::isdigit(static_cast<unsigned char>(pkgUpper[xPos + 1])))
+    {
+        size_t s = xPos - 1;
+        while (s > 0 && std::isdigit(static_cast<unsigned char>(pkgUpper[s - 1]))) --s;
+        int r = std::atoi(pkgUpper.c_str() + s);
+        int c = std::atoi(pkgUpper.c_str() + xPos + 1);
+        if (r >= 1 && r <= 8 && c >= 1 && c <= 64) return r * c;
+    }
+    for (size_t i = 0; i < pkgUpper.size(); ++i) {
+        if (std::isdigit(static_cast<unsigned char>(pkgUpper[i]))) {
+            size_t j = i;
+            while (j < pkgUpper.size() && std::isdigit(static_cast<unsigned char>(pkgUpper[j]))) ++j;
+            int n = std::atoi(pkgUpper.substr(i, j - i).c_str());
+            if (n >= 3 && n <= 256 && n != 402 && n != 603 && n != 805 && n != 1206 && n != 2512 && n != 23 && n != 223) {
+                return n;
+            }
+            i = j;
+        }
+    }
+    return defPins;
+}
+
+} // namespace DetailKiCadSymSesPos
+
+inline bool ParseKiCadSymSesPos(std::string_view sv, const std::wstring& ext, ParsedEdaBoard& out) {
+    if (sv.size() >= 3 &&
+        static_cast<uint8_t>(sv[0]) == 0xEFu &&
+        static_cast<uint8_t>(sv[1]) == 0xBBu &&
+        static_cast<uint8_t>(sv[2]) == 0xBFu)
+    {
+        sv.remove_prefix(3);
+    }
+
+    // #61. KiCad v6–v9 Schematic Symbol Library (.kicad_sym)
+    if (ext == L".kicad_sym" || sv.find("(kicad_symbol_lib") != std::string_view::npos) {
+        using namespace DetailKiCadSymSesPos;
+        if (sv.find("(kicad_symbol_lib") == std::string_view::npos && sv.find("(symbol ") == std::string_view::npos) {
+            return false;
+        }
+
+        std::vector<DetailSpecctra::SNode> roots;
+        if (!DetailSpecctra::ParseSExprTree(sv, roots) || roots.empty()) return false;
+
+        std::vector<KiSymEntry> syms;
+        for (const auto& r : roots) {
+            std::string_view hk = DetailSpecctra::HeadKey(r);
+            if (hk == "kicad_symbol_lib") {
+                for (size_t i = 1; i < r.list.size() && syms.size() < 128; ++i) {
+                    const auto& sn = r.list[i];
+                    if (DetailSpecctra::HeadKey(sn) == "symbol" && sn.list.size() >= 2 && !sn.list[1].isList) {
+                        KiSymEntry ent;
+                        ent.name = sn.list[1].atom;
+                        ParseKiSymPrimitives(sn, 0, 0, ent);
+                        if (!ent.name.empty()) syms.push_back(std::move(ent));
+                    }
+                }
+            } else if (hk == "symbol" && r.list.size() >= 2 && !r.list[1].isList && syms.size() < 128) {
+                KiSymEntry ent;
+                ent.name = r.list[1].atom;
+                ParseKiSymPrimitives(r, 0, 0, ent);
+                if (!ent.name.empty()) syms.push_back(std::move(ent));
+            }
+        }
+        if (syms.empty()) return false;
+
+        // Resolve (extends "ParentSymbol") inheritance across the symbol library
+        std::unordered_map<std::string, size_t> symIdxMap;
+        for (size_t i = 0; i < syms.size(); ++i) {
+            symIdxMap[syms[i].name] = i;
+            size_t col = syms[i].name.find(':');
+            if (col != std::string::npos) symIdxMap[syms[i].name.substr(col + 1)] = i;
+        }
+        for (int pass = 0; pass < 3; ++pass) {
+            for (auto& s : syms) {
+                if (s.extendsName.empty()) continue;
+                auto it = symIdxMap.find(s.extendsName);
+                if (it == symIdxMap.end()) {
+                    size_t col = s.extendsName.find(':');
+                    if (col != std::string::npos) it = symIdxMap.find(s.extendsName.substr(col + 1));
+                }
+                if (it == symIdxMap.end() || it->second >= syms.size()) continue;
+                const KiSymEntry& parent = syms[it->second];
+                if (!parent.extendsName.empty() && pass < 2) continue;
+
+                if (s.segs.empty() && s.circs.empty()) {
+                    s.segs = parent.segs;
+                    s.circs = parent.circs;
+                }
+                if (s.pins.empty()) s.pins = parent.pins;
+                if (s.texts.empty()) s.texts = parent.texts;
+                if (s.footprintStr.empty()) s.footprintStr = parent.footprintStr;
+                s.hidePinNames = parent.hidePinNames;
+                s.hidePinNums  = parent.hidePinNums;
+                s.extendsName.clear();
+            }
+        }
+
+        out.kind = EdaDocKind::KiCadSch;
+
+        const size_t cols = std::max<size_t>(1u, static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(syms.size())))));
+        float cellX = 0.0f, cellY = 0.0f, rowMaxH = 18.0f;
+        size_t colIdx = 0;
+        size_t renderedSyms = 0;
+        size_t totalPins = 0;
+
+        for (size_t si = 0; si < syms.size(); ++si) {
+            const auto& sym = syms[si];
+            int targetUnit = 1;
+            bool hasU01 = false;
+            int minPresentU = 999;
+            for (const auto& g : sym.segs)  { if (g.unit <= 1) hasU01 = true; if (g.unit > 0) minPresentU = std::min(minPresentU, g.unit); }
+            for (const auto& c : sym.circs) { if (c.unit <= 1) hasU01 = true; if (c.unit > 0) minPresentU = std::min(minPresentU, c.unit); }
+            for (const auto& p : sym.pins)  { if (p.unit <= 1) hasU01 = true; if (p.unit > 0) minPresentU = std::min(minPresentU, p.unit); }
+            if (!hasU01 && minPresentU < 999) targetUnit = minPresentU;
+
+            auto matchUS = [&](int u, int st) -> bool {
+                return (u == 0 || u == targetUnit) && (st == 0 || st == 1);
+            };
+
+            float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+            bool hasGeom = false;
+            auto expB = [&](float x, float y) {
+                minX = std::min(minX, x); maxX = std::max(maxX, x);
+                minY = std::min(minY, y); maxY = std::max(maxY, y);
+                hasGeom = true;
+            };
+            for (const auto& g : sym.segs)  if (matchUS(g.unit, g.style)) { expB(g.x1, g.y1); expB(g.x2, g.y2); }
+            for (const auto& c : sym.circs) if (matchUS(c.unit, c.style)) { expB(c.cx - c.r, c.cy - c.r); expB(c.cx + c.r, c.cy + c.r); }
+            for (const auto& p : sym.pins) {
+                if (!matchUS(p.unit, p.style) || p.hidden) continue;
+                expB(p.x, p.y);
+                float rad = p.angleDeg * 3.14159265f / 180.0f;
+                expB(p.x + p.length * std::cos(rad), p.y + p.length * std::sin(rad));
+            }
+            if (!hasGeom) continue;
+
+            float symW = std::max(4.0f, maxX - minX);
+            float symH = std::max(4.0f, maxY - minY);
+            if (colIdx >= cols) {
+                colIdx = 0;
+                cellX = 0.0f;
+                cellY -= (rowMaxH + 14.0f);
+                rowMaxH = 18.0f;
+            }
+            float offX = cellX - minX;
+            float offY = cellY - (minY + maxY) * 0.5f;
+
+            for (const auto& g : sym.segs) {
+                if (!matchUS(g.unit, g.style) || out.traces.size() >= 80000) continue;
+                out.traces.push_back({ offX + g.x1, offY + g.y1, offX + g.x2, offY + g.y2, g.w, EdaLayerId::SchSymbol, 0 });
+            }
+            for (const auto& c : sym.circs) {
+                if (!matchUS(c.unit, c.style)) continue;
+                out.circles.push_back({ offX + c.cx, offY + c.cy, c.r, c.w, false, EdaLayerId::SchSymbol });
+            }
+            for (const auto& t : sym.texts) {
+                if (!matchUS(t.unit, t.style) || out.labels.size() >= 4096) continue;
+                out.labels.push_back({ offX + t.x, offY + t.y, 0.85f, EdaLayerId::SchLabel, PathUtils::Utf8ToWide(t.text) });
+            }
+
+            int symPins = 0;
+            for (const auto& p : sym.pins) {
+                if (!matchUS(p.unit, p.style) || p.hidden) continue;
+                float tx = offX + p.x;
+                float ty = offY + p.y;
+                float rad = p.angleDeg * 3.14159265f / 180.0f;
+                float dx = std::cos(rad), dy = std::sin(rad);
+                float nx = -dy, ny = dx;
+                float bx = tx + p.length * dx;
+                float by = ty + p.length * dy;
+
+                const bool isInv = (p.shape == "inverted" || p.shape == "inverted_clock");
+                const bool isClk = (p.shape == "clock" || p.shape == "inverted_clock" || p.shape == "edge_clock_high");
+                float stemEndLen = isInv ? std::max(0.0f, p.length - 1.25f) : p.length;
+                if (stemEndLen > 0.02f) {
+                    out.traces.push_back({ tx, ty, tx + stemEndLen * dx, ty + stemEndLen * dy, 0.24f, EdaLayerId::SchWire, 1 });
+                }
+                if (isInv) {
+                    out.circles.push_back({ bx - 0.62f * dx, by - 0.62f * dy, 0.60f, 0.22f, false, EdaLayerId::SchSymbol });
+                }
+                if (isClk) {
+                    out.traces.push_back({ bx + 0.75f * nx, by + 0.75f * ny, bx + 1.35f * dx, by + 1.35f * dy, 0.20f, EdaLayerId::SchSymbol, 0 });
+                    out.traces.push_back({ bx - 0.75f * nx, by - 0.75f * ny, bx + 1.35f * dx, by + 1.35f * dy, 0.20f, EdaLayerId::SchSymbol, 0 });
+                }
+                if (p.shape == "non_logic") {
+                    out.traces.push_back({ tx - 0.5f, ty - 0.5f, tx + 0.5f, ty + 0.5f, 0.20f, EdaLayerId::SchSymbol, 0 });
+                    out.traces.push_back({ tx - 0.5f, ty + 0.5f, tx + 0.5f, ty - 0.5f, 0.20f, EdaLayerId::SchSymbol, 0 });
+                }
+
+                EdaPadPrim pad{};
+                pad.x = tx; pad.y = ty;
+                pad.w = 0.58f; pad.h = 0.58f;
+                pad.shape = 0;
+                pad.layer = EdaLayerId::SchSymbol;
+                pad.pinName = PathUtils::Utf8ToWide(p.number.empty() ? p.name : p.number);
+                pad.netName = PathUtils::Utf8ToWide(p.name);
+                out.pads.push_back(std::move(pad));
+
+                if (!sym.hidePinNames && !p.name.empty() && p.name != "~" && out.labels.size() < 4096) {
+                    out.labels.push_back({ bx + 0.65f * dx - 0.4f, by + 0.65f * dy - 0.25f, 0.80f, EdaLayerId::SchLabel, PathUtils::Utf8ToWide(p.name) });
+                }
+                if (!sym.hidePinNums && !p.number.empty() && p.number != "~" && out.labels.size() < 4096) {
+                    float mx = (tx + bx) * 0.5f + 0.55f * nx;
+                    float my = (ty + by) * 0.5f + 0.55f * ny;
+                    out.labels.push_back({ mx, my, 0.72f, EdaLayerId::TopSilk, PathUtils::Utf8ToWide(p.number) });
+                }
+                ++symPins;
+                ++totalPins;
+            }
+
+            std::string dispTitle = sym.name;
+            if (!sym.valueStr.empty() && sym.valueStr != sym.name) dispTitle += " (" + sym.valueStr + ")";
+            out.labels.push_back({ offX + minX, offY + maxY + 1.8f, 1.05f, EdaLayerId::SchLabel, PathUtils::Utf8ToWide(dispTitle) });
+
+            EdaComponent3D comp;
+            comp.refDes = PathUtils::Utf8ToWide(sym.name);
+            comp.value = PathUtils::Utf8ToWide(sym.valueStr.empty() ? sym.refPrefix : sym.valueStr);
+            comp.footprint = PathUtils::Utf8ToWide(sym.footprintStr.empty() ? "KICAD_SYM" : sym.footprintStr);
+            comp.x = offX + (minX + maxX) * 0.5f;
+            comp.y = offY + (minY + maxY) * 0.5f;
+            comp.widthMm = symW;
+            comp.lengthMm = symH;
+            comp.heightMm = 1.2f;
+            comp.pinCount = std::max(1, symPins);
+            comp.category = EdaPartCategory::IC_Package;
+            out.components.push_back(std::move(comp));
+
+            cellX += symW + 14.0f;
+            rowMaxH = std::max(rowMaxH, symH);
+            ++colIdx;
+            ++renderedSyms;
+        }
+
+        if (renderedSyms == 0 || (out.traces.empty() && out.circles.empty() && out.pads.empty())) {
+            out = ParsedEdaBoard{};
+            return false;
+        }
+        out.formatTitle = L"KiCad Schematic Symbol Library (.kicad_sym — " +
+                          std::to_wstring(renderedSyms) + L" symbol" + (renderedSyms == 1 ? L"" : L"s") +
+                          L", " + std::to_wstring(totalPins) + L" pins)";
+        out.netCount = std::max<size_t>(1u, totalPins > 0 ? totalPins : renderedSyms);
         return true;
     }
 
-    // #62. Specctra Autorouter Session (.ses)
+    // #62. Specctra Autorouter Routed Session (.ses)
     if (ext == L".ses") {
-        if (sv.find("(session") == std::string_view::npos && sv.find("(routes") == std::string_view::npos) return false;
+        using namespace DetailKiCadSymSesPos;
+        if (sv.find("(session") == std::string_view::npos && sv.find("(routes") == std::string_view::npos) {
+            return false;
+        }
+        std::vector<DetailSpecctra::SNode> roots;
+        if (!DetailSpecctra::ParseSExprTree(sv, roots) || roots.empty()) {
+            return false;
+        }
+
+        const DetailSpecctra::SNode* sesRoot = nullptr;
+        for (const auto& r : roots) {
+            std::string hk = LowerAsciiSymSes(DetailSpecctra::HeadKey(r));
+            if (hk == "session" || hk == "routes") { sesRoot = &r; break; }
+        }
+        if (!sesRoot) return false;
+
         out.kind = EdaDocKind::KiCadPcb;
-        out.formatTitle = L"Specctra Autorouter Routed Session (.ses)";
+        std::string designName = (sesRoot->list.size() >= 2 && !sesRoot->list[1].isList) ? sesRoot->list[1].atom : "";
 
-        // Resolution default: (resolution mil 10) or (resolution um 1000) -> scale to mm
-        float toMm = 0.001f;
-        size_t resP = sv.find("(resolution ");
-        if (resP != std::string_view::npos) {
-            std::string rblk(sv.substr(resP + 12, std::min<size_t>(48, sv.size() - resP - 12)));
-            char unit[16] = {}; float div = 1000.0f;
-            if (sscanf_s(rblk.c_str(), "%15s %f", unit, static_cast<unsigned>(sizeof(unit)), &div) == 2 && div > 0.0f) {
-                if (_stricmp(unit, "mil") == 0) toMm = 0.0254f / div;
-                else if (_stricmp(unit, "mm") == 0) toMm = 1.0f / div;
-                else if (_stricmp(unit, "um") == 0) toMm = 0.001f / div;
-            }
-        }
-
-        int netId = 1;
-        size_t pos = 0;
-        while ((pos = sv.find("(path ", pos)) != std::string_view::npos && out.traces.size() < 30000) {
-            size_t closeP = sv.find(')', pos);
-            if (closeP == std::string_view::npos) break;
-            std::string pstr(sv.substr(pos + 6, closeP - pos - 6));
-            pos = closeP + 1;
-
-            char layerName[32] = {}; float widthRaw = 250.0f;
-            int consumed = 0;
-            if (sscanf_s(pstr.c_str(), "%31s %f%n", layerName, static_cast<unsigned>(sizeof(layerName)), &widthRaw, &consumed) >= 2) {
-                EdaLayerId lid = (std::strstr(layerName, "B.") || std::strstr(layerName, "Bot") || std::strcmp(layerName, "2") == 0)
-                    ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
-                float wMm = std::clamp(widthRaw * toMm, 0.12f, 2.5f);
-                const char* cp = pstr.c_str() + consumed;
-                std::vector<std::pair<float, float>> pts;
-                while (*cp) {
-                    char* e1 = nullptr; float x = std::strtof(cp, &e1); if (e1 == cp) break; cp = e1;
-                    char* e2 = nullptr; float y = std::strtof(cp, &e2); if (e2 == cp) break; cp = e2;
-                    pts.push_back({ x * toMm, y * toMm });
+        auto parseResNodeScale = [](const DetailSpecctra::SNode& secNode, double fallbackScale) -> double {
+            for (size_t i = 1; i < secNode.list.size(); ++i) {
+                const auto& ch = secNode.list[i];
+                if (LowerAsciiSymSes(DetailSpecctra::HeadKey(ch)) == "resolution" && ch.list.size() >= 3) {
+                    double div = 1.0;
+                    if (!ch.list[1].isList && DetailSpecctra::AtomFloat(ch.list[2], div) && div > 0.0) {
+                        return DetailSpecctra::UnitNameToMm(ch.list[1].atom) / div;
+                    }
                 }
-                for (size_t k = 1; k < pts.size(); ++k) {
-                    out.traces.push_back({ pts[k - 1].first, pts[k - 1].second, pts[k].first, pts[k].second, wMm, lid, netId });
+            }
+            return fallbackScale;
+        };
+
+        auto mapSesLayer = [](std::string_view lyrRaw) -> EdaLayerId {
+            std::string low = LowerAsciiSymSes(lyrRaw);
+            if (low.find("b.") != std::string::npos || low.find("bot") != std::string::npos ||
+                low.find("back") != std::string::npos || low.find("solder") != std::string::npos) {
+                return EdaLayerId::BottomCopper;
+            }
+            if (low.find("in") == 0 || low.find("inner") != std::string::npos || low.find("mid") != std::string::npos ||
+                low.find("gnd") != std::string::npos || low.find("pwr") != std::string::npos) {
+                return EdaLayerId::InnerCopper;
+            }
+            if (low == "2" || low == "16" || low == "32") {
+                return EdaLayerId::BottomCopper;
+            }
+            return EdaLayerId::TopCopper;
+        };
+
+        double rootScaleMm = parseResNodeScale(*sesRoot, 0.001);
+
+        struct SesViaPad { float diamMm = 0.8f; float drillMm = 0.4f; };
+        std::unordered_map<std::string, SesViaPad> viaPadstacks;
+        std::set<std::string> routedNets;
+
+        auto parseRoutesNode = [&](const DetailSpecctra::SNode& routesNode) {
+            double rScale = parseResNodeScale(routesNode, rootScaleMm);
+
+            for (size_t i = 1; i < routesNode.list.size(); ++i) {
+                const auto& sub = routesNode.list[i];
+                if (LowerAsciiSymSes(DetailSpecctra::HeadKey(sub)) != "library_out") continue;
+                for (size_t j = 1; j < sub.list.size(); ++j) {
+                    const auto& ps = sub.list[j];
+                    if (LowerAsciiSymSes(DetailSpecctra::HeadKey(ps)) != "padstack" || ps.list.size() < 2) continue;
+                    std::string psName = ps.list[1].atom;
+                    float maxD = 0.0f;
+                    for (size_t k = 2; k < ps.list.size(); ++k) {
+                        const auto& sh = ps.list[k];
+                        if (LowerAsciiSymSes(DetailSpecctra::HeadKey(sh)) != "shape" || sh.list.size() < 2) continue;
+                        const auto& geom = sh.list[1];
+                        std::string gk = LowerAsciiSymSes(DetailSpecctra::HeadKey(geom));
+                        if (gk == "circle" && geom.list.size() >= 3) {
+                            double d = 0.0;
+                            if (DetailSpecctra::AtomFloat(geom.list[2], d)) maxD = std::max(maxD, static_cast<float>(d * rScale));
+                        } else if (gk == "rect" && geom.list.size() >= 6) {
+                            double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+                            if (DetailSpecctra::AtomFloat(geom.list[2], x1) && DetailSpecctra::AtomFloat(geom.list[3], y1) &&
+                                DetailSpecctra::AtomFloat(geom.list[4], x2) && DetailSpecctra::AtomFloat(geom.list[5], y2)) {
+                                maxD = std::max(maxD, static_cast<float>(std::max(std::fabs(x2 - x1), std::fabs(y2 - y1)) * rScale));
+                            }
+                        }
+                    }
+                    if (!psName.empty() && maxD > 0.1f) {
+                        viaPadstacks[psName] = { std::clamp(maxD, 0.25f, 6.0f), std::clamp(maxD * 0.5f, 0.15f, 3.0f) };
+                    }
                 }
-                ++netId;
+            }
+
+            for (size_t i = 1; i < routesNode.list.size(); ++i) {
+                const auto& sub = routesNode.list[i];
+                if (LowerAsciiSymSes(DetailSpecctra::HeadKey(sub)) != "network_out") continue;
+                for (size_t j = 1; j < sub.list.size(); ++j) {
+                    const auto& netN = sub.list[j];
+                    if (LowerAsciiSymSes(DetailSpecctra::HeadKey(netN)) != "net" || netN.list.size() < 2) continue;
+                    std::string netName = netN.list[1].atom;
+                    routedNets.insert(netName);
+                    int netId = static_cast<int>(routedNets.size());
+
+                    for (size_t k = 2; k < netN.list.size(); ++k) {
+                        const auto& item = netN.list[k];
+                        std::string ik = LowerAsciiSymSes(DetailSpecctra::HeadKey(item));
+                        if (ik == "via" && item.list.size() >= 4 && out.vias.size() < 25000) {
+                            std::string psName = item.list[1].atom;
+                            double vx = 0.0, vy = 0.0;
+                            if (DetailSpecctra::AtomFloat(item.list[2], vx) && DetailSpecctra::AtomFloat(item.list[3], vy)) {
+                                SesViaPad vp{};
+                                auto itVp = viaPadstacks.find(psName);
+                                if (itVp != viaPadstacks.end()) vp = itVp->second;
+                                out.vias.push_back({ static_cast<float>(vx * rScale), static_cast<float>(vy * rScale), vp.diamMm, vp.drillMm, netId });
+                            }
+                        } else if (ik == "wire") {
+                            for (size_t m = 1; m < item.list.size(); ++m) {
+                                const auto& wsub = item.list[m];
+                                std::string wk = LowerAsciiSymSes(DetailSpecctra::HeadKey(wsub));
+                                if ((wk == "path" || wk == "polyline_path" || wk == "polygon") && wsub.list.size() >= 7 && out.traces.size() < 100000) {
+                                    EdaLayerId lid = mapSesLayer(wsub.list[1].atom);
+                                    double wRaw = 0.0;
+                                    DetailSpecctra::AtomFloat(wsub.list[2], wRaw);
+                                    float wMm = std::clamp(static_cast<float>(wRaw * rScale), 0.10f, 4.0f);
+                                    std::vector<std::pair<float, float>> pts;
+                                    for (size_t p = 3; p + 1 < wsub.list.size(); p += 2) {
+                                        if (wsub.list[p].isList || wsub.list[p + 1].isList) break;
+                                        double px = 0.0, py = 0.0;
+                                        if (!DetailSpecctra::AtomFloat(wsub.list[p], px) ||
+                                            !DetailSpecctra::AtomFloat(wsub.list[p + 1], py)) break;
+                                        pts.push_back({ static_cast<float>(px * rScale), static_cast<float>(py * rScale) });
+                                    }
+                                    for (size_t s = 1; s < pts.size(); ++s) {
+                                        out.traces.push_back({ pts[s - 1].first, pts[s - 1].second, pts[s].first, pts[s].second, wMm, lid, netId });
+                                    }
+                                    if (wk == "polygon" && pts.size() >= 3) {
+                                        out.traces.push_back({ pts.back().first, pts.back().second, pts.front().first, pts.front().second, wMm, lid, netId });
+                                    }
+                                } else if (wk == "qarc" && wsub.list.size() >= 9 && out.traces.size() < 100000) {
+                                    EdaLayerId lid = mapSesLayer(wsub.list[1].atom);
+                                    double wRaw = 0, sx = 0, sy = 0, ex = 0, ey = 0, cx = 0, cy = 0;
+                                    if (DetailSpecctra::AtomFloat(wsub.list[2], wRaw) &&
+                                        DetailSpecctra::AtomFloat(wsub.list[3], sx) && DetailSpecctra::AtomFloat(wsub.list[4], sy) &&
+                                        DetailSpecctra::AtomFloat(wsub.list[5], ex) && DetailSpecctra::AtomFloat(wsub.list[6], ey) &&
+                                        DetailSpecctra::AtomFloat(wsub.list[7], cx) && DetailSpecctra::AtomFloat(wsub.list[8], cy))
+                                    {
+                                        float wMm = std::clamp(static_cast<float>(wRaw * rScale), 0.10f, 4.0f);
+                                        DetailEda100::AddTessellatedArc(
+                                            out, static_cast<float>(sx * rScale), static_cast<float>(sy * rScale),
+                                            static_cast<float>(ex * rScale), static_cast<float>(ey * rScale),
+                                            static_cast<float>(cx * rScale), static_cast<float>(cy * rScale),
+                                            false, wMm, lid, netId);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if (LowerAsciiSymSes(DetailSpecctra::HeadKey(*sesRoot)) == "routes") {
+            parseRoutesNode(*sesRoot);
+        } else {
+            for (size_t i = 1; i < sesRoot->list.size(); ++i) {
+                const auto& sec = sesRoot->list[i];
+                std::string sk = LowerAsciiSymSes(DetailSpecctra::HeadKey(sec));
+                if (sk == "base_design" && sec.list.size() >= 2 && !sec.list[1].isList) {
+                    designName = sec.list[1].atom;
+                } else if (sk == "placement") {
+                    double pScale = parseResNodeScale(sec, rootScaleMm);
+                    for (size_t j = 1; j < sec.list.size(); ++j) {
+                        const auto& cmpNode = sec.list[j];
+                        if (LowerAsciiSymSes(DetailSpecctra::HeadKey(cmpNode)) != "component" || cmpNode.list.size() < 2) continue;
+                        std::string pkgName = cmpNode.list[1].atom;
+                        for (size_t k = 2; k < cmpNode.list.size(); ++k) {
+                            const auto& plc = cmpNode.list[k];
+                            if (LowerAsciiSymSes(DetailSpecctra::HeadKey(plc)) != "place" || plc.list.size() < 6) continue;
+                            std::string refDes = plc.list[1].atom;
+                            double px = 0.0, py = 0.0, rot = 0.0;
+                            if (!DetailSpecctra::AtomFloat(plc.list[2], px) || !DetailSpecctra::AtomFloat(plc.list[3], py)) continue;
+                            std::string sideLow = LowerAsciiSymSes(plc.list[4].atom);
+                            DetailSpecctra::AtomFloat(plc.list[5], rot);
+
+                            EdaComponent3D comp;
+                            comp.refDes = PathUtils::Utf8ToWide(refDes);
+                            comp.footprint = PathUtils::Utf8ToWide(pkgName);
+                            comp.x = static_cast<float>(px * pScale);
+                            comp.y = static_cast<float>(py * pScale);
+                            comp.rotDeg = static_cast<float>(rot);
+                            comp.bottomSide = (sideLow == "back" || sideLow == "bottom" || sideLow == "b");
+                            comp.widthMm = 2.4f; comp.lengthMm = 1.6f; comp.heightMm = 1.0f;
+                            comp.category = ClassifyComponent(comp.refDes, comp.footprint, comp.widthMm, comp.lengthMm, comp.heightMm, comp.pinCount);
+                            EdaLayerId silkL = comp.bottomSide ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk;
+                            DetailEda100::AddRectOutline(out, comp.x, comp.y, comp.widthMm, comp.lengthMm, silkL, 0.16f);
+                            out.labels.push_back({ comp.x, comp.y, 0.85f, silkL, comp.refDes });
+                            out.components.push_back(std::move(comp));
+                        }
+                    }
+                } else if (sk == "routes") {
+                    parseRoutesNode(sec);
+                }
             }
         }
 
-        size_t vpos = 0;
-        while ((vpos = sv.find("(via ", vpos)) != std::string_view::npos && out.vias.size() < 8000) {
-            size_t closeV = sv.find(')', vpos);
-            if (closeV == std::string_view::npos) break;
-            std::string vstr(sv.substr(vpos + 5, closeV - vpos - 5));
-            vpos = closeV + 1;
-            char padstack[64] = {}; float vx = 0, vy = 0;
-            if (sscanf_s(vstr.c_str(), "%63s %f %f", padstack, static_cast<unsigned>(sizeof(padstack)), &vx, &vy) == 3) {
-                out.vias.push_back({ vx * toMm, vy * toMm, 0.8f, 0.4f, 1 });
-            }
+        // Zero-Cheat Guarantee: reject empty (session ...) shells with 0 routes, 0 vias, and 0 placed parts
+        if (out.traces.empty() && out.vias.empty() && out.components.empty()) {
+            out = ParsedEdaBoard{};
+            return false;
         }
-        out.netCount = static_cast<size_t>(std::max(1, netId - 1));
-        if (out.traces.empty()) DetailEda100::AddRectOutline(out, 0, 0, 40, 30, EdaLayerId::EdgeCuts, 0.35f);
+
+        out.formatTitle = L"Specctra Autorouter Routed Session (.ses";
+        if (!designName.empty()) out.formatTitle += L" — " + PathUtils::Utf8ToWide(designName);
+        out.formatTitle += L")";
+        out.netCount = std::max<size_t>(1u, routedNets.empty() ? out.components.size() : routedNets.size());
         return true;
     }
 
     // #63. SMT Pick-and-Place Centroid File (.pos / .cpl / .mnt)
     if (ext == L".pos" || ext == L".cpl" || ext == L".mnt") {
+        using namespace DetailKiCadSymSesPos;
+        for (unsigned char c : sv) {
+            if (c == 0) return false;
+        }
+
+        float defaultUnitToMm = 1.0f;
+        int colRef = -1, colVal = -1, colPkg = -1, colX = -1, colY = -1, colRot = -1, colSide = -1;
+        bool hasExplicitHeader = false;
+
         out.kind = EdaDocKind::KiCadPcb;
-        out.formatTitle = L"SMT Pick-and-Place Assembly Centroid (" + ext + L")";
 
         size_t pos = 0;
-        while (pos < sv.size() && out.components.size() < 4000) {
+        while (pos < sv.size() && out.components.size() < 8000) {
             size_t eol = sv.find('\n', pos);
             if (eol == std::string_view::npos) eol = sv.size();
-            std::string ln(sv.substr(pos, eol - pos));
+            std::string_view ln = sv.substr(pos, eol - pos);
             pos = eol + 1;
+            while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ' || ln.back() == '\t')) ln.remove_suffix(1);
+            while (!ln.empty() && (ln.front() == ' ' || ln.front() == '\t')) ln.remove_prefix(1);
+            if (ln.empty()) continue;
 
-            size_t first = ln.find_first_not_of(" \t\r");
-            if (first == std::string::npos || ln[first] == '#') continue;
-
-            // Replace commas & quotes with spaces to parse both KiCad space-aligned .pos and JLCPCB CSV .cpl
-            for (char& ch : ln) if (ch == ',' || ch == '"' || ch == ';') ch = ' ';
-            std::vector<std::string> cols;
-            size_t tp = 0;
-            while (tp < ln.size()) {
-                while (tp < ln.size() && (ln[tp] == ' ' || ln[tp] == '\t' || ln[tp] == '\r')) ++tp;
-                size_t te = ln.find_first_of(" \t\r", tp);
-                if (te == std::string::npos) te = ln.size();
-                if (te > tp) cols.push_back(ln.substr(tp, te - tp));
-                tp = te;
-            }
-            if (cols.size() < 5) continue;
-            if (_stricmp(cols[0].c_str(), "Ref") == 0 || _stricmp(cols[0].c_str(), "Designator") == 0) continue;
-
-            // KiCad .pos: Ref Val Package PosX PosY Rot Side
-            // JLCPCB .cpl: Designator MidX MidY Layer Rotation [Comment]
-            float px = 0.0f, py = 0.0f, rot = 0.0f;
-            bool bottom = false;
-            std::string ref = cols[0], valStr, pkgStr = "SMD_0805";
-
-            char* echk = nullptr;
-            float testCol1 = std::strtof(cols[1].c_str(), &echk);
-            if (echk != cols[1].c_str() && (*echk == '\0' || *echk == 'm')) {
-                // JLCPCB order: Ref MidX MidY Layer Rot
-                px = testCol1;
-                py = std::strtof(cols[2].c_str(), nullptr);
-                bottom = (_stricmp(cols[3].c_str(), "Bottom") == 0 || _stricmp(cols[3].c_str(), "B") == 0);
-                rot = std::strtof(cols[4].c_str(), nullptr);
-            } else if (cols.size() >= 6) {
-                valStr = cols[1];
-                pkgStr = cols[2];
-                px = std::strtof(cols[3].c_str(), nullptr);
-                py = std::strtof(cols[4].c_str(), nullptr);
-                rot = std::strtof(cols[5].c_str(), nullptr);
-                if (cols.size() >= 7) bottom = (_stricmp(cols[6].c_str(), "bottom") == 0 || _stricmp(cols[6].c_str(), "bot") == 0);
-            } else {
+            if (ln.front() == '#' || ln.rfind("//", 0) == 0) {
+                std::string lowHdr = LowerAsciiSymSes(ln);
+                if (lowHdr.find("unit") != std::string::npos) {
+                    if (lowHdr.find("inch") != std::string::npos || lowHdr.find(" = in") != std::string::npos) defaultUnitToMm = 25.4f;
+                    else if (lowHdr.find("mil") != std::string::npos) defaultUnitToMm = 0.0254f;
+                    else if (lowHdr.find("mm") != std::string::npos) defaultUnitToMm = 1.0f;
+                }
                 continue;
             }
+
+            const bool isCsvLine = (ln.find(',') != std::string_view::npos || ln.find(';') != std::string_view::npos);
+            std::vector<std::string> cols = SplitPickAndPlaceRow(ln, isCsvLine);
+            if (cols.size() < 4) continue;
+
+            std::string c0Low = LowerAsciiSymSes(cols[0]);
+            if (c0Low == "ref" || c0Low == "refdes" || c0Low == "designator" || c0Low == "part" || c0Low == "component") {
+                colRef = 0;
+                colVal = colPkg = colX = colY = colRot = colSide = -1;
+                for (size_t ci = 1; ci < cols.size(); ++ci) {
+                    std::string h = LowerAsciiSymSes(cols[ci]);
+                    if (h.find("(mil)") != std::string::npos) defaultUnitToMm = 0.0254f;
+                    else if (h.find("(in)") != std::string::npos || h.find("(inch)") != std::string::npos) defaultUnitToMm = 25.4f;
+                    else if (h.find("(mm)") != std::string::npos) defaultUnitToMm = 1.0f;
+
+                    if (colX < 0 && (h == "posx" || h == "mid x" || h == "midx" || h == "x" || h.find("center-x") != std::string::npos || h.find("ref x") != std::string::npos || h.find("pad x") != std::string::npos)) {
+                        colX = static_cast<int>(ci);
+                    } else if (colY < 0 && (h == "posy" || h == "mid y" || h == "midy" || h == "y" || h.find("center-y") != std::string::npos || h.find("ref y") != std::string::npos || h.find("pad y") != std::string::npos)) {
+                        colY = static_cast<int>(ci);
+                    } else if (colRot < 0 && (h.find("rot") != std::string::npos || h.find("angle") != std::string::npos || h == "orient")) {
+                        colRot = static_cast<int>(ci);
+                    } else if (colSide < 0 && (h == "side" || h == "layer" || h == "tb")) {
+                        colSide = static_cast<int>(ci);
+                    } else if (colPkg < 0 && (h.find("pack") != std::string::npos || h.find("foot") != std::string::npos || h == "pattern")) {
+                        colPkg = static_cast<int>(ci);
+                    } else if (colVal < 0 && (h == "val" || h == "value" || h == "comment" || h == "device")) {
+                        colVal = static_cast<int>(ci);
+                    }
+                }
+                if (colX >= 0 && colY >= 0) hasExplicitHeader = true;
+                continue;
+            }
+
+            std::string ref, valStr, pkgStr;
+            float px = 0.0f, py = 0.0f, rot = 0.0f;
+            bool bottom = false;
+
+            if (hasExplicitHeader) {
+                int maxReq = std::max(colRef, std::max(colX, colY));
+                if (static_cast<int>(cols.size()) <= maxReq) continue;
+                ref = cols[static_cast<size_t>(colRef)];
+                if (!LooksLikeValidRefDes(ref)) continue;
+                if (!ParsePnpCoordTokenMm(cols[static_cast<size_t>(colX)], defaultUnitToMm, px) ||
+                    !ParsePnpCoordTokenMm(cols[static_cast<size_t>(colY)], defaultUnitToMm, py)) {
+                    continue;
+                }
+                if (colVal >= 0 && colVal < static_cast<int>(cols.size())) valStr = cols[static_cast<size_t>(colVal)];
+                if (colPkg >= 0 && colPkg < static_cast<int>(cols.size())) pkgStr = cols[static_cast<size_t>(colPkg)];
+                if (colRot >= 0 && colRot < static_cast<int>(cols.size())) {
+                    rot = std::strtof(cols[static_cast<size_t>(colRot)].c_str(), nullptr);
+                }
+                if (colSide >= 0 && colSide < static_cast<int>(cols.size())) {
+                    std::string sl = LowerAsciiSymSes(cols[static_cast<size_t>(colSide)]);
+                    bottom = (sl == "bottom" || sl == "bot" || sl == "b" || sl == "back" || sl == "bottomlayer");
+                }
+            } else {
+                ref = cols[0];
+                if (!LooksLikeValidRefDes(ref)) continue;
+
+                float tx = 0.0f, ty = 0.0f;
+                if (cols.size() >= 5 &&
+                    ParsePnpCoordTokenMm(cols[1], defaultUnitToMm, tx) &&
+                    ParsePnpCoordTokenMm(cols[2], defaultUnitToMm, ty))
+                {
+                    px = tx; py = ty;
+                    std::string c3Low = LowerAsciiSymSes(cols[3]);
+                    if (c3Low == "top" || c3Low == "bottom" || c3Low == "bot" || c3Low == "t" || c3Low == "b") {
+                        bottom = (c3Low == "bottom" || c3Low == "bot" || c3Low == "b");
+                        rot = std::strtof(cols[4].c_str(), nullptr);
+                        if (cols.size() >= 6) valStr = cols[5];
+                    } else {
+                        rot = std::strtof(cols[3].c_str(), nullptr);
+                        valStr = cols[4];
+                        if (cols.size() >= 6) pkgStr = cols[5];
+                    }
+                } else if (cols.size() >= 6 &&
+                           ParsePnpCoordTokenMm(cols[3], defaultUnitToMm, tx) &&
+                           ParsePnpCoordTokenMm(cols[4], defaultUnitToMm, ty))
+                {
+                    valStr = cols[1];
+                    pkgStr = cols[2];
+                    px = tx; py = ty;
+                    rot = std::strtof(cols[5].c_str(), nullptr);
+                    if (cols.size() >= 7) {
+                        std::string c6Low = LowerAsciiSymSes(cols[6]);
+                        bottom = (c6Low == "bottom" || c6Low == "bot" || c6Low == "b" || c6Low == "back");
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            if (pkgStr.empty()) pkgStr = "SMD_0805";
 
             EdaComponent3D c;
             c.refDes = PathUtils::Utf8ToWide(ref);
             c.value = PathUtils::Utf8ToWide(valStr);
             c.footprint = PathUtils::Utf8ToWide(pkgStr);
-            c.x = px; c.y = py; c.rotDeg = rot;
+            c.x = px;
+            c.y = py;
+            c.rotDeg = rot;
             c.bottomSide = bottom;
-            c.widthMm = 2.4f; c.lengthMm = 1.6f; c.heightMm = 1.0f;
-            if (!ref.empty() && (ref[0] == 'U' || ref[0] == 'I')) { c.category = EdaPartCategory::IC_Package; c.widthMm = 5.5f; c.lengthMm = 5.5f; c.heightMm = 1.5f; }
-            else if (!ref.empty() && ref[0] == 'R') c.category = EdaPartCategory::ResistorSMD;
-            else if (!ref.empty() && ref[0] == 'C') c.category = EdaPartCategory::CapacitorSMD;
-            else if (!ref.empty() && (ref[0] == 'J' || ref[0] == 'P')) { c.category = EdaPartCategory::Connector; c.widthMm = 6.0f; c.lengthMm = 3.0f; c.heightMm = 4.0f; }
-            out.components.push_back(c);
+            c.widthMm = 2.0f;
+            c.lengthMm = 1.25f;
+            c.heightMm = 0.8f;
+            c.pinCount = 2;
+            c.category = ClassifyComponent(c.refDes, c.footprint, c.widthMm, c.lengthMm, c.heightMm, c.pinCount);
 
-            EdaLayerId padL = bottom ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
-            out.pads.push_back({ px - c.widthMm * 0.42f, py, 0.7f, 0.9f, rot, 0.0f, 1, padL, L"1", L"" });
-            out.pads.push_back({ px + c.widthMm * 0.42f, py, 0.7f, 0.9f, rot, 0.0f, 1, padL, L"2", L"" });
+            std::string pkgUp = pkgStr;
+            for (char& ch : pkgUp) if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+            c.pinCount = ExtractTrailingPinCount(pkgUp, c.pinCount);
+
+            const float rad = rot * 3.14159265f / 180.0f;
+            const float cs = std::cos(rad), sn = std::sin(rad);
+            auto emitRotPad = [&](float lx, float ly, float pw, float ph, float padLocalRot, uint8_t shape, int pinNo) {
+                float wx = px + (lx * cs - ly * sn);
+                float wy = py + (lx * sn + ly * cs);
+                EdaLayerId padL = bottom ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
+                out.pads.push_back({ wx, wy, pw, ph, rot + padLocalRot, 0.0f, shape, padL, std::to_wstring(pinNo), L"" });
+            };
+
+            if (pkgUp.find("BGA") != std::string::npos) {
+                int gridN = std::clamp(static_cast<int>(std::round(std::sqrt(static_cast<double>(std::max(4, c.pinCount))))), 2, 8);
+                float pitch = 0.8f;
+                c.widthMm = std::max(c.widthMm, static_cast<float>(gridN) * pitch + 1.0f);
+                c.lengthMm = c.widthMm;
+                int pno = 1;
+                for (int r = 0; r < gridN; ++r) {
+                    for (int cl = 0; cl < gridN; ++cl) {
+                        float lx = (static_cast<float>(cl) - (gridN - 1) * 0.5f) * pitch;
+                        float ly = (static_cast<float>(r)  - (gridN - 1) * 0.5f) * pitch;
+                        emitRotPad(lx, ly, 0.42f, 0.42f, 0.0f, 0, pno++);
+                    }
+                }
+                c.pinCount = gridN * gridN;
+            } else if (pkgUp.find("QFP") != std::string::npos || pkgUp.find("QFN") != std::string::npos) {
+                int perSide = std::clamp(std::max(16, c.pinCount) / 4, 3, 20);
+                float pitch = (perSide >= 12) ? 0.5f : 0.65f;
+                float bodySpan = static_cast<float>(perSide) * pitch + 1.2f;
+                c.widthMm = bodySpan;
+                c.lengthMm = bodySpan;
+                float halfSpan = bodySpan * 0.5f;
+                int pno = 1;
+                for (int i = 0; i < perSide; ++i) {
+                    float ofs = (static_cast<float>(i) - (perSide - 1) * 0.5f) * pitch;
+                    emitRotPad(-halfSpan, -ofs, 0.70f, pitch * 0.55f, 0.0f, 1, pno++);
+                }
+                for (int i = 0; i < perSide; ++i) {
+                    float ofs = (static_cast<float>(i) - (perSide - 1) * 0.5f) * pitch;
+                    emitRotPad(ofs, -halfSpan, pitch * 0.55f, 0.70f, 0.0f, 1, pno++);
+                }
+                for (int i = 0; i < perSide; ++i) {
+                    float ofs = (static_cast<float>(i) - (perSide - 1) * 0.5f) * pitch;
+                    emitRotPad(halfSpan, ofs, 0.70f, pitch * 0.55f, 0.0f, 1, pno++);
+                }
+                for (int i = 0; i < perSide; ++i) {
+                    float ofs = (static_cast<float>(i) - (perSide - 1) * 0.5f) * pitch;
+                    emitRotPad(-ofs, halfSpan, pitch * 0.55f, 0.70f, 0.0f, 1, pno++);
+                }
+                c.pinCount = perSide * 4;
+            } else if (c.category == EdaPartCategory::TransistorSOT && c.pinCount <= 3) {
+                emitRotPad(-0.95f, -1.0f, 0.60f, 0.70f, 0.0f, 1, 1);
+                emitRotPad( 0.95f, -1.0f, 0.60f, 0.70f, 0.0f, 1, 2);
+                emitRotPad( 0.0f,   1.0f, 0.60f, 0.70f, 0.0f, 1, 3);
+                c.pinCount = 3;
+            } else if (c.pinCount >= 4 && (c.category == EdaPartCategory::IC_Package || c.category == EdaPartCategory::TransistorSOT || c.category == EdaPartCategory::Connector)) {
+                int half = std::clamp((c.pinCount + 1) / 2, 2, 24);
+                float pitch = (pkgUp.find("TSSOP") != std::string::npos || pkgUp.find("MSOP") != std::string::npos) ? 0.65f
+                            : (c.category == EdaPartCategory::Connector ? 2.54f : 1.27f);
+                c.lengthMm = std::max(c.lengthMm, static_cast<float>(half) * pitch + 0.6f);
+                float rowX = c.widthMm * 0.5f;
+                int pno = 1;
+                for (int i = 0; i < half; ++i) {
+                    float ly = ((half - 1) * 0.5f - static_cast<float>(i)) * pitch;
+                    emitRotPad(-rowX, ly, 0.85f, pitch * 0.52f, 0.0f, 1, pno++);
+                }
+                for (int i = 0; i < half; ++i) {
+                    float ly = (static_cast<float>(i) - (half - 1) * 0.5f) * pitch;
+                    emitRotPad(rowX, ly, 0.85f, pitch * 0.52f, 0.0f, 1, pno++);
+                }
+            } else {
+                float dx = c.widthMm * 0.44f;
+                float pw = std::clamp(c.widthMm * 0.34f, 0.30f, 1.4f);
+                float ph = std::clamp(c.lengthMm * 0.86f, 0.35f, 2.2f);
+                emitRotPad(-dx, 0.0f, pw, ph, 0.0f, 1, 1);
+                emitRotPad( dx, 0.0f, pw, ph, 0.0f, 1, 2);
+            }
+
+            float hw = c.widthMm * 0.5f, hl = c.lengthMm * 0.5f;
+            auto rotCorner = [&](float lx, float ly) -> std::pair<float, float> {
+                return { px + (lx * cs - ly * sn), py + (lx * sn + ly * cs) };
+            };
+            auto k0 = rotCorner(-hw, -hl), k1 = rotCorner(hw, -hl), k2 = rotCorner(hw, hl), k3 = rotCorner(-hw, hl);
+            EdaLayerId silkL = bottom ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk;
+            out.traces.push_back({ k0.first, k0.second, k1.first, k1.second, 0.14f, silkL, 0 });
+            out.traces.push_back({ k1.first, k1.second, k2.first, k2.second, 0.14f, silkL, 0 });
+            out.traces.push_back({ k2.first, k2.second, k3.first, k3.second, 0.14f, silkL, 0 });
+            out.traces.push_back({ k3.first, k3.second, k0.first, k0.second, 0.14f, silkL, 0 });
+            out.labels.push_back({ px, py, 0.85f, silkL, c.refDes });
+
+            out.components.push_back(std::move(c));
         }
 
-        if (out.components.empty()) return false;
-        // Synthesize Edge.Cuts outline around placed parts
+        if (out.components.empty()) {
+            out = ParsedEdaBoard{};
+            return false;
+        }
+
         float mnX = out.components[0].x, mxX = mnX, mnY = out.components[0].y, mxY = mnY;
         for (const auto& c : out.components) {
-            mnX = std::min(mnX, c.x - 5.0f); mxX = std::max(mxX, c.x + 5.0f);
-            mnY = std::min(mnY, c.y - 5.0f); mxY = std::max(mxY, c.y + 5.0f);
+            float span = std::max(c.widthMm, c.lengthMm) * 0.5f + 3.0f;
+            mnX = std::min(mnX, c.x - span); mxX = std::max(mxX, c.x + span);
+            mnY = std::min(mnY, c.y - span); mxY = std::max(mxY, c.y + span);
         }
-        DetailEda100::AddRectOutline(out, (mnX + mxX) * 0.5f, (mnY + mxY) * 0.5f, mxX - mnX, mxY - mnY, EdaLayerId::EdgeCuts, 0.4f);
+        DetailEda100::AddRectOutline(out, (mnX + mxX) * 0.5f, (mnY + mxY) * 0.5f, mxX - mnX, mxY - mnY, EdaLayerId::EdgeCuts, 0.36f);
+        out.formatTitle = L"SMT Pick-and-Place Assembly (" + ext + L" — " + std::to_wstring(out.components.size()) + L" parts)";
+        out.netCount = out.components.size();
         return true;
     }
     return false;
@@ -502,142 +1376,700 @@ inline bool ParseKiCadSymSesPos(std::string_view sv, const std::wstring& ext, Pa
 inline bool ParseIbisTouchstoneOasis(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
     std::string_view sv(reinterpret_cast<const char*>(data), size);
 
-    // #64. IBIS Signal Integrity Model (.ibs)
+    // #64. IBIS Signal Integrity Model (.ibs — ANSI/EIA-656 v3.2–v7.2)
     if (ext == L".ibs") {
-        if (sv.find("[IBIS Ver]") == std::string_view::npos && sv.find("[Component]") == std::string_view::npos &&
+        for (size_t i = 0; i < size; ++i) {
+            if (data[i] == 0) return false;
+        }
+        if (sv.find("[IBIS Ver]") == std::string_view::npos &&
+            sv.find("[ibis ver]") == std::string_view::npos &&
+            sv.find("[Component]") == std::string_view::npos &&
             sv.find("[Model]") == std::string_view::npos)
         {
             return false;
         }
-        out.kind = EdaDocKind::KiCadSch;
-        out.formatTitle = L"IBIS High-Speed I/O Buffer Model (.ibs)";
-        DetailEda200::DrawGraticule(out, -40.0f, -25.0f, 80.0f, 50.0f, 10, 8);
-        out.labels.push_back({ -38.0f, 27.5f, 1.4f, EdaLayerId::TopSilk, L"IBIS V-I / V-T Buffer Curves" });
 
-        auto parseCurveSection = [&](const char* secHdr, EdaLayerId lid) {
-            size_t sp = sv.find(secHdr);
-            if (sp == std::string_view::npos) return;
-            size_t pos = sv.find('\n', sp);
-            if (pos == std::string_view::npos) return;
-            ++pos;
-            std::vector<std::pair<float, float>> pts;
-            auto parseEng = [](const char* s) -> float {
-                char* ep = nullptr;
-                float v = std::strtof(s, &ep);
-                if (ep && *ep) {
-                    if (*ep == 'm') v *= 1e-3f;
-                    else if (*ep == 'u') v *= 1e-6f;
-                    else if (*ep == 'n') v *= 1e-9f;
-                    else if (*ep == 'p') v *= 1e-12f;
-                    else if (*ep == 'k' || *ep == 'K') v *= 1e3f;
-                }
-                return v;
-            };
-            while (pos < sv.size() && pts.size() < 512) {
-                size_t eol = sv.find('\n', pos);
-                if (eol == std::string_view::npos) eol = sv.size();
-                std::string ln(sv.substr(pos, eol - pos));
-                pos = eol + 1;
-                size_t f = ln.find_first_not_of(" \t\r");
-                if (f == std::string::npos || ln[f] == '|') continue;
-                if (ln[f] == '[') break;
-                char c1[32] = {}, c2[32] = {};
-                if (sscanf_s(ln.c_str() + f, "%31s %31s", c1, static_cast<unsigned>(sizeof(c1)), c2, static_cast<unsigned>(sizeof(c2))) == 2 &&
-                    ((c1[0] >= '0' && c1[0] <= '9') || c1[0] == '-' || c1[0] == '+' || c1[0] == '.'))
-                {
-                    pts.push_back({ parseEng(c1), parseEng(c2) });
-                }
+        auto parseIbisVal = [](std::string_view tok, double& outV) -> bool {
+            while (!tok.empty() && static_cast<unsigned char>(tok.front()) <= 0x20u) tok.remove_prefix(1);
+            while (!tok.empty() && static_cast<unsigned char>(tok.back()) <= 0x20u) tok.remove_suffix(1);
+            if (tok.empty() || _strnicmp(tok.data(), "NA", 2) == 0) return false;
+            char buf[64] = {};
+            std::memcpy(buf, tok.data(), std::min<size_t>(tok.size(), 63));
+            char* ep = nullptr;
+            double v = std::strtod(buf, &ep);
+            if (!ep || ep == buf || !std::isfinite(v)) return false;
+            switch (*ep) {
+            case 'f': case 'F': if (ep[1] != 'a' && ep[1] != 'A') v *= 1e-15; break;
+            case 'p': v *= 1e-12; break;
+            case 'n': v *= 1e-9;  break;
+            case 'u': v *= 1e-6;  break;
+            case 'm': v *= 1e-3;  break;
+            case 'k': case 'K': v *= 1e3; break;
+            case 'M': v *= 1e6;   break;
+            case 'G': case 'g': v *= 1e9; break;
+            case 'T': case 't': v *= 1e12; break;
+            default: break;
             }
-            if (pts.size() >= 2) {
-                float minX = pts[0].first, maxX = minX, minY = pts[0].second, maxY = minY;
-                for (const auto& p : pts) {
-                    minX = std::min(minX, p.first); maxX = std::max(maxX, p.first);
-                    minY = std::min(minY, p.second); maxY = std::max(maxY, p.second);
-                }
-                float dx = std::max(1e-12f, maxX - minX), dy = std::max(1e-12f, maxY - minY);
-                for (size_t i = 1; i < pts.size(); ++i) {
-                    float x0 = -38.0f + ((pts[i - 1].first - minX) / dx) * 76.0f;
-                    float y0 = -23.0f + ((pts[i - 1].second - minY) / dy) * 46.0f;
-                    float x1 = -38.0f + ((pts[i].first - minX) / dx) * 76.0f;
-                    float y1 = -23.0f + ((pts[i].second - minY) / dy) * 46.0f;
-                    out.traces.push_back({ x0, y0, x1, y1, 0.35f, lid, 1 });
-                }
+            outV = v;
+            return true;
+        };
+
+        auto splitWs = [](std::string_view ln, std::vector<std::string_view>& toks) {
+            toks.clear();
+            size_t p = 0;
+            while (p < ln.size()) {
+                while (p < ln.size() && static_cast<unsigned char>(ln[p]) <= 0x20u) ++p;
+                if (p >= ln.size()) break;
+                size_t s = p;
+                while (p < ln.size() && static_cast<unsigned char>(ln[p]) > 0x20u) ++p;
+                toks.push_back(ln.substr(s, p - s));
             }
         };
-        parseCurveSection("[Pulldown]", EdaLayerId::TopCopper);
-        parseCurveSection("[Pullup]", EdaLayerId::BottomCopper);
-        parseCurveSection("[Rising Waveform]", EdaLayerId::TopSilk);
-        parseCurveSection("[Falling Waveform]", EdaLayerId::InnerCopper);
-        return true;
-    }
 
-    // #65. Multi-Port Differential RF Touchstone (.s3p / .s4p / .s8p)
-    if (ext == L".s3p" || ext == L".s4p" || ext == L".s8p") {
-        int nPorts = (ext == L".s3p") ? 3 : ((ext == L".s8p") ? 8 : 4);
-        out.kind = EdaDocKind::KiCadSch;
-        out.formatTitle = L"Touchstone " + std::to_wstring(nPorts) + L"-Port RF Network (" + ext + L")";
-        DetailEda200::DrawGraticule(out, -40.0f, -25.0f, 80.0f, 50.0f, 10, 8);
+        struct IbisPinEntry {
+            std::string pinName;
+            std::string sigName;
+            std::string modelName;
+            double rPin = 0.0, lPin = 0.0, cPin = 0.0;
+            bool hasRlc = false;
+        };
+        struct IbisCurvePt {
+            double x = 0.0;
+            double yTyp = 0.0, yMin = 0.0, yMax = 0.0;
+            bool hasMin = false, hasMax = false;
+        };
+        struct IbisCurveTable {
+            std::string kind;
+            bool isVt = false;
+            std::vector<IbisCurvePt> pts;
+        };
 
-        bool isDb = false, isRi = false;
-        std::vector<float> nums;
+        std::string ibisVer, compName, mfgName, activeModel, modelType;
+        char commentChar = '|';
+        double rPkg = 0.0, lPkg = 0.0, cPkg = 0.0;
+        bool hasPkgRlc = false;
+        double vinl = 0.8, vinh = 2.0, cComp = 0.0;
+        bool hasThresh = false, hasRamp = false;
+        double dvDtRise = 0.0, dvDtFall = 0.0;
+
+        std::vector<IbisPinEntry> pins;
+        std::vector<IbisCurveTable> curves;
+        int curSec = 0;
+
+        std::vector<std::string_view> toks;
         size_t pos = 0;
-        while (pos < sv.size() && nums.size() < 200000) {
+        while (pos < sv.size()) {
             size_t eol = sv.find('\n', pos);
             if (eol == std::string_view::npos) eol = sv.size();
             std::string_view ln = sv.substr(pos, eol - pos);
             pos = eol + 1;
-            size_t excl = ln.find('!');
-            if (excl != std::string_view::npos) ln = ln.substr(0, excl);
-            size_t f = ln.find_first_not_of(" \t\r");
-            if (f == std::string_view::npos) continue;
-            if (ln[f] == '#') {
-                std::string opt(ln.substr(f));
-                for (char& c : opt) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-                isDb = (opt.find(" DB") != std::string::npos);
-                isRi = (opt.find(" RI") != std::string::npos);
+
+            while (!ln.empty() && static_cast<unsigned char>(ln.front()) <= 0x20u) ln.remove_prefix(1);
+            while (!ln.empty() && static_cast<unsigned char>(ln.back()) <= 0x20u) ln.remove_suffix(1);
+            if (ln.empty() || ln.front() == commentChar) continue;
+
+            size_t cmtP = ln.find(commentChar);
+            if (cmtP != std::string_view::npos) {
+                ln = ln.substr(0, cmtP);
+                while (!ln.empty() && static_cast<unsigned char>(ln.back()) <= 0x20u) ln.remove_suffix(1);
+                if (ln.empty()) continue;
+            }
+
+            if (ln.front() == '[') {
+                size_t rb = ln.find(']');
+                if (rb == std::string_view::npos) continue;
+                std::string kw = DetailKiCadSymSesPos::LowerAsciiSymSes(ln.substr(1, rb - 1));
+                std::string_view arg = ln.substr(rb + 1);
+                while (!arg.empty() && static_cast<unsigned char>(arg.front()) <= 0x20u) arg.remove_prefix(1);
+
+                curSec = 0;
+                if (kw == "end") break;
+                else if (kw == "ibis ver") ibisVer = std::string(arg);
+                else if (kw == "comment char") {
+                    if (!arg.empty()) commentChar = arg[0];
+                } else if (kw == "component") compName = std::string(arg);
+                else if (kw == "manufacturer") mfgName = std::string(arg);
+                else if (kw == "package") curSec = 1;
+                else if (kw == "pin") curSec = 2;
+                else if (kw == "model") {
+                    if (activeModel.empty() && !arg.empty()) activeModel = std::string(arg);
+                    curSec = 3;
+                } else if (kw == "ramp") curSec = 4;
+                else if (kw == "pulldown" || kw == "pullup" || kw == "gnd clamp" || kw == "power clamp" ||
+                         kw == "rising waveform" || kw == "falling waveform")
+                {
+                    if (curves.size() < 24) {
+                        IbisCurveTable ct;
+                        ct.kind = std::string(ln.substr(1, rb - 1));
+                        ct.isVt = (kw.find("waveform") != std::string::npos);
+                        curves.push_back(std::move(ct));
+                        curSec = 5;
+                    }
+                }
                 continue;
             }
-            if (ln[f] == '[') continue; // Touchstone v2 keyword
-            const char* p = ln.data() + f;
-            const char* end = ln.data() + ln.size();
-            std::string tmp(p, end - p);
+
+            if (curSec == 1) {
+                splitWs(ln, toks);
+                if (toks.size() >= 2) {
+                    std::string k = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[0]);
+                    double v = 0.0;
+                    if (parseIbisVal(toks[1], v)) {
+                        if (k == "r_pkg") { rPkg = v; hasPkgRlc = true; }
+                        else if (k == "l_pkg") { lPkg = v; hasPkgRlc = true; }
+                        else if (k == "c_pkg") { cPkg = v; hasPkgRlc = true; }
+                    }
+                }
+            } else if (curSec == 2 && pins.size() < 256) {
+                splitWs(ln, toks);
+                if (toks.size() >= 3) {
+                    IbisPinEntry pe;
+                    pe.pinName   = std::string(toks[0]);
+                    pe.sigName   = std::string(toks[1]);
+                    pe.modelName = std::string(toks[2]);
+                    if (toks.size() >= 6) {
+                        bool okR = parseIbisVal(toks[3], pe.rPin);
+                        bool okL = parseIbisVal(toks[4], pe.lPin);
+                        bool okC = parseIbisVal(toks[5], pe.cPin);
+                        pe.hasRlc = (okR || okL || okC);
+                    }
+                    pins.push_back(std::move(pe));
+                }
+            } else if (curSec == 3) {
+                size_t eq = ln.find('=');
+                std::string normLn(ln);
+                if (eq != std::string_view::npos) normLn[eq] = ' ';
+                splitWs(normLn, toks);
+                if (toks.size() >= 2) {
+                    std::string k = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[0]);
+                    double v = 0.0;
+                    if (k == "model_type" && modelType.empty()) modelType = std::string(toks[1]);
+                    else if (k == "vinl" && parseIbisVal(toks[1], v)) { vinl = v; hasThresh = true; }
+                    else if (k == "vinh" && parseIbisVal(toks[1], v)) { vinh = v; hasThresh = true; }
+                    else if (k == "c_comp" && parseIbisVal(toks[1], v)) { cComp = v; }
+                }
+            } else if (curSec == 4) {
+                std::string normLn(ln);
+                for (char& ch : normLn) if (ch == '=' || ch == '/') ch = ' ';
+                splitWs(normLn, toks);
+                if (toks.size() >= 3) {
+                    std::string k0 = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[0]);
+                    std::string k1 = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[1]);
+                    double dv = 0.0, dt = 0.0;
+                    if (k0 == "dv" && parseIbisVal(toks[2], dv) && toks.size() >= 4 && parseIbisVal(toks[3], dt) && dt > 1e-15) {
+                        if (k1 == "dt_r") { dvDtRise = (dv / dt) * 1e-9; hasRamp = true; }
+                        else if (k1 == "dt_f") { dvDtFall = (dv / dt) * 1e-9; hasRamp = true; }
+                    }
+                }
+            } else if (curSec == 5 && !curves.empty()) {
+                if (ln.find('=') != std::string_view::npos) continue;
+                splitWs(ln, toks);
+                if (toks.size() >= 2 && curves.back().pts.size() < 1024) {
+                    IbisCurvePt pt;
+                    if (parseIbisVal(toks[0], pt.x) && parseIbisVal(toks[1], pt.yTyp)) {
+                        if (toks.size() >= 3) pt.hasMin = parseIbisVal(toks[2], pt.yMin);
+                        if (toks.size() >= 4) pt.hasMax = parseIbisVal(toks[3], pt.yMax);
+                        curves.back().pts.push_back(pt);
+                    }
+                }
+            }
+        }
+
+        size_t validViCurves = 0, validVtCurves = 0;
+        for (auto& ct : curves) {
+            if (ct.pts.size() >= 2) {
+                std::sort(ct.pts.begin(), ct.pts.end(), [](const IbisCurvePt& a, const IbisCurvePt& b) { return a.x < b.x; });
+                if (ct.isVt) ++validVtCurves;
+                else         ++validViCurves;
+            }
+        }
+
+        if (validViCurves == 0 && validVtCurves == 0 && pins.empty() && !hasRamp) {
+            return false;
+        }
+
+        out.kind = EdaDocKind::KiCadSch;
+        std::wstring title = L"IBIS High-Speed I/O Buffer Model (";
+        if (!compName.empty()) title += PathUtils::Utf8ToWide(compName);
+        else if (!activeModel.empty()) title += PathUtils::Utf8ToWide(activeModel);
+        else title += L".ibs";
+        if (!ibisVer.empty()) title += L", v" + PathUtils::Utf8ToWide(ibisVer);
+        title += L")";
+        out.formatTitle = title;
+
+        const bool showVi = (validViCurves > 0);
+        const bool showVt = (validVtCurves > 0 || (validViCurves == 0 && hasRamp));
+        const float viX0 = -44.0f, viW = showVt ? 40.0f : 84.0f;
+        const float vtX0 = showVi ? 4.0f : -44.0f, vtW = showVi ? 40.0f : 84.0f;
+        const float plotY0 = -16.0f, plotH = 38.0f;
+        out.labels.push_back({ -44.0f, plotY0 + plotH + 7.0f, 1.12f, EdaLayerId::SchLabel, title });
+
+        if (showVi) {
+            DetailEda200::DrawGraticule(out, viX0, plotY0, viW, plotH, 8, 8);
+            double vMin = 1e300, vMax = -1e300, iMin = 1e300, iMax = -1e300;
+            for (const auto& ct : curves) {
+                if (ct.isVt || ct.pts.size() < 2) continue;
+                for (const auto& p : ct.pts) {
+                    vMin = std::min(vMin, p.x); vMax = std::max(vMax, p.x);
+                    double yc = std::clamp(p.yTyp, -0.5, 0.5);
+                    iMin = std::min(iMin, yc); iMax = std::max(iMax, yc);
+                }
+            }
+            if (!(vMax > vMin + 1e-9)) { vMin -= 1.0; vMax += 1.0; }
+            if (!(iMax > iMin + 1e-9)) { iMin -= 0.01; iMax += 0.01; }
+
+            wchar_t viHdr[128] = {};
+            swprintf_s(viHdr, L"V-I Characteristics [%.2g..%.2g V, %.1f..%.1f mA]", vMin, vMax, iMin * 1e3, iMax * 1e3);
+            out.labels.push_back({ viX0, plotY0 + plotH + 1.5f, 0.95f, EdaLayerId::SchLabel, viHdr });
+
+            auto mapViX = [&](double v) -> float {
+                return viX0 + 1.0f + static_cast<float>(std::clamp((v - vMin) / (vMax - vMin), 0.0, 1.0)) * (viW - 2.0f);
+            };
+            auto mapViY = [&](double iAmp) -> float {
+                double ic = std::clamp(iAmp, iMin, iMax);
+                return plotY0 + 1.0f + static_cast<float>(std::clamp((ic - iMin) / (iMax - iMin), 0.0, 1.0)) * (plotH - 2.0f);
+            };
+
+            if (iMin < 0.0 && iMax > 0.0) {
+                float yZero = mapViY(0.0);
+                out.traces.push_back({ viX0, yZero, viX0 + viW, yZero, 0.14f, EdaLayerId::SchSymbol, 0 });
+            }
+
+            int cIdx = 0;
+            for (const auto& ct : curves) {
+                if (ct.isVt || ct.pts.size() < 2) continue;
+                std::string kl = DetailKiCadSymSesPos::LowerAsciiSymSes(ct.kind);
+                EdaLayerId lid = (kl == "pulldown") ? EdaLayerId::TopCopper
+                               : (kl == "pullup")   ? EdaLayerId::BottomCopper
+                               : (kl == "gnd clamp")? EdaLayerId::SchWire
+                                                    : EdaLayerId::InnerCopper;
+                for (size_t i = 1; i < ct.pts.size(); ++i) {
+                    const auto& p0 = ct.pts[i - 1];
+                    const auto& p1 = ct.pts[i];
+                    out.traces.push_back({ mapViX(p0.x), mapViY(p0.yTyp), mapViX(p1.x), mapViY(p1.yTyp), 0.34f, lid, cIdx + 1 });
+                    if (p0.hasMin && p1.hasMin) {
+                        out.traces.push_back({ mapViX(p0.x), mapViY(p0.yMin), mapViX(p1.x), mapViY(p1.yMin), 0.14f, lid, cIdx + 1 });
+                    }
+                    if (p0.hasMax && p1.hasMax) {
+                        out.traces.push_back({ mapViX(p0.x), mapViY(p0.yMax), mapViX(p1.x), mapViY(p1.yMax), 0.14f, lid, cIdx + 1 });
+                    }
+                }
+                EdaComponent3D mc;
+                mc.refDes = PathUtils::Utf8ToWide(ct.kind);
+                mc.value = std::to_wstring(ct.pts.size()) + L" V-I pts";
+                mc.footprint = L"IBIS_VI";
+                mc.x = mapViX(ct.pts[ct.pts.size() / 2].x);
+                mc.y = mapViY(ct.pts[ct.pts.size() / 2].yTyp);
+                mc.widthMm = 3.0f; mc.lengthMm = 2.0f;
+                out.components.push_back(std::move(mc));
+                ++cIdx;
+            }
+        }
+
+        if (showVt) {
+            DetailEda200::DrawGraticule(out, vtX0, plotY0, vtW, plotH, 8, 8);
+            if (validVtCurves > 0) {
+                double tMin = 1e300, tMax = -1e300, vMin = 1e300, vMax = -1e300;
+                for (const auto& ct : curves) {
+                    if (!ct.isVt || ct.pts.size() < 2) continue;
+                    for (const auto& p : ct.pts) {
+                        tMin = std::min(tMin, p.x); tMax = std::max(tMax, p.x);
+                        vMin = std::min(vMin, p.yTyp); vMax = std::max(vMax, p.yTyp);
+                    }
+                }
+                if (!(tMax > tMin + 1e-15)) { tMax = tMin + 1e-9; }
+                if (!(vMax > vMin + 1e-9))  { vMin -= 0.5; vMax += 0.5; }
+
+                wchar_t vtHdr[128] = {};
+                swprintf_s(vtHdr, L"V-T Switching Waveforms [0..%.2f ns, %.2f..%.2f V]", (tMax - tMin) * 1e9, vMin, vMax);
+                out.labels.push_back({ vtX0, plotY0 + plotH + 1.5f, 0.95f, EdaLayerId::SchLabel, vtHdr });
+
+                auto mapVtX = [&](double t) -> float {
+                    return vtX0 + 1.0f + static_cast<float>(std::clamp((t - tMin) / (tMax - tMin), 0.0, 1.0)) * (vtW - 2.0f);
+                };
+                auto mapVtY = [&](double v) -> float {
+                    return plotY0 + 1.0f + static_cast<float>(std::clamp((v - vMin) / (vMax - vMin), 0.0, 1.0)) * (plotH - 2.0f);
+                };
+
+                if (hasThresh) {
+                    if (vinl >= vMin && vinl <= vMax) {
+                        float yl = mapVtY(vinl);
+                        out.traces.push_back({ vtX0, yl, vtX0 + vtW, yl, 0.14f, EdaLayerId::SchSymbol, 0 });
+                        out.labels.push_back({ vtX0 + 0.8f, yl + 0.4f, 0.72f, EdaLayerId::SchLabel, L"Vinl" });
+                    }
+                    if (vinh >= vMin && vinh <= vMax) {
+                        float yh = mapVtY(vinh);
+                        out.traces.push_back({ vtX0, yh, vtX0 + vtW, yh, 0.14f, EdaLayerId::SchSymbol, 0 });
+                        out.labels.push_back({ vtX0 + 0.8f, yh + 0.4f, 0.72f, EdaLayerId::SchLabel, L"Vinh" });
+                    }
+                }
+
+                int wIdx = 10;
+                for (const auto& ct : curves) {
+                    if (!ct.isVt || ct.pts.size() < 2) continue;
+                    bool isRise = (DetailKiCadSymSesPos::LowerAsciiSymSes(ct.kind).find("rising") != std::string::npos);
+                    EdaLayerId lid = isRise ? EdaLayerId::SchWire : EdaLayerId::InnerCopper;
+                    for (size_t i = 1; i < ct.pts.size(); ++i) {
+                        const auto& p0 = ct.pts[i - 1];
+                        const auto& p1 = ct.pts[i];
+                        out.traces.push_back({ mapVtX(p0.x), mapVtY(p0.yTyp), mapVtX(p1.x), mapVtY(p1.yTyp), 0.36f, lid, wIdx });
+                        if (p0.hasMin && p1.hasMin) {
+                            out.traces.push_back({ mapVtX(p0.x), mapVtY(p0.yMin), mapVtX(p1.x), mapVtY(p1.yMin), 0.14f, lid, wIdx });
+                        }
+                        if (p0.hasMax && p1.hasMax) {
+                            out.traces.push_back({ mapVtX(p0.x), mapVtY(p0.yMax), mapVtX(p1.x), mapVtY(p1.yMax), 0.14f, lid, wIdx });
+                        }
+                    }
+                    EdaComponent3D wc;
+                    wc.refDes = PathUtils::Utf8ToWide(ct.kind);
+                    wc.value = std::to_wstring(ct.pts.size()) + L" V-T pts";
+                    wc.footprint = L"IBIS_VT";
+                    wc.x = mapVtX(ct.pts[ct.pts.size() / 2].x);
+                    wc.y = mapVtY(ct.pts[ct.pts.size() / 2].yTyp);
+                    wc.widthMm = 3.0f; wc.lengthMm = 2.0f;
+                    out.components.push_back(std::move(wc));
+                    ++wIdx;
+                }
+            } else if (hasRamp) {
+                out.labels.push_back({ vtX0, plotY0 + plotH + 1.5f, 0.95f, EdaLayerId::SchLabel, L"[Ramp] Slew-Rate Edges" });
+                float rFrac = std::clamp(static_cast<float>(3.3 / std::max(0.2, dvDtRise)) / 5.0f, 0.08f, 0.85f);
+                float fFrac = std::clamp(static_cast<float>(3.3 / std::max(0.2, dvDtFall)) / 5.0f, 0.08f, 0.85f);
+                float xR0 = vtX0 + 4.0f, xR1 = xR0 + (vtW - 8.0f) * rFrac, xEnd = vtX0 + vtW - 4.0f;
+                float yLo = plotY0 + 4.0f, yHi = plotY0 + plotH - 4.0f;
+                out.traces.push_back({ xR0, yLo, xR1, yHi, 0.34f, EdaLayerId::SchWire, 10 });
+                out.traces.push_back({ xR1, yHi, xEnd, yHi, 0.34f, EdaLayerId::SchWire, 10 });
+                float xF1 = xR0 + (vtW - 8.0f) * fFrac;
+                out.traces.push_back({ xR0, yHi, xF1, yLo, 0.34f, EdaLayerId::InnerCopper, 11 });
+                out.traces.push_back({ xF1, yLo, xEnd, yLo, 0.34f, EdaLayerId::InnerCopper, 11 });
+            }
+        }
+
+        {
+            std::wstring meta = L"Model: " + PathUtils::Utf8ToWide(activeModel.empty() ? "IO_BUF" : activeModel);
+            if (!modelType.empty()) meta += L" [" + PathUtils::Utf8ToWide(modelType) + L"]";
+            if (cComp > 0.0) {
+                wchar_t cb[48] = {};
+                swprintf_s(cb, L" | C_comp=%.2f pF", cComp * 1e12);
+                meta += cb;
+            }
+            if (hasPkgRlc) {
+                wchar_t pb[80] = {};
+                swprintf_s(pb, L" | Pkg RLC=(%.0f m\x03A9, %.2f nH, %.2f pF)", rPkg * 1e3, lPkg * 1e9, cPkg * 1e12);
+                meta += pb;
+            }
+            out.labels.push_back({ -44.0f, plotY0 + plotH + 4.2f, 1.02f, EdaLayerId::SchLabel, meta });
+        }
+
+        if (!pins.empty()) {
+            const size_t nShowPins = std::min<size_t>(pins.size(), 24u);
+            const float stripW = std::max(28.0f, static_cast<float>(nShowPins) * 3.4f + 4.0f);
+            const float stripCx = 0.0f, stripCy = plotY0 - 8.5f, stripH = 5.5f;
+            DetailEda100::AddRectOutline(out, stripCx, stripCy, stripW, stripH, EdaLayerId::SchSymbol, 0.28f);
+            float startX = stripCx - stripW * 0.5f + 2.8f;
+            float pitch = (nShowPins > 1) ? ((stripW - 5.6f) / static_cast<float>(nShowPins - 1)) : 0.0f;
+            for (size_t pi = 0; pi < nShowPins; ++pi) {
+                float px = startX + static_cast<float>(pi) * pitch;
+                float py = stripCy - stripH * 0.5f - 1.5f;
+                out.traces.push_back({ px, stripCy - stripH * 0.5f, px, py, 0.20f, EdaLayerId::SchWire, 0 });
+                out.pads.push_back({ px, py, 0.55f, 0.55f, 0.0f, 0.0f, 0, EdaLayerId::SchSymbol,
+                                     PathUtils::Utf8ToWide(pins[pi].pinName), PathUtils::Utf8ToWide(pins[pi].sigName) });
+                if (nShowPins <= 16) {
+                    out.labels.push_back({ px - 0.9f, stripCy - 0.3f, 0.68f, EdaLayerId::SchLabel, PathUtils::Utf8ToWide(pins[pi].sigName) });
+                }
+            }
+            EdaComponent3D pkgComp;
+            pkgComp.refDes = PathUtils::Utf8ToWide(compName.empty() ? "IBIS_IC" : compName);
+            pkgComp.value = std::to_wstring(pins.size()) + L" pins";
+            pkgComp.footprint = PathUtils::Utf8ToWide(mfgName.empty() ? "IBIS_PKG" : mfgName);
+            pkgComp.x = stripCx; pkgComp.y = stripCy;
+            pkgComp.widthMm = stripW; pkgComp.lengthMm = stripH;
+            pkgComp.pinCount = static_cast<int>(pins.size());
+            out.components.push_back(std::move(pkgComp));
+        }
+
+        out.netCount = std::max<size_t>(1u, validViCurves + validVtCurves + (pins.empty() ? 0u : 1u));
+        return !out.traces.empty();
+    }
+
+    // #65. Multi-Port Single-Ended & Mixed-Mode Differential RF Touchstone (.s3p / .s4p / .s8p — v1.0 & v2.0)
+    if (ext == L".s3p" || ext == L".s4p" || ext == L".s8p") {
+        for (size_t i = 0; i < size; ++i) {
+            if (data[i] == 0) return false;
+        }
+
+        int nPorts = (ext == L".s3p") ? 3 : ((ext == L".s8p") ? 8 : 4);
+        enum class TsFmt : uint8_t { MA = 0, DB = 1, RI = 2 };
+        TsFmt dataFmt = TsFmt::MA;
+        std::wstring freqUnit = L"GHz";
+        std::string paramKind = "S";
+        double z0Ref = 50.0;
+        bool hasOptionLine = false;
+        bool isV2 = false;
+        bool inNetData = false;
+        int matrixFmt = 0;
+
+        std::vector<double> rawNums;
+        rawNums.reserve(4096);
+        bool stopScan = false;
+
+        size_t pos = 0;
+        while (pos < sv.size() && !stopScan && rawNums.size() < 400000) {
+            size_t eol = sv.find('\n', pos);
+            if (eol == std::string_view::npos) eol = sv.size();
+            std::string_view ln = sv.substr(pos, eol - pos);
+            pos = eol + 1;
+
+            size_t excl = ln.find('!');
+            if (excl != std::string_view::npos) ln = ln.substr(0, excl);
+            while (!ln.empty() && static_cast<unsigned char>(ln.front()) <= 0x20u) ln.remove_prefix(1);
+            while (!ln.empty() && static_cast<unsigned char>(ln.back()) <= 0x20u) ln.remove_suffix(1);
+            if (ln.empty()) continue;
+
+            if (ln.front() == '[') {
+                std::string low = DetailKiCadSymSesPos::LowerAsciiSymSes(ln);
+                if (low.rfind("[version]", 0) == 0) {
+                    isV2 = true;
+                } else if (low.rfind("[number of ports]", 0) == 0) {
+                    isV2 = true;
+                    size_t rb = low.find(']');
+                    if (rb != std::string::npos) {
+                        int np = std::atoi(low.c_str() + rb + 1);
+                        if (np >= 1 && np <= 32) nPorts = np;
+                    }
+                } else if (low.rfind("[matrix format]", 0) == 0) {
+                    isV2 = true;
+                    if (low.find("lower") != std::string::npos) matrixFmt = 1;
+                    else if (low.find("upper") != std::string::npos) matrixFmt = 2;
+                    else matrixFmt = 0;
+                } else if (low.rfind("[network data]", 0) == 0) {
+                    isV2 = true;
+                    inNetData = true;
+                } else if (low.rfind("[noise data]", 0) == 0 || low.rfind("[end]", 0) == 0) {
+                    stopScan = true;
+                }
+                continue;
+            }
+
+            if (ln.front() == '#') {
+                hasOptionLine = true;
+                std::string opt = DetailKiCadSymSesPos::LowerAsciiSymSes(ln.substr(1));
+                size_t p = 0;
+                while (p < opt.size()) {
+                    while (p < opt.size() && static_cast<unsigned char>(opt[p]) <= 0x20u) ++p;
+                    if (p >= opt.size()) break;
+                    size_t s = p;
+                    while (p < opt.size() && static_cast<unsigned char>(opt[p]) > 0x20u) ++p;
+                    std::string tok = opt.substr(s, p - s);
+                    if (tok == "hz")       freqUnit = L"Hz";
+                    else if (tok == "khz") freqUnit = L"kHz";
+                    else if (tok == "mhz") freqUnit = L"MHz";
+                    else if (tok == "ghz") freqUnit = L"GHz";
+                    else if (tok == "db")  dataFmt = TsFmt::DB;
+                    else if (tok == "ma")  dataFmt = TsFmt::MA;
+                    else if (tok == "ri")  dataFmt = TsFmt::RI;
+                    else if (tok == "s" || tok == "y" || tok == "z" || tok == "g" || tok == "h") {
+                        paramKind.assign(1, static_cast<char>(std::toupper(static_cast<unsigned char>(tok[0]))));
+                    } else if (tok == "r") {
+                        while (p < opt.size() && static_cast<unsigned char>(opt[p]) <= 0x20u) ++p;
+                        size_t rs = p;
+                        while (p < opt.size() && static_cast<unsigned char>(opt[p]) > 0x20u) ++p;
+                        if (p > rs) {
+                            double rz = std::strtod(opt.substr(rs, p - rs).c_str(), nullptr);
+                            if (std::isfinite(rz) && rz > 0.0) z0Ref = rz;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (isV2 && !inNetData) continue;
+
+            std::string tmp(ln);
             const char* cp = tmp.c_str();
             while (*cp) {
+                while (*cp && static_cast<unsigned char>(*cp) <= 0x20u) ++cp;
+                if (!*cp) break;
                 char* ep = nullptr;
-                float v = std::strtof(cp, &ep);
-                if (ep == cp) { ++cp; continue; }
-                nums.push_back(v);
+                double v = std::strtod(cp, &ep);
+                if (ep == cp || !std::isfinite(v)) return false;
+                rawNums.push_back(v);
                 cp = ep;
             }
         }
 
-        size_t stride = 1 + static_cast<size_t>(nPorts * nPorts * 2);
-        if (nums.size() >= stride * 2) {
-            auto toDb = [&](float a, float b) -> float {
-                if (isDb) return a;
-                float mag = isRi ? std::sqrt(a * a + b * b) : std::max(1e-6f, a);
-                return 20.0f * std::log10(std::max(1e-6f, mag));
-            };
-            size_t rows = nums.size() / stride;
-            float fMin = nums[0], fMax = nums[(rows - 1) * stride];
-            float fSpan = std::max(1e-6f, fMax - fMin);
-            for (size_t r = 1; r < rows; ++r) {
-                const float* p0 = &nums[(r - 1) * stride];
-                const float* p1 = &nums[r * stride];
-                float x0 = -38.0f + ((p0[0] - fMin) / fSpan) * 76.0f;
-                float x1 = -38.0f + ((p1[0] - fMin) / fSpan) * 76.0f;
-                // S11 return loss (TopCopper) & S21 insertion loss (TopSilk)
-                float s11_0 = std::clamp(toDb(p0[1], p0[2]), -60.0f, 5.0f);
-                float s11_1 = std::clamp(toDb(p1[1], p1[2]), -60.0f, 5.0f);
-                float s21_0 = std::clamp(toDb(p0[1 + nPorts * 2], p0[2 + nPorts * 2]), -60.0f, 5.0f);
-                float s21_1 = std::clamp(toDb(p1[1 + nPorts * 2], p1[2 + nPorts * 2]), -60.0f, 5.0f);
-                out.traces.push_back({ x0, 22.0f + s11_0 * 0.7f, x1, 22.0f + s11_1 * 0.7f, 0.32f, EdaLayerId::TopCopper, 1 });
-                out.traces.push_back({ x0, 22.0f + s21_0 * 0.7f, x1, 22.0f + s21_1 * 0.7f, 0.32f, EdaLayerId::TopSilk, 2 });
+        if (!hasOptionLine) return false;
+
+        const size_t complexEntries = (matrixFmt == 0)
+            ? static_cast<size_t>(nPorts * nPorts)
+            : static_cast<size_t>((nPorts * (nPorts + 1)) / 2);
+        const size_t stride = 1u + complexEntries * 2u;
+        if (rawNums.size() < stride * 2u) return false;
+
+        struct Cplx { double re = 0.0, im = 0.0; };
+        auto pairToCplx = [&](double a, double b) -> Cplx {
+            if (dataFmt == TsFmt::RI) return { a, b };
+            double mag = (dataFmt == TsFmt::DB) ? std::pow(10.0, a / 20.0) : a;
+            double rad = b * (3.14159265358979323846 / 180.0);
+            return { mag * std::cos(rad), mag * std::sin(rad) };
+        };
+        auto cplxDb = [](Cplx c) -> double {
+            return 20.0 * std::log10(std::max(1e-6, std::hypot(c.re, c.im)));
+        };
+
+        struct MultiPortSample {
+            double freq = 0.0;
+            double c0Db = 0.0;
+            double c1Db = 0.0;
+            double c2Db = 0.0;
+            double c3Db = 0.0;
+        };
+        std::vector<MultiPortSample> samples;
+        const size_t nRows = std::min<size_t>(rawNums.size() / stride, 4096u);
+        samples.reserve(nRows);
+
+        std::vector<Cplx> mat(static_cast<size_t>(nPorts * nPorts));
+        auto S = [&](int r1Based, int c1Based) -> Cplx {
+            return mat[static_cast<size_t>((r1Based - 1) * nPorts + (c1Based - 1))];
+        };
+
+        for (size_t ri = 0; ri < nRows; ++ri) {
+            const double* row = &rawNums[ri * stride];
+            double f = row[0];
+            if (!samples.empty() && f <= samples.back().freq) break;
+
+            if (matrixFmt == 0) {
+                for (int r = 0; r < nPorts; ++r) {
+                    for (int c = 0; c < nPorts; ++c) {
+                        size_t idx = static_cast<size_t>(r * nPorts + c);
+                        mat[idx] = pairToCplx(row[1u + idx * 2u], row[2u + idx * 2u]);
+                    }
+                }
+            } else if (matrixFmt == 1) {
+                size_t k = 0;
+                for (int r = 0; r < nPorts; ++r) {
+                    for (int c = 0; c <= r; ++c, ++k) {
+                        Cplx v = pairToCplx(row[1u + k * 2u], row[2u + k * 2u]);
+                        mat[static_cast<size_t>(r * nPorts + c)] = v;
+                        mat[static_cast<size_t>(c * nPorts + r)] = v;
+                    }
+                }
+            } else {
+                size_t k = 0;
+                for (int r = 0; r < nPorts; ++r) {
+                    for (int c = r; c < nPorts; ++c, ++k) {
+                        Cplx v = pairToCplx(row[1u + k * 2u], row[2u + k * 2u]);
+                        mat[static_cast<size_t>(r * nPorts + c)] = v;
+                        mat[static_cast<size_t>(c * nPorts + r)] = v;
+                    }
+                }
             }
-        } else {
-            return false;
+
+            MultiPortSample smp;
+            smp.freq = f;
+            if (nPorts >= 4) {
+                Cplx s11 = S(1,1), s13 = S(1,3), s31 = S(3,1), s33 = S(3,3);
+                Cplx s21 = S(2,1), s23 = S(2,3), s41 = S(4,1), s43 = S(4,3);
+                Cplx sdd11{ 0.5 * (s11.re - s13.re - s31.re + s33.re), 0.5 * (s11.im - s13.im - s31.im + s33.im) };
+                Cplx sdd21{ 0.5 * (s21.re - s23.re - s41.re + s43.re), 0.5 * (s21.im - s23.im - s41.im + s43.im) };
+                smp.c0Db = cplxDb(sdd11);
+                smp.c1Db = cplxDb(sdd21);
+                smp.c2Db = cplxDb(s21);
+                smp.c3Db = cplxDb(S(3, 1));
+            } else {
+                smp.c0Db = cplxDb(S(1, 1));
+                smp.c1Db = (nPorts >= 2) ? cplxDb(S(2, 1)) : smp.c0Db;
+                smp.c2Db = (nPorts >= 3) ? cplxDb(S(3, 1)) : smp.c1Db;
+                smp.c3Db = smp.c2Db;
+            }
+            samples.push_back(smp);
         }
-        return true;
+
+        if (samples.size() < 2) return false;
+
+        double minF = samples.front().freq;
+        double maxF = samples.back().freq;
+        if (maxF <= minF) maxF = minF + 1.0;
+
+        double dbMin = 1e300, dbMax = -1e300;
+        const int nTraces = (nPorts >= 4) ? 4 : std::min(nPorts, 3);
+        for (const auto& s : samples) {
+            dbMin = std::min({ dbMin, s.c0Db, s.c1Db, s.c2Db });
+            dbMax = std::max({ dbMax, s.c0Db, s.c1Db, s.c2Db });
+            if (nTraces >= 4) { dbMin = std::min(dbMin, s.c3Db); dbMax = std::max(dbMax, s.c3Db); }
+        }
+        dbMin = std::max(-90.0, std::floor((dbMin - 2.0) / 5.0) * 5.0);
+        dbMax = std::min(25.0,  std::ceil((dbMax + 2.0) / 5.0) * 5.0);
+        if (dbMax - dbMin < 10.0) { dbMin -= 5.0; dbMax += 5.0; }
+        const double dbSpan = dbMax - dbMin;
+
+        out.kind = EdaDocKind::KiCadSch;
+        const wchar_t* fmtName = (dataFmt == TsFmt::DB) ? L"DB" : ((dataFmt == TsFmt::RI) ? L"RI" : L"MA");
+        wchar_t titleBuf[180] = {};
+        swprintf_s(titleBuf, L"Touchstone %d-Port RF %hs-Matrix (%ls, R=%.0f \x03A9, %zu pts%ls)",
+            nPorts, paramKind.c_str(), fmtName, z0Ref, samples.size(),
+            (nPorts >= 4) ? L", Mixed-Mode SDD" : L"");
+        out.formatTitle = titleBuf;
+
+        const float x0 = -40.0f, y0 = -24.0f, w = 84.0f, h = 48.0f;
+        DetailEda200::DrawGraticule(out, x0, y0, w, h, 8, 6);
+
+        for (int gy = 0; gy <= 6; ++gy) {
+            float yy = y0 + (h * static_cast<float>(gy)) / 6.0f;
+            double dv = dbMin + (dbSpan * static_cast<double>(gy)) / 6.0;
+            wchar_t dl[32] = {};
+            swprintf_s(dl, L"%+.0f dB", dv);
+            out.labels.push_back({ x0 - 11.5f, yy - 0.3f, 0.82f, EdaLayerId::SchLabel, dl });
+        }
+        for (int gx = 0; gx <= 4; ++gx) {
+            float xx = x0 + (w * static_cast<float>(gx)) / 4.0f;
+            double fv = minF + ((maxF - minF) * static_cast<double>(gx)) / 4.0;
+            wchar_t fl[48] = {};
+            swprintf_s(fl, L"%.3g %ls", fv, freqUnit.c_str());
+            out.labels.push_back({ xx - 3.2f, y0 - 2.8f, 0.82f, EdaLayerId::SchLabel, fl });
+        }
+
+        auto mapX = [&](double f) -> float {
+            return x0 + static_cast<float>(std::clamp((f - minF) / (maxF - minF), 0.0, 1.0)) * w;
+        };
+        auto mapY = [&](double db) -> float {
+            return y0 + static_cast<float>(std::clamp((db - dbMin) / dbSpan, 0.0, 1.0)) * h;
+        };
+
+        for (size_t i = 1; i < samples.size(); ++i) {
+            const auto& p0 = samples[i - 1];
+            const auto& p1 = samples[i];
+            float sx0 = mapX(p0.freq), sx1 = mapX(p1.freq);
+            out.traces.push_back({ sx0, mapY(p0.c0Db), sx1, mapY(p1.c0Db), 0.34f, EdaLayerId::TopCopper, 1 });
+            out.traces.push_back({ sx0, mapY(p0.c1Db), sx1, mapY(p1.c1Db), 0.36f, EdaLayerId::SchWire, 2 });
+            if (nTraces >= 3) {
+                out.traces.push_back({ sx0, mapY(p0.c2Db), sx1, mapY(p1.c2Db), 0.24f, EdaLayerId::BottomCopper, 3 });
+            }
+            if (nTraces >= 4) {
+                out.traces.push_back({ sx0, mapY(p0.c3Db), sx1, mapY(p1.c3Db), 0.22f, EdaLayerId::InnerCopper, 4 });
+            }
+        }
+
+        const wchar_t* cNamesDiff[4] = { L"SDD11 (Diff Return Loss)", L"SDD21 (Diff Insertion)", L"S21 (Single-Ended)", L"S31 (NEXT Crosstalk)" };
+        const wchar_t* cNames3P[3]   = { L"S11 (Return Loss)", L"S21 (Port 1->2)", L"S31 (Port 1->3)" };
+        out.labels.push_back({ x0, y0 + h + 1.8f, 0.96f, EdaLayerId::SchLabel,
+            (nPorts >= 4) ? L"Traces: SDD21 (Green), SDD11 (Red), S21 (Blue), S31 (Purple)"
+                          : L"Traces: S21 (Green), S11 (Red), S31 (Blue)" });
+
+        for (int ci = 0; ci < nTraces; ++ci) {
+            EdaComponent3D cc;
+            cc.refDes = (nPorts >= 4) ? cNamesDiff[ci] : cNames3P[ci];
+            cc.value = fmtName;
+            cc.footprint = L"TOUCHSTONE_PORT";
+            size_t mid = samples.size() / 2;
+            double mv = (ci == 0) ? samples[mid].c0Db : (ci == 1 ? samples[mid].c1Db : (ci == 2 ? samples[mid].c2Db : samples[mid].c3Db));
+            cc.x = mapX(samples[mid].freq);
+            cc.y = mapY(mv);
+            cc.widthMm = 3.0f; cc.lengthMm = 2.0f;
+            out.components.push_back(std::move(cc));
+        }
+
+        out.netCount = static_cast<size_t>(nPorts);
+        return !out.traces.empty();
     }
 
     // #66. SEMI P39 OASIS Wafer Mask Layout (.oas — "%SEMI-OASIS\r\n")

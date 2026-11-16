@@ -3906,38 +3906,263 @@ inline bool ParseFpgaBitstream(const uint8_t* data, size_t size, const std::wstr
         return true;
     }
 
-    // .rpd (Raw Programming Data — require non-trivial programmed pages, not all 0x00 or all 0xFF)
+    // .rpd (FPGA Raw Programming Data — Intel/Altera Active Serial, Xilinx SPI/BPI Flash, Lattice iCE40/ECP5)
     if (extLower == L".rpd" && size >= 64) {
-        size_t nonFF = 0, nonZero = 0;
-        for (size_t i = 0; i < size; ++i) {
-            if (data[i] != 0xFF) ++nonFF;
-            if (data[i] != 0x00) ++nonZero;
+        // Reject known non-FPGA containers & plain ASCII text prose
+        if ((size >= 4 && (std::memcmp(data, "PK\x03\x04", 4) == 0 || std::memcmp(data, "\x7F" "ELF", 4) == 0 ||
+                           std::memcmp(data, "\x89PNG", 4) == 0 || std::memcmp(data, "%PDF", 4) == 0 ||
+                           std::memcmp(data, "RIFF", 4) == 0 || std::memcmp(data, "GIF8", 4) == 0)) ||
+            (size >= 2 && std::memcmp(data, "MZ", 2) == 0)) {
+            return false;
         }
-        if (nonFF == 0 || nonZero == 0) return false;
-        DetailEda100::AddRectOutline(out, 0.0f, 0.0f, 48.0f, 48.0f, EdaLayerId::EdgeCuts, 0.4f);
-        size_t activePages = 0;
-        for (int i = 0; i < 64; ++i) {
-            size_t p0 = (size * static_cast<size_t>(i)) / 64;
-            size_t p1 = (size * static_cast<size_t>(i + 1)) / 64;
-            size_t used = 0;
-            for (size_t k = p0; k < p1; ++k) if (data[k] != 0xFF && data[k] != 0x00) ++used;
-            float ratio = (p1 > p0) ? (static_cast<float>(used) / static_cast<float>(p1 - p0)) : 0.0f;
-            float px = -19.25f + (i % 8) * 5.5f;
-            float py = 19.25f - (i / 8) * 5.5f;
-            if (ratio > 0.02f) {
-                ++activePages;
-                out.pads.push_back({ px, py, 1.4f + ratio * 3.0f, 1.4f + ratio * 3.0f, 0.0f, 0.0f, 1, EdaLayerId::TopCopper, L"", L"" });
+        size_t nonFF = 0, nonZero = 0, asciiCnt = 0;
+        size_t asciiCheckLen = std::min<size_t>(size, 256);
+        for (size_t i = 0; i < size; ++i) {
+            if (data[i] != 0xFFu) ++nonFF;
+            if (data[i] != 0x00u) ++nonZero;
+            if (i < asciiCheckLen) {
+                uint8_t c = data[i];
+                if ((c >= 0x20u && c <= 0x7Eu) || c == '\r' || c == '\n' || c == '\t') ++asciiCnt;
             }
         }
-        EdaComponent3D ic;
-        ic.refDes = L"U_CFG_FLASH";
-        ic.value = PathUtils::FormatByteSize(size);
-        ic.footprint = L"RPD_IMAGE";
-        ic.widthMm = 42.0f; ic.lengthMm = 42.0f; ic.heightMm = 1.5f;
-        ic.category = EdaPartCategory::IC_Package;
-        out.components.push_back(ic);
-        out.formatTitle = L"FPGA Raw Programming Data (.rpd — " + std::to_wstring(activePages) + L"/64 active blocks)";
-        out.netCount = std::max<size_t>(1, activePages);
+        if (nonFF == 0 || nonZero == 0) return false;
+        if (asciiCnt * 100 >= asciiCheckLen * 92) return false; // Plain text renamed to .rpd
+
+        auto bitRev8 = [](uint8_t x) noexcept -> uint8_t {
+            x = static_cast<uint8_t>(((x & 0xF0u) >> 4) | ((x & 0x0Fu) << 4));
+            x = static_cast<uint8_t>(((x & 0xCCu) >> 2) | ((x & 0x33u) << 2));
+            x = static_cast<uint8_t>(((x & 0xAAu) >> 1) | ((x & 0x55u) << 1));
+            return x;
+        };
+
+        enum class RpdVendor { Unknown, XilinxRaw, AlteraAs, LatticeIce40, LatticeEcp5 };
+        RpdVendor vendor = RpdVendor::Unknown;
+        bool bitReversed = false;
+        size_t syncOffset = 0;
+        uint32_t detectedIdcode = 0;
+        size_t cfgStartOff = 0;
+        const size_t scanLim = std::min<size_t>(size, 262144);
+
+        // 1) Probe Xilinx 32-bit sync word: 0xAA995566 (normal), 0x5599AA66 (SPI bit-reversed), 0x99AA6655 (BPI16 swapped)
+        for (size_t i = 0; i + 8 <= scanLim; ++i) {
+            uint32_t w = DetailEda100::RdU32BE(data + i);
+            if (w == 0xAA995566u || w == 0x5599AA66u || w == 0x99AA6655u) {
+                auto rdWord = [&](size_t off) -> uint32_t {
+                    if (w == 0x5599AA66u) {
+                        uint8_t b0 = bitRev8(data[off + 0]), b1 = bitRev8(data[off + 1]);
+                        uint8_t b2 = bitRev8(data[off + 2]), b3 = bitRev8(data[off + 3]);
+                        return (static_cast<uint32_t>(b0) << 24) | (static_cast<uint32_t>(b1) << 16) |
+                               (static_cast<uint32_t>(b2) << 8)  | static_cast<uint32_t>(b3);
+                    }
+                    if (w == 0x99AA6655u) {
+                        return (static_cast<uint32_t>(data[off + 1]) << 24) | (static_cast<uint32_t>(data[off + 0]) << 16) |
+                               (static_cast<uint32_t>(data[off + 3]) << 8)  | static_cast<uint32_t>(data[off + 2]);
+                    }
+                    return DetailEda100::RdU32BE(data + off);
+                };
+                // Verify Type-1 packet or NOOP (0x20000000) follows sync word
+                uint32_t nextW = rdWord(i + 4);
+                uint32_t pktType = (nextW >> 29) & 0x7u;
+                if (pktType == 1u || pktType == 2u) {
+                    vendor = RpdVendor::XilinxRaw;
+                    bitReversed = (w != 0xAA995566u);
+                    syncOffset = i;
+                    cfgStartOff = i + 4;
+                    size_t wp = i + 4;
+                    for (int pk = 0; pk < 64 && wp + 4 <= size; ++pk) {
+                        uint32_t pw = rdWord(wp);
+                        wp += 4;
+                        if (((pw >> 29) & 0x7u) == 1u) {
+                            uint32_t op = (pw >> 27) & 0x3u;
+                            uint32_t reg = (pw >> 13) & 0x1Fu;
+                            uint32_t cnt = pw & 0x7FFu;
+                            if (op == 2u && reg == 12u && cnt >= 1u && wp + 4 <= size) {
+                                detectedIdcode = rdWord(wp);
+                            }
+                            if (op == 2u && reg == 2u) {
+                                cfgStartOff = wp;
+                                break;
+                            }
+                            wp += std::min<size_t>(static_cast<size_t>(cnt) * 4u, size - wp);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 2) Probe Lattice iCE40 (0x7EAA997E) & Lattice ECP5 (0xFFFFBDB3 + 0xE2 LSC_VERIFY_ID)
+        if (vendor == RpdVendor::Unknown) {
+            for (size_t i = 0; i + 8 <= scanLim; ++i) {
+                uint32_t w = DetailEda100::RdU32BE(data + i);
+                if (w == 0x7EAA997Eu || w == 0x7E55997Eu) {
+                    vendor = RpdVendor::LatticeIce40;
+                    bitReversed = (w == 0x7E55997Eu);
+                    syncOffset = i;
+                    cfgStartOff = i + 4;
+                    break;
+                }
+                if (w == 0xFFFFBDB3u || w == 0xFFFFDBD3u) {
+                    vendor = RpdVendor::LatticeEcp5;
+                    bitReversed = (w == 0xFFFFDBD3u);
+                    syncOffset = i;
+                    cfgStartOff = i + 4;
+                    for (size_t k = i + 4; k + 8 <= std::min<size_t>(size, i + 128); ++k) {
+                        uint8_t op = bitReversed ? bitRev8(data[k]) : data[k];
+                        if (op == 0xE2u && k + 8 <= size) { // LSC_VERIFY_ID: E2 00 00 00 <id32>
+                            uint8_t z0 = bitReversed ? bitRev8(data[k + 1]) : data[k + 1];
+                            uint8_t z1 = bitReversed ? bitRev8(data[k + 2]) : data[k + 2];
+                            if (z0 == 0 && z1 == 0) {
+                                uint8_t i0 = bitReversed ? bitRev8(data[k + 4]) : data[k + 4];
+                                uint8_t i1 = bitReversed ? bitRev8(data[k + 5]) : data[k + 5];
+                                uint8_t i2 = bitReversed ? bitRev8(data[k + 6]) : data[k + 6];
+                                uint8_t i3 = bitReversed ? bitRev8(data[k + 7]) : data[k + 7];
+                                detectedIdcode = (static_cast<uint32_t>(i0) << 24) | (static_cast<uint32_t>(i1) << 16) |
+                                                 (static_cast<uint32_t>(i2) << 8)  | static_cast<uint32_t>(i3);
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 3) Probe Intel / Altera Active Serial (.rpd):
+        //    - Quartus AS preamble: >= 16 bytes of 0xFF followed by 0x6A (MSb) or 0x56 (LSb bit-reversed, bitRev8(0x6A)==0x56)
+        //    - Quartus AS Option-Bits block: 0xA5A5 / 0x5A5A marker at offset 0x08..0x88 after 0xFF padding
+        //    - Arria 10 / Stratix 10 / Agilex boot header magic 0x62294895 (LE) or bit-reversed 0xA9129446
+        if (vendor == RpdVendor::Unknown) {
+            for (size_t i = 0; i + 4 <= std::min<size_t>(scanLim, 4096); i += 4) {
+                uint32_t le = DetailEda100::RdU32LE(data + i);
+                if (le == 0x62294895u || le == 0xA9129446u || le == 0x31575341u) {
+                    vendor = RpdVendor::AlteraAs;
+                    bitReversed = (le == 0xA9129446u);
+                    syncOffset = i;
+                    cfgStartOff = i;
+                    break;
+                }
+            }
+        }
+        if (vendor == RpdVendor::Unknown) {
+            // Check Altera Option-Bits table or >= 16-byte 0xFF erased preamble -> 0x6A / 0x56 AS header byte
+            size_t ffRun = 0;
+            for (size_t i = 0; i < scanLim; ++i) {
+                if (data[i] == 0xFFu) {
+                    ++ffRun;
+                    continue;
+                }
+                if (ffRun >= 16u) {
+                    uint8_t b = data[i];
+                    if (b == 0x6Au || b == 0x56u) {
+                        vendor = RpdVendor::AlteraAs;
+                        bitReversed = (b == 0x56u);
+                        syncOffset = i;
+                        cfgStartOff = i;
+                        break;
+                    }
+                    // Option-bits signature (0xA5 0xA5 or 0x5A 0x5A) within option sector
+                    if (i + 1 < scanLim && ((b == 0xA5u && data[i + 1] == 0xA5u) || (b == 0x5Au && data[i + 1] == 0x5Au))) {
+                        vendor = RpdVendor::AlteraAs;
+                        bitReversed = (b == 0xA5u);
+                        syncOffset = i;
+                        cfgStartOff = i;
+                        break;
+                    }
+                }
+                ffRun = 0;
+            }
+        }
+
+        if (vendor == RpdVendor::Unknown) {
+            return false; // Reject arbitrary binary files without valid FPGA flash framing!
+        }
+
+        // Render SPI NOR Configuration Flash + FPGA CLB/LAB Floorplan Schematic/Layout
+        DetailEda100::AddRectOutline(out, 6.0f, 0.0f, 70.0f, 52.0f, EdaLayerId::EdgeCuts, 0.42f);
+
+        // Left IC: 8-pin QSPI Configuration Flash (SOIC-8) wired via 4x SPI traces to FPGA
+        const float flashX = -20.0f, flashY = 0.0f;
+        DetailEda100::AddRectOutline(out, flashX, flashY, 9.0f, 12.0f, EdaLayerId::TopSilk, 0.22f);
+        static const wchar_t* const kQspiPins[8] = { L"CS#", L"DQ1", L"DQ2", L"GND", L"DQ0", L"CLK", L"DQ3", L"VCC" };
+        for (int p = 0; p < 8; ++p) {
+            float px = (p < 4) ? (flashX - 5.2f) : (flashX + 5.2f);
+            float py = (p < 4) ? (3.75f - p * 2.5f) : (-3.75f + (p - 4) * 2.5f);
+            out.pads.push_back({ px, py, 1.6f, 0.9f, 0.0f, 0.0f, 1, EdaLayerId::TopCopper, kQspiPins[p], L"" });
+            if (p >= 4 && p <= 6) { // DQ0, CLK, DQ3 active bus lines to FPGA die
+                out.traces.push_back({ px + 0.8f, py, -8.5f, py, 0.22f, EdaLayerId::TopCopper, p + 1 });
+            }
+        }
+        out.traces.push_back({ flashX - 5.2f, 3.75f, flashX - 5.2f, 8.0f, 0.20f, EdaLayerId::TopCopper, 1 });
+        out.traces.push_back({ flashX - 5.2f, 8.0f, -8.5f, 8.0f, 0.20f, EdaLayerId::TopCopper, 1 });
+
+        EdaComponent3D flashIc;
+        flashIc.refDes = L"U_QSPI";
+        flashIc.value = PathUtils::FormatByteSize(size);
+        flashIc.footprint = L"SOIC-8_FLASH";
+        flashIc.x = flashX; flashIc.y = flashY;
+        flashIc.widthMm = 9.0f; flashIc.lengthMm = 12.0f; flashIc.heightMm = 1.6f;
+        flashIc.pinCount = 8;
+        flashIc.category = EdaPartCategory::IC_Package;
+        out.components.push_back(flashIc);
+
+        // Right IC: FPGA 8x8 LAB/CLB Configuration Tile Array from cfgStartOff..size
+        const float fpgaX = 14.5f, fpgaY = 0.0f;
+        DetailEda100::AddRectOutline(out, fpgaX, fpgaY, 45.0f, 45.0f, EdaLayerId::TopSilk, 0.28f);
+        const size_t payloadLen = (cfgStartOff < size) ? (size - cfgStartOff) : size;
+        const uint8_t* payloadPtr = (cfgStartOff < size) ? (data + cfgStartOff) : data;
+        size_t activePages = 0;
+        for (int i = 0; i < 64; ++i) {
+            size_t p0 = (payloadLen * static_cast<size_t>(i)) / 64u;
+            size_t p1 = (payloadLen * static_cast<size_t>(i + 1)) / 64u;
+            if (p1 <= p0 && payloadLen > 0) { p0 = static_cast<size_t>(i) % payloadLen; p1 = p0 + 1; }
+            size_t progBits = 0, totBits = (p1 - p0) * 8u;
+            for (size_t k = p0; k < p1; ++k) {
+                // In NOR flash .rpd, 0xFF is erased; count programmed ('0') bits or active transitions
+                uint8_t inv = static_cast<uint8_t>(~payloadPtr[k]);
+                while (inv) { progBits += (inv & 1u); inv >>= 1; }
+            }
+            float ratio = (totBits > 0) ? (static_cast<float>(progBits) / static_cast<float>(totBits)) : 0.0f;
+            float px = fpgaX - 17.5f + (i % 8) * 5.0f;
+            float py = fpgaY + 17.5f - (i / 8) * 5.0f;
+            if (ratio > 0.02f) {
+                ++activePages;
+                float sz = std::clamp(1.3f + ratio * 3.1f, 1.3f, 4.4f);
+                EdaLayerId tl = (ratio > 0.35f) ? EdaLayerId::TopCopper : EdaLayerId::InnerCopper;
+                out.pads.push_back({ px, py, sz, sz, 0.0f, 0.0f, 1, tl, L"LAB", L"" });
+            } else {
+                DetailEda100::AddRectOutline(out, px, py, 3.4f, 3.4f, EdaLayerId::BottomSilk, 0.08f);
+            }
+        }
+
+        const wchar_t* vendorName = L"FPGA";
+        if (vendor == RpdVendor::AlteraAs) vendorName = bitReversed ? L"Altera AS (LSb)" : L"Altera AS (MSb)";
+        else if (vendor == RpdVendor::XilinxRaw) vendorName = bitReversed ? L"Xilinx SPI/BPI" : L"Xilinx Raw";
+        else if (vendor == RpdVendor::LatticeIce40) vendorName = L"Lattice iCE40";
+        else if (vendor == RpdVendor::LatticeEcp5) vendorName = L"Lattice ECP5";
+
+        wchar_t syncMeta[96] = {};
+        if (detectedIdcode != 0) {
+            swprintf_s(syncMeta, L"Sync @0x%zX | IDCODE 0x%08X", syncOffset, detectedIdcode);
+        } else {
+            swprintf_s(syncMeta, L"Sync @0x%zX | %ls", syncOffset, bitReversed ? L"Bit-Reversed SPI" : L"MSb-First");
+        }
+
+        EdaComponent3D fpgaIc;
+        fpgaIc.refDes = L"U_FPGA";
+        fpgaIc.value = vendorName;
+        fpgaIc.footprint = syncMeta;
+        fpgaIc.x = fpgaX; fpgaIc.y = fpgaY;
+        fpgaIc.widthMm = 45.0f; fpgaIc.lengthMm = 45.0f; fpgaIc.heightMm = 1.8f;
+        fpgaIc.pinCount = 256;
+        fpgaIc.category = EdaPartCategory::IC_Package;
+        out.components.push_back(fpgaIc);
+
+        out.labels.push_back({ 6.0f, 28.0f, 1.25f, EdaLayerId::SchLabel, std::wstring(vendorName) + L" Raw Flash Image (.rpd)" });
+        out.labels.push_back({ 6.0f, -28.0f, 0.95f, EdaLayerId::TopSilk, syncMeta });
+        out.formatTitle = std::wstring(vendorName) + L" Raw Programming Data (.rpd — " +
+                          std::to_wstring(activePages) + L"/64 active blocks)";
+        out.netCount = std::max<size_t>(4u, activePages);
         return activePages > 0;
     }
 
