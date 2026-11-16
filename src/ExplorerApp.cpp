@@ -6385,6 +6385,42 @@ void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
     const FileEntry itemCopy = m_items[itemIndex];
     const Strings& s = GetStrings(m_lang);
 
+    if (m_currentPath == L"RECYCLE_BIN") {
+        std::wstring prompt = (m_lang == Lang::PL)
+            ? (L"Czy na pewno chcesz TRWALE usunąć z Kosza:\n\n\"" + itemCopy.name + L"\"?")
+            : (L"Are you sure you want to PERMANENTLY delete from the Recycle Bin:\n\n\"" + itemCopy.name + L"\"?");
+        if (MessageBoxW(m_hwnd, prompt.c_str(), s.dlgConfirmDeleteTitle, MB_YESNO | MB_ICONWARNING) != IDYES) {
+            return;
+        }
+        m_mediaPlayer.CloseMedia();
+        KillTimer(m_hwnd, ID_TIMER_MEDIA);
+        m_imageCache.EvictPath(itemCopy.fullPath);
+
+        DWORD err = 0;
+        if (!FileEngine::DeleteRecycleBinItemPermanently(itemCopy.fullPath, &err)) {
+            MessageBoxW(m_hwnd, SystemErrorText(err).c_str(), s.dlgConfirmDeleteTitle, MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        const std::wstring delKey = itemCopy.normKey;
+        auto shouldRemove = [&](const FileEntry& e) { return e.normKey == delKey; };
+        m_items.erase(std::remove_if(m_items.begin(), m_items.end(), shouldRemove), m_items.end());
+        m_allItems.erase(std::remove_if(m_allItems.begin(), m_allItems.end(), shouldRemove), m_allItems.end());
+        if (!m_items.empty()) {
+            int nextFocusIdx = std::clamp(itemIndex, 0, static_cast<int>(m_items.size()) - 1);
+            SelectSingle(nextFocusIdx, true);
+        } else {
+            m_focusedIndex = -1;
+            m_anchorIndex = -1;
+        }
+        ClampScrollOffset();
+        m_statusToast = s.statusDeletedPerm;
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
     bool noRecycleBin = false;
     if (!permanent && TransferManager::PathHasNoRecycleBin(itemCopy.fullPath)) {
         noRecycleBin = true;
@@ -6455,6 +6491,15 @@ void ExplorerApp::PerformUndoDelete() {
 }
 
 void ExplorerApp::CopySelected(bool isCut) {
+    if (m_currentPath == L"RECYCLE_BIN") {
+        const bool pl = (m_lang == Lang::PL);
+        m_statusToast = pl ? L"\x26A0 Użyj [Przywróć], aby odzyskać elementy z Kosza"
+                           : L"\x26A0 Use [Restore] to recover items from the Recycle Bin";
+        m_statusToastExpireTick = GetTickCount64() + 3200;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
     auto paths = GetSelectedPaths();
     if (paths.empty()) return;
 
@@ -6472,7 +6517,7 @@ void ExplorerApp::PasteIntoCurrent(bool forceVerifyXxHash) {
 }
 
 void ExplorerApp::PasteInto(const std::wstring& targetDir, bool forceVerifyXxHash) {
-    if (targetDir.empty() || targetDir == L"THIS_PC") return;
+    if (targetDir.empty() || IsVirtualFolder(targetDir)) return;
 
     std::vector<std::wstring> srcPaths;
     bool isMove = false;
@@ -6494,6 +6539,24 @@ void ExplorerApp::PasteInto(const std::wstring& targetDir, bool forceVerifyXxHas
 }
 
 void ExplorerApp::CopySelectedPaths() {
+    if (m_currentPath == L"RECYCLE_BIN") {
+        std::wstring combined;
+        auto appendEntryPath = [&](const FileEntry& e) {
+            const std::wstring& p = e.originalPath.empty() ? e.fullPath : e.originalPath;
+            if (!combined.empty()) combined += L"\r\n";
+            combined += L"\"" + p + L"\"";
+        };
+        for (const auto& e : m_items) {
+            if (e.isSelected) appendEntryPath(e);
+        }
+        if (combined.empty() && m_focusedIndex >= 0 && m_focusedIndex < static_cast<int>(m_items.size())) {
+            appendEntryPath(m_items[m_focusedIndex]);
+        }
+        if (!combined.empty()) {
+            FileEngine::CopyTextToClipboard(m_hwnd, combined);
+        }
+        return;
+    }
     auto paths = GetSelectedPaths();
     if (paths.empty()) return;
     std::wstring combined;
@@ -6531,8 +6594,12 @@ void ExplorerApp::CreateNewFolderAction() {
 void ExplorerApp::StartInlineRename() {
     const bool pl = (m_lang == Lang::PL);
     if (m_viewMode == ViewMode::FullViewer) return;
-    if (m_currentPath == L"THIS_PC") {
-        m_statusToast = pl ? L"\x26A0 Nie można zmieniać nazw dysków w widoku Ten komputer" : L"\x26A0 Cannot rename drives in This PC view";
+    if (IsVirtualFolder(m_currentPath)) {
+        m_statusToast = (m_currentPath == L"RECYCLE_BIN")
+            ? (pl ? L"\x26A0 Nie można zmieniać nazw elementów w Koszu (najpierw przywróć element)"
+                  : L"\x26A0 Cannot rename items inside the Recycle Bin (restore first)")
+            : (pl ? L"\x26A0 Nie można zmieniać nazw dysków w widoku Ten komputer"
+                  : L"\x26A0 Cannot rename drives in This PC view");
         m_statusToastExpireTick = GetTickCount64() + 3500;
         EnsureWorkAnimTimerState();
         InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -6765,7 +6832,7 @@ void ExplorerApp::CommitAddressOrRenameEdit(HWND editHwnd) {
     SetFocus(m_hwnd);
 
     if (editHwnd == m_addressEdit) {
-        std::wstring newPath = buf;
+        std::wstring newPath = FileEngine::ResolveAddressInput(buf, m_currentPath);
         if (!newPath.empty()) {
             NavigateTo(newPath, true);
         }
@@ -6842,15 +6909,24 @@ void ExplorerApp::CancelInlineEdits(bool byEscape) {
 void ExplorerApp::ShowDeleteDropdownMenu(int screenX, int screenY) {
     const Strings& s = GetStrings(m_lang);
     HMENU hMenu = CreatePopupMenu();
-    AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_RECYCLE, s.menuDeleteRecycle);
-    AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_PERM, s.menuDeletePerm);
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING | (m_confirmDelete ? MF_CHECKED : MF_UNCHECKED), CMD_CTX_TOGGLE_CONFIRM, s.menuDeleteConfirmToggle);
+    if (m_currentPath == L"RECYCLE_BIN") {
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_RESTORE_RECYCLE, s.ctxRestore);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_PERM, s.menuDeletePerm);
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_EMPTY_RECYCLE_BIN, s.ctxEmptyRecycleBin);
+    } else {
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_RECYCLE, s.menuDeleteRecycle);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_PERM, s.menuDeletePerm);
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING | (m_confirmDelete ? MF_CHECKED : MF_UNCHECKED), CMD_CTX_TOGGLE_CONFIRM, s.menuDeleteConfirmToggle);
+    }
 
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, screenX, screenY, 0, m_hwnd, nullptr);
     DestroyMenu(hMenu);
 
-    if (cmd == CMD_CTX_DELETE_RECYCLE) DeleteSelectedItems(false);
+    if (cmd == CMD_CTX_RESTORE_RECYCLE) RestoreRecycleBinItems(false);
+    else if (cmd == CMD_CTX_EMPTY_RECYCLE_BIN) EmptyRecycleBinAction();
+    else if (cmd == CMD_CTX_DELETE_RECYCLE) DeleteSelectedItems(false);
     else if (cmd == CMD_CTX_DELETE_PERM) DeleteSelectedItems(true);
     else if (cmd == CMD_CTX_TOGGLE_CONFIRM) m_confirmDelete = !m_confirmDelete;
 }
@@ -6913,7 +6989,7 @@ void ExplorerApp::ToggleTreeNodeExpand(int nodeIndex) {
                 children.push_back(tn);
             }
         }
-    } else if (!node.path.empty() && node.path != L"THIS_PC") {
+    } else if (!node.path.empty() && !IsVirtualFolder(node.path)) {
         if (node.isDrive && node.isOffline) {
             node.hasChildren = false;
             node.isExpanded = false;
@@ -6951,7 +7027,7 @@ void ExplorerApp::ToggleTreeNodeExpand(int nodeIndex) {
 }
 
 bool ExplorerApp::IsFolderPinnedToQuickAccess(const std::wstring& folderPath) const {
-    if (folderPath.empty() || folderPath == L"THIS_PC") return false;
+    if (folderPath.empty() || IsVirtualFolder(folderPath)) return false;
     std::wstring targetKey = PathUtils::NormalizePathKey(folderPath);
     for (const auto& [label, path] : m_pinnedFolders) {
         if (PathUtils::NormalizePathKey(path) == targetKey) return true;
@@ -6960,7 +7036,7 @@ bool ExplorerApp::IsFolderPinnedToQuickAccess(const std::wstring& folderPath) co
 }
 
 void ExplorerApp::PinFolderToQuickAccess(const std::wstring& folderPath) {
-    if (folderPath.empty() || folderPath == L"THIS_PC") return;
+    if (folderPath.empty() || IsVirtualFolder(folderPath)) return;
     if (IsFolderPinnedToQuickAccess(folderPath)) return;
 
     std::wstring label = PathUtils::GetFileName(folderPath);
@@ -6990,6 +7066,7 @@ void ExplorerApp::ShowBreadcrumbSubfolderMenu(int breadcrumbIndex) {
 
     std::vector<std::pair<std::wstring, std::wstring>> subTargets;
     if (seg.path == L"THIS_PC") {
+        subTargets.push_back({ GetStrings(m_lang).navRecycleBin, L"RECYCLE_BIN" });
         auto drives = m_fileEngine.EnumerateDirectory(L"THIS_PC", false, false, m_lang);
         for (const auto& d : drives) {
             subTargets.push_back({ d.displayName, d.fullPath });
@@ -7028,13 +7105,12 @@ void ExplorerApp::ShowBreadcrumbSubfolderMenu(int breadcrumbIndex) {
 void ExplorerApp::RecordVisitedDirectory(const std::wstring& path) {
     std::wstring clean = PathUtils::TrimTrailingSlashes(path);
     if (clean.empty()) return;
-    std::wstring nk = (clean == L"THIS_PC") ? L"__HEADER_PC__" : PathUtils::NormalizePathKey(clean);
+    std::wstring nk = NormalizeNavDirKey(clean);
     if (nk.empty()) return;
 
     auto it = std::remove_if(m_recentDirs.begin(), m_recentDirs.end(),
         [&](const std::wstring& existing) {
-            std::wstring enk = (existing == L"THIS_PC") ? L"__HEADER_PC__" : PathUtils::NormalizePathKey(existing);
-            return enk == nk;
+            return NormalizeNavDirKey(existing) == nk;
         });
     m_recentDirs.erase(it, m_recentDirs.end());
     m_recentDirs.insert(m_recentDirs.begin(), clean);
@@ -7070,12 +7146,14 @@ void ExplorerApp::ShowRecentDirsDropdown(int triggerCmdId) {
     } else {
         for (size_t i = 0; i < m_recentDirs.size() && i < 30; ++i) {
             const std::wstring& dir = m_recentDirs[i];
-            std::wstring nk = (dir == L"THIS_PC") ? L"__HEADER_PC__" : PathUtils::NormalizePathKey(dir);
+            std::wstring nk = NormalizeNavDirKey(dir);
             bool isCurrent = (!nk.empty() && nk == m_currentNormKey);
 
             std::wstring label;
             if (dir == L"THIS_PC") {
                 label = std::to_wstring(i + 1) + L".   " + s.navThisPC;
+            } else if (dir == L"RECYCLE_BIN") {
+                label = std::to_wstring(i + 1) + L".   " + s.navRecycleBin;
             } else {
                 std::wstring leaf = PathUtils::GetFileName(dir);
                 if (leaf.empty() || leaf == dir) {
@@ -7165,7 +7243,16 @@ void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeInde
     }
 
     std::vector<EmulatedShellVerb> regVerbs;
-    if (!nodeCopy.path.empty() && nodeCopy.path != L"THIS_PC") {
+    if (nodeCopy.path == L"RECYCLE_BIN") {
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_EMPTY_RECYCLE_BIN, s.ctxEmptyRecycleBin);
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_PROPERTIES, s.ctxProperties);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_EXPLORER, s.ctxOpenExplorer);
+        if (HBITMAP hExpBmp = m_shellEmulator.GetExplorerMenuBitmap()) {
+            ShellMenuEmulator::AttachMenuBitmap(hMenu, CMD_CTX_EXPLORER, false, hExpBmp);
+        }
+    } else if (!nodeCopy.path.empty() && nodeCopy.path != L"THIS_PC") {
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         if (nodeCopy.isQuickAccess || IsFolderPinnedToQuickAccess(nodeCopy.path)) {
             AppendMenuW(hMenu, MF_STRING, CMD_CTX_UNPIN_QUICK, s.ctxUnpinQuickAccess);
@@ -7250,6 +7337,10 @@ void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeInde
         FileEngine::CopyTextToClipboard(m_hwnd, L"\"" + nodeCopy.path + L"\"");
         return;
     }
+    if (cmd == CMD_CTX_EMPTY_RECYCLE_BIN) {
+        EmptyRecycleBinAction();
+        return;
+    }
     if (cmd == CMD_CTX_PROPERTIES) {
         FileEngine::OpenFileOrProperties(m_hwnd, nodeCopy.path, true);
         return;
@@ -7285,7 +7376,58 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
     std::vector<OpenWithApp> openWithApps;
     std::vector<SendToTarget> sendToTargets = m_shellEmulator.GetSendToTargets(m_lang);
 
-    if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
+    if (m_currentPath == L"RECYCLE_BIN") {
+        if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
+            const FileEntry& item = m_items[hitIndex];
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_RESTORE_RECYCLE, s.ctxRestore);
+            SetMenuDefaultItem(hMenu, CMD_CTX_RESTORE_RECYCLE, FALSE);
+            if (item.isImage || item.isVideo || item.isAudio) {
+                AppendMenuW(hMenu, MF_STRING, CMD_CTX_FULLVIEWER, s.ctxFullViewer);
+            }
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_PERM, s.ctxDeletePerm);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_EMPTY_RECYCLE_BIN, s.ctxEmptyRecycleBin);
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_COPY_PATH, s.ctxCopyPath);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_PROPERTIES, s.ctxProperties);
+        } else {
+            HMENU hViewMenu = CreatePopupMenu();
+            auto addViewOption = [&](int cmdId, const wchar_t* label, bool isCurrent) {
+                AppendMenuW(hViewMenu, MF_STRING | (isCurrent ? MF_CHECKED : MF_UNCHECKED), cmdId, label);
+            };
+            addViewOption(CMD_VIEW_JUMBO,       s.viewJumbo,       m_viewMode == ViewMode::JumboIcons);
+            addViewOption(CMD_VIEW_EXTRALARGE,  s.viewExtraLarge,  m_viewMode == ViewMode::ExtraLargeIcons);
+            addViewOption(CMD_VIEW_LARGE,       s.viewLarge,       m_viewMode == ViewMode::LargeIcons);
+            addViewOption(CMD_VIEW_MEDIUM,      s.viewMedium,      m_viewMode == ViewMode::MediumIcons);
+            addViewOption(CMD_VIEW_SMALL,       s.viewSmall,       m_viewMode == ViewMode::SmallIcons);
+            addViewOption(CMD_VIEW_LIST,        s.viewList,        m_viewMode == ViewMode::List);
+            addViewOption(CMD_VIEW_DETAILS,     s.viewDetails,     m_viewMode == ViewMode::Details);
+            AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hViewMenu), s.ctxViewSubmenu);
+
+            HMENU hSortMenu = CreatePopupMenu();
+            AppendMenuW(hSortMenu, MF_STRING | (m_sortCol == SortColumn::Name ? MF_CHECKED : 0), CMD_SORT_NAME, s.colName);
+            AppendMenuW(hSortMenu, MF_STRING | (m_sortCol == SortColumn::DateModified ? MF_CHECKED : 0), CMD_SORT_DATE, s.colDateDeleted);
+            AppendMenuW(hSortMenu, MF_STRING | (m_sortCol == SortColumn::Type ? MF_CHECKED : 0), CMD_SORT_TYPE, s.colOriginalLocation);
+            AppendMenuW(hSortMenu, MF_STRING | (m_sortCol == SortColumn::Size ? MF_CHECKED : 0), CMD_SORT_SIZE, s.colSize);
+            AppendMenuW(hSortMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hSortMenu, MF_STRING | (m_sortAsc ? MF_CHECKED : 0), CMD_SORT_ASC, s.ctxSortAsc);
+            AppendMenuW(hSortMenu, MF_STRING | (!m_sortAsc ? MF_CHECKED : 0), CMD_SORT_DESC, s.ctxSortDesc);
+            AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hSortMenu), s.ctxSortBySubmenu);
+
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_REFRESH, s.ctxRefresh);
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            const UINT binState = m_allItems.empty() ? MF_GRAYED : MF_ENABLED;
+            AppendMenuW(hMenu, MF_STRING | binState, CMD_CTX_RESTORE_ALL_RECYCLE, s.ctxRestoreAll);
+            AppendMenuW(hMenu, MF_STRING | binState, CMD_CTX_EMPTY_RECYCLE_BIN, s.ctxEmptyRecycleBin);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_UNDO_DELETE, s.ctxUndoDelete);
+            AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_PROPERTIES, s.ctxProperties);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_EXPLORER, s.ctxOpenExplorer);
+            if (HBITMAP hExpBmp = m_shellEmulator.GetExplorerMenuBitmap()) {
+                ShellMenuEmulator::AttachMenuBitmap(hMenu, CMD_CTX_EXPLORER, false, hExpBmp);
+            }
+        }
+    } else if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
         const FileEntry& item = m_items[hitIndex];
         bool isFolder = item.isDirectory;
         bool isImg    = item.isImage;
@@ -7806,6 +7948,9 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         }
         break;
     case CMD_CTX_COPY_PATH:      CopySelectedPaths(); break;
+    case CMD_CTX_RESTORE_RECYCLE:     RestoreRecycleBinItems(false); break;
+    case CMD_CTX_RESTORE_ALL_RECYCLE: RestoreRecycleBinItems(true); break;
+    case CMD_CTX_EMPTY_RECYCLE_BIN:   EmptyRecycleBinAction(); break;
     case CMD_CTX_DELETE_RECYCLE: DeleteSelectedItems(false); break;
     case CMD_CTX_DELETE_PERM:    DeleteSelectedItems(true); break;
     case CMD_CTX_RENAME:         StartInlineRename(); break;
@@ -8048,7 +8193,7 @@ void ExplorerApp::RebuildParsedSearchOptions() {
 }
 
 void ExplorerApp::TriggerAsyncSearch() {
-    if (m_currentPath.empty() || m_currentPath == L"THIS_PC") {
+    if (m_currentPath.empty() || IsVirtualFolder(m_currentPath)) {
         ApplyFilterAndSort();
         return;
     }

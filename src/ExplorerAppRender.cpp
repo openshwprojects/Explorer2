@@ -1805,6 +1805,8 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
             m_solidBrush->SetColor(HexColor(0xFFFFFF));
             m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             DrawTextCached(L"F", 1, m_fmtCenterSmall, leadIconR, m_solidBrush);
+        } else if (m_currentPath == L"RECYCLE_BIN") {
+            DrawRibbonIcon(CMD_DELETE_MAIN, leadIconR);
         } else if (m_currentPath == L"THIS_PC" || m_currentPath.empty()) {
             DrawDriveVectorIcon(leadIconR, false, false, false);
         } else {
@@ -2164,6 +2166,10 @@ void ExplorerApp::DrawSplitPaneHeader(int paneIdx, const D2D1_RECT_F& headerRect
     bool isFtpPane = FtpClient::IsFtpPath(m_currentPath);
     if (isFtpPane) {
         DrawDriveVectorIcon(D2D1::RectF(addrR.left + 4.0f, cy - 7.5f, addrR.left + 20.0f, cy + 7.5f), true, false, false);
+    } else if (m_currentPath == L"RECYCLE_BIN") {
+        DrawRibbonIcon(CMD_DELETE_MAIN, D2D1::RectF(addrR.left + 4.0f, cy - 7.5f, addrR.left + 20.0f, cy + 7.5f));
+    } else if (m_currentPath == L"THIS_PC" || m_currentPath.empty()) {
+        DrawDriveVectorIcon(D2D1::RectF(addrR.left + 4.0f, cy - 7.5f, addrR.left + 20.0f, cy + 7.5f), false, false, false);
     } else {
         DrawFolderVectorIcon(D2D1::RectF(addrR.left + 5.0f, cy - 7.0f, addrR.left + 19.0f, cy + 7.0f), true);
     }
@@ -2181,7 +2187,9 @@ void ExplorerApp::DrawSplitPaneHeader(int paneIdx, const D2D1_RECT_F& headerRect
         cntW = 0.0f;
     }
 
-    std::wstring dispPath = (m_currentPath.empty() || m_currentPath == L"THIS_PC") ? std::wstring(s.navThisPC) : m_currentPath;
+    std::wstring dispPath = (m_currentPath.empty() || m_currentPath == L"THIS_PC")
+        ? std::wstring(s.navThisPC)
+        : ((m_currentPath == L"RECYCLE_BIN") ? std::wstring(s.navRecycleBin) : m_currentPath);
     if (isFtpPane) {
         FtpUrlInfo parsed;
         if (FtpClient::ParseFtpUrl(m_currentPath, parsed)) {
@@ -2304,6 +2312,8 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 DrawTextCached(L"FZ", 2, m_fmtSmall, D2D1::RectF(iconR.left - 2.0f, iconR.top, iconR.right + 2.0f, iconR.bottom), m_solidBrush);
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            } else if (node.path == L"RECYCLE_BIN") {
+                DrawRibbonIcon(CMD_DELETE_MAIN, iconR);
             } else if (node.path == L"THIS_PC") {
                 m_solidBrush->SetColor(HexColor(0x2B6CB0));
                 m_rt->DrawRectangle(D2D1::RectF(iconR.left + 1.0f, iconR.top + 2.0f, iconR.right - 1.0f, iconR.bottom - 4.0f), m_solidBrush, 1.5f);
@@ -2427,6 +2437,8 @@ void ExplorerApp::DrawTabBar(const D2D1_RECT_F& barRect) {
         std::wstring label;
         if (tabPath.empty() || tabPath == L"THIS_PC") {
             label = s.navThisPC;
+        } else if (tabPath == L"RECYCLE_BIN") {
+            label = s.navRecycleBin;
         } else if (FtpClient::IsFtpPath(tabPath)) {
             FtpUrlInfo parsed;
             if (FtpClient::ParseFtpUrl(tabPath, parsed)) {
@@ -2440,7 +2452,11 @@ void ExplorerApp::DrawTabBar(const D2D1_RECT_F& barRect) {
         }
 
         float cy = (tr.top + tr.bottom) * 0.5f;
-        DrawFolderVectorIcon(D2D1::RectF(tr.left + 6.0f, cy - 6.5f, tr.left + 19.0f, cy + 6.5f), true);
+        if (tabPath == L"RECYCLE_BIN") {
+            DrawRibbonIcon(CMD_DELETE_MAIN, D2D1::RectF(tr.left + 6.0f, cy - 6.5f, tr.left + 19.0f, cy + 6.5f));
+        } else {
+            DrawFolderVectorIcon(D2D1::RectF(tr.left + 6.0f, cy - 6.5f, tr.left + 19.0f, cy + 6.5f), true);
+        }
 
         D2D1_RECT_F lblR = D2D1::RectF(tr.left + 22.0f, tr.top + 2.0f, closeR.left - 2.0f, tr.bottom - 1.0f);
         DrawClippedText(label, lblR, isActive ? m_fmtBold : m_fmtSmall, isActive ? 0x0F172A : 0x334155);
@@ -2670,7 +2686,14 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
     m_solidBrush->SetColor(HexColor(0xFFFFFF));
     m_rt->FillRectangle(hdrRect, m_solidBrush);
 
-    const wchar_t* colTitles[5] = { s.colName, s.colDateModified, s.colType, s.colSize, s.colActions };
+    const bool inRecycleBin = (m_currentPath == L"RECYCLE_BIN");
+    const wchar_t* colTitles[5] = {
+        s.colName,
+        inRecycleBin ? s.colDateDeleted : s.colDateModified,
+        inRecycleBin ? s.colOriginalLocation : s.colType,
+        s.colSize,
+        s.colActions
+    };
     float cx = rect.left + 6.0f;
     for (int c = 0; c < 5; ++c) {
         if (c == 4 && m_currentPath == L"THIS_PC") break;
@@ -2855,24 +2878,36 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
             m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
 
-        // Column 4: Operacje (Kosz + Trwale usuń buttons with confirmation!)
+        // Column 4: Operacje (Kosz / Przywróć + Trwale usuń buttons with confirmation!)
         if (m_currentPath != L"THIS_PC") {
             float opColX = rect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
-            D2D1_RECT_F rTrash = D2D1::RectF(opColX + 6.0f, rowR.top + 2.0f, opColX + 62.0f, rowR.bottom - 2.0f);
-            D2D1_RECT_F rPerm  = D2D1::RectF(opColX + 66.0f, rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
+            D2D1_RECT_F rTrash = D2D1::RectF(opColX + (inRecycleBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inRecycleBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
+            D2D1_RECT_F rPerm  = D2D1::RectF(opColX + (inRecycleBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
 
             bool hovTrash = (m_hoverIndex == i && m_hoverRowActionKind == 1);
             bool hovPerm  = (m_hoverIndex == i && m_hoverRowActionKind == 2);
 
-            // [🗑 Kosz] button
-            m_solidBrush->SetColor(hovTrash ? HexColor(0xDCEBFC) : HexColor(0xF3F5F8));
-            m_rt->FillRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush);
-            m_solidBrush->SetColor(hovTrash ? HexColor(0x0078D7) : HexColor(0xC8D0DA));
-            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush, 1.0f);
-            m_solidBrush->SetColor(hovTrash ? HexColor(0x005A9E) : HexColor(0x3B4252));
-            std::wstring trashTxt = std::wstring(L"\xD83D\xDDD1 ") + s.btnRowTrash;
-            m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            DrawTextCached(trashTxt.c_str(), static_cast<UINT32>(trashTxt.size()), m_fmtSmall, rTrash, m_solidBrush);
+            if (inRecycleBin) {
+                // [↩ Przywróć] restore button inside Kosz
+                m_solidBrush->SetColor(hovTrash ? HexColor(0xDCFCE7) : HexColor(0xF0FDF4));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush);
+                m_solidBrush->SetColor(hovTrash ? HexColor(0x16A34A) : HexColor(0x86EFAC));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush, 1.0f);
+                m_solidBrush->SetColor(hovTrash ? HexColor(0x166534) : HexColor(0x15803D));
+                std::wstring restTxt = std::wstring(L"\x21A9 ") + s.btnRowRestore;
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(restTxt.c_str(), static_cast<UINT32>(restTxt.size()), m_fmtSmall, rTrash, m_solidBrush);
+            } else {
+                // [🗑 Kosz] button
+                m_solidBrush->SetColor(hovTrash ? HexColor(0xDCEBFC) : HexColor(0xF3F5F8));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush);
+                m_solidBrush->SetColor(hovTrash ? HexColor(0x0078D7) : HexColor(0xC8D0DA));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush, 1.0f);
+                m_solidBrush->SetColor(hovTrash ? HexColor(0x005A9E) : HexColor(0x3B4252));
+                std::wstring trashTxt = std::wstring(L"\xD83D\xDDD1 ") + s.btnRowTrash;
+                m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                DrawTextCached(trashTxt.c_str(), static_cast<UINT32>(trashTxt.size()), m_fmtSmall, rTrash, m_solidBrush);
+            }
 
             // [✕ Usuń] permanent delete button
             m_solidBrush->SetColor(hovPerm ? HexColor(0xFDE7E9) : HexColor(0xFAF2F2));

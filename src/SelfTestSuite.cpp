@@ -4089,6 +4089,125 @@ static void RunStage13Tests(TestCounter& tc) {
         tc.Record(ok, L"Stage13.Test20b_Delete_NetworkNoRecycleBinAndSystemReadOnlyFolderTree");
     }
 
+    // Test 13.20c: Address-bar "Kosz" / "Recycle Bin" aliases, Win7 v1 + Win10/11 v2 $I record parsing,
+    // collision-safe Restore (recreating missing parent folders), permanent $R+$I purge, and live RECYCLE_BIN listing.
+    {
+        const std::wstring subRelDir = baseDir + L"\\t20c_relsub";
+        CreateDirectoryW(subRelDir.c_str(), nullptr);
+
+        const bool aliasOk =
+            FileEngine::ResolveAddressInput(L"Kosz") == L"RECYCLE_BIN" &&
+            FileEngine::ResolveAddressInput(L"  kosz  ") == L"RECYCLE_BIN" &&
+            FileEngine::ResolveAddressInput(L"\"KOSZ\"") == L"RECYCLE_BIN" &&
+            FileEngine::ResolveAddressInput(L"Recycle Bin") == L"RECYCLE_BIN" &&
+            FileEngine::ResolveAddressInput(L"dustbin") == L"RECYCLE_BIN" &&
+            FileEngine::ResolveAddressInput(L"shell:RecycleBinFolder") == L"RECYCLE_BIN" &&
+            FileEngine::ResolveAddressInput(L"::{645FF040-5081-101B-9F08-00AA002F954E}") == L"RECYCLE_BIN" &&
+            FileEngine::ResolveAddressInput(L"Ten komputer") == L"THIS_PC" &&
+            FileEngine::ResolveAddressInput(L"This PC") == L"THIS_PC" &&
+            PathUtils::NormalizePathKey(FileEngine::ResolveAddressInput(L"t20c_relsub", baseDir)) == PathUtils::NormalizePathKey(subRelDir);
+
+        // Synthetic Win7 Version 1 (544-byte) and Win10+ Version 2 $I metadata + scratch $Recycle.Bin restore/purge
+        const std::wstring mockBin = baseDir + L"\\$Recycle.Bin\\S-1-5-21-TEST";
+        CreateDirectoryW((baseDir + L"\\$Recycle.Bin").c_str(), nullptr);
+        CreateDirectoryW(mockBin.c_str(), nullptr);
+
+        const std::wstring missingParentTarget = baseDir + L"\\t20c_restored_parent\\nested\\raport_v1.txt";
+        std::vector<uint8_t> v1Bytes(544, 0);
+        const uint64_t ver1 = 1, sz1 = 12;
+        FILETIME ftNow = {};
+        GetSystemTimeAsFileTime(&ftNow);
+        std::memcpy(v1Bytes.data(), &ver1, 8);
+        std::memcpy(v1Bytes.data() + 8, &sz1, 8);
+        std::memcpy(v1Bytes.data() + 16, &ftNow, 8);
+        std::memcpy(v1Bytes.data() + 24, missingParentTarget.c_str(),
+                    std::min<size_t>((missingParentTarget.size() + 1) * sizeof(wchar_t), 520));
+
+        RecycleBinRecord parsedV1;
+        RecycleBinRecord badRec;
+        const bool parseV1Ok =
+            FileEngine::ParseRecycleBinInfoBytes(v1Bytes, parsedV1) &&
+            parsedV1.version == 1 && parsedV1.fileSize == 12 &&
+            parsedV1.originalPath == missingParentTarget &&
+            !FileEngine::ParseRecycleBinInfoBytes({ 1, 2, 3 }, badRec);
+
+        const std::wstring v1Info = mockBin + L"\\$IA1B2C3.txt";
+        const std::wstring v1Data = mockBin + L"\\$RA1B2C3.txt";
+        PathUtils::WriteFileBytes(v1Info, v1Bytes.data(), v1Bytes.size());
+        PathUtils::WriteFileBytes(v1Data, "hello_win7_1", 12);
+
+        std::wstring restored1;
+        const bool restore1Ok =
+            FileEngine::RestoreRecycleBinItem(v1Data, Lang::PL, restored1) &&
+            PathUtils::NormalizePathKey(restored1) == PathUtils::NormalizePathKey(missingParentTarget) &&
+            existsOnDisk(missingParentTarget) && !existsOnDisk(v1Data) && !existsOnDisk(v1Info);
+
+        // Collision test with Version 2 record when missingParentTarget already exists
+        std::vector<uint8_t> v2Bytes(28 + (missingParentTarget.size() + 1) * sizeof(wchar_t), 0);
+        const uint64_t ver2 = 2, sz2 = 12;
+        const uint32_t chars2 = static_cast<uint32_t>(missingParentTarget.size() + 1);
+        std::memcpy(v2Bytes.data(), &ver2, 8);
+        std::memcpy(v2Bytes.data() + 8, &sz2, 8);
+        std::memcpy(v2Bytes.data() + 16, &ftNow, 8);
+        std::memcpy(v2Bytes.data() + 24, &chars2, 4);
+        std::memcpy(v2Bytes.data() + 28, missingParentTarget.c_str(), chars2 * sizeof(wchar_t));
+
+        const std::wstring v2Info = mockBin + L"\\$ID4E5F6.txt";
+        const std::wstring v2Data = mockBin + L"\\$RD4E5F6.txt";
+        PathUtils::WriteFileBytes(v2Info, v2Bytes.data(), v2Bytes.size());
+        PathUtils::WriteFileBytes(v2Data, "hello_win10!", 12);
+
+        std::wstring restored2;
+        const bool restore2Ok =
+            FileEngine::RestoreRecycleBinItem(v2Data, Lang::PL, restored2) &&
+            PathUtils::NormalizePathKey(restored2) != PathUtils::NormalizePathKey(missingParentTarget) &&
+            restored2.find(L"przywrócony") != std::wstring::npos &&
+            existsOnDisk(restored2) && existsOnDisk(missingParentTarget) && !existsOnDisk(v2Info);
+
+        // Permanent purge of recycled folder tree + $I sidecar
+        const std::wstring pInfo = mockBin + L"\\$IPURGE1";
+        const std::wstring pData = mockBin + L"\\$RPURGE1";
+        PathUtils::WriteFileBytes(pInfo, v2Bytes.data(), v2Bytes.size());
+        CreateDirectoryW(pData.c_str(), nullptr);
+        PathUtils::WriteFileBytes(pData + L"\\inner.bin", "xyz", 3);
+        const bool purgeOk =
+            FileEngine::DeleteRecycleBinItemPermanently(pData) &&
+            !existsOnDisk(pData) && !existsOnDisk(pInfo);
+
+        // Live Windows Recycle Bin enumeration + Restore round-trip (when volume has an active Recycle Bin)
+        bool liveRoundTripOk = true;
+        {
+            wchar_t longBuf[1024] = {};
+            const std::wstring baseLong = (GetLongPathNameW(baseDir.c_str(), longBuf, 1024) > 0) ? std::wstring(longBuf) : baseDir;
+            const std::wstring liveFile = baseLong + L"\\e2_kosz_enum_" + std::to_wstring(GetTickCount64()) + L".txt";
+            PathUtils::WriteFileBytes(liveFile, "kosz_live_test", 14);
+            const int jid = tm.EnqueueDelete({ liveFile }, false);
+            if (tm.WaitForJob(jid, 20000) && !existsOnDisk(liveFile)) {
+                FileEngine fe;
+                auto binEntries = fe.EnumerateDirectory(L"RECYCLE_BIN", true, true, Lang::PL);
+                std::wstring foundDataPath;
+                for (const auto& be : binEntries) {
+                    if (PathUtils::NormalizePathKey(be.originalPath) == PathUtils::NormalizePathKey(liveFile)) {
+                        foundDataPath = be.fullPath;
+                        break;
+                    }
+                }
+                std::wstring liveRestored;
+                liveRoundTripOk = !foundDataPath.empty() &&
+                                  FileEngine::RestoreRecycleBinItem(foundDataPath, Lang::PL, liveRestored) &&
+                                  existsOnDisk(liveFile);
+            }
+            DeleteFileW(liveFile.c_str());
+        }
+
+        const bool ok = aliasOk && parseV1Ok && restore1Ok && restore2Ok && purgeOk && liveRoundTripOk;
+        wchar_t detail[200] = {};
+        swprintf_s(detail, L"alias=%d, v1=%d, rest1=%d, rest2=%d, purge=%d, live=%d",
+                   aliasOk ? 1 : 0, parseV1Ok ? 1 : 0, restore1Ok ? 1 : 0,
+                   restore2Ok ? 1 : 0, purgeOk ? 1 : 0, liveRoundTripOk ? 1 : 0);
+        tc.Record(ok, L"Stage13.Test20c_RecycleBin_KoszAddressAliasAndV1V2RestorePurge", detail);
+    }
+
     // Test 13.21: a file that appears in a folder after the folder was listed (a thumbnail cache, a log,
     // a late download) does not leave the folder behind: the engine takes a second pass
     {
