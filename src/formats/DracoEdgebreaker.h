@@ -1,27 +1,60 @@
 #pragma once
-// DracoEdgebreaker.h — #11 Google Draco Edgebreaker + rANS (.drc),
+// DracoEdgebreaker.h — #11 Google Draco Edgebreaker / Valence / KD-Tree (.drc),
 //                      glTF 2.0 KHR_draco_mesh_compression, & EXT_meshopt_compression / KHR_meshopt_compression
 //
 // Pure C++20 zero-cheat implementation:
-//   - Google Draco v1.x / v2.x:
-//       * MESH_EDGEBREAKER_ENCODING (STANDARD_EDGEBREAKER CLERS corner-table + split events + rABS interior faces)
-//       * MESH_SEQUENTIAL_ENCODING (uncompressed & delta-varint / rANS indices)
-//       * Full rANS (RAW_SYMBOLS & TAGGED_SYMBOLS) and rABS entropy decoders
-//       * Attribute decoders: GENERIC raw, QUANTIZATION transform, DIFFERENTIAL & PARALLELOGRAM prediction
-//   - Khronos EXT_meshopt_compression / KHR_meshopt_compression:
-//       * ATTRIBUTES (0xA0) block/byte-lane zigzag delta decoder + OCTAHEDRAL / QUATERNION / EXPONENTIAL filters
-//       * TRIANGLES (0xE0 / 0xE1) edgefifo[16] + vertexfifo[16] + codeaux[16] topological index decoder
-//       * INDICES (0xF0 / 0xF1) general index stream decoder
+//   - Google Draco v1.x / v2.x (up to v2.2 Mesh & v2.3 Point Cloud):
+//       * MESH_EDGEBREAKER_ENCODING:
+//           - MESH_EDGEBREAKER_STANDARD_ENCODING (0): CLERS symbol buffer, topology splits, hole events, rABS start faces
+//           - MESH_EDGEBREAKER_VALENCE_ENCODING  (2): 6 valence-context rANS symbol streams (valences 2..7), vertex merge valences
+//           - Full non-position attribute seam connectivity (DecodeAttributeConnectivitiesOnFace, MeshAttributeCornerTable,
+//             AssignPointsToCorners) and exact DepthFirstTraverser & MaxPredictionDegreeTraverser sequences
+//       * MESH_SEQUENTIAL_ENCODING (uncompressed uint8/uint16/varint/uint32 & rANS / varint delta indices)
+//       * POINT_CLOUD_SEQUENTIAL_ENCODING & POINT_CLOUD_KD_TREE_ENCODING (DynamicIntegerPointsKdTreeDecoder<0..6> + FloatPointsTree)
+//       * Full rANS (SYMBOL_CODING_RAW & SYMBOL_CODING_TAGGED) and rABS / Direct / Folded-rANS bit decoders
+//       * Sequential attribute decoders: GENERIC (0), INTEGER (1), QUANTIZATION (2), NORMALS (3)
+//       * Prediction schemes: DIFFERENCE (0), PARALLELOGRAM (1), MULTI_PARALLELOGRAM (2), TEX_COORDS_DEPRECATED (3),
+//         CONSTRAINED_MULTI_PARALLELOGRAM (4), TEX_COORDS_PORTABLE (5), GEOMETRIC_NORMAL (6), with DELTA / WRAP / OCTAHEDRON transforms
+//   - Khronos EXT_meshopt_compression (v0) & KHR_meshopt_compression (v1):
+//       * ATTRIBUTES (0xA0 / 0xA1): 0/1/2/4/8-bit groups with sentinel escapes, v1 control & 8/16/32-bit XOR-rotate channels
+//       * Attribute filters: NONE, OCTAHEDRAL (8/16-bit), QUATERNION (16-bit), EXPONENTIAL (32-bit float), COLOR (8/16-bit YCoCg)
+//       * TRIANGLES (0xE0 / 0xE1): edgefifo[16] + vertexfifo[16] + codeaux[16] + reset code topological index decoder
+//       * INDICES   (0xD0 / 0xD1): dual-baseline VByte zigzag delta index sequence decoder
 
 namespace Formats {
 
 namespace DracoMeshoptDetail {
 
+#if defined(_MSC_VER)
+#define E2_DRACO_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define E2_DRACO_NOINLINE __attribute__((noinline))
+#else
+#define E2_DRACO_NOINLINE
+#endif
+
 inline uint16_t RdU16LE(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
+inline int16_t  RdI16LE(const uint8_t* p) { int16_t  v = 0; std::memcpy(&v, p, 2); return v; }
 inline uint32_t RdU32LE(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
 inline int32_t  RdI32LE(const uint8_t* p) { int32_t  v = 0; std::memcpy(&v, p, 4); return v; }
+inline uint64_t RdU64LE(const uint8_t* p) { uint64_t v = 0; std::memcpy(&v, p, 8); return v; }
 inline float    RdF32LE(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
 inline double   RdF64LE(const uint8_t* p) { double   v = 0.0; std::memcpy(&v, p, 8); return v; }
+
+constexpr uint16_t DracoVer(uint8_t maj, uint8_t min) {
+    return static_cast<uint16_t>((static_cast<uint16_t>(maj) << 8) | min);
+}
+
+inline int32_t AddAsUnsigned32(int32_t a, int32_t b) {
+    return static_cast<int32_t>(static_cast<uint32_t>(a) + static_cast<uint32_t>(b));
+}
+
+inline int DracoMostSignificantBit(uint32_t n) {
+    if (n == 0u) return -1;
+    int msb = 0;
+    while (n >>= 1u) ++msb;
+    return msb;
+}
 
 inline bool ReadLeb128U32(const uint8_t* data, size_t size, size_t& pos, uint32_t& out) {
     out = 0;
@@ -49,12 +82,22 @@ inline bool ReadLeb128U64(const uint8_t* data, size_t size, size_t& pos, uint64_
     return false;
 }
 
+inline bool ReadDracoU32OrVarint(const uint8_t* data, size_t size, size_t& pos, uint16_t ver, uint32_t minVer, uint32_t& out) {
+    if (ver < minVer) {
+        if (pos + 4 > size) return false;
+        out = RdU32LE(data + pos);
+        pos += 4;
+        return true;
+    }
+    return ReadLeb128U32(data, size, pos, out);
+}
+
 inline int32_t DracoConvertSymbolToSignedInt(uint32_t val) {
     if ((val & 1u) == 0u) return static_cast<int32_t>(val >> 1);
     return -static_cast<int32_t>(val >> 1) - 1;
 }
 
-// LSB-first bit reader matching Draco BitDecoder
+// LSB-first bit reader matching Draco DecoderBuffer::BitDecoder
 struct DracoBitReader {
     const uint8_t* data = nullptr;
     size_t size = 0;
@@ -76,13 +119,94 @@ struct DracoBitReader {
         }
         return true;
     }
+
+    size_t BytesConsumed() const { return (bitOffset + 7u) >> 3; }
 };
 
-// Google Draco rABS (binary Asymmetric Numeral Systems, p8 precision = 256, l_base = 4096)
+inline bool StartDracoBitBuffer(
+    const uint8_t* data,
+    size_t size,
+    size_t& pos,
+    uint16_t ver,
+    DracoBitReader& outBr)
+{
+    uint64_t byteSz = 0;
+    if (ver < DracoVer(2, 2)) {
+        if (pos + 8 > size) return false;
+        byteSz = RdU64LE(data + pos);
+        pos += 8;
+    } else {
+        if (!ReadLeb128U64(data, size, pos, byteSz)) return false;
+    }
+    if (byteSz > size - pos) return false;
+    outBr = DracoBitReader(data + pos, static_cast<size_t>(byteSz));
+    pos += static_cast<size_t>(byteSz);
+    return true;
+}
+
+// MSB-first 32-bit word reader matching Draco DirectBitDecoder (used by KD-tree point cloud decoder)
+struct DracoDirectBitDecoder {
+    std::vector<uint32_t> words;
+    size_t wordIdx = 0;
+    int numUsedBits = 0;
+
+    bool StartDecoding(const uint8_t* data, size_t size, size_t& pos) {
+        words.clear();
+        wordIdx = 0;
+        numUsedBits = 0;
+        if (pos + 4 > size) return false;
+        uint32_t szBytes = RdU32LE(data + pos);
+        pos += 4;
+        if (szBytes == 0 || (szBytes & 3u) != 0u || szBytes > size - pos) return false;
+        uint32_t nWords = szBytes >> 2;
+        words.resize(nWords);
+        for (uint32_t i = 0; i < nWords; ++i) {
+            words[i] = RdU32LE(data + pos + static_cast<size_t>(i) * 4u);
+        }
+        pos += szBytes;
+        return true;
+    }
+
+    bool DecodeNextBit() {
+        if (wordIdx >= words.size()) return false;
+        uint32_t sel = 1u << (31 - numUsedBits);
+        bool bit = (words[wordIdx] & sel) != 0u;
+        if (++numUsedBits == 32) {
+            ++wordIdx;
+            numUsedBits = 0;
+        }
+        return bit;
+    }
+
+    bool DecodeLeastSignificantBits32(int nbits, uint32_t& out) {
+        if (nbits <= 0) { out = 0; return true; }
+        if (nbits > 32 || wordIdx >= words.size()) return false;
+        int rem = 32 - numUsedBits;
+        if (nbits <= rem) {
+            out = (words[wordIdx] << numUsedBits) >> (32 - nbits);
+            numUsedBits += nbits;
+            if (numUsedBits == 32) {
+                ++wordIdx;
+                numUsedBits = 0;
+            }
+            return true;
+        }
+        if (wordIdx + 1 >= words.size()) return false;
+        uint32_t valueL = words[wordIdx] << numUsedBits;
+        numUsedBits = nbits - rem;
+        ++wordIdx;
+        uint32_t valueR = words[wordIdx] >> (32 - numUsedBits);
+        out = (valueL >> (32 - numUsedBits - rem)) | valueR;
+        return true;
+    }
+};
+
+// Google Draco rABS (RAnsBitDecoder, p8 precision = 256, l_base = 4096)
 struct DracoRAbsDecoder {
     const uint8_t* buf = nullptr;
     size_t offset = 0;
     uint32_t state = 0;
+    uint8_t probZero = 128;
 
     bool Init(const uint8_t* p, size_t sz) {
         if (!p || sz == 0) return false;
@@ -111,12 +235,23 @@ struct DracoRAbsDecoder {
         return state < kLBase * 256u;
     }
 
-    uint8_t ReadBit(uint8_t probZero) {
+    bool StartDecoding(const uint8_t* data, size_t size, size_t& pos, uint16_t ver) {
+        if (pos >= size) return false;
+        probZero = data[pos++];
+        uint32_t szBytes = 0;
+        if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 2), szBytes)) return false;
+        if (szBytes == 0 || szBytes > size - pos) return false;
+        if (!Init(data + pos, szBytes)) return false;
+        pos += szBytes;
+        return true;
+    }
+
+    uint8_t ReadBit(uint8_t pz) {
         constexpr uint32_t kLBase = 4096u;
         while (state < kLBase && offset > 0) {
             state = (state << 8) | buf[--offset];
         }
-        uint32_t p = 256u - static_cast<uint32_t>(probZero); // probability of symbol '1'
+        uint32_t p = 256u - static_cast<uint32_t>(pz);
         if (p == 0) return 0;
         if (p == 256u) return 1;
         uint32_t x = state;
@@ -126,14 +261,50 @@ struct DracoRAbsDecoder {
         if (rem < p) {
             state = xn + rem;
             return 1;
-        } else {
-            state = x - xn - p;
-            return 0;
         }
+        state = x - xn - p;
+        return 0;
+    }
+
+    bool DecodeNextBit() { return ReadBit(probZero) != 0u; }
+
+    bool DecodeLeastSignificantBits32(int nbits, uint32_t& out) {
+        if (nbits < 0 || nbits > 32) return false;
+        uint32_t res = 0;
+        for (int i = 0; i < nbits; ++i) {
+            res = (res << 1) | (DecodeNextBit() ? 1u : 0u);
+        }
+        out = res;
+        return true;
     }
 };
 
-// Google Draco rANS multi-symbol decoder (BuildSymbolTables + RansInitDecoder + RansRead)
+// FoldedBit32Decoder<RAnsBitDecoder> (used by KD-tree compression levels 4..6)
+struct DracoFoldedRAnsBitDecoder {
+    std::array<DracoRAbsDecoder, 32> folded;
+    DracoRAbsDecoder bitDec;
+
+    bool StartDecoding(const uint8_t* data, size_t size, size_t& pos, uint16_t ver) {
+        for (int i = 0; i < 32; ++i) {
+            if (!folded[static_cast<size_t>(i)].StartDecoding(data, size, pos, ver)) return false;
+        }
+        return bitDec.StartDecoding(data, size, pos, ver);
+    }
+
+    bool DecodeNextBit() { return bitDec.DecodeNextBit(); }
+
+    bool DecodeLeastSignificantBits32(int nbits, uint32_t& out) {
+        if (nbits < 0 || nbits > 32) return false;
+        uint32_t res = 0;
+        for (int i = 0; i < nbits; ++i) {
+            res = (res << 1) | (folded[static_cast<size_t>(i)].DecodeNextBit() ? 1u : 0u);
+        }
+        out = res;
+        return true;
+    }
+};
+
+// Google Draco rANS multi-symbol decoder (RAnsSymbolDecoder<unique_symbols_bit_length_t>)
 struct DracoRAnsSymbolDecoder {
     struct SymEntry {
         uint32_t prob = 0;
@@ -141,33 +312,37 @@ struct DracoRAnsSymbolDecoder {
     };
     uint32_t precision = 4096;
     uint32_t lBase = 16384;
+    uint32_t numSymbols = 0;
     std::vector<SymEntry> symTable;
     std::vector<uint32_t> lut;
     const uint8_t* buf = nullptr;
     size_t offset = 0;
     uint32_t state = 0;
 
-    bool ReadTable(const uint8_t* data, size_t size, size_t& pos, uint32_t maxBitLength) {
-        uint32_t precBits = std::clamp<uint32_t>((3u * maxBitLength) / 2u, 12u, 20u);
+    bool ReadTable(const uint8_t* data, size_t size, size_t& pos, uint16_t ver, uint32_t uniqueSymbolsBitLen) {
+        uint32_t precBits = std::clamp<uint32_t>((3u * uniqueSymbolsBitLen) / 2u, 12u, 20u);
         precision = 1u << precBits;
         lBase = precision * 4u;
 
-        uint32_t numSymbols = 0;
-        if (!ReadLeb128U32(data, size, pos, numSymbols) || numSymbols == 0 || numSymbols > (1u << 20)) {
-            return false;
+        numSymbols = 0;
+        if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), numSymbols)) return false;
+        if (numSymbols > (1u << 20) || (numSymbols / 64u) > (size - pos)) return false;
+        if (numSymbols == 0) {
+            symTable.clear();
+            lut.clear();
+            return true;
         }
         symTable.assign(numSymbols, {});
         lut.assign(precision, 0u);
 
         uint32_t cumProb = 0;
-        uint32_t i = 0;
-        while (i < numSymbols) {
+        for (uint32_t i = 0; i < numSymbols; ++i) {
             if (pos >= size) return false;
             uint8_t probData = data[pos++];
             uint8_t token = probData & 3u;
             if (token == 3u) {
-                uint32_t skip = (probData >> 2) + 1u;
-                if (i + skip > numSymbols) return false;
+                uint32_t skip = probData >> 2;
+                if (i + skip >= numSymbols) return false;
                 i += skip;
             } else {
                 uint32_t prob = static_cast<uint32_t>(probData >> 2);
@@ -175,21 +350,32 @@ struct DracoRAnsSymbolDecoder {
                     if (pos >= size) return false;
                     prob |= static_cast<uint32_t>(data[pos++]) << (8u * (eb + 1u) - 2u);
                 }
-                if (prob == 0 || cumProb + prob > precision) return false;
+                if (cumProb + prob > precision) return false;
                 symTable[i].prob = prob;
                 symTable[i].cumProb = cumProb;
                 for (uint32_t k = cumProb; k < cumProb + prob; ++k) {
                     lut[k] = i;
                 }
                 cumProb += prob;
-                ++i;
             }
         }
         return cumProb == precision;
     }
 
-    bool StartStream(const uint8_t* p, size_t sz) {
-        if (!p || sz == 0) return false;
+    bool StartStream(const uint8_t* data, size_t size, size_t& pos, uint16_t ver) {
+        uint64_t ansByteLen = 0;
+        if (ver < DracoVer(2, 0)) {
+            if (pos + 8 > size) return false;
+            ansByteLen = RdU64LE(data + pos);
+            pos += 8;
+        } else {
+            if (!ReadLeb128U64(data, size, pos, ansByteLen)) return false;
+        }
+        if (ansByteLen == 0 || ansByteLen > size - pos) return false;
+        const uint8_t* p = data + pos;
+        size_t sz = static_cast<size_t>(ansByteLen);
+        pos += sz;
+
         buf = p;
         uint8_t top = p[sz - 1] >> 6;
         if (top == 0) {
@@ -203,7 +389,7 @@ struct DracoRAnsSymbolDecoder {
             if (sz < 3) return false;
             offset = sz - 3;
             state = ((static_cast<uint32_t>(p[sz - 1] & 0x3Fu) << 16) |
-                     (static_cast<uint32_t>(p[sz - 2]) << 8) | p[sz - 3]) + lBase;
+                     (static_cast<uint32_t>(p[sz - 2]) << 8) | p[sz - 3]) + kLBaseScaled();
         } else {
             if (sz < 4) return false;
             offset = sz - 4;
@@ -213,6 +399,8 @@ struct DracoRAnsSymbolDecoder {
         }
         return state < static_cast<uint64_t>(lBase) * 256ULL;
     }
+
+    uint32_t kLBaseScaled() const { return lBase; }
 
     uint32_t ReadSymbol() {
         while (state < lBase && offset > 0) {
@@ -227,11 +415,12 @@ struct DracoRAnsSymbolDecoder {
     }
 };
 
-// DecodeSymbols (Draco spec: scheme 0 = TAGGED_SYMBOLS, scheme 1 = RAW_SYMBOLS)
+// Draco DecodeSymbols (symbol_decoding.cc: scheme 0 = SYMBOL_CODING_TAGGED, scheme 1 = SYMBOL_CODING_RAW)
 inline bool DracoDecodeSymbols(
     const uint8_t* data,
     size_t size,
     size_t& pos,
+    uint16_t ver,
     uint32_t numValues,
     uint32_t numComponents,
     std::vector<uint32_t>& outValues)
@@ -244,36 +433,28 @@ inline bool DracoDecodeSymbols(
     if (scheme == 1u) { // SYMBOL_CODING_RAW
         if (pos >= size) return false;
         uint8_t maxBitLen = data[pos++];
-        if (maxBitLen > 32) return false;
+        if (maxBitLen < 1u || maxBitLen > 18u) return false;
         DracoRAnsSymbolDecoder dec;
-        if (!dec.ReadTable(data, size, pos, std::max<uint32_t>(1u, maxBitLen))) return false;
-        uint64_t ansByteLen = 0;
-        if (!ReadLeb128U64(data, size, pos, ansByteLen) || ansByteLen == 0 || pos + ansByteLen > size) return false;
-        if (!dec.StartStream(data + pos, static_cast<size_t>(ansByteLen))) return false;
-        pos += static_cast<size_t>(ansByteLen);
+        if (!dec.ReadTable(data, size, pos, ver, maxBitLen)) return false;
+        if (dec.numSymbols == 0) return false;
+        if (!dec.StartStream(data, size, pos, ver)) return false;
 
         outValues.resize(numValues);
         for (uint32_t i = 0; i < numValues; ++i) {
             outValues[i] = dec.ReadSymbol();
         }
         return true;
-    } else if (scheme == 0u) { // SYMBOL_CODING_TAGGED
+    }
+    if (scheme == 0u) { // SYMBOL_CODING_TAGGED (SymbolDecoderT<5> + unprefixed bit buffer!)
         if ((numValues % numComponents) != 0u) return false;
         uint32_t numVectors = numValues / numComponents;
         DracoRAnsSymbolDecoder tagDec;
-        // Tagged rANS always uses precision_bits = 12 (maxBitLength = 8 -> clamp(12,12,20)=12)
-        if (!tagDec.ReadTable(data, size, pos, 8u)) return false;
-        uint64_t ansByteLen = 0;
-        if (!ReadLeb128U64(data, size, pos, ansByteLen) || ansByteLen == 0 || pos + ansByteLen > size) return false;
-        if (!tagDec.StartStream(data + pos, static_cast<size_t>(ansByteLen))) return false;
-        pos += static_cast<size_t>(ansByteLen);
+        if (!tagDec.ReadTable(data, size, pos, ver, 5u)) return false;
+        if (tagDec.numSymbols == 0) return false;
+        if (!tagDec.StartStream(data, size, pos, ver)) return false;
 
-        // Next in bitstream: varUI64 bitLengthByteSize (or bit count? In Draco BitDecoder::Decode: varUI64 byteSize + raw bytes!)
-        uint64_t rawBitBytes = 0;
-        if (!ReadLeb128U64(data, size, pos, rawBitBytes) || pos + rawBitBytes > size) return false;
-        DracoBitReader br(data + pos, static_cast<size_t>(rawBitBytes));
-        pos += static_cast<size_t>(rawBitBytes);
-
+        // StartBitDecoding(false, nullptr): raw bits follow immediately; EndBitDecoding advances (bits + 7) / 8!
+        DracoBitReader br(data + pos, size - pos);
         outValues.resize(numValues);
         size_t outIdx = 0;
         for (uint32_t v = 0; v < numVectors; ++v) {
@@ -285,398 +466,1290 @@ inline bool DracoDecodeSymbols(
                 outValues[outIdx++] = val;
             }
         }
+        pos += br.BytesConsumed();
         return true;
     }
     return false;
 }
 
-// CornerTable for Draco EdgeBreaker
+// ============================================================================
+// Draco CornerTable & MeshAttributeCornerTable (exact match to Google Draco)
+// ============================================================================
 struct DracoCornerTable {
     static constexpr int32_t kInvalid = -1;
     uint32_t numFaces = 0;
-    uint32_t numVertices = 0;
     std::vector<int32_t> cornerToVert;
     std::vector<int32_t> oppCorner;
+    std::vector<int32_t> vertexCorners; // LeftMostCorner per vertex
 
-    void Init(uint32_t nFaces) {
+    void Reset(uint32_t nFaces, uint32_t reserveVerts) {
         numFaces = nFaces;
-        numVertices = 0;
         cornerToVert.assign(static_cast<size_t>(nFaces) * 3u, kInvalid);
         oppCorner.assign(static_cast<size_t>(nFaces) * 3u, kInvalid);
+        vertexCorners.clear();
+        vertexCorners.reserve(reserveVerts);
     }
+
+    int32_t NumFaces() const { return static_cast<int32_t>(numFaces); }
+    int32_t NumCorners() const { return static_cast<int32_t>(cornerToVert.size()); }
+    int32_t NumVertices() const { return static_cast<int32_t>(vertexCorners.size()); }
 
     static inline int32_t Next(int32_t c) { return (c < 0) ? kInvalid : (((c % 3) == 2) ? (c - 2) : (c + 1)); }
     static inline int32_t Prev(int32_t c) { return (c < 0) ? kInvalid : (((c % 3) == 0) ? (c + 2) : (c - 1)); }
+
     inline int32_t Opposite(int32_t c) const {
         return (c >= 0 && static_cast<size_t>(c) < oppCorner.size()) ? oppCorner[static_cast<size_t>(c)] : kInvalid;
     }
-    inline void SetOpposite(int32_t a, int32_t b) {
+    inline int32_t Vertex(int32_t c) const {
+        return (c >= 0 && static_cast<size_t>(c) < cornerToVert.size()) ? cornerToVert[static_cast<size_t>(c)] : kInvalid;
+    }
+    inline void MapCornerToVertex(int32_t c, int32_t v) {
+        if (c >= 0 && static_cast<size_t>(c) < cornerToVert.size()) cornerToVert[static_cast<size_t>(c)] = v;
+    }
+    inline void SetOppositeCorners(int32_t a, int32_t b) {
         if (a >= 0 && static_cast<size_t>(a) < oppCorner.size()) oppCorner[static_cast<size_t>(a)] = b;
         if (b >= 0 && static_cast<size_t>(b) < oppCorner.size()) oppCorner[static_cast<size_t>(b)] = a;
     }
-    // SwingLeft / PosOpposite: walk around vertex to find open boundary corner on right/left
-    int32_t PosOpposite(int32_t c) const {
-        int32_t cur = Next(c);
-        int guard = 0;
-        while (cur != kInvalid && guard++ < 65536) {
-            int32_t opp = Opposite(cur);
-            if (opp == kInvalid) return cur;
-            cur = Next(opp);
-            if (cur == Next(c)) break;
-        }
-        return kInvalid;
+    inline int32_t AddNewVertex() {
+        vertexCorners.push_back(kInvalid);
+        return static_cast<int32_t>(vertexCorners.size() - 1);
     }
-    int32_t NegOpposite(int32_t c) const {
-        int32_t cur = Prev(c);
-        int guard = 0;
-        while (cur != kInvalid && guard++ < 65536) {
-            int32_t opp = Opposite(cur);
-            if (opp == kInvalid) return cur;
-            cur = Prev(opp);
-            if (cur == Prev(c)) break;
-        }
-        return kInvalid;
+    inline int32_t LeftMostCorner(int32_t v) const {
+        return (v >= 0 && static_cast<size_t>(v) < vertexCorners.size()) ? vertexCorners[static_cast<size_t>(v)] : kInvalid;
+    }
+    inline void SetLeftMostCorner(int32_t v, int32_t c) {
+        if (v >= 0 && static_cast<size_t>(v) < vertexCorners.size()) vertexCorners[static_cast<size_t>(v)] = c;
+    }
+    inline void MakeVertexIsolated(int32_t v) {
+        if (v >= 0 && static_cast<size_t>(v) < vertexCorners.size()) vertexCorners[static_cast<size_t>(v)] = kInvalid;
+    }
+
+    // corner_table.h: GetLeftCorner = Opposite(Previous(c)), GetRightCorner = Opposite(Next(c))
+    inline int32_t GetLeftCorner(int32_t c) const { return (c < 0) ? kInvalid : Opposite(Prev(c)); }
+    inline int32_t GetRightCorner(int32_t c) const { return (c < 0) ? kInvalid : Opposite(Next(c)); }
+
+    // corner_table.h: SwingRight = Previous(Opposite(Previous(c))), SwingLeft = Next(Opposite(Next(c)))
+    inline int32_t SwingRight(int32_t c) const { return Prev(Opposite(Prev(c))); }
+    inline int32_t SwingLeft(int32_t c) const { return Next(Opposite(Next(c))); }
+
+    inline bool IsOnBoundary(int32_t v) const {
+        int32_t c = LeftMostCorner(v);
+        return c == kInvalid || SwingLeft(c) == kInvalid;
     }
 };
 
-// Decode Standard EdgeBreaker connectivity into DracoCornerTable + vertex traversal order
-inline bool DecodeDracoEdgebreakerConnectivity(
+struct DracoAttrCornerTable {
+    static constexpr int32_t kInvalid = -1;
+    const DracoCornerTable* base = nullptr;
+    std::vector<uint8_t> isEdgeOnSeam;
+    std::vector<uint8_t> isVertexOnSeam;
+    std::vector<int32_t> cornerToVert;
+    std::vector<int32_t> vertToLeftMostCorner;
+
+    void InitEmpty(const DracoCornerTable* tbl) {
+        base = tbl;
+        isEdgeOnSeam.assign(static_cast<size_t>(tbl->NumCorners()), 0u);
+        isVertexOnSeam.assign(static_cast<size_t>(tbl->NumVertices()), 0u);
+        cornerToVert.assign(static_cast<size_t>(tbl->NumCorners()), kInvalid);
+        vertToLeftMostCorner.clear();
+    }
+
+    void AddSeamEdge(int32_t c) {
+        if (!base || c < 0 || c >= base->NumCorners()) return;
+        isEdgeOnSeam[static_cast<size_t>(c)] = 1u;
+        int32_t vn = base->Vertex(DracoCornerTable::Next(c));
+        int32_t vp = base->Vertex(DracoCornerTable::Prev(c));
+        if (vn >= 0 && static_cast<size_t>(vn) < isVertexOnSeam.size()) isVertexOnSeam[static_cast<size_t>(vn)] = 1u;
+        if (vp >= 0 && static_cast<size_t>(vp) < isVertexOnSeam.size()) isVertexOnSeam[static_cast<size_t>(vp)] = 1u;
+
+        int32_t opp = base->Opposite(c);
+        if (opp != kInvalid) {
+            isEdgeOnSeam[static_cast<size_t>(opp)] = 1u;
+            int32_t ovn = base->Vertex(DracoCornerTable::Next(opp));
+            int32_t ovp = base->Vertex(DracoCornerTable::Prev(opp));
+            if (ovn >= 0 && static_cast<size_t>(ovn) < isVertexOnSeam.size()) isVertexOnSeam[static_cast<size_t>(ovn)] = 1u;
+            if (ovp >= 0 && static_cast<size_t>(ovp) < isVertexOnSeam.size()) isVertexOnSeam[static_cast<size_t>(ovp)] = 1u;
+        }
+    }
+
+    inline bool IsCornerOppositeToSeamEdge(int32_t c) const {
+        return c >= 0 && static_cast<size_t>(c) < isEdgeOnSeam.size() && isEdgeOnSeam[static_cast<size_t>(c)] != 0u;
+    }
+    inline bool IsCornerOnSeam(int32_t c) const {
+        int32_t v = base ? base->Vertex(c) : kInvalid;
+        return v >= 0 && static_cast<size_t>(v) < isVertexOnSeam.size() && isVertexOnSeam[static_cast<size_t>(v)] != 0u;
+    }
+
+    static inline int32_t Next(int32_t c) { return DracoCornerTable::Next(c); }
+    static inline int32_t Prev(int32_t c) { return DracoCornerTable::Prev(c); }
+
+    inline int32_t Opposite(int32_t c) const {
+        if (!base || c < 0 || IsCornerOppositeToSeamEdge(c)) return kInvalid;
+        return base->Opposite(c);
+    }
+    inline int32_t GetLeftCorner(int32_t c) const { return Opposite(Prev(c)); }
+    inline int32_t GetRightCorner(int32_t c) const { return Opposite(Next(c)); }
+    inline int32_t SwingRight(int32_t c) const { return Prev(Opposite(Prev(c))); }
+    inline int32_t SwingLeft(int32_t c) const { return Next(Opposite(Next(c))); }
+
+    int32_t NumFaces() const { return base ? base->NumFaces() : 0; }
+    int32_t NumCorners() const { return base ? base->NumCorners() : 0; }
+    int32_t NumVertices() const { return static_cast<int32_t>(vertToLeftMostCorner.size()); }
+
+    inline int32_t Vertex(int32_t c) const {
+        return (c >= 0 && static_cast<size_t>(c) < cornerToVert.size()) ? cornerToVert[static_cast<size_t>(c)] : kInvalid;
+    }
+    inline int32_t LeftMostCorner(int32_t v) const {
+        return (v >= 0 && static_cast<size_t>(v) < vertToLeftMostCorner.size()) ? vertToLeftMostCorner[static_cast<size_t>(v)] : kInvalid;
+    }
+    inline bool IsOnBoundary(int32_t v) const {
+        int32_t c = LeftMostCorner(v);
+        return c == kInvalid || SwingLeft(c) == kInvalid;
+    }
+
+    bool RecomputeVertices() {
+        if (!base) return false;
+        vertToLeftMostCorner.clear();
+        vertToLeftMostCorner.reserve(static_cast<size_t>(base->NumVertices()));
+        int32_t numNewVerts = 0;
+        const int32_t maxRingGuard = base->NumCorners() + 4;
+
+        for (int32_t v = 0; v < base->NumVertices(); ++v) {
+            int32_t c = base->LeftMostCorner(v);
+            if (c == kInvalid) continue;
+            int32_t firstVertId = numNewVerts++;
+            int32_t firstC = c;
+            if (isVertexOnSeam[static_cast<size_t>(v)] != 0u) {
+                int32_t actC = SwingLeft(firstC);
+                int guard = 0;
+                while (actC != kInvalid) {
+                    if (++guard > maxRingGuard) return false;
+                    firstC = actC;
+                    actC = SwingLeft(actC);
+                    if (actC == c) return false;
+                }
+            }
+            cornerToVert[static_cast<size_t>(firstC)] = firstVertId;
+            vertToLeftMostCorner.push_back(firstC);
+            int32_t actC = base->SwingRight(firstC);
+            int guard = 0;
+            while (actC != kInvalid && actC != firstC) {
+                if (++guard > maxRingGuard) return false;
+                if (IsCornerOppositeToSeamEdge(DracoCornerTable::Next(actC))) {
+                    firstVertId = numNewVerts++;
+                    vertToLeftMostCorner.push_back(actC);
+                }
+                cornerToVert[static_cast<size_t>(actC)] = firstVertId;
+                actC = base->SwingRight(actC);
+            }
+        }
+        return true;
+    }
+};
+
+struct DracoEdgebreakerState {
+    DracoCornerTable cornerTable;
+    int32_t numConnectivityVerts = 0;
+    std::vector<DracoAttrCornerTable> attrTables;
+    std::vector<int32_t> pointToCorner;
+    std::vector<int32_t> cornerToPoint;
+    uint32_t numPoints = 0;
+};
+
+// Decode Standard (0) & Valence (2) EdgeBreaker connectivity + non-position attribute seams + point deduplication
+E2_DRACO_NOINLINE inline bool DecodeDracoEdgebreakerFull(
     const uint8_t* data,
     size_t size,
     size_t& pos,
-    DracoCornerTable& ct,
-    uint8_t& outNumAttrDecoders,
-    std::vector<int32_t>& outEncodedIdxToPointIdx)
+    uint16_t ver,
+    DracoEdgebreakerState& st)
 {
     if (pos >= size) return false;
     uint8_t travType = data[pos++]; // 0 = STANDARD_EDGEBREAKER, 2 = VALENCE_EDGEBREAKER
     if (travType != 0u && travType != 2u) return false;
 
-    uint32_t numEncodedVertices = 0, numFaces = 0, numEncodedSymbols = 0, numSplitSymbols = 0;
-    if (!ReadLeb128U32(data, size, pos, numEncodedVertices)) return false;
-    if (!ReadLeb128U32(data, size, pos, numFaces)) return false;
-    if (pos >= size) return false;
-    outNumAttrDecoders = data[pos++];
-    if (!ReadLeb128U32(data, size, pos, numEncodedSymbols)) return false;
-    if (!ReadLeb128U32(data, size, pos, numSplitSymbols)) return false;
+    if (ver < DracoVer(2, 2)) {
+        uint32_t numNewVerts = 0;
+        if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), numNewVerts)) return false;
+        (void)numNewVerts;
+    }
 
-    if (numFaces == 0 || numFaces > 4000000u || numEncodedSymbols > numFaces ||
-        numEncodedVertices + numSplitSymbols < 3u || numEncodedVertices > 4000000u ||
-        outNumAttrDecoders == 0 || outNumAttrDecoders > 32u)
+    uint32_t numEncodedVertices = 0, numFaces = 0, numEncodedSymbols = 0, numSplitSymbols = 0;
+    if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), numEncodedVertices)) return false;
+    if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), numFaces)) return false;
+    if (pos >= size) return false;
+    uint8_t numAttrData = data[pos++]; // Number of NON-POSITION attribute connectivity streams!
+    if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), numEncodedSymbols)) return false;
+    if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), numSplitSymbols)) return false;
+
+    if (numFaces == 0 || numFaces > 4000000u || numEncodedVertices > numFaces * 3u ||
+        numFaces < numEncodedSymbols || numFaces > numEncodedSymbols + (numEncodedSymbols / 3u) ||
+        numSplitSymbols > numEncodedSymbols || numAttrData > 64u)
     {
         return false;
     }
+    const uint64_t minFaceEdges = (3ULL * numFaces) / 2ULL;
+    const uint64_t maxVertEdges = (static_cast<uint64_t>(numEncodedVertices) * (numEncodedVertices > 0 ? numEncodedVertices - 1 : 0)) / 2ULL;
+    if (maxVertEdges < minFaceEdges) return false;
 
-    // Parse topology split events (numTopologySplits varUI32 + delta pairs + sourceEdgeBit flags)
-    uint32_t numTopoSplits = 0;
-    if (!ReadLeb128U32(data, size, pos, numTopoSplits) || numTopoSplits > numEncodedSymbols) return false;
+    const uint32_t maxVerts = numEncodedVertices + numSplitSymbols;
+    if (maxVerts < 3u || maxVerts > 8000000u) return false;
+
     struct SplitEvent {
         uint32_t splitSymId = 0;
         uint32_t sourceSymId = 0;
-        uint8_t sourceEdge = 0; // 0 = LEFT, 1 = RIGHT
+        uint8_t sourceEdge = 0; // 0 = LEFT_FACE_EDGE, 1 = RIGHT_FACE_EDGE
     };
-    std::vector<SplitEvent> splits(numTopoSplits);
-    uint32_t lastId = 0;
-    for (uint32_t i = 0; i < numTopoSplits; ++i) {
-        uint32_t srcDelta = 0, splitDelta = 0;
-        if (!ReadLeb128U32(data, size, pos, srcDelta)) return false;
-        if (!ReadLeb128U32(data, size, pos, splitDelta)) return false;
-        splits[i].sourceSymId = lastId + srcDelta;
-        splits[i].splitSymId  = splits[i].sourceSymId - splitDelta;
-        lastId = splits[i].sourceSymId;
-    }
-    if (numTopoSplits > 0) {
-        size_t edgeFlagBytes = (numTopoSplits + 7u) / 8u;
-        if (pos + edgeFlagBytes > size) return false;
-        DracoBitReader splitBr(data + pos, edgeFlagBytes);
-        for (uint32_t i = 0; i < numTopoSplits; ++i) {
-            uint32_t b = 0;
-            if (!splitBr.ReadBits(1, b)) return false;
-            splits[i].sourceEdge = static_cast<uint8_t>(b);
-        }
-        pos += edgeFlagBytes;
-    }
+    std::vector<SplitEvent> splits;
 
-    // Parse EdgeBreaker Start Face buffer & Symbol buffer
-    // Note: in Draco EdgebreakerTraversalDecoder::Start():
-    //   1) ParseEdgebreakerTraversalStandardSymbolData: varUI64 eb_symbol_buffer_size + UI8[sz]
-    //   2) ParseEdgebreakerTraversalStandardFaceData: UI8 prob_zero + varUI32 eb_start_face_size + UI8[sz]
-    std::vector<uint8_t> symbols(numEncodedSymbols, 0);
-    DracoRAbsDecoder startFaceDec;
-    uint8_t startFaceProbZero = 128;
-
-    if (travType == 0u) {
-        uint64_t symBufSz = 0;
-        if (!ReadLeb128U64(data, size, pos, symBufSz) || pos + symBufSz > size) return false;
-        DracoBitReader symBr(data + pos, static_cast<size_t>(symBufSz));
-        pos += static_cast<size_t>(symBufSz);
-
-        // Symbols in eb_symbol_buffer are read in reverse order (from last encoded symbol to 0) during decoding!
-        for (uint32_t i = 0; i < numEncodedSymbols; ++i) {
-            uint32_t s = 0;
-            if (!symBr.ReadBits(1, s)) return false;
-            if (s != 0u) {
-                uint32_t suf = 0;
-                if (!symBr.ReadBits(2, suf)) return false;
-                s |= (suf << 1);
+    auto decodeSplitAndHoleEvents = [&](size_t& evPos) -> bool {
+        uint32_t numTopoSplits = 0;
+        if (!ReadDracoU32OrVarint(data, size, evPos, ver, DracoVer(2, 0), numTopoSplits)) return false;
+        if (numTopoSplits > numFaces) return false;
+        splits.resize(numTopoSplits);
+        if (numTopoSplits > 0) {
+            if (ver < DracoVer(1, 2)) {
+                for (uint32_t i = 0; i < numTopoSplits; ++i) {
+                    if (evPos + 9 > size) return false;
+                    splits[i].splitSymId  = RdU32LE(data + evPos);
+                    splits[i].sourceSymId = RdU32LE(data + evPos + 4);
+                    splits[i].sourceEdge  = data[evPos + 8] & 1u;
+                    evPos += 9;
+                }
+            } else {
+                uint32_t lastSrcId = 0;
+                for (uint32_t i = 0; i < numTopoSplits; ++i) {
+                    uint32_t srcDelta = 0, splitDelta = 0;
+                    if (!ReadLeb128U32(data, size, evPos, srcDelta)) return false;
+                    if (!ReadLeb128U32(data, size, evPos, splitDelta)) return false;
+                    uint32_t srcId = lastSrcId + srcDelta;
+                    if (splitDelta > srcId) return false;
+                    splits[i].sourceSymId = srcId;
+                    splits[i].splitSymId  = srcId - splitDelta;
+                    lastSrcId = srcId;
+                }
+                DracoBitReader splitBr(data + evPos, size - evPos);
+                uint32_t bitsPerEdge = (ver < DracoVer(2, 2)) ? 2u : 1u;
+                for (uint32_t i = 0; i < numTopoSplits; ++i) {
+                    uint32_t eb = 0;
+                    if (!splitBr.ReadBits(bitsPerEdge, eb)) return false;
+                    splits[i].sourceEdge = static_cast<uint8_t>(eb & 1u);
+                }
+                evPos += splitBr.BytesConsumed();
             }
-            symbols[i] = static_cast<uint8_t>(s);
         }
+        if (ver < DracoVer(2, 1)) {
+            uint32_t numHoleEvents = 0;
+            if (!ReadDracoU32OrVarint(data, size, evPos, ver, DracoVer(2, 0), numHoleEvents)) return false;
+            if (numHoleEvents > numFaces) return false;
+            if (numHoleEvents > 0) {
+                if (ver < DracoVer(1, 2)) {
+                    if (evPos + static_cast<size_t>(numHoleEvents) * 4u > size) return false;
+                    evPos += static_cast<size_t>(numHoleEvents) * 4u;
+                } else {
+                    for (uint32_t i = 0; i < numHoleEvents; ++i) {
+                        uint32_t d = 0;
+                        if (!ReadLeb128U32(data, size, evPos, d)) return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
 
-        if (pos >= size) return false;
-        startFaceProbZero = data[pos++];
-        uint32_t sfSz = 0;
-        if (!ReadLeb128U32(data, size, pos, sfSz) || sfSz == 0 || pos + sfSz > size) return false;
-        if (!startFaceDec.Init(data + pos, sfSz)) return false;
-        pos += sfSz;
+    size_t legacyTopoSplitBytes = 0;
+    if (ver < DracoVer(2, 2)) {
+        uint32_t encConnSz = 0;
+        if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), encConnSz)) return false;
+        if (encConnSz == 0 || encConnSz > size - pos) return false;
+        size_t evStart = pos + encConnSz;
+        size_t evPos = evStart;
+        if (!decodeSplitAndHoleEvents(evPos)) return false;
+        legacyTopoSplitBytes = evPos - evStart;
     } else {
-        // Unsupported valence edgebreaker variant -> fail cleanly without fabricating
-        return false;
+        if (!decodeSplitAndHoleEvents(pos)) return false;
     }
 
-    // Reconstruct CornerTable from CLERS symbols (0=C, 1=S, 3=L, 5=R, 7=E)
-    ct.Init(numFaces);
+    // TraversalDecoder::Start()
+    DracoBitReader stdSymBr;
+    DracoBitReader legacyStartFaceBr;
+    DracoRAbsDecoder startFaceDec;
+    std::vector<DracoRAbsDecoder> attrSeamDecs(numAttrData);
+
+    constexpr int kMinValence = 2;
+    constexpr int kMaxValence = 7;
+    constexpr int kNumValenceContexts = kMaxValence - kMinValence + 1;
+    std::vector<uint32_t> valenceContextSyms[kNumValenceContexts];
+    int32_t valenceContextCounters[kNumValenceContexts] = {};
+
+    auto decodeStdSym = [&](uint32_t& outSym) -> bool {
+        uint32_t s = 0;
+        if (!stdSymBr.ReadBits(1, s)) return false;
+        if (s != 0u) {
+            uint32_t suf = 0;
+            if (!stdSymBr.ReadBits(2, suf)) return false;
+            s |= (suf << 1);
+        }
+        outSym = s;
+        return true;
+    };
+
+    if (travType == 0u || ver < DracoVer(2, 2)) {
+        if (!StartDracoBitBuffer(data, size, pos, ver, stdSymBr)) return false;
+    }
+    if (ver < DracoVer(2, 2)) {
+        if (!StartDracoBitBuffer(data, size, pos, ver, legacyStartFaceBr)) return false;
+    } else {
+        if (!startFaceDec.StartDecoding(data, size, pos, ver)) return false;
+    }
+    for (uint8_t i = 0; i < numAttrData; ++i) {
+        if (!attrSeamDecs[i].StartDecoding(data, size, pos, ver)) return false;
+    }
+
+    if (travType == 2u) {
+        if (ver < DracoVer(2, 2)) {
+            uint32_t vSplitSyms = 0;
+            if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), vSplitSyms)) return false;
+            if (vSplitSyms >= maxVerts || pos >= size) return false;
+            int8_t vMode = static_cast<int8_t>(data[pos++]);
+            if (vMode != 0) return false; // EDGEBREAKER_VALENCE_MODE_2_7
+        }
+        for (int ctx = 0; ctx < kNumValenceContexts; ++ctx) {
+            uint32_t nCtxSyms = 0;
+            if (!ReadLeb128U32(data, size, pos, nCtxSyms) || nCtxSyms > numFaces) return false;
+            if (nCtxSyms > 0) {
+                if (!DracoDecodeSymbols(data, size, pos, ver, nCtxSyms, 1u, valenceContextSyms[ctx])) return false;
+                valenceContextCounters[ctx] = static_cast<int32_t>(nCtxSyms);
+            }
+        }
+    }
+
+    if (ver < DracoVer(2, 2)) {
+        if (legacyTopoSplitBytes > size - pos) return false;
+        pos += legacyTopoSplitBytes;
+    }
+
+    // MeshEdgebreakerDecoderImpl::DecodeConnectivity()
+    DracoCornerTable& ct = st.cornerTable;
+    ct.Reset(numFaces, maxVerts);
+    std::vector<uint8_t> isVertHole(maxVerts, 1u);
+    std::vector<int32_t> vertexValences(maxVerts, 0);
+    int activeContext = -1;
+    uint32_t lastSymbol = 7u;
+
+    static constexpr uint32_t kSymbolIdToTopology[5] = { 0u, 1u, 3u, 5u, 7u }; // C, S, L, R, E
+
+    auto decodeNextTopologySymbol = [&](uint32_t& outSym) -> bool {
+        if (travType == 0u) {
+            return decodeStdSym(outSym);
+        }
+        if (activeContext != -1) {
+            int32_t cnt = --valenceContextCounters[activeContext];
+            if (cnt < 0) return false;
+            uint32_t symId = valenceContextSyms[activeContext][static_cast<size_t>(cnt)];
+            if (symId > 4u) return false;
+            lastSymbol = kSymbolIdToTopology[symId];
+        } else {
+            if (ver < DracoVer(2, 2)) {
+                if (!decodeStdSym(lastSymbol)) return false;
+            } else {
+                lastSymbol = 7u; // TOPOLOGY_E
+            }
+        }
+        outSym = lastSymbol;
+        return true;
+    };
+
+    auto onNewActiveCorner = [&](int32_t corner) {
+        if (travType != 2u) return;
+        int32_t next = DracoCornerTable::Next(corner);
+        int32_t prev = DracoCornerTable::Prev(corner);
+        int32_t vC = ct.Vertex(corner);
+        int32_t vN = ct.Vertex(next);
+        int32_t vP = ct.Vertex(prev);
+        switch (lastSymbol) {
+            case 0u: // TOPOLOGY_C
+            case 1u: // TOPOLOGY_S
+                vertexValences[static_cast<size_t>(vN)] += 1;
+                vertexValences[static_cast<size_t>(vP)] += 1;
+                break;
+            case 5u: // TOPOLOGY_R
+                vertexValences[static_cast<size_t>(vC)] += 1;
+                vertexValences[static_cast<size_t>(vN)] += 1;
+                vertexValences[static_cast<size_t>(vP)] += 2;
+                break;
+            case 3u: // TOPOLOGY_L
+                vertexValences[static_cast<size_t>(vC)] += 1;
+                vertexValences[static_cast<size_t>(vN)] += 2;
+                vertexValences[static_cast<size_t>(vP)] += 1;
+                break;
+            case 7u: // TOPOLOGY_E
+                vertexValences[static_cast<size_t>(vC)] += 2;
+                vertexValences[static_cast<size_t>(vN)] += 2;
+                vertexValences[static_cast<size_t>(vP)] += 2;
+                break;
+            default: break;
+        }
+        int actVal = vertexValences[static_cast<size_t>(vN)];
+        int clamped = std::clamp(actVal, kMinValence, kMaxValence);
+        activeContext = clamped - kMinValence;
+    };
+
     std::vector<int32_t> activeStack;
     activeStack.reserve(256);
-    std::unordered_map<uint32_t, int32_t> topoSplitActiveCorners;
-    size_t splitPtr = splits.size(); // processed backwards
+    std::unordered_map<int32_t, int32_t> topoSplitActiveCorners;
+    std::vector<int32_t> invalidVertices;
+    const bool removeInvalidVertices = (numAttrData == 0u);
+    size_t splitIdx = splits.size(); // IsTopologySplit consumes from back!
 
-    int32_t lastVertAdded = -1;
     uint32_t curFace = 0;
-
-    for (uint32_t symIdx = 0; symIdx < numEncodedSymbols; ++symIdx) {
+    for (uint32_t symId = 0; symId < numEncodedSymbols; ++symId) {
         if (curFace >= numFaces) return false;
         int32_t corner = static_cast<int32_t>(curFace * 3u);
-        int32_t cornerN = corner + 1;
-        int32_t cornerP = corner + 2;
-        uint8_t sym = symbols[symIdx];
-        uint32_t origSymId = numEncodedSymbols - 1u - symIdx;
+        ++curFace;
         bool checkSplit = false;
+        uint32_t sym = 0;
+        if (!decodeNextTopologySymbol(sym)) return false;
 
         if (sym == 0u) { // TOPOLOGY_C
             if (activeStack.empty()) return false;
             int32_t cornerA = activeStack.back();
-            int32_t cornerB = ct.NegOpposite(cornerA);
-            if (cornerB == DracoCornerTable::kInvalid) return false;
-            int32_t vPivot = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerA))];
-            int32_t vStart = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerB))];
-            int32_t vEnd   = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Prev(cornerA))];
-            ct.SetOpposite(cornerN, cornerA);
-            ct.SetOpposite(cornerP, cornerB);
-            ct.cornerToVert[static_cast<size_t>(corner)]  = vPivot;
-            ct.cornerToVert[static_cast<size_t>(cornerN)] = vStart;
-            ct.cornerToVert[static_cast<size_t>(cornerP)] = vEnd;
+            int32_t vertexX = ct.Vertex(DracoCornerTable::Next(cornerA));
+            if (vertexX < 0) return false;
+            int32_t cornerB = DracoCornerTable::Next(ct.LeftMostCorner(vertexX));
+            if (cornerB < 0 || cornerA == cornerB ||
+                ct.Opposite(cornerA) != DracoCornerTable::kInvalid ||
+                ct.Opposite(cornerB) != DracoCornerTable::kInvalid)
+            {
+                return false;
+            }
+            ct.SetOppositeCorners(cornerA, corner + 1);
+            ct.SetOppositeCorners(cornerB, corner + 2);
+            int32_t vertAPrev = ct.Vertex(DracoCornerTable::Prev(cornerA));
+            int32_t vertBNext = ct.Vertex(DracoCornerTable::Next(cornerB));
+            if (vertAPrev < 0 || vertBNext < 0 || vertexX == vertAPrev || vertexX == vertBNext) return false;
+            ct.MapCornerToVertex(corner, vertexX);
+            ct.MapCornerToVertex(corner + 1, vertBNext);
+            ct.MapCornerToVertex(corner + 2, vertAPrev);
+            ct.SetLeftMostCorner(vertAPrev, corner + 2);
+            isVertHole[static_cast<size_t>(vertexX)] = 0u;
             activeStack.back() = corner;
-        } else if (sym == 3u || sym == 5u) { // TOPOLOGY_L (3) or TOPOLOGY_R (5)
+        } else if (sym == 5u || sym == 3u) { // TOPOLOGY_R (5) or TOPOLOGY_L (3)
             if (activeStack.empty()) return false;
             int32_t cornerA = activeStack.back();
-            int32_t newVert = ++lastVertAdded;
-            if (sym == 5u) { // TOPOLOGY_R: opp_corner = cornerP (corner + 2)
-                ct.SetOpposite(cornerP, cornerA);
-                ct.cornerToVert[static_cast<size_t>(corner)]  = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Prev(cornerA))];
-                ct.cornerToVert[static_cast<size_t>(cornerN)] = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerA))];
-                ct.cornerToVert[static_cast<size_t>(cornerP)] = newVert;
-            } else { // TOPOLOGY_L: opp_corner = cornerN (corner + 1)
-                ct.SetOpposite(cornerN, cornerA);
-                ct.cornerToVert[static_cast<size_t>(corner)]  = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerA))];
-                ct.cornerToVert[static_cast<size_t>(cornerN)] = newVert;
-                ct.cornerToVert[static_cast<size_t>(cornerP)] = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Prev(cornerA))];
-            }
+            if (ct.Opposite(cornerA) != DracoCornerTable::kInvalid) return false;
+            int32_t oppC = (sym == 5u) ? (corner + 2) : (corner + 1);
+            int32_t cornerL = (sym == 5u) ? (corner + 1) : corner;
+            int32_t cornerR = (sym == 5u) ? corner : (corner + 2);
+            ct.SetOppositeCorners(oppC, cornerA);
+            int32_t newVert = ct.AddNewVertex();
+            if (static_cast<uint32_t>(ct.NumVertices()) > maxVerts) return false;
+            ct.MapCornerToVertex(oppC, newVert);
+            ct.SetLeftMostCorner(newVert, oppC);
+            int32_t vertR = ct.Vertex(DracoCornerTable::Prev(cornerA));
+            int32_t vertL = ct.Vertex(DracoCornerTable::Next(cornerA));
+            if (vertR < 0 || vertL < 0) return false;
+            ct.MapCornerToVertex(cornerR, vertR);
+            ct.SetLeftMostCorner(vertR, cornerR);
+            ct.MapCornerToVertex(cornerL, vertL);
             activeStack.back() = corner;
             checkSplit = true;
         } else if (sym == 1u) { // TOPOLOGY_S
             if (activeStack.empty()) return false;
             int32_t cornerB = activeStack.back();
             activeStack.pop_back();
-            auto itSp = topoSplitActiveCorners.find(origSymId);
+            auto itSp = topoSplitActiveCorners.find(static_cast<int32_t>(symId));
             if (itSp != topoSplitActiveCorners.end()) {
                 activeStack.push_back(itSp->second);
             }
             if (activeStack.empty()) return false;
             int32_t cornerA = activeStack.back();
-            ct.SetOpposite(cornerP, cornerA);
-            ct.SetOpposite(cornerN, cornerB);
-            ct.cornerToVert[static_cast<size_t>(corner)]  = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Prev(cornerA))];
-            ct.cornerToVert[static_cast<size_t>(cornerN)] = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerA))];
-            ct.cornerToVert[static_cast<size_t>(cornerP)] = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Prev(cornerB))];
+            if (cornerA == cornerB ||
+                ct.Opposite(cornerA) != DracoCornerTable::kInvalid ||
+                ct.Opposite(cornerB) != DracoCornerTable::kInvalid)
+            {
+                return false;
+            }
+            ct.SetOppositeCorners(cornerA, corner + 2);
+            ct.SetOppositeCorners(cornerB, corner + 1);
+            int32_t vertP = ct.Vertex(DracoCornerTable::Prev(cornerA));
+            int32_t vertANext = ct.Vertex(DracoCornerTable::Next(cornerA));
+            int32_t vertBPrev = ct.Vertex(DracoCornerTable::Prev(cornerB));
+            int32_t cornerN = DracoCornerTable::Next(cornerB);
+            int32_t vertN = ct.Vertex(cornerN);
+            if (vertP < 0 || vertANext < 0 || vertBPrev < 0 || vertN < 0) return false;
+            ct.MapCornerToVertex(corner, vertP);
+            ct.MapCornerToVertex(corner + 1, vertANext);
+            ct.MapCornerToVertex(corner + 2, vertBPrev);
+            ct.SetLeftMostCorner(vertBPrev, corner + 2);
+            if (travType == 2u) {
+                vertexValences[static_cast<size_t>(vertP)] += vertexValences[static_cast<size_t>(vertN)];
+            }
+            ct.SetLeftMostCorner(vertP, ct.LeftMostCorner(vertN));
+            int32_t firstCorner = cornerN;
+            int guard = 0;
+            while (cornerN != DracoCornerTable::kInvalid) {
+                if (++guard > ct.NumCorners() + 4) return false;
+                ct.MapCornerToVertex(cornerN, vertP);
+                cornerN = ct.SwingLeft(cornerN);
+                if (cornerN == firstCorner) return false;
+            }
+            ct.MakeVertexIsolated(vertN);
+            if (removeInvalidVertices) invalidVertices.push_back(vertN);
             activeStack.back() = corner;
         } else if (sym == 7u) { // TOPOLOGY_E
-            ct.cornerToVert[static_cast<size_t>(corner)]  = ++lastVertAdded;
-            ct.cornerToVert[static_cast<size_t>(cornerN)] = ++lastVertAdded;
-            ct.cornerToVert[static_cast<size_t>(cornerP)] = ++lastVertAdded;
+            int32_t v0 = ct.AddNewVertex();
+            int32_t v1 = ct.AddNewVertex();
+            int32_t v2 = ct.AddNewVertex();
+            if (static_cast<uint32_t>(ct.NumVertices()) > maxVerts) return false;
+            ct.MapCornerToVertex(corner, v0);
+            ct.MapCornerToVertex(corner + 1, v1);
+            ct.MapCornerToVertex(corner + 2, v2);
+            ct.SetLeftMostCorner(v0, corner);
+            ct.SetLeftMostCorner(v1, corner + 1);
+            ct.SetLeftMostCorner(v2, corner + 2);
             activeStack.push_back(corner);
             checkSplit = true;
         } else {
             return false;
         }
 
+        onNewActiveCorner(activeStack.back());
+
         if (checkSplit) {
-            while (splitPtr > 0 && splits[splitPtr - 1].sourceSymId == origSymId) {
-                --splitPtr;
-                int32_t splitActive = (splits[splitPtr].sourceEdge == 0u) ? cornerN : cornerP;
-                topoSplitActiveCorners[splits[splitPtr].splitSymId] = splitActive;
+            uint32_t encSymId = numEncodedSymbols - 1u - symId;
+            while (splitIdx > 0 && splits[splitIdx - 1].sourceSymId == encSymId) {
+                --splitIdx;
+                if (splits[splitIdx].splitSymId >= numEncodedSymbols) return false;
+                int32_t actTop = activeStack.back();
+                int32_t newAct = (splits[splitIdx].sourceEdge == 1u)
+                    ? DracoCornerTable::Next(actTop)
+                    : DracoCornerTable::Prev(actTop);
+                int32_t decSplitSymId = static_cast<int32_t>(numEncodedSymbols - 1u - splits[splitIdx].splitSymId);
+                topoSplitActiveCorners[decSplitSymId] = newAct;
             }
         }
-        ++curFace;
     }
 
-    // ProcessInteriorEdges: close start faces using startFaceDec rABS bits
+    // Start faces
     while (!activeStack.empty()) {
         int32_t cornerA = activeStack.back();
         activeStack.pop_back();
-        uint8_t interiorFace = startFaceDec.ReadBit(startFaceProbZero);
-        if (interiorFace != 0u) {
+        bool interiorFace = false;
+        if (ver < DracoVer(2, 2)) {
+            uint32_t fc = 0;
+            if (!legacyStartFaceBr.ReadBits(1, fc)) return false;
+            interiorFace = (fc != 0u);
+        } else {
+            interiorFace = startFaceDec.DecodeNextBit();
+        }
+        if (interiorFace) {
             if (curFace >= numFaces) return false;
-            int32_t cornerB = ct.NegOpposite(cornerA);
-            int32_t cornerC = ct.PosOpposite(cornerA);
-            if (cornerB == DracoCornerTable::kInvalid || cornerC == DracoCornerTable::kInvalid) return false;
-
-            int32_t c0 = static_cast<int32_t>(curFace * 3u);
-            int32_t c1 = c0 + 1;
-            int32_t c2 = c0 + 2;
-            ct.SetOpposite(c0, cornerA);
-            ct.SetOpposite(c1, cornerB);
-            ct.SetOpposite(c2, cornerC);
-            ct.cornerToVert[static_cast<size_t>(c0)] = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerB))];
-            ct.cornerToVert[static_cast<size_t>(c1)] = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerC))];
-            ct.cornerToVert[static_cast<size_t>(c2)] = ct.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cornerA))];
+            int32_t vertN = ct.Vertex(DracoCornerTable::Next(cornerA));
+            if (vertN < 0) return false;
+            int32_t cornerB = DracoCornerTable::Next(ct.LeftMostCorner(vertN));
+            if (cornerB < 0) return false;
+            int32_t vertX = ct.Vertex(DracoCornerTable::Next(cornerB));
+            if (vertX < 0) return false;
+            int32_t cornerC = DracoCornerTable::Next(ct.LeftMostCorner(vertX));
+            if (cornerC < 0) return false;
+            if (cornerA == cornerB || cornerA == cornerC || cornerB == cornerC) return false;
+            if (ct.Opposite(cornerA) != DracoCornerTable::kInvalid ||
+                ct.Opposite(cornerB) != DracoCornerTable::kInvalid ||
+                ct.Opposite(cornerC) != DracoCornerTable::kInvalid)
+            {
+                return false;
+            }
+            int32_t vertP = ct.Vertex(DracoCornerTable::Next(cornerC));
+            if (vertP < 0) return false;
+            int32_t newCorner = static_cast<int32_t>(curFace * 3u);
             ++curFace;
+            ct.SetOppositeCorners(newCorner, cornerA);
+            ct.SetOppositeCorners(newCorner + 1, cornerB);
+            ct.SetOppositeCorners(newCorner + 2, cornerC);
+            ct.MapCornerToVertex(newCorner, vertX);
+            ct.MapCornerToVertex(newCorner + 1, vertP);
+            ct.MapCornerToVertex(newCorner + 2, vertN);
+            isVertHole[static_cast<size_t>(vertX)] = 0u;
+            isVertHole[static_cast<size_t>(vertP)] = 0u;
+            isVertHole[static_cast<size_t>(vertN)] = 0u;
+        }
+    }
+    if (curFace != numFaces) return false;
+
+    // Compact isolated vertices when numAttrData == 0
+    int32_t numConnectivityVerts = ct.NumVertices();
+    for (int32_t invVert : invalidVertices) {
+        int32_t srcVert = numConnectivityVerts - 1;
+        while (srcVert >= 0 && ct.LeftMostCorner(srcVert) == DracoCornerTable::kInvalid) {
+            srcVert = --numConnectivityVerts - 1;
+        }
+        if (srcVert < invVert) continue;
+        int32_t startC = ct.LeftMostCorner(srcVert);
+        int32_t cid = startC;
+        bool swungRight = false;
+        int guard = 0;
+        while (cid != DracoCornerTable::kInvalid) {
+            if (++guard > ct.NumCorners() + 4) return false;
+            if (ct.Vertex(cid) != srcVert) return false;
+            ct.MapCornerToVertex(cid, invVert);
+            if (!swungRight) {
+                cid = ct.SwingLeft(cid);
+                if (cid == startC) break;
+                if (cid == DracoCornerTable::kInvalid) {
+                    swungRight = true;
+                    cid = ct.SwingRight(startC);
+                }
+            } else {
+                cid = ct.SwingRight(cid);
+                if (cid == startC) break;
+            }
+        }
+        ct.SetLeftMostCorner(invVert, ct.LeftMostCorner(srcVert));
+        ct.MakeVertexIsolated(srcVert);
+        isVertHole[static_cast<size_t>(invVert)] = isVertHole[static_cast<size_t>(srcVert)];
+        isVertHole[static_cast<size_t>(srcVert)] = 0u;
+        --numConnectivityVerts;
+    }
+    if (numConnectivityVerts < 3) return false;
+    st.numConnectivityVerts = numConnectivityVerts;
+
+    // Decode non-position attribute seams & build MeshAttributeCornerTables
+    st.attrTables.resize(numAttrData);
+    if (numAttrData > 0u) {
+        std::vector<std::vector<int32_t>> seamCorners(numAttrData);
+        const int32_t nCorners = ct.NumCorners();
+        for (int32_t baseC = 0; baseC < nCorners; baseC += 3) {
+            const int32_t cs[3] = { baseC, DracoCornerTable::Next(baseC), DracoCornerTable::Prev(baseC) };
+            const int32_t srcFace = baseC / 3;
+            for (int k = 0; k < 3; ++k) {
+                int32_t opp = ct.Opposite(cs[k]);
+                if (opp == DracoCornerTable::kInvalid) {
+                    for (uint8_t a = 0; a < numAttrData; ++a) seamCorners[a].push_back(cs[k]);
+                    continue;
+                }
+                if (ver >= DracoVer(2, 1) && (opp / 3) < srcFace) continue;
+                for (uint8_t a = 0; a < numAttrData; ++a) {
+                    if (attrSeamDecs[a].DecodeNextBit()) seamCorners[a].push_back(cs[k]);
+                }
+            }
+        }
+        for (uint8_t a = 0; a < numAttrData; ++a) {
+            st.attrTables[a].InitEmpty(&ct);
+            for (int32_t sc : seamCorners[a]) st.attrTables[a].AddSeamEdge(sc);
+            if (!st.attrTables[a].RecomputeVertices()) return false;
         }
     }
 
-    if (curFace != numFaces || lastVertAdded < 2) return false;
-    ct.numVertices = static_cast<uint32_t>(lastVertAdded + 1);
+    // AssignPointsToCorners
+    const int32_t nCorners = ct.NumCorners();
+    st.pointToCorner.clear();
+    st.cornerToPoint.assign(static_cast<size_t>(nCorners), -1);
 
-    // Build standard Draco EdgeBreaker Depth-First / Max-Prediction-Degree Attribute Traversal Sequence!
-    // MeshTraversalSequencer (Start from corner 3*(f) in reverse face order / prediction degree):
-    // Wait: in STANDARD_EDGEBREAKER, attribute decoder traversalMethod == 0 (MESH_TRAVERSAL_DEPTH_FIRST)
-    // or 1 (MESH_TRAVERSAL_PREDICTION_DEGREE)! We decode traversalMethod per attribute decoder below.
-    outEncodedIdxToPointIdx.clear();
-    return true;
+    if (numAttrData == 0u) {
+        st.numPoints = static_cast<uint32_t>(numConnectivityVerts);
+        for (int32_t c = 0; c < nCorners; ++c) {
+            int32_t v = ct.Vertex(c);
+            if (v < 0 || v >= numConnectivityVerts) return false;
+            st.cornerToPoint[static_cast<size_t>(c)] = v;
+        }
+        return true;
+    }
+
+    const int32_t maxRingGuard = nCorners + 4;
+    for (int32_t v = 0; v < ct.NumVertices(); ++v) {
+        int32_t c = ct.LeftMostCorner(v);
+        if (c == DracoCornerTable::kInvalid) continue;
+        int32_t dedupFirst = c;
+        if (isVertHole[static_cast<size_t>(v)] == 0u) {
+            for (uint8_t a = 0; a < numAttrData; ++a) {
+                if (!st.attrTables[a].IsCornerOnSeam(c)) continue;
+                int32_t vertId = st.attrTables[a].Vertex(c);
+                int32_t actC = ct.SwingRight(c);
+                bool found = false;
+                int guard = 0;
+                while (actC != c) {
+                    if (actC == DracoCornerTable::kInvalid || ++guard > maxRingGuard) return false;
+                    if (st.attrTables[a].Vertex(actC) != vertId) {
+                        dedupFirst = actC;
+                        found = true;
+                        break;
+                    }
+                    actC = ct.SwingRight(actC);
+                }
+                if (found) break;
+            }
+        }
+        c = dedupFirst;
+        st.cornerToPoint[static_cast<size_t>(c)] = static_cast<int32_t>(st.pointToCorner.size());
+        st.pointToCorner.push_back(c);
+        int32_t prevC = c;
+        c = ct.SwingRight(c);
+        int guard = 0;
+        while (c != DracoCornerTable::kInvalid && c != dedupFirst) {
+            if (++guard > maxRingGuard) return false;
+            bool seam = false;
+            for (uint8_t a = 0; a < numAttrData; ++a) {
+                if (st.attrTables[a].Vertex(c) != st.attrTables[a].Vertex(prevC)) {
+                    seam = true;
+                    break;
+                }
+            }
+            if (seam) {
+                st.cornerToPoint[static_cast<size_t>(c)] = static_cast<int32_t>(st.pointToCorner.size());
+                st.pointToCorner.push_back(c);
+            } else {
+                st.cornerToPoint[static_cast<size_t>(c)] = st.cornerToPoint[static_cast<size_t>(prevC)];
+            }
+            prevC = c;
+            c = ct.SwingRight(c);
+        }
+    }
+    for (int32_t c = 0; c < nCorners; ++c) {
+        if (st.cornerToPoint[static_cast<size_t>(c)] < 0) return false;
+    }
+    st.numPoints = static_cast<uint32_t>(st.pointToCorner.size());
+    return st.numPoints >= 3u;
 }
 
-// Compute vertex encoding order for Draco EdgeBreaker Attribute Decoder:
-//   method 0 = MESH_TRAVERSAL_DEPTH_FIRST
-//   method 1 = MESH_TRAVERSAL_PREDICTION_DEGREE
-inline void BuildEdgebreakerVertexSequence(
-    const DracoCornerTable& ct,
+// ============================================================================
+// Draco Mesh Traversal Sequencer (DepthFirstTraverser & MaxPredictionDegreeTraverser)
+// ============================================================================
+template <class TableT>
+inline bool BuildDracoTraversalSequence(
+    const TableT& tbl,
+    const std::vector<int32_t>& cornerToPoint,
     uint8_t traversalMethod,
-    std::vector<int32_t>& outVertexOrder,
-    std::vector<int32_t>& outCornerOrder)
+    std::vector<uint32_t>& outPointIds,
+    std::vector<int32_t>& outEncodedToCorner,
+    std::vector<int32_t>& outVertToEncoded)
 {
-    outVertexOrder.clear();
-    outCornerOrder.clear();
-    outVertexOrder.reserve(ct.numVertices);
-    outCornerOrder.reserve(ct.numVertices);
+    const int32_t nFaces = tbl.NumFaces();
+    const int32_t nVerts = tbl.NumVertices();
+    outPointIds.clear();
+    outEncodedToCorner.clear();
+    outPointIds.reserve(static_cast<size_t>(nVerts));
+    outEncodedToCorner.reserve(static_cast<size_t>(nVerts));
+    outVertToEncoded.assign(static_cast<size_t>(nVerts), -1);
+    if (nFaces <= 0 || nVerts <= 0) return false;
 
-    std::vector<uint8_t> faceVisited(ct.numFaces, 0);
-    std::vector<uint8_t> vertVisited(ct.numVertices, 0);
+    std::vector<uint8_t> faceVisited(static_cast<size_t>(nFaces), 0u);
+    std::vector<uint8_t> vertVisited(static_cast<size_t>(nVerts), 0u);
 
-    auto visitVert = [&](int32_t v, int32_t c) {
-        if (v >= 0 && static_cast<uint32_t>(v) < ct.numVertices && !vertVisited[static_cast<size_t>(v)]) {
-            vertVisited[static_cast<size_t>(v)] = 1;
-            outVertexOrder.push_back(v);
-            outCornerOrder.push_back(c);
-        }
+    auto isFaceVisited = [&](int32_t f) -> bool {
+        return f < 0 || f >= nFaces || faceVisited[static_cast<size_t>(f)] != 0u;
+    };
+    auto onNewVertexVisited = [&](int32_t v, int32_t c) {
+        outPointIds.push_back(static_cast<uint32_t>(cornerToPoint[static_cast<size_t>(c)]));
+        outEncodedToCorner.push_back(c);
+        outVertToEncoded[static_cast<size_t>(v)] = static_cast<int32_t>(outEncodedToCorner.size() - 1);
     };
 
     if (traversalMethod == 0u) {
-        // MESH_TRAVERSAL_DEPTH_FIRST
+        // DepthFirstTraverser (depth_first_traverser.h)
         std::vector<int32_t> stack;
-        for (uint32_t f = 0; f < ct.numFaces; ++f) {
-            if (faceVisited[f]) continue;
-            int32_t startC = static_cast<int32_t>(f * 3u);
-            faceVisited[f] = 1;
-            visitVert(ct.cornerToVert[static_cast<size_t>(startC)], startC);
-            visitVert(ct.cornerToVert[static_cast<size_t>(startC + 1)], startC + 1);
-            visitVert(ct.cornerToVert[static_cast<size_t>(startC + 2)], startC + 2);
-            stack.push_back(startC);
+        for (int32_t f = 0; f < nFaces; ++f) {
+            int32_t cornerId = 3 * f;
+            if (isFaceVisited(cornerId / 3)) continue;
+            stack.clear();
+            stack.push_back(cornerId);
+
+            int32_t nextV = tbl.Vertex(TableT::Next(cornerId));
+            int32_t prevV = tbl.Vertex(TableT::Prev(cornerId));
+            if (nextV < 0 || prevV < 0) return false;
+            if (!vertVisited[static_cast<size_t>(nextV)]) {
+                vertVisited[static_cast<size_t>(nextV)] = 1u;
+                onNewVertexVisited(nextV, TableT::Next(cornerId));
+            }
+            if (!vertVisited[static_cast<size_t>(prevV)]) {
+                vertVisited[static_cast<size_t>(prevV)] = 1u;
+                onNewVertexVisited(prevV, TableT::Prev(cornerId));
+            }
 
             while (!stack.empty()) {
-                int32_t curC = stack.back();
-                stack.pop_back();
-                int32_t cn = DracoCornerTable::Next(curC);
-                int32_t cp = DracoCornerTable::Prev(curC);
-                visitVert(ct.cornerToVert[static_cast<size_t>(curC)], curC);
-
-                int32_t oppL = ct.Opposite(cn);
-                int32_t oppR = ct.Opposite(cp);
-                uint32_t fL = (oppL >= 0) ? static_cast<uint32_t>(oppL / 3) : UINT32_MAX;
-                uint32_t fR = (oppR >= 0) ? static_cast<uint32_t>(oppR / 3) : UINT32_MAX;
-                bool okL = (oppL >= 0 && fL < ct.numFaces && !faceVisited[fL]);
-                bool okR = (oppR >= 0 && fR < ct.numFaces && !faceVisited[fR]);
-                if (okL) {
-                    faceVisited[fL] = 1;
-                    stack.push_back(oppL);
+                cornerId = stack.back();
+                if (cornerId < 0 || isFaceVisited(cornerId / 3)) {
+                    stack.pop_back();
+                    continue;
                 }
-                if (okR && fR != fL) {
-                    faceVisited[fR] = 1;
-                    stack.push_back(oppR);
-                }
-            }
-        }
-    } else {
-        // MESH_TRAVERSAL_PREDICTION_DEGREE (Draco default for EdgeBreaker!)
-        constexpr int kMaxPriority = 3;
-        std::vector<int32_t> priorityStacks[kMaxPriority + 1];
-        std::vector<int> predDegree(ct.numVertices, 0);
-        int bestPriority = 0;
-
-        auto popNext = [&]() -> int32_t {
-            for (int p = bestPriority; p >= 0; --p) {
-                while (!priorityStacks[p].empty()) {
-                    int32_t c = priorityStacks[p].back();
-                    priorityStacks[p].pop_back();
-                    if (!faceVisited[static_cast<size_t>(c / 3)]) {
-                        bestPriority = p;
-                        return c;
+                for (;;) {
+                    int32_t faceId = cornerId / 3;
+                    faceVisited[static_cast<size_t>(faceId)] = 1u;
+                    int32_t vertId = tbl.Vertex(cornerId);
+                    if (vertId < 0) return false;
+                    if (!vertVisited[static_cast<size_t>(vertId)]) {
+                        bool onBoundary = tbl.IsOnBoundary(vertId);
+                        vertVisited[static_cast<size_t>(vertId)] = 1u;
+                        onNewVertexVisited(vertId, cornerId);
+                        if (!onBoundary) {
+                            cornerId = tbl.GetRightCorner(cornerId);
+                            if (cornerId < 0) { stack.pop_back(); break; }
+                            continue;
+                        }
+                    }
+                    int32_t rightC = tbl.GetRightCorner(cornerId);
+                    int32_t leftC  = tbl.GetLeftCorner(cornerId);
+                    bool rightVis = (rightC < 0) || isFaceVisited(rightC / 3);
+                    bool leftVis  = (leftC  < 0) || isFaceVisited(leftC / 3);
+                    if (rightVis) {
+                        if (leftVis) {
+                            stack.pop_back();
+                            break;
+                        }
+                        cornerId = leftC;
+                    } else {
+                        if (leftVis) {
+                            cornerId = rightC;
+                        } else {
+                            stack.back() = leftC;
+                            stack.push_back(rightC);
+                            break;
+                        }
                     }
                 }
             }
-            return DracoCornerTable::kInvalid;
-        };
+        }
+        return true;
+    }
 
-        auto addCornerToQueue = [&](int32_t c) {
-            if (c < 0 || faceVisited[static_cast<size_t>(c / 3)]) return;
-            int32_t vTip = ct.cornerToVert[static_cast<size_t>(c)];
+    if (traversalMethod == 1u) {
+        // MaxPredictionDegreeTraverser (max_prediction_degree_traverser.h)
+        constexpr int kMaxPriority = 3;
+        std::vector<int32_t> stacks[kMaxPriority];
+        std::vector<int> predDegree(static_cast<size_t>(nVerts), 0);
+        int bestPriority = 0;
+
+        auto popNext = [&]() -> int32_t {
+            for (int i = bestPriority; i < kMaxPriority; ++i) {
+                if (!stacks[i].empty()) {
+                    int32_t ret = stacks[i].back();
+                    stacks[i].pop_back();
+                    bestPriority = i;
+                    return ret;
+                }
+            }
+            return TableT::kInvalid;
+        };
+        auto addCorner = [&](int32_t ci, int prio) {
+            stacks[prio].push_back(ci);
+            if (prio < bestPriority) bestPriority = prio;
+        };
+        auto computePriority = [&](int32_t ci) -> int {
+            int32_t vTip = tbl.Vertex(ci);
             int prio = 0;
             if (vTip >= 0 && !vertVisited[static_cast<size_t>(vTip)]) {
                 int deg = ++predDegree[static_cast<size_t>(vTip)];
-                prio = (deg > 1) ? std::min(deg, kMaxPriority) : 0;
-            } else {
-                prio = kMaxPriority;
+                prio = (deg > 1) ? 1 : 2;
             }
-            priorityStacks[prio].push_back(c);
-            if (prio > bestPriority) bestPriority = prio;
+            return (prio >= kMaxPriority) ? (kMaxPriority - 1) : prio;
         };
 
-        for (uint32_t f = 0; f < ct.numFaces; ++f) {
-            if (faceVisited[f]) continue;
-            int32_t startC = static_cast<int32_t>(f * 3u);
-            faceVisited[f] = 1;
-            visitVert(ct.cornerToVert[static_cast<size_t>(startC)], startC);
-            visitVert(ct.cornerToVert[static_cast<size_t>(startC + 1)], startC + 1);
-            visitVert(ct.cornerToVert[static_cast<size_t>(startC + 2)], startC + 2);
+        for (int32_t f = 0; f < nFaces; ++f) {
+            int32_t cornerId = 3 * f;
+            stacks[0].push_back(cornerId);
+            bestPriority = 0;
 
-            int32_t opp0 = ct.Opposite(startC);
-            int32_t opp1 = ct.Opposite(startC + 1);
-            int32_t opp2 = ct.Opposite(startC + 2);
-            addCornerToQueue(opp0);
-            addCornerToQueue(opp1);
-            addCornerToQueue(opp2);
+            int32_t nextV = tbl.Vertex(TableT::Next(cornerId));
+            int32_t prevV = tbl.Vertex(TableT::Prev(cornerId));
+            int32_t tipV  = tbl.Vertex(cornerId);
+            if (nextV < 0 || prevV < 0 || tipV < 0) return false;
+            if (!vertVisited[static_cast<size_t>(nextV)]) {
+                vertVisited[static_cast<size_t>(nextV)] = 1u;
+                onNewVertexVisited(nextV, TableT::Next(cornerId));
+            }
+            if (!vertVisited[static_cast<size_t>(prevV)]) {
+                vertVisited[static_cast<size_t>(prevV)] = 1u;
+                onNewVertexVisited(prevV, TableT::Prev(cornerId));
+            }
+            if (!vertVisited[static_cast<size_t>(tipV)]) {
+                vertVisited[static_cast<size_t>(tipV)] = 1u;
+                onNewVertexVisited(tipV, cornerId);
+            }
 
-            for (;;) {
-                int32_t curC = popNext();
-                if (curC == DracoCornerTable::kInvalid) break;
-                faceVisited[static_cast<size_t>(curC / 3)] = 1;
-                visitVert(ct.cornerToVert[static_cast<size_t>(curC)], curC);
-                int32_t oppN = ct.Opposite(DracoCornerTable::Next(curC));
-                int32_t oppP = ct.Opposite(DracoCornerTable::Prev(curC));
-                addCornerToQueue(oppP);
-                addCornerToQueue(oppN);
+            while ((cornerId = popNext()) != TableT::kInvalid) {
+                if (isFaceVisited(cornerId / 3)) continue;
+                for (;;) {
+                    faceVisited[static_cast<size_t>(cornerId / 3)] = 1u;
+                    int32_t vertId = tbl.Vertex(cornerId);
+                    if (vertId < 0) return false;
+                    if (!vertVisited[static_cast<size_t>(vertId)]) {
+                        vertVisited[static_cast<size_t>(vertId)] = 1u;
+                        onNewVertexVisited(vertId, cornerId);
+                    }
+                    int32_t rightC = tbl.GetRightCorner(cornerId);
+                    int32_t leftC  = tbl.GetLeftCorner(cornerId);
+                    bool rightVis = (rightC < 0) || isFaceVisited(rightC / 3);
+                    bool leftVis  = (leftC  < 0) || isFaceVisited(leftC / 3);
+                    if (!leftVis) {
+                        int prio = computePriority(leftC);
+                        if (rightVis && prio <= bestPriority) {
+                            cornerId = leftC;
+                            continue;
+                        }
+                        addCorner(leftC, prio);
+                    }
+                    if (!rightVis) {
+                        int prio = computePriority(rightC);
+                        if (prio <= bestPriority) {
+                            cornerId = rightC;
+                            continue;
+                        }
+                        addCorner(rightC, prio);
+                    }
+                    break;
+                }
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// Prediction transform helper (DELTA = 0, WRAP = 1, NORMAL_OCTAHEDRON = 2, NORMAL_OCTAHEDRON_CANONICALIZED = 3)
+struct DracoPredTransform {
+    int8_t type = -1;
+    int32_t wrapMin = 0;
+    int32_t wrapMax = 0;
+    int64_t wrapMaxDif = 0;
+
+    bool AreCorrectionsPositive() const { return type == 2 || type == 3; }
+
+    bool DecodeTransformData(const uint8_t* data, size_t size, size_t& pos, uint16_t ver) {
+        if (type <= 0) return true; // NONE (-1) or DELTA (0)
+        if (type == 1) { // WRAP
+            if (pos + 8 > size) return false;
+            wrapMin = RdI32LE(data + pos + 0);
+            wrapMax = RdI32LE(data + pos + 4);
+            pos += 8;
+            if (wrapMin > wrapMax) return false;
+            wrapMaxDif = 1LL + static_cast<int64_t>(wrapMax) - static_cast<int64_t>(wrapMin);
+            if (wrapMaxDif <= 0 || wrapMaxDif >= INT32_MAX) return false;
+            return true;
+        }
+        if (type == 2) { // NORMAL_OCTAHEDRON
+            if (pos + 4 > size) return false;
+            int32_t maxQ = RdI32LE(data + pos);
+            pos += 4;
+            if (ver < DracoVer(2, 2)) {
+                if (pos + 4 > size) return false;
+                pos += 4; // center_value
+            }
+            return maxQ > 0;
+        }
+        if (type == 3) { // NORMAL_OCTAHEDRON_CANONICALIZED
+            if (pos + 8 > size) return false;
+            int32_t maxQ = RdI32LE(data + pos);
+            pos += 8; // max_quantized_value + center_value
+            return maxQ > 0;
+        }
+        return false;
+    }
+
+    void ComputeOriginal(const int32_t* pred, const int32_t* corr, int32_t* out, int numComps) const {
+        if (type == 1) {
+            for (int c = 0; c < numComps; ++c) {
+                int64_t clamped = std::clamp<int64_t>(pred[c], wrapMin, wrapMax);
+                int64_t v = clamped + static_cast<int64_t>(corr[c]);
+                if (v > wrapMax) v -= wrapMaxDif;
+                else if (v < wrapMin) v += wrapMaxDif;
+                out[c] = static_cast<int32_t>(v);
+            }
+        } else {
+            for (int c = 0; c < numComps; ++c) {
+                out[c] = AddAsUnsigned32(pred[c], corr[c]);
             }
         }
     }
+};
+
+template <class TableT>
+inline bool ComputeDracoParallelogram(
+    int dataEntryId,
+    int32_t ci,
+    const TableT& tbl,
+    const std::vector<int32_t>& vertToData,
+    const int32_t* inData,
+    int numComps,
+    int32_t* outPred)
+{
+    int32_t oci = tbl.Opposite(ci);
+    if (oci < 0) return false;
+    int32_t vO = tbl.Vertex(oci);
+    int32_t vN = tbl.Vertex(TableT::Next(oci));
+    int32_t vP = tbl.Vertex(TableT::Prev(oci));
+    if (vO < 0 || vN < 0 || vP < 0) return false;
+    int32_t dO = vertToData[static_cast<size_t>(vO)];
+    int32_t dN = vertToData[static_cast<size_t>(vN)];
+    int32_t dP = vertToData[static_cast<size_t>(vP)];
+    if (dO >= 0 && dN >= 0 && dP >= 0 && dO < dataEntryId && dN < dataEntryId && dP < dataEntryId) {
+        const size_t offO = static_cast<size_t>(dO) * numComps;
+        const size_t offN = static_cast<size_t>(dN) * numComps;
+        const size_t offP = static_cast<size_t>(dP) * numComps;
+        for (int c = 0; c < numComps; ++c) {
+            int64_t r = (static_cast<int64_t>(inData[offN + c]) + static_cast<int64_t>(inData[offP + c])) -
+                        static_cast<int64_t>(inData[offO + c]);
+            outPred[c] = static_cast<int32_t>(r);
+        }
+        return true;
+    }
+    return false;
+}
+
+template <class TableT>
+inline bool ReconstructDracoMeshPrediction(
+    int8_t predScheme,
+    const DracoPredTransform& tr,
+    const TableT& tbl,
+    const std::vector<int32_t>& dataToCorner,
+    const std::vector<int32_t>& vertToData,
+    const std::vector<uint8_t> creaseFlags[4],
+    int numComps,
+    std::vector<int32_t>& vals)
+{
+    const int nEntries = static_cast<int>(dataToCorner.size());
+    if (nEntries <= 0 || static_cast<size_t>(nEntries) * numComps > vals.size()) return false;
+
+    std::vector<int32_t> corr = vals; // copy corrections
+    std::vector<int32_t> zeroPred(static_cast<size_t>(numComps), 0);
+    tr.ComputeOriginal(zeroPred.data(), corr.data(), vals.data(), numComps);
+
+    if (predScheme == 1) { // MESH_PREDICTION_PARALLELOGRAM
+        std::vector<int32_t> pred(static_cast<size_t>(numComps), 0);
+        for (int p = 1; p < nEntries; ++p) {
+            size_t dstOff = static_cast<size_t>(p) * numComps;
+            if (ComputeDracoParallelogram(p, dataToCorner[static_cast<size_t>(p)], tbl, vertToData, vals.data(), numComps, pred.data())) {
+                tr.ComputeOriginal(pred.data(), corr.data() + dstOff, vals.data() + dstOff, numComps);
+            } else {
+                tr.ComputeOriginal(vals.data() + dstOff - numComps, corr.data() + dstOff, vals.data() + dstOff, numComps);
+            }
+        }
+        return true;
+    }
+    if (predScheme == 2) { // MESH_PREDICTION_MULTI_PARALLELOGRAM
+        std::vector<int32_t> pred(static_cast<size_t>(numComps), 0);
+        std::vector<int32_t> single(static_cast<size_t>(numComps), 0);
+        const int maxRing = tbl.NumCorners() + 4;
+        for (int p = 1; p < nEntries; ++p) {
+            int32_t startC = dataToCorner[static_cast<size_t>(p)];
+            int32_t cid = startC;
+            int count = 0;
+            std::fill(pred.begin(), pred.end(), 0);
+            int guard = 0;
+            while (cid != TableT::kInvalid) {
+                if (++guard > maxRing) return false;
+                if (ComputeDracoParallelogram(p, cid, tbl, vertToData, vals.data(), numComps, single.data())) {
+                    for (int c = 0; c < numComps; ++c) pred[static_cast<size_t>(c)] = AddAsUnsigned32(pred[static_cast<size_t>(c)], single[static_cast<size_t>(c)]);
+                    ++count;
+                }
+                cid = tbl.SwingRight(cid);
+                if (cid == startC) break;
+            }
+            size_t dstOff = static_cast<size_t>(p) * numComps;
+            if (count == 0) {
+                tr.ComputeOriginal(vals.data() + dstOff - numComps, corr.data() + dstOff, vals.data() + dstOff, numComps);
+            } else {
+                for (int c = 0; c < numComps; ++c) pred[static_cast<size_t>(c)] /= count;
+                tr.ComputeOriginal(pred.data(), corr.data() + dstOff, vals.data() + dstOff, numComps);
+            }
+        }
+        return true;
+    }
+    if (predScheme == 4) { // MESH_PREDICTION_CONSTRAINED_MULTI_PARALLELOGRAM
+        constexpr int kMaxPar = 4;
+        std::vector<int32_t> predVals[kMaxPar];
+        for (int i = 0; i < kMaxPar; ++i) predVals[i].assign(static_cast<size_t>(numComps), 0);
+        std::vector<int32_t> multiPred(static_cast<size_t>(numComps), 0);
+        size_t creasePos[kMaxPar] = {};
+        const int maxRing = tbl.NumCorners() + 4;
+
+        for (int p = 1; p < nEntries; ++p) {
+            int32_t startC = dataToCorner[static_cast<size_t>(p)];
+            int32_t cid = startC;
+            int nPar = 0;
+            bool firstPass = true;
+            int guard = 0;
+            while (cid != TableT::kInvalid) {
+                if (++guard > maxRing) return false;
+                if (ComputeDracoParallelogram(p, cid, tbl, vertToData, vals.data(), numComps, predVals[nPar].data())) {
+                    if (++nPar == kMaxPar) break;
+                }
+                cid = firstPass ? tbl.SwingLeft(cid) : tbl.SwingRight(cid);
+                if (cid == startC) break;
+                if (cid == TableT::kInvalid && firstPass) {
+                    firstPass = false;
+                    cid = tbl.SwingRight(startC);
+                }
+            }
+            int nUsed = 0;
+            if (nPar > 0) {
+                std::fill(multiPred.begin(), multiPred.end(), 0);
+                int ctx = nPar - 1;
+                for (int i = 0; i < nPar; ++i) {
+                    size_t cp = creasePos[ctx]++;
+                    if (cp >= creaseFlags[ctx].size()) return false;
+                    if (creaseFlags[ctx][cp] == 0u) {
+                        ++nUsed;
+                        for (int c = 0; c < numComps; ++c) {
+                            multiPred[static_cast<size_t>(c)] = AddAsUnsigned32(multiPred[static_cast<size_t>(c)], predVals[i][static_cast<size_t>(c)]);
+                        }
+                    }
+                }
+            }
+            size_t dstOff = static_cast<size_t>(p) * numComps;
+            if (nUsed == 0) {
+                tr.ComputeOriginal(vals.data() + dstOff - numComps, corr.data() + dstOff, vals.data() + dstOff, numComps);
+            } else {
+                for (int c = 0; c < numComps; ++c) multiPred[static_cast<size_t>(c)] /= nUsed;
+                tr.ComputeOriginal(multiPred.data(), corr.data() + dstOff, vals.data() + dstOff, numComps);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Draco Dynamic Integer Points KD-Tree Decoder (compression levels 0..6)
+// ============================================================================
+E2_DRACO_NOINLINE inline bool DispatchDracoKdTreePoints(
+    uint8_t compLevel,
+    const uint8_t* data,
+    size_t size,
+    size_t& pos,
+    uint16_t ver,
+    uint32_t dimension,
+    uint32_t expectedPoints,
+    std::vector<uint32_t>& outFlatCoords)
+{
+    if (compLevel > 6u || dimension == 0 || dimension > 64 || pos + 8 > size) return false;
+    uint32_t bitLength = RdU32LE(data + pos);
+    uint32_t numPoints = RdU32LE(data + pos + 4);
+    pos += 8;
+    if (bitLength > 32u || numPoints != expectedPoints) return false;
+    outFlatCoords.clear();
+    if (numPoints == 0) return true;
+    outFlatCoords.reserve(static_cast<size_t>(numPoints) * dimension);
+
+    DracoDirectBitDecoder numDirectDec;
+    DracoRAbsDecoder numRabsDec;
+    DracoFoldedRAnsBitDecoder numFoldedDec;
+    DracoDirectBitDecoder remDec, axisDec, halfDec;
+
+    if (compLevel >= 4u) {
+        if (!numFoldedDec.StartDecoding(data, size, pos, ver)) return false;
+    } else if (compLevel >= 2u) {
+        if (!numRabsDec.StartDecoding(data, size, pos, ver)) return false;
+    } else {
+        if (!numDirectDec.StartDecoding(data, size, pos)) return false;
+    }
+    if (!remDec.StartDecoding(data, size, pos)) return false;
+    if (!axisDec.StartDecoding(data, size, pos)) return false;
+    if (!halfDec.StartDecoding(data, size, pos)) return false;
+
+    const bool selectAxis = (compLevel == 6u);
+    auto getAxis = [&](uint32_t numRemPts, const std::vector<uint32_t>& levels, uint32_t lastAxis, uint32_t& outAxis) -> bool {
+        if (!selectAxis) {
+            outAxis = (lastAxis + 1u == dimension) ? 0u : (lastAxis + 1u);
+            return true;
+        }
+        uint32_t best = 0;
+        if (numRemPts < 64u) {
+            for (uint32_t ax = 1; ax < dimension; ++ax) {
+                if (levels[best] > levels[ax]) best = ax;
+            }
+        } else {
+            if (!axisDec.DecodeLeastSignificantBits32(4, best)) return false;
+        }
+        outAxis = best;
+        return best < dimension;
+    };
+
+    auto decodeNumberBits = [&](int nbits, uint32_t& outVal) -> bool {
+        if (compLevel >= 4u) return numFoldedDec.DecodeLeastSignificantBits32(nbits, outVal);
+        if (compLevel >= 2u) return numRabsDec.DecodeLeastSignificantBits32(nbits, outVal);
+        return numDirectDec.DecodeLeastSignificantBits32(nbits, outVal);
+    };
+
+    struct Status { uint32_t numRem; uint32_t lastAxis; uint32_t depth; };
+    struct SplitUndo { uint32_t depth; uint32_t axis; uint32_t oldLevel; uint32_t oldBase; };
+
+    std::vector<uint32_t> base(dimension, 0u), levels(dimension, 0u), pt(dimension, 0u), axes(dimension, 0u);
+    std::vector<SplitUndo> undo;
+    std::vector<Status> stack;
+    stack.push_back({ numPoints, 0u, 0u });
+    uint32_t depth = 0u;
+    uint32_t decodedPts = 0u;
+
+    while (!stack.empty()) {
+        Status st = stack.back();
+        stack.pop_back();
+        if (st.depth != depth) {
+            if (st.depth > depth) return false;
+            while (!undo.empty()) {
+                const SplitUndo& sp = undo.back();
+                if (sp.depth < st.depth) break;
+                base[sp.axis] = sp.oldBase;
+                if (sp.depth == st.depth) break;
+                levels[sp.axis] = sp.oldLevel;
+                undo.pop_back();
+            }
+            depth = st.depth;
+        }
+        if (st.numRem > numPoints) return false;
+        uint32_t axis = 0;
+        if (!getAxis(st.numRem, levels, st.lastAxis, axis)) return false;
+        uint32_t level = levels[axis];
+        if (level > bitLength) return false;
+
+        if (bitLength - level == 0u) {
+            if (decodedPts + st.numRem > numPoints) return false;
+            for (uint32_t i = 0; i < st.numRem; ++i) {
+                outFlatCoords.insert(outFlatCoords.end(), base.begin(), base.end());
+                ++decodedPts;
+            }
+            continue;
+        }
+        if (st.numRem <= 2u) {
+            if (decodedPts + st.numRem > numPoints) return false;
+            axes[0] = axis;
+            for (uint32_t i = 1; i < dimension; ++i) {
+                axes[i] = (axes[i - 1] + 1u == dimension) ? 0u : (axes[i - 1] + 1u);
+            }
+            for (uint32_t i = 0; i < st.numRem; ++i) {
+                for (uint32_t j = 0; j < dimension; ++j) {
+                    uint32_t aj = axes[j];
+                    uint32_t remBits = bitLength - levels[aj];
+                    uint32_t v = 0;
+                    if (remBits > 0u && !remDec.DecodeLeastSignificantBits32(static_cast<int>(remBits), v)) return false;
+                    pt[aj] = base[aj] | v;
+                }
+                outFlatCoords.insert(outFlatCoords.end(), pt.begin(), pt.end());
+                ++decodedPts;
+            }
+            continue;
+        }
+        if (decodedPts > numPoints) return false;
+        int remBits = static_cast<int>(bitLength - level);
+        uint32_t modifier = 1u << (remBits - 1);
+        int incomingBits = DracoMostSignificantBit(st.numRem);
+        uint32_t number = 0;
+        if (incomingBits > 0 && !decodeNumberBits(incomingBits, number)) return false;
+        uint32_t firstHalf = st.numRem / 2u;
+        if (firstHalf < number) return false;
+        firstHalf -= number;
+        uint32_t secondHalf = st.numRem - firstHalf;
+        if (firstHalf != secondHalf) {
+            if (!halfDec.DecodeNextBit()) std::swap(firstHalf, secondHalf);
+        }
+        if (depth == UINT32_MAX) return false;
+        undo.push_back({ depth, axis, levels[axis], base[axis] });
+        levels[axis] += 1u;
+        base[axis] += modifier;
+        if (firstHalf > 0u) stack.push_back({ firstHalf, axis, depth });
+        if (secondHalf > 0u) stack.push_back({ secondHalf, axis, depth + 1u });
+        ++depth;
+    }
+    return decodedPts == numPoints;
 }
 
 } // namespace DracoMeshoptDetail
@@ -684,9 +1757,9 @@ inline void BuildEdgebreakerVertexSequence(
 // ============================================================================
 // Core Google Draco Decoder (used by both .drc and glTF KHR_draco_mesh_compression)
 //   targetPosUniqueId < 0 -> selects POSITION (attType == 0)
-//   targetPosUniqueId >= 0 -> selects attribute matching uniqueId (or attType == 0)
+//   targetPosUniqueId >= 0 -> selects attribute matching uniqueId (or fallback attType == 0)
 // ============================================================================
-inline bool DecodeDracoBufferToMesh(
+E2_DRACO_NOINLINE inline bool DecodeDracoBufferToMesh(
     const uint8_t* data,
     size_t size,
     int targetPosUniqueId,
@@ -704,24 +1777,28 @@ inline bool DecodeDracoBufferToMesh(
     outMaj = data[5];
     outMin = data[6];
     outEncType = data[7];          // 0 = POINT_CLOUD, 1 = TRIANGULAR_MESH
-    uint8_t encMethod = data[8];   // 0 = SEQUENTIAL, 1 = EDGEBREAKER
+    uint8_t encMethod = data[8];   // 0 = SEQUENTIAL, 1 = EDGEBREAKER (mesh) / KD_TREE (point cloud)
     uint16_t flags = RdU16LE(data + 9);
+    if (outMaj < 1 || outMaj > 2) return false;
     if ((outEncType != 0u && outEncType != 1u) || (encMethod != 0u && encMethod != 1u)) return false;
+    const uint16_t ver = DracoVer(outMaj, outMin);
 
     size_t pos = 11;
 
-    // 1. Optional Metadata block (METADATA_FLAG_MASK = 0x8000)
-    if ((flags & 0x8000u) != 0u) {
-        auto skipMeta = [&](auto& self) -> bool {
+    // 1. Optional Metadata block (METADATA_FLAG_MASK = 0x8000, supported since v1.3)
+    if (ver >= DracoVer(1, 3) && (flags & 0x8000u) != 0u) {
+        auto skipMeta = [&](auto& self, int depth) -> bool {
+            if (depth > 16) return false;
             uint32_t nEntries = 0;
             if (!ReadLeb128U32(data, size, pos, nEntries) || nEntries > 4096) return false;
             for (uint32_t e = 0; e < nEntries; ++e) {
                 if (pos >= size) return false;
                 uint8_t kl = data[pos++];
-                if (pos + kl >= size) return false;
+                if (kl > size - pos) return false;
                 pos += kl;
+                if (pos >= size) return false;
                 uint8_t vl = data[pos++];
-                if (pos + vl > size) return false;
+                if (vl > size - pos) return false;
                 pos += vl;
             }
             uint32_t nSub = 0;
@@ -729,9 +1806,9 @@ inline bool DecodeDracoBufferToMesh(
             for (uint32_t s = 0; s < nSub; ++s) {
                 if (pos >= size) return false;
                 uint8_t sl = data[pos++];
-                if (pos + sl > size) return false;
+                if (sl > size - pos) return false;
                 pos += sl;
-                if (!self(self)) return false;
+                if (!self(self, depth + 1)) return false;
             }
             return true;
         };
@@ -740,116 +1817,21 @@ inline bool DecodeDracoBufferToMesh(
         for (uint32_t a = 0; a < nAttMeta; ++a) {
             uint32_t uid = 0;
             if (!ReadLeb128U32(data, size, pos, uid)) return false;
-            if (!skipMeta(skipMeta)) return false;
+            if (!skipMeta(skipMeta, 0)) return false;
         }
-        if (!skipMeta(skipMeta)) return false;
+        if (!skipMeta(skipMeta, 0)) return false;
     }
 
-    // 2. Connectivity Decode
-    uint64_t numFaces = 0, numPoints = 0;
-    std::vector<uint32_t> seqIndices;
-    DracoCornerTable ebCornerTable;
-    uint8_t numDecoders = 0;
-
-    if (encMethod == 0u) {
-        // SEQUENTIAL connectivity
-        if (outEncType == 1u) {
-            if (!ReadLeb128U64(data, size, pos, numFaces)) return false;
-            if (!ReadLeb128U64(data, size, pos, numPoints)) return false;
-            if (numFaces == 0 || numFaces > 4000000ULL || numPoints < 3 || numPoints > 4000000ULL) return false;
-            if (pos >= size) return false;
-            uint8_t connMethod = data[pos++];
-            size_t totalCorners = static_cast<size_t>(numFaces) * 3u;
-            seqIndices.resize(totalCorners);
-
-            if (connMethod == 1u) { // Uncompressed indices
-                if (numPoints < 256ULL) {
-                    if (pos + totalCorners > size) return false;
-                    for (size_t i = 0; i < totalCorners; ++i) seqIndices[i] = data[pos++];
-                } else if (numPoints < 65536ULL) {
-                    if (pos + totalCorners * 2u > size) return false;
-                    for (size_t i = 0; i < totalCorners; ++i) { seqIndices[i] = RdU16LE(data + pos); pos += 2; }
-                } else if (numPoints < (1ULL << 21) && (outMaj > 2 || (outMaj == 2 && outMin >= 2))) {
-                    size_t tryP = pos;
-                    bool okVar = true;
-                    for (size_t i = 0; i < totalCorners; ++i) {
-                        uint32_t idx = 0;
-                        if (!ReadLeb128U32(data, size, tryP, idx) || idx >= numPoints) { okVar = false; break; }
-                        seqIndices[i] = idx;
-                    }
-                    if (okVar && tryP < size && data[tryP] >= 1 && data[tryP] <= 32) {
-                        pos = tryP;
-                    } else {
-                        if (pos + totalCorners * 4u > size) return false;
-                        for (size_t i = 0; i < totalCorners; ++i) { seqIndices[i] = RdU32LE(data + pos); pos += 4; }
-                    }
-                } else {
-                    if (pos + totalCorners * 4u > size) return false;
-                    for (size_t i = 0; i < totalCorners; ++i) { seqIndices[i] = RdU32LE(data + pos); pos += 4; }
-                }
-            } else if (connMethod == 0u) {
-                // Sequential compressed indices: Draco uses DecodeSymbols (rANS) in v2.x, or varint delta in v1.0/1.1!
-                size_t savedPos = pos;
-                std::vector<uint32_t> symDeltas;
-                if ((outMaj >= 2 || (outMaj == 1 && outMin >= 2)) &&
-                    DracoDecodeSymbols(data, size, pos, static_cast<uint32_t>(totalCorners), 1u, symDeltas))
-                {
-                    int64_t prev = 0;
-                    bool okRansIdx = true;
-                    for (size_t i = 0; i < totalCorners; ++i) {
-                        int32_t d = DracoConvertSymbolToSignedInt(symDeltas[i]);
-                        int64_t v = prev + d;
-                        if (v < 0 || static_cast<uint64_t>(v) >= numPoints) { okRansIdx = false; break; }
-                        seqIndices[i] = static_cast<uint32_t>(v);
-                        prev = v;
-                    }
-                    if (!okRansIdx) pos = savedPos;
-                }
-                if (pos == savedPos) {
-                    int64_t prev = 0;
-                    for (size_t i = 0; i < totalCorners; ++i) {
-                        uint32_t zz = 0;
-                        if (!ReadLeb128U32(data, size, pos, zz)) return false;
-                        int64_t d = DracoConvertSymbolToSignedInt(zz);
-                        int64_t v = prev + d;
-                        if (v < 0 || static_cast<uint64_t>(v) >= numPoints) return false;
-                        seqIndices[i] = static_cast<uint32_t>(v);
-                        prev = v;
-                    }
-                }
-            } else {
-                return false;
-            }
-        } else {
-            if (!ReadLeb128U64(data, size, pos, numPoints) || numPoints == 0 || numPoints > 4000000ULL) return false;
+    auto dtElemBytes = [](uint8_t dt) -> size_t {
+        switch (dt) {
+            case 1: case 2: case 11: return 1; // INT8, UINT8, BOOL
+            case 3: case 4: return 2;          // INT16, UINT16
+            case 5: case 6: case 9: return 4;  // INT32, UINT32, FLOAT32
+            case 7: case 8: case 10: return 8; // INT64, UINT64, FLOAT64
+            default: return 0;
         }
-        if (pos >= size) return false;
-        numDecoders = data[pos++];
-    } else {
-        // EDGEBREAKER connectivity
-        if (outEncType != 1u) return false;
-        uint8_t nAttrData = 0;
-        std::vector<int32_t> dummyMap;
-        if (!DecodeDracoEdgebreakerConnectivity(data, size, pos, ebCornerTable, nAttrData, dummyMap)) return false;
-        numFaces = ebCornerTable.numFaces;
-        numPoints = ebCornerTable.numVertices;
+    };
 
-        // Edgebreaker seam data for extra attribute decoders (nAttrData - 1): skip if only decoding geometry (decoder 0)
-        for (uint8_t ad = 1; ad < nAttrData; ++ad) {
-            if (pos >= size) return false;
-            uint8_t seamProbZero = data[pos++];
-            (void)seamProbZero;
-            uint32_t seamSz = 0;
-            if (!ReadLeb128U32(data, size, pos, seamSz) || pos + seamSz > size) return false;
-            pos += seamSz;
-        }
-        if (pos >= size) return false;
-        numDecoders = data[pos++];
-    }
-
-    if (numDecoders == 0 || numDecoders > 32) return false;
-
-    // 3. Attribute Decoder Headers
     struct DracoAttrDesc {
         uint8_t attType = 0;
         uint8_t dataType = 0;
@@ -858,305 +1840,599 @@ inline bool DecodeDracoBufferToMesh(
         uint32_t uniqueId = 0;
         uint8_t seqType = 0;
     };
+
+    auto decodeAttrDescriptors = [&](uint32_t& outNAttrs, std::vector<DracoAttrDesc>& attrs) -> bool {
+        outNAttrs = 0;
+        if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 0), outNAttrs)) return false;
+        if (outNAttrs == 0 || outNAttrs > 64 || outNAttrs > 5u * (size - pos)) return false;
+        attrs.resize(outNAttrs);
+        for (uint32_t a = 0; a < outNAttrs; ++a) {
+            if (pos + 4 > size) return false;
+            attrs[a].attType    = data[pos++];
+            attrs[a].dataType   = data[pos++];
+            attrs[a].numComps   = data[pos++];
+            attrs[a].normalized = data[pos++];
+            if (ver < DracoVer(1, 3)) {
+                if (pos + 2 > size) return false;
+                attrs[a].uniqueId = RdU16LE(data + pos);
+                pos += 2;
+            } else {
+                if (!ReadLeb128U32(data, size, pos, attrs[a].uniqueId)) return false;
+            }
+            if (dtElemBytes(attrs[a].dataType) == 0 || attrs[a].numComps == 0 || attrs[a].numComps > 16) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // ========================================================================
+    // 2A. Point Cloud KD-Tree Path (encType == 0, encMethod == 1)
+    // ========================================================================
+    if (outEncType == 0u && encMethod == 1u) {
+        if (pos + 5 > size) return false;
+        int32_t nPtsI = RdI32LE(data + pos);
+        pos += 4;
+        if (nPtsI <= 0 || nPtsI > 4000000) return false;
+        uint32_t nPts = static_cast<uint32_t>(nPtsI);
+
+        uint8_t numDecoders = data[pos++];
+        if (numDecoders != 1u) return false;
+        uint32_t nAttrs = 0;
+        std::vector<DracoAttrDesc> attrs;
+        if (!decodeAttrDescriptors(nAttrs, attrs)) return false;
+
+        int posAttrIdx = -1;
+        for (size_t a = 0; a < attrs.size(); ++a) {
+            bool match = (targetPosUniqueId >= 0)
+                ? (static_cast<int>(attrs[a].uniqueId) == targetPosUniqueId)
+                : (attrs[a].attType == 0u);
+            if (match && attrs[a].numComps >= 3) { posAttrIdx = static_cast<int>(a); break; }
+        }
+        if (posAttrIdx < 0) return false;
+
+        if (ver >= DracoVer(2, 3)) {
+            if (pos >= size) return false;
+            uint8_t compLevel = data[pos++];
+            uint32_t totalDim = 0;
+            std::vector<uint32_t> attOffsets(attrs.size(), 0);
+            size_t numSignedComps = 0;
+            for (size_t a = 0; a < attrs.size(); ++a) {
+                attOffsets[a] = totalDim;
+                totalDim += attrs[a].numComps;
+                uint8_t dt = attrs[a].dataType;
+                if (dt == 1 || dt == 3 || dt == 5) numSignedComps += attrs[a].numComps;
+                else if (dt != 2 && dt != 4 && dt != 6 && dt != 9) return false;
+            }
+            std::vector<uint32_t> flatCoords;
+            if (!DispatchDracoKdTreePoints(compLevel, data, size, pos, ver, totalDim, nPts, flatCoords)) return false;
+
+            std::vector<std::vector<float>> minVals(attrs.size());
+            std::vector<float> ranges(attrs.size(), 0.0f);
+            std::vector<uint8_t> qBits(attrs.size(), 0u);
+            for (size_t a = 0; a < attrs.size(); ++a) {
+                if (attrs[a].dataType == 9u) {
+                    size_t qb = static_cast<size_t>(attrs[a].numComps) * 4u + 5u;
+                    if (qb > size - pos) return false;
+                    minVals[a].resize(attrs[a].numComps);
+                    for (uint8_t c = 0; c < attrs[a].numComps; ++c) minVals[a][c] = RdF32LE(data + pos + c * 4u);
+                    ranges[a] = RdF32LE(data + pos + attrs[a].numComps * 4u);
+                    qBits[a]  = data[pos + attrs[a].numComps * 4u + 4u];
+                    pos += qb;
+                    if (qBits[a] < 1u || qBits[a] > 30u || !std::isfinite(ranges[a]) || ranges[a] < 0.0f) return false;
+                }
+            }
+            std::vector<int32_t> minSigned(numSignedComps, 0);
+            for (size_t s = 0; s < numSignedComps; ++s) {
+                uint32_t rawU = 0;
+                if (!ReadLeb128U32(data, size, pos, rawU)) return false;
+                minSigned[s] = DracoConvertSymbolToSignedInt(rawU);
+            }
+
+            const auto& pa = attrs[static_cast<size_t>(posAttrIdx)];
+            const uint32_t pOff = attOffsets[static_cast<size_t>(posAttrIdx)];
+            outPositions.resize(nPts);
+            if (pa.dataType == 9u) {
+                float step = (ranges[posAttrIdx] > 0.0f)
+                    ? (ranges[posAttrIdx] / static_cast<float>((1ULL << qBits[posAttrIdx]) - 1ULL))
+                    : 0.0f;
+                for (uint32_t i = 0; i < nPts; ++i) {
+                    const uint32_t* row = flatCoords.data() + static_cast<size_t>(i) * totalDim + pOff;
+                    outPositions[i] = {
+                        minVals[posAttrIdx][0] + static_cast<float>(row[0]) * step,
+                        minVals[posAttrIdx][1] + static_cast<float>(row[1]) * step,
+                        minVals[posAttrIdx][2] + static_cast<float>(row[2]) * step
+                    };
+                }
+            } else {
+                size_t signedBase = 0;
+                for (int a = 0; a < posAttrIdx; ++a) {
+                    uint8_t dt = attrs[a].dataType;
+                    if (dt == 1 || dt == 3 || dt == 5) signedBase += attrs[a].numComps;
+                }
+                bool isSigned = (pa.dataType == 1 || pa.dataType == 3 || pa.dataType == 5);
+                for (uint32_t i = 0; i < nPts; ++i) {
+                    const uint32_t* row = flatCoords.data() + static_cast<size_t>(i) * totalDim + pOff;
+                    int32_t x = static_cast<int32_t>(row[0]) + (isSigned ? minSigned[signedBase + 0] : 0);
+                    int32_t y = static_cast<int32_t>(row[1]) + (isSigned ? minSigned[signedBase + 1] : 0);
+                    int32_t z = static_cast<int32_t>(row[2]) + (isSigned ? minSigned[signedBase + 2] : 0);
+                    outPositions[i] = { static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
+                }
+            }
+            return true;
+        }
+
+        // Legacy < v2.3 KD-tree point cloud (FloatPointsTreeDecoder / kKdTreeIntegerEncoding)
+        if (pos >= size) return false;
+        uint8_t kdMethod = data[pos++];
+        if (kdMethod == 0u) { // kKdTreeQuantizationEncoding
+            if (attrs.size() != 1 || attrs[0].numComps != 3 || pos + 5 > size) return false;
+            pos += 1; // outer compression_level
+            uint32_t hdrPts = RdU32LE(data + pos);
+            pos += 4;
+            if (hdrPts != nPts || pos + 13 > size) return false;
+            uint32_t qb = RdU32LE(data + pos);
+            float qRange = RdF32LE(data + pos + 4);
+            uint32_t treePts = RdU32LE(data + pos + 8);
+            uint8_t treeLvl = data[pos + 12];
+            pos += 13;
+            if (qb < 1u || qb > 31u || treePts != nPts || !std::isfinite(qRange) || qRange < 0.0f) return false;
+            std::vector<uint32_t> flatCoords;
+            if (!DispatchDracoKdTreePoints(treeLvl, data, size, pos, ver, 3u, nPts, flatCoords)) return false;
+            float step = (qRange > 0.0f) ? (qRange / static_cast<float>((1ULL << qb) - 1ULL)) : 0.0f;
+            float halfRange = qRange * 0.5f;
+            outPositions.resize(nPts);
+            for (uint32_t i = 0; i < nPts; ++i) {
+                outPositions[i] = {
+                    static_cast<float>(flatCoords[i * 3 + 0]) * step - halfRange,
+                    static_cast<float>(flatCoords[i * 3 + 1]) * step - halfRange,
+                    static_cast<float>(flatCoords[i * 3 + 2]) * step - halfRange
+                };
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // ========================================================================
+    // 2B. Connectivity Decode (Sequential Mesh/PointCloud or Edgebreaker Mesh)
+    // ========================================================================
+    uint64_t numFaces = 0, numPoints = 0;
+    std::vector<uint32_t> seqIndices;
+    DracoEdgebreakerState ebState;
+    uint8_t numDecoders = 0;
+
+    if (encMethod == 0u) {
+        if (outEncType == 1u) {
+            if (ver < DracoVer(2, 0)) {
+                if (pos + 8 > size) return false;
+                numFaces  = RdU32LE(data + pos);
+                numPoints = RdU32LE(data + pos + 4);
+                pos += 8;
+            } else {
+                uint32_t nf = 0, np = 0;
+                if (!ReadLeb128U32(data, size, pos, nf) || !ReadLeb128U32(data, size, pos, np)) return false;
+                numFaces = nf; numPoints = np;
+            }
+            if (numFaces == 0 || numFaces > 4000000ULL || numPoints < 3 || numPoints > 4000000ULL) return false;
+            if (pos >= size) return false;
+            uint8_t connMethod = data[pos++];
+            size_t totalCorners = static_cast<size_t>(numFaces) * 3u;
+            seqIndices.resize(totalCorners);
+
+            if (connMethod == 1u) { // SEQUENTIAL_UNCOMPRESSED_INDICES
+                if (numPoints < 256ULL) {
+                    if (totalCorners > size - pos) return false;
+                    for (size_t i = 0; i < totalCorners; ++i) seqIndices[i] = data[pos++];
+                } else if (numPoints < 65536ULL) {
+                    if (totalCorners * 2u > size - pos) return false;
+                    for (size_t i = 0; i < totalCorners; ++i) { seqIndices[i] = RdU16LE(data + pos); pos += 2; }
+                } else if (numPoints < (1ULL << 21) && ver >= DracoVer(2, 2)) {
+                    for (size_t i = 0; i < totalCorners; ++i) {
+                        uint32_t idx = 0;
+                        if (!ReadLeb128U32(data, size, pos, idx) || idx >= numPoints) return false;
+                        seqIndices[i] = idx;
+                    }
+                } else {
+                    if (totalCorners * 4u > size - pos) return false;
+                    for (size_t i = 0; i < totalCorners; ++i) { seqIndices[i] = RdU32LE(data + pos); pos += 4; }
+                }
+            } else if (connMethod == 0u) { // SEQUENTIAL_COMPRESSED_INDICES
+                std::vector<uint32_t> symDeltas;
+                if (!DracoDecodeSymbols(data, size, pos, ver, static_cast<uint32_t>(totalCorners), 1u, symDeltas)) return false;
+                int64_t lastIdx = 0;
+                for (size_t i = 0; i < totalCorners; ++i) {
+                    int32_t d = DracoConvertSymbolToSignedInt(symDeltas[i]);
+                    int64_t v = lastIdx + d;
+                    if (v < 0 || static_cast<uint64_t>(v) >= numPoints) return false;
+                    seqIndices[i] = static_cast<uint32_t>(v);
+                    lastIdx = v;
+                }
+            } else {
+                return false;
+            }
+        } else {
+            if (pos + 4 > size) return false;
+            int32_t np = RdI32LE(data + pos);
+            pos += 4;
+            if (np <= 0 || np > 4000000) return false;
+            numPoints = static_cast<uint64_t>(np);
+        }
+        if (pos >= size) return false;
+        numDecoders = data[pos++];
+    } else {
+        if (outEncType != 1u) return false;
+        if (!DecodeDracoEdgebreakerFull(data, size, pos, ver, ebState)) return false;
+        numFaces  = ebState.cornerTable.numFaces;
+        numPoints = ebState.numPoints;
+        if (pos >= size) return false;
+        numDecoders = data[pos++];
+    }
+
+    if (numDecoders == 0 || numDecoders > 32) return false;
+
+    // ========================================================================
+    // 3. Attribute Decoder Headers
+    // ========================================================================
     struct DecoderGroup {
-        uint8_t dataId = 0;
-        uint8_t decoderType = 0;     // 0 = VERTEX_ATTRIBUTE_DECODER, 1 = MESH_CORNER_ATTRIBUTE_DECODER
+        int8_t dataId = -1;          // -1 = pos_encoding_data_, >= 0 = attribute_data_[dataId]
+        uint8_t decoderType = 0;     // 0 = MESH_VERTEX_ATTRIBUTE, 1 = MESH_CORNER_ATTRIBUTE
         uint8_t traversalMethod = 0; // 0 = DEPTH_FIRST, 1 = PREDICTION_DEGREE
         std::vector<DracoAttrDesc> attrs;
     };
 
-    auto dtElemBytes = [](uint8_t dt) -> size_t {
-        switch (dt) {
-            case 1: case 2: case 11: return 1;
-            case 3: case 4: return 2;
-            case 5: case 6: case 9: return 4;
-            case 7: case 8: case 10: return 8;
-            default: return 0;
-        }
-    };
-
     std::vector<DecoderGroup> groups(numDecoders);
     if (encMethod == 1u) {
+        bool posUsed = false;
+        std::vector<uint8_t> attDataUsed(ebState.attrTables.size(), 0u);
         for (uint8_t d = 0; d < numDecoders; ++d) {
             if (pos + 2 > size) return false;
-            groups[d].dataId = data[pos++];
+            groups[d].dataId = static_cast<int8_t>(data[pos++]);
             groups[d].decoderType = data[pos++];
-            if (outMaj > 1 || (outMaj == 1 && outMin >= 2)) {
+            if (ver >= DracoVer(1, 2)) {
                 if (pos >= size) return false;
                 groups[d].traversalMethod = data[pos++];
+                if (groups[d].traversalMethod >= 2u) return false;
+            }
+            if (groups[d].dataId < 0) {
+                if (groups[d].dataId != -1 || posUsed || groups[d].decoderType != 0u) return false;
+                posUsed = true;
+            } else {
+                size_t ad = static_cast<size_t>(groups[d].dataId);
+                if (ad >= ebState.attrTables.size() || attDataUsed[ad]) return false;
+                attDataUsed[ad] = 1u;
+                if (groups[d].decoderType == 1u && groups[d].traversalMethod != 0u) return false;
             }
         }
     }
 
     for (uint8_t d = 0; d < numDecoders; ++d) {
         uint32_t nAttrs = 0;
-        if (!ReadLeb128U32(data, size, pos, nAttrs) || nAttrs == 0 || nAttrs > 64) return false;
-        groups[d].attrs.resize(nAttrs);
+        if (!decodeAttrDescriptors(nAttrs, groups[d].attrs)) return false;
+        if (nAttrs > size - pos) return false;
         for (uint32_t a = 0; a < nAttrs; ++a) {
-            if (pos + 4 > size) return false;
-            groups[d].attrs[a].attType    = data[pos++];
-            groups[d].attrs[a].dataType   = data[pos++];
-            groups[d].attrs[a].numComps   = data[pos++];
-            groups[d].attrs[a].normalized = data[pos++];
-            if (!ReadLeb128U32(data, size, pos, groups[d].attrs[a].uniqueId)) return false;
-            if (dtElemBytes(groups[d].attrs[a].dataType) == 0 ||
-                groups[d].attrs[a].numComps == 0 || groups[d].attrs[a].numComps > 16)
-            {
-                return false;
-            }
-        }
-        for (uint32_t a = 0; a < nAttrs; ++a) {
-            if (pos >= size) return false;
             groups[d].attrs[a].seqType = data[pos++];
+            if (groups[d].attrs[a].seqType > 3u) return false;
         }
     }
 
-    // 4. Decode Portable Attributes & Reconstruct Position Buffer!
-    // Note: in Draco v2.x, for each decoder group d:
-    //   First ALL attributes in group d decode their prediction/symbol data (DecodePortableAttributes),
-    //   and THEN ALL attributes in group d decode their transform parameters (DecodeDataNeededByPortableTransforms: quantization min/range/bits)!
-    //   Wait: in Draco v1.x vs v2.x:
-    //     In Draco v2.0+: DecodePortableAttributes runs for all a in group[d], THEN DecodeDataNeededByPortableTransforms runs for all a in group[d]!
-    //     In Draco v1.x: transform data is inline right after each attribute's portable data!
-    //   Let's handle both v2.0+ (batched per group) and v1.x cleanly!
+    // Identify which decoder group contains the requested POSITION attribute so we can stop once it is decoded
+    int targetGroup = -1;
+    for (uint8_t d = 0; d < numDecoders && targetGroup < 0; ++d) {
+        for (const auto& attr : groups[d].attrs) {
+            bool match = (targetPosUniqueId >= 0)
+                ? (static_cast<int>(attr.uniqueId) == targetPosUniqueId)
+                : (attr.attType == 0u);
+            if (match) { targetGroup = static_cast<int>(d); break; }
+        }
+    }
+    if (targetGroup < 0 && targetPosUniqueId >= 0) {
+        // Fallback to attType == 0 if caller's uniqueId was absent
+        for (uint8_t d = 0; d < numDecoders && targetGroup < 0; ++d) {
+            for (const auto& attr : groups[d].attrs) {
+                if (attr.attType == 0u) { targetGroup = static_cast<int>(d); break; }
+            }
+        }
+    }
+    if (targetGroup < 0) return false;
 
-    for (uint8_t d = 0; d < numDecoders; ++d) {
-        const auto& grp = groups[d];
-        std::vector<int32_t> vertOrder;
-        std::vector<int32_t> cornerOrder;
-        size_t nEntries = static_cast<size_t>(numPoints);
+    // ========================================================================
+    // 4. Decode Attribute Groups Up Through targetGroup
+    // ========================================================================
+    for (int d = 0; d <= targetGroup; ++d) {
+        const auto& grp = groups[static_cast<size_t>(d)];
+        std::vector<uint32_t> pointIds;
+        std::vector<int32_t> dataToCorner;
+        std::vector<int32_t> vertToData;
+        const DracoAttrCornerTable* activeAttrTbl = nullptr;
 
-        if (encMethod == 1u && grp.dataId == 0u) {
-            BuildEdgebreakerVertexSequence(ebCornerTable, grp.traversalMethod, vertOrder, cornerOrder);
-            nEntries = vertOrder.size();
-            if (nEntries == 0) return false;
-        } else if (encMethod == 1u && grp.dataId > 0u) {
-            if (!outPositions.empty()) break; // already decoded geometry positions from decoder 0!
-            return false;
+        if (encMethod == 0u) {
+            pointIds.resize(static_cast<size_t>(numPoints));
+            for (size_t i = 0; i < pointIds.size(); ++i) pointIds[i] = static_cast<uint32_t>(i);
+        } else {
+            if (grp.decoderType == 0u) {
+                if (!BuildDracoTraversalSequence(ebState.cornerTable, ebState.cornerToPoint, grp.traversalMethod,
+                                                 pointIds, dataToCorner, vertToData)) {
+                    return false;
+                }
+            } else {
+                activeAttrTbl = &ebState.attrTables[static_cast<size_t>(grp.dataId)];
+                if (!BuildDracoTraversalSequence(*activeAttrTbl, ebState.cornerToPoint, grp.traversalMethod,
+                                                 pointIds, dataToCorner, vertToData)) {
+                    return false;
+                }
+            }
         }
 
-        struct DecodedIntAttr {
-            bool isRawFloat = false;
-            std::vector<Vec3f> rawPositions;
-            std::vector<int32_t> portableVals; // size = nEntries * numComps (in traversal order)
-            int8_t predScheme = -2;
-            int32_t predTransformType = -1;
-        };
-        std::vector<DecodedIntAttr> portAttrs(grp.attrs.size());
+        const size_t nEntries = pointIds.size();
+        const uint32_t maxCorners = (encMethod == 1u) ? static_cast<uint32_t>(ebState.cornerTable.NumCorners()) : 0u;
 
+        struct DecodedPortAttr {
+            bool isRaw = false;
+            std::vector<Vec3f> rawPos;
+            std::vector<int32_t> vals;
+            float inlineMin[16] = {};
+            float inlineRange = 0.0f;
+            uint8_t inlineQBits = 0;
+        };
+        std::vector<DecodedPortAttr> portAttrs(grp.attrs.size());
+
+        // 4a. DecodePortableAttributes for all attributes in group d
         for (size_t a = 0; a < grp.attrs.size(); ++a) {
             const auto& attr = grp.attrs[a];
             auto& pa = portAttrs[a];
+            bool wantsPos = (d == targetGroup) && ((targetPosUniqueId >= 0)
+                ? (static_cast<int>(attr.uniqueId) == targetPosUniqueId || attr.attType == 0u)
+                : (attr.attType == 0u));
 
-            if (attr.seqType == 0u) { // SEQUENTIAL_ATTRIBUTE_ENCODER_GENERIC (raw uncompressed bytes)
+            if (attr.seqType == 0u) { // SEQUENTIAL_ATTRIBUTE_ENCODER_GENERIC
                 size_t elemSz = dtElemBytes(attr.dataType);
                 size_t rawBytes = nEntries * attr.numComps * elemSz;
-                if (pos < size && data[pos] == 0xFEu && (size - pos) >= rawBytes + 1u && grp.attrs.size() == 1) {
-                    // Optional PREDICTION_NONE (-2) byte
-                    if ((size - pos) == rawBytes + 1u) ++pos;
-                }
-                if (pos + rawBytes > size) return false;
-                if ((attr.attType == 0u || static_cast<int>(attr.uniqueId) == targetPosUniqueId) &&
-                    attr.numComps >= 3 && (attr.dataType == 9u || attr.dataType == 10u))
-                {
-                    pa.isRawFloat = true;
-                    pa.rawPositions.resize(nEntries);
+                if (rawBytes > size - pos) return false;
+                if (wantsPos && attr.numComps >= 3) {
+                    pa.isRaw = true;
+                    pa.rawPos.resize(nEntries);
                     for (size_t v = 0; v < nEntries; ++v) {
                         const uint8_t* vp = data + pos + v * attr.numComps * elemSz;
                         if (attr.dataType == 9u) {
-                            pa.rawPositions[v] = { RdF32LE(vp + 0), RdF32LE(vp + 4), RdF32LE(vp + 8) };
-                        } else {
-                            pa.rawPositions[v] = {
+                            pa.rawPos[v] = { RdF32LE(vp + 0), RdF32LE(vp + 4), RdF32LE(vp + 8) };
+                        } else if (attr.dataType == 10u) {
+                            pa.rawPos[v] = {
                                 static_cast<float>(RdF64LE(vp + 0)),
                                 static_cast<float>(RdF64LE(vp + 8)),
                                 static_cast<float>(RdF64LE(vp + 16))
                             };
+                        } else {
+                            return false;
                         }
                     }
                 }
                 pos += rawBytes;
-            } else if (attr.seqType == 1u || attr.seqType == 2u) {
-                // 1 = INTEGER, 2 = QUANTIZATION, 3 = NORMALS
-                if (pos >= size) return false;
-                pa.predScheme = static_cast<int8_t>(data[pos++]);
-                if (pa.predScheme != -2) {
-                    // Prediction transform type (varint I32 / byte: 1 = PREDICTION_TRANSFORM_WRAP, 0 = DELTA, etc.)
-                    if (outMaj > 1 || (outMaj == 1 && outMin >= 2)) {
-                        uint32_t ptU = 0;
-                        if (!ReadLeb128U32(data, size, pos, ptU)) return false;
-                        pa.predTransformType = static_cast<int32_t>(ptU);
-                    } else {
-                        if (pos + 4 > size) return false;
-                        pa.predTransformType = RdI32LE(data + pos);
-                        pos += 4;
-                    }
-                }
+                continue;
+            }
 
-                if (pos >= size) return false;
-                uint8_t compressed = data[pos++];
-                size_t totalScalars = nEntries * attr.numComps;
-                pa.portableVals.resize(totalScalars, 0);
+            // seqType 1 = INTEGER, 2 = QUANTIZATION, 3 = NORMALS (2 octahedral components!)
+            const int valComps = (attr.seqType == 3u) ? 2 : static_cast<int>(attr.numComps);
+            if (attr.seqType == 3u && (attr.numComps != 3u || attr.dataType != 9u)) return false;
+            if (attr.seqType == 2u && attr.dataType != 9u) return false;
 
-                if (compressed > 0u) {
-                    std::vector<uint32_t> syms;
-                    if (!DracoDecodeSymbols(data, size, pos, static_cast<uint32_t>(totalScalars), attr.numComps, syms)) {
-                        return false;
-                    }
-                    for (size_t k = 0; k < totalScalars; ++k) {
-                        if (pa.predScheme == -2 && attr.seqType == 2u) {
-                            // Unsigned quantized symbols when no prediction scheme is active?
-                            // In Draco SequentialIntegerAttributeDecoder::ConvertSymbolsToSignedInts: ALWAYS converts symbols to signed ints EXCEPT when PREDICTION_NONE? No: ConvertSymbolsToSignedInts ALWAYS runs when compressed > 0!
-                            pa.portableVals[k] = DracoConvertSymbolToSignedInt(syms[k]);
-                        } else {
-                            pa.portableVals[k] = DracoConvertSymbolToSignedInt(syms[k]);
-                        }
-                    }
-                } else {
+            if (pos >= size) return false;
+            int8_t predScheme = static_cast<int8_t>(data[pos++]);
+            if (predScheme < -2 || predScheme >= 7) return false;
+            DracoPredTransform predTr;
+            if (predScheme != -2) {
+                if (pos >= size) return false;
+                predTr.type = static_cast<int8_t>(data[pos++]);
+                if (predTr.type < -1 || predTr.type >= 4) return false;
+            }
+
+            // Legacy < v2.0 decodes quantization / octahedral parameters BEFORE integer symbols!
+            if (ver < DracoVer(2, 0)) {
+                if (attr.seqType == 2u) {
+                    size_t qSz = static_cast<size_t>(attr.numComps) * 4u + 5u;
+                    if (qSz > size - pos) return false;
+                    for (uint8_t c = 0; c < attr.numComps; ++c) pa.inlineMin[c] = RdF32LE(data + pos + c * 4u);
+                    pa.inlineRange = RdF32LE(data + pos + attr.numComps * 4u);
+                    pa.inlineQBits = data[pos + attr.numComps * 4u + 4u];
+                    pos += qSz;
+                    if (pa.inlineQBits < 1u || pa.inlineQBits > 30u || !std::isfinite(pa.inlineRange) || pa.inlineRange < 0.0f) return false;
+                } else if (attr.seqType == 3u) {
                     if (pos >= size) return false;
-                    // Legacy v1 uncompressed quantized case or Draco uncompressed byteSize (1/2/4)
-                    if (outMaj == 1 && outMin == 0 && pa.predScheme == -2) {
-                        if (pos + totalScalars * 4u > size) return false;
-                        for (size_t k = 0; k < totalScalars; ++k) {
-                            pa.portableVals[k] = RdI32LE(data + pos + k * 4u);
-                        }
-                        pos += totalScalars * 4u;
-                    } else {
-                        uint8_t intByteSz = data[pos++];
-                        if ((intByteSz != 1 && intByteSz != 2 && intByteSz != 4) || pos + totalScalars * intByteSz > size) {
-                            // Fallback for legacy 4-byte raw array without intByteSz prefix
-                            --pos;
-                            if (pos + totalScalars * 4u > size) return false;
-                            for (size_t k = 0; k < totalScalars; ++k) pa.portableVals[k] = RdI32LE(data + pos + k * 4u);
-                            pos += totalScalars * 4u;
-                        } else {
-                            for (size_t k = 0; k < totalScalars; ++k) {
-                                if (intByteSz == 1)      pa.portableVals[k] = static_cast<int32_t>(data[pos + k]);
-                                else if (intByteSz == 2) pa.portableVals[k] = static_cast<int32_t>(RdU16LE(data + pos + k * 2u));
-                                else                     pa.portableVals[k] = RdI32LE(data + pos + k * 4u);
-                            }
-                            pos += totalScalars * intByteSz;
-                        }
-                    }
+                    pa.inlineQBits = data[pos++];
+                    if (pa.inlineQBits < 1u || pa.inlineQBits > 30u) return false;
                 }
+            }
 
-                // Read prediction transform ancillary data (e.g. WRAP min/max for transformType == 1)
-                if (pa.predScheme != -2 && pa.predTransformType == 1) {
-                    if (pos + 8 > size) return false;
-                    int32_t wrapMin = RdI32LE(data + pos + 0);
-                    int32_t wrapMax = RdI32LE(data + pos + 4);
-                    (void)wrapMin; (void)wrapMax;
-                    pos += 8;
+            if (pos >= size) return false;
+            uint8_t compressed = data[pos++];
+            const size_t totalScalars = nEntries * static_cast<size_t>(valComps);
+            if (wantsPos) pa.vals.resize(totalScalars, 0);
+
+            std::vector<uint32_t> syms;
+            if (compressed > 0u) {
+                if (!DracoDecodeSymbols(data, size, pos, ver, static_cast<uint32_t>(totalScalars), static_cast<uint32_t>(valComps), syms)) {
+                    return false;
                 }
-
-                // Reconstruct predicted values across traversal sequence!
-                if (pa.predScheme == 0) { // DIFFERENTIAL_PREDICTION (delta from previous entry)
-                    for (size_t i = 1; i < nEntries; ++i) {
-                        for (uint8_t c = 0; c < attr.numComps; ++c) {
-                            pa.portableVals[i * attr.numComps + c] += pa.portableVals[(i - 1) * attr.numComps + c];
-                        }
-                    }
-                } else if (pa.predScheme == 1 && encMethod == 1u && cornerOrder.size() == nEntries) {
-                    // MESH_PREDICTION_PARALLELOGRAM across CornerTable!
-                    std::vector<int32_t> vertToSeqIdx(ebCornerTable.numVertices, -1);
-                    for (size_t i = 0; i < nEntries; ++i) {
-                        int32_t cId = cornerOrder[i];
-                        int32_t vTip = vertOrder[i];
-                        bool predicted = false;
-                        if (cId >= 0) {
-                            int32_t oppC = ebCornerTable.Opposite(cId);
-                            if (oppC >= 0) {
-                                int32_t vNext = ebCornerTable.cornerToVert[static_cast<size_t>(DracoCornerTable::Next(cId))];
-                                int32_t vPrev = ebCornerTable.cornerToVert[static_cast<size_t>(DracoCornerTable::Prev(cId))];
-                                int32_t vOpp  = ebCornerTable.cornerToVert[static_cast<size_t>(oppC)];
-                                int32_t sNext = (vNext >= 0) ? vertToSeqIdx[static_cast<size_t>(vNext)] : -1;
-                                int32_t sPrev = (vPrev >= 0) ? vertToSeqIdx[static_cast<size_t>(vPrev)] : -1;
-                                int32_t sOpp  = (vOpp  >= 0) ? vertToSeqIdx[static_cast<size_t>(vOpp)]  : -1;
-                                if (sNext >= 0 && sPrev >= 0 && sOpp >= 0) {
-                                    for (uint8_t c = 0; c < attr.numComps; ++c) {
-                                        int32_t pred = pa.portableVals[static_cast<size_t>(sNext) * attr.numComps + c] +
-                                                       pa.portableVals[static_cast<size_t>(sPrev) * attr.numComps + c] -
-                                                       pa.portableVals[static_cast<size_t>(sOpp)  * attr.numComps + c];
-                                        pa.portableVals[i * attr.numComps + c] += pred;
-                                    }
-                                    predicted = true;
-                                }
-                            }
-                        }
-                        if (!predicted && i > 0) {
-                            for (uint8_t c = 0; c < attr.numComps; ++c) {
-                                pa.portableVals[i * attr.numComps + c] += pa.portableVals[(i - 1) * attr.numComps + c];
-                            }
-                        }
-                        if (vTip >= 0 && static_cast<size_t>(vTip) < vertToSeqIdx.size()) {
-                            vertToSeqIdx[static_cast<size_t>(vTip)] = static_cast<int32_t>(i);
-                        }
+                if (wantsPos) {
+                    const bool keepUnsigned = (predScheme != -2 && predTr.AreCorrectionsPositive());
+                    for (size_t k = 0; k < totalScalars; ++k) {
+                        pa.vals[k] = keepUnsigned ? static_cast<int32_t>(syms[k]) : DracoConvertSymbolToSignedInt(syms[k]);
                     }
                 }
             } else {
-                if (!outPositions.empty()) break;
-                return false;
+                if (pos >= size) return false;
+                uint8_t numBytes = data[pos++];
+                if (numBytes != 1u && numBytes != 2u && numBytes != 4u) return false;
+                if (totalScalars * numBytes > size - pos) return false;
+                if (wantsPos) {
+                    const bool keepUnsigned = (predScheme != -2 && predTr.AreCorrectionsPositive());
+                    for (size_t k = 0; k < totalScalars; ++k) {
+                        uint32_t u = 0;
+                        if (numBytes == 1u)      u = data[pos + k];
+                        else if (numBytes == 2u) u = RdU16LE(data + pos + k * 2u);
+                        else                     u = RdU32LE(data + pos + k * 4u);
+                        pa.vals[k] = keepUnsigned ? static_cast<int32_t>(u) : DracoConvertSymbolToSignedInt(u);
+                    }
+                }
+                pos += totalScalars * numBytes;
+            }
+
+            // DecodePredictionData (exact byte order per prediction scheme)
+            std::vector<uint8_t> creaseFlags[4];
+            if (predScheme != -2) {
+                if (predScheme == 6) { // MESH_PREDICTION_GEOMETRIC_NORMAL: transform FIRST, then mode (<2.2), then flip rABS!
+                    if (!predTr.DecodeTransformData(data, size, pos, ver)) return false;
+                    if (ver < DracoVer(2, 2)) {
+                        if (pos >= size) return false;
+                        uint8_t pMode = data[pos++];
+                        if (pMode > 1u) return false;
+                    }
+                    DracoRAbsDecoder flipDec;
+                    if (!flipDec.StartDecoding(data, size, pos, ver)) return false;
+                } else {
+                    if (predScheme == 3) { // MESH_PREDICTION_TEX_COORDS_DEPRECATED
+                        uint32_t numOri = 0;
+                        if (!ReadDracoU32OrVarint(data, size, pos, ver, DracoVer(2, 2), numOri)) return false;
+                        if (numOri == 0 || numOri > maxCorners) return false;
+                        DracoRAbsDecoder oriDec;
+                        if (!oriDec.StartDecoding(data, size, pos, ver)) return false;
+                    } else if (predScheme == 4) { // MESH_PREDICTION_CONSTRAINED_MULTI_PARALLELOGRAM
+                        if (ver < DracoVer(2, 2)) {
+                            if (pos >= size || data[pos++] != 0u) return false;
+                        }
+                        for (int ctx = 0; ctx < 4; ++ctx) {
+                            uint32_t nFlags = 0;
+                            if (!ReadLeb128U32(data, size, pos, nFlags) || nFlags > maxCorners) return false;
+                            if (nFlags > 0u) {
+                                DracoRAbsDecoder crDec;
+                                if (!crDec.StartDecoding(data, size, pos, ver)) return false;
+                                if (wantsPos) {
+                                    creaseFlags[ctx].resize(nFlags);
+                                    for (uint32_t j = 0; j < nFlags; ++j) creaseFlags[ctx][j] = crDec.DecodeNextBit() ? 1u : 0u;
+                                }
+                            }
+                        }
+                    } else if (predScheme == 5) { // MESH_PREDICTION_TEX_COORDS_PORTABLE
+                        if (pos + 4 > size) return false;
+                        int32_t numOri = RdI32LE(data + pos);
+                        pos += 4;
+                        if (numOri < 0 || static_cast<size_t>(numOri) > totalScalars) return false;
+                        DracoRAbsDecoder oriDec;
+                        if (!oriDec.StartDecoding(data, size, pos, ver)) return false;
+                    }
+                    if (!predTr.DecodeTransformData(data, size, pos, ver)) return false;
+                }
+
+                // ComputeOriginalValues for POSITION
+                if (wantsPos && nEntries > 0) {
+                    if (predScheme == 0) { // PREDICTION_DIFFERENCE
+                        std::vector<int32_t> corr = pa.vals;
+                        std::vector<int32_t> zeroPred(static_cast<size_t>(valComps), 0);
+                        predTr.ComputeOriginal(zeroPred.data(), corr.data(), pa.vals.data(), valComps);
+                        for (size_t i = 1; i < nEntries; ++i) {
+                            size_t off = i * static_cast<size_t>(valComps);
+                            predTr.ComputeOriginal(pa.vals.data() + off - valComps, corr.data() + off, pa.vals.data() + off, valComps);
+                        }
+                    } else if ((predScheme == 1 || predScheme == 2 || predScheme == 4) && encMethod == 1u) {
+                        bool okPred = (activeAttrTbl != nullptr)
+                            ? ReconstructDracoMeshPrediction(predScheme, predTr, *activeAttrTbl, dataToCorner, vertToData, creaseFlags, valComps, pa.vals)
+                            : ReconstructDracoMeshPrediction(predScheme, predTr, ebState.cornerTable, dataToCorner, vertToData, creaseFlags, valComps, pa.vals);
+                        if (!okPred) return false;
+                    } else {
+                        return false;
+                    }
+                }
             }
         }
 
-        // Transform portable attributes to final floats (Quantization Transform parameters follow portable attributes in v2.x!)
+        // 4b. DecodeDataNeededByPortableTransforms (v2.0+) & Reconstruct Final Positions
         for (size_t a = 0; a < grp.attrs.size(); ++a) {
             const auto& attr = grp.attrs[a];
             auto& pa = portAttrs[a];
-            bool wantsPos = (targetPosUniqueId >= 0)
-                ? (static_cast<int>(attr.uniqueId) == targetPosUniqueId)
-                : (attr.attType == 0u);
+            bool wantsPos = (d == targetGroup) && ((targetPosUniqueId >= 0)
+                ? (static_cast<int>(attr.uniqueId) == targetPosUniqueId || (outPositions.empty() && attr.attType == 0u))
+                : (attr.attType == 0u));
 
-            std::vector<Vec3f> seqPos;
-            if (pa.isRawFloat) {
-                if (wantsPos) seqPos = std::move(pa.rawPositions);
+            float minVals[16] = {};
+            float maxRange = 0.0f;
+            uint8_t qBits = 0;
+
+            if (ver >= DracoVer(2, 0)) {
+                if (attr.seqType == 2u) {
+                    size_t qSz = static_cast<size_t>(attr.numComps) * 4u + 5u;
+                    if (qSz > size - pos) return false;
+                    for (uint8_t c = 0; c < attr.numComps; ++c) minVals[c] = RdF32LE(data + pos + c * 4u);
+                    maxRange = RdF32LE(data + pos + attr.numComps * 4u);
+                    qBits    = data[pos + attr.numComps * 4u + 4u];
+                    pos += qSz;
+                    if (qBits < 1u || qBits > 30u || !std::isfinite(maxRange) || maxRange < 0.0f) return false;
+                } else if (attr.seqType == 3u) {
+                    if (pos >= size) return false;
+                    qBits = data[pos++];
+                    if (qBits < 1u || qBits > 30u) return false;
+                }
+            } else {
+                std::memcpy(minVals, pa.inlineMin, sizeof(minVals));
+                maxRange = pa.inlineRange;
+                qBits    = pa.inlineQBits;
+            }
+
+            if (!wantsPos || attr.numComps < 3u) continue;
+
+            std::vector<Vec3f> entryPos;
+            if (pa.isRaw) {
+                entryPos = std::move(pa.rawPos);
             } else if (attr.seqType == 2u) {
-                // Quantization Transform: in v2.x starts with transformType varint (1 = ATTRIBUTE_QUANTIZATION_TRANSFORM), then minValues[numComps], maxRange(float), quantBits(uint8)!
-                if (outMaj >= 2) {
-                    uint32_t trType = 0;
-                    if (!ReadLeb128U32(data, size, pos, trType) || trType != 1u) return false;
+                float step = (maxRange > 0.0f)
+                    ? (maxRange / static_cast<float>((1ULL << qBits) - 1ULL))
+                    : 0.0f;
+                entryPos.resize(nEntries);
+                for (size_t i = 0; i < nEntries; ++i) {
+                    float x = minVals[0] + static_cast<float>(pa.vals[i * attr.numComps + 0]) * step;
+                    float y = minVals[1] + static_cast<float>(pa.vals[i * attr.numComps + 1]) * step;
+                    float z = minVals[2] + static_cast<float>(pa.vals[i * attr.numComps + 2]) * step;
+                    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+                    entryPos[i] = { x, y, z };
                 }
-                size_t qMetaBytes = static_cast<size_t>(attr.numComps) * 4u + 4u + 1u;
-                if (pos + qMetaBytes > size) return false;
-                std::vector<float> minVals(attr.numComps, 0.0f);
-                for (uint8_t c = 0; c < attr.numComps; ++c) {
-                    minVals[c] = RdF32LE(data + pos + static_cast<size_t>(c) * 4u);
+            } else if (attr.seqType == 1u) {
+                float scale = 1.0f;
+                if (attr.normalized != 0u) {
+                    if (attr.dataType == 1u) scale = 1.0f / 127.0f;
+                    else if (attr.dataType == 2u) scale = 1.0f / 255.0f;
+                    else if (attr.dataType == 3u) scale = 1.0f / 32767.0f;
+                    else if (attr.dataType == 4u) scale = 1.0f / 65535.0f;
                 }
-                float maxRange = RdF32LE(data + pos + static_cast<size_t>(attr.numComps) * 4u);
-                uint8_t qBits = data[pos + static_cast<size_t>(attr.numComps) * 4u + 4u];
-                pos += qMetaBytes;
-                if (qBits == 0 || qBits > 31 || !std::isfinite(maxRange) || maxRange < 0.0f) return false;
-
-                if (wantsPos && attr.numComps >= 3) {
-                    float step = (maxRange > 0.0f)
-                        ? (maxRange / static_cast<float>((1ULL << qBits) - 1ULL))
-                        : 0.0f;
-                    seqPos.resize(nEntries);
-                    for (size_t i = 0; i < nEntries; ++i) {
-                        float x = minVals[0] + static_cast<float>(pa.portableVals[i * attr.numComps + 0]) * step;
-                        float y = minVals[1] + static_cast<float>(pa.portableVals[i * attr.numComps + 1]) * step;
-                        float z = minVals[2] + static_cast<float>(pa.portableVals[i * attr.numComps + 2]) * step;
-                        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
-                        seqPos[i] = { x, y, z };
-                    }
+                entryPos.resize(nEntries);
+                for (size_t i = 0; i < nEntries; ++i) {
+                    entryPos[i] = {
+                        static_cast<float>(pa.vals[i * attr.numComps + 0]) * scale,
+                        static_cast<float>(pa.vals[i * attr.numComps + 1]) * scale,
+                        static_cast<float>(pa.vals[i * attr.numComps + 2]) * scale
+                    };
                 }
             }
+            if (entryPos.empty()) continue;
 
-            if (wantsPos && !seqPos.empty()) {
-                if (encMethod == 1u && !vertOrder.empty()) {
-                    outPositions.assign(ebCornerTable.numVertices, { 0.0f, 0.0f, 0.0f });
-                    for (size_t i = 0; i < seqPos.size(); ++i) {
-                        int32_t ptIdx = vertOrder[i];
-                        if (ptIdx >= 0 && static_cast<size_t>(ptIdx) < outPositions.size()) {
-                            outPositions[static_cast<size_t>(ptIdx)] = seqPos[i];
-                        }
+            // Map encoded attribute entries to final mesh/point-cloud points (UpdatePointToAttributeIndexMapping)
+            if (encMethod == 0u) {
+                outPositions = std::move(entryPos);
+            } else {
+                outPositions.assign(static_cast<size_t>(numPoints), { 0.0f, 0.0f, 0.0f });
+                const int32_t nCorners = ebState.cornerTable.NumCorners();
+                for (int32_t c = 0; c < nCorners; ++c) {
+                    int32_t ptId = ebState.cornerToPoint[static_cast<size_t>(c)];
+                    int32_t vId  = (activeAttrTbl != nullptr) ? activeAttrTbl->Vertex(c) : ebState.cornerTable.Vertex(c);
+                    if (ptId < 0 || static_cast<size_t>(ptId) >= outPositions.size() ||
+                        vId < 0 || static_cast<size_t>(vId) >= vertToData.size()) {
+                        return false;
                     }
-                } else {
-                    outPositions = std::move(seqPos);
+                    int32_t encIdx = vertToData[static_cast<size_t>(vId)];
+                    if (encIdx < 0 || static_cast<size_t>(encIdx) >= entryPos.size()) return false;
+                    outPositions[static_cast<size_t>(ptId)] = entryPos[static_cast<size_t>(encIdx)];
                 }
             }
+            if (targetPosUniqueId >= 0 && static_cast<int>(attr.uniqueId) == targetPosUniqueId) break;
         }
-
-        if (!outPositions.empty()) break;
     }
 
     if (outPositions.empty()) return false;
@@ -1168,20 +2444,21 @@ inline bool DecodeDracoBufferToMesh(
                 uint32_t i0 = seqIndices[f * 3 + 0];
                 uint32_t i1 = seqIndices[f * 3 + 1];
                 uint32_t i2 = seqIndices[f * 3 + 2];
-                if (i0 < outPositions.size() && i1 < outPositions.size() && i2 < outPositions.size()) {
+                if (i0 >= outPositions.size() || i1 >= outPositions.size() || i2 >= outPositions.size()) return false;
+                if (i0 != i1 && i1 != i2 && i0 != i2) {
                     outTris.push_back({ i0, i1, i2 });
                 }
             }
         } else {
-            outTris.reserve(ebCornerTable.numFaces);
-            for (uint32_t f = 0; f < ebCornerTable.numFaces; ++f) {
-                int32_t v0 = ebCornerTable.cornerToVert[static_cast<size_t>(f) * 3u + 0];
-                int32_t v1 = ebCornerTable.cornerToVert[static_cast<size_t>(f) * 3u + 1];
-                int32_t v2 = ebCornerTable.cornerToVert[static_cast<size_t>(f) * 3u + 2];
-                if (v0 < 0 || v1 < 0 || v2 < 0) return false;
-                uint32_t u0 = static_cast<uint32_t>(v0);
-                uint32_t u1 = static_cast<uint32_t>(v1);
-                uint32_t u2 = static_cast<uint32_t>(v2);
+            outTris.reserve(ebState.cornerTable.numFaces);
+            for (uint32_t f = 0; f < ebState.cornerTable.numFaces; ++f) {
+                int32_t p0 = ebState.cornerToPoint[static_cast<size_t>(f) * 3u + 0];
+                int32_t p1 = ebState.cornerToPoint[static_cast<size_t>(f) * 3u + 1];
+                int32_t p2 = ebState.cornerToPoint[static_cast<size_t>(f) * 3u + 2];
+                if (p0 < 0 || p1 < 0 || p2 < 0) return false;
+                uint32_t u0 = static_cast<uint32_t>(p0);
+                uint32_t u1 = static_cast<uint32_t>(p1);
+                uint32_t u2 = static_cast<uint32_t>(p2);
                 if (u0 >= outPositions.size() || u1 >= outPositions.size() || u2 >= outPositions.size()) return false;
                 if (u0 != u1 && u1 != u2 && u0 != u2) {
                     outTris.push_back({ u0, u1, u2 });
@@ -1194,7 +2471,7 @@ inline bool DecodeDracoBufferToMesh(
 }
 
 // Standalone .drc entry point
-inline bool ParseDracoDrcComplete(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
+E2_DRACO_NOINLINE inline bool ParseDracoDrcComplete(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     std::vector<Vec3f> positions;
     std::vector<std::array<uint32_t, 3>> tris;
     uint8_t encType = 0, maj = 0, minV = 0;
@@ -1204,14 +2481,14 @@ inline bool ParseDracoDrcComplete(const uint8_t* data, size_t size, LoadedMesh3D
     mesh.tris.clear();
     bool isEb = (size >= 9 && data[8] == 1u);
     mesh.formatName = L"Google Draco v" + std::to_wstring(maj) + L"." + std::to_wstring(minV) +
-                      (encType == 0 ? L" Point Cloud (.drc)" : (isEb ? L" Edgebreaker 3D Mesh (.drc)" : L" 3D Mesh (.drc)"));
+                      (encType == 0 ? (isEb ? L" KD-Tree Point Cloud (.drc)" : L" Point Cloud (.drc)")
+                                    : (isEb ? L" Edgebreaker 3D Mesh (.drc)" : L" 3D Mesh (.drc)"));
 
     if (encType == 1u) {
         mesh.vertices = std::move(positions);
         mesh.tris.reserve(tris.size());
         for (const auto& t : tris) mesh.tris.push_back({ t[0], t[1], t[2], {} });
     } else {
-        // Point cloud tetrahedra
         Vec3f bmin = positions[0], bmax = positions[0];
         for (const auto& p : positions) {
             bmin.x = std::min(bmin.x, p.x); bmin.y = std::min(bmin.y, p.y); bmin.z = std::min(bmin.z, p.z);
@@ -1234,47 +2511,131 @@ inline bool ParseDracoDrcComplete(const uint8_t* data, size_t size, LoadedMesh3D
 }
 
 // ============================================================================
-// Khronos EXT_meshopt_compression / KHR_meshopt_compression BufferView Decoder
+// Khronos EXT_meshopt_compression (v0) & KHR_meshopt_compression (v1) Decoder
 // ============================================================================
 namespace MeshoptCodec {
 
-inline uint8_t Unzigzag8(uint8_t v) {
-    return static_cast<uint8_t>(static_cast<uint8_t>(0u - (v & 1u)) ^ (v >> 1));
-}
-inline uint32_t Unzigzag32(uint32_t v) {
-    return (0u - (v & 1u)) ^ (v >> 1);
+inline uint8_t  Unzigzag8(uint8_t v)   { return static_cast<uint8_t>(static_cast<uint8_t>(0u - (v & 1u)) ^ (v >> 1)); }
+inline uint16_t Unzigzag16(uint16_t v) { return static_cast<uint16_t>(static_cast<uint16_t>(0u - (v & 1u)) ^ (v >> 1)); }
+inline uint32_t Unzigzag32(uint32_t v) { return (0u - (v & 1u)) ^ (v >> 1); }
+inline uint32_t Rotate32(uint32_t v, int r) { return (v << r) | (v >> ((32 - r) & 31)); }
+
+// Exact scalar decodeBytesGroup from meshoptimizer vertexcodec.cpp (handles 0/1/2/4/8-bit groups + sentinel escape bytes!)
+inline const uint8_t* DecodeBytesGroup(const uint8_t* data, uint8_t* out, int bits) {
+    if (bits == 0) {
+        std::memset(out, 0, 16);
+        return data;
+    }
+    if (bits == 8) {
+        std::memcpy(out, data, 16);
+        return data + 16;
+    }
+    if (bits == 1) {
+        const uint8_t* dataVar = data + 2;
+        for (int b = 0; b < 2; ++b) {
+            uint8_t byte = *data++;
+            byte = static_cast<uint8_t>(((static_cast<uint64_t>(byte) * 0x80200802ULL) & 0x0884422110ULL) * 0x0101010101ULL >> 32);
+            for (int k = 0; k < 8; ++k) {
+                uint8_t enc = byte >> 7;
+                byte = static_cast<uint8_t>(byte << 1);
+                uint8_t encv = *dataVar;
+                *out++ = (enc == 1u) ? encv : enc;
+                dataVar += (enc == 1u) ? 1 : 0;
+            }
+        }
+        return dataVar;
+    }
+    if (bits == 2) {
+        const uint8_t* dataVar = data + 4;
+        for (int b = 0; b < 4; ++b) {
+            uint8_t byte = *data++;
+            for (int k = 0; k < 4; ++k) {
+                uint8_t enc = byte >> 6;
+                byte = static_cast<uint8_t>(byte << 2);
+                uint8_t encv = *dataVar;
+                *out++ = (enc == 3u) ? encv : enc;
+                dataVar += (enc == 3u) ? 1 : 0;
+            }
+        }
+        return dataVar;
+    }
+    // bits == 4
+    const uint8_t* dataVar = data + 8;
+    for (int b = 0; b < 8; ++b) {
+        uint8_t byte = *data++;
+        for (int k = 0; k < 2; ++k) {
+            uint8_t enc = byte >> 4;
+            byte = static_cast<uint8_t>(byte << 4);
+            uint8_t encv = *dataVar;
+            *out++ = (enc == 15u) ? encv : enc;
+            dataVar += (enc == 15u) ? 1 : 0;
+        }
+    }
+    return dataVar;
 }
 
-inline bool DecodeBytesGroup(int bitslog2, const uint8_t*& data, const uint8_t* dataEnd, uint8_t out[16]) {
-    if (bitslog2 == 0) {
-        std::memset(out, 0, 16);
-        return true;
+inline const uint8_t* DecodeBytesStream(
+    const uint8_t* data,
+    const uint8_t* dataEnd,
+    uint8_t* buffer,
+    size_t bufferSizeAligned,
+    const int* bitsTable)
+{
+    constexpr size_t kByteGroupSize = 16;
+    constexpr size_t kByteGroupDecodeLimit = 24;
+    size_t groups = bufferSizeAligned / kByteGroupSize;
+    size_t headerSize = (groups + 3u) / 4u;
+    if (static_cast<size_t>(dataEnd - data) < headerSize) return nullptr;
+
+    const uint8_t* header = data;
+    data += headerSize;
+    for (size_t g = 0; g < groups; ++g) {
+        if (static_cast<size_t>(dataEnd - data) < kByteGroupDecodeLimit) return nullptr;
+        int bitsk = (header[g >> 2] >> ((g & 3u) * 2u)) & 3;
+        data = DecodeBytesGroup(data, buffer + g * kByteGroupSize, bitsTable[bitsk]);
     }
-    if (bitslog2 == 1) { // 2-bit values (4 bytes -> 16 values; optionally escaped by literal bytes in v0 if needed)
-        if (dataEnd - data < 4) return false;
-        for (int i = 0; i < 4; ++i) {
-            uint8_t b = *data++;
-            out[i * 4 + 0] = (b >> 6) & 3u;
-            out[i * 4 + 1] = (b >> 4) & 3u;
-            out[i * 4 + 2] = (b >> 2) & 3u;
-            out[i * 4 + 3] = b & 3u;
+    return data;
+}
+
+template <typename T, bool XorMode>
+inline void DecodeDeltas4(
+    const uint8_t* buffer,
+    size_t laneStride,
+    uint8_t* dst,
+    size_t vertexCount,
+    size_t vertexSize,
+    const uint8_t* lastVertex,
+    int rot)
+{
+    for (size_t k = 0; k < 4u; k += sizeof(T)) {
+        size_t vertexOffset = k;
+        T p = lastVertex[0];
+        for (size_t j = 1; j < sizeof(T); ++j) {
+            p = static_cast<T>(p | (static_cast<T>(lastVertex[j]) << (8u * j)));
         }
-        return true;
-    }
-    if (bitslog2 == 2) { // 4-bit values (8 bytes -> 16 values)
-        if (dataEnd - data < 8) return false;
-        for (int i = 0; i < 8; ++i) {
-            uint8_t b = *data++;
-            out[i * 2 + 0] = (b >> 4) & 15u;
-            out[i * 2 + 1] = b & 15u;
+        for (size_t i = 0; i < vertexCount; ++i) {
+            T v = buffer[i];
+            for (size_t j = 1; j < sizeof(T); ++j) {
+                v = static_cast<T>(v | (static_cast<T>(buffer[i + laneStride * j]) << (8u * j)));
+            }
+            if constexpr (XorMode) {
+                v = static_cast<T>(Rotate32(static_cast<uint32_t>(v), rot) ^ p);
+            } else if constexpr (sizeof(T) == 1) {
+                v = static_cast<T>(Unzigzag8(static_cast<uint8_t>(v)) + p);
+            } else if constexpr (sizeof(T) == 2) {
+                v = static_cast<T>(Unzigzag16(static_cast<uint16_t>(v)) + p);
+            } else {
+                v = static_cast<T>(Unzigzag32(static_cast<uint32_t>(v)) + p);
+            }
+            for (size_t j = 0; j < sizeof(T); ++j) {
+                dst[vertexOffset + j] = static_cast<uint8_t>(v >> (j * 8u));
+            }
+            p = v;
+            vertexOffset += vertexSize;
         }
-        return true;
+        buffer += laneStride * sizeof(T);
+        lastVertex += sizeof(T);
     }
-    // bitslog2 == 3: 8-bit literal values (16 bytes)
-    if (dataEnd - data < 16) return false;
-    std::memcpy(out, data, 16);
-    data += 16;
-    return true;
 }
 
 inline bool DecodeMeshoptAttributes(
@@ -1286,53 +2647,127 @@ inline bool DecodeMeshoptAttributes(
 {
     if (!src || srcSize < 1 || count == 0 || stride == 0 || stride > 256 || (stride % 4u) != 0u) return false;
     if ((src[0] & 0xF0u) != 0xA0u) return false;
-    uint8_t version = src[0] & 0x0Fu;
-    if (version > 1u) return false;
+    int version = src[0] & 0x0Fu;
+    if (version > 1) return false;
 
-    size_t tailSize = (version == 0u) ? std::max<size_t>(stride, 32u) : 32u;
-    if (srcSize < 1u + tailSize) return false;
+    const size_t tailSize = stride + (version == 0 ? 0u : (stride / 4u));
+    const size_t tailSizeMin = (version == 0) ? 32u : 24u;
+    const size_t tailSizePad = std::max(tailSize, tailSizeMin);
+    if (srcSize - 1u < tailSizePad) return false;
 
     const uint8_t* data = src + 1;
-    const uint8_t* dataEnd = src + srcSize - stride; // last `stride` bytes store initial reference lastVertex!
-    std::vector<uint8_t> lastVertex(src + srcSize - stride, src + srcSize);
+    const uint8_t* dataEnd = src + srcSize;
+    const uint8_t* tail = dataEnd - tailSize;
+
+    uint8_t lastVertex[256] = {};
+    std::memcpy(lastVertex, tail, stride);
+    const uint8_t* channels = (version == 0) ? nullptr : (tail + stride);
 
     size_t vertexBlockSize = (8192u / stride) & ~size_t(15);
-    vertexBlockSize = std::clamp<size_t>(vertexBlockSize, 32u, 256u);
+    vertexBlockSize = std::clamp<size_t>(vertexBlockSize, 16u, 256u);
+
+    static constexpr int kBitsV0[4] = { 0, 2, 4, 8 };
+    static constexpr int kBitsV1[5] = { 0, 1, 2, 4, 8 };
 
     dst.assign(count * stride, 0u);
-    std::vector<uint8_t> transposed(vertexBlockSize * stride, 0u);
+    uint8_t buffer[256 * 4] = {};
 
     size_t vertexOffset = 0;
     while (vertexOffset < count) {
         size_t blockSize = (vertexOffset + vertexBlockSize <= count) ? vertexBlockSize : (count - vertexOffset);
         size_t blockSizeAligned = (blockSize + 15u) & ~size_t(15);
-        size_t groups = blockSizeAligned / 16u;
-        size_t headerSize = (groups + 3u) / 4u;
-
-        for (size_t k = 0; k < stride; ++k) {
-            if (static_cast<size_t>(dataEnd - data) < headerSize) return false;
-            const uint8_t* header = data;
-            data += headerSize;
-            for (size_t g = 0; g < groups; ++g) {
-                int bitslog2 = (header[g >> 2] >> ((g & 3u) * 2u)) & 3;
-                uint8_t grpBuf[16];
-                if (!DecodeBytesGroup(bitslog2, data, dataEnd, grpBuf)) return false;
-                std::memcpy(transposed.data() + k * blockSizeAligned + g * 16u, grpBuf, 16u);
-            }
-        }
+        size_t controlSize = (version == 0) ? 0u : (stride / 4u);
+        if (static_cast<size_t>(dataEnd - data) < controlSize) return false;
+        const uint8_t* control = data;
+        data += controlSize;
 
         uint8_t* blockDst = dst.data() + vertexOffset * stride;
-        for (size_t v = 0; v < blockSize; ++v) {
-            for (size_t k = 0; k < stride; ++k) {
-                uint8_t delta = transposed[k * blockSizeAligned + v];
-                uint8_t val = static_cast<uint8_t>(lastVertex[k] + Unzigzag8(delta));
-                lastVertex[k] = val;
-                blockDst[v * stride + k] = val;
+
+        for (size_t k = 0; k < stride; k += 4u) {
+            uint8_t ctrlByte = (version == 0) ? 0u : control[k / 4u];
+            for (size_t j = 0; j < 4u; ++j) {
+                int ctrl = (ctrlByte >> (j * 2u)) & 3;
+                uint8_t* lane = buffer + j * blockSizeAligned;
+                if (ctrl == 3) {
+                    if (static_cast<size_t>(dataEnd - data) < blockSize) return false;
+                    std::memcpy(lane, data, blockSize);
+                    data += blockSize;
+                } else if (ctrl == 2) {
+                    std::memset(lane, 0, blockSize);
+                } else {
+                    data = DecodeBytesStream(data, dataEnd, lane, blockSizeAligned, (version == 0) ? kBitsV0 : (kBitsV1 + ctrl));
+                    if (!data) return false;
+                }
+            }
+
+            int ch = (version == 0) ? 0 : channels[k / 4u];
+            switch (ch & 3) {
+                case 0:
+                    DecodeDeltas4<uint8_t, false>(buffer, blockSizeAligned, blockDst + k, blockSize, stride, lastVertex + k, 0);
+                    break;
+                case 1:
+                    DecodeDeltas4<uint16_t, false>(buffer, blockSizeAligned, blockDst + k, blockSize, stride, lastVertex + k, 0);
+                    break;
+                case 2:
+                    DecodeDeltas4<uint32_t, true>(buffer, blockSizeAligned, blockDst + k, blockSize, stride, lastVertex + k, (32 - (ch >> 4)) & 31);
+                    break;
+                default:
+                    return false;
             }
         }
+        std::memcpy(lastVertex, blockDst + (blockSize - 1u) * stride, stride);
         vertexOffset += blockSize;
     }
-    return true;
+
+    return static_cast<size_t>(dataEnd - data) == tailSizePad;
+}
+
+template <typename T>
+inline void ApplyMeshoptFilterOctahedral(uint8_t* raw, size_t count) {
+    const float maxVal = static_cast<float>((1 << (sizeof(T) * 8 - 1)) - 1);
+    for (size_t i = 0; i < count; ++i) {
+        T elem[4];
+        std::memcpy(elem, raw + i * 4u * sizeof(T), sizeof(elem));
+        float x = static_cast<float>(elem[0]);
+        float y = static_cast<float>(elem[1]);
+        float z = static_cast<float>(elem[2]) - std::fabs(x) - std::fabs(y);
+        float t = (z >= 0.0f) ? 0.0f : z;
+        x += (x >= 0.0f) ? t : -t;
+        y += (y >= 0.0f) ? t : -t;
+        float l = std::sqrt(x * x + y * y + z * z);
+        float s = (l > 0.0f) ? (maxVal / l) : 0.0f;
+        elem[0] = static_cast<T>(static_cast<int>(x * s + (x >= 0.0f ? 0.5f : -0.5f)));
+        elem[1] = static_cast<T>(static_cast<int>(y * s + (y >= 0.0f ? 0.5f : -0.5f)));
+        elem[2] = static_cast<T>(static_cast<int>(z * s + (z >= 0.0f ? 0.5f : -0.5f)));
+        std::memcpy(raw + i * 4u * sizeof(T), elem, sizeof(elem));
+    }
+}
+
+inline void ApplyMeshoptFilterQuaternion(uint8_t* raw, size_t count) {
+    const float scale = 32767.0f / std::sqrt(2.0f);
+    for (size_t i = 0; i < count; ++i) {
+        int16_t elem[4];
+        std::memcpy(elem, raw + i * 8u, 8);
+        int sf = elem[3] | 3;
+        float s = static_cast<float>(sf);
+        float x = static_cast<float>(elem[0]);
+        float y = static_cast<float>(elem[1]);
+        float z = static_cast<float>(elem[2]);
+        float ww = s * s * 2.0f - x * x - y * y - z * z;
+        float w = std::sqrt(ww >= 0.0f ? ww : 0.0f);
+        float ss = (s != 0.0f) ? (scale / s) : 0.0f;
+        int xf = static_cast<int>(x * ss + (x >= 0.0f ? 0.5f : -0.5f));
+        int yf = static_cast<int>(y * ss + (y >= 0.0f ? 0.5f : -0.5f));
+        int zf = static_cast<int>(z * ss + (z >= 0.0f ? 0.5f : -0.5f));
+        int wf = static_cast<int>(w * ss + 0.5f);
+        int qc = elem[3] & 3;
+        int16_t out[4];
+        out[(qc + 1) & 3] = static_cast<int16_t>(xf);
+        out[(qc + 2) & 3] = static_cast<int16_t>(yf);
+        out[(qc + 3) & 3] = static_cast<int16_t>(zf);
+        out[(qc + 0) & 3] = static_cast<int16_t>(wf);
+        std::memcpy(raw + i * 8u, out, 8);
+    }
 }
 
 inline void ApplyMeshoptFilterExponential(uint8_t* data, size_t count, size_t stride) {
@@ -1341,9 +2776,31 @@ inline void ApplyMeshoptFilterExponential(uint8_t* data, size_t count, size_t st
         int32_t v = 0;
         std::memcpy(&v, data + i * 4u, 4);
         int32_t exp = v >> 24;
-        int32_t mant = (v << 8) >> 8; // sign-extend 24-bit signed mantissa
+        int32_t mant = (v << 8) >> 8;
         float f = std::ldexp(static_cast<float>(mant), exp);
         std::memcpy(data + i * 4u, &f, 4);
+    }
+}
+
+template <typename ST, typename T>
+inline void ApplyMeshoptFilterColor(uint8_t* raw, size_t count) {
+    const float maxVal = static_cast<float>((1 << (sizeof(T) * 8)) - 1);
+    for (size_t i = 0; i < count; ++i) {
+        T elem[4];
+        std::memcpy(elem, raw + i * 4u * sizeof(T), sizeof(elem));
+        int as = elem[3];
+        as |= as >> 1; as |= as >> 2; as |= as >> 4; as |= as >> 8;
+        int y = elem[0], co = static_cast<ST>(elem[1]), cg = static_cast<ST>(elem[2]);
+        int r = y + co - cg;
+        int g = y + cg;
+        int b = y - co - cg;
+        int a = ((static_cast<int>(elem[3]) << 1) & as) | (static_cast<int>(elem[3]) & 1);
+        float ss = (as > 0) ? (maxVal / static_cast<float>(as)) : 0.0f;
+        elem[0] = static_cast<T>(static_cast<int>(static_cast<float>(r) * ss + 0.5f));
+        elem[1] = static_cast<T>(static_cast<int>(static_cast<float>(g) * ss + 0.5f));
+        elem[2] = static_cast<T>(static_cast<int>(static_cast<float>(b) * ss + 0.5f));
+        elem[3] = static_cast<T>(static_cast<int>(static_cast<float>(a) * ss + 0.5f));
+        std::memcpy(raw + i * 4u * sizeof(T), elem, sizeof(elem));
     }
 }
 
@@ -1377,6 +2834,7 @@ inline bool DecodeMeshoptTriangles(
     const uint8_t* code = src + 1;
     const uint8_t* data = code + triCount;
     const uint8_t* dataSafeEnd = src + srcSize - 16u;
+    const uint8_t* streamEnd   = src + srcSize;
     const uint8_t* codeauxTable = dataSafeEnd;
 
     int fecmax = (version >= 1u) ? 13 : 15;
@@ -1400,7 +2858,7 @@ inline bool DecodeMeshoptTriangles(
     };
     auto decodeIndexDelta = [&](uint32_t& outIdx) -> bool {
         uint32_t v = 0;
-        if (!ReadMeshoptVByte(data, dataSafeEnd, v)) return false;
+        if (!ReadMeshoptVByte(data, streamEnd, v)) return false;
         uint32_t d = Unzigzag32(v);
         last += d;
         outIdx = last;
@@ -1432,8 +2890,9 @@ inline bool DecodeMeshoptTriangles(
                 next += fec0 ? 1u : 0u;
                 pushVertexFifo(c, fec0);
             } else {
+                if (data > dataSafeEnd) return false;
                 if (fec != 15) {
-                    c = last + static_cast<uint32_t>(fec - (fec ^ 3)); // v1 small delta
+                    c = last + static_cast<uint32_t>(fec * 2 - 27);
                     last = c;
                 } else {
                     if (!decodeIndexDelta(c)) return false;
@@ -1446,7 +2905,6 @@ inline bool DecodeMeshoptTriangles(
             writeIdx(i * 3u + 1, b);
             writeIdx(i * 3u + 2, c);
         } else {
-            // Restart triangle (0xF0 .. 0xFF)
             if (codetri < 0xFEu) {
                 uint8_t aux = codeauxTable[codetri & 15u];
                 int feb = aux >> 4;
@@ -1471,23 +2929,22 @@ inline bool DecodeMeshoptTriangles(
                 writeIdx(i * 3u + 1, b);
                 writeIdx(i * 3u + 2, c);
             } else {
-                uint8_t extra = (codetri == 0xFEu) ? *data++ : *data++;
                 if (data > dataSafeEnd) return false;
+                uint8_t extra = *data++;
                 int fea = (codetri == 0xFEu) ? 0 : 15;
                 int feb = extra >> 4;
                 int fec = extra & 15;
+                if (extra == 0u) next = 0u; // v1 reset code!
 
-                uint32_t a = 0, b = 0, c = 0;
-                if (fea == 0) { a = next++; } else { if (!decodeIndexDelta(a)) return false; }
-                if (feb == 0) { b = next++; }
-                else if (feb < 15) { b = vertexfifo[(vertexfifoOffset - static_cast<size_t>(feb)) & 15u]; }
-                else { if (!decodeIndexDelta(b)) return false; }
+                uint32_t a = (fea == 0) ? next++ : 0u;
+                uint32_t b = (feb == 0) ? next++ : vertexfifo[(vertexfifoOffset - static_cast<size_t>(feb)) & 15u];
+                uint32_t c = (fec == 0) ? next++ : vertexfifo[(vertexfifoOffset - static_cast<size_t>(fec)) & 15u];
 
-                if (fec == 0) { c = next++; }
-                else if (fec < 15) { c = vertexfifo[(vertexfifoOffset - static_cast<size_t>(fec)) & 15u]; }
-                else { if (!decodeIndexDelta(c)) return false; }
+                if (fea == 15 && !decodeIndexDelta(a)) return false;
+                if (feb == 15 && !decodeIndexDelta(b)) return false;
+                if (fec == 15 && !decodeIndexDelta(c)) return false;
 
-                pushVertexFifo(a, fea == 0 || fea == 15);
+                pushVertexFifo(a);
                 pushVertexFifo(b, feb == 0 || feb == 15);
                 pushVertexFifo(c, fec == 0 || fec == 15);
                 pushEdgeFifo(b, a);
@@ -1499,12 +2956,52 @@ inline bool DecodeMeshoptTriangles(
             }
         }
     }
-    return true;
+    return data == dataSafeEnd;
+}
+
+// Meshopt INDICES (0xD0 / 0xD1): dual-baseline VByte zigzag delta index sequence (meshopt_decodeIndexSequence)
+inline bool DecodeMeshoptIndices(
+    const uint8_t* src,
+    size_t srcSize,
+    size_t indexCount,
+    size_t indexSize,
+    std::vector<uint8_t>& dst)
+{
+    if (!src || (indexSize != 2u && indexSize != 4u)) return false;
+    if (srcSize < 1u + indexCount + 4u) return false;
+    if ((src[0] & 0xF0u) != 0xD0u) return false;
+    uint8_t version = src[0] & 0x0Fu;
+    if (version > 1u) return false;
+
+    const uint8_t* data = src + 1;
+    const uint8_t* dataSafeEnd = src + srcSize - 4u;
+    const uint8_t* streamEnd   = src + srcSize;
+    uint32_t last[2] = { 0u, 0u };
+
+    dst.resize(indexCount * indexSize);
+    for (size_t i = 0; i < indexCount; ++i) {
+        if (data >= dataSafeEnd) return false;
+        uint32_t v = 0;
+        if (!ReadMeshoptVByte(data, streamEnd, v)) return false;
+        uint32_t current = v & 1u;
+        v >>= 1;
+        uint32_t d = Unzigzag32(v);
+        uint32_t index = last[current] + d;
+        last[current] = index;
+
+        if (indexSize == 2u) {
+            uint16_t v16 = static_cast<uint16_t>(index);
+            std::memcpy(dst.data() + i * 2u, &v16, 2);
+        } else {
+            std::memcpy(dst.data() + i * 4u, &index, 4);
+        }
+    }
+    return data == dataSafeEnd;
 }
 
 } // namespace MeshoptCodec
 
-inline bool DecodeMeshoptBufferView(
+E2_DRACO_NOINLINE inline bool DecodeMeshoptBufferView(
     const uint8_t* src,
     size_t srcSize,
     size_t count,
@@ -1519,14 +3016,38 @@ inline bool DecodeMeshoptBufferView(
 
     if (mode == "ATTRIBUTES") {
         if (!MeshoptCodec::DecodeMeshoptAttributes(src, srcSize, count, byteStride, outDecoded)) return false;
+        if (filter.empty() || filter == "NONE") {
+            return true;
+        }
+        if (filter == "OCTAHEDRAL") {
+            if (byteStride == 4u) MeshoptCodec::ApplyMeshoptFilterOctahedral<int8_t>(outDecoded.data(), count);
+            else if (byteStride == 8u) MeshoptCodec::ApplyMeshoptFilterOctahedral<int16_t>(outDecoded.data(), count);
+            else return false;
+            return true;
+        }
+        if (filter == "QUATERNION") {
+            if (byteStride != 8u) return false;
+            MeshoptCodec::ApplyMeshoptFilterQuaternion(outDecoded.data(), count);
+            return true;
+        }
         if (filter == "EXPONENTIAL") {
             if ((byteStride % 4u) != 0u) return false;
             MeshoptCodec::ApplyMeshoptFilterExponential(outDecoded.data(), count, byteStride);
+            return true;
         }
-        return true;
+        if (filter == "COLOR") {
+            if (byteStride == 4u) MeshoptCodec::ApplyMeshoptFilterColor<int8_t, uint8_t>(outDecoded.data(), count);
+            else if (byteStride == 8u) MeshoptCodec::ApplyMeshoptFilterColor<int16_t, uint16_t>(outDecoded.data(), count);
+            else return false;
+            return true;
+        }
+        return false;
     }
     if (mode == "TRIANGLES") {
         return MeshoptCodec::DecodeMeshoptTriangles(src, srcSize, count, byteStride, outDecoded);
+    }
+    if (mode == "INDICES") {
+        return MeshoptCodec::DecodeMeshoptIndices(src, srcSize, count, byteStride, outDecoded);
     }
     return false;
 }
