@@ -1582,7 +1582,7 @@ int TransferManager::EnqueueTransfer(
     const TransferConfig* overrideCfg)
 {
     std::wstring cleanTarget = PathUtils::TrimTrailingSlashes(targetDir);
-    if (sources.empty() || cleanTarget.empty() || cleanTarget == L"THIS_PC") return 0;
+    if (sources.empty() || cleanTarget.empty() || IsVirtualFolder(cleanTarget)) return 0;
 
     if (!m_running.load()) {
         Initialize(m_notifyHwnd);
@@ -1594,7 +1594,7 @@ int TransferManager::EnqueueTransfer(
 
     for (const auto& rawSrc : sources) {
         std::wstring s = PathUtils::TrimTrailingSlashes(rawSrc);
-        if (s.empty() || s == L"THIS_PC") continue;
+        if (s.empty() || IsVirtualFolder(s)) continue;
         std::wstring spNorm = PathUtils::NormalizePathKey(s);
 
         // Moving an item into its own current parent folder is a no-op;
@@ -1660,7 +1660,7 @@ int TransferManager::EnqueueDelete(
     std::unordered_set<std::wstring> allKeys;
     for (const auto& raw : paths) {
         std::wstring p = PathUtils::TrimTrailingSlashes(raw);
-        if (p.empty() || p == L"THIS_PC") continue;
+        if (p.empty() || IsVirtualFolder(p)) continue;
         if (IsDeleteRefused(p)) {
             // A whole drive, a share root or a relative path never even becomes part of a job
             AppLog::Warn(L"Delete", L"Refused to delete: " + p);
@@ -3861,7 +3861,7 @@ bool TransferManager::IsDeleteRefused(const std::wstring& rawPath) {
     for (wchar_t& ch : p) {
         if (ch == L'/') ch = L'\\';
     }
-    if (p.empty() || p == L"THIS_PC") return true;
+    if (p.empty() || IsVirtualFolder(p)) return true;
 
     // Judge "\\?\C:\x" like "C:\x" and "\\?\UNC\server\share\x" like "\\server\share\x"
     if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) p = L"\\\\" + p.substr(8);

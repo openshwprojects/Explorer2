@@ -2405,7 +2405,7 @@ void FileContentPane::LoadDirectoryPreview(const std::wstring& folderPath, bool 
     m_dirSelectedIdx = -1;
     m_dirHoverIdx = -1;
 
-    if (folderPath.empty() || folderPath == L"THIS_PC") {
+    if (folderPath.empty() || IsVirtualFolder(folderPath)) {
         StopWaitingForPreview();
         m_dirPreviewPath = folderPath;
         return;

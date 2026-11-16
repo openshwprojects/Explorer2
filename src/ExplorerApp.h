@@ -259,6 +259,8 @@ private:
     void ExecuteRibbonCommand(int cmdId);
     void ActivateFocusedOrSelectedItem();
     void DeleteSelectedItems(bool permanent);
+    void RestoreRecycleBinItems(bool restoreAll = false, int singleRowIndex = -1);
+    void EmptyRecycleBinAction();
     void StartDeleteJob(const std::vector<std::wstring>& paths, bool permanent);
     bool ReportDeleteJobResult(const TransferCompletionEvent& ev);
     void ShowDeleteFailures(const TransferCompletionEvent& ev);

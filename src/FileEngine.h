@@ -38,6 +38,13 @@ struct FolderSizeTask {
     uint64_t generation = 0;
 };
 
+struct RecycleBinRecord {
+    uint64_t version = 0;       // 1 = Vista / Win7 SP1, 2 = Win10 / Win11
+    uint64_t fileSize = 0;
+    FILETIME deletedTime = {};
+    std::wstring originalPath;
+};
+
 class FileEngine {
 public:
     FileEngine();
@@ -145,6 +152,11 @@ public:
     static bool CopyTextToClipboard(HWND hwnd, const std::wstring& text);
 
     // File management operations
+    static std::wstring ResolveAddressInput(std::wstring_view rawInput, const std::wstring& currentDir = L"");
+    static bool ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord);
+    static bool GetRecycleBinCompanionInfoPath(const std::wstring& dataPath, std::wstring& outInfoPath);
+    static bool RestoreRecycleBinItem(const std::wstring& dataPath, Lang lang, std::wstring& outRestoredPath, DWORD* outError = nullptr);
+    static bool DeleteRecycleBinItemPermanently(const std::wstring& dataPath, DWORD* outError = nullptr);
     static bool CreateNewFolder(const std::wstring& parentDir, const std::wstring& baseName, std::wstring& outCreatedPath);
     static bool RenameFileOrFolder(const std::wstring& oldPath, const std::wstring& newName, std::wstring& outNewPath, DWORD* outError = nullptr);
     static void MergeDirectoryContents(const std::wstring& srcDir, const std::wstring& dstDir, std::atomic<int>* progressCounter, MergeFolderResult& outResult);

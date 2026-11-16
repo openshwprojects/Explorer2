@@ -156,6 +156,15 @@ struct Strings {
     const wchar_t* dlgNewFolderDefault;
     const wchar_t* viewerHelpHint;
     const wchar_t* viewerNoImages;
+
+    // Recycle Bin ("Kosz") virtual folder
+    const wchar_t* navRecycleBin;
+    const wchar_t* colOriginalLocation;
+    const wchar_t* colDateDeleted;
+    const wchar_t* btnRowRestore;
+    const wchar_t* ctxRestore;
+    const wchar_t* ctxRestoreAll;
+    const wchar_t* ctxEmptyRecycleBin;
 };
 
 inline const Strings kStringsPL = {
@@ -236,7 +245,15 @@ inline const Strings kStringsPL = {
     L"Zmień nazwę",
     L"Nowy folder",
     L"[←/→] Nawigacja   [Del] Kosz   [Shift+Del] Trwale usuń   [Scroll] Zoom   [1] 100%   [0] Dopasuj   [F11] Pełny ekran   [Esc/Space] Wróć",
-    L"Brak obrazów w tym folderze (wybierz obraz lub przełącz widok)"
+    L"Brak obrazów w tym folderze (wybierz obraz lub przełącz widok)",
+
+    L"Kosz",
+    L"Oryginalna lokalizacja",
+    L"Data usunięcia",
+    L"Przywróć",
+    L"Przywróć",
+    L"Przywróć wszystkie elementy",
+    L"Opróżnij Kosz"
 };
 
 inline const Strings kStringsEN = {
@@ -317,7 +334,15 @@ inline const Strings kStringsEN = {
     L"Rename",
     L"New folder",
     L"[←/→] Prev/Next   [Del] Recycle   [Shift+Del] Perm Delete   [Scroll] Zoom   [1] 100%   [0] Fit   [F11] Fullscreen   [Esc/Space] Back",
-    L"No images in this folder (select an image or switch view mode)"
+    L"No images in this folder (select an image or switch view mode)",
+
+    L"Recycle Bin",
+    L"Original location",
+    L"Date deleted",
+    L"Restore",
+    L"Restore",
+    L"Restore all items",
+    L"Empty Recycle Bin"
 };
 
 inline const Strings& GetStrings(Lang lang) {

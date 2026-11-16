@@ -9,14 +9,37 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <sddl.h>
 #include <algorithm>
 #include <cwctype>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace Explorer2 {
+
+static std::wstring GetCurrentUserSidString() {
+    static std::wstring s_cachedSid;
+    static std::once_flag s_once;
+    std::call_once(s_once, []() {
+        HANDLE token = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            BYTE tokenBuf[256] = {};
+            DWORD len = 0;
+            if (GetTokenInformation(token, TokenUser, tokenBuf, sizeof(tokenBuf), &len)) {
+                LPWSTR sidText = nullptr;
+                if (ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(tokenBuf)->User.Sid, &sidText) && sidText) {
+                    s_cachedSid = sidText;
+                    LocalFree(sidText);
+                }
+            }
+            CloseHandle(token);
+        }
+    });
+    return s_cachedSid;
+}
 
 // Reads HKCU\Network\<Letter>\RemotePath in <0.005ms without touching the network!
 // Formats "\\NAS191725\Backup" on 'X' as "Backup (\\NAS191725) (X:)" matching Windows 10 Explorer.
@@ -342,7 +365,18 @@ void FileEngine::Shutdown() {
 
 void FileEngine::WatchDirectory(const std::wstring& dirPath) {
     std::wstring clean = PathUtils::TrimTrailingSlashes(dirPath);
-    if (clean == L"THIS_PC" || FtpClient::IsFtpPath(clean) || ArchiveExplorer::IsVirtualArchivePath(clean)) {
+    if (clean == L"RECYCLE_BIN") {
+        clean.clear();
+        wchar_t sysDir[MAX_PATH] = {};
+        std::wstring sid = GetCurrentUserSidString();
+        if (!sid.empty() && GetWindowsDirectoryW(sysDir, MAX_PATH) >= 3 && sysDir[1] == L':') {
+            std::wstring candidate = std::wstring(sysDir, 2) + L"\\$Recycle.Bin\\" + sid;
+            DWORD attrs = GetFileAttributesW(candidate.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                clean = std::move(candidate);
+            }
+        }
+    } else if (clean == L"THIS_PC" || FtpClient::IsFtpPath(clean) || ArchiveExplorer::IsVirtualArchivePath(clean)) {
         clean.clear();
     } else if (!clean.empty()) {
         DWORD attrs = GetFileAttributesW(clean.c_str());
@@ -667,6 +701,119 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
         return results;
     }
 
+    if (dirPath == L"RECYCLE_BIN") {
+        const std::wstring sid = GetCurrentUserSidString();
+        const ExtTypeInfo dirExtInfo = GetExtensionInfo(L"", true, lang);
+        std::wstring lastExt = L"__INIT__";
+        ExtTypeInfo lastExtInfo = {};
+
+        DWORD drivesMask = GetLogicalDrives();
+        wchar_t rootPath[] = L"A:\\";
+        for (int i = 0; i < 26; ++i) {
+            if (!(drivesMask & (1 << i))) continue;
+            wchar_t dlChar = static_cast<wchar_t>(L'A' + i);
+            rootPath[0] = dlChar;
+            UINT dtype = GetDriveTypeW(rootPath);
+            if (dtype != DRIVE_FIXED && dtype != DRIVE_REMOVABLE) continue;
+            // Skip legacy A:/B: floppy slots unless explicitly fixed
+            if (dtype == DRIVE_REMOVABLE && (dlChar == L'A' || dlChar == L'B')) continue;
+
+            std::vector<std::wstring> binDirs;
+            std::wstring baseBin = std::wstring(1, dlChar) + L":\\$Recycle.Bin";
+            DWORD baseAttrs = GetFileAttributesW(baseBin.c_str());
+            if (baseAttrs == INVALID_FILE_ATTRIBUTES || !(baseAttrs & FILE_ATTRIBUTE_DIRECTORY)) continue;
+
+            if (!sid.empty()) {
+                std::wstring sidBin = baseBin + L"\\" + sid;
+                DWORD sidAttrs = GetFileAttributesW(sidBin.c_str());
+                if (sidAttrs != INVALID_FILE_ATTRIBUTES && (sidAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    binDirs.push_back(std::move(sidBin));
+                }
+            }
+            binDirs.push_back(std::move(baseBin)); // Also covers FAT32 / exFAT flat $Recycle.Bin
+
+            for (const std::wstring& binDir : binDirs) {
+                WIN32_FIND_DATAW ffd = {};
+                HANDLE hFind = FindFirstFileExW(
+                    (binDir + L"\\$I*").c_str(),
+                    FindExInfoBasic,
+                    &ffd,
+                    FindExSearchNameMatch,
+                    nullptr,
+                    FIND_FIRST_EX_LARGE_FETCH);
+                if (hFind == INVALID_HANDLE_VALUE) continue;
+
+                do {
+                    if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    const wchar_t* fn = ffd.cFileName;
+                    if (!fn || fn[0] != L'$' || (fn[1] != L'I' && fn[1] != L'i') || fn[2] == L'\0') continue;
+
+                    std::wstring infoPath = binDir + L"\\" + fn;
+                    std::wstring dataPath = binDir + L"\\$R" + (fn + 2);
+
+                    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+                    if (!GetFileAttributesExW(dataPath.c_str(), GetFileExInfoStandard, &fad)) continue;
+
+                    std::vector<uint8_t> raw;
+                    RecycleBinRecord rec;
+                    if (!PathUtils::ReadFileBytes(infoPath, 65536, raw) || !ParseRecycleBinInfoBytes(raw, rec)) continue;
+
+                    FileEntry entry;
+                    entry.name = PathUtils::GetFileName(rec.originalPath);
+                    if (entry.name.empty()) entry.name = dataPath.substr(binDir.size() + 1);
+                    entry.originalPath = rec.originalPath;
+                    entry.fullPath = dataPath;
+                    entry.normKey = PathUtils::NormalizePathKey(dataPath);
+                    entry.attributes = fad.dwFileAttributes;
+                    entry.isDirectory = (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    entry.isHidden = false;
+                    entry.writeTime = rec.deletedTime;
+                    entry.dateStr = FormatFileTime(rec.deletedTime);
+
+                    uint64_t diskSize = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+                    entry.size = (rec.fileSize > 0) ? rec.fileSize : (entry.isDirectory ? 0ULL : diskSize);
+                    entry.sizeStr = (entry.isDirectory && entry.size == 0) ? L"" : FormatSizeKB(entry.size);
+
+                    if (!entry.isDirectory) {
+                        entry.ext = PathUtils::GetExtension(entry.name);
+                        entry.displayName = showExtensions ? entry.name : PathUtils::GetStem(entry.name, false);
+                        entry.isImage = IsImageExtension(entry.ext);
+                        entry.isVideo = IsVideoExtension(entry.ext);
+                        entry.isAudio = IsAudioExtension(entry.ext);
+                        if (entry.ext != lastExt) {
+                            lastExt = entry.ext;
+                            lastExtInfo = GetExtensionInfo(entry.ext, false, lang);
+                        }
+                        entry.sysIconIndex = lastExtInfo.sysIconIndex;
+                    } else {
+                        entry.displayName = entry.name;
+                        entry.sysIconIndex = dirExtInfo.sysIconIndex;
+                    }
+
+                    std::wstring origDir = PathUtils::GetParentPath(rec.originalPath);
+                    entry.typeName = !origDir.empty()
+                        ? origDir
+                        : (entry.isDirectory ? dirExtInfo.typeName : lastExtInfo.typeName);
+
+                    results.push_back(std::move(entry));
+                } while (FindNextFileW(hFind, &ffd));
+
+                FindClose(hFind);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_deleteStateMutex);
+            if (!m_pendingDeleteKeys.empty()) {
+                results.erase(std::remove_if(results.begin(), results.end(), [this](const FileEntry& e) {
+                    return m_pendingDeleteKeys.count(e.normKey) != 0;
+                }), results.end());
+            }
+        }
+        SyncDirectorySizes(results);
+        return results;
+    }
+
     if (FtpClient::IsFtpPath(dirPath)) {
         FtpClient::EnumerateFtpDirectory(dirPath, showHidden, showExtensions, lang, results, nullptr);
         std::wstring lastExt = L"__INIT__";
@@ -938,6 +1085,18 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
         }
     }
 
+    // Recycle Bin ("Kosz") virtual folder at top level
+    {
+        TreeNode binNode;
+        binNode.label = s.navRecycleBin;
+        binNode.path = L"RECYCLE_BIN";
+        binNode.normKey = L"__RECYCLE_BIN__";
+        binNode.indent = 0;
+        binNode.hasChildren = false;
+        binNode.isExpanded = false;
+        nodes.push_back(std::move(binNode));
+    }
+
     // 2. This PC ("Ten komputer", expanded by default)
     TreeNode pcHeader;
     pcHeader.label = s.navThisPC;
@@ -1092,7 +1251,7 @@ std::vector<TreeNode> FileEngine::EnumerateSubfoldersForTree(
     bool isQuickAccessBranch)
 {
     std::vector<TreeNode> subNodes;
-    if (parentPath.empty() || parentPath == L"THIS_PC") return subNodes;
+    if (parentPath.empty() || IsVirtualFolder(parentPath)) return subNodes;
 
     if (FtpClient::IsFtpPath(parentPath)) {
         std::vector<FileEntry> ftpEntries;
@@ -1592,7 +1751,7 @@ bool FileEngine::ReadFilesFromClipboard(HWND hwnd, std::vector<std::wstring>& ou
 
 bool FileEngine::PasteFilesFromClipboard(HWND hwnd, const std::wstring& targetDir, bool& outWasCut) {
     outWasCut = false;
-    if (targetDir.empty() || targetDir == L"THIS_PC") return false;
+    if (targetDir.empty() || IsVirtualFolder(targetDir)) return false;
 
     bool isMove = false;
     std::vector<std::wstring> srcPaths;
@@ -1653,8 +1812,284 @@ bool FileEngine::CopyTextToClipboard(HWND hwnd, const std::wstring& text) {
     return true;
 }
 
+std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const std::wstring& currentDir) {
+    std::wstring s = PathUtils::Trim(rawInput);
+    if (s.size() >= 2 && ((s.front() == L'"' && s.back() == L'"') || (s.front() == L'\'' && s.back() == L'\''))) {
+        s = PathUtils::Trim(std::wstring_view(s).substr(1, s.size() - 2));
+    }
+    if (s.empty()) return L"";
+
+    if (s.find(L'%') != std::wstring::npos) {
+        wchar_t expanded[2048] = {};
+        DWORD n = ExpandEnvironmentStringsW(s.c_str(), expanded, static_cast<DWORD>(std::size(expanded)));
+        if (n > 0 && n < std::size(expanded)) {
+            s = PathUtils::Trim(expanded);
+        }
+    }
+
+    std::wstring clean = PathUtils::TrimTrailingSlashes(s);
+    std::wstring low = PathUtils::ToLower(clean);
+
+    // 1. Recycle Bin ("Kosz") aliases — matches Windows Explorer address bar behavior
+    if (low == L"kosz" ||
+        low == L"recycle bin" ||
+        low == L"recyclebin" ||
+        low == L"recycle_bin" ||
+        low == L"dustbin" ||
+        low == L"trash" ||
+        low == L"shell:recyclebinfolder" ||
+        low == L"::{645ff040-5081-101b-9f08-00aa002f954e}") {
+        return L"RECYCLE_BIN";
+    }
+
+    // 2. This PC ("Ten komputer") aliases
+    if (low == L"ten komputer" ||
+        low == L"this pc" ||
+        low == L"this_pc" ||
+        low == L"mój komputer" ||
+        low == L"moj komputer" ||
+        low == L"my computer" ||
+        low == L"komputer" ||
+        low == L"computer" ||
+        low == L"shell:mycomputerfolder" ||
+        low == L"::{20d04fe0-3aea-1069-a2d8-08002b30309d}") {
+        return L"THIS_PC";
+    }
+
+    // 3. Standard user Known Folders when typed as bare shell aliases in top bar
+    auto resolveKnown = [](REFKNOWNFOLDERID rfid) -> std::wstring {
+        PWSTR psz = nullptr;
+        std::wstring out;
+        if (SUCCEEDED(SHGetKnownFolderPath(rfid, 0, nullptr, &psz)) && psz) {
+            out = PathUtils::TrimTrailingSlashes(psz);
+            CoTaskMemFree(psz);
+        }
+        return out;
+    };
+    if (low == L"pulpit" || low == L"desktop" || low == L"shell:desktop") {
+        std::wstring p = resolveKnown(FOLDERID_Desktop);
+        if (!p.empty()) return p;
+    } else if (low == L"pobrane" || low == L"downloads" || low == L"shell:downloads") {
+        std::wstring p = resolveKnown(FOLDERID_Downloads);
+        if (!p.empty()) return p;
+    } else if (low == L"dokumenty" || low == L"documents" || low == L"moje dokumenty" || low == L"shell:personal") {
+        std::wstring p = resolveKnown(FOLDERID_Documents);
+        if (!p.empty()) return p;
+    } else if (low == L"obrazy" || low == L"pictures" || low == L"shell:mypictures") {
+        std::wstring p = resolveKnown(FOLDERID_Pictures);
+        if (!p.empty()) return p;
+    }
+
+    // 4. Relative child path inside current local folder (e.g. ".\Kosz" or typing a subfolder name)
+    if (!FtpClient::IsFtpPath(clean) &&
+        !(clean.size() >= 2 && clean[1] == L':') &&
+        clean.rfind(L"\\\\", 0) != 0 &&
+        !currentDir.empty() && !IsVirtualFolder(currentDir) && !FtpClient::IsFtpPath(currentDir))
+    {
+        std::wstring relPart = clean;
+        if (relPart.rfind(L".\\", 0) == 0 || relPart.rfind(L"./", 0) == 0) {
+            relPart = relPart.substr(2);
+        }
+        if (!relPart.empty()) {
+            std::wstring candidate = PathUtils::EnsureTrailingSlash(currentDir) + relPart;
+            wchar_t fullBuf[MAX_PATH * 4] = {};
+            DWORD fn = GetFullPathNameW(candidate.c_str(), static_cast<DWORD>(std::size(fullBuf)), fullBuf, nullptr);
+            std::wstring resolved = (fn > 0 && fn < std::size(fullBuf))
+                ? PathUtils::TrimTrailingSlashes(fullBuf)
+                : PathUtils::TrimTrailingSlashes(candidate);
+            DWORD attrs = GetFileAttributesW(resolved.c_str());
+            if ((attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) ||
+                ArchiveExplorer::IsVirtualArchivePath(resolved)) {
+                return resolved;
+            }
+        }
+    }
+
+    return clean;
+}
+
+bool FileEngine::ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord) {
+    outRecord = {};
+    if (raw.size() < 26) return false;
+
+    uint64_t version = 0;
+    uint64_t fileSize = 0;
+    FILETIME deletedTime = {};
+    std::memcpy(&version, raw.data(), sizeof(version));
+    std::memcpy(&fileSize, raw.data() + 8, sizeof(fileSize));
+    std::memcpy(&deletedTime, raw.data() + 16, sizeof(deletedTime));
+
+    std::wstring orig;
+    if (version == 1) {
+        // Windows Vista / Windows 7 SP1 fixed 544-byte layout: 24-byte header + wchar_t[260]
+        size_t maxChars = std::min<size_t>((raw.size() - 24) / sizeof(wchar_t), 260);
+        if (maxChars == 0) return false;
+        std::vector<wchar_t> wbuf(maxChars, L'\0');
+        std::memcpy(wbuf.data(), raw.data() + 24, maxChars * sizeof(wchar_t));
+        size_t len = 0;
+        while (len < maxChars && wbuf[len] != L'\0') ++len;
+        orig.assign(wbuf.data(), len);
+    } else if (version == 2) {
+        // Windows 10 / Windows 11 variable-length layout: 24-byte header + uint32_t charCount + wchar_t[charCount]
+        if (raw.size() < 28) return false;
+        uint32_t chars = 0;
+        std::memcpy(&chars, raw.data() + 24, sizeof(chars));
+        if (chars == 0 || chars > 32768 || 28 + static_cast<size_t>(chars) * sizeof(wchar_t) > raw.size()) {
+            return false;
+        }
+        std::vector<wchar_t> wbuf(chars, L'\0');
+        std::memcpy(wbuf.data(), raw.data() + 28, static_cast<size_t>(chars) * sizeof(wchar_t));
+        size_t len = 0;
+        while (len < chars && wbuf[len] != L'\0') ++len;
+        orig.assign(wbuf.data(), len);
+    } else {
+        return false;
+    }
+
+    if (orig.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+        orig = L"\\\\" + orig.substr(8);
+    } else if (orig.rfind(L"\\\\?\\", 0) == 0 && orig.size() > 6 && orig[5] == L':') {
+        orig.erase(0, 4);
+    }
+    orig = PathUtils::TrimTrailingSlashes(orig);
+    if (orig.empty()) return false;
+
+    outRecord.version = version;
+    outRecord.fileSize = fileSize;
+    outRecord.deletedTime = deletedTime;
+    outRecord.originalPath = std::move(orig);
+    return true;
+}
+
+bool FileEngine::GetRecycleBinCompanionInfoPath(const std::wstring& dataPath, std::wstring& outInfoPath) {
+    outInfoPath.clear();
+    std::wstring clean = PathUtils::TrimTrailingSlashes(dataPath);
+    if (clean.empty()) return false;
+
+    std::wstring parentDir = PathUtils::GetParentPath(clean);
+    std::wstring leaf = PathUtils::GetFileName(clean);
+    if (parentDir.empty() || leaf.size() < 3 || leaf[0] != L'$' || (leaf[1] != L'R' && leaf[1] != L'r')) {
+        return false;
+    }
+
+    std::wstring parentNorm = PathUtils::NormalizePathKey(parentDir);
+    if (parentNorm.find(L"\\$recycle.bin") == std::wstring::npos) {
+        return false;
+    }
+
+    outInfoPath = PathUtils::EnsureTrailingSlash(parentDir) + L"$I" + leaf.substr(2);
+    return true;
+}
+
+bool FileEngine::RestoreRecycleBinItem(
+    const std::wstring& dataPath,
+    Lang lang,
+    std::wstring& outRestoredPath,
+    DWORD* outError)
+{
+    outRestoredPath.clear();
+    if (outError) *outError = 0;
+
+    std::wstring infoPath;
+    if (!GetRecycleBinCompanionInfoPath(dataPath, infoPath)) {
+        if (outError) *outError = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+
+    DWORD dataAttrs = GetFileAttributesW(dataPath.c_str());
+    if (dataAttrs == INVALID_FILE_ATTRIBUTES) {
+        if (outError) *outError = GetLastError();
+        return false;
+    }
+    const bool isDir = (dataAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    std::vector<uint8_t> raw;
+    RecycleBinRecord rec;
+    if (!PathUtils::ReadFileBytes(infoPath, 65536, raw) || !ParseRecycleBinInfoBytes(raw, rec) || rec.originalPath.empty()) {
+        if (outError) *outError = ERROR_INVALID_DATA;
+        return false;
+    }
+
+    std::wstring origParent = PathUtils::GetParentPath(rec.originalPath);
+    if (!origParent.empty() && GetFileAttributesW(origParent.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        int shRes = SHCreateDirectoryExW(nullptr, origParent.c_str(), nullptr);
+        if (shRes != ERROR_SUCCESS && shRes != ERROR_ALREADY_EXISTS && shRes != ERROR_FILE_EXISTS) {
+            if (outError) *outError = static_cast<DWORD>(shRes);
+            return false;
+        }
+    }
+
+    std::wstring targetPath = rec.originalPath;
+    if (GetFileAttributesW(targetPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::wstring origName = PathUtils::GetFileName(rec.originalPath);
+        std::wstring stem = isDir ? origName : PathUtils::GetStem(origName, false);
+        std::wstring ext  = isDir ? L"" : PathUtils::GetExtension(origName);
+        if (!isDir && !ext.empty() && origName.size() >= ext.size()) {
+            // Preserve original extension casing
+            ext = origName.substr(origName.size() - ext.size());
+        }
+        const std::wstring tagBase = (lang == Lang::PL) ? L" (przywrócony" : L" (restored";
+        std::wstring parentSlash = PathUtils::EnsureTrailingSlash(origParent);
+        bool foundSlot = false;
+        for (int idx = 1; idx < 1000; ++idx) {
+            std::wstring suffix = (idx == 1) ? (tagBase + L")") : (tagBase + L" " + std::to_wstring(idx) + L")");
+            std::wstring candidate = parentSlash + stem + suffix + ext;
+            if (GetFileAttributesW(candidate.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                targetPath = std::move(candidate);
+                foundSlot = true;
+                break;
+            }
+        }
+        if (!foundSlot) {
+            if (outError) *outError = ERROR_FILE_EXISTS;
+            return false;
+        }
+    }
+
+    if (!MoveFileExW(dataPath.c_str(), targetPath.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+        if (outError) *outError = GetLastError();
+        return false;
+    }
+
+    SetFileAttributesW(infoPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+    DeleteFileW(infoPath.c_str());
+
+    outRestoredPath = std::move(targetPath);
+    return true;
+}
+
+bool FileEngine::DeleteRecycleBinItemPermanently(const std::wstring& dataPath, DWORD* outError) {
+    if (outError) *outError = 0;
+
+    std::wstring infoPath;
+    if (!GetRecycleBinCompanionInfoPath(dataPath, infoPath)) {
+        if (outError) *outError = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+
+    if (GetFileAttributesW(dataPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::vector<TransferFileError> errs;
+        if (!TransferManager::DeleteTreeNow(dataPath, &errs)) {
+            if (outError) *outError = errs.empty() ? ERROR_ACCESS_DENIED : errs[0].win32Error;
+            return false;
+        }
+    }
+
+    if (GetFileAttributesW(infoPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        SetFileAttributesW(infoPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!DeleteFileW(infoPath.c_str())) {
+            DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                if (outError) *outError = err;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool FileEngine::CreateNewFolder(const std::wstring& parentDir, const std::wstring& baseName, std::wstring& outCreatedPath) {
-    if (parentDir.empty() || parentDir == L"THIS_PC") return false;
+    if (parentDir.empty() || IsVirtualFolder(parentDir)) return false;
     std::wstring cleanParent = PathUtils::EnsureTrailingSlash(parentDir);
 
     for (int i = 1; i < 500; ++i) {
@@ -1892,6 +2327,22 @@ void FileEngine::MergeDirectoryContents(const std::wstring& srcDir, const std::w
 }
 
 void FileEngine::OpenFileOrProperties(HWND hwnd, const std::wstring& path, bool propertiesOnly) {
+    if (path == L"RECYCLE_BIN" || path == L"THIS_PC") {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        const int csidl = (path == L"RECYCLE_BIN") ? CSIDL_BITBUCKET : CSIDL_DRIVES;
+        if (SUCCEEDED(SHGetSpecialFolderLocation(hwnd, csidl, &pidl)) && pidl) {
+            SHELLEXECUTEINFOW sei = {};
+            sei.cbSize = sizeof(sei);
+            sei.hwnd = hwnd;
+            sei.fMask = SEE_MASK_INVOKEIDLIST;
+            sei.lpVerb = propertiesOnly ? L"properties" : L"open";
+            sei.lpIDList = pidl;
+            sei.nShow = SW_SHOWNORMAL;
+            ShellExecuteExW(&sei);
+            CoTaskMemFree(pidl);
+        }
+        return;
+    }
     SHELLEXECUTEINFOW sei = {};
     sei.cbSize = sizeof(sei);
     sei.hwnd = hwnd;
@@ -1903,12 +2354,20 @@ void FileEngine::OpenFileOrProperties(HWND hwnd, const std::wstring& path, bool 
 }
 
 void FileEngine::OpenInClassicExplorer(const std::wstring& path, bool selectItem) {
+    if (path == L"RECYCLE_BIN") {
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", L"shell:RecycleBinFolder", nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (path == L"THIS_PC") {
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", L"shell:MyComputerFolder", nullptr, SW_SHOWNORMAL);
+        return;
+    }
     std::wstring params = selectItem ? (L"/select,\"" + path + L"\"") : (L"\"" + path + L"\"");
     ShellExecuteW(nullptr, L"open", L"explorer.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
 }
 
 void FileEngine::OpenTerminalInFolder(const std::wstring& dirPath) {
-    if (dirPath.empty() || dirPath == L"THIS_PC") return;
+    if (dirPath.empty() || IsVirtualFolder(dirPath)) return;
     ShellExecuteW(nullptr, L"open", L"powershell.exe", nullptr, dirPath.c_str(), SW_SHOWNORMAL);
 }
 
@@ -2042,7 +2501,7 @@ void FileEngine::RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, 
         std::lock_guard<std::mutex> lock(m_sizeMutex);
         for (const auto& node : treeNodes) {
             if (node.isHeader || node.isDrive || node.isFtpNode || node.isOffline || node.normKey.empty() || node.path.empty()) continue;
-            if (FtpClient::IsFtpPath(node.path) || ArchiveExplorer::IsVirtualArchivePath(node.path)) continue;
+            if (IsVirtualFolder(node.path) || FtpClient::IsFtpPath(node.path) || ArchiveExplorer::IsVirtualArchivePath(node.path)) continue;
             // Skip massive cloud sync roots (Dropbox / OneDrive at indent 0) during automatic background tree sizing
             // so the 4 folder-size worker threads remain immediately available for active directory browsing!
             if (!forceRefresh && node.indent == 0 && !node.isQuickAccess) continue;
@@ -2125,7 +2584,7 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
         outAborted = true;
         return 0;
     }
-    if (dirPath.empty() || dirPath == L"THIS_PC" || FtpClient::IsFtpPath(dirPath)) {
+    if (dirPath.empty() || IsVirtualFolder(dirPath) || FtpClient::IsFtpPath(dirPath)) {
         return 0;
     }
 
@@ -2540,7 +2999,7 @@ void FileEngine::SearchWorkerLoop() {
             myGen = m_searchGeneration.load(std::memory_order_relaxed);
         }
 
-        if (rootDir.empty() || rootDir == L"THIS_PC" || FtpClient::IsFtpPath(rootDir)) {
+        if (rootDir.empty() || IsVirtualFolder(rootDir) || FtpClient::IsFtpPath(rootDir)) {
             std::lock_guard<std::mutex> lock(m_searchMutex);
             m_searchProgress.isRunning = false;
             m_searchProgress.isFinished = true;

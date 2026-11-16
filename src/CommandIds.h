@@ -391,7 +391,10 @@ enum CommandId : int {
     CMD_XFER_NEW_TRANSFER_DLG    = 1033,
     CMD_CTX_PASTE_VERIFIED       = 1034,
     CMD_CTX_PASTE_NEXT_TO        = 1035,     // item menu: paste into the folder the item is in
-    CMD_CTX_PASTE_INTO_FOLDER    = 1036      // item menu on a folder: paste into that folder
+    CMD_CTX_PASTE_INTO_FOLDER    = 1036,     // item menu on a folder: paste into that folder
+    CMD_CTX_RESTORE_RECYCLE      = 1037,     // Recycle Bin ("Kosz"): restore selected item(s) to original path
+    CMD_CTX_RESTORE_ALL_RECYCLE  = 1038,     // Recycle Bin ("Kosz"): restore all items
+    CMD_CTX_EMPTY_RECYCLE_BIN    = 1039      // Recycle Bin ("Kosz"): empty Recycle Bin across drives
 };
 
 // Layout constants (in DIPs / pixels)

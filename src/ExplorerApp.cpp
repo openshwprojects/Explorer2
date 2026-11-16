@@ -88,6 +88,21 @@ static std::wstring DescribePaths(const std::vector<std::wstring>& paths) {
     if (paths.size() > 1) s += L" (+" + std::to_wstring(paths.size() - 1) + L" more)";
     return s + L"  in  " + PathUtils::GetParentPath(paths[0]);
 }
+
+static std::wstring FormatNavFolderTitle(const std::wstring& path, Lang lang) {
+    const Strings& s = GetStrings(lang);
+    if (path.empty() || path == L"THIS_PC") return s.navThisPC;
+    if (path == L"RECYCLE_BIN") return s.navRecycleBin;
+    if (FtpClient::IsFtpPath(path)) return FtpClient::GetFtpLeafName(path);
+    std::wstring leaf = PathUtils::GetFileName(path);
+    return leaf.empty() ? path : leaf;
+}
+
+static std::wstring NormalizeNavDirKey(const std::wstring& path) {
+    if (path == L"THIS_PC") return L"__HEADER_PC__";
+    if (path == L"RECYCLE_BIN") return L"__RECYCLE_BIN__";
+    return PathUtils::NormalizePathKey(path);
+}
 static ExplorerApp* g_appInstance = nullptr;
 constexpr WORD kEditCancelCode = 0x0FF0;   // sent by InlineEditSubclassProc when the user presses Escape
 
@@ -246,7 +261,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
 
     std::wstring startDir = initialPath;
     if (startDir.empty()) {
-        if (!m_currentPath.empty() && (m_currentPath == L"THIS_PC" || GetFileAttributesW(m_currentPath.c_str()) != INVALID_FILE_ATTRIBUTES)) {
+        if (!m_currentPath.empty() && (IsVirtualFolder(m_currentPath) || GetFileAttributesW(m_currentPath.c_str()) != INVALID_FILE_ATTRIBUTES)) {
             startDir = m_currentPath;
         } else {
             wchar_t cwd[MAX_PATH] = {};
@@ -1093,7 +1108,8 @@ void ExplorerApp::SyncMediaPlayerToSelection() {
 }
 
 void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const std::wstring& selectFileName) {
-    std::wstring cleanPath = PathUtils::TrimTrailingSlashes(path);
+    std::wstring resolvedInput = FileEngine::ResolveAddressInput(path, m_currentPath);
+    std::wstring cleanPath = resolvedInput.empty() ? PathUtils::TrimTrailingSlashes(path) : resolvedInput;
 
     if (FtpClient::IsFtpPath(cleanPath)) {
         std::wstring ftpErr;
@@ -1111,7 +1127,7 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
             InvalidateRect(m_hwnd, nullptr, FALSE);
             return;
         }
-    } else if (cleanPath != L"THIS_PC") {
+    } else if (!IsVirtualFolder(cleanPath)) {
         std::wstring offlineName;
         if (m_fileEngine.IsDriveOffline(cleanPath, m_lang, &offlineName)) {
             m_statusToast = (m_lang == Lang::PL ? L"Dysk jest niedostępny (offline): " : L"Drive is unavailable (offline): ") + offlineName;
@@ -1145,10 +1161,10 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
 
     // If leaving a subfolder back to its parent/ancestor (via Back, Up, or Breadcrumb), remember the subfolder we came from
     std::wstring effectiveSelectName = selectFileName;
-    if (effectiveSelectName.empty() && !prevPath.empty() && prevPath != L"THIS_PC") {
+    if (effectiveSelectName.empty() && !prevPath.empty() && !IsVirtualFolder(prevPath)) {
         if (cleanPath == L"THIS_PC" && prevPath.size() >= 2 && prevPath[1] == L':') {
             effectiveSelectName = prevPath.substr(0, 2) + L"\\";
-        } else if (cleanPath != L"THIS_PC") {
+        } else if (!IsVirtualFolder(cleanPath)) {
             std::wstring cleanPrefix = PathUtils::EnsureTrailingSlash(cleanPath);
             if (prevPath.size() > cleanPrefix.size() &&
                 _wcsnicmp(prevPath.c_str(), cleanPrefix.c_str(), cleanPrefix.size()) == 0) {
@@ -1160,7 +1176,7 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
     }
 
     m_currentPath = cleanPath;
-    m_currentNormKey = (cleanPath == L"THIS_PC") ? L"__HEADER_PC__" : PathUtils::NormalizePathKey(cleanPath);
+    m_currentNormKey = NormalizeNavDirKey(cleanPath);
     RecordVisitedDirectory(m_currentPath);
     m_fileEngine.WatchDirectory(m_currentPath);
 
@@ -1219,9 +1235,7 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
     }
     ResetViewerZoom();
 
-    std::wstring folderTitle = (m_currentPath == L"THIS_PC")
-        ? GetStrings(m_lang).navThisPC
-        : (FtpClient::IsFtpPath(m_currentPath) ? FtpClient::GetFtpLeafName(m_currentPath) : PathUtils::GetFileName(m_currentPath));
+    std::wstring folderTitle = FormatNavFolderTitle(m_currentPath, m_lang);
     SetWindowTextW(m_hwnd, folderTitle.c_str());
 
     m_focusedIndex = -1;
@@ -1287,6 +1301,10 @@ void ExplorerApp::NavigateForward() {
 
 void ExplorerApp::NavigateUp() {
     if (m_currentPath.empty() || m_currentPath == L"THIS_PC") return;
+    if (m_currentPath == L"RECYCLE_BIN") {
+        NavigateTo(L"THIS_PC", true);
+        return;
+    }
     if (FtpClient::IsFtpPath(m_currentPath)) {
         std::wstring childName = FtpClient::GetFtpLeafName(m_currentPath);
         std::wstring parentUrl = FtpClient::GetParentFtpUrl(m_currentPath);
@@ -1374,6 +1392,13 @@ void ExplorerApp::RebuildBreadcrumbs() {
     m_breadcrumbs.push_back(rootSeg);
 
     if (m_currentPath.empty() || m_currentPath == L"THIS_PC") {
+        return;
+    }
+    if (m_currentPath == L"RECYCLE_BIN") {
+        BreadcrumbSegment binSeg;
+        binSeg.label = s.navRecycleBin;
+        binSeg.path = L"RECYCLE_BIN";
+        m_breadcrumbs.push_back(binSeg);
         return;
     }
 
@@ -1543,7 +1568,8 @@ void ExplorerApp::ApplyFilterAndSort() {
         std::wstring needle = PathUtils::ToLower(m_filterText);
         for (const auto& item : m_allItems) {
             std::wstring hay = PathUtils::ToLower(item.name);
-            if (hay.find(needle) != std::wstring::npos) {
+            if (hay.find(needle) != std::wstring::npos ||
+                (!item.originalPath.empty() && PathUtils::ToLower(item.originalPath).find(needle) != std::wstring::npos)) {
                 m_items.push_back(item);
             }
         }
@@ -1661,7 +1687,7 @@ void ExplorerApp::CreateNewTab(const std::wstring& initialPath, bool switchToNew
     }
     const bool pl = (m_lang == Lang::PL);
     m_statusToast = (pl ? L"\x2795 Otwarto nową kartę: " : L"\x2795 Opened new tab: ") +
-                    (targetPath == L"THIS_PC" ? GetStrings(m_lang).navThisPC : PathUtils::GetFileName(targetPath));
+                    FormatNavFolderTitle(targetPath, m_lang);
     m_statusToastExpireTick = GetTickCount64() + 2600;
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -1677,9 +1703,7 @@ void ExplorerApp::SwitchToTab(int tabIndex) {
     SyncGitRepo();
     SyncMediaPlayerToSelection();
     ClampScrollOffset();
-    std::wstring folderTitle = (m_currentPath == L"THIS_PC")
-        ? GetStrings(m_lang).navThisPC
-        : (FtpClient::IsFtpPath(m_currentPath) ? FtpClient::GetFtpLeafName(m_currentPath) : PathUtils::GetFileName(m_currentPath));
+    std::wstring folderTitle = FormatNavFolderTitle(m_currentPath, m_lang);
     SetWindowTextW(m_hwnd, folderTitle.c_str());
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -1713,7 +1737,7 @@ std::wstring ExplorerApp::ResolveDropTargetFolder(float x, float y, std::wstring
                 PathUtils::PtInRectF(x, y, th.tabRect)) {
                 std::wstring tabPath = (th.tabIndex == m_activeTab) ? m_currentPath : m_tabs[th.tabIndex].currentPath;
                 if (!tabPath.empty() && tabPath != L"THIS_PC") {
-                    if (outTargetLabel) *outTargetLabel = PathUtils::GetFileName(tabPath);
+                    if (outTargetLabel) *outTargetLabel = FormatNavFolderTitle(tabPath, m_lang);
                     return tabPath;
                 }
             }
@@ -1753,7 +1777,8 @@ std::wstring ExplorerApp::ResolveDropTargetFolder(float x, float y, std::wstring
         int otherIdx = 1 - m_activePane;
         D2D1_RECT_F otherOuter = GetSplitPaneOuterRect(otherIdx);
         if (PathUtils::PtInRectF(x, y, otherOuter)) {
-            if (m_otherPane.hoverIndex >= 0 && m_otherPane.hoverIndex < static_cast<int>(m_otherPane.items.size())) {
+            if (m_otherPane.currentPath != L"RECYCLE_BIN" &&
+                m_otherPane.hoverIndex >= 0 && m_otherPane.hoverIndex < static_cast<int>(m_otherPane.items.size())) {
                 const auto& oItem = m_otherPane.items[m_otherPane.hoverIndex];
                 if (oItem.isDirectory && !oItem.isDrive) {
                     if (outTargetLabel) *outTargetLabel = oItem.displayName;
@@ -1761,21 +1786,23 @@ std::wstring ExplorerApp::ResolveDropTargetFolder(float x, float y, std::wstring
                 }
             }
             if (!m_otherPane.currentPath.empty() && m_otherPane.currentPath != L"THIS_PC") {
-                if (outTargetLabel) *outTargetLabel = PathUtils::GetFileName(m_otherPane.currentPath);
+                if (outTargetLabel) *outTargetLabel = FormatNavFolderTitle(m_otherPane.currentPath, m_lang);
                 return m_otherPane.currentPath;
             }
         }
     }
 
     // 5. Check folder item in active content view
-    D2D1_RECT_F contentRect = GetContentItemsRect();
-    bool onItem = false;
-    int hitIdx = HitTestItem(x, y, contentRect, &onItem);
-    if (hitIdx >= 0 && hitIdx < static_cast<int>(m_items.size()) && onItem) {
-        const auto& item = m_items[hitIdx];
-        if (item.isDirectory && !item.isDrive) {
-            if (outTargetLabel) *outTargetLabel = item.displayName;
-            return item.fullPath;
+    if (m_currentPath != L"RECYCLE_BIN") {
+        D2D1_RECT_F contentRect = GetContentItemsRect();
+        bool onItem = false;
+        int hitIdx = HitTestItem(x, y, contentRect, &onItem);
+        if (hitIdx >= 0 && hitIdx < static_cast<int>(m_items.size()) && onItem) {
+            const auto& item = m_items[hitIdx];
+            if (item.isDirectory && !item.isDrive) {
+                if (outTargetLabel) *outTargetLabel = item.displayName;
+                return item.fullPath;
+            }
         }
     }
 
@@ -1788,7 +1815,7 @@ void ExplorerApp::StartManagedTransfer(
     bool isMove,
     bool forceVerifyXxHash)
 {
-    if (srcPaths.empty() || targetDir.empty() || targetDir == L"THIS_PC") return;
+    if (srcPaths.empty() || targetDir.empty() || IsVirtualFolder(targetDir)) return;
     const bool pl = (m_lang == Lang::PL);
 
     if (ArchiveExplorer::IsVirtualArchivePath(targetDir)) {
@@ -1847,6 +1874,11 @@ void ExplorerApp::StartManagedTransfer(
 
 void ExplorerApp::ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, const std::wstring& targetDir, bool forceCopy, bool forceMove) {
     if (srcPaths.empty() || targetDir.empty() || targetDir == L"THIS_PC") return;
+    if (targetDir == L"RECYCLE_BIN") {
+        // Dropping items onto Kosz sends them to the Recycle Bin just like Windows Explorer
+        DeleteSelectedItems(false);
+        return;
+    }
     std::wstring dstNorm = PathUtils::NormalizePathKey(targetDir);
 
     std::vector<std::wstring> validSrc;
@@ -1882,9 +1914,7 @@ void ExplorerApp::SetActivePane(int paneIdx) {
     RebuildBreadcrumbs();
     SyncGitRepo();
     SyncMediaPlayerToSelection();
-    std::wstring folderTitle = (m_currentPath == L"THIS_PC")
-        ? GetStrings(m_lang).navThisPC
-        : (FtpClient::IsFtpPath(m_currentPath) ? FtpClient::GetFtpLeafName(m_currentPath) : PathUtils::GetFileName(m_currentPath));
+    std::wstring folderTitle = FormatNavFolderTitle(m_currentPath, m_lang);
     SetWindowTextW(m_hwnd, folderTitle.c_str());
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -1931,6 +1961,17 @@ void ExplorerApp::CopyOrMoveToOtherPane(bool move) {
         ToggleSplitView();
         return;
     }
+    if (m_currentPath == L"RECYCLE_BIN") {
+        if (move && !m_otherPane.currentPath.empty() && !IsVirtualFolder(m_otherPane.currentPath)) {
+            RestoreRecycleBinItems(false);
+        } else {
+            m_statusToast = pl ? L"\x26A0 Użyj [Przywróć], aby odzyskać elementy z Kosza"
+                               : L"\x26A0 Use [Restore] to recover items from the Recycle Bin";
+            m_statusToastExpireTick = GetTickCount64() + 3500;
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+        }
+        return;
+    }
     auto paths = GetSelectedPaths();
     if (paths.empty()) {
         m_statusToast = pl ? L"\x26A0 Zaznacz pliki lub foldery, aby skopiować / przenieść do drugiego panelu"
@@ -1940,6 +1981,17 @@ void ExplorerApp::CopyOrMoveToOtherPane(bool move) {
         return;
     }
     const std::wstring dstDir = m_otherPane.currentPath;
+    if (dstDir == L"RECYCLE_BIN") {
+        if (move) {
+            DeleteSelectedItems(false);
+        } else {
+            m_statusToast = pl ? L"\x26A0 Nie można kopiować do Kosza (użyj Przenieś lub Usuń)"
+                               : L"\x26A0 Cannot copy into the Recycle Bin (use Move or Delete)";
+            m_statusToastExpireTick = GetTickCount64() + 3500;
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+        }
+        return;
+    }
     if (dstDir.empty() || dstDir == L"THIS_PC") {
         m_statusToast = pl ? L"\x26A0 Otwórz folder docelowy w drugim panelu (nie można kopiować do „Ten komputer”)"
                            : L"\x26A0 Open a destination folder in the other pane (cannot copy into 'This PC')";
@@ -1972,7 +2024,9 @@ void ExplorerApp::BeginPaneAddressEdit(int paneIdx) {
         static_cast<int>(r.right - r.left),
         static_cast<int>(r.bottom - r.top),
         SWP_SHOWWINDOW);
-    std::wstring addrText = (m_currentPath == L"THIS_PC") ? L"" : m_currentPath;
+    std::wstring addrText = (m_currentPath == L"THIS_PC")
+        ? L""
+        : ((m_currentPath == L"RECYCLE_BIN") ? std::wstring(GetStrings(m_lang).navRecycleBin) : m_currentPath);
     if (FtpClient::IsFtpPath(m_currentPath)) {
         FtpUrlInfo parsed;
         if (FtpClient::ParseFtpUrl(m_currentPath, parsed)) {
@@ -2126,10 +2180,10 @@ void ExplorerApp::LoadUiSettings() {
         GetPrivateProfileStringW(L"RecentDirs", key, L"", val, static_cast<DWORD>(std::size(val)), ini.c_str());
         std::wstring p = PathUtils::TrimTrailingSlashes(val);
         if (!p.empty()) {
-            std::wstring nk = (p == L"THIS_PC") ? L"__HEADER_PC__" : PathUtils::NormalizePathKey(p);
+            std::wstring nk = NormalizeNavDirKey(p);
             bool dup = false;
             for (const auto& existing : m_recentDirs) {
-                std::wstring enk = (existing == L"THIS_PC") ? L"__HEADER_PC__" : PathUtils::NormalizePathKey(existing);
+                std::wstring enk = NormalizeNavDirKey(existing);
                 if (enk == nk) { dup = true; break; }
             }
             if (!dup) m_recentDirs.push_back(p);
@@ -2299,7 +2353,7 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
 // Finds the git repository (if any) that contains the folder being browsed and asks the worker to refresh it.
 void ExplorerApp::SyncGitRepo(bool force) {
     std::wstring root;
-    if (m_gitEnabled && !m_currentPath.empty() && m_currentPath != L"THIS_PC") {
+    if (m_gitEnabled && !m_currentPath.empty() && !IsVirtualFolder(m_currentPath)) {
         root = GitIntegration::FindRepoRoot(m_currentPath);
     }
     bool changed = (root != m_gitRoot);
@@ -2801,7 +2855,9 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                         static_cast<int>(m_addressBarRect.right - m_addressBarRect.left),
                         static_cast<int>(m_addressBarRect.bottom - m_addressBarRect.top),
                         SWP_SHOWWINDOW);
-                    std::wstring addrText = (m_currentPath == L"THIS_PC") ? L"" : m_currentPath;
+                    std::wstring addrText = (m_currentPath == L"THIS_PC")
+                        ? L""
+                        : ((m_currentPath == L"RECYCLE_BIN") ? std::wstring(GetStrings(m_lang).navRecycleBin) : m_currentPath);
                     if (FtpClient::IsFtpPath(m_currentPath)) {
                         FtpUrlInfo parsed;
                         if (FtpClient::ParseFtpUrl(m_currentPath, parsed)) {
@@ -3104,14 +3160,16 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
         bool onItem = false;
         int hitIdx = HitTestItem(x, y, contentRect, &onItem);
 
-        // Check "Operacje" column buttons ([Kosz] and [Usuń]) in Details view
+        // Check "Operacje" column buttons ([Kosz] / [Przywróć] and [Usuń]) in Details view
         if (!rightButton && m_viewMode == ViewMode::Details && hitIdx >= 0 && m_currentPath != L"THIS_PC") {
             D2D1_RECT_F rowR = GetItemRect(hitIdx, contentRect);
             float opColX = contentRect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
-            D2D1_RECT_F trashBtn = D2D1::RectF(opColX + 6.0f, rowR.top + 2.0f, opColX + 62.0f, rowR.bottom - 2.0f);
-            D2D1_RECT_F permBtn  = D2D1::RectF(opColX + 66.0f, rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
+            const bool inBin = (m_currentPath == L"RECYCLE_BIN");
+            D2D1_RECT_F trashBtn = D2D1::RectF(opColX + (inBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
+            D2D1_RECT_F permBtn  = D2D1::RectF(opColX + (inBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
             if (PathUtils::PtInRectF(x, y, trashBtn)) {
-                ConfirmAndDeleteRowItem(hitIdx, false);
+                if (inBin) RestoreRecycleBinItems(false, hitIdx);
+                else ConfirmAndDeleteRowItem(hitIdx, false);
                 return;
             }
             if (PathUtils::PtInRectF(x, y, permBtn)) {
@@ -3153,7 +3211,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
             } else {
                 SelectSingle(hitIdx, true);
             }
-            if (m_currentPath != L"THIS_PC" && !IsProgramsView()) {
+            if (!IsVirtualFolder(m_currentPath) && !IsProgramsView()) {
                 m_dragCandidate = true;
                 m_dragSourceItemIdx = hitIdx;
                 m_dragStartPt = D2D1::Point2F(x, y);
@@ -3330,8 +3388,9 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
     if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC") {
         D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, contentRect);
         float opColX = contentRect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
-        D2D1_RECT_F trashBtn = D2D1::RectF(opColX + 6.0f, rowR.top + 2.0f, opColX + 62.0f, rowR.bottom - 2.0f);
-        D2D1_RECT_F permBtn  = D2D1::RectF(opColX + 66.0f, rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
+        const bool inBin = (m_currentPath == L"RECYCLE_BIN");
+        D2D1_RECT_F trashBtn = D2D1::RectF(opColX + (inBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
+        D2D1_RECT_F permBtn  = D2D1::RectF(opColX + (inBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
         if (PathUtils::PtInRectF(x, y, trashBtn)) m_hoverRowActionKind = 1;
         else if (PathUtils::PtInRectF(x, y, permBtn)) m_hoverRowActionKind = 2;
     }
@@ -3351,8 +3410,9 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
             if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC") {
                 D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, otherContent);
                 float opColX = otherContent.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
-                D2D1_RECT_F trashBtn = D2D1::RectF(opColX + 6.0f, rowR.top + 2.0f, opColX + 62.0f, rowR.bottom - 2.0f);
-                D2D1_RECT_F permBtn  = D2D1::RectF(opColX + 66.0f, rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
+                const bool inBin = (m_currentPath == L"RECYCLE_BIN");
+                D2D1_RECT_F trashBtn = D2D1::RectF(opColX + (inBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
+                D2D1_RECT_F permBtn  = D2D1::RectF(opColX + (inBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
                 if (PathUtils::PtInRectF(x, y, trashBtn)) m_hoverRowActionKind = 1;
                 else if (PathUtils::PtInRectF(x, y, permBtn)) m_hoverRowActionKind = 2;
             }
@@ -3990,9 +4050,9 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
 
     case CMD_PIN_QUICK: {
         auto paths = GetSelectedPaths();
-        if (!paths.empty() && (GetFileAttributesW(paths[0].c_str()) & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (!paths.empty() && !IsVirtualFolder(m_currentPath) && (GetFileAttributesW(paths[0].c_str()) & FILE_ATTRIBUTE_DIRECTORY)) {
             PinFolderToQuickAccess(paths[0]);
-        } else if (!m_currentPath.empty() && m_currentPath != L"THIS_PC") {
+        } else if (!m_currentPath.empty() && !IsVirtualFolder(m_currentPath)) {
             PinFolderToQuickAccess(m_currentPath);
         }
         break;
@@ -4002,6 +4062,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_PASTE:         PasteIntoCurrent(); break;
     case CMD_COPY_PATH:     CopySelectedPaths(); break;
     case CMD_PASTE_SHORTCUT: {
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath)) break;
         if (OpenClipboard(m_hwnd)) {
             HDROP hDrop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
             if (hDrop) {
@@ -4058,7 +4119,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_RENAME:        StartInlineRename(); break;
     case CMD_NEW_FOLDER:    CreateNewFolderAction(); break;
     case CMD_NEW_ITEM: {
-        if (m_currentPath.empty() || m_currentPath == L"THIS_PC") break;
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath)) break;
         std::wstring created;
         std::wstring base = (m_lang == Lang::PL) ? L"Nowy dokument tekstowy" : L"New Text Document";
         if (ShellMenuEmulator::CreateNewEmptyFile(m_currentPath, base, L".txt", created)) {
@@ -4070,7 +4131,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_PROPERTIES: {
         auto paths = GetSelectedPaths();
         if (!paths.empty()) FileEngine::OpenFileOrProperties(m_hwnd, paths[0], true);
-        else if (!m_currentPath.empty() && m_currentPath != L"THIS_PC") FileEngine::OpenFileOrProperties(m_hwnd, m_currentPath, true);
+        else if (!m_currentPath.empty()) FileEngine::OpenFileOrProperties(m_hwnd, m_currentPath, true);
         break;
     }
     case CMD_OPEN:          ActivateFocusedOrSelectedItem(); break;
@@ -4488,7 +4549,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         FileEngine::OpenTerminalInFolder(m_currentPath);
         break;
     case CMD_SHARE_CMD: {
-        std::wstring dir = (m_currentPath.empty() || m_currentPath == L"THIS_PC") ? L"C:\\" : m_currentPath;
+        std::wstring dir = (m_currentPath.empty() || IsVirtualFolder(m_currentPath)) ? L"C:\\" : m_currentPath;
         ShellExecuteW(m_hwnd, L"open", L"cmd.exe", nullptr, dir.c_str(), SW_SHOWNORMAL);
         break;
     }
@@ -5683,7 +5744,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     }
     case CMD_BATCH_RENAME: {
         const bool pl = (m_lang == Lang::PL);
-        if (m_currentPath.empty() || m_currentPath == L"THIS_PC" || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
             m_statusToast = pl ? L"\x26A0 Wybierz pliki w lokalnym folderze do masowej zmiany nazwy" : L"\x26A0 Select files in a local folder to batch rename";
             m_statusToastExpireTick = GetTickCount64() + 3000;
             break;
@@ -5782,7 +5843,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     }
     case CMD_SEARCH_DUPLICATES: {
         const bool pl = (m_lang == Lang::PL);
-        if (m_currentPath.empty() || m_currentPath == L"THIS_PC" || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
             m_statusToast = pl ? L"\x26A0 Otwórz lokalny folder, aby wyszukać duplikaty plików" : L"\x26A0 Open a local folder to scan for duplicate files";
             m_statusToastExpireTick = GetTickCount64() + 3200;
             break;
@@ -5904,6 +5965,16 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
 void ExplorerApp::ActivateFocusedOrSelectedItem() {
     if (m_focusedIndex < 0 || m_focusedIndex >= static_cast<int>(m_items.size())) return;
     const FileEntry& item = m_items[m_focusedIndex];
+    if (m_currentPath == L"RECYCLE_BIN") {
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring msg = pl
+            ? (L"Czy chcesz przywrócić ten element z Kosza do pierwotnej lokalizacji?\n\n\"" + item.name + L"\"\n\x2192 " + item.originalPath)
+            : (L"Do you want to restore this item from the Recycle Bin to its original location?\n\n\"" + item.name + L"\"\n\x2192 " + item.originalPath);
+        if (MessageBoxW(m_hwnd, msg.c_str(), GetStrings(m_lang).navRecycleBin, MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            RestoreRecycleBinItems(false, m_focusedIndex);
+        }
+        return;
+    }
     if (item.isDirectory || ArchiveExplorer::IsArchiveExtension(item.ext)) {
         NavigateTo(item.fullPath, true);
     } else if (item.isImage || item.isVideo || item.isAudio) {
@@ -5937,8 +6008,169 @@ void ExplorerApp::ActivateFocusedOrSelectedItem() {
     }
 }
 
+void ExplorerApp::RestoreRecycleBinItems(bool restoreAll, int singleRowIndex) {
+    const bool pl = (m_lang == Lang::PL);
+    std::vector<FileEntry> targets;
+    if (singleRowIndex >= 0 && singleRowIndex < static_cast<int>(m_items.size())) {
+        targets.push_back(m_items[singleRowIndex]);
+    } else if (restoreAll) {
+        targets = m_allItems;
+    } else {
+        for (const auto& e : m_items) {
+            if (e.isSelected) targets.push_back(e);
+        }
+        if (targets.empty() && m_focusedIndex >= 0 && m_focusedIndex < static_cast<int>(m_items.size())) {
+            targets.push_back(m_items[m_focusedIndex]);
+        }
+    }
+    if (targets.empty()) return;
+
+    m_mediaPlayer.CloseMedia();
+    KillTimer(m_hwnd, ID_TIMER_MEDIA);
+
+    std::unordered_set<std::wstring> restoredKeys;
+    std::wstring lastRestoredPath;
+    std::wstring failMsg;
+    size_t restoredCount = 0;
+
+    for (const auto& e : targets) {
+        DWORD err = 0;
+        std::wstring outPath;
+        if (FileEngine::RestoreRecycleBinItem(e.fullPath, m_lang, outPath, &err)) {
+            m_imageCache.EvictPath(e.fullPath);
+            restoredKeys.insert(e.normKey);
+            lastRestoredPath = outPath;
+            ++restoredCount;
+            AppLog::Ok(L"RecycleBin", L"Restored: " + e.name + L" -> " + outPath);
+        } else {
+            if (failMsg.size() < 600) {
+                failMsg += e.name + L"  (" + SystemErrorText(err) + L")\n";
+            }
+            AppLog::Error(L"RecycleBin", L"Restore failed for " + e.fullPath + L": " + SystemErrorText(err));
+        }
+    }
+
+    if (!restoredKeys.empty()) {
+        auto wasRestored = [&](const FileEntry& e) { return restoredKeys.find(e.normKey) != restoredKeys.end(); };
+        int nextFocus = m_focusedIndex;
+        m_items.erase(std::remove_if(m_items.begin(), m_items.end(), wasRestored), m_items.end());
+        m_allItems.erase(std::remove_if(m_allItems.begin(), m_allItems.end(), wasRestored), m_allItems.end());
+        if (!m_items.empty()) {
+            nextFocus = std::clamp(nextFocus, 0, static_cast<int>(m_items.size()) - 1);
+            SelectSingle(nextFocus, true);
+        } else {
+            m_focusedIndex = -1;
+            m_anchorIndex = -1;
+        }
+        ClampScrollOffset();
+
+        if (restoredCount == 1) {
+            m_statusToast = (pl ? L"\x21A9 Przywrócono z Kosza: " : L"\x21A9 Restored from Recycle Bin: ") + lastRestoredPath;
+        } else {
+            m_statusToast = (pl ? L"\x21A9 Przywrócono z Kosza elementów: " : L"\x21A9 Restored items from Recycle Bin: ") +
+                            std::to_wstring(restoredCount);
+        }
+        m_statusToastExpireTick = GetTickCount64() + 4200;
+        EnsureWorkAnimTimerState();
+        RefreshCurrentFolder();
+    }
+
+    if (!failMsg.empty()) {
+        MessageBoxW(
+            m_hwnd,
+            ((pl ? L"Nie udało się przywrócić wszystkich elementów:\n\n" : L"Could not restore all items:\n\n") + failMsg).c_str(),
+            GetStrings(m_lang).navRecycleBin,
+            MB_OK | MB_ICONWARNING);
+    }
+}
+
+void ExplorerApp::EmptyRecycleBinAction() {
+    const bool pl = (m_lang == Lang::PL);
+    m_mediaPlayer.CloseMedia();
+    KillTimer(m_hwnd, ID_TIMER_MEDIA);
+
+    SHQUERYRBINFO rbInfo = {};
+    rbInfo.cbSize = sizeof(rbInfo);
+    if (SUCCEEDED(SHQueryRecycleBinW(nullptr, &rbInfo)) && rbInfo.i64NumItems == 0) {
+        m_statusToast = pl ? L"\xD83D\xDDD1 Kosz jest już pusty" : L"\xD83D\xDDD1 Recycle Bin is already empty";
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    HRESULT hr = SHEmptyRecycleBinW(m_hwnd, nullptr, 0);
+    if (SUCCEEDED(hr)) {
+        AppLog::Ok(L"RecycleBin", L"Emptied Windows Recycle Bin across drives");
+        m_statusToast = pl ? L"\xD83D\xDDD1 Opróżniono Kosz" : L"\xD83D\xDDD1 Emptied Recycle Bin";
+        m_statusToastExpireTick = GetTickCount64() + 3500;
+        EnsureWorkAnimTimerState();
+    }
+    RefreshCurrentFolder();
+}
+
 void ExplorerApp::DeleteSelectedItems(bool permanent) {
     if (m_currentPath == L"THIS_PC") return;   // drives are not something to delete
+
+    if (m_currentPath == L"RECYCLE_BIN") {
+        // Items inside Kosz are already recycled: deleting them permanently purges both $R and $I!
+        std::vector<FileEntry> targets;
+        for (const auto& e : m_items) {
+            if (e.isSelected) targets.push_back(e);
+        }
+        if (targets.empty() && m_focusedIndex >= 0 && m_focusedIndex < static_cast<int>(m_items.size())) {
+            targets.push_back(m_items[m_focusedIndex]);
+        }
+        if (targets.empty()) return;
+
+        const Strings& s = GetStrings(m_lang);
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring warnMsg = (targets.size() == 1)
+            ? (pl ? (L"Czy na pewno chcesz TRWALE usunąć z Kosza:\n\n\"" + targets[0].name + L"\"?")
+                  : (L"Are you sure you want to PERMANENTLY delete from the Recycle Bin:\n\n\"" + targets[0].name + L"\"?"))
+            : std::wstring(s.dlgConfirmPermMsg);
+        if (MessageBoxW(m_hwnd, warnMsg.c_str(), s.dlgConfirmDeleteTitle, MB_YESNO | MB_ICONWARNING) != IDYES) {
+            return;
+        }
+
+        m_mediaPlayer.CloseMedia();
+        KillTimer(m_hwnd, ID_TIMER_MEDIA);
+
+        std::unordered_set<std::wstring> purgedKeys;
+        std::wstring failMsg;
+        for (const auto& e : targets) {
+            DWORD err = 0;
+            m_imageCache.EvictPath(e.fullPath);
+            if (FileEngine::DeleteRecycleBinItemPermanently(e.fullPath, &err)) {
+                purgedKeys.insert(e.normKey);
+                AppLog::Ok(L"RecycleBin", L"Purged permanently: " + e.name);
+            } else if (failMsg.size() < 600) {
+                failMsg += e.name + L"  (" + SystemErrorText(err) + L")\n";
+            }
+        }
+        if (!purgedKeys.empty()) {
+            auto wasPurged = [&](const FileEntry& e) { return purgedKeys.find(e.normKey) != purgedKeys.end(); };
+            int nextFocus = m_focusedIndex;
+            m_items.erase(std::remove_if(m_items.begin(), m_items.end(), wasPurged), m_items.end());
+            m_allItems.erase(std::remove_if(m_allItems.begin(), m_allItems.end(), wasPurged), m_allItems.end());
+            if (!m_items.empty()) {
+                nextFocus = std::clamp(nextFocus, 0, static_cast<int>(m_items.size()) - 1);
+                SelectSingle(nextFocus, true);
+            } else {
+                m_focusedIndex = -1;
+                m_anchorIndex = -1;
+            }
+            ClampScrollOffset();
+            m_statusToast = s.statusDeletedPerm;
+            m_statusToastExpireTick = GetTickCount64() + 3000;
+            EnsureWorkAnimTimerState();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+        }
+        if (!failMsg.empty()) {
+            MessageBoxW(m_hwnd, failMsg.c_str(), s.dlgConfirmDeleteTitle, MB_OK | MB_ICONWARNING);
+        }
+        return;
+    }
 
     std::vector<std::wstring> toDelete = GetSelectedPaths();
     // Whole drives and share roots are never deleted; the delete engine refuses them too

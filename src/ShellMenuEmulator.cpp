@@ -512,7 +512,7 @@ bool ShellMenuEmulator::CreateShortcutFile(const std::wstring& targetFullPath, c
 }
 
 bool ShellMenuEmulator::CreateNewEmptyFile(const std::wstring& parentDir, const std::wstring& baseName, const std::wstring& ext, std::wstring& outCreatedPath) {
-    if (parentDir.empty() || parentDir == L"THIS_PC") return false;
+    if (parentDir.empty() || IsVirtualFolder(parentDir)) return false;
     std::wstring cleanParent = PathUtils::EnsureTrailingSlash(parentDir);
 
     for (int i = 1; i < 500; ++i) {

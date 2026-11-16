@@ -3419,7 +3419,7 @@ bool ArchiveExplorer::SplitVirtualArchivePath(
 {
     outArchiveFile.clear();
     outInnerPath.clear();
-    if (fullPath.empty() || fullPath == L"THIS_PC") return false;
+    if (fullPath.empty() || IsVirtualFolder(fullPath)) return false;
 
     std::wstring clean = PathUtils::TrimTrailingSlashes(fullPath);
     // Walk slash positions from left to right to find if any prefix is an archive file on disk

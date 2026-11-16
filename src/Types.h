@@ -154,6 +154,7 @@ struct FileEntry {
     std::wstring name;
     std::wstring displayName;
     std::wstring fullPath;
+    std::wstring originalPath; // Original path before Recycle Bin deletion (populated in RECYCLE_BIN)
     std::wstring normKey;   // Precomputed normalized lowercase path key for O(1) hash lookups
     std::wstring ext;       // Lowercase including dot, e.g. L".png"
     std::wstring typeName;  // Cached per extension
@@ -257,6 +258,10 @@ struct HardwareCardHit {
 struct UndoDeleteBatch {
     std::vector<std::pair<std::wstring, std::wstring>> originalToTrashPaths; // <originalFullPath, stagingTrashPath>
 };
+
+static inline bool IsVirtualFolder(const std::wstring& p) {
+    return p == L"THIS_PC" || p == L"RECYCLE_BIN";
+}
 
 static inline bool IsImageExtension(const std::wstring& extLower) {
     return extLower == L".png"  || extLower == L".jpg"  || extLower == L".jpeg" ||
