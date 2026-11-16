@@ -65,6 +65,23 @@ jobs:
           E2_SKIP_GEN_VERSION: "1"
         run: call build.bat
 
+      # GitHub has no Windows 7 / 8 runners (only Server 2022 / 2025), so the exe is checked statically: PE header,
+      # no API-set / Windows 8+ DLLs, and every imported function against Microsoft's Win32 metadata
+      # ("Minimum supported client"). Passing for Windows 7 SP1 also covers Windows 8 / 8.1.
+      - name: Cache Win32 API metadata
+        uses: actions/cache@v4
+        with:
+          path: build/win32metadata
+          key: win32metadata-71.0.45-preview
+
+      - name: Windows 7 SP1+ compatibility check (static)
+        shell: pwsh
+        run: |
+          & .\tools\check_win7_api.ps1 -Exe Explorer2.exe -MinOs 6.1
+          if ($LASTEXITCODE -ne 0) {
+              throw "Explorer2.exe would not start on Windows 7 SP1 (see the list above)"
+          }
+          $global:LASTEXITCODE = 0
       - name: Verify executable & PE version info
         shell: pwsh
         run: |

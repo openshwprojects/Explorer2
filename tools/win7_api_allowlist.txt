@@ -1,0 +1,11 @@
+# Functions tools/check_win7_api.ps1 must not fail on although Microsoft's metadata says they need a newer
+# Windows than the target (wrong "Minimum supported client" in the docs). One name per line, then "# reason".
+# Only add a name after confirming the function really is exported by that DLL on Windows 7 SP1.
+
+# ws2_32: the docs say "Windows 8.1, Windows Vista/XP SP2 [desktop apps | UWP apps]" = desktop since Vista/XP SP2,
+# UWP since 8.1; the metadata keeps only the first entry. All are exported by ws2_32.dll on Windows 7.
+GetAddrInfoW    # desktop since Windows XP SP2
+FreeAddrInfoW   # desktop since Windows XP SP2
+GetNameInfoW    # desktop since Windows XP SP2
+inet_pton       # desktop since Windows Vista
+InetNtopW       # desktop since Windows Vista
