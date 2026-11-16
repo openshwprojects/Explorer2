@@ -53,6 +53,7 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\ArchiveExplorer.cpp ^
     src\PdfViewer.cpp ^
     src\WinRtShim.cpp ^
+    src\Win7ApiShims.cpp ^
     src\BackupManager.cpp ^
     src\TransferManager.cpp ^
     src\FtpClient.cpp ^
