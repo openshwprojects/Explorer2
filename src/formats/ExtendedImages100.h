@@ -4926,6 +4926,7 @@ inline bool TryDecodeHevcViaMediaFoundation(
     std::vector<uint8_t>& outBgra)
 {
     if (annexB.empty() || alignedW == 0u || alignedH == 0u) return false;
+    if (!::Explorer2::IsMediaFoundationAvailable()) return false;
     HRESULT hrMf = ::MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (FAILED(hrMf)) return false;
 

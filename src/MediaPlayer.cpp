@@ -1,4 +1,5 @@
 #include "MediaPlayer.h"
+#include "OsCompat.h"
 #include <shlwapi.h>
 #include <algorithm>
 #include <cmath>
@@ -72,7 +73,7 @@ MediaPlayer::~MediaPlayer() {
 
 bool MediaPlayer::Initialize(HWND notifyHwnd) {
     m_notifyHwnd = notifyHwnd;
-    if (!m_mfInitialized) {
+    if (!m_mfInitialized && IsMediaFoundationAvailable()) {
         if (SUCCEEDED(MFStartup(MF_VERSION))) {
             m_mfInitialized = true;
         }

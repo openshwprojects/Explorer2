@@ -69,19 +69,17 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     /Fo:build\ ^
     /Fe:Explorer2.exe ^
     /link /SUBSYSTEM:WINDOWS build\Explorer2.res ^
-    kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib ws2_32.lib cfgmgr32.lib crypt32.lib bcrypt.lib setupapi.lib version.lib
+    kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib ws2_32.lib cfgmgr32.lib crypt32.lib bcrypt.lib setupapi.lib version.lib ^
+    delayimp.lib /DELAYLOAD:mfplat.dll
 set "E2_LINK_RC=%ERRORLEVEL%"
 
-rem Windows 7 guard: never link WindowsApp.lib (or other umbrella libs). They import kernel32 functions through
-rem api-ms-win-core-*.dll API sets that Windows 7 does not have, and the exe then fails to start there with
-rem "api-ms-win-core-heap-l2-1-0.dll was not found". Fail the build if any such import sneaks back in.
+rem Windows 7 / N-edition guard: never link WindowsApp.lib (or other umbrella libs). They import kernel32
+rem functions through api-ms-win-core-*.dll API sets that Windows 7 does not have, and the exe then fails to start
+rem there with "api-ms-win-core-heap-l2-1-0.dll was not found". mfplat.dll must stay delay-loaded (absent on
+rem Windows N editions without the Media Feature Pack). tools\check_imports.ps1 fails the build otherwise.
 if "%E2_LINK_RC%"=="0" (
-    dumpbin.exe /nologo /imports Explorer2.exe | findstr /i /r /c:"^ *api-ms-win-[a-z0-9-]*\.dll" /c:"^ *ext-ms-win-[a-z0-9-]*\.dll" >build\apiset_imports.txt
-    if not errorlevel 1 (
-        echo Build failed: Explorer2.exe imports Windows 8+ API-set DLLs and would not start on Windows 7:
-        type build\apiset_imports.txt
-        exit /b 1
-    )
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\check_imports.ps1" -Exe Explorer2.exe
+    if errorlevel 1 exit /b 1
 )
 
 if "%E2_LINK_RC%"=="0" (

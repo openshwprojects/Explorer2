@@ -455,7 +455,7 @@ inline bool DecodeAvc1StillItem(
     }
 
     // Fallback to Windows inbox Media Foundation H.264 MFT (CLSID_CMSH264DecoderMFT via MFTEnumEx)
-    if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) return false;
+    if (!::Explorer2::IsMediaFoundationAvailable() || FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) return false;
     bool mfDecoded = false;
     {
         MFT_REGISTER_TYPE_INFO inType  = { MFMediaType_Video, MFVideoFormat_H264 };

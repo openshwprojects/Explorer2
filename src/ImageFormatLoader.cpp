@@ -1,4 +1,5 @@
 #include "ImageFormatLoader.h"
+#include "OsCompat.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
