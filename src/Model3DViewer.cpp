@@ -573,7 +573,7 @@ try {
             parsedMod = Formats::ParseSplatOrOpenVdb(buf.data(), buf.size(), ext, mesh);
         else if (ext == L".abc" || ext == L".lws" ||
                  ext == L".ma"  || ext == L".mb")
-            parsedMod = Formats::ParseMayaOrCadContainer(buf.data(), buf.size(), ext, mesh);
+            parsedMod = Formats::ParseMayaOrCadContainer(buf.data(), buf.size(), ext, mesh, fullPath);
         else
             parsedMod = Formats::ParseExtended3D200(buf.data(), buf.size(), ext, mesh);
         if (parsedMod) {
@@ -590,6 +590,8 @@ try {
     for (wchar_t& ch : extUp) ch = static_cast<wchar_t>(towupper(ch));
     unreadable.formatName = extUp.empty() ? std::wstring(L"3D") : extUp;
     unreadable.statusMessage = L"Nie udało się odczytać modelu 3D z tego pliku";
+    // A scene (.lws) whose objects could not be found says which files are missing, instead of the generic line
+    if (ext == L".lws" && !mesh.statusMessage.empty()) unreadable.statusMessage = mesh.statusMessage;
     return unreadable;
 } E2_READER_CATCH(L"3D model reader", fullPath, { LoadedMesh3D unreadable; unreadable.filePath = fullPath; return unreadable; })
 

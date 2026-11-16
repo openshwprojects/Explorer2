@@ -93,6 +93,10 @@ struct ByteWriter {
     void U32BE(uint32_t v) {
         for (int i = 3; i >= 0; --i) buf.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFFu));
     }
+    void U16BE(uint16_t v) {
+        buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+        buf.push_back(static_cast<uint8_t>(v & 0xFFu));
+    }
     void I32BE(int32_t v) { U32BE(static_cast<uint32_t>(v)); }
     void F32BE(float f) {
         uint32_t u = 0;
@@ -2419,6 +2423,46 @@ static std::vector<uint8_t> WrapBlendInZstdSeekAndCompressedBlocks(const std::ve
 
 } // namespace
 
+// LightWave LWO2 object: one LAYR + PNTS + POLS(FACE) per layer, big-endian IFF chunks
+struct LwoTestLayer {
+    uint16_t number = 0;
+    std::vector<Vec3f> pts;
+    std::vector<std::vector<uint16_t>> faces;
+};
+static std::vector<uint8_t> BuildSyntheticLwo2(const std::vector<LwoTestLayer>& layers) {
+    ByteWriter body;
+    body.Tag4("LWO2");
+    auto chunk = [&](const char* tag, const ByteWriter& c) {
+        body.Tag4(tag);
+        body.U32BE(static_cast<uint32_t>(c.buf.size()));
+        body.Bytes(c.buf.data(), c.buf.size());
+        if (c.buf.size() & 1u) body.U8(0);
+    };
+    for (const auto& L : layers) {
+        ByteWriter layr;
+        layr.U16BE(L.number);
+        layr.U16BE(0);
+        layr.F32BE(0); layr.F32BE(0); layr.F32BE(0);
+        layr.Bytes("Layer\0", 6);
+        chunk("LAYR", layr);
+        ByteWriter pnts;
+        for (const auto& p : L.pts) { pnts.F32BE(p.x); pnts.F32BE(p.y); pnts.F32BE(p.z); }
+        chunk("PNTS", pnts);
+        ByteWriter pols;
+        pols.Tag4("FACE");
+        for (const auto& f : L.faces) {
+            pols.U16BE(static_cast<uint16_t>(f.size()));
+            for (uint16_t idx : f) pols.U16BE(idx);
+        }
+        chunk("POLS", pols);
+    }
+    ByteWriter file;
+    file.Tag4("FORM");
+    file.U32BE(static_cast<uint32_t>(body.buf.size()));
+    file.Bytes(body.buf.data(), body.buf.size());
+    return file.buf;
+}
+
 void RunFormatTests3D(TestCounter& tc) {
     const std::wstring workDir = ScratchTestDir() + L"\\fmt3d";
     CreateDirectoryW(workDir.c_str(), nullptr);
@@ -4147,6 +4191,130 @@ void RunFormatTests3D(TestCounter& tc) {
                   HashMeshGeometry(mX3dPlain) != HashMeshGeometry(mX3dGz),
                   L"Stage15.3D.X3D.TransformDefUseAndGzipMultiPrimitives",
                   L"tris=" + std::to_wstring(mX3dPlain.rawTriangleCount) + L" spanXGz=" + std::to_wstring(mX3dGz.bboxSize.x));
+    }
+
+    // ========================================================================
+    // 11c. LightWave Scene (.lws): objects come from the referenced .lwo files (the right layer), placed with
+    //      position / heading / scale / pivot / parent; missing objects are named, never replaced by boxes
+    // ========================================================================
+    {
+        const std::wstring content = workDir + L"\\lws_content";
+        const std::wstring scenesDir = content + L"\\Scenes";
+        const std::wstring objectsDir = content + L"\\Objects";
+        CreateDirectoryW(content.c_str(), nullptr);
+        CreateDirectoryW(scenesDir.c_str(), nullptr);
+        CreateDirectoryW(objectsDir.c_str(), nullptr);
+        std::vector<std::wstring> lwsFiles;
+        auto put = [&](const std::wstring& p, const void* data, size_t n) {
+            PathUtils::WriteFileBytes(p, data, n);
+            lwsFiles.push_back(p);
+            return p;
+        };
+
+        // tri.lwo: one layer, one triangle. two.lwo: layer 1 = quad near the origin, layer 2 = triangle at (5,5,5)
+        auto triLwo = BuildSyntheticLwo2({ { 0, { {0,0,0}, {1,0,0}, {0,0,1} }, { {0,1,2} } } });
+        auto twoLwo = BuildSyntheticLwo2({
+            { 0, { {0,0,0}, {1,0,0}, {1,1,0}, {0,1,0} }, { {0,1,2,3} } },
+            { 1, { {5,5,5}, {6,5,5}, {5,6,5} }, { {0,1,2} } } });
+        put(objectsDir + L"\\tri.lwo", triLwo.data(), triLwo.size());
+        const std::wstring twoPath = put(objectsDir + L"\\two.lwo", twoLwo.data(), twoLwo.size());
+
+        auto env = [](int ch, const char* val) {
+            return std::string("Channel ") + std::to_string(ch) + "\n{ Envelope\n  1\n  Key " + val +
+                   " 0 0 0 0 0 0 0 0\n  Behaviors 1 1\n}\n";
+        };
+        // LightWave 9 style IDs on the first two objects, pre-9 style on the third (missing) one.
+        // tri: position (10,0,0), heading 90 deg (radians), scale 2. two (layer 2): child of tri, position (0,3,0),
+        // pivot (5,5,5). The light's intensity envelope after its motion channels must not be taken as motion.
+        std::string scene =
+            "LWSC\n3\n\nFirstFrame 1\nLastFrame 30\n\n"
+            "LoadObjectLayer 1 10000000 Objects/tri.lwo\nShowObject 6 3\nObjectMotion\nNumChannels 9\n" +
+            env(0, "10") + env(1, "0") + env(2, "0") + env(3, "1.5707963267948966") + env(6, "2") + env(7, "2") + env(8, "2") +
+            "PivotPosition 0 0 0\n\n"
+            "LoadObjectLayer 2 10000001 Objects/two.lwo\nObjectMotion\nNumChannels 9\n" + env(1, "3") +
+            "PivotPosition 5 5 5\nParentItem 10000000\n\n"
+            "LoadObjectLayer 1 Objects/missing_robot.lwo\n\n"
+            "AddLight\nLightName Light\nLightMotion\nNumChannels 9\n" + env(2, "0") +
+            "LightIntensity (envelope)\n{ Envelope\n  1\n  Key 7 0 0 0 0 0 0 0 0\n  Behaviors 1 1\n}\n\n"
+            "AddCamera\nCameraName Camera\n";
+        const std::wstring scenePath = put(scenesDir + L"\\scene_v3.lws", scene.data(), scene.size());
+
+        // LightWave 5 scene: degrees, keys as rows of 9 values; tri at (0,0,5) turned 90 deg
+        std::string sceneV1 =
+            "LWSC\n1\n\nFirstFrame 1\nLastFrame 30\n\n"
+            "LoadObject Objects\\tri.lwo\nShowObject 6 7\nObjectMotion (unnamed)\n  9\n  1\n"
+            "  0 0 5 90 0 0 1 1 1\n  0 0 0 0 0\nEndBehavior 1\n";
+        const std::wstring sceneV1Path = put(scenesDir + L"\\scene_v1.lws", sceneV1.data(), sceneV1.size());
+
+        // Nothing but objects that cannot be loaded: a missing file and a network path (refused, never opened)
+        std::string sceneMissing =
+            "LWSC\n3\n\nLoadObjectLayer 1 Objects/nowhere.lwo\nLoadObjectLayer 1 \\\\no-such-host\\share\\robot.lwo\n";
+        const std::wstring sceneMissingPath = put(scenesDir + L"\\scene_missing.lws", sceneMissing.data(), sceneMissing.size());
+
+        // Raw (scene-space) position of vertex i: undo the viewer's centring and scaling to [-1, 1]
+        auto rawVertex = [](const LoadedMesh3D& m, size_t i) -> Vec3f {
+            const float span = std::max({ m.bboxSize.x, m.bboxSize.y, m.bboxSize.z, 1e-5f });
+            const float s = span * 0.5f;
+            return { m.vertices[i].x * s + (m.bboxMin.x + m.bboxMax.x) * 0.5f,
+                     m.vertices[i].y * s + (m.bboxMin.y + m.bboxMax.y) * 0.5f,
+                     m.vertices[i].z * s + (m.bboxMin.z + m.bboxMax.z) * 0.5f };
+        };
+        auto expectVerts = [&](const LoadedMesh3D& m, size_t first, std::initializer_list<Vec3f> want, std::wstring& why) {
+            size_t i = first;
+            for (const Vec3f& w : want) {
+                if (i >= m.vertices.size()) { why = L"too few vertices"; return false; }
+                const Vec3f r = rawVertex(m, i);
+                if (std::fabs(r.x - w.x) > 2e-3f || std::fabs(r.y - w.y) > 2e-3f || std::fabs(r.z - w.z) > 2e-3f) {
+                    wchar_t b[160];
+                    swprintf_s(b, L"v%zu=(%.3f,%.3f,%.3f) want (%.3f,%.3f,%.3f)", i, r.x, r.y, r.z, w.x, w.y, w.z);
+                    why = b;
+                    return false;
+                }
+                ++i;
+            }
+            return true;
+        };
+
+        LoadedMesh3D mScene, mV1, mMissing, mTwo;
+        const bool okScene = Model3DViewer::InspectMeshFile(scenePath, mScene);
+        const bool okV1 = Model3DViewer::InspectMeshFile(sceneV1Path, mV1);
+        const bool okMissing = Model3DViewer::InspectMeshFile(sceneMissingPath, mMissing);
+        const bool okTwo = Model3DViewer::InspectMeshFile(twoPath, mTwo);
+
+        // tri: T(10,0,0) * Ry(90) * S(2): (0,0,0)->(10,0,0), (1,0,0)->(10,0,-2), (0,0,1)->(12,0,0)
+        // two layer 2 through tri: (5,5,5)->(10,6,0), (6,5,5)->(10,6,-2), (5,6,5)->(10,8,0)
+        std::wstring whyScene;
+        const bool placed = okScene && expectVerts(mScene, 0, { {10,0,0}, {10,0,-2}, {12,0,0}, {10,6,0}, {10,6,-2}, {10,8,0} }, whyScene);
+        // Layer 1 of two.lwo would land at y = -4 / z = +10, a leaked light-intensity key at z = 7
+        const bool onlyLayer2 = okScene && mScene.bboxMin.y > -1.0f && mScene.bboxMax.z < 3.0f;
+        const bool namesMissing = mScene.statusMessage.find(L"2/3") != std::wstring::npos &&
+                                  mScene.statusMessage.find(L"missing_robot.lwo") != std::wstring::npos;
+        tc.Record(placed && onlyLayer2 && namesMissing,
+                  L"Stage15.3D.LightWaveScene.ObjectsFromLwoPlacedByMotion",
+                  L"ok=" + std::to_wstring(okScene) + L" " + whyScene + L" bboxMinY=" + std::to_wstring(mScene.bboxMin.y) +
+                  L" bboxMaxZ=" + std::to_wstring(mScene.bboxMax.z) + L" status=" + mScene.statusMessage);
+
+        // LightWave 5: (0,0,0)->(0,0,5), (1,0,0)->(0,0,4), (0,0,1)->(1,0,5)
+        std::wstring whyV1;
+        const bool placedV1 = okV1 && expectVerts(mV1, 0, { {0,0,5}, {0,0,4}, {1,0,5} }, whyV1) && mV1.rawTriangleCount == 1;
+        tc.Record(placedV1, L"Stage15.3D.LightWaveScene.Lw5MotionRowsInDegrees",
+                  L"ok=" + std::to_wstring(okV1) + L" tris=" + std::to_wstring(mV1.rawTriangleCount) + L" " + whyV1);
+
+        // No geometry at all: not shown, and the message names both objects (the network one as refused)
+        const bool missingOk = !okMissing && mMissing.tris.empty() &&
+                               mMissing.statusMessage.find(L"nowhere.lwo") != std::wstring::npos &&
+                               mMissing.statusMessage.find(L"robot.lwo") != std::wstring::npos &&
+                               mMissing.statusMessage.find(L"sieciowa") != std::wstring::npos;
+        tc.Record(missingOk, L"Stage15.3D.LightWaveScene.MissingObjectsNamedNoBoxes", L"status=" + mMissing.statusMessage);
+
+        // The .lwo by itself still shows every layer: quad (4 verts, 2 tris) + triangle (3 verts, 1 tri)
+        tc.Record(okTwo && mTwo.rawVertexCount == 7 && mTwo.rawTriangleCount == 3, L"Stage15.3D.LightWaveObject.AllLayersStandalone",
+                  L"verts=" + std::to_wstring(mTwo.rawVertexCount) + L" tris=" + std::to_wstring(mTwo.rawTriangleCount));
+
+        for (const auto& f : lwsFiles) DeleteFileW(f.c_str());
+        RemoveDirectoryW(objectsDir.c_str());
+        RemoveDirectoryW(scenesDir.c_str());
+        RemoveDirectoryW(content.c_str());
     }
 
     // ========================================================================
