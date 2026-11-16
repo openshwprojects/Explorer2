@@ -58,6 +58,8 @@ public:
     void Shutdown();
 
     static bool Is3DModelExtension(const std::wstring& extLower);
+    static bool IsLikely3DDxfFile(const std::wstring& fullPath);
+    static bool IsLikely3DGeoOrDemFile(const std::wstring& fullPath, const std::wstring& extLower);
     static bool InspectMeshFile(const std::wstring& fullPath, LoadedMesh3D& outMesh);
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);

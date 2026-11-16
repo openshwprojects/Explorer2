@@ -2005,39 +2005,342 @@ inline bool ParseWindowsForensics200(const std::vector<uint8_t>& raw, const std:
         return true;
     }
 
-    // #93. Windows Event Trace Log (.etl — WMI_BUFFER_HEADER + TRACE_LOGFILE_HEADER)
-    if (ext == L".etl" && raw.size() >= 72) {
-        uint32_t bufSize   = DetailDocs200::RdU32LE(raw.data() + 0);
-        uint32_t savedOff  = DetailDocs200::RdU32LE(raw.data() + 4);
-        if (bufSize < 64 || bufSize > 64 * 1024 * 1024) return false;
+    // #93. Windows Event Trace Log (.etl — WMI_BUFFER_HEADER + TRACE_LOGFILE_HEADER + ETW Event Records)
+    if (ext == L".etl" && raw.size() >= 1024) {
+        const uint32_t buf0Size = DetailDocs200::RdU32LE(raw.data() + 0);
+        // WMI_BUFFER_HEADER BufferSize must be a 1 KB multiple in [1024, 16 MB] and fit inside raw
+        if (buf0Size < 1024u || buf0Size > (16u * 1024u * 1024u) || (buf0Size % 1024u) != 0 || buf0Size > raw.size()) {
+            return false;
+        }
+
+        auto getValidBufferEnd = [](const uint8_t* bHdr, uint32_t bSize) -> uint32_t {
+            const uint32_t savedOff = DetailDocs200::RdU32LE(bHdr + 4);
+            const uint32_t wnodeOff = DetailDocs200::RdU32LE(bHdr + 48);
+            if (wnodeOff >= 72u && wnodeOff <= bSize) return wnodeOff;
+            if (savedOff >= 72u && savedOff <= bSize) return savedOff;
+            return 0u;
+        };
+
+        auto formatGuid = [](const uint8_t* g) -> std::wstring {
+            const uint32_t d1 = DetailDocs200::RdU32LE(g + 0);
+            const uint16_t d2 = DetailDocs200::RdU16LE(g + 4);
+            const uint16_t d3 = DetailDocs200::RdU16LE(g + 6);
+            wchar_t buf[64] = {};
+            swprintf_s(buf, L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                d1, d2, d3, g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+            return buf;
+        };
+
+        auto formatFileTime = [](uint64_t ft100ns) -> std::wstring {
+            // Windows FILETIME: 100-ns intervals since 1601-01-01 UTC; if small QPC tick, render raw tick
+            if (ft100ns < 116444736000000000ULL || ft100ns > 200000000000000000ULL) {
+                return L"QPC " + std::to_wstring(ft100ns);
+            }
+            FILETIME ft{};
+            ft.dwLowDateTime  = static_cast<DWORD>(ft100ns & 0xFFFFFFFFULL);
+            ft.dwHighDateTime = static_cast<DWORD>(ft100ns >> 32);
+            SYSTEMTIME st{};
+            if (!FileTimeToSystemTime(&ft, &st)) return std::to_wstring(ft100ns);
+            const uint32_t us = static_cast<uint32_t>((ft100ns / 10ULL) % 1000000ULL);
+            wchar_t buf[64] = {};
+            swprintf_s(buf, L"%04u-%02u-%02u %02u:%02u:%02u.%06u",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, us);
+            return buf;
+        };
+
+        auto levelName = [](uint8_t lvl) -> std::wstring {
+            switch (lvl) {
+            case 0: return L"0 (LogAlways)";
+            case 1: return L"1 (Critical)";
+            case 2: return L"2 (Error)";
+            case 3: return L"3 (Warning)";
+            case 4: return L"4 (Info)";
+            case 5: return L"5 (Verbose)";
+            default: return std::to_wstring(lvl);
+            }
+        };
+
+        auto isValidEtwRecordAt = [](const uint8_t* rec, size_t maxBytes) -> bool {
+            if (maxBytes < 16) return false;
+            const uint16_t recSize = DetailDocs200::RdU16LE(rec + 0);
+            const uint8_t hdrType  = rec[2];
+            const uint8_t marker   = rec[3];
+            if (marker != 0xC0u || recSize > maxBytes) return false;
+            if (hdrType == 0x12u || hdrType == 0x13u) return recSize >= 80u;      // EVENT_HEADER (32/64-bit)
+            if (hdrType == 0x10u || hdrType == 0x11u) return recSize >= 32u;      // Compact EVENT_HEADER
+            if (hdrType == 0x01u || hdrType == 0x02u) return recSize >= 32u;      // SYSTEM_TRACE_HEADER (32/64-bit)
+            if (hdrType == 0x03u || hdrType == 0x0Cu || hdrType == 0x0Du) return recSize >= 16u; // PERFINFO_TRACE_HEADER
+            if (hdrType <= 0x0Fu) return recSize >= 48u;                          // EVENT_TRACE_HEADER
+            return false;
+        };
+
+        const uint32_t validEnd0 = getValidBufferEnd(raw.data(), buf0Size);
+        if (validEnd0 <= 72u || !isValidEtwRecordAt(raw.data() + 72, validEnd0 - 72u)) {
+            return false;
+        }
+
+        struct ProviderAgg {
+            uint64_t count = 0;
+            uint16_t minId = 0xFFFFu;
+            uint16_t maxId = 0;
+            uint32_t levelMask = 0;
+        };
+        std::map<std::wstring, ProviderAgg> providers;
+
+        SpreadsheetSheet sessSh;
+        sessSh.name = L"Session & Buffers";
+        sessSh.maxCols = 2;
+        sessSh.rows.push_back({ L"ETW Property", L"Value" });
+
+        SpreadsheetSheet evtSh;
+        evtSh.name = L"Events";
+        evtSh.maxCols = 9;
+        evtSh.rows.push_back({ L"Seq", L"Timestamp", L"PID", L"TID", L"Provider GUID", L"EventID", L"Level", L"Opcode", L"Payload Bytes" });
+
+        bool parsedLogfileHdr = false;
+        uint64_t totalBuffers = 0;
+        uint64_t totalEvents  = 0;
+
+        size_t bufFileOff = 0;
+        while (bufFileOff + 72u <= raw.size()) {
+            const uint8_t* bHdr = raw.data() + bufFileOff;
+            const uint32_t bSize = DetailDocs200::RdU32LE(bHdr + 0);
+            if (bSize < 1024u || bSize > (16u * 1024u * 1024u) || (bSize % 1024u) != 0) break;
+            if (bufFileOff + bSize > raw.size()) break;
+
+            const uint32_t vEnd = getValidBufferEnd(bHdr, bSize);
+            ++totalBuffers;
+            if (vEnd > 72u && vEnd <= bSize) {
+                size_t rOff = 72u;
+                while (rOff + 16u <= vEnd) {
+                    const uint8_t* rec = bHdr + rOff;
+                    if (rec[3] != 0xC0u) break;
+                    const uint16_t recSize = DetailDocs200::RdU16LE(rec + 0);
+                    const uint8_t hdrType  = rec[2];
+                    if (recSize < 16u || rOff + recSize > vEnd) break;
+
+                    if ((hdrType == 0x12u || hdrType == 0x13u) && recSize >= 80u) {
+                        // Vista+ Crimson EVENT_HEADER (80 bytes)
+                        const uint16_t flags   = DetailDocs200::RdU16LE(rec + 4);
+                        const uint32_t tid     = DetailDocs200::RdU32LE(rec + 8);
+                        const uint32_t pid     = DetailDocs200::RdU32LE(rec + 12);
+                        const uint64_t ts      = DetailDocs200::RdU64LE(rec + 16);
+                        const std::wstring gid = formatGuid(rec + 24);
+                        const uint16_t evtId   = DetailDocs200::RdU16LE(rec + 40);
+                        const uint8_t level    = rec[44];
+                        const uint8_t opcode   = rec[45];
+                        uint32_t payloadLen    = recSize - 80u;
+                        if ((flags & 0x0001u) != 0 && payloadLen >= 2u) {
+                            // Adjust for extended data items if present
+                            const uint16_t extCnt = DetailDocs200::RdU16LE(rec + 80);
+                            size_t extPos = 82u;
+                            for (uint16_t e = 0; e < extCnt && extPos + 8u <= recSize; ++e) {
+                                const uint16_t dSz = DetailDocs200::RdU16LE(rec + extPos + 6u);
+                                extPos += 8u + dSz;
+                            }
+                            if (extPos <= recSize) payloadLen = static_cast<uint32_t>(recSize - extPos);
+                        }
+
+                        ++totalEvents;
+                        auto& pa = providers[gid];
+                        pa.count++;
+                        pa.minId = std::min(pa.minId, evtId);
+                        pa.maxId = std::max(pa.maxId, evtId);
+                        if (level < 32u) pa.levelMask |= (1u << level);
+
+                        if (evtSh.rows.size() <= 512) {
+                            evtSh.rows.push_back({
+                                std::to_wstring(totalEvents),
+                                formatFileTime(ts),
+                                std::to_wstring(pid),
+                                std::to_wstring(tid),
+                                gid,
+                                std::to_wstring(evtId),
+                                levelName(level),
+                                std::to_wstring(opcode),
+                                std::to_wstring(payloadLen)
+                            });
+                        }
+                    } else if ((hdrType == 0x01u || hdrType == 0x02u) && recSize >= 32u) {
+                        // Kernel SYSTEM_TRACE_HEADER (32 bytes)
+                        const uint8_t opcode = rec[4];
+                        const uint8_t group  = rec[5];
+                        const uint32_t tid   = DetailDocs200::RdU32LE(rec + 8);
+                        const uint32_t pid   = DetailDocs200::RdU32LE(rec + 12);
+                        const uint64_t ts    = DetailDocs200::RdU64LE(rec + 16);
+                        const uint16_t synId = static_cast<uint16_t>((static_cast<uint16_t>(group) << 8) | opcode);
+                        const std::wstring kGuid = L"{9E814AAD-3204-11D2-9A82-006008A86939}"; // SystemTraceControlGuid
+
+                        ++totalEvents;
+                        auto& pa = providers[kGuid];
+                        pa.count++;
+                        pa.minId = std::min(pa.minId, synId);
+                        pa.maxId = std::max(pa.maxId, synId);
+                        pa.levelMask |= (1u << 4);
+
+                        if (evtSh.rows.size() <= 512) {
+                            evtSh.rows.push_back({
+                                std::to_wstring(totalEvents),
+                                formatFileTime(ts),
+                                std::to_wstring(pid),
+                                std::to_wstring(tid),
+                                kGuid,
+                                std::to_wstring(synId),
+                                L"4 (Kernel)",
+                                std::to_wstring(opcode),
+                                std::to_wstring(recSize - 32u)
+                            });
+                        }
+                    } else if (hdrType <= 0x0Fu && hdrType != 0x03u && hdrType != 0x0Cu && hdrType != 0x0Du && recSize >= 48u) {
+                        // Classic EVENT_TRACE_HEADER (48 bytes)
+                        const uint8_t opcode   = rec[4];
+                        const uint8_t level    = rec[5];
+                        const uint32_t tid     = DetailDocs200::RdU32LE(rec + 8);
+                        const uint32_t pid     = DetailDocs200::RdU32LE(rec + 12);
+                        const uint64_t ts      = DetailDocs200::RdU64LE(rec + 16);
+                        const std::wstring gid = formatGuid(rec + 24);
+                        const uint32_t payLen  = recSize - 48u;
+
+                        if (!parsedLogfileHdr && totalBuffers == 1 && rOff == 72u && opcode == 0u && payLen >= 64u) {
+                            parsedLogfileHdr = true;
+                            const uint8_t* lh = rec + 48;
+                            const uint8_t majVer  = lh[4];
+                            const uint8_t minVer  = lh[5];
+                            const uint32_t build  = DetailDocs200::RdU32LE(lh + 8);
+                            const uint32_t nProcs = DetailDocs200::RdU32LE(lh + 12);
+                            const uint64_t endFt  = DetailDocs200::RdU64LE(lh + 16);
+                            const uint32_t timRes = DetailDocs200::RdU32LE(lh + 24);
+                            const uint32_t bufWr  = DetailDocs200::RdU32LE(lh + 36);
+                            const uint32_t ptrSz  = DetailDocs200::RdU32LE(lh + 44);
+                            const uint32_t evtLst = DetailDocs200::RdU32LE(lh + 48);
+                            const uint32_t cpuMhz = DetailDocs200::RdU32LE(lh + 52);
+
+                            sessSh.rows.push_back({ L"OS Version",
+                                std::to_wstring(majVer) + L"." + std::to_wstring(minVer) + L" (Build " + std::to_wstring(build) + L")" });
+                            if (ptrSz == 4u || ptrSz == 8u) {
+                                sessSh.rows.push_back({ L"Architecture Pointer Size", std::to_wstring(ptrSz * 8u) + L"-bit" });
+                            }
+                            sessSh.rows.push_back({ L"Number of Processors", std::to_wstring(nProcs) });
+                            if (cpuMhz > 0) sessSh.rows.push_back({ L"CPU Speed", std::to_wstring(cpuMhz) + L" MHz" });
+                            if (timRes > 0) sessSh.rows.push_back({ L"Timer Resolution (100ns)", std::to_wstring(timRes) });
+                            sessSh.rows.push_back({ L"Header Buffers Written", std::to_wstring(bufWr) });
+                            sessSh.rows.push_back({ L"Events Lost", std::to_wstring(evtLst) });
+
+                            const size_t tailBase = (ptrSz == 4u) ? 240u : 248u;
+                            if (payLen >= tailBase + 32u) {
+                                const uint64_t bootFt  = DetailDocs200::RdU64LE(lh + tailBase + 0);
+                                const uint64_t startFt = DetailDocs200::RdU64LE(lh + tailBase + 16);
+                                const uint32_t bufLost = DetailDocs200::RdU32LE(lh + tailBase + 28);
+                                if (bootFt > 0)  sessSh.rows.push_back({ L"Boot Time (UTC)", formatFileTime(bootFt) });
+                                if (startFt > 0) sessSh.rows.push_back({ L"Session Start Time (UTC)", formatFileTime(startFt) });
+                                if (endFt > 0)   sessSh.rows.push_back({ L"Session End Time (UTC)", formatFileTime(endFt) });
+                                sessSh.rows.push_back({ L"Buffers Lost", std::to_wstring(bufLost) });
+
+                                const size_t strOff = tailBase + 32u;
+                                if (payLen > strOff + 2u) {
+                                    std::wstring loggerName = DetailDocs200::ReadUtf16LE(lh + strOff, payLen - strOff);
+                                    if (!loggerName.empty()) {
+                                        sessSh.rows.push_back({ L"Logger Name", loggerName });
+                                        const size_t nextStr = strOff + (loggerName.size() + 1u) * 2u;
+                                        if (payLen > nextStr + 2u) {
+                                            std::wstring logFile = DetailDocs200::ReadUtf16LE(lh + nextStr, payLen - nextStr);
+                                            if (!logFile.empty()) sessSh.rows.push_back({ L"Log File Name", logFile });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        ++totalEvents;
+                        auto& pa = providers[gid];
+                        pa.count++;
+                        pa.minId = std::min<uint16_t>(pa.minId, opcode);
+                        pa.maxId = std::max<uint16_t>(pa.maxId, opcode);
+                        if (level < 32u) pa.levelMask |= (1u << level);
+
+                        if (evtSh.rows.size() <= 512) {
+                            evtSh.rows.push_back({
+                                std::to_wstring(totalEvents),
+                                formatFileTime(ts),
+                                std::to_wstring(pid),
+                                std::to_wstring(tid),
+                                gid,
+                                std::to_wstring(opcode),
+                                levelName(level),
+                                std::to_wstring(opcode),
+                                std::to_wstring(payLen)
+                            });
+                        }
+                    } else {
+                        // PERFINFO_TRACE_HEADER (0x03/0x0C/0x0D)
+                        const uint16_t hookId = DetailDocs200::RdU16LE(rec + 4);
+                        const uint64_t ts     = DetailDocs200::RdU64LE(rec + 8);
+                        const std::wstring pGuid = L"{CE1DBFB4-137E-4DA6-87B0-3F59AA102CBC}";
+                        ++totalEvents;
+                        auto& pa = providers[pGuid];
+                        pa.count++;
+                        pa.minId = std::min(pa.minId, hookId);
+                        pa.maxId = std::max(pa.maxId, hookId);
+                        pa.levelMask |= (1u << 4);
+                        if (evtSh.rows.size() <= 512) {
+                            evtSh.rows.push_back({
+                                std::to_wstring(totalEvents),
+                                formatFileTime(ts),
+                                L"0",
+                                L"0",
+                                pGuid,
+                                std::to_wstring(hookId),
+                                L"4 (PerfInfo)",
+                                std::to_wstring(hookId & 0xFFu),
+                                std::to_wstring(recSize - 16u)
+                            });
+                        }
+                    }
+
+                    const size_t alignedStep = (static_cast<size_t>(recSize) + 7u) & ~static_cast<size_t>(7u);
+                    if (alignedStep == 0) break;
+                    rOff += alignedStep;
+                }
+            }
+
+            bufFileOff += bSize;
+        }
+
+        if (totalEvents == 0) return false;
+
+        sessSh.rows.insert(sessSh.rows.begin() + 1, { L"WMI Buffer Size", PathUtils::FormatByteSize(buf0Size) });
+        sessSh.rows.insert(sessSh.rows.begin() + 2, { L"Parsed ETW Buffers", std::to_wstring(totalBuffers) });
+        sessSh.rows.insert(sessSh.rows.begin() + 3, { L"Total Decoded Event Records", std::to_wstring(totalEvents) });
+        sessSh.rows.insert(sessSh.rows.begin() + 4, { L"Distinct Provider GUIDs", std::to_wstring(providers.size()) });
+        sessSh.rows.push_back({ L"First Buffer LoggerId", std::to_wstring(DetailDocs200::RdU16LE(raw.data() + 42)) });
+        sessSh.rows.push_back({ L"First Buffer Processor", std::to_wstring(raw[40]) });
+
+        SpreadsheetSheet provSh;
+        provSh.name = L"Providers";
+        provSh.maxCols = 4;
+        provSh.rows.push_back({ L"Provider GUID", L"Event Count", L"Levels Seen", L"EventID Range" });
+        for (const auto& kv : providers) {
+            std::wstring lvls;
+            for (uint8_t l = 0; l < 8u; ++l) {
+                if ((kv.second.levelMask & (1u << l)) != 0) {
+                    if (!lvls.empty()) lvls += L", ";
+                    lvls += std::to_wstring(l);
+                }
+            }
+            provSh.rows.push_back({
+                kv.first,
+                std::to_wstring(kv.second.count),
+                lvls.empty() ? L"0" : lvls,
+                std::to_wstring(kv.second.minId) + L" .. " + std::to_wstring(kv.second.maxId)
+            });
+        }
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
         out.formatTitle = L"Windows Event Trace Log (ETW .etl)";
-
-        SpreadsheetSheet sh;
-        sh.name = L"ETW_Header_And_Strings";
-        sh.maxCols = 2;
-        sh.rows.push_back({ L"ETW Field / Provider String", L"Value" });
-        sh.rows.push_back({ L"WMI Buffer Size", PathUtils::FormatByteSize(bufSize) });
-        sh.rows.push_back({ L"First Buffer Saved Offset", std::to_wstring(savedOff) + L" B" });
-        sh.rows.push_back({ L"Estimated ETW Buffers", std::to_wstring(std::max<size_t>(1, raw.size() / bufSize)) });
-
-        // Extract UTF-16LE strings (Session Name, LogFileName, Kernel Image paths) inside trace buffers
-        for (size_t i = 64; i + 12 < std::min<size_t>(raw.size(), 262144) && sh.rows.size() < 200; i += 2) {
-            if (raw[i] >= 33 && raw[i] <= 126 && raw[i + 1] == 0 &&
-                raw[i + 2] >= 32 && raw[i + 2] <= 126 && raw[i + 3] == 0 &&
-                raw[i + 4] >= 32 && raw[i + 4] <= 126 && raw[i + 5] == 0 &&
-                raw[i + 6] >= 32 && raw[i + 6] <= 126 && raw[i + 7] == 0)
-            {
-                std::wstring s = DetailDocs200::ReadUtf16LE(raw.data() + i, std::min<size_t>(256, raw.size() - i));
-                if (s.size() >= 4) {
-                    sh.rows.push_back({ L"Trace String @ " + std::to_wstring(i), s });
-                    i += s.size() * 2;
-                }
-            }
-        }
-        out.sheets.push_back(std::move(sh));
+        out.sheets.push_back(std::move(sessSh));
+        out.sheets.push_back(std::move(provSh));
+        out.sheets.push_back(std::move(evtSh));
         out.valid = true;
         return true;
     }
@@ -2460,22 +2763,22 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
         return true;
     }
 
-    // #100. Apple iWork (.pages / .numbers / .key) & Microsoft Visio (.vsdx) ZIP Packages
-    if ((ext == L".pages" || ext == L".numbers" || ext == L".key" || ext == L".vsdx") &&
-        raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K')
-    {
+    // #100a. Microsoft Visio Drawing Package (.vsdx — OPC ZIP + Visio Page XML)
+    if (ext == L".vsdx" && raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K') {
         std::vector<ZipDeflate::ArchiveItemMeta> entries;
         if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries)) return false;
 
+        bool hasVisioPart = false;
         SpreadsheetSheet sh;
-        sh.name = (ext == L".vsdx") ? L"Visio_Shapes" : L"Package_And_Text";
+        sh.name = L"Visio_Shapes";
         sh.maxCols = 3;
         sh.rows.push_back({ L"Part / Page", L"Shape / Component", L"Text / Size" });
 
         for (const auto& e : entries) {
-            if (ext == L".vsdx" && e.pathInArchive.find(L"visio/pages/page") != std::wstring::npos &&
-                PathUtils::GetExtension(e.pathInArchive) == L".xml")
-            {
+            std::wstring lp = PathUtils::ToLower(e.pathInArchive);
+            std::replace(lp.begin(), lp.end(), L'\\', L'/');
+            if (lp.find(L"visio/") != std::wstring::npos) hasVisioPart = true;
+            if (lp.find(L"visio/pages/page") != std::wstring::npos && PathUtils::GetExtension(lp) == L".xml") {
                 std::vector<uint8_t> pgBytes;
                 if (ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, pgBytes) && !pgBytes.empty()) {
                     std::string_view psv(reinterpret_cast<const char*>(pgBytes.data()), pgBytes.size());
@@ -2485,7 +2788,6 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
                         size_t gt = psv.find('>', tp);
                         size_t te = (gt != std::string_view::npos) ? psv.find("</Text>", gt + 1) : std::string_view::npos;
                         if (te == std::string_view::npos) break;
-                        // Strip inner <cp .../> tags
                         std::string rawTxt(psv.substr(gt + 1, te - gt - 1));
                         std::string clean;
                         bool inTag = false;
@@ -2501,40 +2803,462 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
                         tp = te + 7;
                     }
                 }
-            } else if (ext != L".vsdx" && (PathUtils::GetExtension(e.pathInArchive) == L".iwa" || PathUtils::GetExtension(e.pathInArchive) == L".xml")) {
-                std::vector<uint8_t> partBytes;
-                std::wstring preview = PathUtils::FormatByteSize(e.uncompressedSize);
-                if (e.uncompressedSize <= 512 * 1024 && ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, partBytes)) {
-                    // Extract first readable UTF-8 run >= 5 chars from .iwa / .xml
-                    std::string run;
-                    for (uint8_t b : partBytes) {
-                        if (b >= 32 && b <= 126) run.push_back(static_cast<char>(b));
-                        else {
-                            if (run.size() >= 6) { preview = PathUtils::Utf8ToWide(run.substr(0, 120)); break; }
-                            run.clear();
-                        }
-                    }
-                }
-                sh.rows.push_back({ e.pathInArchive, L"iWork Stream", preview });
             }
         }
-
-        // Also list package manifest items if no shape text was extracted yet
+        if (!hasVisioPart) return false;
         if (sh.rows.size() == 1) {
             for (const auto& e : entries) {
                 if (!e.isDirectory && sh.rows.size() < 200) {
-                    sh.rows.push_back({ e.pathInArchive, L"ZIP Entry", PathUtils::FormatByteSize(e.uncompressedSize) });
+                    sh.rows.push_back({ e.pathInArchive, L"Visio Part", PathUtils::FormatByteSize(e.uncompressedSize) });
                 }
             }
+        }
+        out.kind = OfficeFileKind::SqliteDb;
+        out.isSpreadsheet = true;
+        out.formatTitle = L"Microsoft Visio Drawing Package (.vsdx)";
+        out.sheets.push_back(std::move(sh));
+        out.valid = true;
+        return true;
+    }
+
+    // #100b. Apple iWork '13+ (.iwa Snappy-Framed Protobuf) & iWork '09 (index.xml / index.apxl) Packages
+    if ((ext == L".pages" || ext == L".numbers" || ext == L".key") &&
+        raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K')
+    {
+        std::vector<ZipDeflate::ArchiveItemMeta> entries;
+        if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries)) return false;
+
+        auto snappyDecompress = [](const uint8_t* src, size_t srcLen, std::vector<uint8_t>& dst) -> bool {
+            dst.clear();
+            size_t p = 0;
+            uint64_t uncompLen = 0;
+            if (!DetailDocs200::ReadVarint64(src, srcLen, p, uncompLen) || uncompLen > (16ULL * 1024ULL * 1024ULL)) {
+                return false;
+            }
+            dst.reserve(static_cast<size_t>(uncompLen));
+            while (p < srcLen && dst.size() < uncompLen) {
+                const uint8_t tag = src[p++];
+                const uint8_t tagType = static_cast<uint8_t>(tag & 0x03u);
+                if (tagType == 0u) {
+                    uint32_t lenMinus1 = static_cast<uint32_t>(tag >> 2);
+                    if (lenMinus1 >= 60u) {
+                        const size_t extraBytes = static_cast<size_t>(lenMinus1 - 59u);
+                        if (p + extraBytes > srcLen) return false;
+                        lenMinus1 = 0;
+                        for (size_t b = 0; b < extraBytes; ++b) {
+                            lenMinus1 |= static_cast<uint32_t>(src[p++]) << (b * 8u);
+                        }
+                    }
+                    const size_t litLen = static_cast<size_t>(lenMinus1) + 1u;
+                    if (p + litLen > srcLen || dst.size() + litLen > uncompLen) return false;
+                    dst.insert(dst.end(), src + p, src + p + litLen);
+                    p += litLen;
+                } else {
+                    size_t copyLen = 0;
+                    size_t copyOff = 0;
+                    if (tagType == 1u) {
+                        if (p >= srcLen) return false;
+                        copyLen = static_cast<size_t>((tag >> 2) & 0x07u) + 4u;
+                        copyOff = (static_cast<size_t>(tag & 0xE0u) << 3) | static_cast<size_t>(src[p++]);
+                    } else if (tagType == 2u) {
+                        if (p + 2u > srcLen) return false;
+                        copyLen = static_cast<size_t>(tag >> 2) + 1u;
+                        copyOff = DetailDocs200::RdU16LE(src + p);
+                        p += 2u;
+                    } else {
+                        if (p + 4u > srcLen) return false;
+                        copyLen = static_cast<size_t>(tag >> 2) + 1u;
+                        copyOff = DetailDocs200::RdU32LE(src + p);
+                        p += 4u;
+                    }
+                    if (copyOff == 0u || copyOff > dst.size() || dst.size() + copyLen > uncompLen) return false;
+                    for (size_t k = 0; k < copyLen; ++k) {
+                        dst.push_back(dst[dst.size() - copyOff]);
+                    }
+                }
+            }
+            return p == srcLen && dst.size() == uncompLen;
+        };
+
+        auto unframeIwa = [&](const std::vector<uint8_t>& framed, std::vector<uint8_t>& outStream) -> bool {
+            outStream.clear();
+            if (framed.size() < 4) return false;
+            size_t pos = 0;
+            size_t validChunks = 0;
+            bool sawSnappyIdent = false;
+            while (pos + 4 <= framed.size()) {
+                const uint8_t chunkType = framed[pos];
+                const uint32_t chunkLen = static_cast<uint32_t>(framed[pos + 1]) |
+                                          (static_cast<uint32_t>(framed[pos + 2]) << 8) |
+                                          (static_cast<uint32_t>(framed[pos + 3]) << 16);
+                pos += 4;
+                if (pos + chunkLen > framed.size()) return false;
+                const uint8_t* payload = framed.data() + pos;
+                if (chunkType == 0xFFu && chunkLen == 6u && std::memcmp(payload, "sNaPpY", 6) == 0) {
+                    sawSnappyIdent = true;
+                } else if (chunkType == 0x00u) {
+                    std::vector<uint8_t> blk;
+                    bool ok = snappyDecompress(payload, chunkLen, blk);
+                    if (!ok && sawSnappyIdent && chunkLen > 4u) {
+                        ok = snappyDecompress(payload + 4, chunkLen - 4u, blk);
+                    }
+                    if (!ok) return false;
+                    if (outStream.size() + blk.size() > 32u * 1024u * 1024u) return false;
+                    outStream.insert(outStream.end(), blk.begin(), blk.end());
+                    ++validChunks;
+                } else if (chunkType == 0x01u) {
+                    const size_t crcSkip = (sawSnappyIdent && chunkLen >= 4u) ? 4u : 0u;
+                    if (outStream.size() + (chunkLen - crcSkip) > 32u * 1024u * 1024u) return false;
+                    outStream.insert(outStream.end(), payload + crcSkip, payload + chunkLen);
+                    ++validChunks;
+                } else {
+                    return false;
+                }
+                pos += chunkLen;
+            }
+            return pos == framed.size() && validChunks > 0 && !outStream.empty();
+        };
+
+        auto pbSkip = [](const uint8_t* buf, size_t sz, size_t& p, uint8_t wt) -> bool {
+            if (wt == 0u) { uint64_t v = 0; return DetailDocs200::ReadVarint64(buf, sz, p, v); }
+            if (wt == 1u) { if (p + 8u > sz) return false; p += 8u; return true; }
+            if (wt == 2u) {
+                uint64_t l = 0;
+                if (!DetailDocs200::ReadVarint64(buf, sz, p, l) || l > sz - p) return false;
+                p += static_cast<size_t>(l);
+                return true;
+            }
+            if (wt == 5u) { if (p + 4u > sz) return false; p += 4u; return true; }
+            return false;
+        };
+
+        auto cleanIworkText = [](std::string_view utf8) -> std::vector<std::wstring> {
+            // Strip U+FFFC (EF BF BC) object replacement markers and split paragraphs
+            std::string cleaned;
+            cleaned.reserve(utf8.size());
+            for (size_t i = 0; i < utf8.size(); ++i) {
+                const uint8_t b = static_cast<uint8_t>(utf8[i]);
+                if (b == 0xEFu && i + 2 < utf8.size() &&
+                    static_cast<uint8_t>(utf8[i + 1]) == 0xBFu && static_cast<uint8_t>(utf8[i + 2]) == 0xBCu)
+                {
+                    i += 2;
+                    continue;
+                }
+                if (b == 0xE2u && i + 2 < utf8.size() &&
+                    static_cast<uint8_t>(utf8[i + 1]) == 0x80u &&
+                    (static_cast<uint8_t>(utf8[i + 2]) == 0xA8u || static_cast<uint8_t>(utf8[i + 2]) == 0xA9u))
+                {
+                    cleaned.push_back('\n');
+                    i += 2;
+                    continue;
+                }
+                if (b == '\r') {
+                    if (i + 1 < utf8.size() && utf8[i + 1] == '\n') ++i;
+                    cleaned.push_back('\n');
+                } else if (b == '\n' || b == '\t' || b >= 0x20u) {
+                    cleaned.push_back(static_cast<char>(b));
+                }
+            }
+            std::vector<std::wstring> lines;
+            size_t st = 0;
+            while (st <= cleaned.size()) {
+                size_t nl = cleaned.find('\n', st);
+                std::string_view seg = (nl == std::string::npos)
+                    ? std::string_view(cleaned).substr(st)
+                    : std::string_view(cleaned).substr(st, nl - st);
+                std::wstring w = PathUtils::Trim(PathUtils::Utf8ToWide(std::string(seg)));
+                if (!w.empty()) lines.push_back(std::move(w));
+                if (nl == std::string::npos) break;
+                st = nl + 1;
+            }
+            return lines;
+        };
+
+        SpreadsheetSheet sh;
+        sh.name = L"Package_And_Text";
+        sh.maxCols = 3;
+        sh.rows.push_back({ L"Archive Stream", L"Object / Message Type", L"Extracted Content" });
+
+        SpreadsheetSheet cellsSh;
+        cellsSh.name = L"Numbers_Table_Data";
+        cellsSh.maxCols = 3;
+        cellsSh.rows.push_back({ L"Table / Stream", L"Entry Key", L"Cell Value" });
+
+        size_t validIwaFiles = 0;
+        size_t validIwaObjects = 0;
+        bool validLegacyXml = false;
+        std::wstring quickLookNote;
+
+        for (const auto& e : entries) {
+            if (e.isDirectory) continue;
+            std::wstring lp = PathUtils::ToLower(e.pathInArchive);
+            std::replace(lp.begin(), lp.end(), L'\\', L'/');
+
+            if (lp.find(L"quicklook/") == 0 && (PathUtils::GetExtension(lp) == L".pdf" || PathUtils::GetExtension(lp) == L".jpg")) {
+                if (!quickLookNote.empty()) quickLookNote += L", ";
+                quickLookNote += e.pathInArchive + L" (" + PathUtils::FormatByteSize(e.uncompressedSize) + L")";
+                continue;
+            }
+
+            if (PathUtils::GetExtension(lp) == L".iwa" && e.uncompressedSize <= 32u * 1024u * 1024u) {
+                std::vector<uint8_t> rawIwa, decomp;
+                if (!ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, rawIwa) || rawIwa.empty()) continue;
+                if (!unframeIwa(rawIwa, decomp)) continue;
+
+                // Walk decompressed .iwa Protobuf stream: [archiveInfoLen: varint][ArchiveInfo][MessagePayloads...]
+                size_t pos = 0;
+                bool streamOk = true;
+                size_t localObjs = 0;
+                while (pos < decomp.size()) {
+                    uint64_t aiLen = 0;
+                    if (!DetailDocs200::ReadVarint64(decomp.data(), decomp.size(), pos, aiLen) ||
+                        aiLen == 0 || aiLen > decomp.size() - pos)
+                    {
+                        streamOk = false;
+                        break;
+                    }
+                    const uint8_t* aiBuf = decomp.data() + pos;
+                    const size_t aiSize = static_cast<size_t>(aiLen);
+                    pos += aiSize;
+
+                    uint64_t archiveId = 0;
+                    struct MsgDesc { uint32_t type = 0; size_t length = 0; };
+                    std::vector<MsgDesc> msgs;
+
+                    size_t ap = 0;
+                    while (ap < aiSize) {
+                        uint64_t tag = 0;
+                        if (!DetailDocs200::ReadVarint64(aiBuf, aiSize, ap, tag) || tag == 0) { streamOk = false; break; }
+                        const uint32_t fn = static_cast<uint32_t>(tag >> 3);
+                        const uint8_t wt  = static_cast<uint8_t>(tag & 0x07u);
+                        if (fn == 1 && wt == 0u) {
+                            if (!DetailDocs200::ReadVarint64(aiBuf, aiSize, ap, archiveId)) { streamOk = false; break; }
+                        } else if (fn == 2 && wt == 2u) {
+                            uint64_t miLen = 0;
+                            if (!DetailDocs200::ReadVarint64(aiBuf, aiSize, ap, miLen) || miLen > aiSize - ap) { streamOk = false; break; }
+                            const uint8_t* miBuf = aiBuf + ap;
+                            const size_t miSize = static_cast<size_t>(miLen);
+                            ap += miSize;
+                            MsgDesc md;
+                            size_t mp = 0;
+                            while (mp < miSize) {
+                                uint64_t mtag = 0;
+                                if (!DetailDocs200::ReadVarint64(miBuf, miSize, mp, mtag) || mtag == 0) { streamOk = false; break; }
+                                const uint32_t mfn = static_cast<uint32_t>(mtag >> 3);
+                                const uint8_t mwt  = static_cast<uint8_t>(mtag & 0x07u);
+                                if (mfn == 1 && mwt == 0u) {
+                                    uint64_t tv = 0;
+                                    if (!DetailDocs200::ReadVarint64(miBuf, miSize, mp, tv)) { streamOk = false; break; }
+                                    md.type = static_cast<uint32_t>(tv);
+                                } else if (mfn == 3 && mwt == 0u) {
+                                    uint64_t lv = 0;
+                                    if (!DetailDocs200::ReadVarint64(miBuf, miSize, mp, lv) || lv > decomp.size()) { streamOk = false; break; }
+                                    md.length = static_cast<size_t>(lv);
+                                } else if (!pbSkip(miBuf, miSize, mp, mwt)) {
+                                    streamOk = false;
+                                    break;
+                                }
+                            }
+                            if (!streamOk) break;
+                            msgs.push_back(md);
+                        } else if (!pbSkip(aiBuf, aiSize, ap, wt)) {
+                            streamOk = false;
+                            break;
+                        }
+                    }
+                    if (!streamOk) break;
+
+                    for (const auto& md : msgs) {
+                        if (md.length > decomp.size() - pos) { streamOk = false; break; }
+                        const uint8_t* mPtr = decomp.data() + pos;
+                        const size_t mLen = md.length;
+                        pos += mLen;
+                        ++localObjs;
+
+                        // TSWP::StorageArchive (type 2001..2025): field 3 = repeated string text
+                        if (md.type >= 2000u && md.type <= 2030u) {
+                            size_t sp = 0;
+                            while (sp < mLen) {
+                                uint64_t stag = 0;
+                                if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                                const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                                const uint8_t swt  = static_cast<uint8_t>(stag & 0x07u);
+                                if (sfn == 3 && swt == 2u) {
+                                    uint64_t sLen = 0;
+                                    if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, sLen) || sLen > mLen - sp) break;
+                                    std::string_view sv(reinterpret_cast<const char*>(mPtr + sp), static_cast<size_t>(sLen));
+                                    sp += static_cast<size_t>(sLen);
+                                    for (auto& line : cleanIworkText(sv)) {
+                                        if (sh.rows.size() <= 500) {
+                                            sh.rows.push_back({
+                                                e.pathInArchive,
+                                                L"TSWP::StorageArchive (#" + std::to_wstring(archiveId) + L")",
+                                                std::move(line)
+                                            });
+                                        }
+                                    }
+                                } else if (!pbSkip(mPtr, mLen, sp, swt)) {
+                                    break;
+                                }
+                            }
+                        }
+                        // TST::TableDataList (type 6005 / 6201): field 3 = repeated ListEntry { key=1, string=3 / number=6 }
+                        else if (md.type == 6005u || md.type == 6201u) {
+                            size_t sp = 0;
+                            while (sp < mLen) {
+                                uint64_t stag = 0;
+                                if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                                const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                                const uint8_t swt  = static_cast<uint8_t>(stag & 0x07u);
+                                if (sfn == 3 && swt == 2u) {
+                                    uint64_t eLen = 0;
+                                    if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, eLen) || eLen > mLen - sp) break;
+                                    const uint8_t* ePtr = mPtr + sp;
+                                    const size_t eSz = static_cast<size_t>(eLen);
+                                    sp += eSz;
+                                    uint64_t key = 0;
+                                    std::wstring cellVal;
+                                    size_t ep = 0;
+                                    while (ep < eSz) {
+                                        uint64_t etag = 0;
+                                        if (!DetailDocs200::ReadVarint64(ePtr, eSz, ep, etag) || etag == 0) break;
+                                        const uint32_t efn = static_cast<uint32_t>(etag >> 3);
+                                        const uint8_t ewt  = static_cast<uint8_t>(etag & 0x07u);
+                                        if (efn == 1 && ewt == 0u) {
+                                            DetailDocs200::ReadVarint64(ePtr, eSz, ep, key);
+                                        } else if ((efn == 3 || efn == 8) && ewt == 2u) {
+                                            uint64_t sl = 0;
+                                            if (!DetailDocs200::ReadVarint64(ePtr, eSz, ep, sl) || sl > eSz - ep) break;
+                                            cellVal = PathUtils::Trim(PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(ePtr + ep), static_cast<size_t>(sl))));
+                                            ep += static_cast<size_t>(sl);
+                                        } else if (efn == 6 && ewt == 1u && ep + 8u <= eSz) {
+                                            uint64_t bits = DetailDocs200::RdU64LE(ePtr + ep);
+                                            ep += 8u;
+                                            double dv = 0.0;
+                                            std::memcpy(&dv, &bits, 8);
+                                            wchar_t dbuf[64] = {};
+                                            swprintf_s(dbuf, L"%.6g", dv);
+                                            cellVal = dbuf;
+                                        } else if (!pbSkip(ePtr, eSz, ep, ewt)) {
+                                            break;
+                                        }
+                                    }
+                                    if (!cellVal.empty()) {
+                                        if (cellsSh.rows.size() <= 500) {
+                                            cellsSh.rows.push_back({ e.pathInArchive, std::to_wstring(key), cellVal });
+                                        }
+                                        if (sh.rows.size() <= 500) {
+                                            sh.rows.push_back({ e.pathInArchive, L"TST::TableDataList [#" + std::to_wstring(key) + L"]", cellVal });
+                                        }
+                                    }
+                                } else if (!pbSkip(mPtr, mLen, sp, swt)) {
+                                    break;
+                                }
+                            }
+                        }
+                        // TST::TableModelArchive (6001) / TN::SheetArchive (2): extract table/sheet name
+                        else if (md.type == 6001u || md.type == 2u) {
+                            size_t sp = 0;
+                            while (sp < mLen) {
+                                uint64_t stag = 0;
+                                if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                                const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                                const uint8_t swt  = static_cast<uint8_t>(stag & 0x07u);
+                                if (((md.type == 6001u && (sfn == 4u || sfn == 8u)) || (md.type == 2u && sfn == 1u)) && swt == 2u) {
+                                    uint64_t sl = 0;
+                                    if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, sl) || sl > mLen - sp) break;
+                                    if (sl > 0 && sl <= 256u && DetailDocs200::IsMostlyPrintableUtf8(mPtr + sp, static_cast<size_t>(sl))) {
+                                        std::wstring nm = PathUtils::Trim(PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(mPtr + sp), static_cast<size_t>(sl))));
+                                        if (!nm.empty() && sh.rows.size() <= 500) {
+                                            sh.rows.push_back({
+                                                e.pathInArchive,
+                                                (md.type == 2u) ? L"TN::SheetArchive" : L"TST::TableModelArchive",
+                                                std::move(nm)
+                                            });
+                                        }
+                                    }
+                                    sp += static_cast<size_t>(sl);
+                                } else if (!pbSkip(mPtr, mLen, sp, swt)) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!streamOk) break;
+                }
+
+                if (streamOk && localObjs > 0) {
+                    ++validIwaFiles;
+                    validIwaObjects += localObjs;
+                }
+            }
+            // iWork '09 XML format: index.xml / index.apxl (plain or gzip-compressed inside ZIP)
+            else if (lp == L"index.xml" || lp == L"index.apxl" || lp == L"index.xml.gz" || lp == L"index.apxl.gz") {
+                std::vector<uint8_t> xmlRaw, xmlBuf;
+                if (!ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, xmlRaw) || xmlRaw.empty()) continue;
+                if (xmlRaw.size() >= 2 && xmlRaw[0] == 0x1Fu && xmlRaw[1] == 0x8Bu) {
+                    if (!ZipDeflate::InflateGzip(xmlRaw.data(), xmlRaw.size(), xmlBuf)) continue;
+                } else {
+                    xmlBuf = std::move(xmlRaw);
+                }
+                std::string_view xsv(reinterpret_cast<const char*>(xmlBuf.data()), xmlBuf.size());
+                if (xsv.find("<ls:document") == std::string_view::npos &&
+                    xsv.find("<sl:document") == std::string_view::npos &&
+                    xsv.find("<key:presentation") == std::string_view::npos &&
+                    xsv.find("xmlns:sf=") == std::string_view::npos)
+                {
+                    continue;
+                }
+                validLegacyXml = true;
+                size_t pPos = 0;
+                while ((pPos = xsv.find("<sf:p", pPos)) != std::string_view::npos && sh.rows.size() <= 500) {
+                    size_t gt = xsv.find('>', pPos);
+                    if (gt == std::string_view::npos) break;
+                    if (xsv[gt - 1] == '/') { pPos = gt + 1; continue; }
+                    size_t closeP = xsv.find("</sf:p>", gt + 1);
+                    if (closeP == std::string_view::npos) break;
+                    std::string inner(xsv.substr(gt + 1, closeP - gt - 1));
+                    std::string plain;
+                    bool inTag = false;
+                    for (char ch : inner) {
+                        if (ch == '<') inTag = true;
+                        else if (ch == '>') inTag = false;
+                        else if (!inTag) plain.push_back(ch);
+                    }
+                    std::wstring wtxt = PathUtils::Trim(PathUtils::Utf8ToWide(plain));
+                    if (!wtxt.empty()) {
+                        sh.rows.push_back({ e.pathInArchive, L"iWork '09 Paragraph", std::move(wtxt) });
+                    }
+                    pPos = closeP + 7;
+                }
+            }
+        }
+
+        // Strict anti-cheat: if ZIP contains ZERO valid .iwa Snappy-Protobuf streams and ZERO iWork '09 index.xml/apxl, reject!
+        if (validIwaFiles == 0 && !validLegacyXml) {
+            return false;
+        }
+
+        if (validIwaFiles > 0) {
+            sh.rows.insert(sh.rows.begin() + 1, {
+                L"Package Summary",
+                L"iWork '13+ Archive",
+                std::to_wstring(validIwaFiles) + L" .iwa streams, " + std::to_wstring(validIwaObjects) + L" protobuf objects"
+            });
+        }
+        if (!quickLookNote.empty()) {
+            sh.rows.push_back({ L"QuickLook Preview", L"Supplemental Preview", quickLookNote });
         }
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
-        out.formatTitle = (ext == L".vsdx")    ? L"Microsoft Visio Drawing Package (.vsdx)" :
-                          (ext == L".pages")   ? L"Apple Pages Document Package (.pages)" :
+        out.formatTitle = (ext == L".pages")   ? L"Apple Pages Document Package (.pages)" :
                           (ext == L".numbers") ? L"Apple Numbers Spreadsheet Package (.numbers)" :
                                                  L"Apple Keynote Presentation Package (.key)";
         out.sheets.push_back(std::move(sh));
+        if (cellsSh.rows.size() > 1) {
+            out.sheets.push_back(std::move(cellsSh));
+        }
         out.valid = true;
         return true;
     }

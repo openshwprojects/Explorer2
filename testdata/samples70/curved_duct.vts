@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<VTKFile type="StructuredGrid" version="0.1" byte_order="LittleEndian">
+  <StructuredGrid WholeExtent="0 2 0 2 0 0">
+    <Piece Extent="0 2 0 2 0 0">
+      <Points>
+        <DataArray type="Float32" NumberOfComponents="3" format="ascii">
+          -6 0 -6   0 4 -6   6 0 -6
+          -6 0  0   0 5  0   6 0  0
+          -6 0  6   0 4  6   6 0  6
+        </DataArray>
+      </Points>
+    </Piece>
+  </StructuredGrid>
+</VTKFile>

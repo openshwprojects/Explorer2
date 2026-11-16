@@ -1,0 +1,31 @@
+-- Xilinx Zynq-7020 CLG400 Subset IEEE 1149.1 BSDL
+entity XC7Z020_CLG400 is
+  generic (PHYSICAL_PIN_MAP : string := "CLG400_BGA");
+  port (
+    TCK      : in      bit;
+    TMS      : in      bit;
+    TDI      : in      bit;
+    TDO      : out     bit;
+    PS_POR_B : in      bit;
+    MIO      : inout   bit_vector(3 downto 0);
+    VCCINT   : linkage bit;
+    GND      : linkage bit
+  );
+  use STD_1149_1_2001.all;
+  attribute COMPONENT_CONFORMANCE of XC7Z020_CLG400 : entity is "STD_1149_1_2001";
+  attribute PIN_MAP of XC7Z020_CLG400 : entity is PHYSICAL_PIN_MAP;
+  constant CLG400_BGA : PIN_MAP_STRING :=
+    "TCK:F6, TMS:E6, TDI:F5, TDO:E5, PS_POR_B:B4, " &
+    "MIO(0):A1, MIO(1):A2, MIO(2):B1, MIO(3):B2, " &
+    "VCCINT:(C3,D3), GND:(C4,D4)";
+  attribute TAP_SCAN_IN    of TDI : signal is true;
+  attribute TAP_SCAN_MODE  of TMS : signal is true;
+  attribute TAP_SCAN_OUT   of TDO : signal is true;
+  attribute TAP_SCAN_CLOCK of TCK : signal is (50.0e6, BOTH);
+  attribute IDCODE_REGISTER of XC7Z020_CLG400 : entity is
+    "0010" &              -- version
+    "0011011100100111" &  -- part number 0x3727
+    "00001001001" &       -- manufacturer Xilinx
+    "1";
+  attribute BOUNDARY_LENGTH of XC7Z020_CLG400 : entity is 12;
+end XC7Z020_CLG400;

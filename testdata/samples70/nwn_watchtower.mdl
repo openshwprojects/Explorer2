@@ -1,0 +1,64 @@
+# BioWare Aurora ASCII Model
+filedependancy watchtower.max
+newmodel nwn_watchtower
+setsupermodel nwn_watchtower NULL
+classification Tile
+setanimationscale 1.0
+beginmodelgeom nwn_watchtower
+node dummy nwn_watchtower
+  parent NULL
+endnode
+node trimesh tower_base
+  parent nwn_watchtower
+  position 0.0 0.0 0.0
+  orientation 0.0 0.0 1.0 0.0
+  wirecolor 0.6 0.6 0.8
+  verts 8
+    -2.0 -2.0 0.0
+     2.0 -2.0 0.0
+     2.0  2.0 0.0
+    -2.0  2.0 0.0
+    -1.6 -1.6 5.0
+     1.6 -1.6 5.0
+     1.6  1.6 5.0
+    -1.6  1.6 5.0
+  faces 10
+    0 2 1  1  0 2 1  1
+    0 3 2  1  0 3 2  1
+    0 1 5  2  0 1 5  1
+    0 5 4  2  0 5 4  1
+    1 2 6  4  1 2 6  1
+    1 6 5  4  1 6 5  1
+    2 3 7  8  2 3 7  1
+    2 7 6  8  2 7 6  1
+    3 0 4  16 3 0 4  1
+    3 4 7  16 3 0 4  1
+endnode
+node trimesh tower_spire
+  parent tower_base
+  position 0.0 0.0 5.0
+  orientation 0.0 0.0 1.0 0.785398
+  verts 5
+    -1.8 -1.8 0.0
+     1.8 -1.8 0.0
+     1.8  1.8 0.0
+    -1.8  1.8 0.0
+     0.0  0.0 3.2
+  faces 6
+    0 2 1  1  0 2 1  2
+    0 3 2  1  0 3 2  2
+    0 1 4  2  0 1 4  2
+    1 2 4  4  1 2 4  2
+    2 3 4  8  2 3 4  2
+    3 0 4  16 3 0 4  2
+endnode
+endmodelgeom nwn_watchtower
+newanim beacon_pulse nwn_watchtower
+  length 2.0
+  transtime 0.25
+  animroot nwn_watchtower
+  node dummy nwn_watchtower
+    parent NULL
+  endnode
+doneanim beacon_pulse nwn_watchtower
+donemodel nwn_watchtower

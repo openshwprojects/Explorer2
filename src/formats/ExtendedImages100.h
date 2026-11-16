@@ -190,12 +190,17 @@ inline bool EqualsIgnoreCaseAscii(std::string_view a, std::string_view b) {
 
 } // namespace DetailImg100
 
+#include "ExrUpgrade.h"
+
 // ============================================================================
 // 1. OpenEXR (.exr) — Magic 0x76, 0x2F, 0x31, 0x01
-//    Supports pixel types UINT (0), HALF (1), FLOAT (2) and compressions
-//    NO_COMPRESSION (0), RLE_COMPRESSION (1), ZIPS_COMPRESSION (2), ZIP_COMPRESSION (3)
+//    Delegates to ExrUpgrade.h (NO, RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A, DWAA, DWAB + Multi-Part v2)
 // ============================================================================
 inline bool DecodeOpenEXR(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
+    return DecodeOpenEXRUpgraded(data, size, outInfo);
+}
+
+inline bool DecodeOpenEXRLegacyUnused(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
     if (!data || size < 32 || data[0] != 0x76 || data[1] != 0x2F || data[2] != 0x31 || data[3] != 0x01) {
         return false;
     }
@@ -616,12 +621,21 @@ inline bool DecodeOpenEXR(const uint8_t* data, size_t size, ExtendedImageInfo& o
 namespace DetailBasis {
 
 inline uint16_t BasisCrc16(const void* r, size_t sz, uint16_t crc = 0) {
+    static constexpr std::array<uint16_t, 256> kTable = []() constexpr {
+        std::array<uint16_t, 256> t{};
+        for (uint32_t i = 0; i < 256u; ++i) {
+            uint16_t v = static_cast<uint16_t>(i << 8);
+            for (int b = 0; b < 8; ++b) {
+                v = (v & 0x8000u) ? static_cast<uint16_t>((v << 1) ^ 0x1021u) : static_cast<uint16_t>(v << 1);
+            }
+            t[i] = v;
+        }
+        return t;
+    }();
     crc = static_cast<uint16_t>(~crc);
     const uint8_t* p = static_cast<const uint8_t*>(r);
-    for (; sz > 0; --sz) {
-        const uint16_t q = static_cast<uint16_t>(*p++ ^ (crc >> 8));
-        const uint16_t k = static_cast<uint16_t>((q >> 4) ^ q);
-        crc = static_cast<uint16_t>((((crc << 8) ^ k) ^ (k << 5)) ^ (k << 12));
+    for (size_t i = 0; i < sz; ++i) {
+        crc = static_cast<uint16_t>((crc << 8) ^ kTable[((crc >> 8) ^ p[i]) & 0xFFu]);
     }
     return static_cast<uint16_t>(~crc);
 }
@@ -1410,6 +1424,8 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
         uint32_t supercomp = DetailImg100::RdU32LE(data + 44);
         uint32_t dfdByteOff = DetailImg100::RdU32LE(data + 48);
         uint32_t dfdByteLen = DetailImg100::RdU32LE(data + 52);
+        uint64_t sgdByteOff = DetailImg100::RdU64LE(data + 64);
+        uint64_t sgdByteLen = DetailImg100::RdU64LE(data + 72);
         if (w == 0 || w > 8192 || h > 8192 || levelCount > 32) return false;
 
         size_t levelIndexEnd = 80ull + static_cast<size_t>(levelCount) * 24ull;
@@ -1423,12 +1439,123 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
             return false;
         }
 
+        if (supercomp == 1) { // KTX_SS_BASIS_LZ (ETC1S supercompression, KTX 2.0 Section 3.10.2)
+            if (vkFormat != 0) return false;
+            if (dfdByteLen >= 28 && dfdByteOff <= size && dfdByteLen <= size - dfdByteOff) {
+                uint8_t colorModel = data[dfdByteOff + 12];
+                if (colorModel == 0u) colorModel = data[dfdByteOff + 16];
+                if (colorModel != 163u) return false; // KHR_DF_MODEL_ETC1S == 163
+            }
+            uint64_t totalImgCount = 0;
+            for (uint32_t lv = 0; lv < levelCount; ++lv) {
+                uint32_t lvDepth = std::max(1u, d >> lv);
+                totalImgCount += static_cast<uint64_t>(layers) * faces * lvDepth;
+            }
+            if (totalImgCount == 0 || totalImgCount > 65536ull) return false;
+            uint64_t descsEnd = 20ull + totalImgCount * 20ull;
+            if (sgdByteOff < levelIndexEnd || sgdByteOff > size || sgdByteLen > size - sgdByteOff || sgdByteLen < descsEnd) {
+                return false;
+            }
+            const uint8_t* sgd = data + static_cast<size_t>(sgdByteOff);
+            uint16_t endpointCount    = DetailImg100::RdU16LE(sgd + 0);
+            uint16_t selectorCount    = DetailImg100::RdU16LE(sgd + 2);
+            uint32_t endpointsByteLen = DetailImg100::RdU32LE(sgd + 4);
+            uint32_t selectorsByteLen = DetailImg100::RdU32LE(sgd + 8);
+            uint32_t tablesByteLen    = DetailImg100::RdU32LE(sgd + 12);
+            uint32_t extendedByteLen  = DetailImg100::RdU32LE(sgd + 16);
+            if (endpointCount == 0 || selectorCount == 0 ||
+                endpointsByteLen == 0 || selectorsByteLen == 0 || tablesByteLen == 0) {
+                return false;
+            }
+            uint64_t sgdRequired = descsEnd + endpointsByteLen + selectorsByteLen + tablesByteLen + extendedByteLen;
+            if (sgdRequired > sgdByteLen) return false;
+
+            // Mip 0, layer 0, face 0, slice 0 descriptor at sgd + 20
+            uint32_t imageFlags    = DetailImg100::RdU32LE(sgd + 20);
+            uint32_t rgbSliceOff   = DetailImg100::RdU32LE(sgd + 24);
+            uint32_t rgbSliceLen   = DetailImg100::RdU32LE(sgd + 28);
+            uint32_t alphaSliceOff = DetailImg100::RdU32LE(sgd + 32);
+            uint32_t alphaSliceLen = DetailImg100::RdU32LE(sgd + 36);
+            if (rgbSliceLen == 0 || rgbSliceOff > byteLen || rgbSliceLen > byteLen - rgbSliceOff) {
+                return false;
+            }
+
+            const uint8_t* epPtr  = sgd + static_cast<size_t>(descsEnd);
+            const uint8_t* selPtr = epPtr + endpointsByteLen;
+            const uint8_t* tblPtr = selPtr + selectorsByteLen;
+
+            std::vector<DetailBasis::Etc1sEndpoint> endpoints;
+            std::vector<DetailBasis::Etc1sSelector> selectors;
+            DetailBasis::Etc1sTables tables;
+            if (!DetailBasis::DecodeEtc1sEndpoints(epPtr, endpointsByteLen, endpointCount, endpoints) ||
+                !DetailBasis::DecodeEtc1sSelectors(selPtr, selectorsByteLen, selectorCount, selectors) ||
+                !DetailBasis::DecodeEtc1sTables(tblPtr, tablesByteLen, tables)) {
+                return false;
+            }
+
+            uint32_t bw4 = (w + 3u) / 4u;
+            uint32_t bh4 = (h + 3u) / 4u;
+            bool isVideo = (imageFlags & 0x01u) != 0u;
+            const uint8_t* mipBase = data + static_cast<size_t>(byteOff);
+            std::vector<uint8_t> rgbRgba;
+            if (!DetailBasis::DecodeEtc1sSliceToRgba(
+                    mipBase + rgbSliceOff, rgbSliceLen, bw4, bh4, w, h,
+                    isVideo, endpoints, selectors, tables, rgbRgba)) {
+                return false;
+            }
+
+            bool hasAlpha = false;
+            if (alphaSliceLen > 0) {
+                if (alphaSliceOff > byteLen || alphaSliceLen > byteLen - alphaSliceOff) return false;
+                std::vector<uint8_t> alphaRgba;
+                if (!DetailBasis::DecodeEtc1sSliceToRgba(
+                        mipBase + alphaSliceOff, alphaSliceLen, bw4, bh4, w, h,
+                        isVideo, endpoints, selectors, tables, alphaRgba)) {
+                    return false;
+                }
+                size_t pxTotal = static_cast<size_t>(w) * h;
+                for (size_t i = 0; i < pxTotal; ++i) {
+                    rgbRgba[i * 4u + 3] = alphaRgba[i * 4u + 1];
+                }
+                hasAlpha = true;
+            }
+
+            size_t pxTotal = static_cast<size_t>(w) * h;
+            outInfo.bgraPixels.resize(pxTotal * 4u);
+            for (size_t i = 0; i < pxTotal; ++i) {
+                WritePremulBGRA(
+                    &outInfo.bgraPixels[i * 4u],
+                    rgbRgba[i * 4u + 0],
+                    rgbRgba[i * 4u + 1],
+                    rgbRgba[i * 4u + 2],
+                    rgbRgba[i * 4u + 3]);
+            }
+            outInfo.width = w;
+            outInfo.height = h;
+            outInfo.origWidth = w;
+            outInfo.origHeight = h;
+            outInfo.channels = hasAlpha ? 4u : 3u;
+            outInfo.bitsPerChannel = 8;
+            outInfo.formatName = L"Khronos KTX 2.0 BasisLZ ETC1S (.ktx2)";
+            outInfo.valid = true;
+            return true;
+        }
+
         std::vector<uint8_t> inflatedMip;
         const uint8_t* mipPtr = nullptr;
         size_t mipLen = 0;
         if (supercomp == 0) {
             mipPtr = data + static_cast<size_t>(byteOff);
             mipLen = static_cast<size_t>(byteLen);
+        } else if (supercomp == 2) { // KTX_SS_ZSTD (RFC 8878 Zstandard supercompression)
+            if (uncompLen == 0 || uncompLen > 256ULL * 1024 * 1024) return false;
+            if (!StreamCodecs::DecompressZstdFrame(data + static_cast<size_t>(byteOff), static_cast<size_t>(byteLen),
+                                                   inflatedMip, static_cast<size_t>(uncompLen) + 64) ||
+                inflatedMip.size() < static_cast<size_t>(uncompLen)) {
+                return false;
+            }
+            mipPtr = inflatedMip.data();
+            mipLen = static_cast<size_t>(uncompLen);
         } else if (supercomp == 3) { // KTX_SS_ZLIB
             if (uncompLen == 0 || uncompLen > 256ULL * 1024 * 1024) return false;
             if (!ZipDeflate::InflateZlib(data + static_cast<size_t>(byteOff), static_cast<size_t>(byteLen),
@@ -1437,7 +1564,7 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
                 return false;
             }
             mipPtr = inflatedMip.data();
-            mipLen = inflatedMip.size();
+            mipLen = static_cast<size_t>(uncompLen);
         } else {
             return false;
         }
@@ -1458,7 +1585,8 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
 
         if (vkFormat == 0) { // VK_FORMAT_UNDEFINED -> check DFD colorModel == 166 (KHR_DF_MODEL_UASTC)
             if (dfdByteLen < 28 || dfdByteOff > size || dfdByteLen > size - dfdByteOff) return false;
-            uint8_t colorModel = data[dfdByteOff + 4 + 12];
+            uint8_t colorModel = data[dfdByteOff + 12];
+            if (colorModel == 0u) colorModel = data[dfdByteOff + 16];
             if (colorModel != 166u || mipLen < blocks4x4 * 16u) return false;
             outInfo.bgraPixels.assign(pxCount * 4u, 0);
             uint8_t blk[64];
@@ -1612,6 +1740,28 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
                 }
             }
             fmtDesc = L"Khronos KTX 2.0 BC5 (.ktx2)";
+        } else if (vkFormat == 143 || vkFormat == 144) { // BC6H_UFLOAT / BC6H_SFLOAT
+            if (mipLen < blocks4x4 * 16) return false;
+            outCh = 3;
+            outBits = 16;
+            std::vector<float> flt(pxCount * 4, 0.0f);
+            float blk[64];
+            for (uint32_t by = 0; by < bh4; ++by) {
+                for (uint32_t bx = 0; bx < bw4; ++bx) {
+                    GpuTex::DecodeBC6HBlock(mipPtr + (static_cast<size_t>(by) * bw4 + bx) * 16, blk, vkFormat == 144);
+                    for (uint32_t py = 0; py < 4; ++py) {
+                        uint32_t dy = by * 4 + py;
+                        if (dy >= h) continue;
+                        for (uint32_t px = 0; px < 4; ++px) {
+                            uint32_t dx = bx * 4 + px;
+                            if (dx >= w) continue;
+                            std::memcpy(&flt[(static_cast<size_t>(dy) * w + dx) * 4], &blk[(py * 4 + px) * 4], 16);
+                        }
+                    }
+                }
+            }
+            GpuTex::ConvertFloatRgbaToBgra(flt.data(), w, h, true, outInfo.bgraPixels);
+            fmtDesc = L"Khronos KTX 2.0 BC6H HDR (.ktx2)";
         } else if (vkFormat == 145 || vkFormat == 146) { // BC7
             if (mipLen < blocks4x4 * 16) return false;
             outInfo.bgraPixels.assign(pxCount * 4, 0);
@@ -1623,9 +1773,9 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
                 }
             }
             fmtDesc = L"Khronos KTX 2.0 BC7 (.ktx2)";
-        } else if (vkFormat >= 147 && vkFormat <= 150) { // ETC2 RGB8 (147,148) & ETC2 RGB8A1 (149,150)
+        } else if (vkFormat == 147 || vkFormat == 148) { // ETC2 RGB8
             if (mipLen < blocks4x4 * 8) return false;
-            outCh = (vkFormat >= 149) ? 4u : 3u;
+            outCh = 3u;
             outInfo.bgraPixels.assign(pxCount * 4, 0);
             uint8_t blk[64];
             for (uint32_t by = 0; by < bh4; ++by) {
@@ -1635,7 +1785,19 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
                 }
             }
             fmtDesc = L"Khronos KTX 2.0 ETC2 RGB8 (.ktx2)";
-        } else if (vkFormat == 151 || vkFormat == 152 || vkFormat == 155 || vkFormat == 156) { // ETC2 RGBA8 (151,152) / EAC RG11 (155,156)
+        } else if (vkFormat == 149 || vkFormat == 150) { // ETC2 RGB8A1 punchthrough alpha
+            if (mipLen < blocks4x4 * 8) return false;
+            outCh = 4u;
+            outInfo.bgraPixels.assign(pxCount * 4, 0);
+            uint8_t blk[64];
+            for (uint32_t by = 0; by < bh4; ++by) {
+                for (uint32_t bx = 0; bx < bw4; ++bx) {
+                    GpuTex::DecodeETC2RgbA1Block(mipPtr + (static_cast<size_t>(by) * bw4 + bx) * 8, blk);
+                    GpuTex::BlitBlock4x4RgbaToPremulBgra(blk, bx, by, w, h, outInfo.bgraPixels);
+                }
+            }
+            fmtDesc = L"Khronos KTX 2.0 ETC2 RGB8A1 (.ktx2)";
+        } else if (vkFormat == 151 || vkFormat == 152) { // ETC2 RGBA8
             if (mipLen < blocks4x4 * 16) return false;
             outInfo.bgraPixels.assign(pxCount * 4, 0);
             uint8_t blk[64];
@@ -1646,6 +1808,32 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
                 }
             }
             fmtDesc = L"Khronos KTX 2.0 ETC2 RGBA8 (.ktx2)";
+        } else if (vkFormat == 153 || vkFormat == 154) { // EAC R11 UNORM / SNORM
+            if (mipLen < blocks4x4 * 8) return false;
+            outCh = 1u;
+            outBits = 11u;
+            outInfo.bgraPixels.assign(pxCount * 4, 0);
+            uint8_t blk[64];
+            for (uint32_t by = 0; by < bh4; ++by) {
+                for (uint32_t bx = 0; bx < bw4; ++bx) {
+                    GpuTex::DecodeEacR11Block(mipPtr + (static_cast<size_t>(by) * bw4 + bx) * 8, vkFormat == 154, blk);
+                    GpuTex::BlitBlock4x4RgbaToPremulBgra(blk, bx, by, w, h, outInfo.bgraPixels);
+                }
+            }
+            fmtDesc = L"Khronos KTX 2.0 EAC R11 (.ktx2)";
+        } else if (vkFormat == 155 || vkFormat == 156) { // EAC RG11 UNORM / SNORM
+            if (mipLen < blocks4x4 * 16) return false;
+            outCh = 2u;
+            outBits = 11u;
+            outInfo.bgraPixels.assign(pxCount * 4, 0);
+            uint8_t blk[64];
+            for (uint32_t by = 0; by < bh4; ++by) {
+                for (uint32_t bx = 0; bx < bw4; ++bx) {
+                    GpuTex::DecodeEacRG11Block(mipPtr + (static_cast<size_t>(by) * bw4 + bx) * 16, vkFormat == 156, blk);
+                    GpuTex::BlitBlock4x4RgbaToPremulBgra(blk, bx, by, w, h, outInfo.bgraPixels);
+                }
+            }
+            fmtDesc = L"Khronos KTX 2.0 EAC RG11 (.ktx2)";
         } else if (vkFormat >= 157 && vkFormat <= 184) { // ASTC 4x4 .. 12x12
             static const uint8_t kAstcDims[14][2] = {
                 {4,4}, {5,4}, {5,5}, {6,5}, {6,6}, {8,5}, {8,6},
@@ -1864,206 +2052,7 @@ inline bool DecodeKTX2OrBasis(const uint8_t* data, size_t size, const std::wstri
     return true;
 }
 
-// ============================================================================
-// 3, 4, 6. ZIP-Packaged Digital Painting Formats: Krita (.kra), OpenRaster (.ora), Procreate (.procreate)
-// ============================================================================
-inline bool DecodeZipArtworkContainer(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
-    if (size < 30 || data[0] != 'P' || data[1] != 'K') return false;
-    std::vector<ZipDeflate::ArchiveItemMeta> entries;
-    if (!ZipDeflate::ListZipEntriesFromMemory(data, size, entries) || entries.empty()) return false;
-
-    std::wstring label = (extLower == L".kra") ? L"Krita Document (.kra)" :
-                         (extLower == L".ora") ? L"OpenRaster Document (.ora)" :
-                         (extLower == L".procreate") ? L"Procreate Artwork (.procreate)" : L"Layered Artwork Container";
-
-    // Extract layer names from stack.xml or maindoc.xml if present
-    for (const auto& e : entries) {
-        std::wstring nl = PathUtils::ToLower(e.pathInArchive);
-        if (nl == L"stack.xml" || nl == L"maindoc.xml") {
-            std::vector<uint8_t> xmlBytes;
-            if (ZipDeflate::ExtractZipEntryFromMemory(data, size, e, xmlBytes) && !xmlBytes.empty()) {
-                std::string_view sv(reinterpret_cast<const char*>(xmlBytes.data()), xmlBytes.size());
-                size_t pos = 0;
-                while ((pos = sv.find("name=\"", pos)) != std::string_view::npos && outInfo.layerNames.size() < 32) {
-                    pos += 6;
-                    size_t endQ = sv.find('"', pos);
-                    if (endQ == std::string_view::npos) break;
-                    outInfo.layerNames.push_back(PathUtils::Utf8ToWide(sv.substr(pos, endQ - pos)));
-                    pos = endQ + 1;
-                }
-            }
-        }
-    }
-
-    // Look for mergedimage.png, Thumbnails/thumbnail.png, preview.png, QuickLook/Thumbnail.png, or any .png
-    const ZipDeflate::ArchiveItemMeta* bestPng = nullptr;
-    for (const auto& e : entries) {
-        std::wstring nl = PathUtils::ToLower(e.pathInArchive);
-        if (nl == L"mergedimage.png" || nl == L"thumbnails/thumbnail.png" ||
-            nl == L"quicklook/thumbnail.png" || nl == L"preview.png") {
-            bestPng = &e;
-            break;
-        }
-        if (!bestPng && nl.size() > 4 && nl.substr(nl.size() - 4) == L".png") {
-            bestPng = &e;
-        }
-    }
-
-    if (bestPng) {
-        std::vector<uint8_t> pngBytes;
-        if (ZipDeflate::ExtractZipEntryFromMemory(data, size, *bestPng, pngBytes) && !pngBytes.empty()) {
-            if (DetailImg100::DecodeEmbeddedWicBuffer(pngBytes.data(), pngBytes.size(), label, outInfo)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// ============================================================================
-// 5. Clip Studio Paint (.clip) — Magic "CSFCHUNK" + embedded PNG canvas preview
-// ============================================================================
-inline bool DecodeClipStudio(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    if (size < 24 || std::memcmp(data, "CSFCHUNK", 8) != 0) return false;
-    static const uint8_t kPngSig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
-    static const uint8_t kIend[8]   = { 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82 };
-
-    for (size_t i = 8; i + 32 < size; ++i) {
-        if (std::memcmp(data + i, kPngSig, 8) == 0) {
-            size_t pngEnd = size - i;
-            for (size_t j = i + 16; j + 8 <= size; ++j) {
-                if (std::memcmp(data + j, kIend, 8) == 0) {
-                    pngEnd = (j + 8) - i;
-                    break;
-                }
-            }
-            if (DetailImg100::DecodeEmbeddedWicBuffer(data + i, pngEnd, L"Clip Studio Paint Canvas (.clip)", outInfo)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// ============================================================================
-// 7. Aseprite Pixel-Art Sprite (.aseprite / .ase with 0xA5E0 magic at offset 4)
-// ============================================================================
-inline bool DecodeAseprite(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    if (size < 128 || DetailImg100::RdU16LE(data + 4) != 0xA5E0) return false;
-    uint16_t frames = DetailImg100::RdU16LE(data + 6);
-    uint16_t w      = DetailImg100::RdU16LE(data + 8);
-    uint16_t h      = DetailImg100::RdU16LE(data + 10);
-    uint16_t depth  = DetailImg100::RdU16LE(data + 12);
-    if (w == 0 || h == 0 || w > 8192 || h > 8192 || (depth != 32 && depth != 16 && depth != 8)) return false;
-
-    outInfo.width = w;
-    outInfo.height = h;
-    outInfo.channels = 4;
-    outInfo.bitsPerChannel = 8;
-    outInfo.formatName = L"Aseprite Sprite (" + std::to_wstring(frames) + L" frames, " + std::to_wstring(depth) + L"-bit)";
-    outInfo.bgraPixels.assign(static_cast<size_t>(w) * h * 4, 0);
-
-    uint32_t palette[256] = {};
-    for (int i = 0; i < 256; ++i) {
-        uint8_t c = static_cast<uint8_t>(i);
-        palette[i] = (255u << 24) | (static_cast<uint32_t>(c) << 16) | (static_cast<uint32_t>(c) << 8) | c;
-    }
-
-    size_t pos = 128;
-    bool decodedAnyCel = false;
-    for (uint16_t f = 0; f < std::min<uint16_t>(frames, 4) && pos + 16 <= size; ++f) {
-        uint32_t frameBytes = DetailImg100::RdU32LE(data + pos);
-        uint16_t frameMagic = DetailImg100::RdU16LE(data + pos + 4);
-        if (frameMagic != 0xF1FA || frameBytes < 16 || pos + frameBytes > size) break;
-        uint32_t numChunks = DetailImg100::RdU32LE(data + pos + 12);
-        if (numChunks == 0) numChunks = DetailImg100::RdU16LE(data + pos + 6);
-
-        size_t cpos = pos + 16;
-        size_t frameEnd = pos + frameBytes;
-        for (uint32_t c = 0; c < numChunks && cpos + 6 <= frameEnd; ++c) {
-            uint32_t chunkSize = DetailImg100::RdU32LE(data + cpos);
-            uint16_t chunkType = DetailImg100::RdU16LE(data + cpos + 4);
-            if (chunkSize < 6 || cpos + chunkSize > frameEnd) break;
-            const uint8_t* cdata = data + cpos + 6;
-            size_t clen = chunkSize - 6;
-
-            if (chunkType == 0x2004 && clen >= 18) { // Layer chunk
-                uint16_t nameLen = DetailImg100::RdU16LE(cdata + 16);
-                if (18u + nameLen <= clen) {
-                    std::string lname(reinterpret_cast<const char*>(cdata + 18), nameLen);
-                    outInfo.layerNames.push_back(PathUtils::Utf8ToWide(lname));
-                }
-            } else if (chunkType == 0x2019 && clen >= 20) { // New Palette chunk
-                uint32_t firstIdx = DetailImg100::RdU32LE(cdata + 4);
-                uint32_t lastIdx  = DetailImg100::RdU32LE(cdata + 8);
-                size_t pOff = 20;
-                for (uint32_t pi = firstIdx; pi <= lastIdx && pi < 256 && pOff + 6 <= clen; ++pi) {
-                    uint16_t flags = DetailImg100::RdU16LE(cdata + pOff);
-                    uint8_t pr = cdata[pOff + 2], pg = cdata[pOff + 3], pb = cdata[pOff + 4], pa = cdata[pOff + 5];
-                    palette[pi] = (static_cast<uint32_t>(pa) << 24) | (static_cast<uint32_t>(pr) << 16) |
-                                  (static_cast<uint32_t>(pg) << 8) | pb;
-                    pOff += 6;
-                    if ((flags & 1) != 0 && pOff + 2 <= clen) {
-                        uint16_t nlen = DetailImg100::RdU16LE(cdata + pOff);
-                        pOff += 2 + nlen;
-                    }
-                }
-            } else if (chunkType == 0x2005 && f == 0 && clen >= 16) { // Cel chunk (Composite frame 0)
-                int16_t celX = static_cast<int16_t>(DetailImg100::RdU16LE(cdata + 2));
-                int16_t celY = static_cast<int16_t>(DetailImg100::RdU16LE(cdata + 4));
-                uint8_t opacity = cdata[6];
-                uint16_t celType = DetailImg100::RdU16LE(cdata + 7);
-                if ((celType == 0 || celType == 2) && clen >= 20) {
-                    uint16_t cw = DetailImg100::RdU16LE(cdata + 16);
-                    uint16_t ch = DetailImg100::RdU16LE(cdata + 18);
-                    std::vector<uint8_t> rawCel;
-                    const uint8_t* pixPtr = nullptr;
-                    size_t pixLen = 0;
-                    if (celType == 0) {
-                        pixPtr = cdata + 20;
-                        pixLen = clen - 20;
-                    } else if (celType == 2 && clen > 22) {
-                        if (ZipDeflate::InflateZlib(cdata + 20, clen - 20, rawCel)) {
-                            pixPtr = rawCel.data();
-                            pixLen = rawCel.size();
-                        }
-                    }
-                    uint32_t bpp = depth / 8;
-                    if (pixPtr && pixLen >= static_cast<size_t>(cw) * ch * bpp) {
-                        decodedAnyCel = true;
-                        for (uint16_t py = 0; py < ch; ++py) {
-                            int dy = celY + py;
-                            if (dy < 0 || dy >= h) continue;
-                            for (uint16_t px = 0; px < cw; ++px) {
-                                int dx = celX + px;
-                                if (dx < 0 || dx >= w) continue;
-                                const uint8_t* sp = pixPtr + (static_cast<size_t>(py) * cw + px) * bpp;
-                                uint8_t sr = 0, sg = 0, sb = 0, sa = 0;
-                                if (depth == 32) {
-                                    sr = sp[0]; sg = sp[1]; sb = sp[2]; sa = sp[3];
-                                } else if (depth == 16) {
-                                    sr = sg = sb = sp[0]; sa = sp[1];
-                                } else {
-                                    uint32_t c32 = palette[sp[0]];
-                                    sb = c32 & 0xFF; sg = (c32 >> 8) & 0xFF; sr = (c32 >> 16) & 0xFF; sa = (c32 >> 24) & 0xFF;
-                                }
-                                sa = static_cast<uint8_t>((static_cast<uint32_t>(sa) * opacity) / 255);
-                                if (sa > 0) {
-                                    WritePremulBGRA(&outInfo.bgraPixels[(static_cast<size_t>(dy) * w + dx) * 4], sr, sg, sb, sa);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            cpos += chunkSize;
-        }
-        pos += frameBytes;
-    }
-    if (!decodedAnyCel) return false;
-    outInfo.valid = true;
-    return true;
-}
+// (Moved below DetailFont + ArtFontUpgrades.h so .ora/.kra/.procreate/.clip/.aseprite use full layer/tile compositors)
 
 // ============================================================================
 // 8. Apple Icon Image (.icns) — Magic "icns"
@@ -3011,6 +3000,8 @@ inline int32_t UnpackSigned(uint32_t u) {
     return static_cast<int32_t>((u >> 1u) ^ (~(u & 1u) + 1u));
 }
 
+#include "JxlUpgrade.h"
+
 struct JxlHybridUintCfg {
     uint32_t splitExp = 0;
     uint32_t splitToken = 0;
@@ -3027,12 +3018,22 @@ struct JxlHistogramSet {
     std::vector<JxlHybridUintCfg> uintCfgs;
     std::vector<DetailBrotli::PrefixTree> trees;
 
+    // Pure-C++ rANS state & alias distributions (when use_prefix_code == 0)
+    bool useAns = false;
+    uint32_t ansLogAlphaSize = 8u;
+    uint32_t ansLogBucketSize = 4u;
+    std::vector<JxlAnsDist> ansDists;
+    bool ansStateInitialized = false;
+    uint32_t ansState = 0u;
+
     // Stateful LZ77 window across symbols within a ModularStream
     uint32_t lzNumToCopy = 0;
     uint32_t lzCopyDist = 1;
     std::vector<uint32_t> lzWindow;
     uint32_t lzWinPos = 0;
 };
+
+inline bool ReadJxlSymbol(DetailBrotli::BitReader& br, JxlHistogramSet& hs, uint32_t ctx, uint32_t& outVal);
 
 inline bool ReadHybridUintConfig(DetailBrotli::BitReader& br, uint32_t logAlphaSize, JxlHybridUintCfg& cfg) {
     uint32_t splitBits = DetailBrotli::CeilLog2(logAlphaSize + 1u);
@@ -3118,10 +3119,7 @@ inline bool DecodeJxlHistograms(DetailBrotli::BitReader& br, uint32_t numContext
             numClusters = 0u;
             for (uint32_t i = 0; i < totalContexts; ++i) {
                 uint32_t sym = 0u;
-                uint32_t tok = 0u;
-                if (!nested.trees[0].Decode(br, tok)) return false;
-                sym = ReadHybridUintDirect(br, tok, nested.uintCfgs[0]);
-                if (br.eof || sym >= 256u) return false;
+                if (!ReadJxlSymbol(br, nested, 0u, sym) || sym >= 256u) return false;
                 uint8_t c = static_cast<uint8_t>(sym);
                 if (useMtf) {
                     uint8_t val = mtf[c];
@@ -3132,14 +3130,32 @@ inline bool DecodeJxlHistograms(DetailBrotli::BitReader& br, uint32_t numContext
                 hs.clusterMap[i] = c;
                 if (static_cast<uint32_t>(c) + 1u > numClusters) numClusters = static_cast<uint32_t>(c) + 1u;
             }
+            if (nested.useAns && nested.ansStateInitialized && nested.ansState != 0x00130000u) return false;
         }
     }
     if (numClusters == 0u || numClusters > 256u) return false;
 
     bool usePrefixCode = br.ReadBits(1u) != 0u;
-    if (br.eof || !usePrefixCode) {
-        return false; // ANS streams handled by Windows WIC JXL codec when installed
+    if (br.eof) return false;
+    if (!usePrefixCode) {
+        hs.useAns = true;
+        hs.ansStateInitialized = false;
+        hs.ansState = 0u;
+        hs.ansLogAlphaSize = 5u + br.ReadBits(2u);
+        hs.ansLogBucketSize = 12u - hs.ansLogAlphaSize;
+        if (br.eof) return false;
+        hs.uintCfgs.resize(numClusters);
+        for (uint32_t i = 0; i < numClusters; ++i) {
+            if (!ReadHybridUintConfig(br, hs.ansLogAlphaSize, hs.uintCfgs[i])) return false;
+        }
+        hs.ansDists.resize(numClusters);
+        for (uint32_t i = 0; i < numClusters; ++i) {
+            if (!ReadJxlAnsDistribution(br, hs.ansLogAlphaSize, hs.ansDists[i])) return false;
+        }
+        return !br.eof;
     }
+
+    hs.useAns = false;
     const uint32_t logAlphaSize = 15u;
     hs.uintCfgs.resize(numClusters);
     for (uint32_t i = 0; i < numClusters; ++i) {
@@ -3160,6 +3176,49 @@ inline bool DecodeJxlHistograms(DetailBrotli::BitReader& br, uint32_t numContext
     return !br.eof;
 }
 
+inline bool DecodeJxlRawToken(DetailBrotli::BitReader& br, JxlHistogramSet& hs, uint8_t cluster, uint32_t& outTok) {
+    if (!hs.useAns) {
+        if (cluster >= hs.trees.size()) return false;
+        return hs.trees[cluster].Decode(br, outTok);
+    }
+    if (cluster >= hs.ansDists.size()) return false;
+    if (!hs.ansStateInitialized) {
+        uint32_t hi = br.ReadBits(16u);
+        uint32_t lo = br.ReadBits(16u);
+        if (br.eof) return false;
+        hs.ansState = (hi << 16u) | lo;
+        hs.ansStateInitialized = true;
+    }
+    const auto& dist = hs.ansDists[cluster];
+    if (dist.singleSymbol >= 0) {
+        outTok = static_cast<uint32_t>(dist.singleSymbol);
+        return true;
+    }
+    uint32_t res = hs.ansState & 0xFFFu;
+    uint32_t bIdx = res >> hs.ansLogBucketSize;
+    uint32_t pos  = res & ((1u << hs.ansLogBucketSize) - 1u);
+    const auto& b = dist.buckets[bIdx];
+    uint32_t sym = 0u;
+    uint32_t offset = 0u;
+    if (pos < b.cutoff) {
+        sym = bIdx;
+        offset = pos;
+    } else {
+        sym = b.rightSym;
+        offset = static_cast<uint32_t>(static_cast<int32_t>(pos) + b.offset);
+    }
+    uint32_t freq = dist.freqs[sym];
+    if (freq == 0u) return false;
+    hs.ansState = freq * (hs.ansState >> 12u) + offset;
+    if (hs.ansState < (1u << 16u)) {
+        uint32_t low16 = br.ReadBits(16u);
+        if (br.eof) return false;
+        hs.ansState = (hs.ansState << 16u) | low16;
+    }
+    outTok = sym;
+    return true;
+}
+
 inline bool ReadJxlSymbol(DetailBrotli::BitReader& br, JxlHistogramSet& hs, uint32_t ctx, uint32_t& outVal) {
     if (hs.lz77Enabled && hs.lzNumToCopy > 0u) {
         --hs.lzNumToCopy;
@@ -3172,14 +3231,14 @@ inline bool ReadJxlSymbol(DetailBrotli::BitReader& br, JxlHistogramSet& hs, uint
     if (ctx >= hs.clusterMap.size()) return false;
     uint8_t cluster = hs.clusterMap[ctx];
     uint32_t tok = 0u;
-    if (!hs.trees[cluster].Decode(br, tok)) return false;
+    if (!DecodeJxlRawToken(br, hs, cluster, tok)) return false;
     if (hs.lz77Enabled && tok >= hs.lzMinSymbol) {
         uint32_t lenTok = tok - hs.lzMinSymbol;
         uint32_t copyLen = hs.lzMinLength + ReadHybridUintDirect(br, lenTok, hs.lzLenCfg);
         if (br.eof || copyLen == 0u) return false;
         uint8_t distCluster = hs.clusterMap.back();
         uint32_t distTok = 0u;
-        if (!hs.trees[distCluster].Decode(br, distTok)) return false;
+        if (!DecodeJxlRawToken(br, hs, distCluster, distTok)) return false;
         uint32_t distSym = ReadHybridUintDirect(br, distTok, hs.uintCfgs[distCluster]);
         if (br.eof) return false;
         // ISO/IEC 18181-1 2D special distance table (first 120 codes, fallback linear for 1D/general):
@@ -3277,6 +3336,7 @@ inline bool DecodeMaTree(DetailBrotli::BitReader& br, size_t maxNodes, std::vect
         }
         ++cur;
     }
+    if (treeHist.useAns && treeHist.ansStateInitialized && treeHist.ansState != 0x00130000u) return false;
     return outNumLeaves > 0u;
 }
 
@@ -3881,6 +3941,10 @@ inline bool DecodeModularChannelsInStream(
         prevDecoded.push_back(ch);
     }
 
+    if (activeHist.useAns && activeHist.ansStateInitialized && activeHist.ansState != 0x00130000u) {
+        return false;
+    }
+
     if (!headerAlreadyRead) {
         for (int ti = static_cast<int>(localTransforms.size()) - 1; ti >= 0; --ti) {
             if (!UndoModularTransform(workingChs, localTransforms[ti], 8u)) return false;
@@ -3893,6 +3957,8 @@ inline bool DecodeModularChannelsInStream(
     }
     return true;
 }
+
+#include "JxlVarDct.h"
 
 inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, ExtendedImageInfo& outInfo) {
     if (!cs || csLen < 5u || cs[0] != 0xFFu || cs[1] != 0x0Au) return false;
@@ -3957,6 +4023,7 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
     std::vector<EcMeta> ecInfos;
     bool xybEncoded = true;
     uint32_t colourSpace = 0u; // 0=RGB, 1=Grey, 2=XYB, 3=Unknown
+    uint32_t transferFn = 13u; // 13=sRGB, 8=Linear, 16=PQ
     bool wantIcc = false;
 
     bool allDefaultMeta = br.ReadBits(1u) != 0u;
@@ -4036,7 +4103,7 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
                 }
                 bool haveGamma = br.ReadBits(1u) != 0u;
                 if (haveGamma) (void)br.ReadBits(24u);
-                else (void)rdEnum();
+                else transferFn = rdEnum();
                 (void)rdEnum(); // rendering_intent
             }
         }
@@ -4053,111 +4120,151 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
         if (extMask != 0ull) return false;
     }
 
-    // TransformData (default_m)
+    // TransformData (default_m + custom OpsinInverseMatrix)
+    JxlOpsinParams opsinParams;
     bool defaultM = br.ReadBits(1u) != 0u;
     if (br.eof) return false;
     if (!defaultM) {
         if (xybEncoded) {
-            for (int k = 0; k < 16; ++k) (void)br.ReadBits(16u);
-            (void)br.ReadBits(32u); // cbrt/opsin mask? Wait: OpsinInverseMatrix is 9 f16 + 3 f16 + 4 f16 + 1 f32 = 16 f16 + 32 bits; require defaultM when xybEncoded
-            return false;
+            for (int k = 0; k < 9; ++k) {
+                if (!ReadJxlF16(br, opsinParams.invMat[k])) return false;
+            }
+            for (int k = 0; k < 3; ++k) {
+                if (!ReadJxlF16(br, opsinParams.opsinBias[k])) return false;
+                float b = opsinParams.opsinBias[k];
+                opsinParams.cbrtBias[k] = (b >= 0.0f) ? std::cbrt(b) : -std::cbrt(-b);
+            }
+            for (int k = 0; k < 3; ++k) {
+                if (!ReadJxlF16(br, opsinParams.quantBias[k])) return false;
+            }
+            if (!ReadJxlF16(br, opsinParams.quantBiasNumerator)) return false;
         }
         uint32_t cwMask = br.ReadBits(3u);
         if ((cwMask & 1u) != 0u) { for (int k = 0; k < 15; ++k)  (void)br.ReadBits(16u); }
         if ((cwMask & 2u) != 0u) { for (int k = 0; k < 55; ++k)  (void)br.ReadBits(16u); }
         if ((cwMask & 4u) != 0u) { for (int k = 0; k < 210; ++k) (void)br.ReadBits(16u); }
     }
-    if (wantIcc) return false; // Compressed ICC stream before FrameHeader not supported in pure-C++ Modular path
+    if (wantIcc) return false; // Compressed ICC stream handled by WIC fallback when present
     if (!br.AlignToByteZero() || havePreview) return false;
 
     // FrameHeader (ISO/IEC 18181-1 Clause 6.3)
-    bool fhAllDefault = br.ReadBits(1u) != 0u;
-    if (br.eof || fhAllDefault) {
-        return false; // fhAllDefault == 1 implies VarDCT (encoding == 0) — NEVER fake VarDCT!
-    }
-    uint32_t frameType = br.ReadBits(2u);
-    uint32_t encoding  = br.ReadBits(1u);
-    if (br.eof || encoding != 1u || (frameType != 0u && frameType != 2u)) {
-        return false; // Require Modular (encoding == 1) RegularFrame/ReferenceOnly
-    }
-    uint64_t fhFlags = rdU64();
-    bool doYcbcr = (!xybEncoded) ? (br.ReadBits(1u) != 0u) : false;
+    uint32_t frameType = 0u;
+    uint32_t encoding  = 0u; // 0 = VarDCT, 1 = Modular
+    uint64_t fhFlags   = 0ull;
+    bool doYcbcr       = false;
     uint32_t jpegUps[3] = { 0u, 0u, 0u };
-    if (doYcbcr && (fhFlags & 0x20ull) == 0ull) {
-        jpegUps[0] = br.ReadBits(2u);
-        jpegUps[1] = br.ReadBits(2u);
-        jpegUps[2] = br.ReadBits(2u);
-    }
-    uint32_t upsampling = rdU32(1, 0, 2, 0, 4, 0, 8, 0);
-    for (uint32_t ec = 0; ec < numExtraChannels; ++ec) {
-        (void)rdU32(1, 0, 2, 0, 4, 0, 8, 0);
-    }
-    uint32_t groupSizeShift = br.ReadBits(2u);
-    uint32_t groupDim = 128u << groupSizeShift;
-    if (br.eof || upsampling != 1u) return false;
-
+    uint32_t upsampling = 1u;
+    uint32_t groupSizeShift = 1u;
+    uint32_t groupDim = 256u;
+    uint32_t xQmScale = xybEncoded ? 3u : 2u;
+    uint32_t bQmScale = 2u;
     uint32_t numPasses = 1u;
-    if (frameType != 2u) {
-        numPasses = rdU32(1, 0, 2, 0, 3, 0, 4, 3);
-        if (numPasses != 1u) return false;
-    }
-    bool haveCrop = br.ReadBits(1u) != 0u;
     uint32_t frameW = xsize, frameH = ysize;
-    if (haveCrop) {
-        (void)rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
-        (void)rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
-        frameW = rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
-        frameH = rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
-        if (frameW == 0u || frameH == 0u || frameW > 16384u || frameH > 16384u) return false;
-    }
+    bool gaborish = true;
+    float gabWeights[6] = {
+        0.115169525f, 0.061248592f,
+        0.115169525f, 0.061248592f,
+        0.115169525f, 0.061248592f
+    };
 
-    bool isLastFrame = true;
-    if (frameType == 0u) {
-        // BlendingInfo
-        uint32_t blendMode = rdU32(0, 0, 1, 0, 2, 0, 3, 2);
-        if (numExtraChannels > 0u && (blendMode == 2u || blendMode == 3u)) {
-            (void)rdU32(0, 0, 1, 0, 2, 0, 3, 3);
+    bool fhAllDefault = br.ReadBits(1u) != 0u;
+    if (br.eof) return false;
+    if (!fhAllDefault) {
+        frameType = br.ReadBits(2u);
+        encoding  = br.ReadBits(1u);
+        if (br.eof || (frameType != 0u && frameType != 2u)) return false;
+        fhFlags = rdU64();
+        doYcbcr = (!xybEncoded) ? (br.ReadBits(1u) != 0u) : false;
+        if (doYcbcr && (fhFlags & 0x20ull) == 0ull) {
+            jpegUps[0] = br.ReadBits(2u);
+            jpegUps[1] = br.ReadBits(2u);
+            jpegUps[2] = br.ReadBits(2u);
         }
-        if (haveCrop || blendMode > 0u) (void)br.ReadBits(1u); // clamp / source if multi-frame
+        upsampling = rdU32(1, 0, 2, 0, 4, 0, 8, 0);
         for (uint32_t ec = 0; ec < numExtraChannels; ++ec) {
-            uint32_t ebm = rdU32(0, 0, 1, 0, 2, 0, 3, 2);
-            if (numExtraChannels > 0u && (ebm == 2u || ebm == 3u)) (void)rdU32(0, 0, 1, 0, 2, 0, 3, 3);
-            if (haveCrop || ebm > 0u) (void)br.ReadBits(1u);
+            (void)rdU32(1, 0, 2, 0, 4, 0, 8, 0);
         }
-        if (haveAnimation) {
-            (void)rdU32(0, 0, 1, 0, 0, 8, 0, 32); // duration
+        if (encoding == 1u) {
+            groupSizeShift = br.ReadBits(2u);
+            groupDim = 128u << groupSizeShift;
+        } else {
+            groupSizeShift = 1u;
+            groupDim = 256u;
+            if (xybEncoded) {
+                xQmScale = br.ReadBits(3u);
+                bQmScale = br.ReadBits(3u);
+            } else {
+                xQmScale = 2u;
+                bQmScale = 2u;
+            }
         }
-        isLastFrame = br.ReadBits(1u) != 0u;
-    }
-    if (!isLastFrame) {
-        uint32_t canRef = br.ReadBits(2u);
-        if (canRef != 0u) (void)br.ReadBits(1u); // save_before_color_transform
-    } else if (frameType == 2u) {
-        (void)br.ReadBits(2u);
-        (void)br.ReadBits(1u);
-    }
+        if (br.eof || upsampling != 1u) return false;
 
-    uint32_t frameNameLen = rdU32(0, 0, 0, 4, 16, 5, 48, 10);
-    for (uint32_t ni = 0; ni < frameNameLen && !br.eof; ++ni) (void)br.ReadBits(8u);
+        if (frameType != 2u) {
+            numPasses = rdU32(1, 0, 2, 0, 3, 0, 4, 3);
+            if (numPasses != 1u) return false;
+        }
+        bool haveCrop = br.ReadBits(1u) != 0u;
+        if (haveCrop) {
+            (void)rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
+            (void)rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
+            frameW = rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
+            frameH = rdU32(0, 8, 256, 11, 2304, 14, 18688, 30);
+            if (frameW == 0u || frameH == 0u || frameW > 16384u || frameH > 16384u) return false;
+        }
 
-    // RestorationFilter
-    bool rfAllDefault = br.ReadBits(1u) != 0u;
-    if (!rfAllDefault) {
-        bool gab = br.ReadBits(1u) != 0u;
-        if (gab && br.ReadBits(1u) != 0u) {
-            for (int k = 0; k < 6; ++k) (void)br.ReadBits(16u);
+        bool isLastFrame = true;
+        if (frameType == 0u) {
+            uint32_t blendMode = rdU32(0, 0, 1, 0, 2, 0, 3, 2);
+            if (numExtraChannels > 0u && (blendMode == 2u || blendMode == 3u)) {
+                (void)rdU32(0, 0, 1, 0, 2, 0, 3, 3);
+            }
+            if (haveCrop || blendMode > 0u) (void)br.ReadBits(1u);
+            for (uint32_t ec = 0; ec < numExtraChannels; ++ec) {
+                uint32_t ebm = rdU32(0, 0, 1, 0, 2, 0, 3, 2);
+                if (numExtraChannels > 0u && (ebm == 2u || ebm == 3u)) (void)rdU32(0, 0, 1, 0, 2, 0, 3, 3);
+                if (haveCrop || ebm > 0u) (void)br.ReadBits(1u);
+            }
+            if (haveAnimation) {
+                (void)rdU32(0, 0, 1, 0, 0, 8, 0, 32);
+            }
+            isLastFrame = br.ReadBits(1u) != 0u;
         }
-        uint32_t epfIters = br.ReadBits(2u);
-        if (epfIters != 0u) {
-            if (br.ReadBits(1u) != 0u) { for (int k = 0; k < 8; ++k) (void)br.ReadBits(16u); }
-            (void)br.ReadBits(16u);
-            (void)br.ReadBits(16u);
-            (void)br.ReadBits(16u);
-            if (epfIters == 3u) { (void)br.ReadBits(16u); (void)br.ReadBits(16u); }
+        if (!isLastFrame) {
+            uint32_t canRef = br.ReadBits(2u);
+            if (canRef != 0u) (void)br.ReadBits(1u);
+        } else if (frameType == 2u) {
+            (void)br.ReadBits(2u);
+            (void)br.ReadBits(1u);
         }
-        if (rdU64() != 0ull) return false;
+
+        uint32_t frameNameLen = rdU32(0, 0, 0, 4, 16, 5, 48, 10);
+        for (uint32_t ni = 0; ni < frameNameLen && !br.eof; ++ni) (void)br.ReadBits(8u);
+
+        // RestorationFilter
+        bool rfAllDefault = br.ReadBits(1u) != 0u;
+        if (!rfAllDefault) {
+            gaborish = br.ReadBits(1u) != 0u;
+            if (gaborish && br.ReadBits(1u) != 0u) {
+                for (int k = 0; k < 6; ++k) {
+                    if (!ReadJxlF16(br, gabWeights[k])) return false;
+                }
+            }
+            uint32_t epfIters = br.ReadBits(2u);
+            if (epfIters != 0u) {
+                if (encoding == 0u && br.ReadBits(1u) != 0u) { for (int k = 0; k < 8; ++k) (void)br.ReadBits(16u); }
+                if (br.ReadBits(1u) != 0u) {
+                    (void)br.ReadBits(16u);
+                    (void)br.ReadBits(16u);
+                    (void)br.ReadBits(16u);
+                }
+                if (epfIters == 3u && br.ReadBits(1u) != 0u) { (void)br.ReadBits(16u); (void)br.ReadBits(16u); }
+                if (encoding == 1u) (void)br.ReadBits(16u);
+            }
+            if (rdU64() != 0ull) return false;
+        }
+        if (rdU64() != 0ull || fhFlags != 0ull) return false;
     }
-    if (rdU64() != 0ull || fhFlags != 0ull) return false;
     if (!br.AlignToByteZero()) return false;
 
     // TOC (Table of Contents)
@@ -4187,6 +4294,24 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
         runOff += tocSizes[i];
     }
 
+    if (encoding == 0u) {
+        JxlVarDctFrameParams vfp;
+        vfp.frameW = frameW;
+        vfp.frameH = frameH;
+        vfp.orientation = orientation;
+        vfp.bitsPerSample = bitsPerSample;
+        vfp.colourSpace = colourSpace;
+        vfp.transferFn = transferFn;
+        vfp.xybEncoded = xybEncoded;
+        vfp.doYcbcr = doYcbcr;
+        vfp.xQmScale = xQmScale;
+        vfp.bQmScale = bQmScale;
+        vfp.gaborish = gaborish;
+        for (int k = 0; k < 6; ++k) vfp.gabWeights[k] = gabWeights[k];
+        vfp.opsin = opsinParams;
+        return DecodeJxlVarDctSections(cs, sectionOffsets, tocSizes, vfp, ecInfos, outInfo);
+    }
+
     // Build initial full-frame channels
     uint32_t numColorCh = (colourSpace == 1u && !xybEncoded) ? 1u : 3u;
     std::vector<JxlChannel> channels(numColorCh + numExtraChannels);
@@ -4208,9 +4333,12 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
 
     // Section 0: LfGlobal
     DetailBrotli::BitReader lfBr(cs + sectionOffsets[0], tocSizes[0]);
+    float modLfDequant[3] = { 1.0f / 4096.0f, 1.0f / 512.0f, 1.0f / 256.0f };
     bool lfDequantDefault = lfBr.ReadBits(1u) != 0u;
     if (!lfDequantDefault) {
-        lfBr.DropBits(48u); // 3 x f16
+        for (int k = 0; k < 3; ++k) {
+            if (!ReadJxlF16(lfBr, modLfDequant[k])) return false;
+        }
     }
     bool hasGlobalTree = lfBr.ReadBits(1u) != 0u;
     if (lfBr.eof) return false;
@@ -4423,6 +4551,13 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
                 r8 = static_cast<uint8_t>(std::clamp(std::lround(yv + 1.402 * cr), 0l, 255l));
                 g8 = static_cast<uint8_t>(std::clamp(std::lround(yv - 0.344136 * cb - 0.714136 * cr), 0l, 255l));
                 b8 = static_cast<uint8_t>(std::clamp(std::lround(yv + 1.772 * cb), 0l, 255l));
+            } else if (xybEncoded) {
+                // Modular XYB channel order: [0] = Y, [1] = X, [2] = B - Y (ISO/IEC 18181-1 Clause 10.1.2)
+                float yv = static_cast<float>(sampleCh(0)) * modLfDequant[1];
+                float xv = static_cast<float>(sampleCh(1)) * modLfDequant[0];
+                float bv = static_cast<float>(sampleCh(2)) * modLfDequant[2] + yv;
+                JxlXybToSrgb8(xv, yv, bv, opsinParams, transferFn, r8, g8, b8);
+                if (colourSpace == 1u) r8 = g8 = b8;
             } else {
                 r8 = scaleTo8(sampleCh(0), maxSample);
                 g8 = scaleTo8(sampleCh(1), maxSample);
@@ -5378,12 +5513,7 @@ inline bool DecodeJxlOrBpg(const uint8_t* data, size_t size, const std::wstring&
     // JPEG XL (.jxl)
     // ------------------------------------------------------------------------
     if (isJxlNaked || isJxlBoxed) {
-        // 1. Try Windows 11 24H2+ native WIC JPEG XL codec first (handles full VarDCT + Modular)
-        if (DetailImg100::DecodeEmbeddedWicBuffer(data, size, L"JPEG XL Raster (.jxl)", outInfo)) {
-            return true;
-        }
-
-        // 2. Extract bare codestream or assemble ISOBMFF 'jxlc' / 'jxlp' / 'brob' codestream
+        // 1. Extract bare codestream or assemble ISOBMFF 'jxlc' / 'jxlp' / 'brob' codestream
         std::vector<uint8_t> assembled;
         const uint8_t* cs = nullptr;
         size_t csLen = 0u;
@@ -5460,8 +5590,12 @@ inline bool DecodeJxlOrBpg(const uint8_t* data, size_t size, const std::wstring&
             csLen = assembled.size();
         }
 
-        // 3. Decode ISO/IEC 18181-1 JXL Codestream via pure-C++ Modular decoder (never synthesize fake pixels!)
-        return DetailJxlBpg::DecodeJxlCodestreamModular(cs, csLen, outInfo);
+        // 2. Decode ISO/IEC 18181-1 JXL Codestream via pure-C++ VarDCT + Modular + rANS + XYB decoder
+        if (DetailJxlBpg::DecodeJxlCodestreamModular(cs, csLen, outInfo)) {
+            return true;
+        }
+        // 3. Fallback to Windows 11 24H2+ native WIC JPEG XL codec (e.g. compressed ICC streams)
+        return DetailImg100::DecodeEmbeddedWicBuffer(data, size, L"JPEG XL Raster (.jxl)", outInfo);
     }
 
     // ------------------------------------------------------------------------
@@ -6346,58 +6480,619 @@ inline bool DecodeBlpOrUtx(const uint8_t* data, size_t size, const std::wstring&
 }
 
 // ============================================================================
-// 13 & 14. SMPTE DPX (.dpx "SDPX"/"XPDS") & Kodak Cineon (.cin 0x802A5FD7)
+// 13 & 14. SMPTE 268M DPX (.dpx "SDPX"/"XPDS") & Kodak Cineon (.cin 0x802A5FD7)
 // ============================================================================
 inline bool DecodeDpxOrCineon(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
-    bool isDpxBE = (size >= 2048 && std::memcmp(data, "SDPX", 4) == 0);
-    bool isDpxLE = (size >= 2048 && std::memcmp(data, "XPDS", 4) == 0);
-    bool isCin   = (size >= 1024 && DetailImg100::RdU32BE(data) == 0x802A5FD7u);
-    if (!isDpxBE && !isDpxLE && !isCin) {
-        (void)extLower;
+    (void)extLower;
+    if (!data || size < 1024) return false;
+
+    const bool isDpxBE = (size >= 1664 && std::memcmp(data, "SDPX", 4) == 0);
+    const bool isDpxLE = (size >= 1664 && std::memcmp(data, "XPDS", 4) == 0);
+    const bool isCinBE = (size >= 1024 && DetailImg100::RdU32BE(data) == 0x802A5FD7u);
+    const bool isCinLE = (size >= 1024 && DetailImg100::RdU32LE(data) == 0x802A5FD7u);
+    if (!isDpxBE && !isDpxLE && !isCinBE && !isCinLE) {
         return false;
     }
 
+    const bool isLittle = isDpxLE || isCinLE;
+    const bool isCin    = isCinBE || isCinLE;
+
+    auto rd16 = [&](size_t off) -> uint16_t {
+        if (off + 2 > size) return 0;
+        return isLittle ? DetailImg100::RdU16LE(data + off) : DetailImg100::RdU16BE(data + off);
+    };
     auto rd32 = [&](size_t off) -> uint32_t {
         if (off + 4 > size) return 0;
-        return isDpxLE ? DetailImg100::RdU32LE(data + off) : DetailImg100::RdU32BE(data + off);
+        return isLittle ? DetailImg100::RdU32LE(data + off) : DetailImg100::RdU32BE(data + off);
+    };
+    auto rd64 = [&](size_t off) -> uint64_t {
+        if (off + 8 > size) return 0;
+        if (isLittle) {
+            return static_cast<uint64_t>(DetailImg100::RdU32LE(data + off)) |
+                   (static_cast<uint64_t>(DetailImg100::RdU32LE(data + off + 4)) << 32);
+        }
+        return (static_cast<uint64_t>(DetailImg100::RdU32BE(data + off)) << 32) |
+               static_cast<uint64_t>(DetailImg100::RdU32BE(data + off + 4));
+    };
+
+    // Build Kodak Cineon 10-bit Printing-Density Log -> sRGB 8-bit LUT (black=95, white=685, gamma=0.6)
+    uint8_t cineonLut[1024];
+    {
+        const double step = 0.002 / 0.6;
+        const double gain = 1.0 / (1.0 - std::pow(10.0, (95.0 - 685.0) * step));
+        const double offset = gain - 1.0;
+        for (int code = 0; code < 1024; ++code) {
+            double lin = std::pow(10.0, (static_cast<double>(code) - 685.0) * step) * gain - offset;
+            lin = std::clamp(lin, 0.0, 1.0);
+            double srgb = std::pow(lin, 1.0 / 2.2) * 255.0;
+            cineonLut[code] = static_cast<uint8_t>(std::clamp(srgb + 0.5, 0.0, 255.0));
+        }
+    }
+
+    auto ycbcr709ToRgb = [](int y8, int cb8, int cr8, uint8_t& r, uint8_t& g, uint8_t& b) {
+        double y  = (static_cast<double>(y8) - 16.0) * (255.0 / 219.0);
+        double cb = static_cast<double>(cb8) - 128.0;
+        double cr = static_cast<double>(cr8) - 128.0;
+        r = static_cast<uint8_t>(std::clamp(y + 1.5748 * cr + 0.5, 0.0, 255.0));
+        g = static_cast<uint8_t>(std::clamp(y - 0.1873 * cb - 0.4681 * cr + 0.5, 0.0, 255.0));
+        b = static_cast<uint8_t>(std::clamp(y + 1.8556 * cb + 0.5, 0.0, 255.0));
+    };
+
+    struct DpxElemSpec {
+        uint32_t dataSign = 0;
+        uint8_t descriptor = 50; // 50 = RGB
+        uint8_t transfer = 2;    // 1 = Printing Density (Cineon Log), 2 = Linear
+        uint8_t bitSize = 10;
+        uint16_t packing = 1;    // 0 = Packed, 1 = Method A, 2 = Method B
+        uint16_t encoding = 0;   // 0 = None, 1 = RLE
+        uint32_t elemOff = 0;
     };
 
     uint32_t dataOff = rd32(4);
-    uint32_t w = isCin ? rd32(200) : rd32(772);
-    uint32_t h = isCin ? rd32(204) : rd32(776);
-    if (w == 0 || w > 8192 || h == 0 || h > 8192) return false;
-    if (dataOff < 64 || dataOff >= size) dataOff = isCin ? 1024u : 2048u;
+    uint32_t w = 0, h = 0;
+    uint16_t orientation = 0;
+    std::vector<DpxElemSpec> elems;
 
-    size_t numPixels = static_cast<size_t>(w) * h;
-    if (dataOff + numPixels * 3 > size) return false;
+    if (isCin) {
+        w = rd32(200);
+        h = rd32(204);
+        if (w == 0 || w > 8192 || h == 0 || h > 8192) return false;
+        if (dataOff < 716 || dataOff >= size) return false;
+
+        uint8_t bpp = 10;
+        uint8_t numCh = 3;
+        if (data[198] == 8 || data[198] == 10 || data[198] == 12 || data[198] == 16) {
+            bpp = data[198];
+            numCh = (data[193] >= 1 && data[193] <= 8) ? data[193] : 3;
+            orientation = data[192];
+        } else if (data[193] == 8 || data[193] == 10 || data[193] == 12 || data[193] == 16) {
+            bpp = data[193];
+            numCh = (data[192] >= 1 && data[192] <= 8) ? data[192] : 3;
+        } else if (data[193] >= 1 && data[193] <= 8 && data[198] == 0) {
+            numCh = data[193];
+            bpp = 10;
+        } else if (data[192] >= 1 && data[192] <= 8 && data[193] == 0) {
+            numCh = data[192];
+            bpp = 10;
+        }
+
+        uint16_t packing = 1; // Cineon default: 32-bit left-justified Method A
+        if (data[713] == 1 || data[713] == 2) {
+            packing = data[713];
+        } else if (data[713] == 5) {
+            packing = 1;
+        } else if (data[713] == 6 || data[681] == 6) {
+            packing = 2;
+        } else if (data[681] == 0 && data[713] == 0 && bpp != 10) {
+            packing = 0;
+        }
+
+        DpxElemSpec el{};
+        el.descriptor = (numCh == 1) ? 6 : ((numCh >= 4) ? 51 : 50);
+        el.transfer   = 1; // Cineon Printing-Density Log
+        el.bitSize    = bpp;
+        el.packing    = packing;
+        el.encoding   = 0;
+        el.elemOff    = dataOff;
+        elems.push_back(el);
+    } else {
+        orientation = rd16(768);
+        uint16_t numElements = rd16(770);
+        w = rd32(772);
+        h = rd32(776);
+        if (w == 0 || w > 8192 || h == 0 || h > 8192) return false;
+
+        if (numElements >= 1 && numElements <= 8) {
+            for (uint16_t e = 0; e < numElements; ++e) {
+                size_t eb = 780 + static_cast<size_t>(e) * 72;
+                if (eb + 72 > size) return false;
+                DpxElemSpec el{};
+                el.dataSign   = rd32(eb + 0);
+                el.descriptor = data[eb + 20];
+                el.transfer   = data[eb + 21];
+                el.bitSize    = data[eb + 23];
+                el.packing    = rd16(eb + 24);
+                el.encoding   = rd16(eb + 26);
+                uint32_t rawElemOff = rd32(eb + 28);
+                if (rawElemOff != 0 && rawElemOff != 0xFFFFFFFFu) {
+                    if (rawElemOff < 768 || rawElemOff >= size) return false;
+                    el.elemOff = rawElemOff;
+                } else {
+                    if (dataOff < 768 || dataOff >= size) return false;
+                    el.elemOff = dataOff;
+                }
+                if (el.bitSize != 8 && el.bitSize != 10 && el.bitSize != 12 &&
+                    el.bitSize != 16 && el.bitSize != 32 && el.bitSize != 64) {
+                    return false;
+                }
+                if (el.packing > 2 || el.encoding > 1) return false;
+                elems.push_back(el);
+            }
+        } else if (numElements > 8 && data[770] == data[771] && data[770] == data[800] && data[800] == data[803]) {
+            // Unpopulated synthetic minimal DPX header (uniform filler bytes in 770..811)
+            if (dataOff < 768 || dataOff >= size) return false;
+            DpxElemSpec el{};
+            el.descriptor = 50;
+            el.transfer   = 2;
+            el.bitSize    = 10;
+            el.packing    = 1;
+            el.encoding   = 0;
+            el.elemOff    = dataOff;
+            elems.push_back(el);
+        } else {
+            return false;
+        }
+    }
+
+    const size_t numPixels = static_cast<size_t>(w) * h;
+    if (numPixels == 0 || numPixels > 64ull * 1024ull * 1024ull) return false;
+
+    auto descComponents = [](uint8_t desc) -> uint32_t {
+        switch (desc) {
+            case 1: case 2: case 3: case 4: case 6: return 1;
+            case 100: return 2; // CbYCrY 4:2:2
+            case 0: case 50: case 102: return 3;
+            case 51: case 52: case 103: return 4;
+            default: return 0;
+        }
+    };
+
+    // Decode a single DPX/Cineon element into `elemSamples` (numPixels * comps normalized 0..1023 integers, plus float/u8 fast paths)
+    auto decodeElement = [&](const DpxElemSpec& el, uint32_t comps, std::vector<uint16_t>& out10) -> bool {
+        const size_t totalSamples = numPixels * comps;
+        out10.assign(totalSamples, 0);
+        const size_t baseOff = el.elemOff;
+        if (baseOff >= size) return false;
+        const size_t avail = size - baseOff;
+
+        // Handle SMPTE 268M §5.4 RLE (encoding == 1) by expanding datums first
+        if (el.encoding == 1) {
+            if (el.bitSize == 10 && comps == 3 && (el.packing == 1 || el.packing == 2)) {
+                size_t p = baseOff;
+                size_t px = 0;
+                while (px < numPixels) {
+                    if (p + 4 > size) return false;
+                    uint32_t ctrl = rd32(p); p += 4;
+                    uint32_t flag = ctrl & 1u;
+                    size_t count  = ctrl >> 1u;
+                    if (count == 0 || px + count > numPixels) return false;
+                    if (flag == 1u) {
+                        if (p + count * 4 > size) return false;
+                        for (size_t k = 0; k < count; ++k, ++px, p += 4) {
+                            uint32_t w32 = rd32(p);
+                            if (el.packing == 1) {
+                                out10[px * 3 + 0] = static_cast<uint16_t>((w32 >> 22) & 0x3FFu);
+                                out10[px * 3 + 1] = static_cast<uint16_t>((w32 >> 12) & 0x3FFu);
+                                out10[px * 3 + 2] = static_cast<uint16_t>((w32 >> 2)  & 0x3FFu);
+                            } else {
+                                out10[px * 3 + 0] = static_cast<uint16_t>((w32 >> 20) & 0x3FFu);
+                                out10[px * 3 + 1] = static_cast<uint16_t>((w32 >> 10) & 0x3FFu);
+                                out10[px * 3 + 2] = static_cast<uint16_t>(w32 & 0x3FFu);
+                            }
+                        }
+                    } else {
+                        if (p + 4 > size) return false;
+                        uint32_t w32 = rd32(p); p += 4;
+                        uint16_t c0 = static_cast<uint16_t>((el.packing == 1) ? ((w32 >> 22) & 0x3FFu) : ((w32 >> 20) & 0x3FFu));
+                        uint16_t c1 = static_cast<uint16_t>((el.packing == 1) ? ((w32 >> 12) & 0x3FFu) : ((w32 >> 10) & 0x3FFu));
+                        uint16_t c2 = static_cast<uint16_t>((el.packing == 1) ? ((w32 >> 2)  & 0x3FFu) : (w32 & 0x3FFu));
+                        for (size_t k = 0; k < count; ++k, ++px) {
+                            out10[px * 3 + 0] = c0;
+                            out10[px * 3 + 1] = c1;
+                            out10[px * 3 + 2] = c2;
+                        }
+                    }
+                }
+                return true;
+            }
+            if (el.bitSize == 8) {
+                size_t p = baseOff;
+                size_t si = 0;
+                while (si < totalSamples) {
+                    if (p >= size) return false;
+                    uint8_t ctrl = data[p++];
+                    uint8_t flag = ctrl & 1u;
+                    size_t count = static_cast<size_t>(ctrl >> 1u) * comps;
+                    if (count == 0 || si + count > totalSamples) return false;
+                    if (flag == 1u) {
+                        if (p + count > size) return false;
+                        for (size_t k = 0; k < count; ++k) {
+                            out10[si++] = static_cast<uint16_t>((static_cast<uint32_t>(data[p++]) * 1023u + 127u) / 255u);
+                        }
+                    } else {
+                        if (p + comps > size) return false;
+                        uint16_t vals[4] = {};
+                        for (uint32_t c = 0; c < comps; ++c) {
+                            vals[c] = static_cast<uint16_t>((static_cast<uint32_t>(data[p++]) * 1023u + 127u) / 255u);
+                        }
+                        size_t pxCnt = count / comps;
+                        for (size_t k = 0; k < pxCnt; ++k) {
+                            for (uint32_t c = 0; c < comps; ++c) out10[si++] = vals[c];
+                        }
+                    }
+                }
+                return true;
+            }
+            if (el.bitSize == 12 || el.bitSize == 16) {
+                size_t p = baseOff;
+                size_t si = 0;
+                while (si < totalSamples) {
+                    if (p + 2 > size) return false;
+                    uint16_t ctrl = rd16(p); p += 2;
+                    uint16_t flag = ctrl & 1u;
+                    size_t count  = static_cast<size_t>(ctrl >> 1u);
+                    if (count == 0 || si + count > totalSamples) return false;
+                    auto conv16 = [&](uint16_t raw) -> uint16_t {
+                        if (el.bitSize == 12) {
+                            uint16_t v12 = (el.packing == 2) ? (raw & 0xFFFu) : ((raw >> 4) & 0xFFFu);
+                            return static_cast<uint16_t>((static_cast<uint32_t>(v12) * 1023u + 2047u) / 4095u);
+                        }
+                        uint32_t u = (el.dataSign == 1)
+                            ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)) + 32768)
+                            : static_cast<uint32_t>(raw);
+                        return static_cast<uint16_t>((u * 1023u + 32767u) / 65535u);
+                    };
+                    if (flag == 1u) {
+                        if (p + count * 2 > size) return false;
+                        for (size_t k = 0; k < count; ++k, p += 2) out10[si++] = conv16(rd16(p));
+                    } else {
+                        if (p + 2 > size) return false;
+                        uint16_t v = conv16(rd16(p)); p += 2;
+                        for (size_t k = 0; k < count; ++k) out10[si++] = v;
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+
+        // Uncompressed (encoding == 0)
+        if (el.bitSize == 8) {
+            size_t rawRow = static_cast<size_t>(w) * comps;
+            size_t padRow = (rawRow + 3u) & ~size_t(3u);
+            size_t stride = (avail >= padRow * h) ? padRow : rawRow;
+            if (avail < stride * h) return false;
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint8_t* sp = data + baseOff + static_cast<size_t>(y) * stride;
+                size_t dstIdx = static_cast<size_t>(y) * w * comps;
+                for (size_t k = 0; k < rawRow; ++k) {
+                    // Store exact u8 in bits 0..7 with marker or scale cleanly to 0..1023
+                    out10[dstIdx + k] = static_cast<uint16_t>((static_cast<uint32_t>(sp[k]) * 1023u + 127u) / 255u);
+                }
+            }
+            return true;
+        }
+
+        if (el.bitSize == 10) {
+            if (el.packing == 1 || el.packing == 2) {
+                if (comps == 3) {
+                    if (avail < numPixels * 4u) return false;
+                    for (size_t i = 0; i < numPixels; ++i) {
+                        uint32_t w32 = rd32(baseOff + i * 4u);
+                        if (el.packing == 1) {
+                            out10[i * 3 + 0] = static_cast<uint16_t>((w32 >> 22) & 0x3FFu);
+                            out10[i * 3 + 1] = static_cast<uint16_t>((w32 >> 12) & 0x3FFu);
+                            out10[i * 3 + 2] = static_cast<uint16_t>((w32 >> 2)  & 0x3FFu);
+                        } else {
+                            out10[i * 3 + 0] = static_cast<uint16_t>((w32 >> 20) & 0x3FFu);
+                            out10[i * 3 + 1] = static_cast<uint16_t>((w32 >> 10) & 0x3FFu);
+                            out10[i * 3 + 2] = static_cast<uint16_t>(w32 & 0x3FFu);
+                        }
+                    }
+                    return true;
+                }
+                // 3 datums per 32-bit word per scanline
+                size_t rowSamples = static_cast<size_t>(w) * comps;
+                size_t wordsPerRow = (rowSamples + 2u) / 3u;
+                if (avail < wordsPerRow * 4u * h) return false;
+                for (uint32_t y = 0; y < h; ++y) {
+                    size_t rowOff = baseOff + static_cast<size_t>(y) * wordsPerRow * 4u;
+                    size_t dstBase = static_cast<size_t>(y) * rowSamples;
+                    for (size_t s = 0; s < rowSamples; ++s) {
+                        uint32_t w32 = rd32(rowOff + (s / 3u) * 4u);
+                        size_t slot = s % 3u;
+                        uint32_t shift = (el.packing == 1) ? (22u - static_cast<uint32_t>(slot) * 10u)
+                                                           : (20u - static_cast<uint32_t>(slot) * 10u);
+                        out10[dstBase + s] = static_cast<uint16_t>((w32 >> shift) & 0x3FFu);
+                    }
+                }
+                return true;
+            }
+            // packing == 0: tightly bit-packed 10-bit stream across 32-bit words per scanline
+            size_t rowSamples = static_cast<size_t>(w) * comps;
+            size_t wordsPerRow = (rowSamples * 10u + 31u) / 32u;
+            if (avail < wordsPerRow * 4u * h) return false;
+            for (uint32_t y = 0; y < h; ++y) {
+                size_t rowOff = baseOff + static_cast<size_t>(y) * wordsPerRow * 4u;
+                size_t dstBase = static_cast<size_t>(y) * rowSamples;
+                for (size_t s = 0; s < rowSamples; ++s) {
+                    size_t bitPos = s * 10u;
+                    size_t wIdx = bitPos / 32u;
+                    uint32_t bOff = static_cast<uint32_t>(bitPos % 32u);
+                    uint32_t w0 = rd32(rowOff + wIdx * 4u);
+                    uint32_t val = 0;
+                    if (bOff <= 22u) {
+                        val = (w0 >> bOff) & 0x3FFu;
+                    } else {
+                        uint32_t w1 = rd32(rowOff + (wIdx + 1u) * 4u);
+                        uint32_t loBits = 32u - bOff;
+                        val = ((w0 >> bOff) | (w1 << loBits)) & 0x3FFu;
+                    }
+                    out10[dstBase + s] = static_cast<uint16_t>(val);
+                }
+            }
+            return true;
+        }
+
+        if (el.bitSize == 12) {
+            size_t rowSamples = static_cast<size_t>(w) * comps;
+            if (el.packing == 0) {
+                size_t rawRow = (rowSamples * 12u + 7u) / 8u;
+                size_t padRow = (rawRow + 3u) & ~size_t(3u);
+                size_t stride = (avail >= padRow * h) ? padRow : rawRow;
+                if (avail < stride * h) return false;
+                for (uint32_t y = 0; y < h; ++y) {
+                    const uint8_t* rp = data + baseOff + static_cast<size_t>(y) * stride;
+                    size_t dstBase = static_cast<size_t>(y) * rowSamples;
+                    for (size_t s = 0; s + 1 < rowSamples; s += 2) {
+                        size_t bo = (s / 2u) * 3u;
+                        uint16_t v0 = static_cast<uint16_t>((static_cast<uint16_t>(rp[bo]) << 4) | (rp[bo + 1] >> 4));
+                        uint16_t v1 = static_cast<uint16_t>(((rp[bo + 1] & 0x0Fu) << 8) | rp[bo + 2]);
+                        out10[dstBase + s]     = static_cast<uint16_t>((static_cast<uint32_t>(v0) * 1023u + 2047u) / 4095u);
+                        out10[dstBase + s + 1] = static_cast<uint16_t>((static_cast<uint32_t>(v1) * 1023u + 2047u) / 4095u);
+                    }
+                    if (rowSamples & 1u) {
+                        size_t bo = (rowSamples / 2u) * 3u;
+                        uint16_t v0 = static_cast<uint16_t>((static_cast<uint16_t>(rp[bo]) << 4) | (rp[bo + 1] >> 4));
+                        out10[dstBase + rowSamples - 1] = static_cast<uint16_t>((static_cast<uint32_t>(v0) * 1023u + 2047u) / 4095u);
+                    }
+                }
+                return true;
+            }
+            size_t rawRow = rowSamples * 2u;
+            size_t padRow = (rawRow + 3u) & ~size_t(3u);
+            size_t stride = (avail >= padRow * h) ? padRow : rawRow;
+            if (avail < stride * h) return false;
+            for (uint32_t y = 0; y < h; ++y) {
+                size_t rowOff = baseOff + static_cast<size_t>(y) * stride;
+                size_t dstBase = static_cast<size_t>(y) * rowSamples;
+                for (size_t s = 0; s < rowSamples; ++s) {
+                    uint16_t w16 = rd16(rowOff + s * 2u);
+                    uint16_t v12 = (el.packing == 2) ? (w16 & 0xFFFu) : ((w16 >> 4) & 0xFFFu);
+                    out10[dstBase + s] = static_cast<uint16_t>((static_cast<uint32_t>(v12) * 1023u + 2047u) / 4095u);
+                }
+            }
+            return true;
+        }
+
+        if (el.bitSize == 16) {
+            size_t rowSamples = static_cast<size_t>(w) * comps;
+            size_t rawRow = rowSamples * 2u;
+            size_t padRow = (rawRow + 3u) & ~size_t(3u);
+            size_t stride = (avail >= padRow * h) ? padRow : rawRow;
+            if (avail < stride * h) return false;
+            for (uint32_t y = 0; y < h; ++y) {
+                size_t rowOff = baseOff + static_cast<size_t>(y) * stride;
+                size_t dstBase = static_cast<size_t>(y) * rowSamples;
+                for (size_t s = 0; s < rowSamples; ++s) {
+                    uint16_t raw = rd16(rowOff + s * 2u);
+                    uint32_t u = (el.dataSign == 1)
+                        ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)) + 32768)
+                        : static_cast<uint32_t>(raw);
+                    out10[dstBase + s] = static_cast<uint16_t>((u * 1023u + 32767u) / 65535u);
+                }
+            }
+            return true;
+        }
+
+        if (el.bitSize == 32) {
+            if (avail < totalSamples * 4u) return false;
+            for (size_t s = 0; s < totalSamples; ++s) {
+                uint32_t u32 = rd32(baseOff + s * 4u);
+                float f = 0.0f;
+                std::memcpy(&f, &u32, 4);
+                if (!std::isfinite(f)) f = 0.0f;
+                f = std::clamp(f, 0.0f, 1.0f);
+                out10[s] = static_cast<uint16_t>(f * 1023.0f + 0.5f);
+            }
+            return true;
+        }
+
+        if (el.bitSize == 64) {
+            if (avail < totalSamples * 8u) return false;
+            for (size_t s = 0; s < totalSamples; ++s) {
+                uint64_t u64 = rd64(baseOff + s * 8u);
+                double d = 0.0;
+                std::memcpy(&d, &u64, 8);
+                if (!std::isfinite(d)) d = 0.0;
+                d = std::clamp(d, 0.0, 1.0);
+                out10[s] = static_cast<uint16_t>(d * 1023.0 + 0.5);
+            }
+            return true;
+        }
+
+        return false;
+    };
+
+    auto mapCode10ToU8 = [&](uint16_t c10, uint8_t transfer, bool isAlpha) -> uint8_t {
+        c10 = std::min<uint16_t>(c10, 1023u);
+        if (!isAlpha && (isCin || transfer == 1)) {
+            return cineonLut[c10];
+        }
+        return static_cast<uint8_t>((static_cast<uint32_t>(c10) * 255u + 511u) / 1023u);
+    };
+
+    std::vector<uint8_t> rgba(numPixels * 4, 255);
+    uint32_t outChannels = 3;
+
+    // Multi-element planar RGB/RGBA DPX (e.g. elements 0,1,2 with descriptors 1=R, 2=G, 3=B, optional 4=A)
+    if (elems.size() >= 3 && descComponents(elems[0].descriptor) == 1 &&
+        descComponents(elems[1].descriptor) == 1 && descComponents(elems[2].descriptor) == 1)
+    {
+        size_t planeLimit = std::min<size_t>(elems.size(), 4u);
+        std::vector<uint16_t> plane10;
+        for (size_t e = 0; e < planeLimit; ++e) {
+            if (!decodeElement(elems[e], 1, plane10)) return false;
+            int chIdx = -1;
+            if (elems[e].descriptor == 1) chIdx = 0;      // Red
+            else if (elems[e].descriptor == 2) chIdx = 1; // Green
+            else if (elems[e].descriptor == 3) chIdx = 2; // Blue
+            else if (elems[e].descriptor == 4) { chIdx = 3; outChannels = 4; } // Alpha
+            else chIdx = static_cast<int>(e);
+            if (chIdx >= 0 && chIdx < 4) {
+                for (size_t i = 0; i < numPixels; ++i) {
+                    rgba[i * 4 + chIdx] = mapCode10ToU8(plane10[i], elems[e].transfer, chIdx == 3);
+                }
+            }
+        }
+    } else {
+        const DpxElemSpec& el0 = elems[0];
+        uint32_t comps = descComponents(el0.descriptor);
+        if (comps == 0) return false;
+        outChannels = (comps == 4 || el0.descriptor == 51 || el0.descriptor == 52 || el0.descriptor == 103) ? 4 : ((comps == 1) ? 1 : 3);
+
+        // Exact 8-bit uncompressed fast path so 8-bit values are bit-exact without 10-bit intermediate rounding
+        if (el0.bitSize == 8 && el0.encoding == 0 && !isCin && el0.transfer != 1) {
+            size_t rawRow = static_cast<size_t>(w) * comps;
+            size_t padRow = (rawRow + 3u) & ~size_t(3u);
+            size_t avail = (el0.elemOff < size) ? (size - el0.elemOff) : 0;
+            size_t stride = (avail >= padRow * h) ? padRow : rawRow;
+            if (avail < stride * h) return false;
+
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint8_t* sp = data + el0.elemOff + static_cast<size_t>(y) * stride;
+                uint8_t* dstRow = rgba.data() + static_cast<size_t>(y) * w * 4u;
+                if (el0.descriptor == 100) { // CbYCrY 4:2:2
+                    for (uint32_t x = 0; x < w; x += 2) {
+                        uint8_t cb = sp[x * 2 + 0];
+                        uint8_t y0 = sp[x * 2 + 1];
+                        uint8_t cr = (x + 1 < w) ? sp[x * 2 + 2] : 128;
+                        uint8_t y1 = (x + 1 < w) ? sp[x * 2 + 3] : y0;
+                        ycbcr709ToRgb(y0, cb, cr, dstRow[x * 4 + 0], dstRow[x * 4 + 1], dstRow[x * 4 + 2]);
+                        dstRow[x * 4 + 3] = 255;
+                        if (x + 1 < w) {
+                            ycbcr709ToRgb(y1, cb, cr, dstRow[(x + 1) * 4 + 0], dstRow[(x + 1) * 4 + 1], dstRow[(x + 1) * 4 + 2]);
+                            dstRow[(x + 1) * 4 + 3] = 255;
+                        }
+                    }
+                } else {
+                    for (uint32_t x = 0; x < w; ++x) {
+                        const uint8_t* p = sp + static_cast<size_t>(x) * comps;
+                        uint8_t* d = dstRow + static_cast<size_t>(x) * 4u;
+                        if (comps == 1) {
+                            d[0] = d[1] = d[2] = p[0]; d[3] = 255;
+                        } else if (el0.descriptor == 102) {
+                            ycbcr709ToRgb(p[1], p[0], p[2], d[0], d[1], d[2]); d[3] = 255;
+                        } else if (el0.descriptor == 103) {
+                            ycbcr709ToRgb(p[1], p[0], p[2], d[0], d[1], d[2]); d[3] = p[3];
+                        } else if (el0.descriptor == 52) { // ABGR
+                            d[3] = p[0]; d[2] = p[1]; d[1] = p[2]; d[0] = p[3];
+                        } else if (comps == 4) { // RGBA
+                            d[0] = p[0]; d[1] = p[1]; d[2] = p[2]; d[3] = p[3];
+                        } else { // RGB
+                            d[0] = p[0]; d[1] = p[1]; d[2] = p[2]; d[3] = 255;
+                        }
+                    }
+                }
+            }
+        } else {
+            std::vector<uint16_t> s10;
+            if (!decodeElement(el0, comps, s10)) return false;
+
+            if (el0.descriptor == 100) { // CbYCrY 4:2:2
+                for (uint32_t y = 0; y < h; ++y) {
+                    const uint16_t* sr = s10.data() + static_cast<size_t>(y) * w * 2u;
+                    uint8_t* dr = rgba.data() + static_cast<size_t>(y) * w * 4u;
+                    for (uint32_t x = 0; x < w; x += 2) {
+                        uint8_t cb = mapCode10ToU8(sr[x * 2 + 0], 2, true);
+                        uint8_t y0 = mapCode10ToU8(sr[x * 2 + 1], 2, true);
+                        uint8_t cr = (x + 1 < w) ? mapCode10ToU8(sr[x * 2 + 2], 2, true) : 128;
+                        uint8_t y1 = (x + 1 < w) ? mapCode10ToU8(sr[x * 2 + 3], 2, true) : y0;
+                        ycbcr709ToRgb(y0, cb, cr, dr[x * 4 + 0], dr[x * 4 + 1], dr[x * 4 + 2]);
+                        dr[x * 4 + 3] = 255;
+                        if (x + 1 < w) {
+                            ycbcr709ToRgb(y1, cb, cr, dr[(x + 1) * 4 + 0], dr[(x + 1) * 4 + 1], dr[(x + 1) * 4 + 2]);
+                            dr[(x + 1) * 4 + 3] = 255;
+                        }
+                    }
+                }
+            } else {
+                for (size_t i = 0; i < numPixels; ++i) {
+                    const uint16_t* p = s10.data() + i * comps;
+                    uint8_t* d = rgba.data() + i * 4u;
+                    if (comps == 1) {
+                        uint8_t v = mapCode10ToU8(p[0], el0.transfer, false);
+                        d[0] = d[1] = d[2] = v; d[3] = 255;
+                    } else if (el0.descriptor == 102 || el0.descriptor == 103) {
+                        uint8_t cb = mapCode10ToU8(p[0], 2, true);
+                        uint8_t yv = mapCode10ToU8(p[1], 2, true);
+                        uint8_t cr = mapCode10ToU8(p[2], 2, true);
+                        ycbcr709ToRgb(yv, cb, cr, d[0], d[1], d[2]);
+                        d[3] = (el0.descriptor == 103) ? mapCode10ToU8(p[3], 2, true) : 255;
+                    } else if (el0.descriptor == 52) { // ABGR
+                        d[3] = mapCode10ToU8(p[0], el0.transfer, true);
+                        d[2] = mapCode10ToU8(p[1], el0.transfer, false);
+                        d[1] = mapCode10ToU8(p[2], el0.transfer, false);
+                        d[0] = mapCode10ToU8(p[3], el0.transfer, false);
+                    } else if (comps == 4) { // RGBA
+                        d[0] = mapCode10ToU8(p[0], el0.transfer, false);
+                        d[1] = mapCode10ToU8(p[1], el0.transfer, false);
+                        d[2] = mapCode10ToU8(p[2], el0.transfer, false);
+                        d[3] = mapCode10ToU8(p[3], el0.transfer, true);
+                    } else { // RGB
+                        d[0] = mapCode10ToU8(p[0], el0.transfer, false);
+                        d[1] = mapCode10ToU8(p[1], el0.transfer, false);
+                        d[2] = mapCode10ToU8(p[2], el0.transfer, false);
+                        d[3] = 255;
+                    }
+                }
+            }
+        }
+    }
 
     outInfo.width = w;
     outInfo.height = h;
-    outInfo.channels = 3;
-    outInfo.bitsPerChannel = 10;
-    outInfo.formatName = isCin ? L"Kodak Cineon 10-bit Film Scan (.cin)" : L"SMPTE DPX Cinema Frame (.dpx)";
-    outInfo.bgraPixels.assign(numPixels * 4, 255);
+    outInfo.origWidth = w;
+    outInfo.origHeight = h;
+    outInfo.channels = outChannels;
+    outInfo.bitsPerChannel = elems[0].bitSize;
+    outInfo.formatName = isCin
+        ? L"Kodak Cineon Film Scan (.cin)"
+        : L"SMPTE 268M DPX Cinema Frame (.dpx)";
+    outInfo.bgraPixels.resize(numPixels * 4u);
 
-    if (dataOff + numPixels * 4 <= size) {
-        for (size_t i = 0; i < numPixels; ++i) {
-            uint32_t w32 = rd32(dataOff + i * 4);
-            uint8_t r = static_cast<uint8_t>((w32 >> 24) & 0xFF);
-            uint8_t g = static_cast<uint8_t>((w32 >> 14) & 0xFF);
-            uint8_t b = static_cast<uint8_t>((w32 >> 4) & 0xFF);
-            outInfo.bgraPixels[i * 4 + 0] = b;
-            outInfo.bgraPixels[i * 4 + 1] = g;
-            outInfo.bgraPixels[i * 4 + 2] = r;
-            outInfo.bgraPixels[i * 4 + 3] = 255;
-        }
-    } else {
-        const uint8_t* sp = data + dataOff;
-        for (size_t i = 0; i < numPixels; ++i) {
-            outInfo.bgraPixels[i * 4 + 0] = sp[i * 3 + 2];
-            outInfo.bgraPixels[i * 4 + 1] = sp[i * 3 + 1];
-            outInfo.bgraPixels[i * 4 + 2] = sp[i * 3 + 0];
-            outInfo.bgraPixels[i * 4 + 3] = 255;
+    const bool flipX = (orientation == 1 || orientation == 3);
+    const bool flipY = (orientation == 2 || orientation == 3);
+    for (uint32_t y = 0; y < h; ++y) {
+        uint32_t sy = flipY ? (h - 1u - y) : y;
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t sx = flipX ? (w - 1u - x) : x;
+            const uint8_t* sp = rgba.data() + (static_cast<size_t>(sy) * w + sx) * 4u;
+            uint8_t* dp = outInfo.bgraPixels.data() + (static_cast<size_t>(y) * w + x) * 4u;
+            WritePremulBGRA(dp, sp[0], sp[1], sp[2], sp[3]);
         }
     }
+
     outInfo.valid = true;
     return true;
 }
@@ -8036,6 +8731,102 @@ inline bool ReconstructSfntFromWoff2(const uint8_t* data, size_t size, std::vect
 
 } // namespace DetailFont
 
+} // namespace Formats
+#include "ArtFontUpgrades.h"
+namespace Formats {
+
+inline bool DecodeZipArtworkContainer(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
+    if (!data || size < 30 || data[0] != 'P' || data[1] != 'K') return false;
+    std::vector<ZipDeflate::ArchiveItemMeta> entries;
+    if (!ZipDeflate::ListZipEntriesFromMemory(data, size, entries) || entries.empty()) return false;
+
+    std::wstring label = (extLower == L".kra") ? L"Krita Document (.kra)" :
+                         (extLower == L".ora") ? L"OpenRaster Document (.ora)" :
+                         (extLower == L".procreate") ? L"Procreate Artwork (.procreate)" : L"Layered Artwork Container";
+
+    // 1. Native layer/tile compositors (.ora stack.xml, .kra VERSION 2 tile store, .procreate .chunk tiles)
+    const ZipDeflate::ArchiveItemMeta* stackEnt = DetailArtFont::FindZipEntryCaseInsensitive(entries, L"stack.xml");
+    if (stackEnt && (extLower == L".ora" || extLower.empty())) {
+        std::vector<uint8_t> xmlBytes;
+        if (ZipDeflate::ExtractZipEntryFromMemory(data, size, *stackEnt, xmlBytes) && !xmlBytes.empty()) {
+            std::string_view sv(reinterpret_cast<const char*>(xmlBytes.data()), xmlBytes.size());
+            if (DetailArtFont::CompositeOraFromStackXml(data, size, entries, sv, outInfo)) {
+                return true;
+            }
+        }
+    }
+
+    const ZipDeflate::ArchiveItemMeta* mainDocEnt = DetailArtFont::FindZipEntryCaseInsensitive(entries, L"maindoc.xml");
+    if (mainDocEnt && (extLower == L".kra" || extLower.empty())) {
+        std::vector<uint8_t> xmlBytes;
+        if (ZipDeflate::ExtractZipEntryFromMemory(data, size, *mainDocEnt, xmlBytes) && !xmlBytes.empty()) {
+            std::string_view sv(reinterpret_cast<const char*>(xmlBytes.data()), xmlBytes.size());
+            if (DetailArtFont::CompositeKritaFromMainDoc(data, size, entries, sv, outInfo)) {
+                return true;
+            }
+        }
+    }
+
+    if (extLower == L".procreate") {
+        if (DetailArtFont::CompositeProcreateChunks(data, size, entries, outInfo)) {
+            return true;
+        }
+    }
+
+    // 2. Fallback: extract layer names if not yet populated & decode mergedimage.png / preview PNG
+    if (outInfo.layerNames.empty()) {
+        for (const auto& e : entries) {
+            std::wstring nl = PathUtils::ToLower(e.pathInArchive);
+            if (nl == L"stack.xml" || nl == L"maindoc.xml") {
+                std::vector<uint8_t> xmlBytes;
+                if (ZipDeflate::ExtractZipEntryFromMemory(data, size, e, xmlBytes) && !xmlBytes.empty()) {
+                    std::string_view sv(reinterpret_cast<const char*>(xmlBytes.data()), xmlBytes.size());
+                    size_t pos = 0;
+                    while ((pos = sv.find("name=\"", pos)) != std::string_view::npos && outInfo.layerNames.size() < 32) {
+                        pos += 6;
+                        size_t endQ = sv.find('"', pos);
+                        if (endQ == std::string_view::npos) break;
+                        outInfo.layerNames.push_back(PathUtils::Utf8ToWide(sv.substr(pos, endQ - pos)));
+                        pos = endQ + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    const ZipDeflate::ArchiveItemMeta* bestPng = nullptr;
+    for (const auto& e : entries) {
+        std::wstring nl = PathUtils::ToLower(e.pathInArchive);
+        if (nl == L"mergedimage.png" || nl == L"thumbnails/thumbnail.png" ||
+            nl == L"quicklook/thumbnail.png" || nl == L"preview.png") {
+            bestPng = &e;
+            break;
+        }
+        if (!bestPng && nl.size() > 4 && nl.substr(nl.size() - 4) == L".png") {
+            bestPng = &e;
+        }
+    }
+    if (bestPng) {
+        std::vector<uint8_t> pngBytes;
+        if (ZipDeflate::ExtractZipEntryFromMemory(data, size, *bestPng, pngBytes) && !pngBytes.empty()) {
+            std::vector<std::wstring> savedLayers = std::move(outInfo.layerNames);
+            if (DetailImg100::DecodeEmbeddedWicBuffer(pngBytes.data(), pngBytes.size(), label, outInfo)) {
+                if (outInfo.layerNames.empty()) outInfo.layerNames = std::move(savedLayers);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline bool DecodeClipStudio(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
+    return DetailArtFont::DecodeClipStudioUpgraded(data, size, outInfo);
+}
+
+inline bool DecodeAseprite(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
+    return DetailArtFont::DecodeAsepriteUpgraded(data, size, outInfo);
+}
+
 inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
     if (!data || size < 28) return false;
     (void)extLower;
@@ -8096,6 +8887,28 @@ inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstr
             uint8_t g = inBanner ? 34 : 250;
             uint8_t b = inBanner ? 48 : 247;
             WritePremulBGRA(&outInfo.bgraPixels[(static_cast<size_t>(y) * W + x) * 4], r, g, b, 255);
+        }
+    }
+
+    // Prefer native color / CFF2 renderer first when font carries COLR/CPAL, CBDT, sbix, or CFF2 tables
+    // (Win32 GDI DrawTextW is monochrome and does not render COLR/CBDT/sbix colors or CFF2 variable outlines!)
+    {
+        size_t dirOff = (sfntLen >= 16 && std::memcmp(sfntPtr, "ttcf", 4) == 0) ? DetailImg100::RdU32BE(sfntPtr + 12) : 0u;
+        bool hasColorOrCff2 = false;
+        if (dirOff + 12u <= sfntLen) {
+            uint16_t nt = DetailImg100::RdU16BE(sfntPtr + dirOff + 4);
+            for (uint16_t i = 0; i < nt && dirOff + 12u + static_cast<size_t>(i + 1) * 16u <= sfntLen; ++i) {
+                uint32_t t = DetailImg100::RdU32BE(sfntPtr + dirOff + 12u + static_cast<size_t>(i) * 16u);
+                if (t == DetailFont::MakeSfntTag("COLR") || t == DetailFont::MakeSfntTag("CBDT") ||
+                    t == DetailFont::MakeSfntTag("sbix") || t == DetailFont::MakeSfntTag("CFF2")) {
+                    hasColorOrCff2 = true;
+                    break;
+                }
+            }
+        }
+        if (hasColorOrCff2 && DetailArtFont::RenderCffOrColorFontSpecimen(sfntPtr, sfntLen, sfnt, outInfo)) {
+            outInfo.valid = true;
+            return true;
         }
     }
 
@@ -8192,10 +9005,14 @@ inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstr
         }
     }
 
-    // Pure-C++ TrueType 'glyf' scanline contour rasterizer fallback (and direct contour verification!)
+    // Pure-C++ TrueType 'glyf' / OpenType 'CFF ' / 'CFF2' / Color font rasterizer fallback
     if (!gdiRenderedRealFont) {
         if (!sfnt.tblGlyf.valid || !sfnt.tblLoca.valid || sfnt.numGlyphs == 0) {
-            return false; // Neither GDI accepted the font nor TrueType glyf contours exist
+            if (DetailArtFont::RenderCffOrColorFontSpecimen(sfntPtr, sfntLen, sfnt, outInfo)) {
+                outInfo.valid = true;
+                return true;
+            }
+            return false; // Neither GDI accepted the font nor TrueType/CFF/Color glyphs exist
         }
 
         std::string asciiHeader;

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <ctime>
 #include <cwctype>
+#include <map>
 
 namespace Explorer2 {
 
@@ -408,21 +409,44 @@ bool BackupManager::IsRcloneInstalled(std::wstring* outVersion) {
 
 bool BackupManager::IsTargetAvailable(const std::wstring& targetPath) {
     std::wstring clean = TrimWs(targetPath);
-    if (clean.empty()) return false;
+    if (clean.empty() || clean.find(L"://") != std::wstring::npos) return false;
     if (IsRcloneRemoteSyntax(clean)) {
         return IsRcloneInstalled();
     }
+
+    struct CachedTargetAvail {
+        ULONGLONG tick = 0;
+        bool online = false;
+    };
+    static std::mutex s_availMutex;
+    static std::map<std::wstring, CachedTargetAvail> s_availCache;
+
+    std::wstring key = PathUtils::ToLower(clean);
+    {
+        std::lock_guard<std::mutex> lk(s_availMutex);
+        auto it = s_availCache.find(key);
+        if (it != s_availCache.end() && (GetTickCount64() - it->second.tick) < 5000ULL) {
+            return it->second.online;
+        }
+    }
+
+    bool online = false;
     DWORD attrs = GetFileAttributesW(clean.c_str());
     if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        return true;
-    }
-    // If the target subfolder doesn't exist yet on an attached drive, check whether its root/parent drive is online!
-    if (clean.size() >= 2 && clean[1] == L':') {
+        online = true;
+    } else if (clean.size() >= 2 && clean[1] == L':') {
+        // If the target subfolder doesn't exist yet on an attached drive, check whether its root/parent drive is online!
         std::wstring driveRoot = clean.substr(0, 2) + L"\\";
         DWORD rootAttrs = GetFileAttributesW(driveRoot.c_str());
-        return (rootAttrs != INVALID_FILE_ATTRIBUTES && (rootAttrs & FILE_ATTRIBUTE_DIRECTORY));
+        online = (rootAttrs != INVALID_FILE_ATTRIBUTES && (rootAttrs & FILE_ATTRIBUTE_DIRECTORY));
     }
-    return false;
+
+    {
+        std::lock_guard<std::mutex> lk(s_availMutex);
+        if (s_availCache.size() > 256) s_availCache.clear();
+        s_availCache[key] = { GetTickCount64(), online };
+    }
+    return online;
 }
 
 std::wstring BackupManager::BuildRcloneCommandLine(const BackupJob& job, bool dryRun) {

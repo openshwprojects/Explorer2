@@ -1,6 +1,7 @@
 // FormatTestsDocs.cpp: self-tests of the office, data and text document readers (SpreadsheetDocViewer, formats/), stage 15 ("15.docsa" runs these alone)
 #include "SelfTestCommon.h"
 #include "SpreadsheetDocViewer.h"
+#include "FileContentPane.h"
 #include "PathUtils.h"
 #include <algorithm>
 #include <array>
@@ -265,6 +266,86 @@ inline std::vector<uint8_t> MakeOle2SingleStream(std::wstring_view streamName, c
 
     if (!streamData.empty()) {
         std::memcpy(cfb.data() + 1536, streamData.data(), streamData.size());
+    }
+    return cfb;
+}
+
+// Multi-stream 512B-sector OLE2 Compound File Binary (MS-CFB v3) for .doc ("WordDocument" + "1Table") & .ppt
+inline std::vector<uint8_t> MakeOle2MultiStream(const std::vector<std::pair<std::wstring, std::vector<uint8_t>>>& streams) {
+    const size_t dirEntries = 1 + streams.size();
+    const size_t dirSectors = (dirEntries + 3) / 4;
+    size_t dataSectorsTotal = 0;
+    std::vector<size_t> streamStartSec(streams.size(), 0);
+    std::vector<size_t> streamSecCount(streams.size(), 0);
+    for (size_t i = 0; i < streams.size(); ++i) {
+        streamStartSec[i] = 1 + dirSectors + dataSectorsTotal;
+        streamSecCount[i] = std::max<size_t>(1, (streams[i].second.size() + 511) / 512);
+        dataSectorsTotal += streamSecCount[i];
+    }
+    const size_t totalSectors = 1 + dirSectors + dataSectorsTotal; // Sector 0 = FAT (supports up to 128 sectors = 64 KB)
+    std::vector<uint8_t> cfb((1 + totalSectors) * 512, 0);
+
+    static const uint8_t kMagic[8] = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+    std::memcpy(cfb.data(), kMagic, 8);
+    PutU16LE(cfb.data() + 24, 0x003Eu);
+    PutU16LE(cfb.data() + 26, 0x0003u);
+    PutU16LE(cfb.data() + 28, 0xFFFEu);
+    PutU16LE(cfb.data() + 30, 9);
+    PutU16LE(cfb.data() + 32, 6);
+    PutU32LE(cfb.data() + 44, 1); // 1 FAT sector
+    PutU32LE(cfb.data() + 48, 1); // first Directory sector = 1
+    PutU32LE(cfb.data() + 56, 4096);
+    PutU32LE(cfb.data() + 60, 0xFFFFFFFEu);
+    PutU32LE(cfb.data() + 68, 0xFFFFFFFEu);
+    for (int i = 0; i < 109; ++i) PutU32LE(cfb.data() + 76 + i * 4, 0xFFFFFFFFu);
+    PutU32LE(cfb.data() + 76, 0);
+
+    uint8_t* fat = cfb.data() + 512;
+    for (size_t i = 0; i < 128; ++i) PutU32LE(fat + i * 4, 0xFFFFFFFFu);
+    PutU32LE(fat + 0 * 4, 0xFFFFFFFDu); // FATSECT
+    for (size_t ds = 0; ds < dirSectors; ++ds) {
+        uint32_t next = (ds + 1 < dirSectors) ? static_cast<uint32_t>(1 + ds + 1) : 0xFFFFFFFEu;
+        PutU32LE(fat + (1 + ds) * 4, next);
+    }
+    for (size_t i = 0; i < streams.size(); ++i) {
+        for (size_t s = 0; s < streamSecCount[i]; ++s) {
+            const size_t secIdx = streamStartSec[i] + s;
+            uint32_t next = (s + 1 < streamSecCount[i]) ? static_cast<uint32_t>(secIdx + 1) : 0xFFFFFFFEu;
+            PutU32LE(fat + secIdx * 4, next);
+        }
+    }
+
+    auto writeDirName = [](uint8_t* ent, std::wstring_view nm) {
+        size_t n = std::min<size_t>(nm.size(), 31);
+        for (size_t i = 0; i < n; ++i) PutU16LE(ent + i * 2, static_cast<uint16_t>(nm[i]));
+        PutU16LE(ent + n * 2, 0);
+        PutU16LE(ent + 64, static_cast<uint16_t>((n + 1) * 2));
+    };
+
+    uint8_t* dir = cfb.data() + 1024;
+    writeDirName(dir, L"Root Entry");
+    dir[66] = 5;
+    dir[67] = 1;
+    PutU32LE(dir + 68, 0xFFFFFFFFu);
+    PutU32LE(dir + 72, 0xFFFFFFFFu);
+    PutU32LE(dir + 76, streams.empty() ? 0xFFFFFFFFu : 1u);
+    PutU32LE(dir + 116, 0xFFFFFFFEu);
+    PutU32LE(dir + 120, 0);
+
+    for (size_t i = 0; i < streams.size(); ++i) {
+        uint8_t* ent = dir + (1 + i) * 128;
+        writeDirName(ent, streams[i].first);
+        ent[66] = 2; // Stream
+        ent[67] = 1;
+        PutU32LE(ent + 68, 0xFFFFFFFFu);
+        PutU32LE(ent + 72, (i + 1 < streams.size()) ? static_cast<uint32_t>(1 + i + 1) : 0xFFFFFFFFu);
+        PutU32LE(ent + 76, 0xFFFFFFFFu);
+        PutU32LE(ent + 116, static_cast<uint32_t>(streamStartSec[i]));
+        PutU32LE(ent + 120, static_cast<uint32_t>(streams[i].second.size()));
+
+        if (!streams[i].second.empty()) {
+            std::memcpy(cfb.data() + (1 + streamStartSec[i]) * 512, streams[i].second.data(), streams[i].second.size());
+        }
     }
     return cfb;
 }
@@ -1671,23 +1752,151 @@ static std::vector<uint8_t> BuildRdsDataFrame(
     return gzipWrap ? MakeGzipStored(r) : r;
 }
 
-// 20. DuckDB Database (.duckdb)
-static std::vector<uint8_t> BuildDuckDbFile(uint64_t fmtVer, uint64_t checkpointIter, std::string_view ddl) {
-    std::vector<uint8_t> d(16384, 0);
+// 20. DuckDB Database (.duckdb — BinaryMetadataDeserializer Catalog + RowGroup + Uncompressed Column Segments)
+static std::vector<uint8_t> BuildDuckDbFile(
+    uint64_t fmtVer,
+    uint64_t checkpointIter,
+    std::string_view tableName,
+    std::string_view col0Name, int64_t id0, int64_t id1,
+    std::string_view col1Name, double val0, double val1,
+    std::string_view col2Name, std::string_view tag0, std::string_view tag1)
+{
+    // 12288B headers + Block 0 (4096B MetaBlock) + Block 1 (4096B Columnar Data Block) = 20480B
+    constexpr uint64_t kBlockAlloc = 4096;
+    std::vector<uint8_t> d(12288 + 2 * kBlockAlloc, 0);
     std::memcpy(d.data() + 8, "DUCK", 4);
     PutU64LE(d.data() + 12, fmtVer);
     std::string eng = "v1.1.3";
-    std::memcpy(d.data() + 28, eng.data(), eng.size());
+    std::memcpy(d.data() + 52, eng.data(), eng.size());
 
-    // DatabaseHeader 1 at 4096 (iter=1) & DatabaseHeader 2 at 8192 (active checkpointIter)
+    // DatabaseHeader 0 at 4096 (inactive iter=1) & DatabaseHeader 1 at 8192 (active checkpointIter)
     PutU64LE(d.data() + 4096 + 8, 1);
-    PutU64LE(d.data() + 8192 + 8, checkpointIter);
-    PutU64LE(d.data() + 8192 + 16, 3);      // metaBlock
-    PutU64LE(d.data() + 8192 + 32, 42);     // blockCount
-    PutU64LE(d.data() + 8192 + 40, 262144); // 256 KB block alloc
-    PutU64LE(d.data() + 8192 + 48, 2048);   // vectorSize
+    PutU64LE(d.data() + 4096 + 16, UINT64_MAX);
 
-    std::memcpy(d.data() + 12300, ddl.data(), std::min<size_t>(ddl.size(), 512));
+    PutU64LE(d.data() + 8192 + 8, checkpointIter);
+    PutU64LE(d.data() + 8192 + 16, 0);           // metaBlock = block 0, subIdx 0
+    PutU64LE(d.data() + 8192 + 24, UINT64_MAX);  // freeList
+    PutU64LE(d.data() + 8192 + 32, 2);           // blockCount = 2
+    PutU64LE(d.data() + 8192 + 40, kBlockAlloc); // 4 KB blockAlloc
+    PutU64LE(d.data() + 8192 + 48, 2048);        // vectorSize
+
+    auto putVarU64 = [](std::vector<uint8_t>& b, uint64_t v) {
+        do {
+            uint8_t byte = static_cast<uint8_t>(v & 0x7Fu);
+            v >>= 7;
+            if (v != 0) byte |= 0x80u;
+            b.push_back(byte);
+        } while (v != 0);
+    };
+    auto putVarI64 = [&](std::vector<uint8_t>& b, int64_t v) {
+        uint64_t zz = (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63);
+        putVarU64(b, zz);
+    };
+    auto putFid = [](std::vector<uint8_t>& b, uint16_t fid) { AppendU16LE(b, fid); };
+    auto putEnd = [](std::vector<uint8_t>& b) { AppendU16LE(b, 0xFFFFu); };
+    auto putStr = [&](std::vector<uint8_t>& b, std::string_view s) {
+        putVarU64(b, s.size());
+        AppendStr(b, s);
+    };
+    auto putMetaPtr = [&](std::vector<uint8_t>& b, uint64_t blkPtr, uint32_t subOff) {
+        putFid(b, 100); putVarU64(b, blkPtr);
+        putFid(b, 101); putVarU64(b, subOff);
+        putEnd(b);
+    };
+    auto putColDef = [&](std::vector<uint8_t>& b, std::string_view cname, uint8_t typeId) {
+        putFid(b, 100); putStr(b, cname);
+        putFid(b, 101);
+        putFid(b, 100); putVarU64(b, typeId);
+        putEnd(b);
+        putEnd(b);
+    };
+    auto makeColDataObj = [&](int64_t dataBlkId, uint32_t dataOff) {
+        std::vector<uint8_t> cb;
+        putFid(cb, 100); putVarU64(cb, 1); // 1 DataPointer
+        putFid(cb, 100); putVarU64(cb, 0); // row_start = 0
+        putFid(cb, 101); putVarU64(cb, 2); // tuple_count = 2
+        putFid(cb, 102);                   // BlockPointer
+        putFid(cb, 100); putVarI64(cb, dataBlkId);
+        putFid(cb, 101); putVarU64(cb, dataOff);
+        putEnd(cb);
+        putFid(cb, 103); putVarU64(cb, 1); // UNCOMPRESSED = 1
+        putEnd(cb);
+        putEnd(cb);
+        return cb;
+    };
+
+    // Place ColumnData objects at fixed sub-offsets inside MetaBlock 0:
+    // chunkStart = 12288 + 8 = 12296; subOff 8..511 = Root Catalog; 512 = PTD; 768 = Col0; 896 = Col1; 1024 = Col2
+    const uint32_t kPtdOff  = 512;
+    const uint32_t kCol0Off = 768;
+    const uint32_t kCol1Off = 896;
+    const uint32_t kCol2Off = 1024;
+
+    std::vector<uint8_t> rootCat;
+    // Entry 0: Schema "main"
+    putFid(rootCat, 100);
+    putFid(rootCat, 100); putVarU64(rootCat, 2); // SCHEMA
+    putFid(rootCat, 102); putStr(rootCat, "main");
+    putFid(rootCat, 104); AppendU8(rootCat, 0);
+    putEnd(rootCat);
+    putEnd(rootCat);
+
+    // Entry 1: User Table
+    putFid(rootCat, 100);
+    putFid(rootCat, 100); putVarU64(rootCat, 1); // TABLE
+    putFid(rootCat, 102); putStr(rootCat, "main");
+    putFid(rootCat, 104); AppendU8(rootCat, 0);
+    putFid(rootCat, 200); putStr(rootCat, tableName);
+    putFid(rootCat, 201); // ColumnList
+    putFid(rootCat, 100); putVarU64(rootCat, 3);
+    putColDef(rootCat, col0Name, 14); // BIGINT
+    putColDef(rootCat, col1Name, 23); // DOUBLE
+    putColDef(rootCat, col2Name, 25); // VARCHAR
+    putEnd(rootCat);
+    putEnd(rootCat);
+    putFid(rootCat, 101); putMetaPtr(rootCat, 0, kPtdOff);
+    putEnd(rootCat);
+
+    // End of Catalog
+    putEnd(rootCat);
+
+    std::vector<uint8_t> ptd;
+    putFid(ptd, 100); putVarU64(ptd, 2); // totalRows = 2
+    putFid(ptd, 101); putVarU64(ptd, 1); // 1 inline RowGroup
+    putFid(ptd, 100); putVarU64(ptd, 0);
+    putFid(ptd, 101); putVarU64(ptd, 2);
+    putFid(ptd, 102); putVarU64(ptd, 3);
+    putMetaPtr(ptd, 0, kCol0Off);
+    putMetaPtr(ptd, 0, kCol1Off);
+    putMetaPtr(ptd, 0, kCol2Off);
+    putEnd(ptd);
+    putEnd(ptd);
+
+    const auto cd0 = makeColDataObj(1, 0);
+    const auto cd1 = makeColDataObj(1, 16);
+    const auto cd2 = makeColDataObj(1, 32);
+
+    uint8_t* chunk0 = d.data() + 12288 + 8;
+    PutU64LE(chunk0 + 0, UINT64_MAX); // next_block_pointer = none
+    std::memcpy(chunk0 + 8,        rootCat.data(), rootCat.size());
+    std::memcpy(chunk0 + kPtdOff,  ptd.data(),     ptd.size());
+    std::memcpy(chunk0 + kCol0Off, cd0.data(),     cd0.size());
+    std::memcpy(chunk0 + kCol1Off, cd1.data(),     cd1.size());
+    std::memcpy(chunk0 + kCol2Off, cd2.data(),     cd2.size());
+
+    // Physical Block 1 (offset 16384): 8B block checksum + uncompressed column vectors
+    uint8_t* data1 = d.data() + 16384 + 8;
+    PutU64LE(data1 + 0,  static_cast<uint64_t>(id0));
+    PutU64LE(data1 + 8,  static_cast<uint64_t>(id1));
+    PutF64LE(data1 + 16, val0);
+    PutF64LE(data1 + 24, val1);
+    auto writeInlineStringT = [](uint8_t* dst, std::string_view sv) {
+        const uint32_t n = static_cast<uint32_t>(std::min<size_t>(sv.size(), 12));
+        PutU32LE(dst, n);
+        std::memcpy(dst + 4, sv.data(), n);
+    };
+    writeInlineStringT(data1 + 32, tag0);
+    writeInlineStringT(data1 + 48, tag1);
     return d;
 }
 
@@ -2581,17 +2790,36 @@ void RunFormatTestsDocs(TestCounter& tc) {
                   HashParsedDoc(rdsA) != HashParsedDoc(rdsB) && InspectFails(rdBad),
             L"DocsA.Rds.XdrDataFrameRawAndGzip");
 
-        std::wstring dkA = tmp.Write(L"wh_a.duckdb", BuildDuckDbFile(64, 7, "CREATE TABLE events (ts TIMESTAMP, latency DOUBLE);"));
-        std::wstring dkB = tmp.Write(L"wh_b.duckdb", BuildDuckDbFile(65, 19, "CREATE TABLE ledger (acct BIGINT, balance DECIMAL);"));
+        std::wstring dkA = tmp.Write(L"wh_a.duckdb", BuildDuckDbFile(64, 7, "events", "event_id", 1001, 1002, "latency_ms", 4.25, 19.75, "region", "eu-central", "us-east"));
+        std::wstring dkB = tmp.Write(L"wh_b.duckdb", BuildDuckDbFile(65, 19, "ledger", "acct_id", 9001, 9002, "balance", 12500.5, -340.25, "currency", "CHF", "USD"));
+        // Anti-cheat negative test: "DUCK" magic + DatabaseHeader + raw ASCII "CREATE TABLE" without binary MetaBlock catalog must fail!
+        std::vector<uint8_t> dkRawAscii(16384, 0);
+        std::memcpy(dkRawAscii.data() + 8, "DUCK", 4);
+        PutU64LE(dkRawAscii.data() + 12, 64);
+        PutU64LE(dkRawAscii.data() + 8192 + 8, 5);
+        PutU64LE(dkRawAscii.data() + 8192 + 16, 0);
+        PutU64LE(dkRawAscii.data() + 8192 + 32, 1);
+        PutU64LE(dkRawAscii.data() + 8192 + 40, 4096);
+        const char* fakeSql = "CREATE TABLE fake_scraped_table (id INTEGER, secret VARCHAR);";
+        std::memcpy(dkRawAscii.data() + 12304, fakeSql, std::strlen(fakeSql));
+        std::wstring dkCheat = tmp.Write(L"cheat_ascii.duckdb", dkRawAscii);
         std::wstring dkBad = tmp.Write(L"bad.duckdb", kGarbage);
+
         ParsedOfficeDocument dkdA, dkdB;
         tc.Record(SpreadsheetDocViewer::InspectOfficeFile(dkA, dkdA) &&
                   SpreadsheetDocViewer::InspectOfficeFile(dkB, dkdB) &&
                   dkdA.valid && dkdB.valid &&
-                  SheetContains(dkdA, L"DuckDB_Header_And_Catalog", L"events") &&
+                  SheetContains(dkdA, L"DuckDB_Header_And_Catalog", L"main.events") &&
+                  SheetContains(dkdA, L"events", L"1001") &&
+                  SheetContains(dkdA, L"events", L"19.75") &&
+                  SheetContains(dkdA, L"events", L"eu-central") &&
                   SheetContains(dkdB, L"DuckDB_Header_And_Catalog", L"19") &&
-                  SheetContains(dkdB, L"DuckDB_Header_And_Catalog", L"ledger") &&
-                  HashParsedDoc(dkdA) != HashParsedDoc(dkdB) && InspectFails(dkBad),
+                  SheetContains(dkdB, L"DuckDB_Header_And_Catalog", L"main.ledger") &&
+                  SheetContains(dkdB, L"ledger", L"9001") &&
+                  SheetContains(dkdB, L"ledger", L"12500.5") &&
+                  SheetContains(dkdB, L"ledger", L"CHF") &&
+                  HashParsedDoc(dkdA) != HashParsedDoc(dkdB) &&
+                  InspectFails(dkCheat) && InspectFails(dkBad),
             L"DocsA.DuckDb.MainHeaderAndCatalogDdl");
     }
 
@@ -3086,7 +3314,279 @@ void RunFormatTestsDocs(TestCounter& tc) {
         tc.Record(odsOk, L"DocsA.CalcOds.TrailingRepeatGuardsCoveredCellsAndRichText");
     }
 
+    // ------------------------------------------------------------------------
+    // 15. AI Model Inspector (.onnx, .gguf, .safetensors) & Legacy Office OLE2 (.doc, .dot, .ppt, .pps)
+    // ------------------------------------------------------------------------
+    {
+        // A. AI Model Inspector (FileContentPane::InspectAiModelFile + SpreadsheetDocViewer::InspectOfficeFile)
+        // 1) .onnx positive + anti-cheat ASCII-scraper / invalid-wiretype negative tests
+        std::wstring onnxPath = tmp.Write(L"stage15_matmul.onnx", BuildOnnxModel("TransformerBlock0", "MatMul", 0.25f, -0.75f));
+        std::string fakeOnnxAscii = "Conv MatMul Relu Softmax BatchNormalization TorchExport";
+        std::wstring onnxAsciiCheat = tmp.Write(L"ascii_cheat.onnx",
+            std::vector<uint8_t>(fakeOnnxAscii.begin(), fakeOnnxAscii.end()));
+        std::vector<uint8_t> onnxBadWire = { 0x0E, 0x01, 0x0F, 0xFF, 0x3E, 0x12 }; // illegal wire types 6 & 7
+        std::wstring onnxWireBadPath = tmp.Write(L"bad_wire.onnx", onnxBadWire);
+
+        auto onnxInfo = FileContentPane::InspectAiModelFile(onnxPath, L".onnx");
+        auto onnxCheatInfo = FileContentPane::InspectAiModelFile(onnxAsciiCheat, L".onnx");
+        auto onnxWireBadInfo = FileContentPane::InspectAiModelFile(onnxWireBadPath, L".onnx");
+
+        // 2) .gguf v3 with STRING, UINT32, FLOAT32, BOOL, recursive ARRAY (tokenizer) + quantized Q4_K & F32 tensor table
+        auto buildGgufV3 = []() {
+            std::vector<uint8_t> g;
+            auto putGgufStr = [&](std::string_view s) {
+                AppendU64LE(g, s.size());
+                AppendStr(g, s);
+            };
+            AppendStr(g, "GGUF");
+            AppendU32LE(g, 3); // v3
+            AppendU64LE(g, 2); // 2 tensors
+            AppendU64LE(g, 6); // 6 KV entries
+
+            // KV 1: general.architecture = "llama" (STRING=8)
+            putGgufStr("general.architecture"); AppendU32LE(g, 8); putGgufStr("llama");
+            // KV 2: general.name = "TinyLlama-Stage15" (STRING=8)
+            putGgufStr("general.name"); AppendU32LE(g, 8); putGgufStr("TinyLlama-Stage15");
+            // KV 3: llama.context_length = 8192 (UINT32=4)
+            putGgufStr("llama.context_length"); AppendU32LE(g, 4); AppendU32LE(g, 8192);
+            // KV 4: llama.rope.freq_base = 10000.0f (FLOAT32=6)
+            putGgufStr("llama.rope.freq_base"); AppendU32LE(g, 6); AppendF32LE(g, 10000.0f);
+            // KV 5: tokenizer.ggml.add_bos_token = true (BOOL=7)
+            putGgufStr("tokenizer.ggml.add_bos_token"); AppendU32LE(g, 7); AppendU8(g, 1);
+            // KV 6: tokenizer.ggml.tokens = ["<unk>", "<s>", "</s>", "hello"] (ARRAY=9 of STRING=8)
+            putGgufStr("tokenizer.ggml.tokens"); AppendU32LE(g, 9); AppendU32LE(g, 8); AppendU64LE(g, 4);
+            putGgufStr("<unk>"); putGgufStr("<s>"); putGgufStr("</s>"); putGgufStr("hello");
+
+            // Tensor 0: blk.0.attn_q.weight, 2D [64, 64] = 4096 params, Q4_K (12) -> 4096/256 * 144 = 2304 B
+            putGgufStr("blk.0.attn_q.weight");
+            AppendU32LE(g, 2);
+            AppendU64LE(g, 64); AppendU64LE(g, 64);
+            AppendU32LE(g, 12); // Q4_K
+            AppendU64LE(g, 0);
+
+            // Tensor 1: output_norm.weight, 1D [64] = 64 params, F32 (0) -> 256 B
+            putGgufStr("output_norm.weight");
+            AppendU32LE(g, 1);
+            AppendU64LE(g, 64);
+            AppendU32LE(g, 0); // F32
+            AppendU64LE(g, 2304);
+
+            while ((g.size() % 32u) != 0) AppendU8(g, 0);
+            g.insert(g.end(), 2304 + 256, 0x3Cu);
+            return g;
+        };
+        std::wstring ggufPath = tmp.Write(L"tinyllama_q4k.gguf", buildGgufV3());
+        // Truncated/scraped GGUF cheat: "GGUF" + v3 + claims 4 KVs + raw "llama" string without valid KV table
+        std::vector<uint8_t> ggufCheat;
+        AppendStr(ggufCheat, "GGUF"); AppendU32LE(ggufCheat, 3); AppendU64LE(ggufCheat, 1); AppendU64LE(ggufCheat, 4);
+        AppendStr(ggufCheat, "llama\0qwen2\0mistral\0");
+        std::wstring ggufCheatPath = tmp.Write(L"cheat_scan.gguf", ggufCheat);
+
+        auto ggufInfo = FileContentPane::InspectAiModelFile(ggufPath, L".gguf");
+        auto ggufCheatInfo = FileContentPane::InspectAiModelFile(ggufCheatPath, L".gguf");
+        ParsedOfficeDocument ggufDoc;
+        bool ggufOfficeOk = SpreadsheetDocViewer::InspectOfficeFile(ggufPath, ggufDoc);
+
+        // 3) .safetensors positive + forged out-of-bounds data_offsets negative test
+        auto buildSafeTensors = [](uint64_t claimedEndOffset, size_t payloadBytes) {
+            std::string hdr =
+                "{\"__metadata__\":{\"format\":\"pt\",\"modelspec.title\":\"FluxAdapterV2\"},"
+                "\"lora.down.weight\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},"
+                "\"lora.alpha\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[16," + std::to_string(claimedEndOffset) + "]}}";
+            std::vector<uint8_t> st;
+            AppendU64LE(st, hdr.size());
+            AppendStr(st, hdr);
+            st.insert(st.end(), payloadBytes, 0x3Fu);
+            return st;
+        };
+        std::wstring stGoodPath = tmp.Write(L"flux_lora.safetensors", buildSafeTensors(20, 20));
+        std::wstring stForgedPath = tmp.Write(L"forged_oob.safetensors", buildSafeTensors(4096, 20));
+
+        auto stInfo = FileContentPane::InspectAiModelFile(stGoodPath, L".safetensors");
+        auto stForgedInfo = FileContentPane::InspectAiModelFile(stForgedPath, L".safetensors");
+        ParsedOfficeDocument stDoc;
+        bool stOfficeOk = SpreadsheetDocViewer::InspectOfficeFile(stGoodPath, stDoc);
+
+        bool aiOk =
+            onnxInfo.valid && !onnxInfo.tensors.empty() && onnxInfo.totalParameters >= 2 &&
+            onnxInfo.precisionSummary.find(L"FLOAT32") != std::wstring::npos &&
+            !onnxCheatInfo.valid && !onnxWireBadInfo.valid &&
+            InspectFails(onnxAsciiCheat) && InspectFails(onnxWireBadPath) &&
+            ggufInfo.valid && ggufInfo.arch == L"llama" && ggufInfo.modelTitle == L"TinyLlama-Stage15" &&
+            ggufInfo.contextLength == L"8192" && ggufInfo.tensorCount == 2 && ggufInfo.totalParameters == 4160 &&
+            ggufInfo.tensors.size() == 2 &&
+            ggufInfo.precisionSummary.find(L"Q4_K") != std::wstring::npos &&
+            !ggufCheatInfo.valid && InspectFails(ggufCheatPath) &&
+            ggufOfficeOk && ggufDoc.valid &&
+            SheetContains(ggufDoc, L"GGUF_Metadata", L"TinyLlama-Stage15") &&
+            SheetContains(ggufDoc, L"GGUF_Tensors", L"blk.0.attn_q.weight") &&
+            stInfo.valid && stInfo.modelTitle == L"FluxAdapterV2" &&
+            stInfo.tensorCount == 2 && stInfo.totalParameters == 6 && stInfo.tensors.size() == 2 &&
+            stInfo.precisionSummary.find(L"BF16") != std::wstring::npos &&
+            !stForgedInfo.valid && InspectFails(stForgedPath) &&
+            stOfficeOk && stDoc.valid &&
+            SheetContains(stDoc, L"SafeTensors_Metadata", L"FluxAdapterV2") &&
+            SheetContains(stDoc, L"SafeTensors_Tensors", L"lora.down.weight");
+        tc.Record(aiOk, L"DocsA.AiModels.OnnxGgufSafetensorsAndNegativeGuards");
+
+        // B. Legacy Microsoft Word (.doc/.dot [MS-DOC] Clx Piece Table) & PowerPoint (.ppt/.pps [MS-PPT] Record Tree + Escher)
+        auto buildWord97Doc = [](bool encryptedFlag) {
+            // Piece 0 (CP1252 compressed): "Executive \x93Smart\x94 Summary \x97 Q4\r"
+            const std::string p0 = "Executive \x93" "Smart\x94" " Summary \x97" " Q4\r";
+            // Piece 1 (UTF-16LE uncompressed): L"Portal: \x0013HYPERLINK \"https://corp.local\"\x0014VisiblePortalLink\x0015\r"
+            const std::wstring p1 = L"Portal: \x0013" L"HYPERLINK \"https://corp.local\"\x0014" L"VisiblePortalLink\x0015\r";
+            // Piece 2 (CP1252 compressed Word table): "Metric\x07Target\x07\x07Latency\x0712 ms\x07\x07"
+            const std::string p2 = "Metric\x07" "Target\x07\x07" "Latency\x07" "12 ms\x07\x07";
+
+            const uint32_t ccp0 = static_cast<uint32_t>(p0.size());
+            const uint32_t ccp1 = static_cast<uint32_t>(p1.size());
+            const uint32_t ccp2 = static_cast<uint32_t>(p2.size());
+            const uint32_t ccpTotal = ccp0 + ccp1 + ccp2;
+
+            // WordDocument stream: 1024B FIB header + piece data at 1024+
+            std::vector<uint8_t> wdoc(1024, 0);
+            const uint32_t off0 = static_cast<uint32_t>(wdoc.size());
+            AppendStr(wdoc, p0);
+            if ((wdoc.size() & 1u) != 0) AppendU8(wdoc, 0);
+            const uint32_t off1 = static_cast<uint32_t>(wdoc.size());
+            for (wchar_t ch : p1) AppendU16LE(wdoc, static_cast<uint16_t>(ch));
+            const uint32_t off2 = static_cast<uint32_t>(wdoc.size());
+            AppendStr(wdoc, p2);
+
+            // 1Table stream: Clx = optional RgPrc (0x01, cb=2) + Pcdt (0x02, lcb=40)
+            std::vector<uint8_t> tbl;
+            AppendU8(tbl, 0x01u); AppendU16LE(tbl, 2); AppendU8(tbl, 0); AppendU8(tbl, 0);
+            AppendU8(tbl, 0x02u);
+            // PlcPcd for 3 pieces: 4 * u32 aCP (16B) + 3 * 8B Pcd (24B) = 40B
+            AppendU32LE(tbl, 40);
+            AppendU32LE(tbl, 0);
+            AppendU32LE(tbl, ccp0);
+            AppendU32LE(tbl, ccp0 + ccp1);
+            AppendU32LE(tbl, ccpTotal);
+            auto appendPcd = [&](uint32_t fcEncoded) {
+                AppendU16LE(tbl, 0);
+                AppendU32LE(tbl, fcEncoded);
+                AppendU16LE(tbl, 0);
+            };
+            appendPcd((off0 * 2u) | 0x40000000u); // CP1252 compressed
+            appendPcd(off1);                      // UTF-16LE uncompressed
+            appendPcd((off2 * 2u) | 0x40000000u); // CP1252 compressed
+
+            // Populate [MS-DOC] §2.5.2 FIB: FibBase(32) + csw(14 -> 28B) + cslw(22 -> 88B) + cbRgFcLcb(93 -> 744B)
+            PutU16LE(wdoc.data() + 0, 0xA5ECu); // wIdent (Word 97-2003)
+            PutU16LE(wdoc.data() + 2, 0x00C1u); // nFib
+            uint16_t flags = 0x0200u;           // fWhichTblStm = 1 ("1Table")
+            if (encryptedFlag) flags |= 0x0100u;// fEncrypted
+            PutU16LE(wdoc.data() + 10, flags);
+            PutU16LE(wdoc.data() + 32, 14);     // csw = 14 -> FibRgLw97 starts at 34 + 28 = 62
+            PutU16LE(wdoc.data() + 62, 22);     // cslw = 22 -> ccpText at 64 + 3*4 = 76; cbRgFcLcb at 64 + 88 = 152
+            PutU32LE(wdoc.data() + 76, ccpTotal);
+            PutU16LE(wdoc.data() + 152, 93);    // FibRgFcLcb starts at 154; fcClx is pair #33 at 154 + 33*8 = 418
+            PutU32LE(wdoc.data() + 418, 0);
+            PutU32LE(wdoc.data() + 422, static_cast<uint32_t>(tbl.size()));
+
+            return MakeOle2MultiStream({
+                { L"WordDocument", std::move(wdoc) },
+                { L"1Table",       std::move(tbl)  }
+            });
+        };
+
+        auto buildPpt97 = [](bool encryptedSession) {
+            auto makeRec = [](uint16_t verInst, uint16_t recType, const std::vector<uint8_t>& payload) {
+                std::vector<uint8_t> r;
+                AppendU16LE(r, verInst);
+                AppendU16LE(r, recType);
+                AppendU32LE(r, static_cast<uint32_t>(payload.size()));
+                r.insert(r.end(), payload.begin(), payload.end());
+                return r;
+            };
+            auto makeUtf16Atom = [&](uint16_t recType, std::wstring_view ws) {
+                std::vector<uint8_t> p;
+                for (wchar_t ch : ws) AppendU16LE(p, static_cast<uint16_t>(ch));
+                return makeRec(0x0000u, recType, p);
+            };
+            auto makeAsciiAtom = [&](uint16_t recType, std::string_view sv) {
+                return makeRec(0x0000u, recType, std::vector<uint8_t>(sv.begin(), sv.end()));
+            };
+            auto concatRecs = [](std::initializer_list<std::vector<uint8_t>> parts) {
+                std::vector<uint8_t> out;
+                for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+                return out;
+            };
+
+            // RT_SlideListWithText (0x0FF0, ver=0xF, inst=0) with 2 slides
+            std::vector<uint8_t> persistDummy(20, 0);
+            auto slwt = makeRec(0x000Fu, 0x0FF0u, concatRecs({
+                makeRec(0x0000u, 0x03F3u, persistDummy), // Slide 1 PersistAtom
+                makeUtf16Atom(0x0FA0u, L"Q4 Architecture Keynote\rScalable Storage Engine"),
+                makeRec(0x0000u, 0x03F3u, persistDummy), // Slide 2 PersistAtom
+                makeAsciiAtom(0x0FA8u, "Zero-Copy Networking")
+            }));
+            auto docContainer = makeRec(0x000Fu, 0x03E8u, slwt); // RT_Document
+
+            // Slide 1 container (RT_Slide 0x03EE -> RT_Drawing 0x040C -> msofbtDgContainer 0xF002 -> msofbtSpContainer 0xF004 -> msofbtClientTextbox 0xF00D)
+            auto clientTb = makeRec(0x000Fu, 0xF00Du, makeUtf16Atom(0x0FA0u, L"Diagram Callout: RDMA Fabric"));
+            auto spCont   = makeRec(0x000Fu, 0xF004u, clientTb);
+            auto dgCont   = makeRec(0x000Fu, 0xF002u, spCont);
+            auto ppDraw   = makeRec(0x000Fu, 0x040Cu, dgCont);
+            auto slide1   = makeRec(0x000Fu, 0x03EEu, ppDraw);
+            // Slide 2 container duplicating "Zero-Copy Networking" (tests per-slide deduplication!) + unique shape callout
+            auto slide2Tb = makeRec(0x000Fu, 0xF00Du, concatRecs({
+                makeAsciiAtom(0x0FA8u, "Zero-Copy Networking"),
+                makeUtf16Atom(0x0FA0u, L"Latency P99 < 80 us")
+            }));
+            auto slide2   = makeRec(0x000Fu, 0x03EEu, makeRec(0x000Fu, 0x040Cu, slide2Tb));
+
+            std::vector<uint8_t> pptStream = concatRecs({ docContainer, slide1, slide2 });
+
+            std::vector<uint8_t> curUser(28, 0);
+            PutU16LE(curUser.data() + 0, 0x0000u);
+            PutU16LE(curUser.data() + 2, 0x0FF6u); // RT_CurrentUserAtom
+            PutU32LE(curUser.data() + 4, 20);
+            PutU32LE(curUser.data() + 8, 20);
+            PutU32LE(curUser.data() + 12, encryptedSession ? 0xF3D1C4DFu : 0xE391C05Fu);
+
+            return MakeOle2MultiStream({
+                { L"PowerPoint Document", std::move(pptStream) },
+                { L"Current User",        std::move(curUser)   }
+            });
+        };
+
+        std::wstring docGoodPath = tmp.Write(L"report_97.doc", buildWord97Doc(false));
+        std::wstring docEncPath  = tmp.Write(L"encrypted_97.doc", buildWord97Doc(true));
+        std::wstring pptGoodPath = tmp.Write(L"keynote_97.ppt", buildPpt97(false));
+        std::wstring pptEncPath  = tmp.Write(L"encrypted_97.ppt", buildPpt97(true));
+
+        ParsedOfficeDocument wDoc, pDoc;
+        bool legacyOk =
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".doc") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".dot") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".ppt") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".pps") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".gguf") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".safetensors") &&
+            SpreadsheetDocViewer::InspectOfficeFile(docGoodPath, wDoc) && wDoc.valid &&
+            DocContains(wDoc, L"Executive \x201CSmart\x201D Summary \x2014 Q4") &&
+            DocContains(wDoc, L"Portal: VisiblePortalLink") &&
+            !DocContains(wDoc, L"HYPERLINK") &&
+            DocContains(wDoc, L"Metric | Target") &&
+            DocContains(wDoc, L"Latency | 12 ms") &&
+            SheetContains(wDoc, L"Word_Tables", L"12 ms") &&
+            InspectFails(docEncPath) &&
+            SpreadsheetDocViewer::InspectOfficeFile(pptGoodPath, pDoc) && pDoc.valid &&
+            DocContains(pDoc, L"--- Slide 1 ---") &&
+            DocContains(pDoc, L"Q4 Architecture Keynote") &&
+            DocContains(pDoc, L"Scalable Storage Engine") &&
+            DocContains(pDoc, L"Diagram Callout: RDMA Fabric") &&
+            DocContains(pDoc, L"--- Slide 2 ---") &&
+            DocContains(pDoc, L"Zero-Copy Networking") &&
+            DocContains(pDoc, L"Latency P99 < 80 us") &&
+            InspectFails(pptEncPath);
+        tc.Record(legacyOk, L"DocsA.LegacyOfficeOle.WordDocClxPieceTableAndPowerPointPpt");
+    }
+
     tmp.Cleanup();
+    RunFormatTestsDocsBatch70(tc);
 }
 
 } // namespace Explorer2::SelfTestSuite

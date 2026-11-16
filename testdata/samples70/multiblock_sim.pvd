@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">
+  <Collection>
+    <DataSet timestep="0.0" group="" part="0" file="fem_bracket_zlib.vtu"/>
+    <DataSet timestep="0.0" group="" part="1" file="aerofoil_appended_raw.vtp"/>
+    <DataSet timestep="1.0" group="" part="0" file="fem_bracket_zlib.vtu"/>
+  </Collection>
+</VTKFile>

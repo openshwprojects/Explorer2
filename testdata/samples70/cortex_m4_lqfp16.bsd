@@ -1,0 +1,14 @@
+entity STM32G031_LQFP16 is
+  generic (PHYSICAL_PIN_MAP : string := "LQFP16");
+  port (
+    SWCLK, SWDIO : inout bit;
+    PA0, PA1, PA2, PA3, PB0, PB1 : inout bit;
+    NRST : in bit;
+    VDD, VSS : linkage bit
+  );
+  use STD_1149_1_1994.all;
+  constant LQFP16 : PIN_MAP_STRING :=
+    "PB0:1, PB1:2, VDD:(3,11), VSS:(4,12), PA0:5, PA1:6, PA2:7, PA3:8, " &
+    "NRST:9, SWDIO:10, SWCLK:13, PA4:14, PA5:15, PA6:16";
+  attribute BOUNDARY_LENGTH of STM32G031_LQFP16 : entity is 24;
+end STM32G031_LQFP16;

@@ -1,0 +1,17 @@
+{
+  "head": {
+    "docType": "3",
+    "editorVersion": "6.5.40",
+    "c_para": { "package": "ESP32_USB_Dongle", "Contributor": "JLCPCB" }
+  },
+  "canvas": "CA~1000~1000~#000000~yes~#FFFFFF~10~1000~1000~line~0.5~mm~1~45~visible~0.5~4000~3000~0~yes",
+  "shape": [
+    "TRACK~1~10~S$1~4000 3000 4160 3000 4160 3090 4000 3090 4000 3000~gge1~0",
+    "LIB~4060~3045~package`QFN-32_5x5`Contributor`LCSC~0~~gge10~1#@$TEXT~P~4050~3025~0.6~0~0~3~~4.5~U1~M 4050 3025~~0~gge11#@$TEXT~N~4050~3065~0.6~0~0~3~~4.5~ESP32-C3FH4~M 4050 3065~~none~gge12#@$PAD~RECT~4045~3035~5~2~1~VCC_3V3~1~0~~0~gge13#@$PAD~RECT~4045~3045~5~2~1~SPI_CLK~2~0~~0~gge14#@$PAD~RECT~4075~3035~5~2~1~USB_DP~3~0~~0~gge15#@$PAD~RECT~4075~3045~5~2~1~GND~4~0~~0~gge16",
+    "LIB~4130~3045~package`C0603`~90~~gge20~1#@$TEXT~P~4126~3032~0.6~0~0~3~~4.0~C1~M 4126 3032~~0~gge21#@$PAD~RECT~4130~3040~3.6~3.8~1~VCC_3V3~1~0~~90~gge22#@$PAD~RECT~4130~3050~3.6~3.8~1~GND~2~0~~90~gge23",
+    "TRACK~1.5~1~VCC_3V3~4045 3035 4100 3035 4130 3040~gge30~0",
+    "TRACK~1.2~2~USB_DP~4075 3035 4110 3035 4145 3045~gge31~0",
+    "VIA~4110~3035~3.2~USB_DP~0.8~gge32~0",
+    "SOLIDREGION~2~GND~M 4010 3010 L 4150 3010 L 4150 3080 L 4010 3080 Z~solid~gge40~~~~0"
+  ]
+}

@@ -499,6 +499,51 @@ struct Mat4 {
         }
         return r;
     }
+    bool Inverse(Mat4& out) const {
+        double aug[4][8] = {};
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                aug[i][j] = m[i][j];
+                aug[i][j + 4] = (i == j) ? 1.0 : 0.0;
+            }
+        }
+        for (int col = 0; col < 4; ++col) {
+            int piv = col;
+            double best = std::fabs(aug[col][col]);
+            for (int r = col + 1; r < 4; ++r) {
+                double cand = std::fabs(aug[r][col]);
+                if (cand > best) { best = cand; piv = r; }
+            }
+            if (!std::isfinite(best) || best < 1e-12) return false;
+            if (piv != col) {
+                for (int k = 0; k < 8; ++k) std::swap(aug[col][k], aug[piv][k]);
+            }
+            const double invDiag = 1.0 / aug[col][col];
+            for (int k = 0; k < 8; ++k) aug[col][k] *= invDiag;
+            for (int r = 0; r < 4; ++r) {
+                if (r == col) continue;
+                const double factor = aug[r][col];
+                if (factor == 0.0) continue;
+                for (int k = 0; k < 8; ++k) aug[r][k] -= factor * aug[col][k];
+            }
+        }
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) out.m[i][j] = aug[i][j + 4];
+        }
+        return true;
+    }
+    // Converts FBX 16-element FbxAMatrix (4 row-vectors / OpenGL column-major) to column-vector Mat4
+    static Mat4 FromFbxMatrixArray(const std::vector<double>& vals) {
+        Mat4 r;
+        if (vals.size() >= 16) {
+            for (int col = 0; col < 4; ++col) {
+                for (int row = 0; row < 4; ++row) {
+                    r.m[row][col] = vals[col * 4 + row];
+                }
+            }
+        }
+        return r;
+    }
 };
 
 inline Mat4 Translation(const Vec3d& t) {
@@ -662,16 +707,38 @@ inline bool ParseFbxMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     }
     if (!objects) return false;
 
-    // The objects: models, and the meshes. An FBX 6 model holds its own mesh.
+    // The objects: models, meshes, skin deformers, cluster subdeformers, and animation stacks.
     struct MeshSource {
         int64_t id = 0;
         const Node* node = nullptr;
         std::vector<int64_t> models;
+        std::vector<int64_t> skins;
+    };
+    struct SkinInfo {
+        int64_t id = 0;
+        std::vector<int64_t> clusters;
+    };
+    struct ClusterInfo {
+        int64_t id = 0;
+        int64_t boneModelId = 0;
+        bool hasBone = false;
+        std::vector<int32_t> indexes;
+        std::vector<double> weights;
+        Mat4 transform;
+        Mat4 transformLink;
+        bool hasTransformLink = false;
     };
     std::unordered_map<int64_t, ModelInfo> models;
     std::vector<MeshSource> meshes;
     std::unordered_map<int64_t, size_t> geometryById;
+    std::unordered_map<int64_t, SkinInfo> skins;
+    std::unordered_map<int64_t, ClusterInfo> clusters;
+    size_t animStackCount = 0;
+    std::vector<double> tmpNums;
     for (const Node& obj : objects->children) {
+        if (obj.name == "AnimationStack" || obj.name == "Take") {
+            ++animStackCount;
+        }
         if (obj.props.empty()) continue;
         if (obj.name == "Model") {
             const int64_t id = IdOf(obj.props[0]);
@@ -681,6 +748,7 @@ inline bool ParseFbxMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
                 own.id = id;
                 own.node = &obj;
                 own.models.push_back(id);
+                geometryById[id] = meshes.size();
                 meshes.push_back(std::move(own));
             }
         } else if (obj.name == "Geometry" && ObjectClass(obj) == "Mesh") {
@@ -689,20 +757,82 @@ inline bool ParseFbxMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
             g.node = &obj;
             geometryById[g.id] = meshes.size();
             meshes.push_back(std::move(g));
+        } else if ((obj.name == "Deformer" || obj.name == "SubDeformer")) {
+            const std::string cls = ObjectClass(obj);
+            const int64_t id = IdOf(obj.props[0]);
+            if (cls == "Skin") {
+                skins[id].id = id;
+            } else if (cls == "Cluster") {
+                ClusterInfo cl;
+                cl.id = id;
+                if (const Node* idxNode = obj.Child("Indexes")) {
+                    if (NodeNumbers(*idxNode, tmpNums)) {
+                        cl.indexes.reserve(tmpNums.size());
+                        for (double v : tmpNums) cl.indexes.push_back(static_cast<int32_t>(v));
+                    }
+                }
+                if (const Node* wNode = obj.Child("Weights")) {
+                    NodeNumbers(*wNode, cl.weights);
+                }
+                if (const Node* tNode = obj.Child("Transform")) {
+                    if (NodeNumbers(*tNode, tmpNums) && tmpNums.size() >= 16) {
+                        cl.transform = Mat4::FromFbxMatrixArray(tmpNums);
+                    }
+                }
+                if (const Node* tlNode = obj.Child("TransformLink")) {
+                    if (NodeNumbers(*tlNode, tmpNums) && tmpNums.size() >= 16) {
+                        cl.transformLink = Mat4::FromFbxMatrixArray(tmpNums);
+                        cl.hasTransformLink = true;
+                    }
+                }
+                clusters[id] = std::move(cl);
+            }
         }
     }
     if (meshes.empty()) return false;
 
-    // Which model uses which geometry, and which model is whose child ("OO": object to object)
+    // Which model uses which geometry, skin/cluster links, and model parent hierarchy ("OO": object to object)
     if (connections) {
         for (const Node& c : connections->children) {
             if ((c.name != "C" && c.name != "Connect") || c.props.size() < 3) continue;
             if (c.props[0].type != 'S' || c.props[0].s != "OO") continue;
             const int64_t child = IdOf(c.props[1]);
             const int64_t parent = IdOf(c.props[2]);
+
+            // Deformer (Skin) -> Geometry
+            if (skins.find(child) != skins.end()) {
+                auto gIt = geometryById.find(parent);
+                if (gIt != geometryById.end()) {
+                    meshes[gIt->second].skins.push_back(child);
+                    continue;
+                }
+            }
+            // SubDeformer (Cluster) -> Deformer (Skin)
+            if (clusters.find(child) != clusters.end()) {
+                auto sIt = skins.find(parent);
+                if (sIt != skins.end()) {
+                    sIt->second.clusters.push_back(child);
+                    continue;
+                }
+                if (models.find(parent) != models.end()) {
+                    clusters[child].boneModelId = parent;
+                    clusters[child].hasBone = true;
+                    continue;
+                }
+            }
+            // Bone Model -> SubDeformer (Cluster)
+            auto clParent = clusters.find(parent);
+            if (clParent != clusters.end() && models.find(child) != models.end()) {
+                clParent->second.boneModelId = child;
+                clParent->second.hasBone = true;
+                continue;
+            }
+
             if (models.find(parent) == models.end()) continue;      // 0 / "Model::Scene": the root
+            // An FBX 6 model that holds its own mesh is in geometryById only so skins can find it: its "OO" link to
+            // another model is a parent link, not a second user of the mesh (that would draw it twice)
             auto g = geometryById.find(child);
-            if (g != geometryById.end()) {
+            if (g != geometryById.end() && meshes[g->second].node->name != "Model") {
                 auto& users = meshes[g->second].models;
                 if (std::find(users.begin(), users.end(), parent) == users.end()) users.push_back(parent);
                 continue;
@@ -752,12 +882,66 @@ inline bool ParseFbxMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
                 break;
             }
             Mat4 place = toYUp;
+            Mat4 geomLocal;
             auto mi = models.find(modelId);
-            if (mi != models.end()) place = toYUp * WorldOf(models, modelId) * mi->second.Geometric();
+            if (mi != models.end()) {
+                geomLocal = mi->second.Geometric();
+                place = toYUp * WorldOf(models, modelId) * geomLocal;
+            }
+
+            // Evaluate Linear-Blend Skinning (Deformer::Skin -> SubDeformer::Cluster) if rigged
+            std::vector<Vec3d> skinAccum;
+            std::vector<double> skinWeightSum;
+            bool hasActiveSkin = false;
+            if (!src.skins.empty()) {
+                for (int64_t skinId : src.skins) {
+                    auto sIt = skins.find(skinId);
+                    if (sIt == skins.end()) continue;
+                    for (int64_t clId : sIt->second.clusters) {
+                        auto cIt = clusters.find(clId);
+                        if (cIt == clusters.end() || !cIt->second.hasBone) continue;
+                        const ClusterInfo& cl = cIt->second;
+                        if (models.find(cl.boneModelId) == models.end() || cl.indexes.empty()) continue;
+
+                        const Mat4 boneCurWorld = WorldOf(models, cl.boneModelId);
+                        Mat4 invBoneBind;
+                        if (!cl.hasTransformLink || !cl.transformLink.Inverse(invBoneBind)) {
+                            if (!boneCurWorld.Inverse(invBoneBind)) continue;
+                        }
+                        const Mat4 clusterMat = boneCurWorld * invBoneBind * cl.transform * geomLocal;
+                        if (!hasActiveSkin) {
+                            skinAccum.assign(vertexCount, Vec3d{});
+                            skinWeightSum.assign(vertexCount, 0.0);
+                            hasActiveSkin = true;
+                        }
+                        const size_t pairCnt = std::min(cl.indexes.size(), cl.weights.size());
+                        for (size_t p = 0; p < pairCnt; ++p) {
+                            const int32_t vi = cl.indexes[p];
+                            const double w = cl.weights[p];
+                            if (vi < 0 || static_cast<size_t>(vi) >= vertexCount || !std::isfinite(w) || w <= 1e-9) continue;
+                            const Vec3d bp = clusterMat.Apply({
+                                coords[static_cast<size_t>(vi) * 3],
+                                coords[static_cast<size_t>(vi) * 3 + 1],
+                                coords[static_cast<size_t>(vi) * 3 + 2]
+                            });
+                            skinAccum[static_cast<size_t>(vi)].x += bp.x * w;
+                            skinAccum[static_cast<size_t>(vi)].y += bp.y * w;
+                            skinAccum[static_cast<size_t>(vi)].z += bp.z * w;
+                            skinWeightSum[static_cast<size_t>(vi)] += w;
+                        }
+                    }
+                }
+            }
 
             const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
             for (size_t k = 0; k < vertexCount; ++k) {
-                Vec3d w = place.Apply({ coords[k * 3], coords[k * 3 + 1], coords[k * 3 + 2] });
+                Vec3d w;
+                if (hasActiveSkin && skinWeightSum[k] > 1e-8) {
+                    const double invW = 1.0 / skinWeightSum[k];
+                    w = toYUp.Apply({ skinAccum[k].x * invW, skinAccum[k].y * invW, skinAccum[k].z * invW });
+                } else {
+                    w = place.Apply({ coords[k * 3], coords[k * 3 + 1], coords[k * 3 + 2] });
+                }
                 if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z)) w = Vec3d();
                 mesh.vertices.push_back({ static_cast<float>(w.x), static_cast<float>(w.y), static_cast<float>(w.z) });
             }
@@ -790,6 +974,9 @@ inline bool ParseFbxMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     }
     if (mesh.tris.empty()) return false;
 
+    if (animStackCount > 0) {
+        mesh.animFrameCount = std::max<size_t>(mesh.animFrameCount, animStackCount + 1);
+    }
     mesh.formatName = format;
     wchar_t note[96] = {};
     swprintf_s(note, cut ? L"%zu siatek (pokazano część)" : L"%zu siatek", meshesShown);

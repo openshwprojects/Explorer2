@@ -1100,7 +1100,13 @@ inline KvMap ParsePipeRecord(std::string_view rec) {
         if (eq == std::string_view::npos || eq == 0) continue;
         std::string k = PathUtils::ToLowerAscii(DetailEda100::TrimAsciiView(item.substr(0, eq)));
         std::string v = DetailEda100::TrimAsciiView(item.substr(eq + 1));
-        kv[std::move(k)] = std::move(v);
+        if (k.rfind("%utf8%", 0) == 0 && k.size() > 6) {
+            std::string baseK = k.substr(6);
+            if (!v.empty()) kv[baseK] = v;
+            kv[std::move(k)] = std::move(v);
+        } else if (!kv.count("%utf8%" + k)) {
+            kv[std::move(k)] = std::move(v);
+        }
     }
     return kv;
 }
@@ -1175,10 +1181,11 @@ struct SchCompBuilder {
     float rotDeg = 0.0f;
     float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
     int pinCount = 0;
+    int currentPartId = 1;
     bool hasBody = false;
 };
 
-inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard& out) {
+inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard& out, float offsetX = 0.0f, float offsetY = 0.0f) {
     std::unordered_map<int, SchCompBuilder> compMap;
     std::set<std::wstring> netSet;
     size_t decodedCount = 0;
@@ -1189,6 +1196,15 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
         if (recStr.empty()) continue;
         int recId = std::atoi(recStr.c_str());
         int ownerIdx = GetKvInt(kv, "ownerindex", -1);
+        int ownerPartId = GetKvInt(kv, "ownerpartid", 0);
+
+        // Multi-part symbol filtering: skip primitives belonging to inactive sub-parts (e.g. Part B/C when CurrentPartId=1)
+        if (ownerIdx >= 0 && ownerPartId > 0) {
+            auto itOwner = compMap.find(ownerIdx);
+            if (itOwner != compMap.end() && itOwner->second.currentPartId > 0 && ownerPartId != itOwner->second.currentPartId) {
+                continue;
+            }
+        }
 
         switch (recId) {
         case 1: { // SchComponent
@@ -1199,16 +1215,17 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
             if (!inlDes.empty()) cb.refDes = PathUtils::Utf8ToWide(inlDes);
             std::string inlCmt = GetKvStr(kv, "comment");
             if (!inlCmt.empty()) cb.value = PathUtils::Utf8ToWide(inlCmt);
-            cb.x = GetSchCoordMm(kv, "location.x");
-            cb.y = GetSchCoordMm(kv, "location.y");
+            cb.x = GetSchCoordMm(kv, "location.x") + offsetX;
+            cb.y = GetSchCoordMm(kv, "location.y") + offsetY;
             cb.rotDeg = static_cast<float>((GetKvInt(kv, "orientation", 0) & 3) * 90);
+            cb.currentPartId = std::max(1, GetKvInt(kv, "currentpartid", 1));
             compMap[static_cast<int>(idx)] = cb;
             ++decodedCount;
             break;
         }
         case 2: { // Pin
-            float px = GetSchCoordMm(kv, "location.x");
-            float py = GetSchCoordMm(kv, "location.y");
+            float px = GetSchCoordMm(kv, "location.x") + offsetX;
+            float py = GetSchCoordMm(kv, "location.y") + offsetY;
             float plen = GetSchCoordMm(kv, "pinlength", 5.08f);
             int cong = GetKvInt(kv, "pinconglomerate", 0);
             int orient = cong & 3; // 0=0 deg (right), 1=90 (up), 2=180 (left), 3=270 (down)
@@ -1219,7 +1236,7 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
 
             std::wstring pName = PathUtils::Utf8ToWide(GetKvStr(kv, "name"));
             std::wstring pDes  = PathUtils::Utf8ToWide(GetKvStr(kv, "designator"));
-            out.pads.push_back({ tipX, tipY, 0.7f, 0.7f, 0.0f, 0.0f, 0, EdaLayerId::SchSymbol, pDes, pName });
+            out.pads.push_back({ tipX, tipY, 0.7f, 0.7f, 0.0f, 0.0f, 0, EdaLayerId::SchSymbol, pDes.empty() ? pName : pDes, pName });
             if (!pName.empty()) {
                 out.labels.push_back({ px, py + 0.8f, 0.9f, EdaLayerId::SchLabel, pName });
             }
@@ -1235,10 +1252,10 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
             break;
         }
         case 14: { // Rectangle
-            float x1 = GetSchCoordMm(kv, "location.x");
-            float y1 = GetSchCoordMm(kv, "location.y");
-            float x2 = GetSchCoordMm(kv, "corner.x", x1 + 10.16f);
-            float y2 = GetSchCoordMm(kv, "corner.y", y1 + 7.62f);
+            float x1 = GetSchCoordMm(kv, "location.x") + offsetX;
+            float y1 = GetSchCoordMm(kv, "location.y") + offsetY;
+            float x2 = GetSchCoordMm(kv, "corner.x", (x1 - offsetX) + 10.16f) + offsetX;
+            float y2 = GetSchCoordMm(kv, "corner.y", (y1 - offsetY) + 7.62f) + offsetY;
             DetailEda100::AddRectOutline(out, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f, std::fabs(x2 - x1), std::fabs(y2 - y1), EdaLayerId::SchSymbol, 0.30f);
             auto it = compMap.find(ownerIdx);
             if (it != compMap.end()) {
@@ -1252,36 +1269,46 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
             break;
         }
         case 13: { // Line
-            float x1 = GetSchCoordMm(kv, "location.x");
-            float y1 = GetSchCoordMm(kv, "location.y");
-            float x2 = GetSchCoordMm(kv, "corner.x");
-            float y2 = GetSchCoordMm(kv, "corner.y");
+            float x1 = GetSchCoordMm(kv, "location.x") + offsetX;
+            float y1 = GetSchCoordMm(kv, "location.y") + offsetY;
+            float x2 = GetSchCoordMm(kv, "corner.x") + offsetX;
+            float y2 = GetSchCoordMm(kv, "corner.y") + offsetY;
             out.traces.push_back({ x1, y1, x2, y2, 0.25f, EdaLayerId::SchSymbol, 0 });
             ++decodedCount;
             break;
         }
+        case 5: // Bezier
         case 6: // Polyline
+        case 7: // Polygon
         case 26: // Bus
         case 27: { // Wire
             int cnt = std::clamp(GetKvInt(kv, "locationcount", 0), 0, 128);
-            EdaLayerId lid = (recId == 6) ? EdaLayerId::SchSymbol : EdaLayerId::SchWire;
+            EdaLayerId lid = (recId == 26 || recId == 27) ? EdaLayerId::SchWire : EdaLayerId::SchSymbol;
             float stroke = (recId == 26) ? 0.55f : 0.28f;
             for (int i = 1; i < cnt; ++i) {
                 std::string kx1 = "x" + std::to_string(i), ky1 = "y" + std::to_string(i);
                 std::string kx2 = "x" + std::to_string(i + 1), ky2 = "y" + std::to_string(i + 1);
-                float x1 = GetSchCoordMm(kv, kx1);
-                float y1 = GetSchCoordMm(kv, ky1);
-                float x2 = GetSchCoordMm(kv, kx2);
-                float y2 = GetSchCoordMm(kv, ky2);
+                float x1 = GetSchCoordMm(kv, kx1) + offsetX;
+                float y1 = GetSchCoordMm(kv, ky1) + offsetY;
+                float x2 = GetSchCoordMm(kv, kx2) + offsetX;
+                float y2 = GetSchCoordMm(kv, ky2) + offsetY;
+                out.traces.push_back({ x1, y1, x2, y2, stroke, lid, 1 });
+            }
+            if (recId == 7 && cnt >= 3) {
+                float x1 = GetSchCoordMm(kv, "x" + std::to_string(cnt)) + offsetX;
+                float y1 = GetSchCoordMm(kv, "y" + std::to_string(cnt)) + offsetY;
+                float x2 = GetSchCoordMm(kv, "x1") + offsetX;
+                float y2 = GetSchCoordMm(kv, "y1") + offsetY;
                 out.traces.push_back({ x1, y1, x2, y2, stroke, lid, 1 });
             }
             if (cnt >= 2) ++decodedCount;
             break;
         }
         case 8:  // Ellipse
+        case 11: // EllipticalArc
         case 12: { // Arc
-            float cx = GetSchCoordMm(kv, "location.x");
-            float cy = GetSchCoordMm(kv, "location.y");
+            float cx = GetSchCoordMm(kv, "location.x") + offsetX;
+            float cy = GetSchCoordMm(kv, "location.y") + offsetY;
             float r  = std::max(0.4f, GetSchCoordMm(kv, "radius", 1.27f));
             out.circles.push_back({ cx, cy, r, 0.22f, false, EdaLayerId::SchSymbol });
             ++decodedCount;
@@ -1293,8 +1320,8 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
         case 4: { // Text Label
             std::wstring txt = PathUtils::Utf8ToWide(GetKvStr(kv, "text"));
             if (txt.empty()) txt = PathUtils::Utf8ToWide(GetKvStr(kv, "name"));
-            float lx = GetSchCoordMm(kv, "location.x");
-            float ly = GetSchCoordMm(kv, "location.y");
+            float lx = GetSchCoordMm(kv, "location.x") + offsetX;
+            float ly = GetSchCoordMm(kv, "location.y") + offsetY;
             if (!txt.empty()) {
                 out.labels.push_back({ lx, ly, 1.15f, EdaLayerId::SchLabel, txt });
                 if (recId == 17 || recId == 25) netSet.insert(txt);
@@ -1307,8 +1334,8 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
             break;
         }
         case 29: { // Junction
-            float jx = GetSchCoordMm(kv, "location.x");
-            float jy = GetSchCoordMm(kv, "location.y");
+            float jx = GetSchCoordMm(kv, "location.x") + offsetX;
+            float jy = GetSchCoordMm(kv, "location.y") + offsetY;
             out.circles.push_back({ jx, jy, 0.50f, 0.50f, true, EdaLayerId::SchWire });
             ++decodedCount;
             break;
@@ -1320,7 +1347,7 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
                 it->second.refDes = des;
             }
             if (!des.empty() && GetKvStr(kv, "ishidden") != "T") {
-                out.labels.push_back({ GetSchCoordMm(kv, "location.x"), GetSchCoordMm(kv, "location.y"), 1.1f, EdaLayerId::SchLabel, des });
+                out.labels.push_back({ GetSchCoordMm(kv, "location.x") + offsetX, GetSchCoordMm(kv, "location.y") + offsetY, 1.1f, EdaLayerId::SchLabel, des });
             }
             ++decodedCount;
             break;
@@ -1651,6 +1678,219 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
         }
     }
 
+    // 8. Fills6/Data (recordType == 6: rectangular copper fills [6][blkLen:u32][layer:1]..[net:u16 +3]..[x1:i32 +13][y1:i32 +17][x2:i32 +21][y2:i32 +25][rot:f64 +29])
+    if (const auto* fillEnt = Explorer2::Ole2::FindStreamCaseInsensitive(cf, L"Fills6/Data")) {
+        std::vector<uint8_t> bytes;
+        if (Explorer2::Ole2::ExtractStream(cf, *fillEnt, bytes, 16 * 1024 * 1024)) {
+            size_t pos = 0;
+            while (pos + 5 <= bytes.size() && out.pads.size() < 60000) {
+                uint8_t recType = bytes[pos];
+                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                if (recType != 6 || blkLen < 29 || blkLen > bytes.size() - (pos + 5)) break;
+                const uint8_t* pay = bytes.data() + pos + 5;
+                EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
+                float x1 = static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                float y1 = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                float x2 = static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm;
+                float y2 = static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm;
+                float rotDeg = 0.0f;
+                if (blkLen >= 37) {
+                    double rd = 0.0;
+                    std::memcpy(&rd, pay + 29, 8);
+                    if (std::isfinite(rd) && std::fabs(rd) <= 360.0) rotDeg = static_cast<float>(rd);
+                }
+                EdaPadPrim fp{};
+                fp.x = (x1 + x2) * 0.5f;
+                fp.y = (y1 + y2) * 0.5f;
+                fp.w = std::max(0.15f, std::fabs(x2 - x1));
+                fp.h = std::max(0.15f, std::fabs(y2 - y1));
+                fp.rotDeg = rotDeg;
+                fp.shape = 1;
+                fp.layer = lid;
+                out.pads.push_back(std::move(fp));
+                pos += 5 + blkLen;
+            }
+        }
+    }
+
+    // Helper to hatch a copper polygon / region into out.traces
+    auto emitAltiumCopperPolygon = [&](const std::vector<std::pair<float, float>>& pts, EdaLayerId lid, int netId) {
+        if (pts.size() < 3) return;
+        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+        for (size_t i = 0; i < pts.size() && out.traces.size() < 120000; ++i) {
+            const auto& p0 = pts[i];
+            const auto& p1 = pts[(i + 1) % pts.size()];
+            minX = std::min(minX, p0.first); maxX = std::max(maxX, p0.first);
+            minY = std::min(minY, p0.second); maxY = std::max(maxY, p0.second);
+            out.traces.push_back({ p0.first, p0.second, p1.first, p1.second, 0.16f, lid, netId });
+        }
+        if (maxY > minY + 0.3f && maxX > minX + 0.3f) {
+            float spanY = maxY - minY;
+            int nScan = std::clamp(static_cast<int>(spanY / 0.55f), 2, 36);
+            float stepY = spanY / static_cast<float>(nScan + 1);
+            float strokeW = std::clamp(stepY * 0.75f, 0.14f, 0.60f);
+            std::vector<float> xHits;
+            for (int si = 1; si <= nScan; ++si) {
+                float sy = minY + stepY * static_cast<float>(si);
+                xHits.clear();
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    const auto& a = pts[i];
+                    const auto& b = pts[(i + 1) % pts.size()];
+                    if ((a.second <= sy && b.second > sy) || (b.second <= sy && a.second > sy)) {
+                        float t = (sy - a.second) / (b.second - a.second);
+                        xHits.push_back(a.first + t * (b.first - a.first));
+                    }
+                }
+                std::sort(xHits.begin(), xHits.end());
+                for (size_t k = 0; k + 1 < xHits.size() && out.traces.size() < 120000; k += 2) {
+                    if (xHits[k + 1] > xHits[k] + 0.05f) {
+                        out.traces.push_back({ xHits[k], sy, xHits[k + 1], sy, strokeW, lid, netId });
+                    }
+                }
+            }
+        }
+    };
+
+    // 9. Polygons6/Data (copper pour polygons stored as pipe-delimited VX0/VY0..VXn/VYn records)
+    if (const auto* polyEnt = Explorer2::Ole2::FindStreamCaseInsensitive(cf, L"Polygons6/Data")) {
+        std::vector<uint8_t> bytes;
+        if (Explorer2::Ole2::ExtractStream(cf, *polyEnt, bytes, 32 * 1024 * 1024)) {
+            std::vector<KvMap> pRecs;
+            WalkLengthPrefixedBlocks(bytes, pRecs, false);
+            for (const auto& kv : pRecs) {
+                EdaLayerId lid = MapAltiumPcbLayerStr(GetKvStr(kv, "layer"));
+                int netId = std::max(0, GetKvInt(kv, "net", -1) + 1);
+                std::vector<std::pair<float, float>> verts;
+                for (int vi = 0; vi < 1024; ++vi) {
+                    auto ix = kv.find("vx" + std::to_string(vi));
+                    auto iy = kv.find("vy" + std::to_string(vi));
+                    if (ix == kv.end() || iy == kv.end()) break;
+                    verts.push_back({ ParsePcbCoordStrMm(ix->second), ParsePcbCoordStrMm(iy->second) });
+                }
+                emitAltiumCopperPolygon(verts, lid, netId);
+            }
+        }
+    }
+
+    // 10. Regions6/Data (recordType == 11: [11][blkLen:u32][hdr:18+][propLen:u32][props][vCount:u32]([vx_f64:8][vy_f64:8])*)
+    if (const auto* regEnt = Explorer2::Ole2::FindStreamCaseInsensitive(cf, L"Regions6/Data")) {
+        std::vector<uint8_t> bytes;
+        if (Explorer2::Ole2::ExtractStream(cf, *regEnt, bytes, 32 * 1024 * 1024)) {
+            size_t pos = 0;
+            while (pos + 5 <= bytes.size()) {
+                uint8_t recType = bytes[pos];
+                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                if (recType != 11 || blkLen < 26 || blkLen > bytes.size() - (pos + 5)) break;
+                const uint8_t* pay = bytes.data() + pos + 5;
+                EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
+                uint16_t netRaw = DetailEda100::RdU16LE(pay + 3);
+                int netId = (netRaw == 0xFFFFu) ? 0 : static_cast<int>(netRaw + 1);
+                // After 18-byte common header: uint32 propLen + propStr + uint32 vertCount + vertCount * 16B (f64 x, f64 y)
+                uint32_t propLen = DetailEda100::RdU32LE(pay + 18);
+                size_t vOff = 22 + static_cast<size_t>(propLen);
+                if (vOff + 4 <= blkLen) {
+                    uint32_t vCnt = DetailEda100::RdU32LE(pay + vOff);
+                    vOff += 4;
+                    if (vCnt >= 3 && vCnt <= 4096 && vOff + static_cast<size_t>(vCnt) * 16u <= blkLen) {
+                        std::vector<std::pair<float, float>> verts;
+                        verts.reserve(vCnt);
+                        for (uint32_t vi = 0; vi < vCnt; ++vi) {
+                            double dx = 0.0, dy = 0.0;
+                            std::memcpy(&dx, pay + vOff + vi * 16u, 8);
+                            std::memcpy(&dy, pay + vOff + vi * 16u + 8u, 8);
+                            verts.push_back({ static_cast<float>(dx * kAltiumUnitToMm), static_cast<float>(dy * kAltiumUnitToMm) });
+                        }
+                        emitAltiumCopperPolygon(verts, lid, netId);
+                    }
+                }
+                pos += 5 + blkLen;
+            }
+        }
+    }
+
+    // 11. WideStrings6/Data + Texts6/Data (recordType == 5 silkscreen labels)
+    std::unordered_map<int, std::wstring> wideStrings;
+    if (const auto* wsEnt = Explorer2::Ole2::FindStreamCaseInsensitive(cf, L"WideStrings6/Data")) {
+        std::vector<uint8_t> bytes;
+        if (Explorer2::Ole2::ExtractStream(cf, *wsEnt, bytes, 16 * 1024 * 1024) && !bytes.empty()) {
+            std::vector<KvMap> wsRecs;
+            WalkLengthPrefixedBlocks(bytes, wsRecs, false);
+            for (const auto& kv : wsRecs) {
+                for (const auto& pair : kv) {
+                    if (pair.first.rfind("encodedtext", 0) == 0 && pair.first.size() > 11) {
+                        int idx = std::atoi(pair.first.c_str() + 11);
+                        std::wstring ws;
+                        size_t cp = 0;
+                        const std::string& val = pair.second;
+                        while (cp < val.size()) {
+                            size_t cm = val.find(',', cp);
+                            if (cm == std::string::npos) cm = val.size();
+                            int ch = std::atoi(val.substr(cp, cm - cp).c_str());
+                            if (ch > 0 && ch < 0x10000) ws.push_back(static_cast<wchar_t>(ch));
+                            cp = cm + 1;
+                        }
+                        if (!ws.empty()) wideStrings[idx] = std::move(ws);
+                    }
+                }
+            }
+            if (wideStrings.empty()) {
+                // Binary PcbLib/AD18+ WideStrings6 format: ([idx:u32][byteLen:u32][utf16le...])*
+                size_t p = 0;
+                while (p + 8 <= bytes.size() && wideStrings.size() < 16000) {
+                    uint32_t idx = DetailEda100::RdU32LE(bytes.data() + p);
+                    uint32_t bLen = DetailEda100::RdU32LE(bytes.data() + p + 4);
+                    p += 8;
+                    if (bLen > bytes.size() - p || (bLen & 1u) != 0) break;
+                    std::wstring ws;
+                    for (uint32_t i = 0; i + 2 <= bLen; i += 2) {
+                        uint16_t cu = DetailEda100::RdU16LE(bytes.data() + p + i);
+                        if (cu != 0) ws.push_back(static_cast<wchar_t>(cu));
+                    }
+                    if (!ws.empty()) wideStrings[static_cast<int>(idx)] = std::move(ws);
+                    p += bLen;
+                }
+            }
+        }
+    }
+    if (const auto* txtEnt = Explorer2::Ole2::FindStreamCaseInsensitive(cf, L"Texts6/Data")) {
+        std::vector<uint8_t> bytes;
+        if (Explorer2::Ole2::ExtractStream(cf, *txtEnt, bytes, 16 * 1024 * 1024)) {
+            size_t pos = 0;
+            int txtOrd = 0;
+            while (pos + 5 <= bytes.size() && out.labels.size() < 8000) {
+                uint8_t recType = bytes[pos];
+                uint32_t geomLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                if (recType != 5 || geomLen < 25 || geomLen > bytes.size() - (pos + 5)) break;
+                const uint8_t* geom = bytes.data() + pos + 5;
+                pos += 5 + geomLen;
+                if (pos + 4 > bytes.size()) break;
+                uint32_t strBlkLen = DetailEda100::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
+                pos += 4;
+                if (strBlkLen > bytes.size() - pos) break;
+                const uint8_t* strPtr = bytes.data() + pos;
+                pos += strBlkLen;
+
+                EdaLayerId lid = MapAltiumPcbLayerByte(geom[0]);
+                float tx = static_cast<float>(DetailEda100::RdI32LE(geom + 13)) * kAltiumUnitToMm;
+                float ty = static_cast<float>(DetailEda100::RdI32LE(geom + 17)) * kAltiumUnitToMm;
+                float th = std::clamp(static_cast<float>(DetailEda100::RdI32LE(geom + 21)) * kAltiumUnitToMm, 0.7f, 4.0f);
+
+                std::wstring labelW;
+                auto itWs = wideStrings.find(txtOrd);
+                if (itWs != wideStrings.end()) {
+                    labelW = itWs->second;
+                } else if (strBlkLen >= 2) {
+                    size_t sLen = std::min<size_t>(strPtr[0], strBlkLen - 1);
+                    labelW = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(strPtr + 1), sLen));
+                }
+                if (!labelW.empty()) {
+                    out.labels.push_back({ tx, ty, th, lid, std::move(labelW) });
+                }
+                ++txtOrd;
+            }
+        }
+    }
+
     if (out.traces.empty() && out.pads.empty() && out.vias.empty() && out.components.empty() && out.circles.empty()) {
         return false;
     }
@@ -1658,11 +1898,205 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
     return true;
 }
 
+inline bool ParseAltiumSchLibOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEdaBoard& out) {
+    // Altium .SchLib stores each symbol inside <SectionName>/Data (pipe-delimited |RECORD=...| blocks), indexed by FileHeader
+    size_t symCount = 0;
+    float offX = 0.0f;
+    for (const auto& e : cf.entries) {
+        if (e.objectType != 2 || e.size < 8) continue;
+        std::wstring lowPath = PathUtils::ToLower(e.fullPath);
+        if (lowPath == L"fileheader" || lowPath == L"storage" || lowPath.find(L"/data") == std::wstring::npos) {
+            continue;
+        }
+        std::vector<uint8_t> bytes;
+        if (!Explorer2::Ole2::ExtractStream(cf, e, bytes, 16 * 1024 * 1024) || bytes.empty()) continue;
+        std::vector<KvMap> recs;
+        WalkLengthPrefixedBlocks(bytes, recs, true);
+        if (recs.empty()) continue;
+
+        size_t before = out.traces.size() + out.pads.size() + out.components.size();
+        ProcessSchRecords(recs, out, offX, 0.0f);
+        if (out.traces.size() + out.pads.size() + out.components.size() > before) {
+            size_t sl = e.fullPath.find(L'/');
+            std::wstring symTitle = (sl != std::wstring::npos) ? e.fullPath.substr(0, sl) : e.name;
+            out.labels.push_back({ offX, 16.0f, 1.2f, EdaLayerId::SchLabel, symTitle });
+            offX += 36.0f;
+            ++symCount;
+        }
+    }
+    if (symCount == 0) return false;
+    out.kind = EdaDocKind::EagleSch;
+    out.formatTitle = L"Altium Schematic Symbol Library (.SchLib — " + std::to_wstring(symCount) + L" symbols)";
+    out.netCount = std::max<size_t>(1, symCount);
+    return true;
+}
+
+inline bool ParseAltiumPcbLibOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEdaBoard& out) {
+    // Altium .PcbLib stores each footprint inside <FootprintDir>/Data:
+    // Header block: [blkLen:u32][pascalLen:1][patternName] followed by packed binary primitive records (1=Arc, 2=Pad, 3=Via, 4=Track, 6=Fill)
+    constexpr float kAltiumUnitToMm = 0.00000254f;
+    size_t fpCount = 0;
+    float offX = 0.0f;
+
+    for (const auto& e : cf.entries) {
+        if (e.objectType != 2 || e.size < 10) continue;
+        std::wstring lowPath = PathUtils::ToLower(e.fullPath);
+        if (lowPath.find(L"library/") == 0 || lowPath == L"fileversioninfo/data" || lowPath.find(L"/data") == std::wstring::npos) {
+            continue;
+        }
+        if (lowPath.find(L"/primitives") != std::wstring::npos || lowPath.find(L"/uniqueparameters") != std::wstring::npos ||
+            lowPath.find(L"/widestrings") != std::wstring::npos) {
+            continue;
+        }
+
+        std::vector<uint8_t> bytes;
+        if (!Explorer2::Ole2::ExtractStream(cf, e, bytes, 16 * 1024 * 1024) || bytes.size() < 10) continue;
+
+        uint32_t nameBlkLen = DetailEda100::RdU32LE(bytes.data()) & 0x00FFFFFFu;
+        if (nameBlkLen == 0 || 4 + nameBlkLen > bytes.size()) continue;
+        size_t patLen = std::min<size_t>(bytes[4], nameBlkLen - 1);
+        std::wstring patName = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(bytes.data() + 5), patLen));
+        if (patName.empty()) {
+            size_t sl = e.fullPath.find(L'/');
+            patName = (sl != std::wstring::npos) ? e.fullPath.substr(0, sl) : e.name;
+        }
+
+        size_t pos = 4 + nameBlkLen;
+        size_t primAdded = 0;
+        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+        auto expFp = [&](float x, float y) {
+            minX = std::min(minX, x); maxX = std::max(maxX, x);
+            minY = std::min(minY, y); maxY = std::max(maxY, y);
+        };
+
+        while (pos < bytes.size()) {
+            uint8_t recType = bytes[pos++];
+            if (recType == 0) break;
+            if (recType == 2) { // Pad (6 subrecords or 2 compact subrecords)
+                auto readSub = [&](const uint8_t*& outPtr, uint32_t& outLen) -> bool {
+                    if (pos + 4 > bytes.size()) return false;
+                    outLen = DetailEda100::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
+                    pos += 4;
+                    if (outLen > bytes.size() - pos) return false;
+                    outPtr = bytes.data() + pos;
+                    pos += outLen;
+                    return true;
+                };
+                const uint8_t *s0 = nullptr, *s1 = nullptr;
+                uint32_t l0 = 0, l1 = 0;
+                if (!readSub(s0, l0) || !readSub(s1, l1)) break;
+                std::wstring padDes;
+                if (l0 >= 1) {
+                    size_t so = (l0 > 1 && s0[0] == l0 - 1) ? 1 : 0;
+                    padDes = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(s0 + so), l0 - so));
+                }
+                const uint8_t* geom = s1;
+                uint32_t geomLen = l1;
+                if (l1 < 29) {
+                    const uint8_t *s2 = nullptr, *s3 = nullptr, *s4 = nullptr, *s5 = nullptr;
+                    uint32_t l2 = 0, l3 = 0, l4 = 0, l5 = 0;
+                    if (!readSub(s2, l2) || !readSub(s3, l3) || !readSub(s4, l4)) break;
+                    geom = s4; geomLen = l4;
+                    if (pos + 4 <= bytes.size() && (bytes[pos] != 2 && bytes[pos] != 4 && bytes[pos] != 1 && bytes[pos] != 6)) {
+                        readSub(s5, l5);
+                    }
+                }
+                if (geom && geomLen >= 29) {
+                    EdaPadPrim p{};
+                    p.layer = MapAltiumPcbLayerByte(geom[0]);
+                    p.x = offX + static_cast<float>(DetailEda100::RdI32LE(geom + 13)) * kAltiumUnitToMm;
+                    p.y = static_cast<float>(DetailEda100::RdI32LE(geom + 17)) * kAltiumUnitToMm;
+                    p.w = std::max(0.15f, static_cast<float>(DetailEda100::RdI32LE(geom + 21)) * kAltiumUnitToMm);
+                    p.h = std::max(0.15f, static_cast<float>(DetailEda100::RdI32LE(geom + 25)) * kAltiumUnitToMm);
+                    if (geomLen >= 49) p.drill = std::max(0.0f, static_cast<float>(DetailEda100::RdI32LE(geom + 45)) * kAltiumUnitToMm);
+                    else if (geomLen >= 33) p.drill = std::max(0.0f, static_cast<float>(DetailEda100::RdI32LE(geom + 29)) * kAltiumUnitToMm);
+                    p.shape = (p.drill > 0.05f) ? 0 : 1;
+                    if (p.drill > 0.05f) p.layer = EdaLayerId::PadsThrough;
+                    p.pinName = padDes;
+                    expFp(p.x - p.w * 0.5f, p.y - p.h * 0.5f);
+                    expFp(p.x + p.w * 0.5f, p.y + p.h * 0.5f);
+                    out.pads.push_back(std::move(p));
+                    ++primAdded;
+                }
+            } else if (pos + 4 <= bytes.size()) {
+                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
+                pos += 4;
+                if (blkLen > bytes.size() - pos) break;
+                const uint8_t* pay = bytes.data() + pos;
+                pos += blkLen;
+                if (recType == 4 && blkLen >= 33) { // Track
+                    EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
+                    float x1 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                    float y1 = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                    float x2 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm;
+                    float y2 = static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm;
+                    float w  = std::max(0.06f, static_cast<float>(DetailEda100::RdI32LE(pay + 29)) * kAltiumUnitToMm);
+                    expFp(x1, y1); expFp(x2, y2);
+                    out.traces.push_back({ x1, y1, x2, y2, w, lid, 0 });
+                    ++primAdded;
+                } else if (recType == 1 && blkLen >= 45) { // Arc
+                    EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
+                    float cx = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                    float cy = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                    float r  = std::max(0.1f, static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm);
+                    float w  = std::max(0.08f, static_cast<float>(DetailEda100::RdI32LE(pay + 41)) * kAltiumUnitToMm);
+                    expFp(cx - r, cy - r); expFp(cx + r, cy + r);
+                    out.circles.push_back({ cx, cy, r, w, false, lid });
+                    ++primAdded;
+                } else if (recType == 6 && blkLen >= 29) { // Fill
+                    EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
+                    float x1 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                    float y1 = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                    float x2 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm;
+                    float y2 = static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm;
+                    EdaPadPrim fp{};
+                    fp.x = (x1 + x2) * 0.5f; fp.y = (y1 + y2) * 0.5f;
+                    fp.w = std::max(0.15f, std::fabs(x2 - x1)); fp.h = std::max(0.15f, std::fabs(y2 - y1));
+                    fp.shape = 1; fp.layer = lid;
+                    expFp(x1, y1); expFp(x2, y2);
+                    out.pads.push_back(std::move(fp));
+                    ++primAdded;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if (primAdded > 0) {
+            float fw = (minX <= maxX) ? std::max(1.5f, maxX - minX) : 4.0f;
+            float fh = (minY <= maxY) ? std::max(1.2f, maxY - minY) : 3.0f;
+            float fcx = (minX <= maxX) ? ((minX + maxX) * 0.5f) : offX;
+            float fcy = (minY <= maxY) ? ((minY + maxY) * 0.5f) : 0.0f;
+
+            EdaComponent3D comp;
+            comp.refDes = patName;
+            comp.footprint = patName;
+            comp.x = fcx; comp.y = fcy;
+            comp.widthMm = fw; comp.lengthMm = fh; comp.heightMm = 1.3f;
+            comp.category = ClassifyComponent(comp.refDes, comp.footprint, comp.widthMm, comp.lengthMm, comp.heightMm, comp.pinCount);
+            out.components.push_back(std::move(comp));
+            out.labels.push_back({ fcx - fw * 0.5f, fcy + fh * 0.5f + 1.0f, 1.0f, EdaLayerId::TopSilk, patName });
+
+            offX += fw + 8.0f;
+            ++fpCount;
+        }
+    }
+
+    if (fpCount == 0) return false;
+    out.kind = EdaDocKind::KiCadPcb;
+    out.formatTitle = L"Altium PCB Footprint Library (.PcbLib — " + std::to_wstring(fpCount) + L" footprints)";
+    out.netCount = fpCount;
+    return true;
+}
+
 } // namespace DetailAltium
 
 inline bool ParseAltiumDocBoard(const uint8_t* data, size_t size, const std::wstring& extLower, ParsedEdaBoard& out) {
-    if (!data || size < 8 || (extLower != L".pcbdoc" && extLower != L".schdoc")) return false;
-    bool isSch = (extLower == L".schdoc");
+    if (!data || size < 8 ||
+        (extLower != L".pcbdoc" && extLower != L".schdoc" && extLower != L".pcblib" && extLower != L".schlib")) {
+        return false;
+    }
+    bool isSch = (extLower == L".schdoc" || extLower == L".schlib");
     out.kind = isSch ? EdaDocKind::EagleSch : EdaDocKind::KiCadPcb;
     out.formatTitle = isSch ? L"Altium Designer Schematic (.SchDoc)" : L"Altium Designer 3D PCB (.PcbDoc)";
 
@@ -1671,6 +2105,12 @@ inline bool ParseAltiumDocBoard(const uint8_t* data, size_t size, const std::wst
     if (size >= 512 && std::memcmp(data, kOle2Magic, 8) == 0) {
         Explorer2::Ole2::CompoundFile cf;
         if (!Explorer2::Ole2::ParseCompoundFile(data, size, cf)) return false;
+        if (extLower == L".schlib") {
+            return DetailAltium::ParseAltiumSchLibOle2(cf, out);
+        }
+        if (extLower == L".pcblib") {
+            return DetailAltium::ParseAltiumPcbLibOle2(cf, out);
+        }
         if (isSch || Explorer2::Ole2::FindStreamCaseInsensitive(cf, L"FileHeader") != nullptr) {
             out.kind = EdaDocKind::EagleSch;
             out.formatTitle = L"Altium Designer Schematic (.SchDoc)";
@@ -2239,8 +2679,115 @@ namespace DetailHwBin {
 struct DecodedWaveSignal {
     std::wstring name;
     int bitWidth = 1;
+    bool isReal = false;
     std::vector<std::pair<uint64_t, std::string>> changes; // (timestamp, state e.g. "0", "1", "x", "z", or multi-bit)
+    std::vector<std::pair<uint64_t, double>> realChanges;  // (timestamp, IEEE-754 double for FST_VT_REAL)
 };
+
+inline bool DecompressFstLz4RawBlock(const uint8_t* src, size_t srcLen, size_t expectedOut, std::vector<uint8_t>& out, size_t maxOut = 32 * 1024 * 1024) {
+    out.clear();
+    if (!src || expectedOut > maxOut) return false;
+    if (expectedOut == 0) return srcLen == 0;
+    if (srcLen == 0) return false;
+    out.reserve(std::min<size_t>(expectedOut, 4 * 1024 * 1024));
+
+    size_t sp = 0;
+    while (sp < srcLen) {
+        uint8_t tok = src[sp++];
+        size_t litLen = static_cast<size_t>(tok >> 4);
+        if (litLen == 15) {
+            for (;;) {
+                if (sp >= srcLen) return false;
+                uint8_t b = src[sp++];
+                litLen += b;
+                if (b != 255) break;
+                if (litLen > maxOut) return false;
+            }
+        }
+        if (sp + litLen > srcLen || out.size() + litLen > maxOut) return false;
+        out.insert(out.end(), src + sp, src + sp + litLen);
+        sp += litLen;
+        if (sp == srcLen) break;
+
+        if (sp + 2 > srcLen) return false;
+        size_t offset = static_cast<size_t>(src[sp]) | (static_cast<size_t>(src[sp + 1]) << 8);
+        sp += 2;
+        if (offset == 0 || offset > out.size()) return false;
+
+        size_t matchLen = static_cast<size_t>(tok & 0x0Fu) + 4u;
+        if ((tok & 0x0Fu) == 15u) {
+            for (;;) {
+                if (sp >= srcLen) return false;
+                uint8_t b = src[sp++];
+                matchLen += b;
+                if (b != 255) break;
+                if (matchLen > maxOut) return false;
+            }
+        }
+        if (out.size() + matchLen > maxOut) return false;
+        for (size_t i = 0; i < matchLen; ++i) {
+            out.push_back(out[out.size() - offset]);
+        }
+    }
+    return out.size() == expectedOut;
+}
+
+inline bool DecompressFstFastLzBlock(const uint8_t* src, size_t srcLen, size_t expectedOut, std::vector<uint8_t>& out, size_t maxOut = 32 * 1024 * 1024) {
+    out.clear();
+    if (!src || srcLen == 0 || expectedOut > maxOut) return false;
+    int level = (src[0] >> 5) + 1;
+    if (level != 1 && level != 2) return false;
+    out.reserve(std::min<size_t>(expectedOut, 4 * 1024 * 1024));
+
+    size_t sp = 0;
+    uint32_t ctrl = src[sp++] & 31u;
+    for (;;) {
+        if (ctrl >= 32u) {
+            size_t len = (ctrl >> 5) - 1u;
+            size_t ofs = static_cast<size_t>(ctrl & 31u) << 8;
+            if (level == 1) {
+                if (len == 6u) {
+                    if (sp >= srcLen) return false;
+                    len += src[sp++];
+                }
+                if (sp >= srcLen) return false;
+                ofs += src[sp++];
+            } else {
+                if (len == 6u) {
+                    for (;;) {
+                        if (sp >= srcLen) return false;
+                        uint8_t code = src[sp++];
+                        len += code;
+                        if (code != 255) break;
+                        if (len > maxOut) return false;
+                    }
+                }
+                if (sp >= srcLen) return false;
+                uint8_t code = src[sp++];
+                ofs += code;
+                if (code == 255 && (ctrl & 31u) == 31u) {
+                    if (sp + 2 > srcLen) return false;
+                    ofs = (31u << 8) + 255u + ((static_cast<size_t>(src[sp]) << 8) | src[sp + 1]);
+                    sp += 2;
+                }
+            }
+            size_t copyLen = len + 3u;
+            size_t lookback = ofs + 1u;
+            if (lookback == 0 || lookback > out.size() || out.size() + copyLen > maxOut) return false;
+            for (size_t i = 0; i < copyLen; ++i) {
+                out.push_back(out[out.size() - lookback]);
+            }
+        } else {
+            size_t litLen = static_cast<size_t>(ctrl) + 1u;
+            if (sp + litLen > srcLen || out.size() + litLen > maxOut) return false;
+            out.insert(out.end(), src + sp, src + sp + litLen);
+            sp += litLen;
+        }
+        if (sp >= srcLen) break;
+        ctrl = src[sp++];
+    }
+    return expectedOut == 0 ? !out.empty() : (out.size() == expectedOut);
+}
 
 inline bool RenderWaveSignalsToBoard(
     const std::vector<DecodedWaveSignal>& sigs,
@@ -2259,6 +2806,10 @@ inline bool RenderWaveSignalsToBoard(
             if (c.first < minT) minT = c.first;
             if (c.first > maxT) maxT = c.first;
         }
+        for (const auto& rc : s.realChanges) {
+            if (rc.first < minT) minT = rc.first;
+            if (rc.first > maxT) maxT = rc.first;
+        }
     }
     double spanT = (maxT > minT) ? static_cast<double>(maxT - minT) : 100.0;
     const float x0 = -24.0f, plotW = 84.0f;
@@ -2267,9 +2818,53 @@ inline bool RenderWaveSignalsToBoard(
     for (size_t r = 0; r < maxRows; ++r) {
         const auto& s = sigs[r];
         float yMid = 24.0f - static_cast<float>(r) * 7.5f;
-        out.labels.push_back({ -36.0f, yMid, 1.05f, EdaLayerId::SchLabel, s.name });
-
         EdaLayerId lid = (r % 2 == 0) ? EdaLayerId::TopCopper : EdaLayerId::SchWire;
+
+        if (s.isReal) {
+            double rMin = 1e300, rMax = -1e300;
+            for (const auto& rc : s.realChanges) {
+                if (std::isfinite(rc.second)) {
+                    rMin = std::min(rMin, rc.second);
+                    rMax = std::max(rMax, rc.second);
+                }
+            }
+            if (rMin > rMax) { rMin = -1.0; rMax = 1.0; }
+            double rSpan = (rMax - rMin > 1e-12) ? (rMax - rMin) : 1.0;
+
+            wchar_t realLbl[160] = {};
+            swprintf_s(realLbl, L"%s [%.3g..%.3g]", s.name.c_str(), rMin, rMax);
+            out.labels.push_back({ -36.0f, yMid, 1.05f, EdaLayerId::SchLabel, realLbl });
+
+            if (s.realChanges.empty()) {
+                out.traces.push_back({ x0, yMid, x0 + plotW, yMid, 0.24f, lid, static_cast<int>(r + 1) });
+                continue;
+            }
+            auto realToY = [&](double v) -> float {
+                if (!std::isfinite(v)) return yMid;
+                float norm = (rMax - rMin > 1e-12) ? static_cast<float>((v - rMin) / rSpan) : 0.5f;
+                return (yMid - 2.3f) + std::clamp(norm, 0.0f, 1.0f) * 4.6f;
+            };
+            float prevX = x0;
+            float prevY = realToY(s.realChanges[0].second);
+            for (size_t ci = 0; ci < s.realChanges.size(); ++ci) {
+                float cx = x0 + static_cast<float>((static_cast<double>(s.realChanges[ci].first - minT) / spanT)) * plotW;
+                cx = std::clamp(cx, x0, x0 + plotW);
+                float newY = realToY(s.realChanges[ci].second);
+                if (ci > 0) {
+                    out.traces.push_back({ prevX, prevY, cx, newY, 0.30f, EdaLayerId::InnerCopper, static_cast<int>(r + 1) });
+                } else if (cx > prevX + 0.01f) {
+                    out.traces.push_back({ prevX, prevY, cx, prevY, 0.28f, EdaLayerId::InnerCopper, static_cast<int>(r + 1) });
+                }
+                prevX = cx;
+                prevY = newY;
+            }
+            if (prevX < x0 + plotW) {
+                out.traces.push_back({ prevX, prevY, x0 + plotW, prevY, 0.28f, EdaLayerId::InnerCopper, static_cast<int>(r + 1) });
+            }
+            continue;
+        }
+
+        out.labels.push_back({ -36.0f, yMid, 1.05f, EdaLayerId::SchLabel, s.name });
         auto stateToLevel = [&](const std::string& st) -> float {
             if (st.empty()) return yMid - 2.0f;
             if (s.bitWidth == 1 && st.size() == 1) {
@@ -2327,9 +2922,30 @@ inline bool RenderWaveSignalsToBoard(
     return !out.traces.empty();
 }
 
-// Authentic GTKWave FST (.fst) Binary Waveform Reader
-inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& out) {
-    if (!data || size < 33) return false;
+// Authentic GTKWave FST (.fst) Binary Waveform Reader (Zlib, LZ4, FastLZ, HIER_LZ4/LZ4DUO, GWRAPPER & Real Analog)
+inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& out, int wrapDepth = 0) {
+    if (!data || size < 33 || wrapDepth > 1) return false;
+
+    // FST_BL_GWRAPPER (9): entire FST image wrapped in [type=9][seclen:8][uncompLen:8][gzip/zlib]
+    if (data[0] == 9) {
+        if (size < 26) return false;
+        uint64_t secLen = DetailEda100::RdU64BE(data + 1);
+        if (secLen < 16 || 1 + secLen > size) return false;
+        size_t payLen = static_cast<size_t>(secLen - 8);
+        const uint8_t* pay = data + 9;
+        uint64_t uncompLen = DetailEda100::RdU64BE(pay);
+        if (uncompLen < 33 || uncompLen > 128ULL * 1024 * 1024) return false;
+        std::vector<uint8_t> inner;
+        bool okW = false;
+        if (payLen > 10 && pay[8] == 0x1F && pay[9] == 0x8B) {
+            okW = ZipDeflate::InflateGzip(pay + 8, payLen - 8, inner, static_cast<size_t>(uncompLen) + 64);
+        } else if (payLen > 10) {
+            okW = ZipDeflate::InflateZlib(pay + 8, payLen - 8, inner, static_cast<size_t>(uncompLen) + 64);
+        }
+        if (!okW || inner.size() != uncompLen) return false;
+        return ParseGtkWaveFst(inner.data(), inner.size(), out, wrapDepth + 1);
+    }
+
     if (data[0] != 0) return false; // Must begin with FST_BL_HDR (0)
 
     struct FstHandleDef {
@@ -2337,26 +2953,44 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
         uint32_t bitLen = 1;
         bool isReal = false;
         std::vector<std::pair<uint64_t, std::string>> changes;
+        std::vector<std::pair<uint64_t, double>> realChanges;
+    };
+    struct FstStaticAlias {
+        std::wstring name;
+        size_t targetZeroBased = 0;
     };
     std::vector<FstHandleDef> handles; // index 0 = handle 1
+    std::vector<FstStaticAlias> staticAliases;
     uint64_t hdrStartTime = 0, hdrEndTime = 0;
     std::string writerName;
     int8_t timescale = -9;
+    bool writerBigEndian = false;
     bool sawValidHdr = false;
 
+    auto rdWriterDouble = [&](const uint8_t* p) -> double {
+        double d = 0.0;
+        if (writerBigEndian) {
+            uint8_t rev[8] = { p[7], p[6], p[5], p[4], p[3], p[2], p[1], p[0] };
+            std::memcpy(&d, rev, 8);
+        } else {
+            std::memcpy(&d, p, 8);
+        }
+        return d;
+    };
+
     size_t pos = 0;
-    while (pos + 9 <= size) {
+    while (pos < size) {
+        if (pos + 9 > size) return false; // Truncated block header
         uint8_t blkType = data[pos];
         uint64_t blkLen = DetailEda100::RdU64BE(data + pos + 1);
-        if (blkLen < 8) break;
+        if (blkLen < 8) return false;
 
         // In fstapi.c, seclen includes the 8-byte length field (next = pos + 1 + blkLen).
-        // Also gracefully handle writers where blkLen is payload-only if 1 + blkLen overshoots or doesn't land cleanly.
         size_t payStart = pos + 9;
         size_t payLen = 0;
         size_t nextPos = 0;
         if (blkLen - 8 <= size - payStart &&
-            (pos + 1 + blkLen == size || (pos + 1 + blkLen < size && data[pos + 1 + blkLen] <= 8)))
+            (pos + 1 + blkLen == size || (pos + 1 + blkLen < size && data[pos + 1 + blkLen] <= 9)))
         {
             payLen = static_cast<size_t>(blkLen - 8);
             nextPos = pos + 1 + static_cast<size_t>(blkLen);
@@ -2364,7 +2998,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             payLen = static_cast<size_t>(blkLen);
             nextPos = payStart + payLen;
         } else {
-            break;
+            return false; // Truncated FST section payload!
         }
 
         const uint8_t* pay = data + payStart;
@@ -2377,9 +3011,10 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             std::memcpy(&dLE, pay + 16, 8);
             uint8_t rev[8] = { pay[23], pay[22], pay[21], pay[20], pay[19], pay[18], pay[17], pay[16] };
             std::memcpy(&dBE, rev, 8);
-            bool validE = (std::isfinite(dLE) && std::fabs(dLE - 2.718281828459045) < 1e-3) ||
-                          (std::isfinite(dBE) && std::fabs(dBE - 2.718281828459045) < 1e-3);
-            if (!validE) return false;
+            bool okLE = (std::isfinite(dLE) && std::fabs(dLE - 2.718281828459045) < 1e-3);
+            bool okBE = (std::isfinite(dBE) && std::fabs(dBE - 2.718281828459045) < 1e-3);
+            if (!okLE && !okBE) return false;
+            writerBigEndian = (!okLE && okBE);
             timescale = static_cast<int8_t>(pay[64]);
             if (payLen >= 193) {
                 size_t wlen = 0;
@@ -2387,21 +3022,43 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                 writerName.assign(reinterpret_cast<const char*>(pay + 65), wlen);
             }
             sawValidHdr = true;
-        } else if (blkType == 4 || blkType == 5) { // FST_BL_HIER / FST_BL_HIER_GZ
+        } else if (blkType == 4 || blkType == 5 || blkType == 6 || blkType == 7) {
+            // FST_BL_HIER (4), FST_BL_HIER_GZ (5), FST_BL_HIER_LZ4 (6), FST_BL_HIER_LZ4DUO (7)
             std::vector<uint8_t> hierBuf;
             const uint8_t* hp = pay;
             size_t hlen = payLen;
             if (blkType == 5) {
-                if (payLen < 10) { pos = nextPos; continue; }
-                // FST_BL_HIER_GZ begins with uint64_be uncompressed length followed by gzip or zlib stream
+                if (payLen < 10) return false;
                 size_t zOff = (pay[8] == 0x1F && pay[9] == 0x8B) || ((pay[8] & 0x0F) == 0x08) ? 8 : 0;
-                bool okZ = false;
-                if (pay[zOff] == 0x1F && pay[zOff + 1] == 0x8B) {
-                    okZ = ZipDeflate::InflateGzip(pay + zOff, payLen - zOff, hierBuf, 32 * 1024 * 1024);
-                } else {
-                    okZ = ZipDeflate::InflateZlib(pay + zOff, payLen - zOff, hierBuf, 32 * 1024 * 1024);
+                bool okZ = (pay[zOff] == 0x1F && pay[zOff + 1] == 0x8B)
+                    ? ZipDeflate::InflateGzip(pay + zOff, payLen - zOff, hierBuf, 32 * 1024 * 1024)
+                    : ZipDeflate::InflateZlib(pay + zOff, payLen - zOff, hierBuf, 32 * 1024 * 1024);
+                if (!okZ || hierBuf.empty()) return false;
+                hp = hierBuf.data();
+                hlen = hierBuf.size();
+            } else if (blkType == 6) {
+                // FST_BL_HIER_LZ4: [uncompLen:8 BE][LZ4 raw block]
+                if (payLen < 9) return false;
+                uint64_t uncompLen = DetailEda100::RdU64BE(pay);
+                if (uncompLen == 0 || uncompLen > 32 * 1024 * 1024) return false;
+                if (!DecompressFstLz4RawBlock(pay + 8, payLen - 8, static_cast<size_t>(uncompLen), hierBuf, 32 * 1024 * 1024)) {
+                    return false;
                 }
-                if (!okZ || hierBuf.empty()) { pos = nextPos; continue; }
+                hp = hierBuf.data();
+                hlen = hierBuf.size();
+            } else if (blkType == 7) {
+                // FST_BL_HIER_LZ4DUO: [uncompLen:8 BE][midLen:8 BE][LZ4 outer -> LZ4 inner]
+                if (payLen < 17) return false;
+                uint64_t uncompLen = DetailEda100::RdU64BE(pay + 0);
+                uint64_t midLen    = DetailEda100::RdU64BE(pay + 8);
+                if (uncompLen == 0 || midLen == 0 || uncompLen > 32 * 1024 * 1024 || midLen > 32 * 1024 * 1024) return false;
+                std::vector<uint8_t> midBuf;
+                if (!DecompressFstLz4RawBlock(pay + 16, payLen - 16, static_cast<size_t>(midLen), midBuf, 32 * 1024 * 1024)) {
+                    return false;
+                }
+                if (!DecompressFstLz4RawBlock(midBuf.data(), midBuf.size(), static_cast<size_t>(uncompLen), hierBuf, 32 * 1024 * 1024)) {
+                    return false;
+                }
                 hp = hierBuf.data();
                 hlen = hierBuf.size();
             }
@@ -2441,8 +3098,8 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                     uint64_t alias  = DetailEda100::ReadULeb128(hp, hlen, hpos);
 
                     std::string fullName;
-                    if (!scopeStack.empty()) fullName = scopeStack.back() + "." + vname;
-                    else fullName = vname;
+                    for (const auto& sc : scopeStack) { fullName += sc; fullName.push_back('.'); }
+                    fullName += vname;
 
                     if (alias == 0) {
                         FstHandleDef hd;
@@ -2450,6 +3107,8 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                         hd.isReal = (tag == 3 || tag == 4 || tag == 20 || tag == 29);
                         hd.bitLen = hd.isReal ? 64 : static_cast<uint32_t>(std::clamp<uint64_t>(bitLen, 1, 512));
                         handles.push_back(std::move(hd));
+                    } else if (alias <= handles.size() && staticAliases.size() < 256) {
+                        staticAliases.push_back({ PathUtils::Utf8ToWide(fullName), static_cast<size_t>(alias - 1) });
                     }
                 } else {
                     break;
@@ -2466,15 +3125,14 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             uint64_t timeCompLen   = DetailEda100::RdU64BE(pay + payLen - 16);
             uint64_t timeCount     = DetailEda100::RdU64BE(pay + payLen - 8);
             if (timeCompLen > payLen - 32 || timeCount == 0 || timeCount > 1000000) {
-                pos = nextPos;
-                continue;
+                return false;
             }
             size_t timeOff = payLen - 24 - static_cast<size_t>(timeCompLen);
             std::vector<uint8_t> timeRaw;
             const uint8_t* tp = pay + timeOff;
             size_t tlen = static_cast<size_t>(timeCompLen);
             if (timeCompLen != timeUncompLen) {
-                if (!ZipDeflate::InflateZlib(tp, tlen, timeRaw, 32 * 1024 * 1024)) { pos = nextPos; continue; }
+                if (!ZipDeflate::InflateZlib(tp, tlen, timeRaw, 32 * 1024 * 1024)) return false;
                 tp = timeRaw.data();
                 tlen = timeRaw.size();
             }
@@ -2488,23 +3146,34 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             }
             if (timestamps.empty()) timestamps.push_back(vcStart);
 
-            // 2. Decode Initial Value Bits at pay + 24
+            // 2. Decode Initial Value Bits at pay + 24 (digital char-per-bit + 8-byte IEEE-754 double for isReal)
             size_t vpos = 24;
             uint64_t bitsUncomp = DetailEda100::ReadULeb128(pay, timeOff, vpos);
             uint64_t bitsComp   = DetailEda100::ReadULeb128(pay, timeOff, vpos);
-            if (bitsComp > timeOff - vpos) { pos = nextPos; continue; }
+            if (bitsComp > timeOff - vpos) return false;
             std::vector<uint8_t> initBits;
             if (bitsComp == bitsUncomp) {
                 initBits.assign(pay + vpos, pay + vpos + static_cast<size_t>(bitsComp));
             } else if (bitsComp > 0) {
-                ZipDeflate::InflateZlib(pay + vpos, static_cast<size_t>(bitsComp), initBits, 16 * 1024 * 1024);
+                if (!ZipDeflate::InflateZlib(pay + vpos, static_cast<size_t>(bitsComp), initBits, 16 * 1024 * 1024) &&
+                    !DecompressFstFastLzBlock(pay + vpos, static_cast<size_t>(bitsComp), static_cast<size_t>(bitsUncomp), initBits, 16 * 1024 * 1024)) {
+                    return false;
+                }
             }
             vpos += static_cast<size_t>(bitsComp);
 
             size_t bitCursor = 0;
             uint64_t initT = timestamps.front();
             for (auto& h : handles) {
-                if (!h.isReal && bitCursor + h.bitLen <= initBits.size()) {
+                if (h.isReal) {
+                    if (bitCursor + 8 <= initBits.size()) {
+                        double dv = rdWriterDouble(initBits.data() + bitCursor);
+                        if (h.realChanges.empty() || h.realChanges.back().second != dv) {
+                            h.realChanges.push_back({ initT, dv });
+                        }
+                        bitCursor += 8;
+                    }
+                } else if (bitCursor + h.bitLen <= initBits.size()) {
                     std::string initState(reinterpret_cast<const char*>(initBits.data() + bitCursor), h.bitLen);
                     if (h.changes.empty() || h.changes.back().second != initState) {
                         h.changes.push_back({ initT, initState });
@@ -2521,7 +3190,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             size_t wavesDataStart = vpos;
 
             uint64_t posTableLen = DetailEda100::RdU64BE(pay + timeOff - 8);
-            if (posTableLen > (timeOff - 8) - wavesDataStart) { pos = nextPos; continue; }
+            if (posTableLen > (timeOff - 8) - wavesDataStart) return false;
             size_t posTableStart = (timeOff - 8) - static_cast<size_t>(posTableLen);
             size_t wavesDataEnd = posTableStart;
 
@@ -2559,17 +3228,20 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                 }
             }
 
-            // 4. Decode each handle's wave transitions
+            // 4. Decode each handle's wave transitions (Zlib 'Z'/0, LZ4 '4', FastLZ 'F', or uncompressed)
             size_t wcur = wavesDataStart;
             for (size_t hi = 0; hi < nHandles; ++hi) {
                 if (chunkLens[hi] < 0) {
                     size_t aliasIdx = static_cast<size_t>(-chunkLens[hi]) - 1;
-                    if (aliasIdx < hi) handles[hi].changes = handles[aliasIdx].changes;
+                    if (aliasIdx < hi) {
+                        handles[hi].changes = handles[aliasIdx].changes;
+                        handles[hi].realChanges = handles[aliasIdx].realChanges;
+                    }
                     continue;
                 }
                 if (chunkLens[hi] == 0) continue;
                 size_t clen = static_cast<size_t>(chunkLens[hi]);
-                if (clen > wavesDataEnd - wcur) break;
+                if (clen > wavesDataEnd - wcur) return false;
                 const uint8_t* cptr = pay + wcur;
                 wcur += clen;
 
@@ -2578,18 +3250,48 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                 std::vector<uint8_t> waveRaw;
                 const uint8_t* wp = cptr + subPos;
                 size_t wlen = clen - subPos;
-                if (uncompWaveLen != 0 && (packType == 'Z' || packType == 0)) {
-                    if (!ZipDeflate::InflateZlib(wp, wlen, waveRaw, 16 * 1024 * 1024)) continue;
+                if (uncompWaveLen != 0) {
+                    if (uncompWaveLen > 32 * 1024 * 1024) return false;
+                    if (packType == '4') {
+                        if (!DecompressFstLz4RawBlock(wp, wlen, static_cast<size_t>(uncompWaveLen), waveRaw, 32 * 1024 * 1024)) return false;
+                    } else if (packType == 'F') {
+                        if (!DecompressFstFastLzBlock(wp, wlen, static_cast<size_t>(uncompWaveLen), waveRaw, 32 * 1024 * 1024)) return false;
+                    } else if (packType == 'Z' || packType == 0) {
+                        if (!ZipDeflate::InflateZlib(wp, wlen, waveRaw, 32 * 1024 * 1024)) return false;
+                    } else {
+                        return false;
+                    }
                     wp = waveRaw.data();
                     wlen = waveRaw.size();
-                } else if (uncompWaveLen != 0) {
-                    continue; // Unsupported LZ4/FastLZ block
                 }
 
                 FstHandleDef& hd = handles[hi];
-                if (hd.isReal) continue;
                 size_t vp = 0;
                 size_t timeIdx = 0;
+                if (hd.isReal) {
+                    while (vp < wlen && hd.realChanges.size() < 8192) {
+                        uint64_t vli = DetailEda100::ReadULeb128(wp, wlen, vp);
+                        timeIdx += static_cast<size_t>(vli >> 1);
+                        double dv = 0.0;
+                        if ((vli & 1ULL) == 0) {
+                            if (vp + 8 > wlen) break;
+                            dv = rdWriterDouble(wp + vp);
+                            vp += 8;
+                        } else {
+                            size_t s = vp;
+                            while (vp < wlen && wp[vp] != 0) ++vp;
+                            char b[64] = {};
+                            std::memcpy(b, wp + s, std::min<size_t>(vp - s, 63));
+                            if (vp < wlen) ++vp;
+                            dv = std::strtod(b, nullptr);
+                        }
+                        if (timeIdx < timestamps.size()) {
+                            hd.realChanges.push_back({ timestamps[timeIdx], dv });
+                        }
+                    }
+                    continue;
+                }
+
                 while (vp < wlen && hd.changes.size() < 8192) {
                     uint64_t vli = DetailEda100::ReadULeb128(wp, wlen, vp);
                     if (hd.bitLen == 1) {
@@ -2639,14 +3341,27 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
     if (!sawValidHdr || handles.empty()) return false;
 
     std::vector<DecodedWaveSignal> sigs;
-    sigs.reserve(handles.size());
-    for (auto& h : handles) {
-        if (h.isReal) continue;
+    sigs.reserve(handles.size() + staticAliases.size());
+    for (const auto& h : handles) {
         DecodedWaveSignal ds;
         ds.name = h.name;
         ds.bitWidth = static_cast<int>(h.bitLen);
-        ds.changes = std::move(h.changes);
+        ds.isReal = h.isReal;
+        ds.changes = h.changes;
+        ds.realChanges = h.realChanges;
         sigs.push_back(std::move(ds));
+    }
+    for (const auto& al : staticAliases) {
+        if (al.targetZeroBased < handles.size() && sigs.size() < 48) {
+            const auto& h = handles[al.targetZeroBased];
+            DecodedWaveSignal ds;
+            ds.name = al.name;
+            ds.bitWidth = static_cast<int>(h.bitLen);
+            ds.isReal = h.isReal;
+            ds.changes = h.changes;
+            ds.realChanges = h.realChanges;
+            sigs.push_back(std::move(ds));
+        }
     }
     std::wstring title = L"GTKWave FST Waveform (" + std::to_wstring(sigs.size()) + L" signals";
     if (!writerName.empty()) title += L", " + PathUtils::Utf8ToWide(writerName);

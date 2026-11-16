@@ -373,8 +373,7 @@ void FileEngine::DirWatcherWorkerLoop() {
         {
             std::unique_lock<std::mutex> lk(m_watcherMutex);
             m_watcherCv.wait(lk, [&]() {
-                return !m_running || (m_watcherGeneration.load() != seenGen && !m_watchedDir.empty()) ||
-                       (!m_watchedDir.empty() && m_watcherGeneration.load() == seenGen);
+                return !m_running || m_watcherGeneration.load() != seenGen;
             });
             if (!m_running) break;
             seenGen = m_watcherGeneration.load();
@@ -383,8 +382,6 @@ void FileEngine::DirWatcherWorkerLoop() {
         }
 
         if (watchDir.empty()) {
-            std::unique_lock<std::mutex> lk(m_watcherMutex);
-            m_watcherCv.wait(lk, [&]() { return !m_running || m_watcherGeneration.load() != seenGen; });
             continue;
         }
 
@@ -399,9 +396,6 @@ void FileEngine::DirWatcherWorkerLoop() {
             nullptr);
 
         if (hDir == INVALID_HANDLE_VALUE) {
-            // Wait until directory changes or shutdown
-            std::unique_lock<std::mutex> lk(m_watcherMutex);
-            m_watcherCv.wait(lk, [&]() { return !m_running || m_watcherGeneration.load() != seenGen; });
             continue;
         }
 
@@ -2048,6 +2042,7 @@ void FileEngine::RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, 
         std::lock_guard<std::mutex> lock(m_sizeMutex);
         for (const auto& node : treeNodes) {
             if (node.isHeader || node.isDrive || node.isFtpNode || node.isOffline || node.normKey.empty() || node.path.empty()) continue;
+            if (FtpClient::IsFtpPath(node.path) || ArchiveExplorer::IsVirtualArchivePath(node.path)) continue;
             // Skip massive cloud sync roots (Dropbox / OneDrive at indent 0) during automatic background tree sizing
             // so the 4 folder-size worker threads remain immediately available for active directory browsing!
             if (!forceRefresh && node.indent == 0 && !node.isQuickAccess) continue;
@@ -2108,7 +2103,8 @@ void FileEngine::RequestFolderSizes(const std::vector<FileEntry>& entries, bool 
         }
 
         for (const auto& e : entries) {
-            if (!e.isDirectory || e.normKey.empty()) continue;
+            if (!e.isDirectory || e.normKey.empty() || e.isDrive) continue;
+            if (FtpClient::IsFtpPath(e.fullPath) || ArchiveExplorer::IsVirtualArchivePath(e.fullPath)) continue;
             if (!forceRefresh &&
                 m_folderSizeCache.find(e.normKey) != m_folderSizeCache.end() &&
                 m_folderChildrenCache.find(e.normKey) != m_folderChildrenCache.end()) {
@@ -2127,6 +2123,9 @@ void FileEngine::RequestFolderSizes(const std::vector<FileEntry>& entries, bool 
 uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int depth, uint64_t generation, bool& outAborted) {
     if (!m_running || generation != m_sizeGeneration.load(std::memory_order_relaxed)) {
         outAborted = true;
+        return 0;
+    }
+    if (dirPath.empty() || dirPath == L"THIS_PC" || FtpClient::IsFtpPath(dirPath)) {
         return 0;
     }
 
@@ -2541,7 +2540,7 @@ void FileEngine::SearchWorkerLoop() {
             myGen = m_searchGeneration.load(std::memory_order_relaxed);
         }
 
-        if (rootDir.empty() || rootDir == L"THIS_PC") {
+        if (rootDir.empty() || rootDir == L"THIS_PC" || FtpClient::IsFtpPath(rootDir)) {
             std::lock_guard<std::mutex> lock(m_searchMutex);
             m_searchProgress.isRunning = false;
             m_searchProgress.isFinished = true;

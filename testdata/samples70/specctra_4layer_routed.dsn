@@ -1,0 +1,82 @@
+(pcb "MotorCtrl_4Layer.dsn"
+  (parser
+    (string_quote ")
+    (space_in_quoted_tokens on)
+    (host_cad "KiCad's Pcbnew")
+    (host_version "8.0.4")
+  )
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu (type signal))
+    (layer In1.GND (type power))
+    (layer In2.3V3 (type power))
+    (layer B.Cu (type signal))
+    (boundary
+      (path pcb 0 0 0 520000 0 520000 360000 0 360000 0 0)
+    )
+    (plane GND
+      (polygon In1.GND 0 20000 20000 500000 20000 500000 340000 20000 340000)
+    )
+    (via "Via[0-3]_600:300_um")
+  )
+  (library
+    (image "QFN-12_3x3mm"
+      (outline (path signal 1500 -16000 -16000 16000 -16000 16000 16000 -16000 16000 -16000 -16000))
+      (pin "SMD_Rect_800x300" 1 -15000 -7500)
+      (pin "SMD_Rect_800x300" 2 -15000 -2500)
+      (pin "SMD_Rect_800x300" 3 -15000  2500)
+      (pin "SMD_Rect_800x300" 4 -15000  7500)
+      (pin "SMD_Rect_800x300" (rotate 90) 5 -2500 15000)
+      (pin "SMD_Rect_800x300" (rotate 90) 6  2500 15000)
+      (pin "SMD_Rect_800x300" 7  15000  2500)
+      (pin "SMD_Rect_800x300" 8  15000 -2500)
+    )
+    (image "C_0603"
+      (outline (rect signal -12000 -6000 12000 6000))
+      (pin "SMD_Rect_900x950" 1 -8000 0)
+      (pin "SMD_Rect_900x950" 2  8000 0)
+    )
+    (image "PinHeader_1x02"
+      (pin "THT_Circ_1700" 1 0 0)
+      (pin "THT_Circ_1700" 2 25400 0)
+    )
+    (padstack "SMD_Rect_800x300"
+      (shape (rect F.Cu -4000 -1500 4000 1500))
+    )
+    (padstack "SMD_Rect_900x950"
+      (shape (rect F.Cu -4500 -4750 4500 4750))
+    )
+    (padstack "THT_Circ_1700"
+      (shape (circle F.Cu 17000))
+      (shape (circle B.Cu 17000))
+    )
+    (padstack "Via[0-3]_600:300_um"
+      (shape (circle F.Cu 6000))
+      (shape (circle B.Cu 6000))
+    )
+  )
+  (placement
+    (component "QFN-12_3x3mm"
+      (place U1 220000 180000 front 0 (PN "DRV8837C"))
+    )
+    (component "C_0603"
+      (place C1 150000 180000 front 90 (PN "100nF"))
+      (place C2 310000 180000 back 180 (PN "4.7uF"))
+    )
+    (component "PinHeader_1x02"
+      (place J1 60000 180000 front 0 (PN "VMOT_IN"))
+    )
+  )
+  (network
+    (net VMOT (pins J1-1 C1-1 U1-1))
+    (net GND  (pins J1-2 C1-2 C2-2 U1-4))
+    (net OUT1 (pins U1-7 C2-1))
+  )
+  (wiring
+    (wire (path F.Cu 4000 60000 180000 150000 172000 205000 172500) (net VMOT))
+    (wire (path F.Cu 3000 235000 182500 275000 182500) (net OUT1))
+    (via "Via[0-3]_600:300_um" 275000 182500 (net OUT1))
+    (wire (path B.Cu 3000 275000 182500 302000 180000) (net OUT1))
+  )
+)

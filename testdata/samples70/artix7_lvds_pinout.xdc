@@ -1,0 +1,12 @@
+# Artix-7 XC7A35T High-Speed LVDS & DDR3 Constraints
+create_clock -period 5.000 -name sys_clk_200m [get_ports sys_clk_p]
+set_property PACKAGE_PIN R4 [get_ports sys_clk_p]
+set_property IOSTANDARD LVDS_25 [get_ports sys_clk_p]
+set_property PACKAGE_PIN T4 [get_ports sys_clk_n]
+set_property IOSTANDARD LVDS_25 [get_ports sys_clk_n]
+set_property PACKAGE_PIN U2 [get_ports uart_txd]
+set_property IOSTANDARD LVCMOS33 [get_ports uart_txd]
+set_property PACKAGE_PIN V2 [get_ports uart_rxd]
+set_property IOSTANDARD LVCMOS33 [get_ports uart_rxd]
+set_property PACKAGE_PIN W5 [get_ports eth_mdc]
+set_property PACKAGE_PIN Y6 [get_ports eth_mdio]

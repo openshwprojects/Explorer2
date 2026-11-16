@@ -19,6 +19,7 @@
 #pragma comment(lib, "bcrypt.lib")
 
 namespace Explorer2 {
+#include "formats/UnrealAsset3DTex.h"
 
 static D2D1_COLOR_F FcpColor(uint32_t rgb, float a = 1.0f) {
     return PathUtils::ColorFromRgb(rgb, a);
@@ -347,6 +348,1331 @@ static ImageMetadataSummary InspectImageMetadata(const std::wstring& path) {
     return res;
 }
 
+namespace {
+
+static std::wstring FormatModelParamCount(uint64_t n) {
+    wchar_t buf[64] = {};
+    if (n >= 1000000000ULL) {
+        swprintf_s(buf, L"%.2fB (%llu)", static_cast<double>(n) / 1e9, static_cast<unsigned long long>(n));
+    } else if (n >= 1000000ULL) {
+        swprintf_s(buf, L"%.2fM (%llu)", static_cast<double>(n) / 1e6, static_cast<unsigned long long>(n));
+    } else if (n >= 10000ULL) {
+        swprintf_s(buf, L"%.1fK (%llu)", static_cast<double>(n) / 1e3, static_cast<unsigned long long>(n));
+    } else {
+        swprintf_s(buf, L"%llu", static_cast<unsigned long long>(n));
+    }
+    return buf;
+}
+
+class WinAiFileStream {
+public:
+    explicit WinAiFileStream(HANDLE hFile, uint64_t fileSize)
+        : m_hFile(hFile), m_fileSize(fileSize), m_buf(65536) {}
+
+    uint64_t FileSize() const { return m_fileSize; }
+    uint64_t Pos() const { return m_bufStart + m_bufPos; }
+    uint64_t Remaining() const {
+        const uint64_t p = Pos();
+        return (p < m_fileSize) ? (m_fileSize - p) : 0;
+    }
+
+    bool Seek(uint64_t target) {
+        if (target > m_fileSize) return false;
+        if (target >= m_bufStart && target <= m_bufStart + m_bufLen) {
+            m_bufPos = static_cast<size_t>(target - m_bufStart);
+            return true;
+        }
+        LARGE_INTEGER li{};
+        li.QuadPart = static_cast<LONGLONG>(target);
+        if (!SetFilePointerEx(m_hFile, li, nullptr, FILE_BEGIN)) return false;
+        m_bufStart = target;
+        m_bufLen = 0;
+        m_bufPos = 0;
+        return true;
+    }
+
+    bool Skip(uint64_t n) {
+        if (n > Remaining()) return false;
+        return Seek(Pos() + n);
+    }
+
+    bool ReadBytes(void* dst, size_t n) {
+        if (n == 0) return true;
+        if (n > Remaining()) return false;
+        uint8_t* out = static_cast<uint8_t*>(dst);
+        size_t done = 0;
+        while (done < n) {
+            if (m_bufPos < m_bufLen) {
+                const size_t avail = m_bufLen - m_bufPos;
+                const size_t take = std::min(avail, n - done);
+                std::memcpy(out + done, m_buf.data() + m_bufPos, take);
+                m_bufPos += take;
+                done += take;
+            } else {
+                const uint64_t curPos = m_bufStart + m_bufLen;
+                if (n - done >= m_buf.size()) {
+                    const DWORD chunk = static_cast<DWORD>(std::min<size_t>(n - done, 16u * 1024u * 1024u));
+                    DWORD got = 0;
+                    if (!ReadFile(m_hFile, out + done, chunk, &got, nullptr) || got != chunk) return false;
+                    done += got;
+                    m_bufStart = curPos + got;
+                    m_bufLen = 0;
+                    m_bufPos = 0;
+                } else {
+                    const uint64_t remFile = m_fileSize - curPos;
+                    const DWORD toRead = static_cast<DWORD>(std::min<uint64_t>(m_buf.size(), remFile));
+                    DWORD got = 0;
+                    if (!ReadFile(m_hFile, m_buf.data(), toRead, &got, nullptr) || got == 0) return false;
+                    m_bufStart = curPos;
+                    m_bufLen = got;
+                    m_bufPos = 0;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool ReadU8(uint8_t& v) {
+        if (m_bufPos < m_bufLen) {
+            v = m_buf[m_bufPos++];
+            return true;
+        }
+        return ReadBytes(&v, 1);
+    }
+    bool ReadU16(uint16_t& v) {
+        uint8_t b[2];
+        if (!ReadBytes(b, 2)) return false;
+        v = static_cast<uint16_t>(b[0] | (static_cast<uint16_t>(b[1]) << 8));
+        return true;
+    }
+    bool ReadU32(uint32_t& v) {
+        uint8_t b[4];
+        if (!ReadBytes(b, 4)) return false;
+        v = static_cast<uint32_t>(b[0]) |
+            (static_cast<uint32_t>(b[1]) << 8) |
+            (static_cast<uint32_t>(b[2]) << 16) |
+            (static_cast<uint32_t>(b[3]) << 24);
+        return true;
+    }
+    bool ReadU64(uint64_t& v) {
+        uint32_t lo = 0, hi = 0;
+        if (!ReadU32(lo) || !ReadU32(hi)) return false;
+        v = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+        return true;
+    }
+    bool ReadF32(float& v) {
+        uint32_t u = 0;
+        if (!ReadU32(u)) return false;
+        std::memcpy(&v, &u, 4);
+        return true;
+    }
+    bool ReadF64(double& v) {
+        uint64_t u = 0;
+        if (!ReadU64(u)) return false;
+        std::memcpy(&v, &u, 8);
+        return true;
+    }
+
+    bool ReadPbVarint(uint64_t endPos, uint64_t& out) {
+        out = 0;
+        for (int shift = 0; shift < 64; shift += 7) {
+            if (Pos() >= endPos) return false;
+            uint8_t b = 0;
+            if (!ReadU8(b)) return false;
+            if (shift == 63 && b > 1) return false;
+            out |= static_cast<uint64_t>(b & 0x7Fu) << shift;
+            if ((b & 0x80u) == 0) return true;
+        }
+        return false;
+    }
+
+    bool ReadPbTag(uint64_t endPos, uint32_t& fieldNum, uint8_t& wireType) {
+        uint64_t tag = 0;
+        if (!ReadPbVarint(endPos, tag) || tag == 0) return false;
+        wireType = static_cast<uint8_t>(tag & 0x07u);
+        const uint64_t fn = tag >> 3;
+        if (fn == 0 || fn > 0x1FFFFFFFULL) return false;
+        if (wireType != 0 && wireType != 1 && wireType != 2 && wireType != 5) return false;
+        fieldNum = static_cast<uint32_t>(fn);
+        return true;
+    }
+
+    bool SkipPbField(uint64_t endPos, uint8_t wireType) {
+        switch (wireType) {
+        case 0: {
+            uint64_t dummy = 0;
+            return ReadPbVarint(endPos, dummy);
+        }
+        case 1:
+            return (Pos() + 8 <= endPos) && Skip(8);
+        case 2: {
+            uint64_t len = 0;
+            if (!ReadPbVarint(endPos, len)) return false;
+            return (Pos() + len <= endPos) && Skip(len);
+        }
+        case 5:
+            return (Pos() + 4 <= endPos) && Skip(4);
+        default:
+            return false;
+        }
+    }
+
+    bool ReadPbStringBounded(uint64_t endPos, std::string& out, size_t maxKeep = 1024) {
+        uint64_t len = 0;
+        if (!ReadPbVarint(endPos, len) || Pos() + len > endPos) return false;
+        const size_t keep = static_cast<size_t>(std::min<uint64_t>(len, maxKeep));
+        out.resize(keep);
+        if (keep > 0 && !ReadBytes(out.data(), keep)) return false;
+        if (len > keep && !Skip(len - keep)) return false;
+        return true;
+    }
+
+private:
+    HANDLE m_hFile = INVALID_HANDLE_VALUE;
+    uint64_t m_fileSize = 0;
+    uint64_t m_bufStart = 0;
+    size_t m_bufLen = 0;
+    size_t m_bufPos = 0;
+    std::vector<uint8_t> m_buf;
+};
+
+static std::wstring FormatAiScalarDouble(double v) {
+    if (std::isnan(v)) return L"NaN";
+    if (std::isinf(v)) return v < 0 ? L"-Inf" : L"Inf";
+    wchar_t buf[64] = {};
+    swprintf_s(buf, L"%.6g", v);
+    return buf;
+}
+
+// Structural JSON parser for SafeTensors headers
+struct StJsonCursor {
+    const char* s = nullptr;
+    size_t n = 0;
+    size_t pos = 0;
+
+    void SkipWs() {
+        while (pos < n) {
+            const char c = s[pos];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') ++pos;
+            else break;
+        }
+    }
+
+    static void AppendUtf8Codepoint(std::string& out, uint32_t cp) {
+        if (cp <= 0x7Fu) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FFu) {
+            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0xFFFFu) {
+            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0x10FFFFu) {
+            out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+    }
+
+    static bool ParseHex4(const char* p, uint32_t& out) {
+        out = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char c = p[i];
+            uint32_t v = 0;
+            if (c >= '0' && c <= '9') v = static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') v = static_cast<uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v = static_cast<uint32_t>(c - 'A' + 10);
+            else return false;
+            out = (out << 4) | v;
+        }
+        return true;
+    }
+
+    bool ParseString(std::string& out) {
+        SkipWs();
+        if (pos >= n || s[pos] != '"') return false;
+        ++pos;
+        out.clear();
+        while (pos < n) {
+            const unsigned char c = static_cast<unsigned char>(s[pos++]);
+            if (c == '"') return true;
+            if (c < 0x20u) return false;
+            if (c == '\\') {
+                if (pos >= n) return false;
+                const char esc = s[pos++];
+                switch (esc) {
+                case '"':  out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/'); break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'u': {
+                    if (pos + 4 > n) return false;
+                    uint32_t u1 = 0;
+                    if (!ParseHex4(s + pos, u1)) return false;
+                    pos += 4;
+                    if (u1 >= 0xD800u && u1 <= 0xDBFFu && pos + 6 <= n && s[pos] == '\\' && s[pos + 1] == 'u') {
+                        uint32_t u2 = 0;
+                        if (ParseHex4(s + pos + 2, u2) && u2 >= 0xDC00u && u2 <= 0xDFFFu) {
+                            pos += 6;
+                            const uint32_t cp = 0x10000u + (((u1 - 0xD800u) << 10) | (u2 - 0xDC00u));
+                            AppendUtf8Codepoint(out, cp);
+                            break;
+                        }
+                    }
+                    AppendUtf8Codepoint(out, u1);
+                    break;
+                }
+                default:
+                    return false;
+                }
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+        return false;
+    }
+
+    bool ParseUint64(uint64_t& out) {
+        SkipWs();
+        if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+        if (s[pos] == '0' && pos + 1 < n && s[pos + 1] >= '0' && s[pos + 1] <= '9') return false;
+        out = 0;
+        while (pos < n && s[pos] >= '0' && s[pos] <= '9') {
+            const uint64_t d = static_cast<uint64_t>(s[pos] - '0');
+            if (out > (UINT64_MAX - d) / 10ULL) return false;
+            out = out * 10ULL + d;
+            ++pos;
+        }
+        if (pos < n && (s[pos] == '.' || s[pos] == 'e' || s[pos] == 'E')) return false;
+        return true;
+    }
+
+    bool SkipNumber() {
+        if (pos < n && s[pos] == '-') ++pos;
+        if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+        if (s[pos] == '0') {
+            ++pos;
+            if (pos < n && s[pos] >= '0' && s[pos] <= '9') return false;
+        } else {
+            while (pos < n && s[pos] >= '0' && s[pos] <= '9') ++pos;
+        }
+        if (pos < n && s[pos] == '.') {
+            ++pos;
+            if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+            while (pos < n && s[pos] >= '0' && s[pos] <= '9') ++pos;
+        }
+        if (pos < n && (s[pos] == 'e' || s[pos] == 'E')) {
+            ++pos;
+            if (pos < n && (s[pos] == '+' || s[pos] == '-')) ++pos;
+            if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+            while (pos < n && s[pos] >= '0' && s[pos] <= '9') ++pos;
+        }
+        return true;
+    }
+
+    bool SkipValue(int depth = 0) {
+        if (depth > 32) return false;
+        SkipWs();
+        if (pos >= n) return false;
+        const char c = s[pos];
+        if (c == '"') {
+            std::string dummy;
+            return ParseString(dummy);
+        }
+        if (c == '{') {
+            ++pos;
+            SkipWs();
+            if (pos < n && s[pos] == '}') { ++pos; return true; }
+            for (;;) {
+                std::string k;
+                if (!ParseString(k)) return false;
+                SkipWs();
+                if (pos >= n || s[pos] != ':') return false;
+                ++pos;
+                if (!SkipValue(depth + 1)) return false;
+                SkipWs();
+                if (pos < n && s[pos] == ',') { ++pos; continue; }
+                if (pos < n && s[pos] == '}') { ++pos; return true; }
+                return false;
+            }
+        }
+        if (c == '[') {
+            ++pos;
+            SkipWs();
+            if (pos < n && s[pos] == ']') { ++pos; return true; }
+            for (;;) {
+                if (!SkipValue(depth + 1)) return false;
+                SkipWs();
+                if (pos < n && s[pos] == ',') { ++pos; continue; }
+                if (pos < n && s[pos] == ']') { ++pos; return true; }
+                return false;
+            }
+        }
+        if (c == 't') {
+            if (pos + 4 <= n && std::memcmp(s + pos, "true", 4) == 0) { pos += 4; return true; }
+            return false;
+        }
+        if (c == 'f') {
+            if (pos + 5 <= n && std::memcmp(s + pos, "false", 5) == 0) { pos += 5; return true; }
+            return false;
+        }
+        if (c == 'n') {
+            if (pos + 4 <= n && std::memcmp(s + pos, "null", 4) == 0) { pos += 4; return true; }
+            return false;
+        }
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            return SkipNumber();
+        }
+        return false;
+    }
+
+    bool ParseMetadataValueAsString(std::string& out) {
+        SkipWs();
+        if (pos >= n) return false;
+        if (s[pos] == '"') return ParseString(out);
+        const size_t start = pos;
+        if (!SkipValue(1)) return false;
+        out.assign(s + start, pos - start);
+        return true;
+    }
+};
+
+static bool ParseSafeTensorsSummary(WinAiFileStream& st, AiModelInfoSummary& info) {
+    const uint64_t fileSize = st.FileSize();
+    if (fileSize < 10) return false;
+    uint64_t hdrLen = 0;
+    if (!st.ReadU64(hdrLen)) return false;
+    if (hdrLen < 2 || hdrLen > (64ULL * 1024ULL * 1024ULL)) return false;
+    if (8ULL + hdrLen > fileSize) return false;
+
+    std::string json(static_cast<size_t>(hdrLen), '\0');
+    if (!st.ReadBytes(json.data(), static_cast<size_t>(hdrLen))) return false;
+
+    size_t firstNonWs = 0;
+    while (firstNonWs < json.size() && (json[firstNonWs] == ' ' || json[firstNonWs] == '\t' || json[firstNonWs] == '\r' || json[firstNonWs] == '\n')) {
+        ++firstNonWs;
+    }
+    size_t lastNonWs = json.size();
+    while (lastNonWs > firstNonWs && (json[lastNonWs - 1] == ' ' || json[lastNonWs - 1] == '\t' || json[lastNonWs - 1] == '\r' || json[lastNonWs - 1] == '\n')) {
+        --lastNonWs;
+    }
+    if (lastNonWs - firstNonWs < 2 || json[firstNonWs] != '{' || json[lastNonWs - 1] != '}') return false;
+
+    StJsonCursor cur{ json.data(), json.size(), 0 };
+    cur.SkipWs();
+    if (cur.pos >= cur.n || cur.s[cur.pos] != '{') return false;
+    ++cur.pos;
+    cur.SkipWs();
+
+    std::map<std::string, uint64_t> dtypeCounts;
+    std::map<std::string, std::wstring> metaMap;
+
+    if (cur.pos < cur.n && cur.s[cur.pos] == '}') {
+        ++cur.pos;
+    } else {
+        for (;;) {
+            std::string topKey;
+            if (!cur.ParseString(topKey)) return false;
+            cur.SkipWs();
+            if (cur.pos >= cur.n || cur.s[cur.pos] != ':') return false;
+            ++cur.pos;
+            cur.SkipWs();
+            if (cur.pos >= cur.n || cur.s[cur.pos] != '{') return false;
+            ++cur.pos;
+            cur.SkipWs();
+
+            if (topKey == "__metadata__") {
+                if (cur.pos < cur.n && cur.s[cur.pos] == '}') {
+                    ++cur.pos;
+                } else {
+                    for (;;) {
+                        std::string mk, mv;
+                        if (!cur.ParseString(mk)) return false;
+                        cur.SkipWs();
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != ':') return false;
+                        ++cur.pos;
+                        if (!cur.ParseMetadataValueAsString(mv)) return false;
+                        ++info.metadataKeyCount;
+                        std::wstring wv = Utf8ToWideStr(mv.data(), mv.size());
+                        metaMap[mk] = wv;
+                        if (info.kvRows.size() < 256) {
+                            std::wstring disp = wv.size() > 220 ? (wv.substr(0, 220) + L"...") : wv;
+                            info.kvRows.push_back({ Utf8ToWideStr(mk.data(), mk.size()), std::move(disp) });
+                        }
+                        cur.SkipWs();
+                        if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+                        if (cur.pos < cur.n && cur.s[cur.pos] == '}') { ++cur.pos; break; }
+                        return false;
+                    }
+                }
+            } else {
+                if (topKey.empty()) return false;
+                bool hasDtype = false, hasShape = false, hasOffsets = false;
+                std::string dtype;
+                std::vector<uint64_t> shape;
+                uint64_t offBegin = 0, offEnd = 0;
+
+                if (cur.pos < cur.n && cur.s[cur.pos] == '}') {
+                    return false; // Empty tensor descriptor is invalid
+                }
+                for (;;) {
+                    std::string fk;
+                    if (!cur.ParseString(fk)) return false;
+                    cur.SkipWs();
+                    if (cur.pos >= cur.n || cur.s[cur.pos] != ':') return false;
+                    ++cur.pos;
+                    cur.SkipWs();
+                    if (fk == "dtype") {
+                        if (!cur.ParseString(dtype) || dtype.empty() || dtype.size() > 32) return false;
+                        hasDtype = true;
+                    } else if (fk == "shape") {
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != '[') return false;
+                        ++cur.pos;
+                        cur.SkipWs();
+                        shape.clear();
+                        if (cur.pos < cur.n && cur.s[cur.pos] == ']') {
+                            ++cur.pos;
+                        } else {
+                            for (;;) {
+                                uint64_t dim = 0;
+                                if (!cur.ParseUint64(dim) || shape.size() >= 32) return false;
+                                shape.push_back(dim);
+                                cur.SkipWs();
+                                if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+                                if (cur.pos < cur.n && cur.s[cur.pos] == ']') { ++cur.pos; break; }
+                                return false;
+                            }
+                        }
+                        hasShape = true;
+                    } else if (fk == "data_offsets") {
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != '[') return false;
+                        ++cur.pos;
+                        if (!cur.ParseUint64(offBegin)) return false;
+                        cur.SkipWs();
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != ',') return false;
+                        ++cur.pos;
+                        if (!cur.ParseUint64(offEnd)) return false;
+                        cur.SkipWs();
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != ']') return false;
+                        ++cur.pos;
+                        hasOffsets = true;
+                    } else {
+                        if (!cur.SkipValue(2)) return false;
+                    }
+                    cur.SkipWs();
+                    if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+                    if (cur.pos < cur.n && cur.s[cur.pos] == '}') { ++cur.pos; break; }
+                    return false;
+                }
+
+                if (!hasDtype || !hasShape || !hasOffsets) return false;
+                if (offBegin > offEnd) return false;
+                if (offEnd > fileSize - (8ULL + hdrLen)) return false;
+
+                uint64_t params = 1;
+                if (shape.empty()) {
+                    params = (offEnd > offBegin) ? 1ULL : 0ULL;
+                } else {
+                    for (uint64_t d : shape) {
+                        if (d == 0) { params = 0; break; }
+                        if (params > UINT64_MAX / d) { params = UINT64_MAX; break; }
+                        params *= d;
+                    }
+                }
+
+                ++info.tensorCount;
+                if (info.totalParameters <= UINT64_MAX - params) info.totalParameters += params;
+                else info.totalParameters = UINT64_MAX;
+                dtypeCounts[dtype]++;
+
+                if (info.tensors.size() < 1024) {
+                    AiModelInfoSummary::TensorEntry te;
+                    te.name = Utf8ToWideStr(topKey.data(), topKey.size());
+                    te.dtype = Utf8ToWideStr(dtype.data(), dtype.size());
+                    te.shape = L"[";
+                    for (size_t i = 0; i < shape.size(); ++i) {
+                        if (i > 0) te.shape += L", ";
+                        te.shape += std::to_wstring(shape[i]);
+                    }
+                    te.shape += L"]";
+                    te.paramCount = params;
+                    te.byteSize = offEnd - offBegin;
+                    info.tensors.push_back(std::move(te));
+                }
+            }
+
+            cur.SkipWs();
+            if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+            if (cur.pos < cur.n && cur.s[cur.pos] == '}') { ++cur.pos; break; }
+            return false;
+        }
+    }
+
+    cur.SkipWs();
+    if (cur.pos != cur.n) return false;
+
+    info.valid = true;
+    info.formatName = L"SafeTensors";
+
+    for (const auto& kv : dtypeCounts) {
+        if (!info.precisionSummary.empty()) info.precisionSummary += L", ";
+        info.precisionSummary += Utf8ToWideStr(kv.first.data(), kv.first.size()) + L" (" + std::to_wstring(kv.second) + L")";
+    }
+
+    auto getMeta = [&](const char* k) -> std::wstring {
+        auto it = metaMap.find(k);
+        return (it != metaMap.end()) ? it->second : L"";
+    };
+
+    info.modelTitle = getMeta("modelspec.title");
+    if (info.modelTitle.empty()) info.modelTitle = getMeta("ss_output_name");
+    if (info.modelTitle.empty()) info.modelTitle = getMeta("name");
+
+    info.arch = getMeta("modelspec.architecture");
+    if (info.arch.empty()) info.arch = getMeta("ss_network_module");
+    if (info.arch.empty()) info.arch = getMeta("architecture");
+
+    info.baseModel = getMeta("modelspec.base_model");
+    if (info.baseModel.empty()) info.baseModel = getMeta("ss_base_model_version");
+    if (info.baseModel.empty()) info.baseModel = getMeta("ss_sd_model_name");
+
+    const std::wstring dim = getMeta("ss_network_dim");
+    const std::wstring alpha = getMeta("ss_network_alpha");
+    if (!dim.empty()) {
+        info.networkDimAlpha = L"Rank/Dim: " + dim + (alpha.empty() ? L"" : (L"  /  Alpha: " + alpha));
+    }
+    info.triggerWords = getMeta("modelspec.trigger_phrase");
+    return true;
+}
+
+struct GgmlTypeTrait {
+    const wchar_t* name;
+    uint32_t blockElems;
+    uint32_t blockBytes;
+};
+
+static bool GetGgmlTypeTrait(uint32_t t, GgmlTypeTrait& out) {
+    switch (t) {
+    case 0:  out = { L"F32",     1,   4   }; return true;
+    case 1:  out = { L"F16",     1,   2   }; return true;
+    case 2:  out = { L"Q4_0",    32,  18  }; return true;
+    case 3:  out = { L"Q4_1",    32,  20  }; return true;
+    case 4:  out = { L"Q4_2",    16,  10  }; return true;
+    case 5:  out = { L"Q4_3",    16,  12  }; return true;
+    case 6:  out = { L"Q5_0",    32,  22  }; return true;
+    case 7:  out = { L"Q5_1",    32,  24  }; return true;
+    case 8:  out = { L"Q8_0",    32,  34  }; return true;
+    case 9:  out = { L"Q8_1",    32,  36  }; return true;
+    case 10: out = { L"Q2_K",    256, 84  }; return true;
+    case 11: out = { L"Q3_K",    256, 110 }; return true;
+    case 12: out = { L"Q4_K",    256, 144 }; return true;
+    case 13: out = { L"Q5_K",    256, 176 }; return true;
+    case 14: out = { L"Q6_K",    256, 210 }; return true;
+    case 15: out = { L"Q8_K",    256, 292 }; return true;
+    case 16: out = { L"IQ2_XXS", 256, 66  }; return true;
+    case 17: out = { L"IQ2_XS",  256, 74  }; return true;
+    case 18: out = { L"IQ3_XXS", 256, 98  }; return true;
+    case 19: out = { L"IQ1_S",   256, 50  }; return true;
+    case 20: out = { L"IQ4_NL",  32,  18  }; return true;
+    case 21: out = { L"IQ3_S",   256, 110 }; return true;
+    case 22: out = { L"IQ2_S",   256, 82  }; return true;
+    case 23: out = { L"IQ4_XS",  256, 136 }; return true;
+    case 24: out = { L"I8",      1,   1   }; return true;
+    case 25: out = { L"I16",     1,   2   }; return true;
+    case 26: out = { L"I32",     1,   4   }; return true;
+    case 27: out = { L"I64",     1,   8   }; return true;
+    case 28: out = { L"F64",     1,   8   }; return true;
+    case 29: out = { L"IQ1_M",   256, 56  }; return true;
+    case 30: out = { L"BF16",    1,   2   }; return true;
+    case 31: out = { L"Q4_0_4_4",32,  18  }; return true;
+    case 32: out = { L"Q4_0_4_8",32,  18  }; return true;
+    case 33: out = { L"Q4_0_8_8",32,  18  }; return true;
+    case 34: out = { L"TQ1_0",   256, 54  }; return true;
+    case 35: out = { L"TQ2_0",   256, 66  }; return true;
+    case 36: out = { L"IQ4_NL_4_4", 32, 18 }; return true;
+    case 37: out = { L"IQ4_NL_4_8", 32, 18 }; return true;
+    case 38: out = { L"IQ4_NL_8_8", 32, 18 }; return true;
+    case 39: out = { L"MXFP4",   32,  17  }; return true;
+    default: return false;
+    }
+}
+
+static const wchar_t* GgufMetaTypeName(uint32_t vt) {
+    switch (vt) {
+    case 0:  return L"uint8";
+    case 1:  return L"int8";
+    case 2:  return L"uint16";
+    case 3:  return L"int16";
+    case 4:  return L"uint32";
+    case 5:  return L"int32";
+    case 6:  return L"float32";
+    case 7:  return L"bool";
+    case 8:  return L"string";
+    case 9:  return L"array";
+    case 10: return L"uint64";
+    case 11: return L"int64";
+    case 12: return L"float64";
+    default: return L"unknown";
+    }
+}
+
+static uint32_t GgufFixedScalarByteSize(uint32_t vt) {
+    switch (vt) {
+    case 0: case 1: case 7: return 1;
+    case 2: case 3:         return 2;
+    case 4: case 5: case 6: return 4;
+    case 10: case 11: case 12: return 8;
+    default: return 0;
+    }
+}
+
+static bool ReadGgufCount(WinAiFileStream& st, uint32_t version, uint64_t& out) {
+    if (version == 1) {
+        uint32_t v32 = 0;
+        if (!st.ReadU32(v32)) return false;
+        out = v32;
+        return true;
+    }
+    return st.ReadU64(out);
+}
+
+static bool ReadGgufString(WinAiFileStream& st, uint32_t version, std::string& out, size_t maxKeep = 512) {
+    uint64_t len = 0;
+    if (!ReadGgufCount(st, version, len)) return false;
+    if (len > st.Remaining()) return false;
+    const size_t keep = static_cast<size_t>(std::min<uint64_t>(len, maxKeep));
+    out.resize(keep);
+    if (keep > 0 && !st.ReadBytes(out.data(), keep)) return false;
+    if (len > keep && !st.Skip(len - keep)) return false;
+    return true;
+}
+
+static bool ReadGgufMetadataValue(WinAiFileStream& st, uint32_t version, uint32_t vtype, std::wstring& outVal, bool captureText, int depth = 0) {
+    if (depth > 4) return false;
+    switch (vtype) {
+    case 0: {
+        uint8_t v = 0;
+        if (!st.ReadU8(v)) return false;
+        if (captureText) outVal = std::to_wstring(v);
+        return true;
+    }
+    case 1: {
+        uint8_t v = 0;
+        if (!st.ReadU8(v)) return false;
+        if (captureText) outVal = std::to_wstring(static_cast<int8_t>(v));
+        return true;
+    }
+    case 2: {
+        uint16_t v = 0;
+        if (!st.ReadU16(v)) return false;
+        if (captureText) outVal = std::to_wstring(v);
+        return true;
+    }
+    case 3: {
+        uint16_t v = 0;
+        if (!st.ReadU16(v)) return false;
+        if (captureText) outVal = std::to_wstring(static_cast<int16_t>(v));
+        return true;
+    }
+    case 4: {
+        uint32_t v = 0;
+        if (!st.ReadU32(v)) return false;
+        if (captureText) outVal = std::to_wstring(v);
+        return true;
+    }
+    case 5: {
+        uint32_t v = 0;
+        if (!st.ReadU32(v)) return false;
+        if (captureText) outVal = std::to_wstring(static_cast<int32_t>(v));
+        return true;
+    }
+    case 6: {
+        float v = 0.0f;
+        if (!st.ReadF32(v)) return false;
+        if (captureText) outVal = FormatAiScalarDouble(v);
+        return true;
+    }
+    case 7: {
+        uint8_t v = 0;
+        if (!st.ReadU8(v) || v > 1u) return false;
+        if (captureText) outVal = (v != 0) ? L"true" : L"false";
+        return true;
+    }
+    case 8: {
+        std::string s;
+        if (!ReadGgufString(st, version, s, captureText ? 256 : 0)) return false;
+        if (captureText) outVal = Utf8ToWideStr(s.data(), s.size());
+        return true;
+    }
+    case 9: {
+        uint32_t elemType = 0;
+        uint64_t count = 0;
+        if (!st.ReadU32(elemType) || elemType > 12 || !ReadGgufCount(st, version, count)) return false;
+        const uint32_t fixedSz = GgufFixedScalarByteSize(elemType);
+        if (fixedSz > 0) {
+            if (count > st.Remaining() / fixedSz) return false;
+            if (!captureText) {
+                return st.Skip(count * fixedSz);
+            }
+            const uint64_t previewN = std::min<uint64_t>(count, 6);
+            std::wstring sample;
+            for (uint64_t i = 0; i < previewN; ++i) {
+                std::wstring ev;
+                if (!ReadGgufMetadataValue(st, version, elemType, ev, true, depth + 1)) return false;
+                if (i > 0) sample += L", ";
+                sample += ev;
+            }
+            if (count > previewN) {
+                if (!st.Skip((count - previewN) * fixedSz)) return false;
+                outVal = L"[" + std::to_wstring(count) + L" \x00D7 " + GgufMetaTypeName(elemType) + L"] (" + sample + L", ...)";
+            } else {
+                outVal = L"[" + sample + L"]";
+            }
+            return true;
+        }
+        // Variable-length elements (strings or nested arrays)
+        if (count > 10000000ULL) return false;
+        const uint64_t previewN = captureText ? std::min<uint64_t>(count, 5) : 0;
+        std::wstring sample;
+        for (uint64_t i = 0; i < count; ++i) {
+            std::wstring ev;
+            const bool wantElem = (i < previewN);
+            if (!ReadGgufMetadataValue(st, version, elemType, ev, wantElem, depth + 1)) return false;
+            if (wantElem) {
+                if (i > 0) sample += L", ";
+                if (ev.size() > 24) ev = ev.substr(0, 24) + L"...";
+                sample += L"\"" + ev + L"\"";
+            }
+        }
+        if (captureText) {
+            if (count > previewN) {
+                outVal = L"[" + std::to_wstring(count) + L" \x00D7 " + GgufMetaTypeName(elemType) + L"] (" + sample + L", ...)";
+            } else {
+                outVal = L"[" + sample + L"]";
+            }
+        }
+        return true;
+    }
+    case 10: {
+        uint64_t v = 0;
+        if (!st.ReadU64(v)) return false;
+        if (captureText) outVal = std::to_wstring(v);
+        return true;
+    }
+    case 11: {
+        uint64_t v = 0;
+        if (!st.ReadU64(v)) return false;
+        if (captureText) outVal = std::to_wstring(static_cast<int64_t>(v));
+        return true;
+    }
+    case 12: {
+        double v = 0.0;
+        if (!st.ReadF64(v)) return false;
+        if (captureText) outVal = FormatAiScalarDouble(v);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+static bool ParseGgufSummary(WinAiFileStream& st, AiModelInfoSummary& info) {
+    if (st.FileSize() < 16) return false;
+    uint8_t magic[4] = {};
+    uint32_t version = 0;
+    if (!st.ReadBytes(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0) return false;
+    if (!st.ReadU32(version) || version < 1 || version > 3) return false;
+
+    uint64_t tensorCount = 0;
+    uint64_t kvCount = 0;
+    if (!ReadGgufCount(st, version, tensorCount) || !ReadGgufCount(st, version, kvCount)) return false;
+    if (kvCount > 1000000ULL || tensorCount > 5000000ULL) return false;
+
+    std::map<std::string, std::wstring> kvMap;
+    for (uint64_t i = 0; i < kvCount; ++i) {
+        std::string key;
+        if (!ReadGgufString(st, version, key, 256) || key.empty()) return false;
+        uint32_t vtype = 0;
+        if (!st.ReadU32(vtype) || vtype > 12) return false;
+        std::wstring valW;
+        if (!ReadGgufMetadataValue(st, version, vtype, valW, true, 0)) return false;
+
+        kvMap[key] = valW;
+        if (info.kvRows.size() < 256) {
+            std::wstring disp = valW;
+            if (disp.size() > 160) disp = disp.substr(0, 160) + L"...";
+            info.kvRows.push_back({ Utf8ToWideStr(key.data(), key.size()), std::move(disp) });
+        }
+    }
+
+    std::map<std::wstring, uint64_t> quantHist;
+    for (uint64_t t = 0; t < tensorCount; ++t) {
+        std::string tName;
+        if (!ReadGgufString(st, version, tName, 512) || tName.empty()) return false;
+        uint32_t nDims = 0;
+        if (!st.ReadU32(nDims) || nDims < 1 || nDims > 8) return false;
+
+        uint64_t dims[8] = {};
+        uint64_t params = 1;
+        for (uint32_t d = 0; d < nDims; ++d) {
+            if (!st.ReadU64(dims[d]) || dims[d] == 0) return false;
+            if (params > UINT64_MAX / dims[d]) params = UINT64_MAX;
+            else params *= dims[d];
+        }
+
+        uint32_t ggmlType = 0;
+        uint64_t relOffset = 0;
+        if (!st.ReadU32(ggmlType) || !st.ReadU64(relOffset)) return false;
+        GgmlTypeTrait trait{};
+        if (!GetGgmlTypeTrait(ggmlType, trait)) return false;
+        if (relOffset > st.FileSize()) return false;
+
+        const uint64_t blocks = (params + trait.blockElems - 1ULL) / trait.blockElems;
+        const uint64_t byteSize = (blocks <= UINT64_MAX / trait.blockBytes) ? (blocks * trait.blockBytes) : UINT64_MAX;
+
+        if (info.totalParameters <= UINT64_MAX - params) info.totalParameters += params;
+        else info.totalParameters = UINT64_MAX;
+        quantHist[trait.name]++;
+
+        if (info.tensors.size() < 512) {
+            AiModelInfoSummary::TensorEntry te;
+            te.name = Utf8ToWideStr(tName.data(), tName.size());
+            te.dtype = trait.name;
+            te.shape = L"[";
+            for (uint32_t d = 0; d < nDims; ++d) {
+                if (d > 0) te.shape += L", ";
+                te.shape += std::to_wstring(dims[d]);
+            }
+            te.shape += L"]";
+            te.paramCount = params;
+            te.byteSize = byteSize;
+            info.tensors.push_back(std::move(te));
+        }
+    }
+
+    info.valid = true;
+    info.formatName = L"GGUF v" + std::to_wstring(version);
+    info.tensorCount = tensorCount;
+    info.metadataKeyCount = kvCount;
+
+    auto findKv = [&](const std::string& k) -> std::wstring {
+        auto it = kvMap.find(k);
+        return (it != kvMap.end()) ? it->second : L"";
+    };
+
+    info.arch = findKv("general.architecture");
+    info.modelTitle = findKv("general.name");
+    info.baseModel = findKv("general.basename");
+    if (!info.arch.empty()) {
+        const std::string archUtf8 = PathUtils::WideToUtf8(info.arch);
+        info.contextLength = findKv(archUtf8 + ".context_length");
+    }
+    if (info.contextLength.empty()) {
+        for (const auto& kv : kvMap) {
+            if (kv.first.size() > 15 && kv.first.rfind(".context_length") == kv.first.size() - 15) {
+                info.contextLength = kv.second;
+                break;
+            }
+        }
+    }
+
+    for (const auto& q : quantHist) {
+        if (!info.precisionSummary.empty()) info.precisionSummary += L", ";
+        info.precisionSummary += q.first + L" (" + std::to_wstring(q.second) + L")";
+    }
+    if (info.precisionSummary.empty()) {
+        std::wstring ft = findKv("general.file_type");
+        if (!ft.empty()) info.precisionSummary = L"FileType #" + ft;
+    }
+    return true;
+}
+
+static const wchar_t* OnnxElemTypeName(uint64_t dt, uint32_t& outElemBytes) {
+    outElemBytes = 0;
+    switch (dt) {
+    case 1:  outElemBytes = 4;  return L"FLOAT32";
+    case 2:  outElemBytes = 1;  return L"UINT8";
+    case 3:  outElemBytes = 1;  return L"INT8";
+    case 4:  outElemBytes = 2;  return L"UINT16";
+    case 5:  outElemBytes = 2;  return L"INT16";
+    case 6:  outElemBytes = 4;  return L"INT32";
+    case 7:  outElemBytes = 8;  return L"INT64";
+    case 8:  outElemBytes = 0;  return L"STRING";
+    case 9:  outElemBytes = 1;  return L"BOOL";
+    case 10: outElemBytes = 2;  return L"FLOAT16";
+    case 11: outElemBytes = 8;  return L"DOUBLE";
+    case 12: outElemBytes = 4;  return L"UINT32";
+    case 13: outElemBytes = 8;  return L"UINT64";
+    case 14: outElemBytes = 8;  return L"COMPLEX64";
+    case 15: outElemBytes = 16; return L"COMPLEX128";
+    case 16: outElemBytes = 2;  return L"BFLOAT16";
+    case 17: outElemBytes = 1;  return L"FLOAT8E4M3FN";
+    case 18: outElemBytes = 1;  return L"FLOAT8E4M3FNUZ";
+    case 19: outElemBytes = 1;  return L"FLOAT8E5M2";
+    case 20: outElemBytes = 1;  return L"FLOAT8E5M2FNUZ";
+    case 21: outElemBytes = 1;  return L"UINT4";
+    case 22: outElemBytes = 1;  return L"INT4";
+    default: return L"UNKNOWN";
+    }
+}
+
+static bool ParseOnnxValueInfoStream(WinAiFileStream& st, uint64_t endPos, std::wstring& outName, std::wstring& outDtype, std::wstring& outShape) {
+    std::string name;
+    uint64_t elemType = 0;
+    std::vector<std::wstring> dims;
+    while (st.Pos() < endPos) {
+        uint32_t fn = 0; uint8_t wt = 0;
+        if (!st.ReadPbTag(endPos, fn, wt)) return false;
+        if (fn == 1 && wt == 2) {
+            if (!st.ReadPbStringBounded(endPos, name, 512)) return false;
+        } else if (fn == 2 && wt == 2) { // TypeProto
+            uint64_t tLen = 0;
+            if (!st.ReadPbVarint(endPos, tLen) || st.Pos() + tLen > endPos) return false;
+            const uint64_t tEnd = st.Pos() + tLen;
+            while (st.Pos() < tEnd) {
+                uint32_t tfn = 0; uint8_t twt = 0;
+                if (!st.ReadPbTag(tEnd, tfn, twt)) return false;
+                if (tfn == 1 && twt == 2) { // TypeProto.Tensor
+                    uint64_t ttLen = 0;
+                    if (!st.ReadPbVarint(tEnd, ttLen) || st.Pos() + ttLen > tEnd) return false;
+                    const uint64_t ttEnd = st.Pos() + ttLen;
+                    while (st.Pos() < ttEnd) {
+                        uint32_t xfn = 0; uint8_t xwt = 0;
+                        if (!st.ReadPbTag(ttEnd, xfn, xwt)) return false;
+                        if (xfn == 1 && xwt == 0) {
+                            if (!st.ReadPbVarint(ttEnd, elemType)) return false;
+                        } else if (xfn == 2 && xwt == 2) { // TensorShapeProto
+                            uint64_t sLen = 0;
+                            if (!st.ReadPbVarint(ttEnd, sLen) || st.Pos() + sLen > ttEnd) return false;
+                            const uint64_t sEnd = st.Pos() + sLen;
+                            while (st.Pos() < sEnd) {
+                                uint32_t sfn = 0; uint8_t swt = 0;
+                                if (!st.ReadPbTag(sEnd, sfn, swt)) return false;
+                                if (sfn == 1 && swt == 2) { // Dimension
+                                    uint64_t dLen = 0;
+                                    if (!st.ReadPbVarint(sEnd, dLen) || st.Pos() + dLen > sEnd) return false;
+                                    const uint64_t dEnd = st.Pos() + dLen;
+                                    std::wstring dimTxt = L"?";
+                                    while (st.Pos() < dEnd) {
+                                        uint32_t dfn = 0; uint8_t dwt = 0;
+                                        if (!st.ReadPbTag(dEnd, dfn, dwt)) return false;
+                                        if (dfn == 1 && dwt == 0) {
+                                            uint64_t dv = 0;
+                                            if (!st.ReadPbVarint(dEnd, dv)) return false;
+                                            dimTxt = std::to_wstring(static_cast<int64_t>(dv));
+                                        } else if (dfn == 2 && dwt == 2) {
+                                            std::string dp;
+                                            if (!st.ReadPbStringBounded(dEnd, dp, 128)) return false;
+                                            dimTxt = Utf8ToWideStr(dp.data(), dp.size());
+                                        } else if (!st.SkipPbField(dEnd, dwt)) {
+                                            return false;
+                                        }
+                                    }
+                                    if (dims.size() < 32) dims.push_back(std::move(dimTxt));
+                                } else if (!st.SkipPbField(sEnd, swt)) {
+                                    return false;
+                                }
+                            }
+                        } else if (!st.SkipPbField(ttEnd, xwt)) {
+                            return false;
+                        }
+                    }
+                } else if (!st.SkipPbField(tEnd, twt)) {
+                    return false;
+                }
+            }
+        } else if (!st.SkipPbField(endPos, wt)) {
+            return false;
+        }
+    }
+    uint32_t dummyBytes = 0;
+    outName = Utf8ToWideStr(name.data(), name.size());
+    outDtype = OnnxElemTypeName(elemType, dummyBytes);
+    outShape = L"[";
+    for (size_t i = 0; i < dims.size(); ++i) {
+        if (i > 0) outShape += L", ";
+        outShape += dims[i];
+    }
+    outShape += L"]";
+    return true;
+}
+
+static bool ParseOnnxSummary(WinAiFileStream& st, AiModelInfoSummary& info) {
+    const uint64_t fileSize = st.FileSize();
+    if (fileSize < 4) return false;
+
+    uint64_t irVersion = 0;
+    uint64_t modelVersion = 0;
+    std::string producerName, producerVersion, domain, docString, graphName;
+    std::vector<std::wstring> opsets;
+    std::vector<std::pair<std::wstring, std::wstring>> metaProps;
+    std::map<std::string, uint64_t> opHist;
+    std::map<std::wstring, uint64_t> dtypeHist;
+    std::vector<AiModelInfoSummary::TensorEntry> ioEntries;
+
+    bool hasGraph = false;
+    uint64_t nodeCount = 0;
+    uint64_t initCount = 0;
+    uint64_t ioCount = 0;
+
+    while (st.Pos() < fileSize) {
+        uint32_t fn = 0; uint8_t wt = 0;
+        if (!st.ReadPbTag(fileSize, fn, wt)) return false;
+        if (fn == 1 && wt == 0) {
+            if (!st.ReadPbVarint(fileSize, irVersion)) return false;
+        } else if (fn == 2 && wt == 2) {
+            if (!st.ReadPbStringBounded(fileSize, producerName, 256)) return false;
+        } else if (fn == 3 && wt == 2) {
+            if (!st.ReadPbStringBounded(fileSize, producerVersion, 128)) return false;
+        } else if (fn == 4 && wt == 2) {
+            if (!st.ReadPbStringBounded(fileSize, domain, 256)) return false;
+        } else if (fn == 5 && wt == 0) {
+            if (!st.ReadPbVarint(fileSize, modelVersion)) return false;
+        } else if (fn == 6 && wt == 2) {
+            if (!st.ReadPbStringBounded(fileSize, docString, 512)) return false;
+        } else if (fn == 8 && wt == 2) { // opset_import
+            uint64_t oLen = 0;
+            if (!st.ReadPbVarint(fileSize, oLen) || st.Pos() + oLen > fileSize) return false;
+            const uint64_t oEnd = st.Pos() + oLen;
+            std::string opDom;
+            uint64_t opVer = 0;
+            while (st.Pos() < oEnd) {
+                uint32_t ofn = 0; uint8_t owt = 0;
+                if (!st.ReadPbTag(oEnd, ofn, owt)) return false;
+                if (ofn == 1 && owt == 2) { if (!st.ReadPbStringBounded(oEnd, opDom, 128)) return false; }
+                else if (ofn == 2 && owt == 0) { if (!st.ReadPbVarint(oEnd, opVer)) return false; }
+                else if (!st.SkipPbField(oEnd, owt)) return false;
+            }
+            if (opVer == 0 || opVer > 1000) return false;
+            opsets.push_back((opDom.empty() ? L"ai.onnx" : Utf8ToWideStr(opDom.data(), opDom.size())) + L" v" + std::to_wstring(opVer));
+        } else if (fn == 14 && wt == 2) { // metadata_props
+            uint64_t mLen = 0;
+            if (!st.ReadPbVarint(fileSize, mLen) || st.Pos() + mLen > fileSize) return false;
+            const uint64_t mEnd = st.Pos() + mLen;
+            std::string mk, mv;
+            while (st.Pos() < mEnd) {
+                uint32_t mfn = 0; uint8_t mwt = 0;
+                if (!st.ReadPbTag(mEnd, mfn, mwt)) return false;
+                if (mfn == 1 && mwt == 2) { if (!st.ReadPbStringBounded(mEnd, mk, 256)) return false; }
+                else if (mfn == 2 && mwt == 2) { if (!st.ReadPbStringBounded(mEnd, mv, 512)) return false; }
+                else if (!st.SkipPbField(mEnd, mwt)) return false;
+            }
+            if (!mk.empty() && metaProps.size() < 128) {
+                metaProps.push_back({ Utf8ToWideStr(mk.data(), mk.size()), Utf8ToWideStr(mv.data(), mv.size()) });
+            }
+        } else if (fn == 7 && wt == 2) { // GraphProto
+            hasGraph = true;
+            uint64_t gLen = 0;
+            if (!st.ReadPbVarint(fileSize, gLen) || st.Pos() + gLen > fileSize) return false;
+            const uint64_t gEnd = st.Pos() + gLen;
+            while (st.Pos() < gEnd) {
+                uint32_t gfn = 0; uint8_t gwt = 0;
+                if (!st.ReadPbTag(gEnd, gfn, gwt)) return false;
+                if (gfn == 2 && gwt == 2) {
+                    if (!st.ReadPbStringBounded(gEnd, graphName, 256)) return false;
+                } else if (gfn == 1 && gwt == 2) { // NodeProto
+                    uint64_t nLen = 0;
+                    if (!st.ReadPbVarint(gEnd, nLen) || st.Pos() + nLen > gEnd) return false;
+                    const uint64_t nEnd = st.Pos() + nLen;
+                    std::string opType;
+                    while (st.Pos() < nEnd) {
+                        uint32_t nfn = 0; uint8_t nwt = 0;
+                        if (!st.ReadPbTag(nEnd, nfn, nwt)) return false;
+                        if (nfn == 4 && nwt == 2) {
+                            if (!st.ReadPbStringBounded(nEnd, opType, 128)) return false;
+                        } else if (!st.SkipPbField(nEnd, nwt)) {
+                            return false;
+                        }
+                    }
+                    ++nodeCount;
+                    if (!opType.empty()) opHist[opType]++;
+                } else if (gfn == 5 && gwt == 2) { // initializer TensorProto
+                    uint64_t tLen = 0;
+                    if (!st.ReadPbVarint(gEnd, tLen) || st.Pos() + tLen > gEnd) return false;
+                    const uint64_t tEnd = st.Pos() + tLen;
+                    std::vector<int64_t> dims;
+                    uint64_t dt = 0;
+                    std::string tName;
+                    uint64_t rawDataBytes = 0;
+                    while (st.Pos() < tEnd) {
+                        uint32_t tfn = 0; uint8_t twt = 0;
+                        if (!st.ReadPbTag(tEnd, tfn, twt)) return false;
+                        if (tfn == 1 && twt == 0) {
+                            uint64_t dv = 0;
+                            if (!st.ReadPbVarint(tEnd, dv)) return false;
+                            if (dims.size() < 32) dims.push_back(static_cast<int64_t>(dv));
+                        } else if (tfn == 1 && twt == 2) { // packed repeated int64 dims
+                            uint64_t pLen = 0;
+                            if (!st.ReadPbVarint(tEnd, pLen) || st.Pos() + pLen > tEnd) return false;
+                            const uint64_t pEnd = st.Pos() + pLen;
+                            while (st.Pos() < pEnd) {
+                                uint64_t dv = 0;
+                                if (!st.ReadPbVarint(pEnd, dv)) return false;
+                                if (dims.size() < 32) dims.push_back(static_cast<int64_t>(dv));
+                            }
+                        } else if (tfn == 2 && twt == 0) {
+                            if (!st.ReadPbVarint(tEnd, dt)) return false;
+                        } else if (tfn == 8 && twt == 2) {
+                            if (!st.ReadPbStringBounded(tEnd, tName, 512)) return false;
+                        } else if (tfn == 9 && twt == 2) { // raw_data (skip cleanly via Seek!)
+                            uint64_t rLen = 0;
+                            if (!st.ReadPbVarint(tEnd, rLen) || st.Pos() + rLen > tEnd) return false;
+                            rawDataBytes = rLen;
+                            if (!st.Skip(rLen)) return false;
+                        } else if (!st.SkipPbField(tEnd, twt)) {
+                            return false;
+                        }
+                    }
+                    uint32_t elemBytes = 0;
+                    const wchar_t* dtName = OnnxElemTypeName(dt, elemBytes);
+                    if (dt == 0 || dt > 22) return false;
+
+                    uint64_t params = 1;
+                    if (dims.empty()) {
+                        params = 1;
+                    } else {
+                        for (int64_t d : dims) {
+                            if (d <= 0) { params = 0; break; }
+                            const uint64_t ud = static_cast<uint64_t>(d);
+                            if (params > UINT64_MAX / ud) { params = UINT64_MAX; break; }
+                            params *= ud;
+                        }
+                    }
+                    const uint64_t byteSz = (rawDataBytes > 0)
+                        ? rawDataBytes
+                        : ((elemBytes > 0 && params <= UINT64_MAX / elemBytes) ? (params * elemBytes) : 0ULL);
+
+                    ++initCount;
+                    if (info.totalParameters <= UINT64_MAX - params) info.totalParameters += params;
+                    else info.totalParameters = UINT64_MAX;
+                    dtypeHist[dtName]++;
+
+                    if (info.tensors.size() < 512) {
+                        AiModelInfoSummary::TensorEntry te;
+                        te.name = tName.empty() ? (L"initializer_" + std::to_wstring(initCount)) : Utf8ToWideStr(tName.data(), tName.size());
+                        te.dtype = dtName;
+                        te.shape = L"[";
+                        for (size_t i = 0; i < dims.size(); ++i) {
+                            if (i > 0) te.shape += L", ";
+                            te.shape += std::to_wstring(dims[i]);
+                        }
+                        te.shape += L"]";
+                        te.paramCount = params;
+                        te.byteSize = byteSz;
+                        info.tensors.push_back(std::move(te));
+                    }
+                } else if ((gfn == 11 || gfn == 12) && gwt == 2) { // input / output ValueInfoProto
+                    uint64_t vLen = 0;
+                    if (!st.ReadPbVarint(gEnd, vLen) || st.Pos() + vLen > gEnd) return false;
+                    const uint64_t vEnd = st.Pos() + vLen;
+                    std::wstring vName, vDt, vShape;
+                    if (!ParseOnnxValueInfoStream(st, vEnd, vName, vDt, vShape)) return false;
+                    ++ioCount;
+                    if (ioEntries.size() < 128) {
+                        AiModelInfoSummary::TensorEntry ioTe;
+                        ioTe.name = (gfn == 11 ? L"[in] " : L"[out] ") + vName;
+                        ioTe.dtype = vDt;
+                        ioTe.shape = vShape;
+                        ioTe.paramCount = 0;
+                        ioTe.byteSize = 0;
+                        ioEntries.push_back(std::move(ioTe));
+                    }
+                } else if (!st.SkipPbField(gEnd, gwt)) {
+                    return false;
+                }
+            }
+        } else if (!st.SkipPbField(fileSize, wt)) {
+            return false;
+        }
+    }
+
+    if (st.Pos() != fileSize) return false;
+    if (irVersion < 1 || irVersion > 20) return false;
+    if (!hasGraph || (nodeCount == 0 && initCount == 0 && ioCount == 0)) return false;
+
+    // Prepend graph I/O entries before initializer weights if room allows
+    if (!ioEntries.empty()) {
+        std::vector<AiModelInfoSummary::TensorEntry> merged;
+        merged.reserve(ioEntries.size() + info.tensors.size());
+        for (auto& e : ioEntries) merged.push_back(std::move(e));
+        for (auto& e : info.tensors) {
+            if (merged.size() >= 512) break;
+            merged.push_back(std::move(e));
+        }
+        info.tensors = std::move(merged);
+    }
+
+    info.valid = true;
+    info.formatName = L"ONNX v" + std::to_wstring(irVersion);
+    info.modelTitle = graphName.empty() ? L"" : Utf8ToWideStr(graphName.data(), graphName.size());
+    info.arch = producerName.empty()
+        ? L""
+        : (Utf8ToWideStr(producerName.data(), producerName.size()) +
+           (producerVersion.empty() ? L"" : (L" " + Utf8ToWideStr(producerVersion.data(), producerVersion.size()))));
+    info.tensorCount = initCount > 0 ? initCount : ioCount;
+
+    for (const auto& kv : dtypeHist) {
+        if (!info.precisionSummary.empty()) info.precisionSummary += L", ";
+        info.precisionSummary += kv.first + L" (" + std::to_wstring(kv.second) + L")";
+    }
+
+    info.kvRows.push_back({ L"ir_version", std::to_wstring(irVersion) });
+    if (!producerName.empty()) {
+        info.kvRows.push_back({ L"producer", info.arch });
+    }
+    if (!domain.empty()) {
+        info.kvRows.push_back({ L"domain", Utf8ToWideStr(domain.data(), domain.size()) });
+    }
+    if (modelVersion != 0) {
+        info.kvRows.push_back({ L"model_version", std::to_wstring(modelVersion) });
+    }
+    if (!graphName.empty()) {
+        info.kvRows.push_back({ L"graph.name", info.modelTitle });
+    }
+    info.kvRows.push_back({ L"graph.nodes", std::to_wstring(nodeCount) });
+    info.kvRows.push_back({ L"graph.initializers", std::to_wstring(initCount) });
+    info.kvRows.push_back({ L"graph.io_ports", std::to_wstring(ioCount) });
+    if (!opsets.empty()) {
+        std::wstring opJoined;
+        for (size_t i = 0; i < opsets.size(); ++i) {
+            if (i > 0) opJoined += L", ";
+            opJoined += opsets[i];
+        }
+        info.kvRows.push_back({ L"opset_import", std::move(opJoined) });
+    }
+    if (!opHist.empty()) {
+        std::vector<std::pair<std::string, uint64_t>> sortedOps(opHist.begin(), opHist.end());
+        std::sort(sortedOps.begin(), sortedOps.end(), [](const auto& a, const auto& b) {
+            return (a.second != b.second) ? (a.second > b.second) : (a.first < b.first);
+        });
+        std::wstring histStr;
+        for (size_t i = 0; i < sortedOps.size() && i < 16; ++i) {
+            if (i > 0) histStr += L", ";
+            histStr += Utf8ToWideStr(sortedOps[i].first.data(), sortedOps[i].first.size()) +
+                       L" (" + std::to_wstring(sortedOps[i].second) + L")";
+        }
+        info.kvRows.push_back({ L"operators", std::move(histStr) });
+    }
+    if (!docString.empty()) {
+        std::wstring docW = Utf8ToWideStr(docString.data(), docString.size());
+        if (docW.size() > 180) docW = docW.substr(0, 180) + L"...";
+        info.kvRows.push_back({ L"doc_string", std::move(docW) });
+    }
+    for (auto& mp : metaProps) {
+        info.kvRows.push_back(std::move(mp));
+    }
+    info.metadataKeyCount = info.kvRows.size();
+    return true;
+}
+
+} // namespace
+
 static AiModelInfoSummary InspectAiModelHeader(const std::wstring& path, const std::wstring& ext) {
     AiModelInfoSummary info;
     HANDLE hFile = CreateFileW(
@@ -355,192 +1681,35 @@ static AiModelInfoSummary InspectAiModelHeader(const std::wstring& path, const s
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
         nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return info;
 
-    if (ext == L".safetensors") {
-        uint64_t hdrLen = 0;
-        DWORD got = 0;
-        if (ReadFile(hFile, &hdrLen, 8, &got, nullptr) && got == 8 && hdrLen > 2 && hdrLen <= (24ULL * 1024 * 1024)) {
-            size_t readLen = static_cast<size_t>(std::min<uint64_t>(hdrLen, 4ULL * 1024 * 1024));
-            std::vector<char> buf(readLen);
-            if (ReadFile(hFile, buf.data(), static_cast<DWORD>(readLen), &got, nullptr) && got > 2) {
-                info.valid = true;
-                info.formatName = L"SafeTensors";
-                std::string json(buf.data(), got);
-
-                // Count tensors & dtypes ("dtype":"F16", "BF16", "F32", "F8_E4M3")
-                std::map<std::string, uint64_t> dtypeCounts;
-                size_t p = 0;
-                while ((p = json.find("\"dtype\"", p)) != std::string::npos) {
-                    size_t c = json.find(':', p + 7);
-                    if (c == std::string::npos) break;
-                    size_t q1 = json.find('"', c + 1);
-                    size_t q2 = (q1 != std::string::npos) ? json.find('"', q1 + 1) : std::string::npos;
-                    if (q1 != std::string::npos && q2 != std::string::npos && q2 - q1 <= 16) {
-                        std::string dt = json.substr(q1 + 1, q2 - q1 - 1);
-                        dtypeCounts[dt]++;
-                        info.tensorCount++;
-                    }
-                    p = (q2 != std::string::npos) ? (q2 + 1) : (c + 1);
-                }
-
-                for (const auto& kv : dtypeCounts) {
-                    if (!info.precisionSummary.empty()) info.precisionSummary += L", ";
-                    info.precisionSummary += Utf8ToWideStr(kv.first.c_str(), kv.first.size()) + L" (" + std::to_wstring(kv.second) + L")";
-                }
-
-                auto findMetaStr = [&](const char* key) -> std::wstring {
-                    std::string needle = std::string("\"") + key + "\"";
-                    size_t kp = json.find(needle);
-                    if (kp == std::string::npos) return L"";
-                    size_t col = json.find(':', kp + needle.size());
-                    if (col == std::string::npos) return L"";
-                    size_t q1 = json.find('"', col + 1);
-                    if (q1 == std::string::npos || q1 > col + 10) return L"";
-                    std::string out;
-                    for (size_t i = q1 + 1; i < json.size() && out.size() < 260; ++i) {
-                        if (json[i] == '\\' && i + 1 < json.size()) {
-                            out.push_back(json[i + 1]);
-                            ++i;
-                        } else if (json[i] == '"') {
-                            break;
-                        } else {
-                            out.push_back(json[i]);
-                        }
-                    }
-                    return Utf8ToWideStr(out.c_str(), out.size());
-                };
-
-                info.modelTitle = findMetaStr("modelspec.title");
-                if (info.modelTitle.empty()) info.modelTitle = findMetaStr("ss_output_name");
-                info.arch = findMetaStr("modelspec.architecture");
-                if (info.arch.empty()) info.arch = findMetaStr("ss_network_module");
-                info.baseModel = findMetaStr("ss_base_model_version");
-                if (info.baseModel.empty()) info.baseModel = findMetaStr("ss_sd_model_name");
-
-                std::wstring dim = findMetaStr("ss_network_dim");
-                std::wstring alpha = findMetaStr("ss_network_alpha");
-                if (!dim.empty()) {
-                    info.networkDimAlpha = L"Rank/Dim: " + dim + (alpha.empty() ? L"" : (L"  /  Alpha: " + alpha));
-                }
-
-                const char* interestingKeys[] = {
-                    "modelspec.title", "modelspec.architecture", "modelspec.resolution",
-                    "modelspec.prediction_type", "ss_output_name", "ss_sd_model_name",
-                    "ss_base_model_version", "ss_network_module", "ss_network_dim",
-                    "ss_network_alpha", "ss_resolution", "ss_clip_skip", "ss_epoch", "ss_num_train_images"
-                };
-                for (const char* k : interestingKeys) {
-                    std::wstring v = findMetaStr(k);
-                    if (!v.empty()) {
-                        info.kvRows.push_back({ Utf8ToWideStr(k, std::strlen(k)), v });
-                    }
-                }
-                info.metadataKeyCount = info.kvRows.size();
-            }
-        }
-    } else if (ext == L".gguf") {
-        uint8_t hdr[24] = {};
-        DWORD got = 0;
-        if (ReadFile(hFile, hdr, 24, &got, nullptr) && got == 24 &&
-            hdr[0] == 'G' && hdr[1] == 'G' && hdr[2] == 'U' && hdr[3] == 'F')
-        {
-            uint32_t version = *reinterpret_cast<const uint32_t*>(hdr + 4);
-            uint64_t tensorCount = *reinterpret_cast<const uint64_t*>(hdr + 8);
-            uint64_t kvCount = *reinterpret_cast<const uint64_t*>(hdr + 16);
-            info.valid = true;
-            info.formatName = L"GGUF v" + std::to_wstring(version);
-            info.tensorCount = tensorCount;
-            info.metadataKeyCount = kvCount;
-
-            // Read first 256 KB to extract printable key/value strings from GGUF header
-            std::vector<char> buf(256 * 1024);
-            if (ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got > 0) {
-                auto scanGgufKey = [&](const char* keyName, std::wstring& outVal) {
-                    size_t klen = std::strlen(keyName);
-                    for (size_t i = 0; i + klen + 16 < got; ++i) {
-                        if (std::memcmp(buf.data() + i, keyName, klen) == 0) {
-                            uint32_t vtype = *reinterpret_cast<const uint32_t*>(buf.data() + i + klen);
-                            if (vtype == 8) { // GGUF_TYPE_STRING
-                                uint64_t slen = *reinterpret_cast<const uint64_t*>(buf.data() + i + klen + 4);
-                                if (slen > 0 && slen < 256 && i + klen + 12 + slen <= got) {
-                                    outVal = Utf8ToWideStr(buf.data() + i + klen + 12, static_cast<size_t>(slen));
-                                    return true;
-                                }
-                            } else if (vtype == 4 || vtype == 5) { // UINT32 / INT32
-                                uint32_t val32 = *reinterpret_cast<const uint32_t*>(buf.data() + i + klen + 4);
-                                outVal = std::to_wstring(val32);
-                                return true;
-                            }
-                        }
-                    }
-                    return false;
-                };
-
-                scanGgufKey("general.architecture", info.arch);
-                scanGgufKey("general.name", info.modelTitle);
-                std::wstring quant;
-                if (scanGgufKey("general.file_type", quant)) {
-                    info.precisionSummary = L"GGUF FileType #" + quant;
-                }
-                const char* ggufKeys[] = {
-                    "general.architecture", "general.name", "general.quantization_version",
-                    "general.file_type", "tokenizer.ggml.model", "tokenizer.chat_template"
-                };
-                for (const char* gk : ggufKeys) {
-                    std::wstring v;
-                    if (scanGgufKey(gk, v) && !v.empty()) {
-                        if (v.size() > 120) v = v.substr(0, 120) + L"...";
-                        info.kvRows.push_back({ Utf8ToWideStr(gk, std::strlen(gk)), v });
-                    }
-                }
-                if (!info.arch.empty()) {
-                    std::string archUtf8 = PathUtils::WideToUtf8(info.arch);
-                    std::string ctxKey = archUtf8 + ".context_length";
-                    std::string embKey = archUtf8 + ".embedding_length";
-                    std::string blkKey = archUtf8 + ".block_count";
-                    std::wstring v;
-                    if (scanGgufKey(ctxKey.c_str(), v)) {
-                        info.contextLength = v;
-                        info.kvRows.push_back({ Utf8ToWideStr(ctxKey.c_str(), ctxKey.size()), v });
-                    }
-                    if (scanGgufKey(embKey.c_str(), v)) {
-                        info.kvRows.push_back({ Utf8ToWideStr(embKey.c_str(), embKey.size()), v });
-                    }
-                    if (scanGgufKey(blkKey.c_str(), v)) {
-                        info.kvRows.push_back({ Utf8ToWideStr(blkKey.c_str(), blkKey.size()), v });
-                    }
-                }
-            }
-        }
-    } else if (ext == L".onnx") {
-        std::vector<uint8_t> buf(256 * 1024);
-        DWORD got = 0;
-        if (ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got > 4) {
-            info.valid = true;
-            info.formatName = L"ONNX Neural Graph (Protobuf)";
-            std::string cur;
-            for (DWORD i = 0; i < got; ++i) {
-                uint8_t b = buf[i];
-                if (b >= 32 && b <= 126) {
-                    cur.push_back(static_cast<char>(b));
-                } else {
-                    if (cur.size() >= 3 && cur.size() <= 80) {
-                        ++info.tensorCount;
-                        if (info.kvRows.size() < 24) {
-                            info.kvRows.push_back({ L"Node / Tensor [" + std::to_wstring(info.kvRows.size() + 1) + L"]", Utf8ToWideStr(cur.c_str(), cur.size()) });
-                        }
-                    }
-                    cur.clear();
-                }
-            }
-            info.metadataKeyCount = info.kvRows.size();
-        }
+    LARGE_INTEGER liSize{};
+    if (!GetFileSizeEx(hFile, &liSize) || liSize.QuadPart <= 0) {
+        CloseHandle(hFile);
+        return info;
     }
+    WinAiFileStream stream(hFile, static_cast<uint64_t>(liSize.QuadPart));
+
+    const std::wstring extLower = PathUtils::ToLower(ext.empty() ? PathUtils::GetExtension(path) : ext);
+    if (extLower == L".safetensors") {
+        AiModelInfoSummary parsed;
+        if (ParseSafeTensorsSummary(stream, parsed)) info = std::move(parsed);
+    } else if (extLower == L".gguf") {
+        AiModelInfoSummary parsed;
+        if (ParseGgufSummary(stream, parsed)) info = std::move(parsed);
+    } else if (extLower == L".onnx") {
+        AiModelInfoSummary parsed;
+        if (ParseOnnxSummary(stream, parsed)) info = std::move(parsed);
+    }
+
     CloseHandle(hFile);
     return info;
+}
+
+AiModelInfoSummary FileContentPane::InspectAiModelFile(const std::wstring& path, const std::wstring& ext) {
+    return InspectAiModelHeader(path, ext);
 }
 
 static bool ComputeFileHashes(const std::wstring& path, std::wstring& outSummary, std::wstring& outSha256Hex) {
@@ -1290,6 +2459,41 @@ ResolvedContentKind FileContentPane::ResolveKindForCurrentEntry() const {
     if (PdfViewer::IsPdfExtension(ext)) {
         return ResolvedContentKind::PdfDocument;
     }
+    if (ext == L".dxf") {
+        if (Model3DViewer::IsLikely3DDxfFile(m_currentEntry.fullPath)) {
+            return ResolvedContentKind::Model3DViewport;
+        }
+        return ResolvedContentKind::EdaViewport;
+    }
+    if (ext == L".raw" && !EdaViewer::IsLikelySpiceRawFile(m_currentEntry.fullPath)) {
+        return ResolvedContentKind::HexInspector;
+    }
+    if (ext == L".def" && !EdaViewer::IsLikelyAsicDefFile(m_currentEntry.fullPath)) {
+        return ResolvedContentKind::NotepadEditor;
+    }
+    if (ext == L".json" && !EdaViewer::IsLikelyEasyEdaJsonFile(m_currentEntry.fullPath)) {
+        return ResolvedContentKind::NotepadEditor;
+    }
+    if (ext == L".lib" && !EdaViewer::IsLikelyLibertyOrEdaSdfFile(m_currentEntry.fullPath, ext)) {
+        if (ArchiveExplorer::IsArchiveExtension(ext)) {
+            return ResolvedContentKind::ArchiveSubExplorer;
+        }
+        return ResolvedContentKind::HexInspector;
+    }
+    if (ext == L".sdf" && !EdaViewer::IsLikelyLibertyOrEdaSdfFile(m_currentEntry.fullPath, ext)) {
+        return ResolvedContentKind::Model3DViewport;
+    }
+    if (ext == L".tgz" && !EdaViewer::IsLikelyOdbPlusPlusTgz(m_currentEntry.fullPath)) {
+        return ResolvedContentKind::ArchiveSubExplorer;
+    }
+    if (ext == L".ipc") {
+        std::vector<uint8_t> hdr;
+        if (PathUtils::ReadFileBytes(m_currentEntry.fullPath, 16, hdr) && hdr.size() >= 8 &&
+            (std::memcmp(hdr.data(), "ARROW1", 6) == 0 ||
+             (hdr[0] == 0xFF && hdr[1] == 0xFF && hdr[2] == 0xFF && hdr[3] == 0xFF))) {
+            return ResolvedContentKind::OfficeDocument;
+        }
+    }
     if (EdaViewer::IsEdaExtension(ext)) {
         return ResolvedContentKind::EdaViewport;
     }
@@ -1315,6 +2519,69 @@ ResolvedContentKind FileContentPane::ResolveKindForCurrentEntry() const {
             hdr.size() >= 4 && std::memcmp(hdr.data(), "regf", 4) == 0) {
             return ResolvedContentKind::OfficeDocument;
         }
+    }
+    if (ext == L".res") {
+        std::vector<uint8_t> hdr;
+        if (PathUtils::ReadFileBytes(m_currentEntry.fullPath, 32, hdr) && hdr.size() >= 4) {
+            if (std::memcmp(hdr.data(), "RSRC", 4) == 0 || std::memcmp(hdr.data(), "RSCC", 4) == 0 ||
+                std::memcmp(hdr.data(), "[gd_", 4) == 0) {
+                return ResolvedContentKind::Model3DViewport;
+            }
+        }
+        return ResolvedContentKind::HexInspector;
+    }
+    if (ext == L".mod") {
+        std::vector<uint8_t> hdr;
+        if (PathUtils::ReadFileBytes(m_currentEntry.fullPath, 16, hdr) && hdr.size() >= 8 &&
+            (std::memcmp(hdr.data(), "MOD V1.", 7) == 0 || std::memcmp(hdr.data(), "ERF V1.", 7) == 0)) {
+            return ResolvedContentKind::ArchiveSubExplorer;
+        }
+        return ResolvedContentKind::OfficeDocument;
+    }
+    if (ext == L".uasset" || ext == L".umap") {
+        std::vector<uint8_t> hdr;
+        if (PathUtils::ReadFileBytes(m_currentEntry.fullPath, 65536, hdr)) {
+            auto uKind = Formats::ClassifyUnrealPackageMemory(hdr.data(), hdr.size());
+            if (uKind == Formats::UnrealPackageAssetKind::StaticMesh3D) return ResolvedContentKind::Model3DViewport;
+            if (uKind == Formats::UnrealPackageAssetKind::Texture2D)    return ResolvedContentKind::ImagePreview;
+        }
+        return ResolvedContentKind::OfficeDocument;
+    }
+    if (ext == L".shp" || ext == L".geojson") {
+        if (Model3DViewer::IsLikely3DGeoOrDemFile(m_currentEntry.fullPath, ext)) {
+            return ResolvedContentKind::Model3DViewport;
+        }
+        return ResolvedContentKind::OfficeDocument;
+    }
+    if ((ext == L".tif" || ext == L".tiff") &&
+        Model3DViewer::IsLikely3DGeoOrDemFile(m_currentEntry.fullPath, ext)) {
+        return ResolvedContentKind::Model3DViewport;
+    }
+    if (ext == L".tex") {
+        std::vector<uint8_t> hdr;
+        if (PathUtils::ReadFileBytes(m_currentEntry.fullPath, 8, hdr) && hdr.size() >= 4 &&
+            (std::memcmp(hdr.data(), "TEX\0", 4) == 0 || std::memcmp(hdr.data(), "\0XET", 4) == 0)) {
+            return ResolvedContentKind::ImagePreview;
+        }
+    }
+    if (ext == L".wad") {
+        std::vector<uint8_t> hdr;
+        if (PathUtils::ReadFileBytes(m_currentEntry.fullPath, 8, hdr) && hdr.size() >= 4 &&
+            (std::memcmp(hdr.data(), "WAD2", 4) == 0 || std::memcmp(hdr.data(), "WAD3", 4) == 0)) {
+            return ResolvedContentKind::ImagePreview;
+        }
+        return ResolvedContentKind::ArchiveSubExplorer;
+    }
+    if (ext == L".nc") {
+        std::vector<uint8_t> hdr;
+        if (PathUtils::ReadFileBytes(m_currentEntry.fullPath, 560, hdr)) {
+            if ((hdr.size() >= 4 && std::memcmp(hdr.data(), "CDF", 3) == 0 && (hdr[3] == 1 || hdr[3] == 2 || hdr[3] == 5)) ||
+                (hdr.size() >= 8 && std::memcmp(hdr.data(), "\x89HDF\r\n\x1A\n", 8) == 0) ||
+                (hdr.size() >= 520 && std::memcmp(hdr.data() + 512, "\x89HDF\r\n\x1A\n", 8) == 0)) {
+                return ResolvedContentKind::OfficeDocument;
+            }
+        }
+        return ResolvedContentKind::Model3DViewport;
     }
     if (Model3DViewer::Is3DModelExtension(ext)) {
         return ResolvedContentKind::Model3DViewport;
@@ -1780,7 +3047,9 @@ void FileContentPane::Draw(
         rt->DrawRoundedRectangle(D2D1::RoundedRect(cardR, 6.0f, 6.0f), brush, 1.0f);
 
         if (!m_aiModelInfo.valid) {
-            std::wstring errMsg = pl ? L"Nie udało się odczytać nagłówka modelu AI (.safetensors / .gguf)." : L"Could not parse AI model header (.safetensors / .gguf).";
+            std::wstring errMsg = pl
+                ? L"Nie udało się odczytać nagłówka modelu AI (.safetensors / .gguf / .onnx)."
+                : L"Could not parse AI model header (.safetensors / .gguf / .onnx).";
             brush->SetColor(FcpColor(0x64748B));
             rt->DrawTextW(errMsg.c_str(), static_cast<UINT32>(errMsg.size()), fmtCenterSmall, cardR, brush);
             break;
@@ -1813,35 +3082,112 @@ void FileContentPane::Draw(
 
         // Summary metrics strip
         std::wstring metrics = (pl ? L"Tensory: " : L"Tensors: ") + std::to_wstring(m_aiModelInfo.tensorCount);
+        if (m_aiModelInfo.totalParameters > 0) {
+            metrics += (pl ? L"   \x2022   Parametry: " : L"   \x2022   Total Params: ") +
+                       FormatModelParamCount(m_aiModelInfo.totalParameters);
+        }
         if (!m_aiModelInfo.arch.empty()) metrics += (pl ? L"   \x2022   Architektura: " : L"   \x2022   Arch: ") + m_aiModelInfo.arch;
         if (!m_aiModelInfo.baseModel.empty()) metrics += (pl ? L"   \x2022   Baza: " : L"   \x2022   Base: ") + m_aiModelInfo.baseModel;
+        if (!m_aiModelInfo.contextLength.empty()) metrics += (pl ? L"   \x2022   Kontekst: " : L"   \x2022   Ctx: ") + m_aiModelInfo.contextLength;
         if (!m_aiModelInfo.precisionSummary.empty()) metrics += (pl ? L"   \x2022   Precyzja: " : L"   \x2022   Precision: ") + m_aiModelInfo.precisionSummary;
         if (!m_aiModelInfo.networkDimAlpha.empty()) metrics += L"   \x2022   " + m_aiModelInfo.networkDimAlpha;
 
-        D2D1_RECT_F sumBox = D2D1::RectF(lx, y, rxCard, y + 40.0f);
+        D2D1_RECT_F sumBox = D2D1::RectF(lx, y, rxCard, y + 44.0f);
         brush->SetColor(FcpColor(0xEFF6FF));
         rt->FillRoundedRectangle(D2D1::RoundedRect(sumBox, 4.0f, 4.0f), brush);
         brush->SetColor(FcpColor(0xBFDBFE));
         rt->DrawRoundedRectangle(D2D1::RoundedRect(sumBox, 4.0f, 4.0f), brush, 1.0f);
         brush->SetColor(FcpColor(0x1E3A8A));
         rt->DrawTextW(metrics.c_str(), static_cast<UINT32>(metrics.size()), fmtSmall, D2D1::RectF(sumBox.left + 8.0f, sumBox.top + 4.0f, sumBox.right - 8.0f, sumBox.bottom - 4.0f), brush);
-        y += 48.0f;
+        y += 52.0f;
 
         // Key-Value Metadata rows
         for (size_t i = 0; i < m_aiModelInfo.kvRows.size(); ++i) {
-            D2D1_RECT_F rowR = D2D1::RectF(lx, y, rxCard, y + 22.0f);
-            if (i % 2 == 0) {
-                brush->SetColor(FcpColor(0xFFFFFF));
-                rt->FillRectangle(rowR, brush);
+            if (y + 22.0f >= cardR.top && y <= cardR.bottom) {
+                D2D1_RECT_F rowR = D2D1::RectF(lx, y, rxCard, y + 22.0f);
+                if (i % 2 == 0) {
+                    brush->SetColor(FcpColor(0xFFFFFF));
+                    rt->FillRectangle(rowR, brush);
+                }
+                float keyW = std::min(190.0f, (rxCard - lx) * 0.42f);
+                brush->SetColor(FcpColor(0x475569));
+                rt->DrawTextW(m_aiModelInfo.kvRows[i].first.c_str(), static_cast<UINT32>(m_aiModelInfo.kvRows[i].first.size()), fmtBold,
+                    D2D1::RectF(lx + 6.0f, y + 2.0f, lx + keyW, y + 20.0f), brush);
+                brush->SetColor(FcpColor(0x0F172A));
+                rt->DrawTextW(m_aiModelInfo.kvRows[i].second.c_str(), static_cast<UINT32>(m_aiModelInfo.kvRows[i].second.size()), fmtSmall,
+                    D2D1::RectF(lx + keyW + 8.0f, y + 2.0f, rxCard - 6.0f, y + 20.0f), brush);
             }
-            float keyW = std::min(190.0f, (rxCard - lx) * 0.42f);
-            brush->SetColor(FcpColor(0x475569));
-            rt->DrawTextW(m_aiModelInfo.kvRows[i].first.c_str(), static_cast<UINT32>(m_aiModelInfo.kvRows[i].first.size()), fmtBold,
-                D2D1::RectF(lx + 6.0f, y + 2.0f, lx + keyW, y + 20.0f), brush);
-            brush->SetColor(FcpColor(0x0F172A));
-            rt->DrawTextW(m_aiModelInfo.kvRows[i].second.c_str(), static_cast<UINT32>(m_aiModelInfo.kvRows[i].second.size()), fmtSmall,
-                D2D1::RectF(lx + keyW + 8.0f, y + 2.0f, rxCard - 6.0f, y + 20.0f), brush);
             y += 22.0f;
+        }
+
+        // Tensor Table (Name, DType, Shape, Params / Size)
+        if (!m_aiModelInfo.tensors.empty()) {
+            y += 10.0f;
+            std::wstring tblTitle = (pl ? L"Tabela tensorów (" : L"Tensor Table (") +
+                std::to_wstring(m_aiModelInfo.tensors.size()) +
+                (m_aiModelInfo.tensorCount > m_aiModelInfo.tensors.size()
+                    ? (L" / " + std::to_wstring(m_aiModelInfo.tensorCount))
+                    : L"") + L")";
+            if (y + 24.0f >= cardR.top && y <= cardR.bottom) {
+                brush->SetColor(FcpColor(0x1E293B));
+                rt->DrawTextW(tblTitle.c_str(), static_cast<UINT32>(tblTitle.size()), fmtBold,
+                    D2D1::RectF(lx, y, rxCard, y + 20.0f), brush);
+            }
+            y += 22.0f;
+
+            const float totalW = std::max(160.0f, rxCard - lx);
+            const float cNameW  = totalW * 0.40f;
+            const float cTypeW  = totalW * 0.14f;
+            const float cShapeW = totalW * 0.23f;
+            const float xName  = lx;
+            const float xType  = xName + cNameW;
+            const float xShape = xType + cTypeW;
+            const float xSize  = xShape + cShapeW;
+
+            if (y + 24.0f >= cardR.top && y <= cardR.bottom) {
+                D2D1_RECT_F hdrR = D2D1::RectF(lx, y, rxCard, y + 22.0f);
+                brush->SetColor(FcpColor(0xE2E8F0));
+                rt->FillRoundedRectangle(D2D1::RoundedRect(hdrR, 3.0f, 3.0f), brush);
+                brush->SetColor(FcpColor(0x334155));
+                const wchar_t* hName  = pl ? L"Nazwa" : L"Name";
+                const wchar_t* hDType = L"DType";
+                const wchar_t* hShape = pl ? L"Kształt" : L"Shape";
+                const wchar_t* hSize  = pl ? L"Parametry / Rozmiar" : L"Params / Size";
+                rt->DrawTextW(hName,  static_cast<UINT32>(wcslen(hName)),  fmtBold, D2D1::RectF(xName + 6.0f,  y + 2.0f, xType - 4.0f,  y + 20.0f), brush);
+                rt->DrawTextW(hDType, static_cast<UINT32>(wcslen(hDType)), fmtBold, D2D1::RectF(xType + 4.0f,  y + 2.0f, xShape - 4.0f, y + 20.0f), brush);
+                rt->DrawTextW(hShape, static_cast<UINT32>(wcslen(hShape)), fmtBold, D2D1::RectF(xShape + 4.0f, y + 2.0f, xSize - 4.0f,  y + 20.0f), brush);
+                rt->DrawTextW(hSize,  static_cast<UINT32>(wcslen(hSize)),  fmtBold, D2D1::RectF(xSize + 4.0f,  y + 2.0f, rxCard - 6.0f, y + 20.0f), brush);
+            }
+            y += 23.0f;
+
+            for (size_t i = 0; i < m_aiModelInfo.tensors.size(); ++i) {
+                if (y + 21.0f >= cardR.top && y <= cardR.bottom) {
+                    const auto& te = m_aiModelInfo.tensors[i];
+                    D2D1_RECT_F trR = D2D1::RectF(lx, y, rxCard, y + 20.0f);
+                    if (i % 2 == 0) {
+                        brush->SetColor(FcpColor(0xFFFFFF));
+                        rt->FillRectangle(trR, brush);
+                    }
+                    std::wstring psCell;
+                    if (te.paramCount > 0 || te.byteSize > 0) {
+                        psCell = std::to_wstring(te.paramCount);
+                        if (te.byteSize > 0) {
+                            psCell += L" (" + PathUtils::FormatByteSize(te.byteSize) + L")";
+                        }
+                    } else {
+                        psCell = L"dynamic";
+                    }
+                    brush->SetColor(FcpColor(0x0F172A));
+                    rt->DrawTextW(te.name.c_str(),  static_cast<UINT32>(te.name.size()),  fmtSmall, D2D1::RectF(xName + 6.0f,  y + 1.0f, xType - 4.0f,  y + 19.0f), brush);
+                    brush->SetColor(FcpColor(0x1D4ED8));
+                    rt->DrawTextW(te.dtype.c_str(), static_cast<UINT32>(te.dtype.size()), fmtSmall, D2D1::RectF(xType + 4.0f,  y + 1.0f, xShape - 4.0f, y + 19.0f), brush);
+                    brush->SetColor(FcpColor(0x334155));
+                    rt->DrawTextW(te.shape.c_str(), static_cast<UINT32>(te.shape.size()), fmtSmall, D2D1::RectF(xShape + 4.0f, y + 1.0f, xSize - 4.0f,  y + 19.0f), brush);
+                    brush->SetColor(FcpColor(0x475569));
+                    rt->DrawTextW(psCell.c_str(),   static_cast<UINT32>(psCell.size()),   fmtSmall, D2D1::RectF(xSize + 4.0f,  y + 1.0f, rxCard - 6.0f, y + 19.0f), brush);
+                }
+                y += 20.0f;
+            }
         }
         rt->PopAxisAlignedClip();
         break;
@@ -2084,9 +3430,21 @@ bool FileContentPane::OnMouseDown(
                 case HBTN_COPY_MODEL_META: {
                     std::wstring dump = m_aiModelInfo.formatName + L" - " + m_currentEntry.name + L"\r\n";
                     dump += L"Tensors: " + std::to_wstring(m_aiModelInfo.tensorCount) + L"\r\n";
+                    if (m_aiModelInfo.totalParameters > 0) {
+                        dump += L"Total Parameters: " + FormatModelParamCount(m_aiModelInfo.totalParameters) + L"\r\n";
+                    }
                     if (!m_aiModelInfo.precisionSummary.empty()) dump += L"Precision: " + m_aiModelInfo.precisionSummary + L"\r\n";
                     for (const auto& kv : m_aiModelInfo.kvRows) {
                         dump += kv.first + L": " + kv.second + L"\r\n";
+                    }
+                    if (!m_aiModelInfo.tensors.empty()) {
+                        dump += L"\r\n[Tensors]\r\n";
+                        const size_t lim = std::min<size_t>(m_aiModelInfo.tensors.size(), 128);
+                        for (size_t i = 0; i < lim; ++i) {
+                            const auto& te = m_aiModelInfo.tensors[i];
+                            dump += te.name + L"\t" + te.dtype + L"\t" + te.shape + L"\t" +
+                                    std::to_wstring(te.paramCount) + L" (" + PathUtils::FormatByteSize(te.byteSize) + L")\r\n";
+                        }
                     }
                     CopyUnicodeToClipboard(m_parentHwnd, dump);
                     if (outStatusToast) *outStatusToast = (lang == Lang::PL ? L"\x2713 Skopiowano metadane modelu AI do schowka" : L"\x2713 Copied AI model metadata to clipboard");

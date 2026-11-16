@@ -1,0 +1,80 @@
+# release: pcb 4.3.0
+FileVersion[20170218]
+
+PCB["LM2596_Buck_5V" 45.0mm 30.0mm]
+
+Grid[0.50mm 0.0000 0.0000 1]
+Thermal[0.500000]
+DRC[0.15mm 0.15mm 0.15mm 0.15mm 0.35mm 0.25mm]
+Flags("nameonpcb,uniquename,clearnew,snappin")
+
+Via[20.0mm 15.0mm 0.90mm 0.40mm 1.00mm 0.45mm "GND" ""]
+Via[32.0mm 15.0mm 0.90mm 0.40mm 1.00mm 0.45mm "VOUT_5V" ""]
+
+Element["" "HEADER_2P_5MM" "J1" "VIN_12V" 5.0mm 15.0mm -1.5mm -5.0mm 0 100 ""]
+(
+    Pin[0.0mm -2.5mm 2.00mm 0.50mm 2.15mm 1.10mm "VIN" "1" "square"]
+    Pin[0.0mm  2.5mm 2.00mm 0.50mm 2.15mm 1.10mm "GND" "2" ""]
+    ElementLine[-2.5mm -5.0mm  2.5mm -5.0mm 0.20mm]
+    ElementLine[ 2.5mm -5.0mm  2.5mm  5.0mm 0.20mm]
+    ElementLine[ 2.5mm  5.0mm -2.5mm  5.0mm 0.20mm]
+    ElementLine[-2.5mm  5.0mm -2.5mm -5.0mm 0.20mm]
+)
+
+Element["" "TO263_5" "U1" "LM2596S-5.0" 20.0mm 12.0mm -4.0mm -6.5mm 0 100 ""]
+(
+    Pad[-3.40mm 4.50mm -3.40mm 6.20mm 0.95mm 0.35mm 1.05mm "VIN"  "1" "square"]
+    Pad[-1.70mm 4.50mm -1.70mm 6.20mm 0.95mm 0.35mm 1.05mm "SW"   "2" "square"]
+    Pad[ 0.00mm 4.50mm  0.00mm 6.20mm 0.95mm 0.35mm 1.05mm "GND"  "3" "square"]
+    Pad[ 1.70mm 4.50mm  1.70mm 6.20mm 0.95mm 0.35mm 1.05mm "FB"   "4" "square"]
+    Pad[ 3.40mm 4.50mm  3.40mm 6.20mm 0.95mm 0.35mm 1.05mm "ONOFF" "5" "square"]
+    Pad[-3.00mm -2.50mm 3.00mm -2.50mm 5.00mm 0.40mm 5.20mm "TAB_GND" "6" "square"]
+)
+
+Element["onsolder" "CAP_0805" "C1" "100nF" 35.0mm 15.0mm -1.5mm -2.0mm 0 100 "onsolder"]
+(
+    Pad[-0.95mm 0.0mm -0.95mm 0.0mm 1.20mm 0.30mm 1.35mm "1" "1" "square"]
+    Pad[ 0.95mm 0.0mm  0.95mm 0.0mm 1.20mm 0.30mm 1.35mm "2" "2" "square"]
+)
+
+Layer(1 "top" "copper")
+(
+    Line[5.0mm 12.5mm 16.6mm 17.35mm 0.80mm 0.40mm "clearline"]
+    Line[18.3mm 17.35mm 32.0mm 15.0mm 0.80mm 0.40mm "clearline"]
+    Arc[32.0mm 12.0mm 3.0mm 3.0mm 0 90 0.50mm 0.35mm "clearline"]
+    Polygon("clearpoly")
+    (
+        [2.0mm 22.0mm] [43.0mm 22.0mm] [43.0mm 28.0mm] [2.0mm 28.0mm]
+    )
+)
+
+Layer(2 "solder" "copper")
+(
+    Line[32.0mm 15.0mm 34.05mm 15.0mm 0.50mm 0.35mm "clearline"]
+    Line[20.0mm 15.0mm 35.95mm 15.0mm 0.50mm 0.35mm "clearline"]
+)
+
+NetList()
+(
+    Net("VIN" "(unknown)")
+    (
+        Connect("J1-1")
+        Connect("U1-1")
+    )
+    Net("SW" "(unknown)")
+    (
+        Connect("U1-2")
+    )
+    Net("VOUT_5V" "(unknown)")
+    (
+        Connect("U1-4")
+        Connect("C1-1")
+    )
+    Net("GND" "(unknown)")
+    (
+        Connect("J1-2")
+        Connect("U1-3")
+        Connect("U1-6")
+        Connect("C1-2")
+    )
+)

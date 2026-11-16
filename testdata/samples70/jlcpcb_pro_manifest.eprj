@@ -1,0 +1,11 @@
+{
+  "doctype": "PROJECT",
+  "version": "2.2",
+  "title": "CH340N_USB_UART_Pro",
+  "boards": {
+    "Board1": { "pcb": "PCB/main.epcb" }
+  },
+  "schematics": {
+    "Sch1": { "sheets": ["SHEET/1/top.esch"] }
+  }
+}

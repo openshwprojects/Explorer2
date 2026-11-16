@@ -1,0 +1,43 @@
+{
+  "Header": {
+    "GenerationSoftware": {
+      "Vendor": "KiCad",
+      "Application": "Pcbnew",
+      "Version": "8.0.4"
+    },
+    "CreationDate": "2026-11-16T07:00:00+01:00"
+  },
+  "GeneralSpecs": {
+    "ProjectId": {
+      "Name": "STM32H7_FlightCtrl",
+      "GUID": "53544d33-3248-4374-926c-010203040506",
+      "Revision": "revB"
+    },
+    "Size": {
+      "X": 64.0,
+      "Y": 42.0
+    },
+    "LayerNumber": 4,
+    "BoardThickness": 1.60,
+    "Finish": "ENIG"
+  },
+  "MaterialStackup": [
+    { "Type": "Legend", "Name": "Top Silk Screen" },
+    { "Type": "SolderMask", "Thickness": 0.02, "Name": "Top Solder Mask" },
+    { "Type": "Copper", "Thickness": 0.035, "Name": "F.Cu" },
+    { "Type": "Dielectric", "Thickness": 0.20, "Material": "FR4", "Name": "Prepreg 1" },
+    { "Type": "Copper", "Thickness": 0.018, "Name": "In1.Cu (GND)" },
+    { "Type": "Dielectric", "Thickness": 1.05, "Material": "FR4", "Name": "Core" },
+    { "Type": "Copper", "Thickness": 0.018, "Name": "In2.Cu (3V3)" },
+    { "Type": "Dielectric", "Thickness": 0.20, "Material": "FR4", "Name": "Prepreg 2" },
+    { "Type": "Copper", "Thickness": 0.035, "Name": "B.Cu" },
+    { "Type": "SolderMask", "Thickness": 0.02, "Name": "Bottom Solder Mask" }
+  ],
+  "FilesAttributes": [
+    { "FilePath": "STM32H7_FlightCtrl-F_Cu.gtl", "FileFunction": "Copper,L1,Top", "FilePolarity": "Positive" },
+    { "FilePath": "STM32H7_FlightCtrl-In1_Cu.g2", "FileFunction": "Copper,L2,Inr", "FilePolarity": "Positive" },
+    { "FilePath": "STM32H7_FlightCtrl-In2_Cu.g3", "FileFunction": "Copper,L3,Inr", "FilePolarity": "Positive" },
+    { "FilePath": "STM32H7_FlightCtrl-B_Cu.gbl", "FileFunction": "Copper,L4,Bot", "FilePolarity": "Positive" },
+    { "FilePath": "STM32H7_FlightCtrl-Edge_Cuts.gm1", "FileFunction": "Profile,NP", "FilePolarity": "Positive" }
+  ]
+}

@@ -299,6 +299,10 @@ bool ImageCache::DecodeShellThumbnail(
     RawImageBuffer& outBuf)
 {
     outBuf = {};
+    if (FtpClient::IsFtpPath(path)) {
+        outBuf.failed = true;
+        return false;
+    }
     std::wstring effectivePath = path;
     if (GetFileAttributesW(effectivePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         std::wstring arcFile, innerEntry;
@@ -612,7 +616,7 @@ ID2D1Bitmap* ImageCache::GetOrQueueThumbnail(ID2D1RenderTarget* rt, const std::w
 }
 
 bool ImageCache::GetOrQueueFolderPreview(const std::wstring& folderPath, const std::wstring& normKey, FolderPreviewData& outPreview) {
-    if (folderPath.empty() || normKey.empty() || folderPath == L"THIS_PC") return false;
+    if (folderPath.empty() || normKey.empty() || folderPath == L"THIS_PC" || FtpClient::IsFtpPath(folderPath)) return false;
     m_thumbNotifyPending.store(false, std::memory_order_relaxed);
 
     {

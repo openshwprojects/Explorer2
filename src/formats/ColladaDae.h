@@ -255,6 +255,36 @@ inline void ParseUInts(std::string_view text, std::vector<uint32_t>& out, size_t
     }
 }
 
+inline void ParseSignedInts(std::string_view text, std::vector<int32_t>& out, size_t maxCount = 24000000) {
+    const char* p = text.data();
+    const char* end = p + text.size();
+    while (p < end && out.size() < maxCount) {
+        while (p < end && IsWs(*p)) ++p;
+        if (p >= end) break;
+        if (*p == '+') ++p;
+        int32_t val = 0;
+        auto res = std::from_chars(p, end, val);
+        if (res.ec != std::errc{} || res.ptr == p) {
+            while (p < end && !IsWs(*p)) ++p;
+            continue;
+        }
+        p = res.ptr;
+        out.push_back(val);
+    }
+}
+
+inline void ParseTokens(std::string_view text, std::vector<std::string>& out, size_t maxCount = 65536) {
+    const char* p = text.data();
+    const char* end = p + text.size();
+    while (p < end && out.size() < maxCount) {
+        while (p < end && IsWs(*p)) ++p;
+        if (p >= end) break;
+        const char* s = p;
+        while (p < end && !IsWs(*p)) ++p;
+        out.emplace_back(s, static_cast<size_t>(p - s));
+    }
+}
+
 // Row-major 4x4 matrix matching COLLADA <matrix> specification:
 // m[row * 4 + col]
 struct Mat4Row {
@@ -361,7 +391,167 @@ struct DaeGeometry {
 struct DaeController {
     std::string sourceId;
     Mat4Row bindShapeMat = Mat4Row::Identity();
+    bool isSkin = false;
+    std::vector<std::string> jointNames;
+    std::vector<Mat4Row> invBindMats;
+    std::vector<std::pair<int32_t, float>> influences;        // {jointIdx (-1 = bind shape), weight}
+    std::vector<std::pair<uint32_t, uint32_t>> vertInfSpan;   // {start, count} per vertex
 };
+
+inline void ParseDaeSkinBody(std::string_view skinBody, DaeController& dc) {
+    dc.isSkin = true;
+    struct SkinSrc {
+        std::vector<float> floats;
+        std::vector<std::string> names;
+        uint32_t stride = 1;
+    };
+    std::unordered_map<std::string, SkinSrc> sources;
+    std::string jointNamesSrcId;
+    std::string ibmSrcId;
+    std::string vwJointSrcId;
+    std::string vwWeightSrcId;
+    uint32_t vwJointOff = 0, vwWeightOff = 1, vwStride = 2;
+    bool hasVwJoint = false, hasVwWeight = false;
+    std::vector<uint32_t> vwCounts;
+    std::vector<int32_t> vwIndices;
+
+    size_t bp = 0;
+    XmlTag bt;
+    while (NextTag(skinBody, bp, bt)) {
+        if (bt.isClosing) continue;
+        if (bt.localName == "bind_shape_matrix" && !bt.isSelfClosing) {
+            std::string_view bsmTxt;
+            if (FindElementBody(skinBody, bp, "bind_shape_matrix", bsmTxt, bp)) {
+                std::vector<float> vals;
+                ParseFloats(bsmTxt, vals, 16);
+                if (vals.size() == 16) {
+                    for (size_t k = 0; k < 16; ++k) dc.bindShapeMat.m[k] = vals[k];
+                }
+            }
+        } else if (bt.localName == "source" && !bt.isSelfClosing) {
+            std::string srcId(GetAttr(bt.attrs, "id"));
+            std::string_view srcBody;
+            if (!FindElementBody(skinBody, bp, "source", srcBody, bp)) break;
+            if (srcId.empty()) continue;
+            SkinSrc ss;
+            size_t sp = 0;
+            XmlTag st;
+            while (NextTag(srcBody, sp, st)) {
+                if (st.isClosing) continue;
+                if (st.localName == "float_array" && !st.isSelfClosing) {
+                    std::string_view faBody;
+                    if (!FindElementBody(srcBody, sp, "float_array", faBody, sp)) break;
+                    ParseFloats(faBody, ss.floats);
+                } else if ((st.localName == "Name_array" || st.localName == "IDREF_array") && !st.isSelfClosing) {
+                    std::string_view naBody;
+                    if (!FindElementBody(srcBody, sp, st.localName, naBody, sp)) break;
+                    ParseTokens(naBody, ss.names);
+                } else if (st.localName == "accessor") {
+                    uint32_t stVal = 0;
+                    if (ParseOneU32(GetAttr(st.attrs, "stride"), stVal) && stVal > 0) ss.stride = stVal;
+                    if (!st.isSelfClosing) {
+                        std::string_view dummy;
+                        FindElementBody(srcBody, sp, "accessor", dummy, sp);
+                    }
+                }
+            }
+            sources[srcId] = std::move(ss);
+        } else if (bt.localName == "joints" && !bt.isSelfClosing) {
+            std::string_view jBody;
+            if (!FindElementBody(skinBody, bp, "joints", jBody, bp)) break;
+            size_t jp = 0;
+            XmlTag jt;
+            while (NextTag(jBody, jp, jt)) {
+                if (!jt.isClosing && jt.localName == "input") {
+                    std::string_view sem = GetAttr(jt.attrs, "semantic");
+                    std::string ref(StripHash(GetAttr(jt.attrs, "source")));
+                    if (sem == "JOINT") jointNamesSrcId = ref;
+                    else if (sem == "INV_BIND_MATRIX") ibmSrcId = ref;
+                }
+            }
+        } else if (bt.localName == "vertex_weights" && !bt.isSelfClosing) {
+            std::string_view vwBody;
+            if (!FindElementBody(skinBody, bp, "vertex_weights", vwBody, bp)) break;
+            uint32_t maxOff = 0;
+            bool anyIn = false;
+            size_t vp = 0;
+            XmlTag vt;
+            while (NextTag(vwBody, vp, vt)) {
+                if (vt.isClosing) continue;
+                if (vt.localName == "input") {
+                    uint32_t off = 0;
+                    ParseOneU32(GetAttr(vt.attrs, "offset"), off);
+                    if (!anyIn || off > maxOff) maxOff = off;
+                    anyIn = true;
+                    std::string_view sem = GetAttr(vt.attrs, "semantic");
+                    std::string ref(StripHash(GetAttr(vt.attrs, "source")));
+                    if (sem == "JOINT") { vwJointSrcId = ref; vwJointOff = off; hasVwJoint = true; }
+                    else if (sem == "WEIGHT") { vwWeightSrcId = ref; vwWeightOff = off; hasVwWeight = true; }
+                    if (!vt.isSelfClosing) {
+                        std::string_view dummy;
+                        FindElementBody(vwBody, vp, "input", dummy, vp);
+                    }
+                } else if (vt.localName == "vcount" && !vt.isSelfClosing) {
+                    std::string_view vcTxt;
+                    if (FindElementBody(vwBody, vp, "vcount", vcTxt, vp)) ParseUInts(vcTxt, vwCounts);
+                } else if (vt.localName == "v" && !vt.isSelfClosing) {
+                    std::string_view vTxt;
+                    if (FindElementBody(vwBody, vp, "v", vTxt, vp)) ParseSignedInts(vTxt, vwIndices);
+                } else if (!vt.isSelfClosing) {
+                    std::string_view skip;
+                    FindElementBody(vwBody, vp, vt.localName, skip, vp);
+                }
+            }
+            if (anyIn) vwStride = maxOff + 1u;
+        } else if (!bt.isSelfClosing) {
+            std::string_view skip;
+            FindElementBody(skinBody, bp, bt.localName, skip, bp);
+        }
+    }
+
+    const std::string& jSrcKey = !vwJointSrcId.empty() ? vwJointSrcId : jointNamesSrcId;
+    if (!jSrcKey.empty()) {
+        auto itJ = sources.find(jSrcKey);
+        if (itJ != sources.end()) dc.jointNames = itJ->second.names;
+    }
+    if (!ibmSrcId.empty()) {
+        auto itM = sources.find(ibmSrcId);
+        if (itM != sources.end() && itM->second.floats.size() >= 16) {
+            size_t nMats = itM->second.floats.size() / 16;
+            dc.invBindMats.resize(nMats);
+            for (size_t m = 0; m < nMats; ++m) {
+                for (size_t k = 0; k < 16; ++k) dc.invBindMats[m].m[k] = itM->second.floats[m * 16 + k];
+            }
+        }
+    }
+    if (hasVwJoint && hasVwWeight && !vwCounts.empty() && !vwIndices.empty() && vwStride >= 2) {
+        auto itW = sources.find(vwWeightSrcId);
+        if (itW != sources.end() && !itW->second.floats.empty()) {
+            const auto& wArr = itW->second.floats;
+            dc.vertInfSpan.reserve(vwCounts.size());
+            size_t cursor = 0;
+            for (uint32_t cnt : vwCounts) {
+                if (cnt > 256 || cursor + static_cast<size_t>(cnt) * vwStride > vwIndices.size()) break;
+                uint32_t startOut = static_cast<uint32_t>(dc.influences.size());
+                uint32_t validCnt = 0;
+                for (uint32_t c = 0; c < cnt; ++c) {
+                    int32_t jIdx = vwIndices[cursor + static_cast<size_t>(c) * vwStride + vwJointOff];
+                    int32_t wIdx = vwIndices[cursor + static_cast<size_t>(c) * vwStride + vwWeightOff];
+                    if (wIdx >= 0 && static_cast<size_t>(wIdx) < wArr.size() &&
+                        (jIdx == -1 || (jIdx >= 0 && static_cast<size_t>(jIdx) < dc.jointNames.size()))) {
+                        float w = wArr[static_cast<size_t>(wIdx)];
+                        if (std::isfinite(w) && w > 1e-7f) {
+                            dc.influences.emplace_back(jIdx, w);
+                            ++validCnt;
+                        }
+                    }
+                }
+                dc.vertInfSpan.emplace_back(startOut, validCnt);
+                cursor += static_cast<size_t>(cnt) * vwStride;
+            }
+        }
+    }
+}
 
 inline void ParseDaeMeshBody(std::string_view meshBody, DaeGeometry& geomOut) {
     std::unordered_map<std::string, DaeSource> sources;
@@ -687,6 +877,7 @@ inline bool ParseColladaDaeMesh(std::string_view sv, LoadedMesh3D& mesh) {
     std::unordered_map<std::string, std::string_view> visualScenes;
     std::vector<std::string_view> visualSceneOrder;
     std::string activeVisualSceneId;
+    size_t animClipCount = 0;
 
     // Locate <COLLADA> root body (or scan whole document if root wrapper variant)
     std::string_view docBody = sv;
@@ -800,24 +991,7 @@ inline bool ParseColladaDaeMesh(std::string_view sv, LoadedMesh3D& mesh) {
                             std::string_view skinBody;
                             if (!FindElementBody(ctrlBody, sp, st.localName, skinBody, sp)) break;
                             if (st.localName == "skin") {
-                                size_t bp = 0;
-                                XmlTag bt;
-                                while (NextTag(skinBody, bp, bt)) {
-                                    if (!bt.isClosing && bt.localName == "bind_shape_matrix" && !bt.isSelfClosing) {
-                                        std::string_view bsmTxt;
-                                        if (FindElementBody(skinBody, bp, "bind_shape_matrix", bsmTxt, bp)) {
-                                            std::vector<float> vals;
-                                            ParseFloats(bsmTxt, vals, 16);
-                                            if (vals.size() == 16) {
-                                                for (size_t k = 0; k < 16; ++k) dc.bindShapeMat.m[k] = vals[k];
-                                            }
-                                        }
-                                        break;
-                                    } else if (!bt.isClosing && !bt.isSelfClosing) {
-                                        std::string_view skip;
-                                        FindElementBody(skinBody, bp, bt.localName, skip, bp);
-                                    }
-                                }
+                                ParseDaeSkinBody(skinBody, dc);
                             }
                         } else if (!st.isSelfClosing) {
                             std::string_view skip;
@@ -853,6 +1027,23 @@ inline bool ParseColladaDaeMesh(std::string_view sv, LoadedMesh3D& mesh) {
                 } else if (!vt.isSelfClosing) {
                     std::string_view skip;
                     FindElementBody(libBody, vp, vt.localName, skip, vp);
+                }
+            }
+        } else if (tag.localName == "library_animations" && !tag.isSelfClosing) {
+            std::string_view libBody;
+            if (!FindElementBody(docBody, pos, "library_animations", libBody, pos)) break;
+            size_t ap = 0;
+            XmlTag at;
+            while (NextTag(libBody, ap, at)) {
+                if (!at.isClosing && at.localName == "animation") {
+                    ++animClipCount;
+                    if (!at.isSelfClosing) {
+                        std::string_view skip;
+                        if (!FindElementBody(libBody, ap, "animation", skip, ap)) break;
+                    }
+                } else if (!at.isClosing && !at.isSelfClosing) {
+                    std::string_view skip;
+                    if (!FindElementBody(libBody, ap, at.localName, skip, ap)) break;
                 }
             }
         } else if (tag.localName == "scene" && !tag.isSelfClosing) {
@@ -916,7 +1107,161 @@ inline bool ParseColladaDaeMesh(std::string_view sv, LoadedMesh3D& mesh) {
         return nullptr;
     };
 
+    std::unordered_map<std::string, Mat4Row> jointWorldBySid;
+    std::unordered_map<std::string, Mat4Row> jointWorldById;
+    std::unordered_map<std::string, Mat4Row> jointWorldByName;
+
+    auto lookupJointWorld = [&](const std::string& key, Mat4Row& outWorld) -> bool {
+        auto itS = jointWorldBySid.find(key);
+        if (itS != jointWorldBySid.end()) { outWorld = itS->second; return true; }
+        auto itI = jointWorldById.find(key);
+        if (itI != jointWorldById.end()) { outWorld = itI->second; return true; }
+        auto itN = jointWorldByName.find(key);
+        if (itN != jointWorldByName.end()) { outWorld = itN->second; return true; }
+        return false;
+    };
+
+    auto emitSkinnedController = [&](const DaeController& dc, const DaeGeometry& dg, const Mat4Row& fallbackWorld) -> bool {
+        if (!dc.isSkin || dc.jointNames.empty() || dc.vertInfSpan.empty()) return false;
+        if (mesh.vertices.size() + dg.positions.size() > kMaxVerts ||
+            mesh.tris.size() + dg.tris.size() > kMaxTris) {
+            return true;
+        }
+        std::vector<Mat4Row> skinMats(dc.jointNames.size());
+        std::vector<uint8_t> jointValid(dc.jointNames.size(), 0);
+        size_t foundAnyJoint = 0;
+        for (size_t j = 0; j < dc.jointNames.size(); ++j) {
+            Mat4Row jWorld;
+            if (lookupJointWorld(dc.jointNames[j], jWorld)) {
+                const Mat4Row ibm = (j < dc.invBindMats.size()) ? dc.invBindMats[j] : Mat4Row::Identity();
+                skinMats[j] = Mat4Row::Mul(jWorld, Mat4Row::Mul(ibm, dc.bindShapeMat));
+                jointValid[j] = 1;
+                ++foundAnyJoint;
+            }
+        }
+        if (foundAnyJoint == 0) return false;
+
+        uint32_t baseOff = static_cast<uint32_t>(mesh.vertices.size());
+        mesh.vertices.reserve(mesh.vertices.size() + dg.positions.size());
+        for (size_t vi = 0; vi < dg.positions.size(); ++vi) {
+            const Vec3f& localPos = dg.positions[vi];
+            Vec3f wp = { 0.0f, 0.0f, 0.0f };
+            float wSum = 0.0f;
+            if (vi < dc.vertInfSpan.size()) {
+                auto [infStart, infCnt] = dc.vertInfSpan[vi];
+                for (uint32_t k = 0; k < infCnt; ++k) {
+                    auto [jIdx, w] = dc.influences[infStart + k];
+                    Vec3f jp;
+                    if (jIdx == -1) {
+                        jp = dc.bindShapeMat.TransformPoint(localPos);
+                    } else if (jIdx >= 0 && static_cast<size_t>(jIdx) < skinMats.size() && jointValid[static_cast<size_t>(jIdx)]) {
+                        jp = skinMats[static_cast<size_t>(jIdx)].TransformPoint(localPos);
+                    } else {
+                        continue;
+                    }
+                    wp.x += jp.x * w;
+                    wp.y += jp.y * w;
+                    wp.z += jp.z * w;
+                    wSum += w;
+                }
+            }
+            if (wSum > 1e-6f) {
+                float invW = 1.0f / wSum;
+                wp.x *= invW; wp.y *= invW; wp.z *= invW;
+            } else {
+                wp = Mat4Row::Mul(fallbackWorld, dc.bindShapeMat).TransformPoint(localPos);
+            }
+            wp.x *= unitMeter; wp.y *= unitMeter; wp.z *= unitMeter;
+            Vec3f vp = ConvertUpAxis(wp, upAxis);
+            if (!std::isfinite(vp.x) || !std::isfinite(vp.y) || !std::isfinite(vp.z)) vp = { 0.0f, 0.0f, 0.0f };
+            mesh.vertices.push_back(vp);
+        }
+        mesh.tris.reserve(mesh.tris.size() + dg.tris.size());
+        for (const auto& t : dg.tris) {
+            mesh.tris.push_back({ baseOff + t[0], baseOff + t[1], baseOff + t[2], {} });
+        }
+        return true;
+    };
+
     std::vector<std::string> activeNodeIds;
+    // Pass 1 over visual_scene: evaluate and index world matrices of all <node> elements by sid / id / name
+    std::function<void(std::string_view, Mat4Row, std::string_view, int)> collectNodeMatrices =
+        [&](std::string_view nBody, Mat4Row curWorld, std::string_view nodeAttrs, int depth) {
+            if (depth > 64) return;
+            size_t np = 0;
+            XmlTag nt;
+            std::vector<std::pair<std::string, std::string_view>> childNodes;
+            std::vector<std::string> instNodeRefs;
+            while (NextTag(nBody, np, nt)) {
+                if (nt.isClosing) continue;
+                if (nt.localName == "matrix" && !nt.isSelfClosing) {
+                    std::string_view mTxt;
+                    if (!FindElementBody(nBody, np, "matrix", mTxt, np)) break;
+                    std::vector<float> vals;
+                    ParseFloats(mTxt, vals, 16);
+                    if (vals.size() == 16) {
+                        Mat4Row m;
+                        for (size_t k = 0; k < 16; ++k) m.m[k] = vals[k];
+                        curWorld = Mat4Row::Mul(curWorld, m);
+                    }
+                } else if (nt.localName == "translate" && !nt.isSelfClosing) {
+                    std::string_view tTxt;
+                    if (!FindElementBody(nBody, np, "translate", tTxt, np)) break;
+                    std::vector<float> vals;
+                    ParseFloats(tTxt, vals, 3);
+                    if (vals.size() >= 3) curWorld = Mat4Row::Mul(curWorld, Mat4Row::Translate(vals[0], vals[1], vals[2]));
+                } else if (nt.localName == "rotate" && !nt.isSelfClosing) {
+                    std::string_view rTxt;
+                    if (!FindElementBody(nBody, np, "rotate", rTxt, np)) break;
+                    std::vector<float> vals;
+                    ParseFloats(rTxt, vals, 4);
+                    if (vals.size() >= 4) curWorld = Mat4Row::Mul(curWorld, Mat4Row::RotateAxisDeg(vals[0], vals[1], vals[2], vals[3]));
+                } else if (nt.localName == "scale" && !nt.isSelfClosing) {
+                    std::string_view sTxt;
+                    if (!FindElementBody(nBody, np, "scale", sTxt, np)) break;
+                    std::vector<float> vals;
+                    ParseFloats(sTxt, vals, 3);
+                    if (vals.size() >= 3) curWorld = Mat4Row::Mul(curWorld, Mat4Row::Scale(vals[0], vals[1], vals[2]));
+                } else if (nt.localName == "node") {
+                    std::string attrsCopy(nt.attrs);
+                    if (nt.isSelfClosing) continue;
+                    std::string_view cBody;
+                    if (!FindElementBody(nBody, np, "node", cBody, np)) break;
+                    childNodes.emplace_back(std::move(attrsCopy), cBody);
+                } else if (nt.localName == "instance_node") {
+                    std::string refId(StripHash(GetAttr(nt.attrs, "url")));
+                    if (!refId.empty()) instNodeRefs.push_back(std::move(refId));
+                    if (!nt.isSelfClosing) {
+                        std::string_view skip;
+                        if (!FindElementBody(nBody, np, "instance_node", skip, np)) break;
+                    }
+                } else if (!nt.isSelfClosing) {
+                    std::string_view skip;
+                    if (!FindElementBody(nBody, np, nt.localName, skip, np)) break;
+                }
+            }
+            if (!nodeAttrs.empty()) {
+                std::string sid(GetAttr(nodeAttrs, "sid"));
+                std::string id(GetAttr(nodeAttrs, "id"));
+                std::string nm(GetAttr(nodeAttrs, "name"));
+                if (!sid.empty()) jointWorldBySid[sid] = curWorld;
+                if (!id.empty())  jointWorldById[id]   = curWorld;
+                if (!nm.empty())  jointWorldByName[nm] = curWorld;
+            }
+            for (const auto& [cAttrs, cBody] : childNodes) {
+                collectNodeMatrices(cBody, curWorld, cAttrs, depth + 1);
+            }
+            for (const std::string& refId : instNodeRefs) {
+                auto itN = namedNodes.find(refId);
+                if (itN != namedNodes.end() &&
+                    std::find(activeNodeIds.begin(), activeNodeIds.end(), refId) == activeNodeIds.end()) {
+                    activeNodeIds.push_back(refId);
+                    collectNodeMatrices(itN->second, curWorld, "", depth + 1);
+                    activeNodeIds.pop_back();
+                }
+            }
+        };
+
     std::function<void(std::string_view, Mat4Row, int)> traverseNodeBody =
         [&](std::string_view nBody, Mat4Row curWorld, int depth) {
             if (depth > 64) return;
@@ -973,7 +1318,10 @@ inline bool ParseColladaDaeMesh(std::string_view sv, LoadedMesh3D& mesh) {
                     std::string ctrlId(StripHash(GetAttr(nt.attrs, "url")));
                     Mat4Row bindMat;
                     if (const DaeGeometry* dg = resolveControllerToGeom(ctrlId, bindMat)) {
-                        emitGeometry(*dg, Mat4Row::Mul(curWorld, bindMat));
+                        auto itC = controllers.find(ctrlId);
+                        if (itC == controllers.end() || !emitSkinnedController(itC->second, *dg, curWorld)) {
+                            emitGeometry(*dg, Mat4Row::Mul(curWorld, bindMat));
+                        }
                     }
                     if (!nt.isSelfClosing) {
                         std::string_view skip;
@@ -1010,6 +1358,23 @@ inline bool ParseColladaDaeMesh(std::string_view sv, LoadedMesh3D& mesh) {
         };
 
     auto traverseVisualScene = [&](std::string_view vsBody) {
+        // Pre-pass: index all joint/node world transforms before evaluating <instance_controller>
+        {
+            size_t jp = 0;
+            XmlTag jt;
+            while (NextTag(vsBody, jp, jt)) {
+                if (jt.isClosing) continue;
+                if (jt.localName == "node" && !jt.isSelfClosing) {
+                    std::string attrsCopy(jt.attrs);
+                    std::string_view nBody;
+                    if (!FindElementBody(vsBody, jp, "node", nBody, jp)) break;
+                    collectNodeMatrices(nBody, Mat4Row::Identity(), attrsCopy, 0);
+                } else if (!jt.isSelfClosing) {
+                    std::string_view skip;
+                    if (!FindElementBody(vsBody, jp, jt.localName, skip, jp)) break;
+                }
+            }
+        }
         size_t vp = 0;
         XmlTag vt;
         while (NextTag(vsBody, vp, vt)) {
@@ -1052,6 +1417,9 @@ inline bool ParseColladaDaeMesh(std::string_view sv, LoadedMesh3D& mesh) {
         mesh.vertices.clear();
         mesh.tris.clear();
         return false;
+    }
+    if (animClipCount > 0) {
+        mesh.animFrameCount = std::max<size_t>(mesh.animFrameCount, animClipCount + 1);
     }
     return true;
 }

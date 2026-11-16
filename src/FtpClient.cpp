@@ -1,9 +1,16 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "FtpClient.h"
 #include "PathUtils.h"
 #include "FileEngine.h"
 #include "AppLog.h"
 #include <wininet.h>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <cwctype>
 #include <map>
@@ -11,6 +18,7 @@
 #include <thread>
 
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 namespace Explorer2 {
 
@@ -26,6 +34,215 @@ struct CachedFtpListing {
 };
 std::mutex g_ftpListingCacheMutex;
 std::map<std::wstring, CachedFtpListing> g_ftpListingCache;
+
+struct CachedUnreachableFtp {
+    ULONGLONG tick = 0;
+    std::wstring errorMsg;
+};
+std::mutex g_ftpUnreachableMutex;
+std::map<std::wstring, CachedUnreachableFtp> g_ftpUnreachableCache;
+
+std::once_flag g_wsaInitOnce;
+void EnsureWinsockInitialized() {
+    std::call_once(g_wsaInitOnce, []() {
+        WSADATA wsa = {};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    });
+}
+
+HANDLE GetCurlJobObject() {
+    static HANDLE s_job = []() -> HANDLE {
+        HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
+        if (hJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+        }
+        return hJob;
+    }();
+    return s_job;
+}
+
+std::mutex g_curlSemMutex;
+std::condition_variable g_curlSemCv;
+int g_activeCurlProcesses = 0;
+constexpr int kMaxConcurrentCurlProcesses = 2;
+
+struct CurlConcurrencyGuard {
+    bool acquired = false;
+    explicit CurlConcurrencyGuard(DWORD maxWaitMs = 2500) {
+        std::unique_lock<std::mutex> lk(g_curlSemMutex);
+        if (g_curlSemCv.wait_for(lk, std::chrono::milliseconds(maxWaitMs),
+                []() { return g_activeCurlProcesses < kMaxConcurrentCurlProcesses; })) {
+            ++g_activeCurlProcesses;
+            acquired = true;
+        }
+    }
+    ~CurlConcurrencyGuard() {
+        if (acquired) {
+            {
+                std::lock_guard<std::mutex> lk(g_curlSemMutex);
+                --g_activeCurlProcesses;
+            }
+            g_curlSemCv.notify_one();
+        }
+    }
+    CurlConcurrencyGuard(const CurlConcurrencyGuard&) = delete;
+    CurlConcurrencyGuard& operator=(const CurlConcurrencyGuard&) = delete;
+};
+
+bool ProbeTcpEndpointReachable(const std::wstring& rawHost, uint16_t port, std::wstring* outError) {
+    if (rawHost.empty() || port == 0) {
+        if (outError) *outError = L"Nieprawidłowy host lub port FTP";
+        return false;
+    }
+
+    std::wstring host = rawHost;
+    if (host.size() >= 2 && host.front() == L'[' && host.back() == L']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    std::wstring hostLower = PathUtils::ToLower(host);
+    std::wstring endpointKey = hostLower + L":" + std::to_wstring(port);
+
+    // 1. Negative reachability cache (8s cooldown so background workers / rapid clicks complete in 0 ms)
+    {
+        std::lock_guard<std::mutex> lk(g_ftpUnreachableMutex);
+        auto it = g_ftpUnreachableCache.find(endpointKey);
+        if (it != g_ftpUnreachableCache.end() && (GetTickCount64() - it->second.tick) < 8000ULL) {
+            if (outError) *outError = it->second.errorMsg;
+            return false;
+        }
+    }
+
+    EnsureWinsockInitialized();
+
+    sockaddr_storage ss = {};
+    int ssLen = 0;
+    int family = AF_UNSPEC;
+    bool isLoopback = false;
+
+    std::string hostAscii = PathUtils::WideToUtf8(hostLower);
+    if (hostLower == L"localhost") {
+        auto* sin = reinterpret_cast<sockaddr_in*>(&ss);
+        sin->sin_family = AF_INET;
+        sin->sin_port = htons(port);
+        sin->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ssLen = sizeof(sockaddr_in);
+        family = AF_INET;
+        isLoopback = true;
+    } else {
+        in_addr v4 = {};
+        in6_addr v6 = {};
+        if (inet_pton(AF_INET, hostAscii.c_str(), &v4) == 1) {
+            auto* sin = reinterpret_cast<sockaddr_in*>(&ss);
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons(port);
+            sin->sin_addr = v4;
+            ssLen = sizeof(sockaddr_in);
+            family = AF_INET;
+            uint32_t hostOrder = ntohl(v4.s_addr);
+            isLoopback = ((hostOrder >> 24) == 127u);
+        } else if (inet_pton(AF_INET6, hostAscii.c_str(), &v6) == 1) {
+            auto* sin6 = reinterpret_cast<sockaddr_in6*>(&ss);
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port = htons(port);
+            sin6->sin6_addr = v6;
+            ssLen = sizeof(sockaddr_in6);
+            family = AF_INET6;
+            static const uint8_t kLoop6[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 };
+            isLoopback = (std::memcmp(&v6, kLoop6, 16) == 0);
+        }
+    }
+
+    ADDRINFOW* resolvedList = nullptr;
+    if (family == AF_UNSPEC) {
+        ADDRINFOW hints = {};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        std::wstring portStr = std::to_wstring(port);
+        if (GetAddrInfoW(host.c_str(), portStr.c_str(), &hints, &resolvedList) != 0 || !resolvedList) {
+            std::wstring err = L"Nie można rozwiązać nazwy serwera FTP: " + rawHost;
+            {
+                std::lock_guard<std::mutex> lk(g_ftpUnreachableMutex);
+                g_ftpUnreachableCache[endpointKey] = { GetTickCount64(), err };
+            }
+            if (outError) *outError = err;
+            return false;
+        }
+        family = resolvedList->ai_family;
+        ssLen = static_cast<int>(resolvedList->ai_addrlen);
+        std::memcpy(&ss, resolvedList->ai_addr, resolvedList->ai_addrlen);
+        FreeAddrInfoW(resolvedList);
+    }
+
+    SOCKET sock = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        if (outError) *outError = L"Nie można utworzyć gniazda TCP dla FTP";
+        return false;
+    }
+
+    u_long nonBlock = 1;
+    ioctlsocket(sock, FIONBIO, &nonBlock);
+
+    bool connected = false;
+    int lastWsaErr = 0;
+    int rc = connect(sock, reinterpret_cast<const sockaddr*>(&ss), ssLen);
+    if (rc == 0) {
+        connected = true;
+    } else {
+        lastWsaErr = WSAGetLastError();
+        if (lastWsaErr == WSAEWOULDBLOCK || lastWsaErr == WSAEINPROGRESS) {
+            fd_set wfds, efds;
+            FD_ZERO(&wfds);
+            FD_ZERO(&efds);
+            FD_SET(sock, &wfds);
+            FD_SET(sock, &efds);
+            // Loopback responds in < 2 ms (SYN -> RST when no server listens); cap at 350 ms loopback / 1500 ms remote
+            const long timeoutMs = isLoopback ? 350 : 1500;
+            timeval tv = {};
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            int sel = select(0, nullptr, &wfds, &efds, &tv);
+            if (sel > 0 && FD_ISSET(sock, &wfds) && !FD_ISSET(sock, &efds)) {
+                int soErr = 0;
+                int optLen = sizeof(soErr);
+                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &optLen) == 0 && soErr == 0) {
+                    connected = true;
+                } else {
+                    lastWsaErr = soErr;
+                }
+            } else if (sel > 0 && FD_ISSET(sock, &efds)) {
+                int soErr = 0;
+                int optLen = sizeof(soErr);
+                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &optLen) == 0) {
+                    lastWsaErr = soErr;
+                }
+            } else {
+                lastWsaErr = WSAETIMEDOUT;
+            }
+        }
+    }
+
+    closesocket(sock);
+
+    if (connected) {
+        std::lock_guard<std::mutex> lk(g_ftpUnreachableMutex);
+        g_ftpUnreachableCache.erase(endpointKey);
+        return true;
+    }
+
+    std::wstring reason = (lastWsaErr == WSAECONNREFUSED)
+        ? L"połączenie odrzucone — brak uruchomionego serwera FTP"
+        : L"przekroczono limit czasu lub host niedostępny";
+    std::wstring errMsg = L"Brak odpowiedzi serwera FTP " + rawHost + L":" + std::to_wstring(port) + L" (" + reason + L")";
+    {
+        std::lock_guard<std::mutex> lk(g_ftpUnreachableMutex);
+        g_ftpUnreachableCache[endpointKey] = { GetTickCount64(), errMsg };
+    }
+    if (outError) *outError = errMsg;
+    return false;
+}
 
 std::mutex g_fzCacheMutex;
 std::vector<FtpBookmark> g_cachedFzSites;
@@ -152,6 +369,11 @@ bool RunCurlProcessCapture(
     if (outStdout) outStdout->clear();
     if (outStderr) outStderr->clear();
 
+    CurlConcurrencyGuard semGuard(2500);
+    if (!semGuard.acquired) {
+        return false;
+    }
+
     wchar_t sysDir[MAX_PATH] = {};
     GetSystemDirectoryW(sysDir, MAX_PATH);
     std::wstring curlExe = std::wstring(sysDir) + L"\\curl.exe";
@@ -181,7 +403,7 @@ bool RunCurlProcessCapture(
     si.wShowWindow = SW_HIDE;
     si.hStdOutput = hOutW;
     si.hStdError = hErrW;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdInput = nullptr;
 
     PROCESS_INFORMATION pi = {};
     BOOL started = CreateProcessW(
@@ -205,6 +427,20 @@ bool RunCurlProcessCapture(
         return false;
     }
 
+    if (HANDLE hJob = GetCurlJobObject()) {
+        AssignProcessToJobObject(hJob, pi.hProcess);
+    }
+
+    std::thread outReader([hOutR, outStdout]() {
+        char buf[4096];
+        DWORD n = 0;
+        while (ReadFile(hOutR, buf, sizeof(buf), &n, nullptr) && n > 0) {
+            if (outStdout && outStdout->size() < (16 * 1024 * 1024)) {
+                outStdout->append(buf, n);
+            }
+        }
+    });
+
     std::thread errReader([hErrR, outStderr]() {
         char buf[1024];
         DWORD n = 0;
@@ -215,19 +451,13 @@ bool RunCurlProcessCapture(
         }
     });
 
-    char buf[4096];
-    DWORD n = 0;
-    while (ReadFile(hOutR, buf, sizeof(buf), &n, nullptr) && n > 0) {
-        if (outStdout && outStdout->size() < (16 * 1024 * 1024)) {
-            outStdout->append(buf, n);
-        }
-    }
-
     DWORD waitRes = WaitForSingleObject(pi.hProcess, timeoutMs);
-    if (waitRes == WAIT_TIMEOUT) {
+    if (waitRes != WAIT_OBJECT_0) {
         TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 1000);
     }
 
+    if (outReader.joinable()) outReader.join();
     if (errReader.joinable()) errReader.join();
     CloseHandle(hOutR);
     CloseHandle(hErrR);
@@ -246,6 +476,11 @@ bool RunCurlStreamDownload(
     bool& outCancelled)
 {
     outCancelled = false;
+    CurlConcurrencyGuard semGuard(5000);
+    if (!semGuard.acquired) {
+        return false;
+    }
+
     wchar_t sysDir[MAX_PATH] = {};
     GetSystemDirectoryW(sysDir, MAX_PATH);
     std::wstring curlExe = std::wstring(sysDir) + L"\\curl.exe";
@@ -279,7 +514,7 @@ bool RunCurlStreamDownload(
     si.wShowWindow = SW_HIDE;
     si.hStdOutput = hOutW;
     si.hStdError = hErrW;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdInput = nullptr;
 
     PROCESS_INFORMATION pi = {};
     BOOL started = CreateProcessW(
@@ -301,6 +536,10 @@ bool RunCurlStreamDownload(
         CloseHandle(hOutR);
         CloseHandle(hErrR);
         return false;
+    }
+
+    if (HANDLE hJob = GetCurlJobObject()) {
+        AssignProcessToJobObject(hJob, pi.hProcess);
     }
 
     std::thread errReader([hErrR]() {
@@ -349,6 +588,11 @@ bool RunCurlStreamUpload(
     bool& outCancelled)
 {
     outCancelled = false;
+    CurlConcurrencyGuard semGuard(5000);
+    if (!semGuard.acquired) {
+        return false;
+    }
+
     wchar_t sysDir[MAX_PATH] = {};
     GetSystemDirectoryW(sysDir, MAX_PATH);
     std::wstring curlExe = std::wstring(sysDir) + L"\\curl.exe";
@@ -414,6 +658,10 @@ bool RunCurlStreamUpload(
         CloseHandle(hOutR);
         CloseHandle(hErrR);
         return false;
+    }
+
+    if (HANDLE hJob = GetCurlJobObject()) {
+        AssignProcessToJobObject(hJob, pi.hProcess);
     }
 
     std::thread outReader([hOutR]() {
@@ -883,14 +1131,53 @@ void FtpClient::RegisterMockFtpFileContent(const std::wstring& ftpFileUrl, const
 }
 
 void FtpClient::ClearMockFtpData() {
-    std::lock_guard<std::mutex> lk(g_mockFtpMutex);
-    g_mockListings.clear();
-    g_mockFiles.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_mockFtpMutex);
+        g_mockListings.clear();
+        g_mockFiles.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_ftpUnreachableMutex);
+        g_ftpUnreachableCache.clear();
+    }
 }
 
 void FtpClient::InvalidateListingCache() {
-    std::lock_guard<std::mutex> lk(g_ftpListingCacheMutex);
-    g_ftpListingCache.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_ftpListingCacheMutex);
+        g_ftpListingCache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_ftpUnreachableMutex);
+        g_ftpUnreachableCache.clear();
+    }
+}
+
+bool FtpClient::CanReachFtpEndpoint(const std::wstring& ftpUrl, std::wstring* outError) {
+    FtpUrlInfo info;
+    if (!ParseFtpUrl(ftpUrl, info)) {
+        if (outError) *outError = L"Nieprawidłowy adres URL FTP";
+        return false;
+    }
+
+    // Registered in-memory mock FTP hosts are always reachable offline
+    {
+        std::wstring mockKey = NormalizeMockKey(info);
+        std::wstring hostPrefix = PathUtils::ToLower(info.host) + L":" + std::to_wstring(info.port) + L"/";
+        std::lock_guard<std::mutex> lk(g_mockFtpMutex);
+        if (g_mockListings.find(mockKey) != g_mockListings.end() ||
+            g_mockFiles.find(mockKey) != g_mockFiles.end()) {
+            return true;
+        }
+        for (const auto& kv : g_mockListings) {
+            if (kv.first.rfind(hostPrefix, 0) == 0) return true;
+        }
+        for (const auto& kv : g_mockFiles) {
+            if (kv.first.rfind(hostPrefix, 0) == 0) return true;
+        }
+    }
+
+    return ProbeTcpEndpointReachable(info.host, info.port, outError);
 }
 
 bool FtpClient::EnumerateFtpDirectory(
@@ -928,6 +1215,11 @@ bool FtpClient::EnumerateFtpDirectory(
             outEntries = it->second.entries;
             return true;
         }
+    }
+
+    // 2b. Fast non-blocking TCP pre-flight check before spawning any curl.exe or WinINet session!
+    if (!ProbeTcpEndpointReachable(info.host, info.port, outError)) {
+        return false;
     }
 
     // 3. Try curl.exe with WinSSL (--ssl -k --ftp-pasv) which supports Explicit FTPS (AUTH TLS),
@@ -1164,6 +1456,10 @@ bool FtpClient::DownloadFtpFileToLocalEx(
             if (!ok) DeleteFileW(localDestPath.c_str());
             return ok;
         }
+    }
+
+    if (!ProbeTcpEndpointReachable(info.host, info.port, outError)) {
+        return false;
     }
 
     HANDLE hDst = CreateFileW(
@@ -1443,6 +1739,10 @@ bool FtpClient::UploadLocalFileToFtpEx(
         }
     }
 
+    if (!ProbeTcpEndpointReachable(info.host, info.port, outError)) {
+        return false;
+    }
+
     HANDLE hSrc = CreateFileW(
         localSrcPath.c_str(),
         GENERIC_READ,
@@ -1598,6 +1898,10 @@ bool FtpClient::CreateFtpDirectory(const std::wstring& ftpDirUrl, std::wstring* 
         }
     }
 
+    if (!ProbeTcpEndpointReachable(info.host, info.port, outError)) {
+        return false;
+    }
+
     {
         std::wstring scheme = (info.useFtps && info.port == 990) ? L"ftps://" : L"ftp://";
         std::wstring cleanRootUrl = scheme + info.host + L":" + std::to_wstring(info.port) + L"/";
@@ -1666,6 +1970,10 @@ bool FtpClient::DeleteFtpItem(const std::wstring& ftpItemUrl, bool isDirectory, 
             }
             return true;
         }
+    }
+
+    if (!ProbeTcpEndpointReachable(info.host, info.port, outError)) {
+        return false;
     }
 
     {
@@ -1741,6 +2049,10 @@ bool FtpClient::RenameFtpItem(
             }
             return true;
         }
+    }
+
+    if (!ProbeTcpEndpointReachable(oldInfo.host, oldInfo.port, outError)) {
+        return false;
     }
 
     // Try curl.exe RNFR / RNTO
@@ -2051,9 +2363,6 @@ std::vector<FtpBookmark> FtpClient::LoadBookmarks(const std::wstring& iniPathIn)
                 addUniqueBookmark(std::move(bm));
             }
         }
-    } else if (out.empty()) {
-        addUniqueBookmark({ L"Lokalny serwer FTP (127.0.0.1:21)", L"ftp://anonymous@127.0.0.1:21/" });
-        addUniqueBookmark({ L"Serwer NAS / Router (192.168.1.1:21)", L"ftp://admin@192.168.1.1:21/" });
     }
 
     return out;

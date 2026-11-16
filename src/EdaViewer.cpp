@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <tuple>
 #include <unordered_map>
 
 namespace Explorer2 {
@@ -704,6 +705,7 @@ static bool ParseEagleBinaryV4V5(const uint8_t* data, size_t size, const std::ws
 } // namespace
 
 #include "formats/LtspiceAsc.h"
+#include "formats/SpiceRawWave.h"
 #include "formats/SpecctraDsn.h"
 #include "formats/IpcD356.h"
 #include "formats/IntelHex.h"
@@ -719,6 +721,9 @@ static bool ParseEagleBinaryV4V5(const uint8_t* data, size_t size, const std::ws
 #include "formats/CmsisSvd.h"
 #include "formats/ExtendedEda100.h"
 #include "formats/ExtendedEda200.h"
+#include "formats/EasyEda.h"
+#include "formats/GateNetlistTdms.h"
+#include "formats/Ipc2581OdbFritzing.h"
 
 EdaViewer::~EdaViewer() {
     Shutdown();
@@ -739,17 +744,22 @@ bool EdaViewer::IsEdaExtension(const std::wstring& extLower) {
            extLower == L".gbr"       || extLower == L".ger"       || extLower == L".gtl"       ||
            extLower == L".gbl"       || extLower == L".gts"       || extLower == L".gbs"       ||
            extLower == L".gto"       || extLower == L".gbo"       || extLower == L".gm1"       ||
-           extLower == L".gko"       || extLower == L".drl"       || extLower == L".xln"       ||
-           extLower == L".dxf"       || extLower == L".asc"       || extLower == L".dsn"       ||
+           extLower == L".gko"       || extLower == L".gtp"       || extLower == L".gbp"       ||
+           extLower == L".g2"        || extLower == L".g3"        || extLower == L".gp1"       ||
+           extLower == L".gp2"       || extLower == L".oln"       || extLower == L".gbrjob"    ||
+           extLower == L".drl"       || extLower == L".xln"       || extLower == L".exc"       ||
+           extLower == L".dxf"       || extLower == L".asc"       || extLower == L".asy"       ||
+           extLower == L".dsn"       || extLower == L".olb"       ||
            extLower == L".d356"      || extLower == L".ipc"       || extLower == L".hex"       ||
            extLower == L".ihex"      || extLower == L".srec"      || extLower == L".s19"       ||
            extLower == L".mot"       || extLower == L".cir"       || extLower == L".spice"     ||
            extLower == L".sp"        || extLower == L".net"       || extLower == L".hpgl"      ||
            extLower == L".plt"       || extLower == L".vcd"       || extLower == L".s1p"       ||
            extLower == L".s2p"       || extLower == L".lef"       || extLower == L".def"       ||
-           extLower == L".gds"       || extLower == L".gds2"      || extLower == L".bsdl"      ||
+           extLower == L".gds"       || extLower == L".gds2"      || extLower == L".bsdl"      || extLower == L".bsd" ||
            extLower == L".svd"       || extLower == L".odb"       || extLower == L".ipc2581"   ||
            extLower == L".cvg"       || extLower == L".pcbdoc"    || extLower == L".schdoc"    ||
+           extLower == L".pcblib"    || extLower == L".schlib"    ||
            extLower == L".blf"       || extLower == L".can"       || extLower == L".dbc"       ||
            extLower == L".fst"       || extLower == L".ghw"       || extLower == L".bit"       ||
            extLower == L".rpd"       || extLower == L".dfu"       || extLower == L".ufd"       ||
@@ -763,7 +773,46 @@ bool EdaViewer::IsEdaExtension(const std::wstring& extLower) {
            extLower == L".sr"        || extLower == L".sal"       || extLower == L".wfm"       ||
            extLower == L".isf"       || extLower == L".mf4"       || extLower == L".mdf"       ||
            extLower == L".ldf"       || extLower == L".arxml"     || extLower == L".eds"       ||
-           extLower == L".dcf"       || extLower == L".gsdml"     || extLower == L".l5x";
+           extLower == L".dcf"       || extLower == L".gsdml"     || extLower == L".l5x"       ||
+           extLower == L".raw"       || extLower == L".tr0"       || extLower == L".ac0"       || extLower == L".sw0"  ||
+           extLower == L".epro"      || extLower == L".eprj"      || extLower == L".epcb"      || extLower == L".esch" ||
+           extLower == L".esym"      || extLower == L".efoo"      || extLower == L".json"      ||
+           extLower == L".edif"      || extLower == L".edn"       || extLower == L".blif"      || extLower == L".eblif"||
+           extLower == L".aig"       || extLower == L".aag"       || extLower == L".lib"       || extLower == L".sdf"  ||
+           extLower == L".tdms"      || extLower == L".tgz"       || extLower == L".fzz"       || extLower == L".fzpz" ||
+           extLower == L".fz"        || extLower == L".fzp"       || extLower == L".pcb";
+}
+
+bool EdaViewer::IsLikelyOdbPlusPlusTgz(const std::wstring& fullPath) {
+    std::vector<uint8_t> raw;
+    if (!PathUtils::ReadFileBytes(fullPath, 8 * 1024 * 1024, raw) || raw.size() < 16) return false;
+    return Formats::IsLikelyOdbPlusPlusArchiveBytes(raw.data(), raw.size());
+}
+
+bool EdaViewer::IsLikelyLibertyOrEdaSdfFile(const std::wstring& fullPath, const std::wstring& extLower) {
+    std::vector<uint8_t> hdr;
+    if (!PathUtils::ReadFileBytes(fullPath, 8192, hdr) || hdr.size() < 16) return false;
+    if (extLower == L".lib") return Formats::IsLikelyLibertyLibBytes(hdr.data(), hdr.size());
+    if (extLower == L".sdf") return Formats::IsLikelyIeeeSdfBytes(hdr.data(), hdr.size());
+    return false;
+}
+
+bool EdaViewer::IsLikelyEasyEdaJsonFile(const std::wstring& fullPath) {
+    std::vector<uint8_t> hdr;
+    if (!PathUtils::ReadFileBytes(fullPath, 8192, hdr) || hdr.size() < 24) return false;
+    return Formats::IsLikelyEasyEdaJsonBytes(hdr.data(), hdr.size());
+}
+
+bool EdaViewer::IsLikelySpiceRawFile(const std::wstring& fullPath) {
+    std::vector<uint8_t> hdr;
+    if (!PathUtils::ReadFileBytes(fullPath, 1024, hdr) || hdr.size() < 24) return false;
+    return Formats::IsLikelySpiceRawHeaderBytes(hdr.data(), hdr.size());
+}
+
+bool EdaViewer::IsLikelyAsicDefFile(const std::wstring& fullPath) {
+    std::vector<uint8_t> hdr;
+    if (!PathUtils::ReadFileBytes(fullPath, 4096, hdr) || hdr.size() < 16) return false;
+    return Formats::IsLikelyAsicDefBytes(hdr.data(), hdr.size());
 }
 
 bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& outBoard) try {
@@ -786,8 +835,9 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
     {
         bool handledExt = true;
         bool okMod = false;
-        if (ext == L".asc") okMod = Formats::ParseLtspiceAsc(sv, outBoard);
-        else if (ext == L".dsn") okMod = Formats::ParseSpecctraDsn(sv, outBoard);
+        if (ext == L".asc" || ext == L".asy") okMod = Formats::ParseLtspiceBytes(raw.data(), raw.size(), fullPath, ext, outBoard);
+        else if (ext == L".raw" || ext == L".tr0" || ext == L".ac0" || ext == L".sw0") okMod = Formats::ParseSpiceWaveformFile(raw.data(), raw.size(), ext, outBoard);
+        else if (ext == L".dsn" || ext == L".olb") okMod = Formats::ParseOrCadOrSpecctraDsn(raw.data(), raw.size(), outBoard);
         else if (ext == L".d356" || ext == L".ipc") okMod = Formats::ParseIpcD356(sv, outBoard);
         else if (ext == L".hex" || ext == L".ihex") okMod = Formats::ParseIntelHexBoard(sv, outBoard);
         else if (ext == L".srec" || ext == L".s19" || ext == L".mot") okMod = Formats::ParseMotorolaSrecBoard(sv, outBoard);
@@ -798,10 +848,18 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
         else if (ext == L".lef") okMod = Formats::ParseAsicLefBoard(sv, outBoard);
         else if (ext == L".def") okMod = Formats::ParseAsicDefBoard(sv, outBoard);
         else if (ext == L".gds" || ext == L".gds2") okMod = Formats::ParseGdsiiStreamBoard(raw.data(), raw.size(), outBoard);
-        else if (ext == L".bsdl") okMod = Formats::ParseJtagBsdlBoard(sv, outBoard);
+        else if (ext == L".bsdl" || ext == L".bsd") okMod = Formats::ParseJtagBsdlBoard(sv, outBoard);
         else if (ext == L".svd") okMod = Formats::ParseCmsisSvdBoard(sv, outBoard);
-        else if (ext == L".odb" || ext == L".ipc2581" || ext == L".cvg") okMod = Formats::ParseOdbOrIpc2581Board(raw.data(), raw.size(), ext, outBoard);
-        else if (ext == L".pcbdoc" || ext == L".schdoc") okMod = Formats::ParseAltiumDocBoard(raw.data(), raw.size(), ext, outBoard);
+        else if (ext == L".odb" || ext == L".tgz" || ext == L".ipc2581" || ext == L".cvg" ||
+                 ext == L".fzz" || ext == L".fzpz" || ext == L".fz" || ext == L".fzp" || ext == L".pcb")
+            okMod = Formats::ParseMfgIpcOdbFritzingGeda(raw.data(), raw.size(), ext, outBoard);
+        else if (ext == L".pcbdoc" || ext == L".schdoc" || ext == L".pcblib" || ext == L".schlib") okMod = Formats::ParseAltiumDocBoard(raw.data(), raw.size(), ext, outBoard);
+        else if (ext == L".epro" || ext == L".eprj" || ext == L".epcb" || ext == L".esch" ||
+                 ext == L".esym" || ext == L".efoo" || ext == L".json")
+            okMod = Formats::ParseEasyEdaFile(raw.data(), raw.size(), fullPath, ext, outBoard);
+        else if (ext == L".edif" || ext == L".edn" || ext == L".blif" || ext == L".eblif" ||
+                 ext == L".aig"  || ext == L".aag" || ext == L".lib"  || ext == L".sdf"   || ext == L".tdms")
+            okMod = Formats::ParseGateNetlistOrTdmsFile(raw.data(), raw.size(), ext, outBoard);
         else if (ext == L".dbc" || ext == L".blf" || ext == L".can") okMod = Formats::ParseVectorCanBoard(raw.data(), raw.size(), ext, outBoard);
         else if (ext == L".fst" || ext == L".ghw" || ext == L".bit" || ext == L".rpd" ||
                  ext == L".dfu" || ext == L".ufd" || ext == L".edid" || ext == L".spd")
@@ -857,8 +915,10 @@ bool EdaViewer::InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& out
     const bool isGerberOrDrillExt =
         ext == L".gbr" || ext == L".ger" || ext == L".gtl" || ext == L".gbl" ||
         ext == L".gts" || ext == L".gbs" || ext == L".gto" || ext == L".gbo" ||
-        ext == L".gm1" || ext == L".gko" || ext == L".drl" || ext == L".xln";
-    if (!isGerberOrDrillExt && sv.find("%FSLA") == std::string_view::npos && sv.rfind("M48", 0) != 0) {
+        ext == L".gm1" || ext == L".gko" || ext == L".gtp" || ext == L".gbp" ||
+        ext == L".g2"  || ext == L".g3"  || ext == L".gp1" || ext == L".gp2" ||
+        ext == L".oln" || ext == L".gbrjob" || ext == L".drl" || ext == L".xln" || ext == L".exc";
+    if (!isGerberOrDrillExt && sv.find("%FS") == std::string_view::npos && sv.rfind("M48", 0) != 0) {
         outBoard = ParsedEdaBoard{};
         return false;
     }
@@ -1073,6 +1133,57 @@ void EdaViewer::Draw2DCanvas(
                 fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             }
         }
+    }
+
+    // 6. Board & Schematic Text Labels (board.labels)
+    if ((m_showSilk || isSch) && fmtSmall && !board.labels.empty()) {
+        rt->PushAxisAlignedClip(canvasR, D2D1_ANTIALIAS_MODE_ALIASED);
+        fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        const size_t maxLabels = 2048;
+        size_t drawn = 0;
+        for (const auto& lbl : board.labels) {
+            if (lbl.text.empty()) continue;
+            D2D1_POINT_2F pt = toScreen(lbl.x, lbl.y);
+            if (pt.x < canvasR.left || pt.x > canvasR.right ||
+                pt.y < canvasR.top  || pt.y > canvasR.bottom) {
+                continue;
+            }
+            if (scale >= 2.2f && m_showSilk && board.components.size() <= 256) {
+                bool dupCompRef = false;
+                for (const auto& c : board.components) {
+                    if (c.refDes == lbl.text &&
+                        std::fabs(c.x - lbl.x) < 0.05f &&
+                        std::fabs(c.y - lbl.y) < 0.05f) {
+                        dupCompRef = true;
+                        break;
+                    }
+                }
+                if (dupCompRef) continue;
+            }
+
+            if (isSch) {
+                if (lbl.layer == EdaLayerId::SchWire) brush->SetColor(EdaColor(0x166534));
+                else if (lbl.layer == EdaLayerId::SchSymbol) brush->SetColor(EdaColor(0x7F1D1D));
+                else brush->SetColor(EdaColor(0x1E293B));
+            } else {
+                if (lbl.layer == EdaLayerId::BottomCopper || lbl.layer == EdaLayerId::BottomSilk) {
+                    brush->SetColor(EdaColor(0x93C5FD));
+                } else if (lbl.layer == EdaLayerId::InnerCopper) {
+                    brush->SetColor(EdaColor(0xD8B4FE));
+                } else if (lbl.layer == EdaLayerId::EdgeCuts) {
+                    brush->SetColor(EdaColor(0xFDE047));
+                } else {
+                    brush->SetColor(EdaColor(0xF8FAFC));
+                }
+            }
+
+            D2D1_RECT_F tr = D2D1::RectF(pt.x, pt.y - 9.0f, std::min(canvasR.right, pt.x + 260.0f), pt.y + 11.0f);
+            if (tr.right > tr.left + 2.0f) {
+                rt->DrawTextW(lbl.text.c_str(), static_cast<UINT32>(lbl.text.size()), fmtSmall, tr, brush);
+                if (++drawn >= maxLabels) break;
+            }
+        }
+        rt->PopAxisAlignedClip();
     }
     (void)fmtBold;
     (void)lang;

@@ -131,6 +131,11 @@ public:
     void Shutdown();
 
     static bool IsEdaExtension(const std::wstring& extLower);
+    static bool IsLikelySpiceRawFile(const std::wstring& fullPath);
+    static bool IsLikelyAsicDefFile(const std::wstring& fullPath);
+    static bool IsLikelyEasyEdaJsonFile(const std::wstring& fullPath);
+    static bool IsLikelyLibertyOrEdaSdfFile(const std::wstring& fullPath, const std::wstring& extLower);
+    static bool IsLikelyOdbPlusPlusTgz(const std::wstring& fullPath);
     static bool InspectEdaFile(const std::wstring& fullPath, ParsedEdaBoard& outBoard);
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);

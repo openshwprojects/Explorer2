@@ -1,0 +1,46 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN sky130_alu_slice ;
+UNITS DISTANCE MICRONS 1000 ;
+
+DIEAREA ( 0 0 ) ( 0 24000 ) ( 18000 24000 ) ( 18000 14000 ) ( 28000 14000 ) ( 28000 0 ) ;
+
+COMPONENTS 5 ;
+  - u_inv0 sky130_inv_2 + PLACED ( 2500 3000 ) N ;
+  - u_inv1 sky130_inv_2 + PLACED ( 2500 5720 ) FS ;
+  - u_nand0 sky130_nand2_4 + PLACED ( 7000 3000 ) FN ;
+  - u_dff0 sky130_dfxtp_1 + PLACED ( 12000 3000 ) N ;
+  - u_buf_rot sky130_inv_2 + FIXED ( 5000 14000 ) W ;
+END COMPONENTS
+
+PINS 4 ;
+  - clk_i + NET clk + DIRECTION INPUT + LAYER met2 ( -140 -400 ) ( 140 400 ) + FIXED ( 0 12000 ) E ;
+  - a_i + NET net_a + DIRECTION INPUT + LAYER met1 ( -400 -140 ) ( 400 140 ) + PLACED ( 0 4200 ) N ;
+  - b_i + NET net_b + DIRECTION INPUT + LAYER met1 ( -400 -140 ) ( 400 140 ) + PLACED ( 0 7000 ) N ;
+  - q_o + NET net_q + DIRECTION OUTPUT + LAYER met2 ( -140 -400 ) ( 140 400 ) + PLACED ( 28000 6500 ) W ;
+END PINS
+
+SPECIALNETS 2 ;
+  - VPWR ( * VPWR )
+    + ROUTED met1 480 + SHAPE FOLLOWPIN ( 0 2720 ) ( 28000 * )
+    NEW met3 1200 + SHAPE STRIPE ( 10000 0 ) ( * 24000 ) ;
+  - VGND ( * VGND )
+    + ROUTED met1 480 + SHAPE FOLLOWPIN ( 0 0 ) ( 28000 * )
+    NEW met3 1200 + SHAPE STRIPE ( 16000 0 ) ( * 14000 ) ;
+END SPECIALNETS
+
+NETS 4 ;
+  - clk ( PIN clk_i ) ( u_dff0 CLK )
+    + ROUTED met2 ( 0 12000 ) ( 6200 * ) ( * 4350 ) M2_M1
+    NEW met1 ( 6200 4350 ) ( 12490 * ) ;
+  - net_a ( PIN a_i ) ( u_inv0 A )
+    + ROUTED met1 ( 0 4200 ) ( 2770 * ) ;
+  - net_mid ( u_inv0 Y ) ( u_nand0 A ) ( u_dff0 D )
+    + ROUTED met1 ( 3550 4360 ) ( 5800 * ) M2_M1
+    NEW met2 ( 5800 4360 ) ( * 8200 ) ( 13390 * ) ( * 4250 ) M2_M1 ;
+  - net_q ( u_dff0 Q ) ( PIN q_o )
+    + ROUTED met2 ( 16900 4350 ) ( * 6500 ) ( 28000 * ) ;
+END NETS
+
+END DESIGN

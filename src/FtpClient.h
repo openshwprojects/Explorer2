@@ -58,6 +58,11 @@ public:
         bool showExtensions,
         Lang lang);
 
+    // Fast non-blocking WinSock2 pre-flight check (with negative cooldown cache; mock hosts always pass)
+    static bool CanReachFtpEndpoint(
+        const std::wstring& ftpUrl,
+        std::wstring* outError = nullptr);
+
     // WinINet FTP directory enumeration & file transfer (works in both Main Pane and Split Pane)
     static bool EnumerateFtpDirectory(
         const std::wstring& ftpUrl,

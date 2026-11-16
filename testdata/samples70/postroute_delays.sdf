@@ -1,0 +1,39 @@
+(DELAYFILE
+  (SDFVERSION "3.0")
+  (DESIGN "riscv_alu_top")
+  (VENDOR "OpenROAD")
+  (TIMESCALE 1ns)
+  (CELL
+    (CELLTYPE "sky130_fd_sc_hd__nand2_1")
+    (INSTANCE u_alu_nand0)
+    (DELAY
+      (ABSOLUTE
+        (IOPATH A Y (0.052:0.068:0.091) (0.045:0.059:0.078))
+        (IOPATH B Y (0.058:0.074:0.099) (0.049:0.063:0.084))
+      )
+    )
+  )
+  (CELL
+    (CELLTYPE "sky130_fd_sc_hd__dfxtp_1")
+    (INSTANCE u_alu_reg0)
+    (DELAY
+      (ABSOLUTE
+        (IOPATH (posedge CLK) Q (0.140:0.185:0.242) (0.132:0.174:0.228))
+      )
+    )
+    (TIMINGCHECK
+      (SETUP D (posedge CLK) (0.045:0.062:0.088))
+      (HOLD  D (posedge CLK) (0.012:0.018:0.025))
+    )
+  )
+  (CELL
+    (CELLTYPE "riscv_alu_top")
+    (INSTANCE)
+    (DELAY
+      (ABSOLUTE
+        (INTERCONNECT u_alu_nand0/Y u_alu_reg0/D (0.018:0.024:0.033))
+        (INTERCONNECT clk_buf/X u_alu_reg0/CLK (0.011:0.015:0.021))
+      )
+    )
+  )
+)

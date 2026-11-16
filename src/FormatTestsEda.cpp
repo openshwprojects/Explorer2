@@ -2156,7 +2156,784 @@ void RunFormatTestsEda(TestCounter& tc) {
             L" salBTraces=" + std::to_wstring(bsB.traces.size()));
     }
 
+    // ------------------------------------------------------------------------
+    // 13. ASAM MDF 3.30 (.mdf) & MDF 4.10 (.mf4) ECU Telemetry + ##CC + ##DZ Transpose
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        auto buildMdf33 = [](uint32_t numRecs) -> std::vector<uint8_t> {
+            // Offsets: ID=0(64), HD=64(164), DG=228(28), CG=256(26), CN0=282(228), CN1=510(228), CN2=738(228), CC=966(62), TX=1028(16), DATA=1044
+            std::vector<uint8_t> buf(1044u + numRecs * 8u, 0);
+            std::memcpy(buf.data() + 0,  "MDF     ", 8);
+            std::memcpy(buf.data() + 8,  "3.30    ", 8);
+            std::memcpy(buf.data() + 16, "Explorer", 8);
+            PutU16LE(buf.data() + 24, 0u);   // Little-Endian
+            PutU16LE(buf.data() + 28, 330u); // Version 3.30
+
+            // HD at 64 (size 164)
+            buf[64] = 'H'; buf[65] = 'D';
+            PutU16LE(buf.data() + 66, 164u);
+            PutU32LE(buf.data() + 68, 228u); // firstDG
+            PutU16LE(buf.data() + 80, 1u);   // numDG
+
+            // DG at 228 (size 28)
+            buf[228] = 'D'; buf[229] = 'G';
+            PutU16LE(buf.data() + 230, 28u);
+            PutU32LE(buf.data() + 232, 0u);  // nextDG
+            PutU32LE(buf.data() + 236, 256u);// firstCG
+            PutU32LE(buf.data() + 244, numRecs > 0u ? 1044u : 0u); // dataBlock
+            PutU16LE(buf.data() + 248, 1u);  // numCG
+            PutU16LE(buf.data() + 250, 0u);  // numRecIds = 0 (sorted)
+
+            // CG at 256 (size 26)
+            buf[256] = 'C'; buf[257] = 'G';
+            PutU16LE(buf.data() + 258, 26u);
+            PutU32LE(buf.data() + 260, 0u);   // nextCG
+            PutU32LE(buf.data() + 264, 282u); // firstCN
+            PutU16LE(buf.data() + 274, 3u);   // numCh
+            PutU16LE(buf.data() + 276, 8u);   // recordByteSize = 8 (float32 t + uint16 rpm + sint16 boost)
+            PutU32LE(buf.data() + 278, numRecs);
+
+            auto writeCn = [&](size_t off, uint32_t nextCn, uint32_t convCc, uint16_t cnType,
+                               const char* shortNm, uint16_t startBit, uint16_t nBits, uint16_t sigDt, uint32_t longTx) {
+                buf[off] = 'C'; buf[off + 1] = 'N';
+                PutU16LE(buf.data() + off + 2, 228u);
+                PutU32LE(buf.data() + off + 4, nextCn);
+                PutU32LE(buf.data() + off + 8, convCc);
+                PutU16LE(buf.data() + off + 24, cnType);
+                std::memcpy(buf.data() + off + 26, shortNm, std::strlen(shortNm));
+                PutU16LE(buf.data() + off + 186, startBit);
+                PutU16LE(buf.data() + off + 188, nBits);
+                PutU16LE(buf.data() + off + 190, sigDt);
+                PutU32LE(buf.data() + off + 218, longTx);
+            };
+            writeCn(282u, 510u, 0u,   1u, "t_master",  0u,  32u, 2u, 0u);
+            writeCn(510u, 738u, 966u, 0u, "rpm_short", 32u, 16u, 0u, 1028u);
+            writeCn(738u, 0u,   0u,   0u, "Boost_kPa", 48u, 16u, 1u, 0u);
+
+            // CC at 966 (size 62): linear P1=500.0, P2=0.25, unit="rpm"
+            buf[966] = 'C'; buf[967] = 'C';
+            PutU16LE(buf.data() + 968, 62u);
+            std::memcpy(buf.data() + 966 + 22, "rpm", 3);
+            PutU16LE(buf.data() + 966 + 42, 0u); // parametric linear
+            PutU16LE(buf.data() + 966 + 44, 2u); // 2 parameters
+            double p1 = 500.0, p2 = 0.25;
+            std::memcpy(buf.data() + 966 + 46, &p1, 8);
+            std::memcpy(buf.data() + 966 + 54, &p2, 8);
+
+            // TX at 1028 (size 16): "Engine_RPM"
+            buf[1028] = 'T'; buf[1029] = 'X';
+            PutU16LE(buf.data() + 1030, 16u);
+            std::memcpy(buf.data() + 1032, "Engine_RPM", 10);
+
+            for (uint32_t r = 0; r < numRecs; ++r) {
+                size_t ro = 1044u + static_cast<size_t>(r) * 8u;
+                float tf = static_cast<float>(r) * 0.02f;
+                uint16_t rawRpm = static_cast<uint16_t>(r * 300u);
+                int16_t boost = static_cast<int16_t>(-20 + static_cast<int>(r) * 5);
+                std::memcpy(buf.data() + ro + 0, &tf, 4);
+                PutU16LE(buf.data() + ro + 4, rawRpm);
+                PutU16LE(buf.data() + ro + 6, static_cast<uint16_t>(boost));
+            }
+            return buf;
+        };
+
+        auto buildMdf41 = [](bool withData) -> std::vector<uint8_t> {
+            std::vector<uint8_t> buf(64, 0);
+            std::memcpy(buf.data() + 0,  "MDF     ", 8);
+            std::memcpy(buf.data() + 8,  "4.10    ", 8);
+            std::memcpy(buf.data() + 16, "Explorer", 8);
+            PutU16LE(buf.data() + 28, 410u);
+
+            auto appendMdf4Blk = [&](const char id4[5], const std::vector<uint64_t>& links, const std::vector<uint8_t>& pay) -> uint64_t {
+                while ((buf.size() & 7u) != 0u) buf.push_back(0);
+                uint64_t off = static_cast<uint64_t>(buf.size());
+                uint64_t blkLen = 24ULL + static_cast<uint64_t>(links.size()) * 8ULL + static_cast<uint64_t>(pay.size());
+                uint8_t hdr[24] = {};
+                std::memcpy(hdr, id4, 4);
+                PutU32LE(hdr + 8,  static_cast<uint32_t>(blkLen & 0xFFFFFFFFULL));
+                PutU32LE(hdr + 12, static_cast<uint32_t>(blkLen >> 32));
+                uint64_t lc = static_cast<uint64_t>(links.size());
+                PutU32LE(hdr + 16, static_cast<uint32_t>(lc & 0xFFFFFFFFULL));
+                PutU32LE(hdr + 20, static_cast<uint32_t>(lc >> 32));
+                buf.insert(buf.end(), hdr, hdr + 24);
+                for (uint64_t lk : links) {
+                    uint8_t lb[8] = {};
+                    PutU32LE(lb + 0, static_cast<uint32_t>(lk & 0xFFFFFFFFULL));
+                    PutU32LE(lb + 4, static_cast<uint32_t>(lk >> 32));
+                    buf.insert(buf.end(), lb, lb + 8);
+                }
+                buf.insert(buf.end(), pay.begin(), pay.end());
+                return off;
+            };
+            auto appendTx = [&](const std::string& s) -> uint64_t {
+                std::vector<uint8_t> p(s.begin(), s.end());
+                p.push_back(0);
+                return appendMdf4Blk("##TX", {}, p);
+            };
+
+            // Reserve ##HD at offset 64 (6 links, 32B data)
+            std::vector<uint8_t> hdData(32, 0);
+            uint64_t hdOff = appendMdf4Blk("##HD", { 0, 0, 0, 0, 0, 0 }, hdData);
+            (void)hdOff;
+
+            uint64_t txSpd  = appendTx("WheelSpeed_FL");
+            uint64_t txUnit = appendTx("km/h");
+            uint64_t txBat  = appendTx("Battery_mV");
+
+            // ##CC linear conversion: P1 = -10.0, P2 = 0.05 -> raw [200..2150] => [0..97.5 km/h]
+            std::vector<uint8_t> ccPay(40, 0);
+            ccPay[0] = 1u; // linear
+            PutU16LE(ccPay.data() + 6, 2u); // val_count = 2
+            double cp1 = -10.0, cp2 = 0.05;
+            std::memcpy(ccPay.data() + 24, &cp1, 8);
+            std::memcpy(ccPay.data() + 32, &cp2, 8);
+            uint64_t ccOff = appendMdf4Blk("##CC", { 0, txUnit, txUnit, 0 }, ccPay);
+
+            auto makeCnPay = [](uint8_t cnType, uint8_t dType, uint32_t byteOff, uint32_t bitCnt) {
+                std::vector<uint8_t> p(72, 0);
+                p[0] = cnType;
+                p[2] = dType;
+                PutU32LE(p.data() + 4, byteOff);
+                PutU32LE(p.data() + 8, bitCnt);
+                return p;
+            };
+
+            uint64_t cnBat  = appendMdf4Blk("##CN", { 0,     0, txBat, 0, 0,     0, 0, 0 }, makeCnPay(0u, 0u, 10u, 16u));
+            uint64_t cnSpd  = appendMdf4Blk("##CN", { cnBat, 0, txSpd, 0, ccOff, 0, txUnit, 0 }, makeCnPay(0u, 0u, 8u, 16u));
+            uint64_t cnTime = appendMdf4Blk("##CN", { cnSpd, 0, 0,     0, 0,     0, 0, 0 }, makeCnPay(2u, 4u, 0u, 64u));
+
+            uint64_t dlOff = 0ULL;
+            const uint64_t nCycles = withData ? 40ULL : 0ULL;
+            if (withData) {
+                // 40 records x 12 bytes = 480 bytes, byte-transposed with M = 12 columns inside ##DZ + ##DL
+                const size_t N = 40u, M = 12u;
+                std::vector<uint8_t> rawRecs(N * M, 0);
+                for (size_t r = 0; r < N; ++r) {
+                    double tSec = static_cast<double>(r) * 0.005;
+                    uint16_t rawSpd = static_cast<uint16_t>(200u + r * 50u);
+                    uint16_t rawBat = static_cast<uint16_t>(12000u + (r % 8u) * 150u);
+                    std::memcpy(rawRecs.data() + r * M + 0, &tSec, 8);
+                    PutU16LE(rawRecs.data() + r * M + 8,  rawSpd);
+                    PutU16LE(rawRecs.data() + r * M + 10, rawBat);
+                }
+                std::vector<uint8_t> transposed(N * M, 0);
+                for (size_t r = 0; r < N; ++r) {
+                    for (size_t c = 0; c < M; ++c) {
+                        transposed[c * N + r] = rawRecs[r * M + c];
+                    }
+                }
+                std::vector<uint8_t> zStream = WrapZlibStored(transposed);
+                std::vector<uint8_t> dzPay(24 + zStream.size(), 0);
+                dzPay[0] = 'D'; dzPay[1] = 'T';
+                dzPay[2] = 1u; // Deflate + Byte Transpose
+                PutU32LE(dzPay.data() + 4,  static_cast<uint32_t>(M));
+                PutU32LE(dzPay.data() + 8,  static_cast<uint32_t>(rawRecs.size()));
+                PutU32LE(dzPay.data() + 16, static_cast<uint32_t>(zStream.size()));
+                std::memcpy(dzPay.data() + 24, zStream.data(), zStream.size());
+                uint64_t dzOff = appendMdf4Blk("##DZ", {}, dzPay);
+
+                std::vector<uint8_t> dlPay(16, 0);
+                PutU32LE(dlPay.data() + 4, 1u); // count = 1
+                dlOff = appendMdf4Blk("##DL", { 0ULL, dzOff }, dlPay);
+            }
+
+            std::vector<uint8_t> cgPay(32, 0);
+            PutU32LE(cgPay.data() + 8,  static_cast<uint32_t>(nCycles));
+            PutU32LE(cgPay.data() + 24, 12u); // cg_data_bytes = 12
+            uint64_t cgOff = appendMdf4Blk("##CG", { 0ULL, cnTime, 0ULL, 0ULL }, cgPay);
+
+            std::vector<uint8_t> dgPay(8, 0); // rec_id_size = 0
+            uint64_t dgOff = appendMdf4Blk("##DG", { 0ULL, cgOff, dlOff, 0ULL }, dgPay);
+
+            // Patch hd_dg_first at offset 64 + 24 = 88
+            PutU32LE(buf.data() + 88, static_cast<uint32_t>(dgOff & 0xFFFFFFFFULL));
+            PutU32LE(buf.data() + 92, static_cast<uint32_t>(dgOff >> 32));
+            return buf;
+        };
+
+        auto mdf3Valid = buildMdf33(32u);
+        auto mdf3Empty = buildMdf33(0u);
+        auto mf4Valid  = buildMdf41(true);
+        auto mf4Empty  = buildMdf41(false);
+
+        std::vector<uint8_t> hdrOnlyMdf(64, 0);
+        std::memcpy(hdrOnlyMdf.data(), "MDF     4.10    ", 16);
+
+        ParsedEdaBoard bMdf3, bMf4, badM1, badM2, badM3, badM4;
+        bool okMdf3 = WriteAndInspect(dir + L"\\ecu_v33.mdf", mdf3Valid.data(), mdf3Valid.size(), bMdf3);
+        bool okMf4  = WriteAndInspect(dir + L"\\ecu_v41.mf4", mf4Valid.data(),  mf4Valid.size(),  bMf4);
+        bool rejMdf = !WriteAndInspect(dir + L"\\empty_rec.mdf", mdf3Empty.data(), mdf3Empty.size(), badM1) &&
+                      !WriteAndInspect(dir + L"\\empty_rec.mf4", mf4Empty.data(),  mf4Empty.size(),  badM2) &&
+                      !WriteAndInspect(dir + L"\\hdr_only.mdf",  hdrOnlyMdf.data(), hdrOnlyMdf.size(), badM3) &&
+                      !WriteAndInspect(dir + L"\\hdr_only.mf4",  hdrOnlyMdf.data(), hdrOnlyMdf.size(), badM4);
+
+        bool passMdf = okMdf3 && okMf4 && rejMdf &&
+                       bMdf3.kind == EdaDocKind::KiCadSch && bMf4.kind == EdaDocKind::KiCadSch &&
+                       bMdf3.netCount == 2u && bMf4.netCount == 2u &&
+                       bMdf3.components.size() == 2u && bMf4.components.size() == 2u &&
+                       hasLabelSubstr(bMdf3, L"Engine_RPM") && hasLabelSubstr(bMdf3, L"Boost_kPa") &&
+                       hasLabelSubstr(bMdf3, L"rpm") && hasLabelSubstr(bMdf3, L"500") &&
+                       hasLabelSubstr(bMf4, L"WheelSpeed_FL") && hasLabelSubstr(bMf4, L"Battery_mV") &&
+                       hasLabelSubstr(bMf4, L"km/h") && hasLabelSubstr(bMf4, L"97.5") &&
+                       bMdf3.traces.size() > 60u && bMf4.traces.size() > 70u &&
+                       HashEdaGeometry(bMdf3) != HashEdaGeometry(bMf4);
+
+        tc.Record(passMdf, L"Stage15.Eda.AsamMdf3AndMdf4_CcConversionAndDzTranspose",
+            L"mdf3Traces=" + std::to_wstring(bMdf3.traces.size()) +
+            L" mf4Traces=" + std::to_wstring(bMf4.traces.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 14. Automotive & Industrial Fieldbus Schematics (.ldf, .arxml, .eds, .dcf, .gsdml, .l5x)
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+        auto hasFakePcbNode = [](const ParsedEdaBoard& b) -> bool {
+            if (b.kind == EdaDocKind::KiCadPcb) return true;
+            for (const auto& c : b.components) {
+                if (c.footprint == L"ECU_NODE" || c.refDes == L"Master_ECU") return true;
+            }
+            return false;
+        };
+
+        const std::string validLdf =
+            "LIN_description_file;\n"
+            "LIN_protocol_version = \"2.1\";\n"
+            "LIN_speed = 19.2 kbps;\n"
+            "Nodes {\n"
+            "  Master: BCM_Master, 5 ms, 0.1 ms;\n"
+            "  Slaves: Wiper_Slave, RainSensor_Slave;\n"
+            "}\n"
+            "Signals {\n"
+            "  WiperCmd: 4, 0, BCM_Master, Wiper_Slave;\n"
+            "  RainLevel: 8, 0, RainSensor_Slave, BCM_Master;\n"
+            "}\n"
+            "Frames {\n"
+            "  Frm_WiperCtrl: 0x12, BCM_Master, 4 { WiperCmd, 0; }\n"
+            "  Frm_RainStat: 0x24, RainSensor_Slave, 2 { RainLevel, 0; }\n"
+            "}\n"
+            "Schedule_tables {\n"
+            "  NormalTable { Frm_WiperCtrl delay 10 ms; Frm_RainStat delay 10 ms; }\n"
+            "}\n";
+
+        const std::string validArxml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<AUTOSAR xmlns=\"http://autosar.org/schema/r4.0\">\n"
+            "  <AR-PACKAGES><AR-PACKAGE><SHORT-NAME>SysPkg</SHORT-NAME><ELEMENTS>\n"
+            "    <CAN-CLUSTER><SHORT-NAME>ChassisCAN</SHORT-NAME></CAN-CLUSTER>\n"
+            "    <ECU-INSTANCE><SHORT-NAME>BrakeECU</SHORT-NAME></ECU-INSTANCE>\n"
+            "    <ECU-INSTANCE><SHORT-NAME>SteerECU</SHORT-NAME></ECU-INSTANCE>\n"
+            "    <APPLICATION-SW-COMPONENT-TYPE><SHORT-NAME>AbsCtrlSwc</SHORT-NAME>\n"
+            "      <PORTS>\n"
+            "        <P-PORT-PROTOTYPE><SHORT-NAME>WheelTorqueOut</SHORT-NAME></P-PORT-PROTOTYPE>\n"
+            "        <R-PORT-PROTOTYPE><SHORT-NAME>VehSpeedIn</SHORT-NAME></R-PORT-PROTOTYPE>\n"
+            "      </PORTS>\n"
+            "    </APPLICATION-SW-COMPONENT-TYPE>\n"
+            "    <I-SIGNAL><SHORT-NAME>Sig_WheelTorque</SHORT-NAME></I-SIGNAL>\n"
+            "  </ELEMENTS></AR-PACKAGE></AR-PACKAGES>\n"
+            "</AUTOSAR>\n";
+
+        const std::string validEds =
+            "[DeviceInfo]\n"
+            "VendorName=MaxonMotor\n"
+            "ProductName=EPOS4_Servo\n"
+            "BaudRate_500=1\n"
+            "BaudRate_1000=1\n"
+            "[MandatoryObjects]\n"
+            "SupportedObjects=3\n"
+            "[1000]\n"
+            "ParameterName=Device Type\n"
+            "ObjectType=0x7\n"
+            "DataType=0x0007\n"
+            "AccessType=ro\n"
+            "DefaultValue=0x00020192\n"
+            "[1400]\n"
+            "ParameterName=RPDO1 Comm Param\n"
+            "ObjectType=0x9\n"
+            "[1400sub1]\n"
+            "ParameterName=COB-ID Used\n"
+            "DefaultValue=0x201\n"
+            "[1600sub1]\n"
+            "ParameterName=Map Controlword\n"
+            "DefaultValue=0x60400010\n"
+            "[1800]\n"
+            "ParameterName=TPDO1 Comm Param\n"
+            "ObjectType=0x9\n"
+            "[1800sub1]\n"
+            "ParameterName=COB-ID Used\n"
+            "DefaultValue=0x181\n"
+            "[1A00sub1]\n"
+            "ParameterName=Map Statusword\n"
+            "DefaultValue=0x60410010\n";
+
+        const std::string validGsdml =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<ISO15745Profile xmlns=\"http://www.profibus.com/GSDML/2003/11/DeviceProfile\">\n"
+            "  <ProfileBody>\n"
+            "    <DeviceIdentity VendorID=\"0x002A\" DeviceID=\"0x0105\">\n"
+            "      <VendorName Value=\"Siemens AG\"/>\n"
+            "    </DeviceIdentity>\n"
+            "    <DeviceFunction><Family MainFamily=\"I/O\" ProductFamily=\"ET200SP\"/></DeviceFunction>\n"
+            "    <ApplicationProcess>\n"
+            "      <DeviceAccessPointList>\n"
+            "        <DeviceAccessPointItem ID=\"DAP_1\" PhysicalSlots=\"0..16\" MinDeviceInterval=\"32\">\n"
+            "          <ModuleInfo><Name TextId=\"T_DAP_CPU\"/></ModuleInfo>\n"
+            "        </DeviceAccessPointItem>\n"
+            "      </DeviceAccessPointList>\n"
+            "      <ModuleList>\n"
+            "        <ModuleItem ID=\"MOD_DI16\">\n"
+            "          <ModuleInfo><Name TextId=\"T_MOD_DI16\"/></ModuleInfo>\n"
+            "          <VirtualSubmoduleList><VirtualSubmoduleItem ID=\"SUB_DI\">\n"
+            "            <IOData>\n"
+            "              <Input><DataItem DataType=\"OctetString\" Length=\"2\" TextId=\"T_IN\"/></Input>\n"
+            "              <Output><DataItem DataType=\"OctetString\" Length=\"4\" TextId=\"T_OUT\"/></Output>\n"
+            "            </IOData>\n"
+            "          </VirtualSubmoduleItem></VirtualSubmoduleList>\n"
+            "        </ModuleItem>\n"
+            "      </ModuleList>\n"
+            "      <ExternalTextList><PrimaryLanguage>\n"
+            "        <Text TextId=\"T_DAP_CPU\" Value=\"IM 155-6 PN HF\"/>\n"
+            "        <Text TextId=\"T_MOD_DI16\" Value=\"DI 16x24VDC ST\"/>\n"
+            "      </PrimaryLanguage></ExternalTextList>\n"
+            "    </ApplicationProcess>\n"
+            "  </ProfileBody>\n"
+            "</ISO15745Profile>\n";
+
+        const std::string validL5x =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<RSLogix5000Content SchemaRevision=\"1.0\">\n"
+            "  <Controller Name=\"Packaging_PLC\" ProcessorType=\"1756-L83E\">\n"
+            "    <Tags><Tag Name=\"Conveyor_Speed\" DataType=\"DINT\"/></Tags>\n"
+            "    <Programs><Program Name=\"MainProgram\"><Routines>\n"
+            "      <Routine Name=\"MainRoutine\" Type=\"RLL\"><RLLContent>\n"
+            "        <Rung Number=\"0\" Type=\"N\">\n"
+            "          <Text><![CDATA[[XIC(Start_Btn),XIC(Auto_Latch)]XIO(EStop_NC)TON(Warmup_Tmr,500,0)OTE(Auto_Latch);]]></Text>\n"
+            "        </Rung>\n"
+            "      </RLLContent></Routine>\n"
+            "    </Routines></Program></Programs>\n"
+            "  </Controller>\n"
+            "</RSLogix5000Content>\n";
+
+        ParsedEdaBoard bLdf, bArx, bEds, bDcf, bGsd, bL5x;
+        bool okLdf = WriteAndInspect(dir + L"\\body_bus.ldf",    validLdf.data(),   validLdf.size(),   bLdf);
+        bool okArx = WriteAndInspect(dir + L"\\chassis.arxml",   validArxml.data(), validArxml.size(), bArx);
+        bool okEds = WriteAndInspect(dir + L"\\epos4.eds",       validEds.data(),   validEds.size(),   bEds);
+        bool okDcf = WriteAndInspect(dir + L"\\epos4_node.dcf",  validEds.data(),   validEds.size(),   bDcf);
+        bool okGsd = WriteAndInspect(dir + L"\\et200sp.gsdml",   validGsdml.data(), validGsdml.size(), bGsd);
+        bool okL5x = WriteAndInspect(dir + L"\\packaging.l5x",   validL5x.data(),   validL5x.size(),   bL5x);
+
+        // Strict negative rejection: empty shells with 0 domain entities MUST return false (no fake fallbacks!)
+        const char* emptyLdf   = "LIN_description_file;\nLIN_speed = 19.2 kbps;\n";
+        const char* emptyArxml = "<AUTOSAR></AUTOSAR>";
+        const char* emptyEds   = "[DeviceInfo]\nVendorName=Nobody\n";
+        const char* emptyGsdml = "<ISO15745Profile><ProfileBody></ProfileBody></ISO15745Profile>";
+        const char* emptyL5x   = "<RSLogix5000Content><Controller Name=\"EmptyPLC\"></Controller></RSLogix5000Content>";
+
+        ParsedEdaBoard badF1, badF2, badF3, badF4, badF5;
+        bool rejFieldbus = !WriteAndInspect(dir + L"\\empty.ldf",   emptyLdf,   std::strlen(emptyLdf),   badF1) &&
+                           !WriteAndInspect(dir + L"\\empty.arxml", emptyArxml, std::strlen(emptyArxml), badF2) &&
+                           !WriteAndInspect(dir + L"\\empty.eds",   emptyEds,   std::strlen(emptyEds),   badF3) &&
+                           !WriteAndInspect(dir + L"\\empty.gsdml", emptyGsdml, std::strlen(emptyGsdml), badF4) &&
+                           !WriteAndInspect(dir + L"\\empty.l5x",   emptyL5x,   std::strlen(emptyL5x),   badF5);
+
+        bool passFieldbus = okLdf && okArx && okEds && okDcf && okGsd && okL5x && rejFieldbus &&
+                            bLdf.kind == EdaDocKind::KiCadSch && bArx.kind == EdaDocKind::KiCadSch &&
+                            bEds.kind == EdaDocKind::KiCadSch && bGsd.kind == EdaDocKind::KiCadSch &&
+                            bL5x.kind == EdaDocKind::KiCadSch &&
+                            !hasFakePcbNode(bLdf) && !hasFakePcbNode(bArx) &&
+                            !hasFakePcbNode(bEds) && !hasFakePcbNode(bGsd) &&
+                            hasLabelSubstr(bLdf, L"BCM_Master") && hasLabelSubstr(bLdf, L"Wiper_Slave") &&
+                            hasLabelSubstr(bLdf, L"19.2") &&
+                            hasLabelSubstr(bArx, L"ChassisCAN") && hasLabelSubstr(bArx, L"BrakeECU") &&
+                            hasLabelSubstr(bArx, L"AbsCtrlSwc") &&
+                            hasLabelSubstr(bEds, L"EPOS4_Servo") && hasLabelSubstr(bEds, L"RPDO") &&
+                            hasLabelSubstr(bEds, L"TPDO") &&
+                            hasLabelSubstr(bGsd, L"IM 155-6 PN HF") && hasLabelSubstr(bGsd, L"DI 16x24VDC ST") &&
+                            hasLabelSubstr(bL5x, L"Packaging_PLC") && hasLabelSubstr(bL5x, L"Start_Btn") &&
+                            hasLabelSubstr(bL5x, L"Warmup_Tmr");
+
+        tc.Record(passFieldbus, L"Stage15.Eda.FieldbusAndPlcSchematics_LdfArxmlEdsGsdmlL5x",
+            L"ldfTr=" + std::to_wstring(bLdf.traces.size()) +
+            L" arxTr=" + std::to_wstring(bArx.traces.size()) +
+            L" l5xTr=" + std::to_wstring(bL5x.traces.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 15. GDSII Hierarchical Layout (.gds), IEEE 1364 VCD Bus/Real (.vcd), & Touchstone RF (.s1p/.s2p)
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        // Build binary GDSII with IBM System/370 excess-64 floats, child cell BITCELL, and root cell TOP_ARRAY (SREF + AREF)
+        std::vector<uint8_t> gds;
+        auto pushGdsRec = [&](uint8_t rType, uint8_t dType, const std::vector<uint8_t>& pay) {
+            std::vector<uint8_t> aligned = pay;
+            if (aligned.size() & 1u) aligned.push_back(0);
+            uint16_t len = static_cast<uint16_t>(4u + aligned.size());
+            uint8_t hdr[4] = {};
+            PutU16BE(hdr, len);
+            hdr[2] = rType;
+            hdr[3] = dType;
+            gds.insert(gds.end(), hdr, hdr + 4);
+            gds.insert(gds.end(), aligned.begin(), aligned.end());
+        };
+        auto strPay = [](const char* s) {
+            return std::vector<uint8_t>(s, s + std::strlen(s));
+        };
+        auto u16Pay = [](uint16_t v) {
+            std::vector<uint8_t> p(2);
+            PutU16BE(p.data(), v);
+            return p;
+        };
+        auto xyPay = [](const std::vector<std::pair<int32_t, int32_t>>& pts) {
+            std::vector<uint8_t> p(pts.size() * 8u);
+            for (size_t i = 0; i < pts.size(); ++i) {
+                PutU32BE(p.data() + i * 8u + 0u, static_cast<uint32_t>(pts[i].first));
+                PutU32BE(p.data() + i * 8u + 4u, static_cast<uint32_t>(pts[i].second));
+            }
+            return p;
+        };
+
+        pushGdsRec(0x00, 0x02, u16Pay(600u));              // HEADER v6.0
+        pushGdsRec(0x01, 0x02, std::vector<uint8_t>(24, 0)); // BGNLIB
+        pushGdsRec(0x02, 0x06, strPay("SRAM_IC_LIB"));     // LIBNAME
+        // UNITS: 1e-3 user units/DB unit, 1e-9 meters/DB unit (1 DB unit = 1 nm, 1000 DB units = 1 um)
+        const std::vector<uint8_t> ibmUnits = {
+            0x3E, 0x41, 0x89, 0x37, 0x4B, 0xC6, 0xA7, 0xEF, // 1e-3 in IBM System/370 excess-64
+            0x39, 0x44, 0xB8, 0x2F, 0xA0, 0x9B, 0x5A, 0x53  // 1e-9 in IBM System/370 excess-64
+        };
+        pushGdsRec(0x03, 0x05, ibmUnits);
+        std::vector<uint8_t> gdsHeaderOnly = gds;
+        {
+            uint8_t endLib[4] = { 0x00, 0x04, 0x04, 0x00 };
+            gdsHeaderOnly.insert(gdsHeaderOnly.end(), endLib, endLib + 4);
+        }
+
+        // Child structure BITCELL: 10um x 5um BOUNDARY + TEXT "VDD_RAIL"
+        pushGdsRec(0x05, 0x02, std::vector<uint8_t>(24, 0)); // BGNSTR
+        pushGdsRec(0x06, 0x06, strPay("BITCELL"));
+        pushGdsRec(0x08, 0x00, {});                          // BOUNDARY
+        pushGdsRec(0x0D, 0x02, u16Pay(1u));                  // LAYER 1
+        pushGdsRec(0x0E, 0x02, u16Pay(0u));                  // DATATYPE 0
+        pushGdsRec(0x10, 0x03, xyPay({ {0,0}, {10000,0}, {10000,5000}, {0,5000}, {0,0} }));
+        pushGdsRec(0x11, 0x00, {});                          // ENDEL
+        pushGdsRec(0x0C, 0x00, {});                          // TEXT
+        pushGdsRec(0x0D, 0x02, u16Pay(2u));                  // LAYER 2
+        pushGdsRec(0x10, 0x03, xyPay({ {2000, 2500} }));
+        pushGdsRec(0x19, 0x06, strPay("VDD_RAIL"));          // STRING
+        pushGdsRec(0x11, 0x00, {});                          // ENDEL
+        pushGdsRec(0x07, 0x00, {});                          // ENDSTR
+
+        // Top structure TOP_ARRAY: places BITCELL via mirrored+scaled+rotated SREF + 3x2 AREF
+        pushGdsRec(0x05, 0x02, std::vector<uint8_t>(24, 0)); // BGNSTR
+        pushGdsRec(0x06, 0x06, strPay("TOP_ARRAY"));
+        pushGdsRec(0x0A, 0x00, {});                          // SREF
+        pushGdsRec(0x12, 0x06, strPay("BITCELL"));           // SNAME
+        pushGdsRec(0x1A, 0x01, u16Pay(0x8000u));             // STRANS X-reflection
+        pushGdsRec(0x1B, 0x05, { 0x41, 0x20, 0,0,0,0,0,0 }); // MAG = 2.0
+        pushGdsRec(0x1C, 0x05, { 0x42, 0x5A, 0,0,0,0,0,0 }); // ANGLE = 90.0 deg
+        pushGdsRec(0x10, 0x03, xyPay({ {50000, 30000} }));
+        pushGdsRec(0x11, 0x00, {});                          // ENDEL
+
+        pushGdsRec(0x0B, 0x00, {});                          // AREF
+        pushGdsRec(0x12, 0x06, strPay("BITCELL"));           // SNAME
+        pushGdsRec(0x13, 0x02, { 0x00, 0x03, 0x00, 0x02 });  // COLROW: 3 cols, 2 rows
+        pushGdsRec(0x10, 0x03, xyPay({ {100000, 0}, {160000, 0}, {100000, 40000} }));
+        pushGdsRec(0x11, 0x00, {});                          // ENDEL
+        pushGdsRec(0x07, 0x00, {});                          // ENDSTR
+        pushGdsRec(0x04, 0x00, {});                          // ENDLIB
+
+        // IEEE 1364 VCD with multi-char IDs, 8-bit bus b10101100 (0xAC), and real trace
+        const std::string validVcd =
+            "$timescale 1ns $end\n"
+            "$scope module axi_tb $end\n"
+            "$var wire 1 $% aclk $end\n"
+            "$var reg 8 !# wdata [7:0] $end\n"
+            "$var real 64 &* pll_vctrl $end\n"
+            "$upscope $end\n"
+            "$enddefinitions $end\n"
+            "$dumpvars\n"
+            "0$%\n"
+            "b10101100 !#\n"
+            "r0.85 &*\n"
+            "$end\n"
+            "#2500\n1$%\nr1.65 &*\n"
+            "#5000\n0$%\nb00111100 !#\nr2.40 &*\n"
+            "#7500\n1$%\nb11110000 !#\nr1.10 &*\n"
+            "#10000\n0$%\n";
+
+        const char* hdrOnlyVcd =
+            "$timescale 1ps $end\n$scope module empty $end\n$var wire 1 ! clk $end\n$upscope $end\n$enddefinitions $end\n";
+
+        // Touchstone .s2p in MA (wrapped across lines) & RI formats, plus .s1p
+        const std::string validS2pMa =
+            "! 2-Port Bandpass Filter S-Parameters\n"
+            "# GHz S MA R 50\n"
+            "1.0  0.85 -120.0   0.12  45.0\n"
+            "     0.12   45.0   0.84 -118.0\n"
+            "2.0  0.10  -30.0   0.92 -15.0\n"
+            "     0.92  -15.0   0.11 -28.0\n"
+            "3.0  0.05    5.0   0.96 -85.0\n"
+            "     0.96  -85.0   0.05   4.0\n"
+            "4.0  0.75   95.0   0.18 -160.0\n"
+            "     0.18 -160.0   0.74  92.0\n";
+
+        const std::string validS2pRi =
+            "# MHz S RI R 50\n"
+            "100  0.60 -0.40  0.10 0.05  0.10 0.05  0.58 -0.38\n"
+            "500  0.08  0.04  0.88 -0.22 0.88 -0.22 0.07  0.03\n"
+            "900  0.70  0.30  0.15 -0.10 0.15 -0.10 0.69  0.29\n";
+
+        const std::string validS1pDb =
+            "# GHz S DB R 50\n"
+            "1.0 -3.2 -40.0\n"
+            "2.4 -18.5 12.0\n"
+            "5.0 -6.1 110.0\n";
+
+        const char* badS2pTxt = "1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0\n"; // missing '#' option line
+
+        ParsedEdaBoard bGds, badGds, bVcd, badVcd, bS2pMa, bS2pRi, bS1p, badS2p;
+        bool okGds   = WriteAndInspect(dir + L"\\sram_top.gds",   gds.data(), gds.size(), bGds);
+        bool rejGds  = !WriteAndInspect(dir + L"\\hdr_only.gds",  gdsHeaderOnly.data(), gdsHeaderOnly.size(), badGds);
+        bool okVcd   = WriteAndInspect(dir + L"\\axi_bus.vcd",    validVcd.data(), validVcd.size(), bVcd);
+        bool rejVcd  = !WriteAndInspect(dir + L"\\hdr_only.vcd",  hdrOnlyVcd, std::strlen(hdrOnlyVcd), badVcd);
+        bool okS2pMa = WriteAndInspect(dir + L"\\bpf_ma.s2p",     validS2pMa.data(), validS2pMa.size(), bS2pMa);
+        bool okS2pRi = WriteAndInspect(dir + L"\\bpf_ri.s2p",     validS2pRi.data(), validS2pRi.size(), bS2pRi);
+        bool okS1p   = WriteAndInspect(dir + L"\\ant.s1p",        validS1pDb.data(), validS1pDb.size(), bS1p);
+        bool rejSnp  = !WriteAndInspect(dir + L"\\no_opt.s2p",    badS2pTxt, std::strlen(badS2pTxt), badS2p);
+
+        // Verify Touchstone MA & RI curves are non-flat (distinct Y coordinates across S21/S11 segments)
+        auto hasCurveVariation = [](const ParsedEdaBoard& b) -> bool {
+            float mnY = 1e9f, mxY = -1e9f;
+            for (const auto& t : b.traces) {
+                if (t.layer == EdaLayerId::TopCopper || t.layer == EdaLayerId::BottomCopper || t.layer == EdaLayerId::SchWire) {
+                    if (std::fabs(t.y2 - t.y1) > 0.5f) {
+                        mnY = std::min({ mnY, t.y1, t.y2 });
+                        mxY = std::max({ mxY, t.y1, t.y2 });
+                    }
+                }
+            }
+            return mxY > mnY + 2.0f;
+        };
+
+        // Verify VCD timestamps were normalized rather than exploding to curTime * 0.5f (= 5000)
+        bool vcdNormalized = (bVcd.maxX < 250.0f && bVcd.minX > -80.0f);
+
+        bool passItem18 = okGds && rejGds &&
+                          (bGds.maxX - bGds.minX) > 90.0f && (bGds.maxY - bGds.minY) > 20.0f &&
+                          bGds.traces.size() >= 28u && hasLabelSubstr(bGds, L"VDD_RAIL") &&
+                          okVcd && rejVcd && vcdNormalized &&
+                          hasLabelSubstr(bVcd, L"wdata") &&
+                          (hasLabelSubstr(bVcd, L"AC") || hasLabelSubstr(bVcd, L"ac")) &&
+                          okS2pMa && okS2pRi && okS1p && rejSnp &&
+                          hasCurveVariation(bS2pMa) && hasCurveVariation(bS2pRi) && hasCurveVariation(bS1p) &&
+                          hasLabelSubstr(bS2pMa, L"S11") && hasLabelSubstr(bS2pMa, L"S21");
+
+        tc.Record(passItem18, L"Stage15.Eda.GdsiiHierarchy_VcdMultiBitBus_TouchstoneMaRi",
+            L"gdsSpanX=" + std::to_wstring(static_cast<int>(bGds.maxX - bGds.minX)) +
+            L" vcdMaxX=" + std::to_wstring(static_cast<int>(bVcd.maxX)) +
+            L" s2pMaTr=" + std::to_wstring(bS2pMa.traces.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 16. SPICE Netlist (.cir), Eagle/KiCad Schematics (.sch/.kicad_sch), & Checksummed HEX/SREC
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        const std::string validSpice =
+            "Two-Stage Amplifier & Filter Testbench\n"
+            "V1 VIN 0 DC 5.0 AC 1.0\n"
+            "R1 VIN N_BASE 10k\n"
+            "+ TC1=0.001\n"
+            "C1 VIN N_BASE 100n\n"
+            "L1 VCC N_COL 47u\n"
+            "D1 N_COL VCC D1N4148\n"
+            "Q1 N_COL N_BASE 0 Q2N2222\n"
+            "M1 VOUT N_COL 0 0 NMOS_FAST W=10u L=1u\n"
+            "X1 VOUT VFILT 0 LPF_STAGE params: fc=1e6\n"
+            ".model D1N4148 D(IS=2.52n)\n"
+            ".model Q2N2222 NPN(BF=200)\n"
+            ".tran 1n 500n\n"
+            ".end\n";
+
+        const char* proseFakeCir =
+            "This document describes a quarterly sales forecast and is not a SPICE circuit.\n"
+            "Please review section 3 before Friday.\n";
+
+        const std::string validEagleSch =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+            "<eagle version=\"9.6.2\"><drawing><schematic>\n"
+            "  <libraries><library name=\"analog\">\n"
+            "    <symbols><symbol name=\"OPAMP\">\n"
+            "      <wire x1=\"-5.08\" y1=\"5.08\" x2=\"-5.08\" y2=\"-5.08\" width=\"0.254\" layer=\"94\"/>\n"
+            "      <wire x1=\"-5.08\" y1=\"-5.08\" x2=\"5.08\" y2=\"0\" width=\"0.254\" layer=\"94\"/>\n"
+            "      <wire x1=\"5.08\" y1=\"0\" x2=\"-5.08\" y2=\"5.08\" width=\"0.254\" layer=\"94\"/>\n"
+            "      <pin name=\"IN+\" x=\"-10.16\" y=\"2.54\" length=\"middle\" rot=\"R0\"/>\n"
+            "      <pin name=\"IN-\" x=\"-10.16\" y=\"-2.54\" length=\"middle\" rot=\"R0\"/>\n"
+            "      <pin name=\"OUT\" x=\"10.16\" y=\"0\" length=\"middle\" rot=\"R180\"/>\n"
+            "    </symbol></symbols>\n"
+            "    <devicesets><deviceset name=\"TL072\" prefix=\"U\">\n"
+            "      <gates><gate name=\"G$1\" symbol=\"OPAMP\" x=\"0\" y=\"0\"/></gates>\n"
+            "    </deviceset></devicesets>\n"
+            "  </library></libraries>\n"
+            "  <parts><part name=\"U1\" library=\"analog\" deviceset=\"TL072\" device=\"\" value=\"TL072\"/></parts>\n"
+            "  <sheets><sheet>\n"
+            "    <instances><instance part=\"U1\" gate=\"G$1\" x=\"30.48\" y=\"25.4\" rot=\"MR90\"/></instances>\n"
+            "    <nets><net name=\"AUDIO_IN\">\n"
+            "      <segment>\n"
+            "        <wire x1=\"12.7\" y1=\"15.24\" x2=\"27.94\" y2=\"15.24\" width=\"0.1524\" layer=\"91\"/>\n"
+            "        <label x=\"15.24\" y=\"15.24\" size=\"1.778\" layer=\"95\"/>\n"
+            "      </segment>\n"
+            "    </net></nets>\n"
+            "  </sheet></sheets>\n"
+            "</schematic></drawing></eagle>\n";
+
+        const std::string validKiCadSch =
+            "(kicad_sch (version 20230121) (generator eeschema)\n"
+            "  (lib_symbols\n"
+            "    (symbol \"Device:R\"\n"
+            "      (symbol \"R_0_1\"\n"
+            "        (rectangle (start -1.016 -2.54) (end 1.016 2.54) (stroke (width 0.254))))\n"
+            "      (symbol \"R_1_1\"\n"
+            "        (pin passive line (at 0 3.81 270) (length 1.27) (name \"~\") (number \"1\"))\n"
+            "        (pin passive line (at 0 -3.81 90) (length 1.27) (name \"~\") (number \"2\")))))\n"
+            "  (symbol (lib_id \"Device:R\") (at 100 80 0) (unit 1)\n"
+            "    (property \"Reference\" \"R1\" (at 102.5 79 0))\n"
+            "    (property \"Value\" \"4.7k\" (at 102.5 81.5 0)))\n"
+            "  (wire (pts (xy 100 76.19) (xy 100 68)))\n"
+            "  (wire (pts (xy 100 83.81) (xy 100 92)))\n"
+            "  (label \"VCC_3V3\" (at 100 68 0))\n"
+            ")\n";
+
+        auto makeIhexLine = [](uint8_t recType, uint16_t addr, const std::vector<uint8_t>& pay) -> std::string {
+            uint8_t sum = static_cast<uint8_t>(pay.size()) +
+                          static_cast<uint8_t>((addr >> 8) & 0xFFu) +
+                          static_cast<uint8_t>(addr & 0xFFu) + recType;
+            char hdr[16] = {};
+            sprintf_s(hdr, ":%02X%04X%02X", static_cast<unsigned>(pay.size()), static_cast<unsigned>(addr), static_cast<unsigned>(recType));
+            std::string s(hdr);
+            for (uint8_t b : pay) {
+                sum = static_cast<uint8_t>(sum + b);
+                char hb[4] = {};
+                sprintf_s(hb, "%02X", static_cast<unsigned>(b));
+                s += hb;
+            }
+            uint8_t cksum = static_cast<uint8_t>((0u - sum) & 0xFFu);
+            char cb[8] = {};
+            sprintf_s(cb, "%02X\n", static_cast<unsigned>(cksum));
+            s += cb;
+            return s;
+        };
+
+        std::vector<uint8_t> fwRow0(16), fwRow1(16);
+        for (size_t i = 0; i < 16; ++i) {
+            fwRow0[i] = static_cast<uint8_t>(0x10u + i * 3u);
+            fwRow1[i] = static_cast<uint8_t>(0xA0u ^ i);
+        }
+        std::string validHex =
+            makeIhexLine(0x04u, 0x0000u, { 0x08u, 0x04u }) + // Extended Linear Address 0x08040000
+            makeIhexLine(0x00u, 0x0000u, fwRow0) +
+            makeIhexLine(0x00u, 0x0010u, fwRow1) +
+            makeIhexLine(0x05u, 0x0000u, { 0x08u, 0x04u, 0x01u, 0x01u }) + // Entry 0x08040101
+            makeIhexLine(0x01u, 0x0000u, {});
+
+        std::string badCksumHex = validHex;
+        // Corrupt checksum of first data record
+        size_t nlPos = badCksumHex.find('\n');
+        size_t nlPos2 = badCksumHex.find('\n', nlPos + 1);
+        badCksumHex[nlPos2 - 1] = (badCksumHex[nlPos2 - 1] == '0') ? '1' : '0';
+        const std::string eofOnlyHex = makeIhexLine(0x01u, 0x0000u, {});
+
+        auto makeSrecLine = [](char sType, int addrBytes, uint32_t addr, const std::vector<uint8_t>& pay) -> std::string {
+            uint8_t byteCnt = static_cast<uint8_t>(addrBytes + static_cast<int>(pay.size()) + 1);
+            uint8_t sum = byteCnt;
+            char hdr[8] = {};
+            sprintf_s(hdr, "S%c%02X", sType, static_cast<unsigned>(byteCnt));
+            std::string s(hdr);
+            for (int k = addrBytes - 1; k >= 0; --k) {
+                uint8_t ab = static_cast<uint8_t>((addr >> (k * 8)) & 0xFFu);
+                sum = static_cast<uint8_t>(sum + ab);
+                char hb[4] = {};
+                sprintf_s(hb, "%02X", static_cast<unsigned>(ab));
+                s += hb;
+            }
+            for (uint8_t b : pay) {
+                sum = static_cast<uint8_t>(sum + b);
+                char hb[4] = {};
+                sprintf_s(hb, "%02X", static_cast<unsigned>(b));
+                s += hb;
+            }
+            uint8_t cksum = static_cast<uint8_t>((~sum) & 0xFFu);
+            char cb[8] = {};
+            sprintf_s(cb, "%02X\n", static_cast<unsigned>(cksum));
+            s += cb;
+            return s;
+        };
+
+        std::string validSrec =
+            makeSrecLine('0', 2, 0x0000u, { 'B','O','O','T' }) +
+            makeSrecLine('3', 4, 0x08040000u, fwRow0) +
+            makeSrecLine('3', 4, 0x08040010u, fwRow1) +
+            makeSrecLine('7', 4, 0x08040100u, {});
+
+        std::string badCksumSrec = validSrec;
+        size_t snl1 = badCksumSrec.find('\n');
+        size_t snl2 = badCksumSrec.find('\n', snl1 + 1);
+        badCksumSrec[snl2 - 1] = (badCksumSrec[snl2 - 1] == 'F') ? 'E' : 'F';
+
+        ParsedEdaBoard bCir, badCir, bEagS, bKiS, bHex, badHex1, badHex2, bSrec, badSrec;
+        bool okCir   = WriteAndInspect(dir + L"\\amp_filter.cir",   validSpice.data(),    validSpice.size(),    bCir);
+        bool rejCir  = !WriteAndInspect(dir + L"\\prose.cir",       proseFakeCir,         std::strlen(proseFakeCir), badCir);
+        bool okEagS  = WriteAndInspect(dir + L"\\opamp_xml.sch",    validEagleSch.data(), validEagleSch.size(), bEagS);
+        bool okKiS   = WriteAndInspect(dir + L"\\resistor.kicad_sch", validKiCadSch.data(), validKiCadSch.size(), bKiS);
+        bool okHex   = WriteAndInspect(dir + L"\\stm32_app.hex",    validHex.data(),      validHex.size(),      bHex);
+        bool rejHex  = !WriteAndInspect(dir + L"\\corrupt.hex",     badCksumHex.data(),   badCksumHex.size(),   badHex1) &&
+                       !WriteAndInspect(dir + L"\\eof_only.hex",    eofOnlyHex.data(),    eofOnlyHex.size(),    badHex2);
+        bool okSrec  = WriteAndInspect(dir + L"\\stm32_app.srec",   validSrec.data(),     validSrec.size(),     bSrec);
+        bool rejSrec = !WriteAndInspect(dir + L"\\corrupt.srec",    badCksumSrec.data(),  badCksumSrec.size(),  badSrec);
+
+        bool passItem19 = okCir && rejCir &&
+                          bCir.netCount >= 4u && bCir.components.size() >= 6u && bCir.traces.size() > 30u &&
+                          hasLabelSubstr(bCir, L"R1") && hasLabelSubstr(bCir, L"M1") &&
+                          okEagS && bEagS.pads.size() >= 3u && bEagS.traces.size() >= 4u &&
+                          hasLabelSubstr(bEagS, L"AUDIO_IN") &&
+                          okKiS && bKiS.pads.size() >= 2u && bKiS.traces.size() >= 6u &&
+                          hasLabelSubstr(bKiS, L"VCC_3V3") && hasLabelSubstr(bKiS, L"R1") &&
+                          okHex && rejHex && okSrec && rejSrec &&
+                          hasLabelSubstr(bHex, L"0x08040000") && hasLabelSubstr(bSrec, L"0x08040000") &&
+                          bHex.components.size() >= 1u && bSrec.components.size() >= 1u;
+
+        tc.Record(passItem19, L"Stage15.Eda.SpiceNetlist_EagleKiCadSchSymbols_ChecksummedHexSrec",
+            L"spiceNets=" + std::to_wstring(bCir.netCount) +
+            L" eagPads=" + std::to_wstring(bEagS.pads.size()) +
+            L" kiPads=" + std::to_wstring(bKiS.pads.size()));
+    }
+
     RemoveDirectoryW(dir.c_str());
+    RunFormatTestsEdaBatch70(tc);
 }
 
 } // namespace Explorer2::SelfTestSuite

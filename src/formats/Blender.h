@@ -12,7 +12,7 @@
                 bSize = decompBlend.size();
             }
         }
-        // 8b. Blender 3.0+ Zstandard frame wrapper (skippable seek-table frames + Raw/RLE Zstd blocks)
+        // 8b. Blender 3.0–5.0+ Zstandard frame wrapper (RFC 8878 Compressed/Raw/RLE blocks + skippable seek-table frames)
         else if (bSize >= 12 && std::memcmp(bData, "BLENDER", 7) != 0) {
             auto rd32le = [](const uint8_t* p) -> uint32_t {
                 return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -20,62 +20,8 @@
             };
             uint32_t firstMagic = rd32le(bData);
             if (firstMagic == 0xFD2FB528u || (firstMagic & 0xFFFFFFF0u) == 0x184D2A50u) {
-                size_t zp = 0;
-                bool zstdOk = true;
-                while (zp + 4 <= bSize && zstdOk) {
-                    uint32_t mg = rd32le(bData + zp);
-                    if ((mg & 0xFFFFFFF0u) == 0x184D2A50u) {
-                        if (zp + 8 > bSize) { zstdOk = false; break; }
-                        uint32_t skipSz = rd32le(bData + zp + 4);
-                        if (zp + 8 + static_cast<size_t>(skipSz) > bSize) { zstdOk = false; break; }
-                        zp += 8 + static_cast<size_t>(skipSz);
-                        continue;
-                    }
-                    if (mg != 0xFD2FB528u) break;
-                    zp += 4;
-                    if (zp >= bSize) { zstdOk = false; break; }
-                    uint8_t fhd = bData[zp++];
-                    bool singleSeg = (fhd & 0x20u) != 0;
-                    bool hasChecksum = (fhd & 0x04u) != 0;
-                    uint8_t dictFlag = (fhd & 0x03u);
-                    uint8_t fcsFlag = (fhd >> 6) & 0x03u;
-                    if (!singleSeg) {
-                        if (zp >= bSize) { zstdOk = false; break; }
-                        ++zp;
-                    }
-                    size_t dictBytes = (dictFlag == 3) ? 4 : dictFlag;
-                    size_t fcsBytes = (fcsFlag == 0) ? (singleSeg ? 1 : 0) : (static_cast<size_t>(1) << fcsFlag);
-                    if (zp + dictBytes + fcsBytes > bSize) { zstdOk = false; break; }
-                    zp += dictBytes + fcsBytes;
-
-                    bool lastBlock = false;
-                    while (!lastBlock && zp + 3 <= bSize) {
-                        uint32_t bh = static_cast<uint32_t>(bData[zp]) |
-                                      (static_cast<uint32_t>(bData[zp + 1]) << 8) |
-                                      (static_cast<uint32_t>(bData[zp + 2]) << 16);
-                        zp += 3;
-                        lastBlock = (bh & 1u) != 0;
-                        uint32_t bType = (bh >> 1) & 3u;
-                        uint32_t blkSz = (bh >> 3);
-                        if (bType == 0) { // Raw_Block
-                            if (zp + blkSz > bSize || decompBlend.size() + blkSz > 256 * 1024 * 1024) { zstdOk = false; break; }
-                            decompBlend.insert(decompBlend.end(), bData + zp, bData + zp + blkSz);
-                            zp += blkSz;
-                        } else if (bType == 1) { // RLE_Block
-                            if (zp + 1 > bSize || decompBlend.size() + blkSz > 256 * 1024 * 1024) { zstdOk = false; break; }
-                            decompBlend.insert(decompBlend.end(), blkSz, bData[zp]);
-                            zp += 1;
-                        } else {
-                            zstdOk = false;
-                            break;
-                        }
-                    }
-                    if (zstdOk && hasChecksum) {
-                        if (zp + 4 > bSize) { zstdOk = false; break; }
-                        zp += 4;
-                    }
-                }
-                if (zstdOk && decompBlend.size() >= 12) {
+                if (StreamCodecs::DecompressZstdFrame(bData, bSize, decompBlend, 256 * 1024 * 1024) &&
+                    decompBlend.size() >= 12) {
                     bData = decompBlend.data();
                     bSize = decompBlend.size();
                 }

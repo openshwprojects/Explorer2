@@ -1,0 +1,58 @@
+/* SkyWater 130nm High-Density NLDM Standard Cell Timing Sample */
+library (sky130_fd_sc_hd__tt_025C_1v80) {
+  delay_model : table_lookup ;
+  time_unit : "1ns" ;
+  voltage_unit : "1V" ;
+  capacitive_load_unit (1, pf) ;
+
+  cell ("sky130_fd_sc_hd__inv_2") {
+    area : 3.7536 ;
+    pin ("A") {
+      direction : input ;
+      capacitance : 0.0031 ;
+    }
+    pin ("Y") {
+      direction : output ;
+      function : "(!A)" ;
+      timing () {
+        related_pin : "A" ;
+        timing_sense : negative_unate ;
+        cell_rise (scalar) { values ("0.042") ; }
+        cell_fall (scalar) { values ("0.035") ; }
+      }
+    }
+  }
+
+  cell ("sky130_fd_sc_hd__nand2_1") {
+    area : 5.0048 ;
+    pin ("A") { direction : input ; }
+    pin ("B") { direction : input ; }
+    pin ("Y") {
+      direction : output ;
+      function : "(!(A&B))" ;
+      timing () {
+        related_pin : "A" ;
+        cell_rise (scalar) { values ("0.068") ; }
+      }
+      timing () {
+        related_pin : "B" ;
+        cell_rise (scalar) { values ("0.074") ; }
+      }
+    }
+  }
+
+  cell ("sky130_fd_sc_hd__dfxtp_1") {
+    area : 20.0192 ;
+    pin ("CLK") { direction : input ; }
+    pin ("D")   { direction : input ; }
+    pin ("Q") {
+      direction : output ;
+      function : "IQ" ;
+      timing () {
+        related_pin : "CLK" ;
+        timing_type : rising_edge ;
+        cell_rise (scalar) { values ("0.185") ; }
+      }
+    }
+  }
+}

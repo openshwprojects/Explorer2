@@ -1,0 +1,7 @@
+# Intel Quartus Prime Cyclone V Pinout
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CEBA4F23C7
+set_location_assignment PIN_M9 -to clk_50m
+set_location_assignment PIN_U7 -to key_rst_n
+set_location_assignment PIN_AA2 -to led_heartbeat
+set_location_assignment PIN_AB3 -to hdmi_tx_clk

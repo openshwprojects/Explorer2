@@ -457,7 +457,7 @@ void ParseBranches(const std::wstring& text, std::vector<GitBranch>& out) {
 bool GitIntegration::IsGitInstalled() { return !GetGitPath().empty(); }
 
 std::wstring GitIntegration::FindRepoRoot(const std::wstring& folder) {
-    if (folder.empty()) return {};
+    if (folder.empty() || folder == L"THIS_PC" || folder.find(L"://") != std::wstring::npos) return {};
     wchar_t full[MAX_PATH * 4];
     DWORD n = GetFullPathNameW(folder.c_str(), (DWORD)(sizeof(full) / sizeof(full[0])), full, nullptr);
     if (n == 0 || n >= sizeof(full) / sizeof(full[0])) return {};

@@ -1323,7 +1323,15 @@ inline const wchar_t* OnnxDataTypeName(uint64_t dt) {
         case 11: return L"FLOAT64";
         case 12: return L"UINT32";
         case 13: return L"UINT64";
+        case 14: return L"COMPLEX64";
+        case 15: return L"COMPLEX128";
         case 16: return L"BFLOAT16";
+        case 17: return L"FLOAT8E4M3FN";
+        case 18: return L"FLOAT8E4M3FNUZ";
+        case 19: return L"FLOAT8E5M2";
+        case 20: return L"FLOAT8E5M2FNUZ";
+        case 21: return L"UINT4";
+        case 22: return L"INT4";
         default: return L"TENSOR";
     }
 }
@@ -1560,10 +1568,26 @@ inline bool ParseOnnxModel(const std::vector<uint8_t>& raw, ParsedOfficeDocument
                     }
                 } else if (!gr.SkipField(gwt)) return false;
             }
+        } else if (fn == 14 && wt == 2) { // metadata_props (StringStringEntryProto)
+            const uint8_t* mp = nullptr; size_t ml = 0;
+            if (!r.ReadLengthDelimited(mp, ml)) return false;
+            PbReader mr(mp, ml);
+            std::string mk, mv;
+            uint32_t mfn = 0; uint8_t mwt = 0;
+            while (mr.pos < mr.size) {
+                if (!mr.ReadTag(mfn, mwt)) return false;
+                if (mfn == 1 && mwt == 2) { if (!mr.ReadString(mk)) return false; }
+                else if (mfn == 2 && mwt == 2) { if (!mr.ReadString(mv)) return false; }
+                else if (!mr.SkipField(mwt)) return false;
+            }
+            if (!mk.empty() && tensorRows.size() < 300) {
+                tensorRows.push_back({ L"Metadata Property", PathUtils::Utf8ToWide(mk), L"string", PathUtils::Utf8ToWide(mv) });
+            }
         } else if (!r.SkipField(wt)) return false;
     }
 
-    if (r.pos != r.size || irVersion == 0 || irVersion > 50 || (!hasGraph && opsets.empty())) {
+    if (r.pos != r.size || irVersion == 0 || irVersion > 20 || !hasGraph ||
+        (nodeSheet.rows.size() <= 1 && tensorRows.empty())) {
         return false;
     }
 
@@ -1587,6 +1611,671 @@ inline bool ParseOnnxModel(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     out.formatTitle = L"ONNX Neural Network Graph (.onnx)";
     out.sheets.push_back(std::move(ioSheet));
     if (nodeSheet.rows.size() > 1) out.sheets.push_back(std::move(nodeSheet));
+    out.valid = true;
+    return true;
+}
+
+// ============================================================================
+// 4b. GGUF Quantized LLM Container (.gguf v1, v2, v3)
+// ============================================================================
+struct GgufMemCursor {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    size_t pos = 0;
+    uint32_t version = 3;
+
+    size_t Remaining() const { return (pos < size) ? (size - pos) : 0; }
+
+    bool ReadBytes(void* dst, size_t n) {
+        if (n > Remaining()) return false;
+        if (n > 0) std::memcpy(dst, data + pos, n);
+        pos += n;
+        return true;
+    }
+    bool Skip(size_t n) {
+        if (n > Remaining()) return false;
+        pos += n;
+        return true;
+    }
+    bool ReadU8(uint8_t& v) {
+        if (pos >= size) return false;
+        v = data[pos++];
+        return true;
+    }
+    bool ReadU16(uint16_t& v) {
+        if (Remaining() < 2) return false;
+        v = RdU16LE(data + pos); pos += 2;
+        return true;
+    }
+    bool ReadU32(uint32_t& v) {
+        if (Remaining() < 4) return false;
+        v = RdU32LE(data + pos); pos += 4;
+        return true;
+    }
+    bool ReadU64(uint64_t& v) {
+        if (Remaining() < 8) return false;
+        v = RdU64LE(data + pos); pos += 8;
+        return true;
+    }
+    bool ReadCount(uint64_t& out) {
+        if (version == 1) {
+            uint32_t v32 = 0;
+            if (!ReadU32(v32)) return false;
+            out = v32;
+            return true;
+        }
+        return ReadU64(out);
+    }
+    bool ReadStr(std::string& out, size_t maxKeep = 512) {
+        uint64_t len = 0;
+        if (!ReadCount(len) || len > Remaining()) return false;
+        const size_t keep = static_cast<size_t>(std::min<uint64_t>(len, maxKeep));
+        out.assign(reinterpret_cast<const char*>(data + pos), keep);
+        pos += static_cast<size_t>(len);
+        return true;
+    }
+};
+
+inline bool GetGgmlSheetTrait(uint32_t t, const wchar_t*& outName, uint32_t& blockElems, uint32_t& blockBytes) {
+    switch (t) {
+    case 0:  outName = L"F32";     blockElems = 1;   blockBytes = 4;   return true;
+    case 1:  outName = L"F16";     blockElems = 1;   blockBytes = 2;   return true;
+    case 2:  outName = L"Q4_0";    blockElems = 32;  blockBytes = 18;  return true;
+    case 3:  outName = L"Q4_1";    blockElems = 32;  blockBytes = 20;  return true;
+    case 4:  outName = L"Q4_2";    blockElems = 16;  blockBytes = 10;  return true;
+    case 5:  outName = L"Q4_3";    blockElems = 16;  blockBytes = 12;  return true;
+    case 6:  outName = L"Q5_0";    blockElems = 32;  blockBytes = 22;  return true;
+    case 7:  outName = L"Q5_1";    blockElems = 32;  blockBytes = 24;  return true;
+    case 8:  outName = L"Q8_0";    blockElems = 32;  blockBytes = 34;  return true;
+    case 9:  outName = L"Q8_1";    blockElems = 32;  blockBytes = 36;  return true;
+    case 10: outName = L"Q2_K";    blockElems = 256; blockBytes = 84;  return true;
+    case 11: outName = L"Q3_K";    blockElems = 256; blockBytes = 110; return true;
+    case 12: outName = L"Q4_K";    blockElems = 256; blockBytes = 144; return true;
+    case 13: outName = L"Q5_K";    blockElems = 256; blockBytes = 176; return true;
+    case 14: outName = L"Q6_K";    blockElems = 256; blockBytes = 210; return true;
+    case 15: outName = L"Q8_K";    blockElems = 256; blockBytes = 292; return true;
+    case 16: outName = L"IQ2_XXS"; blockElems = 256; blockBytes = 66;  return true;
+    case 17: outName = L"IQ2_XS";  blockElems = 256; blockBytes = 74;  return true;
+    case 18: outName = L"IQ3_XXS"; blockElems = 256; blockBytes = 98;  return true;
+    case 19: outName = L"IQ1_S";   blockElems = 256; blockBytes = 50;  return true;
+    case 20: outName = L"IQ4_NL";  blockElems = 32;  blockBytes = 18;  return true;
+    case 21: outName = L"IQ3_S";   blockElems = 256; blockBytes = 110; return true;
+    case 22: outName = L"IQ2_S";   blockElems = 256; blockBytes = 82;  return true;
+    case 23: outName = L"IQ4_XS";  blockElems = 256; blockBytes = 136; return true;
+    case 24: outName = L"I8";      blockElems = 1;   blockBytes = 1;   return true;
+    case 25: outName = L"I16";     blockElems = 1;   blockBytes = 2;   return true;
+    case 26: outName = L"I32";     blockElems = 1;   blockBytes = 4;   return true;
+    case 27: outName = L"I64";     blockElems = 1;   blockBytes = 8;   return true;
+    case 28: outName = L"F64";     blockElems = 1;   blockBytes = 8;   return true;
+    case 29: outName = L"IQ1_M";   blockElems = 256; blockBytes = 56;  return true;
+    case 30: outName = L"BF16";    blockElems = 1;   blockBytes = 2;   return true;
+    case 31: outName = L"Q4_0_4_4";blockElems = 32;  blockBytes = 18;  return true;
+    case 32: outName = L"Q4_0_4_8";blockElems = 32;  blockBytes = 18;  return true;
+    case 33: outName = L"Q4_0_8_8";blockElems = 32;  blockBytes = 18;  return true;
+    case 34: outName = L"TQ1_0";   blockElems = 256; blockBytes = 54;  return true;
+    case 35: outName = L"TQ2_0";   blockElems = 256; blockBytes = 66;  return true;
+    case 36: outName = L"IQ4_NL_4_4"; blockElems = 32; blockBytes = 18; return true;
+    case 37: outName = L"IQ4_NL_4_8"; blockElems = 32; blockBytes = 18; return true;
+    case 38: outName = L"IQ4_NL_8_8"; blockElems = 32; blockBytes = 18; return true;
+    case 39: outName = L"MXFP4";   blockElems = 32;  blockBytes = 17;  return true;
+    default: return false;
+    }
+}
+
+inline const wchar_t* GgufSheetValTypeName(uint32_t vt) {
+    switch (vt) {
+    case 0: return L"uint8";   case 1: return L"int8";    case 2: return L"uint16";  case 3: return L"int16";
+    case 4: return L"uint32";  case 5: return L"int32";   case 6: return L"float32"; case 7: return L"bool";
+    case 8: return L"string";  case 9: return L"array";   case 10: return L"uint64"; case 11: return L"int64";
+    case 12: return L"float64"; default: return L"unknown";
+    }
+}
+
+inline bool ReadGgufSheetVal(GgufMemCursor& c, uint32_t vt, std::wstring& outVal, bool capture, int depth = 0) {
+    if (depth > 4) return false;
+    switch (vt) {
+    case 0: { uint8_t v = 0; if (!c.ReadU8(v)) return false; if (capture) outVal = std::to_wstring(v); return true; }
+    case 1: { uint8_t v = 0; if (!c.ReadU8(v)) return false; if (capture) outVal = std::to_wstring(static_cast<int8_t>(v)); return true; }
+    case 2: { uint16_t v = 0; if (!c.ReadU16(v)) return false; if (capture) outVal = std::to_wstring(v); return true; }
+    case 3: { uint16_t v = 0; if (!c.ReadU16(v)) return false; if (capture) outVal = std::to_wstring(static_cast<int16_t>(v)); return true; }
+    case 4: { uint32_t v = 0; if (!c.ReadU32(v)) return false; if (capture) outVal = std::to_wstring(v); return true; }
+    case 5: { uint32_t v = 0; if (!c.ReadU32(v)) return false; if (capture) outVal = std::to_wstring(static_cast<int32_t>(v)); return true; }
+    case 6: {
+        if (c.Remaining() < 4) return false;
+        float f = RdF32LE(c.data + c.pos); c.pos += 4;
+        if (capture) outVal = FmtDouble(f);
+        return true;
+    }
+    case 7: {
+        uint8_t v = 0;
+        if (!c.ReadU8(v) || v > 1u) return false;
+        if (capture) outVal = v ? L"true" : L"false";
+        return true;
+    }
+    case 8: {
+        std::string s;
+        if (!c.ReadStr(s, capture ? 300 : 0)) return false;
+        if (capture) outVal = PathUtils::Utf8ToWide(s);
+        return true;
+    }
+    case 9: {
+        uint32_t elemType = 0; uint64_t count = 0;
+        if (!c.ReadU32(elemType) || elemType > 12 || !c.ReadCount(count)) return false;
+        size_t fixedSz = 0;
+        if (elemType <= 1 || elemType == 7) fixedSz = 1;
+        else if (elemType <= 3) fixedSz = 2;
+        else if (elemType <= 6) fixedSz = 4;
+        else if (elemType >= 10 && elemType <= 12) fixedSz = 8;
+        if (fixedSz > 0) {
+            if (count > c.Remaining() / fixedSz) return false;
+            if (!capture) return c.Skip(static_cast<size_t>(count * fixedSz));
+            const uint64_t showN = std::min<uint64_t>(count, 6);
+            std::wstring sample;
+            for (uint64_t i = 0; i < showN; ++i) {
+                std::wstring ev;
+                if (!ReadGgufSheetVal(c, elemType, ev, true, depth + 1)) return false;
+                if (i > 0) sample += L", ";
+                sample += ev;
+            }
+            if (count > showN) {
+                if (!c.Skip(static_cast<size_t>((count - showN) * fixedSz))) return false;
+                outVal = L"[" + std::to_wstring(count) + L" \x00D7 " + GgufSheetValTypeName(elemType) + L"] (" + sample + L", ...)";
+            } else {
+                outVal = L"[" + sample + L"]";
+            }
+            return true;
+        }
+        if (count > 10000000ULL) return false;
+        const uint64_t showN = capture ? std::min<uint64_t>(count, 5) : 0;
+        std::wstring sample;
+        for (uint64_t i = 0; i < count; ++i) {
+            std::wstring ev;
+            const bool want = (i < showN);
+            if (!ReadGgufSheetVal(c, elemType, ev, want, depth + 1)) return false;
+            if (want) {
+                if (i > 0) sample += L", ";
+                if (ev.size() > 24) ev = ev.substr(0, 24) + L"...";
+                sample += L"\"" + ev + L"\"";
+            }
+        }
+        if (capture) {
+            outVal = (count > showN)
+                ? (L"[" + std::to_wstring(count) + L" \x00D7 " + GgufSheetValTypeName(elemType) + L"] (" + sample + L", ...)")
+                : (L"[" + sample + L"]");
+        }
+        return true;
+    }
+    case 10: { uint64_t v = 0; if (!c.ReadU64(v)) return false; if (capture) outVal = std::to_wstring(v); return true; }
+    case 11: { uint64_t v = 0; if (!c.ReadU64(v)) return false; if (capture) outVal = std::to_wstring(static_cast<int64_t>(v)); return true; }
+    case 12: {
+        if (c.Remaining() < 8) return false;
+        double d = RdF64LE(c.data + c.pos); c.pos += 8;
+        if (capture) outVal = FmtDouble(d);
+        return true;
+    }
+    default: return false;
+    }
+}
+
+inline bool ParseGgufModel(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
+    if (raw.size() < 16 || std::memcmp(raw.data(), "GGUF", 4) != 0) return false;
+    GgufMemCursor cur{ raw.data(), raw.size(), 4, 3 };
+    if (!cur.ReadU32(cur.version) || cur.version < 1 || cur.version > 3) return false;
+
+    uint64_t tensorCount = 0, kvCount = 0;
+    if (!cur.ReadCount(tensorCount) || !cur.ReadCount(kvCount)) return false;
+    if (kvCount > 1000000ULL || tensorCount > 5000000ULL) return false;
+
+    SpreadsheetSheet metaSheet;
+    metaSheet.name = L"GGUF_Metadata";
+    metaSheet.rows.push_back({ L"Key", L"Value Type", L"Value" });
+    metaSheet.rows.push_back({ L"gguf.version", L"uint32", std::to_wstring(cur.version) });
+    metaSheet.rows.push_back({ L"gguf.tensor_count", L"uint64", std::to_wstring(tensorCount) });
+    metaSheet.rows.push_back({ L"gguf.kv_count", L"uint64", std::to_wstring(kvCount) });
+
+    for (uint64_t i = 0; i < kvCount; ++i) {
+        std::string key;
+        if (!cur.ReadStr(key, 256) || key.empty()) return false;
+        uint32_t vt = 0;
+        if (!cur.ReadU32(vt) || vt > 12) return false;
+        std::wstring valW;
+        const bool keep = (metaSheet.rows.size() < 512);
+        if (!ReadGgufSheetVal(cur, vt, valW, keep, 0)) return false;
+        if (keep) {
+            metaSheet.rows.push_back({ PathUtils::Utf8ToWide(key), GgufSheetValTypeName(vt), std::move(valW) });
+        }
+    }
+
+    SpreadsheetSheet tensorSheet;
+    tensorSheet.name = L"GGUF_Tensors";
+    tensorSheet.rows.push_back({ L"#", L"Tensor Name", L"Quantization", L"Shape", L"Parameters", L"Byte Size", L"Data Offset" });
+
+    uint64_t totalParams = 0;
+    for (uint64_t t = 0; t < tensorCount; ++t) {
+        std::string name;
+        if (!cur.ReadStr(name, 512) || name.empty()) return false;
+        uint32_t nDims = 0;
+        if (!cur.ReadU32(nDims) || nDims < 1 || nDims > 8) return false;
+        uint64_t dims[8] = {};
+        uint64_t params = 1;
+        for (uint32_t d = 0; d < nDims; ++d) {
+            if (!cur.ReadU64(dims[d]) || dims[d] == 0) return false;
+            if (params > UINT64_MAX / dims[d]) params = UINT64_MAX;
+            else params *= dims[d];
+        }
+        uint32_t ggmlType = 0;
+        uint64_t relOff = 0;
+        if (!cur.ReadU32(ggmlType) || !cur.ReadU64(relOff)) return false;
+        const wchar_t* qName = nullptr;
+        uint32_t blkElems = 1, blkBytes = 1;
+        if (!GetGgmlSheetTrait(ggmlType, qName, blkElems, blkBytes)) return false;
+        if (relOff > raw.size()) return false;
+
+        const uint64_t blocks = (params + blkElems - 1ULL) / blkElems;
+        const uint64_t byteSz = (blocks <= UINT64_MAX / blkBytes) ? (blocks * blkBytes) : UINT64_MAX;
+        if (totalParams <= UINT64_MAX - params) totalParams += params;
+        else totalParams = UINT64_MAX;
+
+        if (tensorSheet.rows.size() <= 1024) {
+            std::wstring shStr = L"[";
+            for (uint32_t d = 0; d < nDims; ++d) {
+                if (d > 0) shStr += L", ";
+                shStr += std::to_wstring(dims[d]);
+            }
+            shStr += L"]";
+            tensorSheet.rows.push_back({
+                std::to_wstring(t + 1),
+                PathUtils::Utf8ToWide(name),
+                qName,
+                std::move(shStr),
+                std::to_wstring(params),
+                PathUtils::FormatByteSize(byteSz),
+                std::to_wstring(relOff)
+            });
+        }
+    }
+
+    metaSheet.rows.insert(metaSheet.rows.begin() + 4, { L"gguf.total_parameters", L"uint64", std::to_wstring(totalParams) });
+    FinalizeSheetCols(metaSheet);
+    FinalizeSheetCols(tensorSheet);
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"GGUF Quantized Model v" + std::to_wstring(cur.version) + L" (.gguf)";
+    out.sheets.push_back(std::move(metaSheet));
+    if (tensorSheet.rows.size() > 1) out.sheets.push_back(std::move(tensorSheet));
+    out.valid = true;
+    return true;
+}
+
+// ============================================================================
+// 4c. HuggingFace SafeTensors (.safetensors)
+// ============================================================================
+struct StSheetJson {
+    const char* s = nullptr;
+    size_t n = 0;
+    size_t pos = 0;
+
+    void SkipWs() {
+        while (pos < n && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n')) ++pos;
+    }
+    static bool Hex4(const char* p, uint32_t& out) {
+        out = 0;
+        for (int i = 0; i < 4; ++i) {
+            char c = p[i];
+            uint32_t v = 0;
+            if (c >= '0' && c <= '9') v = static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') v = static_cast<uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v = static_cast<uint32_t>(c - 'A' + 10);
+            else return false;
+            out = (out << 4) | v;
+        }
+        return true;
+    }
+    static void AppendUtf8(std::string& out, uint32_t cp) {
+        if (cp <= 0x7Fu) out.push_back(static_cast<char>(cp));
+        else if (cp <= 0x7FFu) {
+            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0xFFFFu) {
+            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0x10FFFFu) {
+            out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+    }
+    bool ParseStr(std::string& out) {
+        SkipWs();
+        if (pos >= n || s[pos] != '"') return false;
+        ++pos;
+        out.clear();
+        while (pos < n) {
+            unsigned char c = static_cast<unsigned char>(s[pos++]);
+            if (c == '"') return true;
+            if (c < 0x20u) return false;
+            if (c == '\\') {
+                if (pos >= n) return false;
+                char e = s[pos++];
+                switch (e) {
+                case '"': out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/': out.push_back('/'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'u': {
+                    if (pos + 4 > n) return false;
+                    uint32_t u1 = 0;
+                    if (!Hex4(s + pos, u1)) return false;
+                    pos += 4;
+                    if (u1 >= 0xD800u && u1 <= 0xDBFFu && pos + 6 <= n && s[pos] == '\\' && s[pos + 1] == 'u') {
+                        uint32_t u2 = 0;
+                        if (Hex4(s + pos + 2, u2) && u2 >= 0xDC00u && u2 <= 0xDFFFu) {
+                            pos += 6;
+                            AppendUtf8(out, 0x10000u + (((u1 - 0xD800u) << 10) | (u2 - 0xDC00u)));
+                            break;
+                        }
+                    }
+                    AppendUtf8(out, u1);
+                    break;
+                }
+                default: return false;
+                }
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+        return false;
+    }
+    bool ParseU64(uint64_t& out) {
+        SkipWs();
+        if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+        if (s[pos] == '0' && pos + 1 < n && s[pos + 1] >= '0' && s[pos + 1] <= '9') return false;
+        out = 0;
+        while (pos < n && s[pos] >= '0' && s[pos] <= '9') {
+            uint64_t d = static_cast<uint64_t>(s[pos] - '0');
+            if (out > (UINT64_MAX - d) / 10ULL) return false;
+            out = out * 10ULL + d;
+            ++pos;
+        }
+        if (pos < n && (s[pos] == '.' || s[pos] == 'e' || s[pos] == 'E')) return false;
+        return true;
+    }
+    bool SkipVal(int depth = 0) {
+        if (depth > 32) return false;
+        SkipWs();
+        if (pos >= n) return false;
+        char c = s[pos];
+        if (c == '"') { std::string tmp; return ParseStr(tmp); }
+        if (c == '{') {
+            ++pos; SkipWs();
+            if (pos < n && s[pos] == '}') { ++pos; return true; }
+            for (;;) {
+                std::string k; if (!ParseStr(k)) return false;
+                SkipWs(); if (pos >= n || s[pos] != ':') return false; ++pos;
+                if (!SkipVal(depth + 1)) return false;
+                SkipWs();
+                if (pos < n && s[pos] == ',') { ++pos; continue; }
+                if (pos < n && s[pos] == '}') { ++pos; return true; }
+                return false;
+            }
+        }
+        if (c == '[') {
+            ++pos; SkipWs();
+            if (pos < n && s[pos] == ']') { ++pos; return true; }
+            for (;;) {
+                if (!SkipVal(depth + 1)) return false;
+                SkipWs();
+                if (pos < n && s[pos] == ',') { ++pos; continue; }
+                if (pos < n && s[pos] == ']') { ++pos; return true; }
+                return false;
+            }
+        }
+        if (c == 't' && pos + 4 <= n && std::memcmp(s + pos, "true", 4) == 0) { pos += 4; return true; }
+        if (c == 'f' && pos + 5 <= n && std::memcmp(s + pos, "false", 5) == 0) { pos += 5; return true; }
+        if (c == 'n' && pos + 4 <= n && std::memcmp(s + pos, "null", 4) == 0) { pos += 4; return true; }
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            if (c == '-') ++pos;
+            if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+            if (s[pos] == '0') { ++pos; if (pos < n && s[pos] >= '0' && s[pos] <= '9') return false; }
+            else { while (pos < n && s[pos] >= '0' && s[pos] <= '9') ++pos; }
+            if (pos < n && s[pos] == '.') {
+                ++pos; if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+                while (pos < n && s[pos] >= '0' && s[pos] <= '9') ++pos;
+            }
+            if (pos < n && (s[pos] == 'e' || s[pos] == 'E')) {
+                ++pos; if (pos < n && (s[pos] == '+' || s[pos] == '-')) ++pos;
+                if (pos >= n || s[pos] < '0' || s[pos] > '9') return false;
+                while (pos < n && s[pos] >= '0' && s[pos] <= '9') ++pos;
+            }
+            return true;
+        }
+        return false;
+    }
+    bool ParseMetaVal(std::string& out) {
+        SkipWs();
+        if (pos >= n) return false;
+        if (s[pos] == '"') return ParseStr(out);
+        size_t st = pos;
+        if (!SkipVal(1)) return false;
+        out.assign(s + st, pos - st);
+        return true;
+    }
+};
+
+inline bool ParseSafeTensorsModel(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
+    if (raw.size() < 10) return false;
+    const uint64_t hdrLen = RdU64LE(raw.data());
+    if (hdrLen < 2 || hdrLen > (64ULL * 1024ULL * 1024ULL)) return false;
+    if (8ULL + hdrLen > raw.size()) return false;
+
+    const char* jsonPtr = reinterpret_cast<const char*>(raw.data() + 8);
+    const size_t jsonLen = static_cast<size_t>(hdrLen);
+    size_t first = 0, last = jsonLen;
+    while (first < last && (jsonPtr[first] == ' ' || jsonPtr[first] == '\t' || jsonPtr[first] == '\r' || jsonPtr[first] == '\n')) ++first;
+    while (last > first && (jsonPtr[last - 1] == ' ' || jsonPtr[last - 1] == '\t' || jsonPtr[last - 1] == '\r' || jsonPtr[last - 1] == '\n')) --last;
+    if (last - first < 2 || jsonPtr[first] != '{' || jsonPtr[last - 1] != '}') return false;
+
+    StSheetJson cur{ jsonPtr, jsonLen, 0 };
+    cur.SkipWs();
+    if (cur.pos >= cur.n || cur.s[cur.pos] != '{') return false;
+    ++cur.pos;
+    cur.SkipWs();
+
+    SpreadsheetSheet metaSheet;
+    metaSheet.name = L"SafeTensors_Metadata";
+    metaSheet.rows.push_back({ L"Key", L"Value" });
+    metaSheet.rows.push_back({ L"header_bytes", std::to_wstring(hdrLen) });
+
+    SpreadsheetSheet tensorSheet;
+    tensorSheet.name = L"SafeTensors_Tensors";
+    tensorSheet.rows.push_back({ L"#", L"Tensor Name", L"DType", L"Shape", L"Parameters", L"Byte Size", L"Sample Values" });
+
+    uint64_t tensorIdx = 0;
+    uint64_t totalParams = 0;
+    const uint64_t dataBase = 8ULL + hdrLen;
+
+    if (cur.pos < cur.n && cur.s[cur.pos] == '}') {
+        ++cur.pos;
+    } else {
+        for (;;) {
+            std::string topKey;
+            if (!cur.ParseStr(topKey)) return false;
+            cur.SkipWs();
+            if (cur.pos >= cur.n || cur.s[cur.pos] != ':') return false;
+            ++cur.pos;
+            cur.SkipWs();
+            if (cur.pos >= cur.n || cur.s[cur.pos] != '{') return false;
+            ++cur.pos;
+            cur.SkipWs();
+
+            if (topKey == "__metadata__") {
+                if (cur.pos < cur.n && cur.s[cur.pos] == '}') {
+                    ++cur.pos;
+                } else {
+                    for (;;) {
+                        std::string mk, mv;
+                        if (!cur.ParseStr(mk)) return false;
+                        cur.SkipWs();
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != ':') return false;
+                        ++cur.pos;
+                        if (!cur.ParseMetaVal(mv)) return false;
+                        if (metaSheet.rows.size() < 512) {
+                            metaSheet.rows.push_back({ PathUtils::Utf8ToWide(mk), PathUtils::Utf8ToWide(mv) });
+                        }
+                        cur.SkipWs();
+                        if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+                        if (cur.pos < cur.n && cur.s[cur.pos] == '}') { ++cur.pos; break; }
+                        return false;
+                    }
+                }
+            } else {
+                if (topKey.empty()) return false;
+                bool hasDt = false, hasSh = false, hasOff = false;
+                std::string dt;
+                std::vector<uint64_t> sh;
+                uint64_t bOff = 0, eOff = 0;
+                if (cur.pos < cur.n && cur.s[cur.pos] == '}') return false;
+                for (;;) {
+                    std::string fk;
+                    if (!cur.ParseStr(fk)) return false;
+                    cur.SkipWs();
+                    if (cur.pos >= cur.n || cur.s[cur.pos] != ':') return false;
+                    ++cur.pos;
+                    cur.SkipWs();
+                    if (fk == "dtype") {
+                        if (!cur.ParseStr(dt) || dt.empty() || dt.size() > 32) return false;
+                        hasDt = true;
+                    } else if (fk == "shape") {
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != '[') return false;
+                        ++cur.pos; cur.SkipWs();
+                        sh.clear();
+                        if (cur.pos < cur.n && cur.s[cur.pos] == ']') {
+                            ++cur.pos;
+                        } else {
+                            for (;;) {
+                                uint64_t dv = 0;
+                                if (!cur.ParseU64(dv) || sh.size() >= 32) return false;
+                                sh.push_back(dv);
+                                cur.SkipWs();
+                                if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+                                if (cur.pos < cur.n && cur.s[cur.pos] == ']') { ++cur.pos; break; }
+                                return false;
+                            }
+                        }
+                        hasSh = true;
+                    } else if (fk == "data_offsets") {
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != '[') return false;
+                        ++cur.pos;
+                        if (!cur.ParseU64(bOff)) return false;
+                        cur.SkipWs();
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != ',') return false;
+                        ++cur.pos;
+                        if (!cur.ParseU64(eOff)) return false;
+                        cur.SkipWs();
+                        if (cur.pos >= cur.n || cur.s[cur.pos] != ']') return false;
+                        ++cur.pos;
+                        hasOff = true;
+                    } else {
+                        if (!cur.SkipVal(2)) return false;
+                    }
+                    cur.SkipWs();
+                    if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+                    if (cur.pos < cur.n && cur.s[cur.pos] == '}') { ++cur.pos; break; }
+                    return false;
+                }
+                if (!hasDt || !hasSh || !hasOff || bOff > eOff || eOff > raw.size() - dataBase) return false;
+
+                uint64_t params = 1;
+                if (sh.empty()) {
+                    params = (eOff > bOff) ? 1ULL : 0ULL;
+                } else {
+                    for (uint64_t d : sh) {
+                        if (d == 0) { params = 0; break; }
+                        if (params > UINT64_MAX / d) { params = UINT64_MAX; break; }
+                        params *= d;
+                    }
+                }
+                ++tensorIdx;
+                if (totalParams <= UINT64_MAX - params) totalParams += params;
+                else totalParams = UINT64_MAX;
+
+                if (tensorSheet.rows.size() <= 1024) {
+                    std::wstring shStr = L"[";
+                    for (size_t i = 0; i < sh.size(); ++i) {
+                        if (i > 0) shStr += L", ";
+                        shStr += std::to_wstring(sh[i]);
+                    }
+                    shStr += L"]";
+
+                    std::wstring sampleStr;
+                    const uint8_t* tPtr = raw.data() + static_cast<size_t>(dataBase + bOff);
+                    const uint64_t tLen = eOff - bOff;
+                    if (dt == "F32" && tLen >= 4) {
+                        for (size_t k = 0; k + 4 <= tLen && k < 16; k += 4) {
+                            if (!sampleStr.empty()) sampleStr += L", ";
+                            sampleStr += FmtDouble(RdF32LE(tPtr + k));
+                        }
+                    } else if (dt == "F16" && tLen >= 2) {
+                        for (size_t k = 0; k + 2 <= tLen && k < 8; k += 2) {
+                            if (!sampleStr.empty()) sampleStr += L", ";
+                            sampleStr += FmtDouble(HalfToFloat(RdU16LE(tPtr + k)));
+                        }
+                    } else if (dt == "BF16" && tLen >= 2) {
+                        for (size_t k = 0; k + 2 <= tLen && k < 8; k += 2) {
+                            if (!sampleStr.empty()) sampleStr += L", ";
+                            sampleStr += FmtDouble(BFloat16ToFloat(RdU16LE(tPtr + k)));
+                        }
+                    } else if (dt == "I32" && tLen >= 4) {
+                        for (size_t k = 0; k + 4 <= tLen && k < 16; k += 4) {
+                            if (!sampleStr.empty()) sampleStr += L", ";
+                            sampleStr += std::to_wstring(RdI32LE(tPtr + k));
+                        }
+                    } else if (dt == "I64" && tLen >= 8) {
+                        for (size_t k = 0; k + 8 <= tLen && k < 32; k += 8) {
+                            if (!sampleStr.empty()) sampleStr += L", ";
+                            sampleStr += std::to_wstring(RdI64LE(tPtr + k));
+                        }
+                    }
+
+                    tensorSheet.rows.push_back({
+                        std::to_wstring(tensorIdx),
+                        PathUtils::Utf8ToWide(topKey),
+                        PathUtils::Utf8ToWide(dt),
+                        std::move(shStr),
+                        std::to_wstring(params),
+                        PathUtils::FormatByteSize(tLen),
+                        std::move(sampleStr)
+                    });
+                }
+            }
+            cur.SkipWs();
+            if (cur.pos < cur.n && cur.s[cur.pos] == ',') { ++cur.pos; continue; }
+            if (cur.pos < cur.n && cur.s[cur.pos] == '}') { ++cur.pos; break; }
+            return false;
+        }
+    }
+
+    cur.SkipWs();
+    if (cur.pos != cur.n) return false;
+
+    metaSheet.rows.push_back({ L"tensor_count", std::to_wstring(tensorIdx) });
+    metaSheet.rows.push_back({ L"total_parameters", std::to_wstring(totalParams) });
+
+    FinalizeSheetCols(metaSheet);
+    FinalizeSheetCols(tensorSheet);
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"SafeTensors Model (.safetensors)";
+    out.sheets.push_back(std::move(metaSheet));
+    if (tensorSheet.rows.size() > 1) out.sheets.push_back(std::move(tensorSheet));
     out.valid = true;
     return true;
 }
@@ -2127,7 +2816,7 @@ inline bool ParseTfLiteModel(const std::vector<uint8_t>& raw, ParsedOfficeDocume
 }
 
 // ============================================================================
-// 7. Apache Arrow IPC File / Stream & Feather v1 (.arrow / .feather / .ipc)
+// 7. Apache Arrow IPC File / Stream & Feather v1 / v2 (.arrow / .feather / .ipc)
 // ============================================================================
 struct ArrowColSchema {
     std::wstring name;
@@ -2136,6 +2825,10 @@ struct ArrowColSchema {
     uint8_t typeId = 0;    // Arrow Type union: 2=Int, 3=FloatingPoint, 5=Utf8, 6=Bool, 4=Binary, 20=LargeUtf8
     int32_t bitWidth = 32; // for Int / FloatingPoint (0=HALF,1=SINGLE,2=DOUBLE)
     bool isSigned = true;
+    bool hasDict = false;
+    int64_t dictId = 0;
+    int32_t dictIdxBitWidth = 32;
+    bool dictIdxSigned = true;
 };
 
 inline void ParseArrowSchemaFb(const FbTable& schemaTbl, std::vector<ArrowColSchema>& outCols) {
@@ -2153,6 +2846,17 @@ inline void ParseArrowSchemaFb(const FbTable& schemaTbl, std::vector<ArrowColSch
         col.typeId = ft.GetU8(2, 0);
         FbTable typeTbl;
         bool hasTypeTbl = ft.GetTable(3, typeTbl);
+
+        FbTable dictTbl;
+        if (ft.GetTable(4, dictTbl)) {
+            col.hasDict = true;
+            col.dictId = dictTbl.GetI64(0, 0);
+            FbTable idxIntTbl;
+            if (dictTbl.GetTable(1, idxIntTbl)) {
+                col.dictIdxBitWidth = idxIntTbl.GetI32(0, 32);
+                col.dictIdxSigned   = idxIntTbl.GetU8(1, 1) != 0;
+            }
+        }
 
         switch (col.typeId) {
             case 1: col.typeLabel = L"Null"; break;
@@ -2173,47 +2877,99 @@ inline void ParseArrowSchemaFb(const FbTable& schemaTbl, std::vector<ArrowColSch
             case 7: col.typeLabel = L"Decimal"; break;
             case 8: col.typeLabel = L"Date"; col.bitWidth = (hasTypeTbl && typeTbl.GetI16(0, 1) == 0) ? 32 : 64; break;
             case 10: col.typeLabel = L"Timestamp"; col.bitWidth = 64; break;
+            case 19: col.typeLabel = L"LargeBinary"; break;
             case 20: col.typeLabel = L"LargeUtf8"; break;
             default: col.typeLabel = L"ArrowType(" + std::to_wstring(col.typeId) + L")"; break;
+        }
+        if (col.hasDict) {
+            col.typeLabel = L"Dict<" + col.typeLabel + L">";
         }
         outCols.push_back(std::move(col));
     }
 }
 
-inline void DecodeArrowRecordBatch(
+inline bool DecodeArrowRecordBatch(
     const FbTable& rbTbl,
     const uint8_t* bodyPtr,
     size_t bodyLen,
     const std::vector<ArrowColSchema>& cols,
+    const std::unordered_map<int64_t, std::vector<std::wstring>>& dictMap,
     std::vector<std::vector<std::wstring>>& outRows,
-    int64_t& totalRowsAccum)
+    int64_t& totalRowsAccum,
+    std::wstring* outCompressionLabel = nullptr)
 {
     int64_t batchRows = rbTbl.GetI64(0, 0);
-    if (batchRows <= 0) return;
+    if (batchRows < 0) return false;
+    if (batchRows == 0) return true;
     totalRowsAccum += batchRows;
 
     uint32_t nodeCnt = 0;
-    size_t nodeVec = rbTbl.GetVector(1, nodeCnt); // struct FieldNode { int64 length, int64 null_count } = 16B
+    size_t nodeVec = rbTbl.GetVector(1, nodeCnt);
     uint32_t bufCnt = 0;
-    size_t bufVec = rbTbl.GetVector(2, bufCnt);   // struct Buffer { int64 offset, int64 length } = 16B
-    // Note: compressed batches (slot 3 BodyCompression) cannot be read as raw buffers without LZ4/ZSTD
-    FbTable compTbl;
-    if (rbTbl.GetTable(3, compTbl)) return;
-    if (!bufVec) return;
+    size_t bufVec = rbTbl.GetVector(2, bufCnt);
+    if (!bufVec) return false;
 
+    bool hasBodyComp = false;
+    int8_t compCodec = 0;  // 0 = LZ4_FRAME, 1 = ZSTD
+    int8_t compMethod = 0; // 0 = BUFFER
+    FbTable compTbl;
+    if (rbTbl.GetTable(3, compTbl)) {
+        hasBodyComp = true;
+        compCodec   = compTbl.GetI8(0, 0);
+        compMethod  = compTbl.GetI8(1, 0);
+        if (compMethod != 0 || (compCodec != 0 && compCodec != 1)) return false;
+        if (outCompressionLabel) {
+            *outCompressionLabel = (compCodec == 1) ? L"ZSTD" : L"LZ4_FRAME";
+        }
+    }
+
+    size_t rowsToEmit = static_cast<size_t>(std::min<int64_t>(batchRows, static_cast<int64_t>(500 - std::min<size_t>(outRows.size(), 500))));
+    if (rowsToEmit == 0) return true;
+
+    std::vector<std::vector<uint8_t>> decompHolders;
+    decompHolders.reserve(bufCnt);
+
+    bool corruptComp = false;
     auto getBuf = [&](uint32_t idx, const uint8_t*& p, size_t& l) -> bool {
         p = nullptr; l = 0;
         if (idx >= bufCnt || bufVec + static_cast<size_t>(idx + 1) * 16 > rbTbl.len) return false;
         int64_t off = RdI64LE(rbTbl.buf + bufVec + static_cast<size_t>(idx) * 16);
         int64_t bl  = RdI64LE(rbTbl.buf + bufVec + static_cast<size_t>(idx) * 16 + 8);
-        if (off < 0 || bl < 0 || static_cast<uint64_t>(off) + static_cast<uint64_t>(bl) > bodyLen) return false;
-        p = bodyPtr + static_cast<size_t>(off);
-        l = static_cast<size_t>(bl);
+        if (off < 0 || bl < 0 || static_cast<uint64_t>(off) + static_cast<uint64_t>(bl) > bodyLen) {
+            corruptComp = true;
+            return false;
+        }
+        if (bl == 0) return true;
+        const uint8_t* rawP = bodyPtr + static_cast<size_t>(off);
+        size_t rawL = static_cast<size_t>(bl);
+        if (!hasBodyComp) {
+            p = rawP;
+            l = rawL;
+            return true;
+        }
+        if (rawL < 8) { corruptComp = true; return false; }
+        int64_t uncompLen = RdI64LE(rawP);
+        if (uncompLen == -1) {
+            p = rawP + 8;
+            l = rawL - 8;
+            return true;
+        }
+        if (uncompLen == 0) return true;
+        if (uncompLen < -1 || uncompLen > 128LL * 1024LL * 1024LL) { corruptComp = true; return false; }
+        std::vector<uint8_t> dec;
+        size_t maxCap = static_cast<size_t>(uncompLen) + 64;
+        bool okDec = (compCodec == 0)
+            ? StreamCodecs::DecompressLz4Frame(rawP + 8, rawL - 8, dec, maxCap)
+            : StreamCodecs::DecompressZstdFrame(rawP + 8, rawL - 8, dec, maxCap);
+        if (!okDec || dec.size() != static_cast<size_t>(uncompLen)) {
+            corruptComp = true;
+            return false;
+        }
+        decompHolders.push_back(std::move(dec));
+        p = decompHolders.back().data();
+        l = decompHolders.back().size();
         return true;
     };
-
-    size_t rowsToEmit = static_cast<size_t>(std::min<int64_t>(batchRows, static_cast<int64_t>(500 - std::min<size_t>(outRows.size(), 500))));
-    if (rowsToEmit == 0) return;
 
     size_t baseRow = outRows.size();
     outRows.resize(baseRow + rowsToEmit, std::vector<std::wstring>(cols.size()));
@@ -2224,7 +2980,7 @@ inline void DecodeArrowRecordBatch(
     for (size_t c = 0; c < cols.size(); ++c) {
         const auto& col = cols[c];
         const uint8_t* validBmp = nullptr; size_t validLen = 0;
-        getBuf(bCursor++, validBmp, validLen);
+        if (!getBuf(bCursor++, validBmp, validLen) && corruptComp) return false;
 
         auto isNull = [&](size_t r) -> bool {
             if (!validBmp || validLen == 0) return false;
@@ -2233,41 +2989,69 @@ inline void DecodeArrowRecordBatch(
             return ((validBmp[byteIdx] >> (r & 7)) & 1u) == 0;
         };
 
+        if (col.hasDict) {
+            const uint8_t* idxBuf = nullptr; size_t idxLen = 0;
+            if (!getBuf(bCursor++, idxBuf, idxLen) && corruptComp) return false;
+            size_t bw = static_cast<size_t>(std::max(8, col.dictIdxBitWidth) / 8);
+            auto itD = dictMap.find(col.dictId);
+            for (size_t r = 0; r < rowsToEmit; ++r) {
+                if (isNull(r)) { outRows[baseRow + r][c] = L"NULL"; continue; }
+                if (!idxBuf || (r + 1) * bw > idxLen) continue;
+                const uint8_t* p = idxBuf + r * bw;
+                int64_t dv = 0;
+                if (col.dictIdxSigned) {
+                    dv = (bw == 1) ? static_cast<int8_t>(p[0]) :
+                         (bw == 2) ? RdI16LE(p) :
+                         (bw == 4) ? RdI32LE(p) : RdI64LE(p);
+                } else {
+                    dv = static_cast<int64_t>((bw == 1) ? p[0] :
+                         (bw == 2) ? RdU16LE(p) :
+                         (bw == 4) ? RdU32LE(p) : RdU64LE(p));
+                }
+                if (itD != dictMap.end() && dv >= 0 && static_cast<size_t>(dv) < itD->second.size()) {
+                    outRows[baseRow + r][c] = itD->second[static_cast<size_t>(dv)];
+                } else {
+                    outRows[baseRow + r][c] = std::to_wstring(dv);
+                }
+            }
+            continue;
+        }
+
         if (col.typeId == 5 || col.typeId == 4) { // Utf8 / Binary (validity, int32 offsets, data)
             const uint8_t* offBuf = nullptr; size_t offLen = 0;
             const uint8_t* valBuf = nullptr; size_t valLen = 0;
-            getBuf(bCursor++, offBuf, offLen);
-            getBuf(bCursor++, valBuf, valLen);
+            if (!getBuf(bCursor++, offBuf, offLen) && corruptComp) return false;
+            if (!getBuf(bCursor++, valBuf, valLen) && corruptComp) return false;
             for (size_t r = 0; r < rowsToEmit; ++r) {
                 if (isNull(r)) { outRows[baseRow + r][c] = L"NULL"; continue; }
-                if (offBuf && (r + 2) * 4 <= offLen && valBuf) {
+                if (offBuf && (r + 2) * 4 <= offLen) {
                     int32_t o0 = RdI32LE(offBuf + r * 4);
                     int32_t o1 = RdI32LE(offBuf + (r + 1) * 4);
-                    if (o0 >= 0 && o1 >= o0 && static_cast<size_t>(o1) <= valLen) {
-                        std::string s(reinterpret_cast<const char*>(valBuf + o0), static_cast<size_t>(o1 - o0));
+                    if (o0 >= 0 && o1 >= o0 && (o1 == o0 || (valBuf && static_cast<size_t>(o1) <= valLen))) {
+                        std::string s = (o1 > o0) ? std::string(reinterpret_cast<const char*>(valBuf + o0), static_cast<size_t>(o1 - o0)) : std::string{};
                         outRows[baseRow + r][c] = PathUtils::Utf8ToWide(s);
                     }
                 }
             }
-        } else if (col.typeId == 20) { // LargeUtf8 (validity, int64 offsets, data)
+        } else if (col.typeId == 20 || col.typeId == 19) { // LargeUtf8 / LargeBinary (validity, int64 offsets, data)
             const uint8_t* offBuf = nullptr; size_t offLen = 0;
             const uint8_t* valBuf = nullptr; size_t valLen = 0;
-            getBuf(bCursor++, offBuf, offLen);
-            getBuf(bCursor++, valBuf, valLen);
+            if (!getBuf(bCursor++, offBuf, offLen) && corruptComp) return false;
+            if (!getBuf(bCursor++, valBuf, valLen) && corruptComp) return false;
             for (size_t r = 0; r < rowsToEmit; ++r) {
                 if (isNull(r)) { outRows[baseRow + r][c] = L"NULL"; continue; }
-                if (offBuf && (r + 2) * 8 <= offLen && valBuf) {
+                if (offBuf && (r + 2) * 8 <= offLen) {
                     int64_t o0 = RdI64LE(offBuf + r * 8);
                     int64_t o1 = RdI64LE(offBuf + (r + 1) * 8);
-                    if (o0 >= 0 && o1 >= o0 && static_cast<uint64_t>(o1) <= valLen) {
-                        std::string s(reinterpret_cast<const char*>(valBuf + o0), static_cast<size_t>(o1 - o0));
+                    if (o0 >= 0 && o1 >= o0 && (o1 == o0 || (valBuf && static_cast<uint64_t>(o1) <= valLen))) {
+                        std::string s = (o1 > o0) ? std::string(reinterpret_cast<const char*>(valBuf + o0), static_cast<size_t>(o1 - o0)) : std::string{};
                         outRows[baseRow + r][c] = PathUtils::Utf8ToWide(s);
                     }
                 }
             }
         } else { // Fixed-width primitive (validity, data)
             const uint8_t* valBuf = nullptr; size_t valLen = 0;
-            getBuf(bCursor++, valBuf, valLen);
+            if (!getBuf(bCursor++, valBuf, valLen) && corruptComp) return false;
             for (size_t r = 0; r < rowsToEmit; ++r) {
                 if (isNull(r)) { outRows[baseRow + r][c] = L"NULL"; continue; }
                 if (!valBuf) continue;
@@ -2275,7 +3059,7 @@ inline void DecodeArrowRecordBatch(
                     if ((r >> 3) < valLen) {
                         outRows[baseRow + r][c] = (((valBuf[r >> 3] >> (r & 7)) & 1u) != 0) ? L"true" : L"false";
                     }
-                } else if (col.typeId == 2 || col.typeId == 8 || col.typeId == 10) { // Int / Date / Timestamp
+                } else if (col.typeId == 2 || col.typeId == 8 || col.typeId == 10) {
                     size_t bw = static_cast<size_t>(col.bitWidth / 8);
                     if (bw > 0 && (r + 1) * bw <= valLen) {
                         const uint8_t* p = valBuf + r * bw;
@@ -2291,7 +3075,7 @@ inline void DecodeArrowRecordBatch(
                             outRows[baseRow + r][c] = std::to_wstring(v);
                         }
                     }
-                } else if (col.typeId == 3) { // FloatingPoint
+                } else if (col.typeId == 3) {
                     size_t bw = static_cast<size_t>(col.bitWidth / 8);
                     if (bw > 0 && (r + 1) * bw <= valLen) {
                         const uint8_t* p = valBuf + r * bw;
@@ -2303,6 +3087,93 @@ inline void DecodeArrowRecordBatch(
             }
         }
     }
+    return !corruptComp;
+}
+
+inline bool DecodeArrowDictionaryBatch(
+    const FbTable& dbTbl,
+    const uint8_t* bodyPtr,
+    size_t bodyLen,
+    const std::vector<ArrowColSchema>& cols,
+    std::unordered_map<int64_t, std::vector<std::wstring>>& dictMap)
+{
+    int64_t dictId = dbTbl.GetI64(0, 0);
+    FbTable rbTbl;
+    if (!dbTbl.GetTable(1, rbTbl)) return false;
+    bool isDelta = dbTbl.GetU8(2, 0) != 0;
+
+    // Find a schema column using this dictId to determine the dictionary value type
+    ArrowColSchema valCol;
+    bool found = false;
+    for (const auto& c : cols) {
+        if (c.hasDict && c.dictId == dictId) {
+            valCol = c;
+            valCol.hasDict = false; // Decode physical dictionary values!
+            found = true;
+            break;
+        }
+    }
+    if (!found) return true;
+
+    std::vector<ArrowColSchema> singleCol = { valCol };
+    std::vector<std::vector<std::wstring>> decRows;
+    int64_t dummyAccum = 0;
+    std::unordered_map<int64_t, std::vector<std::wstring>> emptyDict;
+    if (!DecodeArrowRecordBatch(rbTbl, bodyPtr, bodyLen, singleCol, emptyDict, decRows, dummyAccum)) {
+        return false;
+    }
+    auto& dst = dictMap[dictId];
+    if (!isDelta) dst.clear();
+    for (auto& r : decRows) {
+        if (!r.empty()) dst.push_back(std::move(r[0]));
+    }
+    return true;
+}
+
+inline bool FinalizeArrowSheets(
+    const std::wstring& extLower,
+    const std::wstring& compLabel,
+    size_t batchCount,
+    int64_t totalRows,
+    const std::vector<ArrowColSchema>& cols,
+    std::vector<std::vector<std::wstring>>& dataRows,
+    ParsedOfficeDocument& out)
+{
+    if (cols.empty()) return false;
+    if (totalRows > 0 && dataRows.empty()) return false; // Corrupt or undecodable record batch!
+
+    SpreadsheetSheet schemaSh;
+    schemaSh.name = L"Arrow_Schema";
+    schemaSh.rows.push_back({ L"#", L"Field Name", L"Arrow Type", L"Nullable" });
+    schemaSh.rows.push_back({
+        L"(summary)",
+        L"RecordBatches: " + std::to_wstring(batchCount),
+        L"Total Rows: " + std::to_wstring(totalRows),
+        compLabel.empty() ? L"UNCOMPRESSED" : compLabel
+    });
+    for (size_t i = 0; i < cols.size(); ++i) {
+        schemaSh.rows.push_back({ std::to_wstring(i), cols[i].name, cols[i].typeLabel, cols[i].nullable ? L"true" : L"false" });
+    }
+    FinalizeSheetCols(schemaSh);
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"Apache Arrow Columnar IPC (" + extLower +
+        (compLabel.empty() ? L"" : (L", " + compLabel)) + L")";
+    out.sheets.push_back(std::move(schemaSh));
+
+    if (!dataRows.empty()) {
+        SpreadsheetSheet dataSh;
+        dataSh.name = L"Arrow_Data";
+        std::vector<std::wstring> hdr;
+        for (const auto& c : cols) hdr.push_back(c.name);
+        dataSh.rows.push_back(std::move(hdr));
+        for (auto& r : dataRows) dataSh.rows.push_back(std::move(r));
+        FinalizeSheetCols(dataSh);
+        out.sheets.push_back(std::move(dataSh));
+    }
+    out.valid = true;
+    return true;
 }
 
 inline bool ParseArrowOrFeather(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
@@ -2375,14 +3246,15 @@ inline bool ParseArrowOrFeather(const std::vector<uint8_t>& raw, const std::wstr
     }
 
     std::vector<ArrowColSchema> cols;
+    std::unordered_map<int64_t, std::vector<std::wstring>> dictMap;
     std::vector<std::vector<std::wstring>> dataRows;
+    std::wstring compLabel;
     int64_t totalRows = 0;
     size_t batchCount = 0;
 
-    // 2. Arrow IPC Random-Access File ("ARROW1" ... "ARROW1")
-    if (raw.size() >= 18 && std::memcmp(raw.data(), "ARROW1", 6) == 0 &&
-        std::memcmp(raw.data() + raw.size() - 6, "ARROW1", 6) == 0)
-    {
+    // 2. Arrow IPC Random-Access File / Feather v2 ("ARROW1" ... "ARROW1")
+    if (raw.size() >= 18 && std::memcmp(raw.data(), "ARROW1", 6) == 0) {
+        if (std::memcmp(raw.data() + raw.size() - 6, "ARROW1", 6) != 0) return false;
         uint32_t footerLen = RdU32LE(raw.data() + raw.size() - 10);
         if (footerLen == 0 || footerLen > raw.size() - 16) return false;
         size_t footerOff = raw.size() - 10 - footerLen;
@@ -2393,37 +3265,43 @@ inline bool ParseArrowOrFeather(const std::vector<uint8_t>& raw, const std::wstr
         if (!footer.GetTable(1, schemaTbl)) return false;
         ParseArrowSchemaFb(schemaTbl, cols);
 
-        uint32_t rbCnt = 0;
-        size_t rbVec = footer.GetVector(3, rbCnt); // struct Block { int64 offset, int32 metaDataLength, [4B pad], int64 bodyLength } = 24B
-        batchCount = rbCnt;
-        for (uint32_t b = 0; b < rbCnt && rbVec && rbVec + (b + 1) * 24 <= footer.len; ++b) {
-            int64_t blkOff  = RdI64LE(footer.buf + rbVec + b * 24);
-            int32_t metaLen = RdI32LE(footer.buf + rbVec + b * 24 + 8);
-            int64_t bodyLen = RdI64LE(footer.buf + rbVec + b * 24 + 16);
-            if (blkOff < 0 || metaLen < 8 || bodyLen < 0) continue;
-            if (static_cast<uint64_t>(blkOff) + static_cast<uint64_t>(metaLen) + static_cast<uint64_t>(bodyLen) > raw.size()) continue;
-
+        auto parseIpcBlockAt = [&](int64_t blkOff, int32_t metaLen, int64_t bodyLen, uint8_t expectedType) -> bool {
+            if (blkOff < 0 || metaLen < 8 || bodyLen < 0) return false;
+            if (static_cast<uint64_t>(blkOff) + static_cast<uint64_t>(metaLen) + static_cast<uint64_t>(bodyLen) > footerOff) return false;
             size_t msgPos = static_cast<size_t>(blkOff);
             uint32_t firstWord = RdU32LE(raw.data() + msgPos);
-            size_t fbLen = 0;
-            size_t fbOff = 0;
-            if (firstWord == 0xFFFFFFFFu) {
-                fbLen = RdU32LE(raw.data() + msgPos + 4);
-                fbOff = msgPos + 8;
-            } else {
-                fbLen = firstWord;
-                fbOff = msgPos + 4;
+            size_t fbLen = (firstWord == 0xFFFFFFFFu) ? RdU32LE(raw.data() + msgPos + 4) : firstWord;
+            size_t fbOff = (firstWord == 0xFFFFFFFFu) ? (msgPos + 8) : (msgPos + 4);
+            if (fbLen == 0 || fbOff + fbLen > msgPos + static_cast<size_t>(metaLen)) return false;
+            FbTable msg;
+            if (!GetFbRootTable(raw.data() + fbOff, fbLen, msg) || msg.GetU8(1, 0) != expectedType) return false;
+            const uint8_t* bodyPtr = raw.data() + static_cast<size_t>(blkOff) + static_cast<size_t>(metaLen);
+            if (expectedType == 2) {
+                FbTable db;
+                return msg.GetTable(2, db) && DecodeArrowDictionaryBatch(db, bodyPtr, static_cast<size_t>(bodyLen), cols, dictMap);
             }
-            if (fbLen > 0 && fbOff + fbLen <= raw.size()) {
-                FbTable msg;
-                if (GetFbRootTable(raw.data() + fbOff, fbLen, msg) && msg.GetU8(1, 0) == 3) {
-                    FbTable rb;
-                    if (msg.GetTable(2, rb)) {
-                        DecodeArrowRecordBatch(rb, raw.data() + static_cast<size_t>(blkOff) + static_cast<size_t>(metaLen),
-                            static_cast<size_t>(bodyLen), cols, dataRows, totalRows);
-                    }
-                }
-            }
+            FbTable rb;
+            return msg.GetTable(2, rb) &&
+                   DecodeArrowRecordBatch(rb, bodyPtr, static_cast<size_t>(bodyLen), cols, dictMap, dataRows, totalRows, &compLabel);
+        };
+
+        // Footer slot 2: dictionaries: [Block]
+        uint32_t dictCnt = 0;
+        size_t dictVec = footer.GetVector(2, dictCnt);
+        for (uint32_t d = 0; d < dictCnt && dictVec && dictVec + (d + 1) * 24 <= footer.len; ++d) {
+            if (!parseIpcBlockAt(RdI64LE(footer.buf + dictVec + d * 24),
+                                 RdI32LE(footer.buf + dictVec + d * 24 + 8),
+                                 RdI64LE(footer.buf + dictVec + d * 24 + 16), 2)) return false;
+        }
+
+        // Footer slot 3: recordBatches: [Block]
+        uint32_t rbCnt = 0;
+        size_t rbVec = footer.GetVector(3, rbCnt);
+        batchCount = rbCnt;
+        for (uint32_t b = 0; b < rbCnt && rbVec && rbVec + (b + 1) * 24 <= footer.len; ++b) {
+            if (!parseIpcBlockAt(RdI64LE(footer.buf + rbVec + b * 24),
+                                 RdI32LE(footer.buf + rbVec + b * 24 + 8),
+                                 RdI64LE(footer.buf + rbVec + b * 24 + 16), 3)) return false;
         }
     } else if (raw.size() >= 12) {
         // 3. Arrow IPC Stream Format (0xFFFFFFFF + uint32 metaLen + Message FlatBuffer + Body)
@@ -2439,61 +3317,186 @@ inline bool ParseArrowOrFeather(const std::vector<uint8_t>& raw, const std::wstr
                 metaLen = w0;
                 pos += 4;
             }
-            if (metaLen == 0) break; // EOS marker
+            if (metaLen == 0) break;
             if (metaLen > raw.size() - pos) return false;
 
             FbTable msg;
             if (!GetFbRootTable(raw.data() + pos, metaLen, msg)) return false;
             pos += metaLen;
 
-            uint8_t hdrType = msg.GetU8(1, 0); // 1=Schema, 2=DictionaryBatch, 3=RecordBatch
+            uint8_t hdrType = msg.GetU8(1, 0);
             int64_t bodyLen = msg.GetI64(3, 0);
             if (bodyLen < 0 || static_cast<uint64_t>(bodyLen) > raw.size() - pos) return false;
 
             if (hdrType == 1) {
                 FbTable schemaTbl;
                 if (msg.GetTable(2, schemaTbl)) ParseArrowSchemaFb(schemaTbl, cols);
+            } else if (hdrType == 2 && !cols.empty()) {
+                FbTable db;
+                if (!msg.GetTable(2, db) ||
+                    !DecodeArrowDictionaryBatch(db, raw.data() + pos, static_cast<size_t>(bodyLen), cols, dictMap)) return false;
             } else if (hdrType == 3 && !cols.empty()) {
                 ++batchCount;
                 FbTable rb;
-                if (msg.GetTable(2, rb)) {
-                    DecodeArrowRecordBatch(rb, raw.data() + pos, static_cast<size_t>(bodyLen), cols, dataRows, totalRows);
+                if (!msg.GetTable(2, rb) ||
+                    !DecodeArrowRecordBatch(rb, raw.data() + pos, static_cast<size_t>(bodyLen), cols, dictMap, dataRows, totalRows, &compLabel)) {
+                    return false;
                 }
             } else if (pos == metaLen + 8 && cols.empty()) {
-                return false; // First message in Arrow IPC stream must be Schema!
+                return false;
             }
             pos += static_cast<size_t>(bodyLen);
         }
     }
 
-    if (cols.empty()) return false;
+    return FinalizeArrowSheets(extLower, compLabel, batchCount, totalRows, cols, dataRows, out);
+}
 
-    SpreadsheetSheet schemaSh;
-    schemaSh.name = L"Arrow_Schema";
-    schemaSh.rows.push_back({ L"#", L"Field Name", L"Arrow Type", L"Nullable" });
-    schemaSh.rows.push_back({ L"(summary)", L"RecordBatches: " + std::to_wstring(batchCount), L"Total Rows: " + std::to_wstring(totalRows), L"" });
-    for (size_t i = 0; i < cols.size(); ++i) {
-        schemaSh.rows.push_back({ std::to_wstring(i), cols[i].name, cols[i].typeLabel, cols[i].nullable ? L"true" : L"false" });
+// Streaming & random-access Arrow IPC / Feather v1 & v2 reader supporting >32 MB / multi-GB files
+inline bool ParseArrowOrFeatherFile(const std::wstring& fullPath, const std::wstring& extLower, ParsedOfficeDocument& out) {
+    ParquetDetail::WinParquetRandomFile rf;
+    if (!rf.Open(fullPath) || rf.fileSize < 12) return false;
+
+    if (rf.fileSize <= 16ULL * 1024ULL * 1024ULL) {
+        std::vector<uint8_t> raw(static_cast<size_t>(rf.fileSize));
+        if (!rf.ReadAt(0, raw.data(), raw.size())) return false;
+        return ParseArrowOrFeather(raw, extLower, out);
     }
-    FinalizeSheetCols(schemaSh);
 
-    out.kind = OfficeFileKind::SqliteDb;
-    out.isSpreadsheet = true;
-    out.formatTitle = L"Apache Arrow Columnar IPC (" + extLower + L")";
-    out.sheets.push_back(std::move(schemaSh));
+    uint8_t head8[8] = {};
+    if (!rf.ReadAt(0, head8, 8)) return false;
 
-    if (!dataRows.empty()) {
-        SpreadsheetSheet dataSh;
-        dataSh.name = L"Arrow_Data";
-        std::vector<std::wstring> hdr;
-        for (const auto& c : cols) hdr.push_back(c.name);
-        dataSh.rows.push_back(std::move(hdr));
-        for (auto& r : dataRows) dataSh.rows.push_back(std::move(r));
-        FinalizeSheetCols(dataSh);
-        out.sheets.push_back(std::move(dataSh));
+    std::vector<ArrowColSchema> cols;
+    std::unordered_map<int64_t, std::vector<std::wstring>> dictMap;
+    std::vector<std::vector<std::wstring>> dataRows;
+    std::wstring compLabel;
+    int64_t totalRows = 0;
+    size_t batchCount = 0;
+
+    if (std::memcmp(head8, "ARROW1", 6) == 0) {
+        uint8_t tail10[10] = {};
+        if (!rf.ReadAt(rf.fileSize - 10, tail10, 10) || std::memcmp(tail10 + 4, "ARROW1", 6) != 0) return false;
+        uint32_t footerLen = RdU32LE(tail10);
+        if (footerLen == 0 || footerLen > 64u * 1024u * 1024u || static_cast<uint64_t>(footerLen) + 16ULL > rf.fileSize) return false;
+        uint64_t footerOff = rf.fileSize - 10ULL - footerLen;
+        std::vector<uint8_t> footerBuf(footerLen);
+        if (!rf.ReadAt(footerOff, footerBuf.data(), footerLen)) return false;
+
+        FbTable footer;
+        if (!GetFbRootTable(footerBuf.data(), footerBuf.size(), footer)) return false;
+        FbTable schemaTbl;
+        if (!footer.GetTable(1, schemaTbl)) return false;
+        ParseArrowSchemaFb(schemaTbl, cols);
+
+        std::vector<uint8_t> msgBuf, bodyBuf;
+        auto readMsgTable = [&](uint64_t blkOff, int32_t metaLen, FbTable& outMsg) -> bool {
+            if (metaLen < 8 || metaLen > 16 * 1024 * 1024 || blkOff + static_cast<uint64_t>(metaLen) > footerOff) return false;
+            msgBuf.resize(static_cast<size_t>(metaLen));
+            if (!rf.ReadAt(blkOff, msgBuf.data(), msgBuf.size())) return false;
+            uint32_t w0 = RdU32LE(msgBuf.data());
+            size_t fbLen = (w0 == 0xFFFFFFFFu) ? RdU32LE(msgBuf.data() + 4) : w0;
+            size_t fbOff = (w0 == 0xFFFFFFFFu) ? 8 : 4;
+            if (fbLen == 0 || fbOff + fbLen > msgBuf.size()) return false;
+            return GetFbRootTable(msgBuf.data() + fbOff, fbLen, outMsg);
+        };
+
+        uint32_t dictCnt = 0;
+        size_t dictVec = footer.GetVector(2, dictCnt);
+        for (uint32_t d = 0; d < dictCnt && dictVec && dictVec + (d + 1) * 24 <= footer.len; ++d) {
+            int64_t blkOff  = RdI64LE(footer.buf + dictVec + d * 24);
+            int32_t metaLen = RdI32LE(footer.buf + dictVec + d * 24 + 8);
+            int64_t bodyLen = RdI64LE(footer.buf + dictVec + d * 24 + 16);
+            if (blkOff < 0 || bodyLen < 0 || bodyLen > 64LL * 1024LL * 1024LL) return false;
+            FbTable msg;
+            if (!readMsgTable(static_cast<uint64_t>(blkOff), metaLen, msg) || msg.GetU8(1, 0) != 2) return false;
+            bodyBuf.resize(static_cast<size_t>(bodyLen));
+            if (bodyLen > 0 && !rf.ReadAt(static_cast<uint64_t>(blkOff + metaLen), bodyBuf.data(), bodyBuf.size())) return false;
+            FbTable db;
+            if (!msg.GetTable(2, db) || !DecodeArrowDictionaryBatch(db, bodyBuf.data(), bodyBuf.size(), cols, dictMap)) return false;
+        }
+
+        uint32_t rbCnt = 0;
+        size_t rbVec = footer.GetVector(3, rbCnt);
+        batchCount = rbCnt;
+        for (uint32_t b = 0; b < rbCnt && rbVec && rbVec + (b + 1) * 24 <= footer.len; ++b) {
+            int64_t blkOff  = RdI64LE(footer.buf + rbVec + b * 24);
+            int32_t metaLen = RdI32LE(footer.buf + rbVec + b * 24 + 8);
+            int64_t bodyLen = RdI64LE(footer.buf + rbVec + b * 24 + 16);
+            if (blkOff < 0 || bodyLen < 0 || static_cast<uint64_t>(blkOff + metaLen + bodyLen) > footerOff) return false;
+            FbTable msg;
+            if (!readMsgTable(static_cast<uint64_t>(blkOff), metaLen, msg) || msg.GetU8(1, 0) != 3) return false;
+            FbTable rb;
+            if (!msg.GetTable(2, rb)) return false;
+            if (dataRows.size() < 500 && bodyLen <= 128LL * 1024LL * 1024LL) {
+                bodyBuf.resize(static_cast<size_t>(bodyLen));
+                if (bodyLen > 0 && !rf.ReadAt(static_cast<uint64_t>(blkOff + metaLen), bodyBuf.data(), bodyBuf.size())) return false;
+                if (!DecodeArrowRecordBatch(rb, bodyBuf.data(), bodyBuf.size(), cols, dictMap, dataRows, totalRows, &compLabel)) {
+                    return false;
+                }
+            } else {
+                totalRows += std::max<int64_t>(0, rb.GetI64(0, 0));
+            }
+        }
+        return FinalizeArrowSheets(extLower, compLabel, batchCount, totalRows, cols, dataRows, out);
     }
-    out.valid = true;
-    return true;
+
+    // Large >16 MB Arrow IPC Stream (0xFFFFFFFF + metaLen + Message + Body)
+    uint64_t pos = 0;
+    std::vector<uint8_t> metaBuf, bodyBuf;
+    while (pos + 8 <= rf.fileSize) {
+        uint8_t pfx[8] = {};
+        if (!rf.ReadAt(pos, pfx, 8)) break;
+        uint32_t w0 = RdU32LE(pfx);
+        uint32_t metaLen = 0;
+        if (w0 == 0xFFFFFFFFu) {
+            metaLen = RdU32LE(pfx + 4);
+            pos += 8;
+        } else {
+            if (pos == 0 && w0 > 16 * 1024 * 1024) return false;
+            metaLen = w0;
+            pos += 4;
+        }
+        if (metaLen == 0) break;
+        if (metaLen > 16 * 1024 * 1024 || metaLen > rf.fileSize - pos) return false;
+
+        metaBuf.resize(metaLen);
+        if (!rf.ReadAt(pos, metaBuf.data(), metaLen)) return false;
+        pos += metaLen;
+
+        FbTable msg;
+        if (!GetFbRootTable(metaBuf.data(), metaLen, msg)) return false;
+        uint8_t hdrType = msg.GetU8(1, 0);
+        int64_t bodyLen = msg.GetI64(3, 0);
+        if (bodyLen < 0 || static_cast<uint64_t>(bodyLen) > rf.fileSize - pos) return false;
+
+        if (hdrType == 1) {
+            FbTable schemaTbl;
+            if (msg.GetTable(2, schemaTbl)) ParseArrowSchemaFb(schemaTbl, cols);
+        } else if (hdrType == 2 && !cols.empty() && bodyLen <= 64LL * 1024LL * 1024LL) {
+            bodyBuf.resize(static_cast<size_t>(bodyLen));
+            if (bodyLen > 0 && !rf.ReadAt(pos, bodyBuf.data(), bodyBuf.size())) return false;
+            FbTable db;
+            if (!msg.GetTable(2, db) || !DecodeArrowDictionaryBatch(db, bodyBuf.data(), bodyBuf.size(), cols, dictMap)) return false;
+        } else if (hdrType == 3 && !cols.empty()) {
+            ++batchCount;
+            FbTable rb;
+            if (!msg.GetTable(2, rb)) return false;
+            if (dataRows.size() < 500 && bodyLen <= 128LL * 1024LL * 1024LL) {
+                bodyBuf.resize(static_cast<size_t>(bodyLen));
+                if (bodyLen > 0 && !rf.ReadAt(pos, bodyBuf.data(), bodyBuf.size())) return false;
+                if (!DecodeArrowRecordBatch(rb, bodyBuf.data(), bodyBuf.size(), cols, dictMap, dataRows, totalRows, &compLabel)) {
+                    return false;
+                }
+            } else {
+                totalRows += std::max<int64_t>(0, rb.GetI64(0, 0));
+            }
+        } else if (cols.empty()) {
+            return false;
+        }
+        pos += static_cast<uint64_t>(bodyLen);
+    }
+
+    return FinalizeArrowSheets(extLower, compLabel, batchCount, totalRows, cols, dataRows, out);
 }
 
 // ============================================================================
@@ -2756,6 +3759,12 @@ struct Hdf5Ctx {
     }
 };
 
+struct Hdf5FilterDesc {
+    uint16_t id = 0;    // 1=deflate, 2=shuffle, 3=fletcher32
+    uint16_t flags = 0; // bit 0: optional
+    std::vector<uint32_t> cdVals;
+};
+
 struct Hdf5DatasetInfo {
     std::wstring path;
     std::wstring dtypeDesc;
@@ -2767,6 +3776,15 @@ struct Hdf5DatasetInfo {
     std::vector<uint8_t> compactData;
     uint64_t contigAddr = UINT64_MAX;
     uint64_t contigSize = 0;
+    // Chunked storage + filter pipeline (#32)
+    bool isChunked = false;
+    uint8_t chunkLayoutVer = 0;
+    uint8_t chunkIdxType = 0; // v4: 1=SingleChunk, 2=Implicit
+    uint64_t chunkAddr = UINT64_MAX;
+    uint64_t singleChunkCompSize = 0;
+    uint32_t singleChunkFilterMask = 0;
+    std::vector<uint64_t> chunkDims;
+    std::vector<Hdf5FilterDesc> filters;
 };
 
 inline std::string ReadHdf5HeapString(const Hdf5Ctx& ctx, uint64_t heapAddr, uint64_t strOff) {
@@ -2951,7 +3969,7 @@ inline void ParseHdf5HeaderMessage(
         else ds.dtypeDesc = L"class(" + std::to_wstring(cls) + L"," + std::to_wstring(sz) + L"B)";
     } else if (msgType == 0x0008 && msize >= 2) { // Data Layout
         uint8_t ver = mp[0];
-        if (ver == 3 || ver == 4) {
+        if (ver == 3) {
             uint8_t layoutClass = mp[1];
             if (layoutClass == 0 && msize >= 4) { // Compact
                 uint16_t csz = RdU16LE(mp + 2);
@@ -2959,6 +3977,54 @@ inline void ParseHdf5HeaderMessage(
             } else if (layoutClass == 1 && msize >= static_cast<size_t>(2 + ctx.offSize + ctx.lenSize)) { // Contiguous
                 ds.contigAddr = ctx.RdOff(mp + 2);
                 ds.contigSize = ctx.RdLen(mp + 2 + ctx.offSize);
+            } else if (layoutClass == 2 && msize >= static_cast<size_t>(3 + ctx.offSize + 4)) { // Chunked v3
+                uint8_t nd = mp[2]; // dimensionality = rank + 1 (last is element byte size)
+                ds.isChunked = true;
+                ds.chunkLayoutVer = 3;
+                ds.chunkAddr = ctx.RdOff(mp + 3);
+                ds.chunkDims.clear();
+                size_t doff = 3 + ctx.offSize;
+                for (uint8_t d = 0; d < nd && doff + 4 <= msize; ++d, doff += 4) {
+                    ds.chunkDims.push_back(RdU32LE(mp + doff));
+                }
+            }
+        } else if (ver == 4 && msize >= 2) {
+            uint8_t layoutClass = mp[1];
+            if (layoutClass == 0 && msize >= 4) {
+                uint16_t csz = RdU16LE(mp + 2);
+                if (4u + csz <= msize) ds.compactData.assign(mp + 4, mp + 4 + csz);
+            } else if (layoutClass == 1 && msize >= static_cast<size_t>(2 + ctx.offSize + ctx.lenSize)) {
+                ds.contigAddr = ctx.RdOff(mp + 2);
+                ds.contigSize = ctx.RdLen(mp + 2 + ctx.offSize);
+            } else if (layoutClass == 2 && msize >= 6) { // Chunked v4
+                uint8_t lflags = mp[2];
+                uint8_t nd = mp[3];
+                uint8_t dimBytes = mp[4];
+                if (dimBytes >= 1 && dimBytes <= 8 && 5u + static_cast<size_t>(nd) * dimBytes + 1u <= msize) {
+                    ds.isChunked = true;
+                    ds.chunkLayoutVer = 4;
+                    ds.chunkDims.clear();
+                    size_t doff = 5;
+                    for (uint8_t d = 0; d < nd; ++d, doff += dimBytes) {
+                        uint64_t dv = 0;
+                        for (uint8_t b = 0; b < dimBytes; ++b) dv |= static_cast<uint64_t>(mp[doff + b]) << (b * 8);
+                        ds.chunkDims.push_back(dv);
+                    }
+                    ds.chunkIdxType = mp[doff++];
+                    if (ds.chunkIdxType == 1) { // Single Chunk index
+                        if (lflags & 0x02u) { // Filtered single chunk
+                            if (doff + ctx.lenSize + 4 + ctx.offSize <= msize) {
+                                ds.singleChunkCompSize = ctx.RdLen(mp + doff);
+                                ds.singleChunkFilterMask = RdU32LE(mp + doff + ctx.lenSize);
+                                ds.chunkAddr = ctx.RdOff(mp + doff + ctx.lenSize + 4);
+                            }
+                        } else if (doff + ctx.offSize <= msize) {
+                            ds.chunkAddr = ctx.RdOff(mp + doff);
+                        }
+                    } else if (ds.chunkIdxType == 2 && doff + ctx.offSize <= msize) { // Implicit index
+                        ds.chunkAddr = ctx.RdOff(mp + doff);
+                    }
+                }
             }
         } else if ((ver == 1 || ver == 2) && msize >= 4) {
             uint8_t rank = mp[1];
@@ -2970,6 +4036,66 @@ inline void ParseHdf5HeaderMessage(
                 uint64_t prod = 1;
                 for (uint8_t d = 0; d < rank && off + 4 <= msize; ++d, off += 4) prod *= RdU32LE(mp + off);
                 ds.contigSize = prod;
+            } else if (layoutClass == 2 && off + ctx.offSize <= msize) { // Chunked v1/v2
+                ds.isChunked = true;
+                ds.chunkLayoutVer = ver;
+                ds.chunkAddr = ctx.RdOff(mp + off);
+                off += ctx.offSize;
+                ds.chunkDims.clear();
+                for (uint8_t d = 0; d < rank && off + 4 <= msize; ++d, off += 4) {
+                    ds.chunkDims.push_back(RdU32LE(mp + off));
+                }
+            }
+        }
+    } else if (msgType == 0x000B && msize >= 2) { // Filter Pipeline (v1 / v2)
+        uint8_t ver = mp[0];
+        uint8_t nFilt = mp[1];
+        size_t pos = (ver == 1) ? 8 : 2;
+        if ((ver == 1 || ver == 2) && nFilt <= 16 && pos <= msize) {
+            ds.filters.clear();
+            for (uint8_t fi = 0; fi < nFilt; ++fi) {
+                Hdf5FilterDesc fd;
+                if (ver == 1) {
+                    if (pos + 8 > msize) break;
+                    fd.id = RdU16LE(mp + pos);
+                    uint16_t nameLen = RdU16LE(mp + pos + 2);
+                    fd.flags = RdU16LE(mp + pos + 4);
+                    uint16_t nCd = RdU16LE(mp + pos + 6);
+                    pos += 8;
+                    if (nameLen > 0) {
+                        size_t npad = (static_cast<size_t>(nameLen) + 7u) & ~size_t(7u);
+                        if (npad > msize - pos) break;
+                        pos += npad;
+                    }
+                    if (static_cast<size_t>(nCd) * 4u > msize - pos) break;
+                    for (uint16_t c = 0; c < nCd; ++c) {
+                        fd.cdVals.push_back(RdU32LE(mp + pos + c * 4u));
+                    }
+                    pos += static_cast<size_t>(nCd) * 4u;
+                    if ((nCd & 1u) != 0 && pos + 4 <= msize) pos += 4;
+                } else {
+                    if (pos + 6 > msize) break;
+                    fd.id = RdU16LE(mp + pos);
+                    pos += 2;
+                    uint16_t nameLen = 0;
+                    if (fd.id >= 256) {
+                        if (pos + 2 > msize) break;
+                        nameLen = RdU16LE(mp + pos);
+                        pos += 2;
+                    }
+                    if (pos + 4 > msize) break;
+                    fd.flags = RdU16LE(mp + pos);
+                    uint16_t nCd = RdU16LE(mp + pos + 2);
+                    pos += 4;
+                    if (nameLen > msize - pos) break;
+                    pos += nameLen;
+                    if (static_cast<size_t>(nCd) * 4u > msize - pos) break;
+                    for (uint16_t c = 0; c < nCd; ++c) {
+                        fd.cdVals.push_back(RdU32LE(mp + pos + c * 4u));
+                    }
+                    pos += static_cast<size_t>(nCd) * 4u;
+                }
+                ds.filters.push_back(std::move(fd));
             }
         }
     } else if (msgType == 0x0011 && msize >= static_cast<size_t>(2 * ctx.offSize)) { // Symbol Table
@@ -3097,6 +4223,201 @@ inline void WalkHdf5Object(
     }
 }
 
+inline bool ApplyHdf5ChunkFiltersReverse(
+    const uint8_t* src,
+    size_t srcLen,
+    uint32_t filterMask,
+    size_t expectedUncompBytes,
+    const Hdf5DatasetInfo& ds,
+    std::vector<uint8_t>& outBuf)
+{
+    outBuf.assign(src, src + srcLen);
+    if (ds.filters.empty()) return true;
+
+    const size_t maxCap = std::max<size_t>(expectedUncompBytes + 65536, 65536);
+    for (int fi = static_cast<int>(ds.filters.size()) - 1; fi >= 0; --fi) {
+        if ((filterMask & (1u << fi)) != 0) continue; // Filter was bypassed on write
+        const auto& f = ds.filters[static_cast<size_t>(fi)];
+        if (f.id == 1) { // H5Z_FILTER_DEFLATE (zlib / deflate)
+            std::vector<uint8_t> dec;
+            if (!ZipDeflate::InflateZlib(outBuf.data(), outBuf.size(), dec, maxCap) &&
+                !ZipDeflate::InflateRaw(outBuf.data(), outBuf.size(), dec, maxCap))
+            {
+                return false;
+            }
+            outBuf = std::move(dec);
+        } else if (f.id == 2) { // H5Z_FILTER_SHUFFLE (byte-unshuffle)
+            size_t elemSz = (!f.cdVals.empty() && f.cdVals[0] > 0) ? static_cast<size_t>(f.cdVals[0]) : static_cast<size_t>(ds.dtSize);
+            if (elemSz > 1 && outBuf.size() >= elemSz) {
+                size_t nElems = outBuf.size() / elemSz;
+                std::vector<uint8_t> unshuf(outBuf.size());
+                for (size_t i = 0; i < nElems; ++i) {
+                    for (size_t b = 0; b < elemSz; ++b) {
+                        unshuf[i * elemSz + b] = outBuf[b * nElems + i];
+                    }
+                }
+                size_t remOff = nElems * elemSz;
+                if (remOff < outBuf.size()) {
+                    std::memcpy(unshuf.data() + remOff, outBuf.data() + remOff, outBuf.size() - remOff);
+                }
+                outBuf = std::move(unshuf);
+            }
+        } else if (f.id == 3) { // H5Z_FILTER_FLETCHER32 (4-byte trailing checksum)
+            if (outBuf.size() < 4) return false;
+            outBuf.resize(outBuf.size() - 4);
+        } else if ((f.flags & 0x0001u) == 0) {
+            return false; // Unsupported mandatory filter
+        }
+    }
+    return outBuf.size() >= expectedUncompBytes || expectedUncompBytes == 0;
+}
+
+inline void ScatterHdf5ChunkToLinear(
+    const uint8_t* chunkData,
+    size_t chunkDataBytes,
+    const std::vector<uint64_t>& coords,
+    const std::vector<uint64_t>& cDims,
+    const std::vector<uint64_t>& dsDims,
+    uint32_t elemBytes,
+    std::vector<uint8_t>& dstLinear)
+{
+    if (elemBytes == 0 || dstLinear.empty()) return;
+    const size_t rank = dsDims.size();
+    if (rank == 0) {
+        if (chunkDataBytes >= elemBytes && dstLinear.size() >= elemBytes) {
+            std::memcpy(dstLinear.data(), chunkData, elemBytes);
+        }
+        return;
+    }
+    if (coords.size() < rank || cDims.size() < rank) return;
+
+    // General N-D row-major coordinate scatter (exact for 1D, 2D, 3D, N-D!)
+    uint64_t chunkTotalElems = 1;
+    for (size_t d = 0; d < rank; ++d) {
+        if (cDims[d] == 0) return;
+        chunkTotalElems *= cDims[d];
+    }
+    const size_t maxSrcElems = std::min<size_t>(static_cast<size_t>(chunkTotalElems), chunkDataBytes / elemBytes);
+    const size_t maxDstElems = dstLinear.size() / elemBytes;
+
+    std::vector<uint64_t> dsStrides(rank, 1);
+    std::vector<uint64_t> chStrides(rank, 1);
+    for (size_t d = rank - 1; d > 0; --d) {
+        dsStrides[d - 1] = dsStrides[d] * dsDims[d];
+        chStrides[d - 1] = chStrides[d] * cDims[d];
+    }
+
+    for (size_t lin = 0; lin < maxSrcElems; ++lin) {
+        uint64_t rem = lin;
+        uint64_t dstIdx = 0;
+        bool inBounds = true;
+        for (size_t d = 0; d < rank; ++d) {
+            uint64_t localC = rem / chStrides[d];
+            rem %= chStrides[d];
+            uint64_t globalC = coords[d] + localC;
+            if (globalC >= dsDims[d]) { inBounds = false; break; }
+            dstIdx += globalC * dsStrides[d];
+        }
+        if (inBounds && dstIdx < maxDstElems) {
+            std::memcpy(dstLinear.data() + static_cast<size_t>(dstIdx) * elemBytes,
+                        chunkData + lin * elemBytes, elemBytes);
+        }
+    }
+}
+
+inline bool WalkHdf5ChunkBTreeV1(
+    const Hdf5Ctx& ctx,
+    uint64_t nodeAddr,
+    const Hdf5DatasetInfo& ds,
+    const std::vector<uint64_t>& cDims,
+    size_t uncompChunkBytes,
+    std::vector<uint8_t>& dstLinear,
+    size_t& decodedChunks,
+    int depth)
+{
+    if (depth > 16 || !ctx.AddrOk(nodeAddr, 8 + 2 * ctx.offSize)) return false;
+    const uint8_t* p = ctx.Ptr(nodeAddr);
+    if (std::memcmp(p, "TREE", 4) != 0 || p[4] != 1) return false; // Must be B-tree type 1 (Raw Data Chunks)
+    uint8_t level = p[5];
+    uint16_t entriesUsed = RdU16LE(p + 6);
+    if (entriesUsed == 0 || entriesUsed > 16384) return false;
+
+    const size_t keyDimCnt = ds.dims.size() + 1; // HDF5 v1 chunk B-tree stores rank + 1 uint64 offsets
+    const size_t keySize = 8 + keyDimCnt * 8;
+    size_t cur = 8 + 2 * ctx.offSize;
+
+    for (uint16_t i = 0; i < entriesUsed && decodedChunks < 4096; ++i) {
+        if (!ctx.AddrOk(nodeAddr + cur, keySize + ctx.offSize)) return false;
+        const uint8_t* kp = p + cur;
+        uint32_t chunkByteSize = RdU32LE(kp);
+        uint32_t filterMask    = RdU32LE(kp + 4);
+        std::vector<uint64_t> coords(ds.dims.size(), 0);
+        for (size_t d = 0; d < ds.dims.size(); ++d) {
+            coords[d] = RdU64LE(kp + 8 + d * 8);
+        }
+        cur += keySize;
+        uint64_t childAddr = ctx.RdOff(p + cur);
+        cur += ctx.offSize;
+
+        if (level > 0) {
+            if (!WalkHdf5ChunkBTreeV1(ctx, childAddr, ds, cDims, uncompChunkBytes, dstLinear, decodedChunks, depth + 1)) {
+                return false;
+            }
+        } else {
+            if (chunkByteSize == 0 || chunkByteSize > 32 * 1024 * 1024 || !ctx.AddrOk(childAddr, chunkByteSize)) {
+                return false;
+            }
+            std::vector<uint8_t> decChunk;
+            if (!ApplyHdf5ChunkFiltersReverse(ctx.Ptr(childAddr), chunkByteSize, filterMask, uncompChunkBytes, ds, decChunk)) {
+                return false;
+            }
+            ScatterHdf5ChunkToLinear(decChunk.data(), decChunk.size(), coords, cDims, ds.dims, ds.dtSize, dstLinear);
+            ++decodedChunks;
+        }
+    }
+    return decodedChunks > 0;
+}
+
+inline bool ReconstructHdf5ChunkedDataset(
+    const Hdf5Ctx& ctx,
+    const Hdf5DatasetInfo& ds,
+    uint64_t totalElems,
+    std::vector<uint8_t>& outBuf)
+{
+    outBuf.clear();
+    if (!ds.isChunked || ds.dtSize == 0 || ds.chunkAddr == UINT64_MAX) return false;
+
+    std::vector<uint64_t> cDims = ds.chunkDims;
+    if (cDims.size() == ds.dims.size() + 1) cDims.pop_back();
+    if (cDims.size() != ds.dims.size()) return false;
+
+    uint64_t chunkElems = 1;
+    for (uint64_t cd : cDims) {
+        if (cd == 0 || cd > 64 * 1024 * 1024) return false;
+        chunkElems *= cd;
+        if (chunkElems > 64 * 1024 * 1024) return false;
+    }
+    const size_t uncompChunkBytes = static_cast<size_t>(chunkElems) * ds.dtSize;
+    const uint64_t cappedElems = std::min<uint64_t>(totalElems, (16ULL * 1024ULL * 1024ULL) / ds.dtSize);
+    if (cappedElems == 0) return false;
+    outBuf.assign(static_cast<size_t>(cappedElems) * ds.dtSize, 0);
+
+    if (ds.chunkLayoutVer == 4 && ds.chunkIdxType == 1) { // v4 Single Chunk
+        size_t compSz = (ds.singleChunkCompSize > 0) ? static_cast<size_t>(ds.singleChunkCompSize) : uncompChunkBytes;
+        if (compSz == 0 || compSz > 32 * 1024 * 1024 || !ctx.AddrOk(ds.chunkAddr, compSz)) return false;
+        std::vector<uint8_t> dec;
+        if (!ApplyHdf5ChunkFiltersReverse(ctx.Ptr(ds.chunkAddr), compSz, ds.singleChunkFilterMask, uncompChunkBytes, ds, dec)) {
+            return false;
+        }
+        std::vector<uint64_t> zeroCoords(ds.dims.size(), 0);
+        ScatterHdf5ChunkToLinear(dec.data(), dec.size(), zeroCoords, cDims, ds.dims, ds.dtSize, outBuf);
+        return true;
+    }
+
+    size_t decodedChunks = 0;
+    return WalkHdf5ChunkBTreeV1(ctx, ds.chunkAddr, ds, cDims, uncompChunkBytes, outBuf, decodedChunks, 0);
+}
+
 inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
     static const uint8_t kSig[8] = { 0x89, 'H', 'D', 'F', '\r', '\n', 0x1A, '\n' };
     size_t sbOff = SIZE_MAX;
@@ -3125,19 +4446,18 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
         if ((ctx.offSize != 2 && ctx.offSize != 4 && ctx.offSize != 8) ||
             (ctx.lenSize != 2 && ctx.lenSize != 4 && ctx.lenSize != 8)) return false;
         size_t pos = 24;
-        if (sbVer == 1) pos = 28; // v1 adds indexed storage internal node K + 2B reserved
+        if (sbVer == 1) pos = 28;
         if (sbOff + pos + 4 * ctx.offSize + 24 > raw.size()) return false;
         ctx.baseAddr = ctx.RdOff(sb + pos);
         if (ctx.baseAddr == UINT64_MAX || ctx.baseAddr >= raw.size()) ctx.baseAddr = sbOff;
-        pos += 4 * ctx.offSize; // base, freespace, eof, driverInfo
-        // Root Group Symbol Table Entry: linkNameOff (offSize), objHdrAddr (offSize), cacheType (4B), reserved (4B), scratchpad (16B)
+        pos += 4 * ctx.offSize;
         rootObjAddr = ctx.RdOff(sb + pos + ctx.offSize);
         uint32_t cacheType = RdU32LE(sb + pos + 2 * ctx.offSize);
         if (cacheType == 1 && sbOff + pos + 4 * ctx.offSize + 8 <= raw.size()) {
             rootBtree = ctx.RdOff(sb + pos + 2 * ctx.offSize + 8);
             rootHeap  = ctx.RdOff(sb + pos + 3 * ctx.offSize + 8);
         }
-    } else { // v2 / v3
+    } else {
         ctx.offSize = sb[9];
         ctx.lenSize = sb[10];
         if ((ctx.offSize != 2 && ctx.offSize != 4 && ctx.offSize != 8) ||
@@ -3156,6 +4476,9 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
     if (rootBtree != UINT64_MAX && rootHeap != UINT64_MAX) {
         WalkHdf5SnodOrBtree(ctx, rootBtree, rootHeap, L"/", datasets, groupsAndAttrs, 0);
     }
+    if (datasets.empty() && groupsAndAttrs.empty()) {
+        return false; // Corrupt/truncated HDF5 superblock with no valid root group or objects
+    }
 
     SpreadsheetSheet overview;
     overview.name = L"HDF5_Datasets";
@@ -3165,9 +4488,11 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
         PathUtils::FormatByteSize(raw.size()) });
 
     std::vector<SpreadsheetSheet> dsSheets;
+    std::vector<double> ncLatVals, ncLonVals;
+
     for (const auto& ds : datasets) {
         std::wstring shStr = L"[";
-        uint64_t totalElems = ds.dims.empty() ? 1 : 1;
+        uint64_t totalElems = 1;
         for (size_t i = 0; i < ds.dims.size(); ++i) {
             if (i > 0) shStr += L", ";
             shStr += std::to_wstring(ds.dims[i]);
@@ -3175,23 +4500,52 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
         }
         shStr += L"]";
 
+        std::vector<uint8_t> chunkReconstructed;
         const uint8_t* rawBuf = nullptr;
         size_t rawAvail = 0;
         if (!ds.compactData.empty()) {
             rawBuf = ds.compactData.data();
             rawAvail = ds.compactData.size();
-        } else if (ds.contigAddr != UINT64_MAX && ctx.AddrOk(ds.contigAddr, 1)) {
+        } else if (ds.isChunked && totalElems > 0) {
+            if (!ReconstructHdf5ChunkedDataset(ctx, ds, totalElems, chunkReconstructed)) {
+                return false; // Corrupt chunk B-tree or corrupt deflate/shuffle stream!
+            }
+            rawBuf = chunkReconstructed.data();
+            rawAvail = chunkReconstructed.size();
+        } else if (ds.contigAddr != UINT64_MAX) {
+            if (!ctx.AddrOk(ds.contigAddr, 1)) return false;
             rawBuf = ctx.Ptr(ds.contigAddr);
             rawAvail = std::min<uint64_t>(ds.contigSize > 0 ? ds.contigSize : (ctx.size - (ctx.baseAddr + ds.contigAddr)),
                                           ctx.size - static_cast<size_t>(ctx.baseAddr + ds.contigAddr));
         }
 
+        auto rdDoubleVal = [&](size_t idx) -> double {
+            const uint8_t* p = rawBuf + idx * ds.dtSize;
+            if (ds.dtClass == 1) {
+                if (ds.dtSize == 2) return HalfToFloat(ds.dtBigEndian ? RdU16BE(p) : RdU16LE(p));
+                if (ds.dtSize == 4) return ds.dtBigEndian ? RdF32BE(p) : RdF32LE(p);
+                if (ds.dtSize == 8) return ds.dtBigEndian ? RdF64BE(p) : RdF64LE(p);
+            } else if (ds.dtClass == 0) {
+                if (ds.dtSigned) {
+                    return static_cast<double>(
+                        (ds.dtSize == 1) ? static_cast<int8_t>(p[0]) :
+                        (ds.dtSize == 2) ? (ds.dtBigEndian ? RdI16BE(p) : RdI16LE(p)) :
+                        (ds.dtSize == 4) ? (ds.dtBigEndian ? RdI32BE(p) : RdI32LE(p)) :
+                                           (ds.dtBigEndian ? RdI64BE(p) : RdI64LE(p)));
+                }
+                return static_cast<double>(
+                    (ds.dtSize == 1) ? p[0] :
+                    (ds.dtSize == 2) ? (ds.dtBigEndian ? RdU16BE(p) : RdU16LE(p)) :
+                    (ds.dtSize == 4) ? (ds.dtBigEndian ? RdU32BE(p) : RdU32LE(p)) :
+                                       (ds.dtBigEndian ? RdU64BE(p) : RdU64LE(p)));
+            }
+            return 0.0;
+        };
+
         auto rdVal = [&](size_t idx) -> std::wstring {
             const uint8_t* p = rawBuf + idx * ds.dtSize;
             if (ds.dtClass == 1) {
-                if (ds.dtSize == 2) return FmtDouble(HalfToFloat(ds.dtBigEndian ? RdU16BE(p) : RdU16LE(p)));
-                if (ds.dtSize == 4) return FmtDouble(ds.dtBigEndian ? RdF32BE(p) : RdF32LE(p));
-                if (ds.dtSize == 8) return FmtDouble(ds.dtBigEndian ? RdF64BE(p) : RdF64LE(p));
+                return FmtDouble(rdDoubleVal(idx));
             } else if (ds.dtClass == 0) {
                 if (ds.dtSigned) {
                     int64_t v = (ds.dtSize == 1) ? static_cast<int8_t>(p[0]) :
@@ -3219,6 +4573,19 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
                 if (i > 0) preview += L", ";
                 preview += rdVal(i);
             }
+
+            // Capture lat/lon coordinate vectors for NetCDF-4 map tracks
+            std::wstring lowLeaf = PathUtils::ToLower(ds.path);
+            size_t slash = lowLeaf.find_last_of(L'/');
+            if (slash != std::wstring::npos) lowLeaf = lowLeaf.substr(slash + 1);
+            if ((ds.dtClass == 0 || ds.dtClass == 1) && ds.dims.size() == 1 && cnt > 0) {
+                if (lowLeaf == L"lat" || lowLeaf == L"latitude") {
+                    for (size_t i = 0; i < std::min<size_t>(cnt, 2000); ++i) ncLatVals.push_back(rdDoubleVal(i));
+                } else if (lowLeaf == L"lon" || lowLeaf == L"longitude") {
+                    for (size_t i = 0; i < std::min<size_t>(cnt, 2000); ++i) ncLonVals.push_back(rdDoubleVal(i));
+                }
+            }
+
             if (dsSheets.size() < 8 && cnt > 0 && (ds.dtClass == 0 || ds.dtClass == 1 || ds.dtClass == 3)) {
                 SpreadsheetSheet dsh;
                 dsh.name = ds.path.size() > 1 ? ds.path.substr(1) : L"Dataset";
@@ -3246,7 +4613,7 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
                 dsSheets.push_back(std::move(dsh));
             }
         } else {
-            preview = L"(chunked/external)";
+            preview = L"(empty/unallocated)";
         }
         overview.rows.push_back({ ds.path, ds.dtypeDesc, shStr, preview });
     }
@@ -3255,6 +4622,19 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
         overview.rows.push_back({ ga.first, ga.second == L"Group" ? L"Group" : L"Attribute", L"", ga.second });
     }
     FinalizeSheetCols(overview);
+
+    if (!ncLatVals.empty() && ncLatVals.size() == ncLonVals.size()) {
+        for (size_t i = 0; i < ncLatVals.size(); ++i) {
+            double lonNorm = (ncLonVals[i] > 180.0 && ncLonVals[i] <= 360.0) ? (ncLonVals[i] - 360.0) : ncLonVals[i];
+            if (std::fabs(ncLatVals[i]) <= 90.0 && std::fabs(lonNorm) <= 180.0) {
+                GpsTrackPoint gp;
+                gp.lat = ncLatVals[i];
+                gp.lon = lonNorm;
+                gp.rowIndex = static_cast<int>(i + 1);
+                out.geoPoints.push_back(std::move(gp));
+            }
+        }
+    }
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
@@ -3268,7 +4648,7 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
 }
 
 // ============================================================================
-// 10. MATLAB Level 5 MAT-File (.mat)
+// 10. MATLAB Level 5 MAT-File (.mat — Numeric, Char, Cell, Struct & Sparse)
 // ============================================================================
 inline bool ReadMatTag(const uint8_t* data, size_t size, size_t& pos, bool be,
     uint32_t& outType, const uint8_t*& outPayload, size_t& outLen)
@@ -3291,10 +4671,84 @@ inline bool ReadMatTag(const uint8_t* data, size_t size, size_t& pos, bool be,
     if (nBytes > size - pos) return false;
     outPayload = data + pos;
     outLen = nBytes;
-    // Top-level miMATRIX (14) and miCOMPRESSED (15) are NOT padded if at EOF, subelements are 8-byte padded
     size_t padded = (static_cast<size_t>(nBytes) + 7u) & ~size_t(7u);
     pos += (outType == 14 || outType == 15) ? nBytes : std::min(size - pos, padded);
     return true;
+}
+
+inline std::wstring ReadMatNumericAt(uint32_t t, const uint8_t* p, size_t l, bool be, size_t idx, size_t& elemStep) {
+    switch (t) {
+        case 1:  elemStep = 1; return (idx < l) ? std::to_wstring(static_cast<int8_t>(p[idx])) : L"";
+        case 2:  elemStep = 1; return (idx < l) ? std::to_wstring(p[idx]) : L"";
+        case 3:  elemStep = 2; return (idx * 2 + 2 <= l) ? std::to_wstring(be ? RdI16BE(p + idx * 2) : RdI16LE(p + idx * 2)) : L"";
+        case 4:  elemStep = 2; return (idx * 2 + 2 <= l) ? std::to_wstring(be ? RdU16BE(p + idx * 2) : RdU16LE(p + idx * 2)) : L"";
+        case 5:  elemStep = 4; return (idx * 4 + 4 <= l) ? std::to_wstring(be ? RdI32BE(p + idx * 4) : RdI32LE(p + idx * 4)) : L"";
+        case 6:  elemStep = 4; return (idx * 4 + 4 <= l) ? std::to_wstring(be ? RdU32BE(p + idx * 4) : RdU32LE(p + idx * 4)) : L"";
+        case 7:  elemStep = 4; return (idx * 4 + 4 <= l) ? FmtDouble(be ? RdF32BE(p + idx * 4) : RdF32LE(p + idx * 4)) : L"";
+        case 9:  elemStep = 8; return (idx * 8 + 8 <= l) ? FmtDouble(be ? RdF64BE(p + idx * 8) : RdF64LE(p + idx * 8)) : L"";
+        case 12: elemStep = 8; return (idx * 8 + 8 <= l) ? std::to_wstring(be ? RdI64BE(p + idx * 8) : RdI64LE(p + idx * 8)) : L"";
+        case 13: elemStep = 8; return (idx * 8 + 8 <= l) ? std::to_wstring(be ? RdU64BE(p + idx * 8) : RdU64LE(p + idx * 8)) : L"";
+        default: elemStep = 0; return L"";
+    }
+}
+
+// Compact inline formatter for nested miMATRIX elements inside MATLAB cell & struct arrays
+inline std::wstring SummarizeMatNestedMatrix(const uint8_t* mdata, size_t msize, bool be, int depth = 0) {
+    if (!mdata || msize < 16 || depth > 6) return L"[]";
+    size_t pos = 0;
+    uint32_t t = 0; const uint8_t* p = nullptr; size_t l = 0;
+    if (!ReadMatTag(mdata, msize, pos, be, t, p, l) || l < 8) return L"[]";
+    uint8_t mxClass = static_cast<uint8_t>((be ? RdU32BE(p) : RdU32LE(p)) & 0xFFu);
+    if (!ReadMatTag(mdata, msize, pos, be, t, p, l) || l < 4) return L"[]";
+    uint64_t totalElems = 1;
+    for (size_t i = 0; i + 4 <= l; i += 4) {
+        totalElems *= static_cast<uint64_t>(std::max<int32_t>(0, be ? RdI32BE(p + i) : RdI32LE(p + i)));
+    }
+    if (!ReadMatTag(mdata, msize, pos, be, t, p, l)) return L"[]"; // skip name
+    if (totalElems == 0) return L"[]";
+
+    if (mxClass == 4) { // char
+        if (!ReadMatTag(mdata, msize, pos, be, t, p, l)) return L"''";
+        if (t == 16 || t == 1 || t == 2) return CleanAsciiFixed(p, std::min<size_t>(l, 128));
+        std::wstring ws;
+        for (size_t i = 0; i + 2 <= std::min<size_t>(l, 256); i += 2) {
+            uint16_t ch = be ? RdU16BE(p + i) : RdU16LE(p + i);
+            if (ch == 0) break;
+            ws.push_back(static_cast<wchar_t>(ch));
+        }
+        return ws;
+    }
+    if (mxClass >= 6 && mxClass <= 15) {
+        if (!ReadMatTag(mdata, msize, pos, be, t, p, l)) return L"[]";
+        size_t step = 0;
+        ReadMatNumericAt(t, p, l, be, 0, step);
+        if (step == 0 || l < step) return L"[]";
+        size_t cnt = l / step;
+        if (cnt == 1) return ReadMatNumericAt(t, p, l, be, 0, step);
+        std::wstring s = L"[";
+        for (size_t i = 0; i < std::min<size_t>(cnt, 4); ++i) {
+            if (i) s += L", ";
+            s += ReadMatNumericAt(t, p, l, be, i, step);
+        }
+        if (cnt > 4) s += L", ...";
+        s += L"]";
+        return s;
+    }
+    if (mxClass == 1) { // nested cell
+        std::wstring s = L"{";
+        for (uint64_t i = 0; i < std::min<uint64_t>(totalElems, 4) && pos < msize; ++i) {
+            if (!ReadMatTag(mdata, msize, pos, be, t, p, l) || t != 14) break;
+            size_t pad = ((l + 7u) & ~size_t(7u)) - l;
+            if (pad <= msize - pos) pos += pad;
+            if (i) s += L", ";
+            s += SummarizeMatNestedMatrix(p, l, be, depth + 1);
+        }
+        s += L"}";
+        return s;
+    }
+    if (mxClass == 2) return L"<struct>";
+    if (mxClass == 5) return L"<sparse>";
+    return L"<array>";
 }
 
 inline bool ParseMatMatrixElement(
@@ -3307,7 +4761,9 @@ inline bool ParseMatMatrixElement(
     // 1. Array Flags (miUINT32 = 6, 8 bytes)
     if (!ReadMatTag(mdata, msize, pos, be, t, p, l) || l < 8) return false;
     uint32_t flags0 = be ? RdU32BE(p) : RdU32LE(p);
+    uint32_t nzmax  = be ? RdU32BE(p + 4) : RdU32LE(p + 4);
     uint8_t mxClass = static_cast<uint8_t>(flags0 & 0xFFu);
+    if (mxClass == 0 || mxClass > 17) return false;
 
     // 2. Dimensions Array (miINT32 = 5)
     if (!ReadMatTag(mdata, msize, pos, be, t, p, l) || l < 4) return false;
@@ -3333,30 +4789,141 @@ inline bool ParseMatMatrixElement(
         L"int8", L"uint8", L"int16", L"uint16", L"int32", L"uint32", L"int64", L"uint64"
     };
     std::wstring clsStr = (mxClass < 16) ? clsNames[mxClass] : L"array";
-
-    // 4. Real Data / Char Data
     std::wstring preview;
-    if (pos < msize && ReadMatTag(mdata, msize, pos, be, t, p, l)) {
-        auto rdMatNum = [&](size_t idx, size_t& elemStep) -> std::wstring {
-            switch (t) {
-                case 1:  elemStep = 1; return (idx < l) ? std::to_wstring(static_cast<int8_t>(p[idx])) : L"";
-                case 2:  elemStep = 1; return (idx < l) ? std::to_wstring(p[idx]) : L"";
-                case 3:  elemStep = 2; return (idx * 2 + 2 <= l) ? std::to_wstring(be ? RdI16BE(p + idx * 2) : RdI16LE(p + idx * 2)) : L"";
-                case 4:  elemStep = 2; return (idx * 2 + 2 <= l) ? std::to_wstring(be ? RdU16BE(p + idx * 2) : RdU16LE(p + idx * 2)) : L"";
-                case 5:  elemStep = 4; return (idx * 4 + 4 <= l) ? std::to_wstring(be ? RdI32BE(p + idx * 4) : RdI32LE(p + idx * 4)) : L"";
-                case 6:  elemStep = 4; return (idx * 4 + 4 <= l) ? std::to_wstring(be ? RdU32BE(p + idx * 4) : RdU32LE(p + idx * 4)) : L"";
-                case 7:  elemStep = 4; return (idx * 4 + 4 <= l) ? FmtDouble(be ? RdF32BE(p + idx * 4) : RdF32LE(p + idx * 4)) : L"";
-                case 9:  elemStep = 8; return (idx * 8 + 8 <= l) ? FmtDouble(be ? RdF64BE(p + idx * 8) : RdF64LE(p + idx * 8)) : L"";
-                case 12: elemStep = 8; return (idx * 8 + 8 <= l) ? std::to_wstring(be ? RdI64BE(p + idx * 8) : RdI64LE(p + idx * 8)) : L"";
-                case 13: elemStep = 8; return (idx * 8 + 8 <= l) ? std::to_wstring(be ? RdU64BE(p + idx * 8) : RdU64LE(p + idx * 8)) : L"";
-                default: elemStep = 0; return L"";
-            }
-        };
 
+    auto readChildMatrixAligned = [&](const uint8_t*& cp, size_t& cl) -> bool {
+        uint32_t ct = 0;
+        if (!ReadMatTag(mdata, msize, pos, be, ct, cp, cl)) return false;
+        if (ct != 14) return false;
+        size_t pad = ((cl + 7u) & ~size_t(7u)) - cl;
+        if (pad <= msize - pos) pos += pad;
+        return true;
+    };
+
+    if (mxClass == 1 && totalElems > 0) { // mxCELL_CLASS
+        size_t nRows = dims.size() >= 1 ? static_cast<size_t>(std::max<int32_t>(1, dims[0])) : 1;
+        size_t nCols = dims.size() >= 2 ? static_cast<size_t>(std::max<int32_t>(1, dims[1])) : 1;
+        size_t cap = static_cast<size_t>(std::min<uint64_t>(totalElems, 1024));
+        std::vector<std::wstring> cells;
+        cells.reserve(cap);
+        for (size_t i = 0; i < cap && pos < msize; ++i) {
+            const uint8_t* cp = nullptr; size_t cl = 0;
+            if (!readChildMatrixAligned(cp, cl)) break;
+            cells.push_back(SummarizeMatNestedMatrix(cp, cl, be, 0));
+        }
+        preview = L"{";
+        for (size_t i = 0; i < std::min<size_t>(cells.size(), 4); ++i) {
+            if (i) preview += L", ";
+            preview += cells[i];
+        }
+        if (cells.size() > 4) preview += L", ...";
+        preview += L"}";
+
+        if (varSheets.size() < 16 && !cells.empty()) {
+            SpreadsheetSheet vsh;
+            vsh.name = varName;
+            size_t rCap = std::min<size_t>(nRows, 128);
+            size_t cCap = std::min<size_t>(nCols, 32);
+            std::vector<std::wstring> hr = { L"Row \\ Col" };
+            for (size_t c = 0; c < cCap; ++c) hr.push_back(L"{:," + std::to_wstring(c + 1) + L"}");
+            vsh.rows.push_back(std::move(hr));
+            for (size_t r = 0; r < rCap; ++r) {
+                std::vector<std::wstring> rv = { L"{" + std::to_wstring(r + 1) + L",:}" };
+                for (size_t c = 0; c < cCap; ++c) {
+                    size_t idx = r + c * nRows; // column-major
+                    rv.push_back(idx < cells.size() ? cells[idx] : L"");
+                }
+                vsh.rows.push_back(std::move(rv));
+            }
+            FinalizeSheetCols(vsh);
+            varSheets.push_back(std::move(vsh));
+        }
+    } else if (mxClass == 2 && totalElems > 0) { // mxSTRUCT_CLASS
+        // 4. Field Name Length (miINT32 = 5)
+        if (!ReadMatTag(mdata, msize, pos, be, t, p, l) || l < 4) return false;
+        int32_t maxFieldLen = be ? RdI32BE(p) : RdI32LE(p);
+        if (maxFieldLen <= 0 || maxFieldLen > 256) return false;
+        // 5. Field Names (miINT8 = 1)
+        if (!ReadMatTag(mdata, msize, pos, be, t, p, l) || (l % static_cast<size_t>(maxFieldLen)) != 0) return false;
+        size_t nFields = l / static_cast<size_t>(maxFieldLen);
+        std::vector<std::wstring> fieldNames;
+        fieldNames.reserve(nFields);
+        for (size_t f = 0; f < nFields; ++f) {
+            fieldNames.push_back(CleanAsciiFixed(p + f * static_cast<size_t>(maxFieldLen), static_cast<size_t>(maxFieldLen)));
+        }
+
+        SpreadsheetSheet vsh;
+        vsh.name = varName;
+        std::vector<std::wstring> hr = { L"Element #" };
+        for (const auto& fn : fieldNames) hr.push_back(fn);
+        vsh.rows.push_back(std::move(hr));
+
+        size_t elemCap = static_cast<size_t>(std::min<uint64_t>(totalElems, 256));
+        for (size_t e = 0; e < elemCap && pos < msize; ++e) {
+            std::vector<std::wstring> rv = { std::to_wstring(e + 1) };
+            for (size_t f = 0; f < nFields; ++f) {
+                const uint8_t* cp = nullptr; size_t cl = 0;
+                if (!readChildMatrixAligned(cp, cl)) { rv.push_back(L""); continue; }
+                std::wstring valStr = SummarizeMatNestedMatrix(cp, cl, be, 0);
+                if (e == 0 && f < 3) {
+                    if (!preview.empty()) preview += L", ";
+                    preview += fieldNames[f] + L"=" + valStr;
+                }
+                rv.push_back(std::move(valStr));
+            }
+            vsh.rows.push_back(std::move(rv));
+        }
+        if (varSheets.size() < 16 && vsh.rows.size() > 1) {
+            FinalizeSheetCols(vsh);
+            varSheets.push_back(std::move(vsh));
+        }
+    } else if (mxClass == 5) { // mxSPARSE_CLASS (CSC: ir, jc, pr)
+        const uint8_t *irPtr = nullptr, *jcPtr = nullptr, *prPtr = nullptr;
+        size_t irLen = 0, jcLen = 0, prLen = 0;
+        uint32_t irType = 0, jcType = 0, prType = 0;
+        if (!ReadMatTag(mdata, msize, pos, be, irType, irPtr, irLen)) return false;
+        if (!ReadMatTag(mdata, msize, pos, be, jcType, jcPtr, jcLen)) return false;
+        if (!ReadMatTag(mdata, msize, pos, be, prType, prPtr, prLen)) return false;
+
+        size_t nCols = dims.size() >= 2 ? static_cast<size_t>(std::max<int32_t>(0, dims[1])) : 0;
+        size_t jcCount = jcLen / 4;
+        size_t irCount = irLen / 4;
+        size_t prStep = 0;
+        ReadMatNumericAt(prType, prPtr, prLen, be, 0, prStep);
+        size_t prCount = (prStep > 0) ? (prLen / prStep) : 0;
+
+        SpreadsheetSheet vsh;
+        vsh.name = varName;
+        vsh.rows.push_back({ L"Row (1-based)", L"Col (1-based)", L"Non-Zero Value" });
+
+        size_t nnzActual = 0;
+        for (size_t c = 0; c < nCols && c + 1 < jcCount; ++c) {
+            int32_t kStart = be ? RdI32BE(jcPtr + c * 4) : RdI32LE(jcPtr + c * 4);
+            int32_t kEnd   = be ? RdI32BE(jcPtr + (c + 1) * 4) : RdI32LE(jcPtr + (c + 1) * 4);
+            if (kStart < 0 || kEnd < kStart) continue;
+            for (int32_t k = kStart; k < kEnd && static_cast<size_t>(k) < irCount && static_cast<size_t>(k) < prCount; ++k) {
+                int32_t r0 = be ? RdI32BE(irPtr + static_cast<size_t>(k) * 4) : RdI32LE(irPtr + static_cast<size_t>(k) * 4);
+                std::wstring vStr = ReadMatNumericAt(prType, prPtr, prLen, be, static_cast<size_t>(k), prStep);
+                if (vsh.rows.size() <= 500) {
+                    vsh.rows.push_back({ std::to_wstring(r0 + 1), std::to_wstring(c + 1), vStr });
+                }
+                if (nnzActual < 3) {
+                    if (!preview.empty()) preview += L", ";
+                    preview += L"(" + std::to_wstring(r0 + 1) + L"," + std::to_wstring(c + 1) + L")=" + vStr;
+                }
+                ++nnzActual;
+            }
+        }
+        preview = L"nnz=" + std::to_wstring(nnzActual) + L" (nzmax=" + std::to_wstring(nzmax) + L") " + preview;
+        if (varSheets.size() < 16 && vsh.rows.size() > 1) {
+            FinalizeSheetCols(vsh);
+            varSheets.push_back(std::move(vsh));
+        }
+    } else if (pos < msize && ReadMatTag(mdata, msize, pos, be, t, p, l)) {
         if (mxClass == 4) { // mxCHAR_CLASS
-            if (t == 16 || t == 1 || t == 2) { // miUTF8 / miINT8 / miUINT8
+            if (t == 16 || t == 1 || t == 2) {
                 preview = CleanAsciiFixed(p, std::min<size_t>(l, 256));
-            } else if (t == 4 || t == 17) { // miUINT16 / miUTF16
+            } else if (t == 4 || t == 17) {
                 for (size_t i = 0; i + 2 <= std::min<size_t>(l, 512); i += 2) {
                     uint16_t ch = be ? RdU16BE(p + i) : RdU16LE(p + i);
                     if (ch == 0) break;
@@ -3373,12 +4940,12 @@ inline bool ParseMatMatrixElement(
             }
         } else if (mxClass >= 6 && mxClass <= 15 && totalElems > 0) {
             size_t step = 0;
-            rdMatNum(0, step);
+            ReadMatNumericAt(t, p, l, be, 0, step);
             if (step > 0 && l >= step) {
                 size_t availElems = l / step;
                 for (size_t i = 0; i < std::min<size_t>(availElems, 4); ++i) {
                     if (i > 0) preview += L", ";
-                    preview += rdMatNum(i, step);
+                    preview += ReadMatNumericAt(t, p, l, be, i, step);
                 }
                 if (varSheets.size() < 16) {
                     SpreadsheetSheet vsh;
@@ -3393,9 +4960,8 @@ inline bool ParseMatMatrixElement(
                     for (size_t r = 0; r < rCap; ++r) {
                         std::vector<std::wstring> rv = { L"(" + std::to_wstring(r + 1) + L",:)" };
                         for (size_t c = 0; c < cCap; ++c) {
-                            // MATLAB Level 5 stores matrices in column-major order!
                             size_t idx = r + c * nRows;
-                            rv.push_back(idx < availElems ? rdMatNum(idx, step) : L"");
+                            rv.push_back(idx < availElems ? ReadMatNumericAt(t, p, l, be, idx, step) : L"");
                         }
                         vsh.rows.push_back(std::move(rv));
                     }
@@ -3418,7 +4984,6 @@ inline bool ParseMatlabMat(const std::vector<uint8_t>& raw, ParsedOfficeDocument
         return ParseHdf5Doc(raw, L".mat", out);
     }
 
-    // MATLAB Level 5 header: 128 bytes, endian indicator "IM" or "MI" at 126..127
     if (raw.size() < 128) return false;
     bool be = false;
     if (raw[126] == 'I' && raw[127] == 'M') be = false;
@@ -3435,24 +5000,31 @@ inline bool ParseMatlabMat(const std::vector<uint8_t>& raw, ParsedOfficeDocument
 
     std::vector<SpreadsheetSheet> varSheets;
     size_t pos = 128;
+    size_t validVars = 0;
     while (pos + 8 <= raw.size()) {
         uint32_t t = 0; const uint8_t* p = nullptr; size_t l = 0;
-        if (!ReadMatTag(raw.data(), raw.size(), pos, be, t, p, l)) break;
+        if (!ReadMatTag(raw.data(), raw.size(), pos, be, t, p, l)) return false;
         if (t == 14) { // miMATRIX
-            ParseMatMatrixElement(p, l, be, summary, varSheets);
+            if (!ParseMatMatrixElement(p, l, be, summary, varSheets)) return false;
+            ++validVars;
         } else if (t == 15) { // miCOMPRESSED (zlib)
             std::vector<uint8_t> uncomp;
-            if (ZipDeflate::InflateZlib(p, l, uncomp, 32 * 1024 * 1024) ||
-                ZipDeflate::InflateRaw(p, l, uncomp, 32 * 1024 * 1024))
+            if (!ZipDeflate::InflateZlib(p, l, uncomp, 32 * 1024 * 1024) &&
+                !ZipDeflate::InflateRaw(p, l, uncomp, 32 * 1024 * 1024))
             {
-                size_t ipos = 0; uint32_t it = 0; const uint8_t* ip = nullptr; size_t il = 0;
-                if (ReadMatTag(uncomp.data(), uncomp.size(), ipos, be, it, ip, il) && it == 14) {
-                    ParseMatMatrixElement(ip, il, be, summary, varSheets);
-                }
+                return false; // Corrupt zlib compressed variable!
             }
+            size_t ipos = 0; uint32_t it = 0; const uint8_t* ip = nullptr; size_t il = 0;
+            if (!ReadMatTag(uncomp.data(), uncomp.size(), ipos, be, it, ip, il) || it != 14) return false;
+            if (!ParseMatMatrixElement(ip, il, be, summary, varSheets)) return false;
+            ++validVars;
+        } else {
+            return false;
         }
         pos = (pos + 7u) & ~size_t(7u);
     }
+
+    if (validVars == 0) return false;
 
     FinalizeSheetCols(summary);
     out.kind = OfficeFileKind::SqliteDb;
@@ -4456,82 +6028,1062 @@ inline bool ParseRdsData(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
 }
 
 // ============================================================================
-// 15. DuckDB Analytical Database (.duckdb)
+// 15. DuckDB Analytical Database (.duckdb — Linked MetaBlocks + BinaryMetadataDeserializer)
 // ============================================================================
-inline bool ParseDuckDb(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    // DuckDB MainHeader starts with 8B checksum followed by "DUCK" at offset 8
-    if (raw.size() < 64 || std::memcmp(raw.data() + 8, "DUCK", 4) != 0) return false;
+struct DuckMetaPtr {
+    uint64_t blockPtr = UINT64_MAX;
+    uint32_t offset = 0;
+};
 
-    uint64_t fmtVersion = RdU64LE(raw.data() + 12);
-    if (fmtVersion == 0 || fmtVersion > 100000) return false;
-
-    std::wstring gitDesc;
-    if (raw.size() >= 92) gitDesc = CleanAsciiFixed(raw.data() + 28, 64);
-    std::wstring gitHash;
-    if (raw.size() >= 156) gitHash = CleanAsciiFixed(raw.data() + 92, 64);
-
-    SpreadsheetSheet sh;
-    sh.name = L"DuckDB_Header_And_Catalog";
-    sh.rows.push_back({ L"Storage Field / Catalog Object", L"Category", L"Value / Details" });
-    sh.rows.push_back({ L"Storage Magic", L"MainHeader", L"DUCK" });
-    sh.rows.push_back({ L"Storage Format Version", L"MainHeader", std::to_wstring(fmtVersion) });
-    if (!gitDesc.empty()) sh.rows.push_back({ L"Engine Version", L"MainHeader", gitDesc });
-    if (!gitHash.empty()) sh.rows.push_back({ L"Engine Git Hash", L"MainHeader", gitHash });
-
-    // DatabaseHeader 1 at 4096 and DatabaseHeader 2 at 8192 (4KB header sectors)
-    if (raw.size() >= 8192 + 64) {
-        uint64_t iter1 = RdU64LE(raw.data() + 4096 + 8);
-        uint64_t iter2 = RdU64LE(raw.data() + 8192 + 8);
-        size_t activeOff = (iter2 > iter1) ? 8192 : 4096;
-        uint64_t activeIter  = RdU64LE(raw.data() + activeOff + 8);
-        int64_t  metaBlock   = RdI64LE(raw.data() + activeOff + 16);
-        int64_t  freeList    = RdI64LE(raw.data() + activeOff + 24);
-        uint64_t blockCount  = RdU64LE(raw.data() + activeOff + 32);
-        uint64_t blockAlloc  = RdU64LE(raw.data() + activeOff + 40);
-        uint64_t vectorSize  = RdU64LE(raw.data() + activeOff + 48);
-
-        sh.rows.push_back({ L"Active Checkpoint Iteration", L"DatabaseHeader", std::to_wstring(activeIter) });
-        sh.rows.push_back({ L"Meta Block Pointer", L"DatabaseHeader", std::to_wstring(metaBlock) });
-        sh.rows.push_back({ L"Free List Pointer", L"DatabaseHeader", std::to_wstring(freeList) });
-        sh.rows.push_back({ L"Block Count", L"DatabaseHeader", std::to_wstring(blockCount) });
-        if (blockAlloc > 0) sh.rows.push_back({ L"Block Allocation Size", L"DatabaseHeader", PathUtils::FormatByteSize(blockAlloc) });
-        if (vectorSize > 0) sh.rows.push_back({ L"Vector Size", L"DatabaseHeader", std::to_wstring(vectorSize) });
+class DuckMetaStream {
+public:
+    DuckMetaStream(const std::vector<uint8_t>& raw, uint64_t blockAlloc, uint64_t startMetaPtr, uint32_t startOff = 0)
+        : m_raw(raw), m_blockAlloc(blockAlloc)
+    {
+        m_valid = OpenChunk(startMetaPtr, startOff);
     }
 
-    // Scan metadata blocks after byte 12288 for length-prefixed DuckDB serializer strings / SQL DDL
-    if (raw.size() > 12288) {
-        std::set<std::string> seenDDL;
-        std::string_view sv(reinterpret_cast<const char*>(raw.data() + 12288), raw.size() - 12288);
-        size_t pos = 0;
-        while ((pos = sv.find("CREATE ", pos)) != std::string_view::npos && seenDDL.size() < 48) {
-            size_t end = pos;
-            while (end < sv.size() && end < pos + 512 &&
-                   ((sv[end] >= 32 && sv[end] <= 126) || sv[end] == '\n' || sv[end] == '\r' || sv[end] == '\t')) {
-                if (sv[end] == ';') { ++end; break; }
-                ++end;
+    bool Valid() const { return m_valid; }
+
+    bool ReadByte(uint8_t& out) {
+        if (!m_valid) return false;
+        while (m_pos >= m_end) {
+            if (m_nextPtr == UINT64_MAX) {
+                m_valid = false;
+                return false;
             }
-            std::string ddl(sv.substr(pos, end - pos));
-            if (ddl.size() >= 14 && seenDDL.insert(ddl).second) {
-                sh.rows.push_back({ L"Catalog SQL DDL", L"Catalog", PathUtils::Trim(PathUtils::Utf8ToWide(ddl)) });
+            if (!OpenChunk(m_nextPtr, 0)) {
+                m_valid = false;
+                return false;
             }
-            pos = end + 1;
+        }
+        out = m_raw[m_pos++];
+        return true;
+    }
+
+    bool ReadBytes(void* dst, size_t n) {
+        uint8_t* p = static_cast<uint8_t*>(dst);
+        for (size_t i = 0; i < n; ++i) {
+            if (!ReadByte(p[i])) return false;
+        }
+        return true;
+    }
+
+    bool ReadU16(uint16_t& out) {
+        uint8_t b[2];
+        if (!ReadBytes(b, 2)) return false;
+        out = RdU16LE(b);
+        return true;
+    }
+
+    bool ReadU32(uint32_t& out) {
+        uint8_t b[4];
+        if (!ReadBytes(b, 4)) return false;
+        out = RdU32LE(b);
+        return true;
+    }
+
+    bool ReadU64(uint64_t& out) {
+        uint8_t b[8];
+        if (!ReadBytes(b, 8)) return false;
+        out = RdU64LE(b);
+        return true;
+    }
+
+    bool ReadBool(bool& out) {
+        uint8_t b = 0;
+        if (!ReadByte(b) || b > 1u) return false;
+        out = (b != 0);
+        return true;
+    }
+
+    bool ReadVarU64(uint64_t& out) {
+        out = 0;
+        for (int shift = 0; shift < 64; shift += 7) {
+            uint8_t b = 0;
+            if (!ReadByte(b)) return false;
+            if (shift == 63 && b > 1u) return false;
+            out |= static_cast<uint64_t>(b & 0x7Fu) << shift;
+            if ((b & 0x80u) == 0) return true;
+        }
+        return false;
+    }
+
+    bool ReadVarI64(int64_t& out) {
+        uint64_t u = 0;
+        if (!ReadVarU64(u)) return false;
+        out = static_cast<int64_t>((u >> 1) ^ (~(u & 1ULL) + 1ULL));
+        return true;
+    }
+
+    bool ReadStr(std::string& out, size_t maxLen = 65536) {
+        uint64_t len = 0;
+        if (!ReadVarU64(len) || len > maxLen) return false;
+        out.resize(static_cast<size_t>(len));
+        if (len > 0 && !ReadBytes(out.data(), static_cast<size_t>(len))) return false;
+        return true;
+    }
+
+private:
+    bool OpenChunk(uint64_t metaPtr, uint32_t subOff) {
+        if (metaPtr == UINT64_MAX || m_hops >= 4096) return false;
+        if (subOff == 0 && !m_visited.insert(metaPtr).second) return false; // cycle detected
+        ++m_hops;
+
+        const uint64_t blockId = metaPtr & 0x00FFFFFFFFFFFFFFULL;
+        const uint8_t subIdx = static_cast<uint8_t>(metaPtr >> 56);
+        if (subIdx >= 64) return false;
+
+        if (m_blockAlloc < 4096 || blockId > (m_raw.size() - 12288ULL) / m_blockAlloc) return false;
+        const uint64_t physStart = 12288ULL + blockId * m_blockAlloc;
+        if (physStart + 16ULL > m_raw.size()) return false;
+
+        const uint64_t usableStart = physStart + 8ULL; // skip 8B physical block checksum
+        const uint64_t usableCap = std::min<uint64_t>(m_blockAlloc - 8ULL, m_raw.size() - usableStart);
+
+        uint64_t subSize = usableCap;
+        if (m_blockAlloc >= 65536ULL || subIdx > 0) {
+            subSize = ((m_blockAlloc - 8ULL) / 64ULL) & ~7ULL;
+            if (subSize < 64ULL) return false;
+        }
+        const uint64_t chunkStart = usableStart + static_cast<uint64_t>(subIdx) * subSize;
+        if (chunkStart + 8ULL > m_raw.size()) return false;
+        const uint64_t chunkEnd = std::min<uint64_t>(chunkStart + subSize, m_raw.size());
+        if (chunkEnd <= chunkStart + 8ULL) return false;
+
+        m_nextPtr = RdU64LE(m_raw.data() + static_cast<size_t>(chunkStart));
+        const uint64_t effOff = (subOff < 8u) ? 8ULL : static_cast<uint64_t>(subOff);
+        if (chunkStart + effOff > chunkEnd) return false;
+
+        m_pos = static_cast<size_t>(chunkStart + effOff);
+        m_end = static_cast<size_t>(chunkEnd);
+        return true;
+    }
+
+    const std::vector<uint8_t>& m_raw;
+    uint64_t m_blockAlloc = 262144;
+    size_t m_pos = 0;
+    size_t m_end = 0;
+    uint64_t m_nextPtr = UINT64_MAX;
+    uint32_t m_hops = 0;
+    bool m_valid = false;
+    std::set<uint64_t> m_visited;
+};
+
+struct DuckColDef {
+    std::string name;
+    uint8_t typeId = 0;
+    uint8_t decWidth = 0;
+    uint8_t decScale = 0;
+};
+
+struct DuckSegPtr {
+    uint64_t rowStart = 0;
+    uint64_t tupleCount = 0;
+    int64_t blockId = -1;
+    uint32_t offset = 0;
+    uint8_t compression = 1; // 1=UNCOMPRESSED, 2=CONSTANT, 3=RLE, 6=DICTIONARY
+    bool hasNull = false;
+    bool hasNoNull = true;
+    bool hasConstVal = false;
+    std::wstring constVal;
+};
+
+struct DuckTableEntry {
+    uint8_t catType = 0; // 1=TABLE, 2=SCHEMA, 3=VIEW
+    std::string schema;
+    std::string name;
+    std::string sql;
+    bool internal = false;
+    std::vector<DuckColDef> cols;
+    DuckMetaPtr tablePtr;
+    uint64_t totalRows = 0;
+    std::vector<std::vector<DuckSegPtr>> colSegments;
+};
+
+inline const wchar_t* DuckTypeName(const DuckColDef& c) {
+    switch (c.typeId) {
+    case 10: return L"BOOLEAN";
+    case 11: return L"TINYINT";
+    case 12: return L"SMALLINT";
+    case 13: return L"INTEGER";
+    case 14: return L"BIGINT";
+    case 15: return L"DATE";
+    case 16: return L"TIME";
+    case 17: return L"TIMESTAMP_S";
+    case 18: return L"TIMESTAMP_MS";
+    case 19: return L"TIMESTAMP";
+    case 20: return L"TIMESTAMP_NS";
+    case 21: return L"DECIMAL";
+    case 22: return L"FLOAT";
+    case 23: return L"DOUBLE";
+    case 24: return L"CHAR";
+    case 25: return L"VARCHAR";
+    case 26: return L"BLOB";
+    case 27: return L"INTERVAL";
+    case 28: return L"UTINYINT";
+    case 29: return L"USMALLINT";
+    case 30: return L"UINTEGER";
+    case 31: return L"UBIGINT";
+    case 32: return L"TIMESTAMPTZ";
+    case 49: return L"UHUGEINT";
+    case 50: return L"HUGEINT";
+    case 54: return L"UUID";
+    case 100: return L"STRUCT";
+    case 101: return L"LIST";
+    case 102: return L"MAP";
+    default: return L"ANY";
+    }
+}
+
+inline std::wstring FormatDuckDateDays(int32_t z) {
+    // Howard Hinnant civil_from_days (days since 1970-01-01)
+    int64_t zz = static_cast<int64_t>(z) + 719468LL;
+    const int64_t era = (zz >= 0 ? zz : zz - 146096LL) / 146097LL;
+    const uint32_t doe = static_cast<uint32_t>(zz - era * 146097LL);
+    const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    int64_t y = static_cast<int64_t>(yoe) + era * 400LL;
+    const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    const uint32_t mp = (5u * doy + 2u) / 153u;
+    const uint32_t d = doy - (153u * mp + 2u) / 5u + 1u;
+    const uint32_t m = mp < 10u ? (mp + 3u) : (mp - 9u);
+    y += (m <= 2u) ? 1 : 0;
+    wchar_t buf[32] = {};
+    swprintf_s(buf, L"%04lld-%02u-%02u", static_cast<long long>(y), m, d);
+    return buf;
+}
+
+inline std::wstring FormatDuckTimestampUs(int64_t us) {
+    int64_t secs = us / 1000000LL;
+    int64_t remUs = us % 1000000LL;
+    if (remUs < 0) { remUs += 1000000LL; --secs; }
+    int64_t days = secs / 86400LL;
+    int64_t sod = secs % 86400LL;
+    if (sod < 0) { sod += 86400LL; --days; }
+    const uint32_t hh = static_cast<uint32_t>(sod / 3600LL);
+    const uint32_t mm = static_cast<uint32_t>((sod % 3600LL) / 60LL);
+    const uint32_t ss = static_cast<uint32_t>(sod % 60LL);
+    wchar_t tbuf[32] = {};
+    swprintf_s(tbuf, L" %02u:%02u:%02u", hh, mm, ss);
+    return FormatDuckDateDays(static_cast<int32_t>(days)) + tbuf;
+}
+
+inline bool ReadDuckMetaPtrObj(DuckMetaStream& ms, DuckMetaPtr& out) {
+    out = {};
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) return true;
+        if (fid == 100) {
+            if (!ms.ReadVarU64(out.blockPtr)) return false;
+        } else if (fid == 101) {
+            uint64_t off = 0;
+            if (!ms.ReadVarU64(off)) return false;
+            out.offset = static_cast<uint32_t>(off);
+        } else {
+            return false;
+        }
+    }
+}
+
+inline bool ReadDuckLogicalTypeObj(DuckMetaStream& ms, DuckColDef& col) {
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) return true;
+        if (fid == 100) {
+            uint64_t tid = 0;
+            if (!ms.ReadVarU64(tid) || tid > 255) return false;
+            col.typeId = static_cast<uint8_t>(tid);
+        } else if (fid == 101) {
+            // Optional ExtraTypeInfo nullable pointer (1B bool + object)
+            bool present = false;
+            if (!ms.ReadBool(present)) return false;
+            if (present) {
+                for (;;) {
+                    uint16_t ef = 0;
+                    if (!ms.ReadU16(ef)) return false;
+                    if (ef == 0xFFFFu) break;
+                    if (ef == 100) { uint64_t et = 0; if (!ms.ReadVarU64(et)) return false; }
+                    else if (ef == 101) { std::string alias; if (!ms.ReadStr(alias)) return false; }
+                    else if (ef == 200) { uint64_t w = 0; if (!ms.ReadVarU64(w)) return false; col.decWidth = static_cast<uint8_t>(w); }
+                    else if (ef == 201) { uint64_t sc = 0; if (!ms.ReadVarU64(sc)) return false; col.decScale = static_cast<uint8_t>(sc); }
+                    else return false;
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
+inline bool ReadDuckColumnDefObj(DuckMetaStream& ms, DuckColDef& out) {
+    out = {};
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) return !out.name.empty();
+        if (fid == 100) {
+            if (!ms.ReadStr(out.name, 4096)) return false;
+        } else if (fid == 101) {
+            if (!ReadDuckLogicalTypeObj(ms, out)) return false;
+        } else if (fid == 102 || fid == 103) {
+            uint64_t v = 0;
+            if (!ms.ReadVarU64(v)) return false;
+        } else if (fid == 104 || fid == 200) {
+            bool hasDef = false;
+            if (!ms.ReadBool(hasDef) || hasDef) return false;
+        } else {
+            return false;
+        }
+    }
+}
+
+inline bool ReadDuckCreateInfoObj(DuckMetaStream& ms, DuckTableEntry& ent) {
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) return true;
+        switch (fid) {
+        case 100: {
+            uint64_t t = 0;
+            if (!ms.ReadVarU64(t) || t > 64) return false;
+            ent.catType = static_cast<uint8_t>(t);
+            break;
+        }
+        case 101: {
+            std::string cat;
+            if (!ms.ReadStr(cat, 4096)) return false;
+            break;
+        }
+        case 102: {
+            if (!ms.ReadStr(ent.schema, 4096)) return false;
+            break;
+        }
+        case 103: {
+            bool tmp = false;
+            if (!ms.ReadBool(tmp)) return false;
+            break;
+        }
+        case 104: {
+            if (!ms.ReadBool(ent.internal)) return false;
+            break;
+        }
+        case 105:
+        case 108: {
+            if (!ms.ReadStr(ent.sql, 65536)) return false;
+            break;
+        }
+        case 106: { // dependencies list (empty or list of {100..0xFFFF})
+            uint64_t depCount = 0;
+            if (!ms.ReadVarU64(depCount) || depCount > 4096) return false;
+            for (uint64_t i = 0; i < depCount; ++i) {
+                for (;;) {
+                    uint16_t df = 0;
+                    if (!ms.ReadU16(df)) return false;
+                    if (df == 0xFFFFu) break;
+                    if (df == 100) {
+                        for (;;) {
+                            uint16_t bf = 0;
+                            if (!ms.ReadU16(bf)) return false;
+                            if (bf == 0xFFFFu) break;
+                            if (bf == 100) { uint64_t dt = 0; if (!ms.ReadVarU64(dt)) return false; }
+                            else if (bf == 101 || bf == 102) { std::string s; if (!ms.ReadStr(s, 4096)) return false; }
+                            else return false;
+                        }
+                    } else if (df == 101) {
+                        std::string cat;
+                        if (!ms.ReadStr(cat, 4096)) return false;
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            break;
+        }
+        case 107: { // optional comment (bool has_val + string)
+            bool hasCmt = false;
+            if (!ms.ReadBool(hasCmt)) return false;
+            if (hasCmt) {
+                std::string cmt;
+                if (!ms.ReadStr(cmt, 16384)) return false;
+            }
+            break;
+        }
+        case 200: { // table / view name
+            if (!ms.ReadStr(ent.name, 4096)) return false;
+            break;
+        }
+        case 201: {
+            if (ent.catType == 1) {
+                // ColumnList object { 100: vector<ColumnDefinition>, 0xFFFF }
+                for (;;) {
+                    uint16_t cf = 0;
+                    if (!ms.ReadU16(cf)) return false;
+                    if (cf == 0xFFFFu) break;
+                    if (cf == 100) {
+                        uint64_t colCount = 0;
+                        if (!ms.ReadVarU64(colCount) || colCount > 4096) return false;
+                        ent.cols.reserve(static_cast<size_t>(colCount));
+                        for (uint64_t c = 0; c < colCount; ++c) {
+                            DuckColDef cd;
+                            if (!ReadDuckColumnDefObj(ms, cd)) return false;
+                            ent.cols.push_back(std::move(cd));
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            } else if (ent.catType == 3) {
+                // View aliases vector<string>
+                uint64_t cnt = 0;
+                if (!ms.ReadVarU64(cnt) || cnt > 4096) return false;
+                for (uint64_t i = 0; i < cnt; ++i) {
+                    std::string a;
+                    if (!ms.ReadStr(a, 4096)) return false;
+                }
+            } else {
+                return false;
+            }
+            break;
+        }
+        case 202: {
+            if (ent.catType == 1) {
+                // constraints vector<unique_ptr<Constraint>> (support empty or simple NOT NULL / PK)
+                uint64_t cnt = 0;
+                if (!ms.ReadVarU64(cnt) || cnt > 4096) return false;
+                for (uint64_t i = 0; i < cnt; ++i) {
+                    bool present = false;
+                    if (!ms.ReadBool(present)) return false;
+                    if (present) {
+                        for (;;) {
+                            uint16_t kf = 0;
+                            if (!ms.ReadU16(kf)) return false;
+                            if (kf == 0xFFFFu) break;
+                            if (kf == 100 || kf == 200) { uint64_t v = 0; if (!ms.ReadVarU64(v)) return false; }
+                            else if (kf == 201) {
+                                uint64_t n = 0; if (!ms.ReadVarU64(n) || n > 1024) return false;
+                                for (uint64_t j = 0; j < n; ++j) { std::string s; if (!ms.ReadStr(s, 1024)) return false; }
+                            } else return false;
+                        }
+                    }
+                }
+            } else if (ent.catType == 3) {
+                uint64_t cnt = 0;
+                if (!ms.ReadVarU64(cnt) || cnt > 4096) return false;
+                for (uint64_t i = 0; i < cnt; ++i) {
+                    DuckColDef cd;
+                    if (!ReadDuckLogicalTypeObj(ms, cd)) return false;
+                    ent.cols.push_back(std::move(cd));
+                }
+            } else {
+                return false;
+            }
+            break;
+        }
+        case 204: {
+            if (ent.catType != 3) return false;
+            uint64_t cnt = 0;
+            if (!ms.ReadVarU64(cnt) || cnt > 4096) return false;
+            for (uint64_t i = 0; i < cnt; ++i) {
+                std::string cn;
+                if (!ms.ReadStr(cn, 4096)) return false;
+                if (i < ent.cols.size()) ent.cols[static_cast<size_t>(i)].name = std::move(cn);
+            }
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+}
+
+inline bool ReadDuckBaseStatsVal(DuckMetaStream& ms, const DuckColDef& col, std::wstring& outVal) {
+    switch (col.typeId) {
+    case 10: { bool b = false; if (!ms.ReadBool(b)) return false; outVal = b ? L"true" : L"false"; return true; }
+    case 11: case 12: case 13: case 14: {
+        int64_t v = 0; if (!ms.ReadVarI64(v)) return false; outVal = std::to_wstring(v); return true;
+    }
+    case 15: {
+        int64_t v = 0; if (!ms.ReadVarI64(v)) return false; outVal = FormatDuckDateDays(static_cast<int32_t>(v)); return true;
+    }
+    case 19: case 32: {
+        int64_t v = 0; if (!ms.ReadVarI64(v)) return false; outVal = FormatDuckTimestampUs(v); return true;
+    }
+    case 22: {
+        uint32_t u = 0; if (!ms.ReadU32(u)) return false;
+        float f = 0.0f; std::memcpy(&f, &u, 4);
+        outVal = FmtDouble(f); return true;
+    }
+    case 23: {
+        uint64_t u = 0; if (!ms.ReadU64(u)) return false;
+        double d = 0.0; std::memcpy(&d, &u, 8);
+        outVal = FmtDouble(d); return true;
+    }
+    case 24: case 25: case 26: {
+        std::string s; if (!ms.ReadStr(s, 4096)) return false;
+        outVal = PathUtils::Utf8ToWide(s); return true;
+    }
+    case 28: case 29: case 30: case 31: {
+        uint64_t v = 0; if (!ms.ReadVarU64(v)) return false; outVal = std::to_wstring(v); return true;
+    }
+    default: {
+        std::string s; if (!ms.ReadStr(s, 4096)) return false;
+        outVal = PathUtils::Utf8ToWide(s); return true;
+    }
+    }
+}
+
+inline bool ReadDuckBaseStatsObj(DuckMetaStream& ms, const DuckColDef& col, DuckSegPtr& seg) {
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) return true;
+        if (fid == 100) { if (!ms.ReadBool(seg.hasNull)) return false; }
+        else if (fid == 101) { if (!ms.ReadBool(seg.hasNoNull)) return false; }
+        else if (fid == 102) { uint64_t dc = 0; if (!ms.ReadVarU64(dc)) return false; }
+        else if (fid == 103) {
+            for (;;) {
+                uint16_t tf = 0;
+                if (!ms.ReadU16(tf)) return false;
+                if (tf == 0xFFFFu) break;
+                if (tf == 200) {
+                    bool hasMin = false;
+                    if (!ms.ReadBool(hasMin)) return false;
+                    seg.hasConstVal = hasMin;
+                } else if (tf == 201) {
+                    if (!ReadDuckBaseStatsVal(ms, col, seg.constVal)) return false;
+                    seg.hasConstVal = true;
+                } else if (tf == 202) {
+                    bool hasMax = false;
+                    if (!ms.ReadBool(hasMax)) return false;
+                } else if (tf == 203) {
+                    std::wstring dummy;
+                    if (!ReadDuckBaseStatsVal(ms, col, dummy)) return false;
+                } else {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
+inline bool ReadDuckDataPointerObj(DuckMetaStream& ms, const DuckColDef& col, DuckSegPtr& seg) {
+    seg = {};
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) return true;
+        if (fid == 100) {
+            if (!ms.ReadVarU64(seg.rowStart)) return false;
+        } else if (fid == 101) {
+            if (!ms.ReadVarU64(seg.tupleCount)) return false;
+        } else if (fid == 102) {
+            // BlockPointer { 100: block_id (int64 zigzag), 101: offset (uint32 varint), 0xFFFF }
+            for (;;) {
+                uint16_t bf = 0;
+                if (!ms.ReadU16(bf)) return false;
+                if (bf == 0xFFFFu) break;
+                if (bf == 100) { if (!ms.ReadVarI64(seg.blockId)) return false; }
+                else if (bf == 101) { uint64_t off = 0; if (!ms.ReadVarU64(off)) return false; seg.offset = static_cast<uint32_t>(off); }
+                else return false;
+            }
+        } else if (fid == 103) {
+            uint64_t comp = 0;
+            if (!ms.ReadVarU64(comp) || comp > 32) return false;
+            seg.compression = static_cast<uint8_t>(comp);
+        } else if (fid == 104) {
+            if (!ReadDuckBaseStatsObj(ms, col, seg)) return false;
+        } else if (fid == 105) {
+            bool hasState = false;
+            if (!ms.ReadBool(hasState)) return false;
+            if (hasState) {
+                for (;;) {
+                    uint16_t sf = 0;
+                    if (!ms.ReadU16(sf)) return false;
+                    if (sf == 0xFFFFu) break;
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
+inline bool ReadDuckColumnDataObj(DuckMetaStream& ms, const DuckColDef& col, std::vector<DuckSegPtr>& outSegs) {
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) return true;
+        if (fid == 100) {
+            uint64_t cnt = 0;
+            if (!ms.ReadVarU64(cnt) || cnt > 65536) return false;
+            for (uint64_t i = 0; i < cnt; ++i) {
+                DuckSegPtr sp;
+                if (!ReadDuckDataPointerObj(ms, col, sp)) return false;
+                outSegs.push_back(std::move(sp));
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
+inline bool ReadDuckRowGroupObj(const std::vector<uint8_t>& raw, uint64_t blockAlloc, DuckMetaStream& ms, DuckTableEntry& tbl) {
+    uint64_t rgRowStart = 0, rgTupleCount = 0;
+    std::vector<DuckMetaPtr> colMetaPtrs;
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) break;
+        if (fid == 100) {
+            if (!ms.ReadVarU64(rgRowStart)) return false;
+        } else if (fid == 101) {
+            if (!ms.ReadVarU64(rgTupleCount)) return false;
+        } else if (fid == 102) {
+            uint64_t colCnt = 0;
+            if (!ms.ReadVarU64(colCnt) || colCnt > 4096) return false;
+            colMetaPtrs.reserve(static_cast<size_t>(colCnt));
+            for (uint64_t c = 0; c < colCnt; ++c) {
+                DuckMetaPtr mp;
+                if (!ReadDuckMetaPtrObj(ms, mp)) return false;
+                colMetaPtrs.push_back(mp);
+            }
+        } else if (fid == 103) {
+            uint64_t delCnt = 0;
+            if (!ms.ReadVarU64(delCnt) || delCnt > 4096) return false;
+            for (uint64_t d = 0; d < delCnt; ++d) {
+                DuckMetaPtr mp;
+                if (!ReadDuckMetaPtrObj(ms, mp)) return false;
+            }
+        } else if (fid == 104) {
+            bool hasMeta = false;
+            if (!ms.ReadBool(hasMeta)) return false;
+        } else if (fid == 105) {
+            uint64_t extraCnt = 0;
+            if (!ms.ReadVarU64(extraCnt) || extraCnt > 65536) return false;
+            for (uint64_t e = 0; e < extraCnt; ++e) {
+                uint64_t blk = 0;
+                if (!ms.ReadVarU64(blk)) return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    (void)rgRowStart;
+    (void)rgTupleCount;
+
+    if (tbl.colSegments.size() < tbl.cols.size()) {
+        tbl.colSegments.resize(tbl.cols.size());
+    }
+    const size_t nCols = std::min(colMetaPtrs.size(), tbl.cols.size());
+    for (size_t c = 0; c < nCols; ++c) {
+        if (colMetaPtrs[c].blockPtr == UINT64_MAX) continue;
+        DuckMetaStream cms(raw, blockAlloc, colMetaPtrs[c].blockPtr, colMetaPtrs[c].offset);
+        if (!cms.Valid()) return false;
+        if (!ReadDuckColumnDataObj(cms, tbl.cols[c], tbl.colSegments[c])) return false;
+    }
+    return true;
+}
+
+inline bool ReadDuckPersistentTableData(const std::vector<uint8_t>& raw, uint64_t blockAlloc, DuckTableEntry& tbl) {
+    if (tbl.tablePtr.blockPtr == UINT64_MAX) return true;
+    DuckMetaStream ms(raw, blockAlloc, tbl.tablePtr.blockPtr, tbl.tablePtr.offset);
+    if (!ms.Valid()) return false;
+
+    DuckMetaPtr rgStreamPtr;
+    uint64_t rgCount = 0;
+    for (;;) {
+        uint16_t fid = 0;
+        if (!ms.ReadU16(fid)) return false;
+        if (fid == 0xFFFFu) break;
+        if (fid == 100) {
+            if (!ms.ReadVarU64(tbl.totalRows)) return false;
+        } else if (fid == 101) {
+            // Inline row_groups list: varint count + RowGroup objects
+            uint64_t inlineRgCnt = 0;
+            if (!ms.ReadVarU64(inlineRgCnt) || inlineRgCnt > 65536) return false;
+            for (uint64_t r = 0; r < inlineRgCnt; ++r) {
+                if (!ReadDuckRowGroupObj(raw, blockAlloc, ms, tbl)) return false;
+            }
+        } else if (fid == 102) {
+            if (!ReadDuckMetaPtrObj(ms, rgStreamPtr)) return false;
+        } else if (fid == 103) {
+            if (!ms.ReadVarU64(rgCount) || rgCount > 65536) return false;
+        } else {
+            return false;
         }
     }
 
-    FinalizeSheetCols(sh);
+    if (rgStreamPtr.blockPtr != UINT64_MAX && rgCount > 0) {
+        DuckMetaStream rgMs(raw, blockAlloc, rgStreamPtr.blockPtr, rgStreamPtr.offset);
+        if (!rgMs.Valid()) return false;
+        for (uint64_t r = 0; r < rgCount; ++r) {
+            if (!ReadDuckRowGroupObj(raw, blockAlloc, rgMs, tbl)) return false;
+        }
+    }
+    return true;
+}
+
+inline void DecodeDuckColumnValues(
+    const std::vector<uint8_t>& raw,
+    uint64_t blockAlloc,
+    const DuckColDef& col,
+    const std::vector<DuckSegPtr>& segs,
+    size_t maxRows,
+    std::vector<std::wstring>& outVals)
+{
+    for (const auto& seg : segs) {
+        if (outVals.size() >= maxRows) break;
+        const size_t want = static_cast<size_t>(std::min<uint64_t>(seg.tupleCount, maxRows - outVals.size()));
+        if (want == 0) continue;
+
+        // CONSTANT compression (2)
+        if (seg.compression == 2) {
+            const std::wstring v = (seg.hasNull && !seg.hasNoNull && !seg.hasConstVal) ? L"NULL" : seg.constVal;
+            for (size_t i = 0; i < want; ++i) outVals.push_back(v);
+            continue;
+        }
+
+        if (seg.blockId < 0) continue;
+        const uint64_t bid = static_cast<uint64_t>(seg.blockId);
+        if (bid > (raw.size() - 12288ULL) / blockAlloc) continue;
+        const uint64_t segFileOff = 12288ULL + bid * blockAlloc + 8ULL + seg.offset;
+        if (segFileOff >= raw.size()) continue;
+        const uint8_t* p = raw.data() + static_cast<size_t>(segFileOff);
+        const size_t avail = raw.size() - static_cast<size_t>(segFileOff);
+
+        auto decodeFixedElem = [&](const uint8_t* ep, size_t elemSz) -> std::wstring {
+            switch (col.typeId) {
+            case 10: return ep[0] ? L"true" : L"false";
+            case 11: return std::to_wstring(static_cast<int8_t>(ep[0]));
+            case 12: return std::to_wstring(RdI16LE(ep));
+            case 13: return std::to_wstring(RdI32LE(ep));
+            case 14: return std::to_wstring(RdI64LE(ep));
+            case 15: return FormatDuckDateDays(RdI32LE(ep));
+            case 17: return FormatDuckTimestampUs(RdI64LE(ep) * 1000000LL);
+            case 18: return FormatDuckTimestampUs(RdI64LE(ep) * 1000LL);
+            case 19:
+            case 32: return FormatDuckTimestampUs(RdI64LE(ep));
+            case 20: return FormatDuckTimestampUs(RdI64LE(ep) / 1000LL);
+            case 21: {
+                int64_t rawDec = (elemSz == 2) ? RdI16LE(ep) : ((elemSz == 4) ? RdI32LE(ep) : RdI64LE(ep));
+                if (col.decScale == 0) return std::to_wstring(rawDec);
+                double sc = std::pow(10.0, static_cast<int>(col.decScale));
+                return FmtDouble(static_cast<double>(rawDec) / sc);
+            }
+            case 22: return FmtDouble(RdF32LE(ep));
+            case 23: return FmtDouble(RdF64LE(ep));
+            case 28: return std::to_wstring(ep[0]);
+            case 29: return std::to_wstring(RdU16LE(ep));
+            case 30: return std::to_wstring(RdU32LE(ep));
+            case 31: return std::to_wstring(RdU64LE(ep));
+            default: return L"";
+            }
+        };
+
+        size_t fixedSz = 0;
+        switch (col.typeId) {
+        case 10: case 11: case 28: fixedSz = 1; break;
+        case 12: case 29: fixedSz = 2; break;
+        case 13: case 15: case 22: case 30: fixedSz = 4; break;
+        case 14: case 16: case 17: case 18: case 19: case 20: case 23: case 31: case 32: fixedSz = 8; break;
+        case 21: fixedSz = (col.decWidth <= 4) ? 2 : ((col.decWidth <= 9) ? 4 : 8); break;
+        default: break;
+        }
+
+        // UNCOMPRESSED (1)
+        if (seg.compression == 1) {
+            if (fixedSz > 0) {
+                const uint64_t valBytes = seg.tupleCount * fixedSz;
+                const uint8_t* validityMask = (seg.hasNull && valBytes + ((seg.tupleCount + 63ULL) / 64ULL) * 8ULL <= avail)
+                    ? (p + static_cast<size_t>(valBytes))
+                    : nullptr;
+                for (size_t i = 0; i < want && (i + 1) * fixedSz <= avail; ++i) {
+                    if (validityMask) {
+                        const uint64_t word = RdU64LE(validityMask + (i / 64) * 8);
+                        if (((word >> (i % 64)) & 1ULL) == 0) {
+                            outVals.push_back(L"NULL");
+                            continue;
+                        }
+                    }
+                    outVals.push_back(decodeFixedElem(p + i * fixedSz, fixedSz));
+                }
+            } else if (col.typeId == 24 || col.typeId == 25 || col.typeId == 26) {
+                // Layout A: DuckDB StringUncompressed dictionary-at-end ([u32 dict_size][u32 dict_end][i32 end_offsets[tupleCount]] ... dict at end)
+                if (avail >= 8 + want * 4) {
+                    const uint32_t dictSize = RdU32LE(p);
+                    const uint32_t dictEnd  = RdU32LE(p + 4);
+                    if (dictEnd >= 8 + seg.tupleCount * 4 && dictEnd <= avail && dictSize <= dictEnd) {
+                        uint32_t prevAbs = 0;
+                        bool okDict = true;
+                        std::vector<std::wstring> tmpStrs;
+                        tmpStrs.reserve(want);
+                        for (size_t i = 0; i < want; ++i) {
+                            const int32_t rawOff = RdI32LE(p + 8 + i * 4);
+                            const uint32_t curAbs = static_cast<uint32_t>(rawOff < 0 ? -rawOff : rawOff);
+                            if (curAbs < prevAbs || curAbs > dictSize || curAbs > dictEnd) { okDict = false; break; }
+                            const uint32_t sLen = curAbs - prevAbs;
+                            const char* sPtr = reinterpret_cast<const char*>(p + dictEnd - curAbs);
+                            tmpStrs.push_back(PathUtils::Utf8ToWide(std::string(sPtr, sLen)));
+                            prevAbs = curAbs;
+                        }
+                        if (okDict) {
+                            for (auto& s : tmpStrs) outVals.push_back(std::move(s));
+                            continue;
+                        }
+                    }
+                }
+                // Layout B: DuckDB 16-byte string_t vector ([u32 len][12B inline OR 4B prefix + u64 relOffset])
+                if (avail >= want * 16) {
+                    for (size_t i = 0; i < want; ++i) {
+                        const uint8_t* sp = p + i * 16;
+                        const uint32_t sLen = RdU32LE(sp);
+                        if (sLen <= 12) {
+                            outVals.push_back(PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(sp + 4), sLen)));
+                        } else {
+                            const uint64_t strOff = RdU64LE(sp + 8);
+                            if (strOff <= avail && sLen <= avail - static_cast<size_t>(strOff)) {
+                                outVals.push_back(PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(p + strOff), sLen)));
+                            } else {
+                                outVals.push_back(PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(sp + 4), 4)) + L"...");
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (seg.compression == 3 && fixedSz > 0 && avail >= 4) {
+            // RLE compression: [u32 run_count] followed by runs of [u16 count][T value]
+            const uint32_t runCount = RdU32LE(p);
+            size_t cur = 4;
+            for (uint32_t r = 0; r < runCount && outVals.size() < maxRows; ++r) {
+                if (cur + 2 + fixedSz > avail) break;
+                const uint16_t rep = RdU16LE(p + cur);
+                const std::wstring val = decodeFixedElem(p + cur + 2, fixedSz);
+                cur += 2 + fixedSz;
+                for (uint16_t k = 0; k < rep && outVals.size() < maxRows; ++k) {
+                    outVals.push_back(val);
+                }
+            }
+        } else if (seg.compression == 6 && (col.typeId == 24 || col.typeId == 25) && avail >= 12) {
+            // DICTIONARY compression: [u32 dict_size][u32 dict_end][u32 dict_count][u32 index[tupleCount]][u32 end_offsets[dict_count]] ...
+            const uint32_t dictSize  = RdU32LE(p);
+            const uint32_t dictEnd   = RdU32LE(p + 4);
+            const uint32_t dictCount = RdU32LE(p + 8);
+            const uint64_t idxTableBytes = seg.tupleCount * 4ULL;
+            const uint64_t offTableStart = 12ULL + idxTableBytes;
+            if (dictEnd <= avail && dictSize <= dictEnd && dictCount <= 65536 && offTableStart + dictCount * 4ULL <= dictEnd) {
+                std::vector<std::wstring> dictEntries(dictCount);
+                uint32_t prev = 0;
+                bool ok = true;
+                for (uint32_t d = 0; d < dictCount; ++d) {
+                    const uint32_t curAbs = RdU32LE(p + static_cast<size_t>(offTableStart) + d * 4);
+                    if (curAbs < prev || curAbs > dictSize) { ok = false; break; }
+                    const uint32_t sLen = curAbs - prev;
+                    dictEntries[d] = PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(p + dictEnd - curAbs), sLen));
+                    prev = curAbs;
+                }
+                if (ok) {
+                    for (size_t i = 0; i < want; ++i) {
+                        const uint32_t idx = RdU32LE(p + 12 + i * 4);
+                        outVals.push_back(idx < dictEntries.size() ? dictEntries[idx] : L"NULL");
+                    }
+                }
+            }
+        }
+    }
+}
+
+inline bool ParseDuckDb(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
+    // DuckDB MainHeader at sector 0 (0..4095), DatabaseHeader 0 at 4096, DatabaseHeader 1 at 8192, blocks at 12288+
+    if (raw.size() < 12288 + 32 || std::memcmp(raw.data() + 8, "DUCK", 4) != 0) return false;
+
+    const uint64_t fmtVersion = RdU64LE(raw.data() + 12);
+    if (fmtVersion == 0 || fmtVersion > 100000) return false;
+
+    std::wstring gitDesc = CleanAsciiFixed(raw.data() + 52, 64);
+    std::wstring gitHash = CleanAsciiFixed(raw.data() + 116, 64);
+    if (gitDesc.empty()) {
+        gitDesc = CleanAsciiFixed(raw.data() + 28, 64);
+        gitHash = CleanAsciiFixed(raw.data() + 92, 64);
+    }
+
+    auto resolveAlloc = [&](uint64_t hdrAlloc) -> uint64_t {
+        if (hdrAlloc >= 4096ULL && hdrAlloc <= 16777216ULL && (hdrAlloc & (hdrAlloc - 1ULL)) == 0) {
+            return hdrAlloc;
+        }
+        if (raw.size() >= 12288ULL + 262144ULL) return 262144ULL;
+        const uint64_t dataBytes = raw.size() - 12288ULL;
+        if (dataBytes >= 16384ULL && (dataBytes % 16384ULL) == 0) return 16384ULL;
+        if (dataBytes >= 4096ULL && (dataBytes % 4096ULL) == 0) return 4096ULL;
+        return 262144ULL;
+    };
+
+    struct DbSlot {
+        bool valid = false;
+        size_t sectorOff = 0;
+        uint64_t iteration = 0;
+        uint64_t metaBlock = UINT64_MAX;
+        uint64_t freeList = UINT64_MAX;
+        uint64_t blockCount = 0;
+        uint64_t blockAlloc = 262144;
+        uint64_t vectorSize = 2048;
+    };
+
+    auto readSlot = [&](size_t off) -> DbSlot {
+        DbSlot s;
+        s.sectorOff = off;
+        s.iteration  = RdU64LE(raw.data() + off + 8);
+        s.metaBlock  = RdU64LE(raw.data() + off + 16);
+        s.freeList   = RdU64LE(raw.data() + off + 24);
+        s.blockCount = RdU64LE(raw.data() + off + 32);
+        const uint64_t rawAlloc = RdU64LE(raw.data() + off + 40);
+        s.blockAlloc = resolveAlloc(rawAlloc);
+        s.vectorSize = RdU64LE(raw.data() + off + 48);
+
+        if (s.metaBlock == UINT64_MAX) return s;
+        if (s.iteration == 0 && s.blockCount == 0) return s;
+        const uint64_t physId = s.metaBlock & 0x00FFFFFFFFFFFFFFULL;
+        const uint8_t subIdx  = static_cast<uint8_t>(s.metaBlock >> 56);
+        if (subIdx >= 64) return s;
+        if (physId > (raw.size() - 12288ULL) / s.blockAlloc) return s;
+        if (12288ULL + physId * s.blockAlloc + 18ULL > raw.size()) return s;
+        s.valid = true;
+        return s;
+    };
+
+    const DbSlot slot0 = readSlot(4096);
+    const DbSlot slot1 = readSlot(8192);
+    if (!slot0.valid && !slot1.valid) return false;
+    const DbSlot& active = (!slot0.valid) ? slot1 : ((!slot1.valid) ? slot0 : ((slot1.iteration >= slot0.iteration) ? slot1 : slot0));
+
+    // Walk linked MetaBlocks and deserialize the binary Catalog via DuckDB BinaryMetadataDeserializer
+    DuckMetaStream rootStream(raw, active.blockAlloc, active.metaBlock, 0);
+    if (!rootStream.Valid()) return false;
+
+    std::vector<DuckTableEntry> entries;
+    for (size_t entryIdx = 0; entryIdx < 4096; ++entryIdx) {
+        uint16_t outerFid = 0;
+        if (!rootStream.ReadU16(outerFid)) break;
+        if (outerFid == 0xFFFFu) break; // explicit end of checkpoint stream
+        if (outerFid != 100u) return false; // reject non-DuckDB / scraped text blocks!
+
+        DuckTableEntry ent;
+        if (!ReadDuckCreateInfoObj(rootStream, ent)) return false;
+
+        // Read remaining fields of checkpoint catalog wrapper (101 = MetaBlockPointer table_pointer, terminated by 0xFFFF)
+        for (;;) {
+            uint16_t wf = 0;
+            if (!rootStream.ReadU16(wf)) return false;
+            if (wf == 0xFFFFu) break;
+            if (wf == 101) {
+                if (!ReadDuckMetaPtrObj(rootStream, ent.tablePtr)) return false;
+            } else {
+                return false;
+            }
+        }
+
+        if (ent.catType == 0) break; // CatalogType::INVALID sentinel marks end of catalog
+        entries.push_back(std::move(ent));
+    }
+
+    if (entries.empty()) return false;
+
+    for (auto& ent : entries) {
+        if (ent.catType == 1 && ent.tablePtr.blockPtr != UINT64_MAX) {
+            if (!ReadDuckPersistentTableData(raw, active.blockAlloc, ent)) return false;
+        }
+    }
+
+    SpreadsheetSheet catSheet;
+    catSheet.name = L"DuckDB_Header_And_Catalog";
+    catSheet.rows.push_back({ L"Storage Field / Catalog Object", L"Category", L"Value / Schema Details" });
+    catSheet.rows.push_back({ L"Storage Magic", L"MainHeader", L"DUCK" });
+    catSheet.rows.push_back({ L"Storage Format Version", L"MainHeader", std::to_wstring(fmtVersion) });
+    if (!gitDesc.empty()) catSheet.rows.push_back({ L"Engine Version", L"MainHeader", gitDesc });
+    if (!gitHash.empty()) catSheet.rows.push_back({ L"Engine Git Hash", L"MainHeader", gitHash });
+    catSheet.rows.push_back({ L"Active Checkpoint Iteration", L"DatabaseHeader", std::to_wstring(active.iteration) });
+    catSheet.rows.push_back({ L"Meta Block Pointer", L"DatabaseHeader",
+        L"block=" + std::to_wstring(active.metaBlock & 0x00FFFFFFFFFFFFFFULL) +
+        L", sub=" + std::to_wstring(active.metaBlock >> 56) });
+    catSheet.rows.push_back({ L"Block Count", L"DatabaseHeader", std::to_wstring(active.blockCount) });
+    catSheet.rows.push_back({ L"Block Allocation Size", L"DatabaseHeader", PathUtils::FormatByteSize(active.blockAlloc) });
+    if (active.vectorSize > 0) {
+        catSheet.rows.push_back({ L"Vector Size", L"DatabaseHeader", std::to_wstring(active.vectorSize) });
+    }
+
+    std::vector<SpreadsheetSheet> tableSheets;
+    for (const auto& ent : entries) {
+        const std::wstring schW = ent.schema.empty() ? L"main" : PathUtils::Utf8ToWide(ent.schema);
+        const std::wstring nameW = PathUtils::Utf8ToWide(ent.name);
+        if (ent.catType == 2) {
+            catSheet.rows.push_back({ schW, L"Schema", ent.internal ? L"internal schema" : L"user schema" });
+        } else if (ent.catType == 3) {
+            std::wstring detail = ent.sql.empty() ? L"VIEW" : PathUtils::Utf8ToWide(ent.sql);
+            catSheet.rows.push_back({ schW + L"." + nameW, L"View", std::move(detail) });
+        } else if (ent.catType == 1) {
+            std::wstring colSummary;
+            for (size_t c = 0; c < ent.cols.size(); ++c) {
+                if (c > 0) colSummary += L", ";
+                colSummary += PathUtils::Utf8ToWide(ent.cols[c].name) + L" " + DuckTypeName(ent.cols[c]);
+            }
+            std::wstring infoStr = L"(" + colSummary + L") \x2014 " + std::to_wstring(ent.totalRows) + L" rows";
+            catSheet.rows.push_back({ schW + L"." + nameW, L"Table", std::move(infoStr) });
+
+            if (!ent.internal && !ent.cols.empty() && tableSheets.size() < 24) {
+                SpreadsheetSheet tsh;
+                tsh.name = nameW.empty() ? L"Table" : nameW;
+                std::vector<std::wstring> hdrRow;
+                hdrRow.reserve(ent.cols.size());
+                for (const auto& cd : ent.cols) {
+                    hdrRow.push_back(PathUtils::Utf8ToWide(cd.name) + L" (" + DuckTypeName(cd) + L")");
+                }
+                tsh.rows.push_back(std::move(hdrRow));
+
+                const size_t maxPreviewRows = static_cast<size_t>(std::min<uint64_t>(ent.totalRows, 256));
+                if (maxPreviewRows > 0 && ent.colSegments.size() == ent.cols.size()) {
+                    std::vector<std::vector<std::wstring>> decodedCols(ent.cols.size());
+                    size_t rowCap = 0;
+                    for (size_t c = 0; c < ent.cols.size(); ++c) {
+                        DecodeDuckColumnValues(raw, active.blockAlloc, ent.cols[c], ent.colSegments[c], maxPreviewRows, decodedCols[c]);
+                        rowCap = std::max(rowCap, decodedCols[c].size());
+                    }
+                    for (size_t r = 0; r < rowCap; ++r) {
+                        std::vector<std::wstring> row(ent.cols.size());
+                        for (size_t c = 0; c < ent.cols.size(); ++c) {
+                            if (r < decodedCols[c].size()) row[c] = std::move(decodedCols[c][r]);
+                        }
+                        tsh.rows.push_back(std::move(row));
+                    }
+                }
+                FinalizeSheetCols(tsh);
+                tableSheets.push_back(std::move(tsh));
+            }
+        }
+    }
+
+    FinalizeSheetCols(catSheet);
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
     out.formatTitle = L"DuckDB Analytical Database (.duckdb)";
-    out.sheets.push_back(std::move(sh));
+    out.sheets.push_back(std::move(catSheet));
+    for (auto& ts : tableSheets) out.sheets.push_back(std::move(ts));
     out.valid = true;
     return true;
 }
 
 } // namespace AiDataDetail
 
-// Exposed in namespace Formats so ExtendedGeoSci100.h (NetCDF-4) can invoke it directly
+// Exposed in namespace Formats so ExtendedGeoSci100.h (NetCDF-4) and SpreadsheetDocViewer.cpp (>32 MB Arrow/Feather) can invoke directly
 inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
     return AiDataDetail::ParseHdf5Doc(raw, extLower, out);
+}
+
+inline bool ParseArrowOrFeatherFile(const std::wstring& fullPath, const std::wstring& extLower, ParsedOfficeDocument& out) {
+    return AiDataDetail::ParseArrowOrFeatherFile(fullPath, extLower, out);
 }
 
 inline bool ParseExtendedAiDataDoc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
@@ -4550,6 +7102,8 @@ inline bool ParseExtendedAiDataDoc(const std::vector<uint8_t>& raw, const std::w
     if (extLower == L".cbor") return AiDataDetail::ParseCborDocument(raw, out);
     if (extLower == L".msgpack" || extLower == L".mpk") return AiDataDetail::ParseMsgPackDocument(raw, extLower, out);
     if (extLower == L".onnx") return AiDataDetail::ParseOnnxModel(raw, out);
+    if (extLower == L".gguf") return AiDataDetail::ParseGgufModel(raw, out);
+    if (extLower == L".safetensors") return AiDataDetail::ParseSafeTensorsModel(raw, out);
     if (extLower == L".pt" || extLower == L".pth" || extLower == L".ckpt") return AiDataDetail::ParsePyTorchCheckpoint(raw, extLower, out);
     if (extLower == L".tflite") return AiDataDetail::ParseTfLiteModel(raw, out);
     if (extLower == L".feather" || extLower == L".arrow" || extLower == L".ipc") return AiDataDetail::ParseArrowOrFeather(raw, extLower, out);

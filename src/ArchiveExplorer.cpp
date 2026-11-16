@@ -18,6 +18,12 @@
 #include <cstdio>
 
 namespace Explorer2 {
+#define E2_AURORA_ENABLE_ARCHIVE 1
+#include "formats/BioWareAurora.h"
+#undef E2_AURORA_ENABLE_ARCHIVE
+#define E2_RETROTEX_ENABLE_ARCHIVE 1
+#include "formats/RetroGameTex.h"
+#undef E2_RETROTEX_ENABLE_ARCHIVE
 
 namespace {
 
@@ -3386,6 +3392,7 @@ bool ArchiveExplorer::IsArchiveExtension(const std::wstring& extLower) {
            extLower == L".lz4"   || extLower == L".tlz4"||
            extLower == L".cab"   || extLower == L".msi" || extLower == L".msp" ||
            extLower == L".deb"   || extLower == L".rpm" || extLower == L".dmg" ||
+           extLower == L".hfs"   || extLower == L".ext2"|| extLower == L".ext3"|| extLower == L".ext4" ||
            extLower == L".vhd"   || extLower == L".vhdx"|| extLower == L".vmdk"||
            extLower == L".vdi"   || extLower == L".qcow2"|| extLower == L".wim"||
            extLower == L".esd"   || extLower == L".pak" || extLower == L".wad" ||
@@ -3400,7 +3407,9 @@ bool ArchiveExplorer::IsArchiveExtension(const std::wstring& extLower) {
            extLower == L".a"     || extLower == L".lib" || extLower == L".xar" ||
            extLower == L".pkg"   || extLower == L".lzh" || extLower == L".lha" ||
            extLower == L".arj"   || extLower == L".ace" || extLower == L".ipa" ||
-           extLower == L".aab"   || extLower == L".xapk"|| extLower == L".ova";
+           extLower == L".aab"   || extLower == L".xapk"|| extLower == L".ova" ||
+           extLower == L".erf"   || extLower == L".mod" || extLower == L".hak" ||
+           extLower == L".nwm"   || extLower == L".rim" || extLower == L".bif";
 }
 
 bool ArchiveExplorer::SplitVirtualArchivePath(
@@ -3901,7 +3910,9 @@ bool ArchiveExplorer::InspectArchiveFile(const std::wstring& archivePath, Archiv
             parsed = ParseSingleGzip(archivePath, data, size, outInfo);
         }
     } else {
-        parsed = Formats::InspectExtendedArchive200(data, size, extLower, outInfo) ||
+        parsed = Formats::ParseOrExtractWad2Wad3Archive(data, size, &outInfo, nullptr, nullptr) ||
+                 Formats::InspectBioWareArchive(archivePath, data, size, extLower, outInfo) ||
+                 Formats::InspectExtendedArchive200(data, size, extLower, outInfo) ||
                  Formats::InspectExtendedArchive100(archivePath, data, size, extLower, outInfo);
     }
 

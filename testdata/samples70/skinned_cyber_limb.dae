@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <up_axis>Y_UP</up_axis>
+    <unit name="meter" meter="1.0"/>
+  </asset>
+  <library_geometries>
+    <geometry id="cyber_limb_geom" name="CyberLimb">
+      <mesh>
+        <source id="cyber_limb_pos">
+          <float_array id="cyber_limb_pos_arr" count="36">0 -0.25 -0.25 0 0.25 -0.25 0 0.25 0.25 0 -0.25 0.25 2 -0.25 -0.25 2 0.25 -0.25 2 0.25 0.25 2 -0.25 0.25 4 -0.25 -0.25 4 0.25 -0.25 4 0.25 0.25 4 -0.25 0.25</float_array>
+          <technique_common>
+            <accessor source="#cyber_limb_pos_arr" count="12" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <vertices id="cyber_limb_verts">
+          <input semantic="POSITION" source="#cyber_limb_pos"/>
+        </vertices>
+        <triangles count="20">
+          <input semantic="VERTEX" source="#cyber_limb_verts" offset="0"/>
+          <p>0 2 1 0 3 2 0 1 5 0 5 4 1 2 6 1 6 5 2 3 7 2 7 6 3 0 4 3 4 7 4 5 9 4 9 8 5 6 10 5 10 9 6 7 11 6 11 10 7 4 8 7 8 11 8 9 10 8 10 11</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_controllers>
+    <controller id="cyber_limb_skin" name="CyberLimbSkin">
+      <skin source="#cyber_limb_geom">
+        <bind_shape_matrix>1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</bind_shape_matrix>
+        <source id="limb_joints">
+          <Name_array id="limb_joints_arr" count="2">UpperArm LowerArm</Name_array>
+          <technique_common>
+            <accessor source="#limb_joints_arr" count="2" stride="1">
+              <param name="JOINT" type="name"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <source id="limb_ibms">
+          <float_array id="limb_ibms_arr" count="32">
+            1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1
+            1 0 0 -2  0 1 0 0  0 0 1 0  0 0 0 1
+          </float_array>
+          <technique_common>
+            <accessor source="#limb_ibms_arr" count="2" stride="16">
+              <param name="TRANSFORM" type="float4x4"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <source id="limb_weights">
+          <float_array id="limb_weights_arr" count="2">1.0 0.5</float_array>
+          <technique_common>
+            <accessor source="#limb_weights_arr" count="2" stride="1">
+              <param name="WEIGHT" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <joints>
+          <input semantic="JOINT" source="#limb_joints"/>
+          <input semantic="INV_BIND_MATRIX" source="#limb_ibms"/>
+        </joints>
+        <vertex_weights count="12">
+          <input semantic="JOINT" source="#limb_joints" offset="0"/>
+          <input semantic="WEIGHT" source="#limb_weights" offset="1"/>
+          <vcount>1 1 1 1 2 2 2 2 1 1 1 1</vcount>
+          <v>0 0  0 0  0 0  0 0   0 1 1 1  0 1 1 1  0 1 1 1  0 1 1 1   1 0  1 0  1 0  1 0</v>
+        </vertex_weights>
+      </skin>
+    </controller>
+  </library_controllers>
+  <library_visual_scenes>
+    <visual_scene id="MainScene" name="MainScene">
+      <node id="Bone_Upper" sid="UpperArm" name="UpperArm" type="JOINT">
+        <translate>0 0 0</translate>
+        <node id="Bone_Lower" sid="LowerArm" name="LowerArm" type="JOINT">
+          <translate>2 0 0</translate>
+          <rotate>0 0 1 90</rotate>
+        </node>
+      </node>
+      <node id="CyberLimbMeshNode" name="CyberLimbMeshNode" type="NODE">
+        <instance_controller url="#cyber_limb_skin">
+          <skeleton>#Bone_Upper</skeleton>
+        </instance_controller>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene>
+    <instance_visual_scene url="#MainScene"/>
+  </scene>
+</COLLADA>

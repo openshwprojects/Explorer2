@@ -942,7 +942,18 @@ inline bool ParseGltfOrGlbMesh(
             size_t reqLen = hasByteLen ? static_cast<size_t>(byteLen64) : 0;
 
             const JsonVal* jUri = jb.Find("uri");
-            if (!jUri || jUri->IsNull()) {
+            bool isMeshoptFallback = false;
+            if (const JsonVal* jBufExt = jb.Find("extensions")) {
+                if (const JsonVal* jMo = jBufExt->Find("EXT_meshopt_compression")) {
+                    isMeshoptFallback = jMo->GetBool("fallback", false);
+                } else if (const JsonVal* jKMo = jBufExt->Find("KHR_meshopt_compression")) {
+                    isMeshoptFallback = jKMo->GetBool("fallback", false);
+                }
+            }
+            if (isMeshoptFallback && (!jUri || jUri->IsNull())) {
+                buffers[bi].ptr = nullptr;
+                buffers[bi].size = 0;
+            } else if (!jUri || jUri->IsNull()) {
                 // Undefined URI refers to the GLB BIN\0 chunk (valid on buffer 0 in GLB/VRM)
                 if (!isBinaryContainer || !glbBinPtr) return false;
                 if (hasByteLen && reqLen > glbBinLen) return false;
@@ -975,7 +986,7 @@ inline bool ParseGltfOrGlbMesh(
         buffers.push_back(std::move(implicitBin));
     }
 
-    // 2. Resolve bufferViews
+    // 2. Resolve bufferViews (including EXT_meshopt_compression / KHR_meshopt_compression)
     std::vector<BufferViewDesc> bufferViews;
     if (const JsonVal* jViews = root.Find("bufferViews")) {
         if (!jViews->IsArray() || jViews->arrVal.size() > 65536) return false;
@@ -983,6 +994,57 @@ inline bool ParseGltfOrGlbMesh(
         for (size_t vi = 0; vi < jViews->arrVal.size(); ++vi) {
             const JsonVal& jv = jViews->arrVal[vi];
             if (!jv.IsObject()) return false;
+
+            const JsonVal* jMeshopt = nullptr;
+            if (const JsonVal* jExt = jv.Find("extensions")) {
+                jMeshopt = jExt->Find("EXT_meshopt_compression");
+                if (!jMeshopt) jMeshopt = jExt->Find("KHR_meshopt_compression");
+            }
+            if (jMeshopt && jMeshopt->IsObject()) {
+                int moBuf = jMeshopt->GetInt("buffer", -1);
+                int64_t moOff = jMeshopt->GetInt64("byteOffset", 0);
+                int64_t moLen = jMeshopt->GetInt64("byteLength", -1);
+                int64_t moStride = jMeshopt->GetInt64("byteStride", 0);
+                int64_t moCount = jMeshopt->GetInt64("count", 0);
+                std::string moMode = jMeshopt->GetString("mode");
+                std::string moFilter = jMeshopt->GetString("filter", "NONE");
+
+                if (moBuf < 0 || static_cast<size_t>(moBuf) >= buffers.size() ||
+                    moOff < 0 || moLen <= 0 || moStride <= 0 || moStride > 256 || moCount <= 0) {
+                    return false;
+                }
+                const BufferSlice& cbs = buffers[static_cast<size_t>(moBuf)];
+                if (!cbs.ptr || static_cast<size_t>(moOff) > cbs.size ||
+                    static_cast<size_t>(moLen) > cbs.size - static_cast<size_t>(moOff)) {
+                    return false;
+                }
+                BufferSlice decSlice;
+                if (!DecodeMeshoptBufferView(
+                        cbs.ptr + static_cast<size_t>(moOff),
+                        static_cast<size_t>(moLen),
+                        static_cast<size_t>(moCount),
+                        static_cast<size_t>(moStride),
+                        moMode,
+                        moFilter,
+                        decSlice.owned)) {
+                    return false;
+                }
+                decSlice.ptr = decSlice.owned.data();
+                decSlice.size = decSlice.owned.size();
+                int newBufIdx = static_cast<int>(buffers.size());
+                buffers.push_back(std::move(decSlice));
+
+                int64_t viewStride = jv.GetInt64("byteStride", 0);
+                BufferViewDesc vd;
+                vd.buffer = newBufIdx;
+                vd.byteOffset = 0;
+                vd.byteLength = buffers[static_cast<size_t>(newBufIdx)].size;
+                vd.byteStride = (viewStride > 0 && viewStride <= 255) ? static_cast<size_t>(viewStride) : 0;
+                vd.valid = true;
+                bufferViews[vi] = vd;
+                continue;
+            }
+
             int bufIdx = jv.GetInt("buffer", 0);
             int64_t off64 = jv.GetInt64("byteOffset", 0);
             int64_t len64 = jv.GetInt64("byteLength", -1);
@@ -990,6 +1052,7 @@ inline bool ParseGltfOrGlbMesh(
             if (bufIdx < 0 || static_cast<size_t>(bufIdx) >= buffers.size()) continue;
             if (off64 < 0 || len64 < 0 || stride64 < 0 || stride64 > 255) continue;
             const BufferSlice& bs = buffers[static_cast<size_t>(bufIdx)];
+            if (!bs.ptr) continue;
             size_t off = static_cast<size_t>(off64);
             size_t len = static_cast<size_t>(len64);
             if (off > bs.size || len > bs.size - off) continue;
@@ -1073,6 +1136,40 @@ inline bool ParseGltfOrGlbMesh(
             if (mode != 4 && mode != 5 && mode != 6) {
                 continue; // skip point/line-only modes (0..3)
             }
+
+            // Check KHR_draco_mesh_compression extension on primitive
+            if (const JsonVal* jPrimExt = jp.Find("extensions")) {
+                if (const JsonVal* jDraco = jPrimExt->Find("KHR_draco_mesh_compression")) {
+                    if (!jDraco->IsObject()) return false;
+                    int dViewIdx = jDraco->GetInt("bufferView", -1);
+                    if (dViewIdx < 0 || static_cast<size_t>(dViewIdx) >= bufferViews.size() ||
+                        !bufferViews[static_cast<size_t>(dViewIdx)].valid) {
+                        return false;
+                    }
+                    int dracoPosId = -1;
+                    if (const JsonVal* jDAttrs = jDraco->Find("attributes")) {
+                        dracoPosId = jDAttrs->GetInt("POSITION", -1);
+                    }
+                    const BufferViewDesc& dvd = bufferViews[static_cast<size_t>(dViewIdx)];
+                    const BufferSlice& dbs = buffers[static_cast<size_t>(dvd.buffer)];
+                    DecodedPrim dpDraco;
+                    uint8_t dEncType = 0, dMaj = 0, dMin = 0;
+                    if (!DecodeDracoBufferToMesh(
+                            dbs.ptr + dvd.byteOffset,
+                            dvd.byteLength,
+                            dracoPosId,
+                            dpDraco.positions,
+                            dpDraco.tris,
+                            dEncType,
+                            dMaj,
+                            dMin) || dpDraco.positions.empty() || dpDraco.tris.empty()) {
+                        return false;
+                    }
+                    decodedMeshes[mi].prims.push_back(std::move(dpDraco));
+                    continue;
+                }
+            }
+
             const JsonVal* jAttrs = jp.Find("attributes");
             if (!jAttrs || !jAttrs->IsObject()) continue;
             int posAccIdx = jAttrs->GetInt("POSITION", -1);

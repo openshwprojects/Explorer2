@@ -1041,7 +1041,61 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
         return ring;
     };
 
-    // 6. Triangulate all ADVANCED_FACE & FACE_SURFACE B-Rep faces
+    // 6. Triangulate all ADVANCED_FACE & FACE_SURFACE B-Rep faces (including NURBS, Sphere, Torus & Assemblies)
+    auto evalStepNurbsBasis = [](int n, int deg, const std::vector<double>& U, double t, std::vector<double>& outB) {
+        outB.assign(static_cast<size_t>(n), 0.0);
+        int order = deg + 1;
+        double tMin = U[static_cast<size_t>(deg)];
+        double tMax = U[static_cast<size_t>(n)];
+        if (t <= tMin) t = tMin;
+        if (t >= tMax) { outB[static_cast<size_t>(n - 1)] = 1.0; return; }
+        int span = deg;
+        for (int i = deg; i < n; ++i) {
+            if (t >= U[static_cast<size_t>(i)] && t < U[static_cast<size_t>(i + 1)]) { span = i; break; }
+        }
+        std::vector<double> N(static_cast<size_t>(order), 0.0);
+        std::vector<double> L(static_cast<size_t>(order), 0.0);
+        std::vector<double> R(static_cast<size_t>(order), 0.0);
+        N[0] = 1.0;
+        for (int j = 1; j <= deg; ++j) {
+            L[static_cast<size_t>(j)] = t - U[static_cast<size_t>(span + 1 - j)];
+            R[static_cast<size_t>(j)] = U[static_cast<size_t>(span + j)] - t;
+            double saved = 0.0;
+            for (int r = 0; r < j; ++r) {
+                double denom = R[static_cast<size_t>(r + 1)] + L[static_cast<size_t>(j - r)];
+                double tmp = (std::fabs(denom) > 1e-15) ? (N[static_cast<size_t>(r)] / denom) : 0.0;
+                N[static_cast<size_t>(r)] = saved + R[static_cast<size_t>(r + 1)] * tmp;
+                saved = L[static_cast<size_t>(j - r)] * tmp;
+            }
+            N[static_cast<size_t>(j)] = saved;
+        }
+        for (int j = 0; j <= deg; ++j) {
+            int idx = span - deg + j;
+            if (idx >= 0 && idx < n) outB[static_cast<size_t>(idx)] = N[static_cast<size_t>(j)];
+        }
+    };
+
+    auto expandMultKnots = [](int nCtrl, int deg, const std::vector<double>& mults, const std::vector<double>& vals) -> std::vector<double> {
+        std::vector<double> U;
+        if (!mults.empty() && mults.size() == vals.size()) {
+            for (size_t k = 0; k < mults.size(); ++k) {
+                int m = std::clamp(static_cast<int>(std::llround(mults[k])), 1, deg + 1);
+                for (int r = 0; r < m; ++r) U.push_back(vals[k]);
+            }
+        }
+        if (static_cast<int>(U.size()) != nCtrl + deg + 1) {
+            U.clear();
+            for (int k = 0; k <= deg; ++k) U.push_back(0.0);
+            int internalCnt = nCtrl - deg - 1;
+            for (int k = 1; k <= internalCnt; ++k) U.push_back(static_cast<double>(k) / static_cast<double>(internalCnt + 1));
+            for (int k = 0; k <= deg; ++k) U.push_back(1.0);
+        }
+        return U;
+    };
+
+    std::unordered_map<int, LoadedMesh3D> faceMeshes;
+    std::vector<int> faceOrderIds;
+
     for (const auto& [id, ent] : entities) {
         if (ent.type != "ADVANCED_FACE" && ent.type != "FACE_SURFACE" && ent.type != "FACE") continue;
         std::vector<std::string_view> fArgs;
@@ -1076,19 +1130,242 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
             }
         }
 
-        if (outerRing.size() < 3) continue;
-
-        // Cylindrical / Conical surface parametric (theta, h) unwrap so curved barrels never fold in planar projection!
+        LoadedMesh3D fMesh;
         bool handledCurvedSurf = false;
         auto sIt = entities.find(surfId);
-        if (sIt != entities.end() && (sIt->second.type == "CYLINDRICAL_SURFACE" || sIt->second.type == "CONICAL_SURFACE")) {
+
+        // A. SPHERICAL_SURFACE('name', #axis2_3d, radius)
+        if (sIt != entities.end() && sIt->second.type == "SPHERICAL_SURFACE") {
+            std::vector<std::string_view> sArgs;
+            SplitStepArgs(sIt->second.params, sArgs);
+            if (sArgs.size() >= 3) {
+                StepAxis2 ax = resolveAxis2(ParseRefId(sArgs[1]));
+                float rad = static_cast<float>(ParseStepDouble(sArgs[2], 0.0));
+                if (rad > 1e-6f) {
+                    const int nLat = 16, nLon = 24;
+                    constexpr float kPi = 3.1415926535f;
+                    uint32_t vBase = static_cast<uint32_t>(fMesh.vertices.size());
+                    for (int i = 0; i <= nLat; ++i) {
+                        float phi = -0.5f * kPi + kPi * (static_cast<float>(i) / nLat);
+                        float cp = std::cos(phi), sp = std::sin(phi);
+                        for (int j = 0; j < nLon; ++j) {
+                            float th = 2.0f * kPi * (static_cast<float>(j) / nLon);
+                            Vec3f p = StepAdd(ax.origin,
+                                StepAdd(StepScale(ax.xAxis, rad * cp * std::cos(th)),
+                                StepAdd(StepScale(ax.yAxis, rad * cp * std::sin(th)),
+                                        StepScale(ax.zAxis, rad * sp))));
+                            fMesh.vertices.push_back({ p.x, p.z, -p.y });
+                        }
+                    }
+                    for (int i = 0; i < nLat; ++i) {
+                        for (int j = 0; j < nLon; ++j) {
+                            int nj = (j + 1) % nLon;
+                            uint32_t a = vBase + static_cast<uint32_t>(i * nLon + j);
+                            uint32_t b = vBase + static_cast<uint32_t>(i * nLon + nj);
+                            uint32_t c = vBase + static_cast<uint32_t>((i + 1) * nLon + nj);
+                            uint32_t d = vBase + static_cast<uint32_t>((i + 1) * nLon + j);
+                            if (i > 0) {
+                                if (faceSameSense) fMesh.tris.push_back({ a, b, c, {} });
+                                else               fMesh.tris.push_back({ a, c, b, {} });
+                            }
+                            if (i + 1 < nLat) {
+                                if (faceSameSense) fMesh.tris.push_back({ a, c, d, {} });
+                                else               fMesh.tris.push_back({ a, d, c, {} });
+                            }
+                        }
+                    }
+                    handledCurvedSurf = true;
+                }
+            }
+        }
+        // B. TOROIDAL_SURFACE('name', #axis2_3d, major_radius, minor_radius)
+        else if (sIt != entities.end() && (sIt->second.type == "TOROIDAL_SURFACE" || sIt->second.type == "DEGENERATE_TOROIDAL_SURFACE")) {
+            std::vector<std::string_view> sArgs;
+            SplitStepArgs(sIt->second.params, sArgs);
+            if (sArgs.size() >= 4) {
+                StepAxis2 ax = resolveAxis2(ParseRefId(sArgs[1]));
+                float rMaj = static_cast<float>(ParseStepDouble(sArgs[2], 0.0));
+                float rMin = static_cast<float>(std::fabs(ParseStepDouble(sArgs[3], 0.0)));
+                if (rMaj > 1e-6f && rMin > 1e-6f) {
+                    const int nMaj = 24, nMin = 16;
+                    constexpr float kTwoPi = 6.283185307f;
+                    uint32_t vBase = static_cast<uint32_t>(fMesh.vertices.size());
+                    for (int i = 0; i < nMaj; ++i) {
+                        float u = kTwoPi * (static_cast<float>(i) / nMaj);
+                        Vec3f radDir = StepAdd(StepScale(ax.xAxis, std::cos(u)), StepScale(ax.yAxis, std::sin(u)));
+                        for (int j = 0; j < nMin; ++j) {
+                            float v = kTwoPi * (static_cast<float>(j) / nMin);
+                            Vec3f p = StepAdd(ax.origin,
+                                StepAdd(StepScale(radDir, rMaj + rMin * std::cos(v)),
+                                        StepScale(ax.zAxis, rMin * std::sin(v))));
+                            fMesh.vertices.push_back({ p.x, p.z, -p.y });
+                        }
+                    }
+                    for (int i = 0; i < nMaj; ++i) {
+                        int ni = (i + 1) % nMaj;
+                        for (int j = 0; j < nMin; ++j) {
+                            int nj = (j + 1) % nMin;
+                            uint32_t a = vBase + static_cast<uint32_t>(i * nMin + j);
+                            uint32_t b = vBase + static_cast<uint32_t>(ni * nMin + j);
+                            uint32_t c = vBase + static_cast<uint32_t>(ni * nMin + nj);
+                            uint32_t d = vBase + static_cast<uint32_t>(i * nMin + nj);
+                            if (faceSameSense) {
+                                fMesh.tris.push_back({ a, b, c, {} });
+                                fMesh.tris.push_back({ a, c, d, {} });
+                            } else {
+                                fMesh.tris.push_back({ a, c, b, {} });
+                                fMesh.tris.push_back({ a, d, c, {} });
+                            }
+                        }
+                    }
+                    handledCurvedSurf = true;
+                }
+            }
+        }
+        // C. B_SPLINE_SURFACE_WITH_KNOTS / RATIONAL_B_SPLINE_SURFACE (standalone or complex entity)
+        else if (sIt != entities.end() &&
+                 (sIt->second.type.find("B_SPLINE_SURFACE") != std::string::npos || !sIt->second.subEntities.empty()))
+        {
+            int uDeg = 0, vDeg = 0;
+            std::vector<std::vector<Vec3f>> ctrlGrid;
+            std::vector<std::vector<double>> weightGrid;
+            std::vector<double> uMults, vMults, uKnots, vKnots;
+
+            auto parseSurfSub = [&](const std::string& st, std::string_view sp) {
+                std::vector<std::string_view> sa;
+                SplitStepArgs(sp, sa);
+                if (st == "B_SPLINE_SURFACE") {
+                    size_t dOff = (sa.size() >= 3 && sa[2].find('#') != std::string_view::npos) ? 0 : 1;
+                    if (dOff + 2 < sa.size()) {
+                        uDeg = static_cast<int>(ParseStepDouble(sa[dOff + 0], 0.0));
+                        vDeg = static_cast<int>(ParseStepDouble(sa[dOff + 1], 0.0));
+                        std::vector<std::string_view> rowsSv;
+                        SplitStepArgs(sa[dOff + 2], rowsSv);
+                        for (auto rSv : rowsSv) {
+                            std::vector<int> rRefs;
+                            ParseRefList(rSv, rRefs);
+                            std::vector<Vec3f> rowPts;
+                            for (int pr : rRefs) {
+                                Vec3f cp;
+                                if (resolvePoint(pr, cp, 0)) rowPts.push_back(cp);
+                            }
+                            if (!rowPts.empty()) ctrlGrid.push_back(std::move(rowPts));
+                        }
+                    }
+                } else if (st == "B_SPLINE_SURFACE_WITH_KNOTS") {
+                    if (sa.size() >= 12) {
+                        uDeg = static_cast<int>(ParseStepDouble(sa[1], 0.0));
+                        vDeg = static_cast<int>(ParseStepDouble(sa[2], 0.0));
+                        std::vector<std::string_view> rowsSv;
+                        SplitStepArgs(sa[3], rowsSv);
+                        for (auto rSv : rowsSv) {
+                            std::vector<int> rRefs;
+                            ParseRefList(rSv, rRefs);
+                            std::vector<Vec3f> rowPts;
+                            for (int pr : rRefs) {
+                                Vec3f cp;
+                                if (resolvePoint(pr, cp, 0)) rowPts.push_back(cp);
+                            }
+                            if (!rowPts.empty()) ctrlGrid.push_back(std::move(rowPts));
+                        }
+                        ParseFloatTuple(sa[8], uMults);
+                        ParseFloatTuple(sa[9], vMults);
+                        ParseFloatTuple(sa[10], uKnots);
+                        ParseFloatTuple(sa[11], vKnots);
+                    } else if (sa.size() >= 4) {
+                        ParseFloatTuple(sa[0], uMults);
+                        ParseFloatTuple(sa[1], vMults);
+                        ParseFloatTuple(sa[2], uKnots);
+                        ParseFloatTuple(sa[3], vKnots);
+                    }
+                } else if (st == "RATIONAL_B_SPLINE_SURFACE" && !sa.empty()) {
+                    size_t wOff = (sa.size() >= 2 && sa[0].find('\'') != std::string_view::npos) ? 1 : 0;
+                    if (wOff < sa.size()) {
+                        std::vector<std::string_view> wRows;
+                        SplitStepArgs(sa[wOff], wRows);
+                        for (auto wr : wRows) {
+                            std::vector<double> wv;
+                            ParseFloatTuple(wr, wv);
+                            if (!wv.empty()) weightGrid.push_back(std::move(wv));
+                        }
+                    }
+                }
+            };
+
+            if (!sIt->second.subEntities.empty()) {
+                for (const auto& sub : sIt->second.subEntities) parseSurfSub(sub.first, sub.second);
+            } else {
+                parseSurfSub(sIt->second.type, sIt->second.params);
+            }
+
+            int nU = static_cast<int>(ctrlGrid.size());
+            int nV = (nU > 0) ? static_cast<int>(ctrlGrid[0].size()) : 0;
+            bool rectOk = (uDeg >= 1 && vDeg >= 1 && nU > uDeg && nV > vDeg);
+            for (int r = 1; r < nU && rectOk; ++r) {
+                if (static_cast<int>(ctrlGrid[static_cast<size_t>(r)].size()) != nV) rectOk = false;
+            }
+            if (rectOk) {
+                std::vector<double> U = expandMultKnots(nU, uDeg, uMults, uKnots);
+                std::vector<double> V = expandMultKnots(nV, vDeg, vMults, vKnots);
+                double u0 = U[static_cast<size_t>(uDeg)], u1 = U[static_cast<size_t>(nU)];
+                double v0 = V[static_cast<size_t>(vDeg)], v1 = V[static_cast<size_t>(nV)];
+                bool hasRat = (static_cast<int>(weightGrid.size()) == nU && static_cast<int>(weightGrid[0].size()) == nV);
+                if (u1 > u0 && v1 > v0) {
+                    constexpr int kNu = 16, kNv = 16;
+                    uint32_t vBase = static_cast<uint32_t>(fMesh.vertices.size());
+                    std::vector<double> bu, bv;
+                    for (int iu = 0; iu <= kNu; ++iu) {
+                        double u = u0 + (u1 - u0) * (static_cast<double>(iu) / kNu);
+                        evalStepNurbsBasis(nU, uDeg, U, u, bu);
+                        for (int iv = 0; iv <= kNv; ++iv) {
+                            double v = v0 + (v1 - v0) * (static_cast<double>(iv) / kNv);
+                            evalStepNurbsBasis(nV, vDeg, V, v, bv);
+                            double sx = 0.0, sy = 0.0, sz = 0.0, sw = 0.0;
+                            for (int i = 0; i < nU; ++i) {
+                                if (bu[static_cast<size_t>(i)] == 0.0) continue;
+                                for (int j = 0; j < nV; ++j) {
+                                    if (bv[static_cast<size_t>(j)] == 0.0) continue;
+                                    double w = hasRat ? weightGrid[static_cast<size_t>(i)][static_cast<size_t>(j)] : 1.0;
+                                    double b = bu[static_cast<size_t>(i)] * bv[static_cast<size_t>(j)] * w;
+                                    const Vec3f& cp = ctrlGrid[static_cast<size_t>(i)][static_cast<size_t>(j)];
+                                    sx += b * cp.x; sy += b * cp.y; sz += b * cp.z;
+                                    sw += b;
+                                }
+                            }
+                            if (std::fabs(sw) > 1e-12) { sx /= sw; sy /= sw; sz /= sw; }
+                            fMesh.vertices.push_back({ static_cast<float>(sx), static_cast<float>(sz), static_cast<float>(-sy) });
+                        }
+                    }
+                    for (int iu = 0; iu < kNu; ++iu) {
+                        for (int iv = 0; iv < kNv; ++iv) {
+                            uint32_t a = vBase + static_cast<uint32_t>(iu * (kNv + 1) + iv);
+                            uint32_t b = vBase + static_cast<uint32_t>((iu + 1) * (kNv + 1) + iv);
+                            uint32_t c = vBase + static_cast<uint32_t>((iu + 1) * (kNv + 1) + (iv + 1));
+                            uint32_t d = vBase + static_cast<uint32_t>(iu * (kNv + 1) + (iv + 1));
+                            if (faceSameSense) {
+                                fMesh.tris.push_back({ a, b, c, {} });
+                                fMesh.tris.push_back({ a, c, d, {} });
+                            } else {
+                                fMesh.tris.push_back({ a, c, b, {} });
+                                fMesh.tris.push_back({ a, d, c, {} });
+                            }
+                        }
+                    }
+                    handledCurvedSurf = true;
+                }
+            }
+        }
+
+        if (!handledCurvedSurf && outerRing.size() < 3) continue;
+
+        // D. Cylindrical / Conical surface parametric (theta, h) unwrap
+        if (!handledCurvedSurf && sIt != entities.end() && (sIt->second.type == "CYLINDRICAL_SURFACE" || sIt->second.type == "CONICAL_SURFACE")) {
             std::vector<std::string_view> sArgs;
             SplitStepArgs(sIt->second.params, sArgs);
             if (sArgs.size() >= 3) {
                 StepAxis2 ax = resolveAxis2(ParseRefId(sArgs[1]));
                 float rad = static_cast<float>(ParseStepDouble(sArgs[2], 1.0));
                 if (rad > 1e-6f) {
-                    // Case A: Two disjoint circular cap bounds (bottom & top rings without seam edges)
                     if (innerRings.size() == 1 && outerRing.size() >= 6 && innerRings[0].size() >= 6) {
                         const auto& rA = outerRing;
                         const auto& rB = innerRings[0];
@@ -1101,7 +1378,7 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
                             if (sIt->second.type == "CONICAL_SURFACE" && sArgs.size() >= 4) {
                                 coneSlope = static_cast<float>(std::tan(ParseStepDouble(sArgs[3], 0.0)));
                             }
-                            uint32_t vBase = static_cast<uint32_t>(mesh.vertices.size());
+                            uint32_t vBase = static_cast<uint32_t>(fMesh.vertices.size());
                             for (int i = 0; i <= segs; ++i) {
                                 float ang = static_cast<float>(i) * 6.2831853f / static_cast<float>(segs);
                                 float ca = std::cos(ang), sa = std::sin(ang);
@@ -1109,26 +1386,23 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
                                 float rHi = std::max(0.0f, rad + zMax * coneSlope);
                                 Vec3f pLo = StepAdd(ax.origin, StepAdd(StepScale(ax.xAxis, ca * rLo), StepAdd(StepScale(ax.yAxis, sa * rLo), StepScale(ax.zAxis, zMin))));
                                 Vec3f pHi = StepAdd(ax.origin, StepAdd(StepScale(ax.xAxis, ca * rHi), StepAdd(StepScale(ax.yAxis, sa * rHi), StepScale(ax.zAxis, zMax))));
-                                mesh.vertices.push_back({ pLo.x, pLo.z, -pLo.y });
-                                mesh.vertices.push_back({ pHi.x, pHi.z, -pHi.y });
+                                fMesh.vertices.push_back({ pLo.x, pLo.z, -pLo.y });
+                                fMesh.vertices.push_back({ pHi.x, pHi.z, -pHi.y });
                             }
                             for (int i = 0; i < segs; ++i) {
                                 uint32_t b0 = vBase + static_cast<uint32_t>(i * 2);
-                                uint32_t t0 = b0 + 1;
-                                uint32_t b1 = b0 + 2;
-                                uint32_t t1 = b0 + 3;
+                                uint32_t t0 = b0 + 1, b1 = b0 + 2, t1 = b0 + 3;
                                 if (faceSameSense) {
-                                    mesh.tris.push_back({ b0, b1, t1, {} });
-                                    mesh.tris.push_back({ b0, t1, t0, {} });
+                                    fMesh.tris.push_back({ b0, b1, t1, {} });
+                                    fMesh.tris.push_back({ b0, t1, t0, {} });
                                 } else {
-                                    mesh.tris.push_back({ b0, t1, b1, {} });
-                                    mesh.tris.push_back({ b0, t0, t1, {} });
+                                    fMesh.tris.push_back({ b0, t1, b1, {} });
+                                    fMesh.tris.push_back({ b0, t0, t1, {} });
                                 }
                             }
                             handledCurvedSurf = true;
                         }
                     }
-                    // Case B: Single seam-unrolled ring (unwrap continuous azimuth theta + axial height h)
                     if (!handledCurvedSurf && innerRings.empty()) {
                         std::vector<std::pair<float, float>> uv;
                         std::vector<uint32_t> idx3D;
@@ -1145,11 +1419,11 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
                             }
                             prevAng = ang;
                             uv.push_back({ static_cast<float>(ang * rad), h });
-                            uint32_t vid = static_cast<uint32_t>(mesh.vertices.size());
-                            mesh.vertices.push_back({ outerRing[i].x, outerRing[i].z, -outerRing[i].y });
+                            uint32_t vid = static_cast<uint32_t>(fMesh.vertices.size());
+                            fMesh.vertices.push_back({ outerRing[i].x, outerRing[i].z, -outerRing[i].y });
                             idx3D.push_back(vid);
                         }
-                        EarClip2DWithHoles(uv, idx3D, {}, {}, !faceSameSense, mesh.tris);
+                        EarClip2DWithHoles(uv, idx3D, {}, {}, !faceSameSense, fMesh.tris);
                         handledCurvedSurf = true;
                     }
                 }
@@ -1157,7 +1431,205 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
         }
 
         if (!handledCurvedSurf) {
-            Triangulate3DRings(outerRing, innerRings, !faceSameSense, mesh);
+            Triangulate3DRings(outerRing, innerRings, !faceSameSense, fMesh);
+        }
+        if (!fMesh.vertices.empty() && !fMesh.tris.empty()) {
+            faceOrderIds.push_back(id);
+            faceMeshes[id] = std::move(fMesh);
+        }
+    }
+
+    // 6b. Resolve Multi-Part STEP Assembly Hierarchy (SHAPE_REPRESENTATION + ITEM_DEFINED_TRANSFORMATION)
+    struct StepMat4 {
+        float m[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        static StepMat4 Identity() { return StepMat4{}; }
+        static StepMat4 FromItemTransform(const StepAxis2& src, const StepAxis2& dst) {
+            // p_dst = dst.origin + dst.x * dot(p - src.origin, src.x) + dst.y * dot(...) + dst.z * dot(...)
+            StepMat4 r;
+            const Vec3f dAxes[3] = { dst.xAxis, dst.yAxis, dst.zAxis };
+            const Vec3f sAxes[3] = { src.xAxis, src.yAxis, src.zAxis };
+            // R_ij = sum_k dAxes[k][i] * sAxes[k][j]
+            float dArr[3][3] = { {dAxes[0].x, dAxes[0].y, dAxes[0].z}, {dAxes[1].x, dAxes[1].y, dAxes[1].z}, {dAxes[2].x, dAxes[2].y, dAxes[2].z} };
+            float sArr[3][3] = { {sAxes[0].x, sAxes[0].y, sAxes[0].z}, {sAxes[1].x, sAxes[1].y, sAxes[1].z}, {sAxes[2].x, sAxes[2].y, sAxes[2].z} };
+            float so[3] = { src.origin.x, src.origin.y, src.origin.z };
+            float do_[3]= { dst.origin.x, dst.origin.y, dst.origin.z };
+            for (int i = 0; i < 3; ++i) {
+                float trans = do_[i];
+                for (int j = 0; j < 3; ++j) {
+                    float rij = dArr[0][i] * sArr[0][j] + dArr[1][i] * sArr[1][j] + dArr[2][i] * sArr[2][j];
+                    r.m[i * 4 + j] = rij;
+                    trans -= rij * so[j];
+                }
+                r.m[i * 4 + 3] = trans;
+            }
+            return r;
+        }
+        static StepMat4 Mul(const StepMat4& a, const StepMat4& b) {
+            StepMat4 c;
+            for (int r = 0; r < 4; ++r) {
+                for (int col = 0; col < 4; ++col) {
+                    c.m[r * 4 + col] =
+                        a.m[r * 4 + 0] * b.m[0 * 4 + col] +
+                        a.m[r * 4 + 1] * b.m[1 * 4 + col] +
+                        a.m[r * 4 + 2] * b.m[2 * 4 + col] +
+                        a.m[r * 4 + 3] * b.m[3 * 4 + col];
+                }
+            }
+            return c;
+        }
+        Vec3f TransformStepPoint(Vec3f p) const {
+            return {
+                m[0] * p.x + m[1] * p.y + m[2]  * p.z + m[3],
+                m[4] * p.x + m[5] * p.y + m[6]  * p.z + m[7],
+                m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]
+            };
+        }
+    };
+
+    auto appendFaceTransformed = [&](const LoadedMesh3D& fm, const StepMat4* xf) {
+        uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+        for (const Vec3f& ev : fm.vertices) {
+            if (!xf) {
+                mesh.vertices.push_back(ev);
+            } else {
+                // Convert Explorer2 Y-up (ex, ey, ez) -> STEP Z-up (ex, -ez, ey), transform, and map back -> Y-up
+                Vec3f sp = xf->TransformStepPoint({ ev.x, -ev.z, ev.y });
+                mesh.vertices.push_back({ sp.x, sp.z, -sp.y });
+            }
+        }
+        for (const auto& t : fm.tris) {
+            mesh.tris.push_back({ base + t.i0, base + t.i1, base + t.i2, {} });
+        }
+    };
+
+    // Map each SHAPE_REPRESENTATION -> owned face IDs (walking solid -> shell -> face)
+    std::function<void(int, std::vector<int>&, int)> collectOwnedFaces = [&](int entId, std::vector<int>& outF, int depth) {
+        if (depth > 8 || entId <= 0) return;
+        if (faceMeshes.count(entId)) { outF.push_back(entId); return; }
+        auto it = entities.find(entId);
+        if (it == entities.end()) return;
+        const std::string& tp = it->second.type;
+        if (tp == "MANIFOLD_SOLID_BREP" || tp == "BREP_WITH_VOIDS" || tp == "FACETED_BREP" ||
+            tp == "SHELL_BASED_SURFACE_MODEL" || tp == "CLOSED_SHELL" || tp == "OPEN_SHELL")
+        {
+            std::vector<int> refs;
+            ParseRefList(it->second.params, refs);
+            for (int r : refs) collectOwnedFaces(r, outF, depth + 1);
+        }
+    };
+
+    std::unordered_map<int, std::vector<int>> repFaces;
+    std::unordered_map<int, std::set<int>> repItemsSet;
+    for (const auto& [id, ent] : entities) {
+        if (ent.type.find("SHAPE_REPRESENTATION") != std::string::npos &&
+            ent.type.find("RELATIONSHIP") == std::string::npos)
+        {
+            std::vector<std::string_view> sa;
+            SplitStepArgs(ent.params, sa);
+            if (sa.size() >= 2) {
+                std::vector<int> itemRefs;
+                ParseRefList(sa[1], itemRefs);
+                for (int r : itemRefs) {
+                    repItemsSet[id].insert(r);
+                    collectOwnedFaces(r, repFaces[id], 0);
+                }
+            }
+        }
+    }
+
+    struct AssyChildEdge {
+        int childRep = -1;
+        StepMat4 xf;
+    };
+    std::unordered_map<int, std::vector<AssyChildEdge>> assyGraph;
+    std::set<int> hasParentRep;
+
+    for (const auto& [id, ent] : entities) {
+        int rep1 = -1, rep2 = -1, idtId = -1;
+        if (!ent.subEntities.empty()) {
+            for (const auto& sub : ent.subEntities) {
+                std::vector<std::string_view> sa;
+                SplitStepArgs(sub.second, sa);
+                if (sub.first == "REPRESENTATION_RELATIONSHIP" && sa.size() >= 4) {
+                    rep1 = ParseRefId(sa[2]);
+                    rep2 = ParseRefId(sa[3]);
+                } else if (sub.first == "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION" && !sa.empty()) {
+                    idtId = ParseRefId(sa[0]);
+                }
+            }
+        } else if (ent.type == "SHAPE_REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION" ||
+                   ent.type == "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION")
+        {
+            std::vector<std::string_view> sa;
+            SplitStepArgs(ent.params, sa);
+            if (sa.size() >= 5) {
+                rep1 = ParseRefId(sa[2]);
+                rep2 = ParseRefId(sa[3]);
+                idtId = ParseRefId(sa[4]);
+            }
+        }
+
+        if (rep1 > 0 && rep2 > 0 && idtId > 0) {
+            auto idtIt = entities.find(idtId);
+            if (idtIt != entities.end() && idtIt->second.type == "ITEM_DEFINED_TRANSFORMATION") {
+                std::vector<std::string_view> ia;
+                SplitStepArgs(idtIt->second.params, ia);
+                if (ia.size() >= 4) {
+                    int axSrcId = ParseRefId(ia[2]);
+                    int axDstId = ParseRefId(ia[3]);
+                    StepAxis2 srcAx = resolveAxis2(axSrcId);
+                    StepAxis2 dstAx = resolveAxis2(axDstId);
+
+                    // Determine parent vs child: if rep1 owns geometry and rep2 is assembly (or dstAx is in rep2), rep2 is parent!
+                    int parentRep = rep2, childRep = rep1;
+                    if (repFaces[rep1].empty() && !repFaces[rep2].empty()) {
+                        parentRep = rep1; childRep = rep2;
+                    }
+                    assyGraph[parentRep].push_back({ childRep, StepMat4::FromItemTransform(srcAx, dstAx) });
+                    hasParentRep.insert(childRep);
+                }
+            }
+        }
+    }
+
+    std::set<int> consumedFacesInAssy;
+    if (!assyGraph.empty()) {
+        // Mark all faces inside any representation participating in the assembly graph
+        for (const auto& kv : assyGraph) {
+            for (int fid : repFaces[kv.first]) consumedFacesInAssy.insert(fid);
+            for (const auto& ch : kv.second) {
+                for (int fid : repFaces[ch.childRep]) consumedFacesInAssy.insert(fid);
+            }
+        }
+
+        std::function<void(int, const StepMat4&, int)> instantiateAssyRep = [&](int rId, const StepMat4& worldMat, int depth) {
+            if (depth > 12) return;
+            auto fit = repFaces.find(rId);
+            if (fit != repFaces.end()) {
+                for (int fid : fit->second) {
+                    auto fmIt = faceMeshes.find(fid);
+                    if (fmIt != faceMeshes.end()) appendFaceTransformed(fmIt->second, &worldMat);
+                }
+            }
+            auto git = assyGraph.find(rId);
+            if (git != assyGraph.end()) {
+                for (const auto& edge : git->second) {
+                    instantiateAssyRep(edge.childRep, StepMat4::Mul(worldMat, edge.xf), depth + 1);
+                }
+            }
+        };
+
+        for (const auto& kv : assyGraph) {
+            if (hasParentRep.find(kv.first) == hasParentRep.end()) {
+                instantiateAssyRep(kv.first, StepMat4::Identity(), 0);
+            }
+        }
+    }
+
+    // Emit all standalone / single-part faces not already instantiated via assembly occurrences
+    for (int fid : faceOrderIds) {
+        if (consumedFacesInAssy.find(fid) == consumedFacesInAssy.end()) {
+            appendFaceTransformed(faceMeshes[fid], nullptr);
         }
     }
 

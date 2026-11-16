@@ -63,8 +63,15 @@ struct ImageMetadataSummary {
 };
 
 struct AiModelInfoSummary {
+    struct TensorEntry {
+        std::wstring name;
+        std::wstring dtype;
+        std::wstring shape;
+        uint64_t paramCount = 0;
+        uint64_t byteSize = 0;
+    };
     bool valid = false;
-    std::wstring formatName;      // "SafeTensors" or "GGUF"
+    std::wstring formatName;      // "SafeTensors", "GGUF", or "ONNX"
     std::wstring arch;
     std::wstring modelTitle;
     std::wstring baseModel;
@@ -73,14 +80,18 @@ struct AiModelInfoSummary {
     std::wstring contextLength;
     std::wstring triggerWords;
     uint64_t tensorCount = 0;
+    uint64_t totalParameters = 0;
     uint64_t metadataKeyCount = 0;
     std::vector<std::pair<std::wstring, std::wstring>> kvRows;
+    std::vector<TensorEntry> tensors;
 };
 
 class FileContentPane {
 public:
     FileContentPane() = default;
     ~FileContentPane();
+
+    static AiModelInfoSummary InspectAiModelFile(const std::wstring& path, const std::wstring& ext);
 
     void Initialize(
         HWND parentHwnd,

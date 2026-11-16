@@ -19,6 +19,7 @@
 #include "TextLayoutCache.h"
 #include "ImageCache.h"
 #include "FileContentPane.h"
+#include "GitIntegration.h"
 #include "SelfTestCommon.h"
 #include "Version.h"
 #include <winver.h>
@@ -2628,6 +2629,64 @@ static void RunStage12Tests(TestCounter& tc) {
                 L" MESH=" + std::to_wstring(ok100Mesh) +
                 L" EDA=" + std::to_wstring(ok100Eda) +
                 L" DOC=" + std::to_wstring(ok100Doc));
+        }
+
+        // 16. Test14: Unreachable Localhost FTP (127.0.0.1) Fast Pre-Flight Fail, Negative Cooldown Cache & Zero Worker Storm
+        {
+            FtpClient::InvalidateListingCache();
+            const std::wstring deadUrl = L"ftp://anonymous@127.0.0.1:65421/";
+
+            ULONGLONG t0 = GetTickCount64();
+            std::wstring errReach, errEnum;
+            const bool reachOk = !FtpClient::CanReachFtpEndpoint(deadUrl, &errReach) && !errReach.empty();
+            std::vector<FileEntry> deadEntries;
+            const bool enumFailClean = !FtpClient::EnumerateFtpDirectory(deadUrl, true, true, Lang::PL, deadEntries, &errEnum) &&
+                                       deadEntries.empty() && !errEnum.empty();
+            const ULONGLONG firstMs = GetTickCount64() - t0;
+
+            // Hammer 12 rapid calls + FileEngine / ImageCache / GitIntegration guards (must hit 0ms negative cache & skip workers)
+            ULONGLONG t1 = GetTickCount64();
+            bool burstOk = true;
+            for (int k = 0; k < 12; ++k) {
+                std::vector<FileEntry> tmp;
+                if (FtpClient::EnumerateFtpDirectory(deadUrl, false, true, Lang::PL, tmp, nullptr)) {
+                    burstOk = false;
+                }
+            }
+            std::wstring tmpDl;
+            const bool dlSkipOk = !FtpClient::DownloadFtpFileToTempCache(deadUrl + L"readme.txt", tmpDl) && tmpDl.empty();
+
+            FileEngine feGuard;
+            FileEntry ftpDirEntry;
+            ftpDirEntry.name = L"[FTP] Dead Localhost";
+            ftpDirEntry.fullPath = deadUrl;
+            ftpDirEntry.normKey = PathUtils::ToLower(deadUrl);
+            ftpDirEntry.isDirectory = true;
+            std::vector<FileEntry> guardEntries = { ftpDirEntry };
+            feGuard.RequestFolderSizes(guardEntries, false);
+            const bool noFtpSizeWorker = !feGuard.IsAnyFolderSizeCalculating();
+
+            ImageCache imgGuard;
+            FolderPreviewData fpOut;
+            const bool noFtpFolderPreview = !imgGuard.GetOrQueueFolderPreview(deadUrl, ftpDirEntry.normKey, fpOut);
+            const bool noFtpGitRoot = GitIntegration::FindRepoRoot(deadUrl).empty();
+
+            std::wstring missingIni = std::wstring(tmpDir) + L"e2_nonexistent_ftp_bookmarks_check.ini";
+            DeleteFileW(missingIni.c_str());
+            const auto defaultCustomBm = FtpClient::LoadBookmarks(missingIni);
+            const bool noFakeSeededFtp = defaultCustomBm.empty();
+
+            const ULONGLONG burstMs = GetTickCount64() - t1;
+            const bool allOk = reachOk && enumFailClean && (firstMs <= 800) &&
+                               burstOk && dlSkipOk && noFtpSizeWorker && noFtpFolderPreview &&
+                               noFtpGitRoot && noFakeSeededFtp && (burstMs <= 400);
+
+            tc.Record(allOk,
+                L"Stage12.Test14_UnreachableLocalhostFtp_FastFail_ZeroExhaustion",
+                L"firstProbeMs=" + std::to_wstring(firstMs) +
+                L"ms, burst12xMs=" + std::to_wstring(burstMs) +
+                L"ms, noFakeSeed=" + std::to_wstring(noFakeSeededFtp) +
+                L", err=" + errReach);
         }
     }
 }
@@ -6275,11 +6334,54 @@ static void RunStage14Tests(TestCounter& tc) {
             }
         }
 
-        // #74 .mf4 (ASAM MDF 4.x "MDF     " 64B ID + "##HD" block)
-        std::vector<uint8_t> mf4(168, 0);
-        std::memcpy(mf4.data(), "MDF     4.10    ", 16);
-        std::memcpy(mf4.data() + 64, "##HD", 4);
-        mf4[64 + 8] = 104;
+        // #74 .mf4 (ASAM MDF 4.x "MDF     " 64B ID + ##HD -> ##DG -> ##CG -> ##CN + ##DT records)
+        std::vector<uint8_t> mf4(64, 0);
+        {
+            std::memcpy(mf4.data(), "MDF     4.10    Explorer", 24);
+            uint16_t mdfVer = 410u;
+            std::memcpy(mf4.data() + 28, &mdfVer, 2);
+            auto addBlk = [&](const char id4[5], std::initializer_list<uint64_t> links, const std::vector<uint8_t>& pay) -> uint64_t {
+                while ((mf4.size() & 7u) != 0u) mf4.push_back(0);
+                uint64_t off = mf4.size();
+                uint64_t blkLen = 24ULL + links.size() * 8ULL + pay.size();
+                uint64_t lnkCnt = links.size();
+                mf4.insert(mf4.end(), id4, id4 + 4);
+                mf4.insert(mf4.end(), 4, 0);
+                p64le(mf4, blkLen);
+                p64le(mf4, lnkCnt);
+                for (uint64_t lk : links) p64le(mf4, lk);
+                mf4.insert(mf4.end(), pay.begin(), pay.end());
+                return off;
+            };
+            addBlk("##HD", { 0, 0, 0, 0, 0, 0 }, std::vector<uint8_t>(32, 0));
+            std::string sigNm = "EngineSpeed_RPM";
+            std::vector<uint8_t> txPay(sigNm.begin(), sigNm.end()); txPay.push_back(0);
+            uint64_t txOff = addBlk("##TX", {}, txPay);
+            auto mkCn = [](uint8_t cnType, uint8_t dType, uint32_t bOff, uint32_t bCnt) {
+                std::vector<uint8_t> p(72, 0);
+                p[0] = cnType; p[2] = dType;
+                std::memcpy(p.data() + 4, &bOff, 4);
+                std::memcpy(p.data() + 8, &bCnt, 4);
+                return p;
+            };
+            uint64_t cnSig  = addBlk("##CN", { 0,     0, txOff, 0, 0, 0, 0, 0 }, mkCn(0u, 4u, 8u, 32u));
+            uint64_t cnTime = addBlk("##CN", { cnSig, 0, 0,     0, 0, 0, 0, 0 }, mkCn(2u, 4u, 0u, 64u));
+            std::vector<uint8_t> dtPay(16 * 12, 0);
+            for (int r = 0; r < 16; ++r) {
+                double tSec = r * 0.01;
+                float rpm = 850.0f + r * 120.0f;
+                std::memcpy(dtPay.data() + r * 12 + 0, &tSec, 8);
+                std::memcpy(dtPay.data() + r * 12 + 8, &rpm,  4);
+            }
+            uint64_t dtOff = addBlk("##DT", {}, dtPay);
+            std::vector<uint8_t> cgPay(32, 0);
+            uint64_t cyc = 16; uint32_t recSz = 12;
+            std::memcpy(cgPay.data() + 8,  &cyc,   8);
+            std::memcpy(cgPay.data() + 24, &recSz, 4);
+            uint64_t cgOff = addBlk("##CG", { 0ULL, cnTime, 0ULL, 0ULL }, cgPay);
+            uint64_t dgOff = addBlk("##DG", { 0ULL, cgOff,  dtOff, 0ULL }, std::vector<uint8_t>(8, 0));
+            std::memcpy(mf4.data() + 88, &dgOff, 8); // ##HD.hd_dg_first
+        }
 
         // #80 .sof (Intel/Altera SRAM Object File packet directory + bitstream)
         std::vector<uint8_t> sof = { 'S','O','F',0 };
@@ -6305,11 +6407,11 @@ static void RunStage14Tests(TestCounter& tc) {
             { L".sal",       salZip },
             { L".wfm",       wfm },
             { L".mf4",       mf4 },
-            { L".ldf",       strVec("LIN_description_file;\nNodes { Master: BCM_Master, 5 ms, 0.1 ms ; Slaves: Wiper_Slave, Rain_Sensor ; }\n") },
-            { L".arxml",     strVec("<AUTOSAR><AR-PACKAGES><SHORT-NAME>ChassisGateway</SHORT-NAME><SHORT-NAME>RadarECU</SHORT-NAME></AR-PACKAGES></AUTOSAR>") },
-            { L".eds",       strVec("[DeviceInfo]\nVendorName=Beckhoff\n[1000]\nParameterName=DeviceType\n[1018]\nParameterName=IdentityObject\n") },
-            { L".gsdml",     strVec("<ISO15745Profile><ProfileBody><ModuleItem ID=\"DI_16x24VDC\"/><ModuleItem ID=\"DQ_16x24VDC\"/></ProfileBody></ISO15745Profile>") },
-            { L".l5x",       strVec("<RSLogix5000Content><Rung Number=\"0\"><Text>XIC(Start_Btn)XIO(Fault_Bit)OTE(Pump_Run);</Text></Rung></RSLogix5000Content>") },
+            { L".ldf",       strVec("LIN_description_file;\nLIN_speed = 19.2 kbps;\nNodes { Master: BCM_Master, 5 ms, 0.1 ms ; Slaves: Wiper_Slave, Rain_Sensor ; }\nSignals { WiperCmd: 4, 0, BCM_Master, Wiper_Slave ; }\nFrames { Frm_Wiper: 0x12, BCM_Master, 4 { WiperCmd, 0 ; } }\n") },
+            { L".arxml",     strVec("<AUTOSAR><AR-PACKAGES><AR-PACKAGE><SHORT-NAME>Pkg</SHORT-NAME><ELEMENTS><ECU-INSTANCE><SHORT-NAME>ChassisGateway</SHORT-NAME></ECU-INSTANCE><ECU-INSTANCE><SHORT-NAME>RadarECU</SHORT-NAME></ECU-INSTANCE></ELEMENTS></AR-PACKAGE></AR-PACKAGES></AUTOSAR>") },
+            { L".eds",       strVec("[DeviceInfo]\nVendorName=Beckhoff\nProductName=EL2008\n[1000]\nParameterName=DeviceType\nDefaultValue=0x00020191\n[1018]\nParameterName=IdentityObject\n[1400]\nParameterName=RPDO1\n[1400sub1]\nParameterName=COB-ID\nDefaultValue=0x201\n") },
+            { L".gsdml",     strVec("<ISO15745Profile><ProfileBody><DeviceIdentity VendorID=\"0x002A\" DeviceID=\"0x0105\"><VendorName Value=\"Siemens\"/></DeviceIdentity><ApplicationProcess><ModuleList><ModuleItem ID=\"DI_16x24VDC\"/><ModuleItem ID=\"DQ_16x24VDC\"/></ModuleList></ApplicationProcess></ProfileBody></ISO15745Profile>") },
+            { L".l5x",       strVec("<RSLogix5000Content><Controller Name=\"LinePLC\"><Programs><Program Name=\"Main\"><Routines><Routine Name=\"MainRoutine\" Type=\"RLL\"><RLLContent><Rung Number=\"0\"><Text>XIC(Start_Btn)XIO(Fault_Bit)OTE(Pump_Run);</Text></Rung></RLLContent></Routine></Routines></Program></Programs></Controller></RSLogix5000Content>") },
             { L".sof",       sof }
         };
 
@@ -6450,11 +6552,51 @@ static void RunStage14Tests(TestCounter& tc) {
         nk[0] = 'n'; nk[1] = 'k'; nk[2] = 0x20; nk[20] = 3; nk[36] = 2; nk[72] = 8;
         std::memcpy(nk + 76, "Software", 8);
 
-        // #93 .etl (ETW buffer header)
-        std::vector<uint8_t> etl(256, 0);
-        uint32_t etlBufSz = 65536; std::memcpy(etl.data(), &etlBufSz, 4);
-        const wchar_t* etlStr = L"NT Kernel Logger";
-        std::memcpy(etl.data() + 72, etlStr, 16 * sizeof(wchar_t));
+        // #93 .etl (Valid 4096B WMI_BUFFER_HEADER + 0xC0 EVENT_TRACE_HEADER + 64-bit EVENT_HEADER)
+        std::vector<uint8_t> etl(4096, 0);
+        {
+            uint32_t etlBufSz = 4096;
+            std::memcpy(etl.data() + 0, &etlBufSz, 4);
+            // Record 0 @ 72: EVENT_TRACE_HEADER (48B) + 64-bit TRACE_LOGFILE_HEADER (280B + UTF-16 strings = 368B -> total 416B)
+            uint16_t rec0Sz = 416;
+            std::memcpy(etl.data() + 72, &rec0Sz, 2);
+            etl[72 + 2] = 0x00u;
+            etl[72 + 3] = 0xC0u; // TRACE_HEADER_FLAG | TRACE_HEADER_EVENT_TRACE
+            etl[72 + 4] = 0x00u; // EVENT_TRACE_TYPE_INFO
+            etl[72 + 5] = 4u;
+            uint32_t tid0 = 100, pid0 = 4;
+            std::memcpy(etl.data() + 72 + 8,  &tid0, 4);
+            std::memcpy(etl.data() + 72 + 12, &pid0, 4);
+            uint64_t ts0 = 133801632000000000ULL;
+            std::memcpy(etl.data() + 72 + 16, &ts0, 8);
+            uint8_t* lh = etl.data() + 72 + 48;
+            std::memcpy(lh + 0, &etlBufSz, 4);
+            lh[4] = 10; lh[5] = 0;
+            uint32_t bld = 22631, procs = 16, bufsWr = 1, ptrSz = 8, mhz = 3600;
+            std::memcpy(lh + 8,  &bld,    4);
+            std::memcpy(lh + 12, &procs,  4);
+            std::memcpy(lh + 36, &bufsWr, 4);
+            std::memcpy(lh + 44, &ptrSz,  4);
+            std::memcpy(lh + 52, &mhz,    4);
+            const wchar_t* etlStr = L"NT Kernel Logger";
+            std::memcpy(lh + 280, etlStr, 17 * sizeof(wchar_t));
+            // Record 1 @ 72 + 416 = 488: 64-bit Vista+ EVENT_HEADER (96B)
+            uint8_t* r1 = etl.data() + 488;
+            uint16_t rec1Sz = 96;
+            std::memcpy(r1 + 0, &rec1Sz, 2);
+            r1[2] = 0x13u; r1[3] = 0xC0u;
+            uint32_t tid1 = 4200, pid1 = 1840;
+            std::memcpy(r1 + 8,  &tid1, 4);
+            std::memcpy(r1 + 12, &pid1, 4);
+            uint64_t ts1 = 133801632050000000ULL;
+            std::memcpy(r1 + 16, &ts1, 8);
+            uint16_t evId = 42;
+            std::memcpy(r1 + 40, &evId, 2);
+            r1[44] = 4; r1[45] = 1;
+            uint32_t validEnd = 488 + 96;
+            std::memcpy(etl.data() + 4,  &validEnd, 4); // SavedOffset
+            std::memcpy(etl.data() + 48, &validEnd, 4); // Offset
+        }
 
         // #94 .pol ("PReg\x01\0\0\0" + UTF-16 [Software\Policies;NoAutorun;4;4;1])
         std::vector<uint8_t> pol = { 'P','R','e','g', 1,0,0,0 };

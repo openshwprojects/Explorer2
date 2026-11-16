@@ -50,4 +50,11 @@ void RunFormatTestsDocs(TestCounter& tc);      // FormatTestsDocs.cpp (office, d
 void RunFormatTestsDocsB(TestCounter& tc);     // FormatTestsDocsB.cpp (binary, media and system formats)
 void RunFormatTestsArchives(TestCounter& tc);  // FormatTestsArchives.cpp
 
+// 70-Format Roadmap Batch Suite (FormatTestsBatch70.cpp — fast incremental compilation unit)
+void RunFormatTests3DBatch70(TestCounter& tc);
+void RunFormatTestsImagesBatch70(TestCounter& tc);
+void RunFormatTestsEdaBatch70(TestCounter& tc);
+void RunFormatTestsDocsBatch70(TestCounter& tc);
+void RunFormatTestsArchivesBatch70(TestCounter& tc);
+
 } // namespace Explorer2::SelfTestSuite

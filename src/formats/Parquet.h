@@ -1,5 +1,7 @@
 #pragma once
-// Parquet.h — Apache Parquet Columnar Storage (.parquet, PAR1) Thrift Compact Footer & Data Page Decoder
+// Parquet.h — Apache Parquet Columnar Storage (.parquet, PAR1) Thrift Compact Footer,
+//             ZSTD / LZ4 / LZ4_RAW / Snappy / Gzip Codecs, DATA_PAGE_V2, Delta & Dictionary Decoders,
+//             and >32 MB Random-Access File Streaming (#31).
 
 namespace Formats {
 
@@ -14,29 +16,73 @@ inline uint32_t RdU32LE(const uint8_t* p) {
            (static_cast<uint32_t>(p[2]) << 16) |
            static_cast<uint32_t>(p[3]) << 24;
 }
+inline uint32_t RdU32BE(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
 inline uint64_t RdU64LE(const uint8_t* p) {
     return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
 }
 
+struct WinParquetRandomFile {
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    uint64_t fileSize = 0;
+
+    ~WinParquetRandomFile() {
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    }
+
+    bool Open(const std::wstring& path) {
+        hFile = CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER li{};
+        if (!GetFileSizeEx(hFile, &li) || li.QuadPart <= 0) return false;
+        fileSize = static_cast<uint64_t>(li.QuadPart);
+        return true;
+    }
+
+    bool ReadAt(uint64_t offset, uint8_t* dst, size_t len) const {
+        if (offset > fileSize || len > fileSize - offset) return false;
+        if (len == 0) return true;
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(offset);
+        if (!SetFilePointerEx(hFile, pos, nullptr, FILE_BEGIN)) return false;
+        size_t done = 0;
+        while (done < len) {
+            DWORD chunk = static_cast<DWORD>(std::min<size_t>(len - done, 16 * 1024 * 1024));
+            DWORD got = 0;
+            if (!ReadFile(hFile, dst + done, chunk, &got, nullptr) || got == 0) return false;
+            done += got;
+        }
+        return true;
+    }
+};
+
 // Native Snappy block decompressor for Parquet SNAPPY pages
 inline bool SnappyDecompress(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out, size_t maxOut = 32 * 1024 * 1024) {
     out.clear();
+    if (!src || srcLen == 0) return false;
     size_t pos = 0;
     uint64_t uncompLen = 0;
     int shift = 0;
+    bool term = false;
     while (pos < srcLen && shift < 35) {
         uint8_t b = src[pos++];
         uncompLen |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) break;
+        if ((b & 0x80u) == 0) { term = true; break; }
         shift += 7;
     }
-    if (uncompLen > maxOut) return false;
+    if (!term || uncompLen > maxOut) return false;
     out.reserve(static_cast<size_t>(uncompLen));
 
     while (pos < srcLen && out.size() < uncompLen) {
         uint8_t tag = src[pos++];
         uint8_t elemType = tag & 0x03u;
-        if (elemType == 0) { // Literal
+        if (elemType == 0) {
             uint32_t len = (tag >> 2);
             if (len < 60) {
                 len += 1;
@@ -77,6 +123,107 @@ inline bool SnappyDecompress(const uint8_t* src, size_t srcLen, std::vector<uint
         }
     }
     return out.size() == uncompLen;
+}
+
+// Raw unframed LZ4 block decompressor for Parquet LZ4_RAW (codec 7) & Hadoop LZ4 chunks (codec 5)
+inline bool Lz4RawBlockDecompress(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out, size_t maxOut = 32 * 1024 * 1024) {
+    if (!src) return false;
+    size_t p = 0;
+    const size_t baseSize = out.size();
+    while (p < srcLen) {
+        uint8_t token = src[p++];
+        size_t litLen = token >> 4;
+        if (litLen == 15u) {
+            uint8_t s = 0;
+            do {
+                if (p >= srcLen) return false;
+                s = src[p++];
+                litLen += s;
+                if (litLen > maxOut) return false;
+            } while (s == 255u);
+        }
+        if (litLen > srcLen - p || out.size() + litLen > maxOut) return false;
+        out.insert(out.end(), src + p, src + p + litLen);
+        p += litLen;
+
+        if (p == srcLen) break;
+        if (p + 2 > srcLen) return false;
+        uint16_t offset = RdU16LE(src + p);
+        p += 2;
+        if (offset == 0 || (out.size() - baseSize) < offset) return false;
+
+        size_t matchLen = (token & 0x0Fu) + 4u;
+        if ((token & 0x0Fu) == 15u) {
+            uint8_t s = 0;
+            do {
+                if (p >= srcLen) return false;
+                s = src[p++];
+                matchLen += s;
+                if (matchLen > maxOut) return false;
+            } while (s == 255u);
+        }
+        if (out.size() + matchLen > maxOut) return false;
+        for (size_t k = 0; k < matchLen; ++k) {
+            out.push_back(out[out.size() - offset]);
+        }
+    }
+    return true;
+}
+
+// Parquet codec 5 (LZ4_HADOOP / LZ4_FRAME / fallback raw LZ4)
+inline bool ParquetLz4HadoopOrFrameDecompress(const uint8_t* src, size_t srcLen, size_t expectedUncomp, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!src || srcLen == 0) return false;
+    const size_t maxOut = std::max<size_t>(expectedUncomp + 65536, 65536);
+
+    // 1. Standard LZ4 frame magic (0x184D2204)
+    if (srcLen >= 7 && RdU32LE(src) == 0x184D2204u) {
+        if (StreamCodecs::DecompressLz4Frame(src, srcLen, out, maxOut)) return true;
+    }
+
+    // 2. Hadoop LZ4 block framing: [uint32_be expectedBlockUncomp][uint32_be subChunkCompLen][lz4_raw]...
+    {
+        size_t pos = 0;
+        std::vector<uint8_t> tmp;
+        tmp.reserve(expectedUncomp);
+        bool okHadoop = true;
+        while (pos < srcLen) {
+            if (pos + 4 > srcLen) { okHadoop = false; break; }
+            uint32_t blockUncomp = RdU32BE(src + pos);
+            pos += 4;
+            if (blockUncomp == 0 || blockUncomp > maxOut || tmp.size() + blockUncomp > maxOut) {
+                okHadoop = false;
+                break;
+            }
+            size_t decodedInBlock = 0;
+            while (decodedInBlock < blockUncomp) {
+                if (pos + 4 > srcLen) { okHadoop = false; break; }
+                uint32_t subCompLen = RdU32BE(src + pos);
+                pos += 4;
+                if (subCompLen == 0 || subCompLen > srcLen - pos) { okHadoop = false; break; }
+                size_t before = tmp.size();
+                if (!Lz4RawBlockDecompress(src + pos, subCompLen, tmp, maxOut)) {
+                    okHadoop = false;
+                    break;
+                }
+                pos += subCompLen;
+                decodedInBlock += (tmp.size() - before);
+            }
+            if (!okHadoop || decodedInBlock != blockUncomp) { okHadoop = false; break; }
+        }
+        if (okHadoop && (expectedUncomp == 0 || tmp.size() == expectedUncomp)) {
+            out = std::move(tmp);
+            return true;
+        }
+    }
+
+    // 3. Raw LZ4 block fallback (legacy writers tagging LZ4_RAW as codec 5)
+    out.clear();
+    if (Lz4RawBlockDecompress(src, srcLen, out, maxOut) && (expectedUncomp == 0 || out.size() == expectedUncomp)) {
+        return true;
+    }
+    out.clear();
+    return false;
 }
 
 class ThriftCompactReader {
@@ -176,37 +323,36 @@ public:
     bool SkipValue(uint8_t type, int depth = 0) {
         if (depth > 24) return false;
         switch (type) {
-            case 1: // CT_BOOLEAN_TRUE
-            case 2: // CT_BOOLEAN_FALSE
+            case 1:
+            case 2:
                 return true;
-            case 3: { // CT_BYTE
+            case 3: {
                 uint8_t b = 0;
                 return ReadByte(b);
             }
-            case 4: // CT_I16
-            case 5: // CT_I32
-            case 6: { // CT_I64
+            case 4:
+            case 5:
+            case 6: {
                 uint64_t v = 0;
                 return ReadVarint64(v);
             }
-            case 7: { // CT_DOUBLE (8 bytes LE)
+            case 7: {
                 if (pos + 8 > size) return false;
                 pos += 8;
                 return true;
             }
-            case 8: { // CT_BINARY
+            case 8: {
                 uint32_t len = 0;
                 if (!ReadVarint32(len) || len > size - pos) return false;
                 pos += len;
                 return true;
             }
-            case 9:   // CT_LIST
-            case 10: { // CT_SET
+            case 9:
+            case 10: {
                 uint8_t elemType = 0;
                 uint32_t cnt = 0;
                 if (!ReadListHeader(elemType, cnt)) return false;
                 for (uint32_t i = 0; i < cnt; ++i) {
-                    // In Thrift Compact list<bool>, element type is 1 or 2 and each element is 1 byte!
                     if (elemType == 1 || elemType == 2) {
                         uint8_t b = 0;
                         if (!ReadByte(b)) return false;
@@ -216,7 +362,7 @@ public:
                 }
                 return true;
             }
-            case 11: { // CT_MAP
+            case 11: {
                 uint32_t cnt = 0;
                 if (!ReadVarint32(cnt) || cnt > 1000000) return false;
                 if (cnt == 0) return true;
@@ -230,7 +376,7 @@ public:
                 }
                 return true;
             }
-            case 12: { // CT_STRUCT
+            case 12: {
                 int16_t lastId = 0;
                 for (;;) {
                     int16_t fid = 0;
@@ -249,7 +395,7 @@ public:
 struct SchemaElem {
     int32_t type = -1;
     int32_t typeLength = 0;
-    int32_t repetitionType = -1; // 0=REQUIRED, 1=OPTIONAL, 2=REPEATED
+    int32_t repetitionType = -1;
     std::string name;
     int32_t numChildren = 0;
     int32_t convertedType = -1;
@@ -362,14 +508,8 @@ inline std::wstring FormatRawStatValue(const std::string& bytes, int32_t physTyp
     if (bytes.empty()) return L"";
     const uint8_t* p = reinterpret_cast<const uint8_t*>(bytes.data());
     if (physType == 0 && bytes.size() >= 1) return p[0] ? L"true" : L"false";
-    if (physType == 1 && bytes.size() >= 4) {
-        int32_t v = static_cast<int32_t>(RdU32LE(p));
-        return std::to_wstring(v);
-    }
-    if (physType == 2 && bytes.size() >= 8) {
-        int64_t v = static_cast<int64_t>(RdU64LE(p));
-        return std::to_wstring(v);
-    }
+    if (physType == 1 && bytes.size() >= 4) return std::to_wstring(static_cast<int32_t>(RdU32LE(p)));
+    if (physType == 2 && bytes.size() >= 8) return std::to_wstring(static_cast<int64_t>(RdU64LE(p)));
     if (physType == 4 && bytes.size() >= 4) {
         float f = 0.0f;
         std::memcpy(&f, p, 4);
@@ -392,7 +532,7 @@ inline std::wstring FormatRawStatValue(const std::string& bytes, int32_t physTyp
         }
     }
     if (printable) {
-        return PathUtils::Utf8ToWide(std::string_view(bytes.data(), std::min<size_t>(bytes.size(), 48)));
+        return PathUtils::Utf8ToWide(std::string_view(bytes.data(), std::min<size_t>(bytes.size(), 96)));
     }
     static const wchar_t kHex[] = L"0123456789ABCDEF";
     std::wstring h = L"0x";
@@ -561,7 +701,7 @@ inline bool ParseFileMetaData(const uint8_t* buf, size_t len, ParquetFooter& out
             if (!tr.SkipValue(ftype)) return false;
         }
     }
-    return !out.schema.empty();
+    return !out.schema.empty() && out.version >= 1 && out.version <= 2 && out.numRows >= 0;
 }
 
 struct LeafColDesc {
@@ -668,7 +808,7 @@ inline bool ParsePageHeader(const uint8_t* data, size_t maxAvail, ParsedPageHead
         }
     }
     ph.headerBytes = tr.pos;
-    return ph.pageType >= 0 && ph.compressedSize >= 0 && ph.uncompressedSize >= 0;
+    return ph.pageType >= 0 && ph.pageType <= 3 && ph.compressedSize >= 0 && ph.uncompressedSize >= 0;
 }
 
 inline int BitWidthForMax(int maxVal) {
@@ -677,7 +817,6 @@ inline int BitWidthForMax(int maxVal) {
     return bw;
 }
 
-// Decodes Parquet hybrid RLE / Bit-Packed unsigned integer stream
 inline bool DecodeRleBitPackedStream(
     const uint8_t* buf,
     size_t len,
@@ -705,7 +844,7 @@ inline bool DecodeRleBitPackedStream(
             if ((b & 0x80u) == 0) break;
             shift += 7;
         }
-        if ((hdr & 1ULL) == 0) { // RLE run
+        if ((hdr & 1ULL) == 0) {
             uint64_t runLen = hdr >> 1;
             if (pos + byteWidth > len) break;
             uint32_t val = 0;
@@ -714,7 +853,7 @@ inline bool DecodeRleBitPackedStream(
             }
             size_t take = static_cast<size_t>(std::min<uint64_t>(runLen, wantedCount - outVals.size()));
             outVals.insert(outVals.end(), take, val);
-        } else { // Bit-packed run of (hdr >> 1) * 8 values
+        } else {
             uint64_t groups = hdr >> 1;
             uint64_t count = groups * 8ULL;
             uint64_t totalBytes = groups * static_cast<uint64_t>(bitWidth);
@@ -735,7 +874,179 @@ inline bool DecodeRleBitPackedStream(
             pos += static_cast<size_t>(totalBytes);
         }
     }
-    return !outVals.empty();
+    return !outVals.empty() || wantedCount == 0;
+}
+
+// Parquet v2 DELTA_BINARY_PACKED (encoding = 5) for INT32 and INT64
+inline bool DecodeDeltaBinaryPackedInts(
+    const uint8_t* buf,
+    size_t len,
+    size_t& ioPos,
+    size_t maxValues,
+    std::vector<int64_t>& outInts)
+{
+    outInts.clear();
+    auto readUleb = [&](uint64_t& v) -> bool {
+        v = 0;
+        int sh = 0;
+        while (ioPos < len && sh < 70) {
+            uint8_t b = buf[ioPos++];
+            v |= static_cast<uint64_t>(b & 0x7Fu) << sh;
+            if ((b & 0x80u) == 0) return true;
+            sh += 7;
+        }
+        return false;
+    };
+    auto readZigZag = [&](int64_t& sv) -> bool {
+        uint64_t u = 0;
+        if (!readUleb(u)) return false;
+        sv = static_cast<int64_t>((u >> 1) ^ (~(u & 1ULL) + 1ULL));
+        return true;
+    };
+
+    uint64_t blockSize = 0, numMiniBlocks = 0, totalValues = 0;
+    int64_t firstVal = 0;
+    if (!readUleb(blockSize) || !readUleb(numMiniBlocks) || !readUleb(totalValues) || !readZigZag(firstVal)) {
+        return false;
+    }
+    if (totalValues == 0) return true;
+    if (blockSize == 0 || numMiniBlocks == 0 || (blockSize % numMiniBlocks) != 0 || (blockSize / numMiniBlocks) % 8 != 0) {
+        return false;
+    }
+
+    const uint64_t valsPerMini = blockSize / numMiniBlocks;
+    const size_t targetTotal = static_cast<size_t>(std::min<uint64_t>(totalValues, 200000));
+    outInts.reserve(std::min(targetTotal, maxValues));
+    outInts.push_back(firstVal);
+    int64_t curVal = firstVal;
+    uint64_t decodedTotal = 1;
+
+    while (decodedTotal < totalValues && ioPos < len) {
+        int64_t minDelta = 0;
+        if (!readZigZag(minDelta)) return false;
+        if (ioPos + numMiniBlocks > len) return false;
+        std::vector<uint8_t> bitWidths(buf + ioPos, buf + ioPos + static_cast<size_t>(numMiniBlocks));
+        ioPos += static_cast<size_t>(numMiniBlocks);
+
+        for (uint64_t mb = 0; mb < numMiniBlocks && decodedTotal < totalValues; ++mb) {
+            uint8_t bw = bitWidths[static_cast<size_t>(mb)];
+            if (bw > 64) return false;
+            size_t mbBytes = static_cast<size_t>((valsPerMini * bw) / 8ULL);
+            if (ioPos + mbBytes > len) return false;
+
+            const uint8_t* mp = buf + ioPos;
+            size_t bitCursor = 0;
+            for (uint64_t k = 0; k < valsPerMini; ++k) {
+                uint64_t delta = 0;
+                if (bw > 0) {
+                    size_t bIdx = bitCursor >> 3;
+                    int bOff = static_cast<int>(bitCursor & 7u);
+                    // Read up to 9 bytes safely for 64-bit unaligned bit-unpack
+                    uint64_t lo = 0;
+                    size_t cpy = std::min<size_t>(8, mbBytes - bIdx);
+                    std::memcpy(&lo, mp + bIdx, cpy);
+                    if (bOff == 0) {
+                        delta = (bw == 64) ? lo : (lo & ((1ULL << bw) - 1ULL));
+                    } else {
+                        uint64_t hi = (bIdx + 8 < mbBytes) ? mp[bIdx + 8] : 0ULL;
+                        uint64_t merged = (lo >> bOff) | (hi << (64 - bOff));
+                        delta = (bw == 64) ? merged : (merged & ((1ULL << bw) - 1ULL));
+                    }
+                    bitCursor += bw;
+                }
+                if (decodedTotal < totalValues) {
+                    curVal = static_cast<int64_t>(static_cast<uint64_t>(curVal) + static_cast<uint64_t>(minDelta) + delta);
+                    if (outInts.size() < maxValues) outInts.push_back(curVal);
+                    ++decodedTotal;
+                }
+            }
+            ioPos += mbBytes;
+        }
+    }
+    return !outInts.empty();
+}
+
+// Parquet v2 DELTA_LENGTH_BYTE_ARRAY (encoding = 6)
+inline bool DecodeDeltaLengthByteArray(
+    const uint8_t* buf,
+    size_t len,
+    size_t& ioPos,
+    int32_t convType,
+    size_t nonNullCount,
+    std::vector<std::wstring>& outVals)
+{
+    std::vector<int64_t> lengths;
+    if (!DecodeDeltaBinaryPackedInts(buf, len, ioPos, nonNullCount, lengths)) return false;
+    outVals.clear();
+    outVals.reserve(lengths.size());
+    for (int64_t sl : lengths) {
+        if (sl < 0 || static_cast<size_t>(sl) > len - ioPos) return false;
+        std::string s(reinterpret_cast<const char*>(buf + ioPos), static_cast<size_t>(sl));
+        ioPos += static_cast<size_t>(sl);
+        outVals.push_back(FormatRawStatValue(s, 6, convType));
+    }
+    return true;
+}
+
+// Parquet v2 DELTA_BYTE_ARRAY (encoding = 7: prefix-compressed strings)
+inline bool DecodeDeltaByteArray(
+    const uint8_t* buf,
+    size_t len,
+    size_t& ioPos,
+    int32_t convType,
+    size_t nonNullCount,
+    std::vector<std::wstring>& outVals)
+{
+    std::vector<int64_t> prefixLens;
+    if (!DecodeDeltaBinaryPackedInts(buf, len, ioPos, nonNullCount, prefixLens)) return false;
+    std::vector<int64_t> suffixLens;
+    if (!DecodeDeltaBinaryPackedInts(buf, len, ioPos, nonNullCount, suffixLens)) return false;
+    const size_t n = std::min(prefixLens.size(), suffixLens.size());
+    outVals.clear();
+    outVals.reserve(n);
+    std::string prev;
+    for (size_t i = 0; i < n; ++i) {
+        int64_t pl = prefixLens[i];
+        int64_t sl = suffixLens[i];
+        if (pl < 0 || sl < 0 || static_cast<size_t>(pl) > prev.size() || static_cast<size_t>(sl) > len - ioPos) {
+            return false;
+        }
+        std::string cur = prev.substr(0, static_cast<size_t>(pl));
+        cur.append(reinterpret_cast<const char*>(buf + ioPos), static_cast<size_t>(sl));
+        ioPos += static_cast<size_t>(sl);
+        outVals.push_back(FormatRawStatValue(cur, 6, convType));
+        prev = std::move(cur);
+    }
+    return true;
+}
+
+// Parquet v2 BYTE_STREAM_SPLIT (encoding = 9) for FLOAT / DOUBLE / INT32 / INT64 / FIXED_LEN_BYTE_ARRAY
+inline bool DecodeByteStreamSplit(
+    const uint8_t* buf,
+    size_t len,
+    size_t& ioPos,
+    const LeafColDesc& col,
+    size_t nonNullCount,
+    std::vector<std::wstring>& outVals)
+{
+    size_t elemW = 0;
+    if (col.physType == 1 || col.physType == 4) elemW = 4;
+    else if (col.physType == 2 || col.physType == 5) elemW = 8;
+    else if (col.physType == 7 && col.typeLength > 0) elemW = static_cast<size_t>(col.typeLength);
+    if (elemW == 0 || nonNullCount * elemW > len - ioPos) return false;
+
+    outVals.clear();
+    outVals.reserve(nonNullCount);
+    const uint8_t* base = buf + ioPos;
+    std::string tmp(elemW, '\0');
+    for (size_t i = 0; i < nonNullCount; ++i) {
+        for (size_t b = 0; b < elemW; ++b) {
+            tmp[b] = static_cast<char>(base[b * nonNullCount + i]);
+        }
+        outVals.push_back(FormatRawStatValue(tmp, col.physType, col.convType));
+    }
+    ioPos += nonNullCount * elemW;
+    return true;
 }
 
 inline bool DecodePlainValues(
@@ -750,30 +1061,30 @@ inline bool DecodePlainValues(
     outVals.reserve(count);
     size_t bitIdx = 0;
     for (size_t i = 0; i < count; ++i) {
-        if (col.physType == 0) { // BOOLEAN (bit-packed LSB-first)
+        if (col.physType == 0) {
             size_t bOff = ioPos + (bitIdx / 8);
             if (bOff >= len) break;
             bool bit = ((buf[bOff] >> (bitIdx % 8)) & 1u) != 0;
             ++bitIdx;
             outVals.push_back(bit ? L"true" : L"false");
-        } else if (col.physType == 1) { // INT32
+        } else if (col.physType == 1) {
             if (ioPos + 4 > len) break;
             int32_t v = static_cast<int32_t>(RdU32LE(buf + ioPos));
             ioPos += 4;
             outVals.push_back(std::to_wstring(v));
-        } else if (col.physType == 2) { // INT64
+        } else if (col.physType == 2) {
             if (ioPos + 8 > len) break;
             int64_t v = static_cast<int64_t>(RdU64LE(buf + ioPos));
             ioPos += 8;
             outVals.push_back(std::to_wstring(v));
-        } else if (col.physType == 3) { // INT96
+        } else if (col.physType == 3) {
             if (ioPos + 12 > len) break;
             uint64_t nanos = RdU64LE(buf + ioPos);
             uint32_t jday = RdU32LE(buf + ioPos + 8);
             ioPos += 12;
             int64_t unixSec = (static_cast<int64_t>(jday) - 2440588LL) * 86400LL + static_cast<int64_t>(nanos / 1000000000ULL);
             outVals.push_back(std::to_wstring(unixSec));
-        } else if (col.physType == 4) { // FLOAT
+        } else if (col.physType == 4) {
             if (ioPos + 4 > len) break;
             float f = 0.0f;
             std::memcpy(&f, buf + ioPos, 4);
@@ -781,7 +1092,7 @@ inline bool DecodePlainValues(
             wchar_t b[64] = {};
             swprintf_s(b, L"%.6g", f);
             outVals.push_back(b);
-        } else if (col.physType == 5) { // DOUBLE
+        } else if (col.physType == 5) {
             if (ioPos + 8 > len) break;
             double d = 0.0;
             std::memcpy(&d, buf + ioPos, 8);
@@ -789,7 +1100,7 @@ inline bool DecodePlainValues(
             wchar_t b[64] = {};
             swprintf_s(b, L"%.12g", d);
             outVals.push_back(b);
-        } else if (col.physType == 6) { // BYTE_ARRAY
+        } else if (col.physType == 6) {
             if (ioPos + 4 > len) break;
             uint32_t slen = RdU32LE(buf + ioPos);
             ioPos += 4;
@@ -797,7 +1108,7 @@ inline bool DecodePlainValues(
             std::string s(reinterpret_cast<const char*>(buf + ioPos), slen);
             ioPos += slen;
             outVals.push_back(FormatRawStatValue(s, 6, col.convType));
-        } else if (col.physType == 7 && col.typeLength > 0) { // FIXED_LEN_BYTE_ARRAY
+        } else if (col.physType == 7 && col.typeLength > 0) {
             size_t fl = static_cast<size_t>(col.typeLength);
             if (ioPos + fl > len) break;
             std::string s(reinterpret_cast<const char*>(buf + ioPos), fl);
@@ -810,7 +1121,7 @@ inline bool DecodePlainValues(
     if (col.physType == 0) {
         ioPos += (bitIdx + 7) / 8;
     }
-    return !outVals.empty() || count == 0;
+    return outVals.size() == count;
 }
 
 inline bool DecompressPageBytes(
@@ -820,77 +1131,120 @@ inline bool DecompressPageBytes(
     size_t uncompLen,
     std::vector<uint8_t>& outBytes)
 {
+    outBytes.clear();
+    const size_t maxCap = std::max<size_t>(uncompLen + 65536, 65536);
     if (codec == 0) { // UNCOMPRESSED
+        if (uncompLen > 0 && compLen != uncompLen) return false;
         outBytes.assign(compPtr, compPtr + compLen);
         return true;
     }
     if (codec == 1) { // SNAPPY
-        return SnappyDecompress(compPtr, compLen, outBytes, std::max<size_t>(uncompLen + 64, 1024));
+        return SnappyDecompress(compPtr, compLen, outBytes, maxCap);
     }
     if (codec == 2) { // GZIP
-        return ZipDeflate::InflateGzip(compPtr, compLen, outBytes, std::max<size_t>(uncompLen + 64, 1024));
+        return ZipDeflate::InflateGzip(compPtr, compLen, outBytes, maxCap);
+    }
+    if (codec == 5) { // LZ4 (Hadoop block framing / LZ4 frame)
+        return ParquetLz4HadoopOrFrameDecompress(compPtr, compLen, uncompLen, outBytes);
+    }
+    if (codec == 6) { // ZSTD (RFC 8878 frame)
+        return StreamCodecs::DecompressZstdFrame(compPtr, compLen, outBytes, maxCap) &&
+               (uncompLen == 0 || outBytes.size() == uncompLen);
+    }
+    if (codec == 7) { // LZ4_RAW (unframed LZ4 block)
+        return Lz4RawBlockDecompress(compPtr, compLen, outBytes, maxCap) &&
+               (uncompLen == 0 || outBytes.size() == uncompLen);
     }
     return false;
 }
 
-inline void DecodeColumnPreview(
-    const std::vector<uint8_t>& raw,
+// Decodes column preview from a contiguous byte slice starting at `sliceFileOffset`
+inline bool DecodeColumnPreviewSlice(
+    const uint8_t* slicePtr,
+    size_t sliceLen,
+    uint64_t sliceFileOffset,
     const LeafColDesc& leaf,
     const ColChunkMeta& cm,
     size_t maxRows,
     std::vector<std::wstring>& outCells)
 {
     outCells.clear();
-    if (!cm.valid) return;
+    if (!cm.valid || !slicePtr || sliceLen == 0) return false;
+
+    auto fileOffToLocal = [&](int64_t foff, size_t& outLoc) -> bool {
+        if (foff < 0 || static_cast<uint64_t>(foff) < sliceFileOffset) return false;
+        uint64_t rel = static_cast<uint64_t>(foff) - sliceFileOffset;
+        if (rel >= sliceLen) return false;
+        outLoc = static_cast<size_t>(rel);
+        return true;
+    };
 
     std::vector<std::wstring> dictValues;
-    auto readDictAt = [&](size_t off, size_t& outAfterDict) -> bool {
-        outAfterDict = off;
-        if (off >= raw.size()) return false;
+    auto readDictAt = [&](size_t locOff, size_t& outAfterDict) -> bool {
+        outAfterDict = locOff;
+        if (locOff >= sliceLen) return false;
         ParsedPageHeader dph;
-        if (!ParsePageHeader(raw.data() + off, std::min<size_t>(512, raw.size() - off), dph)) return false;
+        if (!ParsePageHeader(slicePtr + locOff, std::min<size_t>(512, sliceLen - locOff), dph)) return false;
         if (dph.pageType != 2) return false;
-        size_t payOff = off + dph.headerBytes;
+        size_t payOff = locOff + dph.headerBytes;
         size_t compSz = static_cast<size_t>(dph.compressedSize);
-        if (payOff + compSz > raw.size()) return false;
+        if (payOff + compSz > sliceLen) return false;
         outAfterDict = payOff + compSz;
         std::vector<uint8_t> dBuf;
-        if (!DecompressPageBytes(cm.codec, raw.data() + payOff, compSz, static_cast<size_t>(dph.uncompressedSize), dBuf)) {
+        if (!DecompressPageBytes(cm.codec, slicePtr + payOff, compSz, static_cast<size_t>(dph.uncompressedSize), dBuf)) {
             return false;
         }
         size_t dPos = 0;
         return DecodePlainValues(dBuf.data(), dBuf.size(), dPos, leaf, static_cast<size_t>(std::max(0, dph.numValues)), dictValues);
     };
 
-    size_t pageCursor = static_cast<size_t>(std::max<int64_t>(4, cm.dataPageOffset));
-    if (cm.dictionaryPageOffset >= 4 && static_cast<size_t>(cm.dictionaryPageOffset) < raw.size()) {
-        size_t afterDict = 0;
-        if (readDictAt(static_cast<size_t>(cm.dictionaryPageOffset), afterDict) &&
-            static_cast<size_t>(cm.dictionaryPageOffset) == pageCursor) {
-            pageCursor = afterDict;
+    size_t pageCursor = 0;
+    if (!fileOffToLocal(cm.dataPageOffset, pageCursor)) return false;
+
+    if (cm.dictionaryPageOffset >= 4) {
+        size_t dictLoc = 0;
+        if (fileOffToLocal(cm.dictionaryPageOffset, dictLoc)) {
+            size_t afterDict = 0;
+            if (!readDictAt(dictLoc, afterDict)) return false;
+            if (dictLoc == pageCursor) pageCursor = afterDict;
         }
     }
 
+    const size_t targetVals = (cm.numValues > 0)
+        ? std::min<size_t>(maxRows, static_cast<size_t>(cm.numValues))
+        : maxRows;
     int pagesRead = 0;
-    while (pageCursor < raw.size() - 8 && outCells.size() < maxRows && pagesRead++ < 16) {
+    bool pageDecodeFailed = false;
+    while (pageCursor < sliceLen && outCells.size() < targetVals && pagesRead++ < 16) {
         ParsedPageHeader ph;
-        if (!ParsePageHeader(raw.data() + pageCursor, std::min<size_t>(512, raw.size() - 8 - pageCursor), ph)) break;
+        if (!ParsePageHeader(slicePtr + pageCursor, std::min<size_t>(512, sliceLen - pageCursor), ph)) {
+            if (outCells.empty()) pageDecodeFailed = true;
+            break;
+        }
         size_t payOff = pageCursor + ph.headerBytes;
         size_t compSz = static_cast<size_t>(ph.compressedSize);
-        if (payOff + compSz > raw.size() - 8) break;
+        if (payOff + compSz > sliceLen) {
+            if (outCells.empty()) pageDecodeFailed = true;
+            break;
+        }
         pageCursor = payOff + compSz;
 
-        if (ph.pageType == 2) { // Inline DICTIONARY_PAGE preceding DATA_PAGE
+        if (ph.pageType == 2) {
             std::vector<uint8_t> dBuf;
-            if (DecompressPageBytes(cm.codec, raw.data() + payOff, compSz, static_cast<size_t>(ph.uncompressedSize), dBuf)) {
-                size_t dPos = 0;
-                DecodePlainValues(dBuf.data(), dBuf.size(), dPos, leaf, static_cast<size_t>(std::max(0, ph.numValues)), dictValues);
+            if (!DecompressPageBytes(cm.codec, slicePtr + payOff, compSz, static_cast<size_t>(ph.uncompressedSize), dBuf)) {
+                pageDecodeFailed = true;
+                break;
+            }
+            size_t dPos = 0;
+            if (!DecodePlainValues(dBuf.data(), dBuf.size(), dPos, leaf, static_cast<size_t>(std::max(0, ph.numValues)), dictValues)) {
+                pageDecodeFailed = true;
+                break;
             }
             continue;
         }
-        if (ph.pageType != 0 && ph.pageType != 3) continue; // Only DATA_PAGE v1 / v2
+        if (ph.pageType != 0 && ph.pageType != 3) continue;
 
-        size_t numValues = static_cast<size_t>(std::min<int32_t>(std::max<int32_t>(0, ph.numValues), 10000));
+        size_t numValues = static_cast<size_t>(std::min<int32_t>(std::max<int32_t>(0, ph.numValues), 100000));
         if (numValues == 0) continue;
 
         std::vector<uint8_t> pageBuf;
@@ -898,19 +1252,22 @@ inline void DecodeColumnPreview(
         std::vector<uint32_t> defLevels;
 
         if (ph.pageType == 0) { // DATA_PAGE v1
-            if (!DecompressPageBytes(cm.codec, raw.data() + payOff, compSz, static_cast<size_t>(ph.uncompressedSize), pageBuf)) break;
+            if (!DecompressPageBytes(cm.codec, slicePtr + payOff, compSz, static_cast<size_t>(ph.uncompressedSize), pageBuf)) {
+                pageDecodeFailed = true;
+                break;
+            }
             if (leaf.maxRepLevel > 0) {
-                if (valPos + 4 > pageBuf.size()) break;
+                if (valPos + 4 > pageBuf.size()) { pageDecodeFailed = true; break; }
                 uint32_t repBytes = RdU32LE(pageBuf.data() + valPos);
                 valPos += 4;
-                if (repBytes > pageBuf.size() - valPos) break;
+                if (repBytes > pageBuf.size() - valPos) { pageDecodeFailed = true; break; }
                 valPos += repBytes;
             }
             if (leaf.maxDefLevel > 0) {
-                if (valPos + 4 > pageBuf.size()) break;
+                if (valPos + 4 > pageBuf.size()) { pageDecodeFailed = true; break; }
                 uint32_t defBytes = RdU32LE(pageBuf.data() + valPos);
                 valPos += 4;
-                if (defBytes > pageBuf.size() - valPos) break;
+                if (defBytes > pageBuf.size() - valPos) { pageDecodeFailed = true; break; }
                 DecodeRleBitPackedStream(pageBuf.data() + valPos, defBytes,
                     BitWidthForMax(leaf.maxDefLevel), numValues, defLevels);
                 valPos += defBytes;
@@ -918,15 +1275,20 @@ inline void DecodeColumnPreview(
         } else { // DATA_PAGE_V2
             size_t repLen = static_cast<size_t>(std::max(0, ph.repLevelByteLenV2));
             size_t defLen = static_cast<size_t>(std::max(0, ph.defLevelByteLenV2));
-            if (repLen + defLen > compSz) break;
+            if (repLen + defLen > compSz) { pageDecodeFailed = true; break; }
             if (leaf.maxDefLevel > 0 && defLen > 0) {
-                DecodeRleBitPackedStream(raw.data() + payOff + repLen, defLen,
+                DecodeRleBitPackedStream(slicePtr + payOff + repLen, defLen,
                     BitWidthForMax(leaf.maxDefLevel), numValues, defLevels);
             }
-            const uint8_t* valComp = raw.data() + payOff + repLen + defLen;
+            const uint8_t* valComp = slicePtr + payOff + repLen + defLen;
             size_t valCompLen = compSz - repLen - defLen;
+            size_t valUncompLen = (static_cast<size_t>(ph.uncompressedSize) >= repLen + defLen)
+                ? (static_cast<size_t>(ph.uncompressedSize) - repLen - defLen) : 0;
             int32_t effCodec = ph.isCompressedV2 ? cm.codec : 0;
-            if (!DecompressPageBytes(effCodec, valComp, valCompLen, static_cast<size_t>(ph.uncompressedSize), pageBuf)) break;
+            if (!DecompressPageBytes(effCodec, valComp, valCompLen, valUncompLen, pageBuf)) {
+                pageDecodeFailed = true;
+                break;
+            }
             valPos = 0;
         }
 
@@ -939,19 +1301,25 @@ inline void DecodeColumnPreview(
         }
 
         std::vector<std::wstring> nonNullVals;
-        if (ph.encoding == 0) { // PLAIN
-            DecodePlainValues(pageBuf.data(), pageBuf.size(), valPos, leaf, nonNullCount, nonNullVals);
+        bool encOk = false;
+        if (nonNullCount == 0) {
+            encOk = true;
+        } else if (ph.encoding == 0) { // PLAIN
+            encOk = DecodePlainValues(pageBuf.data(), pageBuf.size(), valPos, leaf, nonNullCount, nonNullVals);
         } else if ((ph.encoding == 8 || ph.encoding == 2) && !dictValues.empty()) { // RLE_DICTIONARY / PLAIN_DICTIONARY
             if (valPos < pageBuf.size()) {
                 int bw = pageBuf[valPos++];
                 std::vector<uint32_t> dictIdx;
-                DecodeRleBitPackedStream(pageBuf.data() + valPos, pageBuf.size() - valPos, bw, nonNullCount, dictIdx);
-                nonNullVals.reserve(dictIdx.size());
-                for (uint32_t idx : dictIdx) {
-                    nonNullVals.push_back(idx < dictValues.size() ? dictValues[idx] : L"?");
+                if (DecodeRleBitPackedStream(pageBuf.data() + valPos, pageBuf.size() - valPos, bw, nonNullCount, dictIdx)) {
+                    nonNullVals.reserve(dictIdx.size());
+                    encOk = true;
+                    for (uint32_t idx : dictIdx) {
+                        if (idx >= dictValues.size()) { encOk = false; break; }
+                        nonNullVals.push_back(dictValues[idx]);
+                    }
                 }
             }
-        } else if (ph.encoding == 3 && leaf.physType == 0) { // RLE BOOLEAN in v2
+        } else if (ph.encoding == 3 && leaf.physType == 0) { // RLE BOOLEAN
             size_t rleOff = valPos;
             size_t rleLen = pageBuf.size() - valPos;
             if (ph.pageType == 0 && rleLen >= 4) {
@@ -959,14 +1327,33 @@ inline void DecodeColumnPreview(
                 if (4 + bl <= rleLen) { rleOff += 4; rleLen = bl; }
             }
             std::vector<uint32_t> bits;
-            DecodeRleBitPackedStream(pageBuf.data() + rleOff, rleLen, 1, nonNullCount, bits);
+            encOk = DecodeRleBitPackedStream(pageBuf.data() + rleOff, rleLen, 1, nonNullCount, bits);
             for (uint32_t b : bits) nonNullVals.push_back(b ? L"true" : L"false");
-        } else {
+        } else if (ph.encoding == 5 && (leaf.physType == 1 || leaf.physType == 2)) { // DELTA_BINARY_PACKED
+            std::vector<int64_t> ints;
+            encOk = DecodeDeltaBinaryPackedInts(pageBuf.data(), pageBuf.size(), valPos, nonNullCount, ints);
+            if (encOk) {
+                nonNullVals.reserve(ints.size());
+                for (int64_t iv : ints) {
+                    if (leaf.physType == 1) nonNullVals.push_back(std::to_wstring(static_cast<int32_t>(iv)));
+                    else nonNullVals.push_back(std::to_wstring(iv));
+                }
+            }
+        } else if (ph.encoding == 6 && leaf.physType == 6) { // DELTA_LENGTH_BYTE_ARRAY
+            encOk = DecodeDeltaLengthByteArray(pageBuf.data(), pageBuf.size(), valPos, leaf.convType, nonNullCount, nonNullVals);
+        } else if (ph.encoding == 7 && (leaf.physType == 6 || leaf.physType == 7)) { // DELTA_BYTE_ARRAY
+            encOk = DecodeDeltaByteArray(pageBuf.data(), pageBuf.size(), valPos, leaf.convType, nonNullCount, nonNullVals);
+        } else if (ph.encoding == 9) { // BYTE_STREAM_SPLIT
+            encOk = DecodeByteStreamSplit(pageBuf.data(), pageBuf.size(), valPos, leaf, nonNullCount, nonNullVals);
+        }
+
+        if (!encOk) {
+            pageDecodeFailed = true;
             break;
         }
 
         size_t nnIdx = 0;
-        size_t takeSlots = std::min(numValues, maxRows - outCells.size());
+        size_t takeSlots = std::min(numValues, targetVals - outCells.size());
         for (size_t i = 0; i < takeSlots; ++i) {
             bool isNull = (leaf.maxDefLevel > 0 && i < defLevels.size() && static_cast<int>(defLevels[i]) < leaf.maxDefLevel);
             if (isNull) {
@@ -978,137 +1365,164 @@ inline void DecodeColumnPreview(
             }
         }
     }
+
+    return !outCells.empty() || (!pageDecodeFailed && cm.numValues == 0);
 }
 
-} // namespace ParquetDetail
+template <typename ReadChunkFn>
+inline bool BuildParquetDocument(
+    uint64_t totalFileSize,
+    uint64_t footerStart,
+    const ParquetFooter& footer,
+    ReadChunkFn&& readChunkSlice,
+    ParsedOfficeDocument& out)
+{
+    std::vector<LeafColDesc> leaves;
+    size_t sIdx = 0;
+    CollectLeafColumns(footer.schema, sIdx, "", 0, 0, true, leaves);
+    if (leaves.empty()) return false;
 
-inline bool ParseApacheParquet(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    if (raw.size() < 12 || std::memcmp(raw.data(), "PAR1", 4) != 0 ||
-        std::memcmp(raw.data() + raw.size() - 4, "PAR1", 4) != 0) {
-        return false;
-    }
-
-    uint32_t footerLen = ParquetDetail::RdU32LE(raw.data() + raw.size() - 8);
-    if (footerLen == 0 || static_cast<uint64_t>(footerLen) + 12ULL > raw.size()) {
-        return false;
-    }
-    size_t footerStart = raw.size() - 8 - footerLen;
-
-    ParquetDetail::ParquetFooter footer;
-    if (ParquetDetail::ParseFileMetaData(raw.data() + footerStart, footerLen, footer)) {
-        out.kind = OfficeFileKind::SqliteDb;
-        out.isSpreadsheet = true;
-        out.formatTitle = L"Apache Parquet Columnar (" +
-            (footer.createdBy.empty() ? std::wstring(L".parquet") : PathUtils::Utf8ToWide(footer.createdBy)) + L")";
-
-        std::vector<ParquetDetail::LeafColDesc> leaves;
-        size_t sIdx = 0;
-        ParquetDetail::CollectLeafColumns(footer.schema, sIdx, "", 0, 0, true, leaves);
-
-        // Sheet 1: Schema & Column Statistics
-        SpreadsheetSheet schemaSheet;
-        schemaSheet.name = L"Parquet_Schema_And_Stats";
-        schemaSheet.maxCols = 8;
-        schemaSheet.rows.push_back({
-            L"Column / Metric", L"Physical Type", L"Converted Type", L"Repetition",
-            L"Codec", L"Values", L"Comp / Uncomp Size", L"Min .. Max (Nulls)"
-        });
-
-        schemaSheet.rows.push_back({
-            L"[File] Total Rows", std::to_wstring(footer.numRows),
-            L"v" + std::to_wstring(footer.version),
-            std::to_wstring(footer.rowGroups.size()) + L" row group(s)",
-            std::to_wstring(leaves.size()) + L" leaf col(s)",
-            L"-",
-            PathUtils::FormatByteSize(raw.size()),
-            footer.createdBy.empty() ? L"-" : PathUtils::Utf8ToWide(footer.createdBy)
-        });
-
-        for (size_t i = 0; i < leaves.size(); ++i) {
-            const auto& lc = leaves[i];
-            int32_t codec = 0;
-            int64_t totalVals = 0, totalComp = 0, totalUncomp = 0, totalNulls = 0;
-            bool hasNulls = false;
-            std::wstring minStr, maxStr;
-
-            for (const auto& rg : footer.rowGroups) {
-                if (i < rg.columns.size() && rg.columns[i].valid) {
-                    const auto& cm = rg.columns[i];
-                    codec = cm.codec;
-                    totalVals += cm.numValues;
-                    totalComp += cm.totalCompressedSize;
-                    totalUncomp += cm.totalUncompressedSize;
-                    if (cm.stats.nullCount >= 0) { totalNulls += cm.stats.nullCount; hasNulls = true; }
-                    if (minStr.empty() && cm.stats.hasMin) {
-                        minStr = ParquetDetail::FormatRawStatValue(cm.stats.minRaw, lc.physType, lc.convType);
-                    }
-                    if (maxStr.empty() && cm.stats.hasMax) {
-                        maxStr = ParquetDetail::FormatRawStatValue(cm.stats.maxRaw, lc.physType, lc.convType);
-                    }
+    // Validate column offsets lie within [4 .. footerStart]
+    for (const auto& rg : footer.rowGroups) {
+        for (const auto& cm : rg.columns) {
+            if (!cm.valid) continue;
+            int64_t firstOff = (cm.dictionaryPageOffset >= 4 && cm.dictionaryPageOffset < cm.dataPageOffset)
+                ? cm.dictionaryPageOffset : cm.dataPageOffset;
+            if (cm.numValues > 0) {
+                if (firstOff < 4 || static_cast<uint64_t>(firstOff) >= footerStart) return false;
+                if (cm.totalCompressedSize < 0 ||
+                    static_cast<uint64_t>(firstOff) + static_cast<uint64_t>(cm.totalCompressedSize) > footerStart) {
+                    return false;
                 }
             }
-
-            std::wstring statSummary = L"-";
-            if (!minStr.empty() || !maxStr.empty() || hasNulls) {
-                statSummary = (minStr.empty() ? L"?" : minStr) + L" .. " + (maxStr.empty() ? L"?" : maxStr);
-                if (hasNulls) statSummary += L" (nulls=" + std::to_wstring(totalNulls) + L")";
-            }
-
-            schemaSheet.rows.push_back({
-                PathUtils::Utf8ToWide(lc.fullPath),
-                ParquetDetail::PhysicalTypeName(lc.physType, lc.typeLength),
-                ParquetDetail::ConvertedTypeName(lc.convType),
-                ParquetDetail::RepetitionName(lc.repType),
-                ParquetDetail::CodecName(codec),
-                std::to_wstring(totalVals),
-                std::to_wstring(totalComp) + L" B / " + std::to_wstring(totalUncomp) + L" B",
-                statSummary
-            });
         }
-
-        // Sheet 2: Real Decoded Columnar Data Preview (up to 500 rows)
-        SpreadsheetSheet dataSheet;
-        dataSheet.name = L"Parquet_Data_Preview";
-        if (!leaves.empty() && !footer.rowGroups.empty()) {
-            constexpr size_t kMaxPreviewRows = 500;
-            std::vector<std::wstring> hdrRow;
-            hdrRow.reserve(leaves.size());
-            for (const auto& lc : leaves) hdrRow.push_back(PathUtils::Utf8ToWide(lc.fullPath));
-            dataSheet.maxCols = hdrRow.size();
-            dataSheet.rows.push_back(std::move(hdrRow));
-
-            std::vector<std::vector<std::wstring>> colData(leaves.size());
-            size_t maxDecodedRows = 0;
-            const auto& rg0 = footer.rowGroups[0];
-            for (size_t c = 0; c < leaves.size() && c < rg0.columns.size(); ++c) {
-                ParquetDetail::DecodeColumnPreview(raw, leaves[c], rg0.columns[c], kMaxPreviewRows, colData[c]);
-                if (colData[c].size() > maxDecodedRows) maxDecodedRows = colData[c].size();
-            }
-
-            for (size_t r = 0; r < maxDecodedRows; ++r) {
-                std::vector<std::wstring> row(leaves.size());
-                for (size_t c = 0; c < leaves.size(); ++c) {
-                    if (r < colData[c].size()) row[c] = std::move(colData[c][r]);
-                }
-                dataSheet.rows.push_back(std::move(row));
-            }
-        }
-
-        out.sheets.push_back(std::move(schemaSheet));
-        if (dataSheet.rows.size() >= 2) {
-            out.sheets.push_back(std::move(dataSheet));
-        }
-        out.valid = true;
-        return true;
     }
 
-    // Strict legacy nul-delimited identifier container check (specifically preserves testdata/telemetry_columnar.parquet
-    // while rejecting any random/corrupted binary payload between PAR1 markers)
+    SpreadsheetSheet schemaSheet;
+    schemaSheet.name = L"Parquet_Schema_And_Stats";
+    schemaSheet.maxCols = 8;
+    schemaSheet.rows.push_back({
+        L"Column / Metric", L"Physical Type", L"Converted Type", L"Repetition",
+        L"Codec", L"Values", L"Comp / Uncomp Size", L"Min .. Max (Nulls)"
+    });
+
+    schemaSheet.rows.push_back({
+        L"[File] Total Rows", std::to_wstring(footer.numRows),
+        L"v" + std::to_wstring(footer.version),
+        std::to_wstring(footer.rowGroups.size()) + L" row group(s)",
+        std::to_wstring(leaves.size()) + L" leaf col(s)",
+        L"-",
+        PathUtils::FormatByteSize(totalFileSize),
+        footer.createdBy.empty() ? L"-" : PathUtils::Utf8ToWide(footer.createdBy)
+    });
+
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        const auto& lc = leaves[i];
+        int32_t codec = 0;
+        int64_t totalVals = 0, totalComp = 0, totalUncomp = 0, totalNulls = 0;
+        bool hasNulls = false;
+        std::wstring minStr, maxStr;
+
+        for (const auto& rg : footer.rowGroups) {
+            if (i < rg.columns.size() && rg.columns[i].valid) {
+                const auto& cm = rg.columns[i];
+                codec = cm.codec;
+                totalVals += cm.numValues;
+                totalComp += cm.totalCompressedSize;
+                totalUncomp += cm.totalUncompressedSize;
+                if (cm.stats.nullCount >= 0) { totalNulls += cm.stats.nullCount; hasNulls = true; }
+                if (minStr.empty() && cm.stats.hasMin) {
+                    minStr = FormatRawStatValue(cm.stats.minRaw, lc.physType, lc.convType);
+                }
+                if (maxStr.empty() && cm.stats.hasMax) {
+                    maxStr = FormatRawStatValue(cm.stats.maxRaw, lc.physType, lc.convType);
+                }
+            }
+        }
+
+        std::wstring statSummary = L"-";
+        if (!minStr.empty() || !maxStr.empty() || hasNulls) {
+            statSummary = (minStr.empty() ? L"?" : minStr) + L" .. " + (maxStr.empty() ? L"?" : maxStr);
+            if (hasNulls) statSummary += L" (nulls=" + std::to_wstring(totalNulls) + L")";
+        }
+
+        schemaSheet.rows.push_back({
+            PathUtils::Utf8ToWide(lc.fullPath),
+            PhysicalTypeName(lc.physType, lc.typeLength),
+            ConvertedTypeName(lc.convType),
+            RepetitionName(lc.repType),
+            CodecName(codec),
+            std::to_wstring(totalVals),
+            std::to_wstring(totalComp) + L" B / " + std::to_wstring(totalUncomp) + L" B",
+            statSummary
+        });
+    }
+
+    SpreadsheetSheet dataSheet;
+    dataSheet.name = L"Parquet_Data_Preview";
+    if (!leaves.empty() && !footer.rowGroups.empty()) {
+        constexpr size_t kMaxPreviewRows = 500;
+        std::vector<std::wstring> hdrRow;
+        hdrRow.reserve(leaves.size());
+        for (const auto& lc : leaves) hdrRow.push_back(PathUtils::Utf8ToWide(lc.fullPath));
+        dataSheet.maxCols = hdrRow.size();
+        dataSheet.rows.push_back(std::move(hdrRow));
+
+        std::vector<std::vector<std::wstring>> colData(leaves.size());
+        size_t maxDecodedRows = 0;
+        const auto& rg0 = footer.rowGroups[0];
+        std::vector<uint8_t> chunkBuf;
+
+        for (size_t c = 0; c < leaves.size() && c < rg0.columns.size(); ++c) {
+            const auto& cm = rg0.columns[c];
+            if (!cm.valid || cm.numValues <= 0) continue;
+            uint64_t startOff = static_cast<uint64_t>((cm.dictionaryPageOffset >= 4 && cm.dictionaryPageOffset < cm.dataPageOffset)
+                ? cm.dictionaryPageOffset : cm.dataPageOffset);
+            uint64_t endOff = footerStart;
+            if (cm.totalCompressedSize > 0) {
+                endOff = std::min<uint64_t>(footerStart, startOff + static_cast<uint64_t>(cm.totalCompressedSize));
+            }
+            size_t readLen = static_cast<size_t>(std::min<uint64_t>(endOff - startOff, 16ULL * 1024ULL * 1024ULL));
+            const uint8_t* ptr = readChunkSlice(startOff, readLen, chunkBuf);
+            if (!ptr) return false;
+            if (!DecodeColumnPreviewSlice(ptr, readLen, startOff, leaves[c], cm, kMaxPreviewRows, colData[c])) {
+                return false; // Corrupt page payload or truncated compressed page!
+            }
+            if (colData[c].size() > maxDecodedRows) maxDecodedRows = colData[c].size();
+        }
+
+        if (rg0.numRows > 0 && !rg0.columns.empty() && maxDecodedRows == 0) {
+            return false;
+        }
+
+        for (size_t r = 0; r < maxDecodedRows; ++r) {
+            std::vector<std::wstring> row(leaves.size());
+            for (size_t c = 0; c < leaves.size(); ++c) {
+                if (r < colData[c].size()) row[c] = std::move(colData[c][r]);
+            }
+            dataSheet.rows.push_back(std::move(row));
+        }
+    }
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"Apache Parquet Columnar (" +
+        (footer.createdBy.empty() ? std::wstring(L".parquet") : PathUtils::Utf8ToWide(footer.createdBy)) + L")";
+    out.sheets.push_back(std::move(schemaSheet));
+    if (dataSheet.rows.size() >= 2) {
+        out.sheets.push_back(std::move(dataSheet));
+    }
+    out.valid = true;
+    return true;
+}
+
+inline bool ParseLegacyPar1TokenContainer(const uint8_t* data, size_t size, ParsedOfficeDocument& out) {
+    if (size < 12 || size > 65536) return false;
     bool allValidIdentOrNul = true;
     std::vector<std::string> tokens;
     std::string cur;
-    for (size_t i = 4; i < raw.size() - 8; ++i) {
-        uint8_t b = raw[i];
+    for (size_t i = 4; i < size - 8; ++i) {
+        uint8_t b = data[i];
         if (b == 0) {
             if (!cur.empty()) { tokens.push_back(std::move(cur)); cur.clear(); }
         } else if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
@@ -1120,9 +1534,7 @@ inline bool ParseApacheParquet(const std::vector<uint8_t>& raw, ParsedOfficeDocu
         }
     }
     if (!cur.empty()) tokens.push_back(std::move(cur));
-    if (!allValidIdentOrNul || tokens.size() < 2) {
-        return false;
-    }
+    if (!allValidIdentOrNul || tokens.size() < 2) return false;
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
@@ -1141,6 +1553,68 @@ inline bool ParseApacheParquet(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     out.sheets.push_back(std::move(sheet));
     out.valid = true;
     return true;
+}
+
+} // namespace ParquetDetail
+
+inline bool ParseApacheParquet(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
+    if (raw.size() < 12 || std::memcmp(raw.data(), "PAR1", 4) != 0 ||
+        std::memcmp(raw.data() + raw.size() - 4, "PAR1", 4) != 0) {
+        return false;
+    }
+
+    uint32_t footerLen = ParquetDetail::RdU32LE(raw.data() + raw.size() - 8);
+    if (footerLen == 0 || static_cast<uint64_t>(footerLen) + 12ULL > raw.size()) {
+        return false;
+    }
+    size_t footerStart = raw.size() - 8 - footerLen;
+
+    ParquetDetail::ParquetFooter footer;
+    if (ParquetDetail::ParseFileMetaData(raw.data() + footerStart, footerLen, footer)) {
+        auto sliceFn = [&](uint64_t off, size_t len, std::vector<uint8_t>&) -> const uint8_t* {
+            if (off + len > raw.size()) return nullptr;
+            return raw.data() + static_cast<size_t>(off);
+        };
+        return ParquetDetail::BuildParquetDocument(raw.size(), footerStart, footer, sliceFn, out);
+    }
+
+    return ParquetDetail::ParseLegacyPar1TokenContainer(raw.data(), raw.size(), out);
+}
+
+inline bool ParseApacheParquetFile(const std::wstring& fullPath, ParsedOfficeDocument& out) {
+    ParquetDetail::WinParquetRandomFile rf;
+    if (!rf.Open(fullPath) || rf.fileSize < 12) return false;
+
+    // Fast path for files <= 16 MB: read once into RAM
+    if (rf.fileSize <= 16ULL * 1024ULL * 1024ULL) {
+        std::vector<uint8_t> raw(static_cast<size_t>(rf.fileSize));
+        if (!rf.ReadAt(0, raw.data(), raw.size())) return false;
+        return ParseApacheParquet(raw, out);
+    }
+
+    // Large >16 MB (including >32 MB / multi-GB) random-access path
+    uint8_t head4[4] = {};
+    uint8_t tail8[8] = {};
+    if (!rf.ReadAt(0, head4, 4) || !rf.ReadAt(rf.fileSize - 8, tail8, 8)) return false;
+    if (std::memcmp(head4, "PAR1", 4) != 0 || std::memcmp(tail8 + 4, "PAR1", 4) != 0) return false;
+
+    uint32_t footerLen = ParquetDetail::RdU32LE(tail8);
+    if (footerLen == 0 || footerLen > 64u * 1024u * 1024u || static_cast<uint64_t>(footerLen) + 12ULL > rf.fileSize) {
+        return false;
+    }
+    uint64_t footerStart = rf.fileSize - 8ULL - footerLen;
+    std::vector<uint8_t> footerBuf(footerLen);
+    if (!rf.ReadAt(footerStart, footerBuf.data(), footerLen)) return false;
+
+    ParquetDetail::ParquetFooter footer;
+    if (!ParquetDetail::ParseFileMetaData(footerBuf.data(), footerBuf.size(), footer)) return false;
+
+    auto sliceFn = [&](uint64_t off, size_t len, std::vector<uint8_t>& scratch) -> const uint8_t* {
+        scratch.resize(len);
+        if (!rf.ReadAt(off, scratch.data(), len)) return nullptr;
+        return scratch.data();
+    };
+    return ParquetDetail::BuildParquetDocument(rf.fileSize, footerStart, footer, sliceFn, out);
 }
 
 } // namespace Formats

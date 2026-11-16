@@ -1930,6 +1930,381 @@ void RunFormatTestsDocsB(TestCounter& tc) {
             kGarbage);
     }
 
+    // 8. Stage 15 Deep Decoders: Apple iWork (.pages/.numbers), RTF (.rtf), Classic PCAP (.pcap),
+    //    Standard MIDI (.mid), BitTorrent (.torrent), and Windows ETW Trace (.etl)
+    {
+        auto writeTempAndInspect = [&](const std::wstring& fileName, const std::vector<uint8_t>& bytes, ParsedOfficeDocument& outDoc) -> bool {
+            std::wstring p = dir + L"\\" + fileName;
+            PathUtils::WriteFileBytes(p, bytes.data(), bytes.size());
+            bool ok = SpreadsheetDocViewer::InspectOfficeFile(p, outDoc) && outDoc.valid;
+            DeleteFileW(p.c_str());
+            return ok;
+        };
+
+        // 8A. Apple iWork '13+ (.pages & .numbers) with real Snappy LZ77 backreference compression + TSP::ArchiveInfo Protobuf
+        auto snappyCompressWithBackref = [](const std::vector<uint8_t>& plain, size_t backrefPos, size_t backrefDist, size_t backrefLen) {
+            ByteBuf sn;
+            sn.Uleb(plain.size());
+            auto emitLiteral = [&](const uint8_t* ptr, size_t len) {
+                if (len == 0) return;
+                const uint32_t lm1 = static_cast<uint32_t>(len - 1);
+                if (lm1 < 60u) {
+                    sn.U8(static_cast<uint8_t>(lm1 << 2));
+                } else {
+                    sn.U8(static_cast<uint8_t>(60u << 2));
+                    sn.U8(static_cast<uint8_t>(lm1 & 0xFFu));
+                }
+                sn.Bytes(ptr, len);
+            };
+            if (backrefLen >= 4 && backrefLen <= 11 && backrefDist > 0 && backrefDist <= backrefPos && backrefPos + backrefLen <= plain.size()) {
+                emitLiteral(plain.data(), backrefPos);
+                // Snappy Copy-1 tag: tagType=1, len-4 in bits 2..4, offset[8..10] in bits 5..7 + offset[0..7]
+                const uint8_t tag = static_cast<uint8_t>(0x01u | (((backrefLen - 4u) & 0x07u) << 2) | (((backrefDist >> 8) & 0x07u) << 5));
+                sn.U8(tag);
+                sn.U8(static_cast<uint8_t>(backrefDist & 0xFFu));
+                emitLiteral(plain.data() + backrefPos + backrefLen, plain.size() - (backrefPos + backrefLen));
+            } else {
+                emitLiteral(plain.data(), plain.size());
+            }
+
+            // Frame inside .iwa chunk: [0xFF][6,0,0]"sNaPpY" + [0x00][u24_le len][snappy block]
+            ByteBuf iwa;
+            iwa.U8(0xFFu); iwa.U8(6); iwa.U8(0); iwa.U8(0); iwa.Str("sNaPpY");
+            const uint32_t cLen = static_cast<uint32_t>(sn.b.size());
+            iwa.U8(0x00u);
+            iwa.U8(static_cast<uint8_t>(cLen & 0xFFu));
+            iwa.U8(static_cast<uint8_t>((cLen >> 8) & 0xFFu));
+            iwa.U8(static_cast<uint8_t>((cLen >> 16) & 0xFFu));
+            iwa.Bytes(sn.b.data(), sn.b.size());
+            return iwa.b;
+        };
+
+        auto makeIwaArchiveStream = [](uint32_t msgType, const std::vector<uint8_t>& msgPayload) {
+            ByteBuf mi; // TSP::MessageInfo { 1: type, 3: length }
+            mi.U8((1u << 3) | 0u); mi.Uleb(msgType);
+            mi.U8((3u << 3) | 0u); mi.Uleb(msgPayload.size());
+
+            ByteBuf ai; // TSP::ArchiveInfo { 1: identifier=42, 2: message_infos }
+            ai.U8((1u << 3) | 0u); ai.Uleb(42);
+            ai.U8((2u << 3) | 2u); ai.Uleb(mi.b.size()); ai.Bytes(mi.b.data(), mi.b.size());
+
+            ByteBuf stream;
+            stream.Uleb(ai.b.size());
+            stream.Bytes(ai.b.data(), ai.b.size());
+            stream.Bytes(msgPayload.data(), msgPayload.size());
+            return stream.b;
+        };
+
+        // Pages TSWP::StorageArchive (type 2001): field 3 = "KeynoteVision_2026_KeynoteVision"
+        // Compress second "KeynoteVision" (10 bytes "KeynoteVis") as an LZ77 backreference so raw ASCII scan CANNOT find the full string!
+        std::string pagesBody = "KeynoteVision_2026_KeynoteVision";
+        ByteBuf pagesMsg;
+        pagesMsg.U8((3u << 3) | 2u); pagesMsg.Uleb(pagesBody.size()); pagesMsg.Str(pagesBody);
+        auto pagesRawStream = makeIwaArchiveStream(2001u, pagesMsg.b);
+        size_t secondOcc = std::string_view(reinterpret_cast<const char*>(pagesRawStream.data()), pagesRawStream.size()).rfind("KeynoteVision");
+        auto pagesIwa = snappyCompressWithBackref(pagesRawStream, secondOcc, 19, 10);
+        std::string pagesIwaStr(reinterpret_cast<const char*>(pagesIwa.data()), pagesIwa.size());
+        auto pagesZip = BuildStoredZipSingle("Index/Document.iwa", pagesIwaStr);
+
+        // Numbers TST::TableDataList (type 6005): field 3 = ListEntry { 1: key=1, 3: string="Quarterly_EBITDA" }, { 1: key=2, 6: double=9420.5 }
+        ByteBuf ent1;
+        ent1.U8((1u << 3) | 0u); ent1.Uleb(1);
+        ent1.U8((3u << 3) | 2u); ent1.Uleb(16); ent1.Str("Quarterly_EBITDA");
+        ByteBuf ent2;
+        ent2.U8((1u << 3) | 0u); ent2.Uleb(2);
+        ent2.U8((6u << 3) | 1u);
+        double numVal = 9420.5;
+        uint64_t numBits = 0; std::memcpy(&numBits, &numVal, 8);
+        ent2.U64LE(numBits);
+        ByteBuf numMsg;
+        numMsg.U8((3u << 3) | 2u); numMsg.Uleb(ent1.b.size()); numMsg.Bytes(ent1.b.data(), ent1.b.size());
+        numMsg.U8((3u << 3) | 2u); numMsg.Uleb(ent2.b.size()); numMsg.Bytes(ent2.b.data(), ent2.b.size());
+        auto numRawStream = makeIwaArchiveStream(6005u, numMsg.b);
+        auto numIwa = snappyCompressWithBackref(numRawStream, 0, 0, 0);
+        std::string numIwaStr(reinterpret_cast<const char*>(numIwa.data()), numIwa.size());
+        auto numZip = BuildStoredZipSingle("Index/Tables/DataList.iwa", numIwaStr);
+
+        // Anti-cheat negative test: plain ZIP renamed to .pages without any .iwa or iWork '09 index.xml must fail!
+        auto plainNonIworkZip = BuildStoredZipSingle("notes/hello.txt", "Not an Apple Pages document");
+
+        ParsedOfficeDocument pgDoc, nmDoc, badPgDoc;
+        bool okPages   = writeTempAndInspect(L"spec_test.pages", pagesZip, pgDoc);
+        bool okNumbers = writeTempAndInspect(L"spec_test.numbers", numZip, nmDoc);
+        bool badPgFail = !writeTempAndInspect(L"plain_zip_cheat.pages", plainNonIworkZip, badPgDoc);
+        tc.Record(okPages && okNumbers && badPgFail &&
+                  DocContainsToken(pgDoc, L"KeynoteVision_2026_KeynoteVision") &&
+                  DocContainsToken(nmDoc, L"Quarterly_EBITDA") &&
+                  DocContainsToken(nmDoc, L"9420.5"),
+            L"DocsB .pages/.numbers (iWork Snappy LZ77 .iwa + TSP Protobuf & Plain-ZIP Reject)");
+
+        // 8B. Rich Text Format (.rtf) — Control-Word State Stack, CP1250 + FontTbl fcharset204, UTF-16 Surrogates, Destination Skip & Tables
+        std::string rtfGood =
+            "{\\rtf1\\ansi\\ansicpg1250\\uc2"
+            "{\\fonttbl{\\f0\\fswiss\\fcharset238 Helvetica;}{\\f1\\froman\\fcharset204 Times New Roman;}}"
+            "{\\colortbl;\\red255\\green0\\blue0;}"
+            "{\\*\\generator HiddenGeneratorNoise;}"
+            "\\pard\\f0 Central European: \\'af\\'f3\\'b3\\'e6\\par\n"
+            "{\\f1 Cyrillic: \\'cc\\'e8\\'f0}\\par\n"
+            "Emoji Rocket: \\u-10179??\\u-8576?? Ready\\par\n"
+            "{\\field{\\*\\fldinst HYPERLINK \"https://hidden.secret.url\"}{\\fldrslt VisibleFieldLabel}}\\par\n"
+            "\\trowd\\cellx2000\\cellx4000\\intbl SensorA\\cell 99.4 K\\cell\\row\n"
+            "}";
+        std::string rtfNotRtf = "Plain text pretending to be RTF without header";
+        ParsedOfficeDocument rtfDoc, rtfBadDoc;
+        bool okRtf = writeTempAndInspect(L"rich_cp1250.rtf", std::vector<uint8_t>(rtfGood.begin(), rtfGood.end()), rtfDoc);
+        bool badRtfFail = !writeTempAndInspect(L"not_rtf.rtf", std::vector<uint8_t>(rtfNotRtf.begin(), rtfNotRtf.end()), rtfBadDoc);
+        tc.Record(okRtf && badRtfFail &&
+                  DocContainsToken(rtfDoc, L"\x017B\x00F3\x0142\x0107") && // "Żółć" decoded via Windows-1250
+                  DocContainsToken(rtfDoc, L"\x041C\x0438\x0440") &&         // "Мир" decoded via \f1 \fcharset204 (Windows-1251)!
+                  DocContainsToken(rtfDoc, L"VisibleFieldLabel") &&
+                  !DocContainsToken(rtfDoc, L"Helvetica") &&
+                  !DocContainsToken(rtfDoc, L"HiddenGeneratorNoise") &&
+                  !DocContainsToken(rtfDoc, L"hidden.secret.url") &&
+                  DocContainsToken(rtfDoc, L"SensorA | 99.4 K"),
+            L"DocsB .rtf (State Stack, CP1250, Surrogate Pairs, Destination Skip & Tables)");
+
+        // 8C. Classic libpcap (.pcap) — Full L2-L7 Dissector (Ethernet + IPv4 + TCP HTTP & UDP DNS)
+        auto makeClassicPcap = [](bool dnsFrame) {
+            ByteBuf p;
+            p.U32LE(0xA1B2C3D4u); // classic microsecond LE magic
+            p.U16LE(2); p.U16LE(4);
+            p.U32LE(0); p.U32LE(0);
+            p.U32LE(65535);
+            p.U32LE(1); // LINKTYPE_ETHERNET = 1
+
+            ByteBuf frm;
+            frm.Bytes("\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xAA\xBB\x08\x00", 14);
+            if (!dnsFrame) {
+                std::string http = "GET /v1/telemetry HTTP/1.1\r\nHost: edge.local\r\n\r\n";
+                uint16_t ipLen = static_cast<uint16_t>(20 + 20 + http.size());
+                frm.U8(0x45); frm.U8(0); frm.U16BE(ipLen);
+                frm.U16BE(10); frm.U16BE(0);
+                frm.U8(64); frm.U8(6); frm.U16BE(0);
+                frm.Bytes("\x0A\x01\x02\x03\x0A\x09\x08\x07", 8);
+                frm.U16BE(49152); frm.U16BE(80);
+                frm.U32BE(100); frm.U32BE(200);
+                frm.U8(0x50); frm.U8(0x18); // PSH+ACK
+                frm.U16BE(4096); frm.U16BE(0); frm.U16BE(0);
+                frm.Str(http);
+            } else {
+                ByteBuf dns;
+                dns.U16BE(0xCAFEu); dns.U16BE(0x0100u);
+                dns.U16BE(1); dns.U16BE(0); dns.U16BE(0); dns.U16BE(0);
+                dns.U8(9); dns.Str("telemetry");
+                dns.U8(4); dns.Str("corp");
+                dns.U8(5); dns.Str("local");
+                dns.U8(0);
+                dns.U16BE(1); dns.U16BE(1);
+                uint16_t udpLen = static_cast<uint16_t>(8 + dns.b.size());
+                uint16_t ipLen  = static_cast<uint16_t>(20 + udpLen);
+                frm.U8(0x45); frm.U8(0); frm.U16BE(ipLen);
+                frm.U16BE(11); frm.U16BE(0);
+                frm.U8(64); frm.U8(17); frm.U16BE(0);
+                frm.Bytes("\xC0\xA8\x0A\x05\x01\x01\x01\x01", 8);
+                frm.U16BE(55111); frm.U16BE(53);
+                frm.U16BE(udpLen); frm.U16BE(0);
+                frm.Bytes(dns.b.data(), dns.b.size());
+            }
+            p.U32LE(1700000123u); p.U32LE(456789u);
+            p.U32LE(static_cast<uint32_t>(frm.b.size()));
+            p.U32LE(static_cast<uint32_t>(frm.b.size()));
+            p.Bytes(frm.b.data(), frm.b.size());
+            return p.b;
+        };
+        VerifyPairAndCorrupt(tc, dir, L"DocsB .pcap (Classic libpcap L2-L7 HTTP & DNS Dissector)", L".pcap",
+            makeClassicPcap(false), L"/v1/telemetry",
+            makeClassicPcap(true), L"telemetry.corp.local",
+            kGarbage);
+
+        // 8D. Standard MIDI (.mid) — Format 1 Multi-Track VLQ, Running Status, Tempo Map & Note-Pair Durations
+        {
+            ByteBuf trk0; // Conductor track: Name="Conductor", Set Tempo 500000 us/qn (120 BPM), TimeSig 4/4, EoT
+            trk0.U8(0); trk0.U8(0xFF); trk0.U8(0x03); trk0.U8(9); trk0.Str("Conductor");
+            trk0.U8(0); trk0.U8(0xFF); trk0.U8(0x51); trk0.U8(3); trk0.U8(0x07); trk0.U8(0xA1); trk0.U8(0x20); // 500,000 us/qn = 120 BPM
+            trk0.U8(0); trk0.U8(0xFF); trk0.U8(0x58); trk0.U8(4); trk0.U8(4); trk0.U8(2); trk0.U8(24); trk0.U8(8);
+            trk0.U8(0); trk0.U8(0xFF); trk0.U8(0x2F); trk0.U8(0);
+
+            ByteBuf trk1; // Lead track: Name="Solo Violin", Program 40 (Violin), Running-Status NoteOn/NoteOff pairs!
+            trk1.U8(0); trk1.U8(0xFF); trk1.U8(0x03); trk1.U8(11); trk1.Str("Solo Violin");
+            trk1.U8(0); trk1.U8(0xC0); trk1.U8(40); // Program Change Ch1 -> 40 ("Violin")
+            trk1.U8(0); trk1.U8(0x90); trk1.U8(60); trk1.U8(105); // Note On C4 vel=105 at tick 0
+            trk1.EncInt(480); trk1.U8(60); trk1.U8(0);            // RUNNING STATUS NoteOn vel=0 (NoteOff C4) at tick 480 (0.5000 s)!
+            trk1.U8(0); trk1.U8(67); trk1.U8(98);                 // RUNNING STATUS NoteOn G4 vel=98 at tick 480
+            trk1.EncInt(960); trk1.U8(67); trk1.U8(0);            // RUNNING STATUS NoteOff G4 at tick 1440 (duration = 1.0000 s, 960 ticks)!
+            trk1.U8(0); trk1.U8(0xFF); trk1.U8(0x2F); trk1.U8(0);
+
+            ByteBuf mid;
+            mid.Str("MThd"); mid.U32BE(6); mid.U16BE(1); mid.U16BE(2); mid.U16BE(480);
+            mid.Str("MTrk"); mid.U32BE(static_cast<uint32_t>(trk0.b.size())); mid.Bytes(trk0.b.data(), trk0.b.size());
+            mid.Str("MTrk"); mid.U32BE(static_cast<uint32_t>(trk1.b.size())); mid.Bytes(trk1.b.data(), trk1.b.size());
+
+            // Anti-cheat negative tests: (1) raw 0x90 bytes without MThd, (2) orphan data byte before any status byte in MTrk
+            std::vector<uint8_t> raw90Cheat = { 0x90, 0x3C, 0x64, 0x90, 0x40, 0x64, 0x90, 0x43, 0x64, 0x00, 0xFF, 0x2F, 0x00, 0x00 };
+            ByteBuf badRunStatus;
+            badRunStatus.Str("MThd"); badRunStatus.U32BE(6); badRunStatus.U16BE(0); badRunStatus.U16BE(1); badRunStatus.U16BE(480);
+            badRunStatus.Str("MTrk"); badRunStatus.U32BE(4); badRunStatus.U8(0); badRunStatus.U8(60); badRunStatus.U8(100); badRunStatus.U8(0);
+
+            ParsedOfficeDocument midDoc, midBad1, midBad2;
+            bool okMid = writeTempAndInspect(L"concerto_fmt1.mid", mid.b, midDoc);
+            bool badMid1 = !writeTempAndInspect(L"raw90_cheat.mid", raw90Cheat, midBad1);
+            bool badMid2 = !writeTempAndInspect(L"orphan_running.mid", badRunStatus.b, midBad2);
+            tc.Record(okMid && badMid1 && badMid2 &&
+                      DocContainsToken(midDoc, L"Solo Violin") &&
+                      DocContainsToken(midDoc, L"Violin") &&
+                      DocContainsToken(midDoc, L"120.00 BPM") &&
+                      DocContainsToken(midDoc, L"C4 (60)") &&
+                      DocContainsToken(midDoc, L"G4 (67)") &&
+                      DocContainsToken(midDoc, L"0.5000 s (480 ticks)") &&
+                      DocContainsToken(midDoc, L"1.0000 s (960 ticks)"),
+                L"DocsB .mid (SMF VLQ, Running Status, Tempo Map, GM Instruments & Note Durations)");
+        }
+
+        // 8E. BitTorrent (.torrent) — Recursive Bencode, CNG SHA-1 info_hash Invariant, Magnet URI & Multi-File Manifest
+        {
+            auto bencStr = [](std::string_view s) {
+                return std::to_string(s.size()) + ":" + std::string(s);
+            };
+            std::string pieces20(20, '\x5A');
+            std::string infoMulti =
+                "d"
+                "5:filesl"
+                    "d6:lengthi4096e4:pathl" + bencStr("src") + bencStr("engine.cpp") + "ee"
+                    "d6:lengthi1024e4:pathl" + bencStr("README.md") + "ee"
+                "e"
+                "4:name" + bencStr("Explorer2_SDK") +
+                "12:piece lengthi262144e"
+                "6:pieces" + bencStr(pieces20) +
+                "e";
+
+            std::string torrentA =
+                "d"
+                "8:announce" + bencStr("https://tracker.opentrackr.org:1337/announce") +
+                "7:comment" + bencStr("Release Build A") +
+                "13:creation datei1735689600e"
+                "4:info" + infoMulti +
+                "e";
+            // Torrent B has a DIFFERENT outer "comment" but the EXACT SAME "info" dictionary -> SHA-1 info_hash MUST be identical!
+            std::string torrentSameInfoDiffComment =
+                "d"
+                "8:announce" + bencStr("https://tracker.opentrackr.org:1337/announce") +
+                "7:comment" + bencStr("Mirror Re-seed Comment Changed") +
+                "4:info" + infoMulti +
+                "e";
+
+            std::string badNoInfo = "d8:announce15:http://t.local/7:comment4:nonee";
+            std::string badLeadZeroInt = "d4:infod6:lengthi03e4:name4:bad112:piece lengthi512e6:pieces" + bencStr(pieces20) + "ee";
+
+            auto extractInfoHash = [](const ParsedOfficeDocument& doc) -> std::wstring {
+                for (const auto& s : doc.sheets) {
+                    for (const auto& r : s.rows) {
+                        if (r.size() >= 2 && r[0] == L"Info Hash (SHA-1)") return r[1];
+                    }
+                }
+                return L"";
+            };
+
+            ParsedOfficeDocument torDocA, torDocB, torBad1, torBad2;
+            bool okTorA = writeTempAndInspect(L"sdk_a.torrent", std::vector<uint8_t>(torrentA.begin(), torrentA.end()), torDocA);
+            bool okTorB = writeTempAndInspect(L"sdk_b.torrent", std::vector<uint8_t>(torrentSameInfoDiffComment.begin(), torrentSameInfoDiffComment.end()), torDocB);
+            bool badTor1 = !writeTempAndInspect(L"no_info.torrent", std::vector<uint8_t>(badNoInfo.begin(), badNoInfo.end()), torBad1);
+            bool badTor2 = !writeTempAndInspect(L"bad_benc.torrent", std::vector<uint8_t>(badLeadZeroInt.begin(), badLeadZeroInt.end()), torBad2);
+            std::wstring hashA = extractInfoHash(torDocA);
+            std::wstring hashB = extractInfoHash(torDocB);
+
+            tc.Record(okTorA && okTorB && badTor1 && badTor2 &&
+                      hashA.size() == 40 && hashA == hashB &&
+                      DocContainsToken(torDocA, L"magnet:?xt=urn:btih:" + hashA) &&
+                      DocContainsToken(torDocA, L"src/engine.cpp") &&
+                      DocContainsToken(torDocA, L"README.md") &&
+                      DocContainsToken(torDocA, L"2025-01-01"),
+                L"DocsB .torrent (Recursive Bencode, SHA-1 info_hash Invariant, Magnet & Multi-File)");
+        }
+
+        // 8F. Windows Event Trace Log (.etl) — WMI_BUFFER_HEADER + TRACE_LOGFILE_HEADER + 64-bit EVENT_HEADER
+        {
+            ByteBuf etl;
+            etl.Zeros(4096);
+
+            // Record 0 @ offset 72: Classic EVENT_TRACE_HEADER (48B) + 64-bit TRACE_LOGFILE_HEADER + UTF-16LE LoggerName & LogFileName
+            ByteBuf logHdrPayload;
+            logHdrPayload.Zeros(280); // 248 (tailBase for 64-bit ptrSz=8) + 32 = 280B before strings
+            PutU32LE(logHdrPayload.b.data() + 0, 4096);
+            logHdrPayload.b[4] = 10; // MajorVersion = 10
+            logHdrPayload.b[5] = 0;  // MinorVersion = 0
+            PutU32LE(logHdrPayload.b.data() + 8,  22631); // Build 22631
+            PutU32LE(logHdrPayload.b.data() + 12, 16);    // 16 Logical Processors
+            PutU32LE(logHdrPayload.b.data() + 36, 1);     // BuffersWritten = 1
+            PutU32LE(logHdrPayload.b.data() + 44, 8);     // PointerSize = 8 (64-bit)
+            PutU32LE(logHdrPayload.b.data() + 52, 3800);  // CpuSpeedInMHz = 3800
+            logHdrPayload.Utf16LE(L"NT Kernel Logger", true);
+            logHdrPayload.Utf16LE(L"C:\\PerfLogs\\BootTrace.etl", true);
+            while ((logHdrPayload.b.size() & 7u) != 0) logHdrPayload.U8(0);
+
+            const uint16_t rec0Size = static_cast<uint16_t>(48u + logHdrPayload.b.size());
+            uint8_t* r0 = etl.b.data() + 72;
+            PutU16LE(r0 + 0, rec0Size);
+            r0[2] = 0x00u; // EVENT_TRACE_HEADER
+            r0[3] = 0xC0u; // TRACE_HEADER_FLAG | TRACE_HEADER_EVENT_TRACE
+            r0[4] = 0x00u; // EVENT_TRACE_TYPE_INFO (logfile header)
+            r0[5] = 4;
+            PutU32LE(r0 + 8,  100); // TID
+            PutU32LE(r0 + 12, 4);   // PID = System(4)
+            // TimeStamp = 2025-01-01 00:00:00 UTC FILETIME (133801632000000000)
+            PutU32LE(r0 + 16, static_cast<uint32_t>(133801632000000000ULL & 0xFFFFFFFFULL));
+            PutU32LE(r0 + 20, static_cast<uint32_t>(133801632000000000ULL >> 32));
+            std::memcpy(r0 + 48, logHdrPayload.b.data(), logHdrPayload.b.size());
+
+            // Record 1 @ 72 + rec0Size: 64-bit Vista+ EVENT_HEADER (80B + 16B payload = 96B)
+            const size_t r1Off = 72u + rec0Size;
+            const uint16_t rec1Size = 96u;
+            uint8_t* r1 = etl.b.data() + r1Off;
+            PutU16LE(r1 + 0, rec1Size);
+            r1[2] = 0x13u; // 64-bit EVENT_HEADER
+            r1[3] = 0xC0u; // MarkerFlags = 0xC0
+            PutU32LE(r1 + 8,  7412); // ThreadId = 7412
+            PutU32LE(r1 + 12, 3180); // ProcessId = 3180
+            PutU32LE(r1 + 16, static_cast<uint32_t>(133801632050000000ULL & 0xFFFFFFFFULL));
+            PutU32LE(r1 + 20, static_cast<uint32_t>(133801632050000000ULL >> 32));
+            // ProviderId = {22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716} (Microsoft-Windows-Kernel-Process)
+            PutU32LE(r1 + 24, 0x22FB2CD6u);
+            PutU16LE(r1 + 28, 0x0E7Bu);
+            PutU16LE(r1 + 30, 0x422Bu);
+            const uint8_t provTail[8] = { 0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16 };
+            std::memcpy(r1 + 32, provTail, 8);
+            PutU16LE(r1 + 40, 42); // EventDescriptor.Id = 42
+            r1[44] = 4;            // Level = 4 (Info)
+            r1[45] = 1;            // Opcode = 1 (Start)
+
+            const uint32_t validEnd = static_cast<uint32_t>(r1Off + rec1Size);
+            PutU32LE(etl.b.data() + 0,  4096);     // WMI_BUFFER_HEADER.BufferSize = 4096
+            PutU32LE(etl.b.data() + 4,  validEnd); // SavedOffset
+            PutU32LE(etl.b.data() + 48, validEnd); // Offset
+
+            // Anti-cheat negative test: 4096-byte buffer starting with uint32_t(4096) + raw UTF-16LE strings at 72 WITHOUT 0xC0 ETW markers!
+            ByteBuf etlFakeScrape;
+            etlFakeScrape.Zeros(4096);
+            PutU32LE(etlFakeScrape.b.data() + 0, 4096);
+            PutU32LE(etlFakeScrape.b.data() + 4, 512);
+            PutU32LE(etlFakeScrape.b.data() + 48, 512);
+            const wchar_t* fakeStr = L"ScrapedFakeLoggerString_ShouldBeRejected";
+            for (size_t i = 0; fakeStr[i] != 0; ++i) {
+                PutU16LE(etlFakeScrape.b.data() + 72 + i * 2, static_cast<uint16_t>(fakeStr[i]));
+            }
+
+            ParsedOfficeDocument etlDoc, etlFakeDoc;
+            bool okEtl = writeTempAndInspect(L"boot_kernel.etl", etl.b, etlDoc);
+            bool fakeEtlRejected = !writeTempAndInspect(L"scraped_cheat.etl", etlFakeScrape.b, etlFakeDoc);
+            tc.Record(okEtl && fakeEtlRejected &&
+                      DocContainsToken(etlDoc, L"NT Kernel Logger") &&
+                      DocContainsToken(etlDoc, L"BootTrace.etl") &&
+                      DocContainsToken(etlDoc, L"3800 MHz") &&
+                      DocContainsToken(etlDoc, L"22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716") &&
+                      DocContainsToken(etlDoc, L"7412") &&
+                      DocContainsToken(etlDoc, L"3180"),
+                L"DocsB .etl (WMI_BUFFER_HEADER, TRACE_LOGFILE_HEADER, 64-bit EVENT_HEADER & Cheat Reject)");
+        }
+    }
+
     RemoveDirectoryW(dir.c_str());
 }
 

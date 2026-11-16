@@ -4,6 +4,93 @@ static bool ParseAutoCadDxf(std::string_view txt, ParsedEdaBoard& out) {
     out.kind = EdaDocKind::AutoCadDxf;
     out.formatTitle = L"AutoCAD Drawing Exchange (.dxf)";
 
+    // Convert Binary DXF ("AutoCAD Binary DXF\r\n\x1A\x00") into normalized ASCII group-pair lines if needed
+    std::string convertedBinTxt;
+    if (txt.size() >= 24 && std::memcmp(txt.data(), "AutoCAD Binary DXF\r\n\x1A\x00", 22) == 0) {
+        out.formatTitle = L"AutoCAD Binary Drawing Exchange (.dxf)";
+        const auto* d = reinterpret_cast<const uint8_t*>(txt.data());
+        const size_t sz = txt.size();
+        const bool twoB = (d[22] == 0u && d[23] == 0u);
+        size_t bp = 22u;
+        char numBuf[64];
+        while (bp < sz && convertedBinTxt.size() < 64 * 1024 * 1024) {
+            int gc = 0;
+            if (twoB) {
+                if (bp + 2u > sz) break;
+                int16_t s = 0; std::memcpy(&s, d + bp, 2); gc = s; bp += 2u;
+            } else {
+                uint8_t b = d[bp++];
+                if (b == 0xFFu) {
+                    if (bp + 2u > sz) return false;
+                    int16_t s = 0; std::memcpy(&s, d + bp, 2); gc = s; bp += 2u;
+                } else {
+                    gc = b;
+                }
+            }
+            if (gc < 0) return false;
+            snprintf(numBuf, sizeof(numBuf), "%d\n", gc);
+            convertedBinTxt += numBuf;
+            auto isStr = [](int c) {
+                return (c <= 9) || c == 100 || c == 102 || c == 105 || (c >= 300 && c <= 309) ||
+                       (c >= 320 && c <= 369) || (c >= 390 && c <= 399) || (c >= 410 && c <= 419) ||
+                       (c >= 430 && c <= 439) || (c >= 470 && c <= 481) || c == 999 ||
+                       (c >= 1000 && c <= 1003) || (c >= 1005 && c <= 1009);
+            };
+            auto isDbl = [](int c) {
+                return (c >= 10 && c <= 59) || (c >= 110 && c <= 149) || (c >= 210 && c <= 239) ||
+                       (c >= 460 && c <= 469) || (c >= 1010 && c <= 1059);
+            };
+            auto isI16 = [](int c) {
+                return (c >= 60 && c <= 79) || (c >= 170 && c <= 179) || (c >= 270 && c <= 289) ||
+                       (c >= 370 && c <= 389) || (c >= 400 && c <= 409) || (c >= 1060 && c <= 1070);
+            };
+            auto isI32 = [](int c) { return (c >= 90 && c <= 99) || (c >= 420 && c <= 429) || (c >= 440 && c <= 459) || c == 1071; };
+            if (isStr(gc)) {
+                size_t se = bp;
+                while (se < sz && d[se] != 0u) ++se;
+                if (se >= sz) return false;
+                std::string_view svStr(reinterpret_cast<const char*>(d + bp), se - bp);
+                convertedBinTxt.append(svStr.data(), svStr.size());
+                convertedBinTxt.push_back('\n');
+                bp = se + 1u;
+                if (gc == 0 && svStr == "EOF") break;
+            } else if (isDbl(gc)) {
+                if (bp + 8u > sz) return false;
+                double dv = 0.0; std::memcpy(&dv, d + bp, 8); bp += 8u;
+                snprintf(numBuf, sizeof(numBuf), "%.8g\n", dv);
+                convertedBinTxt += numBuf;
+            } else if (isI16(gc)) {
+                if (bp + 2u > sz) return false;
+                int16_t iv = 0; std::memcpy(&iv, d + bp, 2); bp += 2u;
+                snprintf(numBuf, sizeof(numBuf), "%d\n", static_cast<int>(iv));
+                convertedBinTxt += numBuf;
+            } else if (isI32(gc)) {
+                if (bp + 4u > sz) return false;
+                int32_t iv = 0; std::memcpy(&iv, d + bp, 4); bp += 4u;
+                snprintf(numBuf, sizeof(numBuf), "%d\n", iv);
+                convertedBinTxt += numBuf;
+            } else if (gc >= 160 && gc <= 169) {
+                if (bp + 8u > sz) return false;
+                int64_t iv = 0; std::memcpy(&iv, d + bp, 8); bp += 8u;
+                snprintf(numBuf, sizeof(numBuf), "%lld\n", static_cast<long long>(iv));
+                convertedBinTxt += numBuf;
+            } else if (gc >= 290 && gc <= 299) {
+                if (bp + 1u > sz) return false;
+                snprintf(numBuf, sizeof(numBuf), "%u\n", static_cast<unsigned>(d[bp++]));
+                convertedBinTxt += numBuf;
+            } else if ((gc >= 310 && gc <= 319) || gc == 1004) {
+                if (bp + 1u > sz) return false;
+                uint8_t cl = d[bp++];
+                if (bp + cl > sz) return false;
+                bp += cl;
+                convertedBinTxt += "\n";
+            } else {
+                return false;
+            }
+        }
+        txt = convertedBinTxt;
+    }
+
     std::vector<std::string_view> lines;
     lines.reserve(4096);
     size_t pos = 0;

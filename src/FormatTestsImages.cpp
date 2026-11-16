@@ -1,5 +1,6 @@
 // FormatTestsImages.cpp: self-tests of the image decoders (ImageFormatLoader, formats/), stage 15 ("15.images" runs these alone)
 #include "SelfTestCommon.h"
+#include "Types.h"
 #include "ImageFormatLoader.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
@@ -533,13 +534,22 @@ std::vector<uint8_t> BuildKtx2Fixture(bool zlibRgba8) {
 }
 
 uint16_t ComputeBasisCrc16(const uint8_t* ptr, size_t len) {
-    uint32_t crc = 0xFFFFu;
+    static constexpr std::array<uint16_t, 256> kTable = []() constexpr {
+        std::array<uint16_t, 256> t{};
+        for (uint32_t i = 0; i < 256u; ++i) {
+            uint16_t v = static_cast<uint16_t>(i << 8);
+            for (int b = 0; b < 8; ++b) {
+                v = (v & 0x8000u) ? static_cast<uint16_t>((v << 1) ^ 0x1021u) : static_cast<uint16_t>(v << 1);
+            }
+            t[i] = v;
+        }
+        return t;
+    }();
+    uint16_t crc = 0xFFFFu;
     for (size_t i = 0; i < len; ++i) {
-        uint32_t x = ((crc >> 8) ^ ptr[i]) & 0xFFu;
-        x ^= (x >> 4);
-        crc = ((crc << 8) ^ (x << 12) ^ (x << 5) ^ x) & 0xFFFFu;
+        crc = static_cast<uint16_t>((crc << 8) ^ kTable[((crc >> 8) ^ ptr[i]) & 0xFFu]);
     }
-    return static_cast<uint16_t>(~crc & 0xFFFFu);
+    return static_cast<uint16_t>(~crc);
 }
 
 struct TestLsbBitWriter {
@@ -2441,7 +2451,8 @@ void RunFormatTestsImages(TestCounter& tc) {
         bool rejOk = !ImageFormatLoader::DecodeImageMemory(badCrcBasis.data(), badCrcBasis.size(), L".basis", 0, rejInfo) &&
                      !ImageFormatLoader::DecodeImageMemory(badMode19Basis.data(), badMode19Basis.size(), L".basis", 0, rejInfo) &&
                      !ImageFormatLoader::DecodeImageMemory(fakeEtc1s.data(), fakeEtc1s.size(), L".basis", 0, rejInfo);
-        tc.Record(uOk && eOk && pxExact && rejOk, L"Stage15.Images.BasisUniversal_Etc1sAndRejectCorrupt");
+        tc.Record(uOk && eOk && pxExact && rejOk, L"Stage15.Images.BasisUniversal_Etc1sAndRejectCorrupt",
+                  L"ETC1S 8x8 + UASTC exact texels + CRC16/Mode19/codebook-less reject");
     }
 
     // 9. PowerVR Texture (.pvr): PVRTC 4bpp bilinear modulation vs DXT1
@@ -3181,6 +3192,639 @@ void RunFormatTestsImages(TestCounter& tc) {
                       !ImageFormatLoader::DecodeImageMemory(badVerAbr.data(), badVerAbr.size(), L".abr", 0, badAbr);
         tc.Record(abrRej, L"Stage15.Images.PhotoshopAbr_RejectComputedOnlyNoCircles");
     }
+
+    // 21. GIMP XCF (.xcf) — v011 64-bit Zlib vs RLE, PROP_COLORMAP Indexed, 16-bit Precision + Mask + Group, Corrupt Reject
+    {
+        auto pushU64BE = [](std::vector<uint8_t>& b, uint64_t v) {
+            PushU32BE(b, static_cast<uint32_t>(v >> 32));
+            PushU32BE(b, static_cast<uint32_t>(v & 0xFFFFFFFFull));
+        };
+        auto encodeXcfRleTile = [](const std::vector<uint8_t>& interleaved, size_t numPixels, uint32_t bpp) {
+            std::vector<uint8_t> out;
+            for (uint32_t ch = 0; ch < bpp; ++ch) {
+                // Emit literal chunks of up to 64 bytes (opcode = 256 - len, 192..255)
+                size_t px = 0;
+                while (px < numPixels) {
+                    size_t chunk = std::min<size_t>(64u, numPixels - px);
+                    out.push_back(static_cast<uint8_t>(256u - chunk));
+                    for (size_t k = 0; k < chunk; ++k) {
+                        out.push_back(interleaved[(px + k) * bpp + ch]);
+                    }
+                    px += chunk;
+                }
+            }
+            return out;
+        };
+
+        auto buildSingleLayerXcf = [&](bool v11Zlib, int patternVariant) -> std::vector<uint8_t> {
+            const uint32_t w = 8, h = 8, bpp = 4;
+            std::vector<uint8_t> rawTile(w * h * bpp);
+            for (uint32_t y = 0; y < h; ++y) {
+                for (uint32_t x = 0; x < w; ++x) {
+                    size_t idx = (y * w + x) * 4u;
+                    if (patternVariant == 0) {
+                        rawTile[idx + 0] = static_cast<uint8_t>(30 + x * 28);
+                        rawTile[idx + 1] = static_cast<uint8_t>(200 - y * 20);
+                        rawTile[idx + 2] = static_cast<uint8_t>((x ^ y) * 30 + 15);
+                        rawTile[idx + 3] = 255u;
+                    } else {
+                        rawTile[idx + 0] = static_cast<uint8_t>(240 - x * 25);
+                        rawTile[idx + 1] = static_cast<uint8_t>(40 + y * 25);
+                        rawTile[idx + 2] = 180u;
+                        rawTile[idx + 3] = 255u;
+                    }
+                }
+            }
+
+            std::vector<uint8_t> compTile = v11Zlib
+                ? CompressZlibFixed(rawTile)
+                : encodeXcfRleTile(rawTile, w * h, bpp);
+
+            std::vector<uint8_t> xcf;
+            if (v11Zlib) {
+                const char hdr[14] = { 'g','i','m','p',' ','x','c','f',' ','v','0','1','1','\0' };
+                xcf.insert(xcf.end(), hdr, hdr + 14);
+                PushU32BE(xcf, w);
+                PushU32BE(xcf, h);
+                PushU32BE(xcf, 0u);   // baseType = RGB
+                PushU32BE(xcf, 150u); // precision = 8-bit sRGB
+                PushU32BE(xcf, 17u); PushU32BE(xcf, 1u); xcf.push_back(2u); // PROP_COMPRESSION = 2 (Zlib)
+                PushU32BE(xcf, 0u);  PushU32BE(xcf, 0u);                    // PROP_END
+
+                size_t layerPtrPos = xcf.size();
+                pushU64BE(xcf, 0ull); // layer[0] offset placeholder
+                pushU64BE(xcf, 0ull); // end of layers
+
+                uint64_t layerOff = xcf.size();
+                PushU32BE(xcf, w); PushU32BE(xcf, h);
+                PushU32BE(xcf, 1u); // RGBA
+                PushU32BE(xcf, 5u); xcf.insert(xcf.end(), { 'Z','l','i','b','\0' });
+                PushU32BE(xcf, 0u); PushU32BE(xcf, 0u); // layer PROP_END
+
+                size_t hierPtrPos = xcf.size();
+                pushU64BE(xcf, 0ull); // hierPtr placeholder
+                pushU64BE(xcf, 0ull); // maskPtr = 0
+
+                uint64_t hierOff = xcf.size();
+                PushU32BE(xcf, w); PushU32BE(xcf, h); PushU32BE(xcf, bpp);
+                size_t lvlPtrPos = xcf.size();
+                pushU64BE(xcf, 0ull); // level0 placeholder
+                pushU64BE(xcf, 0ull); // end levels
+
+                uint64_t lvlOff = xcf.size();
+                PushU32BE(xcf, w); PushU32BE(xcf, h);
+                size_t tilePtrPos = xcf.size();
+                pushU64BE(xcf, 0ull); // tile0 placeholder
+                pushU64BE(xcf, 0ull); // end tiles
+
+                uint64_t tileOff = xcf.size();
+                xcf.insert(xcf.end(), compTile.begin(), compTile.end());
+
+                auto patch64 = [&](size_t at, uint64_t val) {
+                    for (int b = 0; b < 8; ++b) xcf[at + b] = static_cast<uint8_t>((val >> ((7 - b) * 8)) & 0xFFull);
+                };
+                patch64(layerPtrPos, layerOff);
+                patch64(hierPtrPos,  hierOff);
+                patch64(lvlPtrPos,   lvlOff);
+                patch64(tilePtrPos,  tileOff);
+            } else {
+                const char hdr[14] = { 'g','i','m','p',' ','x','c','f',' ','v','0','0','3','\0' };
+                xcf.insert(xcf.end(), hdr, hdr + 14);
+                PushU32BE(xcf, w);
+                PushU32BE(xcf, h);
+                PushU32BE(xcf, 0u);
+                PushU32BE(xcf, 17u); PushU32BE(xcf, 1u); xcf.push_back(1u); // PROP_COMPRESSION = 1 (RLE)
+                PushU32BE(xcf, 0u);  PushU32BE(xcf, 0u);
+
+                size_t layerPtrPos = xcf.size();
+                PushU32BE(xcf, 0u);
+                PushU32BE(xcf, 0u);
+
+                uint32_t layerOff = static_cast<uint32_t>(xcf.size());
+                PushU32BE(xcf, w); PushU32BE(xcf, h);
+                PushU32BE(xcf, 1u);
+                PushU32BE(xcf, 4u); xcf.insert(xcf.end(), { 'R','L','E','\0' });
+                PushU32BE(xcf, 0u); PushU32BE(xcf, 0u);
+
+                size_t hierPtrPos = xcf.size();
+                PushU32BE(xcf, 0u);
+                PushU32BE(xcf, 0u);
+
+                uint32_t hierOff = static_cast<uint32_t>(xcf.size());
+                PushU32BE(xcf, w); PushU32BE(xcf, h); PushU32BE(xcf, bpp);
+                size_t lvlPtrPos = xcf.size();
+                PushU32BE(xcf, 0u);
+                PushU32BE(xcf, 0u);
+
+                uint32_t lvlOff = static_cast<uint32_t>(xcf.size());
+                PushU32BE(xcf, w); PushU32BE(xcf, h);
+                size_t tilePtrPos = xcf.size();
+                PushU32BE(xcf, 0u);
+                PushU32BE(xcf, 0u);
+
+                uint32_t tileOff = static_cast<uint32_t>(xcf.size());
+                xcf.insert(xcf.end(), compTile.begin(), compTile.end());
+
+                auto patch32 = [&](size_t at, uint32_t val) {
+                    xcf[at + 0] = static_cast<uint8_t>((val >> 24) & 0xFFu);
+                    xcf[at + 1] = static_cast<uint8_t>((val >> 16) & 0xFFu);
+                    xcf[at + 2] = static_cast<uint8_t>((val >> 8)  & 0xFFu);
+                    xcf[at + 3] = static_cast<uint8_t>(val & 0xFFu);
+                };
+                patch32(layerPtrPos, layerOff);
+                patch32(hierPtrPos,  hierOff);
+                patch32(lvlPtrPos,   lvlOff);
+                patch32(tilePtrPos,  tileOff);
+            }
+            return xcf;
+        };
+
+        std::vector<uint8_t> xcfZlibA = buildSingleLayerXcf(true, 0);
+        std::vector<uint8_t> xcfRleA  = buildSingleLayerXcf(false, 0);
+        std::vector<uint8_t> xcfZlibB = buildSingleLayerXcf(true, 1);
+
+        verifyPair(L"Stage15.Images.GimpXcf_V11Zlib64BitPair",
+                   L"zlib_a.xcf", xcfZlibA, L"zlib_b.xcf", xcfZlibB, L".xcf", 40);
+
+        ExtendedImageInfo zInfo, rInfo;
+        bool zrOk = ImageFormatLoader::DecodeImageMemory(xcfZlibA.data(), xcfZlibA.size(), L".xcf", 0, zInfo) &&
+                    ImageFormatLoader::DecodeImageMemory(xcfRleA.data(),  xcfRleA.size(),  L".xcf", 0, rInfo) &&
+                    zInfo.width == 8 && rInfo.width == 8 &&
+                    zInfo.bgraPixels == rInfo.bgraPixels &&
+                    zInfo.bgraPixels[2] == 30 && zInfo.bgraPixels[1] == 200 && zInfo.bgraPixels[0] == 15;
+        tc.Record(zrOk, L"Stage15.Images.GimpXcf_V11Zlib64BitMatchesRleExact");
+
+        // Indexed XCF with PROP_COLORMAP (4 entries) + 16-bit Precision=250 XCF with Layer Mask & Group Folder Skip
+        std::vector<uint8_t> xcfIdx;
+        {
+            const char hdr[14] = { 'g','i','m','p',' ','x','c','f',' ','v','0','0','3','\0' };
+            xcfIdx.insert(xcfIdx.end(), hdr, hdr + 14);
+            PushU32BE(xcfIdx, 4u); PushU32BE(xcfIdx, 4u); PushU32BE(xcfIdx, 2u); // baseType = 2 (Indexed)
+            // PROP_COLORMAP (1): 4 colors
+            PushU32BE(xcfIdx, 1u); PushU32BE(xcfIdx, 4u + 12u);
+            PushU32BE(xcfIdx, 4u);
+            xcfIdx.insert(xcfIdx.end(), {
+                240, 20, 30,   // idx 0: Red
+                20, 220, 50,   // idx 1: Green
+                30, 60, 250,   // idx 2: Blue
+                250, 210, 10   // idx 3: Gold
+            });
+            PushU32BE(xcfIdx, 17u); PushU32BE(xcfIdx, 1u); xcfIdx.push_back(0u); // COMPRESSION_NONE
+            PushU32BE(xcfIdx, 0u);  PushU32BE(xcfIdx, 0u);
+
+            size_t lpPos = xcfIdx.size();
+            PushU32BE(xcfIdx, 0u); PushU32BE(xcfIdx, 0u);
+            uint32_t lOff = static_cast<uint32_t>(xcfIdx.size());
+            PushU32BE(xcfIdx, 4u); PushU32BE(xcfIdx, 4u);
+            PushU32BE(xcfIdx, 4u); // ltype = 4 (Indexed)
+            PushU32BE(xcfIdx, 4u); xcfIdx.insert(xcfIdx.end(), { 'P','a','l','\0' });
+            PushU32BE(xcfIdx, 0u); PushU32BE(xcfIdx, 0u);
+            size_t hpPos = xcfIdx.size();
+            PushU32BE(xcfIdx, 0u); PushU32BE(xcfIdx, 0u);
+            uint32_t hOff = static_cast<uint32_t>(xcfIdx.size());
+            PushU32BE(xcfIdx, 4u); PushU32BE(xcfIdx, 4u); PushU32BE(xcfIdx, 1u); // bpp = 1
+            size_t lvpPos = xcfIdx.size();
+            PushU32BE(xcfIdx, 0u); PushU32BE(xcfIdx, 0u);
+            uint32_t lvOff = static_cast<uint32_t>(xcfIdx.size());
+            PushU32BE(xcfIdx, 4u); PushU32BE(xcfIdx, 4u);
+            size_t tpPos = xcfIdx.size();
+            PushU32BE(xcfIdx, 0u); PushU32BE(xcfIdx, 0u);
+            uint32_t tOff = static_cast<uint32_t>(xcfIdx.size());
+            for (int i = 0; i < 16; ++i) xcfIdx.push_back(static_cast<uint8_t>(i & 3));
+
+            auto patch32 = [&](size_t at, uint32_t val) {
+                xcfIdx[at + 0] = static_cast<uint8_t>((val >> 24) & 0xFFu);
+                xcfIdx[at + 1] = static_cast<uint8_t>((val >> 16) & 0xFFu);
+                xcfIdx[at + 2] = static_cast<uint8_t>((val >> 8)  & 0xFFu);
+                xcfIdx[at + 3] = static_cast<uint8_t>(val & 0xFFu);
+            };
+            patch32(lpPos, lOff); patch32(hpPos, hOff); patch32(lvpPos, lvOff); patch32(tpPos, tOff);
+        }
+
+        // 16-bit Precision=250 v011 XCF with a Group Folder layer (PROP_GROUP_ITEM=29, must be skipped)
+        // + a 16-bit RGBA leaf layer (bpp=8) with an active 16-bit Layer Mask (left=0xFFFF, right=0x0000)
+        std::vector<uint8_t> xcf16;
+        {
+            const char hdr[14] = { 'g','i','m','p',' ','x','c','f',' ','v','0','1','1','\0' };
+            xcf16.insert(xcf16.end(), hdr, hdr + 14);
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u);
+            PushU32BE(xcf16, 0u);   // RGB
+            PushU32BE(xcf16, 250u); // Precision = 16-bit non-linear integer (2 bytes/comp -> RGBA bpp=8)
+            PushU32BE(xcf16, 17u); PushU32BE(xcf16, 1u); xcf16.push_back(2u); // Zlib
+            PushU32BE(xcf16, 0u);  PushU32BE(xcf16, 0u);
+
+            auto patch64 = [&](size_t at, uint64_t val) {
+                for (int b = 0; b < 8; ++b) xcf16[at + b] = static_cast<uint8_t>((val >> ((7 - b) * 8)) & 0xFFull);
+            };
+
+            size_t l0PtrPos = xcf16.size(); pushU64BE(xcf16, 0ull); // Group folder layer (top)
+            size_t l1PtrPos = xcf16.size(); pushU64BE(xcf16, 0ull); // Leaf 16-bit layer (bottom)
+            pushU64BE(xcf16, 0ull);
+
+            // Group folder layer filled with pure green (if not skipped, would overwrite leaf with green!)
+            uint64_t grpOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u); PushU32BE(xcf16, 1u);
+            PushU32BE(xcf16, 4u); xcf16.insert(xcf16.end(), { 'G','r','p','\0' });
+            PushU32BE(xcf16, 29u); PushU32BE(xcf16, 0u); // PROP_GROUP_ITEM = 29
+            PushU32BE(xcf16, 0u);  PushU32BE(xcf16, 0u);
+            size_t grpHierPtr = xcf16.size(); pushU64BE(xcf16, 0ull); pushU64BE(xcf16, 0ull);
+            uint64_t grpHierOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u); PushU32BE(xcf16, 8u);
+            size_t grpLvlPtr = xcf16.size(); pushU64BE(xcf16, 0ull); pushU64BE(xcf16, 0ull);
+            uint64_t grpLvlOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u);
+            size_t grpTilePtr = xcf16.size(); pushU64BE(xcf16, 0ull); pushU64BE(xcf16, 0ull);
+            std::vector<uint8_t> grpRaw;
+            for (int i = 0; i < 16; ++i) {
+                PushU16BE(grpRaw, 0u); PushU16BE(grpRaw, 65535u); PushU16BE(grpRaw, 0u); PushU16BE(grpRaw, 65535u);
+            }
+            std::vector<uint8_t> grpZ = CompressZlibFixed(grpRaw);
+            uint64_t grpTileOff = xcf16.size();
+            xcf16.insert(xcf16.end(), grpZ.begin(), grpZ.end());
+            patch64(grpHierPtr, grpHierOff); patch64(grpLvlPtr, grpLvlOff); patch64(grpTilePtr, grpTileOff);
+
+            // Leaf 16-bit RGBA layer (R=0xC8C8=200, G=0x3232=50, B=0xFAFA=250, A=0xFFFF=255) + 16-bit Mask
+            uint64_t leafOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u); PushU32BE(xcf16, 1u);
+            PushU32BE(xcf16, 5u); xcf16.insert(xcf16.end(), { 'L','e','a','f','\0' });
+            PushU32BE(xcf16, 7u); PushU32BE(xcf16, 4u); PushU32BE(xcf16, 1u); // PROP_APPLY_MASK = 1
+            PushU32BE(xcf16, 0u); PushU32BE(xcf16, 0u);
+            size_t leafHierPtr = xcf16.size(); pushU64BE(xcf16, 0ull);
+            size_t leafMaskPtr = xcf16.size(); pushU64BE(xcf16, 0ull);
+
+            uint64_t leafHierOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u); PushU32BE(xcf16, 8u); // bpp = 8 (4 * u16 BE)
+            size_t leafLvlPtr = xcf16.size(); pushU64BE(xcf16, 0ull); pushU64BE(xcf16, 0ull);
+            uint64_t leafLvlOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u);
+            size_t leafTilePtr = xcf16.size(); pushU64BE(xcf16, 0ull); pushU64BE(xcf16, 0ull);
+            std::vector<uint8_t> leafRaw;
+            for (int i = 0; i < 16; ++i) {
+                PushU16BE(leafRaw, 0xC8C8u); PushU16BE(leafRaw, 0x3232u); PushU16BE(leafRaw, 0xFAFAu); PushU16BE(leafRaw, 0xFFFFu);
+            }
+            std::vector<uint8_t> leafZ = CompressZlibFixed(leafRaw);
+            uint64_t leafTileOff = xcf16.size();
+            xcf16.insert(xcf16.end(), leafZ.begin(), leafZ.end());
+
+            // Mask channel (w=4, h=4, name="M\0", PROP_END, maskHierPtr -> bpp=2: left 2 cols=0xFFFF, right 2 cols=0x0000)
+            uint64_t maskOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u);
+            PushU32BE(xcf16, 2u); xcf16.insert(xcf16.end(), { 'M','\0' });
+            PushU32BE(xcf16, 0u); PushU32BE(xcf16, 0u);
+            size_t mHierPtr = xcf16.size(); pushU64BE(xcf16, 0ull);
+            uint64_t mHierOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u); PushU32BE(xcf16, 2u); // bpp = 2 (1 * u16 BE)
+            size_t mLvlPtr = xcf16.size(); pushU64BE(xcf16, 0ull); pushU64BE(xcf16, 0ull);
+            uint64_t mLvlOff = xcf16.size();
+            PushU32BE(xcf16, 4u); PushU32BE(xcf16, 4u);
+            size_t mTilePtr = xcf16.size(); pushU64BE(xcf16, 0ull); pushU64BE(xcf16, 0ull);
+            std::vector<uint8_t> mRaw;
+            for (int y = 0; y < 4; ++y) {
+                for (int x = 0; x < 4; ++x) PushU16BE(mRaw, (x < 2) ? 0xFFFFu : 0x0000u);
+            }
+            std::vector<uint8_t> mZ = CompressZlibFixed(mRaw);
+            uint64_t mTileOff = xcf16.size();
+            xcf16.insert(xcf16.end(), mZ.begin(), mZ.end());
+
+            patch64(l0PtrPos, grpOff);
+            patch64(l1PtrPos, leafOff);
+            patch64(leafHierPtr, leafHierOff); patch64(leafLvlPtr, leafLvlOff); patch64(leafTilePtr, leafTileOff);
+            patch64(leafMaskPtr, maskOff);
+            patch64(mHierPtr, mHierOff); patch64(mLvlPtr, mLvlOff); patch64(mTilePtr, mTileOff);
+        }
+
+        ExtendedImageInfo idxInfo, hi16Info;
+        bool idxAnd16Ok =
+            ImageFormatLoader::DecodeImageMemory(xcfIdx.data(), xcfIdx.size(), L".xcf", 0, idxInfo) &&
+            ImageFormatLoader::DecodeImageMemory(xcf16.data(),  xcf16.size(),  L".xcf", 0, hi16Info) &&
+            idxInfo.bgraPixels.size() == 64 &&
+            // Pixel 0 -> idx 0 (240, 20, 30), Pixel 1 -> idx 1 (20, 220, 50), Pixel 2 -> idx 2 (30, 60, 250)
+            idxInfo.bgraPixels[2] == 240 && idxInfo.bgraPixels[1] == 20 && idxInfo.bgraPixels[0] == 30 &&
+            idxInfo.bgraPixels[6] == 20  && idxInfo.bgraPixels[5] == 220 && idxInfo.bgraPixels[4] == 50 &&
+            idxInfo.bgraPixels[10] == 30 && idxInfo.bgraPixels[9] == 60 && idxInfo.bgraPixels[8] == 250 &&
+            hi16Info.bitsPerChannel == 16 &&
+            // Left half (x=0,y=0): opaque (200, 50, 250, 255) — NOT overwritten by green group projection!
+            hi16Info.bgraPixels[2] == 200 && hi16Info.bgraPixels[1] == 50 && hi16Info.bgraPixels[0] == 250 && hi16Info.bgraPixels[3] == 255 &&
+            // Right half (x=3,y=0): masked out to alpha == 0!
+            hi16Info.bgraPixels[3 * 4 + 3] == 0;
+        tc.Record(idxAnd16Ok, L"Stage15.Images.GimpXcf_IndexedColormapAnd16BitMaskGroup");
+
+        // Corrupt Zlib tile & truncated RLE tile MUST return false (never a blank canvas!)
+        std::vector<uint8_t> corruptZlibXcf = xcfZlibA;
+        corruptZlibXcf[corruptZlibXcf.size() - 6] ^= 0xFFu;
+        corruptZlibXcf[corruptZlibXcf.size() - 5] ^= 0xAAu;
+        std::vector<uint8_t> corruptRleXcf(xcfRleA.begin(), xcfRleA.end() - 20);
+        ExtendedImageInfo badXcf1, badXcf2;
+        bool xcfRejOk = !ImageFormatLoader::DecodeImageMemory(corruptZlibXcf.data(), corruptZlibXcf.size(), L".xcf", 0, badXcf1) &&
+                        !badXcf1.valid &&
+                        !ImageFormatLoader::DecodeImageMemory(corruptRleXcf.data(), corruptRleXcf.size(), L".xcf", 0, badXcf2) &&
+                        !badXcf2.valid;
+        tc.Record(xcfRejOk, L"Stage15.Images.GimpXcf_RejectCorruptTilesNoBlankCanvas");
+    }
+
+    // 22. SMPTE 268M DPX (.dpx) & Kodak Cineon (.cin) — 8-bit RGBA, 10-bit Method A vs B, 16-bit BE, Cineon Log, Truncated Reject
+    {
+        auto buildDpxHeader = [&](bool littleEndian, uint32_t w, uint32_t h, uint8_t desc, uint8_t transfer,
+                                  uint8_t bitSize, uint16_t packing, uint16_t encoding) -> std::vector<uint8_t>
+        {
+            std::vector<uint8_t> d(2048, 0);
+            std::memcpy(d.data(), littleEndian ? "XPDS" : "SDPX", 4);
+            auto wr16 = [&](size_t off, uint16_t v) {
+                if (littleEndian) { d[off] = v & 0xFFu; d[off + 1] = (v >> 8) & 0xFFu; }
+                else              { d[off] = (v >> 8) & 0xFFu; d[off + 1] = v & 0xFFu; }
+            };
+            auto wr32 = [&](size_t off, uint32_t v) {
+                if (littleEndian) {
+                    d[off] = v & 0xFFu; d[off + 1] = (v >> 8) & 0xFFu;
+                    d[off + 2] = (v >> 16) & 0xFFu; d[off + 3] = (v >> 24) & 0xFFu;
+                } else {
+                    d[off] = (v >> 24) & 0xFFu; d[off + 1] = (v >> 16) & 0xFFu;
+                    d[off + 2] = (v >> 8) & 0xFFu;  d[off + 3] = v & 0xFFu;
+                }
+            };
+            wr32(4, 2048u);    // dataOff = 2048
+            wr16(768, 0u);     // orientation = 0
+            wr16(770, 1u);     // numElements = 1
+            wr32(772, w);
+            wr32(776, h);
+            wr32(780, 0u);     // dataSign = 0 (unsigned)
+            d[800] = desc;
+            d[801] = transfer;
+            d[803] = bitSize;
+            wr16(804, packing);
+            wr16(806, encoding);
+            wr32(808, 2048u);  // elemDataOff = 2048
+            return d;
+        };
+
+        // 8-bit RGBA DPX (descriptor=51, bitSize=8) vs 16-bit BE RGB DPX (descriptor=50, bitSize=16)
+        std::vector<uint8_t> dpx8Rgba = buildDpxHeader(false, 4, 4, 51, 2, 8, 0, 0);
+        for (int i = 0; i < 16; ++i) {
+            dpx8Rgba.push_back(static_cast<uint8_t>(200 - i * 5)); // R
+            dpx8Rgba.push_back(static_cast<uint8_t>(40 + i * 10)); // G
+            dpx8Rgba.push_back(90u);                               // B
+            dpx8Rgba.push_back((i == 0) ? 255u : 128u);            // A
+        }
+
+        std::vector<uint8_t> dpx16Be = buildDpxHeader(false, 4, 4, 50, 2, 16, 0, 0);
+        for (int i = 0; i < 16; ++i) {
+            PushU16BE(dpx16Be, 0xF0F0u); // R ~ 240
+            PushU16BE(dpx16Be, 0x5050u); // G ~ 80
+            PushU16BE(dpx16Be, 0x2020u); // B ~ 32
+        }
+
+        verifyPair(L"Stage15.Images.SmpteDpx_8BitRgbaAnd16BitBE",
+                   L"rgba8.dpx", dpx8Rgba, L"rgb16be.dpx", dpx16Be, L".dpx", 2052);
+
+        // 10-bit Method A (packing=1: [R:31..22][G:21..12][B:11..2]) vs Method B (packing=2: [R:29..20][G:19..10][B:9..0])
+        std::vector<uint8_t> dpx10A = buildDpxHeader(false, 4, 4, 50, 2, 10, 1, 0);
+        std::vector<uint8_t> dpx10B = buildDpxHeader(false, 4, 4, 50, 2, 10, 2, 0);
+        const uint32_t r10 = 1023u, g10 = 512u, b10 = 128u;
+        for (int i = 0; i < 16; ++i) {
+            PushU32BE(dpx10A, (r10 << 22) | (g10 << 12) | (b10 << 2));
+            PushU32BE(dpx10B, (r10 << 20) | (g10 << 10) | b10);
+        }
+        // Also test SMPTE 268M RLE (encoding=1) on 10-bit Method A: 1 repeat run of 16 pixels (count=16 -> (16<<1)|0 = 32)
+        std::vector<uint8_t> dpx10Rle = buildDpxHeader(false, 4, 4, 50, 2, 10, 1, 1);
+        PushU32BE(dpx10Rle, (16u << 1) | 0u);
+        PushU32BE(dpx10Rle, (r10 << 22) | (g10 << 12) | (b10 << 2));
+
+        ExtendedImageInfo i8, i16, i10A, i10B, i10Rle;
+        bool dpxModesOk =
+            ImageFormatLoader::DecodeImageMemory(dpx8Rgba.data(), dpx8Rgba.size(), L".dpx", 0, i8) &&
+            ImageFormatLoader::DecodeImageMemory(dpx16Be.data(),  dpx16Be.size(),  L".dpx", 0, i16) &&
+            ImageFormatLoader::DecodeImageMemory(dpx10A.data(),   dpx10A.size(),   L".dpx", 0, i10A) &&
+            ImageFormatLoader::DecodeImageMemory(dpx10B.data(),   dpx10B.size(),   L".dpx", 0, i10B) &&
+            ImageFormatLoader::DecodeImageMemory(dpx10Rle.data(), dpx10Rle.size(), L".dpx", 0, i10Rle) &&
+            i8.bgraPixels[2] == 200 && i8.bgraPixels[1] == 40 && i8.bgraPixels[0] == 90 && i8.bgraPixels[3] == 255 &&
+            std::abs(static_cast<int>(i16.bgraPixels[2]) - 240) <= 1 &&
+            std::abs(static_cast<int>(i16.bgraPixels[1]) - 80)  <= 1 &&
+            std::abs(static_cast<int>(i16.bgraPixels[0]) - 32)  <= 1 &&
+            i10A.bgraPixels == i10B.bgraPixels &&
+            i10A.bgraPixels == i10Rle.bgraPixels &&
+            i10A.bgraPixels[2] == 255 &&
+            std::abs(static_cast<int>(i10A.bgraPixels[1]) - 128) <= 1 &&
+            std::abs(static_cast<int>(i10A.bgraPixels[0]) - 32)  <= 1;
+        tc.Record(dpxModesOk, L"Stage15.Images.SmpteDpx_10BitMethodAVsMethodBAndRleExact");
+
+        // Kodak Cineon (.cin) 10-bit Printing-Density Log (code 95 black -> 0, code 685 white -> 255, code 470 midtone)
+        auto buildCineon = [&](uint32_t c0, uint32_t c1, uint32_t c2) -> std::vector<uint8_t> {
+            std::vector<uint8_t> cin(1024, 0);
+            auto wr32 = [&](size_t off, uint32_t v) {
+                cin[off + 0] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+                cin[off + 1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+                cin[off + 2] = static_cast<uint8_t>((v >> 8)  & 0xFFu);
+                cin[off + 3] = static_cast<uint8_t>(v & 0xFFu);
+            };
+            wr32(0, 0x802A5FD7u); // Kodak Cineon BE magic
+            wr32(4, 1024u);       // dataOff = 1024
+            cin[192] = 0u;        // orientation
+            cin[193] = 3u;        // 3 channels
+            cin[198] = 10u;       // 10 bits/pixel
+            wr32(200, 4u);        // pixelsPerLine = 4
+            wr32(204, 4u);        // linesPerImage = 4
+            cin[681] = 5u;        // 32-bit left-justified Method A
+            cin[713] = 1u;
+            for (int i = 0; i < 16; ++i) {
+                uint32_t code = (i == 0) ? c0 : ((i == 1) ? c1 : c2);
+                PushU32BE(cin, (code << 22) | (code << 12) | (code << 2));
+            }
+            return cin;
+        };
+
+        std::vector<uint8_t> cinA = buildCineon(95u, 685u, 470u);
+        std::vector<uint8_t> cinB = buildCineon(685u, 300u, 150u);
+        verifyPair(L"Stage15.Images.KodakCineon_10BitLogPair",
+                   L"scan_a.cin", cinA, L"scan_b.cin", cinB, L".cin", 1040);
+
+        ExtendedImageInfo cinInfo, truncDpxInfo, truncCinInfo;
+        bool cinLogAndTruncOk =
+            ImageFormatLoader::DecodeImageMemory(cinA.data(), cinA.size(), L".cin", 0, cinInfo) &&
+            cinInfo.bgraPixels[2] <= 2 &&                  // code 95 film black -> ~0
+            cinInfo.bgraPixels[4 + 2] >= 253 &&            // code 685 film white -> ~255
+            cinInfo.bgraPixels[8 + 2] >= 80 && cinInfo.bgraPixels[8 + 2] <= 140 && // code 470 midtone
+            !ImageFormatLoader::DecodeImageMemory(dpx10A.data(), 2048 + 32, L".dpx", 0, truncDpxInfo) &&
+            !ImageFormatLoader::DecodeImageMemory(cinA.data(),   1024 + 32, L".cin", 0, truncCinInfo);
+        tc.Record(cinLogAndTruncOk, L"Stage15.Images.KodakCineon_PrintingDensityLogAndTruncatedReject");
+    }
+
+    // 23. ANSI CP437 Art (.ans) & DEC VT340 Sixel (.sixel) — Box-Drawing, 24-bit TrueColor, SAUCE, VT340 HLS/RGB, Garbage Reject
+    {
+        // Build .ans with 24-bit TrueColor fg (240,120,30) + bg (10,20,40), CP437 box-drawing ┌─┐ (0xDA,0xC4,0xBF) + │ (0xB3),
+        // iCE bright bg via SGR 5, and trailing 128-byte SAUCE00 specifying 40 columns (width = 320) & TFlags = 1
+        std::string ansText =
+            "\x1B[38;2;240;120;30;48;2;10;20;40m\xDA\xC4\xBF\r\n"
+            "\xB3\x1B[5;30;44m*\x1B[25;38;2;240;120;30;48;2;10;20;40m\xB3\r\n"
+            "\xC0\xC4\xD9";
+        std::vector<uint8_t> ansA(ansText.begin(), ansText.end());
+        ansA.push_back(0x1Au); // DOS EOF before SAUCE
+        std::vector<uint8_t> sauce(128, 0);
+        std::memcpy(sauce.data(), "SAUCE00", 7);
+        sauce[94] = 1u; // DataType = Character
+        sauce[95] = 1u; // FileType = ANSi
+        sauce[96] = 40u; sauce[97] = 0u; // TInfo1 = 40 columns -> 320 px width
+        sauce[105] = 1u; // TFlags bit 0 = iCE Colors
+        sauce[106] = 1u;
+        ansA.insert(ansA.end(), sauce.begin(), sauce.end());
+
+        std::string ansTextB = "\x1B[38;5;196;48;5;21m\xDB\xB2\xB1\xB0 ANSI 256 \xDF\xDC\r\n";
+        std::vector<uint8_t> ansB(ansTextB.begin(), ansTextB.end());
+
+        verifyPair(L"Stage15.Images.AnsiArt_Cp437Pair",
+                   L"box_sauce.ans", ansA, L"xterm256.ans", ansB, L".ans", 0);
+
+        ExtendedImageInfo ansInfo;
+        bool ansExactOk = ImageFormatLoader::DecodeImageMemory(ansA.data(), ansA.size(), L".ans", 0, ansInfo) &&
+                          ansInfo.width == 320 && ansInfo.height == 48;
+        if (ansExactOk) {
+            auto pxMatch = [&](uint32_t x, uint32_t y, uint8_t er, uint8_t eg, uint8_t eb) {
+                const uint8_t* p = &ansInfo.bgraPixels[(static_cast<size_t>(y) * ansInfo.width + x) * 4u];
+                return p[2] == er && p[1] == eg && p[0] == eb && p[3] == 255;
+            };
+            // Cell (0,0) = 0xDA '┌': center (3,7) and right boundary (7,7) and bottom boundary (3,15) are fg (240,120,30); (0,0) is bg (10,20,40)
+            // Cell (1,0) = 0xC4 '─': left boundary (8,7) and right boundary (15,7) connect seamlessly in fg (240,120,30)!
+            // Cell (1,1) has SGR 5 + 44m (blue bg=4 -> iCE bright blue kCga16[12] = {85, 85, 255}) at background pixel (8, 16)!
+            ansExactOk = pxMatch(0,  0,  10,  20,  40) &&
+                         pxMatch(3,  7, 240, 120,  30) &&
+                         pxMatch(7,  7, 240, 120,  30) &&
+                         pxMatch(3, 15, 240, 120,  30) &&
+                         pxMatch(8,  7, 240, 120,  30) &&
+                         pxMatch(15, 7, 240, 120,  30) &&
+                         pxMatch(8, 16,  85,  85, 255);
+        }
+        tc.Record(ansExactOk, L"Stage15.Images.AnsiArt_Cp437BoxDrawingTrueColorAndSauceExact");
+
+        // VT340 Sixel with HLS (Blue=0°, Red=120°, Green=240°), RGB (100%, 50%, 0%), and unwritten register #500 (must be {0,0,0}, no hash!)
+        std::string sixA_str =
+            "\x1BP0;0;0q\"1;1;20;6"
+            "#10;1;0;50;100!4~"
+            "#11;1;120;50;100!4~"
+            "#12;1;240;50;100!4~"
+            "#20;2;100;50;0!4~"
+            "#500!4~"
+            "\x1B\\";
+        std::string sixB_str = "\x1BPq\"1;1;12;12#4;2;10;80;90!12~-#5;2;90;20;70!12~\x1B\\";
+        std::vector<uint8_t> sixA(sixA_str.begin(), sixA_str.end());
+        std::vector<uint8_t> sixB(sixB_str.begin(), sixB_str.end());
+
+        verifyPair(L"Stage15.Images.Vt340Sixel_HlsAndRgbPair",
+                   L"hls.sixel", sixA, L"rgb.sixel", sixB, L".sixel", 6);
+
+        ExtendedImageInfo sixInfo;
+        bool sixExactOk = ImageFormatLoader::DecodeImageMemory(sixA.data(), sixA.size(), L".sixel", 0, sixInfo) &&
+                          sixInfo.width == 20 && sixInfo.height == 6;
+        if (sixExactOk) {
+            auto sixPx = [&](uint32_t x, uint8_t er, uint8_t eg, uint8_t eb) {
+                const uint8_t* p = &sixInfo.bgraPixels[(2u * sixInfo.width + x) * 4u];
+                return std::abs(static_cast<int>(p[2]) - er) <= 2 &&
+                       std::abs(static_cast<int>(p[1]) - eg) <= 2 &&
+                       std::abs(static_cast<int>(p[0]) - eb) <= 2;
+            };
+            sixExactOk = sixPx(1,    0,   0, 255) && // #10 HLS 0°   -> Pure Blue
+                         sixPx(5,  255,   0,   0) && // #11 HLS 120° -> Pure Red
+                         sixPx(9,    0, 255,   0) && // #12 HLS 240° -> Pure Green
+                         sixPx(13, 255, 128,   0) && // #20 RGB 100%,50%,0% -> Orange
+                         sixPx(17,   0,   0,   0);   // #500 unwritten -> Black (NO fake hash color!)
+        }
+        tc.Record(sixExactOk, L"Stage15.Images.Vt340Sixel_HlsAndRgbRegistersExactColors");
+
+        // Reject binary NUL garbage & zero-pixel Sixel streams
+        std::vector<uint8_t> nulBin = { 0x00, 0xFF, 0x01, 0x02, 0x00, 0x89, 0x50, 0x4E, 0x00, 0x03, 0x04, 0x00 };
+        std::string emptySixStr = "\x1BPq#1;2;100;0;0\x1B\\";
+        std::vector<uint8_t> emptySix(emptySixStr.begin(), emptySixStr.end());
+        ExtendedImageInfo badAns, badSix1, badSix2;
+        bool rejAnsSix = !ImageFormatLoader::DecodeImageMemory(nulBin.data(), nulBin.size(), L".ans", 0, badAns) &&
+                         !ImageFormatLoader::DecodeImageMemory(nulBin.data(), nulBin.size(), L".sixel", 0, badSix1) &&
+                         !ImageFormatLoader::DecodeImageMemory(emptySix.data(), emptySix.size(), L".sixel", 0, badSix2);
+        tc.Record(rejAnsSix, L"Stage15.Images.AnsiAndSixel_RejectBinaryGarbageAndEmptySixel");
+    }
+
+    // 24. W3C SVG (.svg) — Compact Elliptical Arc Flags & Rotation, <g transform> Stack Pop, <defs> Skip & <linearGradient>/<radialGradient>
+    {
+        auto strToBytes = [](const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); };
+
+        // Minified compact arc flags: "a35,35 0 1050,0" (largeArc=1, sweep=0, dx=50, dy=0)
+        // vs "a35,35 0 0150,0" (largeArc=0, sweep=1, dx=50, dy=0)
+        std::vector<uint8_t> svgArcLarge = strToBytes(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\">"
+            "<path d=\"M39,64a35,35 0 1050,0Z\" fill=\"#ef4444\"/></svg>");
+        std::vector<uint8_t> svgArcSmall = strToBytes(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\">"
+            "<path d=\"M39,64a35,35 0 0150,0Z\" fill=\"#ef4444\"/></svg>");
+        std::vector<uint8_t> svgArcRot0 = strToBytes(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\">"
+            "<path d=\"M24,64 A48,16 0 1,0 104,64 Z\" fill=\"#3b82f6\"/></svg>");
+        std::vector<uint8_t> svgArcRot55 = strToBytes(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\">"
+            "<path d=\"M24,64 A48,16 55 1,0 104,64 Z\" fill=\"#3b82f6\"/></svg>");
+
+        verifyPair(L"Stage15.Images.Svg_CompactEllipticalArcPair",
+                   L"arc_large.svg", svgArcLarge, L"arc_small.svg", svgArcSmall, L".svg", 8);
+
+        ExtendedImageInfo arcLInfo, arcSInfo, arcR0Info, arcR55Info;
+        bool arcOk =
+            ImageFormatLoader::DecodeImageMemory(svgArcLarge.data(), svgArcLarge.size(), L".svg", 128, arcLInfo) &&
+            ImageFormatLoader::DecodeImageMemory(svgArcSmall.data(), svgArcSmall.size(), L".svg", 128, arcSInfo) &&
+            ImageFormatLoader::DecodeImageMemory(svgArcRot0.data(),  svgArcRot0.size(),  L".svg", 128, arcR0Info) &&
+            ImageFormatLoader::DecodeImageMemory(svgArcRot55.data(), svgArcRot55.size(), L".svg", 128, arcR55Info);
+        size_t litLarge = 0, litSmall = 0;
+        if (arcOk) {
+            for (size_t i = 3; i < arcLInfo.bgraPixels.size(); i += 4) if (arcLInfo.bgraPixels[i] > 0) ++litLarge;
+            for (size_t i = 3; i < arcSInfo.bgraPixels.size(); i += 4) if (arcSInfo.bgraPixels[i] > 0) ++litSmall;
+            arcOk = (litLarge > litSmall * 2) &&
+                    (HashBgraBytes(arcR0Info.bgraPixels) != HashBgraBytes(arcR55Info.bgraPixels));
+        }
+        tc.Record(arcOk, L"Stage15.Images.Svg_CompactArcFlagsLargeVsSmallAndRotation");
+
+        // <defs> non-rendering shape skip + <linearGradient> & <radialGradient> url(#id) + nested <g transform> stack pop
+        std::vector<uint8_t> svgGradGroup = strToBytes(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\" fill=\"#102030\">"
+            "  <defs>"
+            "    <linearGradient id=\"linG\" x1=\"0%\" y1=\"0%\" x2=\"100%\" y2=\"0%\">"
+            "      <stop offset=\"0%\" stop-color=\"#ff0000\"/>"
+            "      <stop offset=\"100%\" stop-color=\"#0000ff\"/>"
+            "    </linearGradient>"
+            "    <radialGradient id=\"radG\" cx=\"50%\" cy=\"50%\" r=\"50%\">"
+            "      <stop offset=\"0%\" stop-color=\"#00ff00\"/>"
+            "      <stop offset=\"100%\" stop-color=\"#000000\"/>"
+            "    </radialGradient>"
+            "    <rect x=\"0\" y=\"0\" width=\"128\" height=\"128\" fill=\"#00ff00\"/>"
+            "  </defs>"
+            "  <rect x=\"0\" y=\"0\" width=\"128\" height=\"32\" fill=\"url(#linG)\"/>"
+            "  <circle cx=\"32\" cy=\"64\" r=\"20\" fill=\"url(#radG)\"/>"
+            "  <g transform=\"translate(96, 64) rotate(90)\" fill=\"#facc15\">"
+            "    <rect x=\"-12\" y=\"-6\" width=\"24\" height=\"12\"/>"
+            "  </g>"
+            "  <rect x=\"8\" y=\"96\" width=\"24\" height=\"24\"/>"
+            "</svg>");
+
+        ExtendedImageInfo ggInfo;
+        bool ggOk = ImageFormatLoader::DecodeImageMemory(svgGradGroup.data(), svgGradGroup.size(), L".svg", 128, ggInfo) &&
+                    ggInfo.width == 128 && ggInfo.height == 128;
+        if (ggOk) {
+            auto pxAt = [&](uint32_t x, uint32_t y) -> const uint8_t* {
+                return &ggInfo.bgraPixels[(static_cast<size_t>(y) * 128u + x) * 4u];
+            };
+            const uint8_t* leftG  = pxAt(2, 16);   // Start of linearGradient -> Red (#ff0000)
+            const uint8_t* midG   = pxAt(64, 16);  // Midpoint of linearGradient -> Purple (~128, 0, ~128)
+            const uint8_t* rightG = pxAt(125, 16); // End of linearGradient -> Blue (#0000ff)
+            const uint8_t* radCtr = pxAt(32, 64);  // Center of radialGradient -> Green (#00ff00)
+            const uint8_t* grpPx  = pxAt(96, 72);  // Rotated 90° rect inside <g>: x=[-12..12] became y=[52..76] around (96,64)!
+            const uint8_t* popPx  = pxAt(16, 104); // Sibling rect after </g>: untransformed + root fill #102030!
+            const uint8_t* bgPx   = pxAt(120, 120);// Untouched corner: MUST be alpha=0 (proving <defs> rect was NOT drawn!)
+
+            ggOk = (leftG[2] > 235 && leftG[0] < 20 && leftG[3] == 255) &&
+                   (midG[2] > 100 && midG[2] < 156 && midG[0] > 100 && midG[0] < 156 && midG[1] == 0) &&
+                   (rightG[0] > 235 && rightG[2] < 20 && rightG[3] == 255) &&
+                   (radCtr[1] > 230 && radCtr[2] < 25 && radCtr[0] < 25) &&
+                   (grpPx[2] == 0xFA && grpPx[1] == 0xCC && grpPx[0] == 0x15 && grpPx[3] == 255) &&
+                   (popPx[2] == 0x10 && popPx[1] == 0x20 && popPx[0] == 0x30 && popPx[3] == 255) &&
+                   (bgPx[3] == 0);
+        }
+        tc.Record(ggOk, L"Stage15.Images.Svg_GroupTransformStackDefsSkipAndGradients");
+    }
+
+    RunFormatTestsImagesBatch70(tc);
 }
 
 } // namespace Explorer2::SelfTestSuite

@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<IPC-2581 revision="B" xmlns="http://webstds.ipc.org/2581">
+  <Content roleRef="Owner">
+    <DictionaryLineDesc units="MILLIMETER">
+      <EntryLineDesc id="LD_025"><LineDesc lineEnd="ROUND" lineWidth="0.25"/></EntryLineDesc>
+      <EntryLineDesc id="LD_050"><LineDesc lineEnd="ROUND" lineWidth="0.50"/></EntryLineDesc>
+    </DictionaryLineDesc>
+    <DictionaryStandard units="MILLIMETER">
+      <EntryStandard id="PRIM_RND16"><Circle diameter="1.60"/></EntryStandard>
+      <EntryStandard id="PRIM_SMD_SOIC"><RectRound width="1.55" height="0.60" radius="0.12"/></EntryStandard>
+      <EntryStandard id="PRIM_SMD_0805"><RectCenter width="1.05" height="1.30"/></EntryStandard>
+      <EntryStandard id="PRIM_VIA08"><Circle diameter="0.80"/></EntryStandard>
+    </DictionaryStandard>
+  </Content>
+  <Ecad name="STM32_CAN_Transceiver">
+    <CadHeader units="MILLIMETER"/>
+    <CadData>
+      <Layer name="TOP_COPPER" layerFunction="CONDUCTOR" side="TOP" polarity="POSITIVE"/>
+      <Layer name="GND_PLANE"  layerFunction="PLANE"     side="INTERNAL" polarity="POSITIVE"/>
+      <Layer name="BOT_COPPER" layerFunction="CONDUCTOR" side="BOTTOM" polarity="POSITIVE"/>
+      <Layer name="TOP_SILK"   layerFunction="LEGEND"    side="TOP" polarity="POSITIVE"/>
+      <Step name="PCB_STEP">
+        <PadStackDef name="PS_TH_16_09">
+          <PadstackHoleDef name="H09" diameter="0.90" platingStatus="PLATED" plusTol="0.05" minusTol="0.05"/>
+        </PadStackDef>
+        <PadStackDef name="PS_VIA_08_04">
+          <PadstackHoleDef name="HV04" diameter="0.40" platingStatus="PLATED" plusTol="0.05" minusTol="0.05"/>
+        </PadStackDef>
+        <Package name="SOIC8_NARROW" type="SOIC" pinOne="UPPER_LEFT">
+          <Outline>
+            <Polygon>
+              <PolyBegin x="-2.50" y="-2.00"/>
+              <PolyStepSegment x="2.50" y="-2.00"/>
+              <PolyStepSegment x="2.50" y="2.00"/>
+              <PolyStepSegment x="-2.50" y="2.00"/>
+              <PolyStepSegment x="-2.50" y="-2.00"/>
+            </Polygon>
+          </Outline>
+        </Package>
+        <Package name="CAPC2012X125N" type="CAPACITOR_CHIP">
+          <Outline>
+            <Polygon>
+              <PolyBegin x="-1.10" y="-0.70"/>
+              <PolyStepSegment x="1.10" y="-0.70"/>
+              <PolyStepSegment x="1.10" y="0.70"/>
+              <PolyStepSegment x="-1.10" y="0.70"/>
+              <PolyStepSegment x="-1.10" y="-0.70"/>
+            </Polygon>
+          </Outline>
+        </Package>
+        <Profile>
+          <Polygon>
+            <PolyBegin x="0.0" y="0.0"/>
+            <PolyStepSegment x="36.0" y="0.0"/>
+            <PolyStepSegment x="36.0" y="24.0"/>
+            <PolyStepSegment x="0.0"  y="24.0"/>
+            <PolyStepSegment x="0.0"  y="0.0"/>
+          </Polygon>
+        </Profile>
+        <Component refDes="U1" packageRef="SOIC8_NARROW" part="MCP2562FD" layerRef="TOP_COPPER">
+          <Location x="18.0" y="12.0"/>
+          <Xform rotation="0.0" mirror="false"/>
+        </Component>
+        <Component refDes="C1" packageRef="CAPC2012X125N" part="100nF" layerRef="TOP_COPPER">
+          <Location x="10.5" y="12.0"/>
+          <Xform rotation="90.0" mirror="false"/>
+        </Component>
+        <Component refDes="R1" packageRef="CAPC2012X125N" part="120R" layerRef="BOT_COPPER">
+          <Location x="27.5" y="12.0"/>
+          <Xform rotation="90.0" mirror="true"/>
+        </Component>
+        <LogicalNet name="VCC_5V"/>
+        <LogicalNet name="GND"/>
+        <LogicalNet name="CANH"/>
+        <LogicalNet name="CANL"/>
+        <LayerFeature layerRef="TOP_COPPER">
+          <Set net="VCC_5V">
+            <Pad padstackDefRef="PS_TH_16_09"><Location x="4.0" y="18.0"/><StandardPrimitiveRef id="PRIM_RND16"/><PinRef componentRef="J1" pin="1"/></Pad>
+            <Pad><Location x="15.4" y="13.9"/><StandardPrimitiveRef id="PRIM_SMD_SOIC"/><PinRef componentRef="U1" pin="3"/></Pad>
+            <Pad><Location x="10.5" y="13.0"/><StandardPrimitiveRef id="PRIM_SMD_0805"/><PinRef componentRef="C1" pin="1"/></Pad>
+            <Features><LineDescRef id="LD_050"/><Line startX="4.0" startY="18.0" endX="10.5" endY="13.0"/><Line startX="10.5" startY="13.0" endX="15.4" endY="13.9"/></Features>
+          </Set>
+          <Set net="CANH">
+            <Pad><Location x="20.6" y="13.9"/><StandardPrimitiveRef id="PRIM_SMD_SOIC"/><PinRef componentRef="U1" pin="7"/></Pad>
+            <Features><LineDescRef id="LD_025"/><Line startX="20.6" startY="13.9" endX="27.5" endY="13.0"/></Features>
+          </Set>
+          <Set net="CANH" padUsage="VIA">
+            <Pad padstackDefRef="PS_VIA_08_04"><Location x="27.5" y="13.0"/><StandardPrimitiveRef id="PRIM_VIA08"/></Pad>
+          </Set>
+          <Set net="CANL" padUsage="VIA">
+            <Pad padstackDefRef="PS_VIA_08_04"><Location x="27.5" y="11.0"/><StandardPrimitiveRef id="PRIM_VIA08"/></Pad>
+          </Set>
+          <Set net="GND">
+            <Features>
+              <Polygon>
+                <PolyBegin x="2.0" y="2.0"/>
+                <PolyStepSegment x="34.0" y="2.0"/>
+                <PolyStepSegment x="34.0" y="6.5"/>
+                <PolyStepSegment x="2.0"  y="6.5"/>
+                <PolyStepSegment x="2.0"  y="2.0"/>
+              </Polygon>
+            </Features>
+          </Set>
+        </LayerFeature>
+        <LayerFeature layerRef="BOT_COPPER">
+          <Set net="CANH">
+            <Pad><Location x="27.5" y="13.0"/><StandardPrimitiveRef id="PRIM_SMD_0805"/><PinRef componentRef="R1" pin="1"/></Pad>
+          </Set>
+          <Set net="CANL">
+            <Pad><Location x="27.5" y="11.0"/><StandardPrimitiveRef id="PRIM_SMD_0805"/><PinRef componentRef="R1" pin="2"/></Pad>
+            <Features><LineDescRef id="LD_025"/><Line startX="20.6" startY="12.63" endX="27.5" endY="11.0"/></Features>
+          </Set>
+        </LayerFeature>
+      </Step>
+    </CadData>
+  </Ecad>
+</IPC-2581>

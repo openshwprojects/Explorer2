@@ -409,7 +409,7 @@ inline bool ParseDirectXMeshX(const uint8_t* data, size_t size, LoadedMesh3D& me
 }
 
 // ============================================================================
-// #42. MilkShape 3D (.ms3d — "MS3D000000")
+// #42. MilkShape 3D (.ms3d — "MS3D000000" v3/v4 with Skeletal Joints, Keyframes & VertexExtra LBS)
 // ============================================================================
 inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     if (size < 16 || std::memcmp(data, "MS3D000000", 10) != 0) return false;
@@ -422,14 +422,18 @@ inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& m
     uint16_t nVerts = Detail3D200::RdU16LE(data + pos); pos += 2;
     if (nVerts == 0 || pos + static_cast<size_t>(nVerts) * 15 + 2 > size) return false;
 
-    mesh.vertices.reserve(nVerts);
+    std::vector<Vec3f> bindVerts;
+    std::vector<int8_t> primaryBoneIds;
+    bindVerts.reserve(nVerts);
+    primaryBoneIds.reserve(nVerts);
     for (uint16_t i = 0; i < nVerts; ++i) {
         const uint8_t* vp = data + pos + static_cast<size_t>(i) * 15;
-        mesh.vertices.push_back({
-            Detail3D200::RdF32LE(vp + 1),
-            Detail3D200::RdF32LE(vp + 5),
-            Detail3D200::RdF32LE(vp + 9)
-        });
+        float vx = Detail3D200::RdF32LE(vp + 1);
+        float vy = Detail3D200::RdF32LE(vp + 5);
+        float vz = Detail3D200::RdF32LE(vp + 9);
+        if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz)) return false;
+        bindVerts.push_back({ vx, vy, vz });
+        primaryBoneIds.push_back(static_cast<int8_t>(vp[13]));
     }
     pos += static_cast<size_t>(nVerts) * 15;
 
@@ -444,6 +448,329 @@ inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& m
         if (i0 < nVerts && i1 < nVerts && i2 < nVerts) {
             mesh.tris.push_back({ i0, i1, i2, {} });
         }
+    }
+    pos += static_cast<size_t>(nTris) * 70;
+    if (mesh.tris.empty()) return false;
+
+    // Optional Groups, Materials, Animation Header, Joints, Comments, and VertexExtra multi-bone weights
+    struct MsMat3x4 {
+        float m[3][4] = { {1,0,0,0}, {0,1,0,0}, {0,0,1,0} };
+        static MsMat3x4 FromEulerXYZAndPos(float rx, float ry, float rz, float px, float py, float pz) {
+            const float cx = std::cos(rx), sx = std::sin(rx);
+            const float cy = std::cos(ry), sy = std::sin(ry);
+            const float cz = std::cos(rz), sz = std::sin(rz);
+            // MS3D AngleMatrix: Rz * Ry * Rx
+            MsMat3x4 r;
+            r.m[0][0] = cy * cz;
+            r.m[1][0] = cy * sz;
+            r.m[2][0] = -sy;
+            r.m[0][1] = sx * sy * cz - cx * sz;
+            r.m[1][1] = sx * sy * sz + cx * cz;
+            r.m[2][1] = sx * cy;
+            r.m[0][2] = cx * sy * cz + sx * sz;
+            r.m[1][2] = cx * sy * sz - sx * cz;
+            r.m[2][2] = cx * cy;
+            r.m[0][3] = px;
+            r.m[1][3] = py;
+            r.m[2][3] = pz;
+            return r;
+        }
+        static MsMat3x4 Mul(const MsMat3x4& a, const MsMat3x4& b) {
+            MsMat3x4 r;
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    r.m[i][j] = a.m[i][0] * b.m[0][j] + a.m[i][1] * b.m[1][j] + a.m[i][2] * b.m[2][j];
+                }
+                r.m[i][3] = a.m[i][0] * b.m[0][3] + a.m[i][1] * b.m[1][3] + a.m[i][2] * b.m[2][3] + a.m[i][3];
+            }
+            return r;
+        }
+        // Rigid inverse (transpose 3x3 + inverse rotated translation)
+        MsMat3x4 InverseRigid() const {
+            MsMat3x4 inv;
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) inv.m[i][j] = m[j][i];
+            }
+            inv.m[0][3] = -(inv.m[0][0] * m[0][3] + inv.m[0][1] * m[1][3] + inv.m[0][2] * m[2][3]);
+            inv.m[1][3] = -(inv.m[1][0] * m[0][3] + inv.m[1][1] * m[1][3] + inv.m[1][2] * m[2][3]);
+            inv.m[2][3] = -(inv.m[2][0] * m[0][3] + inv.m[2][1] * m[1][3] + inv.m[2][2] * m[2][3]);
+            return inv;
+        }
+        Vec3f Transform(const Vec3f& v) const {
+            return {
+                m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z + m[0][3],
+                m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z + m[1][3],
+                m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z + m[2][3]
+            };
+        }
+    };
+
+    auto parseFixedName32 = [](const uint8_t* p) -> std::string {
+        size_t len = 0;
+        while (len < 32 && p[len] != 0) ++len;
+        return std::string(reinterpret_cast<const char*>(p), len);
+    };
+
+    bool skeletonApplied = false;
+    if (pos + 2 <= size) {
+        uint16_t nGroups = Detail3D200::RdU16LE(data + pos); pos += 2;
+        bool groupsOk = true;
+        for (uint16_t g = 0; g < nGroups; ++g) {
+            if (pos + 35 > size) { groupsOk = false; break; }
+            uint16_t gTris = Detail3D200::RdU16LE(data + pos + 33);
+            size_t step = 35u + static_cast<size_t>(gTris) * 2u + 1u;
+            if (pos + step > size) { groupsOk = false; break; }
+            pos += step;
+        }
+        if (groupsOk && pos + 2 <= size) {
+            uint16_t nMats = Detail3D200::RdU16LE(data + pos); pos += 2;
+            size_t matsBytes = static_cast<size_t>(nMats) * 361u;
+            if (pos + matsBytes + 14u <= size) {
+                pos += matsBytes;
+                float animFps = Detail3D200::RdF32LE(data + pos + 0);
+                float curTime = Detail3D200::RdF32LE(data + pos + 4);
+                int32_t totalFrames = static_cast<int32_t>(Detail3D200::RdU32LE(data + pos + 8));
+                pos += 12;
+                if (totalFrames > 1 && totalFrames < 1000000) {
+                    mesh.animFrameCount = static_cast<size_t>(totalFrames);
+                }
+                (void)animFps;
+
+                uint16_t nJoints = Detail3D200::RdU16LE(data + pos); pos += 2;
+                struct MsKey { float time = 0.0f; float v[3] = {}; };
+                struct MsJoint {
+                    std::string name, parentName;
+                    int parentIdx = -1;
+                    float bindRot[3] = {};
+                    float bindPos[3] = {};
+                    std::vector<MsKey> rotKeys;
+                    std::vector<MsKey> posKeys;
+                };
+                std::vector<MsJoint> joints;
+                bool jointsOk = (nJoints > 0 && nJoints <= 4096);
+                if (jointsOk) {
+                    joints.reserve(nJoints);
+                    for (uint16_t j = 0; j < nJoints; ++j) {
+                        if (pos + 93 > size) { jointsOk = false; break; }
+                        MsJoint mj;
+                        mj.name = parseFixedName32(data + pos + 1);
+                        mj.parentName = parseFixedName32(data + pos + 33);
+                        mj.bindRot[0] = Detail3D200::RdF32LE(data + pos + 65);
+                        mj.bindRot[1] = Detail3D200::RdF32LE(data + pos + 69);
+                        mj.bindRot[2] = Detail3D200::RdF32LE(data + pos + 73);
+                        mj.bindPos[0] = Detail3D200::RdF32LE(data + pos + 77);
+                        mj.bindPos[1] = Detail3D200::RdF32LE(data + pos + 81);
+                        mj.bindPos[2] = Detail3D200::RdF32LE(data + pos + 85);
+                        uint16_t nRotK = Detail3D200::RdU16LE(data + pos + 89);
+                        uint16_t nPosK = Detail3D200::RdU16LE(data + pos + 91);
+                        pos += 93;
+                        size_t kBytes = (static_cast<size_t>(nRotK) + static_cast<size_t>(nPosK)) * 16u;
+                        if (pos + kBytes > size) { jointsOk = false; break; }
+                        mj.rotKeys.resize(nRotK);
+                        for (uint16_t k = 0; k < nRotK; ++k) {
+                            mj.rotKeys[k].time = Detail3D200::RdF32LE(data + pos + 0);
+                            mj.rotKeys[k].v[0] = Detail3D200::RdF32LE(data + pos + 4);
+                            mj.rotKeys[k].v[1] = Detail3D200::RdF32LE(data + pos + 8);
+                            mj.rotKeys[k].v[2] = Detail3D200::RdF32LE(data + pos + 12);
+                            pos += 16;
+                        }
+                        mj.posKeys.resize(nPosK);
+                        for (uint16_t k = 0; k < nPosK; ++k) {
+                            mj.posKeys[k].time = Detail3D200::RdF32LE(data + pos + 0);
+                            mj.posKeys[k].v[0] = Detail3D200::RdF32LE(data + pos + 4);
+                            mj.posKeys[k].v[1] = Detail3D200::RdF32LE(data + pos + 8);
+                            mj.posKeys[k].v[2] = Detail3D200::RdF32LE(data + pos + 12);
+                            pos += 16;
+                        }
+                        joints.push_back(std::move(mj));
+                    }
+                }
+
+                if (jointsOk && !joints.empty()) {
+                    // Optional Comments section (subVersion == 1) + VertexExtra (subVersion 1..3)
+                    struct VertExtraWeights {
+                        int8_t boneIds[4] = { -1, -1, -1, -1 };
+                        float weights[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+                    };
+                    std::vector<VertExtraWeights> vWeights(nVerts);
+                    for (uint16_t i = 0; i < nVerts; ++i) {
+                        vWeights[i].boneIds[0] = primaryBoneIds[i];
+                        vWeights[i].weights[0] = (primaryBoneIds[i] >= 0) ? 1.0f : 0.0f;
+                    }
+
+                    if (pos + 4 <= size) {
+                        int32_t commentSubVer = static_cast<int32_t>(Detail3D200::RdU32LE(data + pos));
+                        if (commentSubVer == 1) {
+                            size_t cPos = pos + 4;
+                            bool commentsOk = true;
+                            // 3 indexed comment lists (group, material, joint) + 1 model comment flag
+                            for (int listIdx = 0; listIdx < 3 && commentsOk; ++listIdx) {
+                                if (cPos + 4 > size) { commentsOk = false; break; }
+                                uint32_t nCom = Detail3D200::RdU32LE(data + cPos); cPos += 4;
+                                if (nCom > 65536) { commentsOk = false; break; }
+                                for (uint32_t ci = 0; ci < nCom; ++ci) {
+                                    if (cPos + 8 > size) { commentsOk = false; break; }
+                                    uint32_t cLen = Detail3D200::RdU32LE(data + cPos + 4);
+                                    cPos += 8;
+                                    if (cLen > size - cPos) { commentsOk = false; break; }
+                                    cPos += cLen;
+                                }
+                            }
+                            if (commentsOk && cPos + 4 <= size) {
+                                uint32_t hasModelCom = Detail3D200::RdU32LE(data + cPos); cPos += 4;
+                                if (hasModelCom == 1) {
+                                    if (cPos + 4 <= size) {
+                                        uint32_t mLen = Detail3D200::RdU32LE(data + cPos); cPos += 4;
+                                        if (mLen <= size - cPos) cPos += mLen;
+                                        else commentsOk = false;
+                                    } else commentsOk = false;
+                                } else if (hasModelCom > 1) {
+                                    commentsOk = false;
+                                }
+                            }
+                            if (commentsOk) pos = cPos;
+                        }
+                    }
+
+                    if (pos + 4 <= size) {
+                        int32_t vExtraSubVer = static_cast<int32_t>(Detail3D200::RdU32LE(data + pos));
+                        size_t recSz = (vExtraSubVer == 1) ? 6u : (vExtraSubVer == 2) ? 10u : (vExtraSubVer == 3) ? 14u : 0u;
+                        if (recSz > 0 && pos + 4u + static_cast<size_t>(nVerts) * recSz <= size) {
+                            pos += 4;
+                            const float wScale = (vExtraSubVer == 1) ? 255.0f : 100.0f;
+                            for (uint16_t i = 0; i < nVerts; ++i) {
+                                const uint8_t* ep = data + pos + static_cast<size_t>(i) * recSz;
+                                int8_t b1 = static_cast<int8_t>(ep[0]);
+                                int8_t b2 = static_cast<int8_t>(ep[1]);
+                                int8_t b3 = static_cast<int8_t>(ep[2]);
+                                uint8_t w0 = ep[3], w1 = ep[4], w2 = ep[5];
+                                if (w0 > 0 || w1 > 0 || w2 > 0) {
+                                    float fw0 = static_cast<float>(w0) / wScale;
+                                    float fw1 = static_cast<float>(w1) / wScale;
+                                    float fw2 = static_cast<float>(w2) / wScale;
+                                    float fw3 = std::max(0.0f, 1.0f - (fw0 + fw1 + fw2));
+                                    vWeights[i].boneIds[0] = primaryBoneIds[i];
+                                    vWeights[i].boneIds[1] = b1;
+                                    vWeights[i].boneIds[2] = b2;
+                                    vWeights[i].boneIds[3] = b3;
+                                    vWeights[i].weights[0] = fw0;
+                                    vWeights[i].weights[1] = (b1 >= 0) ? fw1 : 0.0f;
+                                    vWeights[i].weights[2] = (b2 >= 0) ? fw2 : 0.0f;
+                                    vWeights[i].weights[3] = (b3 >= 0) ? fw3 : 0.0f;
+                                }
+                            }
+                        }
+                    }
+
+                    // Resolve parent joint indices by name
+                    for (size_t j = 0; j < joints.size(); ++j) {
+                        if (!joints[j].parentName.empty()) {
+                            for (size_t p = 0; p < joints.size(); ++p) {
+                                if (p != j && joints[p].name == joints[j].parentName) {
+                                    joints[j].parentIdx = static_cast<int>(p);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    auto sampleKeys = [](const std::vector<MsKey>& keys, float t, float out[3]) {
+                        out[0] = out[1] = out[2] = 0.0f;
+                        if (keys.empty()) return;
+                        if (keys.size() == 1 || t <= keys.front().time) {
+                            out[0] = keys.front().v[0]; out[1] = keys.front().v[1]; out[2] = keys.front().v[2];
+                            return;
+                        }
+                        if (t >= keys.back().time) {
+                            out[0] = keys.back().v[0]; out[1] = keys.back().v[1]; out[2] = keys.back().v[2];
+                            return;
+                        }
+                        for (size_t k = 0; k + 1 < keys.size(); ++k) {
+                            if (t >= keys[k].time && t <= keys[k + 1].time) {
+                                float dt = keys[k + 1].time - keys[k].time;
+                                float a = (dt > 1e-6f) ? (t - keys[k].time) / dt : 0.0f;
+                                for (int c = 0; c < 3; ++c) {
+                                    out[c] = keys[k].v[c] + (keys[k + 1].v[c] - keys[k].v[c]) * a;
+                                }
+                                return;
+                            }
+                        }
+                    };
+
+                    float evalTime = (std::isfinite(curTime) && curTime > 0.0f) ? curTime : 0.0f;
+                    std::vector<MsMat3x4> bindGlobal(joints.size());
+                    std::vector<MsMat3x4> poseGlobal(joints.size());
+                    std::vector<uint8_t> state(joints.size(), 0);
+
+                    std::function<void(size_t, int)> evalJoint = [&](size_t jIdx, int depth) {
+                        if (state[jIdx] == 2) return;
+                        if (state[jIdx] == 1 || depth > 256) {
+                            bindGlobal[jIdx] = MsMat3x4{};
+                            poseGlobal[jIdx] = MsMat3x4{};
+                            state[jIdx] = 2;
+                            return;
+                        }
+                        state[jIdx] = 1;
+                        const MsJoint& j = joints[jIdx];
+                        MsMat3x4 localBind = MsMat3x4::FromEulerXYZAndPos(
+                            j.bindRot[0], j.bindRot[1], j.bindRot[2],
+                            j.bindPos[0], j.bindPos[1], j.bindPos[2]);
+                        float kfR[3] = {}, kfP[3] = {};
+                        sampleKeys(j.rotKeys, evalTime, kfR);
+                        sampleKeys(j.posKeys, evalTime, kfP);
+                        MsMat3x4 localDelta = MsMat3x4::FromEulerXYZAndPos(kfR[0], kfR[1], kfR[2], kfP[0], kfP[1], kfP[2]);
+                        MsMat3x4 localPose = MsMat3x4::Mul(localBind, localDelta);
+
+                        if (j.parentIdx >= 0 && static_cast<size_t>(j.parentIdx) < joints.size()) {
+                            size_t pIdx = static_cast<size_t>(j.parentIdx);
+                            evalJoint(pIdx, depth + 1);
+                            bindGlobal[jIdx] = MsMat3x4::Mul(bindGlobal[pIdx], localBind);
+                            poseGlobal[jIdx] = MsMat3x4::Mul(poseGlobal[pIdx], localPose);
+                        } else {
+                            bindGlobal[jIdx] = localBind;
+                            poseGlobal[jIdx] = localPose;
+                        }
+                        state[jIdx] = 2;
+                    };
+
+                    std::vector<MsMat3x4> skinMats(joints.size());
+                    for (size_t j = 0; j < joints.size(); ++j) {
+                        evalJoint(j, 0);
+                        skinMats[j] = MsMat3x4::Mul(poseGlobal[j], bindGlobal[j].InverseRigid());
+                    }
+
+                    mesh.vertices.resize(nVerts);
+                    for (uint16_t i = 0; i < nVerts; ++i) {
+                        const Vec3f& bv = bindVerts[i];
+                        const VertExtraWeights& vw = vWeights[i];
+                        Vec3f accum = { 0.0f, 0.0f, 0.0f };
+                        float wSum = 0.0f;
+                        for (int slot = 0; slot < 4; ++slot) {
+                            int b = vw.boneIds[slot];
+                            float w = vw.weights[slot];
+                            if (b >= 0 && static_cast<size_t>(b) < joints.size() && w > 1e-6f) {
+                                Vec3f tp = skinMats[static_cast<size_t>(b)].Transform(bv);
+                                accum.x += tp.x * w;
+                                accum.y += tp.y * w;
+                                accum.z += tp.z * w;
+                                wSum += w;
+                            }
+                        }
+                        if (wSum > 1e-6f) {
+                            float invW = 1.0f / wSum;
+                            mesh.vertices[i] = { accum.x * invW, accum.y * invW, accum.z * invW };
+                        } else {
+                            mesh.vertices[i] = bv;
+                        }
+                    }
+                    skeletonApplied = true;
+                }
+            }
+        }
+    }
+
+    if (!skeletonApplied) {
+        mesh.vertices = std::move(bindVerts);
     }
     return !mesh.vertices.empty() && !mesh.tris.empty();
 }
@@ -2223,11 +2550,16 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
         }
         mesh.formatName = L"OpenCASCADE B-Rep CAD Solid (.brep)";
 
-        // 1. Parse cached "Triangulations" section if present
-        size_t triSec = sv.find("Triangulations");
+        // 1. Parse cached "Triangulations" section if present (avoid matching "PolygonOnTriangulations")
+        size_t triSec = 0;
+        while ((triSec = sv.find("Triangulations", triSec)) != std::string_view::npos) {
+            if (triSec == 0 || !std::isalpha(static_cast<unsigned char>(sv[triSec - 1]))) break;
+            triSec += 14;
+        }
         if (triSec != std::string_view::npos) {
-            const char* p = sv.data() + triSec + 14;
-            const char* end = sv.data() + sv.size();
+            std::string nullSafeBrep(sv.substr(triSec + 14));
+            const char* p = nullSafeBrep.c_str();
+            const char* end = p + nullSafeBrep.size();
             char* ep = nullptr;
             long nTabs = std::strtol(p, &ep, 10); p = ep;
             for (long t = 0; t < nTabs && t < 4096 && p < end; ++t) {
@@ -2339,7 +2671,7 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
             });
         };
 
-        enum class SurfKind { Unknown, Plane, CylinderCone, Sphere, Torus };
+        enum class SurfKind { Unknown, Plane, CylinderCone, Sphere, Torus, Nurbs };
         struct BRepSurf {
             SurfKind kind = SurfKind::Unknown;
             CadVec3 origin;
@@ -2348,6 +2680,12 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
             double radius1 = 0.0;
             double radius2 = 0.0;
             double ratio   = 1.0;
+            int uDeg = 0, vDeg = 0, nU = 0, nV = 0;
+            bool isRational = false;
+            std::vector<double> knotsU;
+            std::vector<double> knotsV;
+            std::vector<CadVec3> poles;
+            std::vector<double> weights;
         };
 
         enum class CurveKind { Straight, Ellipse, Spline };
@@ -2869,7 +3207,8 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
                 }
 
                 // Untrimmed closed analytic Sphere / Torus faces (no boundary loops)
-                if (loops3D.empty() && surf != nullptr) {
+                if (loops3D.empty() && surf != nullptr &&
+                    (surf->kind == SurfKind::Sphere || surf->kind == SurfKind::Torus)) {
                     if (surf->kind == SurfKind::Sphere && surf->radius1 > 1e-9) {
                         CadVec3 center = applyXfPt(xf, surf->origin);
                         double rad = surf->radius1 * (xf.valid ? std::fabs(xf.scale) : 1.0);
@@ -2943,6 +3282,99 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
                         }
                     }
                     continue;
+                }
+
+                // Rational / Non-Rational Cox-de Boor NURBS Surface (b_surface / spline-surface)
+                if (surf != nullptr && surf->kind == SurfKind::Nurbs &&
+                    surf->uDeg >= 1 && surf->vDeg >= 1 && surf->nU > surf->uDeg && surf->nV > surf->vDeg &&
+                    static_cast<int>(surf->knotsU.size()) >= surf->nU + surf->uDeg + 1 &&
+                    static_cast<int>(surf->knotsV.size()) >= surf->nV + surf->vDeg + 1 &&
+                    surf->poles.size() >= static_cast<size_t>(surf->nU) * static_cast<size_t>(surf->nV))
+                {
+                    auto evalBasis = [](int n, int deg, const std::vector<double>& U, double t, std::vector<double>& outB) {
+                        outB.assign(static_cast<size_t>(n), 0.0);
+                        int order = deg + 1;
+                        double tMin = U[static_cast<size_t>(deg)];
+                        double tMax = U[static_cast<size_t>(n)];
+                        if (t <= tMin) t = tMin;
+                        if (t >= tMax) { outB[static_cast<size_t>(n - 1)] = 1.0; return; }
+                        int span = deg;
+                        for (int i = deg; i < n; ++i) {
+                            if (t >= U[static_cast<size_t>(i)] && t < U[static_cast<size_t>(i + 1)]) { span = i; break; }
+                        }
+                        std::vector<double> N(static_cast<size_t>(order), 0.0);
+                        std::vector<double> L(static_cast<size_t>(order), 0.0);
+                        std::vector<double> R(static_cast<size_t>(order), 0.0);
+                        N[0] = 1.0;
+                        for (int j = 1; j <= deg; ++j) {
+                            L[static_cast<size_t>(j)] = t - U[static_cast<size_t>(span + 1 - j)];
+                            R[static_cast<size_t>(j)] = U[static_cast<size_t>(span + j)] - t;
+                            double saved = 0.0;
+                            for (int r = 0; r < j; ++r) {
+                                double denom = R[static_cast<size_t>(r + 1)] + L[static_cast<size_t>(j - r)];
+                                double tmp = (std::fabs(denom) > 1e-15) ? (N[static_cast<size_t>(r)] / denom) : 0.0;
+                                N[static_cast<size_t>(r)] = saved + R[static_cast<size_t>(r + 1)] * tmp;
+                                saved = L[static_cast<size_t>(j - r)] * tmp;
+                            }
+                            N[static_cast<size_t>(j)] = saved;
+                        }
+                        for (int j = 0; j <= deg; ++j) {
+                            int idx = span - deg + j;
+                            if (idx >= 0 && idx < n) outB[static_cast<size_t>(idx)] = N[static_cast<size_t>(j)];
+                        }
+                    };
+
+                    double u0 = surf->knotsU[static_cast<size_t>(surf->uDeg)];
+                    double u1 = surf->knotsU[static_cast<size_t>(surf->nU)];
+                    double v0 = surf->knotsV[static_cast<size_t>(surf->vDeg)];
+                    double v1 = surf->knotsV[static_cast<size_t>(surf->nV)];
+                    if (u1 > u0 && v1 > v0) {
+                        constexpr int kNu = 16, kNv = 16;
+                        std::vector<std::vector<uint32_t>> grid(kNu + 1, std::vector<uint32_t>(kNv + 1));
+                        std::vector<double> bu, bv;
+                        bool hasWeights = surf->isRational && surf->weights.size() >= surf->poles.size();
+                        for (int iu = 0; iu <= kNu; ++iu) {
+                            double u = u0 + (u1 - u0) * (static_cast<double>(iu) / kNu);
+                            evalBasis(surf->nU, surf->uDeg, surf->knotsU, u, bu);
+                            for (int iv = 0; iv <= kNv; ++iv) {
+                                double v = v0 + (v1 - v0) * (static_cast<double>(iv) / kNv);
+                                evalBasis(surf->nV, surf->vDeg, surf->knotsV, v, bv);
+                                double sx = 0.0, sy = 0.0, sz = 0.0, sw = 0.0;
+                                for (int i = 0; i < surf->nU; ++i) {
+                                    if (bu[static_cast<size_t>(i)] == 0.0) continue;
+                                    for (int j = 0; j < surf->nV; ++j) {
+                                        if (bv[static_cast<size_t>(j)] == 0.0) continue;
+                                        size_t pidx = static_cast<size_t>(i * surf->nV + j);
+                                        double w = hasWeights ? surf->weights[pidx] : 1.0;
+                                        double b = bu[static_cast<size_t>(i)] * bv[static_cast<size_t>(j)] * w;
+                                        sx += b * surf->poles[pidx].x;
+                                        sy += b * surf->poles[pidx].y;
+                                        sz += b * surf->poles[pidx].z;
+                                        sw += b;
+                                    }
+                                }
+                                if (std::fabs(sw) > 1e-12) { sx /= sw; sy /= sw; sz /= sw; }
+                                grid[static_cast<size_t>(iu)][static_cast<size_t>(iv)] = emitVertex(applyXfPt(xf, { sx, sy, sz }));
+                            }
+                        }
+                        for (int iu = 0; iu < kNu; ++iu) {
+                            for (int iv = 0; iv < kNv; ++iv) {
+                                uint32_t a = grid[static_cast<size_t>(iu)][static_cast<size_t>(iv)];
+                                uint32_t b = grid[static_cast<size_t>(iu + 1)][static_cast<size_t>(iv)];
+                                uint32_t c = grid[static_cast<size_t>(iu + 1)][static_cast<size_t>(iv + 1)];
+                                uint32_t d = grid[static_cast<size_t>(iu)][static_cast<size_t>(iv + 1)];
+                                if (a != b && b != c && a != c) {
+                                    if (face.reversed) mesh.tris.push_back({ a, c, b, {} });
+                                    else               mesh.tris.push_back({ a, b, c, {} });
+                                }
+                                if (a != c && c != d && a != d) {
+                                    if (face.reversed) mesh.tris.push_back({ a, d, c, {} });
+                                    else               mesh.tris.push_back({ a, c, d, {} });
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 }
 
                 if (loops3D.empty()) continue;
@@ -3196,6 +3628,7 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
             std::vector<double> nums;
             std::vector<std::string> words;
             std::vector<double> subNums;
+            std::vector<std::string> subWords;
         };
 
         auto buildAcisGraphAndTriangulate = [&](const std::vector<AcisRawRec>& recs) -> bool {
@@ -3308,6 +3741,57 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
                             }
                         }
                         g.curves[idx] = std::move(c);
+                    } else if (tp.find("surface") != std::string::npos && rc.subNums.size() >= 12) {
+                        // ACIS spline-surface { exactsur nubs|nurbs uDeg vDeg [nU nV] knotsU knotsV poles [weights] }
+                        bool isRat = false;
+                        for (const auto& sw : rc.subWords) {
+                            if (sw == "nurbs" || sw == "rat" || sw == "rational") { isRat = true; break; }
+                        }
+                        int uDeg = static_cast<int>(std::llround(rc.subNums[0]));
+                        int vDeg = static_cast<int>(std::llround(rc.subNums[1]));
+                        if (uDeg >= 1 && uDeg <= 15 && vDeg >= 1 && vDeg <= 15 && rc.subNums.size() >= 6) {
+                            int nU = static_cast<int>(std::llround(rc.subNums[2]));
+                            int nV = static_cast<int>(std::llround(rc.subNums[3]));
+                            size_t sp = 4;
+                            BRepSurf s;
+                            s.kind = SurfKind::Nurbs;
+                            s.uDeg = uDeg; s.vDeg = vDeg; s.nU = nU; s.nV = nV;
+                            s.isRational = isRat;
+
+                            if (nU > uDeg && nU <= 256 && nV > vDeg && nV <= 256) {
+                                size_t fullKu = static_cast<size_t>(nU + uDeg + 1);
+                                size_t fullKv = static_cast<size_t>(nV + vDeg + 1);
+                                size_t poleCnt = static_cast<size_t>(nU) * static_cast<size_t>(nV);
+                                size_t poleFloats = poleCnt * (isRat ? 4u : 3u);
+
+                                // Variant 1: flat full knot vectors [knotsU(nU+uDeg+1)][knotsV(nV+vDeg+1)][poles (x,y,z[,w])]
+                                if (sp + fullKu + fullKv + poleCnt * 3u <= rc.subNums.size()) {
+                                    s.knotsU.assign(rc.subNums.begin() + static_cast<ptrdiff_t>(sp),
+                                                    rc.subNums.begin() + static_cast<ptrdiff_t>(sp + fullKu));
+                                    sp += fullKu;
+                                    s.knotsV.assign(rc.subNums.begin() + static_cast<ptrdiff_t>(sp),
+                                                    rc.subNums.begin() + static_cast<ptrdiff_t>(sp + fullKv));
+                                    sp += fullKv;
+
+                                    if (isRat && sp + poleFloats <= rc.subNums.size()) {
+                                        s.poles.resize(poleCnt);
+                                        s.weights.resize(poleCnt, 1.0);
+                                        // Check whether weights are interleaved (x,y,z,w) or planar [xyz...][w...]
+                                        for (size_t k = 0; k < poleCnt; ++k) {
+                                            s.poles[k] = { rc.subNums[sp + k * 4 + 0], rc.subNums[sp + k * 4 + 1], rc.subNums[sp + k * 4 + 2] };
+                                            s.weights[k] = rc.subNums[sp + k * 4 + 3];
+                                        }
+                                        g.surfaces[idx] = std::move(s);
+                                    } else if (sp + poleCnt * 3u <= rc.subNums.size()) {
+                                        s.poles.resize(poleCnt);
+                                        for (size_t k = 0; k < poleCnt; ++k) {
+                                            s.poles[k] = { rc.subNums[sp + k * 3 + 0], rc.subNums[sp + k * 3 + 1], rc.subNums[sp + k * 3 + 2] };
+                                        }
+                                        g.surfaces[idx] = std::move(s);
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if (tp == "plane-surface") {
                     BRepSurf s;
@@ -3575,8 +4059,10 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
                     if (p + 4 > size) break;
                     int32_t iv = static_cast<int32_t>(Detail3D200::RdU32LE(data + p));
                     p += 4;
-                    if (!inHeader && cur.type.empty() && braceDepth == 0) {
-                        explicitIdx = (iv < 0) ? -iv : iv;
+                    if (!inHeader) {
+                        if (braceDepth > 0) cur.subNums.push_back(static_cast<double>(iv));
+                        else if (cur.type.empty()) explicitIdx = (iv < 0) ? -iv : iv;
+                        else cur.nums.push_back(static_cast<double>(iv));
                     }
                 } else if (tag == 0x05) { // TAG_FLOAT
                     if (p + 4 > size) break;
@@ -3652,6 +4138,8 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
                         if (braceDepth == 0) {
                             if (cur.type.empty()) cur.type = std::move(id);
                             else cur.words.push_back(std::move(id));
+                        } else {
+                            cur.subWords.push_back(std::move(id));
                         }
                     } else if (p + 8 <= size) {
                         double dv = Detail3D200::RdF64LE(data + p);
@@ -3877,6 +4365,8 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
                     if (braceDepth == 0) {
                         if (cur.type.empty()) cur.type = std::move(tok);
                         else cur.words.push_back(std::move(tok));
+                    } else {
+                        cur.subWords.push_back(std::move(tok));
                     }
                     atRecordStart = false;
                     continue;
@@ -3887,9 +4377,221 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
             return buildAcisGraphAndTriangulate(recs);
         }
 
-        // 3. Siemens Parasolid XT Text (.x_t) & Binary (.x_b)
+        // 3. Siemens Parasolid XT Text (.x_t) & Neutral Binary (.x_b)
         {
-            // Reject binary Parasolid (.x_b / binary PS transmit) strictly — never scrape point soup!
+            // Check Neutral Binary Parasolid (.x_b): "PS\0" prefix (arch byte at data[3]: 0=Big-Endian IEEE, 1=Little-Endian IEEE)
+            // + ASCII header containing "**END_OF_HEADER**" + binary node stream!
+            bool hasPsBinPrefix = (size >= 32 && data[0] == 'P' && data[1] == 'S' && data[2] == 0 && (data[3] == 0 || data[3] == 1));
+            size_t eohBin = sv.find("**END_OF_HEADER**");
+            bool isNeutralBinaryXb = false;
+            size_t xbStart = 0;
+            bool xbBigEndian = true;
+
+            if (eohBin != std::string_view::npos &&
+                (hasPsBinPrefix || sv.find("PARASOLID") != std::string_view::npos || sv.find("SCH_") != std::string_view::npos))
+            {
+                if (hasPsBinPrefix) xbBigEndian = (data[3] == 0);
+                size_t afterEoh = eohBin + 17;
+                while (afterEoh < size && data[afterEoh] == '*') ++afterEoh;
+                while (afterEoh < size && (data[afterEoh] == '\r' || data[afterEoh] == '\n' || data[afterEoh] == ' ')) ++afterEoh;
+                if (hasPsBinPrefix || (afterEoh + 4 <= size && data[afterEoh] == 'B' && data[afterEoh + 1] == 0)) {
+                    isNeutralBinaryXb = true;
+                    xbStart = (afterEoh < size && data[afterEoh] == 'B') ? (afterEoh + 2) : afterEoh;
+                }
+            }
+
+            if (isNeutralBinaryXb) {
+                auto rdU16 = [&](const uint8_t* p) -> uint16_t { return xbBigEndian ? Detail3D200::RdU16BE(p) : Detail3D200::RdU16LE(p); };
+                auto rdI32 = [&](const uint8_t* p) -> int32_t  { return static_cast<int32_t>(xbBigEndian ? Detail3D200::RdU32BE(p) : Detail3D200::RdU32LE(p)); };
+                auto rdF64 = [&](const uint8_t* p) -> double {
+                    if (!xbBigEndian) return Detail3D200::RdF64LE(p);
+                    uint64_t u = Detail3D200::RdU64BE(p);
+                    double d = 0.0;
+                    std::memcpy(&d, &u, 8);
+                    return d;
+                };
+
+                BRepGraph g;
+                std::unordered_map<int32_t, CadXform> xbTransforms;
+                std::unordered_map<int32_t, int32_t> bodyXfMap, shellFirstFace;
+                size_t bp = xbStart;
+
+                // Neutral Binary Parasolid Node Stream:
+                // Each node: [uint16 nodeType][int32 nodeId] followed by schema fields (nodeType == 0 or 999 -> EOF)
+                while (bp + 6 <= size && (g.faces.size() + g.points.size() + g.surfaces.size()) < 200000) {
+                    uint16_t nt = rdU16(data + bp);
+                    int32_t nid = rdI32(data + bp + 2);
+                    bp += 6;
+                    if (nt == 0 || nt == 999) break;
+                    if (nid < 0) return false;
+
+                    if (nt == 12) { // body: [int32 xfId][int32 shellId]
+                        if (bp + 8 > size) return false;
+                        int32_t xfId = rdI32(data + bp);
+                        int32_t shId = rdI32(data + bp + 4);
+                        bp += 8;
+                        if (xfId >= 0) bodyXfMap[nid] = xfId;
+                        (void)shId;
+                    } else if (nt == 13) { // transform: double r[9], t[3], scale (104B)
+                        if (bp + 104 > size) return false;
+                        CadXform xf;
+                        for (int i = 0; i < 9; ++i) xf.r[i] = rdF64(data + bp + i * 8);
+                        xf.t[0] = rdF64(data + bp + 72);
+                        xf.t[1] = rdF64(data + bp + 80);
+                        xf.t[2] = rdF64(data + bp + 88);
+                        xf.scale = rdF64(data + bp + 96);
+                        if (!std::isfinite(xf.scale) || std::fabs(xf.scale) < 1e-12) xf.scale = 1.0;
+                        xf.valid = true;
+                        xbTransforms[nid] = xf;
+                        bp += 104;
+                    } else if (nt == 14) { // shell: [int32 firstFaceId]
+                        if (bp + 4 > size) return false;
+                        shellFirstFace[nid] = rdI32(data + bp);
+                        bp += 4;
+                    } else if (nt == 15) { // face: [int32 nextFace][int32 firstLoop][int32 surfId][int32 bodyId][uint8 rev]
+                        if (bp + 17 > size) return false;
+                        BRepFace fc;
+                        fc.nextFace  = rdI32(data + bp + 0);
+                        fc.firstLoop = rdI32(data + bp + 4);
+                        fc.surfaceId = rdI32(data + bp + 8);
+                        fc.bodyId    = rdI32(data + bp + 12);
+                        fc.reversed  = (data[bp + 16] != 0);
+                        bp += 17;
+                        g.faces[nid] = fc;
+                        g.faceOrder.push_back(nid);
+                    } else if (nt == 16) { // loop: [int32 ownerFace][int32 nextLoop][int32 firstFin]
+                        if (bp + 12 > size) return false;
+                        BRepLoop lp;
+                        lp.ownerFace   = rdI32(data + bp + 0);
+                        lp.nextLoop    = rdI32(data + bp + 4);
+                        lp.firstCoedge = rdI32(data + bp + 8);
+                        bp += 12;
+                        g.loops[nid] = lp;
+                    } else if (nt == 17) { // fin: [int32 nextFin][int32 edgeId][int32 headVert][uint8 rev]
+                        if (bp + 13 > size) return false;
+                        BRepCoedge ce;
+                        ce.nextCoedge = rdI32(data + bp + 0);
+                        ce.edgeId     = rdI32(data + bp + 4);
+                        ce.headVert   = rdI32(data + bp + 8);
+                        ce.reversed   = (data[bp + 12] != 0);
+                        bp += 13;
+                        g.coedges[nid] = ce;
+                    } else if (nt == 18) { // vertex: [int32 pointId]
+                        if (bp + 4 > size) return false;
+                        g.vertexToPoint[nid] = rdI32(data + bp);
+                        bp += 4;
+                    } else if (nt == 19) { // edge: [int32 startVert][int32 endVert][int32 curveId][uint8 rev]
+                        if (bp + 13 > size) return false;
+                        BRepEdge ed;
+                        ed.startVert = rdI32(data + bp + 0);
+                        ed.endVert   = rdI32(data + bp + 4);
+                        ed.curveId   = rdI32(data + bp + 8);
+                        ed.reversed  = (data[bp + 12] != 0);
+                        bp += 13;
+                        g.edges[nid] = ed;
+                        g.edgeOrder.push_back(nid);
+                    } else if (nt == 29) { // point: double3 (24B)
+                        if (bp + 24 > size) return false;
+                        g.points[nid] = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        bp += 24;
+                    } else if (nt == 30) { // line: origin(24B) + dir(24B)
+                        if (bp + 48 > size) return false;
+                        BRepCurve c; c.kind = CurveKind::Straight;
+                        c.origin = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        c.normal = { rdF64(data + bp + 24), rdF64(data + bp + 32), rdF64(data + bp + 40) };
+                        bp += 48;
+                        g.curves[nid] = std::move(c);
+                    } else if (nt == 31) { // circle: origin(24B) + normal(24B) + uAxis(24B) + rad(8B)
+                        if (bp + 80 > size) return false;
+                        BRepCurve c; c.kind = CurveKind::Ellipse; c.ratio = 1.0;
+                        c.origin = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        c.normal = { rdF64(data + bp + 24), rdF64(data + bp + 32), rdF64(data + bp + 40) };
+                        CadVec3 ux = vNorm({ rdF64(data + bp + 48), rdF64(data + bp + 56), rdF64(data + bp + 64) });
+                        c.majorAxis = vMul(ux, std::fabs(rdF64(data + bp + 72)));
+                        bp += 80;
+                        g.curves[nid] = std::move(c);
+                    } else if (nt == 35) { // plane: origin(24B) + normal(24B) + uAxis(24B)
+                        if (bp + 72 > size) return false;
+                        BRepSurf s; s.kind = SurfKind::Plane;
+                        s.origin = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        s.normal = { rdF64(data + bp + 24), rdF64(data + bp + 32), rdF64(data + bp + 40) };
+                        s.uAxis  = { rdF64(data + bp + 48), rdF64(data + bp + 56), rdF64(data + bp + 64) };
+                        bp += 72;
+                        g.surfaces[nid] = s;
+                    } else if (nt == 36) { // cylinder: origin(24B) + axis(24B) + radius(8B)
+                        if (bp + 56 > size) return false;
+                        BRepSurf s; s.kind = SurfKind::CylinderCone;
+                        s.origin  = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        s.normal  = { rdF64(data + bp + 24), rdF64(data + bp + 32), rdF64(data + bp + 40) };
+                        s.radius1 = std::fabs(rdF64(data + bp + 48));
+                        bp += 56;
+                        g.surfaces[nid] = s;
+                    } else if (nt == 37) { // sphere: origin(24B) + radius(8B)
+                        if (bp + 32 > size) return false;
+                        BRepSurf s; s.kind = SurfKind::Sphere;
+                        s.origin  = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        s.radius1 = std::fabs(rdF64(data + bp + 24));
+                        bp += 32;
+                        g.surfaces[nid] = s;
+                    } else if (nt == 41) { // b_surface (NURBS): uDeg(u16), vDeg(u16), nU(i32), nV(i32), isRat(u8), knotsU, knotsV, poles
+                        if (bp + 13 > size) return false;
+                        int uDeg = rdU16(data + bp + 0);
+                        int vDeg = rdU16(data + bp + 2);
+                        int nU   = rdI32(data + bp + 4);
+                        int nV   = rdI32(data + bp + 8);
+                        bool isRat = (data[bp + 12] != 0);
+                        bp += 13;
+                        if (uDeg < 1 || uDeg > 15 || vDeg < 1 || vDeg > 15 ||
+                            nU <= uDeg || nU > 256 || nV <= vDeg || nV > 256)
+                        {
+                            return false;
+                        }
+                        size_t kuCnt = static_cast<size_t>(nU + uDeg + 1);
+                        size_t kvCnt = static_cast<size_t>(nV + vDeg + 1);
+                        size_t pCnt  = static_cast<size_t>(nU) * static_cast<size_t>(nV);
+                        size_t stride = isRat ? 4u : 3u;
+                        size_t need = (kuCnt + kvCnt + pCnt * stride) * 8u;
+                        if (bp + need > size) return false;
+
+                        BRepSurf s;
+                        s.kind = SurfKind::Nurbs;
+                        s.uDeg = uDeg; s.vDeg = vDeg; s.nU = nU; s.nV = nV; s.isRational = isRat;
+                        s.knotsU.resize(kuCnt);
+                        for (size_t k = 0; k < kuCnt; ++k) { s.knotsU[k] = rdF64(data + bp); bp += 8; }
+                        s.knotsV.resize(kvCnt);
+                        for (size_t k = 0; k < kvCnt; ++k) { s.knotsV[k] = rdF64(data + bp); bp += 8; }
+                        s.poles.resize(pCnt);
+                        if (isRat) s.weights.resize(pCnt, 1.0);
+                        for (size_t k = 0; k < pCnt; ++k) {
+                            s.poles[k] = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                            if (isRat) s.weights[k] = rdF64(data + bp + 24);
+                            bp += stride * 8u;
+                        }
+                        g.surfaces[nid] = std::move(s);
+                    } else {
+                        return false; // unknown binary node type -> fail cleanly without guessing
+                    }
+                }
+
+                for (const auto& kv : bodyXfMap) {
+                    if (xbTransforms.count(kv.second)) g.bodyTransforms[kv.first] = xbTransforms[kv.second];
+                }
+                for (auto& kv : g.faces) {
+                    int32_t curL = kv.second.firstLoop;
+                    std::set<int32_t> seen;
+                    while (curL >= 0 && seen.insert(curL).second && seen.size() <= 512) {
+                        kv.second.loopIds.push_back(curL);
+                        auto lit = g.loops.find(curL);
+                        if (lit == g.loops.end()) break;
+                        curL = lit->second.nextLoop;
+                    }
+                }
+                if (!evaluateBRepGraph(g)) return false;
+                mesh.formatName = L"Siemens Parasolid Binary Solid (.x_b)";
+                return true;
+            }
+
+            // Text Parasolid (.x_t): reject NUL-containing garbage strictly!
             for (size_t i = 0; i < std::min<size_t>(size, 1024); ++i) {
                 if (data[i] == 0) return false;
             }
@@ -4285,6 +4987,46 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
                         s.radius2 = std::fabs(rc.nums[b + 7]);
                     }
                     g.surfaces[id] = s;
+                } else if (tp == "b_surface") {
+                    // Parasolid XT b_surface: [uDeg, vDeg, nU, nV, vertexDim(3|4), knotsU(nU+uDeg+1), knotsV(nV+vDeg+1), poles(nU*nV*vertexDim)]
+                    if (rc.nums.size() >= 16) {
+                        int uDeg = static_cast<int>(std::llround(rc.nums[0]));
+                        int vDeg = static_cast<int>(std::llround(rc.nums[1]));
+                        int nU   = static_cast<int>(std::llround(rc.nums[2]));
+                        int nV   = static_cast<int>(std::llround(rc.nums[3]));
+                        int vDim = static_cast<int>(std::llround(rc.nums[4]));
+                        if (uDeg >= 1 && uDeg <= 15 && vDeg >= 1 && vDeg <= 15 &&
+                            nU > uDeg && nU <= 256 && nV > vDeg && nV <= 256 && (vDim == 3 || vDim == 4))
+                        {
+                            size_t kuCnt = static_cast<size_t>(nU + uDeg + 1);
+                            size_t kvCnt = static_cast<size_t>(nV + vDeg + 1);
+                            size_t pCnt  = static_cast<size_t>(nU) * static_cast<size_t>(nV);
+                            size_t sp = 5;
+                            if (sp + kuCnt + kvCnt + pCnt * static_cast<size_t>(vDim) <= rc.nums.size()) {
+                                BRepSurf s;
+                                s.kind = SurfKind::Nurbs;
+                                s.uDeg = uDeg; s.vDeg = vDeg; s.nU = nU; s.nV = nV;
+                                s.isRational = (vDim == 4);
+                                s.knotsU.assign(rc.nums.begin() + static_cast<ptrdiff_t>(sp),
+                                                rc.nums.begin() + static_cast<ptrdiff_t>(sp + kuCnt));
+                                sp += kuCnt;
+                                s.knotsV.assign(rc.nums.begin() + static_cast<ptrdiff_t>(sp),
+                                                rc.nums.begin() + static_cast<ptrdiff_t>(sp + kvCnt));
+                                sp += kvCnt;
+                                s.poles.resize(pCnt);
+                                if (s.isRational) s.weights.resize(pCnt, 1.0);
+                                for (size_t k = 0; k < pCnt; ++k) {
+                                    s.poles[k] = {
+                                        rc.nums[sp + k * static_cast<size_t>(vDim) + 0],
+                                        rc.nums[sp + k * static_cast<size_t>(vDim) + 1],
+                                        rc.nums[sp + k * static_cast<size_t>(vDim) + 2]
+                                    };
+                                    if (s.isRational) s.weights[k] = rc.nums[sp + k * 4u + 3u];
+                                }
+                                g.surfaces[id] = std::move(s);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -4948,118 +5690,740 @@ inline bool ParseSciRoboChem200(const uint8_t* data, size_t size, const std::wst
         return !mesh.vertices.empty() && !mesh.tris.empty();
     }
 
-    // #56. LASzip / LAS 1.2–1.4 LiDAR (.laz — decodes uncompressed point records; returns false if LAZ-compressed)
+    // #56. LASzip / LAS 1.0–1.4 LiDAR (.laz — decodes both LASzip VLR 22204 arithmetic chunks and uncompressed records)
     if (ext == L".laz" || (size >= 227 && std::memcmp(data, "LASF", 4) == 0)) {
-        if (size < 227 || std::memcmp(data, "LASF", 4) != 0) return false;
-        uint8_t vMaj     = data[24];
-        uint8_t vMin     = data[25];
-        uint16_t hdrSize = Detail3D200::RdU16LE(data + 94);
-        uint32_t ptOff   = Detail3D200::RdU32LE(data + 96);
-        uint8_t ptFmt    = data[104];
-        uint16_t recLen  = Detail3D200::RdU16LE(data + 105);
-        uint64_t nPts    = Detail3D200::RdU32LE(data + 107);
-        if (vMaj == 1 && vMin >= 4 && hdrSize >= 375 && size >= 255 && nPts == 0) {
-            nPts = Detail3D200::RdU64LE(data + 247);
+        bool ok = Formats::ParseLasLidarMesh(data, size, mesh);
+        if (ok && ext == L".laz" && mesh.formatName.find(L".laz") == std::wstring::npos) {
+            mesh.formatName = L"LAS / LASzip LiDAR (.laz)";
         }
-        // Bit 7 (ptFmt >= 128) marks LAZ arithmetic-coded chunks; never synthesize fake geometry!
-        if (ptFmt >= 128 || nPts == 0 || recLen < 12 || ptOff < 227 || ptOff >= size || ptOff + recLen > size) {
-            return false;
-        }
-
-        double scaleX = Detail3D200::RdF64LE(data + 131);
-        double scaleY = Detail3D200::RdF64LE(data + 139);
-        double scaleZ = Detail3D200::RdF64LE(data + 147);
-        double offX   = Detail3D200::RdF64LE(data + 155);
-        double offY   = Detail3D200::RdF64LE(data + 163);
-        double offZ   = Detail3D200::RdF64LE(data + 171);
-        if (scaleX == 0.0) scaleX = 0.01;
-        if (scaleY == 0.0) scaleY = 0.01;
-        if (scaleZ == 0.0) scaleZ = 0.01;
-
-        mesh.formatName = L"LAS v" + std::to_wstring(vMaj) + L"." + std::to_wstring(vMin) +
-                          L" LiDAR (" + std::to_wstring(nPts) + L" pts)";
-
-        uint64_t availPts = std::min<uint64_t>(nPts, (size - ptOff) / recLen);
-        if (availPts == 0) return false;
-        uint64_t step = std::max<uint64_t>(1, availPts / 20000);
-
-        std::vector<Vec3f> pts;
-        pts.reserve(static_cast<size_t>(std::min<uint64_t>(availPts, 20000)));
-        for (uint64_t i = 0; i < availPts && pts.size() < 20000; i += step) {
-            const uint8_t* rp = data + ptOff + static_cast<size_t>(i * recLen);
-            int32_t ix = static_cast<int32_t>(Detail3D200::RdU32LE(rp + 0));
-            int32_t iy = static_cast<int32_t>(Detail3D200::RdU32LE(rp + 4));
-            int32_t iz = static_cast<int32_t>(Detail3D200::RdU32LE(rp + 8));
-            float x = static_cast<float>(ix * scaleX + offX);
-            float y = static_cast<float>(iy * scaleY + offY);
-            float z = static_cast<float>(iz * scaleZ + offZ);
-            if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
-                pts.push_back({ x, z, -y });
-            }
-        }
-        if (pts.empty()) return false;
-        float r = Detail3D200::ComputePointCloudSpan(pts) * 0.018f;
-        for (const auto& pt : pts) Detail3D200::AddPointTetra(mesh, pt, r);
-        return !mesh.vertices.empty() && !mesh.tris.empty();
+        return ok;
     }
 
-    // #57. ROS Robot Description Format (.urdf — XML <robot> <link> <joint>)
+    // #57. ROS Robot Description Format (.urdf — Full Kinematic Tree: <link>, <joint> T*Rz*Ry*Rx, <visual> primitives & external meshes)
     if (ext == L".urdf") {
         if (sv.find("<robot") == std::string_view::npos) return false;
         mesh.formatName = L"ROS Robot Description (.urdf)";
 
-        auto attrStr = [](std::string_view blk, const char* key) -> std::string_view {
-            size_t k = blk.find(key);
-            if (k == std::string_view::npos) return {};
-            k += std::strlen(key);
-            size_t q = blk.find('"', k);
-            return (q == std::string_view::npos) ? std::string_view{} : blk.substr(k, q - k);
+        struct UrdfMat4 {
+            float m[4][4] = {
+                { 1.0f, 0.0f, 0.0f, 0.0f },
+                { 0.0f, 1.0f, 0.0f, 0.0f },
+                { 0.0f, 0.0f, 1.0f, 0.0f },
+                { 0.0f, 0.0f, 0.0f, 1.0f }
+            };
         };
 
-        int linkIdx = 0;
-        size_t pos = 0;
-        while ((pos = sv.find("<link", pos)) != std::string_view::npos) {
-            size_t closeL = sv.find("</link>", pos);
-            size_t selfL  = sv.find("/>", pos);
-            size_t endL   = (closeL != std::string_view::npos && (selfL == std::string_view::npos || closeL < selfL))
-                            ? (closeL + 7)
-                            : ((selfL != std::string_view::npos) ? (selfL + 2) : sv.size());
-            std::string_view blk = sv.substr(pos, endL - pos);
-            pos = endL;
+        auto makeUrdfPose = [](float tx, float ty, float tz, float roll, float pitch, float yaw) -> UrdfMat4 {
+            // Exact URDF spec: T(tx,ty,tz) * Rz(yaw) * Ry(pitch) * Rx(roll)
+            const float cr = std::cos(roll),  sr = std::sin(roll);
+            const float cp = std::cos(pitch), sp = std::sin(pitch);
+            const float cy = std::cos(yaw),   sy = std::sin(yaw);
+            UrdfMat4 r;
+            r.m[0][0] = cy * cp;  r.m[0][1] = cy * sp * sr - sy * cr;  r.m[0][2] = cy * sp * cr + sy * sr;  r.m[0][3] = tx;
+            r.m[1][0] = sy * cp;  r.m[1][1] = sy * sp * sr + cy * cr;  r.m[1][2] = sy * sp * cr - cy * sr;  r.m[1][3] = ty;
+            r.m[2][0] = -sp;      r.m[2][1] = cp * sr;                 r.m[2][2] = cp * cr;                 r.m[2][3] = tz;
+            r.m[3][0] = 0.0f;     r.m[3][1] = 0.0f;                    r.m[3][2] = 0.0f;                    r.m[3][3] = 1.0f;
+            return r;
+        };
 
-            float ox = 0.0f, oy = linkIdx * 0.45f, oz = 0.0f;
-            std::string_view xyz = attrStr(blk, "xyz=\"");
-            if (!xyz.empty()) {
-                std::string s(xyz);
-                float tx = 0, ty = 0, tz = 0;
-                if (sscanf_s(s.c_str(), "%f %f %f", &tx, &ty, &tz) == 3) { ox = tx; oy += tz; oz = ty; }
+        auto mulUrdfMat4 = [](const UrdfMat4& a, const UrdfMat4& b) -> UrdfMat4 {
+            UrdfMat4 c;
+            for (int r = 0; r < 4; ++r) {
+                for (int col = 0; col < 4; ++col) {
+                    c.m[r][col] = a.m[r][0] * b.m[0][col] +
+                                  a.m[r][1] * b.m[1][col] +
+                                  a.m[r][2] * b.m[2][col] +
+                                  a.m[r][3] * b.m[3][col];
+                }
             }
+            return c;
+        };
 
-            size_t boxP = blk.find("<box");
-            size_t cylP = blk.find("<cylinder");
-            size_t sphP = blk.find("<sphere");
-            if (boxP != std::string_view::npos) {
-                std::string szStr(attrStr(blk.substr(boxP), "size=\""));
-                float bx = 0.0f, by = 0.0f, bz = 0.0f;
-                if (sscanf_s(szStr.c_str(), "%f %f %f", &bx, &by, &bz) == 3 && bx > 0.0f && by > 0.0f && bz > 0.0f) {
-                    Detail3D100::AddBoxPrim(mesh, ox, oy, oz, bx * 0.5f, bz * 0.5f, by * 0.5f);
-                    ++linkIdx;
+        auto detUrdf3x3 = [](const UrdfMat4& a) -> float {
+            return a.m[0][0] * (a.m[1][1] * a.m[2][2] - a.m[1][2] * a.m[2][1]) -
+                   a.m[0][1] * (a.m[1][0] * a.m[2][2] - a.m[1][2] * a.m[2][0]) +
+                   a.m[0][2] * (a.m[1][0] * a.m[2][1] - a.m[1][1] * a.m[2][0]);
+        };
+
+        auto xformUrdfToViewer = [](const UrdfMat4& m, float lx, float ly, float lz) -> Vec3f {
+            float wx = m.m[0][0] * lx + m.m[0][1] * ly + m.m[0][2] * lz + m.m[0][3];
+            float wy = m.m[1][0] * lx + m.m[1][1] * ly + m.m[1][2] * lz + m.m[1][3];
+            float wz = m.m[2][0] * lx + m.m[2][1] * ly + m.m[2][2] * lz + m.m[2][3];
+            // Convert ROS right-handed Z-up world (wx, wy, wz) -> right-handed studio Y-up (wx, wz, -wy)
+            return { wx, wz, -wy };
+        };
+
+        struct UrdfXmlTag {
+            std::string_view name;
+            std::string_view attrs;
+            size_t tagStart = 0;
+            size_t afterTag = 0;
+            bool isClosing = false;
+            bool isSelfClosing = false;
+        };
+
+        auto nextUrdfTag = [](std::string_view src, size_t& p, UrdfXmlTag& out) -> bool {
+            const size_t n = src.size();
+            while (p < n) {
+                size_t lt = src.find('<', p);
+                if (lt == std::string_view::npos || lt + 1 >= n) { p = n; return false; }
+                if (lt + 4 <= n && src.substr(lt, 4) == "<!--") {
+                    size_t ec = src.find("-->", lt + 4);
+                    p = (ec == std::string_view::npos) ? n : (ec + 3);
+                    continue;
                 }
-            } else if (cylP != std::string_view::npos) {
-                float rad = std::strtof(std::string(attrStr(blk.substr(cylP), "radius=\"")).c_str(), nullptr);
-                float len = std::strtof(std::string(attrStr(blk.substr(cylP), "length=\"")).c_str(), nullptr);
-                if (rad > 0.0f && len > 0.0f) {
-                    Detail3D200::AddCylinderY(mesh, ox, oy, oz, rad, len);
-                    ++linkIdx;
+                if (src[lt + 1] == '?' || src[lt + 1] == '!') {
+                    size_t gt = src.find('>', lt + 2);
+                    p = (gt == std::string_view::npos) ? n : (gt + 1);
+                    continue;
                 }
-            } else if (sphP != std::string_view::npos) {
-                float rad = std::strtof(std::string(attrStr(blk.substr(sphP), "radius=\"")).c_str(), nullptr);
-                if (rad > 0.0f) {
-                    Detail3D200::AddOctaSphere(mesh, ox, oy, oz, rad);
-                    ++linkIdx;
+                size_t gt = lt + 1;
+                char q = 0;
+                while (gt < n) {
+                    char c = src[gt];
+                    if (q) { if (c == q) q = 0; }
+                    else if (c == '"' || c == '\'') q = c;
+                    else if (c == '>') break;
+                    ++gt;
                 }
+                if (gt >= n) { p = n; return false; }
+                out = {};
+                out.tagStart = lt;
+                out.afterTag = gt + 1;
+                p = gt + 1;
+
+                std::string_view inner = src.substr(lt + 1, gt - lt - 1);
+                while (!inner.empty() && (inner.front() == ' ' || inner.front() == '\t' || inner.front() == '\r' || inner.front() == '\n')) inner.remove_prefix(1);
+                while (!inner.empty() && (inner.back() == ' ' || inner.back() == '\t' || inner.back() == '\r' || inner.back() == '\n')) inner.remove_suffix(1);
+                if (inner.empty()) continue;
+                if (inner.front() == '/') {
+                    out.isClosing = true;
+                    inner.remove_prefix(1);
+                } else if (inner.back() == '/') {
+                    out.isSelfClosing = true;
+                    inner.remove_suffix(1);
+                }
+                size_t ne = 0;
+                while (ne < inner.size() && inner[ne] != ' ' && inner[ne] != '\t' && inner[ne] != '\r' && inner[ne] != '\n') ++ne;
+                std::string_view qn = inner.substr(0, ne);
+                size_t col = qn.rfind(':');
+                out.name = (col == std::string_view::npos) ? qn : qn.substr(col + 1);
+                out.attrs = (ne < inner.size()) ? inner.substr(ne) : std::string_view{};
+                return true;
+            }
+            return false;
+        };
+
+        auto findUrdfElementBody = [&](std::string_view src, size_t startAfterOpen, std::string_view elemName, std::string_view& bodyOut, size_t& afterCloseOut) -> bool {
+            int depth = 1;
+            size_t scan = startAfterOpen;
+            UrdfXmlTag t;
+            while (nextUrdfTag(src, scan, t)) {
+                if (t.name == elemName) {
+                    if (t.isClosing) {
+                        if (--depth == 0) {
+                            bodyOut = src.substr(startAfterOpen, t.tagStart - startAfterOpen);
+                            afterCloseOut = t.afterTag;
+                            return true;
+                        }
+                    } else if (!t.isSelfClosing) {
+                        ++depth;
+                    }
+                }
+            }
+            return false;
+        };
+
+        auto getUrdfAttr = [](std::string_view attrs, std::string_view key) -> std::string_view {
+            size_t p = 0;
+            while (p < attrs.size()) {
+                while (p < attrs.size() && (attrs[p] == ' ' || attrs[p] == '\t' || attrs[p] == '\r' || attrs[p] == '\n')) ++p;
+                if (p >= attrs.size()) break;
+                size_t ks = p;
+                while (p < attrs.size() && attrs[p] != '=' && attrs[p] != ' ' && attrs[p] != '\t' && attrs[p] != '\r' && attrs[p] != '\n') ++p;
+                std::string_view k = attrs.substr(ks, p - ks);
+                while (p < attrs.size() && (attrs[p] == ' ' || attrs[p] == '\t' || attrs[p] == '\r' || attrs[p] == '\n')) ++p;
+                if (p >= attrs.size() || attrs[p] != '=') continue;
+                ++p;
+                while (p < attrs.size() && (attrs[p] == ' ' || attrs[p] == '\t' || attrs[p] == '\r' || attrs[p] == '\n')) ++p;
+                if (p >= attrs.size() || (attrs[p] != '"' && attrs[p] != '\'')) continue;
+                char q = attrs[p++];
+                size_t vs = p;
+                size_t ve = attrs.find(q, vs);
+                if (ve == std::string_view::npos) break;
+                p = ve + 1;
+                if (k == key) return attrs.substr(vs, ve - vs);
+            }
+            return {};
+        };
+
+        auto parseUrdfVec3 = [](std::string_view s, float defX, float defY, float defZ, float& ox, float& oy, float& oz) -> bool {
+            ox = defX; oy = defY; oz = defZ;
+            if (s.empty()) return false;
+            const char* c = s.data();
+            const char* e = c + s.size();
+            float vals[3] = { defX, defY, defZ };
+            int got = 0;
+            while (c < e && got < 3) {
+                while (c < e && (*c == ' ' || *c == '\t' || *c == '\r' || *c == '\n')) ++c;
+                if (c >= e) break;
+                const char* ts = c;
+                while (c < e && *c != ' ' && *c != '\t' && *c != '\r' && *c != '\n') ++c;
+                size_t len = static_cast<size_t>(c - ts);
+                if (len == 0 || len >= 64) return false;
+                char buf[64]; std::memcpy(buf, ts, len); buf[len] = '\0';
+                char* nx = nullptr;
+                double v = std::strtod(buf, &nx);
+                if (nx == buf || !std::isfinite(v)) return false;
+                vals[got++] = static_cast<float>(v);
+            }
+            if (got < 3) return false;
+            ox = vals[0]; oy = vals[1]; oz = vals[2];
+            return true;
+        };
+
+        auto parseUrdfFloat = [](std::string_view s, float defV) -> float {
+            while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+            if (s.empty() || s.size() >= 64) return defV;
+            char buf[64]; std::memcpy(buf, s.data(), s.size()); buf[s.size()] = '\0';
+            char* nx = nullptr;
+            double v = std::strtod(buf, &nx);
+            return (nx != buf && std::isfinite(v)) ? static_cast<float>(v) : defV;
+        };
+
+        auto parseOriginTag = [&](std::string_view attrs) -> UrdfMat4 {
+            float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+            float rr = 0.0f, rp = 0.0f, ry = 0.0f;
+            parseUrdfVec3(getUrdfAttr(attrs, "xyz"), 0.0f, 0.0f, 0.0f, tx, ty, tz);
+            parseUrdfVec3(getUrdfAttr(attrs, "rpy"), 0.0f, 0.0f, 0.0f, rr, rp, ry);
+            return makeUrdfPose(tx, ty, tz, rr, rp, ry);
+        };
+
+        struct UrdfVisual {
+            enum GeomKind { None = 0, Box, Cylinder, Sphere, ExternalMesh } kind = None;
+            UrdfMat4 origin;
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f; // Box(bx,by,bz), Cylinder(rad,len), Sphere(rad)
+            std::string meshUri;
+            float scaleX = 1.0f, scaleY = 1.0f, scaleZ = 1.0f;
+            float rgba[4] = { 0.75f, 0.78f, 0.82f, 1.0f };
+        };
+
+        struct UrdfLink {
+            std::string name;
+            std::vector<UrdfVisual> visuals;
+        };
+
+        struct UrdfJoint {
+            std::string name;
+            std::string type;
+            std::string parentLink;
+            std::string childLink;
+            UrdfMat4 origin;
+        };
+
+        // Locate <robot> root body
+        size_t scanPos = 0;
+        UrdfXmlTag rootTag;
+        std::string_view robotBody;
+        bool foundRobot = false;
+        while (nextUrdfTag(sv, scanPos, rootTag)) {
+            if (!rootTag.isClosing && rootTag.name == "robot") {
+                if (rootTag.isSelfClosing) return false;
+                size_t afterRobot = scanPos;
+                if (!findUrdfElementBody(sv, scanPos, "robot", robotBody, afterRobot)) {
+                    robotBody = sv.substr(scanPos);
+                }
+                foundRobot = true;
+                break;
             }
         }
+        if (!foundRobot) return false;
+
+        std::unordered_map<std::string, std::array<float, 4>> namedMaterials;
+        std::vector<UrdfLink> links;
+        std::unordered_map<std::string, size_t> linkIndexByName;
+        std::vector<UrdfJoint> joints;
+
+        size_t rp = 0;
+        UrdfXmlTag topTag;
+        while (nextUrdfTag(robotBody, rp, topTag)) {
+            if (topTag.isClosing) continue;
+
+            if (topTag.name == "material") {
+                std::string matName(getUrdfAttr(topTag.attrs, "name"));
+                std::string_view matBody;
+                if (!topTag.isSelfClosing && findUrdfElementBody(robotBody, rp, "material", matBody, rp)) {
+                    size_t mp = 0;
+                    UrdfXmlTag mt;
+                    while (nextUrdfTag(matBody, mp, mt)) {
+                        if (!mt.isClosing && mt.name == "color") {
+                            std::string_view rgbaSv = getUrdfAttr(mt.attrs, "rgba");
+                            float r = 0.8f, g = 0.8f, b = 0.8f;
+                            if (parseUrdfVec3(rgbaSv, 0.8f, 0.8f, 0.8f, r, g, b) && !matName.empty()) {
+                                namedMaterials[matName] = { r, g, b, 1.0f };
+                            }
+                        }
+                    }
+                }
+            } else if (topTag.name == "link") {
+                UrdfLink lnk;
+                lnk.name.assign(getUrdfAttr(topTag.attrs, "name"));
+                std::string_view linkBody;
+                if (!topTag.isSelfClosing && findUrdfElementBody(robotBody, rp, "link", linkBody, rp)) {
+                    size_t lp = 0;
+                    UrdfXmlTag lt;
+                    while (nextUrdfTag(linkBody, lp, lt)) {
+                        if (lt.isClosing) continue;
+                        if (lt.name == "visual" && !lt.isSelfClosing) {
+                            std::string_view visBody;
+                            if (!findUrdfElementBody(linkBody, lp, "visual", visBody, lp)) break;
+                            UrdfVisual vis;
+                            size_t vp = 0;
+                            UrdfXmlTag vt;
+                            while (nextUrdfTag(visBody, vp, vt)) {
+                                if (vt.isClosing) continue;
+                                if (vt.name == "origin") {
+                                    vis.origin = parseOriginTag(vt.attrs);
+                                    if (!vt.isSelfClosing) {
+                                        std::string_view skip;
+                                        findUrdfElementBody(visBody, vp, "origin", skip, vp);
+                                    }
+                                } else if (vt.name == "geometry" && !vt.isSelfClosing) {
+                                    std::string_view geomBody;
+                                    if (!findUrdfElementBody(visBody, vp, "geometry", geomBody, vp)) break;
+                                    size_t gp = 0;
+                                    UrdfXmlTag gt;
+                                    while (nextUrdfTag(geomBody, gp, gt)) {
+                                        if (gt.isClosing) continue;
+                                        if (gt.name == "box") {
+                                            float bx = 0.0f, by = 0.0f, bz = 0.0f;
+                                            if (parseUrdfVec3(getUrdfAttr(gt.attrs, "size"), 0, 0, 0, bx, by, bz) &&
+                                                bx > 0.0f && by > 0.0f && bz > 0.0f) {
+                                                vis.kind = UrdfVisual::Box;
+                                                vis.p0 = bx; vis.p1 = by; vis.p2 = bz;
+                                            }
+                                        } else if (gt.name == "cylinder") {
+                                            float rad = parseUrdfFloat(getUrdfAttr(gt.attrs, "radius"), 0.0f);
+                                            float len = parseUrdfFloat(getUrdfAttr(gt.attrs, "length"), 0.0f);
+                                            if (rad > 0.0f && len > 0.0f) {
+                                                vis.kind = UrdfVisual::Cylinder;
+                                                vis.p0 = rad; vis.p1 = len;
+                                            }
+                                        } else if (gt.name == "sphere") {
+                                            float rad = parseUrdfFloat(getUrdfAttr(gt.attrs, "radius"), 0.0f);
+                                            if (rad > 0.0f) {
+                                                vis.kind = UrdfVisual::Sphere;
+                                                vis.p0 = rad;
+                                            }
+                                        } else if (gt.name == "mesh") {
+                                            std::string_view fn = getUrdfAttr(gt.attrs, "filename");
+                                            if (!fn.empty()) {
+                                                vis.kind = UrdfVisual::ExternalMesh;
+                                                vis.meshUri.assign(fn);
+                                                parseUrdfVec3(getUrdfAttr(gt.attrs, "scale"), 1.0f, 1.0f, 1.0f, vis.scaleX, vis.scaleY, vis.scaleZ);
+                                            }
+                                        }
+                                    }
+                                } else if (vt.name == "material") {
+                                    std::string mref(getUrdfAttr(vt.attrs, "name"));
+                                    auto itM = namedMaterials.find(mref);
+                                    if (itM != namedMaterials.end()) {
+                                        for (int k = 0; k < 4; ++k) vis.rgba[k] = itM->second[k];
+                                    }
+                                    if (!vt.isSelfClosing) {
+                                        std::string_view mBody;
+                                        if (findUrdfElementBody(visBody, vp, "material", mBody, vp)) {
+                                            size_t cmp = 0;
+                                            UrdfXmlTag cmt;
+                                            while (nextUrdfTag(mBody, cmp, cmt)) {
+                                                if (!cmt.isClosing && cmt.name == "color") {
+                                                    parseUrdfVec3(getUrdfAttr(cmt.attrs, "rgba"), vis.rgba[0], vis.rgba[1], vis.rgba[2], vis.rgba[0], vis.rgba[1], vis.rgba[2]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if (!vt.isSelfClosing) {
+                                    std::string_view skip;
+                                    if (!findUrdfElementBody(visBody, vp, vt.name, skip, vp)) break;
+                                }
+                            }
+                            if (vis.kind != UrdfVisual::None) {
+                                lnk.visuals.push_back(std::move(vis));
+                            }
+                        } else if (!lt.isSelfClosing) {
+                            std::string_view skip;
+                            if (!findUrdfElementBody(linkBody, lp, lt.name, skip, lp)) break;
+                        }
+                    }
+                }
+                if (!lnk.name.empty() && linkIndexByName.find(lnk.name) == linkIndexByName.end()) {
+                    linkIndexByName[lnk.name] = links.size();
+                    links.push_back(std::move(lnk));
+                }
+            } else if (topTag.name == "joint" && !topTag.isSelfClosing) {
+                UrdfJoint jnt;
+                jnt.name.assign(getUrdfAttr(topTag.attrs, "name"));
+                jnt.type.assign(getUrdfAttr(topTag.attrs, "type"));
+                std::string_view jBody;
+                if (findUrdfElementBody(robotBody, rp, "joint", jBody, rp)) {
+                    size_t jp = 0;
+                    UrdfXmlTag jt;
+                    while (nextUrdfTag(jBody, jp, jt)) {
+                        if (jt.isClosing) continue;
+                        if (jt.name == "parent") {
+                            jnt.parentLink.assign(getUrdfAttr(jt.attrs, "link"));
+                        } else if (jt.name == "child") {
+                            jnt.childLink.assign(getUrdfAttr(jt.attrs, "link"));
+                        } else if (jt.name == "origin") {
+                            jnt.origin = parseOriginTag(jt.attrs);
+                        }
+                        if (!jt.isSelfClosing) {
+                            std::string_view skip;
+                            if (!findUrdfElementBody(jBody, jp, jt.name, skip, jp)) break;
+                        }
+                    }
+                }
+                if (!jnt.parentLink.empty() && !jnt.childLink.empty()) {
+                    joints.push_back(std::move(jnt));
+                }
+            } else if (!topTag.isSelfClosing) {
+                std::string_view skip;
+                if (!findUrdfElementBody(robotBody, rp, topTag.name, skip, rp)) break;
+            }
+        }
+
+        if (links.empty()) return false;
+
+        // Build adjacency list parentLinkIdx -> [(childLinkIdx, jointOriginTransform)]
+        std::vector<std::vector<std::pair<size_t, UrdfMat4>>> childrenOf(links.size());
+        std::vector<bool> isChildLink(links.size(), false);
+        for (const auto& j : joints) {
+            auto itP = linkIndexByName.find(j.parentLink);
+            auto itC = linkIndexByName.find(j.childLink);
+            if (itP != linkIndexByName.end() && itC != linkIndexByName.end() && itP->second != itC->second) {
+                childrenOf[itP->second].emplace_back(itC->second, j.origin);
+                isChildLink[itC->second] = true;
+            }
+        }
+
+        // Helper to resolve & load external <mesh filename="..."/> (.stl, .obj, .dae, .ply) in local link coords
+        std::wstring urdfDir;
+        if (!mesh.filePath.empty()) {
+            size_t sl = mesh.filePath.find_last_of(L"\\/");
+            if (sl != std::wstring::npos) urdfDir = mesh.filePath.substr(0, sl);
+        }
+
+        auto loadExternalUrdfMesh = [&](const std::string& rawUri, std::vector<Vec3f>& outV, std::vector<std::array<uint32_t, 3>>& outT) -> bool {
+            if (urdfDir.empty() || rawUri.empty()) return false;
+            std::string clean = rawUri;
+            std::string pkgName;
+            if (clean.rfind("package://", 0) == 0) {
+                clean.erase(0, 10);
+                size_t slash = clean.find('/');
+                if (slash == std::string::npos || slash + 1 >= clean.size()) return false;
+                pkgName = clean.substr(0, slash);
+                clean.erase(0, slash + 1);
+            } else if (clean.rfind("file:///", 0) == 0) {
+                clean.erase(0, 8);
+            } else if (clean.rfind("file://", 0) == 0) {
+                clean.erase(0, 7);
+            }
+            while (!clean.empty() && (clean.front() == '/' || clean.front() == '\\')) clean.erase(clean.begin());
+            if (clean.empty() || clean.find(':') != std::string::npos) return false;
+
+            auto utf8ToWide = [](const std::string& s) -> std::wstring {
+                if (s.empty()) return {};
+                int wn = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+                if (wn <= 0) return {};
+                std::wstring out(static_cast<size_t>(wn), L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), wn);
+                return out;
+            };
+
+            std::wstring wRel = utf8ToWide(clean);
+            for (wchar_t& ch : wRel) { if (ch == L'/') ch = L'\\'; }
+
+            std::vector<std::wstring> candidates;
+            candidates.push_back(urdfDir + L"\\" + wRel);
+            size_t parentSl = urdfDir.find_last_of(L"\\/");
+            if (parentSl != std::wstring::npos) {
+                std::wstring parentDir = urdfDir.substr(0, parentSl);
+                candidates.push_back(parentDir + L"\\" + wRel);
+                if (!pkgName.empty()) {
+                    std::wstring wPkg = utf8ToWide(pkgName);
+                    candidates.push_back(parentDir + L"\\" + wPkg + L"\\" + wRel);
+                    size_t grandSl = parentDir.find_last_of(L"\\/");
+                    if (grandSl != std::wstring::npos) {
+                        candidates.push_back(parentDir.substr(0, grandSl) + L"\\" + wPkg + L"\\" + wRel);
+                    }
+                }
+            }
+
+            std::vector<uint8_t> extBuf;
+            std::wstring matchedPath;
+            for (const auto& cand : candidates) {
+                HANDLE hf = CreateFileW(cand.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hf != INVALID_HANDLE_VALUE) {
+                    LARGE_INTEGER li = {};
+                    GetFileSizeEx(hf, &li);
+                    if (li.QuadPart > 0 && li.QuadPart <= 64LL * 1024LL * 1024LL) {
+                        extBuf.resize(static_cast<size_t>(li.QuadPart));
+                        DWORD br = 0;
+                        ReadFile(hf, extBuf.data(), static_cast<DWORD>(extBuf.size()), &br, nullptr);
+                        extBuf.resize(br);
+                        matchedPath = cand;
+                    }
+                    CloseHandle(hf);
+                    if (!extBuf.empty()) break;
+                }
+            }
+            if (extBuf.empty()) return false;
+
+            std::wstring mExt;
+            const wchar_t* dot = PathFindExtensionW(matchedPath.c_str());
+            if (dot && *dot) mExt = PathUtils::ToLower(dot);
+
+            if (mExt == L".stl") {
+                bool isBinStl = false;
+                if (extBuf.size() >= 84) {
+                    uint32_t tc = Detail3D200::RdU32LE(extBuf.data() + 80);
+                    uint64_t exp = 84ULL + static_cast<uint64_t>(tc) * 50ULL;
+                    if (tc > 0 && (exp == extBuf.size() || (extBuf.size() >= exp && std::memcmp(extBuf.data(), "solid", 5) != 0))) {
+                        isBinStl = true;
+                    }
+                }
+                if (isBinStl) {
+                    uint32_t tc = Detail3D200::RdU32LE(extBuf.data() + 80);
+                    size_t avail = std::min<size_t>(tc, (extBuf.size() - 84) / 50);
+                    for (size_t t = 0; t < avail && outT.size() < 40000; ++t) {
+                        float fv[12] = {};
+                        std::memcpy(fv, extBuf.data() + 84 + t * 50, 48);
+                        uint32_t b = static_cast<uint32_t>(outV.size());
+                        outV.push_back({ fv[3], fv[4], fv[5] });
+                        outV.push_back({ fv[6], fv[7], fv[8] });
+                        outV.push_back({ fv[9], fv[10], fv[11] });
+                        outT.push_back({ b, b + 1, b + 2 });
+                    }
+                } else {
+                    const char* p = reinterpret_cast<const char*>(extBuf.data());
+                    const char* e = p + extBuf.size();
+                    while (p < e) {
+                        while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+                        if (p + 6 < e && std::memcmp(p, "vertex", 6) == 0 && (p[6] == ' ' || p[6] == '\t')) {
+                            p += 6;
+                            char* nx = nullptr;
+                            float vx = std::strtof(p, &nx); p = nx;
+                            float vy = std::strtof(p, &nx); p = nx;
+                            float vz = std::strtof(p, &nx); p = nx;
+                            outV.push_back({ vx, vy, vz });
+                            if (outV.size() % 3 == 0) {
+                                uint32_t b = static_cast<uint32_t>(outV.size() - 3);
+                                outT.push_back({ b, b + 1, b + 2 });
+                            }
+                        }
+                        while (p < e && *p != '\n') ++p;
+                    }
+                }
+                return !outV.empty() && !outT.empty();
+            } else if (mExt == L".obj") {
+                const char* p = reinterpret_cast<const char*>(extBuf.data());
+                const char* e = p + extBuf.size();
+                std::vector<uint32_t> fp;
+                while (p < e) {
+                    while (p < e && (*p == ' ' || *p == '\t' || *p == '\r')) ++p;
+                    if (p >= e) break;
+                    if (*p == '\n') { ++p; continue; }
+                    const char* le = p;
+                    while (le < e && *le != '\n') ++le;
+                    if (p[0] == 'v' && (p[1] == ' ' || p[1] == '\t')) {
+                        char* nx = nullptr;
+                        float vx = std::strtof(p + 2, &nx);
+                        float vy = std::strtof(nx, &nx);
+                        float vz = std::strtof(nx, &nx);
+                        outV.push_back({ vx, vy, vz });
+                    } else if (p[0] == 'f' && (p[1] == ' ' || p[1] == '\t')) {
+                        fp.clear();
+                        const char* c = p + 2;
+                        while (c < le) {
+                            while (c < le && (*c == ' ' || *c == '\t' || *c == '\r')) ++c;
+                            if (c >= le || *c == '#') break;
+                            char* nx = nullptr;
+                            long idx = std::strtol(c, &nx, 10);
+                            if (nx == c) break;
+                            c = nx;
+                            while (c < le && *c != ' ' && *c != '\t' && *c != '\r') ++c;
+                            int vi = (idx > 0) ? (static_cast<int>(idx) - 1) : (static_cast<int>(outV.size()) + static_cast<int>(idx));
+                            if (vi >= 0 && static_cast<size_t>(vi) < outV.size()) fp.push_back(static_cast<uint32_t>(vi));
+                        }
+                        for (size_t k = 1; k + 1 < fp.size(); ++k) outT.push_back({ fp[0], fp[k], fp[k + 1] });
+                    }
+                    p = (le < e) ? (le + 1) : e;
+                }
+                return !outV.empty() && !outT.empty();
+            } else if (mExt == L".ply") {
+                LoadedMesh3D sub;
+                if (Formats::ParsePlyMesh(extBuf.data(), extBuf.size(), sub, false)) {
+                    outV = std::move(sub.vertices);
+                    outT.reserve(sub.tris.size());
+                    for (const auto& tr : sub.tris) outT.push_back({ tr.i0, tr.i1, tr.i2 });
+                    return !outV.empty() && !outT.empty();
+                }
+            } else if (mExt == L".dae") {
+                LoadedMesh3D sub;
+                std::string_view dSv(reinterpret_cast<const char*>(extBuf.data()), extBuf.size());
+                if (Formats::ParseColladaDaeMesh(dSv, sub)) {
+                    const bool zUpDae = (dSv.find("Z_UP") != std::string_view::npos);
+                    outV.reserve(sub.vertices.size());
+                    for (const auto& v : sub.vertices) {
+                        if (zUpDae) outV.push_back(v);
+                        else        outV.push_back({ v.x, -v.z, v.y });
+                    }
+                    outT.reserve(sub.tris.size());
+                    for (const auto& tr : sub.tris) outT.push_back({ tr.i0, tr.i1, tr.i2 });
+                    return !outV.empty() && !outT.empty();
+                }
+            }
+            return false;
+        };
+
+        auto emitTransformedVisual = [&](const UrdfVisual& vis, const UrdfMat4& worldFromLink) {
+            const UrdfMat4 worldFromVis = mulUrdfMat4(worldFromLink, vis.origin);
+            std::vector<Vec3f> localV;
+            std::vector<std::array<uint32_t, 3>> localT;
+            bool flip = (detUrdf3x3(worldFromVis) < 0.0f);
+
+            if (vis.kind == UrdfVisual::Box) {
+                const float hx = vis.p0 * 0.5f, hy = vis.p1 * 0.5f, hz = vis.p2 * 0.5f;
+                localV = {
+                    { -hx, -hy, -hz }, {  hx, -hy, -hz }, {  hx,  hy, -hz }, { -hx,  hy, -hz },
+                    { -hx, -hy,  hz }, {  hx, -hy,  hz }, {  hx,  hy,  hz }, { -hx,  hy,  hz }
+                };
+                localT = {
+                    {{0, 2, 1}}, {{0, 3, 2}},
+                    {{4, 5, 6}}, {{4, 6, 7}},
+                    {{0, 1, 5}}, {{0, 5, 4}},
+                    {{1, 2, 6}}, {{1, 6, 5}},
+                    {{2, 3, 7}}, {{2, 7, 6}},
+                    {{3, 0, 4}}, {{3, 4, 7}}
+                };
+            } else if (vis.kind == UrdfVisual::Cylinder) {
+                // URDF spec: <cylinder> axis is ALWAYS aligned along local Z-axis [-length/2, +length/2]!
+                const float rad = vis.p0;
+                const float hz  = vis.p1 * 0.5f;
+                constexpr int kSegs = 16;
+                localV.reserve(kSegs * 2 + 2);
+                for (int i = 0; i < kSegs; ++i) {
+                    float ang = static_cast<float>(i) * (6.283185307f / static_cast<float>(kSegs));
+                    float cx = rad * std::cos(ang);
+                    float cy = rad * std::sin(ang);
+                    localV.push_back({ cx, cy, -hz });
+                    localV.push_back({ cx, cy,  hz });
+                }
+                const uint32_t botC = static_cast<uint32_t>(localV.size());
+                localV.push_back({ 0.0f, 0.0f, -hz });
+                const uint32_t topC = static_cast<uint32_t>(localV.size());
+                localV.push_back({ 0.0f, 0.0f,  hz });
+
+                for (int i = 0; i < kSegs; ++i) {
+                    int ni = (i + 1) % kSegs;
+                    uint32_t b0 = static_cast<uint32_t>(i * 2);
+                    uint32_t t0 = b0 + 1;
+                    uint32_t b1 = static_cast<uint32_t>(ni * 2);
+                    uint32_t t1 = b1 + 1;
+                    localT.push_back({ b0, b1, t1 });
+                    localT.push_back({ b0, t1, t0 });
+                    localT.push_back({ botC, b1, b0 });
+                    localT.push_back({ topC, t0, t1 });
+                }
+            } else if (vis.kind == UrdfVisual::Sphere) {
+                const float rad = vis.p0;
+                constexpr int kLat = 8;
+                constexpr int kLon = 14;
+                localV.push_back({ 0.0f, 0.0f, -rad }); // south pole = 0
+                for (int ilat = 1; ilat < kLat; ++ilat) {
+                    float phi = -1.570796327f + static_cast<float>(ilat) * (3.141592654f / static_cast<float>(kLat));
+                    float cz = rad * std::sin(phi);
+                    float cr = rad * std::cos(phi);
+                    for (int ilon = 0; ilon < kLon; ++ilon) {
+                        float th = static_cast<float>(ilon) * (6.283185307f / static_cast<float>(kLon));
+                        localV.push_back({ cr * std::cos(th), cr * std::sin(th), cz });
+                    }
+                }
+                const uint32_t northIdx = static_cast<uint32_t>(localV.size());
+                localV.push_back({ 0.0f, 0.0f, rad });
+
+                for (int ilon = 0; ilon < kLon; ++ilon) {
+                    uint32_t c0 = 1u + static_cast<uint32_t>(ilon);
+                    uint32_t c1 = 1u + static_cast<uint32_t>((ilon + 1) % kLon);
+                    localT.push_back({ 0u, c1, c0 });
+                }
+                for (int ilat = 0; ilat + 2 < kLat; ++ilat) {
+                    uint32_t rowA = 1u + static_cast<uint32_t>(ilat * kLon);
+                    uint32_t rowB = rowA + static_cast<uint32_t>(kLon);
+                    for (int ilon = 0; ilon < kLon; ++ilon) {
+                        uint32_t nlon = static_cast<uint32_t>((ilon + 1) % kLon);
+                        uint32_t a0 = rowA + static_cast<uint32_t>(ilon), a1 = rowA + nlon;
+                        uint32_t b0 = rowB + static_cast<uint32_t>(ilon), b1 = rowB + nlon;
+                        localT.push_back({ a0, a1, b1 });
+                        localT.push_back({ a0, b1, b0 });
+                    }
+                }
+                uint32_t topRing = 1u + static_cast<uint32_t>((kLat - 2) * kLon);
+                for (int ilon = 0; ilon < kLon; ++ilon) {
+                    uint32_t c0 = topRing + static_cast<uint32_t>(ilon);
+                    uint32_t c1 = topRing + static_cast<uint32_t>((ilon + 1) % kLon);
+                    localT.push_back({ northIdx, c0, c1 });
+                }
+            } else if (vis.kind == UrdfVisual::ExternalMesh) {
+                if (!loadExternalUrdfMesh(vis.meshUri, localV, localT)) return;
+                for (auto& v : localV) {
+                    v.x *= vis.scaleX;
+                    v.y *= vis.scaleY;
+                    v.z *= vis.scaleZ;
+                }
+                if ((vis.scaleX * vis.scaleY * vis.scaleZ) < 0.0f) flip = !flip;
+            }
+
+            if (localV.empty() || localT.empty()) return;
+            const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+            mesh.vertices.reserve(mesh.vertices.size() + localV.size());
+            for (const auto& lv : localV) {
+                mesh.vertices.push_back(xformUrdfToViewer(worldFromVis, lv.x, lv.y, lv.z));
+            }
+            mesh.tris.reserve(mesh.tris.size() + localT.size());
+            for (const auto& tr : localT) {
+                if (!flip) mesh.tris.push_back({ base + tr[0], base + tr[1], base + tr[2], {} });
+                else       mesh.tris.push_back({ base + tr[0], base + tr[2], base + tr[1], {} });
+            }
+        };
+
+        std::vector<bool> visited(links.size(), false);
+        std::function<void(size_t, const UrdfMat4&, int)> traverseLink = [&](size_t linkIdx, const UrdfMat4& worldFromLink, int depth) {
+            if (linkIdx >= links.size() || visited[linkIdx] || depth > 256) return;
+            visited[linkIdx] = true;
+            for (const auto& vis : links[linkIdx].visuals) {
+                emitTransformedVisual(vis, worldFromLink);
+            }
+            for (const auto& edge : childrenOf[linkIdx]) {
+                UrdfMat4 worldFromChild = mulUrdfMat4(worldFromLink, edge.second);
+                traverseLink(edge.first, worldFromChild, depth + 1);
+            }
+        };
+
+        const UrdfMat4 identityMat;
+        for (size_t i = 0; i < links.size(); ++i) {
+            if (!isChildLink[i]) {
+                traverseLink(i, identityMat, 0);
+            }
+        }
+        for (size_t i = 0; i < links.size(); ++i) {
+            if (!visited[i]) {
+                traverseLink(i, identityMat, 0);
+            }
+        }
+
         return !mesh.vertices.empty() && !mesh.tris.empty();
     }
 

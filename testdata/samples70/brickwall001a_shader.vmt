@@ -1,0 +1,17 @@
+// Source Engine Brick Wall Material
+"LightmappedGeneric"
+{
+    "$basetexture" "brick/brickwall001a"
+    "$bumpmap" "brick/brickwall001a_normal"
+    "$surfaceprop" "brick"
+    "$phong" "1"
+    "$envmaptint" "[0.25 0.25 0.30]" [$WIN32]
+    "Proxies"
+    {
+        "AnimatedTexture"
+        {
+            "animatedTextureVar" "$basetexture"
+            "animatedTextureFrameRate" "12"
+        }
+    }
+}

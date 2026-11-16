@@ -1,0 +1,11 @@
+aig 5 2 1 2 2
+9
+6
+10
+i0 clk_en
+i1 rst_n
+l0 q_state
+o0 q_out
+o1 carry_out
+c
+Binary AIGER sequential counter sample

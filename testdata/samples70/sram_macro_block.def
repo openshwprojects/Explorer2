@@ -1,0 +1,13 @@
+VERSION 5.8 ;
+DESIGN sram_256x32_tile ;
+UNITS DISTANCE MICRONS 2000 ;
+DIEAREA ( 0 0 ) ( 80000 60000 ) ;
+COMPONENTS 2 ;
+  - u_dec0 sky130_nand2_4 + FIXED ( 10000 12000 ) N ;
+  - u_sense0 sky130_dfxtp_1 + PLACED ( 42000 28000 ) S ;
+END COMPONENTS
+NETS 1 ;
+  - wl0 ( u_dec0 Y ) ( u_sense0 D )
+    + ROUTED met2 ( 14500 14000 ) ( 44000 * ) ( * 30000 ) M3_M2 ;
+END NETS
+END DESIGN

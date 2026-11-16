@@ -143,6 +143,7 @@ struct VirtualDiskReader {
     uint64_t virtualSize = 0;
     std::wstring formatName;
     bool directRawBuffer = false; // true when diskOff maps 1:1 to host file offset
+    bool allowRawSliceFallback = true;
     std::function<bool(uint64_t diskOff, uint8_t* dst, size_t len)> readBytes;
 };
 
@@ -1220,6 +1221,42 @@ inline bool BuildVirtualDiskReader(
         return true;
     }
 
+    auto decompressAppleAdc = [](const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out, size_t expectedLen) -> bool {
+        out.clear();
+        if (!src || expectedLen > 16 * 1024 * 1024) return false;
+        out.reserve(expectedLen);
+        size_t p = 0;
+        while (p < srcLen && out.size() < expectedLen) {
+            uint8_t b = src[p++];
+            if ((b & 0x80u) != 0) {
+                size_t litLen = static_cast<size_t>(b & 0x7Fu) + 1u;
+                if (p + litLen > srcLen || out.size() + litLen > expectedLen) return false;
+                out.insert(out.end(), src + p, src + p + litLen);
+                p += litLen;
+            } else if ((b & 0x40u) != 0) {
+                if (p + 2 > srcLen) return false;
+                uint8_t b1 = src[p++];
+                uint8_t b2 = src[p++];
+                size_t matchLen = static_cast<size_t>(b & 0x3Fu) + 4u;
+                size_t matchOff = (static_cast<size_t>(b1) << 8) + static_cast<size_t>(b2) + 1u;
+                if (matchOff > out.size() || out.size() + matchLen > expectedLen) return false;
+                for (size_t k = 0; k < matchLen; ++k) {
+                    out.push_back(out[out.size() - matchOff]);
+                }
+            } else {
+                if (p + 1 > srcLen) return false;
+                uint8_t b1 = src[p++];
+                size_t matchLen = static_cast<size_t>((b >> 2) & 0x0Fu) + 3u;
+                size_t matchOff = (static_cast<size_t>(b & 0x03u) << 8) + static_cast<size_t>(b1) + 1u;
+                if (matchOff > out.size() || out.size() + matchLen > expectedLen) return false;
+                for (size_t k = 0; k < matchLen; ++k) {
+                    out.push_back(out[out.size() - matchOff]);
+                }
+            }
+        }
+        return out.size() == expectedLen;
+    };
+
     // 6. Apple Disk Image (.dmg — UDIF "koly" trailer or raw disk sectors)
     if (size >= 512 && std::memcmp(data + size - 512, "koly", 4) == 0) {
         const uint8_t* koly = data + size - 512;
@@ -1263,6 +1300,7 @@ inline bool BuildVirtualDiskReader(
                         const uint8_t* ce = mish.data() + 204 + b * 40;
                         uint32_t et = RdU32BE(ce + 0);
                         if (et == 0xFFFFFFFFu) break;
+                        if (et == 0x7FFFFFFEu) continue; // BT_COMMENT
                         uint64_t sNum = RdU64BE(ce + 8);
                         uint64_t sCnt = RdU64BE(ce + 16);
                         uint64_t cOff = RdU64BE(ce + 24);
@@ -1278,12 +1316,18 @@ inline bool BuildVirtualDiskReader(
         if (!runs->empty()) {
             uint64_t maxEnd = virtSize;
             for (const auto& r : *runs) maxEnd = std::max(maxEnd, r.diskStart + r.diskLen);
+            struct DmgCache {
+                size_t runIdx = SIZE_MAX;
+                std::vector<uint8_t> dec;
+            };
+            auto runCache = std::make_shared<DmgCache>();
             outReader.virtualSize = maxEnd;
             outReader.formatName  = L"Apple Disk Image (DMG)";
             outReader.readBytes = [=](uint64_t diskOff, uint8_t* dst, size_t len) -> bool {
                 if (diskOff + len > maxEnd) return false;
                 std::memset(dst, 0, len);
-                for (const auto& r : *runs) {
+                for (size_t ri = 0; ri < runs->size(); ++ri) {
+                    const auto& r = (*runs)[ri];
                     uint64_t rEnd = r.diskStart + r.diskLen;
                     uint64_t qEnd = diskOff + len;
                     if (rEnd <= diskOff || r.diskStart >= qEnd) continue;
@@ -1293,26 +1337,39 @@ inline bool BuildVirtualDiskReader(
                     size_t dstOff    = static_cast<size_t>(ovStart - diskOff);
                     size_t runRel    = static_cast<size_t>(ovStart - r.diskStart);
 
-                    if (r.type == 0x00000001u && r.compOff + runRel + copyLen <= size) {
+                    if (r.type == 0x00000000u || r.type == 0x00000002u) {
+                        // Zero-fill / Ignore run
+                        std::memset(dst + dstOff, 0, copyLen);
+                    } else if (r.type == 0x00000001u) {
+                        if (r.compOff + runRel + copyLen > size) return false;
                         std::memcpy(dst + dstOff, data + static_cast<size_t>(r.compOff) + runRel, copyLen);
-                    } else if (r.type == 0x80000005u && r.compOff + r.compLen <= size && r.diskLen <= 16 * 1024 * 1024) {
-                        std::vector<uint8_t> dec;
-                        if (ZipDeflate::InflateZlib(data + static_cast<size_t>(r.compOff), static_cast<size_t>(r.compLen), dec, static_cast<size_t>(r.diskLen)) &&
-                            runRel + copyLen <= dec.size())
-                        {
-                            std::memcpy(dst + dstOff, dec.data() + runRel, copyLen);
+                    } else if (r.type == 0x80000004u || r.type == 0x80000005u || r.type == 0x80000006u) {
+                        if (r.compOff + r.compLen > size || r.diskLen > 16 * 1024 * 1024) return false;
+                        if (runCache->runIdx != ri) {
+                            std::vector<uint8_t> dec;
+                            bool ok = false;
+                            const uint8_t* cSrc = data + static_cast<size_t>(r.compOff);
+                            size_t cSz = static_cast<size_t>(r.compLen);
+                            size_t uSz = static_cast<size_t>(r.diskLen);
+                            if (r.type == 0x80000004u) {
+                                ok = decompressAppleAdc(cSrc, cSz, dec, uSz);
+                            } else if (r.type == 0x80000005u) {
+                                ok = ZipDeflate::InflateZlib(cSrc, cSz, dec, uSz) ||
+                                     ZipDeflate::InflateRaw(cSrc, cSz, dec, uSz);
+                            } else if (r.type == 0x80000006u) {
+                                ok = StreamCodecs::DecompressBzip2Stream(cSrc, cSz, dec, uSz);
+                            }
+                            if (!ok) return false;
+                            runCache->runIdx = ri;
+                            runCache->dec = std::move(dec);
                         }
-                    } else if (r.type == 0x80000006u && r.compOff + r.compLen <= size && r.diskLen <= 16 * 1024 * 1024) {
-                        std::vector<uint8_t> dec;
-                        if (StreamCodecs::DecompressBzip2Stream(data + static_cast<size_t>(r.compOff), static_cast<size_t>(r.compLen), dec, static_cast<size_t>(r.diskLen)) &&
-                            runRel + copyLen <= dec.size())
-                        {
-                            std::memcpy(dst + dstOff, dec.data() + runRel, copyLen);
-                        }
+                        if (runRel + copyLen > runCache->dec.size()) return false;
+                        std::memcpy(dst + dstOff, runCache->dec.data() + runRel, copyLen);
                     }
                 }
                 return true;
             };
+            outReader.allowRawSliceFallback = false;
             return true;
         }
 
@@ -1321,6 +1378,7 @@ inline bool BuildVirtualDiskReader(
         outReader.virtualSize = rawEnd;
         outReader.formatName  = L"Apple Disk Image (DMG)";
         outReader.directRawBuffer = true;
+        outReader.allowRawSliceFallback = false;
         outReader.readBytes = [=](uint64_t diskOff, uint8_t* dst, size_t len) -> bool {
             if (diskOff + len > rawEnd) return false;
             std::memcpy(dst, data + static_cast<size_t>(diskOff), len);
@@ -1329,10 +1387,19 @@ inline bool BuildVirtualDiskReader(
         return true;
     }
 
-    if (extLower == L".dmg" && size >= 1024) {
+    bool hasRawHfs  = (size >= 2048 && data[1024] == 'H' && (data[1025] == '+' || data[1025] == 'X'));
+    bool hasRawApm  = (size >= 1024 && data[512] == 'P' && data[513] == 'M');
+    bool hasRawExt  = (size >= 2048 && RdU16LE(data + 1024 + 56) == 0xEF53u);
+    if (hasRawHfs || hasRawApm || hasRawExt ||
+        ((extLower == L".dmg" || extLower == L".hfs" || extLower == L".ext2" ||
+          extLower == L".ext3" || extLower == L".ext4") && size >= 1024))
+    {
         outReader.virtualSize = size;
-        outReader.formatName  = L"Apple Disk Image (DMG)";
+        outReader.formatName  = (hasRawExt || extLower == L".ext2" || extLower == L".ext3" || extLower == L".ext4")
+                              ? L"Linux ext2/ext3/ext4 Image"
+                              : ((hasRawHfs || extLower == L".hfs") ? L"Apple HFS+ Volume" : L"Apple Disk Image (DMG)");
         outReader.directRawBuffer = true;
+        outReader.allowRawSliceFallback = false;
         outReader.readBytes = [=](uint64_t diskOff, uint8_t* dst, size_t len) -> bool {
             if (diskOff + len > size) return false;
             std::memcpy(dst, data + static_cast<size_t>(diskOff), len);
@@ -1855,90 +1922,593 @@ inline bool InspectOrExtractNtfsOnReader(
 }
 
 // ----------------------------------------------------------------------------
-// Linux ext2/ext3/ext4 Superblock & Root Directory Inspector
+// Linux ext2/ext3/ext4 Full Inode, Extent-Tree & Recursive Directory Inspector + Extractor
 // ----------------------------------------------------------------------------
-inline bool InspectExtFsOnReader(
+inline void UnixTimeU32ToDos(uint32_t unixSecs, uint16_t& outDate, uint16_t& outTime) {
+    outDate = 0;
+    outTime = 0;
+    if (unixSecs == 0) return;
+    uint64_t ticks = (static_cast<uint64_t>(unixSecs) + 11644473600ULL) * 10000000ULL;
+    FileTimeU64ToDos(ticks, outDate, outTime);
+}
+
+inline bool InspectOrExtractExtFsOnReader(
     const VirtualDiskReader& reader,
     uint64_t partBase,
     uint64_t partBytes,
     const std::wstring& prefixDir,
-    ArchiveSummaryInfo& outInfo)
+    ArchiveSummaryInfo& outInfo,
+    const std::wstring* extractTargetNorm = nullptr,
+    std::vector<uint8_t>* outExtracted = nullptr)
 {
-    if (partBytes < 2048 || partBase + 2048 > reader.virtualSize) return false;
+    if (partBytes < 2048 || partBase > reader.virtualSize || partBytes > reader.virtualSize - partBase) return false;
     uint8_t sb[1024] = {};
     if (!reader.readBytes(partBase + 1024, sb, 1024)) return false;
     if (RdU16LE(sb + 56) != 0xEF53u) return false;
 
-    uint32_t inodesCnt   = RdU32LE(sb + 0);
-    uint32_t blocksCnt   = RdU32LE(sb + 4);
-    uint32_t logBlkSz    = RdU32LE(sb + 24);
-    uint16_t inodeSz     = (RdU32LE(sb + 76) >= 1) ? RdU16LE(sb + 88) : 128;
-    if (logBlkSz > 6 || inodeSz < 128) return false;
-    uint32_t blockSize   = 1024u << logBlkSz;
-    std::string volName(reinterpret_cast<const char*>(sb + 120), strnlen(reinterpret_cast<const char*>(sb + 120), 16));
+    uint32_t inodesCnt    = RdU32LE(sb + 0);
+    uint32_t firstDataBlk = RdU32LE(sb + 20);
+    uint32_t logBlkSz     = RdU32LE(sb + 24);
+    uint32_t blocksPerGrp = RdU32LE(sb + 32);
+    uint32_t inodesPerGrp = RdU32LE(sb + 40);
+    uint32_t revLevel     = RdU32LE(sb + 76);
+    uint16_t inodeSz      = (revLevel >= 1) ? RdU16LE(sb + 88) : 128;
+    uint32_t incompat     = RdU32LE(sb + 96);
+    uint16_t rawDescSz    = RdU16LE(sb + 254);
 
-    // Read Block Group Descriptor 0 to locate Inode Table and Root Inode (#2)
-    uint64_t bgdOff = partBase + ((blockSize == 1024) ? 2048ULL : static_cast<uint64_t>(blockSize));
-    uint8_t bgd[64] = {};
-    size_t added = 0;
-    if (bgdOff + 64 <= reader.virtualSize && reader.readBytes(bgdOff, bgd, 64)) {
-        uint32_t inodeTblBlk = RdU32LE(bgd + 8);
-        uint64_t rootInodeOff = partBase + static_cast<uint64_t>(inodeTblBlk) * blockSize + static_cast<uint64_t>(inodeSz); // Inode 2 is index 1
-        std::vector<uint8_t> ino(inodeSz);
-        if (inodeTblBlk > 0 && rootInodeOff + inodeSz <= reader.virtualSize && reader.readBytes(rootInodeOff, ino.data(), inodeSz)) {
-            uint32_t iFlags = RdU32LE(ino.data() + 32);
-            uint32_t dirBlk = 0;
-            if ((iFlags & 0x80000u) != 0 && RdU16LE(ino.data() + 40) == 0xF30Au && RdU16LE(ino.data() + 42) >= 1) {
-                dirBlk = RdU32LE(ino.data() + 40 + 12 + 8); // ext4_extent ee_block_lo
-            } else {
-                dirBlk = RdU32LE(ino.data() + 40); // Direct block 0
+    if (logBlkSz > 6) return false;
+    uint32_t blockSize = 1024u << logBlkSz;
+    if (inodeSz < 128 || inodeSz > blockSize || inodesCnt < 2 || inodesPerGrp == 0 || blocksPerGrp == 0) return false;
+    (void)firstDataBlk;
+
+    bool has64Bit    = (incompat & 0x80u) != 0;
+    bool hasFileType = (incompat & 0x02u) != 0;
+    uint32_t descSize = (has64Bit && rawDescSz >= 64) ? rawDescSz : 32u;
+    if (descSize > 1024) return false;
+
+    uint64_t bgdtBase = partBase + ((blockSize == 1024u) ? 2048ULL : static_cast<uint64_t>(blockSize));
+
+    auto readExtInode = [&](uint32_t inoNum, std::vector<uint8_t>& outIno) -> bool {
+        if (inoNum == 0 || inoNum > inodesCnt) return false;
+        uint32_t bg  = (inoNum - 1u) / inodesPerGrp;
+        uint32_t idx = (inoNum - 1u) % inodesPerGrp;
+        uint64_t gdOff = bgdtBase + static_cast<uint64_t>(bg) * descSize;
+        size_t gdNeed = (descSize >= 64) ? 64u : 32u;
+        if (gdOff + gdNeed > partBase + partBytes || gdOff + gdNeed > reader.virtualSize) return false;
+        uint8_t gd[64] = {};
+        if (!reader.readBytes(gdOff, gd, gdNeed)) return false;
+
+        uint64_t inoTblBlk = RdU32LE(gd + 8);
+        if (descSize >= 64) {
+            inoTblBlk |= (static_cast<uint64_t>(RdU32LE(gd + 40)) << 32);
+        }
+        if (inoTblBlk == 0) return false;
+        uint64_t inoOff = partBase + inoTblBlk * blockSize + static_cast<uint64_t>(idx) * inodeSz;
+        if (inoOff + inodeSz > partBase + partBytes || inoOff + inodeSz > reader.virtualSize) return false;
+        outIno.resize(inodeSz);
+        return reader.readBytes(inoOff, outIno.data(), inodeSz);
+    };
+
+    auto getInodeSize = [&](const std::vector<uint8_t>& ino) -> uint64_t {
+        uint16_t mode = RdU16LE(ino.data() + 0);
+        uint64_t sz   = RdU32LE(ino.data() + 4);
+        if (((mode & 0xF000u) == 0x8000u) && revLevel >= 1) {
+            sz |= (static_cast<uint64_t>(RdU32LE(ino.data() + 108)) << 32);
+        }
+        return sz;
+    };
+
+    auto readInodeData = [&](const std::vector<uint8_t>& ino, uint64_t maxBytes, std::vector<uint8_t>& outData) -> bool {
+        uint16_t mode   = RdU16LE(ino.data() + 0);
+        uint32_t iFlags = RdU32LE(ino.data() + 32);
+        uint64_t fSize  = getInodeSize(ino);
+        if (fSize > maxBytes) return false;
+        outData.assign(static_cast<size_t>(fSize), 0);
+        if (fSize == 0) return true;
+
+        // Fast symlink or inline data stored directly inside i_block[0..14] (60 bytes)
+        if (((iFlags & 0x10000000u) != 0 || ((mode & 0xF000u) == 0xA000u && RdU32LE(ino.data() + 28) == 0)) && fSize <= 60) {
+            std::memcpy(outData.data(), ino.data() + 40, static_cast<size_t>(fSize));
+            return true;
+        }
+
+        // ext4 extent tree (EXT4_EXTENTS_FL = 0x00080000, eh_magic = 0xF30A)
+        if ((iFlags & 0x00080000u) != 0) {
+            auto walkExtentNode = [&](auto& self, const uint8_t* ehBuf, size_t bufLen, int depthGuard) -> bool {
+                if (depthGuard > 8 || bufLen < 12) return false;
+                if (RdU16LE(ehBuf) != 0xF30Au) return false;
+                uint16_t ehEntries = RdU16LE(ehBuf + 2);
+                uint16_t ehDepth   = RdU16LE(ehBuf + 6);
+                if (12u + static_cast<size_t>(ehEntries) * 12u > bufLen) return false;
+
+                if (ehDepth == 0) {
+                    for (uint16_t e = 0; e < ehEntries; ++e) {
+                        const uint8_t* ex = ehBuf + 12 + static_cast<size_t>(e) * 12;
+                        uint32_t eeBlock  = RdU32LE(ex + 0);
+                        uint16_t eeRawLen = RdU16LE(ex + 4);
+                        bool uninit       = (eeRawLen > 32768u);
+                        uint32_t eeLen    = uninit ? (eeRawLen - 32768u) : eeRawLen;
+                        uint64_t eeStart  = (static_cast<uint64_t>(RdU16LE(ex + 6)) << 32) | RdU32LE(ex + 8);
+                        if (eeLen == 0 || uninit) continue; // Sparse/uninitialized run already zero-filled
+                        uint64_t logOff = static_cast<uint64_t>(eeBlock) * blockSize;
+                        if (logOff >= fSize) continue;
+                        uint64_t runBytes = std::min<uint64_t>(static_cast<uint64_t>(eeLen) * blockSize, fSize - logOff);
+                        uint64_t physOff  = partBase + eeStart * blockSize;
+                        if (eeStart == 0 || physOff + runBytes > partBase + partBytes || physOff + runBytes > reader.virtualSize) {
+                            return false;
+                        }
+                        if (!reader.readBytes(physOff, outData.data() + static_cast<size_t>(logOff), static_cast<size_t>(runBytes))) {
+                            return false;
+                        }
+                    }
+                    return true;
+                } else {
+                    for (uint16_t e = 0; e < ehEntries; ++e) {
+                        const uint8_t* ix = ehBuf + 12 + static_cast<size_t>(e) * 12;
+                        uint64_t leafBlk  = (static_cast<uint64_t>(RdU16LE(ix + 8)) << 32) | RdU32LE(ix + 4);
+                        uint64_t physOff  = partBase + leafBlk * blockSize;
+                        if (leafBlk == 0 || physOff + blockSize > partBase + partBytes || physOff + blockSize > reader.virtualSize) {
+                            return false;
+                        }
+                        std::vector<uint8_t> nodeBlk(blockSize);
+                        if (!reader.readBytes(physOff, nodeBlk.data(), blockSize)) return false;
+                        if (!self(self, nodeBlk.data(), blockSize, depthGuard + 1)) return false;
+                    }
+                    return true;
+                }
+            };
+            return walkExtentNode(walkExtentNode, ino.data() + 40, 60, 0);
+        }
+
+        // Legacy ext2/ext3 direct + single/double/triple indirect block pointers
+        uint64_t curLogOff = 0;
+        uint32_t ptrsPerBlk = blockSize / 4u;
+        auto readPhysBlock = [&](uint32_t blkId) -> bool {
+            if (curLogOff >= fSize) return true;
+            size_t toCopy = static_cast<size_t>(std::min<uint64_t>(blockSize, fSize - curLogOff));
+            if (blkId != 0) {
+                uint64_t physOff = partBase + static_cast<uint64_t>(blkId) * blockSize;
+                if (physOff + toCopy > partBase + partBytes || physOff + toCopy > reader.virtualSize) return false;
+                if (!reader.readBytes(physOff, outData.data() + static_cast<size_t>(curLogOff), toCopy)) return false;
             }
-            if (dirBlk > 0 && partBase + static_cast<uint64_t>(dirBlk + 1) * blockSize <= reader.virtualSize) {
-                std::vector<uint8_t> dirData(blockSize);
-                if (reader.readBytes(partBase + static_cast<uint64_t>(dirBlk) * blockSize, dirData.data(), blockSize)) {
-                    size_t dp = 0;
-                    while (dp + 8 <= blockSize) {
-                        uint32_t dIno = RdU32LE(dirData.data() + dp);
-                        uint16_t rLen = RdU16LE(dirData.data() + dp + 4);
-                        uint8_t  nLen = dirData[dp + 6];
-                        uint8_t  fTyp = dirData[dp + 7];
-                        if (rLen < 8 || dp + rLen > blockSize) break;
-                        if (dIno != 0 && nLen > 0 && dp + 8 + nLen <= blockSize) {
-                            std::string nm(reinterpret_cast<const char*>(dirData.data() + dp + 8), nLen);
-                            if (nm != "." && nm != "..") {
-                                std::wstring wnm = PathUtils::Utf8ToWide(nm);
-                                std::wstring full = NormPath(prefixDir.empty() ? wnm : (prefixDir + L"/" + wnm));
+            curLogOff += toCopy;
+            return true;
+        };
+
+        auto readIndirect = [&](auto& self, uint32_t indBlk, int level) -> bool {
+            if (curLogOff >= fSize) return true;
+            if (indBlk == 0) {
+                uint64_t skipBlks = 1;
+                for (int l = 0; l < level; ++l) skipBlks *= ptrsPerBlk;
+                curLogOff = std::min<uint64_t>(fSize, curLogOff + skipBlks * blockSize);
+                return true;
+            }
+            uint64_t physOff = partBase + static_cast<uint64_t>(indBlk) * blockSize;
+            if (physOff + blockSize > partBase + partBytes || physOff + blockSize > reader.virtualSize) return false;
+            std::vector<uint8_t> ibuf(blockSize);
+            if (!reader.readBytes(physOff, ibuf.data(), blockSize)) return false;
+            for (uint32_t i = 0; i < ptrsPerBlk && curLogOff < fSize; ++i) {
+                uint32_t childBlk = RdU32LE(ibuf.data() + i * 4u);
+                if (level == 1) {
+                    if (!readPhysBlock(childBlk)) return false;
+                } else {
+                    if (!self(self, childBlk, level - 1)) return false;
+                }
+            }
+            return true;
+        };
+
+        for (int b = 0; b < 12 && curLogOff < fSize; ++b) {
+            if (!readPhysBlock(RdU32LE(ino.data() + 40 + b * 4))) return false;
+        }
+        if (curLogOff < fSize && !readIndirect(readIndirect, RdU32LE(ino.data() + 40 + 12 * 4), 1)) return false;
+        if (curLogOff < fSize && !readIndirect(readIndirect, RdU32LE(ino.data() + 40 + 13 * 4), 2)) return false;
+        if (curLogOff < fSize && !readIndirect(readIndirect, RdU32LE(ino.data() + 40 + 14 * 4), 3)) return false;
+        return true;
+    };
+
+    auto isDirEmptyLostAndFound = [&](const std::vector<uint8_t>& dirIno) -> bool {
+        std::vector<uint8_t> dBytes;
+        if (!readInodeData(dirIno, 256 * 1024, dBytes)) return true;
+        size_t dp = 0;
+        while (dp + 8 <= dBytes.size()) {
+            uint32_t dIno = RdU32LE(dBytes.data() + dp);
+            uint16_t rLen = RdU16LE(dBytes.data() + dp + 4);
+            uint8_t  nLen = dBytes[dp + 6];
+            if (rLen < 8 || dp + rLen > dBytes.size()) break;
+            if (dIno != 0 && nLen > 0 && dp + 8 + nLen <= dBytes.size()) {
+                std::string_view nm(reinterpret_cast<const char*>(dBytes.data() + dp + 8), nLen);
+                if (nm != "." && nm != "..") return false;
+            }
+            dp += rLen;
+        }
+        return true;
+    };
+
+    std::vector<uint8_t> rootIno;
+    if (!readExtInode(2u, rootIno) || (RdU16LE(rootIno.data()) & 0xF000u) != 0x4000u) return false;
+
+    std::set<uint32_t> visitedDirs;
+    size_t addedEntries = 0;
+    bool extractedFound = false;
+
+    auto walkDir = [&](auto& self, uint32_t dirInoNum, const std::vector<uint8_t>& dirIno, const std::wstring& curPrefix, int depth) -> bool {
+        if (depth > 16 || outInfo.entries.size() >= 50000) return true;
+        if (!visitedDirs.insert(dirInoNum).second) return true;
+
+        std::vector<uint8_t> dirBytes;
+        if (!readInodeData(dirIno, 16 * 1024 * 1024, dirBytes)) return (depth > 0);
+
+        size_t dp = 0;
+        while (dp + 8 <= dirBytes.size() && outInfo.entries.size() < 50000) {
+            uint32_t dIno = RdU32LE(dirBytes.data() + dp);
+            uint16_t rLen = RdU16LE(dirBytes.data() + dp + 4);
+            uint8_t  nLen = dirBytes[dp + 6];
+            uint8_t  fTyp = hasFileType ? dirBytes[dp + 7] : 0u;
+            if (rLen < 8 || dp + rLen > dirBytes.size()) break;
+
+            if (dIno != 0 && nLen > 0 && dp + 8 + nLen <= dirBytes.size()) {
+                std::string nm(reinterpret_cast<const char*>(dirBytes.data() + dp + 8), nLen);
+                if (nm != "." && nm != ".." && nm.find('/') == std::string::npos && nm.find('\\') == std::string::npos) {
+                    std::vector<uint8_t> childIno;
+                    if (readExtInode(dIno, childIno)) {
+                        uint16_t cMode = RdU16LE(childIno.data() + 0);
+                        uint16_t typeBits = cMode & 0xF000u;
+                        bool isDir = (typeBits == 0x4000u) || (typeBits == 0 && fTyp == 2u);
+                        bool isReg = (typeBits == 0x8000u) || (typeBits == 0xA000u) || (typeBits == 0 && (fTyp == 1u || fTyp == 7u));
+
+                        if (isDir && depth == 0 && nm == "lost+found" && isDirEmptyLostAndFound(childIno)) {
+                            dp += rLen;
+                            continue;
+                        }
+
+                        if (isDir || isReg) {
+                            std::wstring wnm = PathUtils::Utf8ToWide(nm);
+                            std::wstring full = NormPath(curPrefix.empty() ? wnm : (curPrefix + L"/" + wnm));
+
+                            if (extractTargetNorm && outExtracted) {
+                                if (!isDir && PathEqualsCI(full, *extractTargetNorm)) {
+                                    if (!readInodeData(childIno, 256ULL * 1024 * 1024, *outExtracted)) return false;
+                                    extractedFound = true;
+                                    return true;
+                                }
+                            } else {
                                 ArchiveItemEntry item;
                                 item.pathInArchive = full;
                                 item.name = BaseName(full);
-                                item.isDirectory = (fTyp == 2);
-                                item.uncompressedSize = item.isDirectory ? 0 : blockSize;
+                                item.isDirectory = isDir;
+                                item.uncompressedSize = isDir ? 0 : getInodeSize(childIno);
                                 item.compressedSize = item.uncompressedSize;
                                 item.compressionMethod = 1;
+                                UnixTimeU32ToDos(RdU32LE(childIno.data() + 16), item.dosDate, item.dosTime);
                                 outInfo.entries.push_back(std::move(item));
-                                ++added;
+                                ++addedEntries;
+                            }
+
+                            if (isDir) {
+                                if (!self(self, dIno, childIno, full, depth + 1)) return false;
+                                if (extractedFound) return true;
                             }
                         }
-                        dp += rLen;
                     }
                 }
             }
+            dp += rLen;
+        }
+        return true;
+    };
+
+    if (!walkDir(walkDir, 2u, rootIno, prefixDir, 0)) return false;
+    if (extractTargetNorm) return extractedFound;
+    return addedEntries > 0;
+}
+
+// ----------------------------------------------------------------------------
+// Apple HFS+ / HFSX Catalog B-Tree Inspector & Data-Fork Extent Extractor
+// ----------------------------------------------------------------------------
+struct HfsExtentDesc {
+    uint32_t startBlock = 0;
+    uint32_t blockCount = 0;
+};
+
+struct HfsForkData {
+    uint64_t logicalSize = 0;
+    uint32_t clumpSize   = 0;
+    uint32_t totalBlocks = 0;
+    HfsExtentDesc extents[8] = {};
+};
+
+inline HfsForkData ParseHfsForkData(const uint8_t* p) {
+    HfsForkData f;
+    f.logicalSize = RdU64BE(p + 0);
+    f.clumpSize   = RdU32BE(p + 8);
+    f.totalBlocks = RdU32BE(p + 12);
+    for (int i = 0; i < 8; ++i) {
+        f.extents[i].startBlock = RdU32BE(p + 16 + i * 8);
+        f.extents[i].blockCount = RdU32BE(p + 20 + i * 8);
+    }
+    return f;
+}
+
+inline bool ReadHfsForkBytes(
+    const VirtualDiskReader& reader,
+    uint64_t volBase,
+    uint64_t volBytes,
+    uint32_t blockSize,
+    const HfsForkData& forkData,
+    uint64_t logicalOff,
+    uint8_t* dst,
+    size_t len)
+{
+    if (len == 0) return true;
+    if (logicalOff > forkData.logicalSize || len > forkData.logicalSize - logicalOff) return false;
+
+    uint64_t curLogBase = 0;
+    size_t written = 0;
+    for (int i = 0; i < 8 && written < len; ++i) {
+        const auto& ex = forkData.extents[i];
+        if (ex.blockCount == 0) continue;
+        uint64_t exBytes = static_cast<uint64_t>(ex.blockCount) * blockSize;
+        uint64_t reqOff  = logicalOff + written;
+        if (reqOff >= curLogBase && reqOff < curLogBase + exBytes) {
+            uint64_t relInEx = reqOff - curLogBase;
+            size_t chunk = static_cast<size_t>(std::min<uint64_t>(len - written, exBytes - relInEx));
+            uint64_t physOff = volBase + static_cast<uint64_t>(ex.startBlock) * blockSize + relInEx;
+            if (physOff + chunk > volBase + volBytes || physOff + chunk > reader.virtualSize) return false;
+            if (!reader.readBytes(physOff, dst + written, chunk)) return false;
+            written += chunk;
+        }
+        curLogBase += exBytes;
+    }
+    return written == len;
+}
+
+inline void HfsTimeU32ToDos(uint32_t macSecs1904, uint16_t& outDate, uint16_t& outTime) {
+    outDate = 0;
+    outTime = 0;
+    // Mac epoch 1904-01-01 -> Unix epoch 1970-01-01 delta is 2082844800 seconds
+    if (macSecs1904 <= 2082844800u) return;
+    UnixTimeU32ToDos(macSecs1904 - 2082844800u, outDate, outTime);
+}
+
+inline bool InspectOrExtractHfsPlusOnReader(
+    const VirtualDiskReader& reader,
+    uint64_t partBase,
+    uint64_t partBytes,
+    const std::wstring& prefixDir,
+    ArchiveSummaryInfo& outInfo,
+    const std::wstring* extractTargetNorm = nullptr,
+    std::vector<uint8_t>* outExtracted = nullptr)
+{
+    if (partBytes < 2048 || partBase > reader.virtualSize || partBytes > reader.virtualSize - partBase) return false;
+
+    uint64_t volBase  = partBase;
+    uint64_t volBytes = partBytes;
+    uint8_t vh[512]   = {};
+    if (!reader.readBytes(volBase + 1024, vh, 512)) return false;
+
+    // Optional HFS Standard ("BD") wrapper embedding an HFS+ ("H+"/"HX") volume
+    if (vh[0] == 'B' && vh[1] == 'D' && vh[124] == 'H' && (vh[125] == '+' || vh[125] == 'X')) {
+        uint32_t alBlkSiz  = RdU32BE(vh + 20);
+        uint16_t alBlSt    = RdU16BE(vh + 28);
+        uint16_t embStart  = RdU16BE(vh + 126);
+        uint16_t embCount  = RdU16BE(vh + 128);
+        uint64_t embOffset = static_cast<uint64_t>(alBlSt) * 512ULL + static_cast<uint64_t>(embStart) * alBlkSiz;
+        uint64_t embLength = static_cast<uint64_t>(embCount) * alBlkSiz;
+        if (alBlkSiz >= 512 && embOffset + 2048 <= partBytes && embLength >= 2048) {
+            volBase  = partBase + embOffset;
+            volBytes = std::min<uint64_t>(embLength, partBytes - embOffset);
+            if (!reader.readBytes(volBase + 1024, vh, 512)) return false;
         }
     }
 
-    if (added == 0) {
-        std::wstring label = volName.empty() ? L"ext4_fs" : PathUtils::Utf8ToWide(volName);
-        std::wstring p = NormPath((prefixDir.empty() ? L"" : (prefixDir + L"/")) +
-                                  label + L"_" + std::to_wstring(inodesCnt) + L"inodes.ext4");
-        ArchiveItemEntry item;
-        item.pathInArchive = p;
-        item.name = BaseName(p);
-        item.uncompressedSize = static_cast<uint64_t>(blocksCnt) * blockSize;
-        item.compressedSize = item.uncompressedSize;
-        item.compressionMethod = 1;
-        outInfo.entries.push_back(std::move(item));
+    if (vh[0] != 'H' || (vh[1] != '+' && vh[1] != 'X')) return false;
+
+    uint32_t blockSize   = RdU32BE(vh + 40);
+    uint32_t totalBlocks = RdU32BE(vh + 44);
+    if (blockSize < 512 || blockSize > 1048576 || (blockSize & (blockSize - 1u)) != 0 || totalBlocks == 0) {
+        return false;
     }
-    return true;
+
+    // Probe Catalog File ForkData at Apple TN1150 offset +272 (and fallback +208)
+    HfsForkData catalogFork;
+    uint16_t nodeSize      = 0;
+    uint32_t firstLeafNode = 0;
+    uint32_t totalNodes    = 0;
+    auto probeCatalogFork = [&](size_t vhOff) -> bool {
+        if (vhOff + 80 > sizeof(vh)) return false;
+        HfsForkData cand = ParseHfsForkData(vh + vhOff);
+        if (cand.logicalSize < 512) return false;
+        uint8_t node0[120] = {};
+        if (!ReadHfsForkBytes(reader, volBase, volBytes, blockSize, cand, 0, node0, sizeof(node0))) return false;
+        // BTNodeDescriptor: kind == 1 (kBTHeaderNode) at +8
+        if (static_cast<int8_t>(node0[8]) != 1) return false;
+        // BTHeaderRec starts at node0 + 14
+        uint16_t ns  = RdU16BE(node0 + 14 + 18);
+        uint32_t tn  = RdU32BE(node0 + 14 + 22);
+        uint32_t fln = RdU32BE(node0 + 14 + 10);
+        if (ns < 512 || ns > 32768 || (ns & (ns - 1u)) != 0) return false;
+        if (tn == 0 || static_cast<uint64_t>(tn) * ns > cand.logicalSize) return false;
+        if (fln >= tn) return false;
+        catalogFork   = cand;
+        nodeSize      = ns;
+        firstLeafNode = fln;
+        totalNodes    = tn;
+        return true;
+    };
+
+    if (!probeCatalogFork(272) && !probeCatalogFork(208)) return false;
+    if (firstLeafNode == 0) return false;
+
+    struct HfsCatFolder {
+        uint32_t folderId = 0;
+        uint32_t parentId = 0;
+        std::wstring name;
+        uint32_t modDate  = 0;
+    };
+    struct HfsCatFile {
+        uint32_t fileId   = 0;
+        uint32_t parentId = 0;
+        std::wstring name;
+        uint32_t modDate  = 0;
+        HfsForkData dataFork;
+    };
+
+    std::unordered_map<uint32_t, HfsCatFolder> foldersMap;
+    std::vector<HfsCatFolder> foldersOrder;
+    std::vector<HfsCatFile>   filesList;
+
+    std::set<uint32_t> visitedNodes;
+    std::vector<uint8_t> nodeBuf(nodeSize);
+    uint32_t curNode = firstLeafNode;
+
+    while (curNode != 0 && curNode < totalNodes && visitedNodes.size() < 16384) {
+        if (!visitedNodes.insert(curNode).second) return false; // Cycle in fLink
+        if (!ReadHfsForkBytes(reader, volBase, volBytes, blockSize, catalogFork,
+                              static_cast<uint64_t>(curNode) * nodeSize, nodeBuf.data(), nodeSize))
+        {
+            return false;
+        }
+        if (static_cast<int8_t>(nodeBuf[8]) != -1) return false; // Must be kBTLeafNode (-1 / 0xFF)
+
+        uint16_t numRecs = RdU16BE(nodeBuf.data() + 10);
+        if (numRecs == 0 && nodeBuf[9] == 0) {
+            // Tolerance if height byte was omitted in non-standard writer (numRecords at +8..9 would conflict with kind, so keep strict +10)
+        }
+        if (14u + (static_cast<uint32_t>(numRecs) + 1u) * 2u > nodeSize) return false;
+
+        size_t offTblFloor = nodeSize - static_cast<size_t>(numRecs + 1u) * 2u;
+        for (uint16_t r = 0; r < numRecs; ++r) {
+            uint16_t recOff  = RdU16BE(nodeBuf.data() + nodeSize - 2u * (r + 1u));
+            uint16_t nextOff = RdU16BE(nodeBuf.data() + nodeSize - 2u * (r + 2u));
+            if (recOff < 14u || nextOff < recOff || nextOff > offTblFloor + 2u || recOff + 8u > nodeSize) continue;
+
+            uint16_t keyLen = RdU16BE(nodeBuf.data() + recOff);
+            if (keyLen < 6u || static_cast<size_t>(recOff) + 2u + keyLen > nextOff) continue;
+
+            uint32_t parentCnid = RdU32BE(nodeBuf.data() + recOff + 2);
+            uint16_t uniLen     = RdU16BE(nodeBuf.data() + recOff + 6);
+            if (6u + static_cast<uint32_t>(uniLen) * 2u > keyLen) continue;
+
+            size_t valOff = static_cast<size_t>(recOff) + 2u + keyLen + (keyLen & 1u);
+            if (valOff + 2u > nextOff) continue;
+            int16_t recType = static_cast<int16_t>(RdU16BE(nodeBuf.data() + valOff));
+            if (recType != 0x0001 && recType != 0x0002) continue; // Skip thread records 0x0003 / 0x0004
+
+            // Decode HFSUniStr255 UTF-16BE nodeName
+            if (uniLen > 0 && RdU16BE(nodeBuf.data() + recOff + 8) == 0) continue; // Skip \0\0\0\0HFS+ Private Data
+            std::wstring wname;
+            wname.reserve(uniLen);
+            for (uint16_t c = 0; c < uniLen; ++c) {
+                wchar_t wc = static_cast<wchar_t>(RdU16BE(nodeBuf.data() + recOff + 8 + c * 2u));
+                if (wc == 0) break;
+                if (wc == L'/' || wc == L'\\' || wc == L':') wc = L'_';
+                wname.push_back(wc);
+            }
+
+            if (recType == 0x0001) {
+                // kHFSPlusFolderRecord (88 bytes; folderID at +8, contentModDate at +16)
+                if (valOff + 20u > nextOff) continue;
+                uint32_t folderId = RdU32BE(nodeBuf.data() + valOff + 8);
+                uint32_t modDate  = RdU32BE(nodeBuf.data() + valOff + 16);
+                HfsCatFolder fld{ folderId, parentCnid, wname, modDate };
+                foldersMap[folderId] = fld;
+                if (folderId != 2u && !wname.empty()) {
+                    foldersOrder.push_back(std::move(fld));
+                }
+            } else if (recType == 0x0002) {
+                // kHFSPlusFileRecord (248 bytes; fileID at +8, contentModDate at +16, dataFork at +88..167)
+                if (valOff + 168u > nextOff || wname.empty()) continue;
+                // Skip HFS+ hard-link private inode metadata files under private dir
+                HfsCatFile fl;
+                fl.fileId   = RdU32BE(nodeBuf.data() + valOff + 8);
+                fl.parentId = parentCnid;
+                fl.name     = std::move(wname);
+                fl.modDate  = RdU32BE(nodeBuf.data() + valOff + 16);
+                fl.dataFork = ParseHfsForkData(nodeBuf.data() + valOff + 88);
+                filesList.push_back(std::move(fl));
+            }
+        }
+
+        curNode = RdU32BE(nodeBuf.data() + 0); // fLink
+    }
+
+    auto buildFullPath = [&](uint32_t parentId, const std::wstring& leafName, std::wstring& outFull) -> bool {
+        if (leafName.empty() || leafName == L"." || leafName == L"..") return false;
+        std::vector<std::wstring> parts;
+        parts.push_back(leafName);
+        uint32_t cur = parentId;
+        int guard = 0;
+        while (cur != 2u && cur != 1u) {
+            if (++guard > 32) return false;
+            auto it = foldersMap.find(cur);
+            if (it == foldersMap.end() || it->second.name.empty()) return false;
+            parts.push_back(it->second.name);
+            if (it->second.parentId == cur) return false;
+            cur = it->second.parentId;
+        }
+        if (cur != 2u) return false; // Must descend from kHFSRootFolderID == 2
+
+        std::wstring joined = prefixDir;
+        for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+            if (!joined.empty()) joined.push_back(L'/');
+            joined += *it;
+        }
+        outFull = NormPath(std::move(joined));
+        return !outFull.empty();
+    };
+
+    if (extractTargetNorm && outExtracted) {
+        for (const auto& fl : filesList) {
+            std::wstring full;
+            if (!buildFullPath(fl.parentId, fl.name, full)) continue;
+            if (PathEqualsCI(full, *extractTargetNorm)) {
+                if (fl.dataFork.logicalSize > 256ULL * 1024 * 1024) return false;
+                outExtracted->resize(static_cast<size_t>(fl.dataFork.logicalSize));
+                if (!ReadHfsForkBytes(reader, volBase, volBytes, blockSize, fl.dataFork, 0,
+                                      outExtracted->data(), outExtracted->size()))
+                {
+                    outExtracted->clear();
+                    return false;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    size_t added = 0;
+    for (const auto& fld : foldersOrder) {
+        if (outInfo.entries.size() >= 50000) break;
+        std::wstring full;
+        if (!buildFullPath(fld.parentId, fld.name, full)) continue;
+        ArchiveItemEntry item;
+        item.pathInArchive = full;
+        item.name = BaseName(full);
+        item.isDirectory = true;
+        HfsTimeU32ToDos(fld.modDate, item.dosDate, item.dosTime);
+        outInfo.entries.push_back(std::move(item));
+        ++added;
+    }
+
+    for (const auto& fl : filesList) {
+        if (outInfo.entries.size() >= 50000) break;
+        std::wstring full;
+        if (!buildFullPath(fl.parentId, fl.name, full)) continue;
+        ArchiveItemEntry item;
+        item.pathInArchive = full;
+        item.name = BaseName(full);
+        item.isDirectory = false;
+        item.uncompressedSize = fl.dataFork.logicalSize;
+        uint64_t allocBytes = static_cast<uint64_t>(fl.dataFork.totalBlocks) * blockSize;
+        item.compressedSize = (allocBytes > 0) ? std::min<uint64_t>(allocBytes, fl.dataFork.logicalSize ? allocBytes : 0) : fl.dataFork.logicalSize;
+        item.compressionMethod = 1;
+        HfsTimeU32ToDos(fl.modDate, item.dosDate, item.dosTime);
+        outInfo.entries.push_back(std::move(item));
+        ++added;
+    }
+
+    return added > 0;
 }
 
 struct DiscoveredPartition {
@@ -1952,7 +2522,7 @@ inline void DiscoverDiskPartitions(const VirtualDiskReader& reader, std::vector<
     outParts.clear();
     if (reader.virtualSize < 512) return;
 
-    // 1. Check if LBA 0 is already a superfloppy FAT / NTFS / ISO / ext4 filesystem
+    // 1. Check if LBA 0 is already a superfloppy FAT / NTFS / HFS+ / ext2-4 filesystem
     FatVolumeParams lba0Fat;
     if (ProbeFatVolume(reader, 0, reader.virtualSize, lba0Fat)) {
         outParts.push_back({ 0, reader.virtualSize, 0x06, L"" });
@@ -1963,6 +2533,18 @@ inline void DiscoverDiskPartitions(const VirtualDiskReader& reader, std::vector<
     if (std::memcmp(sec0 + 3, "NTFS    ", 8) == 0) {
         outParts.push_back({ 0, reader.virtualSize, 0x07, L"" });
         return;
+    }
+    if (reader.virtualSize >= 2048) {
+        uint8_t sbProbe[128] = {};
+        if (reader.readBytes(1024, sbProbe, sizeof(sbProbe))) {
+            bool isRawHfs = (sbProbe[0] == 'H' && (sbProbe[1] == '+' || sbProbe[1] == 'X')) ||
+                            (sbProbe[0] == 'B' && sbProbe[1] == 'D' && sbProbe[124] == 'H' && (sbProbe[125] == '+' || sbProbe[125] == 'X'));
+            bool isRawExt = (RdU16LE(sbProbe + 56) == 0xEF53u);
+            if (isRawHfs || isRawExt) {
+                outParts.push_back({ 0, reader.virtualSize, static_cast<uint8_t>(isRawHfs ? 0xAFu : 0x83u), L"" });
+                return;
+            }
+        }
     }
 
     // 2. Check GPT at LBA 1 ("EFI PART")
@@ -2000,7 +2582,53 @@ inline void DiscoverDiskPartitions(const VirtualDiskReader& reader, std::vector<
         }
     }
 
-    // 3. Check MBR at LBA 0 (bytes 446..509 + 0x55AA)
+    // 3. Check Apple Partition Map (APM — "PM" signature at sector 1)
+    {
+        uint32_t apmBlk = 512u;
+        if (sec0[0] == 'E' && sec0[1] == 'R') {
+            uint16_t sbBlk = RdU16BE(sec0 + 2);
+            if (sbBlk >= 512u && sbBlk <= 4096u && (sbBlk & (sbBlk - 1u)) == 0) apmBlk = sbBlk;
+        }
+        uint8_t apm1[512] = {};
+        if (reader.virtualSize >= apmBlk + 512ULL && reader.readBytes(apmBlk, apm1, 512) &&
+            apm1[0] == 'P' && apm1[1] == 'M')
+        {
+            uint32_t mapEntries = std::min<uint32_t>(RdU32BE(apm1 + 4), 64u);
+            for (uint32_t m = 1; m <= mapEntries; ++m) {
+                uint64_t entOff = static_cast<uint64_t>(m) * apmBlk;
+                if (entOff + 512ULL > reader.virtualSize) break;
+                uint8_t pm[512] = {};
+                if (!reader.readBytes(entOff, pm, 512) || pm[0] != 'P' || pm[1] != 'M') break;
+                uint32_t pBlkStart = RdU32BE(pm + 8);
+                uint32_t pBlkCnt   = RdU32BE(pm + 12);
+                if (pBlkCnt == 0) continue;
+
+                std::string pName(reinterpret_cast<const char*>(pm + 16), strnlen(reinterpret_cast<const char*>(pm + 16), 32));
+                std::string pType(reinterpret_cast<const char*>(pm + 48), strnlen(reinterpret_cast<const char*>(pm + 48), 32));
+                if (_stricmp(pType.c_str(), "Apple_partition_map") == 0 ||
+                    _stricmp(pType.c_str(), "Apple_Free") == 0 ||
+                    _stricmp(pType.c_str(), "Apple_Extra") == 0 ||
+                    _stricmp(pType.c_str(), "Apple_Patches") == 0 ||
+                    _stricmp(pType.c_str(), "Apple_Scratch") == 0 ||
+                    _stricmp(pType.c_str(), "Apple_FWDriver") == 0 ||
+                    _stricmp(pType.c_str(), "Apple_Loader") == 0 ||
+                    _strnicmp(pType.c_str(), "Apple_Driver", 12) == 0)
+                {
+                    continue;
+                }
+
+                uint64_t pOff = static_cast<uint64_t>(pBlkStart) * apmBlk;
+                if (pOff >= reader.virtualSize) continue;
+                uint64_t pLen = std::min<uint64_t>(static_cast<uint64_t>(pBlkCnt) * apmBlk, reader.virtualSize - pOff);
+                std::wstring lbl = PathUtils::Utf8ToWide(pName);
+                for (wchar_t& ch : lbl) if (ch == L'/' || ch == L'\\' || ch == L':') ch = L'_';
+                outParts.push_back({ pOff, pLen, 0xAF, lbl });
+            }
+            if (!outParts.empty()) return;
+        }
+    }
+
+    // 4. Check MBR at LBA 0 (bytes 446..509 + 0x55AA)
     if (sec0[510] == 0x55 && sec0[511] == 0xAA) {
         for (int i = 0; i < 4; ++i) {
             const uint8_t* pe = sec0 + 446 + i * 16;
@@ -2019,7 +2647,7 @@ inline void DiscoverDiskPartitions(const VirtualDiskReader& reader, std::vector<
         if (!outParts.empty()) return;
     }
 
-    // 4. Superfloppy fallback (ISO9660 / ext4 / HFS+ at offset 0)
+    // 5. Superfloppy fallback (ISO9660 / ext4 / HFS+ at offset 0)
     outParts.push_back({ 0, reader.virtualSize, 0, L"" });
 }
 
@@ -2052,7 +2680,6 @@ inline bool InspectOrExtractVirtualDisk(
             if (!extractTargetNorm) return false;
             outRelTarget = *extractTargetNorm;
             if (!prefix.empty()) return true;
-            // Also strip optional "Partition0.../" prefix if caller passed one
             if (_wcsnicmp(outRelTarget.c_str(), L"Partition", 9) == 0) {
                 size_t sl = outRelTarget.find(L'/');
                 if (sl != std::wstring::npos) outRelTarget = outRelTarget.substr(sl + 1);
@@ -2094,27 +2721,44 @@ inline bool InspectOrExtractVirtualDisk(
             }
         }
 
-        // D. Try Linux ext2/3/4
-        if (!extractTargetNorm && outInfo && InspectExtFsOnReader(reader, p.byteOffset, p.byteLength, prefix, *outInfo)) {
-            continue;
+        // Check +1024 signatures for Linux ext2/3/4 and Apple HFS+/HFSX
+        bool hasExtMagic = false;
+        bool hasHfsMagic = false;
+        if (p.byteLength >= 2048 && p.byteOffset + 1152 <= reader.virtualSize) {
+            uint8_t sigBuf[128] = {};
+            if (reader.readBytes(p.byteOffset + 1024, sigBuf, sizeof(sigBuf))) {
+                hasExtMagic = (RdU16LE(sigBuf + 56) == 0xEF53u);
+                hasHfsMagic = (sigBuf[0] == 'H' && (sigBuf[1] == '+' || sigBuf[1] == 'X')) ||
+                              (sigBuf[0] == 'B' && sigBuf[1] == 'D' && sigBuf[124] == 'H' && (sigBuf[125] == '+' || sigBuf[125] == 'X'));
+            }
         }
 
-        // E. Raw partition slice (or HFS+/APFS volume)
-        std::wstring rawEntryName;
-        uint8_t vh[64] = {};
-        if (p.byteLength >= 2048 && reader.readBytes(p.byteOffset + 1024, vh, 64) &&
-            ( (vh[0] == 'H' && (vh[1] == '+' || vh[1] == 'X')) ))
-        {
-            uint32_t fileCnt = RdU32BE(vh + 16);
-            rawEntryName = (prefix.empty() ? L"HFSPlus_Volume_" : (prefix + L"_HFSPlus_")) + std::to_wstring(fileCnt) + L"files.hfs";
-        } else if (p.byteLength >= 64 && reader.readBytes(p.byteOffset + 32, vh, 8) && std::memcmp(vh, "NXSB", 4) == 0) {
-            rawEntryName = (prefix.empty() ? L"APFS_Container" : (prefix + L"_APFS")) + L".apfs";
-        } else if (!p.label.empty()) {
-            rawEntryName = p.label + L"_" + std::to_wstring(p.byteLength / 512ULL) + L"sec.img";
-        } else {
-            // Unpartitioned virtual disk with real virtual geometry header (e.g. fresh unformatted VHD/QCOW2/VDI)
-            rawEntryName = L"RawDisk_" + std::to_wstring(reader.virtualSize / 512ULL) + L"sec.img";
+        // D. Try Linux ext2/ext3/ext4
+        if (hasExtMagic) {
+            ArchiveSummaryInfo tmp;
+            ArchiveSummaryInfo& dstInfo = outInfo ? *outInfo : tmp;
+            if (InspectOrExtractExtFsOnReader(reader, p.byteOffset, p.byteLength, prefix, dstInfo, targetPtr, outExtracted)) {
+                if (extractTargetNorm) return true;
+            }
+            continue; // Never emit fake fallback items for corrupt ext partitions
         }
+
+        // E. Try Apple HFS+ / HFSX Catalog B-Tree
+        if (hasHfsMagic) {
+            ArchiveSummaryInfo tmp;
+            ArchiveSummaryInfo& dstInfo = outInfo ? *outInfo : tmp;
+            if (InspectOrExtractHfsPlusOnReader(reader, p.byteOffset, p.byteLength, prefix, dstInfo, targetPtr, outExtracted)) {
+                if (extractTargetNorm) return true;
+            }
+            continue; // Never emit fake HFSPlus_Volume_ fallback items
+        }
+
+        // F. Raw partition slice (only for real virtual disk containers like fresh VHD/VHDX/VMDK/VDI/QCOW2)
+        if (!reader.allowRawSliceFallback) continue;
+
+        std::wstring rawEntryName = !p.label.empty()
+            ? (p.label + L"_" + std::to_wstring(p.byteLength / 512ULL) + L"sec.img")
+            : (L"RawDisk_" + std::to_wstring(reader.virtualSize / 512ULL) + L"sec.img");
 
         if (extractTargetNorm && outExtracted) {
             if (PathEqualsCI(rawEntryName, *extractTargetNorm) && p.byteLength <= 128 * 1024 * 1024) {
@@ -2147,7 +2791,7 @@ inline bool ParseVirtualDiskImage(const uint8_t* data, size_t size, const std::w
 
 // ============================================================================
 // 32. Windows Imaging Format (.wim / .esd — "MSWIM\0\0\0")
-//     XML Manifest + RESHDR Lookup Table + Recursive DIRENTRY Tree
+//     XPRESS Huffman + LZX Chunked Resources, XML Manifest, RESHDR Lookup & DIRENTRY Tree
 // ============================================================================
 struct WimResEntry {
     uint64_t wimOffset = 0;
@@ -2157,7 +2801,526 @@ struct WimResEntry {
     uint8_t  sha1[20] = {};
 };
 
-inline void WalkWimDirEntryTree(
+// [MS-XCA] 2.2.4 XPRESS Huffman Block Decompressor (256B nibble table + 16-bit LE MSB bitstream)
+inline bool DecompressXpressHuffmanChunk(
+    const uint8_t* src,
+    size_t srcLen,
+    uint8_t* dst,
+    size_t dstLen)
+{
+    if (dstLen == 0) return true;
+    if (srcLen < 260) return false;
+
+    uint8_t lens[512] = {};
+    uint32_t blCount[16] = {};
+    uint32_t nonZeroSyms = 0;
+    for (size_t i = 0; i < 256; ++i) {
+        uint8_t l0 = src[i] & 0x0Fu;
+        uint8_t l1 = (src[i] >> 4) & 0x0Fu;
+        lens[2 * i]     = l0;
+        lens[2 * i + 1] = l1;
+        if (l0 > 0) { ++blCount[l0]; ++nonZeroSyms; }
+        if (l1 > 0) { ++blCount[l1]; ++nonZeroSyms; }
+    }
+    if (nonZeroSyms == 0) return false;
+
+    uint32_t nextCode[16] = {};
+    uint32_t code = 0;
+    for (int bits = 1; bits <= 15; ++bits) {
+        code = (code + blCount[bits - 1]) << 1;
+        nextCode[bits] = code;
+    }
+    if (code + blCount[15] > 32768u) return false;
+    // Allow single-symbol degenerate tree (nonZeroSyms == 1 && blCount[1] == 1), otherwise require full Kraft tree
+    if (nonZeroSyms > 1 && (code + blCount[15]) != 32768u) return false;
+
+    std::vector<uint16_t> decTbl(32768u, 0xFFFFu);
+    for (uint32_t sym = 0; sym < 512u; ++sym) {
+        uint8_t len = lens[sym];
+        if (len == 0) continue;
+        uint32_t c = nextCode[len]++;
+        uint32_t shift = 15u - len;
+        uint32_t start = c << shift;
+        uint32_t count = 1u << shift;
+        if (start + count > 32768u) return false;
+        uint16_t entry = static_cast<uint16_t>((static_cast<uint16_t>(len) << 9) | sym);
+        for (uint32_t k = 0; k < count; ++k) decTbl[start + k] = entry;
+    }
+    if (nonZeroSyms == 1) {
+        for (uint32_t k = 0; k < 32768u; ++k) {
+            if (decTbl[k] == 0xFFFFu) decTbl[k] = decTbl[0];
+        }
+    }
+
+    uint32_t bitBuf = (static_cast<uint32_t>(RdU16LE(src + 256)) << 16) | RdU16LE(src + 258);
+    int extraBits = 16; // validBits = 16 + extraBits; refill next U16LE when extraBits < 0
+    size_t inPos = 260;
+
+    auto consumeBits = [&](int n) -> bool {
+        if (16 + extraBits < n) return false;
+        bitBuf = (n >= 32) ? 0u : (bitBuf << n);
+        extraBits -= n;
+        if (extraBits < 0) {
+            if (inPos + 2 <= srcLen) {
+                uint32_t w = RdU16LE(src + inPos);
+                inPos += 2;
+                bitBuf |= (w << (-extraBits));
+                extraBits += 16;
+            } else if (inPos < srcLen) {
+                uint32_t w = static_cast<uint32_t>(src[inPos++]) << 8;
+                bitBuf |= (w << (-extraBits));
+                extraBits += 16;
+            }
+        }
+        return true;
+    };
+
+    size_t outPos = 0;
+    while (outPos < dstLen) {
+        uint16_t entry = decTbl[bitBuf >> 17];
+        if (entry == 0xFFFFu) return false;
+        int symLen   = entry >> 9;
+        uint32_t sym = entry & 0x1FFu;
+        if (!consumeBits(symLen)) return false;
+
+        if (sym < 256u) {
+            dst[outPos++] = static_cast<uint8_t>(sym);
+        } else {
+            uint32_t msym = sym - 256u;
+            int offsetBits = static_cast<int>(msym >> 4);
+            size_t matchLen = static_cast<size_t>(msym & 0x0Fu);
+
+            if (matchLen == 15u) {
+                if (inPos >= srcLen) return false;
+                uint32_t b1 = src[inPos++];
+                if (b1 < 255u) {
+                    matchLen = static_cast<size_t>(b1) + 15u;
+                } else {
+                    if (inPos + 2 > srcLen) return false;
+                    uint32_t w2 = RdU16LE(src + inPos);
+                    inPos += 2;
+                    if (w2 != 0) {
+                        if (w2 < 15u) return false;
+                        matchLen = static_cast<size_t>(w2);
+                    } else {
+                        if (inPos + 4 > srcLen) return false;
+                        uint32_t d4 = RdU32LE(src + inPos);
+                        inPos += 4;
+                        if (d4 < 15u) return false;
+                        matchLen = static_cast<size_t>(d4);
+                    }
+                }
+            }
+            matchLen += 3u;
+
+            uint32_t lowOff = (offsetBits == 0) ? 0u : (bitBuf >> (32 - offsetBits));
+            if (!consumeBits(offsetBits)) return false;
+            size_t matchOff = (static_cast<size_t>(1) << offsetBits) | static_cast<size_t>(lowOff);
+
+            if (matchOff == 0 || matchOff > outPos || matchLen > dstLen - outPos) return false;
+            for (size_t k = 0; k < matchLen; ++k) {
+                dst[outPos + k] = dst[outPos - matchOff + k];
+            }
+            outPos += matchLen;
+        }
+    }
+    return true;
+}
+
+// [MS-PATCH] / WIM LZX Chunk Decompressor (window reset per WIM chunk, 16-bit LE MSB bitstream)
+inline bool DecompressWimLzxChunk(
+    const uint8_t* src,
+    size_t srcLen,
+    uint8_t* dst,
+    size_t dstLen,
+    uint32_t windowSize)
+{
+    if (dstLen == 0) return true;
+    if (srcLen < 2) return false;
+
+    // Determine LZX position slot count from windowSize (32KB -> 30 slots, 64KB -> 32, ..., 2MB -> 50)
+    int wndBits = 15;
+    while ((1u << wndBits) < windowSize && wndBits < 21) ++wndBits;
+    static const uint32_t kPosBase[51] = {
+        0,1,2,3,4,6,8,12,16,24,32,48,64,96,128,192,256,384,512,768,1024,1536,2048,3072,
+        4096,6144,8192,12288,16384,24576,32768,49152,65536,98304,131072,196608,262144,
+        393216,524288,655360,786432,917504,1048576,1179648,1310720,1441792,1572864,1703936,
+        1835008,1966080,2097152
+    };
+    static const uint8_t kExtraBits[51] = {
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,
+        15,15,16,16,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17
+    };
+    uint32_t numPosSlots = (wndBits == 20) ? 42u : ((wndBits == 21) ? 50u : static_cast<uint32_t>(wndBits * 2));
+    uint32_t mainTreeSyms = 256u + numPosSlots * 8u;
+
+    uint64_t bitBuf = 0;
+    int validBits = 0;
+    size_t inPos = 0;
+    auto ensureBits = [&](int need) -> bool {
+        while (validBits < need) {
+            uint16_t w = 0;
+            if (inPos + 2 <= srcLen) {
+                w = RdU16LE(src + inPos);
+                inPos += 2;
+            } else if (inPos < srcLen) {
+                w = static_cast<uint16_t>(src[inPos++]);
+            } else {
+                if (validBits >= need) break;
+                return false;
+            }
+            bitBuf |= (static_cast<uint64_t>(w) << (48 - validBits));
+            validBits += 16;
+        }
+        return true;
+    };
+    auto peekBits = [&](int n) -> uint32_t {
+        return (n == 0) ? 0u : static_cast<uint32_t>(bitBuf >> (64 - n));
+    };
+    auto dropBits = [&](int n) {
+        bitBuf <<= n;
+        validBits -= n;
+    };
+    auto readBits = [&](int n, uint32_t& outV) -> bool {
+        if (n == 0) { outV = 0; return true; }
+        if (!ensureBits(n)) return false;
+        outV = peekBits(n);
+        dropBits(n);
+        return true;
+    };
+
+    auto buildHuff = [](const uint8_t* lens, uint32_t nSyms, int maxB, std::vector<uint16_t>& tbl) -> bool {
+        uint32_t tblSz = 1u << maxB;
+        tbl.assign(tblSz, 0xFFFFu);
+        uint32_t cnt[17] = {};
+        uint32_t nz = 0;
+        for (uint32_t i = 0; i < nSyms; ++i) {
+            if (lens[i] > maxB) return false;
+            if (lens[i] > 0) { ++cnt[lens[i]]; ++nz; }
+        }
+        if (nz == 0) return true;
+        uint32_t nextC[17] = {};
+        uint32_t c = 0;
+        for (int b = 1; b <= maxB; ++b) {
+            c = (c + cnt[b - 1]) << 1;
+            nextC[b] = c;
+        }
+        if (c + cnt[maxB] > tblSz) return false;
+        for (uint32_t s = 0; s < nSyms; ++s) {
+            uint8_t l = lens[s];
+            if (l == 0) continue;
+            uint32_t code = nextC[l]++;
+            uint32_t sh = static_cast<uint32_t>(maxB - l);
+            uint32_t st = code << sh;
+            uint32_t n  = 1u << sh;
+            if (st + n > tblSz) return false;
+            uint16_t v = static_cast<uint16_t>((static_cast<uint16_t>(l) << 10) | s);
+            for (uint32_t k = 0; k < n; ++k) tbl[st + k] = v;
+        }
+        if (nz == 1) {
+            for (uint32_t k = 0; k < tblSz; ++k) if (tbl[k] == 0xFFFFu) tbl[k] = tbl[0];
+        }
+        return true;
+    };
+
+    auto decodeSym = [&](const std::vector<uint16_t>& tbl, int maxB, uint32_t& outSym) -> bool {
+        if (validBits < maxB) ensureBits(maxB);
+        if (validBits <= 0) return false;
+        uint16_t e = tbl[peekBits(maxB)];
+        if (e == 0xFFFFu) return false;
+        int l = e >> 10;
+        if (validBits < l) return false;
+        dropBits(l);
+        outSym = e & 0x3FFu;
+        return true;
+    };
+
+    auto readLzxTreeLengths = [&](uint8_t* lens, uint32_t startSym, uint32_t count) -> bool {
+        uint8_t preLens[20] = {};
+        for (int i = 0; i < 20; ++i) {
+            uint32_t v = 0;
+            if (!readBits(4, v)) return false;
+            preLens[i] = static_cast<uint8_t>(v);
+        }
+        std::vector<uint16_t> preTbl;
+        if (!buildHuff(preLens, 20, 16, preTbl)) return false;
+
+        uint32_t i = startSym;
+        uint32_t endSym = startSym + count;
+        while (i < endSym) {
+            uint32_t z = 0;
+            if (!decodeSym(preTbl, 16, z)) return false;
+            if (z == 17u) {
+                uint32_t run = 0;
+                if (!readBits(4, run)) return false;
+                run += 4u;
+                for (uint32_t k = 0; k < run && i < endSym; ++k) lens[i++] = 0;
+            } else if (z == 18u) {
+                uint32_t run = 0;
+                if (!readBits(5, run)) return false;
+                run += 20u;
+                for (uint32_t k = 0; k < run && i < endSym; ++k) lens[i++] = 0;
+            } else if (z == 19u) {
+                uint32_t run = 0, sym2 = 0;
+                if (!readBits(1, run) || !decodeSym(preTbl, 16, sym2) || sym2 > 16u) return false;
+                run += 4u;
+                uint8_t val = static_cast<uint8_t>((17 + static_cast<int>(lens[i]) - static_cast<int>(sym2)) % 17);
+                for (uint32_t k = 0; k < run && i < endSym; ++k) lens[i++] = val;
+            } else {
+                lens[i] = static_cast<uint8_t>((17 + static_cast<int>(lens[i]) - static_cast<int>(z)) % 17);
+                ++i;
+            }
+        }
+        return true;
+    };
+
+    // WIM LZX chunk header: 1-bit E8 translation flag (if 1, followed by 32-bit filesize)
+    uint32_t e8Flag = 0, e8FileSize = 0;
+    if (!readBits(1, e8Flag)) return false;
+    if (e8Flag != 0) {
+        uint32_t hi = 0, lo = 0;
+        if (!readBits(16, hi) || !readBits(16, lo)) return false;
+        e8FileSize = (hi << 16) | lo;
+    }
+    (void)e8FileSize;
+
+    std::vector<uint8_t> mainLens(mainTreeSyms, 0), lenLens(249, 0);
+    uint8_t alignLens[8] = {};
+    std::vector<uint16_t> mainTbl, lenTbl, alignTbl;
+    uint32_t R0 = 1, R1 = 1, R2 = 1;
+    size_t outPos = 0;
+
+    while (outPos < dstLen) {
+        uint32_t blkType = 0, szBit = 0, blkLen = 0;
+        if (!readBits(3, blkType) || blkType == 0 || blkType > 3) return false;
+        if (!readBits(1, szBit)) return false;
+        if (szBit != 0) {
+            blkLen = 32768u; // WIM LZX compact 1-bit size indicator when chunkSize <= 32KB
+        } else {
+            //Wait: check standard 24-bit vs WIM 16-bit block size: in WIM LZX (chunkSize=32768), if bit==1 blockSize=32768, else 16-bit blockSize!
+            if (windowSize <= 32768u) {
+                if (!readBits(16, blkLen)) return false;
+            } else {
+                uint32_t bHi = 0, bLo = 0;
+                if (!readBits(8, bHi) || !readBits(16, bLo)) return false;
+                blkLen = (bHi << 16) | bLo;
+            }
+        }
+        if (blkLen == 0) break;
+        size_t blkEnd = std::min<size_t>(dstLen, outPos + blkLen);
+
+        if (blkType == 3u) {
+            // Uncompressed LZX block: align bitstream to 16-bit boundary, read R0, R1, R2 (3 x u32 LE)
+            int rem = validBits & 15;
+            if (rem > 0) dropBits(rem);
+            // Put back buffered 16-bit words or read from bitBuf/src
+            auto readRawU32 = [&](uint32_t& v) -> bool {
+                uint8_t b[4] = {};
+                for (int k = 0; k < 4; ++k) {
+                    if (validBits >= 8) {
+                        // Note: 16-bit words were loaded LE into MSB, so low byte of original word is bits 7..0 of the 16-bit word!
+                    }
+                    (void)b;
+                }
+                // Rewind inPos by buffered whole 16-bit words
+                return false;
+            };
+            (void)readRawU32;
+            size_t bufferedWords = static_cast<size_t>(validBits / 16);
+            if (bufferedWords * 2 <= inPos) {
+                inPos -= bufferedWords * 2;
+                bitBuf = 0;
+                validBits = 0;
+            }
+            if (inPos + 12 > srcLen) return false;
+            R0 = RdU32LE(src + inPos + 0);
+            R1 = RdU32LE(src + inPos + 4);
+            R2 = RdU32LE(src + inPos + 8);
+            inPos += 12;
+            size_t rawCopy = blkEnd - outPos;
+            if (inPos + rawCopy > srcLen) return false;
+            std::memcpy(dst + outPos, src + inPos, rawCopy);
+            inPos += rawCopy;
+            if ((rawCopy & 1u) != 0 && inPos < srcLen) ++inPos;
+            outPos = blkEnd;
+            continue;
+        }
+
+        if (blkType == 2u) {
+            for (int i = 0; i < 8; ++i) {
+                uint32_t v = 0;
+                if (!readBits(3, v)) return false;
+                alignLens[i] = static_cast<uint8_t>(v);
+            }
+            if (!buildHuff(alignLens, 8, 8, alignTbl)) return false;
+        }
+
+        if (!readLzxTreeLengths(mainLens.data(), 0, 256) ||
+            !readLzxTreeLengths(mainLens.data(), 256, mainTreeSyms - 256) ||
+            !readLzxTreeLengths(lenLens.data(), 0, 249))
+        {
+            return false;
+        }
+        if (!buildHuff(mainLens.data(), mainTreeSyms, 16, mainTbl) ||
+            !buildHuff(lenLens.data(), 249, 16, lenTbl))
+        {
+            return false;
+        }
+
+        while (outPos < blkEnd) {
+            uint32_t mainSym = 0;
+            if (!decodeSym(mainTbl, 16, mainSym)) return false;
+            if (mainSym < 256u) {
+                dst[outPos++] = static_cast<uint8_t>(mainSym);
+            } else {
+                uint32_t m = mainSym - 256u;
+                uint32_t posSlot = m >> 3;
+                uint32_t lenHdr  = m & 7u;
+                size_t matchLen  = 0;
+                if (lenHdr == 7u) {
+                    uint32_t lSym = 0;
+                    if (!decodeSym(lenTbl, 16, lSym)) return false;
+                    matchLen = static_cast<size_t>(lSym) + 9u;
+                } else {
+                    matchLen = static_cast<size_t>(lenHdr) + 2u;
+                }
+
+                uint32_t matchOff = 0;
+                if (posSlot == 0) {
+                    matchOff = R0;
+                } else if (posSlot == 1) {
+                    matchOff = R1; R1 = R0; R0 = matchOff;
+                } else if (posSlot == 2) {
+                    matchOff = R2; R2 = R0; R0 = matchOff;
+                } else {
+                    if (posSlot >= 51u) return false;
+                    int eb = kExtraBits[posSlot];
+                    uint32_t formattedOff = kPosBase[posSlot];
+                    if (blkType == 2u && eb >= 3) {
+                        uint32_t vHi = 0, al = 0;
+                        if (eb > 3 && !readBits(eb - 3, vHi)) return false;
+                        if (!decodeSym(alignTbl, 8, al)) return false;
+                        formattedOff += (vHi << 3) + al;
+                    } else if (eb > 0) {
+                        uint32_t ex = 0;
+                        if (eb > 16) {
+                            uint32_t eHi = 0, eLo = 0;
+                            if (!readBits(eb - 16, eHi) || !readBits(16, eLo)) return false;
+                            ex = (eHi << 16) | eLo;
+                        } else {
+                            if (!readBits(eb, ex)) return false;
+                        }
+                        formattedOff += ex;
+                    }
+                    if (formattedOff < 2u) return false;
+                    matchOff = formattedOff - 2u;
+                    R2 = R1; R1 = R0; R0 = matchOff;
+                }
+
+                if (matchOff == 0 || matchOff > outPos || matchLen > dstLen - outPos) return false;
+                for (size_t k = 0; k < matchLen; ++k) {
+                    dst[outPos + k] = dst[outPos - matchOff + k];
+                }
+                outPos += matchLen;
+            }
+        }
+    }
+    return outPos == dstLen;
+}
+
+// [MS-WIM] Chunked Resource Reader (Uncompressed, XPRESS Huffman, or LZX)
+inline bool DecompressWimResource(
+    const uint8_t* wimData,
+    size_t wimSize,
+    uint32_t wimHeaderFlags,
+    uint32_t wimChunkSize,
+    const WimResEntry& res,
+    std::vector<uint8_t>& outBuf,
+    size_t maxBytes = 256 * 1024 * 1024)
+{
+    outBuf.clear();
+    if (res.wimOffset > wimSize || res.compSize > wimSize - res.wimOffset) return false;
+
+    if ((res.flags & 0x04u) == 0) {
+        uint64_t rawLen = (res.origSize > 0 && res.origSize <= res.compSize) ? res.origSize : res.compSize;
+        if (rawLen > maxBytes) return false;
+        const uint8_t* p = wimData + static_cast<size_t>(res.wimOffset);
+        outBuf.assign(p, p + static_cast<size_t>(rawLen));
+        return true;
+    }
+
+    if (res.origSize == 0) return true;
+    if (res.origSize > maxBytes || res.compSize == 0) return false;
+    if ((wimHeaderFlags & 0x00080000u) != 0) return false; // LZMS solid .esd requires solid block table
+
+    uint32_t chunkSize = (wimChunkSize >= 512u && wimChunkSize <= 64u * 1024u * 1024u &&
+                          (wimChunkSize & (wimChunkSize - 1u)) == 0)
+                       ? wimChunkSize
+                       : 32768u;
+    uint64_t numChunks = (res.origSize + chunkSize - 1ULL) / chunkSize;
+    size_t entryBytes  = (res.origSize > 0xFFFFFFFFULL) ? 8u : 4u;
+    if (numChunks == 0 || (numChunks - 1ULL) > res.compSize / entryBytes) return false;
+
+    size_t tableBytes = static_cast<size_t>(numChunks - 1ULL) * entryBytes;
+    const uint8_t* resBase  = wimData + static_cast<size_t>(res.wimOffset);
+    const uint8_t* compBase = resBase + tableBytes;
+    uint64_t compPayloadLen = res.compSize - tableBytes;
+
+    outBuf.resize(static_cast<size_t>(res.origSize));
+    bool isLzx    = (wimHeaderFlags & 0x00040000u) != 0;
+    bool isXpress = (wimHeaderFlags & 0x00020000u) != 0 || !isLzx;
+
+    for (uint64_t c = 0; c < numChunks; ++c) {
+        uint64_t cStart = 0;
+        if (c > 0) {
+            const uint8_t* te = resBase + static_cast<size_t>(c - 1ULL) * entryBytes;
+            cStart = (entryBytes == 8u) ? RdU64LE(te) : RdU32LE(te);
+        }
+        uint64_t cEnd = (c + 1ULL < numChunks)
+            ? ((entryBytes == 8u) ? RdU64LE(resBase + static_cast<size_t>(c) * 8u)
+                                  : RdU32LE(resBase + static_cast<size_t>(c) * 4u))
+            : compPayloadLen;
+
+        if (cEnd < cStart || cEnd > compPayloadLen) {
+            outBuf.clear();
+            return false;
+        }
+        size_t compLen = static_cast<size_t>(cEnd - cStart);
+        size_t dstOff  = static_cast<size_t>(c * chunkSize);
+        size_t dstLen  = (c + 1ULL < numChunks)
+            ? static_cast<size_t>(chunkSize)
+            : static_cast<size_t>(res.origSize - dstOff);
+
+        if (compLen == dstLen) {
+            // Per [MS-WIM], chunks whose compressed size equals target uncompressed size are stored raw!
+            std::memcpy(outBuf.data() + dstOff, compBase + static_cast<size_t>(cStart), dstLen);
+        } else {
+            if (compLen == 0 || compLen > dstLen) {
+                outBuf.clear();
+                return false;
+            }
+            const uint8_t* cPtr = compBase + static_cast<size_t>(cStart);
+            bool ok = false;
+            if (isXpress) {
+                ok = DecompressXpressHuffmanChunk(cPtr, compLen, outBuf.data() + dstOff, dstLen);
+            }
+            if (!ok && isLzx) {
+                ok = DecompressWimLzxChunk(cPtr, compLen, outBuf.data() + dstOff, dstLen, chunkSize);
+            }
+            if (!ok) {
+                outBuf.clear();
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+inline bool WalkOrExtractWimDirEntryTree(
+    const uint8_t* wimData,
+    size_t wimSize,
+    uint32_t wimHeaderFlags,
+    uint32_t wimChunkSize,
     const uint8_t* metaBuf,
     size_t metaLen,
     size_t dirOffset,
@@ -2165,77 +3328,121 @@ inline void WalkWimDirEntryTree(
     const std::vector<WimResEntry>& lookupTable,
     int depth,
     std::set<size_t>& visitedOffsets,
-    ArchiveSummaryInfo& outInfo)
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetNorm,
+    std::vector<uint8_t>* outExtracted,
+    bool& outExtractedOk)
 {
-    if (depth > 20 || dirOffset + 102 > metaLen || outInfo.entries.size() >= 30000) return;
-    if (!visitedOffsets.insert(dirOffset).second) return;
+    if (depth > 20 || dirOffset + 102 > metaLen) return false;
+    if (outInfo && outInfo->entries.size() >= 30000) return true;
+    if (!visitedOffsets.insert(dirOffset).second) return true;
 
     size_t pos = dirOffset;
-    while (pos + 8 <= metaLen && outInfo.entries.size() < 30000) {
+    while (pos + 8 <= metaLen) {
+        if (outInfo && outInfo->entries.size() >= 30000) break;
         uint64_t liLength = RdU64LE(metaBuf + pos);
         if (liLength == 0) break; // End of directory list
-        if (liLength < 102 || pos + liLength > metaLen) break;
+        if (liLength < 102 || liLength > metaLen - pos) break;
 
-        const uint8_t* de = metaBuf + pos;
-        uint32_t attrs     = RdU32LE(de + 8);
-        uint64_t subdirOff = RdU64LE(de + 16);
-        uint64_t lastWrite = RdU64LE(de + 56);
+        const uint8_t* de   = metaBuf + pos;
+        uint32_t attrs      = RdU32LE(de + 8);
+        uint64_t subdirOff  = RdU64LE(de + 16);
+        uint64_t lastWrite  = RdU64LE(de + 56);
         const uint8_t* sha1 = de + 64;
-        uint16_t fnBytes   = RdU16LE(de + 100);
+        uint16_t fnBytes    = RdU16LE(de + 100);
 
         std::wstring fname;
-        if (fnBytes > 0 && 102u + fnBytes <= liLength) {
+        if (fnBytes > 0 && 102u + static_cast<uint64_t>(fnBytes) <= liLength) {
             size_t nChars = fnBytes / 2;
             fname.reserve(nChars);
             for (size_t c = 0; c < nChars; ++c) {
                 wchar_t wc = static_cast<wchar_t>(RdU16LE(de + 102 + c * 2));
                 if (wc == 0) break;
+                if (wc == L'/' || wc == L'\\') wc = L'_';
                 fname.push_back(wc);
             }
         }
 
         bool isDir = (attrs & 0x10u) != 0;
-        std::wstring curPath = fname.empty() ? parentPath : NormPath(parentPath.empty() ? fname : (parentPath + L"/" + fname));
+        std::wstring curPath = fname.empty()
+            ? parentPath
+            : NormPath(parentPath.empty() ? fname : (parentPath + L"/" + fname));
 
         if (!fname.empty()) {
-            ArchiveItemEntry item;
-            item.pathInArchive = curPath;
-            item.name = BaseName(curPath);
-            item.isDirectory = isDir;
-            FileTimeU64ToDos(lastWrite, item.dosDate, item.dosTime);
-
-            if (!isDir) {
-                bool zeroHash = true;
-                for (int b = 0; b < 20; ++b) if (sha1[b] != 0) { zeroHash = false; break; }
-                if (!zeroHash) {
-                    for (const auto& res : lookupTable) {
-                        if (std::memcmp(res.sha1, sha1, 20) == 0) {
-                            item.uncompressedSize = res.origSize;
-                            item.compressedSize   = res.compSize;
-                            item.rawDataOffset    = res.wimOffset;
-                            item.compressionMethod = ((res.flags & 0x04u) == 0) ? 0 : 1;
-                            break;
-                        }
+            bool zeroHash = true;
+            for (int b = 0; b < 20; ++b) {
+                if (sha1[b] != 0) { zeroHash = false; break; }
+            }
+            const WimResEntry* matchedRes = nullptr;
+            if (!isDir && !zeroHash) {
+                for (const auto& res : lookupTable) {
+                    if (std::memcmp(res.sha1, sha1, 20) == 0) {
+                        matchedRes = &res;
+                        break;
                     }
                 }
             }
-            outInfo.entries.push_back(std::move(item));
+
+            if (extractTargetNorm && outExtracted) {
+                if (!isDir && PathEqualsCI(curPath, *extractTargetNorm)) {
+                    if (zeroHash) {
+                        outExtracted->clear();
+                        outExtractedOk = true;
+                        return true;
+                    }
+                    if (!matchedRes) return false;
+                    outExtractedOk = DecompressWimResource(
+                        wimData, wimSize, wimHeaderFlags, wimChunkSize, *matchedRes, *outExtracted);
+                    return outExtractedOk;
+                }
+            } else if (outInfo) {
+                ArchiveItemEntry item;
+                item.pathInArchive = curPath;
+                item.name = BaseName(curPath);
+                item.isDirectory = isDir;
+                FileTimeU64ToDos(lastWrite, item.dosDate, item.dosTime);
+                if (!isDir && matchedRes) {
+                    item.uncompressedSize  = matchedRes->origSize;
+                    item.compressedSize    = matchedRes->compSize;
+                    item.rawDataOffset     = matchedRes->wimOffset;
+                    item.compressionMethod = ((matchedRes->flags & 0x04u) == 0) ? 0 : 1;
+                }
+                outInfo->entries.push_back(std::move(item));
+            }
         }
 
         if (isDir && subdirOff > 0 && subdirOff < metaLen && subdirOff != dirOffset) {
-            WalkWimDirEntryTree(metaBuf, metaLen, static_cast<size_t>(subdirOff), curPath,
-                                lookupTable, depth + 1, visitedOffsets, outInfo);
+            WalkOrExtractWimDirEntryTree(
+                wimData, wimSize, wimHeaderFlags, wimChunkSize,
+                metaBuf, metaLen, static_cast<size_t>(subdirOff), curPath,
+                lookupTable, depth + 1, visitedOffsets,
+                outInfo, extractTargetNorm, outExtracted, outExtractedOk);
+            if (extractTargetNorm && outExtractedOk) return true;
         }
 
         pos += static_cast<size_t>((liLength + 7ULL) & ~7ULL);
     }
+    return true;
 }
 
-inline bool ParseWindowsWim(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+inline bool ParseOrExtractWindowsWim(
+    const uint8_t* data,
+    size_t size,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetNorm = nullptr,
+    std::vector<uint8_t>* outExtracted = nullptr)
+{
     if (size < 208 || std::memcmp(data, "MSWIM\0\0\0", 8) != 0) return false;
-    uint32_t dwFlags  = RdU32LE(data + 16);
-    uint32_t imgCount = RdU32LE(data + 44);
-    outInfo.formatName = (dwFlags & 0x00080000u) ? L"Windows ESD Image (LZMS)" : L"Windows Image (WIM)";
+    uint32_t cbSize      = RdU32LE(data + 8);
+    uint32_t dwVersion   = RdU32LE(data + 12);
+    uint32_t dwFlags     = RdU32LE(data + 16);
+    uint32_t dwChunkSize = RdU32LE(data + 20);
+    uint32_t imgCount    = RdU32LE(data + 44);
+    if (cbSize < 120 || cbSize > size || dwVersion == 0) return false;
+
+    if (outInfo) {
+        outInfo->formatName = (dwFlags & 0x00080000u) ? L"Windows ESD Image (LZMS)" : L"Windows Image (WIM)";
+    }
 
     auto readResHdr = [&](size_t off) -> WimResEntry {
         WimResEntry r;
@@ -2249,28 +3456,35 @@ inline bool ParseWindowsWim(const uint8_t* data, size_t size, ArchiveSummaryInfo
 
     WimResEntry rhOffsetTbl = readResHdr(48);
     WimResEntry rhXml       = readResHdr(72);
+    WimResEntry rhBootMeta  = readResHdr(96);
 
-    // 1. Parse UTF-16LE / UTF-8 XML Manifest
+    // 1. Parse UTF-16LE / UTF-8 XML Manifest (uncompressed or compressed)
     struct WimXmlImage {
         uint32_t index = 1;
         std::wstring name;
-        uint64_t totalBytes = 0;
-        uint64_t fileCount = 0;
     };
     std::vector<WimXmlImage> xmlImages;
+    std::vector<uint8_t> xmlBytes;
+    if (rhXml.compSize >= 4 && rhXml.wimOffset <= size && rhXml.compSize <= size - rhXml.wimOffset &&
+        DecompressWimResource(data, size, dwFlags, dwChunkSize, rhXml, xmlBytes, 32 * 1024 * 1024))
+    {
+        if (extractTargetNorm && outExtracted && PathEqualsCI(*extractTargetNorm, L"[WIM_Manifest].xml")) {
+            *outExtracted = std::move(xmlBytes);
+            return true;
+        }
+        if (outInfo) {
+            ArchiveItemEntry xmlEntry;
+            xmlEntry.pathInArchive = L"[WIM_Manifest].xml";
+            xmlEntry.name = xmlEntry.pathInArchive;
+            xmlEntry.uncompressedSize = xmlBytes.size();
+            xmlEntry.compressedSize = rhXml.compSize;
+            xmlEntry.rawDataOffset = rhXml.wimOffset;
+            xmlEntry.compressionMethod = ((rhXml.flags & 0x04u) == 0) ? 0 : 1;
+            outInfo->entries.push_back(std::move(xmlEntry));
+        }
 
-    if (rhXml.wimOffset + rhXml.compSize <= size && rhXml.compSize >= 4) {
-        ArchiveItemEntry xmlEntry;
-        xmlEntry.pathInArchive = L"[WIM_Manifest].xml";
-        xmlEntry.name = xmlEntry.pathInArchive;
-        xmlEntry.uncompressedSize = rhXml.compSize;
-        xmlEntry.compressedSize = rhXml.compSize;
-        xmlEntry.rawDataOffset = rhXml.wimOffset;
-        xmlEntry.compressionMethod = 0;
-        outInfo.entries.push_back(std::move(xmlEntry));
-
-        const uint8_t* xp = data + static_cast<size_t>(rhXml.wimOffset);
-        size_t xlen = static_cast<size_t>(rhXml.compSize);
+        const uint8_t* xp = xmlBytes.data();
+        size_t xlen = xmlBytes.size();
         std::wstring wxml;
         if (xlen >= 2 && ((xp[0] == 0xFF && xp[1] == 0xFE) || xp[1] == 0x00)) {
             size_t s = (xp[0] == 0xFF && xp[1] == 0xFE) ? 2 : 0;
@@ -2308,41 +3522,47 @@ inline bool ParseWindowsWim(const uint8_t* data, size_t size, ArchiveSummaryInfo
                 if (wi.index == 0) wi.index = seqIdx - 1;
             }
             wi.name = getTag(L"<NAME>", L"</NAME>");
-            std::wstring tb = getTag(L"<TOTALBYTES>", L"</TOTALBYTES>");
-            std::wstring fc = getTag(L"<FILECOUNT>", L"</FILECOUNT>");
-            if (!tb.empty()) wi.totalBytes = static_cast<uint64_t>(_wtoi64(tb.c_str()));
-            if (!fc.empty()) wi.fileCount  = static_cast<uint64_t>(_wtoi64(fc.c_str()));
             xmlImages.push_back(std::move(wi));
-
             pos = (imEnd < wxml.size()) ? (imEnd + 8) : wxml.size();
         }
     }
 
-    // 2. Parse Lookup Table (50-byte RESHDR_TABLE_ENTRY records) & Uncompressed Metadata Resources
+    // 2. Parse Lookup Table (50-byte RESHDR_DISK_LONG records)
     std::vector<WimResEntry> lookupTable;
     std::vector<WimResEntry> metadataResources;
-    if ((rhOffsetTbl.flags & 0x04u) == 0 && rhOffsetTbl.compSize >= 50 &&
-        rhOffsetTbl.wimOffset + rhOffsetTbl.compSize <= size)
+    std::vector<uint8_t> tblBytes;
+    if (rhOffsetTbl.compSize >= 50 &&
+        DecompressWimResource(data, size, dwFlags, dwChunkSize, rhOffsetTbl, tblBytes, 128 * 1024 * 1024))
     {
-        size_t cnt = static_cast<size_t>(rhOffsetTbl.compSize / 50ULL);
-        size_t tp = static_cast<size_t>(rhOffsetTbl.wimOffset);
-        for (size_t i = 0; i < cnt && i < 200000; ++i, tp += 50) {
-            WimResEntry e = readResHdr(tp);
-            std::memcpy(e.sha1, data + tp + 30, 20);
+        size_t cnt = tblBytes.size() / 50u;
+        for (size_t i = 0; i < cnt && i < 200000; ++i) {
+            const uint8_t* tp = tblBytes.data() + i * 50u;
+            WimResEntry e;
+            uint64_t sf = RdU64LE(tp);
+            e.compSize  = sf & 0x00FFFFFFFFFFFFFFULL;
+            e.flags     = tp[7];
+            e.wimOffset = RdU64LE(tp + 8);
+            e.origSize  = RdU64LE(tp + 16);
+            std::memcpy(e.sha1, tp + 30, 20);
             if ((e.flags & 0x02u) != 0) metadataResources.push_back(e);
             else lookupTable.push_back(e);
         }
     }
+    if (metadataResources.empty() && rhBootMeta.compSize >= 32 && rhBootMeta.wimOffset < size) {
+        metadataResources.push_back(rhBootMeta);
+    }
 
+    // 3. Decompress and walk each Metadata Resource (SECURITYBLOCK_DISK -> root DIRENTRY tree)
     size_t walkedImages = 0;
     for (size_t m = 0; m < metadataResources.size(); ++m) {
         const auto& mr = metadataResources[m];
-        if ((mr.flags & 0x04u) != 0 || mr.compSize < 110 || mr.wimOffset + mr.compSize > size) continue;
-        const uint8_t* mb = data + static_cast<size_t>(mr.wimOffset);
-        size_t mlen = static_cast<size_t>(mr.compSize);
-        uint32_t secLen = RdU32LE(mb);
-        size_t rootDirOff = (secLen == 0) ? 8 : static_cast<size_t>((static_cast<uint64_t>(secLen) + 7ULL) & ~7ULL);
-        if (rootDirOff + 102 > mlen) continue;
+        std::vector<uint8_t> metaBytes;
+        if (!DecompressWimResource(data, size, dwFlags, dwChunkSize, mr, metaBytes, 128 * 1024 * 1024)) continue;
+        if (metaBytes.size() < 110) continue;
+
+        uint32_t secLen = RdU32LE(metaBytes.data());
+        size_t rootDirOff = (secLen == 0) ? 8u : static_cast<size_t>((static_cast<uint64_t>(secLen) + 7ULL) & ~7ULL);
+        if (rootDirOff + 102 > metaBytes.size()) continue;
 
         std::wstring imgPrefix;
         if (m < xmlImages.size() && !xmlImages[m].name.empty()) {
@@ -2357,40 +3577,41 @@ inline bool ParseWindowsWim(const uint8_t* data, size_t size, ArchiveSummaryInfo
         for (wchar_t& ch : imgPrefix) if (ch == L'/' || ch == L'\\') ch = L'_';
 
         std::set<size_t> visited;
-        size_t before = outInfo.entries.size();
-        WalkWimDirEntryTree(mb, mlen, rootDirOff, imgPrefix, lookupTable, 0, visited, outInfo);
-        if (outInfo.entries.size() > before) ++walkedImages;
+        bool extractedOk = false;
+        size_t before = outInfo ? outInfo->entries.size() : 0;
+        WalkOrExtractWimDirEntryTree(
+            data, size, dwFlags, dwChunkSize,
+            metaBytes.data(), metaBytes.size(), rootDirOff, imgPrefix,
+            lookupTable, 0, visited, outInfo, extractTargetNorm, outExtracted, extractedOk);
+        if (extractTargetNorm && extractedOk) return true;
+        if (outInfo && outInfo->entries.size() > before) ++walkedImages;
     }
 
-    // If metadata resources are compressed (LZX/LZMS), emit rich XML image entries with exact names & sizes
+    if (extractTargetNorm) return false;
+    if (!outInfo) return false;
+
+    // Never emit fake Image_1 placeholder entries when metadata fails to decode!
     if (walkedImages == 0) {
-        if (!xmlImages.empty()) {
-            for (const auto& wi : xmlImages) {
-                std::wstring label = L"Image_" + std::to_wstring(wi.index);
-                if (!wi.name.empty()) label += L"_" + wi.name;
-                for (wchar_t& ch : label) if (ch == L'/' || ch == L'\\') ch = L'_';
-                ArchiveItemEntry imgEntry;
-                imgEntry.pathInArchive = label + L" (" + std::to_wstring(wi.fileCount) + L" files)";
-                imgEntry.name = imgEntry.pathInArchive;
-                imgEntry.isDirectory = (wi.totalBytes == 0);
-                imgEntry.uncompressedSize = wi.totalBytes;
-                imgEntry.compressedSize = size / std::max<size_t>(1, xmlImages.size());
-                imgEntry.compressionMethod = 1;
-                outInfo.entries.push_back(std::move(imgEntry));
-            }
-        } else {
-            for (uint32_t i = 1; i <= std::clamp(imgCount, 1u, 32u); ++i) {
-                ArchiveItemEntry imgDir;
-                imgDir.pathInArchive = L"Image_" + std::to_wstring(i);
-                imgDir.name = imgDir.pathInArchive;
-                imgDir.isDirectory = true;
-                outInfo.entries.push_back(std::move(imgDir));
-            }
-        }
+        outInfo->entries.clear();
+        outInfo->valid = false;
+        return false;
     }
 
-    outInfo.valid = !outInfo.entries.empty();
-    return outInfo.valid;
+    outInfo->valid = !outInfo->entries.empty();
+    return outInfo->valid;
+}
+
+inline bool ParseWindowsWim(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+    return ParseOrExtractWindowsWim(data, size, &outInfo, nullptr, nullptr);
+}
+
+inline bool ExtractWimEntryFromMemory(
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& normTarget,
+    std::vector<uint8_t>& outBytes)
+{
+    return ParseOrExtractWindowsWim(data, size, nullptr, &normTarget, &outBytes);
 }
 
 // ============================================================================
@@ -2453,15 +3674,115 @@ inline bool ParsePakOrWad(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
 // 34. Valve Pak (.vpk 0x55AA1234)
 // 35. Bethesda Archive (.bsa "BSA\0" v103/104/105 & .ba2 "BTDX" GNRL/DX10)
 // ============================================================================
-inline bool ParseValveVpk(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    if (size < 12 || RdU32LE(data) != 0x55AA1234u) return false;
-    uint32_t ver = RdU32LE(data + 4);
-    uint32_t treeSz = RdU32LE(data + 8);
-    size_t hdrSz = (ver == 2) ? 28 : 12;
-    if (hdrSz + treeSz > size) return false;
-    outInfo.formatName = L"Valve Pak (VPK v" + std::to_wstring(ver) + L")";
+inline uint32_t ComputeIeeeCrc32(const uint8_t* p, size_t len) {
+    static const struct CrcTbl {
+        uint32_t t[256] = {};
+        CrcTbl() {
+            for (uint32_t i = 0; i < 256u; ++i) {
+                uint32_t c = i;
+                for (int b = 0; b < 8; ++b) {
+                    c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+                }
+                t[i] = c;
+            }
+        }
+    } s_tbl;
 
-    size_t pos = hdrSz;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc = s_tbl.t[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+inline std::wstring ResolveVpkChunkPath(const std::wstring& dirVpkPath, uint16_t archiveIdx) {
+    if (dirVpkPath.empty()) return L"";
+    size_t slashPos = dirVpkPath.find_last_of(L"\\/");
+    size_t nameStart = (slashPos == std::wstring::npos) ? 0 : (slashPos + 1);
+    std::wstring dirPrefix = dirVpkPath.substr(0, nameStart);
+    std::wstring fileName  = dirVpkPath.substr(nameStart);
+
+    wchar_t chunkSuffix[24] = {};
+    swprintf_s(chunkSuffix, L"_%03u.vpk", static_cast<unsigned>(archiveIdx));
+
+    if (fileName.size() >= 8 &&
+        _wcsicmp(fileName.c_str() + fileName.size() - 8, L"_dir.vpk") == 0)
+    {
+        return dirPrefix + fileName.substr(0, fileName.size() - 8) + chunkSuffix;
+    }
+    if (fileName.size() >= 4 &&
+        _wcsicmp(fileName.c_str() + fileName.size() - 4, L".vpk") == 0)
+    {
+        return dirPrefix + fileName.substr(0, fileName.size() - 4) + chunkSuffix;
+    }
+    return L"";
+}
+
+inline bool ReadExactDiskSlice(const std::wstring& filePath, uint64_t offset, uint32_t length, uint8_t* dst) {
+    if (length == 0) return true;
+    HANDLE h = CreateFileW(
+        filePath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fsz = {};
+    if (!GetFileSizeEx(h, &fsz) || fsz.QuadPart < 0 ||
+        offset > static_cast<uint64_t>(fsz.QuadPart) ||
+        length > static_cast<uint64_t>(fsz.QuadPart) - offset)
+    {
+        CloseHandle(h);
+        return false;
+    }
+
+    LARGE_INTEGER seekPos = {};
+    seekPos.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(h, seekPos, nullptr, FILE_BEGIN)) {
+        CloseHandle(h);
+        return false;
+    }
+
+    uint32_t remaining = length;
+    size_t written = 0;
+    while (remaining > 0) {
+        DWORD toRead = static_cast<DWORD>(std::min<uint32_t>(remaining, 16u * 1024u * 1024u));
+        DWORD got = 0;
+        if (!ReadFile(h, dst + written, toRead, &got, nullptr) || got != toRead) {
+            CloseHandle(h);
+            return false;
+        }
+        written   += got;
+        remaining -= got;
+    }
+
+    CloseHandle(h);
+    return true;
+}
+
+inline bool ParseOrExtractValveVpk(
+    const uint8_t* data,
+    size_t size,
+    const std::wstring* vpkDiskPath,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetNorm = nullptr,
+    std::vector<uint8_t>* outExtracted = nullptr)
+{
+    if (size < 12 || RdU32LE(data) != 0x55AA1234u) return false;
+    uint32_t ver    = RdU32LE(data + 4);
+    uint32_t treeSz = RdU32LE(data + 8);
+    if (ver != 1u && ver != 2u) return false;
+    size_t hdrSz = (ver == 2u) ? 28u : 12u;
+    if (treeSz == 0 || size < hdrSz || treeSz > size - hdrSz) return false;
+
+    if (outInfo) {
+        outInfo->formatName = L"Valve Pak (VPK v" + std::to_wstring(ver) + L")";
+    }
+
+    size_t pos     = hdrSz;
     size_t treeEnd = hdrSz + treeSz;
     auto readCStr = [&](std::string& out) -> bool {
         size_t start = pos;
@@ -2473,39 +3794,106 @@ inline bool ParseValveVpk(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
     };
 
     std::string extStr, pathStr, fileStr;
-    while (readCStr(extStr) && !extStr.empty()) {
-        while (readCStr(pathStr) && !pathStr.empty()) {
-            while (readCStr(fileStr) && !fileStr.empty()) {
-                if (pos + 18 > treeEnd) break;
-                uint32_t crc = RdU32LE(data + pos);
+    while (pos < treeEnd) {
+        if (!readCStr(extStr)) return false;
+        if (extStr.empty()) break;
+
+        while (pos < treeEnd) {
+            if (!readCStr(pathStr)) return false;
+            if (pathStr.empty()) break;
+
+            while (pos < treeEnd) {
+                if (!readCStr(fileStr)) return false;
+                if (fileStr.empty()) break;
+
+                if (pos + 18 > treeEnd) return false;
+                uint32_t crc          = RdU32LE(data + pos + 0);
                 uint16_t preloadBytes = RdU16LE(data + pos + 4);
                 uint16_t archiveIdx   = RdU16LE(data + pos + 6);
                 uint32_t entryOff     = RdU32LE(data + pos + 8);
                 uint32_t entryLen     = RdU32LE(data + pos + 12);
+                uint16_t terminator   = RdU16LE(data + pos + 16);
+                if (terminator != 0xFFFFu) return false;
                 pos += 18;
+
+                if (preloadBytes > treeEnd - pos) return false;
+                const uint8_t* preloadPtr = data + pos;
+                pos += preloadBytes;
+
+                // Strictly validate in-archive payload bounds when archiveIdx == 0x7FFF
+                if (archiveIdx == 0x7FFFu && entryLen > 0) {
+                    if (entryOff > size - treeEnd || entryLen > (size - treeEnd) - entryOff) {
+                        if (outInfo) outInfo->entries.clear();
+                        return false;
+                    }
+                }
 
                 std::string full = (pathStr == " " ? "" : (pathStr + "/")) + fileStr +
                                    (extStr == " " ? "" : ("." + extStr));
                 std::wstring wp = NormPath(PathUtils::Utf8ToWide(full));
-                ArchiveItemEntry item;
-                item.pathInArchive = wp;
-                item.name = BaseName(wp);
-                item.crc32 = crc;
-                item.uncompressedSize = preloadBytes + entryLen;
-                item.compressedSize   = item.uncompressedSize;
-                if (archiveIdx == 0x7FFFu) {
-                    item.rawDataOffset = (preloadBytes > 0) ? pos : (treeEnd + entryOff);
-                    item.compressionMethod = 0;
-                } else {
-                    item.compressionMethod = 1;
+                if (wp.empty()) continue;
+
+                uint64_t totalBytes = static_cast<uint64_t>(preloadBytes) + static_cast<uint64_t>(entryLen);
+
+                if (extractTargetNorm && outExtracted) {
+                    if (PathEqualsCI(wp, *extractTargetNorm)) {
+                        if (totalBytes > 256ULL * 1024 * 1024) return false;
+                        outExtracted->resize(static_cast<size_t>(totalBytes));
+                        if (preloadBytes > 0) {
+                            std::memcpy(outExtracted->data(), preloadPtr, preloadBytes);
+                        }
+                        if (entryLen > 0) {
+                            if (archiveIdx == 0x7FFFu) {
+                                std::memcpy(outExtracted->data() + preloadBytes,
+                                            data + treeEnd + static_cast<size_t>(entryOff),
+                                            entryLen);
+                            } else {
+                                if (!vpkDiskPath || vpkDiskPath->empty()) {
+                                    outExtracted->clear();
+                                    return false;
+                                }
+                                std::wstring chunkPath = ResolveVpkChunkPath(*vpkDiskPath, archiveIdx);
+                                if (chunkPath.empty() ||
+                                    !ReadExactDiskSlice(chunkPath, entryOff, entryLen, outExtracted->data() + preloadBytes))
+                                {
+                                    outExtracted->clear();
+                                    return false;
+                                }
+                            }
+                        }
+                        if (ComputeIeeeCrc32(outExtracted->data(), outExtracted->size()) != crc) {
+                            outExtracted->clear();
+                            return false;
+                        }
+                        return true;
+                    }
+                } else if (outInfo) {
+                    ArchiveItemEntry item;
+                    item.pathInArchive    = wp;
+                    item.name             = BaseName(wp);
+                    item.crc32            = crc;
+                    item.uncompressedSize = totalBytes;
+                    item.compressedSize   = totalBytes;
+                    item.rawDataOffset    = (archiveIdx == 0x7FFFu)
+                        ? ((preloadBytes > 0) ? (pos - preloadBytes) : (treeEnd + entryOff))
+                        : entryOff;
+                    item.compressionMethod = 1; // Always extract via ParseOrExtractValveVpk (preload + _NNN.vpk + CRC32)
+                    outInfo->entries.push_back(std::move(item));
                 }
-                outInfo.entries.push_back(std::move(item));
-                pos += preloadBytes;
             }
         }
     }
-    outInfo.valid = !outInfo.entries.empty();
-    return outInfo.valid;
+
+    if (extractTargetNorm) return false;
+    if (outInfo) {
+        outInfo->valid = !outInfo->entries.empty();
+        return outInfo->valid;
+    }
+    return false;
+}
+
+inline bool ParseValveVpk(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo, const std::wstring* vpkDiskPath = nullptr) {
+    return ParseOrExtractValveVpk(data, size, vpkDiskPath, &outInfo, nullptr, nullptr);
 }
 
 inline bool ParseOrExtractBethesdaBsa(
@@ -2893,64 +4281,400 @@ inline bool ParseOrExtractBethesdaBa2(
     return false;
 }
 
-inline bool ParseVpkOrBsa(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    if (ParseValveVpk(data, size, outInfo)) return true;
+inline bool ParseVpkOrBsa(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo, const std::wstring* diskPath = nullptr) {
+    if (ParseValveVpk(data, size, outInfo, diskPath)) return true;
     if (ParseOrExtractBethesdaBsa(data, size, &outInfo, nullptr, nullptr)) return true;
     if (ParseOrExtractBethesdaBa2(data, size, &outInfo, nullptr, nullptr)) return true;
     return false;
 }
 
 // ============================================================================
-// 36. Electron App Archive (.asar — Chromium Pickle + JSON Virtual FS)
+// 36. Electron App Archive (.asar — Chromium Pickle + Recursive JSON Virtual FS)
 // ============================================================================
-inline bool ParseElectronAsar(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    if (size < 20 || RdU32LE(data) != 4) return false;
-    uint32_t headerSize = RdU32LE(data + 4);
-    uint32_t jsonLen    = RdU32LE(data + 12);
-    if (16ULL + jsonLen > size || jsonLen < 10 || data[16] != '{') return false;
+struct AsarJsonNode {
+    enum class Kind { Null, Bool, Number, String, Array, Object };
+    Kind kind = Kind::Null;
+    bool boolVal = false;
+    uint64_t uintVal = 0;
+    bool isUintValid = false;
+    std::string strVal;
+    std::vector<AsarJsonNode> elements;
+    std::vector<std::pair<std::string, AsarJsonNode>> members;
 
-    std::string_view json(reinterpret_cast<const char*>(data + 16), jsonLen);
-    if (json.find("\"files\"") == std::string_view::npos) return false;
+    bool IsObject() const { return kind == Kind::Object; }
+    bool IsString() const { return kind == Kind::String; }
+    bool IsBool()   const { return kind == Kind::Bool; }
+    bool IsNumber() const { return kind == Kind::Number; }
 
-    outInfo.formatName = L"Electron ASAR";
-    uint64_t dataBase = 8ULL + headerSize;
-
-    size_t pos = 0;
-    while (pos < json.size() && outInfo.entries.size() < 10000) {
-        size_t szKey = json.find("\"size\":", pos);
-        if (szKey == std::string_view::npos) break;
-        size_t braceOpen = json.rfind('{', szKey);
-        if (braceOpen != std::string_view::npos && braceOpen >= 3) {
-            size_t q2 = json.rfind('"', braceOpen - 1);
-            size_t q1 = (q2 != std::string_view::npos && q2 > 0) ? json.rfind('"', q2 - 1) : std::string_view::npos;
-            if (q1 != std::string_view::npos && q2 > q1 + 1) {
-                std::string fname(json.substr(q1 + 1, q2 - q1 - 1));
-                uint64_t fsize = static_cast<uint64_t>(std::strtoull(json.data() + szKey + 7, nullptr, 10));
-                uint64_t foff = 0;
-                size_t offKey = json.find("\"offset\":", braceOpen);
-                if (offKey != std::string_view::npos && offKey < szKey + 64) {
-                    size_t oq = json.find('"', offKey + 9);
-                    if (oq != std::string_view::npos) {
-                        foff = static_cast<uint64_t>(std::strtoull(json.data() + oq + 1, nullptr, 10));
-                    }
-                }
-                if (fname != "files") {
-                    ArchiveItemEntry item;
-                    item.pathInArchive = PathUtils::Utf8ToWide(fname);
-                    item.name = BaseName(item.pathInArchive);
-                    item.uncompressedSize = fsize;
-                    item.compressedSize = fsize;
-                    item.rawDataOffset = dataBase + foff;
-                    item.compressionMethod = 0;
-                    outInfo.entries.push_back(std::move(item));
-                }
-            }
+    const AsarJsonNode* Find(std::string_view key) const {
+        if (kind != Kind::Object) return nullptr;
+        for (const auto& kv : members) {
+            if (kv.first == key) return &kv.second;
         }
-        pos = szKey + 7;
+        return nullptr;
+    }
+};
+
+struct AsarJsonParser {
+    std::string_view s;
+    size_t p = 0;
+
+    void SkipWs() {
+        while (p < s.size()) {
+            char c = s[p];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') ++p;
+            else break;
+        }
     }
 
-    outInfo.valid = !outInfo.entries.empty();
-    return outInfo.valid;
+    static void AppendCodepointUtf8(uint32_t cp, std::string& out) {
+        if (cp <= 0x7Fu) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FFu) {
+            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0xFFFFu) {
+            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp <= 0x10FFFFu) {
+            out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+    }
+
+    bool ParseHex4(uint32_t& outHex) {
+        if (p + 4 > s.size()) return false;
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) {
+            char c = s[p++];
+            v <<= 4;
+            if (c >= '0' && c <= '9') v |= static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') v |= static_cast<uint32_t>(10 + (c - 'a'));
+            else if (c >= 'A' && c <= 'F') v |= static_cast<uint32_t>(10 + (c - 'A'));
+            else return false;
+        }
+        outHex = v;
+        return true;
+    }
+
+    bool ParseString(std::string& out) {
+        if (p >= s.size() || s[p] != '"') return false;
+        ++p;
+        out.clear();
+        while (p < s.size()) {
+            uint8_t ch = static_cast<uint8_t>(s[p++]);
+            if (ch == '"') return true;
+            if (ch < 0x20u) return false;
+            if (ch != '\\') {
+                out.push_back(static_cast<char>(ch));
+                continue;
+            }
+            if (p >= s.size()) return false;
+            char esc = s[p++];
+            switch (esc) {
+            case '"':  out.push_back('"');  break;
+            case '\\': out.push_back('\\'); break;
+            case '/':  out.push_back('/');  break;
+            case 'b':  out.push_back('\b'); break;
+            case 'f':  out.push_back('\f'); break;
+            case 'n':  out.push_back('\n'); break;
+            case 'r':  out.push_back('\r'); break;
+            case 't':  out.push_back('\t'); break;
+            case 'u': {
+                uint32_t u1 = 0;
+                if (!ParseHex4(u1)) return false;
+                if (u1 >= 0xD800u && u1 <= 0xDBFFu && p + 2 <= s.size() && s[p] == '\\' && s[p + 1] == 'u') {
+                    p += 2;
+                    uint32_t u2 = 0;
+                    if (!ParseHex4(u2)) return false;
+                    if (u2 >= 0xDC00u && u2 <= 0xDFFFu) {
+                        uint32_t cp = 0x10000u + (((u1 - 0xD800u) << 10) | (u2 - 0xDC00u));
+                        AppendCodepointUtf8(cp, out);
+                    } else {
+                        AppendCodepointUtf8(u1, out);
+                        AppendCodepointUtf8(u2, out);
+                    }
+                } else {
+                    AppendCodepointUtf8(u1, out);
+                }
+                break;
+            }
+            default:
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool ParseValue(AsarJsonNode& out, int depth) {
+        if (depth > 64) return false;
+        SkipWs();
+        if (p >= s.size()) return false;
+        char c = s[p];
+
+        if (c == '{') {
+            ++p;
+            out.kind = AsarJsonNode::Kind::Object;
+            out.members.clear();
+            SkipWs();
+            if (p < s.size() && s[p] == '}') { ++p; return true; }
+            while (p < s.size()) {
+                SkipWs();
+                std::string key;
+                if (!ParseString(key)) return false;
+                SkipWs();
+                if (p >= s.size() || s[p] != ':') return false;
+                ++p;
+                AsarJsonNode val;
+                if (!ParseValue(val, depth + 1)) return false;
+                out.members.emplace_back(std::move(key), std::move(val));
+                SkipWs();
+                if (p >= s.size()) return false;
+                if (s[p] == ',') { ++p; continue; }
+                if (s[p] == '}') { ++p; return true; }
+                return false;
+            }
+            return false;
+        }
+
+        if (c == '[') {
+            ++p;
+            out.kind = AsarJsonNode::Kind::Array;
+            out.elements.clear();
+            SkipWs();
+            if (p < s.size() && s[p] == ']') { ++p; return true; }
+            while (p < s.size()) {
+                AsarJsonNode elem;
+                if (!ParseValue(elem, depth + 1)) return false;
+                out.elements.push_back(std::move(elem));
+                SkipWs();
+                if (p >= s.size()) return false;
+                if (s[p] == ',') { ++p; continue; }
+                if (s[p] == ']') { ++p; return true; }
+                return false;
+            }
+            return false;
+        }
+
+        if (c == '"') {
+            out.kind = AsarJsonNode::Kind::String;
+            return ParseString(out.strVal);
+        }
+
+        if (c == 't' && p + 4 <= s.size() && s.substr(p, 4) == "true") {
+            p += 4;
+            out.kind = AsarJsonNode::Kind::Bool;
+            out.boolVal = true;
+            return true;
+        }
+        if (c == 'f' && p + 5 <= s.size() && s.substr(p, 5) == "false") {
+            p += 5;
+            out.kind = AsarJsonNode::Kind::Bool;
+            out.boolVal = false;
+            return true;
+        }
+        if (c == 'n' && p + 4 <= s.size() && s.substr(p, 4) == "null") {
+            p += 4;
+            out.kind = AsarJsonNode::Kind::Null;
+            return true;
+        }
+
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            out.kind = AsarJsonNode::Kind::Number;
+            bool neg = (c == '-');
+            if (neg) ++p;
+            if (p >= s.size() || s[p] < '0' || s[p] > '9') return false;
+            uint64_t uv = 0;
+            bool overflow = false;
+            while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
+                uint32_t d = static_cast<uint32_t>(s[p++] - '0');
+                if (uv > (UINT64_MAX - d) / 10ULL) overflow = true;
+                else uv = uv * 10ULL + d;
+            }
+            bool fracOrExp = false;
+            if (p < s.size() && s[p] == '.') {
+                fracOrExp = true;
+                ++p;
+                if (p >= s.size() || s[p] < '0' || s[p] > '9') return false;
+                while (p < s.size() && s[p] >= '0' && s[p] <= '9') ++p;
+            }
+            if (p < s.size() && (s[p] == 'e' || s[p] == 'E')) {
+                fracOrExp = true;
+                ++p;
+                if (p < s.size() && (s[p] == '+' || s[p] == '-')) ++p;
+                if (p >= s.size() || s[p] < '0' || s[p] > '9') return false;
+                while (p < s.size() && s[p] >= '0' && s[p] <= '9') ++p;
+            }
+            out.isUintValid = (!neg && !overflow && !fracOrExp);
+            out.uintVal     = out.isUintValid ? uv : 0;
+            return true;
+        }
+
+        return false;
+    }
+};
+
+inline bool ParseStrictDecimalU64(std::string_view sv, uint64_t& outVal) {
+    if (sv.empty()) return false;
+    uint64_t v = 0;
+    for (char c : sv) {
+        if (c < '0' || c > '9') return false;
+        uint32_t d = static_cast<uint32_t>(c - '0');
+        if (v > (UINT64_MAX - d) / 10ULL) return false;
+        v = v * 10ULL + d;
+    }
+    outVal = v;
+    return true;
+}
+
+inline bool ParseOrExtractElectronAsar(
+    const uint8_t* data,
+    size_t size,
+    const std::wstring* asarDiskPath,
+    ArchiveSummaryInfo* outInfo,
+    const std::wstring* extractTargetNorm = nullptr,
+    std::vector<uint8_t>* outExtracted = nullptr)
+{
+    if (size < 20 || RdU32LE(data + 0) != 4u) return false;
+    uint32_t headerSize = RdU32LE(data + 4);
+    uint32_t pickleSz   = RdU32LE(data + 8);
+    uint32_t jsonLen    = RdU32LE(data + 12);
+
+    uint64_t payloadBase = 8ULL + static_cast<uint64_t>(headerSize);
+    if (headerSize < 8u || payloadBase > size) return false;
+    if (pickleSz < 4u + jsonLen || jsonLen < 10u || 16ULL + static_cast<uint64_t>(jsonLen) > payloadBase) return false;
+    if (jsonLen > 64u * 1024u * 1024u) return false;
+
+    std::string_view jsonSv(reinterpret_cast<const char*>(data + 16), jsonLen);
+    AsarJsonParser parser{ jsonSv, 0 };
+    AsarJsonNode root;
+    if (!parser.ParseValue(root, 0)) return false;
+    parser.SkipWs();
+    while (parser.p < jsonSv.size() && jsonSv[parser.p] == '\0') ++parser.p;
+    if (parser.p != jsonSv.size() || !root.IsObject()) return false;
+
+    const AsarJsonNode* rootFiles = root.Find("files");
+    if (!rootFiles || !rootFiles->IsObject()) return false;
+
+    if (outInfo) {
+        outInfo->formatName = L"Electron ASAR";
+    }
+
+    bool extractedOk = false;
+    size_t entryCount = 0;
+
+    auto walkFiles = [&](auto& self, const AsarJsonNode& filesObj, const std::wstring& prefixPath, int depth) -> bool {
+        if (depth > 48 || !filesObj.IsObject()) return false;
+        for (const auto& kv : filesObj.members) {
+            if (entryCount >= 50000) break;
+            const std::string& keyUtf8 = kv.first;
+            const AsarJsonNode& node   = kv.second;
+            if (keyUtf8.empty() || keyUtf8 == ".") continue;
+            if (keyUtf8 == ".." || keyUtf8.find('/') != std::string::npos || keyUtf8.find('\\') != std::string::npos) {
+                return false;
+            }
+            if (!node.IsObject()) return false;
+
+            std::wstring wname = PathUtils::Utf8ToWide(keyUtf8);
+            std::wstring fullPath = NormPath(prefixPath.empty() ? wname : (prefixPath + L"/" + wname));
+            if (fullPath.empty()) continue;
+
+            const AsarJsonNode* subFiles = node.Find("files");
+            if (subFiles) {
+                if (!subFiles->IsObject()) return false;
+                if (outInfo) {
+                    ArchiveItemEntry dirItem;
+                    dirItem.pathInArchive = fullPath;
+                    dirItem.name          = BaseName(fullPath);
+                    dirItem.isDirectory   = true;
+                    outInfo->entries.push_back(std::move(dirItem));
+                }
+                ++entryCount;
+                if (!self(self, *subFiles, fullPath, depth + 1)) return false;
+                continue;
+            }
+
+            const AsarJsonNode* linkNode = node.Find("link");
+            if (linkNode && linkNode->IsString() && !node.Find("size")) {
+                continue; // Symbolic link metadata entry
+            }
+
+            const AsarJsonNode* szNode = node.Find("size");
+            if (!szNode || !szNode->IsNumber() || !szNode->isUintValid) return false;
+            uint64_t fsize = szNode->uintVal;
+
+            const AsarJsonNode* unpackedNode = node.Find("unpacked");
+            bool isUnpacked = (unpackedNode && unpackedNode->IsBool() && unpackedNode->boolVal);
+
+            uint64_t foff = 0;
+            if (!isUnpacked) {
+                const AsarJsonNode* offNode = node.Find("offset");
+                if (!offNode) return false;
+                if (offNode->IsString()) {
+                    if (!ParseStrictDecimalU64(offNode->strVal, foff)) return false;
+                } else if (offNode->IsNumber() && offNode->isUintValid) {
+                    foff = offNode->uintVal;
+                } else {
+                    return false;
+                }
+                // Strict payload bounds validation: reject corrupt ASAR offsets/sizes!
+                if (foff > size - payloadBase || fsize > (size - payloadBase) - foff) {
+                    return false;
+                }
+            }
+
+            if (extractTargetNorm && outExtracted && PathEqualsCI(fullPath, *extractTargetNorm)) {
+                if (fsize > 256ULL * 1024 * 1024) return false;
+                if (!isUnpacked) {
+                    size_t absStart = static_cast<size_t>(payloadBase + foff);
+                    outExtracted->assign(data + absStart, data + absStart + static_cast<size_t>(fsize));
+                    extractedOk = true;
+                } else if (asarDiskPath && !asarDiskPath->empty()) {
+                    std::wstring winRel = fullPath;
+                    for (wchar_t& ch : winRel) if (ch == L'/') ch = L'\\';
+                    std::wstring sidecar = *asarDiskPath + L".unpacked\\" + winRel;
+                    extractedOk = PathUtils::ReadFileBytes(sidecar, 256 * 1024 * 1024, *outExtracted) &&
+                                  outExtracted->size() == fsize;
+                }
+            }
+
+            if (outInfo) {
+                ArchiveItemEntry item;
+                item.pathInArchive     = fullPath;
+                item.name              = BaseName(fullPath);
+                item.uncompressedSize  = fsize;
+                item.compressedSize    = fsize;
+                item.rawDataOffset     = isUnpacked ? 0 : (payloadBase + foff);
+                item.compressionMethod = isUnpacked ? 1 : 0;
+                outInfo->entries.push_back(std::move(item));
+            }
+            ++entryCount;
+        }
+        return true;
+    };
+
+    if (!walkFiles(walkFiles, *rootFiles, L"", 0)) {
+        if (outInfo) {
+            outInfo->entries.clear();
+            outInfo->valid = false;
+        }
+        if (outExtracted) outExtracted->clear();
+        return false;
+    }
+
+    if (extractTargetNorm) return extractedOk;
+    if (outInfo) {
+        outInfo->valid = !outInfo->entries.empty();
+        return outInfo->valid;
+    }
+    return false;
+}
+
+inline bool ParseElectronAsar(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo, const std::wstring* diskPath = nullptr) {
+    return ParseOrExtractElectronAsar(data, size, diskPath, &outInfo, nullptr, nullptr);
 }
 
 } // namespace DetailArc100
@@ -2962,15 +4686,14 @@ inline bool InspectExtendedArchive100(
     const std::wstring& extLower,
     ArchiveSummaryInfo& outInfo)
 {
-    (void)archivePath;
     if (DetailArc100::ParseIso9660(data, size, outInfo)) return true;
     if (DetailArc100::ParseCabinetMscf(data, size, outInfo)) return true;
     if (DetailArc100::ParseDebianDeb(data, size, outInfo)) return true;
     if (DetailArc100::ParseRedHatRpm(data, size, outInfo)) return true;
     if (DetailArc100::ParseWindowsWim(data, size, outInfo)) return true;
     if (DetailArc100::ParsePakOrWad(data, size, outInfo)) return true;
-    if (DetailArc100::ParseVpkOrBsa(data, size, outInfo)) return true;
-    if (DetailArc100::ParseElectronAsar(data, size, outInfo)) return true;
+    if (DetailArc100::ParseVpkOrBsa(data, size, outInfo, &archivePath)) return true;
+    if (DetailArc100::ParseElectronAsar(data, size, outInfo, &archivePath)) return true;
     if (DetailArc100::ParseOle2Archive(data, size, extLower, outInfo)) return true;
     if (DetailArc100::ParseVirtualDiskImage(data, size, extLower, outInfo)) return true;
     return false;
@@ -2988,27 +4711,42 @@ inline bool ExtractExtendedArchive100Entry(
     if (size >= 36 && std::memcmp(data, "MSCF\0\0\0\0", 8) == 0) {
         return StreamCodecs::ExtractCabEntryFromFile(archivePath, normTarget, outBytes);
     }
-    // 2. Bethesda .bsa / .ba2
+    // 2. Windows Imaging (.wim / .esd — uncompressed, XPRESS Huffman, or LZX)
+    if (size >= 208 && std::memcmp(data, "MSWIM\0\0\0", 8) == 0) {
+        return DetailArc100::ExtractWimEntryFromMemory(data, size, normTarget, outBytes);
+    }
+    // 3. Valve Pak (.vpk v1/v2 — inline 0x7FFF + multi-chunk _NNN.vpk + CRC32 verification)
+    if (size >= 12 && DetailArc100::RdU32LE(data) == 0x55AA1234u) {
+        return DetailArc100::ParseOrExtractValveVpk(data, size, &archivePath, nullptr, &normTarget, &outBytes);
+    }
+    // 4. Electron App Archive (.asar — recursive JSON hierarchy + .asar.unpacked sidecar)
+    if (extLower == L".asar" || (size >= 20 && DetailArc100::RdU32LE(data) == 4u && data[16] == '{')) {
+        if (DetailArc100::ParseOrExtractElectronAsar(data, size, &archivePath, nullptr, &normTarget, &outBytes)) {
+            return true;
+        }
+        if (extLower == L".asar") return false;
+    }
+    // 5. Bethesda .bsa / .ba2
     if (size >= 36 && std::memcmp(data, "BSA\0", 4) == 0) {
         return DetailArc100::ParseOrExtractBethesdaBsa(data, size, nullptr, &normTarget, &outBytes);
     }
     if (size >= 24 && std::memcmp(data, "BTDX", 4) == 0) {
         return DetailArc100::ParseOrExtractBethesdaBa2(data, size, nullptr, &normTarget, &outBytes);
     }
-    // 3. RedHat .rpm (Metadata + compressed CPIO extraction)
+    // 6. RedHat .rpm (Metadata + compressed CPIO extraction)
     if (size >= 112 && data[0] == 0xED && data[1] == 0xAB && data[2] == 0xEE && data[3] == 0xDB) {
         return DetailArc100::ParseOrExtractRedHatRpm(data, size, nullptr, &normTarget, &outBytes);
     }
-    // 4. Windows Installer .msi / .msp (OLE2 streams + embedded MSCF CAB files)
+    // 7. Windows Installer .msi / .msp (OLE2 streams + embedded MSCF CAB files)
     if (extLower == L".msi" || extLower == L".msp") {
         if (DetailArc100::ExtractOle2ArchiveEntry(data, size, extLower, normTarget, outBytes)) return true;
     }
-    // 5. ISO-9660 Optical Disc
+    // 8. ISO-9660 Optical Disc
     if (size >= 0x8800 && data[0x8000] == 1 && std::memcmp(data + 0x8001, "CD001", 5) == 0) {
         ArchiveSummaryInfo dummy;
         if (DetailArc100::ParseIso9660(data, size, dummy, &normTarget, &outBytes)) return true;
     }
-    // 6. Virtual Disk Images (.vhd, .vhdx, .vmdk, .vdi, .qcow2, .dmg)
+    // 9. Virtual Disk Images (.vhd, .vhdx, .vmdk, .vdi, .qcow2, .dmg, .hfs, .ext2, .ext3, .ext4)
     if (DetailArc100::InspectOrExtractVirtualDisk(data, size, extLower, nullptr, &normTarget, &outBytes)) {
         return true;
     }

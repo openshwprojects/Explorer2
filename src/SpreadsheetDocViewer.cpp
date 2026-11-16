@@ -4,6 +4,8 @@
 #include "ZipDeflate.h"
 #include "Ole2Compound.h"
 #include <wincrypt.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #include <cstdio>
 #include <iomanip>
 #include <map>
@@ -81,6 +83,11 @@ static int ExcelCellRefToColIndex(std::string_view cellRef, int* outRowIdx = nul
 
 } // namespace
 
+namespace StreamCodecs {
+    bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut);
+    bool DecompressZstdFrame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut);
+}
+
 #include "formats/Parquet.h"
 #include "formats/Avro.h"
 #include "formats/Bson.h"
@@ -117,12 +124,15 @@ static int ExcelCellRefToColIndex(std::string_view cellRef, int* outRowIdx = nul
 #include "formats/ExtendedGeoSci100.h"
 #include "formats/ExtendedMediaDoc100.h"
 #include "formats/ExtendedDocs200.h"
+#include "formats/LegacyOfficeOle.h"
+#include "formats/ValveMaterialVmt.h"
 #include <shellapi.h>
 
 bool SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(const std::wstring& extLower) {
     return extLower == L".csv"     || extLower == L".tsv"     || extLower == L".psv"  ||
            extLower == L".xlsx"    || extLower == L".xlsm"    || extLower == L".xls"  ||
            extLower == L".ods"     || extLower == L".docx"    || extLower == L".docm" ||
+           extLower == L".doc"     || extLower == L".dot"     || extLower == L".ppt"  || extLower == L".pps" ||
            extLower == L".odt"     || extLower == L".rtf"     || extLower == L".pptx" ||
            extLower == L".ppsx"    || extLower == L".odp"     || extLower == L".epub" ||
            extLower == L".fb2"     || extLower == L".sqlite"  || extLower == L".sqlite3" ||
@@ -147,14 +157,15 @@ bool SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(const std::wstring& extLo
            extLower == L".dylib"   || extLower == L".crt"     || extLower == L".cer"  || extLower == L".pem"  ||
            extLower == L".der"     || extLower == L".csr"     || extLower == L".p12"  || extLower == L".pfx"  ||
            extLower == L".kdbx"    || extLower == L".pcapng"  || extLower == L".uf2"  ||
-           extLower == L".onnx"    || extLower == L".tflite"  || extLower == L".pt"   || extLower == L".pth"  ||
+           extLower == L".onnx"    || extLower == L".gguf"    || extLower == L".safetensors" ||
+           extLower == L".tflite"  || extLower == L".pt"      || extLower == L".pth"  ||
            extLower == L".ckpt"    || extLower == L".npy"     || extLower == L".npz"  || extLower == L".h5"   ||
            extLower == L".hdf5"    || extLower == L".mat"     || extLower == L".feather" || extLower == L".arrow" ||
            extLower == L".ipc"     || extLower == L".orc"     || extLower == L".duckdb"  || extLower == L".msgpack" ||
            extLower == L".mpk"     || extLower == L".cbor"    || extLower == L".ipynb"   || extLower == L".sav"  ||
            extLower == L".dta"     || extLower == L".sas7bdat"|| extLower == L".rds"  ||
            extLower == L".shp"     || extLower == L".shx"     || extLower == L".gpkg" || extLower == L".kmz"  ||
-           extLower == L".cdf"     || extLower == L".grib"    || extLower == L".grib2"|| extLower == L".grb"  || extLower == L".nii"  ||
+           extLower == L".nc"      || extLower == L".cdf"     || extLower == L".grib" || extLower == L".grib2"|| extLower == L".grb"  || extLower == L".nii"  ||
            extLower == L".ogg"     || extLower == L".opus"    || extLower == L".spx"  || extLower == L".mp3"  ||
            extLower == L".mod"     || extLower == L".xm"      || extLower == L".it"   || extLower == L".s3m"  ||
            extLower == L".sf2"     || extLower == L".sfz"     || extLower == L".gp"   || extLower == L".gp5"  ||
@@ -171,7 +182,8 @@ bool SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(const std::wstring& extLo
            extLower == L".pol"     || extLower == L".sid"     || extLower == L".nsf"  || extLower == L".spc"  ||
            extLower == L".vgm"     || extLower == L".musicxml"|| extLower == L".mxl"  || extLower == L".xmp"  ||
            extLower == L".uasset"  || extLower == L".umap"    || extLower == L".prefab"|| extLower == L".unity"||
-           extLower == L".pages"   || extLower == L".numbers" || extLower == L".key"  || extLower == L".vsdx";
+           extLower == L".pages"   || extLower == L".numbers" || extLower == L".key"  || extLower == L".vsdx" ||
+           extLower == L".vmt";
 }
 
 static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc);
@@ -782,13 +794,19 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     if (ext == L".epub") {
         return ParseEpubDocument(fullPath, outDoc);
     }
+    if (ext == L".parquet") {
+        return Formats::ParseApacheParquetFile(fullPath, outDoc);
+    }
+    if (ext == L".feather" || ext == L".arrow" || ext == L".ipc") {
+        return Formats::ParseArrowOrFeatherFile(fullPath, ext, outDoc);
+    }
 
     std::vector<uint8_t> raw;
     if (!PathUtils::ReadFileBytes(fullPath, 32 * 1024 * 1024, raw) || raw.empty()) {
         return false;
     }
 
-    if (ext == L".parquet") return Formats::ParseApacheParquet(raw, outDoc);
+    if (ext == L".vmt")     return Formats::ParseValveMaterialVmt(raw, outDoc);
     if (ext == L".avro")    return Formats::ParseApacheAvro(raw, outDoc);
     if (ext == L".bson")    return Formats::ParseBsonDocument(raw, outDoc);
     if (ext == L".ics" || ext == L".ical")   return Formats::ParseICalendar(raw, outDoc);
@@ -854,6 +872,11 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     // Legacy .xls (OLE2 BIFF8 / BIFF5 Workbook & Shared String Table parser)
     if (ext == L".xls") {
         return BiffXlsDetail::ParseBiffWorkbook(raw, outDoc);
+    }
+
+    // Legacy .doc/.dot ([MS-DOC] Piece Table) & .ppt/.pps ([MS-PPT] Record Tree + Escher Shapes)
+    if (ext == L".doc" || ext == L".dot" || ext == L".ppt" || ext == L".pps") {
+        return Formats::ParseLegacyOfficeOleDoc(raw, ext, outDoc);
     }
 
     return false;

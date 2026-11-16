@@ -1065,7 +1065,7 @@ static std::vector<uint8_t> BuildSyntheticE57ScaledPose(
 
 // Builds a GoldSrc v10 StudioMDL (.mdl) with 2 hierarchical mstudiobone_t bones and per-vertex bone skinning.
 static std::vector<uint8_t> BuildSyntheticGoldSrcMdl10(float bone1OffsetX) {
-    std::vector<uint8_t> buf(820, 0);
+    std::vector<uint8_t> buf(832, 0);
     auto wrU32 = [&](size_t off, uint32_t v) { std::memcpy(buf.data() + off, &v, 4); };
     auto wrI32 = [&](size_t off, int32_t v)  { std::memcpy(buf.data() + off, &v, 4); };
     auto wrI16 = [&](size_t off, int16_t v)  { std::memcpy(buf.data() + off, &v, 2); };
@@ -1597,6 +1597,825 @@ struct IgesDocBuilder {
         return out;
     }
 };
+
+// Wraps raw bytes in a standard RFC 1952 Gzip stream (0x1F 0x8B + Fixed-Huffman Deflate + CRC32 + ISIZE).
+static std::vector<uint8_t> TfGzipCompress(const void* data, size_t len) {
+    const auto* ptr = static_cast<const uint8_t*>(data);
+    ByteWriter w;
+    const uint8_t gzHdr[10] = { 0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03 };
+    w.Bytes(gzHdr, 10);
+    auto deflated = TfDeflateFixedHuffman(ptr, len);
+    w.Bytes(deflated.data(), deflated.size());
+    w.U32LE(TfCrc32(ptr, len));
+    w.U32LE(static_cast<uint32_t>(len));
+    return w.buf;
+}
+
+// Greedy LibLZF compressor emitting both literal runs (ctrl < 32) and back-references (ctrl >= 32, incl. len >= 9).
+static std::vector<uint8_t> TfLzfCompress(const std::vector<uint8_t>& raw) {
+    std::vector<uint8_t> out;
+    out.reserve(raw.size() + 32);
+    std::vector<uint8_t> lit;
+    auto flushLit = [&]() {
+        size_t pos = 0;
+        while (pos < lit.size()) {
+            size_t chunk = std::min<size_t>(32, lit.size() - pos);
+            out.push_back(static_cast<uint8_t>(chunk - 1));
+            out.insert(out.end(), lit.begin() + static_cast<std::ptrdiff_t>(pos),
+                       lit.begin() + static_cast<std::ptrdiff_t>(pos + chunk));
+            pos += chunk;
+        }
+        lit.clear();
+    };
+
+    size_t ip = 0;
+    const size_t n = raw.size();
+    while (ip < n) {
+        size_t bestLen = 0;
+        size_t bestOff = 0;
+        size_t maxBack = std::min<size_t>(ip, 8192);
+        for (size_t off = 1; off <= maxBack; ++off) {
+            size_t ref = ip - off;
+            size_t maxL = std::min<size_t>(264, n - ip);
+            size_t ml = 0;
+            while (ml < maxL && raw[ref + ml] == raw[ip + ml]) ++ml;
+            if (ml >= 3 && ml > bestLen) {
+                bestLen = ml;
+                bestOff = off;
+                if (bestLen == 264) break;
+            }
+        }
+        if (bestLen >= 3) {
+            flushLit();
+            uint32_t off0 = static_cast<uint32_t>(bestOff - 1);
+            uint32_t lenCode = static_cast<uint32_t>(bestLen - 2);
+            if (lenCode < 7u) {
+                out.push_back(static_cast<uint8_t>((lenCode << 5) | ((off0 >> 8) & 0x1Fu)));
+                out.push_back(static_cast<uint8_t>(off0 & 0xFFu));
+            } else {
+                out.push_back(static_cast<uint8_t>((7u << 5) | ((off0 >> 8) & 0x1Fu)));
+                out.push_back(static_cast<uint8_t>(lenCode - 7u));
+                out.push_back(static_cast<uint8_t>(off0 & 0xFFu));
+            }
+            ip += bestLen;
+        } else {
+            lit.push_back(raw[ip++]);
+        }
+    }
+    flushLit();
+    return out;
+}
+
+// Builds a PCL v0.7 DATA binary_compressed .pcd with 16-byte PointXYZRGB stride in official SoA column-major order.
+static std::vector<uint8_t> BuildPcdBinaryCompressedSoA(
+    const std::vector<Vec3f>& pts,
+    const std::vector<uint32_t>& rgbs,
+    size_t* outCompSize = nullptr,
+    size_t* outUncompSize = nullptr)
+{
+    const size_t n = pts.size();
+    ByteWriter soa;
+    // Column 0: all X float32s; Column 1: all Y float32s; Column 2: all Z float32s; Column 3: all RGB packed float32s
+    for (size_t i = 0; i < n; ++i) soa.F32LE(pts[i].x);
+    for (size_t i = 0; i < n; ++i) soa.F32LE(pts[i].y);
+    for (size_t i = 0; i < n; ++i) soa.F32LE(pts[i].z);
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t c = (i < rgbs.size()) ? rgbs[i] : 0x0033AAFFu;
+        soa.U32LE(c);
+    }
+
+    auto lzf = TfLzfCompress(soa.buf);
+    if (outCompSize) *outCompSize = lzf.size();
+    if (outUncompSize) *outUncompSize = soa.buf.size();
+
+    char hdr[512];
+    std::snprintf(hdr, sizeof(hdr),
+        "# .PCD v0.7 - Point Cloud Data file format\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z rgb\n"
+        "SIZE 4 4 4 4\n"
+        "TYPE F F F F\n"
+        "COUNT 1 1 1 1\n"
+        "WIDTH %zu\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        "POINTS %zu\n"
+        "DATA binary_compressed\n",
+        n, n);
+
+    ByteWriter out;
+    out.Bytes(hdr, std::strlen(hdr));
+    out.U32LE(static_cast<uint32_t>(lzf.size()));
+    out.U32LE(static_cast<uint32_t>(soa.buf.size()));
+    out.Bytes(lzf.data(), lzf.size());
+    return out.buf;
+}
+
+// Builds a Gmsh MSH 4.1 Binary ($MeshFormat 4.1 1 8) mesh with sparse 64-bit node tags.
+static std::vector<uint8_t> BuildGmsh41BinaryVolumetric(
+    const std::vector<std::pair<uint64_t, Vec3f>>& taggedNodes,
+    int32_t elmType,
+    const std::vector<std::vector<uint64_t>>& elemConn)
+{
+    ByteWriter w;
+    const char* fmtHdr = "$MeshFormat\n4.1 1 8\n";
+    w.Bytes(fmtHdr, std::strlen(fmtHdr));
+    w.I32LE(1); // endianness marker
+    const char* fmtEnd = "\n$EndMeshFormat\n$Nodes\n";
+    w.Bytes(fmtEnd, std::strlen(fmtEnd));
+
+    uint64_t minNodeTag = taggedNodes.empty() ? 1 : taggedNodes.front().first;
+    uint64_t maxNodeTag = minNodeTag;
+    for (const auto& nd : taggedNodes) {
+        minNodeTag = std::min(minNodeTag, nd.first);
+        maxNodeTag = std::max(maxNodeTag, nd.first);
+    }
+    w.U64LE(1);                  // numEntityBlocks
+    w.U64LE(taggedNodes.size()); // numNodes
+    w.U64LE(minNodeTag);
+    w.U64LE(maxNodeTag);
+    w.I32LE(3); // entityDim = 3
+    w.I32LE(1); // entityTag = 1
+    w.I32LE(0); // parametric = 0
+    w.U64LE(taggedNodes.size());
+    for (const auto& nd : taggedNodes) w.U64LE(nd.first);
+    for (const auto& nd : taggedNodes) {
+        w.F64LE(nd.second.x);
+        w.F64LE(nd.second.y);
+        w.F64LE(nd.second.z);
+    }
+    const char* nodesEnd = "\n$EndNodes\n$Elements\n";
+    w.Bytes(nodesEnd, std::strlen(nodesEnd));
+
+    w.U64LE(1);               // numEntityBlocks
+    w.U64LE(elemConn.size()); // numElements
+    w.U64LE(500);             // minElementTag
+    w.U64LE(500 + elemConn.size() - 1);
+    w.I32LE(3);               // entityDim = 3
+    w.I32LE(1);               // entityTag = 1
+    w.I32LE(elmType);         // elementType (e.g. 5 = hex8, 4 = tet4)
+    w.U64LE(elemConn.size());
+    for (size_t e = 0; e < elemConn.size(); ++e) {
+        w.U64LE(500 + e);
+        for (uint64_t nt : elemConn[e]) w.U64LE(nt);
+    }
+    const char* elemsEnd = "\n$EndElements\n";
+    w.Bytes(elemsEnd, std::strlen(elemsEnd));
+    return w.buf;
+}
+
+// Builds a genuine 1024-byte USGS 7.5-Minute ASCII DEM (Type A header + Type B profiles with Fortran D floats & -32767 void).
+static std::string BuildUsgs75MinDemFixture() {
+    std::string typeA(1024, ' ');
+    auto putField = [&](size_t off, size_t width, const char* txt) {
+        size_t len = std::min(width, std::strlen(txt));
+        std::memcpy(typeA.data() + off + (width - len), txt, len);
+    };
+    const char* title = "MOUNT RAINIER WEST, WA - USGS 7.5 MINUTE DEM TEST";
+    std::memcpy(typeA.data(), title, std::strlen(title));
+    putField(144, 6, "1"); // DEM level 1
+    putField(150, 6, "1"); // regular elevation pattern
+    putField(156, 6, "1"); // UTM planimetric system
+    putField(528, 6, "2"); // meters ground unit
+    putField(534, 6, "2"); // meters elevation unit
+    putField(540, 6, "4"); // 4-sided quadrangle
+
+    const char* corners[8] = {
+        "0.500000000000000D+06", "0.518000000000000D+07",
+        "0.500000000000000D+06", "0.518005000000000D+07",
+        "0.500050000000000D+06", "0.518005000000000D+07",
+        "0.500050000000000D+06", "0.518000000000000D+07"
+    };
+    for (int i = 0; i < 8; ++i) putField(546 + static_cast<size_t>(i) * 24, 24, corners[i]);
+    putField(738, 24, "0.100000000000000D+02");
+    putField(762, 24, "0.950000000000000D+02");
+    putField(810, 6,  "0");
+    putField(816, 12, "0.100000D+02"); // dx = 10m
+    putField(828, 12, "0.100000D+02"); // dy = 10m
+    putField(840, 12, "0.100000D+01"); // dz = 1m
+    putField(852, 6,  "1");            // 1 row of profiles
+    putField(858, 6,  "6");            // 6 profiles (columns)
+
+    std::string out = typeA;
+    for (int col = 1; col <= 6; ++col) {
+        char pHdr[256];
+        std::snprintf(pHdr, sizeof(pHdr),
+            "     1%6d     6     1 0.5000%d0000000000D+06 0.518000000000000D+07 0.000000D+00 0.100000D+02 0.950000D+02 ",
+            col, col - 1);
+        out += pHdr;
+        for (int row = 0; row < 6; ++row) {
+            int elev = (col == 3 && row == 3) ? -32767 : (15 + col * 8 + row * 6);
+            char eBuf[16];
+            std::snprintf(eBuf, sizeof(eBuf), "%6d", elev);
+            out += eBuf;
+        }
+        out += "\n";
+    }
+    return out;
+}
+
+// ============================================================================
+// Symmetric LASzip v2 Arithmetic Encoder (POINT10 v2 + Chunk Table) for LAZ Test Fixtures
+// ============================================================================
+namespace LazTestEnc {
+
+static constexpr uint32_t kAcMinLen = 0x01000000u;
+static constexpr uint32_t kAcMaxLen = 0xFFFFFFFFu;
+static constexpr uint32_t kBmShift  = 13u;
+static constexpr uint32_t kBmMaxCnt = 1u << kBmShift;
+static constexpr uint32_t kDmShift  = 15u;
+static constexpr uint32_t kDmMaxCnt = 1u << kDmShift;
+
+struct BitModel {
+    uint32_t updateCycle = 4, bitsUntilUpdate = 4;
+    uint32_t bit0Prob = 1u << (kBmShift - 1);
+    uint32_t bit0Count = 1, bitCount = 2;
+    void Init() { bit0Count = 1; bitCount = 2; bit0Prob = 1u << (kBmShift - 1); updateCycle = bitsUntilUpdate = 4; }
+    void Update() {
+        if ((bitCount += updateCycle) > kBmMaxCnt) {
+            bitCount = (bitCount + 1u) >> 1;
+            bit0Count = (bit0Count + 1u) >> 1;
+            if (bit0Count == bitCount) ++bitCount;
+        }
+        uint32_t scale = 0x80000000u / bitCount;
+        bit0Prob = (bit0Count * scale) >> (31u - kBmShift);
+        updateCycle = std::min<uint32_t>(64u, (5u * updateCycle) >> 2);
+        bitsUntilUpdate = updateCycle;
+    }
+};
+
+struct SymModel {
+    uint32_t symbols = 0, totalCount = 0, updateCycle = 0, symbolsUntilUpdate = 0;
+    std::vector<uint32_t> symbolCount, distribution;
+    void Init(uint32_t n) {
+        symbols = n;
+        symbolCount.assign(n, 1u);
+        distribution.assign(n, 0u);
+        totalCount = 0;
+        updateCycle = n;
+        Update();
+        symbolsUntilUpdate = updateCycle = (n + 6u) >> 1;
+    }
+    void Update() {
+        if ((totalCount += updateCycle) > kDmMaxCnt) {
+            totalCount = 0;
+            for (uint32_t i = 0; i < symbols; ++i) totalCount += (symbolCount[i] = (symbolCount[i] + 1u) >> 1);
+        }
+        uint32_t sum = 0;
+        uint32_t scale = 0x80000000u / totalCount;
+        for (uint32_t k = 0; k < symbols; ++k) {
+            distribution[k] = (scale * sum) >> (31u - kDmShift);
+            sum += symbolCount[k];
+        }
+        updateCycle = (5u * updateCycle) >> 2;
+        uint32_t maxCycle = std::min<uint32_t>(kDmMaxCnt >> 1, (symbols + 6u) << 3);
+        if (updateCycle > maxCycle) updateCycle = maxCycle;
+        symbolsUntilUpdate = updateCycle;
+    }
+};
+
+struct ArithEncoder {
+    std::vector<uint8_t> buf;
+    uint32_t base = 0;
+    uint32_t length = kAcMaxLen;
+
+    void Init() {
+        buf.clear();
+        base = 0;
+        length = kAcMaxLen;
+    }
+    void PropagateCarry() {
+        if (buf.empty()) return;
+        size_t i = buf.size() - 1;
+        while (i > 0 && buf[i] == 0xFFu) {
+            buf[i] = 0;
+            --i;
+        }
+        ++buf[i];
+    }
+    void Renorm() {
+        do {
+            buf.push_back(static_cast<uint8_t>(base >> 24));
+            base <<= 8;
+        } while ((length <<= 8) < kAcMinLen);
+    }
+    void EncodeBit(BitModel& m, uint32_t sym) {
+        uint32_t x = m.bit0Prob * (length >> kBmShift);
+        if (sym == 0u) {
+            length = x;
+            ++m.bit0Count;
+        } else {
+            uint32_t initBase = base;
+            base += x;
+            length -= x;
+            if (initBase > base) PropagateCarry();
+        }
+        if (length < kAcMinLen) Renorm();
+        if (--m.bitsUntilUpdate == 0u) m.Update();
+    }
+    void EncodeSymbol(SymModel& m, uint32_t sym) {
+        uint32_t initBase = base;
+        if (sym == m.symbols - 1u) {
+            uint32_t x = m.distribution[sym] * (length >> kDmShift);
+            base += x;
+            length -= x;
+        } else {
+            uint32_t x = m.distribution[sym] * (length >>= kDmShift);
+            base += x;
+            length = m.distribution[sym + 1u] * length - x;
+        }
+        if (initBase > base) PropagateCarry();
+        if (length < kAcMinLen) Renorm();
+        ++m.symbolCount[sym];
+        if (--m.symbolsUntilUpdate == 0u) m.Update();
+    }
+    void WriteBits(uint32_t bits, uint32_t sym) {
+        if (bits == 0u) return;
+        if (bits > 19u) {
+            WriteBits(19u, sym & ((1u << 19) - 1u));
+            WriteBits(bits - 19u, sym >> 19);
+            return;
+        }
+        uint32_t initBase = base;
+        base += sym * (length >>= bits);
+        if (initBase > base) PropagateCarry();
+        if (length < kAcMinLen) Renorm();
+    }
+    void WriteInt(uint32_t v) {
+        WriteBits(16u, v & 0xFFFFu);
+        WriteBits(16u, v >> 16);
+    }
+    void Done() {
+        uint32_t initBase = base;
+        bool anotherByte = true;
+        if (length > 2u * kAcMinLen) {
+            base += kAcMinLen;
+            length = kAcMinLen >> 1;
+        } else {
+            base += kAcMinLen >> 1;
+            length = kAcMinLen >> 9;
+            anotherByte = false;
+        }
+        if (initBase > base) PropagateCarry();
+        Renorm();
+        if (anotherByte) buf.push_back(0);
+        buf.push_back(0);
+        buf.push_back(0);
+    }
+};
+
+struct IntCompressorEnc {
+    uint32_t bits = 32, contexts = 1, bitsHigh = 8, corrBits = 32, k = 0;
+    std::vector<SymModel> mBits;
+    BitModel mCorrector0;
+    std::vector<SymModel> mCorrector;
+
+    void Setup(uint32_t numBits, uint32_t numContexts = 1, uint32_t highBits = 8) {
+        bits = numBits; contexts = numContexts; bitsHigh = highBits; corrBits = numBits; k = 0;
+        mBits.resize(contexts);
+        mCorrector.resize(corrBits + 1);
+    }
+    void InitCompressor() {
+        k = 0;
+        for (uint32_t c = 0; c < contexts; ++c) mBits[c].Init(corrBits + 1u);
+        mCorrector0.Init();
+        for (uint32_t i = 1; i <= corrBits; ++i) {
+            mCorrector[i].Init((i <= bitsHigh) ? (1u << i) : (1u << bitsHigh));
+        }
+    }
+    uint32_t GetK() const { return k; }
+
+    static uint32_t BitWidth32(uint32_t v) {
+        uint32_t w = 0;
+        while (v != 0u) { ++w; v >>= 1; }
+        return w;
+    }
+
+    void Compress(ArithEncoder& enc, int32_t pred, int32_t realVal, uint32_t context = 0) {
+        int32_t corr = static_cast<int32_t>(static_cast<uint32_t>(realVal) - static_cast<uint32_t>(pred));
+        if (corr == 0) {
+            k = 0;
+            enc.EncodeSymbol(mBits[context], 0u);
+            enc.EncodeBit(mCorrector0, 0u);
+            return;
+        }
+        if (corr == 1) {
+            k = 0;
+            enc.EncodeSymbol(mBits[context], 0u);
+            enc.EncodeBit(mCorrector0, 1u);
+            return;
+        }
+        int64_t corr64 = static_cast<int64_t>(realVal) - static_cast<int64_t>(pred);
+        if (corr64 > 1 && corr64 <= 0x7FFFFFFFLL) {
+            uint32_t u = static_cast<uint32_t>(corr64 - 1);
+            uint32_t kw = BitWidth32(u);
+            if (kw <= 31u) {
+                k = kw;
+                enc.EncodeSymbol(mBits[context], k);
+                if (k <= bitsHigh) {
+                    enc.EncodeSymbol(mCorrector[k], u);
+                } else {
+                    uint32_t k1 = k - bitsHigh;
+                    enc.WriteBits(k1, u & ((1u << k1) - 1u));
+                    enc.EncodeSymbol(mCorrector[bitsHigh], u >> k1);
+                }
+                return;
+            }
+        } else if (corr64 < 0 && corr64 >= -0x7FFFFFFFLL) {
+            uint32_t u = static_cast<uint32_t>(-corr64);
+            uint32_t kw = BitWidth32(u);
+            if (kw <= 31u) {
+                k = kw;
+                uint32_t c = ((1u << k) - 1u) - u;
+                enc.EncodeSymbol(mBits[context], k);
+                if (k <= bitsHigh) {
+                    enc.EncodeSymbol(mCorrector[k], c);
+                } else {
+                    uint32_t k1 = k - bitsHigh;
+                    enc.WriteBits(k1, c & ((1u << k1) - 1u));
+                    enc.EncodeSymbol(mCorrector[bitsHigh], c >> k1);
+                }
+                return;
+            }
+        }
+        k = 32u;
+        enc.EncodeSymbol(mBits[context], 32u);
+        enc.WriteInt(static_cast<uint32_t>(corr));
+    }
+};
+
+struct StreamingMedian5 {
+    int32_t values[5] = {};
+    bool high = true;
+    void Init() { for (int& v : values) v = 0; high = true; }
+    int32_t Get() const { return values[2]; }
+    void Add(int32_t v) {
+        if (high) {
+            if (v < values[2]) {
+                values[4] = values[3]; values[3] = values[2];
+                if (v < values[0]) { values[2] = values[1]; values[1] = values[0]; values[0] = v; }
+                else if (v < values[1]) { values[2] = values[1]; values[1] = v; }
+                else { values[2] = v; }
+            } else {
+                if (v < values[3]) { values[4] = values[3]; values[3] = v; }
+                else { values[4] = v; }
+                high = false;
+            }
+        } else {
+            if (values[2] < v) {
+                values[0] = values[1]; values[1] = values[2];
+                if (values[4] < v) { values[2] = values[3]; values[3] = values[4]; values[4] = v; }
+                else if (values[3] < v) { values[2] = values[3]; values[3] = v; }
+                else { values[2] = v; }
+            } else {
+                if (values[1] < v) { values[0] = values[1]; values[1] = v; }
+                else { values[0] = v; }
+                high = true;
+            }
+        }
+    }
+};
+
+static std::vector<uint8_t> EncodeLazPoint10v2Chunk(const Vec3f* pts, size_t count) {
+    ByteWriter chunk;
+    auto qCoord = [](float f) -> int32_t { return static_cast<int32_t>(std::llround(static_cast<double>(f) * 100.0)); };
+
+    // 20-byte uncompressed seed point (return_number=1, number_of_returns=1 -> byte 14 = 0x09 -> m=0, l=0, n=1!)
+    int32_t curX = qCoord(pts[0].x);
+    int32_t curY = qCoord(pts[0].y);
+    int32_t curZ = qCoord(pts[0].z);
+    chunk.I32LE(curX);
+    chunk.I32LE(curY);
+    chunk.I32LE(curZ);
+    chunk.U16LE(0);    // intensity = 0
+    chunk.U8(0x09u);   // return_number=1, number_of_returns=1
+    chunk.U8(2u);      // classification = ground
+    chunk.U8(0u);      // scan_angle_rank
+    chunk.U8(0u);      // user_data
+    chunk.U16LE(1u);   // point_source_ID
+    if (count <= 1) return chunk.buf;
+
+    SymModel mChangedValues;
+    mChangedValues.Init(64);
+    IntCompressorEnc icDx, icDy, icZ;
+    icDx.Setup(32, 2);  icDx.InitCompressor();
+    icDy.Setup(32, 22); icDy.InitCompressor();
+    icZ.Setup(32, 20);  icZ.InitCompressor();
+    StreamingMedian5 medX, medY;
+    medX.Init(); medY.Init();
+    int32_t lastHeight0 = 0;
+
+    ArithEncoder enc;
+    enc.Init();
+    for (size_t i = 1; i < count; ++i) {
+        int32_t nx = qCoord(pts[i].x);
+        int32_t ny = qCoord(pts[i].y);
+        int32_t nz = qCoord(pts[i].z);
+
+        // changedValues == 0 (all non-XYZ attributes match seed; n=1, r=1 -> m=0, l=0)
+        enc.EncodeSymbol(mChangedValues, 0u);
+
+        int32_t dx = nx - curX;
+        icDx.Compress(enc, medX.Get(), dx, 1u);
+        curX = nx;
+        medX.Add(dx);
+
+        uint32_t kBitsX = icDx.GetK();
+        uint32_t ctxY = 1u + ((kBitsX < 20u) ? (kBitsX & ~1u) : 20u);
+        int32_t dy = ny - curY;
+        icDy.Compress(enc, medY.Get(), dy, ctxY);
+        curY = ny;
+        medY.Add(dy);
+
+        uint32_t kBits = (icDx.GetK() + icDy.GetK()) / 2u;
+        uint32_t ctxZ = 1u + ((kBits < 18u) ? (kBits & ~1u) : 18u);
+        icZ.Compress(enc, lastHeight0, nz, ctxZ);
+        lastHeight0 = nz;
+    }
+    enc.Done();
+    chunk.Bytes(enc.buf.data(), enc.buf.size());
+    return chunk.buf;
+}
+
+static std::vector<uint8_t> BuildLazPoint10v2Fixture(const std::vector<Vec3f>& pts, uint32_t chunkSize) {
+    // 1. Build VLR 22204 ("laszip encoded") payload: 34B header + 1 * 6B item (POINT10, 20B, v2) = 40B
+    ByteWriter vlrPay;
+    vlrPay.U16LE(2u);         // compressor = 2 (POINTWISE_CHUNKED)
+    vlrPay.U16LE(0u);         // coder = 0 (ARITHMETIC)
+    vlrPay.U8(2); vlrPay.U8(2); vlrPay.U16LE(0); // version 2.2.0
+    vlrPay.U32LE(0);          // options
+    vlrPay.U32LE(chunkSize);  // chunk_size
+    vlrPay.U64LE(0xFFFFFFFFFFFFFFFFULL); // num_special_evlrs = -1
+    vlrPay.U64LE(0xFFFFFFFFFFFFFFFFULL); // offset_special_evlrs = -1
+    vlrPay.U16LE(1u);         // num_items = 1
+    vlrPay.U16LE(6u);         // item.type = 6 (POINT10)
+    vlrPay.U16LE(20u);        // item.size = 20
+    vlrPay.U16LE(2u);         // item.version = 2
+
+    // 54-byte LAS VLR record header
+    std::vector<uint8_t> vlrHdr(54, 0);
+    std::memcpy(vlrHdr.data() + 2, "laszip encoded", 14);
+    uint16_t recId = 22204u;
+    uint16_t recLen = static_cast<uint16_t>(vlrPay.buf.size());
+    std::memcpy(vlrHdr.data() + 18, &recId, 2);
+    std::memcpy(vlrHdr.data() + 20, &recLen, 2);
+
+    const uint16_t lasHdrSz = 227;
+    const uint32_t ptDataOff = static_cast<uint32_t>(lasHdrSz + vlrHdr.size() + vlrPay.buf.size());
+
+    std::vector<uint8_t> hdr(lasHdrSz, 0);
+    std::memcpy(hdr.data(), "LASF", 4);
+    hdr[24] = 1; hdr[25] = 2; // LAS 1.2
+    std::memcpy(hdr.data() + 94, &lasHdrSz, 2);
+    std::memcpy(hdr.data() + 96, &ptDataOff, 4);
+    uint32_t numVlrs = 1;
+    std::memcpy(hdr.data() + 100, &numVlrs, 4);
+    hdr[104] = 128u + 0u; // compressed Point Format 0 (bit 7 set!)
+    uint16_t ptRecLen = 20;
+    std::memcpy(hdr.data() + 105, &ptRecLen, 2);
+    uint32_t nPts32 = static_cast<uint32_t>(pts.size());
+    std::memcpy(hdr.data() + 107, &nPts32, 4);
+    double sc = 0.01, zero = 0.0;
+    std::memcpy(hdr.data() + 131, &sc, 8);
+    std::memcpy(hdr.data() + 139, &sc, 8);
+    std::memcpy(hdr.data() + 147, &sc, 8);
+    std::memcpy(hdr.data() + 155, &zero, 8);
+    std::memcpy(hdr.data() + 163, &zero, 8);
+    std::memcpy(hdr.data() + 171, &zero, 8);
+
+    std::vector<std::vector<uint8_t>> chunks;
+    for (size_t off = 0; off < pts.size(); off += chunkSize) {
+        size_t cnt = std::min<size_t>(chunkSize, pts.size() - off);
+        chunks.push_back(EncodeLazPoint10v2Chunk(pts.data() + off, cnt));
+    }
+
+    ByteWriter out;
+    out.Bytes(hdr.data(), hdr.size());
+    out.Bytes(vlrHdr.data(), vlrHdr.size());
+    out.Bytes(vlrPay.buf.data(), vlrPay.buf.size());
+
+    size_t tablePtrPos = out.buf.size();
+    out.U64LE(0); // placeholder for int64_t chunkTableStart
+    for (const auto& ch : chunks) out.Bytes(ch.data(), ch.size());
+
+    uint64_t chunkTableStart = out.buf.size();
+    for (int b = 0; b < 8; ++b) {
+        out.buf[tablePtrPos + b] = static_cast<uint8_t>((chunkTableStart >> (b * 8)) & 0xFFu);
+    }
+
+    // Chunk table: version=0, numChunks, arithmetic-coded byte lengths (fixed chunk_size -> context 1 only!)
+    out.U32LE(0u);
+    out.U32LE(static_cast<uint32_t>(chunks.size()));
+    ArithEncoder ctEnc;
+    ctEnc.Init();
+    IntCompressorEnc ctIc;
+    ctIc.Setup(32, 2);
+    ctIc.InitCompressor();
+    int32_t prevBytes = 0;
+    for (const auto& ch : chunks) {
+        int32_t curBytes = static_cast<int32_t>(ch.size());
+        ctIc.Compress(ctEnc, prevBytes, curBytes, 1u);
+        prevBytes = curBytes;
+    }
+    ctEnc.Done();
+    out.Bytes(ctEnc.buf.data(), ctEnc.buf.size());
+    return out.buf;
+}
+
+static std::vector<uint8_t> BuildLas14Fmt6Fixture(const std::vector<Vec3f>& pts) {
+    const uint16_t hdrSz = 375;
+    std::vector<uint8_t> hdr(hdrSz, 0);
+    std::memcpy(hdr.data(), "LASF", 4);
+    hdr[24] = 1; hdr[25] = 4; // LAS 1.4!
+    std::memcpy(hdr.data() + 94, &hdrSz, 2);
+    uint32_t ptOff = hdrSz;
+    std::memcpy(hdr.data() + 96, &ptOff, 4);
+    hdr[104] = 6u; // Point Format 6 (30 bytes)
+    uint16_t recLen = 30;
+    std::memcpy(hdr.data() + 105, &recLen, 2);
+    uint32_t legacyZero = 0; // legacy 32-bit count intentionally 0 per LAS 1.4 spec!
+    std::memcpy(hdr.data() + 107, &legacyZero, 4);
+    double sc = 0.01, zero = 0.0;
+    std::memcpy(hdr.data() + 131, &sc, 8);
+    std::memcpy(hdr.data() + 139, &sc, 8);
+    std::memcpy(hdr.data() + 147, &sc, 8);
+    std::memcpy(hdr.data() + 155, &zero, 8);
+    std::memcpy(hdr.data() + 163, &zero, 8);
+    std::memcpy(hdr.data() + 171, &zero, 8);
+    uint64_t extCount64 = pts.size();
+    std::memcpy(hdr.data() + 247, &extCount64, 8); // LAS 1.4 64-bit Extended Number of Point Records at +247!
+
+    ByteWriter w;
+    w.Bytes(hdr.data(), hdr.size());
+    for (const auto& p : pts) {
+        w.I32LE(static_cast<int32_t>(std::llround(static_cast<double>(p.x) * 100.0)));
+        w.I32LE(static_cast<int32_t>(std::llround(static_cast<double>(p.y) * 100.0)));
+        w.I32LE(static_cast<int32_t>(std::llround(static_cast<double>(p.z) * 100.0)));
+        for (int k = 0; k < 18; ++k) w.U8(0); // remaining 18 bytes of 30-byte Format 6 record
+    }
+    return w.buf;
+}
+
+} // namespace LazTestEnc
+
+// ============================================================================
+// RFC 8878 Zstandard Skippable Seek-Table + Compressed_Block (Huffman + FSE) Encoder for Blender .blend
+// ============================================================================
+static std::vector<uint8_t> PackZstdReverseBitStream(const std::vector<std::pair<uint32_t, int>>& readsInOrder) {
+    // ZstdRevBitStream::ReadBits reads from just below the sentinel 1-bit down to bit 0:
+    // the LAST read sits at bit 0, the FIRST read sits just below the sentinel 1-bit.
+    std::vector<uint8_t> bitsLSB;
+    for (size_t idx = readsInOrder.size(); idx > 0; --idx) {
+        uint32_t val = readsInOrder[idx - 1].first;
+        int nb = readsInOrder[idx - 1].second;
+        for (int b = 0; b < nb; ++b) {
+            bitsLSB.push_back(static_cast<uint8_t>((val >> b) & 1u));
+        }
+    }
+    bitsLSB.push_back(1u); // sentinel top 1-bit
+    std::vector<uint8_t> out((bitsLSB.size() + 7u) / 8u, 0);
+    for (size_t i = 0; i < bitsLSB.size(); ++i) {
+        if (bitsLSB[i]) out[i >> 3] |= static_cast<uint8_t>(1u << (i & 7u));
+    }
+    return out;
+}
+
+static std::vector<uint8_t> EncodeZstdSingleMatchCompressedBlock(
+    const uint8_t* seg, size_t segLen, bool useHuffman7BitLiterals, bool isLastBlock)
+{
+    static const uint32_t kLLBase[36] = {
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        16,18,20,22,24,28,32,40,48,64,128,256,512,1024,2048,4096,
+        8192,16384,32768,65536
+    };
+    static const uint8_t kLLBits[36] = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        1,1,1,1,2,2,3,3,4,6,7,8,9,10,11,12,
+        13,14,15,16
+    };
+    static const uint32_t kMLBase[53] = {
+        3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,
+        19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,
+        35,37,39,41,43,47,51,59,67,83,99,131,259,515,1027,2051,
+        4099,8195,16387,32771,65539
+    };
+    static const uint8_t kMLBits[53] = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        1,1,1,1,2,2,3,3,4,4,5,7,8,9,10,11,
+        12,13,14,15,16
+    };
+
+    // Find the longest RLE/LZ77 match (offset = 1) inside seg so we emit a real FSE sequence!
+    size_t bestPos = 1, bestLen = 0;
+    for (size_t i = 1; i + 4 <= segLen; ++i) {
+        size_t ml = 0;
+        while (i + ml < segLen && ml < 64 && seg[i + ml] == seg[i - 1]) ++ml;
+        if (ml > bestLen) { bestLen = ml; bestPos = i; }
+    }
+    const uint32_t litLen = static_cast<uint32_t>(bestPos);
+    const uint32_t matchLen = static_cast<uint32_t>(bestLen); // >= 16 on CustomDataLayer & ENDB zero runs!
+    const uint32_t actualOffset = 1u;
+
+    std::vector<uint8_t> literals;
+    literals.insert(literals.end(), seg, seg + bestPos);
+    literals.insert(literals.end(), seg + bestPos + bestLen, seg + segLen);
+
+    ByteWriter blk;
+    if (useHuffman7BitLiterals) {
+        // Compressed_Literals_Block (litType = 2), single stream (sizeFmt = 0), regenSize < 1024:
+        // Direct Huffman tree header: h0 = 254 -> numSyms = 127, weights[0..126] = 1, implicit weight[127] = 1 -> flat 7-bit table!
+        ByteWriter huffPay;
+        huffPay.U8(254u);
+        for (int i = 0; i < 63; ++i) huffPay.U8(0x11u);
+        huffPay.U8(0x10u); // 127th nibble = 1, padding nibble = 0 (treeBytes = 65)
+
+        std::vector<std::pair<uint32_t, int>> huffReads;
+        huffReads.reserve(literals.size());
+        for (uint8_t sym : literals) {
+            huffReads.emplace_back(static_cast<uint32_t>(sym & 0x7Fu), 7);
+        }
+        auto huffStream = PackZstdReverseBitStream(huffReads);
+        huffPay.Bytes(huffStream.data(), huffStream.size());
+
+        uint32_t regenSz = static_cast<uint32_t>(literals.size());
+        uint32_t compSz  = static_cast<uint32_t>(huffPay.buf.size());
+        uint32_t litHdr  = 2u | (0u << 2) | (regenSz << 4) | (compSz << 14);
+        blk.U8(static_cast<uint8_t>(litHdr & 0xFFu));
+        blk.U8(static_cast<uint8_t>((litHdr >> 8) & 0xFFu));
+        blk.U8(static_cast<uint8_t>((litHdr >> 16) & 0xFFu));
+        blk.Bytes(huffPay.buf.data(), huffPay.buf.size());
+    } else {
+        // Raw_Literals_Block (litType = 0), sizeFmt = 1 (2-byte header up to 4095 bytes)
+        uint32_t regenSz = static_cast<uint32_t>(literals.size());
+        uint16_t litHdr = static_cast<uint16_t>(0u | (1u << 2) | (regenSz << 4));
+        blk.U16LE(litHdr);
+        blk.Bytes(literals.data(), literals.size());
+    }
+
+    // Sequences Section: numSeq = 1, RLE modes (LL=1, OF=1, ML=1 -> 0x54)
+    uint8_t llCode = 0;
+    for (uint8_t c = 0; c < 36; ++c) if (kLLBase[c] <= litLen) llCode = c;
+    uint32_t llExtra = litLen - kLLBase[llCode];
+
+    uint8_t mlCode = 0;
+    for (uint8_t c = 0; c < 53; ++c) if (kMLBase[c] <= matchLen) mlCode = c;
+    uint32_t mlExtra = matchLen - kMLBase[mlCode];
+
+    uint32_t rawOffset = actualOffset + 3u; // 4 -> ofCode = 2, ofExtra = 0
+    uint8_t ofCode = 2u;
+    uint32_t ofExtra = rawOffset - (1u << ofCode);
+
+    blk.U8(1u);    // numSeq = 1
+    blk.U8(0x54u); // modes: LL=RLE(1), OF=RLE(1), ML=RLE(1)
+    blk.U8(llCode);
+    blk.U8(ofCode);
+    blk.U8(mlCode);
+
+    // Extra bits read in order: OF, ML, LL
+    std::vector<std::pair<uint32_t, int>> seqReads;
+    if (ofCode > 0) seqReads.emplace_back(ofExtra, static_cast<int>(ofCode));
+    if (kMLBits[mlCode] > 0) seqReads.emplace_back(mlExtra, static_cast<int>(kMLBits[mlCode]));
+    if (kLLBits[llCode] > 0) seqReads.emplace_back(llExtra, static_cast<int>(kLLBits[llCode]));
+    auto seqStream = PackZstdReverseBitStream(seqReads);
+    blk.Bytes(seqStream.data(), seqStream.size());
+
+    ByteWriter out;
+    uint32_t bh = (isLastBlock ? 1u : 0u) | (2u << 1) | (static_cast<uint32_t>(blk.buf.size()) << 3);
+    out.U8(static_cast<uint8_t>(bh & 0xFFu));
+    out.U8(static_cast<uint8_t>((bh >> 8) & 0xFFu));
+    out.U8(static_cast<uint8_t>((bh >> 16) & 0xFFu));
+    out.Bytes(blk.buf.data(), blk.buf.size());
+    return out.buf;
+}
+
+static std::vector<uint8_t> WrapBlendInZstdSeekAndCompressedBlocks(const std::vector<uint8_t>& rawBlend) {
+    // Split right at "SDNANAME" so Block 1 is 100% 7-bit ASCII/low-byte (< 128) and exercises Huffman Compressed_Literals!
+    std::string_view sv(reinterpret_cast<const char*>(rawBlend.data()), rawBlend.size());
+    size_t splitPos = sv.find("SDNANAME");
+    if (splitPos == std::string_view::npos) splitPos = rawBlend.size() / 2;
+
+    ByteWriter w;
+    // 1. Blender Zstd Skippable Seek-Table Frame (magic 0x184D2A5E) at offset 0!
+    w.U32LE(0x184D2A5Eu);
+    w.U32LE(9u);
+    w.U32LE(0u);
+    w.U32LE(static_cast<uint32_t>(rawBlend.size()));
+    w.U8(0x80u);
+
+    // 2. RFC 8878 Zstandard Frame (magic 0xFD2FB528, fhd = 0xA0 -> Single_Segment + 4-byte Frame_Content_Size)
+    w.U32LE(0xFD2FB528u);
+    w.U8(0xA0u);
+    w.U32LE(static_cast<uint32_t>(rawBlend.size()));
+
+    // Block 0: Compressed_Block (bType=2, Raw_Literals + FSE Sequence compressing CustomDataLayer zero padding)
+    auto b0 = EncodeZstdSingleMatchCompressedBlock(rawBlend.data(), splitPos, false, false);
+    // Block 1: Compressed_Block (bType=2, Huffman Compressed_Literals + FSE Sequence compressing ENDB zero tail)
+    auto b1 = EncodeZstdSingleMatchCompressedBlock(rawBlend.data() + splitPos, rawBlend.size() - splitPos, true, true);
+    w.Bytes(b0.data(), b0.size());
+    w.Bytes(b1.data(), b1.size());
+    return w.buf;
+}
 
 } // namespace
 
@@ -2689,6 +3508,648 @@ void RunFormatTests3D(TestCounter& tc) {
     }
 
     // ========================================================================
+    // 20. PCL Point Cloud (.pcd) & Stanford PLY (.ply): LZF SoA, Big-Endian Double, Tristrips & Point Cloud
+    // ========================================================================
+    {
+        LoadedMesh3D mRepoPcd;
+        bool okRepoPcd = Model3DViewer::InspectMeshFile(tdDir + L"\\lidar_scan.pcd", mRepoPcd);
+        tc.Record(okRepoPcd && mRepoPcd.loadedOk && mRepoPcd.rawVertexCount == 24 && mRepoPcd.rawTriangleCount == 24,
+                  L"Stage15.3D.PCD.RepoAscii",
+                  L"verts=" + std::to_wstring(mRepoPcd.rawVertexCount));
+
+        // Build two distinct PCL v0.7 DATA binary_compressed 16B-stride PointXYZRGB files in SoA column-major layout!
+        std::vector<Vec3f> ringPts;
+        std::vector<uint32_t> ringRgb;
+        for (int i = 0; i < 16; ++i) {
+            float a = static_cast<float>(i) * 0.3926991f;
+            ringPts.push_back({ 6.0f * std::cos(a), 5.0f * std::sin(a), (i & 1) ? 0.5f : 0.0f });
+            ringRgb.push_back(0x00FF8822u);
+        }
+        std::vector<Vec3f> helixPts;
+        std::vector<uint32_t> helixRgb;
+        for (int i = 0; i < 20; ++i) {
+            float a = static_cast<float>(i) * 0.5f;
+            helixPts.push_back({ 1.5f * std::cos(a), 1.5f * std::sin(a), static_cast<float>(i) * 1.5f });
+            helixRgb.push_back(0x0022CC88u);
+        }
+        size_t compSzA = 0, uncompSzA = 0, compSzB = 0, uncompSzB = 0;
+        auto pcdSoaA = BuildPcdBinaryCompressedSoA(ringPts, ringRgb, &compSzA, &uncompSzA);
+        auto pcdSoaB = BuildPcdBinaryCompressedSoA(helixPts, helixRgb, &compSzB, &uncompSzB);
+
+        LoadedMesh3D mPcdA, mPcdB;
+        bool okPcdA = Model3DViewer::InspectMeshFile(writeBytes(L"lzf_soa_ring.pcd", pcdSoaA), mPcdA);
+        bool okPcdB = Model3DViewer::InspectMeshFile(writeBytes(L"lzf_soa_helix.pcd", pcdSoaB), mPcdB);
+        tc.Record(okPcdA && okPcdB &&
+                  compSzA < uncompSzA && compSzB < uncompSzB &&
+                  mPcdA.rawVertexCount == 16 * 4 && mPcdA.rawTriangleCount == 16 * 4 &&
+                  mPcdB.rawVertexCount == 20 * 4 && mPcdB.rawTriangleCount == 20 * 4 &&
+                  mPcdB.bboxSize.y > 26.0f && // proves SoA Z-column was reconstructed properly (mapped to viewer Y)!
+                  HashMeshGeometry(mPcdA) != HashMeshGeometry(mPcdB),
+                  L"Stage15.3D.PCD.BinaryCompressedLzfSoADistinct",
+                  L"compA=" + std::to_wstring(compSzA) + L"/" + std::to_wstring(uncompSzA) +
+                  L" spanYB=" + std::to_wstring(mPcdB.bboxSize.y));
+
+        // Repo ASCII PLY + Binary Big-Endian PLY (double XYZ + float normals + uchar RGB + tristrips with -1 restart) + Point-Cloud PLY
+        LoadedMesh3D mRepoPly;
+        bool okRepoPly = Model3DViewer::InspectMeshFile(tdDir + L"\\octahedron_mesh.ply", mRepoPly);
+
+        const char* bePlyHdr =
+            "ply\n"
+            "format binary_big_endian 1.0\n"
+            "element vertex 7\n"
+            "property double x\n"
+            "property double y\n"
+            "property double z\n"
+            "property float nx\n"
+            "property float ny\n"
+            "property float nz\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "element tristrips 1\n"
+            "property list int int vertex_indices\n"
+            "end_header\n";
+        ByteWriter bePly;
+        bePly.Bytes(bePlyHdr, std::strlen(bePlyHdr));
+        auto wrF64BE = [&](double d) {
+            uint64_t u = 0;
+            std::memcpy(&u, &d, 8);
+            bePly.U32BE(static_cast<uint32_t>(u >> 32));
+            bePly.U32BE(static_cast<uint32_t>(u & 0xFFFFFFFFu));
+        };
+        const double beVerts[7][3] = {
+            { 0.0, 0.0, 0.0 }, { 4.0, 0.0, 0.0 }, { 0.0, 4.0, 0.0 }, { 4.0, 4.0, 2.0 },
+            { 8.0, 0.0, 0.0 }, { 12.0, 0.0, 0.0 }, { 10.0, 5.0, 3.0 }
+        };
+        for (int i = 0; i < 7; ++i) {
+            wrF64BE(beVerts[i][0]);
+            wrF64BE(beVerts[i][1]);
+            wrF64BE(beVerts[i][2]);
+            bePly.F32BE(0.0f); bePly.F32BE(0.0f); bePly.F32BE(1.0f);
+            bePly.U8(static_cast<uint8_t>(40 + i * 25));
+            bePly.U8(160u);
+            bePly.U8(220u);
+        }
+        // Strip: [0, 1, 2, 3, -1, 4, 5, 6] -> 2 tris from first strip + 1 tri from restarted strip = 3 tris!
+        const int32_t stripList[8] = { 0, 1, 2, 3, -1, 4, 5, 6 };
+        bePly.I32BE(8);
+        for (int32_t idx : stripList) bePly.I32BE(idx);
+
+        // Point-cloud-only binary_little_endian PLY (0 faces, 10 vertices -> 40 splat verts & 40 splat tris)
+        const char* pcPlyHdr =
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            "element vertex 10\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property uchar red\n"
+            "property uchar green\n"
+            "property uchar blue\n"
+            "element face 0\n"
+            "property list uchar int vertex_indices\n"
+            "end_header\n";
+        ByteWriter pcPly;
+        pcPly.Bytes(pcPlyHdr, std::strlen(pcPlyHdr));
+        for (int i = 0; i < 10; ++i) {
+            pcPly.F32LE(static_cast<float>(i) * 1.2f);
+            pcPly.F32LE(std::sin(static_cast<float>(i)) * 3.0f);
+            pcPly.F32LE(static_cast<float>(i % 3) * 2.0f);
+            pcPly.U8(255u); pcPly.U8(128u); pcPly.U8(64u);
+        }
+
+        LoadedMesh3D mBePly, mPcPly;
+        bool okBePly = Model3DViewer::InspectMeshFile(writeBytes(L"big_endian_tristrip.ply", bePly.buf), mBePly);
+        bool okPcPly = Model3DViewer::InspectMeshFile(writeBytes(L"point_cloud_only.ply", pcPly.buf), mPcPly);
+        tc.Record(okRepoPly && mRepoPly.rawVertexCount == 6 && mRepoPly.rawTriangleCount == 8 &&
+                  okBePly && mBePly.rawVertexCount == 7 && mBePly.rawTriangleCount == 3 &&
+                  mBePly.bboxSize.x > 11.5f &&
+                  okPcPly && mPcPly.rawVertexCount == 10 * 4 && mPcPly.rawTriangleCount == 10 * 4 &&
+                  HashMeshGeometry(mBePly) != HashMeshGeometry(mPcPly),
+                  L"Stage15.3D.PLY.BinaryBigEndianTristripsAndPointCloud",
+                  L"beTris=" + std::to_wstring(mBePly.rawTriangleCount) + L" pcTris=" + std::to_wstring(mPcPly.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 21. VTK Legacy 1.0–5.1 (.vtk) & Gmsh FEM 2.2 / 4.1 (.msh): Volumetric Interior Culling & Sparse Binary
+    // ========================================================================
+    {
+        LoadedMesh3D mTorusVtk;
+        bool okTorusVtk = Model3DViewer::InspectMeshFile(tdDir + L"\\torus_mesh.vtk", mTorusVtk);
+
+        // 2 adjacent VTK_HEXAHEDRON (type 12) sharing interior quad (4,5,6,7):
+        // 12 total quads - 2 shared interior faces = 10 exterior boundary quads = 20 triangles!
+        const char* vtkTwoHex =
+            "# vtk DataFile Version 3.0\n"
+            "Two Adjacent Hexahedra\n"
+            "ASCII\n"
+            "DATASET UNSTRUCTURED_GRID\n"
+            "POINTS 12 float\n"
+            "0 0 0  2 0 0  2 2 0  0 2 0\n"
+            "0 0 2  2 0 2  2 2 2  0 2 2\n"
+            "0 0 4  2 0 4  2 2 4  0 2 4\n"
+            "CELLS 2 18\n"
+            "8 0 1 2 3 4 5 6 7\n"
+            "8 4 5 6 7 8 9 10 11\n"
+            "CELL_TYPES 2\n"
+            "12\n12\n";
+
+        // 2 adjacent VTK_TETRA (type 10) sharing interior tri (0,1,2): 8 - 2 = 6 exterior boundary triangles!
+        const char* vtkTwoTet =
+            "# vtk DataFile Version 3.0\n"
+            "Two Adjacent Tetrahedra\n"
+            "ASCII\n"
+            "DATASET UNSTRUCTURED_GRID\n"
+            "POINTS 5 float\n"
+            "0 0 0  4 0 0  2 3 0  2 1 4  2 1 -4\n"
+            "CELLS 2 10\n"
+            "4 0 1 2 3\n"
+            "4 0 2 1 4\n"
+            "CELL_TYPES 2\n"
+            "10\n10\n";
+
+        // VTK 5.1 POLYDATA with OFFSETS + CONNECTIVITY (both implicit counts & explicit OFFSETS <k> <type> / CONNECTIVITY <m> <type>)
+        const char* vtk51Offsets =
+            "# vtk DataFile Version 5.1\n"
+            "vtk output\n"
+            "ASCII\n"
+            "DATASET POLYDATA\n"
+            "POINTS 5 float\n"
+            "-2 -2 0  2 -2 0  2 2 0  -2 2 0  0 0 5\n"
+            "POLYGONS 6 16\n"
+            "OFFSETS vtktypeint64\n"
+            "0 4 7 10 13 16\n"
+            "CONNECTIVITY vtktypeint64\n"
+            "0 3 2 1  0 1 4  1 2 4  2 3 4  3 0 4\n";
+
+        const char* vtk50ExplicitOff =
+            "# vtk DataFile Version 5.0\n"
+            "vtk explicit offsets\n"
+            "ASCII\n"
+            "DATASET POLYDATA\n"
+            "POINTS 4 float\n"
+            "0 0 0  3 0 0  0 3 0  0 0 4\n"
+            "POLYGONS 4 12\n"
+            "OFFSETS 5 vtktypeint32\n"
+            "0 3 6 9 12\n"
+            "CONNECTIVITY 12 vtktypeint32\n"
+            "0 2 1  0 1 3  1 2 3  2 0 3\n";
+
+        // VTK STRUCTURED_POINTS 2D heightfield with POINT_DATA SCALARS
+        const char* vtkStructPts =
+            "# vtk DataFile Version 3.0\n"
+            "Heightfield Grid\n"
+            "ASCII\n"
+            "DATASET STRUCTURED_POINTS\n"
+            "DIMENSIONS 4 4 1\n"
+            "ORIGIN 0 0 0\n"
+            "SPACING 2 2 1\n"
+            "POINT_DATA 16\n"
+            "SCALARS elevation float 1\n"
+            "LOOKUP_TABLE default\n"
+            "0 1 1 0  1 5 6 1  1 6 7 1  0 1 1 0\n";
+
+        LoadedMesh3D mHexVtk, mTetVtk, mVtk51, mVtk50, mVtkSp;
+        bool okHexVtk = Model3DViewer::InspectMeshFile(writeText(L"two_hex_ug.vtk", vtkTwoHex), mHexVtk);
+        bool okTetVtk = Model3DViewer::InspectMeshFile(writeText(L"two_tet_ug.vtk", vtkTwoTet), mTetVtk);
+        bool okVtk51  = Model3DViewer::InspectMeshFile(writeText(L"pyr_v51_offsets.vtk", vtk51Offsets), mVtk51);
+        bool okVtk50  = Model3DViewer::InspectMeshFile(writeText(L"tet_v50_expoff.vtk", vtk50ExplicitOff), mVtk50);
+        bool okVtkSp  = Model3DViewer::InspectMeshFile(writeText(L"height_sp.vtk", vtkStructPts), mVtkSp);
+        tc.Record(okTorusVtk && mTorusVtk.rawVertexCount == 40 && mTorusVtk.rawTriangleCount == 80 &&
+                  okHexVtk && mHexVtk.rawVertexCount == 12 && mHexVtk.rawTriangleCount == 20 &&
+                  okTetVtk && mTetVtk.rawVertexCount == 5 && mTetVtk.rawTriangleCount == 6 &&
+                  okVtk51 && mVtk51.rawVertexCount == 5 && mVtk51.rawTriangleCount == 6 &&
+                  okVtk50 && mVtk50.rawVertexCount == 4 && mVtk50.rawTriangleCount == 4 &&
+                  okVtkSp && mVtkSp.rawVertexCount == 16 && mVtkSp.rawTriangleCount == 18 &&
+                  mVtkSp.bboxSize.z > 6.5f &&
+                  HashMeshGeometry(mHexVtk) != HashMeshGeometry(mTetVtk),
+                  L"Stage15.3D.VTK.UnstructuredHexTetBoundaryAndVtk5Offsets",
+                  L"hexTris=" + std::to_wstring(mHexVtk.rawTriangleCount) +
+                  L" tetTris=" + std::to_wstring(mTetVtk.rawTriangleCount) +
+                  L" v51Tris=" + std::to_wstring(mVtk51.rawTriangleCount));
+
+        // Gmsh MSH: repo 2.2 sample + MSH 4.1 ASCII sparse-tag 2-tet (elmType=4 -> 6 exterior tris) + MSH 4.1 Binary sparse-tag hex (elmType=5 -> 12 tris)
+        LoadedMesh3D mRepoMsh;
+        bool okRepoMsh = Model3DViewer::InspectMeshFile(tdDir + L"\\sample.msh", mRepoMsh);
+
+        const char* msh41AsciiTets =
+            "$MeshFormat\n"
+            "4.1 0 8\n"
+            "$EndMeshFormat\n"
+            "$Nodes\n"
+            "1 5 100 999\n"
+            "3 1 0 5\n"
+            "100\n205\n310\n420\n999\n"
+            "0.0 0.0 0.0\n"
+            "5.0 0.0 0.0\n"
+            "2.5 4.0 0.0\n"
+            "2.5 1.5 6.0\n"
+            "2.5 1.5 -6.0\n"
+            "$EndNodes\n"
+            "$Elements\n"
+            "1 2 10 11\n"
+            "3 1 4 2\n"
+            "10 100 205 310 420\n"
+            "11 100 310 205 999\n"
+            "$EndElements\n";
+
+        auto msh41BinHex = BuildGmsh41BinaryVolumetric(
+            {
+                { 10, {0,0,0} }, { 20, {6,0,0} }, { 30, {6,4,0} }, { 40, {0,4,0} },
+                { 50, {0,0,3} }, { 60, {6,0,3} }, { 70, {6,4,3} }, { 80, {0,4,3} }
+            },
+            5, // Gmsh elmType 5 = 8-node 3D hexahedron
+            { { 10, 20, 30, 40, 50, 60, 70, 80 } });
+
+        LoadedMesh3D mMsh41Tet, mMsh41BinHex;
+        bool okMshTet = Model3DViewer::InspectMeshFile(writeText(L"gmsh41_sparse_2tet.msh", msh41AsciiTets), mMsh41Tet);
+        bool okMshHex = Model3DViewer::InspectMeshFile(writeBytes(L"gmsh41_bin_hex.msh", msh41BinHex), mMsh41BinHex);
+        tc.Record(okRepoMsh && mRepoMsh.rawVertexCount == 6 && mRepoMsh.rawTriangleCount == 8 &&
+                  okMshTet && mMsh41Tet.rawVertexCount == 5 && mMsh41Tet.rawTriangleCount == 6 &&
+                  okMshHex && mMsh41BinHex.rawVertexCount == 8 && mMsh41BinHex.rawTriangleCount == 12 &&
+                  HashMeshGeometry(mMsh41Tet) != HashMeshGeometry(mMsh41BinHex),
+                  L"Stage15.3D.MSH.Gmsh41AsciiAndBinarySparseVolumetric",
+                  L"tetTris=" + std::to_wstring(mMsh41Tet.rawTriangleCount) +
+                  L" binHexTris=" + std::to_wstring(mMsh41BinHex.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 22. 3ds Max ASCII Scene Export (.ase) & ROS Robot Kinematic Tree (.urdf)
+    // ========================================================================
+    {
+        const char* aseMulti =
+            "*3DSMAX_ASCIIEXPORT\t200\n"
+            "*COMMENT \"Explorer2 Multi-Object ASE Test\"\n"
+            "*MATERIAL_LIST {\n"
+            "  *MATERIAL_COUNT 1\n"
+            "  *MATERIAL 0 {\n"
+            "    *MATERIAL_DIFFUSE 0.85 0.35 0.15\n"
+            "  }\n"
+            "}\n"
+            "*GEOMOBJECT {\n"
+            "  *NODE_NAME \"TetPart\"\n"
+            "  *NODE_TM {\n"
+            "    *TM_ROW0 1.0 0.0 0.0\n"
+            "    *TM_ROW1 0.0 1.0 0.0\n"
+            "    *TM_ROW2 0.0 0.0 1.0\n"
+            "    *TM_ROW3 0.0 0.0 0.0\n"
+            "  }\n"
+            "  *MESH {\n"
+            "    *MESH_NUMVERTEX 4\n"
+            "    *MESH_NUMFACES 4\n"
+            "    *MESH_VERTEX_LIST {\n"
+            "      *MESH_VERTEX 0  0.0  0.0  0.0\n"
+            "      *MESH_VERTEX 1  4.0  0.0  0.0\n"
+            "      *MESH_VERTEX 2  0.0  4.0  0.0\n"
+            "      *MESH_VERTEX 3  0.0  0.0  5.0\n"
+            "    }\n"
+            "    *MESH_FACE_LIST {\n"
+            "      *MESH_FACE 0: A: 0 B: 2 C: 1 AB: 1 BC: 1 CA: 1 *MESH_SMOOTHING 1 *MESH_MTLID 0\n"
+            "      *MESH_FACE 1: A: 0 B: 1 C: 3 AB: 1 BC: 1 CA: 1 *MESH_SMOOTHING 1 *MESH_MTLID 0\n"
+            "      *MESH_FACE 2: A: 1 B: 2 C: 3 AB: 1 BC: 1 CA: 1 *MESH_SMOOTHING 1 *MESH_MTLID 0\n"
+            "      *MESH_FACE 3: A: 2 B: 0 C: 3 AB: 1 BC: 1 CA: 1 *MESH_SMOOTHING 1 *MESH_MTLID 0\n"
+            "    }\n"
+            "  }\n"
+            "  *MATERIAL_REF 0\n"
+            "}\n"
+            "*GEOMOBJECT {\n"
+            "  *NODE_NAME \"PyrPart\"\n"
+            "  *MESH {\n"
+            "    *MESH_NUMVERTEX 5\n"
+            "    *MESH_NUMFACES 6\n"
+            "    *MESH_VERTEX_LIST {\n"
+            "      *MESH_VERTEX 0  10.0 -1.0  0.0\n"
+            "      *MESH_VERTEX 1  12.0 -1.0  0.0\n"
+            "      *MESH_VERTEX 2  12.0  1.0  0.0\n"
+            "      *MESH_VERTEX 3  10.0  1.0  0.0\n"
+            "      *MESH_VERTEX 4  11.0  0.0  4.0\n"
+            "    }\n"
+            "    *MESH_FACE_LIST {\n"
+            "      *MESH_FACE 0: A: 0 B: 3 C: 2 AB: 1 BC: 1 CA: 0\n"
+            "      *MESH_FACE 1: A: 0 B: 2 C: 1 AB: 0 BC: 1 CA: 1\n"
+            "      *MESH_FACE 2: A: 0 B: 1 C: 4 AB: 1 BC: 1 CA: 1\n"
+            "      *MESH_FACE 3: A: 1 B: 2 C: 4 AB: 1 BC: 1 CA: 1\n"
+            "      *MESH_FACE 4: A: 2 B: 3 C: 4 AB: 1 BC: 1 CA: 1\n"
+            "      *MESH_FACE 5: A: 3 B: 0 C: 4 AB: 1 BC: 1 CA: 1\n"
+            "    }\n"
+            "  }\n"
+            "  *WIREFRAME_COLOR 0.2 0.7 0.9\n"
+            "}\n";
+
+        const char* asePrism =
+            "*3DSMAX_ASCIIEXPORT 200\n"
+            "*GEOMOBJECT {\n"
+            "  *NODE_NAME \"WedgePrism\"\n"
+            "  *MESH {\n"
+            "    *MESH_NUMVERTEX 6\n"
+            "    *MESH_NUMFACES 8\n"
+            "    *MESH_VERTEX_LIST {\n"
+            "      *MESH_VERTEX 0 0.0 0.0 0.0\n"
+            "      *MESH_VERTEX 1 3.0 0.0 0.0\n"
+            "      *MESH_VERTEX 2 0.0 2.0 0.0\n"
+            "      *MESH_VERTEX 3 0.0 0.0 9.0\n"
+            "      *MESH_VERTEX 4 3.0 0.0 9.0\n"
+            "      *MESH_VERTEX 5 0.0 2.0 9.0\n"
+            "    }\n"
+            "    *MESH_FACE_LIST {\n"
+            "      *MESH_FACE 0: A: 0 B: 2 C: 1\n"
+            "      *MESH_FACE 1: A: 3 B: 4 C: 5\n"
+            "      *MESH_FACE 2: A: 0 B: 1 C: 4\n"
+            "      *MESH_FACE 3: A: 0 B: 4 C: 3\n"
+            "      *MESH_FACE 4: A: 1 B: 2 C: 5\n"
+            "      *MESH_FACE 5: A: 1 B: 5 C: 4\n"
+            "      *MESH_FACE 6: A: 2 B: 0 C: 3\n"
+            "      *MESH_FACE 7: A: 2 B: 3 C: 5\n"
+            "    }\n"
+            "  }\n"
+            "}\n";
+
+        LoadedMesh3D mAseA, mAseB;
+        bool okAseA = Model3DViewer::InspectMeshFile(writeText(L"multi_tet_pyr.ase", aseMulti), mAseA);
+        bool okAseB = Model3DViewer::InspectMeshFile(writeText(L"wedge_prism.ase", asePrism), mAseB);
+        tc.Record(okAseA && okAseB &&
+                  mAseA.rawVertexCount == 9 && mAseA.rawTriangleCount == 10 &&
+                  mAseA.bboxSize.x > 11.5f &&
+                  mAseB.rawVertexCount == 6 && mAseB.rawTriangleCount == 8 &&
+                  HashMeshGeometry(mAseA) != HashMeshGeometry(mAseB),
+                  L"Stage15.3D.ASE.MultiGeomObjectDistinct",
+                  L"trisA=" + std::to_wstring(mAseA.rawTriangleCount) + L" trisB=" + std::to_wstring(mAseB.rawTriangleCount));
+
+        // ROS URDF kinematic chain test: external sibling STL end-effector + 90-deg shoulder pitch rotation!
+        const char* eeTipStl =
+            "solid tip\n"
+            "  facet normal 0 0 -1\n    outer loop\n      vertex -0.2 -0.2 0\n      vertex 0.2 0.2 0\n      vertex 0.2 -0.2 0\n    endloop\n  endfacet\n"
+            "  facet normal 0 -1 0\n    outer loop\n      vertex -0.2 -0.2 0\n      vertex 0.2 -0.2 0\n      vertex 0 0 0.8\n    endloop\n  endfacet\n"
+            "  facet normal 1 0 0\n    outer loop\n      vertex 0.2 -0.2 0\n      vertex 0.2 0.2 0\n      vertex 0 0 0.8\n    endloop\n  endfacet\n"
+            "  facet normal -1 1 0\n    outer loop\n      vertex 0.2 0.2 0\n      vertex -0.2 -0.2 0\n      vertex 0 0 0.8\n    endloop\n  endfacet\n"
+            "endsolid tip\n";
+        writeText(L"urdf_ee_tip.stl", eeTipStl);
+
+        auto buildArmUrdf = [](const char* shoulderPitchRpy) -> std::string {
+            char buf[2048];
+            std::snprintf(buf, sizeof(buf),
+                "<?xml version=\"1.0\"?>\n"
+                "<robot name=\"test_manipulator\">\n"
+                "  <material name=\"orange\"><color rgba=\"1.0 0.5 0.1 1.0\"/></material>\n"
+                "  <link name=\"base_link\">\n"
+                "    <visual>\n"
+                "      <origin xyz=\"0 0 0.2\" rpy=\"0 0 0\"/>\n"
+                "      <geometry><box size=\"0.6 0.6 0.4\"/></geometry>\n"
+                "      <material name=\"orange\"/>\n"
+                "    </visual>\n"
+                "  </link>\n"
+                "  <link name=\"upper_arm\">\n"
+                "    <visual>\n"
+                "      <origin xyz=\"0 0 1.0\" rpy=\"0 0 0\"/>\n"
+                "      <geometry><cylinder radius=\"0.12\" length=\"2.0\"/></geometry>\n"
+                "    </visual>\n"
+                "    <visual>\n"
+                "      <origin xyz=\"0 0 2.0\" rpy=\"0 0 0\"/>\n"
+                "      <geometry><sphere radius=\"0.16\"/></geometry>\n"
+                "    </visual>\n"
+                "  </link>\n"
+                "  <link name=\"tool_tip\">\n"
+                "    <visual>\n"
+                "      <origin xyz=\"0 0 0\" rpy=\"0 0 0\"/>\n"
+                "      <geometry><mesh filename=\"package://my_robot/urdf_ee_tip.stl\" scale=\"1 1 1\"/></geometry>\n"
+                "    </visual>\n"
+                "  </link>\n"
+                "  <joint name=\"shoulder_pitch\" type=\"revolute\">\n"
+                "    <parent link=\"base_link\"/>\n"
+                "    <child link=\"upper_arm\"/>\n"
+                "    <origin xyz=\"0 0 0.4\" rpy=\"%s\"/>\n"
+                "  </joint>\n"
+                "  <joint name=\"wrist_fixed\" type=\"fixed\">\n"
+                "    <parent link=\"upper_arm\"/>\n"
+                "    <child link=\"tool_tip\"/>\n"
+                "    <origin xyz=\"0 0 2.0\" rpy=\"0 0 0\"/>\n"
+                "  </joint>\n"
+                "</robot>\n",
+                shoulderPitchRpy);
+            return std::string(buf);
+        };
+
+        std::string urdfVertical = buildArmUrdf("0 0 0");
+        std::string urdfBent90   = buildArmUrdf("0 1.5707963 0");
+        LoadedMesh3D mUrdfV, mUrdfB;
+        bool okUrdfV = Model3DViewer::InspectMeshFile(writeText(L"arm_vertical.urdf", urdfVertical.c_str()), mUrdfV);
+        bool okUrdfB = Model3DViewer::InspectMeshFile(writeText(L"arm_bent90.urdf", urdfBent90.c_str()), mUrdfB);
+        tc.Record(okUrdfV && okUrdfB &&
+                  mUrdfV.rawTriangleCount == mUrdfB.rawTriangleCount &&
+                  mUrdfV.bboxSize.x < 0.8f && mUrdfV.bboxSize.y > 2.9f &&
+                  mUrdfB.bboxSize.x > 2.8f && // proves 90-deg Ry shoulder pitch rotated 2.0m arm + 0.8m STL tip into +X!
+                  HashMeshGeometry(mUrdfV) != HashMeshGeometry(mUrdfB),
+                  L"Stage15.3D.URDF.KinematicChainPoseAndExternalMesh",
+                  L"spanXV=" + std::to_wstring(mUrdfV.bboxSize.x) + L" spanXB=" + std::to_wstring(mUrdfB.bboxSize.x));
+    }
+
+    // ========================================================================
+    // 23. ESRI / USGS DEM (.dem, .ascgrid) & ASPRS LAS 1.4 / Compressed LAZ (.las, .laz)
+    // ========================================================================
+    {
+        LoadedMesh3D mSampleDem;
+        bool okSampleDem = Model3DViewer::InspectMeshFile(tdDir + L"\\sample.dem", mSampleDem);
+
+        // 300x300 ESRI ASCII Grid (>256x256!) with NODATA_value -9999 crater and far-corner ridge at r,c >= 275
+        std::string bigDem =
+            "ncols 300\n"
+            "nrows 300\n"
+            "xllcorner 100.0\n"
+            "yllcorner 200.0\n"
+            "cellsize 2.0\n"
+            "NODATA_value -9999\n";
+        bigDem.reserve(650000);
+        for (int r = 0; r < 300; ++r) {
+            for (int c = 0; c < 300; ++c) {
+                if (r >= 130 && r < 160 && c >= 130 && c < 160) {
+                    bigDem += "-9999 ";
+                } else if (r >= 275 && c >= 275) {
+                    bigDem += "180.0 ";
+                } else {
+                    int h = 10 + ((r + c) % 15);
+                    bigDem += std::to_string(h) + " ";
+                }
+            }
+            bigDem.push_back('\n');
+        }
+
+        std::string usgsDem = BuildUsgs75MinDemFixture();
+        LoadedMesh3D mBigDem, mUsgsDem;
+        bool okBigDem  = Model3DViewer::InspectMeshFile(writeText(L"terrain_300x300.dem", bigDem.c_str()), mBigDem);
+        bool okUsgsDem = Model3DViewer::InspectMeshFile(writeText(L"rainier_usgs.dem", usgsDem.c_str()), mUsgsDem);
+        tc.Record(okSampleDem && mSampleDem.rawTriangleCount == 98 &&
+                  okBigDem && mBigDem.rawTriangleCount > 50000 &&
+                  mBigDem.bboxMin.y >= 9.5f &&   // proves -9999 NODATA crater cells were culled!
+                  mBigDem.bboxMax.y >= 179.5f && // proves rows/cols > 256 (at 275..299) were read!
+                  okUsgsDem && mUsgsDem.rawTriangleCount >= 40 &&
+                  mUsgsDem.bboxMin.y >= 15.0f && // proves -32767 USGS void cell was culled!
+                  HashMeshGeometry(mBigDem) != HashMeshGeometry(mUsgsDem),
+                  L"Stage15.3D.DEM.Large300x300NoDataAndUsgsTypeAB",
+                  L"bigTris=" + std::to_wstring(mBigDem.rawTriangleCount) +
+                  L" usgsTris=" + std::to_wstring(mUsgsDem.rawTriangleCount));
+
+        // LAS 1.4 Format 6 (legacy count=0, 64-bit count at +247) + Multi-chunk Arithmetic LAZ POINT10 v2 vs Ground-Truth LAS!
+        LoadedMesh3D mRepoLas;
+        bool okRepoLas = Model3DViewer::InspectMeshFile(tdDir + L"\\sample.las", mRepoLas);
+
+        std::vector<Vec3f> las14Pts;
+        for (int i = 0; i < 14; ++i) {
+            las14Pts.push_back({ static_cast<float>(i) * 1.5f, static_cast<float>(i % 4) * 2.0f, static_cast<float>(i) * 0.75f });
+        }
+        auto las14Bytes = LazTestEnc::BuildLas14Fmt6Fixture(las14Pts);
+
+        std::vector<Vec3f> laz24Pts;
+        for (int i = 0; i < 24; ++i) {
+            float fx = static_cast<float>(i * 3 - (i % 5)) * 0.25f;
+            float fy = static_cast<float>((i * 7) % 19) * 0.5f - 4.0f;
+            float fz = static_cast<float>((i * i) % 23) * 0.4f + 1.2f;
+            laz24Pts.push_back({ fx, fy, fz });
+        }
+        // Encode across 3 chunks of 8 points each using real LASzip v2 POINT10 arithmetic coding!
+        auto lazCompBytes = LazTestEnc::BuildLazPoint10v2Fixture(laz24Pts, 8u);
+        auto lasTruthBytes = BuildSyntheticLasOrLaz(laz24Pts, 0u);
+
+        LoadedMesh3D mLas14, mLazComp, mLasTruth;
+        bool okLas14    = Model3DViewer::InspectMeshFile(writeBytes(L"v14_fmt6_ext64.las", las14Bytes), mLas14);
+        bool okLazComp  = Model3DViewer::InspectMeshFile(writeBytes(L"point10_arith.laz", lazCompBytes), mLazComp);
+        bool okLasTruth = Model3DViewer::InspectMeshFile(writeBytes(L"point10_truth.las", lasTruthBytes), mLasTruth);
+        tc.Record(okRepoLas && mRepoLas.rawTriangleCount > 0 &&
+                  okLas14 && mLas14.rawVertexCount == 14 * 4 && mLas14.rawTriangleCount == 14 * 4 &&
+                  okLazComp && okLasTruth &&
+                  mLazComp.rawVertexCount == 24 * 4 && mLazComp.rawTriangleCount == 24 * 4 &&
+                  HashMeshGeometry(mLazComp) == HashMeshGeometry(mLasTruth),
+                  L"Stage15.3D.LAS_LAZ.Las14Fmt6AndLazPoint10Arithmetic",
+                  L"lazVerts=" + std::to_wstring(mLazComp.rawVertexCount));
+    }
+
+    // ========================================================================
+    // 24. Blender Zstd Seek+Compressed_Block (.blend), VRML 1.0/97 Gzip (.wrl) & X3D Scene Graph (.x3d)
+    // ========================================================================
+    {
+        auto rawSoaBlend = BuildSyntheticBlend42SoA(
+            { {0,0,0}, {5,0,0}, {0,4,0}, {0,0,7}, {5,0,7}, {0,4,7} },
+            { {0,2,1}, {3,4,5}, {0,1,4,3}, {1,2,5,4}, {2,0,3,5} });
+        auto zstdSeekBlend = WrapBlendInZstdSeekAndCompressedBlocks(rawSoaBlend);
+
+        LoadedMesh3D mRawBlend, mZstdBlend;
+        bool okRawB  = Model3DViewer::InspectMeshFile(writeBytes(L"raw_ref_42.blend", rawSoaBlend), mRawBlend);
+        bool okZstdB = Model3DViewer::InspectMeshFile(writeBytes(L"zstd_seek_huff_fse_42.blend", zstdSeekBlend), mZstdBlend);
+        tc.Record(okRawB && okZstdB &&
+                  mZstdBlend.rawVertexCount == 6 && mZstdBlend.rawTriangleCount == 8 &&
+                  HashMeshGeometry(mRawBlend) == HashMeshGeometry(mZstdBlend),
+                  L"Stage15.3D.Blend.ZstdCompressedBlockWithSkippableSeekFrame",
+                  L"zstdBytes=" + std::to_wstring(zstdSeekBlend.size()) + L" rawBytes=" + std::to_wstring(rawSoaBlend.size()));
+
+        // VRML97 gzipped DEF/USE + Transform + ElevationGrid + VRML 1.0 Separator
+        LoadedMesh3D mRepoWrl;
+        bool okRepoWrl = Model3DViewer::InspectMeshFile(tdDir + L"\\virtual_reality.wrl", mRepoWrl);
+
+        const char* vrml97Scene =
+            "#VRML V2.0 utf8\n"
+            "Transform {\n"
+            "  translation -6 0 0\n"
+            "  children [\n"
+            "    DEF SharedPillar Shape {\n"
+            "      appearance Appearance { material Material { diffuseColor 0.2 0.7 0.9 } }\n"
+            "      geometry Box { size 2 4 2 }\n"
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Transform {\n"
+            "  translation 10 0 0\n"
+            "  rotation 0 0 1 1.5707963\n"
+            "  children [ USE SharedPillar ]\n"
+            "}\n"
+            "Shape {\n"
+            "  geometry ElevationGrid {\n"
+            "    xDimension 3\n"
+            "    zDimension 3\n"
+            "    xSpacing 1.0\n"
+            "    zSpacing 1.0\n"
+            "    height [ 0, 0.5, 0, 0.5, 2.0, 0.5, 0, 0.5, 0 ]\n"
+            "  }\n"
+            "}\n";
+        auto vrml97Gz = TfGzipCompress(vrml97Scene, std::strlen(vrml97Scene));
+
+        const char* vrml10Scene =
+            "#VRML V1.0 ascii\n"
+            "Separator {\n"
+            "  Separator {\n"
+            "    Translation { translation -8 0 0 }\n"
+            "    Cube { width 2 height 2 depth 2 }\n"
+            "  }\n"
+            "  Separator {\n"
+            "    Translation { translation 8 0 0 }\n"
+            "    Coordinate3 { point [ 0 0 0, 3 0 0, 0 3 0, 0 0 4 ] }\n"
+            "    IndexedFaceSet { coordIndex [ 0, 2, 1, -1, 0, 1, 3, -1, 1, 2, 3, -1, 2, 0, 3, -1 ] }\n"
+            "  }\n"
+            "}\n";
+
+        LoadedMesh3D mWrl97Gz, mWrl10;
+        bool okWrl97Gz = Model3DViewer::InspectMeshFile(writeBytes(L"scene_def_use_gz.wrl", vrml97Gz), mWrl97Gz);
+        bool okWrl10   = Model3DViewer::InspectMeshFile(writeText(L"scene_vrml10.wrl", vrml10Scene), mWrl10);
+        tc.Record(okRepoWrl && mRepoWrl.rawVertexCount == 5 && mRepoWrl.rawTriangleCount == 4 &&
+                  okWrl97Gz && mWrl97Gz.rawTriangleCount == 32 && mWrl97Gz.bboxSize.x > 18.0f &&
+                  okWrl10 && mWrl10.rawTriangleCount == 16 && mWrl10.bboxSize.x > 19.0f &&
+                  HashMeshGeometry(mWrl97Gz) != HashMeshGeometry(mWrl10),
+                  L"Stage15.3D.WRL.Vrml97GzipDefUseAndVrml1Separator",
+                  L"gzTris=" + std::to_wstring(mWrl97Gz.rawTriangleCount) + L" v1Tris=" + std::to_wstring(mWrl10.rawTriangleCount));
+
+        // X3D hierarchical <Transform> + DEF/USE + IndexedTriangleSet + IndexedTriangleStripSet + ElevationGrid + Gzip
+        LoadedMesh3D mRepoX3d;
+        bool okRepoX3d = Model3DViewer::InspectMeshFile(tdDir + L"\\web3d_pyramid.x3d", mRepoX3d);
+
+        auto buildX3dScene = [](float rightTx) -> std::string {
+            char buf[2048];
+            std::snprintf(buf, sizeof(buf),
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                "<X3D profile=\"Immersive\" version=\"3.3\">\n"
+                "  <Scene>\n"
+                "    <Transform translation=\"-5 0 0\">\n"
+                "      <Shape DEF=\"PodBox\">\n"
+                "        <Appearance><Material diffuseColor=\"0.9 0.4 0.2\"/></Appearance>\n"
+                "        <Box size=\"2 2 2\"/>\n"
+                "      </Shape>\n"
+                "    </Transform>\n"
+                "    <Transform translation=\"%.2f 0 0\" rotation=\"0 1 0 0.785398\">\n"
+                "      <Shape USE=\"PodBox\"/>\n"
+                "    </Transform>\n"
+                "    <Shape>\n"
+                "      <IndexedTriangleSet index=\"0 1 2 0 2 3\">\n"
+                "        <Coordinate point=\"-1 0 -2, 1 0 -2, 1 2 -2, -1 2 -2\"/>\n"
+                "      </IndexedTriangleSet>\n"
+                "    </Shape>\n"
+                "    <Shape>\n"
+                "      <IndexedTriangleStripSet index=\"0 1 2 3 -1\">\n"
+                "        <Coordinate point=\"-1 0 2, 1 0 2, -1 2 2, 1 2 2\"/>\n"
+                "      </IndexedTriangleStripSet>\n"
+                "    </Shape>\n"
+                "    <Shape>\n"
+                "      <ElevationGrid xDimension=\"2\" zDimension=\"2\" xSpacing=\"2\" zSpacing=\"2\" height=\"0 1 1 3\"/>\n"
+                "    </Shape>\n"
+                "  </Scene>\n"
+                "</X3D>\n",
+                rightTx);
+            return std::string(buf);
+        };
+
+        std::string x3dPlain = buildX3dScene(10.0f);
+        std::string x3dWide  = buildX3dScene(26.0f);
+        auto x3dWideGz = TfGzipCompress(x3dWide.data(), x3dWide.size());
+
+        LoadedMesh3D mX3dPlain, mX3dGz;
+        bool okX3dPlain = Model3DViewer::InspectMeshFile(writeText(L"scene_multi.x3d", x3dPlain.c_str()), mX3dPlain);
+        bool okX3dGz    = Model3DViewer::InspectMeshFile(writeBytes(L"scene_multi_gz.x3d", x3dWideGz), mX3dGz);
+        tc.Record(okRepoX3d && mRepoX3d.rawVertexCount == 5 && mRepoX3d.rawTriangleCount == 4 &&
+                  okX3dPlain && okX3dGz &&
+                  mX3dPlain.rawTriangleCount == 30 && mX3dGz.rawTriangleCount == 30 &&
+                  mX3dPlain.bboxSize.x > 16.0f && mX3dGz.bboxSize.x > 31.0f &&
+                  HashMeshGeometry(mX3dPlain) != HashMeshGeometry(mX3dGz),
+                  L"Stage15.3D.X3D.TransformDefUseAndGzipMultiPrimitives",
+                  L"tris=" + std::to_wstring(mX3dPlain.rawTriangleCount) + L" spanXGz=" + std::to_wstring(mX3dGz.bboxSize.x));
+    }
+
+    // ========================================================================
     // 12. Negative / Zero-Cheat Tests (corrupt / encrypted / header-only -> false)
     // ========================================================================
     {
@@ -2842,7 +4303,57 @@ void RunFormatTests3D(TestCounter& tc) {
         std::memcpy(hdrOnlyMdl.data() + 4, &v48, 4);
         std::memcpy(hdrOnlyMdl.data() + 76, &len256, 4);
         assertRejected(L"Stage15.3D.Reject.HeaderOnlySourceMDL", writeBytes(L"empty_v48.mdl", hdrOnlyMdl));
+
+        // Group 1 (.pcd & .ply): corrupt/truncated LZF stream, zero-point .pcd, and header-only binary .ply must be rejected
+        auto corruptLzfPcd = BuildPcdBinaryCompressedSoA({ {0,0,0}, {1,2,3}, {4,5,6}, {7,8,9} }, {});
+        if (corruptLzfPcd.size() > 10) corruptLzfPcd.resize(corruptLzfPcd.size() - 10); // truncate mid-LZF stream
+        assertRejected(L"Stage15.3D.Reject.CorruptLzfPCD", writeBytes(L"corrupt_lzf.pcd", corruptLzfPcd));
+
+        const char* zeroPtPcd =
+            "VERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n"
+            "WIDTH 0\nHEIGHT 1\nPOINTS 0\nDATA ascii\n";
+        assertRejected(L"Stage15.3D.Reject.ZeroPointPCD", writeText(L"zero_points.pcd", zeroPtPcd));
+
+        const char* hdrOnlyPly =
+            "ply\nformat binary_little_endian 1.0\nelement vertex 4\n"
+            "property float x\nproperty float y\nproperty float z\nend_header\n";
+        assertRejected(L"Stage15.3D.Reject.HeaderOnlyPLY", writeText(L"header_only_bin.ply", hdrOnlyPly));
+
+        // Group 2 (.vtk & .msh): bare VTK POINTS without cells/polygons (old (i,i+1,i+2) cheat!) & element-less .msh must be rejected
+        const char* barePtsVtk =
+            "# vtk DataFile Version 3.0\nBare Points Without Cells\nASCII\nDATASET POLYDATA\n"
+            "POINTS 6 float\n0 0 0  1 0 0  0 1 0  0 0 1  2 0 0  0 2 0\n";
+        assertRejected(L"Stage15.3D.Reject.PointsOnlyNoCellsVTK", writeText(L"points_only_no_cells.vtk", barePtsVtk));
+
+        const char* nodesOnlyMsh =
+            "$MeshFormat\n4.1 0 8\n$EndMeshFormat\n$Nodes\n1 3 1 3\n3 1 0 3\n1\n2\n3\n0 0 0\n1 0 0\n0 1 0\n$EndNodes\n";
+        assertRejected(L"Stage15.3D.Reject.NodesOnlyNoElementsMSH", writeText(L"nodes_only.msh", nodesOnlyMsh));
+
+        // Group 3 (.ase & .urdf): headerless/empty .ase and visual-less .urdf must be rejected
+        assertRejected(L"Stage15.3D.Reject.HeaderlessASE",
+                       writeText(L"no_magic.ase", "*GEOMOBJECT {\n\t*MESH {\n\t\t*MESH_NUMVERTEX 3\n\t\t*MESH_NUMFACES 1\n\t}\n}\n"));
+        assertRejected(L"Stage15.3D.Reject.EmptyASE",
+                       writeText(L"empty_scene.ase", "*3DSMAX_ASCIIEXPORT\t200\n*COMMENT \"no geomobjects\"\n"));
+        assertRejected(L"Stage15.3D.Reject.EmptyRobotURDF",
+                       writeText(L"empty_robot.urdf", "<?xml version=\"1.0\"?><robot name=\"empty\"><link name=\"base_link\"/></robot>"));
+
+        // Group 4 (.dem & .laz): random prose .dem and .laz with corrupted chunkTableStart must be rejected
+        assertRejected(L"Stage15.3D.Reject.ProseTextDEM",
+                       writeText(L"prose_not_dem.dem", "This is a plain text document, not an ESRI or USGS elevation model.\n1 2 3 4 5\n"));
+
+        auto badChunkLaz = LazTestEnc::BuildLazPoint10v2Fixture({ {0,0,0}, {2,1,3}, {4,2,5}, {6,3,1} }, 4u);
+        uint64_t bogusTblOff = 0x0000FFFFFFFF0000ULL; // out-of-bounds chunk table pointer at offset 227 + 54 + 40 = 321
+        if (badChunkLaz.size() >= 329) std::memcpy(badChunkLaz.data() + 321, &bogusTblOff, 8);
+        assertRejected(L"Stage15.3D.Reject.CorruptChunkLAZ", writeBytes(L"corrupt_chunk_tbl.laz", badChunkLaz));
+
+        // Group 5 (.blend, .wrl, .x3d): corrupt Zstd .blend, headerless .wrl, and non-X3D XML must be rejected
+        std::vector<uint8_t> corruptZstdBlend = { 0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x40, 0xFF, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF };
+        assertRejected(L"Stage15.3D.Reject.CorruptZstdBLEND", writeBytes(L"corrupt_zstd.blend", corruptZstdBlend));
+        assertRejected(L"Stage15.3D.Reject.HeaderlessWRL", writeText(L"no_vrml_hdr.wrl", "Shape { geometry Box { size 2 2 2 } }\n"));
+        assertRejected(L"Stage15.3D.Reject.NonX3dXML", writeText(L"not_x3d.x3d", "<?xml version=\"1.0\"?><svg><Box size=\"2 2 2\"/></svg>"));
     }
+
+    RunFormatTests3DBatch70(tc);
 
     for (const auto& f : createdFiles) {
         DeleteFileW(f.c_str());

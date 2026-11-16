@@ -258,7 +258,7 @@ struct UndoDeleteBatch {
     std::vector<std::pair<std::wstring, std::wstring>> originalToTrashPaths; // <originalFullPath, stagingTrashPath>
 };
 
-inline bool IsImageExtension(const std::wstring& extLower) {
+static inline bool IsImageExtension(const std::wstring& extLower) {
     return extLower == L".png"  || extLower == L".jpg"  || extLower == L".jpeg" ||
            extLower == L".webp" || extLower == L".bmp"  || extLower == L".gif"  ||
            extLower == L".tif"  || extLower == L".tiff" || extLower == L".ico"  ||
@@ -294,7 +294,13 @@ inline bool IsImageExtension(const std::wstring& extLower) {
            extLower == L".afphoto" || extLower == L".afdesign" || extLower == L".afpub" ||
            extLower == L".emf"  || extLower == L".wmf"  || extLower == L".cgm"  ||
            extLower == L".abr"  || extLower == L".pat"  || extLower == L".dst"  ||
-           extLower == L".pes"  || extLower == L".ans"  || extLower == L".sixel";
+           extLower == L".pes"  || extLower == L".ans"  || extLower == L".sixel"||
+           extLower == L".txd"  || extLower == L".uasset"||
+           extLower == L".avif" || extLower == L".heic" || extLower == L".heif" || extLower == L".avci" ||
+           extLower == L".jp2"  || extLower == L".j2k"  || extLower == L".jpf"  || extLower == L".jpx"  || extLower == L".j2c" ||
+           extLower == L".btf"  || extLower == L".tf8"  || extLower == L".cur"  ||
+           extLower == L".wal"  || extLower == L".wad"  || extLower == L".spr"  || extLower == L".lmp"  || extLower == L".art" ||
+           extLower == L".bntx" || extLower == L".gxt"  || extLower == L".gtf"  || extLower == L".nut"  || extLower == L".vtex_c";
 }
 
 inline bool IsVideoExtension(const std::wstring& extLower) {

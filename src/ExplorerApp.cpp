@@ -1095,7 +1095,23 @@ void ExplorerApp::SyncMediaPlayerToSelection() {
 void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const std::wstring& selectFileName) {
     std::wstring cleanPath = PathUtils::TrimTrailingSlashes(path);
 
-    if (cleanPath != L"THIS_PC" && !FtpClient::IsFtpPath(cleanPath)) {
+    if (FtpClient::IsFtpPath(cleanPath)) {
+        std::wstring ftpErr;
+        if (!FtpClient::CanReachFtpEndpoint(cleanPath, &ftpErr)) {
+            m_statusToast = ftpErr.empty()
+                ? (m_lang == Lang::PL ? L"Brak odpowiedzi serwera FTP" : L"FTP server is unreachable")
+                : ftpErr;
+            m_statusToastExpireTick = GetTickCount64() + 5000;
+            AppLog::Warn(L"FTP", m_statusToast);
+            if (m_currentPath.empty()) {
+                NavigateTo(L"THIS_PC", false);
+                return;
+            }
+            EnsureWorkAnimTimerState();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            return;
+        }
+    } else if (cleanPath != L"THIS_PC") {
         std::wstring offlineName;
         if (m_fileEngine.IsDriveOffline(cleanPath, m_lang, &offlineName)) {
             m_statusToast = (m_lang == Lang::PL ? L"Dysk jest niedostępny (offline): " : L"Drive is unavailable (offline): ") + offlineName;
@@ -6577,6 +6593,20 @@ void ExplorerApp::ToggleTreeNodeExpand(int nodeIndex) {
             InvalidateRect(m_hwnd, nullptr, FALSE);
             return;
         }
+        if (FtpClient::IsFtpPath(node.path)) {
+            std::wstring ftpErr;
+            if (!FtpClient::CanReachFtpEndpoint(node.path, &ftpErr)) {
+                node.isExpanded = false;
+                m_statusToast = ftpErr.empty()
+                    ? (m_lang == Lang::PL ? L"Brak odpowiedzi serwera FTP" : L"FTP server is unreachable")
+                    : ftpErr;
+                m_statusToastExpireTick = GetTickCount64() + 5000;
+                AppLog::Warn(L"FTP", m_statusToast);
+                EnsureWorkAnimTimerState();
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+                return;
+            }
+        }
         children = FileEngine::EnumerateSubfoldersForTree(node.path, node.indent + 1, node.isQuickAccess);
     }
 
@@ -7606,8 +7636,8 @@ void ExplorerApp::EnsureWorkAnimTimerState() {
                          (m_hwLiveRefresh || m_hwInspector.IsAsyncBusy() || m_hwInspector.HasStagedData()));
     bool programsPolling = IsProgramsView() && m_progRefreshAtTick != 0;
     bool lanBusy = IsLanView() && (m_lan.IsScanning() || m_lan.IsSsdpRunning() || m_lan.IsPortScanning() || m_lan.IsPingAutoRefreshEnabled());
-    bool backupsBusy = m_backups.IsBusy() || IsBackupsView();
-    bool xferBusy = m_transfers.HasRunningJobs() || IsTransfersView();
+    bool backupsBusy = m_backups.IsBusy();
+    bool xferBusy = m_transfers.HasRunningJobs();
     bool gitBusy = GitDockVisible() && (m_git.IsBusy() || m_gitReloadFolderWhenIdle);
 
     // A running delete is a transfer-queue job and is covered by xferBusy above
