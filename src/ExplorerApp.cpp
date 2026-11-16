@@ -5947,7 +5947,40 @@ void ExplorerApp::DeleteSelectedItems(bool permanent) {
                    toDelete.end());
     if (toDelete.empty()) return;
 
-    if (m_confirmDelete) {
+    // Network shares (\\server\share\...), mapped network drives (Z:\ with DRIVE_REMOTE), RAM disks and
+    // optical media have no Windows Recycle Bin: match standard Windows Explorer by switching to permanent
+    // delete after an explicit Yes/No confirmation.
+    bool autoUpgradedNoBin = false;
+    if (!permanent) {
+        for (const auto& p : toDelete) {
+            if (TransferManager::PathHasNoRecycleBin(p)) {
+                autoUpgradedNoBin = true;
+                permanent = true;
+                break;
+            }
+        }
+    }
+
+    if (autoUpgradedNoBin) {
+        const Strings& s = GetStrings(m_lang);
+        std::wstring warnMsg;
+        if (m_lang == Lang::PL) {
+            warnMsg = (toDelete.size() == 1)
+                ? (L"Ten dysk (np. dysk sieciowy) nie obsługuje Kosza.\n\nCzy na pewno chcesz TRWALE usunąć:\n\"" +
+                   PathUtils::GetFileName(toDelete[0]) + L"\"?")
+                : (L"Ten dysk (np. dysk sieciowy) nie obsługuje Kosza.\n\nCzy na pewno chcesz TRWALE usunąć zaznaczone elementy (" +
+                   std::to_wstring(toDelete.size()) + L")?");
+        } else {
+            warnMsg = (toDelete.size() == 1)
+                ? (L"This drive (e.g. a network share) does not support the Recycle Bin.\n\nAre you sure you want to PERMANENTLY delete:\n\"" +
+                   PathUtils::GetFileName(toDelete[0]) + L"\"?")
+                : (L"This drive (e.g. a network share) does not support the Recycle Bin.\n\nAre you sure you want to PERMANENTLY delete the selected items (" +
+                   std::to_wstring(toDelete.size()) + L")?");
+        }
+        if (MessageBoxW(m_hwnd, warnMsg.c_str(), s.dlgConfirmDeleteTitle, MB_YESNO | MB_ICONWARNING) != IDYES) {
+            return;
+        }
+    } else if (m_confirmDelete) {
         const Strings& s = GetStrings(m_lang);
         const wchar_t* msg = permanent ? s.dlgConfirmPermMsg : s.dlgConfirmRecycleMsg;
         if (MessageBoxW(m_hwnd, msg, s.dlgConfirmDeleteTitle, MB_YESNO | MB_ICONQUESTION) != IDYES) {
@@ -6044,17 +6077,65 @@ bool ExplorerApp::ReportDeleteJobResult(const TransferCompletionEvent& ev) {
 // Tells the user which items a delete job left behind and why, instead of letting them silently reappear
 void ExplorerApp::ShowDeleteFailures(const TransferCompletionEvent& ev) {
     const bool pl = (m_lang == Lang::PL);
+    const Strings& s = GetStrings(m_lang);
+
+    // When a Recycle Bin delete failed solely (or partly) because the Recycle Bin cannot hold the item(s)
+    // (oversized folder, disabled Recycle Bin, or virtual/network filesystem reporting DRIVE_FIXED), offer
+    // direct permanent deletion right away — matching Windows Explorer instead of stranding the user.
+    if (ev.recycle && !ev.notRecyclablePaths.empty()) {
+        std::wstring prompt = pl
+            ? (L"Kosz nie może przyjąć " + std::to_wstring(ev.notRecyclablePaths.size()) +
+               L" element(ów) (zbyt duży rozmiar lub dysk nie obsługuje Kosza):\n\n")
+            : (L"The Recycle Bin cannot hold " + std::to_wstring(ev.notRecyclablePaths.size()) +
+               L" item(s) (too large, or this drive has no Recycle Bin):\n\n");
+        size_t listed = 0;
+        for (const auto& np : ev.notRecyclablePaths) {
+            if (listed++ >= 6) break;
+            prompt += L"  \x2022 " + np + L"\n";
+        }
+        if (ev.notRecyclablePaths.size() > listed) prompt += L"  ...\n";
+        prompt += pl
+            ? L"\nCzy chcesz usunąć te elementy TRWALE (bez Kosza)?"
+            : L"\nDo you want to PERMANENTLY delete these items now?";
+
+        const bool confirmedPerm =
+            (MessageBoxW(m_hwnd, prompt.c_str(), s.dlgConfirmDeleteTitle, MB_YESNO | MB_ICONWARNING) == IDYES);
+        if (confirmedPerm) {
+            m_transfers.CancelOrRemoveJob(ev.jobId);
+            std::unordered_set<std::wstring> delKeys;
+            delKeys.reserve(ev.notRecyclablePaths.size() * 2);
+            for (const auto& np : ev.notRecyclablePaths) {
+                m_imageCache.EvictPath(np);
+                delKeys.insert(PathUtils::NormalizePathKey(np));
+            }
+            auto shouldRemove = [&](const FileEntry& fe) { return delKeys.find(fe.normKey) != delKeys.end(); };
+            m_items.erase(std::remove_if(m_items.begin(), m_items.end(), shouldRemove), m_items.end());
+            m_allItems.erase(std::remove_if(m_allItems.begin(), m_allItems.end(), shouldRemove), m_allItems.end());
+            ClampScrollOffset();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            AppLog::Info(L"Delete", L"Permanent delete confirmed after Recycle Bin refusal: " + DescribePaths(ev.notRecyclablePaths));
+            StartDeleteJob(ev.notRecyclablePaths, /*permanent=*/true);
+        }
+
+        // If every failure in this job was a Recycle Bin refusal, we're done (no redundant error dialog)
+        if (ev.notRecyclablePaths.size() >= ev.errorCount) {
+            return;
+        }
+    }
+
     std::wstring msg = pl ? (std::to_wstring(ev.errorCount) + L" element(ów) nie udało się usunąć:\n\n")
                           : (std::to_wstring(ev.errorCount) + L" item(s) could not be deleted:\n\n");
     bool sawLockOrAccess = false;
     size_t shown = 0;
     for (const auto& e : ev.firstErrors) {
+        if (ev.recycle && e.win32Error == ERROR_NOT_SUPPORTED && !ev.notRecyclablePaths.empty()) continue;
         if (shown++ >= 6) break;
         msg += e.srcPath + L"\n    \x2192 " + e.message + L"\n";
         if (e.win32Error == ERROR_SHARING_VIOLATION || e.win32Error == ERROR_ACCESS_DENIED || e.win32Error == ERROR_LOCK_VIOLATION) {
             sawLockOrAccess = true;
         }
     }
+    if (shown == 0) return;
     if (ev.errorCount > shown) msg += L"...\n";
     if (sawLockOrAccess) {
         msg += pl ? L"\nPlik jest prawdopodobnie używany przez inny program (maszyna wirtualna, Unity, indeksowanie, antywirus) albo wymaga uprawnień administratora."
@@ -6072,18 +6153,32 @@ void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
     const FileEntry itemCopy = m_items[itemIndex];
     const Strings& s = GetStrings(m_lang);
 
-    std::wstring prompt;
-    if (m_lang == Lang::PL) {
-        prompt = permanent
-            ? (L"Czy na pewno chcesz TRWALE usunąć (bez Kosza):\n\n\"" + itemCopy.name + L"\"?")
-            : (L"Czy przenieść do Kosza element:\n\n\"" + itemCopy.name + L"\"?");
-    } else {
-        prompt = permanent
-            ? (L"Are you sure you want to PERMANENTLY delete:\n\n\"" + itemCopy.name + L"\"?")
-            : (L"Move this item to the Recycle Bin?\n\n\"" + itemCopy.name + L"\"");
+    bool noRecycleBin = false;
+    if (!permanent && TransferManager::PathHasNoRecycleBin(itemCopy.fullPath)) {
+        noRecycleBin = true;
+        permanent = true;
     }
 
-    UINT flags = MB_YESNO | (permanent ? (MB_ICONWARNING | MB_DEFBUTTON2) : MB_ICONQUESTION);
+    std::wstring prompt;
+    if (m_lang == Lang::PL) {
+        if (noRecycleBin) {
+            prompt = L"Ten dysk (np. dysk sieciowy) nie obsługuje Kosza.\n\nCzy na pewno chcesz TRWALE usunąć:\n\n\"" + itemCopy.name + L"\"?";
+        } else {
+            prompt = permanent
+                ? (L"Czy na pewno chcesz TRWALE usunąć (bez Kosza):\n\n\"" + itemCopy.name + L"\"?")
+                : (L"Czy przenieść do Kosza element:\n\n\"" + itemCopy.name + L"\"?");
+        }
+    } else {
+        if (noRecycleBin) {
+            prompt = L"This drive (e.g. a network share) does not support the Recycle Bin.\n\nAre you sure you want to PERMANENTLY delete:\n\n\"" + itemCopy.name + L"\"?";
+        } else {
+            prompt = permanent
+                ? (L"Are you sure you want to PERMANENTLY delete:\n\n\"" + itemCopy.name + L"\"?")
+                : (L"Move this item to the Recycle Bin?\n\n\"" + itemCopy.name + L"\"");
+        }
+    }
+
+    UINT flags = MB_YESNO | (noRecycleBin ? MB_ICONWARNING : (permanent ? (MB_ICONWARNING | MB_DEFBUTTON2) : MB_ICONQUESTION));
     if (MessageBoxW(m_hwnd, prompt.c_str(), s.dlgConfirmDeleteTitle, flags) != IDYES) {
         return;
     }

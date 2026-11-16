@@ -187,6 +187,14 @@ std::wstring ToExtPath(const std::wstring& raw) {
     }
     if (p.size() >= 2 && p[1] == L':') {
         if (p.size() == 2) p.push_back(L'\\');
+        // Mapped network redirectors (WebDAV, NAS/Samba, WinFsp) can reject "\\?\Z:\..." on short paths:
+        // use plain "Z:\..." when < 240 chars with no trailing space/dot, and "\\?\Z:\..." when needed.
+        if (p.size() < 240 && p.back() != L' ' && p.back() != L'.') {
+            const wchar_t root[4] = { p[0], L':', L'\\', L'\0' };
+            if (GetDriveTypeW(root) == DRIVE_REMOTE) {
+                return p;
+            }
+        }
         return L"\\\\?\\" + p;
     }
     return p;
@@ -895,6 +903,7 @@ struct TransferManager::InternalJob {
     std::vector<InternalFileItem> fileItems;
     std::vector<InternalDirItem>  dirItems;
     std::vector<TransferFileError> errors;
+    std::vector<std::wstring> notRecyclablePaths;   // Delete jobs: items refused by Recycle Bin
     std::vector<std::wstring> pendingScanSources;   // Delete jobs: requested items that still have to be listed
 
     ULONGLONG startTick = 0;
@@ -1973,6 +1982,7 @@ bool TransferManager::RetryFailedInJob(int jobId) {
         }
         if (!anyFailed) return false;
         oldJob->errors.clear();
+        oldJob->notRecyclablePaths.clear();
         oldJob->doneBytes.store(alreadyDoneBytes);
         oldJob->doneFiles.store(alreadyDoneFiles);
         oldJob->lastSpeedTickAtomic.store(0);
@@ -3540,13 +3550,20 @@ DWORD RemoveDirOnce(const std::wstring& extPath, DWORD attrs) {
     if (RemoveDirectoryW(extPath.c_str())) return 0;
     DWORD err = GetLastError();
     if (IsGoneError(err)) return 0;
-    if (err == ERROR_ACCESS_DENIED && attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
-        // A read-only folder refuses to go; lift the bit for one more try and restore it if that fails too
-        if (SetFileAttributesW(extPath.c_str(), attrs & ~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY))) {
-            if (RemoveDirectoryW(extPath.c_str())) return 0;
-            err = GetLastError();
-            if (IsGoneError(err)) return 0;
-            SetFileAttributesW(extPath.c_str(), attrs);
+    if (err == ERROR_ACCESS_DENIED) {
+        // Customized/system/read-only folders (e.g. "Pobrane" with desktop.ini or Samba read-only bit)
+        // refuse RemoveDirectoryW until READONLY/SYSTEM/HIDDEN attributes are lifted.
+        DWORD liveAttrs = GetFileAttributesW(extPath.c_str());
+        if (liveAttrs == INVALID_FILE_ATTRIBUTES) liveAttrs = attrs;
+        if (liveAttrs != INVALID_FILE_ATTRIBUTES &&
+            (liveAttrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN)))
+        {
+            if (SetFileAttributesW(extPath.c_str(), FILE_ATTRIBUTE_NORMAL)) {
+                if (RemoveDirectoryW(extPath.c_str())) return 0;
+                err = GetLastError();
+                if (IsGoneError(err)) return 0;
+                SetFileAttributesW(extPath.c_str(), liveAttrs);
+            }
         }
     }
     return err;
@@ -3588,6 +3605,10 @@ void WalkTreeForDelete(const std::wstring& rootDir, DWORD rootAttrs,
         const std::wstring prefix = PathUtils::EnsureTrailingSlash(cur.first);
         const std::wstring pattern = ToExtPath(prefix) + L"*";
         HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &ffd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (hFind == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_PARAMETER) {
+            // Older SMB1 / WebDAV redirectors may reject FIND_FIRST_EX_LARGE_FETCH or FindExInfoBasic
+            hFind = FindFirstFileW(pattern.c_str(), &ffd);
+        }
         if (hFind == INVALID_HANDLE_VALUE) {
             const DWORD err = GetLastError();
             if (!IsGoneError(err)) onError(cur.first, err);
@@ -3875,6 +3896,28 @@ bool TransferManager::IsDeleteRefused(const std::wstring& rawPath) {
     return false;
 }
 
+bool TransferManager::PathHasNoRecycleBin(const std::wstring& rawPath) {
+    if (rawPath.empty() || FtpClient::IsFtpPath(rawPath)) return false;
+
+    std::wstring p = rawPath;
+    for (wchar_t& ch : p) {
+        if (ch == L'/') ch = L'\\';
+    }
+    if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) return true;   // extended UNC network share
+    if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
+    if (p.rfind(L"\\\\", 0) == 0) return true;          // standard UNC network share (\\server\share\...)
+
+    if (p.size() >= 2 && p[1] == L':') {
+        const wchar_t root[4] = { p[0], L':', L'\\', L'\0' };
+        const UINT dt = GetDriveTypeW(root);
+        // Mapped network drives (Z:\ -> DRIVE_REMOTE), RAM disks and optical drives have no Recycle Bin
+        if (dt == DRIVE_REMOTE || dt == DRIVE_RAMDISK || dt == DRIVE_CDROM) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool TransferManager::DeleteTreeNow(const std::wstring& path, std::vector<TransferFileError>* outErrors) {
     static const std::atomic<bool> s_neverCancelled{ false };
     const uint32_t kRetries = 2;
@@ -3999,6 +4042,10 @@ void TransferManager::RunRecycleBinPhase(InternalJob& job) {
                 addError(item.srcPath, code, msg);
             } else if (std::find(res.notRecyclable.begin(), res.notRecyclable.end(), key) != res.notRecyclable.end()) {
                 item.failed = true;
+                {
+                    std::lock_guard<std::mutex> jlk(job.jobMutex);
+                    job.notRecyclablePaths.push_back(item.srcPath);
+                }
                 addError(item.srcPath, ERROR_NOT_SUPPORTED, kNotRecyclable);
             } else if (auto it = std::find_if(res.failed.begin(), res.failed.end(),
                                               [&](const std::pair<std::wstring, HRESULT>& f) { return f.first == key; });
@@ -4262,7 +4309,9 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
                 for (auto& t : helpers) t.join();
             }
 
-            const uint32_t dirRetries = std::min<uint32_t>(maxRetries, 3u);
+            const uint32_t dirRetries = job->isRemoteOrRemovable
+                ? std::clamp<uint32_t>(std::max<uint32_t>(maxRetries, 6u), 1u, 8u)
+                : std::min<uint32_t>(maxRetries, 3u);
             for (size_t di = job->dirItems.size(); di-- > 0; ) {
                 if (!WaitIfPausedOrCancelled(*job)) break;
                 InternalDirItem& dir = job->dirItems[di];
@@ -4275,7 +4324,17 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
                 }
 
                 const std::wstring ext = ToExtPath(dir.srcPath);
-                DWORD err = DeleteWithRetry([&]() { return RemoveDirOnce(ext, dir.attributes); }, dirRetries, job->cancelled);
+                auto rmOnce = [&]() -> DWORD {
+                    DWORD e = RemoveDirOnce(ext, dir.attributes);
+                    // On SMB/NAS shares, asynchronous close of a just-deleted child can surface briefly as
+                    // ERROR_ACCESS_DENIED or ERROR_DIR_NOT_EMPTY; treat remote ACCESS_DENIED as retryable once more
+                    return e;
+                };
+                DWORD err = DeleteWithRetry(rmOnce, dirRetries, job->cancelled);
+                if (err == ERROR_ACCESS_DENIED && job->isRemoteOrRemovable && !job->cancelled.load()) {
+                    Sleep(120);
+                    err = RemoveDirOnce(ext, dir.attributes);
+                }
                 if (err == ERROR_DIR_NOT_EMPTY && !job->cancelled.load()) {
                     // Something arrived in the folder after it was listed (a thumbnail cache, a log, a late
                     // download). Take one more pass over what is in there now, then try the folder again.
@@ -4337,6 +4396,7 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
     size_t errCount = 0;
     TransferJobState finalSt = TransferJobState::Completed;
     std::vector<TransferFileError> firstErrors;
+    std::vector<std::wstring> notRecyclableOut;
     {
         std::lock_guard<std::mutex> jlk(job->jobMutex);
         if (job->pauseBeginTick > 0 && endTick > job->pauseBeginTick) {
@@ -4350,6 +4410,7 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
 
         errCount = job->errors.size();
         firstErrors.assign(job->errors.begin(), job->errors.begin() + static_cast<ptrdiff_t>(std::min<size_t>(errCount, 8)));
+        notRecyclableOut = job->notRecyclablePaths;
         job->liveSpeedBps = 0.0;
         job->currentFile.clear();
 
@@ -4395,6 +4456,7 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
     ev.doneBytes = job->doneBytes.load();
     ev.elapsedMs = activeMs;
     ev.errorCount = errCount;
+    ev.notRecyclablePaths = std::move(notRecyclableOut);
     ev.firstErrors = std::move(firstErrors);
 
     {

@@ -134,7 +134,9 @@ bool SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(const std::wstring& extLo
            extLower == L".ods"     || extLower == L".docx"    || extLower == L".docm" ||
            extLower == L".doc"     || extLower == L".dot"     || extLower == L".ppt"  || extLower == L".pps" ||
            extLower == L".odt"     || extLower == L".rtf"     || extLower == L".pptx" ||
-           extLower == L".ppsx"    || extLower == L".odp"     || extLower == L".epub" ||
+           extLower == L".ppsx"    || extLower == L".pptm"    || extLower == L".ppsm" ||
+           extLower == L".potx"    || extLower == L".potm"    || extLower == L".odp"  ||
+           extLower == L".otp"     || extLower == L".epub" ||
            extLower == L".fb2"     || extLower == L".sqlite"  || extLower == L".sqlite3" ||
            extLower == L".db"      || extLower == L".dbf"     || extLower == L".dif"  ||
            extLower == L".slk"     || extLower == L".sylk"    || extLower == L".parquet" ||
@@ -788,7 +790,9 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     if (ext == L".docx" || ext == L".docm" || ext == L".odt") {
         return ParseWordDocx(fullPath, outDoc);
     }
-    if (ext == L".pptx" || ext == L".ppsx" || ext == L".odp") {
+    if (ext == L".pptx" || ext == L".ppsx" || ext == L".pptm" || ext == L".ppsm" ||
+        ext == L".potx" || ext == L".potm" || ext == L".odp"  || ext == L".otp")
+    {
         return ParsePowerPointPptx(fullPath, ext, outDoc);
     }
     if (ext == L".epub") {
@@ -1184,20 +1188,29 @@ void SpreadsheetDocViewer::Draw(
         int charsPerLine = std::max(20, static_cast<int>(textW / 6.8f));
 
         for (const auto& para : m_doc.paragraphs) {
-            int lines = std::max(1, static_cast<int>((para.text.size() + charsPerLine - 1) / charsPerLine));
-            float blockH = lines * 20.0f + (para.headingLevel > 0 ? 10.0f : 6.0f);
+            int explicitBreaks = static_cast<int>(std::count(para.text.begin(), para.text.end(), L'\n'));
+            int wrappedLines = std::max(1, static_cast<int>((para.text.size() + charsPerLine - 1) / charsPerLine));
+            int lines = std::max(wrappedLines, explicitBreaks + 1);
+            float blockH = lines * 20.0f + (para.headingLevel > 0 ? 10.0f : (para.isTableRow ? 8.0f : 6.0f));
             if (y + blockH >= pageR.top && y <= pageR.bottom) {
                 float xLeft = pageR.left + 16.0f + (para.isBullet ? 14.0f : 0.0f);
-                if (para.isBullet) {
+                if (para.isTableRow) {
+                    D2D1_RECT_F trR = D2D1::RectF(pageR.left + 14.0f, y - 1.0f, pageR.right - 14.0f, y + blockH - 3.0f);
+                    brush->SetColor(SdvColor(0xF8FAFC));
+                    rt->FillRectangle(trR, brush);
+                    brush->SetColor(SdvColor(0xCBD5E1));
+                    rt->DrawRectangle(trR, brush, 0.8f);
+                    xLeft = pageR.left + 20.0f;
+                } else if (para.isBullet) {
                     brush->SetColor(SdvColor(0x0078D7));
                     rt->DrawText(L"\x2022", 1, fmtBold, D2D1::RectF(pageR.left + 16.0f, y, xLeft, y + 20.0f), brush);
                 }
-                IDWriteTextFormat* tf = (para.headingLevel > 0) ? fmtBold : fmtRegular;
-                brush->SetColor(para.headingLevel == 1 ? SdvColor(0x1E3A8A) : SdvColor(0x0F172A));
+                IDWriteTextFormat* tf = (para.headingLevel > 0) ? fmtBold : (para.isTableRow ? fmtSmall : fmtRegular);
+                brush->SetColor(para.headingLevel == 1 ? SdvColor(0x1E3A8A) : (para.headingLevel == 2 ? SdvColor(0x1E293B) : SdvColor(0x0F172A)));
                 DWRITE_WORD_WRAPPING prevWrap = tf->GetWordWrapping();
                 tf->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
                 rt->DrawText(para.text.c_str(), static_cast<UINT32>(para.text.size()), tf,
-                    D2D1::RectF(xLeft, y, pageR.right - 16.0f, y + blockH), brush);
+                    D2D1::RectF(xLeft, y + (para.isTableRow ? 2.0f : 0.0f), pageR.right - 16.0f, y + blockH), brush);
                 tf->SetWordWrapping(prevWrap);
             }
             y += blockH;

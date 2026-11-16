@@ -3585,6 +3585,174 @@ void RunFormatTestsDocs(TestCounter& tc) {
         tc.Record(legacyOk, L"DocsA.LegacyOfficeOle.WordDocClxPieceTableAndPowerPointPpt");
     }
 
+    // ------------------------------------------------------------------------
+    // C. PowerPoint OOXML (.pptx/.ppsx/.pptm) & OpenDocument Impress (.odp/.otp):
+    //    Real Apache POI & LibreOffice samples (Notes, Bar Chart, SmartArt, Spanned ODP Tables, Nested Bullets),
+    //    Slide Reordering via <p:sldIdLst>, <a:tbl> Tables, Hyperlinks, Comments, and Strict Fake-ZIP Rejection
+    // ------------------------------------------------------------------------
+    {
+        const std::wstring s70Dir = TestDataDir() + L"\\samples70";
+        ParsedOfficeDocument docNotes, docChart, docSmart, docOdpTbl, docOdpBul;
+
+        bool okNotes  = SpreadsheetDocViewer::InspectOfficeFile(s70Dir + L"\\poi_sample_notes.pptx", docNotes) && docNotes.valid;
+        bool okChart  = SpreadsheetDocViewer::InspectOfficeFile(s70Dir + L"\\poi_bar_chart.pptx", docChart) && docChart.valid;
+        bool okSmart  = SpreadsheetDocViewer::InspectOfficeFile(s70Dir + L"\\poi_smartart_venn.pptx", docSmart) && docSmart.valid;
+        bool okOdpTbl = SpreadsheetDocViewer::InspectOfficeFile(s70Dir + L"\\libre_table_span.odp", docOdpTbl) && docOdpTbl.valid;
+        bool okOdpBul = SpreadsheetDocViewer::InspectOfficeFile(s70Dir + L"\\libre_nested_bullets.odp", docOdpBul) && docOdpBul.valid;
+
+        bool realSamplesOk =
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".pptx") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".ppsx") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".pptm") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".potx") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".odp") &&
+            SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".otp") &&
+            // 1. poi_sample_notes.pptx: 2 slides + multi-run speaker notes (no bogus slide-number "1" note)
+            okNotes &&
+            DocContains(docNotes, L"Title of the first slide") &&
+            DocContains(docNotes, L"Subtitle of the first slide") &&
+            DocContains(docNotes, L"[Notes] I am the notes of the first slide") &&
+            DocContains(docNotes, L"This is the second slide") &&
+            DocContains(docNotes, L"[Notes] These are the notes of the 2nd slide") &&
+            !DocContains(docNotes, L"[Notes] 1") &&
+            // 2. poi_bar_chart.pptx: concatenated multi-run title "My Bar Chart" + chart1.xml series/categories/values
+            okChart &&
+            DocContains(docChart, L"My Bar Chart") &&
+            DocContains(docChart, L"[Chart: Sales]") &&
+            DocContains(docChart, L"1st Qtr: 8.2") &&
+            DocContains(docChart, L"4th Qtr: 1.2") &&
+            // 3. poi_smartart_venn.pptx: slide text + SmartArt diagram data1.xml nodes
+            okSmart &&
+            DocContains(docSmart, L"This file contains a SmartArt diagram") &&
+            DocContains(docSmart, L"[SmartArt] abc") &&
+            DocContains(docSmart, L"[SmartArt] def") &&
+            DocContains(docSmart, L"[SmartArt] ghi") &&
+            // 4. libre_table_span.odp: ODF <table:table> with row/col spans (0,0 | 0,1 0,2 | 0,3) & <draw:page-thumbnail> ignored
+            okOdpTbl &&
+            docOdpTbl.formatTitle.find(L"1 slide)") != std::wstring::npos &&
+            DocContains(docOdpTbl, L"0,0 | 0,1 0,2 | 0,3") &&
+            DocContains(docOdpTbl, L"2,1 | 2,2 | 2,3") &&
+            // 5. libre_nested_bullets.odp: footer-decl title + nested <text:list> items Alice..Emily
+            okOdpBul &&
+            docOdpBul.formatTitle.find(L"1 slide)") != std::wstring::npos &&
+            DocContains(docOdpBul, L"My Great Presentation") &&
+            DocContains(docOdpBul, L"Alice") &&
+            DocContains(docOdpBul, L"Emily");
+
+        tc.Record(realSamplesOk, L"DocsA.PowerPointPptxOdp.RealSamples_NotesChartsSmartArtAndOdpTables");
+
+        // Build synthetic reordered + hidden slide + <a:tbl> + hyperlink + comment + mc:AlternateContent .pptx
+        auto strVec = [](std::string_view sv) {
+            return std::vector<uint8_t>(sv.begin(), sv.end());
+        };
+        std::vector<uint8_t> reorderedPptx = MakeZipStoreArchive({
+            { "[Content_Types].xml", strVec(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+                "<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>"
+                "</Types>") },
+            { "docProps/core.xml", strVec(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
+                "<dc:title>Q3 Systems Architecture</dc:title><dc:creator>Ada Lovelace</dc:creator>"
+                "</cp:coreProperties>") },
+            { "ppt/presentation.xml", strVec(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                "<p:presentation xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+                "<p:sldIdLst>"
+                "<p:sldId id=\"257\" r:id=\"rIdSlideB\"/>"
+                "<p:sldId id=\"256\" r:id=\"rIdSlideA\" show=\"0\"/>"
+                "</p:sldIdLst>"
+                "</p:presentation>") },
+            { "ppt/_rels/presentation.xml.rels", strVec(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                "<Relationship Id=\"rIdSlideA\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide1.xml\"/>"
+                "<Relationship Id=\"rIdSlideB\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" Target=\"slides/slide2.xml\"/>"
+                "</Relationships>") },
+            { "ppt/commentAuthors.xml", strVec(
+                "<p:cmAuthorLst xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">"
+                "<p:cmAuthor id=\"0\" name=\"Grace Hopper\" initials=\"GH\"/>"
+                "</p:cmAuthorLst>") },
+            // slide2.xml MUST appear as Slide 1 because <p:sldIdLst> puts rIdSlideB first!
+            { "ppt/slides/slide2.xml", strVec(
+                "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\">"
+                "<p:cSld><p:spTree>"
+                "<p:sp><p:nvSpPr><p:nvPr><p:ph type=\"title\"/></p:nvPr></p:nvSpPr>"
+                "<p:txBody><a:p><a:r><a:t>Executive OverviewFirst</a:t></a:r></a:p></p:txBody></p:sp>"
+                "<mc:AlternateContent>"
+                "<mc:Choice Requires=\"p14\"><p:sp><p:txBody><a:p><a:r><a:rPr><a:hlinkClick r:id=\"rIdLink1\"/></a:rPr><a:t>Spec Docs</a:t></a:r></a:p></p:txBody></p:sp></mc:Choice>"
+                "<mc:Fallback><p:sp><p:txBody><a:p><a:r><a:t>FALLBACK_DUPLICATE_TRAP</a:t></a:r></a:p></p:txBody></p:sp></mc:Fallback>"
+                "</mc:AlternateContent>"
+                "<p:graphicFrame><a:graphic><a:graphicData><a:tbl>"
+                "<a:tr><a:tc><a:txBody><a:p><a:r><a:t>Node</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>Throughput</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"
+                "<a:tr><a:tc><a:txBody><a:p><a:r><a:t>Core-A</a:t></a:r></a:p></a:txBody></a:tc><a:tc><a:txBody><a:p><a:r><a:t>40 Gbps</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"
+                "</a:tbl></a:graphicData></a:graphic></p:graphicFrame>"
+                "</p:spTree></p:cSld></p:sld>") },
+            { "ppt/slides/_rels/slide2.xml.rels", strVec(
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                "<Relationship Id=\"rIdLink1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"https://example.org/spec\" TargetMode=\"External\"/>"
+                "<Relationship Id=\"rIdCm1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"../comments/comment1.xml\"/>"
+                "</Relationships>") },
+            { "ppt/comments/comment1.xml", strVec(
+                "<p:cmLst xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\">"
+                "<p:cm authorId=\"0\" idx=\"1\"><p:text>Verify 40G NIC thermal budget</p:text></p:cm>"
+                "</p:cmLst>") },
+            // slide1.xml MUST appear second and be marked [Hidden]!
+            { "ppt/slides/slide1.xml", strVec(
+                "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+                "<p:cSld><p:spTree>"
+                "<p:sp><p:nvSpPr><p:nvPr><p:ph type=\"title\"/></p:nvPr></p:nvSpPr>"
+                "<p:txBody><a:p><a:r><a:t>Backup AppendixSecond</a:t></a:r></a:p></p:txBody></p:sp>"
+                "</p:spTree></p:cSld></p:sld>") }
+        });
+
+        // Negative traps: arbitrary ZIP, Word .docx renamed to .pptx, 0-slide .pptx shell, and Calc .ods renamed to .odp
+        std::vector<uint8_t> genericZipAsPptx = MakeZipStoreArchive({
+            { "readme.txt", strVec("Just a plain zip file, NOT a PowerPoint presentation!") }
+        });
+        std::vector<uint8_t> docxAsPptx = MakeZipStoreArchive({
+            { "[Content_Types].xml", strVec("<Types><Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/></Types>") },
+            { "word/document.xml", strVec("<w:document><w:body><w:p><w:r><w:t>Word text</w:t></w:r></w:p></w:body></w:document>") }
+        });
+        std::vector<uint8_t> emptyShellPptx = MakeZipStoreArchive({
+            { "ppt/presentation.xml", strVec("<p:presentation><p:sldIdLst/></p:presentation>") }
+        });
+        std::vector<uint8_t> odsAsOdp = MakeZipStoreArchive({
+            { "mimetype", strVec("application/vnd.oasis.opendocument.spreadsheet") },
+            { "content.xml", strVec("<office:document-content><office:body><office:spreadsheet/></office:body></office:document-content>") }
+        });
+
+        ParsedOfficeDocument reordDoc;
+        bool okReord = SpreadsheetDocViewer::InspectOfficeFile(tmp.Write(L"reordered.pptx", reorderedPptx), reordDoc) && reordDoc.valid;
+
+        // Verify Slide 1 ("Executive OverviewFirst") precedes Slide 2 ("Backup AppendixSecond [Hidden]")
+        int idxSlideB = -1, idxSlideA = -1;
+        bool sawTableFlag = false;
+        for (size_t i = 0; i < reordDoc.paragraphs.size(); ++i) {
+            if (reordDoc.paragraphs[i].text.find(L"Executive OverviewFirst") != std::wstring::npos) idxSlideB = static_cast<int>(i);
+            if (reordDoc.paragraphs[i].text.find(L"Backup AppendixSecond [Hidden]") != std::wstring::npos) idxSlideA = static_cast<int>(i);
+            if (reordDoc.paragraphs[i].isTableRow && reordDoc.paragraphs[i].text == L"Core-A | 40 Gbps") sawTableFlag = true;
+        }
+
+        bool strictAndReordOk =
+            okReord &&
+            idxSlideB >= 0 && idxSlideA > idxSlideB && sawTableFlag &&
+            DocContains(reordDoc, L"Q3 Systems Architecture") &&
+            DocContains(reordDoc, L"Ada Lovelace") &&
+            DocContains(reordDoc, L"Spec Docs [https://example.org/spec]") &&
+            DocContains(reordDoc, L"Grace Hopper") &&
+            DocContains(reordDoc, L"Verify 40G NIC thermal budget") &&
+            !DocContains(reordDoc, L"FALLBACK_DUPLICATE_TRAP") &&
+            InspectFails(tmp.Write(L"fake_zip.pptx", genericZipAsPptx)) &&
+            InspectFails(tmp.Write(L"fake_zip.ppsx", genericZipAsPptx)) &&
+            InspectFails(tmp.Write(L"word_as_ppt.pptx", docxAsPptx)) &&
+            InspectFails(tmp.Write(L"zero_slides.pptx", emptyShellPptx)) &&
+            InspectFails(tmp.Write(L"calc_as_impress.odp", odsAsOdp));
+
+        tc.Record(strictAndReordOk, L"DocsA.PowerPointPptxOdp.SlideReorderTablesCommentsAndRejectFakeZips");
+    }
+
     tmp.Cleanup();
     RunFormatTestsDocsBatch70(tc);
 }

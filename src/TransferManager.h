@@ -136,8 +136,9 @@ struct TransferCompletionEvent {
 
     // Delete jobs only
     bool             recycle = false;
-    std::vector<std::wstring> sources;           // the items that were asked to be deleted
-    std::vector<TransferFileError> firstErrors;  // up to 8 failures, for the summary shown to the user
+    std::vector<std::wstring> sources;              // the items that were asked to be deleted
+    std::vector<std::wstring> notRecyclablePaths;   // items refused by Recycle Bin (too large or volume has no bin)
+    std::vector<TransferFileError> firstErrors;     // up to 8 failures, for the summary shown to the user
 };
 
 struct TransferAggregateTelemetry {
@@ -207,6 +208,10 @@ public:
     // Paths the delete engine refuses outright: empty or relative paths, anything with "." or ".." in it,
     // whole drives ("C:\") and network share roots ("\\server\share").
     static bool IsDeleteRefused(const std::wstring& path);
+
+    // True when Windows has no Recycle Bin for this path's volume (network shares "\\server\share\...",
+    // mapped network drives like "Z:\" with DRIVE_REMOTE, RAM disks, optical media).
+    static bool PathHasNoRecycleBin(const std::wstring& path);
 
     // Self-test hook: wait this long before each deleted item, so pause and cancel can be tested mid-run
     void SetDeleteItemDelayForTesting(uint32_t ms);

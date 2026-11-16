@@ -4061,6 +4061,34 @@ static void RunStage13Tests(TestCounter& tc) {
         tc.Record(ok, L"Stage13.Test20_Delete_RecycleBin_RoundTrip_NeverPermanent", detail);
     }
 
+    // Test 13.20b: Network shares (UNC / DRIVE_REMOTE) report PathHasNoRecycleBin == true, and permanent delete
+    // cleanly removes customized SYSTEM+READONLY+HIDDEN folder trees (e.g. "Pobrane z ..." with desktop.ini).
+    {
+        const bool uncDetected =
+            TransferManager::PathHasNoRecycleBin(L"\\\\nas01\\public\\Pobrane z\\folder1") &&
+            TransferManager::PathHasNoRecycleBin(L"\\\\?\\UNC\\nas01\\public\\Pobrane z\\folder2") &&
+            !TransferManager::PathHasNoRecycleBin(L"ftp://user@host/dir/file.bin") &&
+            (GetDriveTypeW(L"C:\\") != DRIVE_FIXED || !TransferManager::PathHasNoRecycleBin(L"C:\\Users\\test\\file.txt"));
+
+        const std::wstring sysDir = baseDir + L"\\t20b_Pobrane_z_NAS";
+        const std::wstring subDir = sysDir + L"\\SubFolder_System";
+        CreateDirectoryW(sysDir.c_str(), nullptr);
+        CreateDirectoryW(subDir.c_str(), nullptr);
+        const std::wstring deskIni = subDir + L"\\desktop.ini";
+        PathUtils::WriteFileBytes(deskIni, "[.ShellClassInfo]\r\n", 19);
+        SetFileAttributesW(deskIni.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY);
+        SetFileAttributesW(subDir.c_str(), FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY);
+        SetFileAttributesW(sysDir.c_str(), FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY);
+
+        const int jid = tm.EnqueueDelete({ sysDir }, true);
+        const bool waited = tm.WaitForJob(jid, 15000);
+        TransferJobSnapshot snap;
+        const bool have = FindJobSnapshot(tm, jid, snap);
+        const bool gone = !existsOnDisk(sysDir);
+        const bool ok = uncDetected && waited && have && snap.state == TransferJobState::Completed && gone && snap.errors.empty();
+        tc.Record(ok, L"Stage13.Test20b_Delete_NetworkNoRecycleBinAndSystemReadOnlyFolderTree");
+    }
+
     // Test 13.21: a file that appears in a folder after the folder was listed (a thumbnail cache, a log,
     // a late download) does not leave the folder behind: the engine takes a second pass
     {
