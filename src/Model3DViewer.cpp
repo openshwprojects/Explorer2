@@ -52,7 +52,6 @@ namespace StreamCodecs {
 #include "formats/BvhMocap.h"
 #include "formats/ValveSmd.h"
 #include "formats/EsriDem.h"
-#include "formats/SrtmHgt.h"
 #include "formats/LasLidar.h"
 #include "formats/MagicaVox.h"
 #include "formats/Extended3D100.h"
@@ -571,8 +570,7 @@ try {
             parsedMod = Formats::ParseVtkXmlMesh(buf.data(), buf.size(), ext, fullPath, mesh);
         else if (ext == L".splat" || ext == L".ksplat" || ext == L".spz" || ext == L".vdb")
             parsedMod = Formats::ParseSplatOrOpenVdb(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".abc" || ext == L".lws" ||
-                 ext == L".ma"  || ext == L".mb")
+        else if (ext == L".lws" || ext == L".ma" || ext == L".mb")
             parsedMod = Formats::ParseMayaOrCadContainer(buf.data(), buf.size(), ext, mesh, fullPath);
         else
             parsedMod = Formats::ParseExtended3D200(buf.data(), buf.size(), ext, mesh);

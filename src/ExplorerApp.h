@@ -220,7 +220,6 @@ private:
     D2D1_RECT_F GetFullWorkspaceRect() const;
     D2D1_RECT_F GetSplitPaneOuterRect(int paneIdx) const;
     D2D1_RECT_F GetSplitPaneContentMainRect(int paneIdx) const;
-    void DrawSplitPaneHeader(int paneIdx, const D2D1_RECT_F& headerRect, bool isActivePane);
     void SwapWithOtherPane();
     void SetActivePane(int paneIdx);
     void ToggleSplitView();

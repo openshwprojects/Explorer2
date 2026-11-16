@@ -3407,6 +3407,36 @@ void RunFormatTestsDocs(TestCounter& tc) {
         ParsedOfficeDocument stDoc;
         bool stOfficeOk = SpreadsheetDocViewer::InspectOfficeFile(stGoodPath, stDoc);
 
+        // 4) >32 MB streaming regression check (sparse 40 MB .safetensors file — must succeed in both views)
+        std::string bigHdr =
+            "{\"__metadata__\":{\"modelspec.title\":\"Sparse40MBModel\"},"
+            "\"big.weight\":{\"dtype\":\"F32\",\"shape\":[1024,10240],\"data_offsets\":[0,41943040]}}";
+        std::vector<uint8_t> bigPrefix;
+        AppendU64LE(bigPrefix, bigHdr.size());
+        AppendStr(bigPrefix, bigHdr);
+        AppendF32LE(bigPrefix, 1.5f);
+        AppendF32LE(bigPrefix, -2.25f);
+        std::wstring stLargePath = tmp.Write(L"sparse_40mb.safetensors", bigPrefix);
+        bool sparseCreated = false;
+        {
+            HANDLE hSparse = CreateFileW(stLargePath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hSparse != INVALID_HANDLE_VALUE) {
+                DWORD bytesRet = 0;
+                constexpr DWORD kFsctlSetSparse = 0x000900C4u;
+                DeviceIoControl(hSparse, kFsctlSetSparse, nullptr, 0, nullptr, 0, &bytesRet, nullptr);
+                LARGE_INTEGER targetEnd{};
+                targetEnd.QuadPart = static_cast<LONGLONG>(8ULL + bigHdr.size() + 41943040ULL);
+                if (SetFilePointerEx(hSparse, targetEnd, nullptr, FILE_BEGIN) && SetEndOfFile(hSparse)) {
+                    sparseCreated = true;
+                }
+                CloseHandle(hSparse);
+            }
+        }
+        auto stLargeInfo = FileContentPane::InspectAiModelFile(stLargePath, L".safetensors");
+        ParsedOfficeDocument stLargeDoc;
+        bool stLargeOfficeOk = sparseCreated && SpreadsheetDocViewer::InspectOfficeFile(stLargePath, stLargeDoc);
+
         bool aiOk =
             onnxInfo.valid && !onnxInfo.tensors.empty() && onnxInfo.totalParameters >= 2 &&
             onnxInfo.precisionSummary.find(L"FLOAT32") != std::wstring::npos &&
@@ -3426,7 +3456,11 @@ void RunFormatTestsDocs(TestCounter& tc) {
             !stForgedInfo.valid && InspectFails(stForgedPath) &&
             stOfficeOk && stDoc.valid &&
             SheetContains(stDoc, L"SafeTensors_Metadata", L"FluxAdapterV2") &&
-            SheetContains(stDoc, L"SafeTensors_Tensors", L"lora.down.weight");
+            SheetContains(stDoc, L"SafeTensors_Tensors", L"lora.down.weight") &&
+            sparseCreated && stLargeInfo.valid && stLargeInfo.totalParameters == 10485760ULL &&
+            stLargeOfficeOk && stLargeDoc.valid &&
+            SheetContains(stLargeDoc, L"SafeTensors_Metadata", L"Sparse40MBModel") &&
+            SheetContains(stLargeDoc, L"SafeTensors_Tensors", L"1.5");
         tc.Record(aiOk, L"DocsA.AiModels.OnnxGgufSafetensorsAndNegativeGuards");
 
         // B. Legacy Microsoft Word (.doc/.dot [MS-DOC] Clx Piece Table) & PowerPoint (.ppt/.pps [MS-PPT] Record Tree + Escher)

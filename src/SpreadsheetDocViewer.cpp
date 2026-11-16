@@ -3,6 +3,7 @@
 #include "PathUtils.h"
 #include "ZipDeflate.h"
 #include "Ole2Compound.h"
+#include "formats/AiModelFormats.h"
 #include <wincrypt.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
@@ -803,6 +804,9 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     }
     if (ext == L".feather" || ext == L".arrow" || ext == L".ipc") {
         return Formats::ParseArrowOrFeatherFile(fullPath, ext, outDoc);
+    }
+    if (AiModels::IsSupportedAiModelExt(ext)) {
+        return AiModels::ParseAiModelFileToDocument(fullPath, ext, outDoc);
     }
 
     std::vector<uint8_t> raw;
