@@ -20,12 +20,25 @@
 #include <system_error>
 #include <thread>
 
-#pragma comment(lib, "WindowsApp.lib")
-#pragma comment(lib, "Shcore.lib")
+// No WindowsApp.lib / Shcore.lib here: the umbrella WindowsApp.lib re-targets plain kernel32 imports to
+// api-ms-win-core-*.dll API sets that do not exist on Windows 7, and the exe then refuses to start there
+// ("api-ms-win-core-heap-l2-1-0.dll not found"). C++/WinRT finds its runtime functions by itself, and the one
+// Windows 8+ shcore function is looked up at run time below, so the import table stays Windows 7 clean.
 
 namespace Explorer2 {
 
 namespace {
+
+// shcore!CreateStreamOverRandomAccessStream (Windows 8+), resolved on first use; null on Windows 7
+using CreateStreamOverRasFn = HRESULT (WINAPI*)(IUnknown*, REFIID, void**);
+CreateStreamOverRasFn GetCreateStreamOverRandomAccessStream() {
+    static const CreateStreamOverRasFn fn = []() -> CreateStreamOverRasFn {
+        HMODULE shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!shcore) return nullptr;
+        return reinterpret_cast<CreateStreamOverRasFn>(GetProcAddress(shcore, "CreateStreamOverRandomAccessStream"));
+    }();
+    return fn;
+}
 
 static D2D1_COLOR_F PdfColor(uint32_t rgb, float a = 1.0f) {
     return PathUtils::ColorFromRgb(rgb, a);
@@ -305,7 +318,9 @@ bool RenderPageInThisApartment(
     ras.Seek(0);
 
     Microsoft::WRL::ComPtr<IStream> comStream;
-    if (FAILED(CreateStreamOverRandomAccessStream(winrt::get_unknown(ras), IID_PPV_ARGS(&comStream))) || !comStream) {
+    const CreateStreamOverRasFn createStreamOverRas = GetCreateStreamOverRandomAccessStream();
+    if (!createStreamOverRas ||
+        FAILED(createStreamOverRas(winrt::get_unknown(ras), IID_PPV_ARGS(&comStream))) || !comStream) {
         return false;
     }
 

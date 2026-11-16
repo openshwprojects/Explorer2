@@ -69,17 +69,30 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     /Fo:build\ ^
     /Fe:Explorer2.exe ^
     /link /SUBSYSTEM:WINDOWS build\Explorer2.res ^
-    user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib ws2_32.lib WindowsApp.lib Shcore.lib crypt32.lib bcrypt.lib setupapi.lib version.lib
+    kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib ws2_32.lib cfgmgr32.lib crypt32.lib bcrypt.lib setupapi.lib version.lib
+set "E2_LINK_RC=%ERRORLEVEL%"
 
-if %ERRORLEVEL% EQU 0 (
+rem Windows 7 guard: never link WindowsApp.lib (or other umbrella libs). They import kernel32 functions through
+rem api-ms-win-core-*.dll API sets that Windows 7 does not have, and the exe then fails to start there with
+rem "api-ms-win-core-heap-l2-1-0.dll was not found". Fail the build if any such import sneaks back in.
+if "%E2_LINK_RC%"=="0" (
+    dumpbin.exe /nologo /imports Explorer2.exe | findstr /i /r /c:"^ *api-ms-win-[a-z0-9-]*\.dll" /c:"^ *ext-ms-win-[a-z0-9-]*\.dll" >build\apiset_imports.txt
+    if not errorlevel 1 (
+        echo Build failed: Explorer2.exe imports Windows 8+ API-set DLLs and would not start on Windows 7:
+        type build\apiset_imports.txt
+        exit /b 1
+    )
+)
+
+if "%E2_LINK_RC%"=="0" (
     del /Q build\Explorer2_v6.running*.bak >nul 2>&1
     if exist Explorer2_v6.exe move /Y Explorer2_v6.exe build\Explorer2_v6.running.%RANDOM%_%TIME:~6,2%.bak >nul 2>&1
     copy /Y Explorer2.exe Explorer2_v6.exe >nul 2>&1
     del /Q build\Explorer2.running.bak >nul 2>&1
     echo Build succeeded: Explorer2.exe
 ) else (
-    echo Build failed with code %ERRORLEVEL%
-    exit /b %ERRORLEVEL%
+    echo Build failed with code %E2_LINK_RC%
+    exit /b %E2_LINK_RC%
 )
 exit /b 0
 
