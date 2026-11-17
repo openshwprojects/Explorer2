@@ -16,6 +16,8 @@
 #include <mutex>
 #include <thread>
 
+#include <shlobj.h>
+
 namespace Explorer2::RepoBrowser {
 
 namespace {
@@ -404,7 +406,7 @@ bool EnsureGitRepo(const GitUrlParts& parts, GitRepo& out, std::wstring& message
         if (it != g_git.end() && it->second.ready) { out = it->second; return true; }
     }
     const std::wstring dir = TempRoot() + L"Explorer2_Repos\\" + Hash16(key);
-    CreateDirectoryW((TempRoot() + L"Explorer2_Repos").c_str(), nullptr);
+    SHCreateDirectoryExW(nullptr, (TempRoot() + L"Explorer2_Repos").c_str(), nullptr);   // with the folders above it
     std::wstring commit;
     const DWORD gitAttr = GetFileAttributesW((dir + L"\\.git").c_str());
     if (gitAttr != INVALID_FILE_ATTRIBUTES && (gitAttr & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -897,8 +899,7 @@ bool FetchFileToTemp(const std::wstring& url, std::wstring& outLocalPath, std::w
     const std::wstring dest = dir + L"\\" + SafeFileName(LeafName(key));
     const DWORD attr = GetFileAttributesW(dest.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) { outLocalPath = dest; return true; }
-    CreateDirectoryW((TempRoot() + L"Explorer2_RepoFiles").c_str(), nullptr);
-    CreateDirectoryW(dir.c_str(), nullptr);
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);              // with the folders above it
 
     // Written under another name and renamed when complete: a copy that broke off is never taken for the file
     const std::wstring part = dest + L"." + std::to_wstring(GetCurrentThreadId()) + L".part";
