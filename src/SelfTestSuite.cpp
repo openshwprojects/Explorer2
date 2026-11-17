@@ -5802,9 +5802,16 @@ Objects:  {
             }
             return out;
         };
-        auto sameSet = [](std::vector<std::wstring> a, std::vector<std::wstring> b) {
-            for (auto& s : a) s = PathUtils::NormalizePathKey(s);
-            for (auto& s : b) s = PathUtils::NormalizePathKey(s);
+        // Windows hands back long names, while %TEMP% may be written in 8.3 form (C:\Users\RUNNER~1\... on
+        // GitHub's runners): both lists are compared by their long names
+        auto longKey = [](const std::wstring& p) {
+            wchar_t buf[MAX_PATH * 2] = {};
+            const DWORD n = GetLongPathNameW(p.c_str(), buf, MAX_PATH * 2);
+            return PathUtils::NormalizePathKey((n > 0 && n < MAX_PATH * 2) ? std::wstring(buf, n) : p);
+        };
+        auto sameSet = [&longKey](std::vector<std::wstring> a, std::vector<std::wstring> b) {
+            for (auto& s : a) s = longKey(s);
+            for (auto& s : b) s = longKey(s);
             std::sort(a.begin(), a.end());
             std::sort(b.begin(), b.end());
             return a == b;
