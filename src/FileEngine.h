@@ -83,6 +83,8 @@ public:
 
     // Non-blocking check if a drive root ("X:\", "Z:\", "F:\") is currently offline/empty
     bool IsDriveOffline(const std::wstring& path, Lang lang, std::wstring* outDisplayName = nullptr);
+    // "Main (\\NAS191725) (Z:)" for a drive mapped to a share, read locally (no network)
+    static std::wstring MappedNetworkDriveLabel(wchar_t driveLetter, Lang lang);
 
     // Bookkeeping around a delete job (the deleting itself is done by TransferManager::EnqueueDelete).
     // BeginDelete hides the items from listings and, for a Recycle Bin delete, keeps what Ctrl+Z needs;
@@ -253,6 +255,8 @@ private:
         bool online = false;
         uint64_t totalBytes = 0;
         uint64_t freeBytes = 0;
+        bool running = false;           // a probe thread is asking the drive now
+        ULONGLONG tick = 0;             // when the last answer came (asked again after a while)
     };
     struct NetDriveState {
         std::mutex mutex;

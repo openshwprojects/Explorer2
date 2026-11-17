@@ -21,6 +21,9 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
 - Disk-usage views: a squarified treemap and a sunburst chart
 - Dual-pane split view, navigation tree with pinned Quick Access folders, breadcrumb bar
 - Search with filters for date, size, file type and file content
+- Network folders: mapped drives and `\\server\share` paths, and `\\server` alone lists its shared folders (also
+  from the LAN scanner). A server that does not answer never freezes the window: it is asked in the background,
+  and the folder opens by itself when it answers
 - Subversion and git repositories by their URL, read-only, like folders (see [Things to know](#things-to-know))
 - In-window image and media viewer with a filmstrip
 
@@ -212,7 +215,8 @@ $p.ExitCode
 Subversion panel's back end alone, or `100x`, which repeats stages 1 to 10 a hundred times.
 
 The tests read sample files from `testdata/`, which must sit next to the executable or in the
-current directory. Some of them exercise the real machine: they ping 127.0.0.1, enumerate USB
+current directory. Some of them exercise the real machine: they ping 127.0.0.1, ask `\\localhost` for
+its shared folders, try to reach `\\10.255.255.1` (a host that never answers) in the background, enumerate USB
 controllers, render a PDF through Windows, start a second copy of the executable to check that
 it ends cleanly, move one small file to the Recycle Bin and take it out again, and briefly use
 the hidden undo folder on the drive that holds `%TEMP%`. When git is installed, they create a small

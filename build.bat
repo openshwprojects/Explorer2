@@ -59,6 +59,7 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\SvnWorkingCopy.cpp ^
     src\ToolProcess.cpp ^
     src\RepoBrowser.cpp ^
+    src\NetShares.cpp ^
     src\AppLog.cpp ^
     src\ZipDeflate.cpp ^
     src\NotepadViewer.cpp ^
@@ -80,7 +81,7 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     /Fo:build\ ^
     /Fe:Explorer2.exe ^
     /link /SUBSYSTEM:WINDOWS build\Explorer2.res ^
-    kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib ws2_32.lib cfgmgr32.lib crypt32.lib bcrypt.lib setupapi.lib version.lib ^
+    kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib shlwapi.lib ole32.lib oleaut32.lib comctl32.lib d2d1.lib dwrite.lib windowscodecs.lib mfplat.lib mfuuid.lib wininet.lib ws2_32.lib cfgmgr32.lib crypt32.lib bcrypt.lib setupapi.lib version.lib mpr.lib ^
     delayimp.lib /DELAYLOAD:mfplat.dll
 set "E2_LINK_RC=%ERRORLEVEL%"
 

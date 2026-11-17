@@ -2,6 +2,7 @@
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
+#include "NetShares.h"
 #include "RepoBrowser.h"
 #include "OsCompat.h"
 #include "Version.h"
@@ -295,6 +296,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
 
     m_fileEngine.Initialize(m_hwnd);
     RepoBrowser::SetNotifyWindow(m_hwnd);    // repository listings read in the background refresh the view
+    NetShares::SetNotifyWindow(m_hwnd);      // so do a server's shares, and a server that answers late
     m_fileEngine.StartUndoStagingSweep();   // clears undo copies that earlier sessions could not remove
     m_transfers.Initialize(m_hwnd);
     m_wmTaskbarBtnCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
@@ -327,7 +329,10 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
 
     std::wstring startDir = initialPath;
     if (startDir.empty()) {
-        if (!m_currentPath.empty() && (IsVirtualFolder(m_currentPath) || GetFileAttributesW(m_currentPath.c_str()) != INVALID_FILE_ATTRIBUTES)) {
+        // A network folder is not looked at here (a server that does not answer would hold the start for ~20 s):
+        // NavigateTo asks its server in the background
+        if (!m_currentPath.empty() && (IsVirtualFolder(m_currentPath) || NetShares::IsNetworkPath(m_currentPath) ||
+                                       GetFileAttributesW(m_currentPath.c_str()) != INVALID_FILE_ATTRIBUTES)) {
             startDir = m_currentPath;
         } else {
             wchar_t cwd[MAX_PATH] = {};
@@ -883,6 +888,18 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_APP_NET_REACHED:
+        // A network server asked in the background has answered: the folder that waited for it is opened now (or
+        // the reason it cannot be is shown). An answer about another server leaves the waiting folder waiting.
+        if (!m_pendingNetNav.path.empty() &&
+            NetShares::CheckReachable(m_pendingNetNav.path, 0, m_lang) != NetShares::Reach::Pending) {
+            const PendingNetNav pending = m_pendingNetNav;
+            m_pendingNetNav = PendingNetNav();
+            if (!m_statusToast.empty() && m_statusToast[0] == L'\x23F3') m_statusToast.clear();
+            NavigateTo(pending.path, pending.addToHistory, pending.selectName);
+        }
+        return 0;
+
     case WM_APP_DIR_CHANGED:
         if (!m_isSearchActive && m_renamingIndex < 0 && m_renamingPath.empty() &&
             m_renamePending.load() == 0 && m_mergePending.load() == 0 &&
@@ -1189,6 +1206,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DESTROY:
         RepoBrowser::Shutdown();            // ends a repository read still running (and the svn / git it runs)
+        NetShares::Shutdown();              // a server that answers later has no window to tell
         KillTimer(m_hwnd, ID_TIMER_MEDIA);
         KillTimer(m_hwnd, ID_TIMER_WORK_ANIM);
         m_workAnimIntervalMs = 0;
@@ -1241,6 +1259,16 @@ void ExplorerApp::SyncMediaPlayerToSelection() {
 void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const std::wstring& selectFileName) {
     std::wstring resolvedInput = FileEngine::ResolveAddressInput(path, m_currentPath);
     std::wstring cleanPath = resolvedInput.empty() ? PathUtils::TrimTrailingSlashes(path) : resolvedInput;
+    // A newer navigation replaces one that waits for a network server, and its "connecting" note
+    if (!m_pendingNetNav.path.empty() && !m_statusToast.empty() && m_statusToast[0] == L'\x23F3') m_statusToast.clear();
+    m_pendingNetNav = PendingNetNav();
+
+    if (cleanPath == L"NETWORK") {
+        // "Sieć" (Network): the LAN scanner is Explorer2's network place (its hosts open their shares)
+        ExecuteRibbonCommand(CMD_TAB_LAN);
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
 
     if (FtpClient::IsFtpPath(cleanPath)) {
         std::wstring ftpErr;
@@ -1261,18 +1289,54 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
     } else if (RepoBrowser::IsRepoUrl(cleanPath)) {
         // A repository folder: RepoBrowser lists it in the background (the view says so until it arrives)
     } else if (!IsVirtualFolder(cleanPath)) {
-        std::wstring offlineName;
-        if (m_fileEngine.IsDriveOffline(cleanPath, m_lang, &offlineName)) {
-            m_statusToast = (m_lang == Lang::PL ? L"Dysk jest niedostępny (offline): " : L"Drive is unavailable (offline): ") + offlineName;
-            m_statusToastExpireTick = GetTickCount64() + 4000;
-            AppLog::Warn(L"Navigate", L"Drive unavailable (offline): " + cleanPath);
-            InvalidateRect(m_hwnd, nullptr, FALSE);
-            return;
+        if (NetShares::IsNetworkPath(cleanPath)) {
+            // \\server\share\... or a drive mapped to a share: the server is asked in the background first. Windows
+            // waits ~20 s for one that does not answer, and the window must not freeze for that.
+            std::wstring netMessage;
+            const NetShares::Reach reach = NetShares::CheckReachable(cleanPath, 1500, m_lang, &netMessage);
+            if (reach != NetShares::Reach::Ok) {
+                if (m_currentPath.empty()) NavigateTo(L"THIS_PC", false);   // at start-up: not an empty window
+                if (reach == NetShares::Reach::Pending) {
+                    m_pendingNetNav.path = cleanPath;                         // opened when the server answers
+                    m_pendingNetNav.selectName = selectFileName;
+                    m_pendingNetNav.addToHistory = addToHistory;
+                    m_statusToast = (m_lang == Lang::PL ? L"\x23F3 Łączenie z " : L"\x23F3 Connecting to ") + cleanPath + L"\x2026";
+                    m_statusToastExpireTick = GetTickCount64() + 60000;
+                    AppLog::Info(L"Navigate", L"Waiting for the network server of " + cleanPath);
+                } else {
+                    m_statusToast = L"\x26A0 " + netMessage;
+                    m_statusToastExpireTick = GetTickCount64() + 6000;
+                    AppLog::Warn(L"Navigate", netMessage);
+                }
+                EnsureWorkAnimTimerState();
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+                return;
+            }
+        } else {
+            std::wstring offlineName;
+            if (m_fileEngine.IsDriveOffline(cleanPath, m_lang, &offlineName)) {
+                m_statusToast = (m_lang == Lang::PL ? L"Dysk jest niedostępny (offline): " : L"Drive is unavailable (offline): ") + offlineName;
+                m_statusToastExpireTick = GetTickCount64() + 4000;
+                AppLog::Warn(L"Navigate", L"Drive unavailable (offline): " + cleanPath);
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+                return;
+            }
         }
         DWORD attrs = GetFileAttributesW(cleanPath.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            const DWORD err = (attrs == INVALID_FILE_ATTRIBUTES) ? GetLastError() : ERROR_DIRECTORY;
             if (!ArchiveExplorer::IsVirtualArchivePath(cleanPath)) {
                 AppLog::Warn(L"Navigate", L"Folder not found or not a folder: " + cleanPath);
+                const bool pl = (m_lang == Lang::PL);
+                const wchar_t* what = (err == ERROR_DIRECTORY) ? (pl ? L"To nie jest folder: " : L"Not a folder: ")
+                    : (err == ERROR_ACCESS_DENIED || err == ERROR_NETWORK_ACCESS_DENIED || err == ERROR_LOGON_FAILURE)
+                        ? (pl ? L"Brak dostępu: " : L"Access denied: ")
+                        : (pl ? L"Nie znaleziono folderu: " : L"Folder not found: ");
+                m_statusToast = L"\x26A0 " + std::wstring(what) + cleanPath;
+                m_statusToastExpireTick = GetTickCount64() + 5000;
+                EnsureWorkAnimTimerState();
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+                if (m_currentPath.empty()) NavigateTo(L"THIS_PC", false);   // at start-up: not an empty window
                 return;
             }
         }
@@ -1455,6 +1519,10 @@ void ExplorerApp::NavigateUp() {
         NavigateTo(L"THIS_PC", true, m_currentPath);
         return;
     }
+    if (NetShares::IsServerRoot(m_currentPath)) {           // \\server (its shares): This PC is above it
+        NavigateTo(L"THIS_PC", true);
+        return;
+    }
     std::wstring childName = PathUtils::GetFileName(m_currentPath);
     std::wstring parent = PathUtils::GetParentPath(m_currentPath);
     if (!parent.empty()) {
@@ -1462,10 +1530,17 @@ void ExplorerApp::NavigateUp() {
     }
 }
 
-bool ExplorerApp::RefuseRepositoryWrite(const std::wstring& path) {
-    if (!RepoBrowser::IsRepoUrl(path)) return false;
-    m_statusToast = (m_lang == Lang::PL) ? L"\x26A0 Repozytoria są tylko do odczytu (skopiuj pliki do zwykłego folderu)"
-                                         : L"\x26A0 Repositories are read-only (copy the files into a standard folder)";
+bool ExplorerApp::RefuseReadOnlyFolder(const std::wstring& path) {
+    const bool pl = (m_lang == Lang::PL);
+    if (NetShares::IsServerRoot(path)) {
+        m_statusToast = pl ? L"\x26A0 To lista udziałów serwera: otwórz udział, żeby w nim tworzyć, wklejać lub usuwać"
+                           : L"\x26A0 This is the server's list of shares: open a share to create, paste or delete in it";
+    } else if (RepoBrowser::IsRepoUrl(path)) {
+        m_statusToast = pl ? L"\x26A0 Repozytoria są tylko do odczytu (skopiuj pliki do zwykłego folderu)"
+                           : L"\x26A0 Repositories are read-only (copy the files into a standard folder)";
+    } else {
+        return false;
+    }
     m_statusToastExpireTick = GetTickCount64() + 3800;
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -1474,6 +1549,7 @@ bool ExplorerApp::RefuseRepositoryWrite(const std::wstring& path) {
 
 void ExplorerApp::RefreshFromUser() {
     if (RepoBrowser::IsRepoUrl(m_currentPath)) RepoBrowser::Invalidate(m_currentPath);
+    if (NetShares::IsNetworkPath(m_currentPath)) NetShares::Invalidate(m_currentPath);   // the server is asked again
     RefreshCurrentFolder();
 }
 
@@ -1616,6 +1692,31 @@ void ExplorerApp::RebuildBreadcrumbs() {
         return;
     }
 
+    if (NetShares::IsUncPath(m_currentPath)) {
+        // "Sieć" (Network) in place of This PC, "\\server" (the list of its shares), then the share and each folder
+        m_breadcrumbs.front().label = s.navNetwork;
+        m_breadcrumbs.front().path = L"NETWORK";
+        const std::wstring server = NetShares::ServerName(m_currentPath);
+        BreadcrumbSegment serverSeg;
+        serverSeg.label = L"\\\\" + server;
+        serverSeg.path = L"\\\\" + server;
+        m_breadcrumbs.push_back(serverSeg);
+        const std::wstring cur = PathUtils::TrimTrailingSlashes(m_currentPath);
+        size_t pos = 2 + server.size() + 1;
+        while (pos < cur.size()) {
+            size_t slash = cur.find_first_of(L"\\/", pos);
+            if (slash == std::wstring::npos) slash = cur.size();
+            if (slash > pos) {
+                BreadcrumbSegment seg;
+                seg.label = cur.substr(pos, slash - pos);
+                seg.path = cur.substr(0, slash);
+                m_breadcrumbs.push_back(seg);
+            }
+            pos = slash + 1;
+        }
+        return;
+    }
+
     if (m_currentPath.size() >= 2 && m_currentPath[1] == L':') {
         std::wstring driveRoot = m_currentPath.substr(0, 2) + L"\\";
         wchar_t dlChar = static_cast<wchar_t>(towupper(m_currentPath[0]));
@@ -1628,9 +1729,11 @@ void ExplorerApp::RebuildBreadcrumbs() {
             if (!s_cachedDriveProbed[dIdx]) {
                 s_cachedDriveProbed[dIdx] = true;
                 wchar_t volName[MAX_PATH] = {};
-                if (GetDriveTypeW(driveRoot.c_str()) != DRIVE_REMOTE &&
-                    GetVolumeInformationW(driveRoot.c_str(), volName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0) &&
-                    volName[0]) {
+                if (GetDriveTypeW(driveRoot.c_str()) == DRIVE_REMOTE) {
+                    // "Main (\\NAS191725) (Z:)", read locally: the volume of a network drive is never asked here
+                    s_cachedDriveLabels[dIdx] = FileEngine::MappedNetworkDriveLabel(dlChar, m_lang);
+                } else if (GetVolumeInformationW(driveRoot.c_str(), volName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0) &&
+                           volName[0]) {
                     s_cachedDriveLabels[dIdx] = std::wstring(volName) + L" (" + dl + L")";
                 } else {
                     s_cachedDriveLabels[dIdx] = dl;
@@ -1924,15 +2027,19 @@ std::wstring ExplorerApp::ResolveDropTargetFolder(float x, float y, std::wstring
     }
 
     // 2. Check Breadcrumb segments (both panes when Split View is active)
+    // (not This PC, Network or a server's list of shares: nothing can be copied there)
+    auto dropTargetCrumb = [](const BreadcrumbSegment& bc) {
+        return !bc.path.empty() && bc.path != L"THIS_PC" && bc.path != L"NETWORK" && !NetShares::IsServerRoot(bc.path);
+    };
     for (const auto& bc : m_breadcrumbs) {
-        if (PathUtils::PtInRectF(x, y, bc.hitRect) && !bc.path.empty() && bc.path != L"THIS_PC") {
+        if (PathUtils::PtInRectF(x, y, bc.hitRect) && dropTargetCrumb(bc)) {
             if (outTargetLabel) *outTargetLabel = bc.label;
             return bc.path;
         }
     }
     if (IsSplitViewActive()) {
         for (const auto& bc : m_otherPane.breadcrumbs) {
-            if (PathUtils::PtInRectF(x, y, bc.hitRect) && !bc.path.empty() && bc.path != L"THIS_PC") {
+            if (PathUtils::PtInRectF(x, y, bc.hitRect) && dropTargetCrumb(bc)) {
                 if (outTargetLabel) *outTargetLabel = bc.label;
                 return bc.path;
             }
@@ -2004,7 +2111,7 @@ void ExplorerApp::StartManagedTransfer(
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return;
     }
-    if (RefuseRepositoryWrite(targetDir)) return;
+    if (RefuseReadOnlyFolder(targetDir)) return;
 
     // Resolve any source items originating inside a virtual archive by extracting to temp staging, and repository
     // files by their temp copy (a repository folder cannot be copied out: that is said, not skipped silently)
@@ -3659,7 +3766,8 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
 
     int prevRowAction = m_hoverRowActionKind;
     m_hoverRowActionKind = 0;
-    if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+    if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath) &&
+        !NetShares::IsServerRoot(m_currentPath)) {
         D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, contentRect);
         float opColX = contentRect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
         const bool inBin = (m_currentPath == L"RECYCLE_BIN");
@@ -3681,7 +3789,8 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
             D2D1_RECT_F otherContent = GetContentItemsRect();
             m_hoverIndex = (m_viewMode == ViewMode::FullViewer || m_viewMode == ViewMode::Hardware) ? -1 : HitTestItem(x, y, otherContent, nullptr);
             m_hoverRowActionKind = 0;
-            if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+            if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath) &&
+                !NetShares::IsServerRoot(m_currentPath)) {
                 D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, otherContent);
                 float opColX = otherContent.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
                 const bool inBin = (m_currentPath == L"RECYCLE_BIN");
@@ -4392,7 +4501,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_RENAME:        StartInlineRename(); break;
     case CMD_NEW_FOLDER:    CreateNewFolderAction(); break;
     case CMD_NEW_ITEM: {
-        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || RefuseRepositoryWrite(m_currentPath)) break;
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || RefuseReadOnlyFolder(m_currentPath)) break;
         std::wstring created;
         std::wstring base = (m_lang == Lang::PL) ? L"Nowy dokument tekstowy" : L"New Text Document";
         if (ShellMenuEmulator::CreateNewEmptyFile(m_currentPath, base, L".txt", created)) {
@@ -5052,11 +5161,10 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
             ShellExecuteW(m_hwnd, L"open", m_hwActionArg.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
         break;
-    case CMD_LAN_OPEN_SMB: {
-        std::wstring unc = L"\\\\" + m_hwActionArg;
-        ShellExecuteW(m_hwnd, L"open", unc.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    case CMD_LAN_OPEN_SMB:
+        // \\<ip>: the host's shared folders, listed here (in the background) like a folder
+        NavigateTo(L"\\\\" + m_hwActionArg, true);
         break;
-    }
     case CMD_LAN_COPY:
         FileEngine::CopyTextToClipboard(m_hwnd, m_hwActionArg);
         m_statusToast = (m_lang == Lang::PL ? L"\x2713 Skopiowano: " : L"\x2713 Copied: ") + m_hwActionArg;
@@ -6395,7 +6503,7 @@ void ExplorerApp::EmptyRecycleBinAction() {
 
 void ExplorerApp::DeleteSelectedItems(bool permanent) {
     if (m_currentPath == L"THIS_PC") return;   // drives are not something to delete
-    if (RefuseRepositoryWrite(m_currentPath)) return;
+    if (RefuseReadOnlyFolder(m_currentPath)) return;
 
     if (m_currentPath == L"RECYCLE_BIN") {
         // Items inside Kosz are already recycled: deleting them permanently purges both $R and $I!
@@ -6666,7 +6774,7 @@ void ExplorerApp::ShowDeleteFailures(const TransferCompletionEvent& ev) {
 void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
     if (itemIndex < 0 || itemIndex >= static_cast<int>(m_items.size())) return;
     if (m_currentPath == L"THIS_PC") return;
-    if (RefuseRepositoryWrite(m_currentPath)) return;
+    if (RefuseReadOnlyFolder(m_currentPath)) return;
 
     const FileEntry itemCopy = m_items[itemIndex];
     const Strings& s = GetStrings(m_lang);
@@ -6854,7 +6962,7 @@ void ExplorerApp::CopySelectedPaths() {
 }
 
 void ExplorerApp::CreateNewFolderAction() {
-    if (RefuseRepositoryWrite(m_currentPath)) return;
+    if (RefuseReadOnlyFolder(m_currentPath)) return;
     const Strings& s = GetStrings(m_lang);
     if (FtpClient::IsFtpPath(m_currentPath)) {
         std::wstring err;
@@ -6881,7 +6989,7 @@ void ExplorerApp::CreateNewFolderAction() {
 void ExplorerApp::StartInlineRename() {
     const bool pl = (m_lang == Lang::PL);
     if (m_viewMode == ViewMode::FullViewer) return;
-    if (RefuseRepositoryWrite(m_currentPath)) return;
+    if (RefuseReadOnlyFolder(m_currentPath)) return;
     if (IsVirtualFolder(m_currentPath)) {
         m_statusToast = (m_currentPath == L"RECYCLE_BIN")
             ? (pl ? L"\x26A0 Nie można zmieniać nazw elementów w Koszu (najpierw przywróć element)"
@@ -7351,7 +7459,16 @@ void ExplorerApp::ShowBreadcrumbSubfolderMenu(int breadcrumbIndex) {
     const BreadcrumbSegment& seg = m_breadcrumbs[breadcrumbIndex];
 
     std::vector<std::pair<std::wstring, std::wstring>> subTargets;
-    if (seg.path == L"THIS_PC") {
+    bool sharesLoading = false;
+    if (seg.path == L"NETWORK") {
+        // the servers known without asking the network (mapped drives, servers opened in this session)
+        for (const auto& server : NetShares::KnownServers()) subTargets.push_back({ L"\\\\" + server, L"\\\\" + server });
+    } else if (NetShares::IsServerRoot(seg.path)) {
+        // the server's shares (asked in the background the first time)
+        std::vector<FileEntry> shares;
+        sharesLoading = NetShares::GetShares(seg.path, m_lang, shares) == NetShares::ListState::Loading;
+        for (const auto& share : shares) subTargets.push_back({ share.name, share.fullPath });
+    } else if (seg.path == L"THIS_PC") {
         subTargets.push_back({ GetStrings(m_lang).navRecycleBin, L"RECYCLE_BIN" });
         auto drives = m_fileEngine.EnumerateDirectory(L"THIS_PC", false, false, m_lang);
         for (const auto& d : drives) {
@@ -7367,7 +7484,12 @@ void ExplorerApp::ShowBreadcrumbSubfolderMenu(int breadcrumbIndex) {
     HMENU hMenu = CreatePopupMenu();
     HBITMAP hFolderBmp = m_shellEmulator.GetFolderMenuBitmap();
     if (subTargets.empty()) {
-        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, m_lang == Lang::PL ? L"(Brak podfolderów)" : L"(No subfolders)");
+        const bool pl = (m_lang == Lang::PL);
+        const wchar_t* note = sharesLoading ? (pl ? L"(Wczytywanie listy udziałów...)" : L"(Reading the list of shares...)")
+            : (seg.path == L"NETWORK") ? (pl ? L"(Brak znanych serwerów - wpisz \\\\serwer w pasek adresu)"
+                                             : L"(No known servers - type \\\\server in the address bar)")
+            : (pl ? L"(Brak podfolderów)" : L"(No subfolders)");
+        AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, note);
     } else {
         for (size_t i = 0; i < subTargets.size() && i < 150; ++i) {
             UINT id = CMD_BASE_BREADCRUMB + static_cast<UINT>(i);
@@ -8016,7 +8138,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         return;
     }
     if (cmd >= CMD_NEW_TXT_FILE && cmd <= CMD_NEW_MD_FILE) {
-        if (RefuseRepositoryWrite(m_currentPath)) return;
+        if (RefuseReadOnlyFolder(m_currentPath)) return;
         std::wstring ext = L".txt";
         std::wstring base = (m_lang == Lang::PL) ? L"Nowy dokument tekstowy" : L"New Text Document";
         if (cmd == CMD_NEW_BMP_FILE) { ext = L".bmp"; base = (m_lang == Lang::PL) ? L"Nowy obraz" : L"New Bitmap Image"; }

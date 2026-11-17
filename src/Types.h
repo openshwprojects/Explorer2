@@ -28,6 +28,7 @@ constexpr UINT WM_APP_EXTRACT_DONE        = WM_APP + 112;   // lParam = heap Ext
 constexpr UINT WM_APP_EXT_ICONS_READY     = WM_APP + 113;   // file-type icons were looked up (FileEngine::RefreshIconIndices)
 constexpr UINT WM_APP_PREVIEW_READY      = WM_APP + 114;   // the preview pane's worker has read a file (FileContentPane::OnPreviewLoaded)
 constexpr UINT WM_APP_TRANSFER_UPDATE     = WM_APP + 111;   // CopyHandler-style TransferManager state/completion update
+constexpr UINT WM_APP_NET_REACHED         = WM_APP + 115;   // a network server asked in the background has answered (NetShares)
 
 enum class ViewMode : int {
     Details = 0,         // Szczegóły (table with columns)

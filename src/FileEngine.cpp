@@ -4,6 +4,7 @@
 #include "AppLog.h"
 #include "ArchiveExplorer.h"
 #include "FtpClient.h"
+#include "NetShares.h"
 #include "RepoBrowser.h"
 #include "PathUtils.h"
 #include "TransferManager.h"
@@ -76,11 +77,12 @@ void FileEngine::ProbeNetworkDriveAsync(wchar_t driveLetter) {
     wchar_t dl = static_cast<wchar_t>(towupper(driveLetter));
     {
         std::lock_guard<std::mutex> lk(m_net->mutex);
-        auto it = m_net->drives.find(dl);
-        if (it != m_net->drives.end() && it->second.probed) {
+        NetDriveInfo& info = m_net->drives[dl];
+        // Asked again after a while: a NAS switched off (or back on) later is shown as it is now
+        if (info.running || (info.probed && GetTickCount64() - info.tick < 30000)) {
             return;
         }
-        m_net->drives[dl] = { true, false, 0, 0 };
+        info.running = true;
     }
 
     // The thread works on the shared block only, never on the engine itself (see NetDriveState)
@@ -89,15 +91,26 @@ void FileEngine::ProbeNetworkDriveAsync(wchar_t driveLetter) {
         wchar_t rootPath[] = { dl, L':', L'\\', L'\0' };
         ULARGE_INTEGER freeBytes = {}, totalBytes = {};
         BOOL ok = GetDiskFreeSpaceExW(rootPath, &freeBytes, &totalBytes, nullptr);
-        if (!state->wanted) return;
+        bool changed = false;
         {
             std::lock_guard<std::mutex> lk(state->mutex);
-            state->drives[dl] = { true, ok != FALSE, ok ? totalBytes.QuadPart : 0ULL, ok ? freeBytes.QuadPart : 0ULL };
+            NetDriveInfo& info = state->drives[dl];
+            changed = !info.probed || info.online != (ok != FALSE);
+            info.probed = true;
+            info.online = (ok != FALSE);
+            info.totalBytes = ok ? totalBytes.QuadPart : 0ULL;
+            info.freeBytes = ok ? freeBytes.QuadPart : 0ULL;
+            info.running = false;
+            info.tick = GetTickCount64();
         }
-        if (ok && notifyHwnd && state->wanted) {
+        if ((ok || changed) && notifyHwnd && state->wanted) {
             PostMessageW(notifyHwnd, WM_APP_FOLDER_SIZE_UPDATED, 0, 0);
         }
     }).detach();
+}
+
+std::wstring FileEngine::MappedNetworkDriveLabel(wchar_t driveLetter, Lang lang) {
+    return GetMappedNetworkDriveLabel(driveLetter, lang);
 }
 
 bool FileEngine::IsDriveOffline(const std::wstring& path, Lang lang, std::wstring* outDisplayName) {
@@ -377,7 +390,7 @@ void FileEngine::WatchDirectory(const std::wstring& dirPath) {
                 clean = std::move(candidate);
             }
         }
-    } else if (clean == L"THIS_PC" || FtpClient::IsFtpPath(clean) || RepoBrowser::IsRepoUrl(clean) || ArchiveExplorer::IsVirtualArchivePath(clean)) {
+    } else if (IsVirtualFolder(clean) || FtpClient::IsFtpPath(clean) || RepoBrowser::IsRepoUrl(clean) || ArchiveExplorer::IsVirtualArchivePath(clean)) {
         clean.clear();
     } else if (!clean.empty()) {
         DWORD attrs = GetFileAttributesW(clean.c_str());
@@ -812,6 +825,13 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
             }
         }
         SyncDirectorySizes(results);
+        return results;
+    }
+
+    if (IsUncServerRoot(dirPath)) {
+        // \\server: the folders it shares, read in the background (an empty list until they arrive)
+        NetShares::GetShares(dirPath, lang, results);
+        for (auto& entry : results) entry.sysIconIndex = m_folderIconIndex;
         return results;
     }
 
@@ -1859,6 +1879,15 @@ std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const s
         return L"THIS_PC";
     }
 
+    // 2b. Network ("Sieć") aliases: Explorer2's network place is the LAN scanner
+    if (low == L"sieć" ||
+        low == L"siec" ||
+        low == L"network" ||
+        low == L"shell:networkplacesfolder" ||
+        low == L"::{f02c1a0d-be21-4350-88b0-7367fc96ef3c}") {
+        return L"NETWORK";
+    }
+
     // 3. Standard user Known Folders when typed as bare shell aliases in top bar
     auto resolveKnown = [](REFKNOWNFOLDERID rfid) -> std::wstring {
         PWSTR psz = nullptr;
@@ -1883,7 +1912,12 @@ std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const s
         if (!p.empty()) return p;
     }
 
-    // 4. Relative child path inside current local folder (e.g. ".\Kosz" or typing a subfolder name)
+    // 4. A share's name typed while the list of a server's shares is shown
+    if (IsUncServerRoot(currentDir) && clean.find_first_of(L"\\/:") == std::wstring::npos) {
+        return PathUtils::TrimTrailingSlashes(currentDir) + L"\\" + clean;
+    }
+
+    // 5. Relative child path inside current local folder (e.g. ".\Kosz" or typing a subfolder name)
     if (!FtpClient::IsFtpPath(clean) && !RepoBrowser::IsRepoUrl(clean) &&
         !(clean.size() >= 2 && clean[1] == L':') &&
         clean.rfind(L"\\\\", 0) != 0 &&

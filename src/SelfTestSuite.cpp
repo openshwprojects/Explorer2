@@ -22,6 +22,7 @@
 #include "ImageCache.h"
 #include "FileContentPane.h"
 #include "GitIntegration.h"
+#include "NetShares.h"
 #include "OsCompat.h"
 #include "ProgramsInfo.h"
 #include "ReaderInspect.h"
@@ -2836,6 +2837,63 @@ static void RunStage12Tests(TestCounter& tc) {
                 L"ms, noFakeSeed=" + std::to_wstring(noFakeSeededFtp) +
                 L", err=" + errReach);
         }
+    }
+
+    // Test 15: network folders by UNC path (NetShares). \\server alone is the list of its shares (read in the
+    // background, never left "loading"), and the server of a \\server\share path is asked in the background, so one
+    // that does not answer returns at once instead of holding the window for Windows' ~20 s wait.
+    {
+        using namespace NetShares;
+        const bool paths =
+            IsUncPath(L"\\\\nas\\share\\x") && IsUncPath(L"\\\\nas") && !IsUncPath(L"\\\\?\\C:\\x") &&
+            !IsUncPath(L"\\\\.\\pipe\\p") && !IsUncPath(L"C:\\x") && !IsUncPath(L"\\\\") &&
+            IsServerRoot(L"\\\\nas") && IsServerRoot(L"\\\\nas\\") && !IsServerRoot(L"\\\\nas\\share") &&
+            !IsServerRoot(L"\\\\?\\C:") && IsVirtualFolder(L"\\\\nas") && !IsVirtualFolder(L"\\\\nas\\share") &&
+            ServerName(L"\\\\NAS191725\\Main\\Audio") == L"NAS191725" &&
+            ShareRoot(L"\\\\NAS191725\\Main\\Audio") == L"\\\\NAS191725\\Main" && ShareRoot(L"\\\\NAS191725").empty() &&
+            IsNetworkPath(L"\\\\nas\\share") && !IsNetworkPath(L"C:\\Windows") && !IsNetworkPath(L"THIS_PC") &&
+            CheckReachable(L"C:\\Windows", 0, Lang::EN) == Reach::Ok &&
+            FileEngine::ResolveAddressInput(L"Main", L"\\\\nas") == L"\\\\nas\\Main" &&
+            // "Sieć" (Network) is a place of its own, typed or clicked in the breadcrumbs of a \\server path
+            IsVirtualFolder(L"NETWORK") && FileEngine::ResolveAddressInput(L"Sieć", L"C:\\") == L"NETWORK" &&
+            FileEngine::ResolveAddressInput(L"network", L"C:\\") == L"NETWORK";
+
+        // this computer's own server answers (whether or not it has a print$ share)
+        const Reach local = CheckReachable(L"\\\\localhost\\print$\\x", 5000, Lang::EN);
+        bool knowsLocal = false;                          // a server met is offered in the "Sieć" drop-down
+        for (const auto& server : KnownServers()) {
+            if (_wcsicmp(server.c_str(), L"localhost") == 0) knowsLocal = true;
+        }
+        // a host that cannot answer: the call comes back at once, the question goes on in the background
+        const ULONGLONG t0 = GetTickCount64();
+        std::wstring deadMsg;
+        const Reach dead = CheckReachable(L"\\\\10.255.255.1\\share\\x", 300, Lang::EN, &deadMsg);
+        const ULONGLONG deadMs = GetTickCount64() - t0;
+        const ULONGLONG t1 = GetTickCount64();
+        const Reach deadAgain = CheckReachable(L"\\\\10.255.255.1\\share", 0, Lang::EN);
+        const ULONGLONG againMs = GetTickCount64() - t1;
+
+        std::vector<FileEntry> shares;
+        std::wstring listMsg;
+        ListState ls = GetShares(L"\\\\localhost", Lang::EN, shares, &listMsg);
+        for (int i = 0; i < 150 && ls == ListState::Loading; ++i) {
+            Sleep(100);
+            ls = GetShares(L"\\\\localhost", Lang::EN, shares, &listMsg);
+        }
+        bool sharesGood = true;
+        for (const auto& e : shares) {
+            if (!e.isDirectory || e.fullPath.rfind(L"\\\\localhost\\", 0) != 0 || e.name.empty()) sharesGood = false;
+        }
+
+        const bool good = paths && knowsLocal && local != Reach::Pending && dead != Reach::Ok && deadMs < 2000 &&
+                          deadAgain != Reach::Ok && againMs < 200 && ls != ListState::Loading && sharesGood;
+        auto reachName = [](Reach r) { return r == Reach::Ok ? L"ok" : r == Reach::Pending ? L"pending" : L"failed"; };
+        tc.Record(good, L"Stage12.Test15_NetworkPaths_SharesAndBackgroundCheck",
+                  std::wstring(L"paths=") + (paths ? L"ok" : L"BAD") + L", known servers=" + (knowsLocal ? L"ok" : L"BAD") +
+                  L", localhost=" + reachName(local) +
+                  L", dead host=" + reachName(dead) + L" in " + std::to_wstring(deadMs) + L" ms (again " +
+                  std::to_wstring(againMs) + L" ms), \\\\localhost shares=" + std::to_wstring(shares.size()) +
+                  (ls == ListState::Failed ? (L" (" + listMsg + L")") : std::wstring()));
     }
 }
 

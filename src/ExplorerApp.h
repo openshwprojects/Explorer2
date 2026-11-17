@@ -134,10 +134,11 @@ private:
     D2D1_RECT_F GetPreviewPaneRect() const;
     // full: also re-read what comes from a server (a Subversion history), for the dock's Refresh button
     void SyncGitRepo(bool force = false, bool full = false);
-    // Repository folders (RepoBrowser) are read-only: when `path` is one, says so in a toast and returns true
-    bool RefuseRepositoryWrite(const std::wstring& path);
-    // F5, the refresh button and the context menu: like RefreshCurrentFolder, and a repository folder is read again
-    // from its server (a listing that arrives by itself refreshes through RefreshCurrentFolder, which keeps it)
+    // Repository folders (RepoBrowser) and a server's list of shares (\\server) are read-only: when `path` is one,
+    // says so in a toast and returns true
+    bool RefuseReadOnlyFolder(const std::wstring& path);
+    // F5, the refresh button and the context menu: like RefreshCurrentFolder, and a repository folder or a network
+    // server is asked again (a listing that arrives by itself refreshes through RefreshCurrentFolder, which keeps it)
     void RefreshFromUser();
     bool HandleGitDockClick(float x, float y, bool rightButton);
     // Saves the settings file. The write normally happens in the background; with waitUntilWritten the
@@ -362,6 +363,14 @@ private:
     // Navigation state
     std::wstring m_currentPath;
     std::wstring m_currentNormKey;
+    // A network folder whose server is still being asked (NetShares::CheckReachable): NavigateTo goes there when
+    // the answer comes (WM_APP_NET_REACHED), unless another navigation came first
+    struct PendingNetNav {
+        std::wstring path;
+        std::wstring selectName;
+        bool addToHistory = false;
+    };
+    PendingNetNav m_pendingNetNav;
     std::vector<std::wstring> m_history;
     int m_historyIndex = -1;
     std::vector<std::wstring> m_recentDirs; // Last 30 unique visited folders (MRU order, persisted in settings.ini)

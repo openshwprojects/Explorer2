@@ -2,6 +2,7 @@
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
+#include "NetShares.h"
 #include "RepoBrowser.h"
 #include "SvnWorkingCopy.h"
 #include <shlwapi.h>
@@ -2552,8 +2553,32 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
         DrawGridOrListView(viewRect);
     }
 
-    // A repository folder that is still being read, or could not be read, says so where its files would be
-    if (m_items.empty() && !m_isSearchActive && RepoBrowser::IsRepoUrl(m_currentPath)) {
+    // A repository folder or a server's list of shares that is still being read, or could not be read, says so
+    // where its items would be
+    const bool repoFolder = RepoBrowser::IsRepoUrl(m_currentPath);
+    if (m_items.empty() && !m_isSearchActive && NetShares::IsServerRoot(m_currentPath)) {
+        std::wstring netMsg;
+        const NetShares::ListState netState = NetShares::PeekState(m_currentPath, m_lang, &netMsg);
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring text;
+        uint32_t color = 0x64748B;
+        if (netState == NetShares::ListState::Loading) {
+            text = (pl ? L"Łączenie z serwerem " : L"Connecting to the server ") + m_currentPath +
+                   (pl ? L"\x2026\nPobieranie listy udostępnionych folderów." : L"\x2026\nReading the list of its shared folders.");
+        } else if (netState == NetShares::ListState::Failed) {
+            text = (pl ? L"Nie udało się odczytać listy udziałów.\n\n" : L"The list of shares could not be read.\n\n") + netMsg;
+            color = 0xB91C1C;
+        } else {
+            text = pl ? L"Ten serwer nie udostępnia żadnych folderów.\nUkryte udziały (z \"$\" na końcu nazwy) trzeba wpisać w pasek adresu, np. \\\\serwer\\C$."
+                      : L"This server shares no folders.\nHidden shares (ending in \"$\") have to be typed in the address bar, e.g. \\\\server\\C$.";
+        }
+        const D2D1_RECT_F itemsR = GetContentItemsRect();
+        const D2D1_RECT_F msgR = D2D1::RectF(itemsR.left + 40.0f, itemsR.top + 60.0f, itemsR.right - 40.0f, itemsR.bottom - 20.0f);
+        m_solidBrush->SetColor(HexColor(color));
+        m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        DrawTextCached(text.c_str(), static_cast<UINT32>(text.size()), m_fmtCenterSmall, msgR, m_solidBrush);
+    }
+    if (m_items.empty() && !m_isSearchActive && repoFolder) {
         std::wstring repoMsg;
         const RepoBrowser::ListState repoState = RepoBrowser::PeekState(m_currentPath, &repoMsg);
         const bool pl = (m_lang == Lang::PL);
@@ -2798,7 +2823,7 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
         }
 
         // Column 4: Operacje (Kosz / Przywróć + Trwale usuń buttons with confirmation!); none in a read-only repository
-        if (m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+        if (m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath) && !NetShares::IsServerRoot(m_currentPath)) {
             float opColX = rect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
             D2D1_RECT_F rTrash = D2D1::RectF(opColX + (inRecycleBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inRecycleBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
             D2D1_RECT_F rPerm  = D2D1::RectF(opColX + (inRecycleBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
@@ -6285,7 +6310,7 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     if (st.clientMissing || (!loaded && !st.lastError.empty() && !busy)) {
         std::wstring msg = !st.clientMissing ? st.lastError
             : svn ? (pl ? L"Aby zobaczyć zmiany i historię tej kopii roboczej zainstaluj klienta Subversion działającego w wierszu poleceń (svn.exe), "
-                          L"np. TortoiseSVN z opcją „command line client tools” albo SlikSVN, i otwórz folder ponownie."
+                          L"np. TortoiseSVN z opcją \"command line client tools\" albo SlikSVN, i otwórz folder ponownie."
                         : L"Install a command-line Subversion client (svn.exe), such as TortoiseSVN with its \"command line client tools\" "
                           L"option or SlikSVN, to see this working copy's changes and history, then reopen the folder.")
                   : (pl ? L"Aby zobaczyć commity i gałęzie zainstaluj Git for Windows (git-scm.com) i otwórz folder ponownie."
