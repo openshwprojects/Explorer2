@@ -1,4 +1,6 @@
 #include "GitIntegration.h"
+#include "SvnWorkingCopy.h"
+#include "ToolProcess.h"
 
 #include <algorithm>
 #include <cwchar>
@@ -14,6 +16,8 @@ namespace {
 constexpr DWORD  kTimeoutNormalMs  = 20 * 1000;
 constexpr DWORD  kTimeoutStatusMs  = 45 * 1000;     // status on a repo with 100k+ files can legitimately be slow
 constexpr DWORD  kTimeoutNetworkMs = 120 * 1000;    // fetch / pull / push
+constexpr DWORD  kTimeoutSvnServerMs = 60 * 1000;   // svn log / svn status -u ask the repository server
+constexpr ULONGLONG kSvnLogMaxAgeMs = 5 * 60 * 1000; // a Subversion history is read from the server at most this often
 constexpr size_t kMaxCapture       = 64u << 20;     // hard cap on bytes kept per stream (status of huge trees)
 constexpr size_t kMaxOutputChars   = 64u * 1024;    // text exposed through SnapshotOutput()
 constexpr size_t kMaxChanges       = 500;
@@ -28,43 +32,15 @@ std::wstring g_gitPath;                 // empty = not found
 ULONGLONG g_gitLastProbeTick = 0;
 bool g_gitProbed = false;
 
-bool FileExists(const std::wstring& p) {
-    DWORD a = GetFileAttributesW(p.c_str());
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-std::wstring GetEnv(const wchar_t* name) {
-    DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
-    if (n == 0) return {};
-    std::wstring v(n, L'\0');
-    DWORD got = GetEnvironmentVariableW(name, v.data(), n);
-    v.resize(got);
-    return v;
-}
-
 std::wstring ProbeGit() {
-    // PATH walk done by hand: SearchPathW would also look in the current directory (binary planting).
-    std::wstring path = GetEnv(L"PATH");
-    size_t pos = 0;
-    while (pos <= path.size()) {
-        size_t semi = path.find(L';', pos);
-        if (semi == std::wstring::npos) semi = path.size();
-        std::wstring dir = path.substr(pos, semi - pos);
-        pos = semi + 1;
-        dir.erase(std::remove(dir.begin(), dir.end(), L'"'), dir.end());
-        while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) dir.pop_back();
-        if (dir.size() < 3 || dir[1] != L':') continue;     // skip relative / empty entries
-        std::wstring cand = dir + L"\\git.exe";
-        if (FileExists(cand)) return cand;
-    }
-    const std::wstring roots[] = { GetEnv(L"ProgramFiles"), GetEnv(L"ProgramFiles(x86)"), L"C:\\Program Files",
-                                   GetEnv(L"LOCALAPPDATA") + L"\\Programs" };
-    for (const auto& r : roots) {
+    using ToolProcess::GetEnv;
+    std::vector<std::wstring> candidates;
+    for (const std::wstring& r : { GetEnv(L"ProgramFiles"), GetEnv(L"ProgramFiles(x86)"), std::wstring(L"C:\\Program Files"),
+                                   GetEnv(L"LOCALAPPDATA") + L"\\Programs" }) {
         if (r.empty() || r == L"\\Programs") continue;
-        std::wstring cand = r + L"\\Git\\cmd\\git.exe";
-        if (FileExists(cand)) return cand;
+        candidates.push_back(r + L"\\Git\\cmd\\git.exe");
     }
-    return {};
+    return ToolProcess::FindExecutable(L"git.exe", candidates);
 }
 
 // Returns the path of git.exe or empty.
@@ -137,12 +113,7 @@ std::wstring NormalizeOutputText(const std::wstring& in) {
     return o;
 }
 
-std::wstring FirstLine(const std::wstring& s) {
-    std::wstring t = s;
-    TrimInPlace(t);
-    size_t nl = t.find_first_of(L"\r\n");
-    return nl == std::wstring::npos ? t : t.substr(0, nl);
-}
+using ToolProcess::FirstLine;
 
 bool Contains(const std::wstring& hay, const wchar_t* needle) { return hay.find(needle) != std::wstring::npos; }
 
@@ -154,7 +125,7 @@ bool IsSafeRefArg(const std::wstring& a) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Process runner
+// Process runner (ToolProcess does the work; git adds its fixed prefix and environment)
 // ---------------------------------------------------------------------------------------------------------------
 struct RunOptions {
     bool readOnly = true;           // adds --no-optional-locks and GIT_OPTIONAL_LOCKS=0
@@ -163,181 +134,23 @@ struct RunOptions {
     size_t maxBytes = kMaxCapture;
 };
 
-struct RunResult {
-    bool started = false;           // CreateProcess succeeded
-    bool notFound = false;          // git.exe missing
-    bool timedOut = false;
-    bool cancelled = false;         // object is being destroyed
-    DWORD exitCode = (DWORD)-1;
-    std::string out, err;
-    bool ok() const { return started && !timedOut && !cancelled && exitCode == 0; }
-};
+using RunResult = ToolProcess::Result;
 
-void AppendQuotedArg(std::wstring& cl, const std::wstring& a) {
-    cl += L' ';
-    if (!a.empty() && a.find_first_of(L" \t\n\v\"") == std::wstring::npos) { cl += a; return; }
-    // Standard CommandLineToArgvW-compatible quoting.
-    cl += L'"';
-    for (auto it = a.begin();; ++it) {
-        size_t bs = 0;
-        while (it != a.end() && *it == L'\\') { ++it; ++bs; }
-        if (it == a.end()) { cl.append(bs * 2, L'\\'); break; }
-        if (*it == L'"') { cl.append(bs * 2 + 1, L'\\'); cl.push_back(L'"'); }
-        else { cl.append(bs, L'\\'); cl.push_back(*it); }
-    }
-    cl += L'"';
-}
-
-bool EnvNameIs(const wchar_t* entry, const wchar_t* name) {
-    size_t n = wcslen(name);
-    return _wcsnicmp(entry, name, n) == 0 && entry[n] == L'=';
-}
-
-// Current environment + our overrides, as a CREATE_UNICODE_ENVIRONMENT block.
-std::wstring BuildEnvironment(bool readOnly) {
-    std::wstring block;
-    bool hasSshCmd = false;
-    if (LPWCH env = GetEnvironmentStringsW()) {
-        for (const wchar_t* p = env; *p;) {
-            size_t len = wcslen(p);
-            bool ours = EnvNameIs(p, L"GIT_TERMINAL_PROMPT") || EnvNameIs(p, L"GCM_INTERACTIVE") ||
-                        (readOnly && EnvNameIs(p, L"GIT_OPTIONAL_LOCKS"));
-            if (EnvNameIs(p, L"GIT_SSH_COMMAND")) hasSshCmd = true;
-            if (!ours) { block.append(p, len); block.push_back(L'\0'); }
-            p += len + 1;
-        }
-        FreeEnvironmentStringsW(env);
-    }
-    auto add = [&](const wchar_t* kv) { block += kv; block.push_back(L'\0'); };
-    add(L"GIT_TERMINAL_PROMPT=0");          // never wait for a username/password on the (invisible) console
-    add(L"GCM_INTERACTIVE=never");          // Git Credential Manager: no GUI prompt either
-    if (!hasSshCmd) add(L"GIT_SSH_COMMAND=ssh -o BatchMode=yes");   // ssh must not ask for passphrases
-    if (readOnly) add(L"GIT_OPTIONAL_LOCKS=0");
-    block.push_back(L'\0');
-    return block;
-}
-
-// Moves everything currently readable from `h` into `dst` (never blocks). Returns true when bytes were read.
-bool Drain(HANDLE h, std::string& dst, size_t maxBytes) {
-    if (!h) return false;
-    bool any = false;
-    char buf[65536];
-    for (;;) {
-        DWORD avail = 0;
-        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) || avail == 0) return any;
-        DWORD got = 0;
-        if (!ReadFile(h, buf, std::min<DWORD>(avail, sizeof(buf)), &got, nullptr) || got == 0) return any;
-        any = true;
-        if (dst.size() < maxBytes) dst.append(buf, std::min<size_t>(got, maxBytes - dst.size()));
-        // else: keep draining so the child never blocks on a full pipe, but drop the data
-    }
-}
-
-// Runs git with the standard prefix. Output is polled with PeekNamedPipe on this thread, so a large stdout and a
-// large stderr can never dead-lock each other, and a grand-child that inherited the pipe can never keep us waiting
-// after git.exe itself has exited.
 RunResult RunGit(const std::wstring& root, const std::vector<std::wstring>& cmdArgs, const RunOptions& opt,
                  const std::atomic<bool>& stop) {
-    RunResult res;
     const std::wstring gitPath = GetGitPath();
-    if (gitPath.empty()) { res.notFound = true; return res; }
+    if (gitPath.empty()) { RunResult res; res.notFound = true; return res; }
 
-    std::wstring cl = L"\"" + gitPath + L"\"";
-    AppendQuotedArg(cl, L"-C"); AppendQuotedArg(cl, root);
-    AppendQuotedArg(cl, L"-c"); AppendQuotedArg(cl, L"core.quotepath=false");
-    AppendQuotedArg(cl, L"-c"); AppendQuotedArg(cl, L"i18n.logOutputEncoding=UTF-8");
-    if (opt.readOnly) AppendQuotedArg(cl, L"--no-optional-locks");
-    for (const auto& a : cmdArgs) AppendQuotedArg(cl, a);
+    std::vector<std::wstring> args = { L"-C", root, L"-c", L"core.quotepath=false", L"-c", L"i18n.logOutputEncoding=UTF-8" };
+    if (opt.readOnly) args.push_back(L"--no-optional-locks");
+    args.insert(args.end(), cmdArgs.begin(), cmdArgs.end());
 
-    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
-    HANDLE outR = nullptr, outW = nullptr, errR = nullptr, errW = nullptr, nul = INVALID_HANDLE_VALUE;
-    auto closeAll = [&]() {
-        for (HANDLE* h : { &outR, &outW, &errR, &errW }) if (*h) { CloseHandle(*h); *h = nullptr; }
-        if (nul != INVALID_HANDLE_VALUE) { CloseHandle(nul); nul = INVALID_HANDLE_VALUE; }
-    };
-
-    if (!CreatePipe(&outR, &outW, &sa, 1 << 16)) return res;
-    SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);                 // parent end must not leak into the child
-    if (!opt.mergeStderr) {
-        if (!CreatePipe(&errR, &errW, &sa, 1 << 16)) { closeAll(); return res; }
-        SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
-    }
-    nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
-    if (nul == INVALID_HANDLE_VALUE) { closeAll(); return res; }
-    HANDLE childErr = opt.mergeStderr ? outW : errW;
-
-    // Restrict inheritance to exactly the three std handles (other threads of the app may spawn processes too).
-    const DWORD inheritCount = (outW == childErr) ? 2 : 3;
-    HANDLE listed[3] = { nul, outW, childErr };
-    if (inheritCount == 2) { listed[1] = outW; listed[2] = nullptr; }
-
-    SIZE_T attrSize = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
-    std::vector<char> attrBuf(attrSize);
-    auto* attrList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
-    bool attrOk = InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) != FALSE;
-    if (attrOk && !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, listed,
-                                             inheritCount * sizeof(HANDLE), nullptr, nullptr)) {
-        DeleteProcThreadAttributeList(attrList);
-        attrOk = false;
-    }
-    if (!attrOk) { closeAll(); return res; }
-
-    STARTUPINFOEXW si{};
-    si.StartupInfo.cb = sizeof(si);
-    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = nul;
-    si.StartupInfo.hStdOutput = outW;
-    si.StartupInfo.hStdError = childErr;
-    si.lpAttributeList = attrList;
-
-    std::wstring env = BuildEnvironment(opt.readOnly);
-    PROCESS_INFORMATION pi{};
-    const DWORD flags = CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
-    BOOL created = CreateProcessW(gitPath.c_str(), cl.data(), nullptr, nullptr, TRUE, flags, env.data(), nullptr,
-                                  &si.StartupInfo, &pi);
-    DWORD createErr = GetLastError();
-    DeleteProcThreadAttributeList(attrList);
-    // The child owns its copies now; closing ours is what lets us see EOF-style behaviour and frees the handles.
-    CloseHandle(outW); outW = nullptr;
-    if (errW) { CloseHandle(errW); errW = nullptr; }
-    CloseHandle(nul); nul = INVALID_HANDLE_VALUE;
-
-    if (!created) {
-        res.notFound = (createErr == ERROR_FILE_NOT_FOUND || createErr == ERROR_PATH_NOT_FOUND);
-        closeAll();
-        return res;
-    }
-    res.started = true;
-
-    // Put git into a job so a timeout also kills helpers it spawned (ssh, git-remote-https). No kill-on-close
-    // limit: on a normal exit we deliberately leave background helpers (e.g. fsmonitor) alone.
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
-    if (job && !AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = nullptr; }
-    ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
-
-    auto kill = [&]() {
-        if (job) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 2000);
-    };
-
-    const ULONGLONG startTick = GetTickCount64();
-    bool exited = false;
-    for (;;) {
-        bool got = Drain(outR, res.out, opt.maxBytes);
-        got |= Drain(errR, res.err, opt.maxBytes);
-        if (exited) { if (!got) break; continue; }      // final drain after exit
-        if (stop.load()) { kill(); res.cancelled = true; break; }
-        if (GetTickCount64() - startTick > opt.timeoutMs) { kill(); res.timedOut = true; break; }
-        if (!got && WaitForSingleObject(pi.hProcess, 4) == WAIT_OBJECT_0) exited = true;
-    }
-    DWORD code = (DWORD)-1;
-    if (GetExitCodeProcess(pi.hProcess, &code) && code != STILL_ACTIVE) res.exitCode = code;
-    CloseHandle(pi.hProcess);
-    if (job) CloseHandle(job);
-    closeAll();
-    return res;
+    ToolProcess::Options o;
+    o.mergeStderr = opt.mergeStderr;
+    o.timeoutMs = opt.timeoutMs;
+    o.maxBytes = opt.maxBytes;
+    GitIntegration::ApplyGitEnvironment(o, opt.readOnly);
+    return ToolProcess::Run(gitPath, args, o, stop);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -455,8 +268,17 @@ void ParseBranches(const std::wstring& text, std::vector<GitBranch>& out) {
 // Static helpers
 // =================================================================================================================
 bool GitIntegration::IsGitInstalled() { return !GetGitPath().empty(); }
+std::wstring GitIntegration::GitExePath() { return GetGitPath(); }
 
-std::wstring GitIntegration::FindRepoRoot(const std::wstring& folder) {
+void GitIntegration::ApplyGitEnvironment(ToolProcess::Options& o, bool readOnly) {
+    o.envOverride = { L"GIT_TERMINAL_PROMPT=0",         // never wait for a username/password on the (invisible) console
+                      L"GCM_INTERACTIVE=never" };       // Git Credential Manager: no GUI prompt either
+    if (readOnly) o.envOverride.push_back(L"GIT_OPTIONAL_LOCKS=0");
+    o.envDefault = { L"GIT_SSH_COMMAND=ssh -o BatchMode=yes" };   // ssh must not ask for passphrases
+}
+
+std::wstring GitIntegration::FindRepoRoot(const std::wstring& folder, VcsKind* kind) {
+    if (kind) *kind = VcsKind::Git;
     if (folder.empty() || IsVirtualFolder(folder) || folder.find(L"://") != std::wstring::npos) return {};
     wchar_t full[MAX_PATH * 4];
     DWORD n = GetFullPathNameW(folder.c_str(), (DWORD)(sizeof(full) / sizeof(full[0])), full, nullptr);
@@ -472,10 +294,15 @@ std::wstring GitIntegration::FindRepoRoot(const std::wstring& folder) {
     for (;;) {
         while (cur.size() > 3 && (cur.back() == L'\\' || cur.back() == L'/')) cur.pop_back();
         if (!startIsFile) {
-            std::wstring dotGit = cur;
-            if (dotGit.back() != L'\\') dotGit += L'\\';
-            dotGit += L".git";
-            if (GetFileAttributesW(dotGit.c_str()) != INVALID_FILE_ATTRIBUTES) return cur;   // dir or file
+            std::wstring base = cur;
+            if (base.back() != L'\\') base += L'\\';
+            if (GetFileAttributesW((base + L".git").c_str()) != INVALID_FILE_ATTRIBUTES) return cur;   // dir or file
+            // Subversion 1.7 and later keep a single .svn folder, at the root of the working copy
+            const DWORD svnAttr = GetFileAttributesW((base + L".svn").c_str());
+            if (svnAttr != INVALID_FILE_ATTRIBUTES && (svnAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+                if (kind) *kind = VcsKind::Svn;
+                return cur;
+            }
         }
         startIsFile = false;
         size_t slash = cur.find_last_of(L'\\');
@@ -505,6 +332,7 @@ GitIntegration::~GitIntegration() {
     {
         std::lock_guard<std::mutex> lk(m_mutex);
         m_stop = true;                  // RunGit polls this flag and kills the child within a few milliseconds
+        m_abandon = true;               // the same for svn
     }
     m_cv.notify_all();
     if (m_worker.joinable()) m_worker.join();
@@ -513,17 +341,22 @@ GitIntegration::~GitIntegration() {
 // =================================================================================================================
 // Public API
 // =================================================================================================================
-void GitIntegration::RequestRefresh(const std::wstring& repoRoot) {
+void GitIntegration::RequestRefresh(const std::wstring& repoRoot, VcsKind kind, bool full) {
     if (repoRoot.empty()) return;
     {
         std::lock_guard<std::mutex> lk(m_mutex);
-        if (m_state.root != repoRoot) {                 // never show another repo's data under the new root
+        if (m_state.root != repoRoot || m_state.kind != kind) {   // never show another repo's data under the new root
             m_state = GitRepoState();
             m_state.root = repoRoot;
+            m_state.kind = kind;
             ++m_version;
         }
-        m_pendingRefreshRoot = repoRoot;                // coalesce: only the newest root matters
+        // coalesce: only the newest root matters (and a full refresh asked for while one is pending stays full)
+        m_pendingRefreshFull = (m_hasPendingRefresh && m_pendingRefreshRoot == repoRoot && m_pendingRefreshFull) || full;
+        m_pendingRefreshRoot = repoRoot;
+        m_pendingRefreshKind = kind;
         m_hasPendingRefresh = true;
+        if (m_running && !m_runningRoot.empty() && m_runningRoot != repoRoot) m_abandon = true;
     }
     m_cv.notify_all();
 }
@@ -540,6 +373,7 @@ void GitIntegration::RunAction(const std::wstring& repoRoot, GitAction action, c
         Request r;
         r.kind = Request::Kind::Action;
         r.root = repoRoot; r.action = action; r.arg = arg;
+        r.vcs = (m_state.root == repoRoot) ? m_state.kind : VcsKind::Git;   // actions act on the repo being shown
         m_actions.push_back(std::move(r));
         ++m_version;                                    // IsBusy() just became true
     }
@@ -607,17 +441,29 @@ void GitIntegration::WorkerMain() {
         } else {
             req.kind = Request::Kind::Refresh;
             req.root = m_pendingRefreshRoot;
+            req.vcs = m_pendingRefreshKind;
+            req.full = m_pendingRefreshFull;
             m_hasPendingRefresh = false;                // requests arriving while we run schedule one more pass
+            m_pendingRefreshFull = false;
         }
         m_running = true;
+        m_runningRoot = req.root;
+        m_abandon = m_stop.load();
         ++m_version;
         lk.unlock();
 
-        if (req.kind == Request::Kind::Action) DoAction(req);
-        else DoRefresh(req.root);
+        if (req.kind == Request::Kind::Action) {
+            if (req.vcs == VcsKind::Svn) DoActionSvn(req);
+            else DoAction(req);
+        } else if (req.vcs == VcsKind::Svn) {
+            DoRefreshSvn(req.root, req.full);
+        } else {
+            DoRefresh(req.root);
+        }
 
         lk.lock();
         m_running = false;
+        m_runningRoot.clear();
         m_busyDescription.clear();
         ++m_version;
     }
@@ -632,7 +478,7 @@ void GitIntegration::DoRefresh(const std::wstring& root) {
     }
     GitRepoState s = prev;                              // fall back to the previous snapshot on soft failures
     s.root = root;
-    s.gitMissing = false;
+    s.clientMissing = false;
 
     auto publish = [&](GitRepoState& st) {
         std::lock_guard<std::mutex> lk(m_mutex);
@@ -646,7 +492,7 @@ void GitIntegration::DoRefresh(const std::wstring& root) {
         publish(s);
     };
 
-    if (!GitIntegration::IsGitInstalled()) { s = GitRepoState(); s.root = root; s.gitMissing = true; publish(s); return; }
+    if (!GitIntegration::IsGitInstalled()) { s = GitRepoState(); s.root = root; s.clientMissing = true; publish(s); return; }
 
     // All queries are independent and each costs a process start (~60 ms on Windows), so they run concurrently
     // on short-lived helper threads, each writing only to its own result slot (RunGit is re-entrant). Helpers are
@@ -674,7 +520,7 @@ void GitIntegration::DoRefresh(const std::wstring& root) {
     }
     if (m_stop) return;
 
-    if (st.notFound) { s = GitRepoState(); s.root = root; s.gitMissing = true; publish(s); return; }
+    if (st.notFound) { s = GitRepoState(); s.root = root; s.clientMissing = true; publish(s); return; }
     if (!st.started) { fail(L"Cannot start git", false); return; }
     if (st.timedOut) { fail(L"git status timed out", false); return; }
     if (!st.ok()) {
@@ -789,6 +635,159 @@ void GitIntegration::DoAction(const Request& req) {
     SetOutput(std::move(text), ok);
 
     if (mutating) RequestRefresh(root);                 // branch / ahead-behind / file list changed
+}
+
+// =================================================================================================================
+// Subversion working copies (read-only)
+// =================================================================================================================
+void GitIntegration::DoRefreshSvn(const std::wstring& root, bool full) {
+    SetBusy(L"svn status");
+    GitRepoState prev;
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_state.root == root && m_state.kind == VcsKind::Svn) prev = m_state;
+    }
+    auto publish = [&](const GitRepoState& st) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_hasPendingRefresh && m_pendingRefreshRoot != root) return;    // user already moved to another folder
+        m_state = st;
+        ++m_version;
+    };
+    auto fail = [&](const std::wstring& msg, bool invalidate) {
+        GitRepoState s = prev;                          // fall back to the previous snapshot on soft failures
+        s.root = root;
+        s.kind = VcsKind::Svn;
+        s.clientMissing = false;
+        s.lastError = msg.empty() ? std::wstring(L"svn failed") : msg;
+        if (invalidate || !prev.valid) s.valid = false;
+        publish(s);
+    };
+    auto missing = [&]() {
+        GitRepoState s;
+        s.root = root;
+        s.kind = VcsKind::Svn;
+        s.clientMissing = true;
+        publish(s);
+    };
+    if (Svn::FindSvnExe().empty()) { missing(); return; }
+
+    // `svn info` and `svn status` read only the working copy, so they are quick; both run at once
+    RunResult info, st;
+    {
+        std::thread infoThread([&] { info = Svn::Run(root, { L"info", L"--xml" }, kTimeoutNormalMs, m_abandon); });
+        st = Svn::Run(root, { L"status", L"--xml", L"--ignore-externals" }, kTimeoutStatusMs, m_abandon, kMaxCapture);
+        infoThread.join();
+    }
+    if (m_stop || m_abandon) return;                   // shutting down, or another folder is wanted
+    if (info.notFound || st.notFound) { missing(); return; }
+    if (!info.started || !st.started) { fail(L"Cannot start svn", false); return; }
+    if (info.timedOut || st.timedOut) { fail(L"svn timed out", false); return; }
+    if (!info.ok()) {
+        const std::wstring err = FirstLine(ToolProcess::DecodeOutput(info.err));
+        // E155007: not a working copy; E155021 / E155036: written by a newer / older client than this svn.exe
+        fail(err, Contains(err, L"E155007") || Contains(err, L"E155021") || Contains(err, L"E155036"));
+        return;
+    }
+
+    GitRepoState n;                                     // build fresh, publish once everything local is known
+    n.kind = VcsKind::Svn;
+    n.root = root;
+    if (!Svn::ParseInfoXml(info.out, n.svn)) { fail(L"svn info printed nothing that could be read", false); return; }
+    n.branch = Svn::PathInRepository(n.svn);
+    n.remoteUrl = n.svn.url;
+    n.headShort = L"r" + std::to_wstring(n.svn.revision);
+    if (!st.ok()) {                                     // e.g. the working copy's database is busy: keep what was shown
+        fail(FirstLine(ToolProcess::DecodeOutput(st.err)), false);
+        return;
+    }
+    Svn::ParseStatusXml(st.out, n, kMaxChanges);
+
+    // The history comes from the server: shown from the previous read while that is recent and the working copy
+    // is still at the same revision; otherwise the local state is shown first and the history follows
+    const ULONGLONG now = GetTickCount64();
+    const bool logFresh = prev.valid && prev.logTick != 0 && prev.svn.revision == n.svn.revision &&
+                          now - prev.logTick < kSvnLogMaxAgeMs;
+    if (prev.valid) {
+        n.commits = prev.commits;
+        n.logError = prev.logError;
+        n.logTick = prev.logTick;
+    }
+    n.valid = true;
+    n.refreshedTick = now;
+    publish(n);
+    if (logFresh && !full) return;
+
+    SetBusy(L"svn log");
+    RunResult lg = Svn::Run(root, { L"log", L"--xml", L"-l", std::to_wstring(kMaxCommits) }, kTimeoutSvnServerMs, m_abandon);
+    if (m_stop || m_abandon || lg.cancelled) return;
+    if (lg.ok()) {
+        Svn::ParseLogXml(lg.out, n.commits, Svn::NowUnix());
+        n.logError.clear();
+    } else {
+        n.logError = lg.timedOut ? std::wstring(L"The server did not answer (svn log timed out).")
+                                 : FirstLine(ToolProcess::DecodeOutput(lg.err));
+        if (n.logError.empty()) n.logError = L"svn log failed";
+    }
+    n.logTick = GetTickCount64();                       // after a failure too: asked again in a few minutes, not every 20 s
+    publish(n);
+}
+
+void GitIntegration::DoActionSvn(const Request& req) {
+    std::vector<std::wstring> args;
+    DWORD timeout = kTimeoutNormalMs;
+    size_t maxBytes = 16u << 20;
+    switch (req.action) {
+    case GitAction::ShowCommit: {
+        const bool digits = !req.arg.empty() && req.arg.size() <= 10 &&
+                            std::all_of(req.arg.begin(), req.arg.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+        if (!digits) { SetOutput(L"Invalid revision number.", false); return; }
+        args = { L"log", L"-v", L"--xml", L"-r", req.arg };
+        timeout = kTimeoutSvnServerMs;
+        break;
+    }
+    case GitAction::ShowDiffStat:
+        // --internal-diff: a diff program set in the user's svn configuration must not be started (it may be a GUI)
+        args = { L"diff", L"--internal-diff" };
+        timeout = kTimeoutStatusMs;
+        maxBytes = 32u << 20;
+        break;
+    case GitAction::CheckUpdates:
+        args = { L"status", L"-u", L"--xml", L"--ignore-externals" };
+        timeout = kTimeoutSvnServerMs;
+        break;
+    default:
+        SetOutput(L"This action is not available for Subversion working copies: Explorer2 only reads them.", false);
+        return;
+    }
+
+    std::wstring desc = L"svn";
+    for (const auto& a : args) { desc += L' '; desc += a; }
+    SetBusy(desc);
+
+    RunResult r = Svn::Run(req.root, args, timeout, m_stop, maxBytes);
+    if (r.cancelled) return;
+
+    std::wstring text;
+    const bool ok = r.ok();
+    if (r.notFound) {
+        text = L"svn.exe was not found.";
+    } else if (!r.started) {
+        text = L"Cannot start svn.";
+    } else if (r.timedOut) {
+        text = L"[svn timed out after " + std::to_wstring(timeout / 1000) + L" s and was terminated]";
+    } else if (!ok) {
+        text = NormalizeOutputText(ToolProcess::DecodeOutput(r.err));
+        if (text.empty()) text = L"svn failed (exit code " + std::to_wstring(static_cast<int>(r.exitCode)) + L").";
+    } else if (req.action == GitAction::ShowCommit) {
+        text = Svn::FormatRevisionText(r.out);
+    } else if (req.action == GitAction::CheckUpdates) {
+        text = Svn::FormatUpdatesText(r.out);
+    } else {
+        text = Svn::DiffStatText(r.out);
+        if (text.empty()) text = L"No local changes.";
+        else if (r.out.size() >= maxBytes) text += L"\n(the diff was larger than " + std::to_wstring(maxBytes >> 20) + L" MB; this covers its beginning)";
+    }
+    SetOutput(NormalizeOutputText(text), ok);
 }
 
 } // namespace Explorer2

@@ -190,7 +190,7 @@ enum CommandId : int {
     CMD_LAN_COPY = 192,            // copy actionArg to the clipboard
 
     // Git dock
-    CMD_TOGGLE_GIT = 193,          // "Integracja GIT" checkbox
+    CMD_TOGGLE_GIT = 193,          // "Integracja Git / SVN" checkbox
     CMD_TAB_LOG = 194,             // "Log" tab
     CMD_LOG_LEVEL = 195,           // cycle the minimum level filter (all / warnings+ / errors)
     CMD_LOG_CLEAR = 196,           // clear the on-screen list (the file is kept)

@@ -50,6 +50,9 @@ void RunFormatTestsDocs(TestCounter& tc);      // FormatTestsDocs.cpp (office, d
 void RunFormatTestsDocsB(TestCounter& tc);     // FormatTestsDocsB.cpp (binary, media and system formats)
 void RunFormatTestsArchives(TestCounter& tc);  // FormatTestsArchives.cpp
 
+// Stage 12 (also alone as "vcs"): the version-control dock's back end, Subversion working copies (SelfTestVcs.cpp)
+void RunVcsTests(TestCounter& tc);
+
 // 70-Format Roadmap Batch Suite (FormatTestsBatch70.cpp — fast incremental compilation unit)
 void RunFormatTests3DBatch70(TestCounter& tc);
 void RunFormatTestsImagesBatch70(TestCounter& tc);

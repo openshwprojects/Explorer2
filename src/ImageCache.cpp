@@ -3,6 +3,7 @@
 #include "ImageFormatLoader.h"
 #include "ArchiveExplorer.h"
 #include "FtpClient.h"
+#include "RepoBrowser.h"
 #include "ShellMenuEmulator.h"
 #include "PathUtils.h"
 #include <wrl/client.h>
@@ -156,9 +157,11 @@ bool ImageCache::DecodeImageFromDiskZeroLock(
             outBuf.failed = true;
             return false;
         }
-    } else if (FtpClient::IsFtpPath(path)) {
+    } else if (FtpClient::IsFtpPath(path) || RepoBrowser::IsRepoUrl(path)) {
         std::wstring tempFile;
-        if (!FtpClient::DownloadFtpFileToTempCache(path, tempFile) || tempFile.empty() ||
+        const bool fetched = FtpClient::IsFtpPath(path) ? FtpClient::DownloadFtpFileToTempCache(path, tempFile)
+                                                         : RepoBrowser::FetchFileToTemp(path, tempFile);
+        if (!fetched || tempFile.empty() ||
             !PathUtils::ReadFileBytes(tempFile, 256ULL * 1024 * 1024, fileBytes) || fileBytes.empty()) {
             outBuf.failed = true;
             return false;
@@ -299,7 +302,7 @@ bool ImageCache::DecodeShellThumbnail(
     RawImageBuffer& outBuf)
 {
     outBuf = {};
-    if (FtpClient::IsFtpPath(path)) {
+    if (FtpClient::IsFtpPath(path) || RepoBrowser::IsRepoUrl(path)) {
         outBuf.failed = true;
         return false;
     }
@@ -616,7 +619,8 @@ ID2D1Bitmap* ImageCache::GetOrQueueThumbnail(ID2D1RenderTarget* rt, const std::w
 }
 
 bool ImageCache::GetOrQueueFolderPreview(const std::wstring& folderPath, const std::wstring& normKey, FolderPreviewData& outPreview) {
-    if (folderPath.empty() || normKey.empty() || IsVirtualFolder(folderPath) || FtpClient::IsFtpPath(folderPath)) return false;
+    if (folderPath.empty() || normKey.empty() || IsVirtualFolder(folderPath) || FtpClient::IsFtpPath(folderPath) ||
+        RepoBrowser::IsRepoUrl(folderPath)) return false;
     m_thumbNotifyPending.store(false, std::memory_order_relaxed);
 
     {
@@ -911,7 +915,7 @@ std::vector<ImageTransformResult> ImageCache::TakeCompletedTransforms() {
 }
 
 int ImageCache::GetOrQueuePerFileIconIndex(const std::wstring& path, int fallbackSysIconIndex) {
-    if (path.empty() || FtpClient::IsFtpPath(path) || ArchiveExplorer::IsVirtualArchivePath(path)) {
+    if (path.empty() || FtpClient::IsFtpPath(path) || RepoBrowser::IsRepoUrl(path) || ArchiveExplorer::IsVirtualArchivePath(path)) {
         return fallbackSysIconIndex;
     }
     m_iconNotifyPending.store(false, std::memory_order_relaxed);

@@ -7168,6 +7168,9 @@ int RunStageTests(const std::wstring& stageName, const std::wstring& outReportPa
     if (stageLower == L"12" || stageLower == L"stage12" || stageLower == L"pdf" || stageLower == L"all") {
         RunStage12Tests(tc);
     }
+    if (stageLower == L"12" || stageLower == L"stage12" || stageLower == L"vcs" || stageLower == L"all") {
+        RunVcsTests(tc);
+    }
     if (stageLower == L"13" || stageLower == L"stage13" || stageLower == L"transfers" || stageLower == L"all") {
         RunStage13Tests(tc);
     }

@@ -118,7 +118,7 @@ private:
     void StartExtractJob(const std::wstring& archivePath, const std::wstring& targetFolder, bool toSubfolder);
     void ShowRenameFailure(const std::wstring& oldName, const std::wstring& newName, const std::wstring& reason, DWORD err);
 
-    // Git dock (right side) for folders inside a git repository
+    // Version-control dock (right side) for folders inside a git repository or a Subversion working copy
     void DrawGitDock(const D2D1_RECT_F& dock);
     D2D1_RECT_F GetGitDockRect() const;
     // 0 = none, 1 = navigation tree splitter, 2 = git dock splitter, 3 = details column edge
@@ -132,7 +132,13 @@ private:
                m_viewMode != ViewMode::FullViewer && m_viewMode != ViewMode::Hardware;
     }
     D2D1_RECT_F GetPreviewPaneRect() const;
-    void SyncGitRepo(bool force = false);
+    // full: also re-read what comes from a server (a Subversion history), for the dock's Refresh button
+    void SyncGitRepo(bool force = false, bool full = false);
+    // Repository folders (RepoBrowser) are read-only: when `path` is one, says so in a toast and returns true
+    bool RefuseRepositoryWrite(const std::wstring& path);
+    // F5, the refresh button and the context menu: like RefreshCurrentFolder, and a repository folder is read again
+    // from its server (a listing that arrives by itself refreshes through RefreshCurrentFolder, which keeps it)
+    void RefreshFromUser();
     bool HandleGitDockClick(float x, float y, bool rightButton);
     // Saves the settings file. The write normally happens in the background; with waitUntilWritten the
     // call returns only when the file is on disk, which is what the program does on its way out.
@@ -554,9 +560,9 @@ private:
     bool m_lanInit = false;
     std::wstring m_lanSelectedIp;
 
-    // Git dock state (the git CLI work happens on GitIntegration's worker thread)
+    // Version-control dock state (the git / svn CLI work happens on GitIntegration's worker thread)
     enum GitHitKind { GH_Tab = 1, GH_Refresh, GH_Fetch, GH_Pull, GH_Push, GH_DiffStat, GH_File, GH_Commit,
-                      GH_CopyHash, GH_Branch, GH_CloseOutput, GH_CopyOutput };
+                      GH_CopyHash, GH_Branch, GH_CloseOutput, GH_CopyOutput, GH_CheckUpdates, GH_CopyText, GH_BrowseRepo };
     struct GitDockHit {
         D2D1_RECT_F rect = {};
         int kind = 0;
@@ -564,8 +570,9 @@ private:
         int index = 0;
     };
     GitIntegration m_git;
-    bool m_gitEnabled = true;                     // "Integracja GIT" checkbox (persisted)
+    bool m_gitEnabled = true;                     // "Integracja Git / SVN" checkbox (persisted)
     std::wstring m_gitRoot;                       // repo root of the current folder, empty = not a repo
+    VcsKind m_gitKind = VcsKind::Git;             // git repository or Subversion working copy
     GitRepoState m_gitState;
     std::wstring m_gitOutput;
     bool m_gitOutputOk = true;

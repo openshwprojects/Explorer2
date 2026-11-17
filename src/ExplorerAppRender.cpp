@@ -2,6 +2,8 @@
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
+#include "RepoBrowser.h"
+#include "SvnWorkingCopy.h"
 #include <shlwapi.h>
 #include <wincodec.h>
 #include <algorithm>
@@ -1090,7 +1092,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         float sx = lx + 546.0f;
         drawSmallRowButton(CMD_TOGGLE_EXT,    sx, body.top + 6.0f,  175.0f, s.chkFileExt,    m_showExtensions);
         drawSmallRowButton(CMD_TOGGLE_HIDDEN, sx, body.top + 29.0f, 175.0f, s.chkHiddenItems, m_showHidden);
-        drawSmallRowButton(CMD_TOGGLE_GIT,    sx, body.top + 52.0f, 175.0f, pl ? L"Integracja GIT" : L"Git integration", m_gitEnabled);
+        drawSmallRowButton(CMD_TOGGLE_GIT,    sx, body.top + 52.0f, 175.0f, pl ? L"Integracja Git / SVN" : L"Git / SVN integration", m_gitEnabled);
         drawGroupSeparatorAndTitle(sx, sx + 182.0f, s.grpShowHide);
 
         float dx = sx + 190.0f;
@@ -1805,6 +1807,13 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
             m_solidBrush->SetColor(HexColor(0xFFFFFF));
             m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             DrawTextCached(L"F", 1, m_fmtCenterSmall, leadIconR, m_solidBrush);
+        } else if (RepoBrowser::IsRepoUrl(m_currentPath)) {
+            const bool git = (RepoBrowser::GuessKind(m_currentPath) == RepoBrowser::Kind::Git);
+            m_solidBrush->SetColor(HexColor(git ? 0xF05133 : 0x2F6DB5));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(leadIconR, 3.0f, 3.0f), m_solidBrush);
+            m_solidBrush->SetColor(HexColor(0xFFFFFF));
+            m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            DrawTextCached(git ? L"G" : L"S", 1, m_fmtCenterSmall, leadIconR, m_solidBrush);
         } else if (m_currentPath == L"RECYCLE_BIN") {
             DrawRibbonIcon(CMD_DELETE_MAIN, leadIconR);
         } else if (m_currentPath == L"THIS_PC" || m_currentPath.empty()) {
@@ -1993,8 +2002,12 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
     m_rt->DrawRectangle(m_searchBarRect, m_solidBrush, m_isSearchActive ? 1.4f : 1.0f);
     if (!IsWindowVisible(m_searchEdit)) {
         std::wstring folderShort = m_currentPath;
-        const wchar_t* base = PathFindFileNameW(m_currentPath.c_str());
-        if (base && *base) folderShort = base;
+        if (RepoBrowser::IsRepoUrl(m_currentPath)) {
+            folderShort = RepoBrowser::LeafName(m_currentPath);         // "fix spaces", not "fix%20spaces"
+        } else {
+            const wchar_t* base = PathFindFileNameW(m_currentPath.c_str());
+            if (base && *base) folderShort = base;
+        }
         std::wstring ph = m_filterText.empty() ? (std::wstring(s.searchPlaceholder) + folderShort) : m_filterText;
         m_solidBrush->SetColor(m_filterText.empty() ? HexColor(0x767676) : HexColor(0x1E1E1E));
         D2D1_RECT_F sr = D2D1::RectF(m_searchBarRect.left + 8.0f, m_searchBarRect.top, m_searchBarRect.right - 42.0f, m_searchBarRect.bottom);
@@ -2325,6 +2338,8 @@ void ExplorerApp::DrawTabBar(const D2D1_RECT_F& barRect) {
             } else {
                 label = tabPath;
             }
+        } else if (RepoBrowser::IsRepoUrl(tabPath)) {
+            label = RepoBrowser::LeafName(tabPath);
         } else {
             label = PathUtils::GetFileName(tabPath);
             if (label.empty()) label = tabPath;
@@ -2535,6 +2550,31 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
         DrawDetailsView(viewRect);
     } else {
         DrawGridOrListView(viewRect);
+    }
+
+    // A repository folder that is still being read, or could not be read, says so where its files would be
+    if (m_items.empty() && !m_isSearchActive && RepoBrowser::IsRepoUrl(m_currentPath)) {
+        std::wstring repoMsg;
+        const RepoBrowser::ListState repoState = RepoBrowser::PeekState(m_currentPath, &repoMsg);
+        const bool pl = (m_lang == Lang::PL);
+        std::wstring text;
+        uint32_t color = 0x64748B;
+        if (repoState == RepoBrowser::ListState::Loading) {
+            text = (RepoBrowser::GuessKind(m_currentPath) == RepoBrowser::Kind::Git)
+                ? (pl ? L"Wczytywanie repozytorium git\x2026\nPierwsze otwarcie pobiera strukturę folderów (bez zawartości plików)."
+                      : L"Reading the git repository\x2026\nThe first visit downloads its folder structure (not the files' contents).")
+                : (pl ? L"Wczytywanie folderu repozytorium\x2026" : L"Reading the repository folder\x2026");
+        } else if (repoState == RepoBrowser::ListState::Failed) {
+            text = (pl ? L"Nie udało się odczytać repozytorium.\n\n" : L"The repository could not be read.\n\n") + repoMsg;
+            color = 0xB91C1C;
+        } else {
+            text = pl ? L"Ten folder jest pusty." : L"This folder is empty.";
+        }
+        const D2D1_RECT_F itemsR = GetContentItemsRect();
+        const D2D1_RECT_F msgR = D2D1::RectF(itemsR.left + 40.0f, itemsR.top + 60.0f, itemsR.right - 40.0f, itemsR.bottom - 20.0f);
+        m_solidBrush->SetColor(HexColor(color));
+        m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        DrawTextCached(text.c_str(), static_cast<UINT32>(text.size()), m_fmtCenterSmall, msgR, m_solidBrush);
     }
 
     // Draw vertical scrollbar on the right of the main view
@@ -2757,8 +2797,8 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
             m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
 
-        // Column 4: Operacje (Kosz / Przywróć + Trwale usuń buttons with confirmation!)
-        if (m_currentPath != L"THIS_PC") {
+        // Column 4: Operacje (Kosz / Przywróć + Trwale usuń buttons with confirmation!); none in a read-only repository
+        if (m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath)) {
             float opColX = rect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
             D2D1_RECT_F rTrash = D2D1::RectF(opColX + (inRecycleBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inRecycleBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
             D2D1_RECT_F rPerm  = D2D1::RectF(opColX + (inRecycleBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
@@ -6110,6 +6150,7 @@ void ExplorerApp::DrawMonitoringView(const D2D1_RECT_F& rect) {
 }
 
 // Right-side dock shown for folders inside a git repository: branch, status, changes, commits, branches.
+// For a Subversion working copy: path in the repository and revision, changes, log and `svn info` (read-only).
 void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     m_gitHits.clear();
     const bool pl = (m_lang == Lang::PL);
@@ -6124,7 +6165,8 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     }
     const GitRepoState& st = m_gitState;
     const bool busy = m_git.IsBusy();
-    const bool loaded = st.valid && st.root == m_gitRoot;
+    const bool svn = (m_gitKind == VcsKind::Svn);
+    const bool loaded = st.valid && st.root == m_gitRoot && st.kind == m_gitKind;
 
     const float left = dock.left, right = dock.right, top = dock.top;
     const float w = right - left;
@@ -6159,19 +6201,24 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     m_rt->DrawLine(D2D1::Point2F(left + 1.0f, top + headerH), D2D1::Point2F(right, top + headerH), m_solidBrush, 1.0f);
 
     D2D1_RECT_F badge = D2D1::RectF(left + 10.0f, top + 9.0f, left + 38.0f, top + 25.0f);
-    m_solidBrush->SetColor(HexColor(0xF05133));
+    m_solidBrush->SetColor(HexColor(svn ? 0x2F6DB5 : 0xF05133));
     m_rt->FillRoundedRectangle(D2D1::RoundedRect(badge, 3.0f, 3.0f), m_solidBrush);
     m_solidBrush->SetColor(HexColor(0xFFFFFF));
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    DrawTextCached(L"git", 3, m_fmtSmall, badge, m_solidBrush);
+    DrawTextCached(svn ? L"svn" : L"git", 3, m_fmtSmall, badge, m_solidBrush);
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     std::wstring branchTxt = PathUtils::GetFileName(m_gitRoot);
     if (loaded) {
-        branchTxt = st.detachedHead ? ((pl ? L"HEAD odłączony @ " : L"detached HEAD @ ") + st.headShort) : st.branch;
+        if (svn) branchTxt = st.branch;
+        else branchTxt = st.detachedHead ? ((pl ? L"HEAD odłączony @ " : L"detached HEAD @ ") + st.headShort) : st.branch;
     }
     DrawClippedText(branchTxt, D2D1::RectF(left + 46.0f, top + 6.0f, right - 96.0f, top + 28.0f), m_fmtBold, 0x0F172A);
-    if (loaded && !st.detachedHead) {
+    if (loaded && svn) {
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        DrawClippedText(st.headShort, D2D1::RectF(right - 96.0f, top + 9.0f, right - 10.0f, top + 28.0f), m_fmtSmall, 0x64748B);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    } else if (loaded && !st.detachedHead) {
         std::wstring ab;
         if (st.upstream.empty()) ab = pl ? L"brak upstream" : L"no upstream";
         else ab = L"\x2191" + std::to_wstring(st.ahead) + L" \x2193" + std::to_wstring(st.behind);
@@ -6183,13 +6230,17 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
 
     std::wstring summary;
     uint32_t summaryCol = 0x475569;
-    if (st.gitMissing) {
-        summary = pl ? L"Git nie jest zainstalowany" : L"Git is not installed";
+    if (st.clientMissing) {
+        summary = svn ? (pl ? L"Subversion (svn.exe) nie jest zainstalowany" : L"Subversion (svn.exe) is not installed")
+                      : (pl ? L"Git nie jest zainstalowany" : L"Git is not installed");
         summaryCol = 0xB91C1C;
     } else if (!loaded) {
-        summary = st.lastError.empty() ? (pl ? L"Wczytywanie stanu repozytorium…" : L"Reading repository state…") : st.lastError;
+        summary = !st.lastError.empty() ? st.lastError
+                : svn ? (pl ? L"Wczytywanie stanu kopii roboczej…" : L"Reading working copy state…")
+                      : (pl ? L"Wczytywanie stanu repozytorium…" : L"Reading repository state…");
     } else if (st.stagedCount + st.modifiedCount + st.untrackedCount + st.conflictCount == 0) {
-        summary = pl ? L"\x2713 drzewo robocze czyste" : L"\x2713 working tree clean";
+        summary = svn ? (pl ? L"\x2713 kopia robocza czysta" : L"\x2713 working copy clean")
+                      : (pl ? L"\x2713 drzewo robocze czyste" : L"\x2713 working tree clean");
         summaryCol = 0x059669;
     } else {
         auto add = [&](int n, const wchar_t* plTxt, const wchar_t* enTxt) {
@@ -6209,29 +6260,41 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     float bx = left + 10.0f;
     const float by = top + 52.0f;
     gitBtn(bx, by, 74.0f, pl ? L"\x27F3 Odśwież" : L"\x27F3 Refresh", GH_Refresh, L"");   bx += 80.0f;
-    gitBtn(bx, by, 46.0f, L"Fetch", GH_Fetch, L"");                                          bx += 52.0f;
-    gitBtn(bx, by, 42.0f, L"Pull", GH_Pull, L"");                                            bx += 48.0f;
-    gitBtn(bx, by, 44.0f, L"Push", GH_Push, L"");                                            bx += 50.0f;
-    gitBtn(bx, by, 44.0f, L"Diff", GH_DiffStat, L"");
+    if (svn) {
+        // Subversion is only read: no update / commit buttons
+        gitBtn(bx, by, 44.0f, L"Diff", GH_DiffStat, L"");                                    bx += 50.0f;
+        const float updW = pl ? 84.0f : 62.0f;
+        gitBtn(bx, by, updW, pl ? L"Aktualizacje" : L"Updates", GH_CheckUpdates, L"");      bx += updW + 6.0f;
+    } else {
+        gitBtn(bx, by, 46.0f, L"Fetch", GH_Fetch, L"");                                      bx += 52.0f;
+        gitBtn(bx, by, 42.0f, L"Pull", GH_Pull, L"");                                        bx += 48.0f;
+        gitBtn(bx, by, 44.0f, L"Push", GH_Push, L"");                                        bx += 50.0f;
+        gitBtn(bx, by, 44.0f, L"Diff", GH_DiffStat, L"");                                    bx += 50.0f;
+    }
     if (busy) {
         std::wstring bd = m_git.BusyDescription();
         if (bd.size() > 26) bd = bd.substr(0, 25) + L"\x2026";
-        if (right - (bx + 52.0f) > 60.0f) {
+        if (right - (bx + 2.0f) > 60.0f) {
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-            DrawClippedText(L"\x23F3 " + bd, D2D1::RectF(bx + 52.0f, by + 3.0f, right - 8.0f, by + 22.0f), m_fmtSmall, 0xB45309);
+            DrawClippedText(L"\x23F3 " + bd, D2D1::RectF(bx + 2.0f, by + 3.0f, right - 8.0f, by + 22.0f), m_fmtSmall, 0xB45309);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
     }
 
-    // ---- Problem states: git missing / not readable ----
-    if (st.gitMissing || (!loaded && !st.lastError.empty() && !busy)) {
-        std::wstring msg = st.gitMissing
-            ? (pl ? L"Aby zobaczyć commity i gałęzie zainstaluj Git for Windows (git-scm.com) i otwórz folder ponownie."
-                  : L"Install Git for Windows (git-scm.com) to see commits and branches, then reopen the folder.")
-            : st.lastError;
+    // ---- Problem states: git / svn missing, or not readable ----
+    if (st.clientMissing || (!loaded && !st.lastError.empty() && !busy)) {
+        std::wstring msg = !st.clientMissing ? st.lastError
+            : svn ? (pl ? L"Aby zobaczyć zmiany i historię tej kopii roboczej zainstaluj klienta Subversion działającego w wierszu poleceń (svn.exe), "
+                          L"np. TortoiseSVN z opcją „command line client tools” albo SlikSVN, i otwórz folder ponownie."
+                        : L"Install a command-line Subversion client (svn.exe), such as TortoiseSVN with its \"command line client tools\" "
+                          L"option or SlikSVN, to see this working copy's changes and history, then reopen the folder.")
+                  : (pl ? L"Aby zobaczyć commity i gałęzie zainstaluj Git for Windows (git-scm.com) i otwórz folder ponownie."
+                        : L"Install Git for Windows (git-scm.com) to see commits and branches, then reopen the folder.");
         m_rt->PushAxisAlignedClip(D2D1::RectF(left + 10.0f, top + headerH + 10.0f, right - 10.0f, dock.bottom - 10.0f), D2D1_ANTIALIAS_MODE_ALIASED);
         m_solidBrush->SetColor(HexColor(0x64748B));
-        DrawTextCached(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtSmall, D2D1::RectF(left + 10.0f, top + headerH + 10.0f, right - 10.0f, dock.bottom - 10.0f), m_solidBrush);
+        // m_fmtCenterSmall wraps (the message is longer than the dock is wide); top-aligned here
+        m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        DrawTextCached(msg.c_str(), static_cast<UINT32>(msg.size()), m_fmtCenterSmall, D2D1::RectF(left + 16.0f, top + headerH + 24.0f, right - 16.0f, dock.bottom - 10.0f), m_solidBrush);
         m_rt->PopAxisAlignedClip();
         m_gitMaxScrollY = 0.0f;
         m_rt->PopAxisAlignedClip();
@@ -6244,8 +6307,8 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     const int changeCount = st.stagedCount + st.modifiedCount + st.untrackedCount + st.conflictCount;
     const std::wstring tabLabels[3] = {
         (pl ? L"Zmiany (" : L"Changes (") + std::to_wstring(loaded ? changeCount : 0) + L")",
-        (pl ? L"Commity (" : L"Commits (") + std::to_wstring(loaded ? st.commits.size() : 0) + L")",
-        (pl ? L"Gałęzie (" : L"Branches (") + std::to_wstring(loaded ? st.branches.size() : 0) + L")"
+        (svn ? (pl ? L"Historia (" : L"Log (") : (pl ? L"Commity (" : L"Commits (")) + std::to_wstring(loaded ? st.commits.size() : 0) + L")",
+        svn ? std::wstring(L"Info") : (pl ? L"Gałęzie (" : L"Branches (") + std::to_wstring(loaded ? st.branches.size() : 0) + L")"
     };
     const float tabW = (w - 2.0f) / 3.0f;
     for (int i = 0; i < 3; ++i) {
@@ -6303,7 +6366,8 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     } else if (m_gitTab == 0) {
         const float rowH = 22.0f;
         if (st.changes.empty()) {
-            emptyMsg(pl ? L"Brak zmian — drzewo robocze czyste." : L"No changes — working tree clean.");
+            emptyMsg(svn ? (pl ? L"Brak zmian — kopia robocza czysta." : L"No changes — working copy clean.")
+                         : (pl ? L"Brak zmian — drzewo robocze czyste." : L"No changes — working tree clean."));
         }
         float y = bodyTop - m_gitScrollY;
         for (const GitFileChange& c : st.changes) {
@@ -6313,14 +6377,25 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
                     m_solidBrush->SetColor(HexColor(0xE8F1FB));
                     m_rt->FillRectangle(rr, m_solidBrush);
                 }
-                const bool conflict = (c.indexStatus == L'U' || c.workStatus == L'U' || (c.indexStatus == L'A' && c.workStatus == L'A') || (c.indexStatus == L'D' && c.workStatus == L'D'));
-                uint32_t col = conflict ? 0xDC2626 : (c.workStatus == L'?' ? 0x94A3B8 :
-                               (c.workStatus == L'D' || c.indexStatus == L'D' ? 0xDC2626 :
-                               (c.indexStatus == L'A' ? 0x059669 : (c.indexStatus == L'R' ? 0x0284C7 :
-                               (c.workStatus != L' ' ? 0xD97706 : 0x059669)))));
+                uint32_t col = 0;
                 std::wstring code;
-                code += (c.indexStatus == L' ') ? L'\x00B7' : c.indexStatus;
-                code += (c.workStatus == L' ') ? L'\x00B7' : c.workStatus;
+                if (svn) {
+                    // svn status: item letter, then the properties' letter (C when the item is tree-conflicted)
+                    const wchar_t k = c.indexStatus;
+                    const bool conflict = c.treeConflict || k == L'C' || c.workStatus == L'C';
+                    col = conflict ? 0xDC2626 : (k == L'?' ? 0x94A3B8 : ((k == L'D' || k == L'!' || k == L'~') ? 0xDC2626 :
+                          (k == L'A' ? 0x059669 : (k == L'R' ? 0x0284C7 : 0xD97706))));
+                    code += (k == L' ') ? L'\x00B7' : k;
+                    code += (c.workStatus != L' ') ? c.workStatus : (c.treeConflict ? L'C' : L'\x00B7');
+                } else {
+                    const bool conflict = (c.indexStatus == L'U' || c.workStatus == L'U' || (c.indexStatus == L'A' && c.workStatus == L'A') || (c.indexStatus == L'D' && c.workStatus == L'D'));
+                    col = conflict ? 0xDC2626 : (c.workStatus == L'?' ? 0x94A3B8 :
+                          (c.workStatus == L'D' || c.indexStatus == L'D' ? 0xDC2626 :
+                          (c.indexStatus == L'A' ? 0x059669 : (c.indexStatus == L'R' ? 0x0284C7 :
+                          (c.workStatus != L' ' ? 0xD97706 : 0x059669)))));
+                    code += (c.indexStatus == L' ') ? L'\x00B7' : c.indexStatus;
+                    code += (c.workStatus == L' ') ? L'\x00B7' : c.workStatus;
+                }
                 m_solidBrush->SetColor(HexColor(col, 0.14f));
                 m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(rr.left + 6.0f, y + 3.0f, rr.left + 32.0f, y + rowH - 3.0f), 3.0f, 3.0f), m_solidBrush);
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -6341,7 +6416,10 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
     } else if (m_gitTab == 1) {
         const float rowH = 46.0f;
         if (st.commits.empty()) {
-            emptyMsg(pl ? L"Brak commitów w tym repozytorium." : L"No commits in this repository.");
+            if (!st.logError.empty()) emptyMsg(st.logError.c_str());
+            else if (svn) emptyMsg(busy ? (pl ? L"Wczytywanie historii z serwera…" : L"Reading the history from the server…")
+                                        : (pl ? L"Brak rewizji w historii." : L"No revisions in the history."));
+            else emptyMsg(pl ? L"Brak commitów w tym repozytorium." : L"No commits in this repository.");
         }
         float y = bodyTop - m_gitScrollY;
         for (const GitCommit& c : st.commits) {
@@ -6357,8 +6435,13 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
                     m_solidBrush->SetColor(HexColor(0x0078D7));
                     m_rt->FillRectangle(D2D1::RectF(rr.left, rr.top, rr.left + 3.0f, rr.bottom), m_solidBrush);
                 }
-                DrawClippedText(c.subject, D2D1::RectF(rr.left + 10.0f, y + 4.0f, rr.right - 8.0f, y + 24.0f), m_fmtBold, 0x0F172A);
-                std::wstring meta = c.author + L"  \x2022  " + c.relDate;
+                // Subversion allows a revision without a message or an author
+                if (c.subject.empty()) {
+                    DrawClippedText(pl ? L"(bez opisu)" : L"(no message)", D2D1::RectF(rr.left + 10.0f, y + 4.0f, rr.right - 8.0f, y + 24.0f), m_fmtSmall, 0x94A3B8);
+                } else {
+                    DrawClippedText(c.subject, D2D1::RectF(rr.left + 10.0f, y + 4.0f, rr.right - 8.0f, y + 24.0f), m_fmtBold, 0x0F172A);
+                }
+                std::wstring meta = c.author.empty() ? c.relDate : (c.author + L"  \x2022  " + c.relDate);
                 DrawClippedText(c.shortHash, D2D1::RectF(rr.left + 10.0f, y + 25.0f, rr.left + 70.0f, y + rowH), m_fmtSmall, 0x0067B8);
                 DrawClippedText(meta, D2D1::RectF(rr.left + 70.0f, y + 25.0f, c.refs.empty() ? rr.right - 8.0f : rr.left + 70.0f + (rr.right - rr.left - 78.0f) * 0.55f, y + rowH), m_fmtSmall, 0x64748B);
                 if (!c.refs.empty()) {
@@ -6372,11 +6455,77 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
             y += rowH;
         }
         if (!st.commits.empty()) contentH = static_cast<float>(st.commits.size()) * rowH;
+    } else if (svn) {
+        // Info: what `svn info` says about the working copy; a click copies the value
+        struct InfoRow { std::wstring label, value; };
+        std::vector<InfoRow> rows;
+        auto addRow = [&](const wchar_t* plTxt, const wchar_t* enTxt, const std::wstring& value) {
+            if (!value.empty()) rows.push_back({ pl ? plTxt : enTxt, value });
+        };
+        const SvnInfo& si = st.svn;
+        addRow(L"Ścieżka w repozytorium", L"Path in the repository", st.branch);
+        addRow(L"URL", L"URL", si.url);
+        addRow(L"Korzeń repozytorium", L"Repository root", si.repositoryRoot);
+        addRow(L"Rewizja kopii roboczej", L"Working copy revision", si.revision > 0 ? L"r" + std::to_wstring(si.revision) : std::wstring());
+        if (si.lastChangedRevision > 0) {
+            std::wstring last = L"r" + std::to_wstring(si.lastChangedRevision);
+            if (!si.lastChangedAuthor.empty()) last += L"  \x2022  " + si.lastChangedAuthor;
+            if (si.lastChangedTime > 0) last += L"  \x2022  " + Svn::RelativeTime(si.lastChangedTime, Svn::NowUnix());
+            addRow(L"Ostatnia zmiana", L"Last changed", last);
+        }
+        addRow(L"Kopia robocza", L"Working copy", si.wcRoot.empty() ? st.root : si.wcRoot);
+        addRow(L"UUID repozytorium", L"Repository UUID", si.uuid);
+        const float rowH = 42.0f;
+        float y = bodyTop - m_gitScrollY + 4.0f;
+        float linkH = 0.0f;
+        if (RepoBrowser::IsRepoUrl(si.url)) {
+            // the repository on the server, as folders of the main view
+            linkH = 32.0f;
+            if (rowVisible(y, linkH)) {
+                const D2D1_RECT_F lr = D2D1::RectF(left + 10.0f, y + 2.0f, right - 10.0f, y + linkH - 4.0f);
+                const bool hov = mouseInList && PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, lr);
+                m_solidBrush->SetColor(HexColor(hov ? 0x0078D7 : 0xEFF6FF));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(lr, 3.0f, 3.0f), m_solidBrush);
+                DrawClippedText(pl ? L"\x2197 Przeglądaj repozytorium na serwerze" : L"\x2197 Browse the repository on the server",
+                                D2D1::RectF(lr.left + 10.0f, lr.top + 3.0f, lr.right - 8.0f, lr.bottom), m_fmtSmall, hov ? 0xFFFFFF : 0x0067B8);
+                addRowHit(lr, GH_BrowseRepo, si.url);
+            }
+            y += linkH;
+        }
+        for (const InfoRow& r : rows) {
+            if (rowVisible(y, rowH)) {
+                D2D1_RECT_F rr = D2D1::RectF(left + 2.0f, y, right - 2.0f, y + rowH - 2.0f);
+                if (mouseInList && PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, rr)) {
+                    m_solidBrush->SetColor(HexColor(0xF1F5F9));
+                    m_rt->FillRectangle(rr, m_solidBrush);
+                }
+                DrawClippedText(r.label, D2D1::RectF(rr.left + 10.0f, y + 3.0f, rr.right - 8.0f, y + 19.0f), m_fmtSmall, 0x64748B);
+                DrawClippedText(r.value, D2D1::RectF(rr.left + 10.0f, y + 19.0f, rr.right - 8.0f, y + rowH - 2.0f), m_fmtBold, 0x0F172A);
+                addRowHit(rr, GH_CopyText, r.value);
+            }
+            y += rowH;
+        }
+        contentH = linkH + static_cast<float>(rows.size()) * rowH + 8.0f;
     } else {
         const float rowH = 26.0f, labelH = 22.0f;
         float y = bodyTop - m_gitScrollY;
         float total = 0.0f;
         bool remoteLabelDone = false, localLabelDone = false;
+        if (loaded && RepoBrowser::IsRepoUrl(st.remoteUrl)) {
+            // origin's files as they are on the server, as folders of the main view
+            const float linkH = 32.0f;
+            if (rowVisible(y, linkH)) {
+                const D2D1_RECT_F lr = D2D1::RectF(left + 10.0f, y + 4.0f, right - 10.0f, y + linkH - 2.0f);
+                const bool hov = mouseInList && PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, lr);
+                m_solidBrush->SetColor(HexColor(hov ? 0x0078D7 : 0xEFF6FF));
+                m_rt->FillRoundedRectangle(D2D1::RoundedRect(lr, 3.0f, 3.0f), m_solidBrush);
+                DrawClippedText(pl ? L"\x2197 Przeglądaj origin na serwerze" : L"\x2197 Browse origin on the server",
+                                D2D1::RectF(lr.left + 10.0f, lr.top + 3.0f, lr.right - 8.0f, lr.bottom), m_fmtSmall, hov ? 0xFFFFFF : 0x0067B8);
+                addRowHit(lr, GH_BrowseRepo, st.remoteUrl);
+            }
+            y += linkH;
+            total += linkH;
+        }
         if (st.branches.empty()) emptyMsg(pl ? L"Brak gałęzi." : L"No branches.");
         for (const GitBranch& b : st.branches) {
             if (!b.isRemote && !localLabelDone) {
@@ -6435,15 +6584,18 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
         m_rt->DrawLine(D2D1::Point2F(op.left, op.top), D2D1::Point2F(op.right, op.top), m_solidBrush, 1.0f);
 
         std::wstring title = busy ? (L"\x23F3 " + m_git.BusyDescription())
-                                  : (m_gitOutputOk ? (pl ? L"\x2713 Wynik git" : L"\x2713 git output") : (pl ? L"\x2717 Błąd git" : L"\x2717 git error"));
+                           : svn ? (m_gitOutputOk ? (pl ? L"\x2713 Wynik svn" : L"\x2713 svn output") : (pl ? L"\x2717 Błąd svn" : L"\x2717 svn error"))
+                                 : (m_gitOutputOk ? (pl ? L"\x2713 Wynik git" : L"\x2713 git output") : (pl ? L"\x2717 Błąd git" : L"\x2717 git error"));
         float rb = op.right - 8.0f;
         gitBtn(rb - 24.0f, op.top + 4.0f, 24.0f, L"\x2715", GH_CloseOutput, L"");
         rb -= 30.0f;
         gitBtn(rb - 64.0f, op.top + 4.0f, 64.0f, pl ? L"Kopiuj" : L"Copy", GH_CopyOutput, L"");
         rb -= 70.0f;
         if (!m_gitSelectedCommit.empty() && !busy) {
-            gitBtn(rb - 84.0f, op.top + 4.0f, 84.0f, pl ? L"Kopiuj hash" : L"Copy hash", GH_CopyHash, m_gitSelectedCommit);
-            rb -= 90.0f;
+            const float cw = (svn && pl) ? 100.0f : 84.0f;
+            gitBtn(rb - cw, op.top + 4.0f, cw, svn ? (pl ? L"Kopiuj rewizję" : L"Copy revision") : (pl ? L"Kopiuj hash" : L"Copy hash"),
+                   GH_CopyHash, m_gitSelectedCommit);
+            rb -= cw + 6.0f;
         }
         DrawClippedText(title, D2D1::RectF(op.left + 10.0f, op.top + 6.0f, std::max(op.left + 40.0f, rb), op.top + 26.0f), m_fmtBold,
                         busy ? 0xB45309 : (m_gitOutputOk ? 0x047857 : 0xB91C1C));

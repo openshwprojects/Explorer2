@@ -4,6 +4,7 @@
 #include "PathUtils.h"
 #include "FileEngine.h"
 #include "FtpClient.h"
+#include "RepoBrowser.h"
 #include "ReaderGuard.h"
 #include "ThreadUtils.h"
 #include "formats/AiModelFormats.h"
@@ -582,6 +583,8 @@ void FileContentPane::RunPreviewJob(const PreviewJob& job, PreviewResult& out, c
     case PreviewJobKind::Fetch:
         if (FtpClient::IsFtpPath(job.path)) {
             out.ok = FtpClient::DownloadFtpFileToTempCache(job.path, out.localPath, keepGoing);
+        } else if (RepoBrowser::IsRepoUrl(job.path)) {
+            out.ok = RepoBrowser::FetchFileToTemp(job.path, out.localPath);
         } else {
             out.ok = ArchiveExplorer::ExtractSingleEntryToTempFile(job.path, job.innerPath, out.localPath);
         }
@@ -621,6 +624,38 @@ void FileContentPane::RunPreviewJob(const PreviewJob& job, PreviewResult& out, c
 }
 
 void FileContentPane::ListFolderForPreview(const std::wstring& folderPath, PreviewResult& out, const std::function<bool()>& keepGoing) {
+    if (RepoBrowser::IsRepoUrl(folderPath)) {
+        // A repository folder: RepoBrowser's listing, waited for while it is read (this runs on a worker thread)
+        std::vector<FileEntry> entries;
+        RepoBrowser::ListState st = RepoBrowser::GetListing(folderPath, true, Lang::EN, entries);
+        for (int waited = 0; st == RepoBrowser::ListState::Loading && waited < 600 && keepGoing(); ++waited) {
+            Sleep(100);
+            st = RepoBrowser::GetListing(folderPath, true, Lang::EN, entries);
+        }
+        for (const auto& e : entries) {
+            if (e.isDirectory) {
+                ++out.folderCount;
+            } else {
+                ++out.fileCount;
+                out.folderBytes += e.size;
+            }
+            if (out.folderItems.size() < 2500) {
+                DirPreviewEntry item;
+                item.name = e.name;
+                item.fullPath = e.fullPath;
+                item.isDirectory = e.isDirectory;
+                item.size = e.size;
+                if (!e.isDirectory) {
+                    item.ext = e.ext;
+                    item.isImage = e.isImage;
+                    item.sizeStr = e.sizeStr;
+                }
+                item.dateStr = e.dateStr;
+                out.folderItems.push_back(std::move(item));
+            }
+        }
+        return;
+    }
     std::wstring searchPattern = PathUtils::EnsureTrailingSlash(folderPath) + L"*";
     WIN32_FIND_DATAW fd = {};
     HANDLE hFind = FindFirstFileExW(
@@ -880,7 +915,7 @@ void FileContentPane::ShowCurrentEntry() {
     m_fetching = false;
     m_fetchFailed = false;
     if (!m_currentEntry.isDirectory && !m_currentEntry.isDrive) {
-        if (FtpClient::IsFtpPath(m_currentEntry.fullPath)) {
+        if (FtpClient::IsFtpPath(m_currentEntry.fullPath) || RepoBrowser::IsRepoUrl(m_currentEntry.fullPath)) {
             StartFetch(m_currentEntry.fullPath, std::wstring());
             return;
         }
@@ -1003,6 +1038,8 @@ void FileContentPane::DrawWaitNote(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* 
     if (m_fetching) {
         text = FtpClient::IsFtpPath(m_currentEntry.fullPath)
             ? (pl ? L"Pobieranie pliku z serwera FTP\x2026" : L"Downloading the file from the FTP server\x2026")
+            : RepoBrowser::IsRepoUrl(m_currentEntry.fullPath)
+            ? (pl ? L"Pobieranie pliku z repozytorium\x2026" : L"Downloading the file from the repository\x2026")
             : (pl ? L"Rozpakowywanie pliku z archiwum\x2026" : L"Unpacking the file from the archive\x2026");
     } else if (m_previewWantedKind == PreviewJobKind::Folder) {
         text = pl ? L"Wczytywanie zawartości folderu\x2026" : L"Reading the folder\x2026";
@@ -1497,7 +1534,8 @@ void FileContentPane::Draw(
     } else if (m_currentEntry.isDirectory || m_currentEntry.isDrive) {
         hdrTitle = L"\xD83D\xDCC1 " + m_currentEntry.name;
     } else {
-        hdrTitle = L"\xD83D\xDCC4 " + m_currentEntry.name + L"  (" + m_currentEntry.sizeStr + L")";
+        hdrTitle = L"\xD83D\xDCC4 " + m_currentEntry.name;
+        if (!m_currentEntry.sizeStr.empty()) hdrTitle += L"  (" + m_currentEntry.sizeStr + L")";   // not known for a git file
     }
     D2D1_RECT_F titleR = D2D1::RectF(hdrR.left + 8.0f, hdrR.top + 2.0f, std::max(hdrR.left + 20.0f, rx - 4.0f), hdrR.bottom);
     brush->SetColor(FcpColor(0x0F172A));
@@ -1526,6 +1564,8 @@ void FileContentPane::Draw(
     if (m_fetchFailed) {
         const std::wstring failMsg = FtpClient::IsFtpPath(m_currentEntry.fullPath)
             ? (pl ? L"Nie udało się pobrać tego pliku z serwera FTP." : L"Could not download this file from the FTP server.")
+            : RepoBrowser::IsRepoUrl(m_currentEntry.fullPath)
+            ? (pl ? L"Nie udało się pobrać tego pliku z repozytorium." : L"Could not download this file from the repository.")
             : (pl ? L"Nie udało się rozpakować tego pliku z archiwum." : L"Could not unpack this file from the archive.");
         D2D1_RECT_F failR = D2D1::RectF(m_bodyRect.left + 20.0f, m_bodyRect.top + 40.0f, m_bodyRect.right - 20.0f, m_bodyRect.bottom - 40.0f);
         brush->SetColor(FcpColor(0x64748B));
@@ -1560,6 +1600,9 @@ void FileContentPane::Draw(
 
         wchar_t sumBuf[256] = {};
         std::wstring bytesStr = PathUtils::FormatByteSize(m_dirTotalFileBytes);
+        if (RepoBrowser::IsRepoUrl(m_dirPreviewPath) && RepoBrowser::GuessKind(m_dirPreviewPath) == RepoBrowser::Kind::Git) {
+            bytesStr = pl ? L"nieznany (git)" : L"not known (git)";     // a blobless clone does not know file sizes
+        }
         swprintf_s(sumBuf,
             pl ? L"Zawartość: %zu folderów, %zu plików   \x2022   Rozmiar plików: %s   (2\xD7klik = otwórz)"
                : L"Contents: %zu folders, %zu files   \x2022   Files size: %s   (double-click = open)",

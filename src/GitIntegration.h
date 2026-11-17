@@ -1,4 +1,5 @@
 #pragma once
+#include "ToolProcess.h"
 #include "Types.h"
 #include <atomic>
 #include <condition_variable>
@@ -11,18 +12,32 @@
 
 namespace Explorer2 {
 
-// One line of `git status --porcelain=v1`.
+// The dock serves git repositories and Subversion working copies; the snapshot says which one it describes.
+enum class VcsKind { Git, Svn };
+
+// One line of `git status --porcelain=v1`. For a Subversion working copy (`svn status`): indexStatus is the item's
+// status letter (M A D R C ? ! ~, ' ' when only properties changed) and workStatus the properties' (M or C).
 struct GitFileChange {
-    std::wstring path;              // relative to the repo root, '/' separators (as printed by git)
+    std::wstring path;              // relative to the repo root, '/' separators (as printed by git; svn prints '\')
     std::wstring origPath;          // source path for renames / copies, empty otherwise
     wchar_t indexStatus = L' ';     // porcelain "X" column (staged side)
     wchar_t workStatus  = L' ';     // porcelain "Y" column (working tree side); '?' for untracked (both columns)
+    bool treeConflict = false;      // Subversion: the item is tree-conflicted
 };
 
 struct GitCommit {
-    std::wstring hash, shortHash, author, relDate, subject;
+    std::wstring hash, shortHash, author, relDate, subject;   // Subversion: hash "1234", shortHash "r1234"
     std::wstring refs;              // decoration list, e.g. "HEAD -> main, origin/main, tag: v1.0"
     int64_t unixTime = 0;           // committer time
+};
+
+// What `svn info` says about a working copy
+struct SvnInfo {
+    std::wstring url, relativeUrl, repositoryRoot, uuid, wcRoot;
+    int64_t revision = 0;           // revision of the working copy root
+    int64_t lastChangedRevision = 0;
+    std::wstring lastChangedAuthor;
+    int64_t lastChangedTime = 0;    // Unix time
 };
 
 struct GitBranch {
@@ -35,8 +50,10 @@ struct GitBranch {
 };
 
 struct GitRepoState {
+    VcsKind kind = VcsKind::Git;
     bool valid = false;             // a repository was read successfully
-    bool gitMissing = false;        // git.exe could not be found
+    bool clientMissing = false;     // git.exe (svn.exe for a Subversion working copy) could not be found
+    // Subversion: branch is the path in the repository ("trunk"), remoteUrl the URL, headShort "r1234"
     std::wstring root, branch, upstream, remoteUrl, headShort, lastError;
     bool detachedHead = false;      // when true `branch` is empty and `headShort` holds the commit
     int ahead = 0, behind = 0, stashCount = 0;
@@ -45,6 +62,9 @@ struct GitRepoState {
     std::vector<GitCommit> commits;         // newest first, capped at 60 (empty for a repo with no commits)
     std::vector<GitBranch> branches;        // local first, then remotes (HEAD pointers skipped)
     uint64_t refreshedTick = 0;             // GetTickCount64() of the last successful refresh
+    SvnInfo svn;                            // Subversion only
+    std::wstring logError;                  // the history could not be read (Subversion asks the server for it)
+    uint64_t logTick = 0;                   // GetTickCount64() when `commits` was read
 };
 
 enum class GitAction {
@@ -52,13 +72,15 @@ enum class GitAction {
     Pull,               // git pull --ff-only
     Push,               // git push
     Checkout,           // arg = branch: local name, or remote branch such as "origin/x" (creates a tracking branch)
-    ShowCommit,         // arg = hash; output = `git show --stat --format=fuller`
-    ShowDiffStat,       // working tree `git diff --stat`
+    ShowCommit,         // arg = hash; output = `git show --stat --format=fuller` (svn: `svn log -v -r`)
+    ShowDiffStat,       // working tree `git diff --stat` (svn: the same summary computed from `svn diff`)
+    CheckUpdates,       // svn only: what the repository has that the working copy has not (`svn status -u`)
     CopyHashOnlyNoop    // does nothing (the UI copies the hash itself)
 };
 
-// UI-agnostic git front end. Shells out to git.exe on one background worker thread; the UI thread never blocks.
-// Every public method is thread-safe and returns immediately.
+// UI-agnostic front end for git repositories and Subversion working copies. Shells out to git.exe / svn.exe on one
+// background worker thread; the UI thread never blocks. Every public method is thread-safe and returns immediately.
+// Subversion is read-only here: status, history, details of a revision, local diff summary, incoming changes.
 class GitIntegration {
 public:
     GitIntegration();
@@ -69,14 +91,22 @@ public:
     // Cached lookup of git.exe (PATH, then the usual Program Files locations). A negative result is re-tried
     // at most every few seconds so installing git while the app runs is picked up.
     static bool IsGitInstalled();
+    static std::wstring GitExePath();           // empty when git is not installed
 
-    // Walks up from `folder` looking for ".git" (directory OR file: worktrees / submodules).
-    // Returns the directory containing it, or empty. Synchronous, GetFileAttributes calls only.
-    static std::wstring FindRepoRoot(const std::wstring& folder);
+    // The environment every git run gets, for other code that runs git (RepoBrowser): git never asks for a
+    // password or a passphrase (it fails instead), and with readOnly it takes no optional locks.
+    static void ApplyGitEnvironment(ToolProcess::Options& options, bool readOnly);
+
+    // Walks up from `folder` looking for ".git" (directory OR file: worktrees / submodules) or ".svn" (the root of a
+    // Subversion 1.7+ working copy). The nearest one wins; in the same folder git does. Returns the directory
+    // containing it, or empty, and the kind in `kind`. Synchronous, GetFileAttributes calls only.
+    static std::wstring FindRepoRoot(const std::wstring& folder, VcsKind* kind = nullptr);
 
     // Asynchronous, coalesced (any number of pending requests collapse into one). The previous snapshot stays
     // visible while it runs, unless it belongs to a different repo root (then it is cleared immediately).
-    void RequestRefresh(const std::wstring& repoRoot);
+    // `kind` is what FindRepoRoot reported. A Subversion history comes from the server, so it is read again only
+    // when the working copy's revision changed or it is a few minutes old, or when `full` asks for it.
+    void RequestRefresh(const std::wstring& repoRoot, VcsKind kind = VcsKind::Git, bool full = false);
 
     // Queues an action. Mutating actions (Fetch/Pull/Push/Checkout) auto-refresh the repo afterwards.
     // Queued ShowCommit/ShowDiffStat requests are superseded by a newer one.
@@ -93,13 +123,17 @@ private:
     struct Request {
         enum class Kind { Refresh, Action } kind = Kind::Refresh;
         std::wstring root;
+        VcsKind vcs = VcsKind::Git;
+        bool full = false;
         GitAction action = GitAction::CopyHashOnlyNoop;
         std::wstring arg;
     };
 
     void WorkerMain();
     void DoRefresh(const std::wstring& root);
+    void DoRefreshSvn(const std::wstring& root, bool full);
     void DoAction(const Request& req);
+    void DoActionSvn(const Request& req);
     void SetBusy(const std::wstring& description);
     void SetOutput(std::wstring text, bool ok);
 
@@ -107,6 +141,8 @@ private:
     std::condition_variable m_cv;
     std::deque<Request> m_actions;              // guarded by m_mutex
     std::wstring m_pendingRefreshRoot;          // guarded by m_mutex
+    VcsKind m_pendingRefreshKind = VcsKind::Git;
+    bool m_pendingRefreshFull = false;
     bool m_hasPendingRefresh = false;           // guarded by m_mutex
     bool m_running = false;                     // worker is processing a request
     std::wstring m_busyDescription;
@@ -115,6 +151,9 @@ private:
     bool m_lastOk = false;
     uint64_t m_version = 0;
     std::atomic<bool> m_stop{ false };
+    // A Subversion refresh still waiting for its server is given up when another folder is asked for (or on exit)
+    std::atomic<bool> m_abandon{ false };
+    std::wstring m_runningRoot;                 // root of the request being worked on; guarded by m_mutex
     std::thread m_worker;                       // declared last: started after everything else is constructed
 };
 

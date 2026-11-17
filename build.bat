@@ -56,6 +56,9 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\Monitoring.cpp ^
     src\LanScanner.cpp ^
     src\GitIntegration.cpp ^
+    src\SvnWorkingCopy.cpp ^
+    src\ToolProcess.cpp ^
+    src\RepoBrowser.cpp ^
     src\AppLog.cpp ^
     src\ZipDeflate.cpp ^
     src\NotepadViewer.cpp ^
@@ -73,6 +76,7 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\FormatTestsDocsB.cpp ^
     src\FormatTestsArchives.cpp ^
     src\FormatTestsBatch70.cpp ^
+    src\SelfTestVcs.cpp ^
     /Fo:build\ ^
     /Fe:Explorer2.exe ^
     /link /SUBSYSTEM:WINDOWS build\Explorer2.res ^

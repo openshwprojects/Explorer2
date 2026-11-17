@@ -4,6 +4,7 @@
 #include "AppLog.h"
 #include "ArchiveExplorer.h"
 #include "FtpClient.h"
+#include "RepoBrowser.h"
 #include "PathUtils.h"
 #include "TransferManager.h"
 #include <shellapi.h>
@@ -376,7 +377,7 @@ void FileEngine::WatchDirectory(const std::wstring& dirPath) {
                 clean = std::move(candidate);
             }
         }
-    } else if (clean == L"THIS_PC" || FtpClient::IsFtpPath(clean) || ArchiveExplorer::IsVirtualArchivePath(clean)) {
+    } else if (clean == L"THIS_PC" || FtpClient::IsFtpPath(clean) || RepoBrowser::IsRepoUrl(clean) || ArchiveExplorer::IsVirtualArchivePath(clean)) {
         clean.clear();
     } else if (!clean.empty()) {
         DWORD attrs = GetFileAttributesW(clean.c_str());
@@ -814,8 +815,19 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
         return results;
     }
 
-    if (FtpClient::IsFtpPath(dirPath)) {
-        FtpClient::EnumerateFtpDirectory(dirPath, showHidden, showExtensions, lang, results, nullptr);
+    const bool isFtp = FtpClient::IsFtpPath(dirPath);
+    if (isFtp || RepoBrowser::IsRepoUrl(dirPath)) {
+        if (isFtp) {
+            FtpClient::EnumerateFtpDirectory(dirPath, showHidden, showExtensions, lang, results, nullptr);
+        } else {
+            // A repository folder: what is known now (an empty list while it is read in the background)
+            RepoBrowser::GetListing(dirPath, showExtensions, lang, results);
+            if (!showHidden) {
+                results.erase(std::remove_if(results.begin(), results.end(), [](const FileEntry& e) {
+                    return !e.name.empty() && e.name[0] == L'.';
+                }), results.end());
+            }
+        }
         std::wstring lastExt = L"__INIT__";
         ExtTypeInfo lastExtInfo = {};
         for (auto& entry : results) {
@@ -1872,10 +1884,10 @@ std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const s
     }
 
     // 4. Relative child path inside current local folder (e.g. ".\Kosz" or typing a subfolder name)
-    if (!FtpClient::IsFtpPath(clean) &&
+    if (!FtpClient::IsFtpPath(clean) && !RepoBrowser::IsRepoUrl(clean) &&
         !(clean.size() >= 2 && clean[1] == L':') &&
         clean.rfind(L"\\\\", 0) != 0 &&
-        !currentDir.empty() && !IsVirtualFolder(currentDir) && !FtpClient::IsFtpPath(currentDir))
+        !currentDir.empty() && !IsVirtualFolder(currentDir) && !FtpClient::IsFtpPath(currentDir) && !RepoBrowser::IsRepoUrl(currentDir))
     {
         std::wstring relPart = clean;
         if (relPart.rfind(L".\\", 0) == 0 || relPart.rfind(L"./", 0) == 0) {
@@ -2492,7 +2504,7 @@ void FileEngine::RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, 
         std::lock_guard<std::mutex> lock(m_sizeMutex);
         for (const auto& node : treeNodes) {
             if (node.isHeader || node.isDrive || node.isFtpNode || node.isOffline || node.normKey.empty() || node.path.empty()) continue;
-            if (IsVirtualFolder(node.path) || FtpClient::IsFtpPath(node.path) || ArchiveExplorer::IsVirtualArchivePath(node.path)) continue;
+            if (IsVirtualFolder(node.path) || FtpClient::IsFtpPath(node.path) || RepoBrowser::IsRepoUrl(node.path) || ArchiveExplorer::IsVirtualArchivePath(node.path)) continue;
             // Skip massive cloud sync roots (Dropbox / OneDrive at indent 0) during automatic background tree sizing
             // so the 4 folder-size worker threads remain immediately available for active directory browsing!
             if (!forceRefresh && node.indent == 0 && !node.isQuickAccess) continue;
@@ -2554,7 +2566,7 @@ void FileEngine::RequestFolderSizes(const std::vector<FileEntry>& entries, bool 
 
         for (const auto& e : entries) {
             if (!e.isDirectory || e.normKey.empty() || e.isDrive) continue;
-            if (FtpClient::IsFtpPath(e.fullPath) || ArchiveExplorer::IsVirtualArchivePath(e.fullPath)) continue;
+            if (FtpClient::IsFtpPath(e.fullPath) || RepoBrowser::IsRepoUrl(e.fullPath) || ArchiveExplorer::IsVirtualArchivePath(e.fullPath)) continue;
             if (!forceRefresh &&
                 m_folderSizeCache.find(e.normKey) != m_folderSizeCache.end() &&
                 m_folderChildrenCache.find(e.normKey) != m_folderChildrenCache.end()) {
@@ -2575,7 +2587,7 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
         outAborted = true;
         return 0;
     }
-    if (dirPath.empty() || IsVirtualFolder(dirPath) || FtpClient::IsFtpPath(dirPath)) {
+    if (dirPath.empty() || IsVirtualFolder(dirPath) || FtpClient::IsFtpPath(dirPath) || RepoBrowser::IsRepoUrl(dirPath)) {
         return 0;
     }
 
@@ -2990,7 +3002,7 @@ void FileEngine::SearchWorkerLoop() {
             myGen = m_searchGeneration.load(std::memory_order_relaxed);
         }
 
-        if (rootDir.empty() || IsVirtualFolder(rootDir) || FtpClient::IsFtpPath(rootDir)) {
+        if (rootDir.empty() || IsVirtualFolder(rootDir) || FtpClient::IsFtpPath(rootDir) || RepoBrowser::IsRepoUrl(rootDir)) {
             std::lock_guard<std::mutex> lock(m_searchMutex);
             m_searchProgress.isRunning = false;
             m_searchProgress.isFinished = true;

@@ -2,6 +2,7 @@
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
+#include "RepoBrowser.h"
 #include "OsCompat.h"
 #include "Version.h"
 #include <windowsx.h>
@@ -127,6 +128,10 @@ static std::wstring FormatNavFolderTitle(const std::wstring& path, Lang lang) {
     if (path.empty() || path == L"THIS_PC") return s.navThisPC;
     if (path == L"RECYCLE_BIN") return s.navRecycleBin;
     if (FtpClient::IsFtpPath(path)) return FtpClient::GetFtpLeafName(path);
+    if (RepoBrowser::IsRepoUrl(path)) {
+        const std::wstring repoLeaf = RepoBrowser::LeafName(path);
+        return repoLeaf.empty() ? path : repoLeaf;
+    }
     std::wstring leaf = PathUtils::GetFileName(path);
     return leaf.empty() ? path : leaf;
 }
@@ -289,6 +294,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     SetWindowLongPtrW(m_renameEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(InlineEditSubclassProc));
 
     m_fileEngine.Initialize(m_hwnd);
+    RepoBrowser::SetNotifyWindow(m_hwnd);    // repository listings read in the background refresh the view
     m_fileEngine.StartUndoStagingSweep();   // clears undo copies that earlier sessions could not remove
     m_transfers.Initialize(m_hwnd);
     m_wmTaskbarBtnCreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
@@ -1182,6 +1188,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
+        RepoBrowser::Shutdown();            // ends a repository read still running (and the svn / git it runs)
         KillTimer(m_hwnd, ID_TIMER_MEDIA);
         KillTimer(m_hwnd, ID_TIMER_WORK_ANIM);
         m_workAnimIntervalMs = 0;
@@ -1251,6 +1258,8 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
             InvalidateRect(m_hwnd, nullptr, FALSE);
             return;
         }
+    } else if (RepoBrowser::IsRepoUrl(cleanPath)) {
+        // A repository folder: RepoBrowser lists it in the background (the view says so until it arrives)
     } else if (!IsVirtualFolder(cleanPath)) {
         std::wstring offlineName;
         if (m_fileEngine.IsDriveOffline(cleanPath, m_lang, &offlineName)) {
@@ -1437,6 +1446,11 @@ void ExplorerApp::NavigateUp() {
         }
         return;
     }
+    if (RepoBrowser::IsRepoUrl(m_currentPath)) {
+        const std::wstring parentUrl = RepoBrowser::ParentUrl(m_currentPath);
+        if (!parentUrl.empty()) NavigateTo(parentUrl, true, RepoBrowser::LeafName(m_currentPath));
+        return;
+    }
     if (m_currentPath.size() <= 3 && m_currentPath[1] == L':') {
         NavigateTo(L"THIS_PC", true, m_currentPath);
         return;
@@ -1448,10 +1462,27 @@ void ExplorerApp::NavigateUp() {
     }
 }
 
+bool ExplorerApp::RefuseRepositoryWrite(const std::wstring& path) {
+    if (!RepoBrowser::IsRepoUrl(path)) return false;
+    m_statusToast = (m_lang == Lang::PL) ? L"\x26A0 Repozytoria są tylko do odczytu (skopiuj pliki do zwykłego folderu)"
+                                         : L"\x26A0 Repositories are read-only (copy the files into a standard folder)";
+    m_statusToastExpireTick = GetTickCount64() + 3800;
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+    return true;
+}
+
+void ExplorerApp::RefreshFromUser() {
+    if (RepoBrowser::IsRepoUrl(m_currentPath)) RepoBrowser::Invalidate(m_currentPath);
+    RefreshCurrentFolder();
+}
+
 void ExplorerApp::RefreshCurrentFolder(const std::wstring& preserveSelectedPath) {
     if (FtpClient::IsFtpPath(m_currentPath)) {
         FtpClient::InvalidateListingCache();
     }
+    // A repository's root becomes known with its first listing: the breadcrumbs name it from then on
+    if (RepoBrowser::IsRepoUrl(m_currentPath)) RebuildBreadcrumbs();
     std::wstring selPath = preserveSelectedPath;
     if (selPath.empty() && m_focusedIndex >= 0 && m_focusedIndex < static_cast<int>(m_items.size())) {
         selPath = m_items[m_focusedIndex].fullPath;
@@ -1555,6 +1586,31 @@ void ExplorerApp::RebuildBreadcrumbs() {
                     m_breadcrumbs.push_back(seg);
                 }
                 pos = nextSlash + 1;
+            }
+        }
+        return;
+    }
+
+    if (RepoBrowser::IsRepoUrl(m_currentPath)) {
+        // "SVN: host/repos/x" or "git: owner/repo", then each folder below the repository's top
+        const std::wstring root = RepoBrowser::RootUrl(m_currentPath);
+        BreadcrumbSegment repoSeg;
+        repoSeg.label = RepoBrowser::RootLabel(m_currentPath);
+        repoSeg.path = root;
+        m_breadcrumbs.push_back(repoSeg);
+        std::wstring cur = PathUtils::TrimTrailingSlashes(m_currentPath);
+        if (cur.size() > root.size() + 1 && _wcsnicmp(cur.c_str(), root.c_str(), root.size()) == 0 && cur[root.size()] == L'/') {
+            size_t pos = root.size() + 1;
+            while (pos < cur.size()) {
+                size_t slash = cur.find(L'/', pos);
+                if (slash == std::wstring::npos) slash = cur.size();
+                if (slash > pos) {
+                    BreadcrumbSegment seg;
+                    seg.path = cur.substr(0, slash);
+                    seg.label = RepoBrowser::LeafName(seg.path);
+                    m_breadcrumbs.push_back(seg);
+                }
+                pos = slash + 1;
             }
         }
         return;
@@ -1948,11 +2004,15 @@ void ExplorerApp::StartManagedTransfer(
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return;
     }
+    if (RefuseRepositoryWrite(targetDir)) return;
 
-    // Resolve any source items originating inside a virtual archive by extracting to temp staging
+    // Resolve any source items originating inside a virtual archive by extracting to temp staging, and repository
+    // files by their temp copy (a repository folder cannot be copied out: that is said, not skipped silently)
     std::vector<std::wstring> effectiveSrc;
     effectiveSrc.reserve(srcPaths.size());
     bool effectiveIsMove = isMove;
+    size_t repoFailed = 0;
+    std::wstring repoError;
     for (const auto& sp : srcPaths) {
         std::wstring arcFile, innerEntry;
         if (ArchiveExplorer::SplitVirtualArchivePath(sp, arcFile, innerEntry) && !innerEntry.empty()) {
@@ -1961,9 +2021,28 @@ void ExplorerApp::StartManagedTransfer(
                 effectiveSrc.push_back(std::move(tempFile));
                 effectiveIsMove = false;
             }
+        } else if (RepoBrowser::IsRepoUrl(sp)) {
+            effectiveIsMove = false;                    // nothing is ever removed from a repository
+            std::wstring tempFile, err;
+            const auto item = std::find_if(m_items.begin(), m_items.end(), [&](const FileEntry& e) { return e.fullPath == sp; });
+            if (item != m_items.end() && item->isDirectory) {
+                ++repoFailed;
+                repoError = pl ? L"foldery nie są kopiowane z repozytorium" : L"folders are not copied out of a repository";
+            } else if (RepoBrowser::FetchFileToTemp(sp, tempFile, &err) && !tempFile.empty()) {
+                effectiveSrc.push_back(std::move(tempFile));
+            } else {
+                ++repoFailed;
+                repoError = err;
+            }
         } else {
             effectiveSrc.push_back(sp);
         }
+    }
+    if (repoFailed > 0) {
+        m_statusToast = (pl ? L"\x26A0 Nie skopiowano z repozytorium: " : L"\x26A0 Not copied out of the repository: ") +
+                        std::to_wstring(repoFailed) + L" (" + repoError + L")";
+        m_statusToastExpireTick = GetTickCount64() + 5000;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
     }
     if (effectiveSrc.empty()) return;
 
@@ -1998,7 +2077,7 @@ void ExplorerApp::StartManagedTransfer(
 bool ExplorerApp::StartShellDragOut(const std::vector<std::wstring>& paths) {
     std::vector<std::wstring> local;
     for (const auto& p : paths) {
-        if (!p.empty() && !FtpClient::IsFtpPath(p) && !IsVirtualFolder(p)) local.push_back(p);
+        if (!p.empty() && !FtpClient::IsFtpPath(p) && !RepoBrowser::IsRepoUrl(p) && !IsVirtualFolder(p)) local.push_back(p);
     }
     if (local.empty()) return false;
 
@@ -2494,7 +2573,7 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
     for (int c = 0; c < 5; ++c) {
         content += L"ColWidth" + std::to_wstring(c) + L"=" + std::to_wstring(static_cast<int>(std::round(m_colWidths[c]))) + L"\r\n";
     }
-    if (!m_currentPath.empty() && !FtpClient::IsFtpPath(m_currentPath)) {
+    if (!m_currentPath.empty() && !FtpClient::IsFtpPath(m_currentPath) && !RepoBrowser::IsRepoUrl(m_currentPath)) {
         content += L"LastPath=" + m_currentPath + L"\r\n";
     }
     content += L"\r\n[QuickAccess]\r\n";
@@ -2523,15 +2602,18 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
     SubmitSettingsSnapshot(std::move(ini), std::move(content), waitUntilWritten);
 }
 
-// Finds the git repository (if any) that contains the folder being browsed and asks the worker to refresh it.
-void ExplorerApp::SyncGitRepo(bool force) {
+// Finds the git repository or Subversion working copy (if any) that contains the folder being browsed and asks the
+// worker to refresh it.
+void ExplorerApp::SyncGitRepo(bool force, bool full) {
     std::wstring root;
+    VcsKind kind = VcsKind::Git;
     if (m_gitEnabled && !m_currentPath.empty() && !IsVirtualFolder(m_currentPath)) {
-        root = GitIntegration::FindRepoRoot(m_currentPath);
+        root = GitIntegration::FindRepoRoot(m_currentPath, &kind);
     }
-    bool changed = (root != m_gitRoot);
+    bool changed = (root != m_gitRoot || kind != m_gitKind);
     if (changed) {
         m_gitRoot = root;
+        m_gitKind = kind;
         m_gitScrollY = 0.0f;
         m_gitSelectedCommit.clear();
         m_gitShowOutput = false;
@@ -2543,7 +2625,7 @@ void ExplorerApp::SyncGitRepo(bool force) {
         ULONGLONG now = GetTickCount64();
         if (changed || force || now - m_gitLastRequestTick > 2000) {   // coalesce bursts of folder refreshes
             m_gitLastRequestTick = now;
-            m_git.RequestRefresh(m_gitRoot);
+            m_git.RequestRefresh(m_gitRoot, m_gitKind, full);
             EnsureWorkAnimTimerState();
         }
     }
@@ -2563,7 +2645,19 @@ bool ExplorerApp::HandleGitDockClick(float x, float y, bool rightButton) {
             m_gitScrollY = 0.0f;
             break;
         case GH_Refresh:
-            SyncGitRepo(true);
+            SyncGitRepo(true, true);
+            break;
+        case GH_CheckUpdates:
+            m_gitShowOutput = true;
+            m_git.RunAction(m_gitRoot, GitAction::CheckUpdates);
+            break;
+        case GH_BrowseRepo:
+            NavigateTo(h.arg, true);
+            break;
+        case GH_CopyText:
+            FileEngine::CopyTextToClipboard(m_hwnd, h.arg);
+            m_statusToast = pl ? L"\x2713 Skopiowano" : L"\x2713 Copied";
+            m_statusToastExpireTick = GetTickCount64() + 2600;
             break;
         case GH_Fetch:
             m_gitShowOutput = true;
@@ -2609,7 +2703,8 @@ bool ExplorerApp::HandleGitDockClick(float x, float y, bool rightButton) {
             break;
         case GH_CopyHash:
             FileEngine::CopyTextToClipboard(m_hwnd, h.arg);
-            m_statusToast = (pl ? L"\x2713 Skopiowano hash: " : L"\x2713 Copied hash: ") + h.arg.substr(0, 10);
+            if (m_gitKind == VcsKind::Svn) m_statusToast = (pl ? L"\x2713 Skopiowano rewizję: r" : L"\x2713 Copied revision: r") + h.arg;
+            else m_statusToast = (pl ? L"\x2713 Skopiowano hash: " : L"\x2713 Copied hash: ") + h.arg.substr(0, 10);
             m_statusToastExpireTick = GetTickCount64() + 2600;
             break;
         case GH_Branch: {
@@ -2627,7 +2722,8 @@ bool ExplorerApp::HandleGitDockClick(float x, float y, bool rightButton) {
             break;
         case GH_CopyOutput:
             FileEngine::CopyTextToClipboard(m_hwnd, m_gitOutput);
-            m_statusToast = pl ? L"\x2713 Skopiowano wynik git" : L"\x2713 Copied git output";
+            if (m_gitKind == VcsKind::Svn) m_statusToast = pl ? L"\x2713 Skopiowano wynik svn" : L"\x2713 Copied svn output";
+            else m_statusToast = pl ? L"\x2713 Skopiowano wynik git" : L"\x2713 Copied git output";
             m_statusToastExpireTick = GetTickCount64() + 2600;
             break;
         default: break;
@@ -3495,7 +3591,7 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         const D2D1_SIZE_F client = ClientSizeDip();
         const bool outside = (x < 0.0f || y < 0.0f || x >= client.width || y >= client.height);
         if (outside && std::any_of(m_dragPaths.begin(), m_dragPaths.end(),
-                                   [](const std::wstring& p) { return !p.empty() && !FtpClient::IsFtpPath(p) && !IsVirtualFolder(p); })) {
+                                   [](const std::wstring& p) { return !p.empty() && !FtpClient::IsFtpPath(p) && !RepoBrowser::IsRepoUrl(p) && !IsVirtualFolder(p); })) {
             const std::vector<std::wstring> paths = m_dragPaths;
             m_isDraggingItems = false;
             m_dragPaths.clear();
@@ -3563,7 +3659,7 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
 
     int prevRowAction = m_hoverRowActionKind;
     m_hoverRowActionKind = 0;
-    if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC") {
+    if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath)) {
         D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, contentRect);
         float opColX = contentRect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
         const bool inBin = (m_currentPath == L"RECYCLE_BIN");
@@ -3585,7 +3681,7 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
             D2D1_RECT_F otherContent = GetContentItemsRect();
             m_hoverIndex = (m_viewMode == ViewMode::FullViewer || m_viewMode == ViewMode::Hardware) ? -1 : HitTestItem(x, y, otherContent, nullptr);
             m_hoverRowActionKind = 0;
-            if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC") {
+            if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath)) {
                 D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, otherContent);
                 float opColX = otherContent.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
                 const bool inBin = (m_currentPath == L"RECYCLE_BIN");
@@ -4040,7 +4136,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
     if (vk == VK_F2) { StartInlineRename(); return; }
     if (vk == VK_F3) { OnMouseDown(m_searchBarRect.left + 10.0f, m_searchBarRect.top + 5.0f, false, 0); return; }
     if (vk == VK_F4) { BeginPaneAddressEdit(m_activePane); return; }
-    if (vk == VK_F5) { RefreshCurrentFolder(); return; }
+    if (vk == VK_F5) { RefreshFromUser(); return; }
     if (vk == VK_BACK) { NavigateBack(); return; }
     if (vk == VK_DELETE) { DeleteSelectedItems(shift); return; }
     if (vk == VK_SPACE) { ToggleFullViewerMode(); return; }
@@ -4296,7 +4392,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_RENAME:        StartInlineRename(); break;
     case CMD_NEW_FOLDER:    CreateNewFolderAction(); break;
     case CMD_NEW_ITEM: {
-        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath)) break;
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || RefuseRepositoryWrite(m_currentPath)) break;
         std::wstring created;
         std::wstring base = (m_lang == Lang::PL) ? L"Nowy dokument tekstowy" : L"New Text Document";
         if (ShellMenuEmulator::CreateNewEmptyFile(m_currentPath, base, L".txt", created)) {
@@ -4423,7 +4519,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_NAV_BACK:          NavigateBack(); break;
     case CMD_NAV_FORWARD:       NavigateForward(); break;
     case CMD_NAV_UP:            NavigateUp(); break;
-    case CMD_NAV_REFRESH:       RefreshCurrentFolder(); break;
+    case CMD_NAV_REFRESH:       RefreshFromUser(); break;
     case CMD_NAV_RECENT_DIRS:   ShowRecentDirsDropdown(CMD_NAV_RECENT_DIRS); return;
     case CMD_CALC_FOLDER_SIZES: TriggerFolderSizeCalculation(); break;
     case CMD_CLEAR_SEARCH:      ClearSearchAndRestoreFolder(); break;
@@ -5918,7 +6014,8 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     }
     case CMD_BATCH_RENAME: {
         const bool pl = (m_lang == Lang::PL);
-        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || FtpClient::IsFtpPath(m_currentPath) ||
+            RepoBrowser::IsRepoUrl(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
             m_statusToast = pl ? L"\x26A0 Wybierz pliki w lokalnym folderze do masowej zmiany nazwy" : L"\x26A0 Select files in a local folder to batch rename";
             m_statusToastExpireTick = GetTickCount64() + 3000;
             break;
@@ -6017,7 +6114,8 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     }
     case CMD_SEARCH_DUPLICATES: {
         const bool pl = (m_lang == Lang::PL);
-        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || FtpClient::IsFtpPath(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
+        if (m_currentPath.empty() || IsVirtualFolder(m_currentPath) || FtpClient::IsFtpPath(m_currentPath) ||
+            RepoBrowser::IsRepoUrl(m_currentPath) || ArchiveExplorer::IsVirtualArchivePath(m_currentPath)) {
             m_statusToast = pl ? L"\x26A0 Otwórz lokalny folder, aby wyszukać duplikaty plików" : L"\x26A0 Open a local folder to scan for duplicate files";
             m_statusToastExpireTick = GetTickCount64() + 3200;
             break;
@@ -6170,6 +6268,18 @@ void ExplorerApp::ActivateFocusedOrSelectedItem() {
                 return;
             }
         }
+        if (RepoBrowser::IsRepoUrl(item.fullPath)) {
+            // a repository file opens as a copy in the temp folder (changing it changes nothing in the repository)
+            std::wstring tempFile, err;
+            if (RepoBrowser::FetchFileToTemp(item.fullPath, tempFile, &err)) {
+                FileEngine::OpenFileOrProperties(m_hwnd, tempFile, false);
+            } else {
+                m_statusToast = (m_lang == Lang::PL ? L"\x26A0 Nie udało się pobrać pliku z repozytorium: " : L"\x26A0 Could not download the file from the repository: ") + err;
+                m_statusToastExpireTick = GetTickCount64() + 5000;
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+            }
+            return;
+        }
         std::wstring arcFile, innerPath;
         if (ArchiveExplorer::SplitVirtualArchivePath(item.fullPath, arcFile, innerPath) && !innerPath.empty()) {
             std::wstring tempFile;
@@ -6285,6 +6395,7 @@ void ExplorerApp::EmptyRecycleBinAction() {
 
 void ExplorerApp::DeleteSelectedItems(bool permanent) {
     if (m_currentPath == L"THIS_PC") return;   // drives are not something to delete
+    if (RefuseRepositoryWrite(m_currentPath)) return;
 
     if (m_currentPath == L"RECYCLE_BIN") {
         // Items inside Kosz are already recycled: deleting them permanently purges both $R and $I!
@@ -6555,6 +6666,7 @@ void ExplorerApp::ShowDeleteFailures(const TransferCompletionEvent& ev) {
 void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
     if (itemIndex < 0 || itemIndex >= static_cast<int>(m_items.size())) return;
     if (m_currentPath == L"THIS_PC") return;
+    if (RefuseRepositoryWrite(m_currentPath)) return;
 
     const FileEntry itemCopy = m_items[itemIndex];
     const Strings& s = GetStrings(m_lang);
@@ -6742,6 +6854,7 @@ void ExplorerApp::CopySelectedPaths() {
 }
 
 void ExplorerApp::CreateNewFolderAction() {
+    if (RefuseRepositoryWrite(m_currentPath)) return;
     const Strings& s = GetStrings(m_lang);
     if (FtpClient::IsFtpPath(m_currentPath)) {
         std::wstring err;
@@ -6768,6 +6881,7 @@ void ExplorerApp::CreateNewFolderAction() {
 void ExplorerApp::StartInlineRename() {
     const bool pl = (m_lang == Lang::PL);
     if (m_viewMode == ViewMode::FullViewer) return;
+    if (RefuseRepositoryWrite(m_currentPath)) return;
     if (IsVirtualFolder(m_currentPath)) {
         m_statusToast = (m_currentPath == L"RECYCLE_BIN")
             ? (pl ? L"\x26A0 Nie można zmieniać nazw elementów w Koszu (najpierw przywróć element)"
@@ -7784,7 +7898,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         AppendMenuW(hViewMenu, MF_STRING | (m_showExtensions ? MF_CHECKED : MF_UNCHECKED), CMD_TOGGLE_EXT, s.chkFileExt);
         AppendMenuW(hViewMenu, MF_STRING | (m_showHidden ? MF_CHECKED : MF_UNCHECKED), CMD_TOGGLE_HIDDEN, s.chkHiddenItems);
         AppendMenuW(hViewMenu, MF_STRING | (m_gitEnabled ? MF_CHECKED : MF_UNCHECKED), CMD_TOGGLE_GIT,
-                    m_lang == Lang::PL ? L"Integracja GIT" : L"Git integration");
+                    m_lang == Lang::PL ? L"Integracja Git / SVN" : L"Git / SVN integration");
         AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hViewMenu), s.ctxViewSubmenu);
 
         HMENU hSortMenu = CreatePopupMenu();
@@ -7902,6 +8016,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         return;
     }
     if (cmd >= CMD_NEW_TXT_FILE && cmd <= CMD_NEW_MD_FILE) {
+        if (RefuseRepositoryWrite(m_currentPath)) return;
         std::wstring ext = L".txt";
         std::wstring base = (m_lang == Lang::PL) ? L"Nowy dokument tekstowy" : L"New Text Document";
         if (cmd == CMD_NEW_BMP_FILE) { ext = L".bmp"; base = (m_lang == Lang::PL) ? L"Nowy obraz" : L"New Bitmap Image"; }
@@ -7996,6 +8111,17 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
                         FileEngine::OpenFileOrProperties(m_hwnd, tempFile, false);
                         break;
                     }
+                }
+                if (RepoBrowser::IsRepoUrl(targetItem.fullPath)) {
+                    std::wstring tempFile, err;
+                    if (RepoBrowser::FetchFileToTemp(targetItem.fullPath, tempFile, &err)) {
+                        FileEngine::OpenFileOrProperties(m_hwnd, tempFile, false);
+                    } else {
+                        m_statusToast = (m_lang == Lang::PL ? L"\x26A0 Nie udało się pobrać pliku z repozytorium: " : L"\x26A0 Could not download the file from the repository: ") + err;
+                        m_statusToastExpireTick = GetTickCount64() + 5000;
+                        InvalidateRect(m_hwnd, nullptr, FALSE);
+                    }
+                    break;
                 }
                 FileEngine::OpenFileOrProperties(m_hwnd, targetItem.fullPath, false);
             }
@@ -8136,7 +8262,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         else FileEngine::OpenFileOrProperties(m_hwnd, m_currentPath, true);
         break;
     }
-    case CMD_CTX_REFRESH:        RefreshCurrentFolder(); break;
+    case CMD_CTX_REFRESH:        RefreshFromUser(); break;
     }
 }
 

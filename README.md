@@ -21,6 +21,7 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
 - Disk-usage views: a squarified treemap and a sunburst chart
 - Dual-pane split view, navigation tree with pinned Quick Access folders, breadcrumb bar
 - Search with filters for date, size, file type and file content
+- Subversion and git repositories by their URL, read-only, like folders (see [Things to know](#things-to-know))
 - In-window image and media viewer with a filmstrip
 
 **Preview pane**
@@ -44,7 +45,7 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
 - Hardware inventory and live telemetry: CPU, GPU, RAM, disks and SMART, network, thermal,
   USB and COM ports
 - Long-term system monitoring, recorded by an optional background process
-- Installed programs list, LAN scanner, Git panel and an operation log
+- Installed programs list, LAN scanner, Git and Subversion panel and an operation log
 
 ## File formats
 
@@ -101,7 +102,8 @@ build-linux/explorer2-readers testdata/*
 --inspect-files <list> <result>` works like the option of the same name in `Explorer2.exe`, so
 `python3 tools/fuzz_samples.py` drives it (on Linux, `build-linux/explorer2-readers` is the default
 `--exe`). Configure with `-DEXPLORER2_SANITIZE=ON` to build with AddressSanitizer and
-UndefinedBehaviorSanitizer. A crash is reported with the module and offset, and with
+UndefinedBehaviorSanitizer; expect that build to be slow (with GCC 9 the largest reader files take
+over an hour each). A crash is reported with the module and offset, and with
 `-DCMAKE_BUILD_TYPE=RelWithDebInfo`, `addr2line -e build-linux/explorer2-readers 0x<offset>`
 turns that into a source line.
 
@@ -152,7 +154,12 @@ a `[Reader]` line there as well.
 
 Explorer2 uses these when they are installed, and works without them:
 
-- **git**: the Git panel
+- **git**: the Git panel, and browsing git repositories by URL
+- **A command-line Subversion client** (`svn.exe`: TortoiseSVN installed with its "command line client tools",
+  SlikSVN, or another build on the PATH): the panel for Subversion working copies, and browsing Subversion
+  repositories by URL. The panel only reads a working copy: the changes, the history, a revision's changed
+  paths, a summary of the local diff, and what the repository has that the working copy has not. svn and git
+  run without prompts, so a server that needs a password the client has not stored is reported as an error.
 - **rclone**: cloud backup targets
 - **7-Zip or WinRAR** (default install location): extracting compressed entries from RAR and 7z archives
 
@@ -170,6 +177,14 @@ Explorer2 uses these when they are installed, and works without them:
   that file is skipped. Entries that point outside the destination folder are never written.
 - FTP bookmarks are saved as URLs in `ftp_bookmarks.ini`. A password that is part of the URL is
   stored there in plain text.
+- A Subversion or git repository URL typed in the address bar opens like a folder: `svn://`,
+  `svn+ssh://`, `git://`, `ssh://`, or `http(s)://` and `file://` addresses that answer as a repository.
+  GitHub and GitLab links to a folder (`.../tree/<branch>/<path>`, also with a `/` in the branch name)
+  open that branch at that folder, and the panel of a working copy or a git repository has a link to
+  its repository on the server. It is read-only: files open, preview and copy out as copies in
+  `%TEMP%\Explorer2_RepoFiles`; folders cannot be copied out. For git, the first visit makes a shallow
+  clone with the folder structure only (`%TEMP%\Explorer2_Repos`) and each file is downloaded when it
+  is opened, so sizes are not shown. Use `ssh://git@host/path` for addresses written as `git@host:path`.
 - If FileZilla is installed, the sites in its Site Manager appear in Explorer2's FTP list
   automatically.
 - Monitoring is off by default. When enabled it records one CSV row per interval and can start
@@ -193,15 +208,17 @@ $p = Start-Process .\Explorer2.exe -ArgumentList '--self-test','all','build\self
 $p.ExitCode
 ```
 
-`<stage>` is `all`, a stage number (`1` to `10`, `12`, `13`, `14` or `15`), or `100x`, which repeats
-stages 1 to 10 a hundred times.
+`<stage>` is `all`, a stage number (`1` to `10`, `12`, `13`, `14` or `15`), `vcs` for the Git and
+Subversion panel's back end alone, or `100x`, which repeats stages 1 to 10 a hundred times.
 
 The tests read sample files from `testdata/`, which must sit next to the executable or in the
 current directory. Some of them exercise the real machine: they ping 127.0.0.1, enumerate USB
 controllers, render a PDF through Windows, start a second copy of the executable to check that
 it ends cleanly, move one small file to the Recycle Bin and take it out again, and briefly use
-the hidden undo folder on the drive that holds `%TEMP%`. Everything else they write goes to
-`%TEMP%\Explorer2_SelfTest` and is removed.
+the hidden undo folder on the drive that holds `%TEMP%`. When git is installed, they create a small
+local git repository and browse it by its `file://` URL; when a Subversion client with `svnadmin.exe`
+is installed, they do the same with a Subversion repository and test the Subversion panel against a
+working copy of it. Everything else they write goes to `%TEMP%\Explorer2_SelfTest` and is removed.
 
 `python tools/fuzz_samples.py` is a second, slower check: it makes thousands of damaged copies
 of the samples and has every file reader read them. A reader has to cope with a damaged file or
