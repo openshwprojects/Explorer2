@@ -832,10 +832,15 @@
         bool okStpz = Model3DViewer::InspectMeshFile(s70Dir + L"\\step_compressed_dome.stpz", mStpz);
 
         // step_nurbs_airfoil.step: 16x16 rational NURBS surface (289v, 512t); at u=0.5,v=0.5 rational Z->Y > 10.0!
+        // It runs through its corner points: X from -10 to 10 and depth 30 (a build that lost the X and Y sums of the
+        // weighted evaluation, as MSVC 19.36 /O2 did, put every vertex at X = 0, Z = 0)
         tc.Record(okAir && mAir.loadedOk && mAir.rawVertexCount == 289 && mAir.rawTriangleCount == 512 &&
-                  mAir.bboxMax.y > 10.0f,
+                  mAir.bboxMax.y > 10.0f && std::fabs(mAir.bboxMin.x + 10.0f) < 0.01f && std::fabs(mAir.bboxMax.x - 10.0f) < 0.01f &&
+                  std::fabs(mAir.bboxMin.z + 30.0f) < 0.01f,
                   L"Stage15.3D.StepUpgrade.SampleRationalNurbsSTEP",
-                  L"verts=" + std::to_wstring(mAir.rawVertexCount) + L" maxY=" + std::to_wstring(mAir.bboxMax.y));
+                  L"verts=" + std::to_wstring(mAir.rawVertexCount) + L" maxY=" + std::to_wstring(mAir.bboxMax.y) +
+                  L" minX=" + std::to_wstring(mAir.bboxMin.x) + L" maxX=" + std::to_wstring(mAir.bboxMax.x) +
+                  L" minZ=" + std::to_wstring(mAir.bboxMin.z));
         // step_sphere_torus_assembly.stp: 1 torus at X=0 + 2 spheres at X=-20 and X=+25 (radius=4 => minX=-24, maxX=29)!
         tc.Record(okAssy && mAssy.loadedOk && mAssy.rawTriangleCount > 1000 &&
                   std::fabs(mAssy.bboxMin.x - (-24.0f)) < 0.1f && std::fabs(mAssy.bboxMax.x - 29.0f) < 0.1f,

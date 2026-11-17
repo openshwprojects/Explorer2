@@ -156,6 +156,9 @@ struct DecodedRgbaTile {
 // Backend 1: WIC Stream Decoder (handles JPEG items & OS-supported HEIF/AVIF)
 // ============================================================================
 inline bool TryDecodeViaWicMemory(const uint8_t* bytes, size_t len, DecodedRgbaTile& out) {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
+#else
     if (!bytes || len < 16) return false;
     Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) || !factory) {
@@ -188,6 +191,7 @@ inline bool TryDecodeViaWicMemory(const uint8_t* bytes, size_t len, DecodedRgbaT
         return false;
     }
     return true;
+#endif
 }
 
 // ============================================================================
@@ -265,6 +269,9 @@ inline bool DecodeAvc1StillItem(
     bool fullRange, uint16_t matrixCoeffs,
     DecodedRgbaTile& out)
 {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no Media Foundation H.264 decoder
+#else
     if (!itemData || itemLen < 5 || avcC.size() < 7 || avcC[0] != 1) return false;
     uint8_t lenSize = static_cast<uint8_t>((avcC[4] & 0x03u) + 1u);
 
@@ -584,6 +591,7 @@ inline bool DecodeAvc1StillItem(
     }
     MFShutdown();
     return mfDecoded;
+#endif
 }
 
 // ============================================================================

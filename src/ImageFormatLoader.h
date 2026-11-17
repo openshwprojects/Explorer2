@@ -8,7 +8,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
+#include "PlatformCompat.h"   // <windows.h> on Windows
 #include <cstdint>
 #include <string>
 #include <vector>

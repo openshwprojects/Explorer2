@@ -1,5 +1,6 @@
 # Build outputs (the exe is built with build.bat, not stored in git)
 build/
+build-linux/
 dist/
 *.obj
 *.pdb

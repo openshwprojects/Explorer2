@@ -576,6 +576,9 @@ inline bool ParseWindowsPrefetch(const std::vector<uint8_t>& raw, ParsedOfficeDo
     size_t sccaLen = raw.size();
 
     if (isMam) {
+#ifndef _WIN32
+        return false;   // Windows 10+ compressed Prefetch: Xpress Huffman comes from ntdll, which Linux does not have
+#else
         const uint32_t uncompSz = DetailSys100::RdU32LE(raw.data() + 4);
         if (uncompSz < 84 || uncompSz > 32u * 1024u * 1024u) return false;
 
@@ -618,6 +621,7 @@ inline bool ParseWindowsPrefetch(const std::vector<uint8_t>& raw, ParsedOfficeDo
         if (!okDecomp) return false;
         scca = decompressed.data();
         sccaLen = decompressed.size();
+#endif
     }
 
     const uint32_t sccaVer = DetailSys100::RdU32LE(scca + 0);
@@ -1834,6 +1838,7 @@ inline void WalkAsn1Der(const uint8_t* p, size_t len, int depth, std::wstring& l
     }
 }
 
+#ifdef _WIN32   // CryptoAPI: the Linux build of the readers shows certificates as their ASN.1 structure instead
 inline void AppendCertContextRows(PCCERT_CONTEXT pCert, const std::wstring& prefix, std::vector<std::vector<std::wstring>>& rows) {
     if (!pCert || !pCert->pCertInfo) return;
 
@@ -1909,6 +1914,7 @@ inline void AppendCertContextRows(PCCERT_CONTEXT pCert, const std::wstring& pref
         }
     }
 }
+#endif // _WIN32
 
 } // namespace DetailX509
 
@@ -1943,6 +1949,7 @@ inline bool ParseX509AndPkcsDoc(const std::vector<uint8_t>& raw, const std::wstr
         }
 
         std::vector<uint8_t> decoded;
+#ifdef _WIN32
         DWORD cbDecoded = 0;
         if (CryptStringToBinaryA(payloadSv.data(), static_cast<DWORD>(payloadSv.size()), CRYPT_STRING_BASE64, nullptr, &cbDecoded, nullptr, nullptr) && cbDecoded > 0) {
             decoded.resize(cbDecoded);
@@ -1952,6 +1959,7 @@ inline bool ParseX509AndPkcsDoc(const std::vector<uint8_t>& raw, const std::wstr
                 decoded.resize(cbDecoded);
             }
         }
+#endif
         if (decoded.empty()) {
             DetailX509::DecodeBase64Clean(payloadSv, decoded);
         }
@@ -1988,6 +1996,7 @@ inline bool ParseX509AndPkcsDoc(const std::vector<uint8_t>& raw, const std::wstr
                                    blk.label.find(L"KEY") != std::wstring::npos ||
                                    extLower == L".csr" || extLower == L".p12" || extLower == L".pfx");
 
+#ifdef _WIN32
         if (!looksNonCert) {
             PCCERT_CONTEXT pCert = CertCreateCertificateContext(
                 X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
@@ -2013,6 +2022,9 @@ inline bool ParseX509AndPkcsDoc(const std::vector<uint8_t>& raw, const std::wstr
                 }
             }
         }
+#else
+        (void)looksNonCert;
+#endif
 
         if (!handledAsCert) {
             uint8_t t = 0; size_t hl = 0, vl = 0;

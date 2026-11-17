@@ -7,7 +7,7 @@
 // strings), \u escapes with surrogate pairs (a lone surrogate becomes U+FFFD), an optional UTF-8 BOM,
 // and hard limits on nesting depth and node count so hostile input cannot exhaust the stack or memory.
 // Numbers keep their literal text, so 64-bit integers (Avro longs, ASAR sizes) come back exactly.
-#include <charconv>
+#include "CharConvCompat.h"   // <charconv> (+ floating-point from_chars for older libstdc++)
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

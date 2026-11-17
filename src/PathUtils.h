@@ -8,10 +8,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
+#include "PlatformCompat.h"   // <windows.h> on Windows
+#ifdef _WIN32
 #include <d2d1.h>
 #include <dwrite.h>
 #include <shlwapi.h>
+#endif
 #include <string>
 #include <string_view>
 #include <vector>
@@ -164,6 +166,10 @@ inline size_t ValidUtf8PrefixLength(std::string_view s) {
 // U+10FFFF are dropped
 inline void AppendUtf16(std::wstring& out, uint32_t cp) {
     if (cp == 0 || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return;
+    if constexpr (sizeof(wchar_t) == 4) {   // Linux: wchar_t holds any code point (UTF-32)
+        out.push_back(static_cast<wchar_t>(cp));
+        return;
+    }
     if (cp <= 0xFFFFu) {
         out.push_back(static_cast<wchar_t>(cp));
     } else {
@@ -271,6 +277,7 @@ inline bool WriteFileBytes(const std::wstring& fullPath, const void* data, size_
     return ok != FALSE && written == static_cast<DWORD>(byteCount);
 }
 
+#ifdef _WIN32
 inline bool CopyWideToClipboard(HWND ownerHwnd, const std::wstring& text) {
     if (!OpenClipboard(ownerHwnd)) return false;
     EmptyClipboard();
@@ -291,6 +298,7 @@ inline bool CopyWideToClipboard(HWND ownerHwnd, const std::wstring& text) {
     CloseClipboard();
     return true;
 }
+#endif
 
 inline std::wstring FormatByteSize(uint64_t bytes) {
     wchar_t buf[64] = {};
@@ -306,6 +314,7 @@ inline std::wstring FormatByteSize(uint64_t bytes) {
     return buf;
 }
 
+#ifdef _WIN32
 // Shared Direct2D color & UI helpers
 inline D2D1_COLOR_F ColorFromRgb(uint32_t rgb, float a = 1.0f) {
     return D2D1::ColorF(
@@ -360,5 +369,6 @@ inline D2D1_RECT_F FitRectCentered(const D2D1_RECT_F& bounds, float srcW, float 
 inline bool PtInRectF(float x, float y, const D2D1_RECT_F& r) {
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
+#endif // _WIN32
 
 } // namespace Explorer2::PathUtils

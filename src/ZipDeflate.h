@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <string>
 #include <vector>
-#include <windows.h>
+#include "PlatformCompat.h"   // <windows.h> on Windows
 
 namespace Explorer2::ZipDeflate {
 

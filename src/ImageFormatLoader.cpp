@@ -1,9 +1,13 @@
 #include "ImageFormatLoader.h"
 #include "FormatSupport.h"
-#include "OsCompat.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
+#ifdef _WIN32
+// Windows codecs: WIC (JPEG / PNG inside other formats, HEIF), DirectWrite and GDI (fonts, metafiles), Media
+// Foundation (HEVC, H.264). The Linux build of the readers has none of them: the few decoders that need them
+// return false there (#ifndef _WIN32 at the top of each).
+#include "OsCompat.h"
 #include <wrl/client.h>
 #include <wincodec.h>
 #include <dwrite_3.h>
@@ -11,6 +15,7 @@
 #include <mfidl.h>
 #include <mftransform.h>
 #include <mferror.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <cmath>

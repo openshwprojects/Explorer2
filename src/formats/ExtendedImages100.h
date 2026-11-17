@@ -103,6 +103,9 @@ inline void DrawBitmapText5x7(
 
 // Decode an embedded PNG, JPEG, JP2, or JXL buffer via Windows WIC into ExtendedImageInfo
 inline bool DecodeEmbeddedWicBuffer(const uint8_t* bytes, size_t len, const std::wstring& fmtLabel, ExtendedImageInfo& outInfo) {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
+#else
     if (!bytes || len < 16) return false;
     IWICImagingFactory* factory = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
@@ -149,6 +152,7 @@ inline bool DecodeEmbeddedWicBuffer(const uint8_t* bytes, size_t len, const std:
     }
     factory->Release();
     return decoded;
+#endif
 }
 
 inline bool EqualsIgnoreCaseAscii(std::string_view a, std::string_view b) {
@@ -4485,6 +4489,9 @@ inline bool TryDecodeHevcViaMediaFoundation(
     uint32_t cropW, uint32_t cropH,
     std::vector<uint8_t>& outBgra)
 {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no Media Foundation HEVC decoder
+#else
     if (annexB.empty() || alignedW == 0u || alignedH == 0u) return false;
     if (!::Explorer2::IsMediaFoundationAvailable()) return false;
     HRESULT hrMf = ::MFStartup(MF_VERSION, MFSTARTUP_LITE);
@@ -4657,6 +4664,7 @@ inline bool TryDecodeHevcViaMediaFoundation(
 
     ::MFShutdown();
     return ok;
+#endif
 }
 
 // Pure-C++ ITU-T H.265 Intra (I-slice + CABAC + Quadtree + I_PCM) Plane Decoder
@@ -8110,6 +8118,9 @@ inline bool ReconstructWoff2TransformedGlyfLoca(
 }
 
 inline bool ReconstructSfntFromWoff2(const uint8_t* data, size_t size, std::vector<uint8_t>& outSfnt) {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no DirectWrite (WOFF2 fonts)
+#else
     outSfnt.clear();
     if (!data || size < 48u || std::memcmp(data, "wOF2", 4) != 0) return false;
 
@@ -8357,6 +8368,7 @@ inline bool ReconstructSfntFromWoff2(const uint8_t* data, size_t size, std::vect
         WrU32BE(outSfnt.data() + headTableOff + 8u, 0xB1B0AFBAu - fontCsum);
     }
     return true;
+#endif
 }
 
 } // namespace DetailFont
@@ -8458,6 +8470,9 @@ inline bool DecodeAseprite(const uint8_t* data, size_t size, ExtendedImageInfo& 
 }
 
 inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no GDI font rendering
+#else
     if (!data || size < 28) return false;
     (void)extLower;
 
@@ -8689,6 +8704,7 @@ inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstr
 
     outInfo.valid = true;
     return true;
+#endif
 }
 
 } // namespace Formats

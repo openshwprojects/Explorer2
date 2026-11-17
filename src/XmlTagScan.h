@@ -10,7 +10,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
+#include "PlatformCompat.h"   // <windows.h> on Windows
 #include "PathUtils.h"
 
 namespace Explorer2::XmlTagScan {

@@ -13,6 +13,9 @@ Usage:  python tools/fuzz_samples.py [--exe PATH] [--seed N] [--workers N] [--on
 The damaged files are written to a folder under %TEMP% and removed again; the files that caused a
 fault are copied to --findings (default: build/fuzz_findings). The run is deterministic for a seed.
 Exit code: 0 when no fault was found, 1 otherwise.
+
+On Linux the default --exe is build-linux/explorer2-readers, the readers' Linux build (linux/CMakeLists.txt),
+which speaks the same --inspect-files protocol; a crash there names the module and offset for addr2line.
 """
 
 import argparse
@@ -264,7 +267,7 @@ class Symbolizer:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('--exe', default=str(REPO / 'Explorer2.exe'))
+    parser.add_argument('--exe', default=str(REPO / ('Explorer2.exe' if os.name == 'nt' else 'build-linux/explorer2-readers')))
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--workers', type=int, default=max(2, min(6, (os.cpu_count() or 4) // 2)))
     parser.add_argument('--only', default='*', help='file name pattern of the samples to use, for example "*.md2"')

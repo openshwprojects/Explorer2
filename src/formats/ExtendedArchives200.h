@@ -6,7 +6,7 @@
 //   FS & Containers (#31–#35): .squashfs/.snap/.appimage, .erofs, .cpio, .ar/.a/.lib, .xar/.pkg
 //   Retro, Mobile & Appliances (#36–#40): .lzh/.lha, .arj, .ace, .ipa/.aab/.xapk, .ova
 
-#include "../ArchiveExplorer.h"
+#include "../ArchiveTypes.h"
 #include "../ZipDeflate.h"
 #include "../Lz4Block.h"
 #include "../PathUtils.h"

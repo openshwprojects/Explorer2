@@ -236,3 +236,36 @@ jobs:
             dist/Explorer2-${{ steps.version.outputs.semver }}-x64.exe
             dist/Explorer2-${{ steps.version.outputs.semver }}-portable-x64.zip
             dist/SHA256SUMS.txt
+
+  # The file readers alone, built for Linux by a second compiler (linux/CMakeLists.txt). Nothing here is released;
+  # the job shows that the readers still build without Windows and still read every sample without a fault.
+  build-linux-readers:
+    name: File readers on Linux (headless)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build explorer2-readers
+        run: |
+          cmake -S linux -B build-linux -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux -j "$(nproc)"
+
+      - name: Self-check of the harness (a crash, an exception and a hang are each caught)
+        run: python3 tools/fuzz_samples.py --exe build-linux/explorer2-readers --only '__no_sample__'
+
+      - name: Read every sample in testdata/
+        run: |
+          find "$PWD/testdata" -type f ! -name README.md ! -path '*/LICENSES/*' | sort > build-linux/samples.txt
+          build-linux/explorer2-readers --inspect-files build-linux/samples.txt build-linux/samples_result.txt
+          result=build-linux/samples_result.txt
+          faults=$(awk -F'\t' '$1 == "T" || $1 == "X" || $1 == "H"' "$result")
+          if [ "$(tail -n 1 "$result")" != "D" ] || [ -n "$faults" ]; then
+              echo "::error title=Reader fault::a reader crashed, hung or let an exception escape"
+              echo "$faults"
+              tail -n 5 "$result"
+              exit 1
+          fi
+          echo "files: $(wc -l < build-linux/samples.txt)   reader runs: $(grep -c '^E' "$result")   read: $(awk -F'\t' '$1 == "E" && $4 == "1"' "$result" | wc -l)   no reader: $(grep -c '^N' "$result")"

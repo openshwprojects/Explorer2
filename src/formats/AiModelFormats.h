@@ -5,8 +5,8 @@
 // Streams directly from disk (with O(1) SetFilePointerEx skipping over multi-GB tensor payloads) or memory.
 
 #include "../PathUtils.h"
-#include "../SpreadsheetDocViewer.h"
-#include <windows.h>
+#include "../OfficeDocTypes.h"
+#include "../PlatformCompat.h"   // <windows.h> on Windows
 #include <algorithm>
 #include <cmath>
 #include <cstdint>

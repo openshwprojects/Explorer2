@@ -38,6 +38,9 @@ inline uint8_t ExtractBitfield8(uint32_t px, uint32_t mask) {
 }
 
 inline bool DecodePngViaWic(const uint8_t* pngData, size_t pngSize, ExtendedImageInfo& outInfo) {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
+#else
     if (!pngData || pngSize < 8 || pngSize > 0x7FFFFFFFu) return false;
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     bool needUninit = (hrCo == S_OK || hrCo == S_FALSE);
@@ -98,6 +101,7 @@ inline bool DecodePngViaWic(const uint8_t* pngData, size_t pngSize, ExtendedImag
     if (factory) factory->Release();
     if (needUninit) CoUninitialize();
     return ok;
+#endif
 }
 
 inline bool DecodeIcoDibEntry(const uint8_t* sub, size_t subLen, uint8_t dirH, ExtendedImageInfo& outInfo) {

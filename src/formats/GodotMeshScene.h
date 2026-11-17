@@ -558,7 +558,7 @@ inline bool ParseGodotTextMeshOrScene(std::string_view sv, const std::wstring& f
                     GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES)
                 {
                     LoadedMesh3D extLoaded;
-                    if (Model3DViewer::InspectMeshFile(cand, extLoaded) && extLoaded.loadedOk) {
+                    if (MeshReaders::InspectMeshFile(cand, extLoaded) && extLoaded.loadedOk) {
                         GdLocalMesh lm;
                         lm.verts = std::move(extLoaded.vertices);
                         for (const auto& t : extLoaded.tris) lm.tris.push_back({ t.i0, t.i1, t.i2 });

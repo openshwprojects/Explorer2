@@ -4,7 +4,7 @@
 // Covers: .iso, .zst/.tzst, .xz/.txz, .bz2/.tbz2, .lz4, .cab, .msi/.msp, .deb, .rpm,
 //         .dmg, .vhd/.vhdx, .vmdk/.vdi, .qcow2, .wim/.esd, .pak/.wad, .vpk, .bsa/.ba2, .asar
 
-#include "../ArchiveExplorer.h"
+#include "../ArchiveTypes.h"
 #include "../ZipDeflate.h"
 #include "../Ole2Compound.h"
 #include "../PathUtils.h"

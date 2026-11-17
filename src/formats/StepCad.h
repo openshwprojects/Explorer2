@@ -1150,7 +1150,13 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
                 std::vector<double> V = expandMultKnots(nV, vDeg, vMults, vKnots);
                 double u0 = U[static_cast<size_t>(uDeg)], u1 = U[static_cast<size_t>(nU)];
                 double v0 = V[static_cast<size_t>(vDeg)], v1 = V[static_cast<size_t>(nV)];
-                bool hasRat = (static_cast<int>(weightGrid.size()) == nU && static_cast<int>(weightGrid[0].size()) == nV);
+                // A surface without weights gets a grid of 1s, so that the loop below always reads the weight from
+                // the grid. With `hasRat ? weight : 1.0` in it, MSVC 19.36 /O2 splits the loop in two and drops the
+                // x and y sums from the weighted copy: every rational surface came out flat on a line
+                // (testdata/samples70/step_nurbs_airfoil.step). Multiplying by 1.0 changes no result.
+                bool hasRat = static_cast<int>(weightGrid.size()) == nU;
+                for (const auto& wRow : weightGrid) if (static_cast<int>(wRow.size()) != nV) hasRat = false;
+                if (!hasRat) weightGrid.assign(static_cast<size_t>(nU), std::vector<double>(static_cast<size_t>(nV), 1.0));
                 if (u1 > u0 && v1 > v0) {
                     constexpr int kNu = 16, kNv = 16;
                     uint32_t vBase = static_cast<uint32_t>(fMesh.vertices.size());
@@ -1166,7 +1172,7 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
                                 if (bu[static_cast<size_t>(i)] == 0.0) continue;
                                 for (int j = 0; j < nV; ++j) {
                                     if (bv[static_cast<size_t>(j)] == 0.0) continue;
-                                    double w = hasRat ? weightGrid[static_cast<size_t>(i)][static_cast<size_t>(j)] : 1.0;
+                                    double w = weightGrid[static_cast<size_t>(i)][static_cast<size_t>(j)];
                                     double b = bu[static_cast<size_t>(i)] * bv[static_cast<size_t>(j)] * w;
                                     const Vec3f& cp = ctrlGrid[static_cast<size_t>(i)][static_cast<size_t>(j)];
                                     sx += b * cp.x; sy += b * cp.y; sz += b * cp.z;

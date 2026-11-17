@@ -3789,17 +3789,18 @@ inline bool ParseLogicScopeAutoPlc200(const uint8_t* data, size_t size, const st
         };
 
         auto metaEntryUtf8 = [&](const auto& item) -> std::string {
-            if constexpr (requires { item.relativePath; }) {
-                if constexpr (requires { std::string_view(item.relativePath); }) return std::string(std::string_view(item.relativePath));
+            using Item = std::decay_t<decltype(item)>;
+            if constexpr (MemberDetect::HasRelativePath<Item>::value) {
+                if constexpr (std::is_constructible_v<std::string_view, decltype((item.relativePath))>) return std::string(std::string_view(item.relativePath));
                 else return wideToUtf8Local(item.relativePath);
-            } else if constexpr (requires { item.name; }) {
-                if constexpr (requires { std::string_view(item.name); }) return std::string(std::string_view(item.name));
+            } else if constexpr (MemberDetect::HasName<Item>::value) {
+                if constexpr (std::is_constructible_v<std::string_view, decltype((item.name))>) return std::string(std::string_view(item.name));
                 else return wideToUtf8Local(item.name);
-            } else if constexpr (requires { item.path; }) {
-                if constexpr (requires { std::string_view(item.path); }) return std::string(std::string_view(item.path));
+            } else if constexpr (MemberDetect::HasPath<Item>::value) {
+                if constexpr (std::is_constructible_v<std::string_view, decltype((item.path))>) return std::string(std::string_view(item.path));
                 else return wideToUtf8Local(item.path);
-            } else if constexpr (requires { item.fileName; }) {
-                if constexpr (requires { std::string_view(item.fileName); }) return std::string(std::string_view(item.fileName));
+            } else if constexpr (MemberDetect::HasFileName<Item>::value) {
+                if constexpr (std::is_constructible_v<std::string_view, decltype((item.fileName))>) return std::string(std::string_view(item.fileName));
                 else return wideToUtf8Local(item.fileName);
             } else {
                 return {};

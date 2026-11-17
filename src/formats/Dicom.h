@@ -194,6 +194,9 @@ inline bool SkipUndefinedLengthElement(const uint8_t* data, size_t size, size_t&
 }
 
 inline bool DecodeWicFragment(const uint8_t* fragData, size_t fragSize, ExtendedImageInfo& outInfo) {
+#ifndef _WIN32
+    return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
+#else
     if (!fragData || fragSize < 8 || fragSize > 0x7FFFFFFFu) return false;
     HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     bool needUninit = (hrCo == S_OK || hrCo == S_FALSE);
@@ -256,6 +259,7 @@ inline bool DecodeWicFragment(const uint8_t* fragData, size_t fragSize, Extended
     if (factory) factory->Release();
     if (needUninit) CoUninitialize();
     return ok;
+#endif
 }
 
 // Decompress DICOM PS3.5 Annex G RLE Lossless frame into Little-Endian pixel-interleaved native buffer

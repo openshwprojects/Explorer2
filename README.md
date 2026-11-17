@@ -83,6 +83,45 @@ and `SHA256SUMS.txt` into `dist/`:
 build_installer.bat
 ```
 
+### File readers on Linux
+
+Explorer2 itself runs only on Windows, but its file readers (images, 3D models, boards, documents,
+archives) also build on Linux, without the window, as a command-line program. The Windows calls
+they make are supplied by `src/PlatformCompat.h`. It is a second compiler's check of the readers,
+and it lets them be fuzzed with the sanitizers. It needs a C++20 compiler and CMake 3.13 or newer
+(tested with GCC 9.4 and CMake 3.16 on Ubuntu 20.04):
+
+```sh
+cmake -S linux -B build-linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux -j
+build-linux/explorer2-readers testdata/*
+```
+
+`explorer2-readers FILE...` prints what each reader made of each file. `explorer2-readers
+--inspect-files <list> <result>` works like the option of the same name in `Explorer2.exe`, so
+`python3 tools/fuzz_samples.py` drives it (on Linux, `build-linux/explorer2-readers` is the default
+`--exe`). Configure with `-DEXPLORER2_SANITIZE=ON` to build with AddressSanitizer and
+UndefinedBehaviorSanitizer. A crash is reported with the module and offset, and with
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo`, `addr2line -e build-linux/explorer2-readers 0x<offset>`
+turns that into a source line.
+
+Most formats are decoded by Explorer2's own code, and the Linux build reads every sample in
+`testdata/` that the Windows build reads, except the ones that need what is listed here. What
+Windows itself decodes is left out on Linux, and those files are turned down:
+
+- PNG and JPEG data inside other formats, which Windows decodes with WIC: PNG frames in animated
+  cursors, DICOM images with JPEG-compressed pixels, OpenRaster layers, embedded PNG, JPEG,
+  JPEG 2000 and JPEG XL images, and the HEIF and AVIF items Explorer2's own decoders leave to WIC
+- H.264 and the HEVC streams that need Media Foundation (`.avci`, some HEIF files)
+- font specimens and WOFF2 fonts (GDI, DirectWrite), and EMF / WMF metafiles (GDI)
+- Windows 10 compressed Prefetch files (the decompressor is in `ntdll.dll`)
+- PDF (Windows' own PDF renderer)
+- unpacking CAB archives (SetupAPI), and RAR and 7z entries that need 7-Zip or UnRAR. Listing
+  these archives works.
+
+Certificates are shown as their ASN.1 structure instead of CryptoAPI's decoded fields. Legacy
+8-bit text that Windows decodes with the system code page is decoded as Windows-1252.
+
 ## Running
 
 ```bat
@@ -186,6 +225,7 @@ them at your own files:
 | --- | --- |
 | `src/` | Application sources |
 | `src/formats/` | File-format readers, one header per format family |
+| `linux/` | The readers' Linux build (see [File readers on Linux](#file-readers-on-linux)) |
 | `res/` | Application icon |
 | `installer/` | Inno Setup 6 Windows x64 installer definition (`Explorer2.iss`) |
 | `testdata/` | Sample files for the self-tests, with their sources and licences |

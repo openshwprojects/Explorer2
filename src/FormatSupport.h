@@ -11,6 +11,7 @@
 #include "JsonDom.h"
 #include "Lz4Block.h"
 #include "LzxDecoder.h"
+#include "MemberDetect.h"
 #include "StreamCodecs.h"
 #include "XmlTagScan.h"
 #include "ZipDeflate.h"

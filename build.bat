@@ -33,15 +33,19 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
 rem The slowest translation units come first: /MP compiles the list in order, so a heavy file at the end would start only when everything else is done.
 cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
-    src\Model3DViewer.cpp ^
-    src\EdaViewer.cpp ^
-    src\SpreadsheetDocViewer.cpp ^
+    src\EdaReaders.cpp ^
+    src\DocReaders.cpp ^
+    src\Mesh3DReaders.cpp ^
+    src\ArchiveReaders.cpp ^
     src\ExplorerApp.cpp ^
     src\ExplorerAppRender.cpp ^
     src\ImageFormatLoader.cpp ^
-    src\ArchiveExplorer.cpp ^
     src\SelfTestSuite.cpp ^
     src\FormatTestsDocs.cpp ^
+    src\Model3DViewer.cpp ^
+    src\EdaViewer.cpp ^
+    src\SpreadsheetDocViewer.cpp ^
+    src\ArchiveExplorer.cpp ^
     src\main.cpp ^
     src\FileEngine.cpp ^
     src\ImageCache.cpp ^

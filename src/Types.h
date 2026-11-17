@@ -259,9 +259,11 @@ struct UndoDeleteBatch {
     std::vector<std::pair<std::wstring, std::wstring>> originalToTrashPaths; // <originalFullPath, stagingTrashPath>
 };
 
-static inline bool IsVirtualFolder(const std::wstring& p) {
-    return p == L"THIS_PC" || p == L"RECYCLE_BIN";
-}
+} // namespace Explorer2
+
+#include "VirtualFolders.h"   // IsVirtualFolder
+
+namespace Explorer2 {
 
 static inline bool IsImageExtension(const std::wstring& extLower) {
     return extLower == L".png"  || extLower == L".jpg"  || extLower == L".jpeg" ||

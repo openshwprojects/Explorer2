@@ -1,7 +1,7 @@
 #pragma once
 // Per-start application log: every launch creates its own file in %LOCALAPPDATA%\Explorer2\Logs and keeps the
 // most recent entries in memory for the "Log" tab. Thread-safe; Write() may be called from any thread.
-#include <windows.h>
+#include "PlatformCompat.h"   // <windows.h> on Windows
 #include <string>
 #include <vector>
 #include <cstdint>

@@ -1,6 +1,8 @@
 #pragma once
 #include "Types.h"
 #include "Localization.h"
+#include "Mesh3DTypes.h"
+#include "Mesh3DReaders.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wrl/client.h>
@@ -12,36 +14,6 @@
 #include <cstdint>
 
 namespace Explorer2 {
-
-struct Vec3f {
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-};
-
-struct MeshTriangle {
-    uint32_t i0 = 0;
-    uint32_t i1 = 0;
-    uint32_t i2 = 0;
-    Vec3f normal = { 0.0f, 1.0f, 0.0f };
-};
-
-struct LoadedMesh3D {
-    std::wstring filePath;
-    std::wstring formatName;
-    std::wstring statusMessage;
-    bool loadedOk = false;
-    bool isLoading = false;
-
-    std::vector<Vec3f> vertices;       // Normalized into [-1, 1] unit sphere
-    std::vector<MeshTriangle> tris;
-    size_t rawVertexCount = 0;
-    size_t rawTriangleCount = 0;
-    size_t animFrameCount = 1;
-    Vec3f bboxMin = {};
-    Vec3f bboxMax = {};
-    Vec3f bboxSize = {};
-};
 
 enum class RenderMode3D : int {
     Shaded = 0,
@@ -57,10 +29,15 @@ public:
     void Initialize(HWND notifyHwnd, ID2D1Factory* d2dFactory);
     void Shutdown();
 
-    static bool Is3DModelExtension(const std::wstring& extLower);
-    static bool IsLikely3DDxfFile(const std::wstring& fullPath);
-    static bool IsLikely3DGeoOrDemFile(const std::wstring& fullPath, const std::wstring& extLower);
-    static bool InspectMeshFile(const std::wstring& fullPath, LoadedMesh3D& outMesh);
+    // The readers themselves live in Mesh3DReaders.cpp
+    static bool Is3DModelExtension(const std::wstring& extLower) { return MeshReaders::Is3DModelExtension(extLower); }
+    static bool IsLikely3DDxfFile(const std::wstring& fullPath) { return MeshReaders::IsLikely3DDxfFile(fullPath); }
+    static bool IsLikely3DGeoOrDemFile(const std::wstring& fullPath, const std::wstring& extLower) {
+        return MeshReaders::IsLikely3DGeoOrDemFile(fullPath, extLower);
+    }
+    static bool InspectMeshFile(const std::wstring& fullPath, LoadedMesh3D& outMesh) {
+        return MeshReaders::InspectMeshFile(fullPath, outMesh);
+    }
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
     void Clear();
@@ -106,7 +83,6 @@ public:
 
 private:
     void ResetCamera();
-    static LoadedMesh3D ParseMeshFromDisk(const std::wstring& fullPath, uint64_t generation, const std::atomic<uint64_t>* activeGen);
 
     enum ButtonId : int {
         BTN_NONE = 0,

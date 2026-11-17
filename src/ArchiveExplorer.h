@@ -10,6 +10,8 @@
 #endif
 #include "Types.h"
 #include "Localization.h"
+#include "ArchiveTypes.h"
+#include "ArchiveReaders.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <cstdint>
@@ -18,93 +20,35 @@
 
 namespace Explorer2 {
 
-// Paths of entries inside archives: forward slashes, no leading or trailing slash, no leading "./"
-namespace ArchivePath {
-inline std::wstring Normalize(std::wstring p) {
-    for (wchar_t& ch : p) {
-        if (ch == L'\\') ch = L'/';
-    }
-    while (!p.empty() && p.front() == L'/') p.erase(p.begin());
-    while (!p.empty() && p.back() == L'/') p.pop_back();
-    while (p.rfind(L"./", 0) == 0) p.erase(0, 2);
-    return p;
-}
-
-inline std::wstring BaseName(const std::wstring& p) {
-    size_t slash = p.find_last_of(L'/');
-    return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
-}
-} // namespace ArchivePath
-
-struct ArchiveItemEntry {
-    std::wstring pathInArchive; // Forward-slash normalized relative path, no leading/trailing slash
-    std::wstring name;          // Base name
-    uint64_t uncompressedSize = 0;
-    uint64_t compressedSize = 0;
-    uint32_t crc32 = 0;
-    uint16_t dosTime = 0;
-    uint16_t dosDate = 0;
-    bool isDirectory = false;
-    // Internal offsets for fast direct extraction
-    uint64_t rawDataOffset = 0;
-    uint16_t compressionMethod = 0;
-};
-
-struct ArchiveSummaryInfo {
-    std::wstring formatName; // e.g. L"ZIP", L"RAR4", L"RAR5", L"7-Zip", L"TAR.GZ"
-    size_t totalFiles = 0;
-    size_t totalFolders = 0;
-    uint64_t totalUncompressedBytes = 0;
-    uint64_t totalCompressedBytes = 0;
-    std::vector<ArchiveItemEntry> entries;
-    bool valid = false;
-};
-
 class ArchiveExplorer {
 public:
     ArchiveExplorer() = default;
     ~ArchiveExplorer() = default;
 
-    static bool IsArchiveExtension(const std::wstring& extLower);
-
-    // Checks if a filesystem path points to an archive or a virtual subfolder inside an archive
-    // e.g. "C:\Data\bundle.zip\src\main.cpp" -> outArchiveFile = "C:\Data\bundle.zip", outInnerPath = "src/main.cpp"
-    static bool SplitVirtualArchivePath(
-        const std::wstring& fullPath,
-        std::wstring& outArchiveFile,
-        std::wstring& outInnerPath);
-
-    static bool IsVirtualArchivePath(const std::wstring& fullPath);
-
-    // Reads the complete table of contents of an archive (.zip, .rar, .7z, .tar, .gz, .tgz, .jar, .nupkg, .apk)
-    static bool InspectArchiveFile(const std::wstring& archivePath, ArchiveSummaryInfo& outInfo);
-
-    // Lists immediate children at `innerDir` (e.g. "" for root or "src/core" for a subfolder)
-    static bool EnumerateArchiveFolder(
-        const std::wstring& archivePath,
-        const std::wstring& innerDir,
-        std::vector<ArchiveItemEntry>& outImmediateChildren,
-        ArchiveSummaryInfo* outFullSummary = nullptr);
-
-    // Extracts a single file from `archivePath` into memory or a temporary file on disk
-    static bool ExtractSingleEntryToMemory(
-        const std::wstring& archivePath,
-        const std::wstring& innerPath,
-        std::vector<uint8_t>& outBytes);
-
-    static bool ExtractSingleEntryToTempFile(
-        const std::wstring& archivePath,
-        const std::wstring& innerPath,
-        std::wstring& outTempFilePath);
-
-    // Unpacks a whole archive into a folder. Nothing that is already there is replaced: an entry whose name
-    // is taken is written as "name (2).ext" (`outKeptExisting` counts those). An entry that would land outside
-    // the folder ("..", an absolute path) is refused (`outRefused`).
-    static bool ExtractEntireArchiveToFolder(
-        const std::wstring& archivePath,
-        const std::wstring& destFolderPath,
-        size_t* outKeptExisting = nullptr,
-        size_t* outRefused = nullptr);
+    // The readers themselves live in ArchiveReaders.cpp (see ArchiveReaders.h for what each does)
+    static bool IsArchiveExtension(const std::wstring& extLower) { return ArchiveReaders::IsArchiveExtension(extLower); }
+    static bool SplitVirtualArchivePath(const std::wstring& fullPath, std::wstring& outArchiveFile, std::wstring& outInnerPath) {
+        return ArchiveReaders::SplitVirtualArchivePath(fullPath, outArchiveFile, outInnerPath);
+    }
+    static bool IsVirtualArchivePath(const std::wstring& fullPath) { return ArchiveReaders::IsVirtualArchivePath(fullPath); }
+    static bool InspectArchiveFile(const std::wstring& archivePath, ArchiveSummaryInfo& outInfo) {
+        return ArchiveReaders::InspectArchiveFile(archivePath, outInfo);
+    }
+    static bool EnumerateArchiveFolder(const std::wstring& archivePath, const std::wstring& innerDir,
+                                       std::vector<ArchiveItemEntry>& outImmediateChildren,
+                                       ArchiveSummaryInfo* outFullSummary = nullptr) {
+        return ArchiveReaders::EnumerateArchiveFolder(archivePath, innerDir, outImmediateChildren, outFullSummary);
+    }
+    static bool ExtractSingleEntryToMemory(const std::wstring& archivePath, const std::wstring& innerPath, std::vector<uint8_t>& outBytes) {
+        return ArchiveReaders::ExtractSingleEntryToMemory(archivePath, innerPath, outBytes);
+    }
+    static bool ExtractSingleEntryToTempFile(const std::wstring& archivePath, const std::wstring& innerPath, std::wstring& outTempFilePath) {
+        return ArchiveReaders::ExtractSingleEntryToTempFile(archivePath, innerPath, outTempFilePath);
+    }
+    static bool ExtractEntireArchiveToFolder(const std::wstring& archivePath, const std::wstring& destFolderPath,
+                                             size_t* outKeptExisting = nullptr, size_t* outRefused = nullptr) {
+        return ArchiveReaders::ExtractEntireArchiveToFolder(archivePath, destFolderPath, outKeptExisting, outRefused);
+    }
 
     // Right-Side File Content Pane UI methods
     void Initialize(HWND parentHwnd);
@@ -143,12 +87,11 @@ public:
         return out;
     }
 
-    // Runs an external archive tool (7z.exe, UnRAR.exe, tar.exe) without a window and waits for it.
-    // timeoutMs = INFINITE waits for as long as the tool takes. A tool that is still running when its time
-    // is up is ended, and the caller is told so: it must never be left working unseen on files the caller
-    // is about to read, hand to another tool or report on.
-    enum class ToolRun { Succeeded, Failed, TimedOut };
-    static ToolRun RunToolAndWait(const std::wstring& exePath, const std::wstring& args, DWORD timeoutMs);
+    // Runs an external archive tool without a window and waits for it (ArchiveReaders::RunToolAndWait)
+    using ToolRun = ArchiveToolRun;
+    static ToolRun RunToolAndWait(const std::wstring& exePath, const std::wstring& args, DWORD timeoutMs) {
+        return ArchiveReaders::RunToolAndWait(exePath, args, timeoutMs);
+    }
 
     // If the user clicked one of the "Extract" buttons: what to unpack and where to. Unpacking can take
     // minutes, so the pane only records the wish; its owner runs ExtractEntireArchiveToFolder on a worker

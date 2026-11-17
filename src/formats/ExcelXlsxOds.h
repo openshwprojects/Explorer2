@@ -307,14 +307,15 @@ inline bool ExtractZipEntryFlex(
         return true;
     }
     auto getMetaPath = [](const auto& item) -> std::wstring {
-        if constexpr (requires { item.relativePath; }) {
-            if constexpr (requires { std::wstring_view(item.relativePath); }) return std::wstring(std::wstring_view(item.relativePath));
+        using Item = std::decay_t<decltype(item)>;
+        if constexpr (MemberDetect::HasRelativePath<Item>::value) {
+            if constexpr (std::is_constructible_v<std::wstring_view, decltype((item.relativePath))>) return std::wstring(std::wstring_view(item.relativePath));
             else return PathUtils::Utf8ToWide(item.relativePath);
-        } else if constexpr (requires { item.name; }) {
-            if constexpr (requires { std::wstring_view(item.name); }) return std::wstring(std::wstring_view(item.name));
+        } else if constexpr (MemberDetect::HasName<Item>::value) {
+            if constexpr (std::is_constructible_v<std::wstring_view, decltype((item.name))>) return std::wstring(std::wstring_view(item.name));
             else return PathUtils::Utf8ToWide(item.name);
-        } else if constexpr (requires { item.path; }) {
-            if constexpr (requires { std::wstring_view(item.path); }) return std::wstring(std::wstring_view(item.path));
+        } else if constexpr (MemberDetect::HasPath<Item>::value) {
+            if constexpr (std::is_constructible_v<std::wstring_view, decltype((item.path))>) return std::wstring(std::wstring_view(item.path));
             else return PathUtils::Utf8ToWide(item.path);
         } else {
             return {};
