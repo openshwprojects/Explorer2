@@ -1,257 +1,13 @@
 #pragma once
+#include "../ZipDeflate.h"
+#include "../XmlTagScan.h"
 // Amf.h — Additive Manufacturing File Format (.amf, ISO/ASTM 52915) XML + PK-ZIP 3D Mesh Parser
 
 namespace Formats {
 
 namespace DetailPkZip {
 
-inline uint16_t RdU16(const uint8_t* p) {
-    uint16_t v = 0;
-    std::memcpy(&v, p, 2);
-    return v;
-}
-
-inline uint32_t RdU32(const uint8_t* p) {
-    uint32_t v = 0;
-    std::memcpy(&v, p, 4);
-    return v;
-}
-
-struct HuffTable15 {
-    std::vector<uint16_t> lut; // 32768 entries: (codeLen << 9) | sym
-    bool empty = true;
-
-    bool Build(const uint8_t* lengths, size_t numSyms) {
-        lut.assign(32768u, 0u);
-        uint32_t blCount[16] = {};
-        uint32_t totalNonZero = 0;
-        for (size_t i = 0; i < numSyms; ++i) {
-            uint8_t l = lengths[i];
-            if (l > 15u) return false;
-            if (l > 0u) {
-                ++blCount[l];
-                ++totalNonZero;
-            }
-        }
-        if (totalNonZero == 0u) {
-            empty = true;
-            return true;
-        }
-        empty = false;
-
-        uint32_t nextCode[16] = {};
-        uint32_t code = 0;
-        for (uint32_t bits = 1; bits <= 15; ++bits) {
-            code = (code + blCount[bits - 1]) << 1;
-            if (code + blCount[bits] > (1u << bits)) return false; // oversubscribed tree
-            nextCode[bits] = code;
-        }
-
-        for (size_t sym = 0; sym < numSyms; ++sym) {
-            uint32_t len = lengths[sym];
-            if (len == 0u) continue;
-            uint32_t c = nextCode[len]++;
-            // Bit-reverse c across len bits for LSB-first bitstream lookup
-            uint32_t rev = 0;
-            for (uint32_t b = 0; b < len; ++b) {
-                rev = (rev << 1) | ((c >> b) & 1u);
-            }
-            uint16_t packed = static_cast<uint16_t>((len << 9) | (sym & 0x1FFu));
-            uint32_t step = 1u << len;
-            for (uint32_t idx = rev; idx < 32768u; idx += step) {
-                lut[idx] = packed;
-            }
-        }
-        return true;
-    }
-};
-
-// Bounds-safe RFC 1951 raw Deflate decompressor
-inline bool InflateRaw(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out, size_t maxOutBytes) {
-    out.clear();
-    uint64_t bitBuf = 0;
-    int bitCount = 0;
-    size_t bytePos = 0;
-
-    auto ensureBits = [&](int need) {
-        while (bitCount < need && bytePos < srcLen) {
-            bitBuf |= static_cast<uint64_t>(src[bytePos++]) << bitCount;
-            bitCount += 8;
-        }
-    };
-    auto readBits = [&](int n, uint32_t& dst) -> bool {
-        if (n == 0) { dst = 0; return true; }
-        ensureBits(n);
-        if (bitCount < n) return false;
-        dst = static_cast<uint32_t>(bitBuf & ((1ULL << n) - 1ULL));
-        bitBuf >>= n;
-        bitCount -= n;
-        return true;
-    };
-    auto decodeSym = [&](const HuffTable15& ht, uint32_t& symOut) -> bool {
-        if (ht.empty) return false;
-        ensureBits(15);
-        uint16_t entry = ht.lut[static_cast<size_t>(bitBuf & 0x7FFFu)];
-        uint32_t len = entry >> 9;
-        if (len == 0u || bitCount < static_cast<int>(len)) return false;
-        bitBuf >>= len;
-        bitCount -= static_cast<int>(len);
-        symOut = entry & 0x1FFu;
-        return true;
-    };
-
-    static constexpr uint16_t kLenBase[29] = {
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
-    };
-    static constexpr uint8_t kLenExtra[29] = {
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
-    };
-    static constexpr uint16_t kDistBase[30] = {
-        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577
-    };
-    static constexpr uint8_t kDistExtra[30] = {
-        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-        7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
-    };
-    static constexpr uint8_t kClOrder[19] = {
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
-    };
-
-    HuffTable15 litTree, distTree, clTree;
-    uint32_t bfinal = 0;
-    while (bfinal == 0u) {
-        uint32_t btype = 0;
-        if (!readBits(1, bfinal) || !readBits(2, btype)) return false;
-
-        if (btype == 0u) {
-            // Uncompressed stored block
-            int remBits = bitCount & 7;
-            bitBuf >>= remBits;
-            bitCount -= remBits;
-            size_t bufferedBytes = static_cast<size_t>(bitCount / 8);
-            if (bufferedBytes > bytePos) return false;
-            bytePos -= bufferedBytes;
-            bitBuf = 0;
-            bitCount = 0;
-
-            if (bytePos + 4 > srcLen) return false;
-            uint16_t len  = RdU16(src + bytePos);
-            uint16_t nlen = RdU16(src + bytePos + 2);
-            bytePos += 4;
-            if ((len ^ 0xFFFFu) != nlen) return false;
-            if (bytePos + len > srcLen || out.size() + len > maxOutBytes) return false;
-            out.insert(out.end(), src + bytePos, src + bytePos + len);
-            bytePos += len;
-            continue;
-        }
-
-        if (btype == 1u) {
-            uint8_t litLens[288];
-            for (size_t i = 0;   i <= 143; ++i) litLens[i] = 8;
-            for (size_t i = 144; i <= 255; ++i) litLens[i] = 9;
-            for (size_t i = 256; i <= 279; ++i) litLens[i] = 7;
-            for (size_t i = 280; i <= 287; ++i) litLens[i] = 8;
-            uint8_t distLens[32];
-            for (size_t i = 0; i < 32; ++i) distLens[i] = 5;
-            if (!litTree.Build(litLens, 288) || !distTree.Build(distLens, 32)) return false;
-        } else if (btype == 2u) {
-            uint32_t hlit = 0, hdist = 0, hclen = 0;
-            if (!readBits(5, hlit) || !readBits(5, hdist) || !readBits(4, hclen)) return false;
-            hlit  += 257u;
-            hdist += 1u;
-            hclen += 4u;
-            if (hlit > 286u || hdist > 32u) return false;
-
-            uint8_t clLens[19] = {};
-            for (uint32_t i = 0; i < hclen; ++i) {
-                uint32_t v = 0;
-                if (!readBits(3, v)) return false;
-                clLens[kClOrder[i]] = static_cast<uint8_t>(v);
-            }
-            if (!clTree.Build(clLens, 19) || clTree.empty) return false;
-
-            uint8_t allLens[320] = {};
-            uint32_t totalCodes = hlit + hdist;
-            uint32_t idx = 0;
-            while (idx < totalCodes) {
-                uint32_t sym = 0;
-                if (!decodeSym(clTree, sym)) return false;
-                if (sym <= 15u) {
-                    allLens[idx++] = static_cast<uint8_t>(sym);
-                } else if (sym == 16u) {
-                    if (idx == 0u) return false;
-                    uint32_t rep = 0;
-                    if (!readBits(2, rep)) return false;
-                    rep += 3u;
-                    if (idx + rep > totalCodes) return false;
-                    uint8_t prev = allLens[idx - 1];
-                    for (uint32_t k = 0; k < rep; ++k) allLens[idx++] = prev;
-                } else if (sym == 17u) {
-                    uint32_t rep = 0;
-                    if (!readBits(3, rep)) return false;
-                    rep += 3u;
-                    if (idx + rep > totalCodes) return false;
-                    for (uint32_t k = 0; k < rep; ++k) allLens[idx++] = 0;
-                } else if (sym == 18u) {
-                    uint32_t rep = 0;
-                    if (!readBits(7, rep)) return false;
-                    rep += 11u;
-                    if (idx + rep > totalCodes) return false;
-                    for (uint32_t k = 0; k < rep; ++k) allLens[idx++] = 0;
-                } else {
-                    return false;
-                }
-            }
-            if (!litTree.Build(allLens, hlit) || litTree.empty) return false;
-            if (!distTree.Build(allLens + hlit, hdist)) return false;
-        } else {
-            return false;
-        }
-
-        // Decode Huffman-compressed literals & LZ77 back-references
-        for (;;) {
-            uint32_t sym = 0;
-            if (!decodeSym(litTree, sym)) return false;
-            if (sym < 256u) {
-                if (out.size() >= maxOutBytes) return false;
-                out.push_back(static_cast<uint8_t>(sym));
-            } else if (sym == 256u) {
-                break;
-            } else if (sym <= 285u) {
-                uint32_t lenIdx = sym - 257u;
-                uint32_t extra = 0;
-                if (!readBits(kLenExtra[lenIdx], extra)) return false;
-                size_t matchLen = static_cast<size_t>(kLenBase[lenIdx]) + static_cast<size_t>(extra);
-
-                uint32_t distSym = 0;
-                if (!decodeSym(distTree, distSym) || distSym >= 30u) return false;
-                uint32_t distExtra = 0;
-                if (!readBits(kDistExtra[distSym], distExtra)) return false;
-                size_t dist = static_cast<size_t>(kDistBase[distSym]) + static_cast<size_t>(distExtra);
-
-                if (dist == 0 || dist > out.size() || out.size() + matchLen > maxOutBytes) return false;
-                for (size_t k = 0; k < matchLen; ++k) {
-                    out.push_back(out[out.size() - dist]);
-                }
-            } else {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-struct ZipEntryInfo {
-    std::string name;
-    uint16_t method = 0;
-    uint32_t compSize = 0;
-    uint32_t uncompSize = 0;
-    uint32_t localHeaderOffset = 0;
-};
-
+// Part names compare without leading slashes, with '/' separators and ASCII case folded
 inline std::string NormalizeZipPath(std::string_view p) {
     while (!p.empty() && (p.front() == '/' || p.front() == '\\')) p.remove_prefix(1);
     std::string out;
@@ -264,291 +20,50 @@ inline std::string NormalizeZipPath(std::string_view p) {
     return out;
 }
 
-inline bool ListZipEntries(const uint8_t* data, size_t size, std::vector<ZipEntryInfo>& entries) {
-    entries.clear();
-    if (!data || size < 30 || std::memcmp(data, "PK\x03\x04", 4) != 0) return false;
+// Directory of an in-memory ZIP (OPC package, zipped AMF) read through ZipDeflate, with entries looked up by
+// NormalizeZipPath(name)
+struct ZipIndex {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    std::vector<::Explorer2::ZipDeflate::ArchiveItemMeta> entries;
+    std::vector<std::string> names; // UTF-8, as stored in the archive
+    std::unordered_map<std::string, size_t> byKey;
 
-    // 1. Prefer Central Directory via End-Of-Central-Directory record (0x06054B50)
-    size_t searchSpan = std::min<size_t>(size, 65557u);
-    size_t minOff = size - searchSpan;
-    size_t eocdOff = SIZE_MAX;
-    if (size >= 22) {
-        for (size_t pos = size - 22; ; --pos) {
-            if (RdU32(data + pos) == 0x06054B50u) {
-                uint16_t commentLen = RdU16(data + pos + 20);
-                if (pos + 22 + commentLen <= size) {
-                    eocdOff = pos;
-                    break;
-                }
-            }
-            if (pos == minOff) break;
+    bool Open(const uint8_t* d, size_t n) {
+        data = d;
+        size = n;
+        entries.clear();
+        names.clear();
+        byKey.clear();
+        if (!::Explorer2::ZipDeflate::ListZipEntriesFromMemory(d, n, entries)) return false;
+        names.reserve(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            names.push_back(PathUtils::WideToUtf8(entries[i].pathInArchive));
+            if (!entries[i].isDirectory) byKey.emplace(NormalizeZipPath(names.back()), i);
         }
+        return !entries.empty();
     }
 
-    if (eocdOff != SIZE_MAX) {
-        uint16_t totalEntries = RdU16(data + eocdOff + 10);
-        uint32_t cdSize       = RdU32(data + eocdOff + 12);
-        uint32_t cdOffset     = RdU32(data + eocdOff + 16);
-        if (static_cast<uint64_t>(cdOffset) + static_cast<uint64_t>(cdSize) <= size) {
-            size_t cur = cdOffset;
-            size_t cdEnd = cdOffset + cdSize;
-            for (uint16_t i = 0; i < totalEntries && cur + 46 <= cdEnd; ++i) {
-                if (RdU32(data + cur) != 0x02014B50u) break;
-                uint16_t method    = RdU16(data + cur + 10);
-                uint32_t compSz    = RdU32(data + cur + 20);
-                uint32_t uncompSz  = RdU32(data + cur + 24);
-                uint16_t nameLen   = RdU16(data + cur + 28);
-                uint16_t extraLen  = RdU16(data + cur + 30);
-                uint16_t commLen   = RdU16(data + cur + 32);
-                uint32_t localOff  = RdU32(data + cur + 42);
-                if (cur + 46 + nameLen + extraLen + commLen > cdEnd) break;
-
-                ZipEntryInfo info;
-                info.name.assign(reinterpret_cast<const char*>(data + cur + 46), nameLen);
-                info.method = method;
-                info.compSize = compSz;
-                info.uncompSize = uncompSz;
-                info.localHeaderOffset = localOff;
-                entries.push_back(std::move(info));
-
-                cur += 46 + static_cast<size_t>(nameLen) + static_cast<size_t>(extraLen) + static_cast<size_t>(commLen);
-            }
-            if (!entries.empty()) return true;
-        }
+    bool Read(std::string_view rawPath, std::vector<uint8_t>& out, size_t maxBytes = 64ULL * 1024ULL * 1024ULL) const {
+        out.clear();
+        auto it = byKey.find(NormalizeZipPath(rawPath));
+        if (it == byKey.end()) return false;
+        return ::Explorer2::ZipDeflate::ExtractZipEntryFromMemory(data, size, entries[it->second], out, maxBytes) && !out.empty();
     }
-
-    // 2. Fallback: walk sequential Local File Headers (0x04034B50)
-    size_t cur = 0;
-    while (cur + 30 <= size && entries.size() < 8192) {
-        if (RdU32(data + cur) != 0x04034B50u) break;
-        uint16_t flags    = RdU16(data + cur + 6);
-        uint16_t method   = RdU16(data + cur + 8);
-        uint32_t compSz   = RdU32(data + cur + 18);
-        uint32_t uncompSz = RdU32(data + cur + 22);
-        uint16_t nameLen  = RdU16(data + cur + 26);
-        uint16_t extraLen = RdU16(data + cur + 28);
-        if ((flags & 0x08u) != 0 && compSz == 0) break; // data descriptor requires Central Directory
-        size_t dataStart = cur + 30 + static_cast<size_t>(nameLen) + static_cast<size_t>(extraLen);
-        if (dataStart > size || compSz > size - dataStart) break;
-
-        ZipEntryInfo info;
-        info.name.assign(reinterpret_cast<const char*>(data + cur + 30), nameLen);
-        info.method = method;
-        info.compSize = compSz;
-        info.uncompSize = uncompSz;
-        info.localHeaderOffset = static_cast<uint32_t>(cur);
-        entries.push_back(std::move(info));
-
-        cur = dataStart + compSz;
-    }
-    return !entries.empty();
-}
-
-inline bool ExtractZipEntry(
-    const uint8_t* data,
-    size_t size,
-    const ZipEntryInfo& entry,
-    std::vector<uint8_t>& out,
-    size_t maxOutBytes = 64ULL * 1024ULL * 1024ULL)
-{
-    size_t loc = entry.localHeaderOffset;
-    if (loc + 30 > size || RdU32(data + loc) != 0x04034B50u) return false;
-    uint16_t method   = RdU16(data + loc + 8);
-    uint16_t nameLen  = RdU16(data + loc + 26);
-    uint16_t extraLen = RdU16(data + loc + 28);
-    if (entry.method != 0) method = entry.method;
-
-    size_t payloadOff = loc + 30 + static_cast<size_t>(nameLen) + static_cast<size_t>(extraLen);
-    if (payloadOff > size) return false;
-    uint32_t compSz = entry.compSize;
-    if (compSz == 0) compSz = RdU32(data + loc + 18);
-    if (static_cast<size_t>(compSz) > size - payloadOff) return false;
-
-    if (method == 0u) {
-        if (compSz > maxOutBytes) return false;
-        out.assign(data + payloadOff, data + payloadOff + compSz);
-        return true;
-    }
-    if (method == 8u) {
-        if (entry.uncompSize > 0 && entry.uncompSize <= maxOutBytes) {
-            out.reserve(entry.uncompSize);
-        }
-        return InflateRaw(data + payloadOff, compSz, out, maxOutBytes);
-    }
-    return false;
-}
+};
 
 } // namespace DetailPkZip
 
 namespace DetailAmf {
 
-struct XmlTag {
-    std::string_view localName;
-    std::string_view attrs;
-    size_t tagStart = 0;
-    size_t afterTag = 0;
-    bool isClosing = false;
-    bool isSelfClosing = false;
-};
-
-inline bool IsWs(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
-
-inline bool IsNameChar(char c) {
-    unsigned char u = static_cast<unsigned char>(c);
-    return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') ||
-           (u >= '0' && u <= '9') || c == '_' || c == '-' || c == ':' || c == '.';
-}
-
-inline std::string_view TrimWs(std::string_view s) {
-    while (!s.empty() && IsWs(s.front())) s.remove_prefix(1);
-    while (!s.empty() && IsWs(s.back())) s.remove_suffix(1);
-    return s;
-}
-
-inline bool NextTag(std::string_view sv, size_t& pos, XmlTag& out) {
-    const size_t n = sv.size();
-    while (pos < n) {
-        size_t lt = sv.find('<', pos);
-        if (lt == std::string_view::npos || lt + 1 >= n) {
-            pos = n;
-            return false;
-        }
-        if (lt + 4 <= n && sv.substr(lt, 4) == "<!--") {
-            size_t endC = sv.find("-->", lt + 4);
-            pos = (endC == std::string_view::npos) ? n : (endC + 3);
-            continue;
-        }
-        if (lt + 9 <= n && sv.substr(lt, 9) == "<![CDATA[") {
-            size_t endCd = sv.find("]]>", lt + 9);
-            pos = (endCd == std::string_view::npos) ? n : (endCd + 3);
-            continue;
-        }
-        if (sv[lt + 1] == '?') {
-            size_t endPi = sv.find("?>", lt + 2);
-            pos = (endPi == std::string_view::npos) ? n : (endPi + 2);
-            continue;
-        }
-        if (sv[lt + 1] == '!') {
-            size_t gt = sv.find('>', lt + 2);
-            pos = (gt == std::string_view::npos) ? n : (gt + 1);
-            continue;
-        }
-
-        size_t gt = lt + 1;
-        char quote = 0;
-        while (gt < n) {
-            char c = sv[gt];
-            if (quote != 0) {
-                if (c == quote) quote = 0;
-            } else {
-                if (c == '"' || c == '\'') quote = c;
-                else if (c == '>') break;
-            }
-            ++gt;
-        }
-        if (gt >= n) {
-            pos = n;
-            return false;
-        }
-
-        size_t cur = lt + 1;
-        bool closing = false;
-        if (cur < gt && sv[cur] == '/') {
-            closing = true;
-            ++cur;
-        }
-        while (cur < gt && IsWs(sv[cur])) ++cur;
-        size_t nameStart = cur;
-        while (cur < gt && IsNameChar(sv[cur])) ++cur;
-        if (cur == nameStart) {
-            pos = gt + 1;
-            continue;
-        }
-
-        std::string_view rawName = sv.substr(nameStart, cur - nameStart);
-        size_t colon = rawName.rfind(':');
-        std::string_view localName = (colon == std::string_view::npos) ? rawName : rawName.substr(colon + 1);
-
-        size_t attrEnd = gt;
-        bool selfClosing = false;
-        if (!closing) {
-            size_t back = gt;
-            while (back > cur && IsWs(sv[back - 1])) --back;
-            if (back > cur && sv[back - 1] == '/') {
-                selfClosing = true;
-                attrEnd = back - 1;
-            }
-        }
-
-        out.localName = localName;
-        out.attrs = (cur <= attrEnd) ? sv.substr(cur, attrEnd - cur) : std::string_view{};
-        out.tagStart = lt;
-        out.afterTag = gt + 1;
-        out.isClosing = closing;
-        out.isSelfClosing = selfClosing;
-        pos = gt + 1;
-        return true;
-    }
-    return false;
-}
-
-inline bool FindElementBody(
-    std::string_view sv,
-    size_t afterOpenPos,
-    std::string_view localName,
-    std::string_view& bodyOut,
-    size_t& afterClosePos)
-{
-    size_t cur = afterOpenPos;
-    int depth = 1;
-    XmlTag t;
-    while (NextTag(sv, cur, t)) {
-        if (t.localName == localName) {
-            if (t.isClosing) {
-                --depth;
-                if (depth == 0) {
-                    bodyOut = sv.substr(afterOpenPos, t.tagStart - afterOpenPos);
-                    afterClosePos = cur;
-                    return true;
-                }
-            } else if (!t.isSelfClosing) {
-                ++depth;
-            }
-        }
-    }
-    return false;
-}
-
-inline std::string_view GetAttr(std::string_view attrs, std::string_view wantName) {
-    size_t i = 0;
-    const size_t n = attrs.size();
-    while (i < n) {
-        while (i < n && IsWs(attrs[i])) ++i;
-        size_t nameStart = i;
-        while (i < n && IsNameChar(attrs[i])) ++i;
-        if (i == nameStart) { ++i; continue; }
-        std::string_view rawName = attrs.substr(nameStart, i - nameStart);
-        while (i < n && IsWs(attrs[i])) ++i;
-        if (i >= n || attrs[i] != '=') continue;
-        ++i;
-        while (i < n && IsWs(attrs[i])) ++i;
-        if (i >= n || (attrs[i] != '"' && attrs[i] != '\'')) continue;
-        char q = attrs[i++];
-        size_t valStart = i;
-        while (i < n && attrs[i] != q) ++i;
-        std::string_view val = attrs.substr(valStart, i - valStart);
-        if (i < n && attrs[i] == q) ++i;
-
-        if (rawName == wantName) return val;
-        size_t colon = rawName.rfind(':');
-        if (colon != std::string_view::npos && rawName.substr(colon + 1) == wantName) {
-            return val;
-        }
-    }
-    return {};
-}
+// XML tag scanning lives in XmlTagScan.h (shared with the other XML-based 3D readers)
+using ::Explorer2::XmlTagScan::XmlTag;
+using ::Explorer2::XmlTagScan::IsWs;
+using ::Explorer2::XmlTagScan::IsNameChar;
+using ::Explorer2::XmlTagScan::TrimWs;
+using ::Explorer2::XmlTagScan::NextTag;
+using ::Explorer2::XmlTagScan::FindElementBody;
+using ::Explorer2::XmlTagScan::GetAttr;
 
 inline float ParseFloatSv(std::string_view s, float defVal = 0.0f) {
     s = TrimWs(s);
@@ -658,24 +173,19 @@ inline bool ParseAmfMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
 
     // Per ISO/ASTM 52915, .amf files are either uncompressed XML or a PK-ZIP archive containing an XML .amf stream
     if (size >= 4 && std::memcmp(data, "PK\x03\x04", 4) == 0) {
-        std::vector<DetailPkZip::ZipEntryInfo> entries;
-        if (!DetailPkZip::ListZipEntries(data, size, entries) || entries.empty()) {
-            return false;
-        }
-        const DetailPkZip::ZipEntryInfo* chosen = nullptr;
-        for (const auto& e : entries) {
-            if (e.name.empty() || e.name.back() == '/' || e.name.back() == '\\') continue;
-            std::string norm = DetailPkZip::NormalizeZipPath(e.name);
+        DetailPkZip::ZipIndex zip;
+        if (!zip.Open(data, size)) return false;
+        const std::string* chosen = nullptr; // the .amf entry, else the first file
+        for (size_t i = 0; i < zip.entries.size(); ++i) {
+            if (zip.entries[i].isDirectory) continue;
+            std::string norm = DetailPkZip::NormalizeZipPath(zip.names[i]);
             if (norm.size() >= 4 && norm.substr(norm.size() - 4) == ".amf") {
-                chosen = &e;
+                chosen = &zip.names[i];
                 break;
             }
-            if (!chosen) chosen = &e;
+            if (!chosen) chosen = &zip.names[i];
         }
-        if (!chosen) return false;
-        if (!DetailPkZip::ExtractZipEntry(data, size, *chosen, unzippedXml) || unzippedXml.empty()) {
-            return false;
-        }
+        if (!chosen || !zip.Read(*chosen, unzippedXml)) return false;
         sv = std::string_view(reinterpret_cast<const char*>(unzippedXml.data()), unzippedXml.size());
     } else {
         sv = std::string_view(reinterpret_cast<const char*>(data), size);

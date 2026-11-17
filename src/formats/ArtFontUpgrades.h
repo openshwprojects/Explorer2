@@ -13,35 +13,11 @@ namespace Formats {
 
 namespace DetailArtFont {
 
-inline std::string_view TrimAsciiView(std::string_view sv) {
-    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r' || sv.front() == '\n')) sv.remove_prefix(1);
-    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r' || sv.back() == '\n')) sv.remove_suffix(1);
-    return sv;
-}
+inline std::string_view TrimAsciiView(std::string_view sv) { return ::Explorer2::PathUtils::TrimAscii(sv); }
 
-inline std::string GetXmlAttr(std::string_view tagBody, std::string_view attrName) {
-    size_t pos = 0;
-    while (pos < tagBody.size()) {
-        size_t hit = tagBody.find(attrName, pos);
-        if (hit == std::string_view::npos) return {};
-        bool leftOk = (hit == 0) || tagBody[hit - 1] == ' ' || tagBody[hit - 1] == '\t' ||
-                      tagBody[hit - 1] == '\r' || tagBody[hit - 1] == '\n';
-        size_t after = hit + attrName.size();
-        while (after < tagBody.size() && (tagBody[after] == ' ' || tagBody[after] == '\t')) ++after;
-        if (leftOk && after < tagBody.size() && tagBody[after] == '=') {
-            ++after;
-            while (after < tagBody.size() && (tagBody[after] == ' ' || tagBody[after] == '\t')) ++after;
-            if (after < tagBody.size() && (tagBody[after] == '"' || tagBody[after] == '\'')) {
-                char q = tagBody[after++];
-                size_t endQ = tagBody.find(q, after);
-                if (endQ != std::string_view::npos) {
-                    return std::string(tagBody.substr(after, endQ - after));
-                }
-            }
-        }
-        pos = hit + attrName.size();
-    }
-    return {};
+inline std::string GetXmlAttr(std::string_view tag, std::string_view attrName) {
+    std::string_view v;
+    return ::Explorer2::XmlTagScan::FindAttr(tag, attrName, v, false) ? std::string(v) : std::string();
 }
 
 inline int ParseIntOr(const std::string& s, int defVal) {

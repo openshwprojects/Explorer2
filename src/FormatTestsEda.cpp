@@ -1,5 +1,7 @@
 // FormatTestsEda.cpp: self-tests of the electronics / PCB / EDA readers (EdaViewer, formats/), stage 15 ("15.eda" runs these alone)
+#include "Crc32.h"
 #include "SelfTestCommon.h"
+#include "TestBytes.h"
 #include "EdaViewer.h"
 #include "PathUtils.h"
 #include <algorithm>
@@ -97,33 +99,7 @@ static bool HasFakeQfn32(const ParsedEdaBoard& b) {
     return false;
 }
 
-static void PutU16LE(uint8_t* p, uint16_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-}
-static void PutU32LE(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    p[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-    p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-}
-static void PutI32LE(uint8_t* p, int32_t v) {
-    PutU32LE(p, static_cast<uint32_t>(v));
-}
-static void PutU16BE(uint8_t* p, uint16_t v) {
-    p[0] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    p[1] = static_cast<uint8_t>(v & 0xFFu);
-}
-static void PutU32BE(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-    p[2] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    p[3] = static_cast<uint8_t>(v & 0xFFu);
-}
-static void PutU64BE(uint8_t* p, uint64_t v) {
-    PutU32BE(p, static_cast<uint32_t>(v >> 32));
-    PutU32BE(p + 4, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
-}
+using namespace ::Explorer2::TestBytes; // byte writers (TestBytes.h)
 
 static void AppendULeb128(std::vector<uint8_t>& out, uint64_t val) {
     do {
@@ -148,16 +124,6 @@ static void AppendSLeb128(std::vector<uint8_t>& out, int64_t val) {
     }
 }
 
-static uint32_t CalcCrc32(const uint8_t* data, size_t len) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int k = 0; k < 8; ++k) {
-            crc = (crc >> 1) ^ ((crc & 1u) ? 0xEDB88320u : 0u);
-        }
-    }
-    return ~crc;
-}
 
 // Wraps raw payload in RFC 1950 zlib with stored (BTYPE=00) deflate blocks + Adler32
 static std::vector<uint8_t> WrapZlibStored(const std::vector<uint8_t>& raw) {
@@ -208,7 +174,7 @@ static std::vector<uint8_t> WrapGzipStored(const std::vector<uint8_t>& raw) {
     } while (pos < raw.size());
 
     uint8_t tail[8] = {};
-    PutU32LE(tail, CalcCrc32(raw.data(), raw.size()));
+    PutU32LE(tail, Checksum::Crc32(raw.data(), raw.size()));
     PutU32LE(tail + 4, static_cast<uint32_t>(raw.size()));
     gz.insert(gz.end(), tail, tail + 8);
     return gz;
@@ -228,7 +194,7 @@ static std::vector<uint8_t> BuildStoredZip(const std::vector<std::pair<std::stri
         CdRec cd;
         cd.name = f.first;
         cd.sz = static_cast<uint32_t>(f.second.size());
-        cd.crc = CalcCrc32(reinterpret_cast<const uint8_t*>(f.second.data()), f.second.size());
+        cd.crc = Checksum::Crc32(reinterpret_cast<const uint8_t*>(f.second.data()), f.second.size());
         cd.locOff = static_cast<uint32_t>(out.size());
 
         uint8_t lhdr[30] = {};
@@ -1025,7 +991,7 @@ static std::vector<uint8_t> BuildStm32DfuFile(bool variantB) {
     PutU16LE(sfx + 6, 0x011Au); // bcdDFU
     sfx[8] = 'U'; sfx[9] = 'F'; sfx[10] = 'D';
     sfx[11] = 16;
-    PutU32LE(sfx + 12, CalcCrc32(dfu.data(), dfu.size()));
+    PutU32LE(sfx + 12, Checksum::Crc32(dfu.data(), dfu.size()));
     dfu.insert(dfu.end(), sfx, sfx + 16);
     return dfu;
 }
@@ -1184,6 +1150,32 @@ static bool WriteAndInspect(const std::wstring& path, const void* bytes, size_t 
 void RunFormatTestsEda(TestCounter& tc) {
     const std::wstring dir = ScratchTestDir() + L"\\eda_stage15";
     CreateDirectoryW(dir.c_str(), nullptr);
+
+    // Gerber job file read as JSON: "Path" names the files (the spec's key), no outline is drawn without a Size,
+    // copper layers are told apart by count, the project revision reaches the title, broken JSON is turned down
+    {
+        const std::string job =
+            R"({"Header":{"GenerationSoftware":{"Vendor":"KiCad","Application":"Pcbnew","Version":"8.0"}},)"
+            R"("GeneralSpecs":{"ProjectId":{"Name":"Probe","GUID":"1","Revision":"A"},"LayerNumber":2,"BoardThickness":1.6},)"
+            R"("FilesAttributes":[{"Path":"probe-F_Cu.gtl","FileFunction":"Copper,L1,Top"}],)"
+            R"("MaterialStackup":[{"Type":"Copper","Thickness":0.035,"Name":"F.Cu"},{"Type":"Dielectric","Thickness":1.5,"Material":"FR4","Name":"Core"},)"
+            R"({"Type":"Copper","Thickness":0.035,"Name":"B.Cu"}]})";
+        const std::string broken = R"({"GeneralSpecs":{"Size":{"X":10,"Y":10}})";
+        ParsedEdaBoard jb, bad;
+        bool ok = WriteAndInspect(dir + L"\\probe.gbrjob", job.data(), job.size(), jb);
+        bool sawFile = false, sawEdge = false, sawTop = false, sawBottom = false;
+        for (const auto& l : jb.labels) {
+            if (l.text.find(L"probe-F_Cu.gtl [Copper,L1,Top]") != std::wstring::npos) sawFile = true;
+        }
+        for (const auto& t : jb.traces) {
+            if (t.layer == EdaLayerId::EdgeCuts) sawEdge = true;
+            if (t.layer == EdaLayerId::TopCopper) sawTop = true;
+            if (t.layer == EdaLayerId::BottomCopper) sawBottom = true;
+        }
+        bool badRejected = !WriteAndInspect(dir + L"\\broken.gbrjob", broken.data(), broken.size(), bad);
+        tc.Record(ok && sawFile && !sawEdge && sawTop && sawBottom && jb.formatTitle.find(L"Probe A") != std::wstring::npos && badRejected,
+                  L"Stage15.Eda.GerberJob_JsonPathKeyNoInventedOutline", jb.formatTitle);
+    }
 
     // ------------------------------------------------------------------------
     // 1. Binary Eagle v5 .brd & .sch (24-byte blocks) + corrupt rejection

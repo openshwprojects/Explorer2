@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ModoZBrushMaxC4d.h — #70 Foundry Modo LXOB (.lxo), Zlib-Compressed 3ds Max (.max),
 //                      Maxon Cinema 4D C4DC v5-R25 (.c4d), & ZBrush (.zpr, .ztl)
 //
@@ -16,33 +17,15 @@ namespace Formats {
 
 namespace ModoZbMaxC4dDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
-inline uint32_t RdU32LE(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline uint64_t RdU64LE(const uint8_t* p) { uint64_t v = 0; std::memcpy(&v, p, 8); return v; }
-inline float    RdF32LE(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
-
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8)  | static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | static_cast<uint64_t>(RdU32BE(p + 4));
-}
-inline float RdF32BE(const uint8_t* p) {
-    uint32_t u = RdU32BE(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-inline double RdF64BE(const uint8_t* p) {
-    uint64_t u = RdU64BE(p);
-    double d = 0.0;
-    std::memcpy(&d, &u, 8);
-    return d;
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdF32LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
+using ::Explorer2::ByteIO::RdF32BE;
+using ::Explorer2::ByteIO::RdF64BE;
 
 inline bool IsValidCoord3(float x, float y, float z) {
     return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&

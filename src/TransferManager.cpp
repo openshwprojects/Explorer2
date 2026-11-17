@@ -5321,20 +5321,6 @@ TransferJobSnapshot TransferManager::BuildSnapshot(const TransferManager::Intern
     return s;
 }
 
-bool TransferManager::HasActiveOrPausedJobs() const {
-    std::lock_guard<std::mutex> lk(m_mutex);
-    for (const auto& j : m_jobs) {
-        TransferJobState st = j->state.load();
-        if (st == TransferJobState::Queued || st == TransferJobState::Scanning ||
-            st == TransferJobState::Running || st == TransferJobState::Paused ||
-            st == TransferJobState::Verifying)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool TransferManager::HasRunningJobs() const {
     std::lock_guard<std::mutex> lk(m_mutex);
     for (const auto& j : m_jobs) {

@@ -1,4 +1,5 @@
 #include "ImageFormatLoader.h"
+#include "FormatSupport.h"
 #include "OsCompat.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
@@ -24,52 +25,19 @@
 
 namespace Explorer2 {
 
-namespace StreamCodecs {
-bool DecompressZstdFrame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
-bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
-}
-
 namespace {
 
 constexpr uint32_t kMaxRasterDimension = 16384;
 
-inline uint16_t ReadU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-
-inline uint32_t ReadU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-inline uint64_t ReadU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(ReadU32LE(p)) | (static_cast<uint64_t>(ReadU32LE(p + 4)) << 32);
-}
-
-inline uint16_t ReadU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-
-inline int16_t ReadI16BE(const uint8_t* p) {
-    return static_cast<int16_t>(ReadU16BE(p));
-}
-
-inline uint32_t ReadU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8)  |
-           static_cast<uint32_t>(p[3]);
-}
-
-inline int32_t ReadI32BE(const uint8_t* p) {
-    return static_cast<int32_t>(ReadU32BE(p));
-}
-
-inline uint64_t ReadU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(ReadU32BE(p)) << 32) | ReadU32BE(p + 4);
-}
+// Byte loads under this file's names (ByteIO holds the one implementation)
+inline uint16_t ReadU16LE(const uint8_t* p) { return ByteIO::RdU16LE(p); }
+inline uint32_t ReadU32LE(const uint8_t* p) { return ByteIO::RdU32LE(p); }
+inline uint64_t ReadU64LE(const uint8_t* p) { return ByteIO::RdU64LE(p); }
+inline uint16_t ReadU16BE(const uint8_t* p) { return ByteIO::RdU16BE(p); }
+inline int16_t ReadI16BE(const uint8_t* p) { return ByteIO::RdI16BE(p); }
+inline uint32_t ReadU32BE(const uint8_t* p) { return ByteIO::RdU32BE(p); }
+inline int32_t ReadI32BE(const uint8_t* p) { return ByteIO::RdI32BE(p); }
+inline uint64_t ReadU64BE(const uint8_t* p) { return ByteIO::RdU64BE(p); }
 
 inline void WritePremulBGRA(uint8_t* dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     if (a == 255) {
@@ -129,32 +97,7 @@ void DownscaleIfRequested(uint32_t maxDimension, ExtendedImageInfo& info) {
 
 namespace GpuTex {
 
-inline float HalfToFloat(uint16_t h) {
-    uint32_t sign = (static_cast<uint32_t>(h >> 15) & 0x0001u);
-    uint32_t exp  = (static_cast<uint32_t>(h >> 10) & 0x001Fu);
-    uint32_t mant = static_cast<uint32_t>(h & 0x03FFu);
-    uint32_t f = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign << 31;
-        } else {
-            while ((mant & 0x0400u) == 0) {
-                mant <<= 1;
-                --exp;
-            }
-            ++exp;
-            mant &= ~0x0400u;
-            f = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        f = (sign << 31) | 0x7F800000u | (mant << 13);
-    } else {
-        f = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float out = 0.0f;
-    std::memcpy(&out, &f, 4);
-    return out;
-}
+using ::Explorer2::ByteIO::HalfToFloat;
 
 inline float ReadF32LE(const uint8_t* p) {
     uint32_t u = ReadU32LE(p);

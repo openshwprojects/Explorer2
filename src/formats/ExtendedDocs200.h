@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedDocs200.h — 20 Databases, Protobuf, Cloud/SecOps, Crypto/Forensics, Chiptune, MusicXML & Game/Doc Formats (#81–#100)
 // Covers:
 //   Databases & KV (#81–#85): .accdb/.mdb, .rdb (Redis), .sst/.ldb (RocksDB/LevelDB), .mbtiles/.pmtiles, .pb/.pbf (Protobuf)
@@ -10,49 +11,15 @@ namespace Formats {
 
 namespace DetailDocs200 {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline int32_t RdI32LE(const uint8_t* p) {
-    return static_cast<int32_t>(RdU32LE(p));
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) |
-           (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) |
-           static_cast<uint64_t>(RdU32BE(p + 4));
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
 
-inline std::wstring HexBytes(const uint8_t* p, size_t n, size_t maxBytes = 16) {
-    static const wchar_t kHex[] = L"0123456789ABCDEF";
-    size_t lim = std::min(n, maxBytes);
-    std::wstring s;
-    s.reserve(lim * 3 + 4);
-    for (size_t i = 0; i < lim; ++i) {
-        if (i) s.push_back(L' ');
-        s.push_back(kHex[p[i] >> 4]);
-        s.push_back(kHex[p[i] & 0x0F]);
-    }
-    if (n > maxBytes) s += L" ...";
-    return s;
-}
+inline std::wstring HexBytes(const uint8_t* p, size_t n, size_t maxBytes = 16) { return PathUtils::HexBytes(p, n, L' ', maxBytes); }
 
 inline std::wstring ReadUtf16LE(const uint8_t* p, size_t byteLen) {
     std::wstring out;
@@ -66,17 +33,7 @@ inline std::wstring ReadUtf16LE(const uint8_t* p, size_t byteLen) {
     return out;
 }
 
-inline bool ReadVarint64(const uint8_t* data, size_t size, size_t& pos, uint64_t& outVal) {
-    outVal = 0;
-    int shift = 0;
-    while (pos < size && shift < 64) {
-        uint8_t b = data[pos++];
-        outVal |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) return true;
-        shift += 7;
-    }
-    return false;
-}
+inline bool ReadVarint64(const uint8_t* data, size_t size, size_t& pos, uint64_t& outVal) { return ::Explorer2::ByteIO::RdLeb128(data, size, pos, outVal, 10); }
 
 inline bool IsMostlyPrintableUtf8(const uint8_t* p, size_t n) {
     if (n == 0) return false;
@@ -89,65 +46,9 @@ inline bool IsMostlyPrintableUtf8(const uint8_t* p, size_t n) {
     return good * 10 >= n * 9;
 }
 
-inline std::string JsonGetStr(std::string_view obj, std::string_view key) {
-    std::string needle = "\"";
-    needle.append(key);
-    needle.push_back('"');
-    size_t p = obj.find(needle);
-    if (p == std::string_view::npos) return {};
-    p = obj.find(':', p + needle.size());
-    if (p == std::string_view::npos) return {};
-    ++p;
-    while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
-    if (p >= obj.size()) return {};
-    if (obj[p] == '"') {
-        ++p;
-        std::string res;
-        while (p < obj.size() && obj[p] != '"') {
-            if (obj[p] == '\\' && p + 1 < obj.size()) {
-                ++p;
-                if (obj[p] == 'n') res.push_back(' ');
-                else res.push_back(obj[p]);
-            } else {
-                res.push_back(obj[p]);
-            }
-            ++p;
-        }
-        return res;
-    }
-    size_t e = obj.find_first_of(",}\r\n", p);
-    if (e == std::string_view::npos) e = obj.size();
-    std::string_view tok = obj.substr(p, e - p);
-    while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.remove_suffix(1);
-    return std::string(tok);
-}
-
 inline std::vector<uint8_t> DecodeBase64Block(std::string_view in) {
-    static const int8_t kLut[256] = {
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
-    };
     std::vector<uint8_t> out;
-    out.reserve(in.size() * 3 / 4);
-    uint32_t acc = 0;
-    int bits = 0;
-    for (char ch : in) {
-        if (ch == '=') break;
-        int8_t v = kLut[static_cast<uint8_t>(ch)];
-        if (v < 0) continue;
-        acc = (acc << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFFu));
-        }
-    }
+    ::Explorer2::Base64::Decode(in, out);
     return out;
 }
 
@@ -897,7 +798,7 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
     auxSh.maxCols = 2;
     auxSh.rows.push_back({ L"AUX / Header Field", L"Value" });
     auxSh.rows.push_back({ L"RDB Format Version", PathUtils::Utf8ToWide(verStr) });
-    auxSh.rows.push_back({ L"Snapshot Size", PathUtils::FormatByteSize(raw.size()) });
+    auxSh.rows.push_back({ L"Snapshot Size", PathUtils::FormatByteSize(std::max<uint64_t>(out.sourceFileSize, raw.size())) });
 
     size_t pos = 9;
     uint64_t curDb = 0;
@@ -976,9 +877,6 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         pendingTtl = L"Persistent";
     }
 
-    if (keysSh.rows.size() == 1) {
-        keysSh.rows.push_back({ L"0", L"(Empty Database)", L"-", L"0 keys", L"-" });
-    }
     out.sheets.push_back(std::move(keysSh));
     out.sheets.push_back(std::move(auxSh));
     out.valid = true;
@@ -988,40 +886,139 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
 // ============================================================================
 // #83. RocksDB / LevelDB Sorted String Table (.sst / .ldb)
 // ============================================================================
+// The footer names the index block, whose entries are the handles of the data blocks; each data block (stored
+// plain, or Snappy / LZ4 / Zstandard compressed) is read in turn and its prefix-compressed entries become rows,
+// internal keys split into user key, sequence number and operation. RocksDB format 4+ index values are
+// delta-encoded handles. PlainTable files have no blocks: only their footer is shown.
 inline bool ParseRocksLevelDbSst200(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
-    if (raw.size() < 48) return false;
-    uint64_t footerMagic = DetailDocs200::RdU64LE(raw.data() + raw.size() - 8);
-    constexpr uint64_t kLevelDbMagic      = 0xDB4775248B80FB57ULL;
-    constexpr uint64_t kRocksLegacyMagic  = 0x88E241B785F4CFF7ULL;
-    constexpr uint64_t kRocksPlainMagic   = 0x8242229663BF9564ULL;
-    bool hasMagic = (footerMagic == kLevelDbMagic || footerMagic == kRocksLegacyMagic || footerMagic == kRocksPlainMagic);
-    if (!hasMagic && ext != L".sst" && ext != L".ldb") return false;
-    if (!hasMagic && raw.size() < 56) return false;
+    (void)ext;
+    // Bytes past those handed in (RocksDB tables are often 64 MB) are read from the file itself
+    SourceBytes source(raw, out);
+    const uint64_t fileSize = source.Size();
+    auto readRange = [&](uint64_t off, uint64_t len, std::vector<uint8_t>& buf) -> const uint8_t* {
+        return (len > 64u * 1024 * 1024) ? nullptr : source.Read(off, static_cast<size_t>(len), buf);
+    };
+    if (fileSize < 48) return false;
+    std::vector<uint8_t> footerBuf;
+    const size_t footLen = static_cast<size_t>(std::min<uint64_t>(fileSize, 53));
+    const uint8_t* foot = readRange(fileSize - footLen, footLen, footerBuf);
+    if (!foot) return false;
+    const uint8_t* footEnd = foot + footLen;
+    const uint64_t footerMagic = DetailDocs200::RdU64LE(footEnd - 8);
+    constexpr uint64_t kLevelDbMagic = 0xDB4775248B80FB57ULL;      // LevelDB, RocksDB legacy block-based
+    constexpr uint64_t kBlockBasedMagic = 0x88E241B785F4CFF7ULL;   // RocksDB block-based
+    constexpr uint64_t kPlainMagic = 0x8242229663BF9564ULL;        // RocksDB PlainTable
+    constexpr uint64_t kLegacyPlainMagic = 0x4F3418EB7A8F13B8ULL;
+    const bool isLevelDb = footerMagic == kLevelDbMagic;
+    const bool isBlockBased = footerMagic == kBlockBasedMagic;
+    const bool isPlain = footerMagic == kPlainMagic || footerMagic == kLegacyPlainMagic;
+    if (!isLevelDb && !isBlockBased && !isPlain) return false;
+    if ((isBlockBased || isPlain) && footLen < 53) return false;
 
-    std::wstring fmt = (footerMagic == kLevelDbMagic) ? L"LevelDB Table (0xDB4775248B80FB57)" :
-                       (footerMagic == kRocksLegacyMagic) ? L"RocksDB Block-Based SSTable (0x88E241B785F4CFF7)" :
-                       (footerMagic == kRocksPlainMagic) ? L"RocksDB PlainTable SST (0x8242229663BF9564)" :
-                       L"LSM-Tree SSTable (" + ext + L")";
-
-    // Decode Footer BlockHandles (metaindex + index) at raw.size() - 48 (or raw.size() - 53 for RocksDB v1+)
-    size_t footerStart = (footerMagic == kRocksLegacyMagic && raw.size() >= 53 && raw[raw.size() - 53] <= 5)
-                         ? (raw.size() - 52) : (raw.size() - 48);
-    size_t fpos = footerStart;
+    const std::wstring fmt = isLevelDb ? L"LevelDB Table (0xDB4775248B80FB57)"
+                           : isBlockBased ? L"RocksDB Block-Based SSTable (0x88E241B785F4CFF7)"
+                                          : L"RocksDB PlainTable SST";
+    // LevelDB footer: two handles in 40 bytes + magic. RocksDB: checksum type, the handles, format version, magic.
+    const uint32_t formatVersion = isLevelDb ? 0u : DetailDocs200::RdU32LE(footEnd - 12);
+    const uint8_t* handles = isLevelDb ? footEnd - 48 : footEnd - 52; // 40 bytes either way
+    size_t fpos = 0;
     uint64_t metaOff = 0, metaSz = 0, idxOff = 0, idxSz = 0;
-    DetailDocs200::ReadVarint64(raw.data(), raw.size() - 8, fpos, metaOff);
-    DetailDocs200::ReadVarint64(raw.data(), raw.size() - 8, fpos, metaSz);
-    DetailDocs200::ReadVarint64(raw.data(), raw.size() - 8, fpos, idxOff);
-    DetailDocs200::ReadVarint64(raw.data(), raw.size() - 8, fpos, idxSz);
+    const bool handlesOk = DetailDocs200::ReadVarint64(handles, 40, fpos, metaOff) &&
+                           DetailDocs200::ReadVarint64(handles, 40, fpos, metaSz) &&
+                           DetailDocs200::ReadVarint64(handles, 40, fpos, idxOff) &&
+                           DetailDocs200::ReadVarint64(handles, 40, fpos, idxSz);
 
-    // Decode prefix-compressed KV entries from first Data Block [0 .. dataLimit)
-    size_t firstBlockEnd = (metaOff > 0 && metaOff <= raw.size()) ? static_cast<size_t>(metaOff) : (raw.size() - 48);
-    // Block trailer is 5 bytes (1B compressionType + 4B crc32c), preceded by numRestarts*4 + 4B numRestarts
-    size_t kvEnd = firstBlockEnd;
-    if (firstBlockEnd >= 9) {
-        size_t rawBlkLen = firstBlockEnd - 5;
-        uint32_t numRestarts = DetailDocs200::RdU32LE(raw.data() + rawBlkLen - 4);
-        if (numRestarts > 0 && numRestarts < 4096 && 4ull * (numRestarts + 1) < rawBlkLen) {
-            kvEnd = rawBlkLen - 4ull * (numRestarts + 1);
+    // A block's contents, decompressed; the 5-byte trailer (type + checksum) follows the stored bytes
+    std::map<int, size_t> unreadByType;
+    auto readBlock = [&](uint64_t off, uint64_t size, std::vector<uint8_t>& store, const uint8_t*& data, size_t& len) -> bool {
+        if (size > 64u * 1024 * 1024) return false;
+        std::vector<uint8_t> fileBytes;
+        const uint8_t* src = readRange(off, size + 5, fileBytes);
+        if (!src) return false;
+        const int ctype = src[static_cast<size_t>(size)];
+        if (ctype == 0) {
+            if (!fileBytes.empty() && src == fileBytes.data()) { // keep bytes read from the file alive
+                store = std::move(fileBytes);
+                src = store.data();
+            }
+            data = src;
+            len = static_cast<size_t>(size);
+            return true;
+        }
+        bool ok = false;
+        if (ctype == 1) {
+            ok = ::Explorer2::StreamCodecs::SnappyDecompress(src, static_cast<size_t>(size), store, 64 * 1024 * 1024);
+        } else if (ctype == 4 || ctype == 5 || ctype == 7) { // LZ4 / LZ4HC / ZSTD: format 2+ puts the size first
+            size_t p = 0;
+            uint64_t expect = 0;
+            const bool sized = formatVersion >= 2 && DetailDocs200::ReadVarint64(src, static_cast<size_t>(size), p, expect) && expect <= 64u * 1024 * 1024;
+            if (ctype == 7) {
+                ok = ::Explorer2::StreamCodecs::DecompressZstdFrame(src + (sized ? p : 0), static_cast<size_t>(size) - (sized ? p : 0), store, 64 * 1024 * 1024);
+            } else if (sized) {
+                ok = ::Explorer2::Lz4::DecodeBlockExact(src + p, static_cast<size_t>(size) - p, static_cast<size_t>(expect), store);
+            }
+        }
+        if (!ok) {
+            ++unreadByType[ctype];
+            return false;
+        }
+        data = store.data();
+        len = store.size();
+        return true;
+    };
+    // The restart array closing a block: its entries end where it starts
+    auto entriesEnd = [](const uint8_t* b, size_t n, std::vector<uint32_t>* restarts) -> size_t {
+        if (n < 4) return SIZE_MAX;
+        uint32_t nr = DetailDocs200::RdU32LE(b + n - 4);
+        if ((nr & 0x80000000u) != 0 || nr == 0 || 4ull * (nr + 1) > n) return SIZE_MAX; // (a hash-indexed block is not read)
+        size_t end = n - 4 * (static_cast<size_t>(nr) + 1);
+        if (restarts) {
+            restarts->resize(nr);
+            for (uint32_t i = 0; i < nr; ++i) (*restarts)[i] = DetailDocs200::RdU32LE(b + end + 4 * i);
+        }
+        return end;
+    };
+
+    // Data block handles from the index block
+    std::vector<std::pair<uint64_t, uint64_t>> dataBlocks;
+    if (handlesOk && !isPlain) {
+        std::vector<uint8_t> store;
+        const uint8_t* b = nullptr;
+        size_t n = 0;
+        std::vector<uint32_t> restarts;
+        size_t end = readBlock(idxOff, idxSz, store, b, n) ? entriesEnd(b, n, &restarts) : SIZE_MAX;
+        const bool valueDelta = isBlockBased && formatVersion >= 4;
+        size_t pos = 0, ri = 0;
+        uint64_t prevOff = 0, prevSize = 0;
+        while (end != SIZE_MAX && pos < end && dataBlocks.size() < 100000) {
+            const bool restart = ri < restarts.size() && restarts[ri] == pos;
+            if (restart) ++ri;
+            uint64_t shared = 0, nonShared = 0, valLen = 0;
+            if (!DetailDocs200::ReadVarint64(b, end, pos, shared) || !DetailDocs200::ReadVarint64(b, end, pos, nonShared)) break;
+            if (!valueDelta && !DetailDocs200::ReadVarint64(b, end, pos, valLen)) break;
+            if (nonShared > end - pos) break;
+            pos += static_cast<size_t>(nonShared);
+            uint64_t off = 0, size = 0;
+            size_t vpos = pos;
+            if (!valueDelta || restart) {
+                if (!DetailDocs200::ReadVarint64(b, end, vpos, off) || !DetailDocs200::ReadVarint64(b, end, vpos, size)) break;
+            } else {
+                uint64_t zz = 0;
+                if (!DetailDocs200::ReadVarint64(b, end, vpos, zz)) break;
+                const int64_t delta = static_cast<int64_t>(zz >> 1) ^ -static_cast<int64_t>(zz & 1);
+                off = prevOff + prevSize + 5;
+                size = static_cast<uint64_t>(static_cast<int64_t>(prevSize) + delta);
+            }
+            if (valueDelta) {
+                pos = vpos;
+            } else {
+                if (valLen > end - pos) break;
+                pos += static_cast<size_t>(valLen);
+            }
+            if (off >= fileSize || size > fileSize - off) break;
+            dataBlocks.push_back({ off, size });
+            prevOff = off;
+            prevSize = size;
         }
     }
 
@@ -1029,48 +1026,57 @@ inline bool ParseRocksLevelDbSst200(const std::vector<uint8_t>& raw, const std::
     kvSh.name = L"SST_KeyValues";
     kvSh.maxCols = 4;
     kvSh.rows.push_back({ L"User Key", L"Op / Type", L"Sequence #", L"Value Preview" });
+    auto printable = [](const uint8_t* p, size_t n) { return DetailDocs200::IsMostlyPrintableUtf8(p, n); };
+    size_t entries = 0, blocksRead = 0;
+    for (const auto& h : dataBlocks) {
+        std::vector<uint8_t> store;
+        const uint8_t* b = nullptr;
+        size_t n = 0;
+        if (!readBlock(h.first, h.second, store, b, n)) continue;
+        const size_t end = entriesEnd(b, n, nullptr);
+        if (end == SIZE_MAX) continue;
+        ++blocksRead;
+        std::string key;
+        size_t pos = 0;
+        while (pos < end) {
+            uint64_t shared = 0, nonShared = 0, valLen = 0;
+            if (!DetailDocs200::ReadVarint64(b, end, pos, shared) || !DetailDocs200::ReadVarint64(b, end, pos, nonShared) ||
+                !DetailDocs200::ReadVarint64(b, end, pos, valLen)) break;
+            if (shared > key.size() || nonShared > end - pos || valLen > end - pos - nonShared) break;
+            key.resize(static_cast<size_t>(shared));
+            key.append(reinterpret_cast<const char*>(b + pos), static_cast<size_t>(nonShared));
+            pos += static_cast<size_t>(nonShared);
+            const uint8_t* val = b + pos;
+            pos += static_cast<size_t>(valLen);
+            ++entries;
+            if (kvSh.rows.size() > 5000) continue;
 
-    size_t pos = 0;
-    std::string lastKey;
-    while (pos < kvEnd && kvSh.rows.size() < 400) {
-        uint64_t shared = 0, nonShared = 0, valLen = 0;
-        if (!DetailDocs200::ReadVarint64(raw.data(), kvEnd, pos, shared) ||
-            !DetailDocs200::ReadVarint64(raw.data(), kvEnd, pos, nonShared) ||
-            !DetailDocs200::ReadVarint64(raw.data(), kvEnd, pos, valLen)) break;
-        if (shared > lastKey.size() || nonShared > kvEnd - pos || valLen > kvEnd - pos - nonShared) break;
-
-        lastKey.resize(static_cast<size_t>(shared));
-        lastKey.append(reinterpret_cast<const char*>(raw.data() + pos), static_cast<size_t>(nonShared));
-        pos += static_cast<size_t>(nonShared);
-
-        const uint8_t* valPtr = raw.data() + pos;
-        pos += static_cast<size_t>(valLen);
-
-        // InternalKey ends with 8-byte (seq << 8 | valueType) if >= 8 bytes and valueType <= 17
-        std::wstring userKeyW, opStr = L"Put", seqStr = L"-";
-        if (lastKey.size() > 8) {
-            uint64_t tag = DetailDocs200::RdU64LE(reinterpret_cast<const uint8_t*>(lastKey.data() + lastKey.size() - 8));
-            uint8_t vtype = static_cast<uint8_t>(tag & 0xFFu);
-            uint64_t seq = tag >> 8;
-            if (vtype <= 7 && DetailDocs200::IsMostlyPrintableUtf8(reinterpret_cast<const uint8_t*>(lastKey.data()), lastKey.size() - 8)) {
-                userKeyW = PathUtils::Utf8ToWide(std::string_view(lastKey.data(), lastKey.size() - 8));
-                opStr = (vtype == 0) ? L"Deletion (Tombstone)" : (vtype == 1) ? L"Value (Put)" : L"Merge";
-                seqStr = std::to_wstring(seq);
+            // Internal key: user key + 8 bytes (sequence << 8 | type)
+            std::wstring userKey, op = L"-", seq = L"-";
+            size_t userLen = key.size();
+            if (key.size() >= 8) {
+                const uint64_t tag = DetailDocs200::RdU64LE(reinterpret_cast<const uint8_t*>(key.data() + key.size() - 8));
+                const uint32_t type = static_cast<uint32_t>(tag & 0xFFu);
+                static const struct { uint32_t t; const wchar_t* name; } kOps[] = {
+                    { 0x0, L"Delete" }, { 0x1, L"Put" }, { 0x2, L"Merge" }, { 0x7, L"SingleDelete" },
+                    { 0xF, L"RangeDelete" }, { 0x11, L"BlobIndex" }, { 0x14, L"DeleteWithTimestamp" }, { 0x16, L"WideColumns" },
+                };
+                for (const auto& o : kOps) {
+                    if (o.t == type) { op = o.name; break; }
+                }
+                if (op != L"-") {
+                    userLen = key.size() - 8;
+                    seq = std::to_wstring(tag >> 8);
+                }
             }
+            const uint8_t* uk = reinterpret_cast<const uint8_t*>(key.data());
+            userKey = printable(uk, userLen) ? PathUtils::Utf8ToWide(std::string_view(key.data(), userLen))
+                                             : DetailDocs200::HexBytes(uk, userLen, 32);
+            const size_t vShow = std::min<size_t>(static_cast<size_t>(valLen), 160);
+            std::wstring valText = printable(val, vShow) ? PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(val), vShow))
+                                                         : DetailDocs200::HexBytes(val, static_cast<size_t>(valLen), 24);
+            kvSh.rows.push_back({ userKey, op, seq, valText });
         }
-        if (userKeyW.empty()) {
-            if (DetailDocs200::IsMostlyPrintableUtf8(reinterpret_cast<const uint8_t*>(lastKey.data()), lastKey.size())) {
-                userKeyW = PathUtils::Utf8ToWide(lastKey);
-            } else {
-                userKeyW = DetailDocs200::HexBytes(reinterpret_cast<const uint8_t*>(lastKey.data()), lastKey.size(), 16);
-            }
-        }
-
-        size_t vShow = std::min<size_t>(static_cast<size_t>(valLen), 128);
-        std::wstring valW = DetailDocs200::IsMostlyPrintableUtf8(valPtr, vShow)
-                            ? PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(valPtr), vShow))
-                            : DetailDocs200::HexBytes(valPtr, static_cast<size_t>(valLen), 16);
-        kvSh.rows.push_back({ userKeyW, opStr, seqStr, valW });
     }
 
     SpreadsheetSheet hdrSh;
@@ -1078,18 +1084,34 @@ inline bool ParseRocksLevelDbSst200(const std::vector<uint8_t>& raw, const std::
     hdrSh.maxCols = 2;
     hdrSh.rows.push_back({ L"SSTable Field", L"Value" });
     hdrSh.rows.push_back({ L"Table Format", fmt });
-    hdrSh.rows.push_back({ L"File Size", PathUtils::FormatByteSize(raw.size()) });
-    hdrSh.rows.push_back({ L"Metaindex Block Handle", L"offset=" + std::to_wstring(metaOff) + L", size=" + std::to_wstring(metaSz) });
-    hdrSh.rows.push_back({ L"Index Block Handle", L"offset=" + std::to_wstring(idxOff) + L", size=" + std::to_wstring(idxSz) });
-
-    if (kvSh.rows.size() == 1) {
-        kvSh.rows.push_back({ L"(Compressed Snappy/Zstd Data Block)", L"Block", L"0", fmt });
+    if (!isLevelDb) hdrSh.rows.push_back({ L"Format Version", std::to_wstring(formatVersion) });
+    hdrSh.rows.push_back({ L"File Size", PathUtils::FormatByteSize(std::max<uint64_t>(out.sourceFileSize, raw.size())) });
+    if (handlesOk) {
+        hdrSh.rows.push_back({ L"Metaindex Block Handle", L"offset=" + std::to_wstring(metaOff) + L", size=" + std::to_wstring(metaSz) });
+        hdrSh.rows.push_back({ L"Index Block Handle", L"offset=" + std::to_wstring(idxOff) + L", size=" + std::to_wstring(idxSz) });
+    }
+    if (isPlain) {
+        hdrSh.rows.push_back({ L"Entries", L"PlainTable layout: entries are not listed" });
+    } else {
+        hdrSh.rows.push_back({ L"Data Blocks", std::to_wstring(dataBlocks.size()) + L" in the index, " + std::to_wstring(blocksRead) + L" read" });
+        hdrSh.rows.push_back({ L"Entries", std::to_wstring(entries) + (entries + 1 > kvSh.rows.size() ? L" (first " + std::to_wstring(kvSh.rows.size() - 1) + L" listed)" : L"") });
+        static const struct { int t; const wchar_t* name; } kCodecs[] = {
+            { 1, L"Snappy" }, { 2, L"zlib" }, { 3, L"bzip2" }, { 4, L"LZ4" }, { 5, L"LZ4HC" }, { 6, L"XPRESS" }, { 7, L"Zstandard" },
+        };
+        for (const auto& u : unreadByType) {
+            std::wstring codec = L"type " + std::to_wstring(u.first);
+            for (const auto& k : kCodecs) {
+                if (k.t == u.first) codec = k.name;
+            }
+            hdrSh.rows.push_back({ L"Blocks Not Decoded", std::to_wstring(u.second) + L" (" + codec + L")" });
+        }
     }
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
     out.formatTitle = fmt;
-    out.sheets.push_back(std::move(kvSh));
+    if (source.ReadPastHead() && !source.ReadFailed()) out.sourceReadFully = true;
+    if (kvSh.rows.size() > 1) out.sheets.push_back(std::move(kvSh));
     out.sheets.push_back(std::move(hdrSh));
     out.valid = true;
     return true;
@@ -1167,9 +1189,12 @@ inline bool ParseMapTiles200(const std::vector<uint8_t>& raw, const std::wstring
             return false;
         }
         ParsedOfficeDocument sqlDoc;
+        sqlDoc.filePath = out.filePath;
+        sqlDoc.sourceFileSize = out.sourceFileSize;
         if (!ParseSqliteDatabase(raw, sqlDoc) || !sqlDoc.valid || sqlDoc.sheets.empty()) {
             return false;
         }
+        out.sourceReadFully = sqlDoc.sourceReadFully;
 
         const SpreadsheetSheet* metaSheet = nullptr;
         const SpreadsheetSheet* tilesSheet = nullptr;
@@ -1502,153 +1527,695 @@ inline bool ParseProtobufWire200(const std::vector<uint8_t>& raw, const std::wst
 
 // ============================================================================
 // #86–#88. Cloud & SecOps JSON/Tag Formats (.tfstate, .sarif, .spdx, .cdx)
+//   Read with the shared JSON parser (CycloneDX XML with the XML scanner, SPDX tag-value line by line). The big
+//   arrays (resources, results, components, packages) are streamed, so a document cut short by the read limit
+//   still lists everything before the cut, and is marked incomplete.
 // ============================================================================
-inline bool ParseCloudSecOps200(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
-    std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
+namespace DetailCloudSecOps {
 
-    // #86. Terraform Infrastructure State (.tfstate)
-    if (ext == L".tfstate") {
-        if (sv.find("\"resources\"") == std::string_view::npos && sv.find("\"terraform_version\"") == std::string_view::npos) return false;
-        out.kind = OfficeFileKind::SqliteDb;
-        out.isSpreadsheet = true;
-        std::string tfVer = DetailDocs200::JsonGetStr(sv.substr(0, std::min<size_t>(sv.size(), 1024)), "terraform_version");
-        std::string serial = DetailDocs200::JsonGetStr(sv.substr(0, std::min<size_t>(sv.size(), 1024)), "serial");
-        std::string lineage = DetailDocs200::JsonGetStr(sv.substr(0, std::min<size_t>(sv.size(), 1024)), "lineage");
-        out.formatTitle = L"Terraform Infrastructure State (.tfstate" + (tfVer.empty() ? L"" : L" — v" + PathUtils::Utf8ToWide(tfVer)) + L")";
+using JVal = ::Explorer2::Json::Value;
+using JParser = ::Explorer2::Json::Parser;
+constexpr size_t kMaxRows = 5000;
 
-        SpreadsheetSheet resSh;
-        resSh.name = L"Resources";
-        resSh.maxCols = 5;
-        resSh.rows.push_back({ L"Mode", L"Resource Type", L"Name", L"Provider", L"Primary ID" });
+inline std::wstring W(std::string_view s) { return PathUtils::Utf8ToWide(s); }
 
-        size_t rp = sv.find("\"resources\"");
-        if (rp != std::string_view::npos) {
-            size_t pos = rp;
-            while ((pos = sv.find("\"mode\"", pos)) != std::string_view::npos && resSh.rows.size() < 400) {
-                size_t blkStart = (pos > 32) ? (pos - 32) : 0;
-                size_t nextMode = sv.find("\"mode\"", pos + 6);
-                size_t blkLen = std::min<size_t>((nextMode == std::string_view::npos ? sv.size() : nextMode) - blkStart, 4096);
-                std::string_view blk = sv.substr(blkStart, blkLen);
-                std::string mode = DetailDocs200::JsonGetStr(blk, "mode");
-                std::string rtype = DetailDocs200::JsonGetStr(blk, "type");
-                std::string rname = DetailDocs200::JsonGetStr(blk, "name");
-                std::string prov  = DetailDocs200::JsonGetStr(blk, "provider");
-                std::string id    = DetailDocs200::JsonGetStr(blk, "id");
-                resSh.rows.push_back({ PathUtils::Utf8ToWide(mode), PathUtils::Utf8ToWide(rtype),
-                                       PathUtils::Utf8ToWide(rname), PathUtils::Utf8ToWide(prov), PathUtils::Utf8ToWide(id) });
-                pos += 6;
-            }
-        }
-        if (resSh.rows.size() == 1) {
-            resSh.rows.push_back({ L"(empty)", L"-", L"serial=" + PathUtils::Utf8ToWide(serial), L"lineage=" + PathUtils::Utf8ToWide(lineage), L"-" });
-        }
-        out.sheets.push_back(std::move(resSh));
-        out.valid = true;
-        return true;
+// A value as cell text: strings as they are, numbers / booleans as written, arrays and objects compacted
+inline std::wstring Cell(const JVal* v) {
+    if (!v || v->IsNull()) return {};
+    if (v->IsString() || v->IsNumber()) return W(v->strVal);
+    if (v->IsBool()) return v->boolVal ? L"true" : L"false";
+    return W(::Explorer2::Json::Compact(*v, 200));
+}
+
+inline const JVal* Path(const JVal* v, std::initializer_list<std::string_view> keys) {
+    for (std::string_view k : keys) {
+        if (!v) return nullptr;
+        v = v->Find(k);
     }
+    return v;
+}
 
-    // #87. OASIS SARIF Static Analysis Report (.sarif)
-    if (ext == L".sarif") {
-        if (sv.find("\"runs\"") == std::string_view::npos) return false;
-        out.kind = OfficeFileKind::SqliteDb;
-        out.isSpreadsheet = true;
-        std::string toolName = DetailDocs200::JsonGetStr(sv.substr(0, std::min<size_t>(sv.size(), 4096)), "name");
-        out.formatTitle = L"OASIS SARIF Static Analysis Report (" + (toolName.empty() ? L".sarif" : PathUtils::Utf8ToWide(toolName)) + L")";
+inline std::string Str(const JVal* v) { return (v && v->IsString()) ? v->strVal : std::string(); }
 
-        SpreadsheetSheet sh;
-        sh.name = L"SARIF_Findings";
-        sh.maxCols = 5;
-        sh.rows.push_back({ L"Severity", L"Rule ID", L"Artifact URI", L"Line", L"Diagnostic Message" });
+inline ::Explorer2::Json::Limits StreamLimits() {
+    ::Explorer2::Json::Limits limits;
+    limits.maxNodes = 4000000; // per streamed element, and for the members kept whole
+    return limits;
+}
 
-        size_t pos = sv.find("\"results\"");
-        if (pos != std::string_view::npos) {
-            while ((pos = sv.find("\"ruleId\"", pos)) != std::string_view::npos && sh.rows.size() < 500) {
-                size_t blkStart = (pos > 64) ? (pos - 64) : 0;
-                size_t nextR = sv.find("\"ruleId\"", pos + 8);
-                size_t blkLen = std::min<size_t>((nextR == std::string_view::npos ? sv.size() : nextR) - blkStart, 3072);
-                std::string_view blk = sv.substr(blkStart, blkLen);
-                std::string rule  = DetailDocs200::JsonGetStr(blk, "ruleId");
-                std::string level = DetailDocs200::JsonGetStr(blk, "level");
-                if (level.empty()) level = "warning";
-                std::string uri   = DetailDocs200::JsonGetStr(blk, "uri");
-                std::string line  = DetailDocs200::JsonGetStr(blk, "startLine");
-                std::string msg   = DetailDocs200::JsonGetStr(blk, "text");
-                sh.rows.push_back({ PathUtils::Utf8ToWide(level), PathUtils::Utf8ToWide(rule),
-                                    PathUtils::Utf8ToWide(uri), PathUtils::Utf8ToWide(line), PathUtils::Utf8ToWide(msg) });
-                pos += 8;
-            }
-        }
-        if (sh.rows.size() == 1) {
-            sh.rows.push_back({ L"clean", L"-", L"-", L"0", L"0 findings reported by " + PathUtils::Utf8ToWide(toolName) });
-        }
-        out.sheets.push_back(std::move(sh));
-        out.valid = true;
-        return true;
+inline void NoteIncomplete(SpreadsheetSheet& summary, bool complete, const wchar_t* what) {
+    if (!complete) {
+        summary.rows.push_back({ L"Document", std::wstring(L"incomplete (cut short or damaged); the ") + what +
+                                              L" before that point are listed" });
     }
+}
 
-    // #88. SPDX & CycloneDX Software Bill of Materials (.spdx / .cdx)
-    if (ext == L".spdx" || ext == L".cdx") {
-        bool isCdx  = (sv.find("CycloneDX") != std::string_view::npos || sv.find("\"components\"") != std::string_view::npos);
-        bool isJson = (sv.find('{') != std::string_view::npos && (isCdx || sv.find("spdxVersion") != std::string_view::npos));
-        bool isTag  = (sv.find("SPDXVersion:") != std::string_view::npos || sv.find("PackageName:") != std::string_view::npos);
-        if (!isJson && !isTag) return false;
+inline void FinishSheet(SpreadsheetSheet& sh) {
+    sh.maxCols = 0;
+    for (const auto& r : sh.rows) sh.maxCols = std::max(sh.maxCols, r.size());
+}
 
-        out.kind = OfficeFileKind::SqliteDb;
-        out.isSpreadsheet = true;
-        out.formatTitle = isCdx ? L"CycloneDX Software Bill of Materials (.cdx)" : L"Linux Foundation SPDX SBOM (.spdx)";
+// ---- Terraform state (v4: resources[] with instances[]; v1-v3: modules[] with a resources map) ----
+inline bool ParseTerraformState(std::string_view text, ParsedOfficeDocument& out) {
+    SpreadsheetSheet sh;
+    sh.name = L"Resources";
+    sh.rows.push_back({ L"Address", L"Mode", L"Type", L"Name", L"Provider", L"ID", L"Module" });
+    size_t resources = 0, instances = 0;
+    std::map<std::string, size_t> byType;
 
-        SpreadsheetSheet sh;
-        sh.name = L"SBOM_Inventory";
-        sh.maxCols = 4;
-        sh.rows.push_back({ L"Component / Package", L"Version", L"License", L"PURL / Source" });
+    // provider["registry.terraform.io/hashicorp/aws"].west -> registry.terraform.io/hashicorp/aws (west)
+    auto providerName = [](const std::string& p) {
+        size_t q1 = p.find('"');
+        size_t q2 = (q1 == std::string::npos) ? std::string::npos : p.find('"', q1 + 1);
+        if (q2 == std::string::npos) return W(p);
+        std::wstring s = W(std::string_view(p).substr(q1 + 1, q2 - q1 - 1));
+        size_t alias = p.find("].", q2);
+        if (alias != std::string::npos) s += L" (" + W(std::string_view(p).substr(alias + 2)) + L")";
+        return s;
+    };
+    auto addRow = [&](std::string addr, const std::string& mode, const std::string& type, const std::string& name,
+                      const std::string& provider, std::wstring id, const std::string& module) {
+        ++byType[type.empty() ? std::string("(none)") : type];
+        if (sh.rows.size() > kMaxRows) return;
+        sh.rows.push_back({ W(addr), W(mode), W(type), W(name), providerName(provider), std::move(id), W(module) });
+    };
+    auto handleResource = [&](const JVal& r) {
+        if (!r.IsObject()) return;
+        ++resources;
+        std::string mode = r.GetString("mode"), type = r.GetString("type"), name = r.GetString("name");
+        std::string module = r.GetString("module"), provider = r.GetString("provider");
+        std::string base = module.empty() ? std::string() : module + ".";
+        if (mode == "data") base += "data.";
+        base += type + "." + name;
+        const JVal* insts = r.Find("instances");
+        if (!insts || !insts->IsArray() || insts->arrVal.empty()) {
+            addRow(base, mode, type, name, provider, {}, module);
+            return;
+        }
+        for (const auto& in : insts->arrVal) {
+            ++instances;
+            std::string addr = base;
+            if (const JVal* key = in.Find("index_key")) {
+                if (key->IsString()) addr += "[\"" + key->strVal + "\"]";
+                else if (key->IsNumber()) addr += "[" + key->strVal + "]";
+            }
+            addRow(addr, mode, type, name, provider, Cell(Path(&in, { "attributes", "id" })), module);
+        }
+    };
 
-        if (isTag) {
-            std::string curName, curVer, curLic, curLoc;
-            auto flushPkg = [&]() {
-                if (!curName.empty()) {
-                    sh.rows.push_back({ PathUtils::Utf8ToWide(curName), PathUtils::Utf8ToWide(curVer),
-                                        PathUtils::Utf8ToWide(curLic), PathUtils::Utf8ToWide(curLoc) });
-                    curName.clear(); curVer.clear(); curLic.clear(); curLoc.clear();
+    JParser parser(text, StreamLimits());
+    JVal root;
+    root.kind = JVal::Kind::Object;
+    bool sawResources = false;
+    bool complete = parser.StreamObject([&](const std::string& key) {
+        if (key == "resources" && !sawResources && parser.Peek() == '[') {
+            sawResources = true;
+            return parser.StreamArray([&](JVal&& r) { handleResource(r); });
+        }
+        JVal v;
+        if (!parser.ParseValue(v)) return false;
+        root.objVal.emplace_back(key, std::move(v));
+        return true;
+    }) && parser.AtEnd();
+
+    // Legacy states: modules[].resources is a map of address -> { type, provider, primary: { id } }
+    if (const JVal* mods = root.Find("modules"); mods && mods->IsArray()) {
+        sawResources = true;
+        for (const auto& m : mods->arrVal) {
+            std::string module;
+            if (const JVal* path = m.Find("path"); path && path->IsArray()) {
+                for (const auto& seg : path->arrVal) {
+                    if (!seg.IsString() || seg.strVal == "root") continue;
+                    module += (module.empty() ? "module." : ".module.") + seg.strVal;
                 }
-            };
-            size_t ls = 0;
-            while (ls < sv.size() && sh.rows.size() < 500) {
-                size_t le = sv.find('\n', ls);
-                if (le == std::string_view::npos) le = sv.size();
-                std::string_view line = sv.substr(ls, le - ls);
-                ls = le + 1;
-                if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-                if (line.rfind("PackageName:", 0) == 0) { flushPkg(); curName = std::string(line.substr(12)); }
-                else if (line.rfind("PackageVersion:", 0) == 0) curVer = std::string(line.substr(15));
-                else if (line.rfind("PackageLicenseConcluded:", 0) == 0) curLic = std::string(line.substr(24));
-                else if (line.rfind("PackageDownloadLocation:", 0) == 0) curLoc = std::string(line.substr(24));
             }
-            flushPkg();
-        } else {
-            size_t pos = isCdx ? sv.find("\"components\"") : sv.find("\"packages\"");
-            if (pos == std::string_view::npos) pos = 0;
-            while ((pos = sv.find("\"name\"", pos)) != std::string_view::npos && sh.rows.size() < 500) {
-                size_t nextN = sv.find("\"name\"", pos + 6);
-                size_t blkLen = std::min<size_t>((nextN == std::string_view::npos ? sv.size() : nextN) - pos, 2048);
-                std::string_view blk = sv.substr(pos, blkLen);
-                std::string name = DetailDocs200::JsonGetStr(blk, "name");
-                std::string ver  = DetailDocs200::JsonGetStr(blk, "version");
-                if (ver.empty()) ver = DetailDocs200::JsonGetStr(blk, "versionInfo");
-                std::string lic  = DetailDocs200::JsonGetStr(blk, "licenseConcluded");
-                if (lic.empty()) lic = DetailDocs200::JsonGetStr(blk, "id");
-                std::string purl = DetailDocs200::JsonGetStr(blk, "purl");
-                if (purl.empty()) purl = DetailDocs200::JsonGetStr(blk, "downloadLocation");
-                sh.rows.push_back({ PathUtils::Utf8ToWide(name), PathUtils::Utf8ToWide(ver),
-                                    PathUtils::Utf8ToWide(lic), PathUtils::Utf8ToWide(purl) });
-                pos += 6;
+            const JVal* res = m.Find("resources");
+            if (!res || !res->IsObject()) continue;
+            for (const auto& kv : res->objVal) {
+                ++resources;
+                ++instances;
+                const std::string& addr = kv.first;
+                std::string mode = (addr.rfind("data.", 0) == 0) ? "data" : "managed";
+                std::string type = kv.second.GetString("type");
+                size_t lastDot = addr.rfind('.');
+                std::string name = (lastDot == std::string::npos) ? addr : addr.substr(lastDot + 1);
+                addRow(module.empty() ? addr : module + "." + addr, mode, type, name, kv.second.GetString("provider"),
+                       Cell(Path(&kv.second, { "primary", "id" })), module);
             }
         }
-        if (sh.rows.size() == 1) sh.rows.push_back({ L"(SBOM Header Only)", L"1.0", L"NOASSERTION", L"-" });
-        out.sheets.push_back(std::move(sh));
-        out.valid = true;
-        return true;
     }
+    if (!sawResources && !root.Find("terraform_version") && !root.Find("lineage")) return false;
+    if (!complete && resources == 0) return false;
 
+    std::string tfVer = root.GetString("terraform_version");
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"Terraform Infrastructure State (.tfstate" + (tfVer.empty() ? L"" : L" — v" + W(tfVer)) + L")";
+    FinishSheet(sh);
+    out.sheets.push_back(std::move(sh));
+
+    SpreadsheetSheet summary;
+    summary.name = L"State";
+    summary.rows.push_back({ L"Property", L"Value" });
+    summary.rows.push_back({ L"State format version", Cell(root.Find("version")) });
+    summary.rows.push_back({ L"Terraform version", W(tfVer) });
+    summary.rows.push_back({ L"Serial", Cell(root.Find("serial")) });
+    summary.rows.push_back({ L"Lineage", Cell(root.Find("lineage")) });
+    summary.rows.push_back({ L"Resources", std::to_wstring(resources) });
+    summary.rows.push_back({ L"Instances", std::to_wstring(instances) });
+    for (const auto& tc : byType) summary.rows.push_back({ L"Type: " + W(tc.first), std::to_wstring(tc.second) });
+    if (const JVal* outputs = root.Find("outputs"); outputs && outputs->IsObject()) {
+        for (const auto& kv : outputs->objVal) {
+            bool sensitive = kv.second.GetBool("sensitive", false);
+            summary.rows.push_back({ L"Output: " + W(kv.first), sensitive ? L"(sensitive)" : Cell(kv.second.Find("value")) });
+        }
+    }
+    NoteIncomplete(summary, complete, L"resources");
+    FinishSheet(summary);
+    out.sheets.push_back(std::move(summary));
+    out.valid = true;
+    return true;
+}
+
+// ---- SARIF 2.1.0 (runs[] with tool.driver.rules and results[]) ----
+
+// "{0} is unused" + arguments -> "x is unused"
+inline std::string ExpandSarifArguments(const std::string& tmpl, const JVal* args) {
+    if (!args || !args->IsArray()) return tmpl;
+    std::string s;
+    for (size_t i = 0; i < tmpl.size(); ++i) {
+        if (tmpl[i] == '{') {
+            size_t close = tmpl.find('}', i + 1);
+            if (close != std::string::npos && close > i + 1 && close - i <= 4) {
+                size_t idx = 0;
+                bool digits = true;
+                for (size_t k = i + 1; k < close; ++k) {
+                    if (tmpl[k] < '0' || tmpl[k] > '9') { digits = false; break; }
+                    idx = idx * 10 + static_cast<size_t>(tmpl[k] - '0');
+                }
+                if (digits && idx < args->arrVal.size()) {
+                    s += args->arrVal[idx].IsString() ? args->arrVal[idx].strVal : ::Explorer2::Json::Compact(args->arrVal[idx], 80);
+                    i = close;
+                    continue;
+                }
+            }
+        }
+        s.push_back(tmpl[i]);
+    }
+    return s;
+}
+
+inline bool ParseSarifLog(std::string_view text, ParsedOfficeDocument& out) {
+    SpreadsheetSheet sh;
+    sh.name = L"SARIF_Findings";
+    sh.rows.push_back({ L"Level", L"Rule", L"File", L"Line", L"Message", L"Tool" });
+    std::map<std::string, size_t> levelCounts;
+    std::vector<std::wstring> runTools;
+    size_t results = 0;
+
+    struct RunCtx {
+        JVal tool, artifacts;
+        bool haveTool = false;
+        std::wstring toolName;
+        std::map<std::string, const JVal*, std::less<>> rulesById;
+        const JVal* rules = nullptr;
+    };
+    auto setTool = [](RunCtx& ctx, JVal&& tool) {
+        ctx.tool = std::move(tool);
+        ctx.haveTool = true;
+        const JVal* driver = ctx.tool.Find("driver");
+        std::string name = driver ? driver->GetString("name") : std::string();
+        std::string ver = driver ? driver->GetString("semanticVersion", driver->GetString("version")) : std::string();
+        ctx.toolName = W(name) + (ver.empty() ? L"" : L" " + W(ver));
+        ctx.rules = driver ? driver->Find("rules") : nullptr;
+        if (ctx.rules && ctx.rules->IsArray()) {
+            for (const auto& r : ctx.rules->arrVal) {
+                std::string id = r.GetString("id");
+                if (!id.empty()) ctx.rulesById.emplace(std::move(id), &r);
+            }
+        }
+    };
+    auto ruleFor = [](const RunCtx& ctx, const JVal& res) -> const JVal* {
+        if (!ctx.rules || !ctx.rules->IsArray()) return nullptr;
+        int idx = res.GetInt("ruleIndex", -1);
+        if (idx < 0) {
+            if (const JVal* rr = res.Find("rule")) idx = rr->GetInt("index", -1);
+        }
+        if (idx >= 0 && static_cast<size_t>(idx) < ctx.rules->arrVal.size()) return &ctx.rules->arrVal[static_cast<size_t>(idx)];
+        std::string id = res.GetString("ruleId");
+        if (id.empty()) {
+            if (const JVal* rr = res.Find("rule")) id = rr->GetString("id");
+        }
+        auto it = ctx.rulesById.find(id);
+        return (it == ctx.rulesById.end()) ? nullptr : it->second;
+    };
+    auto handleResult = [&](const RunCtx& ctx, const JVal& r, bool addRow) {
+        if (!r.IsObject()) return;
+        ++results;
+        const JVal* rule = ruleFor(ctx, r);
+        // SARIF 3.27.10: the result's level, else "none" for kinds other than fail, else the rule's default, else warning
+        std::string level = r.GetString("level");
+        if (level.empty()) {
+            std::string kind = r.GetString("kind");
+            if (!kind.empty() && kind != "fail") level = "none";
+            else if (rule) level = Str(Path(rule, { "defaultConfiguration", "level" }));
+            if (level.empty()) level = "warning";
+        }
+        ++levelCounts[level];
+        if (!addRow || sh.rows.size() > kMaxRows) return;
+
+        std::string ruleId = r.GetString("ruleId");
+        if (ruleId.empty()) ruleId = Str(Path(&r, { "rule", "id" }));
+        if (ruleId.empty() && rule) ruleId = rule->GetString("id");
+        std::string msg;
+        if (const JVal* m = r.Find("message"); m && m->IsObject()) {
+            msg = m->GetString("text");
+            if (msg.empty() && rule) {
+                std::string mid = m->GetString("id");
+                if (!mid.empty()) msg = Str(Path(rule, { "messageStrings", mid, "text" }));
+            }
+            msg = ExpandSarifArguments(msg, m->Find("arguments"));
+        }
+        std::string uri, line;
+        if (const JVal* locs = r.Find("locations"); locs && locs->IsArray() && !locs->arrVal.empty()) {
+            const JVal& loc = locs->arrVal[0];
+            if (const JVal* pl = loc.Find("physicalLocation")) {
+                if (const JVal* al = pl->Find("artifactLocation")) {
+                    uri = al->GetString("uri");
+                    int ai = al->GetInt("index", -1);
+                    if (uri.empty() && ai >= 0 && ctx.artifacts.IsArray() && static_cast<size_t>(ai) < ctx.artifacts.arrVal.size()) {
+                        uri = Str(Path(&ctx.artifacts.arrVal[static_cast<size_t>(ai)], { "location", "uri" }));
+                    }
+                }
+                if (const JVal* reg = pl->Find("region")) {
+                    int sl = reg->GetInt("startLine", -1), sc = reg->GetInt("startColumn", -1);
+                    if (sl > 0) line = std::to_string(sl) + (sc > 0 ? ":" + std::to_string(sc) : std::string());
+                }
+            }
+            if (uri.empty()) {
+                if (const JVal* ll = loc.Find("logicalLocations"); ll && ll->IsArray() && !ll->arrVal.empty()) {
+                    uri = ll->arrVal[0].GetString("fullyQualifiedName", ll->arrVal[0].GetString("name"));
+                }
+            }
+        }
+        for (char& c : msg) {
+            if (c == '\r' || c == '\n') c = ' ';
+        }
+        sh.rows.push_back({ W(level), W(ruleId), W(uri), W(line), W(msg), ctx.toolName });
+    };
+
+    JParser parser(text, StreamLimits());
+    JVal root;
+    root.kind = JVal::Kind::Object;
+    bool sawRuns = false;
+    size_t runCount = 0;
+    bool complete = parser.StreamObject([&](const std::string& key) {
+        if (key == "runs" && !sawRuns && parser.Peek() == '[') {
+            sawRuns = true;
+            return parser.StreamArrayItems([&]() {
+                if (parser.Peek() != '{') {
+                    JVal skipped;
+                    return parser.ParseValue(skipped);
+                }
+                ++runCount;
+                RunCtx ctx;
+                std::vector<JVal> pending; // results seen before the run's tool (rules) was
+                bool ok = parser.StreamObject([&](const std::string& rk) {
+                    if (rk == "results" && parser.Peek() == '[') {
+                        return parser.StreamArray([&](JVal&& r) {
+                            if (ctx.haveTool) handleResult(ctx, r, true);
+                            else if (pending.size() < kMaxRows) pending.push_back(std::move(r));
+                            else handleResult(ctx, r, false);
+                        });
+                    }
+                    JVal v;
+                    if (!parser.ParseValue(v)) return false;
+                    if (rk == "tool" && !ctx.haveTool) setTool(ctx, std::move(v));
+                    else if (rk == "artifacts") ctx.artifacts = std::move(v);
+                    return true;
+                }, 2);
+                for (const auto& r : pending) handleResult(ctx, r, true);
+                runTools.push_back(ctx.toolName);
+                return ok;
+            });
+        }
+        JVal v;
+        if (!parser.ParseValue(v)) return false;
+        root.objVal.emplace_back(key, std::move(v));
+        return true;
+    }) && parser.AtEnd();
+    if (!sawRuns || (!complete && results == 0)) return false;
+
+    std::wstring firstTool = runTools.empty() ? std::wstring() : runTools[0];
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"OASIS SARIF Static Analysis Report (" + (firstTool.empty() ? std::wstring(L".sarif") : firstTool) + L")";
+    FinishSheet(sh);
+    out.sheets.push_back(std::move(sh));
+
+    SpreadsheetSheet summary;
+    summary.name = L"SARIF_Summary";
+    summary.rows.push_back({ L"Property", L"Value" });
+    summary.rows.push_back({ L"SARIF version", W(root.GetString("version")) });
+    summary.rows.push_back({ L"Runs", std::to_wstring(runCount) });
+    for (size_t i = 0; i < runTools.size() && i < 50; ++i) {
+        summary.rows.push_back({ L"Run " + std::to_wstring(i + 1) + L" tool", runTools[i].empty() ? L"(unnamed)" : runTools[i] });
+    }
+    summary.rows.push_back({ L"Results", std::to_wstring(results) + (results > kMaxRows ? L" (first " + std::to_wstring(kMaxRows) + L" listed)" : L"") });
+    for (const auto& lc : levelCounts) summary.rows.push_back({ L"Level: " + W(lc.first), std::to_wstring(lc.second) });
+    NoteIncomplete(summary, complete, L"results");
+    FinishSheet(summary);
+    out.sheets.push_back(std::move(summary));
+    out.valid = true;
+    return true;
+}
+
+// ---- Software bills of materials: CycloneDX (JSON / XML) and SPDX (JSON / tag-value) ----
+struct SbomRow {
+    std::string name, version, type, license, locator, supplier;
+};
+
+inline void PushSbomRow(SpreadsheetSheet& sh, const SbomRow& r) {
+    if (sh.rows.size() > kMaxRows) return;
+    sh.rows.push_back({ W(r.name), W(r.version), W(r.type), W(r.license), W(r.locator), W(r.supplier) });
+}
+
+inline SpreadsheetSheet NewSbomSheet() {
+    SpreadsheetSheet sh;
+    sh.name = L"SBOM_Inventory";
+    sh.rows.push_back({ L"Component / Package", L"Version", L"Type", L"License", L"PURL / Source", L"Supplier" });
+    return sh;
+}
+
+inline void AppendJoined(std::string& dst, const std::string& part, const char* sep) {
+    if (part.empty()) return;
+    if (!dst.empty()) dst += sep;
+    dst += part;
+}
+
+// CycloneDX component (JSON); nested components follow it
+inline void CycloneDxJsonComponent(const JVal& c, SpreadsheetSheet& sh, size_t& count, int depth) {
+    if (!c.IsObject() || depth > 16) return;
+    ++count;
+    SbomRow r;
+    std::string group = c.GetString("group");
+    r.name = group.empty() ? c.GetString("name") : group + "/" + c.GetString("name");
+    r.version = c.GetString("version");
+    r.type = c.GetString("type");
+    if (const JVal* lics = c.Find("licenses"); lics && lics->IsArray()) {
+        for (const auto& l : lics->arrVal) {
+            std::string one = l.GetString("expression");
+            if (one.empty()) {
+                const JVal* lic = l.Find("license");
+                one = lic ? lic->GetString("id", lic->GetString("name")) : std::string();
+            }
+            AppendJoined(r.license, one, ", ");
+        }
+    }
+    r.locator = c.GetString("purl");
+    r.supplier = Str(Path(&c, { "supplier", "name" }));
+    if (r.supplier.empty()) r.supplier = c.GetString("publisher", c.GetString("author"));
+    PushSbomRow(sh, r);
+    if (const JVal* nested = c.Find("components"); nested && nested->IsArray()) {
+        for (const auto& n : nested->arrVal) CycloneDxJsonComponent(n, sh, count, depth + 1);
+    }
+}
+
+// SPDX 2.x package (JSON)
+inline void SpdxJsonPackage(const JVal& p, SpreadsheetSheet& sh, size_t& count) {
+    if (!p.IsObject()) return;
+    ++count;
+    SbomRow r;
+    r.name = p.GetString("name");
+    r.version = p.GetString("versionInfo");
+    r.type = p.GetString("primaryPackagePurpose");
+    r.license = p.GetString("licenseConcluded");
+    if (r.license.empty() || r.license == "NOASSERTION" || r.license == "NONE") {
+        std::string declared = p.GetString("licenseDeclared");
+        if (!declared.empty() && declared != "NOASSERTION") r.license = declared;
+    }
+    if (const JVal* refs = p.Find("externalRefs"); refs && refs->IsArray()) {
+        for (const auto& ref : refs->arrVal) {
+            if (ref.GetString("referenceType") == "purl") {
+                r.locator = ref.GetString("referenceLocator");
+                break;
+            }
+        }
+    }
+    if (r.locator.empty()) {
+        std::string dl = p.GetString("downloadLocation");
+        if (dl != "NOASSERTION" && dl != "NONE") r.locator = dl;
+    }
+    r.supplier = p.GetString("supplier");
+    PushSbomRow(sh, r);
+}
+
+inline bool ParseSbomJson(std::string_view text, ParsedOfficeDocument& out) {
+    SpreadsheetSheet sh = NewSbomSheet();
+    size_t count = 0;
+    JParser parser(text, StreamLimits());
+    JVal root;
+    root.kind = JVal::Kind::Object;
+    bool sawComponents = false, sawPackages = false;
+    bool complete = parser.StreamObject([&](const std::string& key) {
+        if (key == "components" && !sawComponents && parser.Peek() == '[') {
+            sawComponents = true;
+            return parser.StreamArray([&](JVal&& c) { CycloneDxJsonComponent(c, sh, count, 0); });
+        }
+        if (key == "packages" && !sawPackages && parser.Peek() == '[') {
+            sawPackages = true;
+            return parser.StreamArray([&](JVal&& p) { SpdxJsonPackage(p, sh, count); });
+        }
+        JVal v;
+        if (!parser.ParseValue(v)) return false;
+        root.objVal.emplace_back(key, std::move(v));
+        return true;
+    }) && parser.AtEnd();
+
+    std::string bomFormat = root.GetString("bomFormat"), spdxVersion = root.GetString("spdxVersion");
+    bool isCdx = bomFormat == "CycloneDX" || (bomFormat.empty() && sawComponents && !complete);
+    bool isSpdx = spdxVersion.rfind("SPDX-", 0) == 0 || (spdxVersion.empty() && sawPackages && !complete);
+    if (isCdx == isSpdx) return false; // neither (or a document claiming to be both)
+    if (!complete && count == 0) return false;
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = isCdx ? L"CycloneDX Software Bill of Materials (.cdx)" : L"Linux Foundation SPDX SBOM (.spdx)";
+    FinishSheet(sh);
+    out.sheets.push_back(std::move(sh));
+
+    SpreadsheetSheet summary;
+    summary.name = L"SBOM_Summary";
+    summary.rows.push_back({ L"Property", L"Value" });
+    if (isCdx) {
+        summary.rows.push_back({ L"Specification", L"CycloneDX " + W(root.GetString("specVersion")) });
+        summary.rows.push_back({ L"Serial number", W(root.GetString("serialNumber")) });
+        if (const JVal* subject = Path(&root, { "metadata", "component" })) {
+            summary.rows.push_back({ L"Subject", W(subject->GetString("name")) + L" " + W(subject->GetString("version")) });
+        }
+        std::string created = Str(Path(&root, { "metadata", "timestamp" }));
+        if (!created.empty()) summary.rows.push_back({ L"Created", W(created) });
+        // metadata.tools: an array of tools (1.4) or { components: [...] } (1.5+)
+        if (const JVal* tools = Path(&root, { "metadata", "tools" })) {
+            const JVal* list = tools->IsArray() ? tools : tools->Find("components");
+            std::string names;
+            if (list && list->IsArray()) {
+                for (const auto& t : list->arrVal) AppendJoined(names, t.GetString("name") + (t.GetString("version").empty() ? "" : " " + t.GetString("version")), ", ");
+            }
+            if (!names.empty()) summary.rows.push_back({ L"Tools", W(names) });
+        }
+        summary.rows.push_back({ L"Components", std::to_wstring(count) });
+        if (const JVal* deps = root.Find("dependencies"); deps && deps->IsArray()) {
+            summary.rows.push_back({ L"Dependency entries", std::to_wstring(deps->arrVal.size()) });
+        }
+    } else {
+        summary.rows.push_back({ L"Specification", W(spdxVersion) });
+        summary.rows.push_back({ L"Document name", W(root.GetString("name")) });
+        summary.rows.push_back({ L"Namespace", W(root.GetString("documentNamespace")) });
+        summary.rows.push_back({ L"Data license", W(root.GetString("dataLicense")) });
+        if (const JVal* ci = root.Find("creationInfo")) {
+            summary.rows.push_back({ L"Created", W(ci->GetString("created")) });
+            if (const JVal* creators = ci->Find("creators"); creators && creators->IsArray()) {
+                std::string names;
+                for (const auto& c : creators->arrVal) AppendJoined(names, Str(&c), ", ");
+                summary.rows.push_back({ L"Creators", W(names) });
+            }
+        }
+        summary.rows.push_back({ L"Packages", std::to_wstring(count) });
+        if (const JVal* files = root.Find("files"); files && files->IsArray()) summary.rows.push_back({ L"Files", std::to_wstring(files->arrVal.size()) });
+        if (const JVal* rel = root.Find("relationships"); rel && rel->IsArray()) summary.rows.push_back({ L"Relationships", std::to_wstring(rel->arrVal.size()) });
+    }
+    NoteIncomplete(summary, complete, isCdx ? L"components" : L"packages");
+    FinishSheet(summary);
+    out.sheets.push_back(std::move(summary));
+    out.valid = true;
+    return true;
+}
+
+// CycloneDX XML: <bom><metadata>..</metadata><components><component type=".."><name/>..</component></components>
+inline void CycloneDxXmlComponents(std::string_view body, SpreadsheetSheet& sh, size_t& count, int depth) {
+    namespace X = ::Explorer2::XmlTagScan;
+    if (depth > 16) return;
+    X::ForEachChild(body, [&](std::string_view name, const X::Element& e) {
+        if (name != "component") return true;
+        ++count;
+        SbomRow r;
+        std::string group = X::ChildText(e.body, "group");
+        r.name = group.empty() ? X::ChildText(e.body, "name") : group + "/" + X::ChildText(e.body, "name");
+        r.version = X::ChildText(e.body, "version");
+        r.type = X::AttrText(e.attrs, "type");
+        X::Element lics;
+        if (X::FindChild(e.body, "licenses", lics)) {
+            X::ForEachChild(lics.body, [&](std::string_view ln, const X::Element& le) {
+                if (ln == "expression") AppendJoined(r.license, std::string(X::TrimView(X::DecodeText(le.body))), ", ");
+                else if (ln == "license") {
+                    std::string one = X::ChildText(le.body, "id");
+                    if (one.empty()) one = X::ChildText(le.body, "name");
+                    AppendJoined(r.license, one, ", ");
+                }
+                return true;
+            });
+        }
+        r.locator = X::ChildText(e.body, "purl");
+        X::Element sup;
+        if (X::FindChild(e.body, "supplier", sup)) r.supplier = X::ChildText(sup.body, "name");
+        if (r.supplier.empty()) r.supplier = X::ChildText(e.body, "publisher");
+        PushSbomRow(sh, r);
+        X::Element nested;
+        if (X::FindChild(e.body, "components", nested)) CycloneDxXmlComponents(nested.body, sh, count, depth + 1);
+        return true;
+    });
+}
+
+inline bool ParseCycloneDxXml(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
+    namespace X = ::Explorer2::XmlTagScan;
+    std::string xml = X::DocumentToUtf8(raw.data(), raw.size());
+    X::Element bom;
+    if (!X::FindChild(xml, "bom", bom)) return false;
+    SpreadsheetSheet sh = NewSbomSheet();
+    size_t count = 0;
+    X::Element comps;
+    if (X::FindChild(bom.body, "components", comps)) CycloneDxXmlComponents(comps.body, sh, count, 0);
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"CycloneDX Software Bill of Materials (.cdx)";
+    FinishSheet(sh);
+    out.sheets.push_back(std::move(sh));
+    SpreadsheetSheet summary;
+    summary.name = L"SBOM_Summary";
+    summary.rows.push_back({ L"Property", L"Value" });
+    std::string ns = X::AttrText(bom.attrs, "xmlns");
+    size_t slash = ns.rfind('/');
+    summary.rows.push_back({ L"Specification", L"CycloneDX " + W(slash == std::string::npos ? ns : ns.substr(slash + 1)) });
+    summary.rows.push_back({ L"Serial number", W(X::AttrText(bom.attrs, "serialNumber")) });
+    X::Element meta, subject;
+    if (X::FindChild(bom.body, "metadata", meta) && X::FindChild(meta.body, "component", subject)) {
+        summary.rows.push_back({ L"Subject", W(X::ChildText(subject.body, "name")) + L" " + W(X::ChildText(subject.body, "version")) });
+    }
+    summary.rows.push_back({ L"Components", std::to_wstring(count) });
+    FinishSheet(summary);
+    out.sheets.push_back(std::move(summary));
+    out.valid = true;
+    return true;
+}
+
+// SPDX tag-value: "Tag: value" lines; a value may be a multi-line <text>..</text> block
+inline bool ParseSpdxTagValue(std::string_view sv, ParsedOfficeDocument& out) {
+    SpreadsheetSheet sh = NewSbomSheet();
+    size_t count = 0;
+    std::string spdxVersion, docName, created;
+    std::vector<std::string> creators;
+    SbomRow cur;
+    bool inPackage = false;
+    auto flush = [&]() {
+        if (inPackage) {
+            ++count;
+            PushSbomRow(sh, cur);
+        }
+        cur = SbomRow{};
+        inPackage = false;
+    };
+    size_t pos = 0;
+    while (pos < sv.size()) {
+        size_t eol = sv.find('\n', pos);
+        if (eol == std::string_view::npos) eol = sv.size();
+        std::string_view line = sv.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        size_t colon = line.find(':');
+        if (line.empty() || line.front() == '#' || colon == std::string_view::npos) continue;
+        std::string_view tag = PathUtils::TrimAscii(line.substr(0, colon));
+        std::string_view val = PathUtils::TrimAscii(line.substr(colon + 1));
+        if (val.rfind("<text>", 0) == 0) { // multi-line value: skip to its end
+            if (val.find("</text>") == std::string_view::npos) {
+                size_t end = sv.find("</text>", pos);
+                pos = (end == std::string_view::npos) ? sv.size() : sv.find('\n', end);
+                if (pos == std::string_view::npos) pos = sv.size(); else ++pos;
+            }
+            continue;
+        }
+        if (tag == "SPDXVersion") spdxVersion = std::string(val);
+        else if (tag == "DocumentName") docName = std::string(val);
+        else if (tag == "Created") created = std::string(val);
+        else if (tag == "Creator") creators.emplace_back(val);
+        else if (tag == "PackageName") { flush(); inPackage = true; cur.name = std::string(val); }
+        else if (!inPackage) continue;
+        else if (tag == "PackageVersion") cur.version = std::string(val);
+        else if (tag == "PrimaryPackagePurpose") cur.type = std::string(val);
+        else if (tag == "PackageLicenseConcluded") cur.license = std::string(val);
+        else if (tag == "PackageLicenseDeclared" && (cur.license.empty() || cur.license == "NOASSERTION")) cur.license = std::string(val);
+        else if (tag == "PackageSupplier") cur.supplier = std::string(val);
+        else if (tag == "PackageDownloadLocation" && cur.locator.empty() && val != "NOASSERTION" && val != "NONE") cur.locator = std::string(val);
+        else if (tag == "ExternalRef") { // ExternalRef: PACKAGE-MANAGER purl pkg:npm/x@1
+            size_t p1 = val.find(' ');
+            size_t p2 = (p1 == std::string_view::npos) ? p1 : val.find(' ', p1 + 1);
+            if (p2 != std::string_view::npos && val.substr(p1 + 1, p2 - p1 - 1) == "purl") {
+                cur.locator = std::string(PathUtils::TrimAscii(val.substr(p2 + 1)));
+            }
+        }
+        else if (tag == "FileName" || tag == "SnippetSPDXID" || tag == "LicenseID") flush(); // past the package's tags
+    }
+    flush();
+    if (spdxVersion.rfind("SPDX-", 0) != 0) return false;
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"Linux Foundation SPDX SBOM (.spdx)";
+    FinishSheet(sh);
+    out.sheets.push_back(std::move(sh));
+    SpreadsheetSheet summary;
+    summary.name = L"SBOM_Summary";
+    summary.rows.push_back({ L"Property", L"Value" });
+    summary.rows.push_back({ L"Specification", W(spdxVersion) });
+    summary.rows.push_back({ L"Document name", W(docName) });
+    summary.rows.push_back({ L"Created", W(created) });
+    std::string creatorList;
+    for (const auto& c : creators) AppendJoined(creatorList, c, ", ");
+    summary.rows.push_back({ L"Creators", W(creatorList) });
+    summary.rows.push_back({ L"Packages", std::to_wstring(count) });
+    FinishSheet(summary);
+    out.sheets.push_back(std::move(summary));
+    out.valid = true;
+    return true;
+}
+
+} // namespace DetailCloudSecOps
+
+inline bool ParseCloudSecOps200(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
+    using namespace DetailCloudSecOps;
+    std::string_view text = ::Explorer2::Json::StripUtf8Bom(
+        std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size()));
+    size_t firstPos = text.find_first_not_of(" \t\r\n");
+    char first = (firstPos == std::string_view::npos) ? '\0' : text[firstPos];
+
+    if (ext == L".tfstate") return first == '{' && ParseTerraformState(text, out);
+    if (ext == L".sarif") return first == '{' && ParseSarifLog(text, out);
+    if (ext == L".spdx" || ext == L".cdx") {
+        if (first == '{') return ParseSbomJson(text, out);
+        if (first == '<') return ext == L".cdx" && ParseCycloneDxXml(raw, out); // (SPDX RDF/XML is not read)
+        return ParseSpdxTagValue(text, out);
+    }
     return false;
 }
 
@@ -1838,9 +2405,6 @@ inline bool ParseCryptoSec200(const std::vector<uint8_t>& raw, const std::wstrin
                 break;
             }
         }
-        if (sh.rows.size() == 1) {
-            sh.rows.push_back({ L"(Empty KeyStore)", (magic == 0xCECECECEu) ? L"JCEKS" : L"JKS", L"v" + std::to_wstring(ver), L"0 entries" });
-        }
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
         out.formatTitle = (magic == 0xCECECECEu) ? L"Java JCEKS Cryptographic KeyStore (.jks)" : L"Java KeyStore Binary Vault (.jks)";
@@ -1994,7 +2558,6 @@ inline bool ParseWindowsForensics200(const std::vector<uint8_t>& raw, const std:
         hdrSh.rows.push_back({ L"Hive Format Version", std::to_wstring(majVer) + L"." + std::to_wstring(minVer) });
         hdrSh.rows.push_back({ L"Sequence Numbers", std::to_wstring(seq1) + L" / " + std::to_wstring(seq2) + (seq1 == seq2 ? L" (Clean)" : L" (Dirty)") });
         hdrSh.rows.push_back({ L"Root Key Cell Offset", L"0x" + DetailSys100::Hex32(rootCell).substr(2) });
-        if (keysSh.rows.size() == 1) keysSh.rows.push_back({ L"Header", hiveName, L"regf", L"Base Block Only" });
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
@@ -2386,7 +2949,6 @@ inline bool ParseWindowsForensics200(const std::vector<uint8_t>& raw, const std:
             if (pos + 2 <= raw.size() && DetailDocs200::RdU16LE(raw.data() + pos) == 0x005Du) pos += 2; // ']'
             sh.rows.push_back({ key, val, tStr, dStr });
         }
-        if (sh.rows.size() == 1) sh.rows.push_back({ L"(Empty PReg v" + std::to_wstring(ver) + L")", L"-", L"-", L"-" });
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
@@ -2515,41 +3077,52 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
 
         std::string title = xmlTagVal(sv, "work-title");
         if (title.empty()) title = xmlTagVal(sv, "movement-title");
-        std::string beats = xmlTagVal(sv, "beats");
-        std::string beatType = xmlTagVal(sv, "beat-type");
-
+        // Notes in document order: part-wise scores nest measures in parts, time-wise ones parts in measures. The time
+        // signature in force is tracked; chord notes (sounding with the note before) and grace notes are marked.
+        namespace X = ::Explorer2::XmlTagScan;
         SpreadsheetSheet notesSh;
         notesSh.name = L"Score_Notes";
-        notesSh.maxCols = 5;
-        notesSh.rows.push_back({ L"Measure", L"Pitch", L"Duration Type", L"Time Sig", L"Lyric / Part" });
-
-        std::wstring timeSig = beats.empty() ? L"4/4" : PathUtils::Utf8ToWide(beats + "/" + beatType);
-        size_t mp = 0;
-        int measIdx = 0;
-        while ((mp = sv.find("<measure", mp)) != std::string_view::npos && notesSh.rows.size() < 400) {
-            ++measIdx;
-            size_t me = sv.find("</measure>", mp);
-            if (me == std::string_view::npos) me = sv.size();
-            std::string_view mblk = sv.substr(mp, me - mp);
-            size_t np = 0;
-            while ((np = mblk.find("<note", np)) != std::string_view::npos && notesSh.rows.size() < 400) {
-                size_t ne = mblk.find("</note>", np);
-                if (ne == std::string_view::npos) break;
-                std::string_view nblk = mblk.substr(np, ne - np);
-                std::string step = xmlTagVal(nblk, "step");
-                std::string alter = xmlTagVal(nblk, "alter");
-                std::string oct  = xmlTagVal(nblk, "octave");
-                std::string ntype = xmlTagVal(nblk, "type");
-                std::string lyr  = xmlTagVal(nblk, "text");
-                std::wstring pitch = step.empty() ? L"Rest"
-                    : PathUtils::Utf8ToWide(step + (alter == "1" ? "#" : (alter == "-1" ? "b" : "")) + oct);
-                notesSh.rows.push_back({ std::to_wstring(measIdx), pitch,
-                    PathUtils::Utf8ToWide(ntype.empty() ? "quarter" : ntype), timeSig, PathUtils::Utf8ToWide(lyr) });
-                np = ne + 7;
+        notesSh.rows.push_back({ L"Part", L"Measure", L"Pitch", L"Duration Type", L"Time Sig", L"Lyric" });
+        std::string partId, measureNo, timeSig;
+        size_t tagPos = 0;
+        X::XmlTag t;
+        while (X::NextTag(sv, tagPos, t) && notesSh.rows.size() <= 2000) {
+            if (t.isClosing) continue;
+            if (t.localName == "part" && !t.isSelfClosing) {
+                partId = X::AttrText(t.attrs, "id");
+            } else if (t.localName == "measure") {
+                measureNo = X::AttrText(t.attrs, "number");
+            } else if ((t.localName == "time" || t.localName == "note") && !t.isSelfClosing) {
+                std::string_view body;
+                size_t after = 0;
+                if (!X::FindElementBody(sv, t.afterTag, t.localName, body, after)) break;
+                tagPos = after;
+                if (t.localName == "time") {
+                    std::string beats = X::ChildText(body, "beats");
+                    if (!beats.empty()) timeSig = beats + "/" + X::ChildText(body, "beat-type");
+                    continue;
+                }
+                X::Element el;
+                std::string pitch;
+                if (X::FindChild(body, "pitch", el)) {
+                    std::string alter = X::ChildText(el.body, "alter");
+                    const char* acc = (alter == "1") ? "#" : (alter == "-1") ? "b" : (alter == "2") ? "##" : (alter == "-2") ? "bb" : "";
+                    pitch = X::ChildText(el.body, "step") + acc + X::ChildText(el.body, "octave");
+                } else if (X::FindChild(body, "unpitched", el)) {
+                    pitch = X::ChildText(el.body, "display-step") + X::ChildText(el.body, "display-octave") + " (unpitched)";
+                } else {
+                    pitch = "Rest";
+                }
+                if (X::FindChild(body, "chord", el)) pitch = "+ " + pitch;
+                if (X::FindChild(body, "grace", el)) pitch += " (grace)";
+                std::string lyric;
+                if (X::FindChild(body, "lyric", el)) lyric = X::ChildText(el.body, "text");
+                notesSh.rows.push_back({ PathUtils::Utf8ToWide(partId), PathUtils::Utf8ToWide(measureNo), PathUtils::Utf8ToWide(pitch),
+                                         PathUtils::Utf8ToWide(X::ChildText(body, "type")), PathUtils::Utf8ToWide(timeSig),
+                                         PathUtils::Utf8ToWide(lyric) });
             }
-            mp = (me == sv.size()) ? sv.size() : (me + 10);
         }
-        if (notesSh.rows.size() == 1) notesSh.rows.push_back({ L"1", L"C4", L"whole", timeSig, PathUtils::Utf8ToWide(title) });
+        notesSh.maxCols = 6;
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
@@ -2564,44 +3137,120 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
         std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
         if (sv.find("xmpmeta") == std::string_view::npos && sv.find("rdf:RDF") == std::string_view::npos) return false;
 
+        // Every property of every rdf:Description: attributes (prefix:name="value") and property elements, whose value
+        // is their text, their rdf:Alt / Seq / Bag items ("; "), or their structure's fields ("name=value, ...")
+        namespace X = ::Explorer2::XmlTagScan;
         SpreadsheetSheet sh;
-        sh.name = L"XMP_CameraRaw";
+        sh.name = L"XMP_Properties";
         sh.maxCols = 3;
         sh.rows.push_back({ L"Namespace", L"Property", L"Value" });
-
-        static const char* kPrefixes[] = { "crs:", "exif:", "tiff:", "aux:", "xmp:", "photoshop:", "dc:" };
-        for (const char* pfx : kPrefixes) {
-            size_t plen = std::strlen(pfx);
+        auto forEachAttr = [](std::string_view attrs, auto&& fn) {
+            size_t i = 0;
+            const size_t n = attrs.size();
+            while (i < n) {
+                while (i < n && X::IsWs(attrs[i])) ++i;
+                size_t nameStart = i;
+                while (i < n && X::IsNameChar(attrs[i])) ++i;
+                if (i == nameStart) { ++i; continue; }
+                std::string_view name = attrs.substr(nameStart, i - nameStart);
+                while (i < n && X::IsWs(attrs[i])) ++i;
+                if (i >= n || attrs[i] != '=') continue;
+                ++i;
+                while (i < n && X::IsWs(attrs[i])) ++i;
+                if (i >= n || (attrs[i] != '"' && attrs[i] != '\'')) continue;
+                char q = attrs[i++];
+                size_t valStart = i;
+                while (i < n && attrs[i] != q) ++i;
+                std::string_view val = attrs.substr(valStart, i - valStart);
+                if (i < n) ++i;
+                fn(name, val);
+            }
+        };
+        auto isProperty = [](std::string_view name) {
+            return name.rfind("xmlns", 0) != 0 && name.rfind("rdf:", 0) != 0 && name.rfind("xml:", 0) != 0;
+        };
+        auto localOf = [](std::string_view qname) {
+            size_t colon = qname.find(':');
+            return std::string(colon == std::string_view::npos ? qname : qname.substr(colon + 1));
+        };
+        auto qnameAt = [](std::string_view doc, size_t tagStart) {
+            size_t b = tagStart + 1, e = b;
+            while (e < doc.size() && X::IsNameChar(doc[e])) ++e;
+            return doc.substr(b, e - b);
+        };
+        auto propertyValue = [&](std::string_view attrs, std::string_view body, bool selfClosing) {
+            std::string value;
+            auto append = [&](const std::string& piece, const char* sep) {
+                if (piece.empty()) return;
+                if (!value.empty()) value += sep;
+                value += piece;
+            };
+            std::string_view resource = X::GetAttr(attrs, "resource");
+            if (!resource.empty()) return X::DecodeText(resource);
+            forEachAttr(attrs, [&](std::string_view name, std::string_view val) {
+                if (isProperty(name)) append(localOf(name) + "=" + X::DecodeText(val), ", ");
+            });
+            if (selfClosing) return value;
+            if (body.find('<') == std::string_view::npos) {
+                append(std::string(X::TrimView(X::DecodeText(body))), ", ");
+                return value;
+            }
             size_t p = 0;
-            while ((p = sv.find(pfx, p)) != std::string_view::npos && sh.rows.size() < 300) {
-                size_t kStart = p + plen;
-                size_t kEnd = kStart;
-                while (kEnd < sv.size() && (isalnum(static_cast<unsigned char>(sv[kEnd])) || sv[kEnd] == '_')) ++kEnd;
-                if (kEnd > kStart && kEnd + 2 < sv.size()) {
-                    std::string_view prop = sv.substr(kStart, kEnd - kStart);
-                    if (sv[kEnd] == '=' && (sv[kEnd + 1] == '"' || sv[kEnd + 1] == '\'')) {
-                        char q = sv[kEnd + 1];
-                        size_t vEnd = sv.find(q, kEnd + 2);
-                        if (vEnd != std::string_view::npos) {
-                            sh.rows.push_back({ PathUtils::Utf8ToWide(std::string_view(pfx, plen - 1)),
-                                PathUtils::Utf8ToWide(prop), PathUtils::Utf8ToWide(sv.substr(kEnd + 2, vEnd - kEnd - 2)) });
-                            p = vEnd + 1;
-                            continue;
-                        }
-                    } else if (sv[kEnd] == '>') {
-                        size_t close = sv.find("</", kEnd + 1);
-                        if (close != std::string_view::npos && close - (kEnd + 1) < 200 && sv.substr(kEnd + 1, close - kEnd - 1).find('<') == std::string_view::npos) {
-                            sh.rows.push_back({ PathUtils::Utf8ToWide(std::string_view(pfx, plen - 1)),
-                                PathUtils::Utf8ToWide(prop), PathUtils::Trim(PathUtils::Utf8ToWide(sv.substr(kEnd + 1, close - kEnd - 1))) });
-                            p = close + 2;
-                            continue;
-                        }
+            X::XmlTag c;
+            while (X::NextTag(body, p, c)) {
+                if (c.isClosing) continue;
+                std::string fields;
+                forEachAttr(c.attrs, [&](std::string_view name, std::string_view val) {
+                    if (!isProperty(name)) return;
+                    if (!fields.empty()) fields += ", ";
+                    fields += localOf(name) + "=" + X::DecodeText(val);
+                });
+                const bool container = c.localName == "Alt" || c.localName == "Seq" || c.localName == "Bag" || c.localName == "Description";
+                std::string text;
+                if (!c.isSelfClosing && !container) {
+                    std::string_view inner;
+                    size_t after = 0;
+                    if (X::FindElementBody(body, c.afterTag, c.localName, inner, after) && inner.find('<') == std::string_view::npos) {
+                        text = std::string(X::TrimView(X::DecodeText(inner)));
+                        p = after; // a leaf
                     }
                 }
-                p = kEnd + 1;
+                if (c.localName == "li") {
+                    append(text.empty() ? fields : (fields.empty() ? text : text + " (" + fields + ")"), "; ");
+                } else if (!container && !text.empty()) {
+                    append(std::string(c.localName) + "=" + text, ", ");
+                } else {
+                    append(fields, ", ");
+                }
             }
-        }
-        if (sh.rows.size() == 1) sh.rows.push_back({ L"xmp", L"xmpmeta", L"Valid RDF/XML Sidecar" });
+            return value;
+        };
+        std::string xmpXml = X::DocumentToUtf8(raw.data(), raw.size());
+        X::ForEachElement(xmpXml, "Description", [&](const X::Element& d) {
+            forEachAttr(d.attrs, [&](std::string_view name, std::string_view val) {
+                if (isProperty(name) && sh.rows.size() <= 2000) {
+                    size_t colon = name.find(':');
+                    sh.rows.push_back({ PathUtils::Utf8ToWide(colon == std::string_view::npos ? std::string_view() : name.substr(0, colon)),
+                                        PathUtils::Utf8ToWide(localOf(name)), PathUtils::Utf8ToWide(X::DecodeText(val)) });
+                }
+            });
+            size_t p = 0;
+            X::XmlTag c;
+            while (X::NextTag(d.body, p, c) && sh.rows.size() <= 2000) {
+                if (c.isClosing) continue;
+                std::string_view qn = qnameAt(d.body, c.tagStart);
+                std::string_view inner;
+                if (!c.isSelfClosing) {
+                    size_t after = 0;
+                    if (!X::FindElementBody(d.body, c.afterTag, c.localName, inner, after)) break;
+                    p = after;
+                }
+                size_t colon = qn.find(':');
+                sh.rows.push_back({ PathUtils::Utf8ToWide(colon == std::string_view::npos ? std::string_view() : qn.substr(0, colon)),
+                                    PathUtils::Utf8ToWide(localOf(qn)), PathUtils::Utf8ToWide(propertyValue(c.attrs, inner, c.isSelfClosing)) });
+            }
+            return true;
+        });
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
@@ -2678,13 +3327,12 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
                 nmSh.rows.push_back({ std::to_wstring(i), nm });
             }
         }
-        if (nmSh.rows.size() == 1) nmSh.rows.push_back({ L"0", L"(Zen Store / Unindexed)" });
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
         out.formatTitle = (ext == L".umap") ? L"Unreal Engine Level Map (.umap)" : L"Unreal Engine Asset Package (.uasset)";
         out.sheets.push_back(std::move(hdrSh));
-        out.sheets.push_back(std::move(nmSh));
+        if (nmSh.rows.size() > 1) out.sheets.push_back(std::move(nmSh));
         out.valid = true;
         return true;
     }
@@ -2753,7 +3401,6 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
                                 PathUtils::Utf8ToWide(mName), PathUtils::Utf8ToWide(detail) });
             pos = eol;
         }
-        if (sh.rows.size() == 1) sh.rows.push_back({ L"1", L"Scene", L"Empty", L"%YAML 1.1" });
 
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
@@ -2828,56 +3475,8 @@ inline bool ParseMediaGameOffice200(const std::vector<uint8_t>& raw, const std::
         std::vector<ZipDeflate::ArchiveItemMeta> entries;
         if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries)) return false;
 
-        auto snappyDecompress = [](const uint8_t* src, size_t srcLen, std::vector<uint8_t>& dst) -> bool {
-            dst.clear();
-            size_t p = 0;
-            uint64_t uncompLen = 0;
-            if (!DetailDocs200::ReadVarint64(src, srcLen, p, uncompLen) || uncompLen > (16ULL * 1024ULL * 1024ULL)) {
-                return false;
-            }
-            dst.reserve(static_cast<size_t>(uncompLen));
-            while (p < srcLen && dst.size() < uncompLen) {
-                const uint8_t tag = src[p++];
-                const uint8_t tagType = static_cast<uint8_t>(tag & 0x03u);
-                if (tagType == 0u) {
-                    uint32_t lenMinus1 = static_cast<uint32_t>(tag >> 2);
-                    if (lenMinus1 >= 60u) {
-                        const size_t extraBytes = static_cast<size_t>(lenMinus1 - 59u);
-                        if (p + extraBytes > srcLen) return false;
-                        lenMinus1 = 0;
-                        for (size_t b = 0; b < extraBytes; ++b) {
-                            lenMinus1 |= static_cast<uint32_t>(src[p++]) << (b * 8u);
-                        }
-                    }
-                    const size_t litLen = static_cast<size_t>(lenMinus1) + 1u;
-                    if (p + litLen > srcLen || dst.size() + litLen > uncompLen) return false;
-                    dst.insert(dst.end(), src + p, src + p + litLen);
-                    p += litLen;
-                } else {
-                    size_t copyLen = 0;
-                    size_t copyOff = 0;
-                    if (tagType == 1u) {
-                        if (p >= srcLen) return false;
-                        copyLen = static_cast<size_t>((tag >> 2) & 0x07u) + 4u;
-                        copyOff = (static_cast<size_t>(tag & 0xE0u) << 3) | static_cast<size_t>(src[p++]);
-                    } else if (tagType == 2u) {
-                        if (p + 2u > srcLen) return false;
-                        copyLen = static_cast<size_t>(tag >> 2) + 1u;
-                        copyOff = DetailDocs200::RdU16LE(src + p);
-                        p += 2u;
-                    } else {
-                        if (p + 4u > srcLen) return false;
-                        copyLen = static_cast<size_t>(tag >> 2) + 1u;
-                        copyOff = DetailDocs200::RdU32LE(src + p);
-                        p += 4u;
-                    }
-                    if (copyOff == 0u || copyOff > dst.size() || dst.size() + copyLen > uncompLen) return false;
-                    for (size_t k = 0; k < copyLen; ++k) {
-                        dst.push_back(dst[dst.size() - copyOff]);
-                    }
-                }
-            }
-            return p == srcLen && dst.size() == uncompLen;
+        auto snappyDecompress = [](const uint8_t* src, size_t srcLen, std::vector<uint8_t>& dst) {
+            return ::Explorer2::StreamCodecs::SnappyDecompress(src, srcLen, dst, 16 * 1024 * 1024, true);
         };
 
         auto unframeIwa = [&](const std::vector<uint8_t>& framed, std::vector<uint8_t>& outStream) -> bool {

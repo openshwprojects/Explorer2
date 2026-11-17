@@ -1,4 +1,6 @@
 #pragma once
+#include "../ByteIO.h"
+#include "../Lz4Block.h"
 // Parquet.h — Apache Parquet Columnar Storage (.parquet, PAR1) Thrift Compact Footer,
 //             ZSTD / LZ4 / LZ4_RAW / Snappy / Gzip Codecs, DATA_PAGE_V2, Delta & Dictionary Decoders,
 //             and >32 MB Random-Access File Streaming (#31).
@@ -7,24 +9,10 @@ namespace Formats {
 
 namespace ParquetDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           static_cast<uint32_t>(p[3]) << 24;
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64LE;
 
 struct WinParquetRandomFile {
     HANDLE hFile = INVALID_HANDLE_VALUE;
@@ -62,113 +50,8 @@ struct WinParquetRandomFile {
     }
 };
 
-// Native Snappy block decompressor for Parquet SNAPPY pages
-inline bool SnappyDecompress(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out, size_t maxOut = 32 * 1024 * 1024) {
-    out.clear();
-    if (!src || srcLen == 0) return false;
-    size_t pos = 0;
-    uint64_t uncompLen = 0;
-    int shift = 0;
-    bool term = false;
-    while (pos < srcLen && shift < 35) {
-        uint8_t b = src[pos++];
-        uncompLen |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) { term = true; break; }
-        shift += 7;
-    }
-    if (!term || uncompLen > maxOut) return false;
-    out.reserve(static_cast<size_t>(uncompLen));
-
-    while (pos < srcLen && out.size() < uncompLen) {
-        uint8_t tag = src[pos++];
-        uint8_t elemType = tag & 0x03u;
-        if (elemType == 0) {
-            uint32_t len = (tag >> 2);
-            if (len < 60) {
-                len += 1;
-            } else {
-                uint32_t extraBytes = len - 59;
-                if (pos + extraBytes > srcLen) return false;
-                len = 0;
-                for (uint32_t i = 0; i < extraBytes; ++i) {
-                    len |= static_cast<uint32_t>(src[pos++]) << (i * 8);
-                }
-                len += 1;
-            }
-            if (len > srcLen - pos || out.size() + len > uncompLen) return false;
-            out.insert(out.end(), src + pos, src + pos + len);
-            pos += len;
-        } else {
-            uint32_t copyLen = 0;
-            uint32_t copyOff = 0;
-            if (elemType == 1) {
-                if (pos + 1 > srcLen) return false;
-                copyLen = ((tag >> 2) & 0x07u) + 4;
-                copyOff = ((static_cast<uint32_t>(tag) & 0xE0u) << 3) | src[pos++];
-            } else if (elemType == 2) {
-                if (pos + 2 > srcLen) return false;
-                copyLen = (tag >> 2) + 1;
-                copyOff = RdU16LE(src + pos);
-                pos += 2;
-            } else {
-                if (pos + 4 > srcLen) return false;
-                copyLen = (tag >> 2) + 1;
-                copyOff = RdU32LE(src + pos);
-                pos += 4;
-            }
-            if (copyOff == 0 || copyOff > out.size() || out.size() + copyLen > uncompLen) return false;
-            for (uint32_t i = 0; i < copyLen; ++i) {
-                out.push_back(out[out.size() - copyOff]);
-            }
-        }
-    }
-    return out.size() == uncompLen;
-}
-
-// Raw unframed LZ4 block decompressor for Parquet LZ4_RAW (codec 7) & Hadoop LZ4 chunks (codec 5)
-inline bool Lz4RawBlockDecompress(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out, size_t maxOut = 32 * 1024 * 1024) {
-    if (!src) return false;
-    size_t p = 0;
-    const size_t baseSize = out.size();
-    while (p < srcLen) {
-        uint8_t token = src[p++];
-        size_t litLen = token >> 4;
-        if (litLen == 15u) {
-            uint8_t s = 0;
-            do {
-                if (p >= srcLen) return false;
-                s = src[p++];
-                litLen += s;
-                if (litLen > maxOut) return false;
-            } while (s == 255u);
-        }
-        if (litLen > srcLen - p || out.size() + litLen > maxOut) return false;
-        out.insert(out.end(), src + p, src + p + litLen);
-        p += litLen;
-
-        if (p == srcLen) break;
-        if (p + 2 > srcLen) return false;
-        uint16_t offset = RdU16LE(src + p);
-        p += 2;
-        if (offset == 0 || (out.size() - baseSize) < offset) return false;
-
-        size_t matchLen = (token & 0x0Fu) + 4u;
-        if ((token & 0x0Fu) == 15u) {
-            uint8_t s = 0;
-            do {
-                if (p >= srcLen) return false;
-                s = src[p++];
-                matchLen += s;
-                if (matchLen > maxOut) return false;
-            } while (s == 255u);
-        }
-        if (out.size() + matchLen > maxOut) return false;
-        for (size_t k = 0; k < matchLen; ++k) {
-            out.push_back(out[out.size() - offset]);
-        }
-    }
-    return true;
-}
+// Snappy pages (also used by the Avro and AI-data readers)
+using ::Explorer2::StreamCodecs::SnappyDecompress;
 
 // Parquet codec 5 (LZ4_HADOOP / LZ4_FRAME / fallback raw LZ4)
 inline bool ParquetLz4HadoopOrFrameDecompress(const uint8_t* src, size_t srcLen, size_t expectedUncomp, std::vector<uint8_t>& out) {
@@ -202,7 +85,7 @@ inline bool ParquetLz4HadoopOrFrameDecompress(const uint8_t* src, size_t srcLen,
                 pos += 4;
                 if (subCompLen == 0 || subCompLen > srcLen - pos) { okHadoop = false; break; }
                 size_t before = tmp.size();
-                if (!Lz4RawBlockDecompress(src + pos, subCompLen, tmp, maxOut)) {
+                if (!::Explorer2::Lz4::DecodeBlockAppend(src + pos, subCompLen, tmp, tmp.size(), maxOut)) {
                     okHadoop = false;
                     break;
                 }
@@ -219,7 +102,7 @@ inline bool ParquetLz4HadoopOrFrameDecompress(const uint8_t* src, size_t srcLen,
 
     // 3. Raw LZ4 block fallback (legacy writers tagging LZ4_RAW as codec 5)
     out.clear();
-    if (Lz4RawBlockDecompress(src, srcLen, out, maxOut) && (expectedUncomp == 0 || out.size() == expectedUncomp)) {
+    if (::Explorer2::Lz4::DecodeBlockAppend(src, srcLen, out, 0, maxOut) && (expectedUncomp == 0 || out.size() == expectedUncomp)) {
         return true;
     }
     out.clear();
@@ -1152,7 +1035,7 @@ inline bool DecompressPageBytes(
                (uncompLen == 0 || outBytes.size() == uncompLen);
     }
     if (codec == 7) { // LZ4_RAW (unframed LZ4 block)
-        return Lz4RawBlockDecompress(compPtr, compLen, outBytes, maxCap) &&
+        return ::Explorer2::Lz4::DecodeBlockAppend(compPtr, compLen, outBytes, outBytes.size(), maxCap) &&
                (uncompLen == 0 || outBytes.size() == uncompLen);
     }
     return false;

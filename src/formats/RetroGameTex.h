@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // RetroGameTex.h — #62 Classic Quake / Half-Life / Build Engine Textures, Sprites & WAD2/WAD3 Archives
 // Covers:
 //   - Quake II Mipmapped Textures (.wal)
@@ -17,18 +18,9 @@
 namespace Formats {
 namespace RetroTexDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline int32_t RdI32LE(const uint8_t* p) {
-    return static_cast<int32_t>(RdU32LE(p));
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
 
 // Procedural reconstruction of id Software's classic 16-ramp Quake / Quake II 256-color palette
 // (faithful 16-shade tonal ramps: grey, brown, sky-blue, olive-green, blood-red, gold, tan, violet, fire/lava, 255=key)

@@ -1336,16 +1336,6 @@ bool HardwareInspector::IsProcessElevated() {
     return res;
 }
 
-void HardwareInspector::RefreshDiskSmart(int physIndex) {
-    if (m_workerStarted) {
-        RequestAsyncRefresh(false, false, physIndex);
-        WaitForAsync();
-        ApplyStagedData();
-    } else {
-        RefreshDiskSmartOnVector(m_physDisks, physIndex);
-    }
-}
-
 void HardwareInspector::RefreshDiskSmartOnVector(std::vector<HwPhysicalDisk>& disks, int physIndex) {
     HwPhysicalDisk* pd = nullptr;
     for (auto& d : disks) {

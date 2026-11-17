@@ -1,4 +1,6 @@
 #pragma once
+#include "MeshBuild3D.h"
+#include "../ByteIO.h"
 // Cal3DCryEngine.h — #61 Cal3D Skeletal (.cmf, .xmf, .csf, .xsf) & CryEngine Geometry (.cgf, .chr, .skin, .cga)
 //
 // Pure C++20 zero-cheat implementation:
@@ -15,33 +17,13 @@ namespace Formats {
 
 namespace CalCryDetail {
 
-inline uint16_t RdU16(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
-inline uint32_t RdU32(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline int32_t  RdI32(const uint8_t* p) { int32_t  v = 0; std::memcpy(&v, p, 4); return v; }
-inline float    RdF32(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
+// little-endian loads (ByteIO.h)
+inline uint16_t RdU16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
+inline uint32_t RdU32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline int32_t RdI32(const uint8_t* p) { return ::Explorer2::ByteIO::RdI32LE(p); }
+inline float RdF32(const uint8_t* p) { return ::Explorer2::ByteIO::RdF32LE(p); }
 
-inline float HalfToF32(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x3FFu;
-    uint32_t bits = 0;
-    if (exp == 0) {
-        if (mant == 0) bits = sign;
-        else {
-            exp = 1;
-            while ((mant & 0x400u) == 0) { mant <<= 1; --exp; }
-            mant &= 0x3FFu;
-            bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-    float f = 0.0f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
+using ::Explorer2::ByteIO::HalfToFloat;
 
 struct Quat {
     float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
@@ -51,14 +33,7 @@ struct Quat {
         float inv = 1.0f / std::sqrt(n2);
         return { q.x * inv, q.y * inv, q.z * inv, q.w * inv };
     }
-    static Quat Mul(const Quat& a, const Quat& b) {
-        return {
-            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
-        };
-    }
+    static Quat Mul(const Quat& a, const Quat& b) { return MeshBuild3D::QuatMul(a, b); }
     Vec3f Rotate(const Vec3f& v) const {
         // v + 2*w*(q.xyz x v) + 2*(q.xyz x (q.xyz x v))
         float tx = 2.0f * (y * v.z - z * v.y);
@@ -290,37 +265,9 @@ inline void ParseXmlFloatsSimple(std::string_view sv, std::vector<float>& out) {
     }
 }
 
-inline std::string_view ExtractXmlAttr(std::string_view tag, std::string_view attrName) {
-    size_t pos = 0;
-    while (pos < tag.size()) {
-        size_t eq = tag.find('=', pos);
-        if (eq == std::string_view::npos) break;
-        size_t ns = eq;
-        while (ns > pos && (tag[ns - 1] == ' ' || tag[ns - 1] == '\t')) --ns;
-        size_t nb = ns;
-        while (nb > pos && (std::isalnum(static_cast<unsigned char>(tag[nb - 1])) || tag[nb - 1] == '_')) --nb;
-        std::string_view key = tag.substr(nb, ns - nb);
-        size_t vs = eq + 1;
-        while (vs < tag.size() && (tag[vs] == ' ' || tag[vs] == '\t')) ++vs;
-        if (vs < tag.size() && (tag[vs] == '"' || tag[vs] == '\'')) {
-            char q = tag[vs++];
-            size_t ve = tag.find(q, vs);
-            if (ve == std::string_view::npos) break;
-            if (key.size() == attrName.size()) {
-                bool match = true;
-                for (size_t k = 0; k < key.size(); ++k) {
-                    if (std::tolower(static_cast<unsigned char>(key[k])) != std::tolower(static_cast<unsigned char>(attrName[k]))) {
-                        match = false; break;
-                    }
-                }
-                if (match) return tag.substr(vs, ve - vs);
-            }
-            pos = ve + 1;
-        } else {
-            pos = vs + 1;
-        }
-    }
-    return {};
+inline std::string_view ExtractXmlAttr(std::string_view tag, std::string_view attrName) { // names in any case
+    std::string_view v;
+    return ::Explorer2::XmlTagScan::FindAttr(tag, attrName, v, true, /*ignoreCase=*/true) ? v : std::string_view();
 }
 
 } // namespace CalCryDetail
@@ -749,9 +696,9 @@ inline bool ParseCryEngineGeometry(
                 if (streamType == 0u && elemSize >= 12u) {
                     vx = RdF32(ep + 0); vy = RdF32(ep + 4); vz = RdF32(ep + 8);
                 } else {
-                    vx = HalfToF32(RdU16(ep + 0));
-                    vy = HalfToF32(RdU16(ep + 2));
-                    vz = HalfToF32(RdU16(ep + 4));
+                    vx = HalfToFloat(RdU16(ep + 0));
+                    vy = HalfToFloat(RdU16(ep + 2));
+                    vz = HalfToFloat(RdU16(ep + 4));
                 }
                 if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz)) { ok = false; break; }
                 // CryEngine Z-up meters -> Y-up viewport

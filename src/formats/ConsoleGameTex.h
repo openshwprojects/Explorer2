@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ConsoleGameTex.h — #63 Console & Modern Game Engine GPU Textures
 // Covers:
 //   1. Nintendo Switch Binary Texture (.bntx — "BNTX" + "BRTI" + NVIDIA Tegra X1 GOB Block-Linear Deswizzler)
@@ -12,30 +13,12 @@ namespace Formats {
 
 namespace ConsoleTexDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline int32_t RdI32LE(const uint8_t* p) {
-    return static_cast<int32_t>(RdU32LE(p));
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8)  |
-            static_cast<uint32_t>(p[3]);
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
 
 enum class GpuSurfaceCodec {
     None,

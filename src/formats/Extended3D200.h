@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // Extended3D200.h — Real CAD Kernels, LiDAR, Game Meshes, Robotics, Avatars & Crystallography 3D Parsers (#41–#60)
 // Zero-cheat implementation: decodes genuine geometry from file bytes or returns false honestly.
 
@@ -6,93 +7,20 @@ namespace Formats {
 
 namespace Detail3D200 {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) |
-           (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | static_cast<uint64_t>(RdU32BE(p + 4));
-}
-inline float RdF32LE(const uint8_t* p) {
-    float f = 0.0f;
-    std::memcpy(&f, p, 4);
-    return std::isfinite(f) ? f : 0.0f;
-}
-inline float RdF32BE(const uint8_t* p) {
-    uint32_t u = RdU32BE(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return std::isfinite(f) ? f : 0.0f;
-}
-inline double RdF64LE(const uint8_t* p) {
-    double d = 0.0;
-    std::memcpy(&d, p, 8);
-    return std::isfinite(d) ? d : 0.0;
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
+inline float RdF32LE(const uint8_t* p) { return ::Explorer2::ByteIO::RdFiniteF32LE(p); }
+// float loads that take a non-finite value as 0 (ByteIO.h)
+inline float RdF32BE(const uint8_t* p) { return ::Explorer2::ByteIO::RdFiniteF32BE(p); }
+inline double RdF64LE(const uint8_t* p) { return ::Explorer2::ByteIO::RdFiniteF64LE(p); }
 
 inline float HalfToFloat(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x03FFu;
-    uint32_t bits = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400u) == 0) {
-                mant <<= 1;
-                --exp;
-            }
-            mant &= 0x03FFu;
-            bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        return 0.0f;
-    } else {
-        bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    }
-    float out = 0.0f;
-    std::memcpy(&out, &bits, 4);
-    return std::isfinite(out) ? out : 0.0f;
-}
-
-inline bool ReadVarintU64(const uint8_t* data, size_t size, size_t& pos, uint64_t& out) {
-    out = 0;
-    unsigned shift = 0;
-    for (int i = 0; i < 10; ++i) {
-        if (pos >= size) return false;
-        uint8_t b = data[pos++];
-        out |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) return true;
-        shift += 7;
-    }
-    return false;
-}
-
-inline bool ReadVarintU32(const uint8_t* data, size_t size, size_t& pos, uint32_t& out) {
-    uint64_t v = 0;
-    if (!ReadVarintU64(data, size, pos, v) || v > 0xFFFFFFFFull) return false;
-    out = static_cast<uint32_t>(v);
-    return true;
+    float f = ::Explorer2::ByteIO::HalfToFloat(h);
+    return std::isfinite(f) ? f : 0.0f; // this reader maps Inf/NaN halves to 0
 }
 
 inline void AddOctaSphere(LoadedMesh3D& mesh, float cx, float cy, float cz, float r) {
@@ -145,32 +73,6 @@ inline void AddStrut3D(LoadedMesh3D& mesh, Vec3f p0, Vec3f p1, float radius) {
         uint32_t ni = (i + 1) & 3u;
         mesh.tris.push_back({ b + i, b + ni, b + 4 + ni, {} });
         mesh.tris.push_back({ b + i, b + 4 + ni, b + 4 + i, {} });
-    }
-}
-
-inline void AddCylinderY(LoadedMesh3D& mesh, float cx, float cy, float cz, float radius, float length) {
-    const int segs = 12;
-    uint32_t b = static_cast<uint32_t>(mesh.vertices.size());
-    float hz = length * 0.5f;
-    for (int i = 0; i < segs; ++i) {
-        float a = i * 6.2831853f / segs;
-        float x = cx + radius * std::cos(a);
-        float y = cy + radius * std::sin(a);
-        mesh.vertices.push_back({ x, y, cz - hz });
-        mesh.vertices.push_back({ x, y, cz + hz });
-    }
-    uint32_t cBot = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ cx, cy, cz - hz });
-    uint32_t cTop = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ cx, cy, cz + hz });
-    for (int i = 0; i < segs; ++i) {
-        int ni = (i + 1) % segs;
-        uint32_t b0 = b + i * 2, t0 = b + i * 2 + 1;
-        uint32_t b1 = b + ni * 2, t1 = b + ni * 2 + 1;
-        mesh.tris.push_back({ b0, b1, t1, {} });
-        mesh.tris.push_back({ b0, t1, t0, {} });
-        mesh.tris.push_back({ cBot, b1, b0, {} });
-        mesh.tris.push_back({ cTop, t0, t1, {} });
     }
 }
 
@@ -903,9 +805,7 @@ inline bool ReadSiblingBytes(const std::wstring& path, std::vector<uint8_t>& out
     return true;
 }
 
-inline int32_t RdI32LE(const uint8_t* p) {
-    return static_cast<int32_t>(Detail3D200::RdU32LE(p));
-}
+using ::Explorer2::ByteIO::RdI32LE;
 
 inline bool AssembleSourceVvdVtxMesh(
     const uint8_t* mdl, size_t mdlSize,
@@ -4896,30 +4796,6 @@ inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstr
 // ============================================================================
 namespace DetailE57_200 {
 
-inline const std::array<uint32_t, 256>& Crc32CTable() {
-    static const std::array<uint32_t, 256> tbl = []() {
-        std::array<uint32_t, 256> t = {};
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int b = 0; b < 8; ++b) {
-                c = (c >> 1) ^ (0x82F63B78u & (0u - (c & 1u)));
-            }
-            t[i] = c;
-        }
-        return t;
-    }();
-    return tbl;
-}
-
-inline uint32_t CalcCrc32C(const uint8_t* buf, size_t len) {
-    const auto& tbl = Crc32CTable();
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc = tbl[(crc ^ buf[i]) & 0xFFu] ^ (crc >> 8);
-    }
-    return ~crc;
-}
-
 inline std::string_view XmlAttr(std::string_view tag, std::string_view attrName) {
     size_t pos = 0;
     while (pos < tag.size()) {
@@ -5063,7 +4939,7 @@ inline bool ParseSciRoboChem200(const uint8_t* data, size_t size, const std::wst
                 pageCrcState[pageIdx] = 2;
                 return false;
             }
-            uint32_t expected = DetailE57_200::CalcCrc32C(data + pageStart, usable);
+            uint32_t expected = ::Explorer2::Checksum::Crc32C(data + pageStart, usable);
             uint32_t storedBE = Detail3D200::RdU32BE(data + pageStart + usable);
             uint32_t storedLE = Detail3D200::RdU32LE(data + pageStart + usable);
             bool ok = (storedBE == expected || storedLE == expected);

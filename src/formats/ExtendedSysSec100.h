@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedSysSec100.h — Executables, Reverse Engineering, Security, Forensics & Firmware Formats (37–50)
 // Covers: .exe/.dll/.sys/.ocx/.scr/.efi (PE32/PE32+ Imports & Exports), .lnk (MS-SHLLINK),
 //         .pf (SCCA & MAM XPRESS_HUFF), .evtx (ElfFile/ElfChnk/BinXML), .dmp/.mdmp, .pdb (MSF 7.00),
@@ -14,32 +15,12 @@ namespace Formats {
 
 namespace DetailSys100 {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) |
-           (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) |
-           static_cast<uint64_t>(RdU32BE(p + 4));
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
 
 inline std::wstring Hex32(uint32_t v) {
     wchar_t buf[32] = {};
@@ -52,17 +33,7 @@ inline std::wstring Hex64(uint64_t v) {
     return buf;
 }
 
-inline std::wstring HexBytes(const uint8_t* p, size_t len, wchar_t sep = 0) {
-    static const wchar_t kHex[] = L"0123456789ABCDEF";
-    std::wstring out;
-    out.reserve(len * (sep ? 3 : 2));
-    for (size_t i = 0; i < len; ++i) {
-        if (i > 0 && sep) out.push_back(sep);
-        out.push_back(kHex[(p[i] >> 4) & 0x0Fu]);
-        out.push_back(kHex[p[i] & 0x0Fu]);
-    }
-    return out;
-}
+inline std::wstring HexBytes(const uint8_t* p, size_t len, wchar_t sep = 0) { return PathUtils::HexBytes(p, len, sep); }
 
 inline std::wstring FormatFileTimeUtc(uint64_t ftVal) {
     if (ftVal == 0 || ftVal >= 0x7FFFFFFFFFFFFFFFULL) return L"(not set)";
@@ -763,7 +734,7 @@ inline bool ParseWindowsEvtxLog(const std::vector<uint8_t>& raw, ParsedOfficeDoc
     hdrSh.rows.push_back({ L"Format Version", std::to_wstring(majVer) + L"." + std::to_wstring(minVer) });
     hdrSh.rows.push_back({ L"Chunk Range", std::to_wstring(firstChunk) + L" .. " + std::to_wstring(lastChunk) + L" (" + std::to_wstring(numChunks) + L" chunks)" });
     hdrSh.rows.push_back({ L"Next Event Record ID", std::to_wstring(nextRecId) });
-    hdrSh.rows.push_back({ L"Total File Size", PathUtils::FormatByteSize(raw.size()) });
+    hdrSh.rows.push_back({ L"Total File Size", PathUtils::FormatByteSize(std::max<uint64_t>(out.sourceFileSize, raw.size())) });
 
     SpreadsheetSheet recSh;
     recSh.name = L"Event_Records";
@@ -943,7 +914,7 @@ inline bool ParseWindowsMinidump(const std::vector<uint8_t>& raw, ParsedOfficeDo
         { L"Crash Timestamp", DetailSys100::FormatUnixTimeUtc(timeStamp) },
         { L"Dump Flags", DetailSys100::Hex64(flags) },
         { L"Directory Stream Count", std::to_wstring(numStreams) },
-        { L"Dump File Size", PathUtils::FormatByteSize(raw.size()) }
+        { L"Dump File Size", PathUtils::FormatByteSize(std::max<uint64_t>(out.sourceFileSize, raw.size())) }
     };
 
     SpreadsheetSheet modSh;
@@ -1016,21 +987,31 @@ inline bool ParseMsfPdbSymbols(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     const uint32_t blockMapAddr = DetailSys100::RdU32LE(raw.data() + 52);
 
     if (blkSize < 512 || blkSize > 8192 || (blkSize & (blkSize - 1u)) != 0) return false;
+    // A PDB is usually far larger than the 32 MB a reader is handed, its stream directory near the end: every block
+    // is read through SourceBytes
+    SourceBytes src(raw, out);
+    const uint64_t fileSize = src.Size();
+    std::vector<uint8_t> blockBuf;
     const uint64_t mapOff = static_cast<uint64_t>(blockMapAddr) * blkSize;
-    if (mapOff >= raw.size()) return false;
+    if (mapOff >= fileSize) return false;
 
     // Reassemble Stream Directory via blockMapAddr
     const uint32_t numDirBlocks = (dirBytes + blkSize - 1u) / blkSize;
-    if (numDirBlocks > 16384 || mapOff + static_cast<uint64_t>(numDirBlocks) * 4ULL > raw.size()) return false;
+    if (numDirBlocks > 16384 || mapOff + static_cast<uint64_t>(numDirBlocks) * 4ULL > fileSize) return false;
+    std::vector<uint8_t> mapBuf;
+    const uint8_t* blockMap = numDirBlocks ? src.Read(mapOff, static_cast<size_t>(numDirBlocks) * 4, mapBuf) : nullptr;
+    if (numDirBlocks && !blockMap) return false;
 
     std::vector<uint8_t> dirStream;
     dirStream.reserve(std::min<size_t>(dirBytes, 4 * 1024 * 1024));
     for (uint32_t i = 0; i < numDirBlocks && dirStream.size() < dirBytes; ++i) {
-        const uint32_t blkIdx = DetailSys100::RdU32LE(raw.data() + static_cast<size_t>(mapOff) + i * 4);
+        const uint32_t blkIdx = DetailSys100::RdU32LE(blockMap + static_cast<size_t>(i) * 4);
         const uint64_t bOff   = static_cast<uint64_t>(blkIdx) * blkSize;
-        if (bOff + blkSize > raw.size()) break;
+        if (bOff + blkSize > fileSize) break;
         const size_t take = std::min<size_t>(blkSize, dirBytes - dirStream.size());
-        dirStream.insert(dirStream.end(), raw.data() + static_cast<size_t>(bOff), raw.data() + static_cast<size_t>(bOff) + take);
+        const uint8_t* b = src.Read(bOff, take, blockBuf);
+        if (!b) break;
+        dirStream.insert(dirStream.end(), b, b + take);
     }
 
     uint32_t numStreams = 0;
@@ -1049,11 +1030,15 @@ inline bool ParseMsfPdbSymbols(const std::vector<uint8_t>& raw, ParsedOfficeDocu
             dp += static_cast<size_t>(numStreams) * 4;
             streamBlocks.resize(numStreams);
             for (uint32_t s = 0; s < numStreams; ++s) {
-                const uint32_t nb = (streamSizes[s] + blkSize - 1u) / blkSize;
-                if (nb > 65536 || dp + static_cast<size_t>(nb) * 4 > dirStream.size()) break;
-                streamBlocks[s].resize(nb);
-                for (uint32_t b = 0; b < nb; ++b) {
-                    streamBlocks[s][b] = DetailSys100::RdU32LE(dirStream.data() + dp + b * 4);
+                // every stream's block list is stepped over (a large PDB's type stream alone can span more than
+                // 65536 blocks); only those of the streams read are kept: 1 (PDB info) and 3 (DBI)
+                const uint64_t nb = (static_cast<uint64_t>(streamSizes[s]) + blkSize - 1u) / blkSize;
+                if (nb * 4 > dirStream.size() - dp) break;
+                if (s == 1 || s == 3) {
+                    streamBlocks[s].resize(static_cast<size_t>(nb));
+                    for (size_t b = 0; b < nb; ++b) {
+                        streamBlocks[s][b] = DetailSys100::RdU32LE(dirStream.data() + dp + b * 4);
+                    }
                 }
                 dp += static_cast<size_t>(nb) * 4;
             }
@@ -1068,9 +1053,11 @@ inline bool ParseMsfPdbSymbols(const std::vector<uint8_t>& raw, ParsedOfficeDocu
         for (uint32_t blkIdx : streamBlocks[sIdx]) {
             if (res.size() >= want) break;
             const uint64_t bOff = static_cast<uint64_t>(blkIdx) * blkSize;
-            if (bOff >= raw.size()) break;
-            const size_t take = std::min<size_t>(std::min<size_t>(blkSize, raw.size() - static_cast<size_t>(bOff)), want - res.size());
-            res.insert(res.end(), raw.data() + static_cast<size_t>(bOff), raw.data() + static_cast<size_t>(bOff) + take);
+            if (bOff >= fileSize) break;
+            const size_t take = static_cast<size_t>(std::min<uint64_t>({ blkSize, fileSize - bOff, want - res.size() }));
+            const uint8_t* b = src.Read(bOff, take, blockBuf);
+            if (!b) break;
+            res.insert(res.end(), b, b + take);
         }
         return res;
     };
@@ -1151,6 +1138,7 @@ inline bool ParseMsfPdbSymbols(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     out.formatTitle = L"Microsoft Program Database Symbols (.pdb)";
     out.sheets.push_back(std::move(hdrSh));
     if (modSh.rows.size() > 1) out.sheets.push_back(std::move(modSh));
+    if (!src.ReadFailed()) out.sourceReadFully = true; // every stream shown was read, wherever its blocks lie
     out.valid = true;
     return true;
 }
@@ -1516,8 +1504,10 @@ inline bool IsValidMachOMagic(uint32_t m) {
     return m == 0xFEEDFACEu || m == 0xFEEDFACFu || m == 0xCEFAEDFEu || m == 0xCFFAEDFEu;
 }
 
-inline bool IsValidMachOFatArchive(const std::vector<uint8_t>& raw) {
+// fileSize: the whole file's, when raw holds only its start (a slice past raw is checked when it is read)
+inline bool IsValidMachOFatArchive(const std::vector<uint8_t>& raw, uint64_t fileSize = 0) {
     if (raw.size() < 28) return false;
+    fileSize = std::max<uint64_t>(fileSize, raw.size());
     const uint32_t m = DetailSys100::RdU32BE(raw.data());
     if (m != 0xCAFEBABEu && m != 0xCAFEBABFu) return false;
     const uint32_t nArch = DetailSys100::RdU32BE(raw.data() + 4);
@@ -1527,7 +1517,8 @@ inline bool IsValidMachOFatArchive(const std::vector<uint8_t>& raw) {
     for (uint32_t i = 0; i < nArch; ++i) {
         const uint8_t* ap = raw.data() + 8 + i * entSz;
         const uint64_t off = (m == 0xCAFEBABFu) ? DetailSys100::RdU64BE(ap + 8) : DetailSys100::RdU32BE(ap + 8);
-        if (off + 28 > raw.size()) return false;
+        if (off > fileSize || fileSize - off < 28) return false;
+        if (off > raw.size() || raw.size() - off < 28) continue;
         const uint32_t sliceMagic = DetailSys100::RdU32LE(raw.data() + static_cast<size_t>(off));
         if (!IsValidMachOMagic(sliceMagic)) return false;
     }
@@ -1562,26 +1553,38 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
     symSh.maxCols = 4;
     symSh.rows.push_back({ L"Slice", L"Symbol Name", L"Address", L"Type" });
 
-    auto parseThinSlice = [&](size_t baseOff, size_t sliceSz, const std::wstring& sliceLabel) -> bool {
-        if (sliceSz < 28 || baseOff + sliceSz > raw.size()) return false;
-        const uint8_t* base = raw.data() + baseOff;
-        const uint32_t magicLE = DetailSys100::RdU32LE(base);
+    // A universal binary's slices follow one another, each with its symbol and string tables at its end: in a large
+    // binary they lie past the 32 MB a reader is handed, so slices and tables are read through SourceBytes
+    SourceBytes src(raw, out);
+    const uint64_t fileSize = src.Size();
+
+    auto parseThinSlice = [&](uint64_t baseOff, uint64_t sliceSz, const std::wstring& sliceLabel) -> bool {
+        if (sliceSz < 28 || baseOff > fileSize || sliceSz > fileSize - baseOff) return false;
+        std::vector<uint8_t> hdrBuf;
+        const uint8_t* hdr = src.Read(baseOff, 28, hdrBuf);
+        if (!hdr) return false;
+        const uint32_t magicLE = DetailSys100::RdU32LE(hdr);
         if (!IsValidMachOMagic(magicLE)) return false;
 
         const bool is64 = (magicLE == 0xFEEDFACFu || magicLE == 0xCFFAEDFEu);
         const bool isBE = (magicLE == 0xCEFAEDFEu || magicLE == 0xCFFAEDFEu);
         const size_t machHdrSz = is64 ? 32 : 28;
         if (sliceSz < machHdrSz) return false;
+        auto ld32 = [&](const uint8_t* p) -> uint32_t { return isBE ? DetailSys100::RdU32BE(p) : DetailSys100::RdU32LE(p); };
+        auto ld64 = [&](const uint8_t* p) -> uint64_t { return isBE ? DetailSys100::RdU64BE(p) : DetailSys100::RdU64LE(p); };
+        const uint32_t sizeofcmds = ld32(hdr + 20);
+        if (machHdrSz + sizeofcmds > sliceSz || sizeofcmds > (16u << 20)) return false;
+        std::vector<uint8_t> cmdBuf; // the header and the load commands
+        const uint8_t* base = src.Read(baseOff, machHdrSz + sizeofcmds, cmdBuf);
+        if (!base) return false;
 
-        auto rd32 = [&](size_t o) -> uint32_t { return isBE ? DetailSys100::RdU32BE(base + o) : DetailSys100::RdU32LE(base + o); };
-        auto rd64 = [&](size_t o) -> uint64_t { return isBE ? DetailSys100::RdU64BE(base + o) : DetailSys100::RdU64LE(base + o); };
+        auto rd32 = [&](size_t o) -> uint32_t { return ld32(base + o); };
+        auto rd64 = [&](size_t o) -> uint64_t { return ld64(base + o); };
 
         const uint32_t cpuType    = rd32(4);
         const uint32_t fileType   = rd32(12);
         const uint32_t ncmds      = rd32(16);
-        const uint32_t sizeofcmds = rd32(20);
         const uint32_t flags      = rd32(24);
-        if (machHdrSz + sizeofcmds > sliceSz) return false;
 
         std::wstring ftStr = std::to_wstring(fileType);
         if (fileType == 1) ftStr = L"MH_OBJECT (Relocatable)";
@@ -1626,7 +1629,8 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
                 const uint32_t strOff = rd32(lp + 8);
                 std::string dylib;
                 if (strOff < cmdSz) {
-                    dylib = DetailSys100::ReadCStrBounded(raw, baseOff + lp + strOff, cmdSz - strOff);
+                    const char* name = reinterpret_cast<const char*>(base + lp + strOff);
+                    dylib.assign(name, strnlen(name, cmdSz - strOff));
                 }
                 const wchar_t* cname = (cmd == 0x0Cu) ? L"LC_LOAD_DYLIB" :
                                        (cmd == 0x0Du) ? L"LC_ID_DYLIB" :
@@ -1646,16 +1650,23 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
 
                 const size_t nlSz = is64 ? 16 : 12;
                 if (symOff < sliceSz && strOff < sliceSz) {
-                    for (uint32_t si = 0; si < nSyms && symSh.rows.size() <= 2000; ++si) {
-                        const size_t np = symOff + static_cast<size_t>(si) * nlSz;
-                        if (np + nlSz > sliceSz) break;
-                        const uint32_t strx  = rd32(np + 0);
-                        const uint8_t  ntype = base[np + 4];
-                        const uint64_t nval  = is64 ? rd64(np + 8) : rd32(np + 8);
+                    // far more entries and names than the rows shown
+                    std::vector<uint8_t> symBuf, strBuf;
+                    size_t symAvail = 0, strAvail = 0;
+                    const uint8_t* syms = src.ReadSome(baseOff + symOff, std::min<uint64_t>(static_cast<uint64_t>(nSyms) * nlSz, sliceSz - symOff),
+                                                       4u << 20, symBuf, symAvail);
+                    const uint8_t* strs = src.ReadSome(baseOff + strOff, std::min<uint64_t>(strSize, sliceSz - strOff), 4u << 20, strBuf, strAvail);
+                    for (uint32_t si = 0; syms && si < nSyms && symSh.rows.size() <= 2000; ++si) {
+                        const size_t np = static_cast<size_t>(si) * nlSz;
+                        if (np + nlSz > symAvail) break;
+                        const uint32_t strx  = ld32(syms + np);
+                        const uint8_t  ntype = syms[np + 4];
+                        const uint64_t nval  = is64 ? ld64(syms + np + 8) : ld32(syms + np + 8);
                         if ((ntype & 0xE0u) != 0) continue; // skip STAB debug entries
                         std::string sname;
-                        if (strx < strSize && strOff + strx < sliceSz) {
-                            sname = DetailSys100::ReadCStrBounded(raw, baseOff + strOff + strx, std::min<size_t>(256, sliceSz - strOff - strx));
+                        if (strs && strx < strAvail) {
+                            const char* name = reinterpret_cast<const char*>(strs + strx);
+                            sname.assign(name, strnlen(name, std::min<size_t>(256, strAvail - strx)));
                         }
                         if (sname.empty()) continue;
                         const wchar_t* kind = ((ntype & 0x0Eu) == 0u) ? L"UNDEF" : ((ntype & 0x01u) ? L"EXT" : L"LOCAL");
@@ -1668,7 +1679,7 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
         return true;
     };
 
-    if (IsValidMachOFatArchive(raw)) {
+    if (IsValidMachOFatArchive(raw, out.sourceFileSize)) {
         const uint32_t m = DetailSys100::RdU32BE(raw.data());
         const uint32_t nArch = DetailSys100::RdU32BE(raw.data() + 4);
         const size_t entSz = (m == 0xCAFEBABFu) ? 32 : 20;
@@ -1678,12 +1689,12 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
             const uint32_t cpu = DetailSys100::RdU32BE(ap + 0);
             const uint64_t off = (m == 0xCAFEBABFu) ? DetailSys100::RdU64BE(ap + 8) : DetailSys100::RdU32BE(ap + 8);
             const uint64_t sz  = (m == 0xCAFEBABFu) ? DetailSys100::RdU64BE(ap + 16): DetailSys100::RdU32BE(ap + 12);
-            if (off + sz <= raw.size()) {
-                parseThinSlice(static_cast<size_t>(off), static_cast<size_t>(sz), cpuName(cpu));
+            if (off <= fileSize && sz <= fileSize - off) {
+                parseThinSlice(off, sz, cpuName(cpu));
             }
         }
     } else if (raw.size() >= 28 && IsValidMachOMagic(DetailSys100::RdU32LE(raw.data()))) {
-        if (!parseThinSlice(0, raw.size(), L"Main")) return false;
+        if (!parseThinSlice(0, fileSize, L"Main")) return false;
     } else {
         return false;
     }
@@ -1694,6 +1705,7 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
     out.sheets.push_back(std::move(hdrSh));
     if (cmdSh.rows.size() > 1) out.sheets.push_back(std::move(cmdSh));
     if (symSh.rows.size() > 1) out.sheets.push_back(std::move(symSh));
+    if (!src.ReadFailed()) out.sourceReadFully = true; // every slice and table shown was read
     out.valid = true;
     return true;
 }
@@ -1704,26 +1716,7 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
 namespace DetailX509 {
 
 inline bool DecodeBase64Clean(std::string_view b64, std::vector<uint8_t>& outBytes) {
-    outBytes.clear();
-    outBytes.reserve((b64.size() * 3) / 4);
-    uint32_t val = 0;
-    int bits = -8;
-    for (unsigned char c : b64) {
-        int d = -1;
-        if (c >= 'A' && c <= 'Z') d = c - 'A';
-        else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
-        else if (c >= '0' && c <= '9') d = c - '0' + 52;
-        else if (c == '+') d = 62;
-        else if (c == '/') d = 63;
-        else if (c == '=') break;
-        else continue;
-        val = (val << 6) | static_cast<uint32_t>(d);
-        bits += 6;
-        if (bits >= 0) {
-            outBytes.push_back(static_cast<uint8_t>((val >> bits) & 0xFFu));
-            bits -= 8;
-        }
-    }
+    ::Explorer2::Base64::Decode(b64, outBytes);
     return !outBytes.empty();
 }
 
@@ -2638,7 +2631,7 @@ inline bool ParseExtendedSysSecDoc(const std::vector<uint8_t>& raw, const std::w
     if (extLower == L".class") {
         return ParseJavaClassFile(raw, out);
     }
-    if (raw.size() >= 28 && IsValidMachOFatArchive(raw)) {
+    if (raw.size() >= 28 && IsValidMachOFatArchive(raw, out.sourceFileSize)) {
         return ParseAppleMachOBinary(raw, out);
     }
     if (raw.size() >= 24 && DetailSys100::RdU32BE(raw.data()) == 0xCAFEBABEu) {

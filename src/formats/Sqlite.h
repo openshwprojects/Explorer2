@@ -2,27 +2,14 @@
 
 namespace SqliteDetail {
 
-inline uint16_t RdBE16(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
+// loads (ByteIO.h)
+inline uint16_t RdBE16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16BE(p); }
 
-inline uint32_t RdBE32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
+inline uint32_t RdBE32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32BE(p); }
 
-inline uint64_t RdBE64(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdBE32(p)) << 32) | static_cast<uint64_t>(RdBE32(p + 4));
-}
+inline uint64_t RdBE64(const uint8_t* p) { return ::Explorer2::ByteIO::RdU64BE(p); }
 
-inline uint32_t RdLE32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
+inline uint32_t RdLE32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
 
 inline double RdF64Endian(const uint8_t* p, bool littleEndian) {
     uint8_t b[8];
@@ -225,10 +212,44 @@ struct SqliteDecodedRow {
     std::vector<SqliteDecodedCell> cols;
 };
 
+// The database's pages: the bytes the reader was handed, and for a database larger than those, the file itself,
+// read a page at a time when the B-tree walk gets there (it visits a few hundred pages at most)
+class SqlitePager {
+public:
+    SqlitePager(SourceBytes& src, uint32_t pageSize) : m_src(src), m_pageSize(pageSize) {}
+
+    // Page n (1-based), or nullptr; len is the page size, or less for a short last page
+    const uint8_t* Page(uint32_t n, size_t& len) {
+        if (n == 0) return nullptr;
+        const uint64_t start = static_cast<uint64_t>(n - 1) * m_pageSize;
+        if (start >= m_src.Size()) return nullptr;
+        len = static_cast<size_t>(std::min<uint64_t>(m_pageSize, m_src.Size() - start));
+        if (start + len <= m_src.HeadSize()) {
+            std::vector<uint8_t> unused; // (a range of the handed bytes comes back as a pointer into them)
+            return m_src.Read(start, len, unused);
+        }
+        auto it = m_cache.find(n);
+        if (it != m_cache.end()) return it->second.data;
+        if (m_cache.size() >= 16384) return nullptr; // 64 MB of 4 KB pages read from the file
+        CachedPage& page = m_cache[n];
+        page.data = m_src.Read(start, len, page.bytes);
+        return page.data;
+    }
+
+private:
+    struct CachedPage {
+        std::vector<uint8_t> bytes; // filled when the page was read from the file
+        const uint8_t* data = nullptr;
+    };
+    SourceBytes& m_src;
+    uint32_t m_pageSize;
+    std::unordered_map<uint32_t, CachedPage> m_cache; // node-based: page pointers stay valid
+};
+
 inline bool AssembleCellPayload(
-    const std::vector<uint8_t>& raw,
-    uint32_t pageSize,
+    SqlitePager& pager,
     uint32_t usableSize,
+    const uint8_t* page,
     size_t inlineOff,
     size_t pageEnd,
     uint64_t payloadLen,
@@ -237,7 +258,7 @@ inline bool AssembleCellPayload(
     std::vector<uint8_t>& scratchBuf)
 {
     if (payloadLen == 0) {
-        outPtr = raw.data();
+        outPtr = page;
         outLen = 0;
         return true;
     }
@@ -249,7 +270,7 @@ inline bool AssembleCellPayload(
     if (payloadLen <= X) {
         if (inlineOff >= pageEnd) return false;
         size_t avail = std::min(wanted, pageEnd - inlineOff);
-        outPtr = raw.data() + inlineOff;
+        outPtr = page + inlineOff;
         outLen = avail;
         return true;
     }
@@ -258,7 +279,7 @@ inline bool AssembleCellPayload(
     size_t inPage = static_cast<size_t>((K <= X) ? K : M);
     if (inlineOff + inPage + 4 > pageEnd) {
         if (inlineOff >= pageEnd) return false;
-        outPtr = raw.data() + inlineOff;
+        outPtr = page + inlineOff;
         outLen = std::min(wanted, pageEnd - inlineOff);
         return true;
     }
@@ -266,23 +287,20 @@ inline bool AssembleCellPayload(
     scratchBuf.clear();
     scratchBuf.reserve(wanted);
     size_t firstTake = std::min(inPage, wanted);
-    scratchBuf.insert(scratchBuf.end(), raw.data() + inlineOff, raw.data() + inlineOff + firstTake);
+    scratchBuf.insert(scratchBuf.end(), page + inlineOff, page + inlineOff + firstTake);
 
-    uint32_t ovPage = RdBE32(raw.data() + inlineOff + inPage);
+    uint32_t ovPage = RdBE32(page + inlineOff + inPage);
     std::set<uint32_t> visitedOv;
     size_t steps = 0;
     while (ovPage >= 2 && scratchBuf.size() < wanted && steps++ < 1024) {
         if (!visitedOv.insert(ovPage).second) break;
-        uint64_t ovOff = static_cast<uint64_t>(ovPage - 1) * pageSize;
-        if (ovOff + 4 >= raw.size()) break;
-        size_t ovEnd = std::min<size_t>(raw.size(), static_cast<size_t>(ovOff) + usableSize);
-        if (ovEnd <= static_cast<size_t>(ovOff) + 4) break;
-        uint32_t nextOv = RdBE32(raw.data() + static_cast<size_t>(ovOff));
-        size_t chunkAvail = ovEnd - (static_cast<size_t>(ovOff) + 4);
-        size_t take = std::min(chunkAvail, wanted - scratchBuf.size());
-        scratchBuf.insert(scratchBuf.end(),
-            raw.data() + static_cast<size_t>(ovOff) + 4,
-            raw.data() + static_cast<size_t>(ovOff) + 4 + take);
+        size_t ovLen = 0;
+        const uint8_t* ov = pager.Page(ovPage, ovLen);
+        size_t ovEnd = std::min<size_t>(ovLen, usableSize);
+        if (!ov || ovEnd <= 4) break;
+        uint32_t nextOv = RdBE32(ov);
+        size_t take = std::min(ovEnd - 4, wanted - scratchBuf.size());
+        scratchBuf.insert(scratchBuf.end(), ov + 4, ov + 4 + take);
         ovPage = nextOv;
     }
     outPtr = scratchBuf.data();
@@ -399,7 +417,7 @@ inline bool DecodeRecordPayload(
 }
 
 inline void WalkTableBTree(
-    const std::vector<uint8_t>& raw,
+    SqlitePager& pager,
     uint32_t pageNum,
     uint32_t pageSize,
     uint32_t usableSize,
@@ -411,50 +429,51 @@ inline void WalkTableBTree(
     if (pageNum == 0 || outRows.size() >= maxRows || visitedPages.size() > 8192) return;
     if (!visitedPages.insert(pageNum).second) return;
 
-    uint64_t pageStart64 = static_cast<uint64_t>(pageNum - 1) * pageSize;
-    if (pageStart64 >= raw.size()) return;
-    size_t pageStart = static_cast<size_t>(pageStart64);
-    size_t pageEnd = std::min<size_t>(raw.size(), pageStart + pageSize);
-    size_t hdrOff = (pageNum == 1) ? 100 : pageStart;
+    size_t pageEnd = 0;
+    const uint8_t* page = pager.Page(pageNum, pageEnd);
+    if (!page) return;
+    const size_t hdrOff = (pageNum == 1) ? 100 : 0;
     if (hdrOff + 8 > pageEnd) return;
+    auto cellOffset = [&](size_t ptrArr, uint16_t i) -> size_t {
+        uint16_t cellRel = RdBE16(page + ptrArr + static_cast<size_t>(i) * 2);
+        return (cellRel == 0 && pageSize == 65536) ? 65536 : cellRel;
+    };
 
-    uint8_t pageType = raw[hdrOff];
-    uint16_t numCells = RdBE16(raw.data() + hdrOff + 3);
+    uint8_t pageType = page[hdrOff];
+    uint16_t numCells = RdBE16(page + hdrOff + 3);
 
     if (pageType == 0x05) { // Table Interior B-Tree Page
         if (hdrOff + 12 > pageEnd) return;
-        uint32_t rightMostChild = RdBE32(raw.data() + hdrOff + 8);
+        uint32_t rightMostChild = RdBE32(page + hdrOff + 8);
         size_t ptrArr = hdrOff + 12;
         for (uint16_t i = 0; i < numCells && outRows.size() < maxRows; ++i) {
             if (ptrArr + static_cast<size_t>(i) * 2 + 2 > pageEnd) break;
-            uint16_t cellRel = RdBE16(raw.data() + ptrArr + static_cast<size_t>(i) * 2);
-            size_t cellOff = pageStart + (cellRel == 0 && pageSize == 65536 ? 65536 : cellRel);
+            size_t cellOff = cellOffset(ptrArr, i);
             if (cellOff + 4 > pageEnd) continue;
-            uint32_t leftChild = RdBE32(raw.data() + cellOff);
-            WalkTableBTree(raw, leftChild, pageSize, usableSize, textEnc, maxRows, visitedPages, outRows);
+            uint32_t leftChild = RdBE32(page + cellOff);
+            WalkTableBTree(pager, leftChild, pageSize, usableSize, textEnc, maxRows, visitedPages, outRows);
         }
         if (outRows.size() < maxRows) {
-            WalkTableBTree(raw, rightMostChild, pageSize, usableSize, textEnc, maxRows, visitedPages, outRows);
+            WalkTableBTree(pager, rightMostChild, pageSize, usableSize, textEnc, maxRows, visitedPages, outRows);
         }
     } else if (pageType == 0x0D) { // Table Leaf B-Tree Page
         size_t ptrArr = hdrOff + 8;
         for (uint16_t i = 0; i < numCells && outRows.size() < maxRows; ++i) {
             if (ptrArr + static_cast<size_t>(i) * 2 + 2 > pageEnd) break;
-            uint16_t cellRel = RdBE16(raw.data() + ptrArr + static_cast<size_t>(i) * 2);
-            size_t cellOff = pageStart + (cellRel == 0 && pageSize == 65536 ? 65536 : cellRel);
+            size_t cellOff = cellOffset(ptrArr, i);
             if (cellOff >= pageEnd) continue;
 
             size_t cpos = cellOff;
             uint64_t payloadBytes = 0;
             uint64_t rowidU = 0;
-            if (!ReadVarint(raw.data(), pageEnd, cpos, payloadBytes)) continue;
-            if (!ReadVarint(raw.data(), pageEnd, cpos, rowidU)) continue;
+            if (!ReadVarint(page, pageEnd, cpos, payloadBytes)) continue;
+            if (!ReadVarint(page, pageEnd, cpos, rowidU)) continue;
 
             SqliteDecodedRow row;
             row.rowid = static_cast<int64_t>(rowidU);
             const uint8_t* payloadPtr = nullptr;
             size_t payloadActual = 0;
-            if (!AssembleCellPayload(raw, pageSize, usableSize, cpos, pageEnd, payloadBytes,
+            if (!AssembleCellPayload(pager, usableSize, page, cpos, pageEnd, payloadBytes,
                                      payloadPtr, payloadActual, row.overflowBuf)) {
                 continue;
             }
@@ -598,10 +617,10 @@ static bool ParseSqliteDatabase(const std::vector<uint8_t>& raw, ParsedOfficeDoc
     uint32_t usableSize = (pageSize > reservedSpace) ? (pageSize - reservedSpace) : pageSize;
     if (usableSize < 480) return false;
 
-    // Validate Page 1 B-tree header byte if present (0x0D leaf table, 0x05 interior table, 0x0A/0x02 index, or 0x00 uninitialized/synthetic)
+    // Page 1 holds the sqlite_master table b-tree: a leaf (0x0D) or interior (0x05) table page
     if (raw.size() > 100) {
         uint8_t p1Flag = raw[100];
-        if (p1Flag != 0x0D && p1Flag != 0x05 && p1Flag != 0x0A && p1Flag != 0x02 && p1Flag != 0x00) {
+        if (p1Flag != 0x0D && p1Flag != 0x05) {
             return false;
         }
     }
@@ -634,6 +653,18 @@ static bool ParseSqliteDatabase(const std::vector<uint8_t>& raw, ParsedOfficeDoc
         swprintf_s(vBuf, L"%u.%u.%u", sqliteVer / 1000000, (sqliteVer / 1000) % 1000, sqliteVer % 1000);
         schemaSheet.rows.push_back({ L"SQLite Version", L"Header", vBuf, L"-" });
     }
+    // Pages past the bytes handed in are read from the file; without the file (a database inside another
+    // container) the rows stored past them cannot be listed, which the schema sheet then says
+    SourceBytes source(raw, out);
+    SqliteDetail::SqlitePager pager(source, pageSize);
+    const bool pageCountCurrent = SqliteDetail::RdBE32(raw.data() + 28) != 0 &&
+                                  SqliteDetail::RdBE32(raw.data() + 92) == SqliteDetail::RdBE32(raw.data() + 24);
+    const uint64_t declaredBytes = static_cast<uint64_t>(pageCount) * pageSize;
+    if (pageCountCurrent && declaredBytes > raw.size() && !source.HasMoreThanHead()) {
+        schemaSheet.rows.push_back({ L"Bytes Read", L"Info",
+            std::to_wstring(raw.size()) + L" of " + std::to_wstring(declaredBytes) +
+            L" (rows stored beyond that point are not listed)", L"-" });
+    }
 
     // 1. Decode sqlite_master (root B-Tree on Page 1): columns (type, name, tbl_name, rootpage, sql)
     struct MasterTableEntry {
@@ -646,7 +677,7 @@ static bool ParseSqliteDatabase(const std::vector<uint8_t>& raw, ParsedOfficeDoc
     std::vector<SqliteDetail::SqliteDecodedRow> masterRows;
     {
         std::set<uint32_t> visited;
-        SqliteDetail::WalkTableBTree(raw, 1, pageSize, usableSize, textEnc, 1024, visited, masterRows);
+        SqliteDetail::WalkTableBTree(pager, 1, pageSize, usableSize, textEnc, 1024, visited, masterRows);
     }
 
     bool autoGeoPackage = isGeoPackage;
@@ -682,47 +713,10 @@ static bool ParseSqliteDatabase(const std::vector<uint8_t>& raw, ParsedOfficeDoc
         }
     }
 
-    // Fallback DDL scan ONLY when Page 1 B-tree is empty/synthetic (preserves Stage12.Test8 header+DDL mock)
+    // An empty sqlite_master is a database without tables. Its file may still hold the text of dropped tables'
+    // CREATE statements in freed pages, which is why the schema is never taken from a scan of the raw bytes.
     if (masterRows.empty()) {
-        std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
-        size_t pos = 0;
-        while ((pos = sv.find("CREATE ", pos)) != std::string_view::npos) {
-            size_t endPos = pos;
-            int parenDepth = 0;
-            bool seenParen = false;
-            while (endPos < sv.size() && endPos - pos < 4096) {
-                char c = sv[endPos];
-                if (c < 9 || (c > 13 && c < 32) || static_cast<unsigned char>(c) >= 127) break;
-                if (c == '(') { ++parenDepth; seenParen = true; }
-                else if (c == ')') {
-                    --parenDepth;
-                    if (seenParen && parenDepth <= 0) { ++endPos; break; }
-                }
-                ++endPos;
-            }
-            std::string ddl(sv.substr(pos, endPos - pos));
-            for (char& ch : ddl) { if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' '; }
-            if (ddl.size() > 14) {
-                std::wstring wDdl = PathUtils::Utf8ToWide(ddl);
-                std::wstring objType = L"SQL";
-                if (wDdl.rfind(L"CREATE TABLE", 0) == 0 || wDdl.rfind(L"CREATE TEMP TABLE", 0) == 0) objType = L"TABLE";
-                else if (wDdl.rfind(L"CREATE INDEX", 0) == 0 || wDdl.rfind(L"CREATE UNIQUE INDEX", 0) == 0) objType = L"INDEX";
-                else if (wDdl.rfind(L"CREATE VIEW", 0) == 0) objType = L"VIEW";
-                else if (wDdl.rfind(L"CREATE TRIGGER", 0) == 0) objType = L"TRIGGER";
-
-                std::wstring objName = objType;
-                size_t openP = wDdl.find(L'(');
-                if (openP != std::wstring::npos && openP > 13) {
-                    size_t nameEnd = openP;
-                    while (nameEnd > 0 && wDdl[nameEnd - 1] == L' ') --nameEnd;
-                    size_t nameStart = nameEnd;
-                    while (nameStart > 0 && wDdl[nameStart - 1] != L' ') --nameStart;
-                    if (nameEnd > nameStart) objName = wDdl.substr(nameStart, nameEnd - nameStart);
-                }
-                schemaSheet.rows.push_back({ objName, objType, wDdl, L"-" });
-            }
-            pos = endPos;
-        }
+        schemaSheet.rows.push_back({ L"(schema)", L"Info", L"no tables, views, indexes or triggers", L"-" });
     }
 
     out.sheets.push_back(std::move(schemaSheet));
@@ -745,7 +739,7 @@ static bool ParseSqliteDatabase(const std::vector<uint8_t>& raw, ParsedOfficeDoc
 
         std::vector<SqliteDetail::SqliteDecodedRow> tRows;
         std::set<uint32_t> visited;
-        SqliteDetail::WalkTableBTree(raw, tbl.rootPage, pageSize, usableSize, textEnc, kMaxRowsPerTable, visited, tRows);
+        SqliteDetail::WalkTableBTree(pager, tbl.rootPage, pageSize, usableSize, textEnc, kMaxRowsPerTable, visited, tRows);
 
         size_t maxRowCols = colNames.size();
         for (const auto& r : tRows) {
@@ -831,6 +825,7 @@ static bool ParseSqliteDatabase(const std::vector<uint8_t>& raw, ParsedOfficeDoc
         addCorner(b[1], b[0], L"SW Close");
     }
 
+    if (source.ReadPastHead() && !source.ReadFailed()) out.sourceReadFully = true;
     out.valid = true;
     return true;
 }

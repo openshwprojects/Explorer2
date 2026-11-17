@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // Ase3dsMax.h — Autodesk 3ds Max ASCII Scene Export (.ase) 3D Parser
 // Parses *3DSMAX_ASCIIEXPORT scenes: *MATERIAL_LIST, *GROUP, *GEOMOBJECT (*NODE_TM,
 // *MESH_VERTEX_LIST, *MESH_FACE_LIST, *MESH_VERTCOL, *MESH_NORMALS, *WIREFRAME_COLOR),
@@ -107,31 +108,6 @@ inline bool NextAseInt(const char*& cur, const char* end, int64_t& out) {
     AseToken t;
     if (!NextAseToken(cur, end, t) || t.isBraceOpen || t.isBraceClose) return false;
     return ParseAseInt(t.text, out);
-}
-
-inline void EmitAseStrut(LoadedMesh3D& mesh, const Vec3f& a, const Vec3f& b, float rad) {
-    Vec3f d = { b.x - a.x, b.y - a.y, b.z - a.z };
-    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (len < 1e-6f) return;
-    Vec3f u = { d.x / len, d.y / len, d.z / len };
-    Vec3f ref = (std::fabs(u.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    Vec3f s = { u.y * ref.z - u.z * ref.y, u.z * ref.x - u.x * ref.z, u.x * ref.y - u.y * ref.x };
-    float sl = std::sqrt(s.x * s.x + s.y * s.y + s.z * s.z);
-    if (sl < 1e-6f) return;
-    s = { s.x / sl * rad, s.y / sl * rad, s.z / sl * rad };
-    Vec3f t = { u.y * s.z - u.z * s.y, u.z * s.x - u.x * s.z, u.x * s.y - u.y * s.x };
-
-    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ a.x + s.x, a.y + s.y, a.z + s.z });
-    mesh.vertices.push_back({ a.x - s.x, a.y - s.y, a.z - s.z });
-    mesh.vertices.push_back({ a.x + t.x, a.y + t.y, a.z + t.z });
-    mesh.vertices.push_back({ b.x + s.x, b.y + s.y, b.z + s.z });
-    mesh.vertices.push_back({ b.x - s.x, b.y - s.y, b.z - s.z });
-    mesh.vertices.push_back({ b.x + t.x, b.y + t.y, b.z + t.z });
-    mesh.tris.push_back({ base + 0, base + 3, base + 2, {} });
-    mesh.tris.push_back({ base + 2, base + 3, base + 5, {} });
-    mesh.tris.push_back({ base + 2, base + 5, base + 1, {} });
-    mesh.tris.push_back({ base + 1, base + 5, base + 4, {} });
 }
 
 struct AseMaterialInfo {
@@ -489,7 +465,7 @@ inline bool ParseAseMesh(std::string_view sv, LoadedMesh3D& outMesh) {
         float rad = span * 0.008f;
         for (const auto& poly : shapeLines) {
             for (size_t i = 0; i + 1 < poly.size(); ++i) {
-                DetailAse::EmitAseStrut(outMesh, poly[i], poly[i + 1], rad);
+                MeshBuild3D::EmitEdgeStrut(outMesh, poly[i], poly[i + 1], rad);
             }
         }
     }

@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // GmshMsh.h — Gmsh Finite Element Mesh (.msh v1 / v2.2 / v4.0 / v4.1) 3D Parser
 // Supports both ASCII (fileType=0) and Binary (fileType=1, LE & BE), arbitrary sparse
 // node tags, 1st/2nd-order 2D & 3D elements, and 3D interior shared-face culling.
@@ -84,7 +85,8 @@ inline void SkipAsciiWsGmsh(const char*& p, const char* end) {
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
 }
 
-inline bool NextAsciiU64Gmsh(const char*& p, const char* end, uint64_t& out) {
+template <class Int>
+inline bool NextAsciiIntGmsh(const char*& p, const char* end, Int& out) {
     SkipAsciiWsGmsh(p, end);
     if (p >= end) return false;
     const char* s = p;
@@ -92,15 +94,9 @@ inline bool NextAsciiU64Gmsh(const char*& p, const char* end, uint64_t& out) {
     auto [ptr, ec] = std::from_chars(s, p, out);
     return ec == std::errc{} && ptr == p;
 }
+inline bool NextAsciiU64Gmsh(const char*& p, const char* end, uint64_t& out) { return NextAsciiIntGmsh(p, end, out); }
 
-inline bool NextAsciiI64Gmsh(const char*& p, const char* end, int64_t& out) {
-    SkipAsciiWsGmsh(p, end);
-    if (p >= end) return false;
-    const char* s = p;
-    while (p < end && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') ++p;
-    auto [ptr, ec] = std::from_chars(s, p, out);
-    return ec == std::errc{} && ptr == p;
-}
+inline bool NextAsciiI64Gmsh(const char*& p, const char* end, int64_t& out) { return NextAsciiIntGmsh(p, end, out); }
 
 inline bool NextAsciiDoubleGmsh(const char*& p, const char* end, double& out) {
     SkipAsciiWsGmsh(p, end);
@@ -266,31 +262,6 @@ inline void EmitGmshElement(
     default:
         break;
     }
-}
-
-inline void EmitGmshStrut(LoadedMesh3D& mesh, const Vec3f& a, const Vec3f& b, float rad) {
-    Vec3f d = { b.x - a.x, b.y - a.y, b.z - a.z };
-    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (len < 1e-6f) return;
-    Vec3f u = { d.x / len, d.y / len, d.z / len };
-    Vec3f ref = (std::fabs(u.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    Vec3f s = { u.y * ref.z - u.z * ref.y, u.z * ref.x - u.x * ref.z, u.x * ref.y - u.y * ref.x };
-    float sl = std::sqrt(s.x * s.x + s.y * s.y + s.z * s.z);
-    if (sl < 1e-6f) return;
-    s = { s.x / sl * rad, s.y / sl * rad, s.z / sl * rad };
-    Vec3f t = { u.y * s.z - u.z * s.y, u.z * s.x - u.x * s.z, u.x * s.y - u.y * s.x };
-
-    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ a.x + s.x, a.y + s.y, a.z + s.z });
-    mesh.vertices.push_back({ a.x - s.x, a.y - s.y, a.z - s.z });
-    mesh.vertices.push_back({ a.x + t.x, a.y + t.y, a.z + t.z });
-    mesh.vertices.push_back({ b.x + s.x, b.y + s.y, b.z + s.z });
-    mesh.vertices.push_back({ b.x - s.x, b.y - s.y, b.z - s.z });
-    mesh.vertices.push_back({ b.x + t.x, b.y + t.y, b.z + t.z });
-    mesh.tris.push_back({ base + 0, base + 3, base + 2, {} });
-    mesh.tris.push_back({ base + 2, base + 3, base + 5, {} });
-    mesh.tris.push_back({ base + 2, base + 5, base + 1, {} });
-    mesh.tris.push_back({ base + 1, base + 5, base + 4, {} });
 }
 
 } // namespace DetailGmsh
@@ -814,7 +785,7 @@ inline bool ParseGmshMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) 
         float rad = span * 0.008f;
         for (const auto& seg : lineSegs) {
             if (seg.first < baseVerts.size() && seg.second < baseVerts.size()) {
-                DetailGmsh::EmitGmshStrut(mesh, baseVerts[seg.first], baseVerts[seg.second], rad);
+                MeshBuild3D::EmitEdgeStrut(mesh, baseVerts[seg.first], baseVerts[seg.second], rad);
             }
         }
     }

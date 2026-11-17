@@ -1,5 +1,6 @@
 #include "ZipDeflate.h"
 #include "PathUtils.h"
+#include "ByteIO.h"
 #include <algorithm>
 #include <cstring>
 
@@ -71,12 +72,18 @@ struct BitStream {
 
 struct HuffmanTable {
     static constexpr int kMaxBits = 15;
+    // Codes up to kFastBits long are resolved with one lookup of the next kFastBits stream bits;
+    // longer (rare) codes fall back to the canonical bit-by-bit walk below.
+    static constexpr int kFastBits = 10;
     uint16_t counts[kMaxBits + 1] = {};
     uint16_t symbols[320] = {};
+    // (codeLength << 9) | symbol, indexed by the next kFastBits bits (LSB first); 0 = code longer than kFastBits
+    uint16_t fast[1u << kFastBits] = {};
     int maxCodeLen = 0;
 
     bool Build(const uint8_t* lengths, int numSymbols) {
         std::memset(counts, 0, sizeof(counts));
+        std::memset(fast, 0, sizeof(fast));
         maxCodeLen = 0;
         for (int i = 0; i < numSymbols; ++i) {
             uint8_t len = lengths[i];
@@ -109,18 +116,44 @@ struct HuffmanTable {
                 symbols[offsets[len]++] = static_cast<uint16_t>(i);
             }
         }
+
+        // Canonical codes (RFC 1951 3.2.2), stored bit-reversed because Deflate sends them MSB first
+        uint16_t nextCode[kMaxBits + 1] = {};
+        uint32_t code = 0;
+        for (int bits = 1; bits <= kMaxBits; ++bits) {
+            code = (code + counts[bits - 1]) << 1;
+            nextCode[bits] = static_cast<uint16_t>(code);
+        }
+        for (int i = 0; i < numSymbols; ++i) {
+            int len = lengths[i];
+            if (len == 0) continue;
+            uint32_t c = nextCode[len]++;
+            if (len > kFastBits) continue;
+            uint32_t rev = 0;
+            for (int b = 0; b < len; ++b) rev = (rev << 1) | ((c >> b) & 1u);
+            uint16_t entry = static_cast<uint16_t>((len << 9) | i);
+            for (uint32_t idx = rev; idx < (1u << kFastBits); idx += (1u << len)) fast[idx] = entry;
+        }
         return true;
     }
 
+    // Bits past the end of the input read as zeros and set bs.overrun (through DropBits), as before.
     int Decode(BitStream& bs) const {
         bs.Fill(kMaxBits);
+        const uint32_t peek = bs.bitBuf;
+        uint16_t entry = fast[peek & ((1u << kFastBits) - 1u)];
+        if (entry != 0) {
+            bs.DropBits(entry >> 9);
+            return entry & 0x1FF;
+        }
         int code = 0;
         int first = 0;
         int index = 0;
         for (int len = 1; len <= maxCodeLen; ++len) {
-            code |= static_cast<int>(bs.ReadBits(1));
+            code |= static_cast<int>((peek >> (len - 1)) & 1u);
             int count = counts[len];
             if (code - count < first) {
+                bs.DropBits(len);
                 return symbols[index + (code - first)];
             }
             index += count;
@@ -153,20 +186,9 @@ static const uint8_t kCodeLenOrder[19] = {
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
 };
 
-inline uint16_t ReadLE16(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
-}
+inline uint16_t ReadLE16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
 
-inline uint32_t ReadLE32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-inline uint64_t ReadLE64(const uint8_t* p) {
-    return static_cast<uint64_t>(ReadLE32(p)) | (static_cast<uint64_t>(ReadLE32(p + 4)) << 32);
-}
+inline uint32_t ReadLE32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
 
 } // namespace
 

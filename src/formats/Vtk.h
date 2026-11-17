@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // Vtk.h — Visualization Toolkit Legacy 3D Format (.vtk v1.0 – v5.1) Parser
 // Supports ASCII & Big-Endian BINARY encodings across POLYDATA, UNSTRUCTURED_GRID,
 // STRUCTURED_GRID, STRUCTURED_POINTS, and RECTILINEAR_GRID, VTK 5.x OFFSETS/CONNECTIVITY,
@@ -22,11 +23,7 @@ enum class VtkScalarKind : uint8_t {
     U64
 };
 
-inline std::string ToLowerVtk(std::string_view sv) {
-    std::string s(sv);
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
+inline std::string ToLowerVtk(std::string_view sv) { return ::Explorer2::PathUtils::ToLowerAscii(sv); }
 
 inline VtkScalarKind ParseVtkScalarKind(std::string_view raw) {
     std::string t = ToLowerVtk(raw);
@@ -63,12 +60,7 @@ inline uint16_t RdBE16Vtk(const uint8_t* p) {
     return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]));
 }
 
-inline uint32_t RdBE32Vtk(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8)  |
-            static_cast<uint32_t>(p[3]);
-}
+inline uint32_t RdBE32Vtk(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32BE(p); }
 
 inline uint64_t RdBE64Vtk(const uint8_t* p) {
     return (static_cast<uint64_t>(RdBE32Vtk(p)) << 32) | static_cast<uint64_t>(RdBE32Vtk(p + 4));
@@ -386,31 +378,6 @@ inline void RecordFace3DVtk(
             for (uint8_t i = 0; i < n; ++i) it->second.orig[i] = verts[i];
         }
     }
-}
-
-inline void EmitStrutVtk(LoadedMesh3D& mesh, const Vec3f& a, const Vec3f& b, float rad) {
-    Vec3f d = { b.x - a.x, b.y - a.y, b.z - a.z };
-    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (len < 1e-6f) return;
-    Vec3f u = { d.x / len, d.y / len, d.z / len };
-    Vec3f ref = (std::fabs(u.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    Vec3f s = { u.y * ref.z - u.z * ref.y, u.z * ref.x - u.x * ref.z, u.x * ref.y - u.y * ref.x };
-    float sl = std::sqrt(s.x * s.x + s.y * s.y + s.z * s.z);
-    if (sl < 1e-6f) return;
-    s = { s.x / sl * rad, s.y / sl * rad, s.z / sl * rad };
-    Vec3f t = { u.y * s.z - u.z * s.y, u.z * s.x - u.x * s.z, u.x * s.y - u.y * s.x };
-
-    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ a.x + s.x, a.y + s.y, a.z + s.z });
-    mesh.vertices.push_back({ a.x - s.x, a.y - s.y, a.z - s.z });
-    mesh.vertices.push_back({ a.x + t.x, a.y + t.y, a.z + t.z });
-    mesh.vertices.push_back({ b.x + s.x, b.y + s.y, b.z + s.z });
-    mesh.vertices.push_back({ b.x - s.x, b.y - s.y, b.z - s.z });
-    mesh.vertices.push_back({ b.x + t.x, b.y + t.y, b.z + t.z });
-    mesh.tris.push_back({ base + 0, base + 3, base + 2, {} });
-    mesh.tris.push_back({ base + 2, base + 3, base + 5, {} });
-    mesh.tris.push_back({ base + 2, base + 5, base + 1, {} });
-    mesh.tris.push_back({ base + 1, base + 5, base + 4, {} });
 }
 
 inline void EmitPointSplatsVtk(LoadedMesh3D& mesh, const std::vector<Vec3f>& baseVerts, const std::vector<uint32_t>& ptIndices) {
@@ -767,7 +734,7 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
                 for (size_t k = b; k + 1 < e; ++k) {
                     uint32_t a = lineCells.conn[k], d = lineCells.conn[k + 1];
                     if (a < pts.size() && d < pts.size()) {
-                        DetailVtk::EmitStrutVtk(mesh, pts[a], pts[d], rad);
+                        MeshBuild3D::EmitEdgeStrut(mesh, pts[a], pts[d], rad);
                     }
                 }
             }
@@ -944,7 +911,7 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
             float span = std::max({ bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z, 1e-4f });
             float rad = span * 0.008f;
             for (const auto& ln : fallbackLines) {
-                DetailVtk::EmitStrutVtk(mesh, pts[ln.first], pts[ln.second], rad);
+                MeshBuild3D::EmitEdgeStrut(mesh, pts[ln.first], pts[ln.second], rad);
             }
         } else if (mesh.tris.empty() && !fallbackVerts.empty()) {
             mesh.vertices.clear();

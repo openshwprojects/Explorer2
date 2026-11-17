@@ -1,4 +1,5 @@
 #include "ArchiveExplorer.h"
+#include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "ZipDeflate.h"
 #include "Ole2Compound.h"
@@ -31,21 +32,10 @@ static D2D1_COLOR_F ArcColor(uint32_t rgb, float a = 1.0f) {
     return PathUtils::ColorFromRgb(rgb, a);
 }
 
-inline uint16_t ReadU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-
-inline uint32_t ReadU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-inline uint64_t ReadU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(ReadU32LE(p)) |
-           (static_cast<uint64_t>(ReadU32LE(p + 4)) << 32);
-}
+// Byte loads under this file's names (ByteIO holds the one implementation)
+inline uint16_t ReadU16LE(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
+inline uint32_t ReadU32LE(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline uint64_t ReadU64LE(const uint8_t* p) { return ::Explorer2::ByteIO::RdU64LE(p); }
 
 inline uint32_t HighestBit32(uint32_t v) {
     uint32_t r = 0;
@@ -54,21 +44,6 @@ inline uint32_t HighestBit32(uint32_t v) {
         ++r;
     }
     return r;
-}
-
-std::wstring NormalizeArchiveInternalPath(std::wstring p) {
-    for (wchar_t& ch : p) {
-        if (ch == L'\\') ch = L'/';
-    }
-    while (!p.empty() && p.front() == L'/') p.erase(p.begin());
-    while (!p.empty() && p.back() == L'/') p.pop_back();
-    while (p.rfind(L"./", 0) == 0) p.erase(0, 2);
-    return p;
-}
-
-std::wstring GetBaseNameFromInternalPath(const std::wstring& p) {
-    size_t slash = p.find_last_of(L'/');
-    return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
 }
 
 } // namespace
@@ -1026,56 +1001,6 @@ bool DecompressBzip2Stream(const uint8_t* data, size_t size, std::vector<uint8_t
 // ----------------------------------------------------------------------------
 // LZ4 Frame Decompressor (.lz4 / .tlz4 / .tar.lz4)
 // ----------------------------------------------------------------------------
-namespace {
-bool DecompressLz4RawBlock(
-    const uint8_t* src,
-    size_t srcLen,
-    std::vector<uint8_t>& out,
-    size_t frameBase,
-    size_t maxOut)
-{
-    size_t p = 0;
-    while (p < srcLen) {
-        uint8_t token = src[p++];
-        size_t litLen = token >> 4;
-        if (litLen == 15) {
-            uint8_t s = 0;
-            do {
-                if (p >= srcLen) return false;
-                s = src[p++];
-                litLen += s;
-                if (litLen > maxOut) return false;
-            } while (s == 255);
-        }
-        if (p + litLen > srcLen || out.size() + litLen > maxOut) return false;
-        out.insert(out.end(), src + p, src + p + litLen);
-        p += litLen;
-
-        if (p == srcLen) break;
-        if (p + 2 > srcLen) return false;
-        uint16_t offset = ReadU16LE(src + p);
-        p += 2;
-        if (offset == 0 || out.size() - frameBase < offset) return false;
-
-        size_t matchLen = (token & 0x0Fu) + 4u;
-        if ((token & 0x0Fu) == 15u) {
-            uint8_t s = 0;
-            do {
-                if (p >= srcLen) return false;
-                s = src[p++];
-                matchLen += s;
-                if (matchLen > maxOut) return false;
-            } while (s == 255);
-        }
-        if (out.size() + matchLen > maxOut) return false;
-        for (size_t k = 0; k < matchLen; ++k) {
-            uint8_t b = out[out.size() - offset];
-            out.push_back(b);
-        }
-    }
-    return true;
-}
-} // namespace
 
 bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut) {
     out.clear();
@@ -1105,7 +1030,7 @@ bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& 
                 pos += 4;
                 if (peek == 0) break;
                 if (pos + peek > size) return false;
-                if (!DecompressLz4RawBlock(data + pos, peek, out, frameBase, maxOut)) return false;
+                if (!::Explorer2::Lz4::DecodeBlockAppend(data + pos, peek, out, frameBase, maxOut)) return false;
                 pos += peek;
             }
             decodedAny = true;
@@ -1156,7 +1081,7 @@ bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& 
                 if (out.size() + cLen > maxOut) return false;
                 out.insert(out.end(), data + pos, data + pos + cLen);
             } else {
-                if (!DecompressLz4RawBlock(data + pos, cLen, out, frameBase, maxOut)) return false;
+                if (!::Explorer2::Lz4::DecodeBlockAppend(data + pos, cLen, out, frameBase, maxOut)) return false;
             }
             pos += cLen;
             if (bChecksum) {
@@ -1974,7 +1899,7 @@ bool ParsePosixTarFromMemory(
             }
 
             bool isDir = (typeFlag == '5') || (!fullUtf8.empty() && fullUtf8.back() == '/');
-            std::wstring normPath = NormalizeArchiveInternalPath(PathUtils::Utf8ToWide(fullUtf8));
+            std::wstring normPath = ArchivePath::Normalize(PathUtils::Utf8ToWide(fullUtf8));
             if (!normPath.empty()) {
                 if (extractTargetNorm && outExtracted) {
                     if (!isDir && _wcsicmp(normPath.c_str(), extractTargetNorm->c_str()) == 0) {
@@ -1984,7 +1909,7 @@ bool ParsePosixTarFromMemory(
                 } else {
                     ArchiveItemEntry item;
                     item.pathInArchive = normPath;
-                    item.name = GetBaseNameFromInternalPath(normPath);
+                    item.name = ArchivePath::BaseName(normPath);
                     item.isDirectory = isDir;
                     item.uncompressedSize = isDir ? 0 : fileSz;
                     item.compressedSize = item.uncompressedSize;
@@ -2044,7 +1969,7 @@ UINT CALLBACK CabSingleIterateCallback(PVOID Context, UINT Notification, UINT_PT
     case SPFILENOTIFY_FILEINCABINET: {
         auto* info = reinterpret_cast<FILE_IN_CABINET_INFO_W*>(Param1);
         if (!info || !info->NameInCabinet || ctx->extractedOk) return FILEOP_SKIP;
-        std::wstring entryNorm = NormalizeArchiveInternalPath(info->NameInCabinet);
+        std::wstring entryNorm = ArchivePath::Normalize(info->NameInCabinet);
         if (_wcsicmp(entryNorm.c_str(), ctx->targetNorm.c_str()) == 0) {
             if (ctx->scratchFile.size() >= MAX_PATH) return FILEOP_ABORT;
             DeleteFileW(ctx->scratchFile.c_str());
@@ -2086,7 +2011,7 @@ bool ExtractCabEntryFromFile(
     if (cabFilePath.empty() || targetNorm.empty()) return false;
 
     CabSingleExtractCtx ctx;
-    ctx.targetNorm = NormalizeArchiveInternalPath(targetNorm);
+    ctx.targetNorm = ArchivePath::Normalize(targetNorm);
     ctx.scratchFile = MakeUniqueCabScratchPath(L".tmp");
     ctx.outBytes = &outBytes;
 
@@ -2177,11 +2102,11 @@ bool ParseRar4Headers(const uint8_t* data, size_t size, ArchiveSummaryInfo& outI
                 size_t asciiLen = 0;
                 while (asciiLen < nameLen && data[nameOff + asciiLen] != 0) ++asciiLen;
                 std::string rawName(reinterpret_cast<const char*>(data + nameOff), asciiLen);
-                std::wstring normPath = NormalizeArchiveInternalPath(PathUtils::Utf8ToWide(rawName));
+                std::wstring normPath = ArchivePath::Normalize(PathUtils::Utf8ToWide(rawName));
                 if (!normPath.empty()) {
                     ArchiveItemEntry item;
                     item.pathInArchive = normPath;
-                    item.name = GetBaseNameFromInternalPath(normPath);
+                    item.name = ArchivePath::BaseName(normPath);
                     item.uncompressedSize = unpSize;
                     item.compressedSize = packSize;
                     item.crc32 = fileCrc;
@@ -2246,11 +2171,11 @@ bool ParseRar5Headers(const uint8_t* data, size_t size, ArchiveSummaryInfo& outI
                 {
                     if (hpos + nameLen <= hdrEnd && nameLen > 0 && nameLen < 4096) {
                         std::string utf8Name(reinterpret_cast<const char*>(data + hpos), static_cast<size_t>(nameLen));
-                        std::wstring normPath = NormalizeArchiveInternalPath(PathUtils::Utf8ToWide(utf8Name));
+                        std::wstring normPath = ArchivePath::Normalize(PathUtils::Utf8ToWide(utf8Name));
                         if (!normPath.empty()) {
                             ArchiveItemEntry item;
                             item.pathInArchive = normPath;
-                            item.name = GetBaseNameFromInternalPath(normPath);
+                            item.name = ArchivePath::BaseName(normPath);
                             item.uncompressedSize = unpSize;
                             item.compressedSize = dataSize;
                             item.crc32 = dataCrc;
@@ -2980,7 +2905,7 @@ bool Parse7zHeaderBlock(
 
     for (size_t i = 0; i < count; ++i) {
         std::wstring rawFn = (i < fileNames.size()) ? fileNames[i] : (L"file_" + std::to_wstring(i));
-        std::wstring norm = NormalizeArchiveInternalPath(rawFn);
+        std::wstring norm = ArchivePath::Normalize(rawFn);
         if (norm.empty()) {
             if (i < emptyStream.size() && emptyStream[i]) ++emptyCursor;
             else ++subStreamCursor;
@@ -3075,7 +3000,7 @@ bool Parse7zHeaders(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInf
     for (const auto& f : parsed.files) {
         ArchiveItemEntry item;
         item.pathInArchive    = f.pathInArchive;
-        item.name             = GetBaseNameFromInternalPath(f.pathInArchive);
+        item.name             = ArchivePath::BaseName(f.pathInArchive);
         item.uncompressedSize = f.uncompressedSize;
         item.compressedSize   = f.compressedSize;
         item.crc32            = f.crc32;
@@ -3199,7 +3124,7 @@ bool ParseSingleGzip(const std::wstring& archivePath, const uint8_t* data, size_
     uint32_t crc   = ReadU32LE(data + size - 8);
 
     ArchiveItemEntry item;
-    item.pathInArchive = GetBaseNameFromInternalPath(NormalizeArchiveInternalPath(innerName));
+    item.pathInArchive = ArchivePath::BaseName(ArchivePath::Normalize(innerName));
     item.name = item.pathInArchive;
     item.uncompressedSize = isize;
     item.compressedSize = size;
@@ -3342,7 +3267,7 @@ bool InspectCompressedStreamOrTar(
     }
 
     ArchiveItemEntry item;
-    item.pathInArchive = GetBaseNameFromInternalPath(NormalizeArchiveInternalPath(DeriveSingleStreamInnerName(archivePath)));
+    item.pathInArchive = ArchivePath::BaseName(ArchivePath::Normalize(DeriveSingleStreamInnerName(archivePath)));
     item.name = item.pathInArchive;
     item.uncompressedSize = dec.size();
     item.compressedSize = size;
@@ -3371,7 +3296,7 @@ bool ExtractCompressedStreamOrTar(
         return StreamCodecs::ParsePosixTarFromMemory(dec.data(), dec.size(), dummy, &normTarget, &outBytes);
     }
 
-    std::wstring expectedName = GetBaseNameFromInternalPath(NormalizeArchiveInternalPath(DeriveSingleStreamInnerName(archivePath)));
+    std::wstring expectedName = ArchivePath::BaseName(ArchivePath::Normalize(DeriveSingleStreamInnerName(archivePath)));
     if (_wcsicmp(normTarget.c_str(), expectedName.c_str()) == 0) {
         outBytes = std::move(dec);
         return true;
@@ -3433,7 +3358,7 @@ bool ArchiveExplorer::SplitVirtualArchivePath(
             if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                 outArchiveFile = prefix;
                 if (nextSlash != std::wstring::npos && nextSlash + 1 < clean.size()) {
-                    outInnerPath = NormalizeArchiveInternalPath(clean.substr(nextSlash + 1));
+                    outInnerPath = ArchivePath::Normalize(clean.substr(nextSlash + 1));
                 }
                 return true;
             }
@@ -3528,7 +3453,7 @@ void FilterArchiveSummaryFolder(
     std::vector<ArchiveItemEntry>& outImmediateChildren)
 {
     outImmediateChildren.clear();
-    std::wstring normDir = NormalizeArchiveInternalPath(innerDir);
+    std::wstring normDir = ArchivePath::Normalize(innerDir);
     std::wstring prefix = normDir.empty() ? L"" : (normDir + L"/");
 
     std::unordered_map<std::wstring, size_t> childMap;
@@ -3746,7 +3671,7 @@ UINT CALLBACK CabBulkIterateCallback(PVOID Context, UINT Notification, UINT_PTR 
     case SPFILENOTIFY_FILEINCABINET: {
         auto* info = reinterpret_cast<FILE_IN_CABINET_INFO_W*>(Param1);
         if (!info || !info->NameInCabinet) return FILEOP_SKIP;
-        std::wstring entryNorm = NormalizeArchiveInternalPath(info->NameInCabinet);
+        std::wstring entryNorm = ArchivePath::Normalize(info->NameInCabinet);
         if (!SafeRelativeEntryPath(entryNorm, ctx->curRelWin)) {
             ++ctx->refused;
             return FILEOP_SKIP;
@@ -3849,11 +3774,11 @@ bool ArchiveExplorer::InspectArchiveFile(const std::wstring& archivePath, Archiv
                                  (extLower == L".scs")   ? L"SCS Mod Archive (.scs)" :
                                  (extLower == L".nupkg") ? L"NuGet (ZIP)" : L"ZIP";
             for (const auto& ze : zipEntries) {
-                std::wstring norm = NormalizeArchiveInternalPath(ze.pathInArchive);
+                std::wstring norm = ArchivePath::Normalize(ze.pathInArchive);
                 if (norm.empty()) continue;
                 ArchiveItemEntry item;
                 item.pathInArchive = norm;
-                item.name = GetBaseNameFromInternalPath(norm);
+                item.name = ArchivePath::BaseName(norm);
                 item.uncompressedSize = ze.uncompressedSize;
                 item.compressedSize = ze.compressedSize;
                 item.crc32 = ze.crc32;
@@ -3874,11 +3799,11 @@ bool ArchiveExplorer::InspectArchiveFile(const std::wstring& archivePath, Archiv
             outInfo.formatName = (extLower == L".ova") ? L"OVA Virtual Appliance (.ova)" :
                                  ((data[0] == 0x1F && data[1] == 0x8B) ? L"TAR.GZ" : L"TAR");
             for (const auto& te : tarEntries) {
-                std::wstring norm = NormalizeArchiveInternalPath(te.pathInArchive);
+                std::wstring norm = ArchivePath::Normalize(te.pathInArchive);
                 if (norm.empty()) continue;
                 ArchiveItemEntry item;
                 item.pathInArchive = norm;
-                item.name = GetBaseNameFromInternalPath(norm);
+                item.name = ArchivePath::BaseName(norm);
                 item.uncompressedSize = te.uncompressedSize;
                 item.compressedSize = te.compressedSize;
                 item.isDirectory = te.isDirectory;
@@ -3893,11 +3818,11 @@ bool ArchiveExplorer::InspectArchiveFile(const std::wstring& archivePath, Archiv
         if (ZipDeflate::ListTarEntriesFromFile(archivePath, tarEntries) && !tarEntries.empty()) {
             outInfo.formatName = L"TAR.GZ";
             for (const auto& te : tarEntries) {
-                std::wstring norm = NormalizeArchiveInternalPath(te.pathInArchive);
+                std::wstring norm = ArchivePath::Normalize(te.pathInArchive);
                 if (norm.empty()) continue;
                 ArchiveItemEntry item;
                 item.pathInArchive = norm;
-                item.name = GetBaseNameFromInternalPath(norm);
+                item.name = ArchivePath::BaseName(norm);
                 item.uncompressedSize = te.uncompressedSize;
                 item.compressedSize = te.compressedSize;
                 item.isDirectory = te.isDirectory;
@@ -3972,7 +3897,7 @@ try {
     const uint8_t* data = mapped.data;
     size_t size = mapped.size;
     std::wstring extLower = PathUtils::GetExtension(archivePath);
-    std::wstring normTarget = NormalizeArchiveInternalPath(innerPath);
+    std::wstring normTarget = ArchivePath::Normalize(innerPath);
 
     // 1. ZIP family
     if (size >= 4 && data[0] == 'P' && data[1] == 'K') {
@@ -4036,7 +3961,7 @@ try {
         std::vector<ZipDeflate::ArchiveItemMeta> tarEntries;
         if (ZipDeflate::ListTarEntriesFromFile(archivePath, tarEntries) && !tarEntries.empty()) {
             for (const auto& te : tarEntries) {
-                if (!te.isDirectory && _wcsicmp(NormalizeArchiveInternalPath(te.pathInArchive).c_str(), normTarget.c_str()) == 0) {
+                if (!te.isDirectory && _wcsicmp(ArchivePath::Normalize(te.pathInArchive).c_str(), normTarget.c_str()) == 0) {
                     return ZipDeflate::ExtractTarEntryFromFile(archivePath, te, outBytes);
                 }
             }
@@ -4081,8 +4006,8 @@ bool ArchiveExplorer::ExtractSingleEntryToTempFile(
     std::wstring previewRoot = std::wstring(tmpRoot) + L"Explorer2_ArcPreview";
     CreateDirectoryW(previewRoot.c_str(), nullptr);
 
-    std::wstring normInner = NormalizeArchiveInternalPath(innerPath);
-    std::wstring baseName = SafeCacheFileName(GetBaseNameFromInternalPath(normInner));
+    std::wstring normInner = ArchivePath::Normalize(innerPath);
+    std::wstring baseName = SafeCacheFileName(ArchivePath::BaseName(normInner));
 
     uint64_t arcSize = 0;
     uint64_t arcMtime = 0;

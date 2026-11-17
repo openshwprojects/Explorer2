@@ -9,87 +9,10 @@ namespace Formats {
 
 namespace DetailX3d {
 
-inline std::string ToLowerX3d(std::string_view sv) {
-    std::string s(sv);
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
+inline std::string ToLowerX3d(std::string_view sv) { return ::Explorer2::PathUtils::ToLowerAscii(sv); }
 
-struct X3dMat4 {
-    float m[4][4] = {
-        { 1.0f, 0.0f, 0.0f, 0.0f },
-        { 0.0f, 1.0f, 0.0f, 0.0f },
-        { 0.0f, 0.0f, 1.0f, 0.0f },
-        { 0.0f, 0.0f, 0.0f, 1.0f }
-    };
-
-    static X3dMat4 Mul(const X3dMat4& a, const X3dMat4& b) {
-        X3dMat4 r;
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                r.m[i][j] = a.m[i][0] * b.m[0][j] +
-                            a.m[i][1] * b.m[1][j] +
-                            a.m[i][2] * b.m[2][j] +
-                            a.m[i][3] * b.m[3][j];
-            }
-        }
-        return r;
-    }
-
-    static X3dMat4 Translate(float tx, float ty, float tz) {
-        X3dMat4 r;
-        r.m[0][3] = tx; r.m[1][3] = ty; r.m[2][3] = tz;
-        return r;
-    }
-
-    static X3dMat4 Scale(float sx, float sy, float sz) {
-        X3dMat4 r;
-        r.m[0][0] = sx; r.m[1][1] = sy; r.m[2][2] = sz;
-        return r;
-    }
-
-    static X3dMat4 RotateAxisAngle(float ax, float ay, float az, float angleRad) {
-        X3dMat4 r;
-        float len = std::sqrt(ax * ax + ay * ay + az * az);
-        if (len < 1e-7f || std::fabs(angleRad) < 1e-8f) return r;
-        float x = ax / len, y = ay / len, z = az / len;
-        float c = std::cos(angleRad), s = std::sin(angleRad), t = 1.0f - c;
-        r.m[0][0] = t * x * x + c;     r.m[0][1] = t * x * y - s * z; r.m[0][2] = t * x * z + s * y;
-        r.m[1][0] = t * x * y + s * z; r.m[1][1] = t * y * y + c;     r.m[1][2] = t * y * z - s * x;
-        r.m[2][0] = t * x * z - s * y; r.m[2][1] = t * y * z + s * x; r.m[2][2] = t * z * z + c;
-        return r;
-    }
-
-    static X3dMat4 ComposeTransform(
-        const float tr[3], const float rot[4], const float sc[3],
-        const float scOri[4], const float ctr[3])
-    {
-        X3dMat4 m = Translate(tr[0] + ctr[0], tr[1] + ctr[1], tr[2] + ctr[2]);
-        m = Mul(m, RotateAxisAngle(rot[0], rot[1], rot[2], rot[3]));
-        const bool hasSO = (std::fabs(scOri[3]) > 1e-6f);
-        if (hasSO) m = Mul(m, RotateAxisAngle(scOri[0], scOri[1], scOri[2], scOri[3]));
-        m = Mul(m, Scale(sc[0], sc[1], sc[2]));
-        if (hasSO) m = Mul(m, RotateAxisAngle(scOri[0], scOri[1], scOri[2], -scOri[3]));
-        if (std::fabs(ctr[0]) > 1e-7f || std::fabs(ctr[1]) > 1e-7f || std::fabs(ctr[2]) > 1e-7f) {
-            m = Mul(m, Translate(-ctr[0], -ctr[1], -ctr[2]));
-        }
-        return m;
-    }
-
-    Vec3f TransformPoint(const Vec3f& p) const {
-        return {
-            m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
-            m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
-            m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3]
-        };
-    }
-
-    float Det3x3() const {
-        return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
-               m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
-               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    }
-};
+// X3D transforms are VRML97 transforms (ISO/IEC 19775 keeps the Transform node)
+using X3dMat4 = DetailWrl::WrlMat4;
 
 struct X3dDomNode {
     std::string tagLower;
@@ -338,25 +261,6 @@ struct X3dDom {
     }
 };
 
-inline void EmitX3dLocalTris(
-    LoadedMesh3D& outMesh, const X3dMat4& mat,
-    const std::vector<Vec3f>& localV,
-    const std::vector<std::array<uint32_t, 3>>& localT,
-    bool extraFlip = false)
-{
-    if (localV.empty() || localT.empty()) return;
-    const bool flip = (mat.Det3x3() < 0.0f) ^ extraFlip;
-    const uint32_t base = static_cast<uint32_t>(outMesh.vertices.size());
-    outMesh.vertices.reserve(outMesh.vertices.size() + localV.size());
-    for (const auto& v : localV) {
-        outMesh.vertices.push_back(mat.TransformPoint(v));
-    }
-    outMesh.tris.reserve(outMesh.tris.size() + localT.size());
-    for (const auto& t : localT) {
-        if (!flip) outMesh.tris.push_back({ base + t[0], base + t[1], base + t[2], {} });
-        else       outMesh.tris.push_back({ base + t[0], base + t[2], base + t[1], {} });
-    }
-}
 
 } // namespace DetailX3d
 
@@ -411,7 +315,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                 else if (static_cast<size_t>(v) < pts.size()) face.push_back(static_cast<uint32_t>(v));
             }
             flush();
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "indexedtriangleset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             if (pts.empty()) return;
@@ -428,7 +332,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                     lt.push_back({ static_cast<uint32_t>(a), static_cast<uint32_t>(b), static_cast<uint32_t>(c) });
                 }
             }
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "indexedtrianglestripset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             if (pts.empty()) return;
@@ -450,7 +354,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                 }
                 s0 = s1; s1 = s2; ++sLen;
             }
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "indexedtrianglefanset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             if (pts.empty()) return;
@@ -468,7 +372,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                 else if (static_cast<size_t>(v) < pts.size()) fan.push_back(static_cast<uint32_t>(v));
             }
             flushFan();
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "indexedquadset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             if (pts.empty()) return;
@@ -485,7 +389,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                     lt.push_back({ static_cast<uint32_t>(a), static_cast<uint32_t>(c), static_cast<uint32_t>(d) });
                 }
             }
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "triangleset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             const bool ccw = DetailX3d::ReadX3dBoolAttr(gn, "ccw", true);
@@ -493,7 +397,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
             for (uint32_t i = 0; i + 2 < static_cast<uint32_t>(pts.size()); i += 3) {
                 lt.push_back({ i, i + 1u, i + 2u });
             }
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "trianglestripset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             const bool ccw = DetailX3d::ReadX3dBoolAttr(gn, "ccw", true);
@@ -511,7 +415,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                 }
                 vOff += static_cast<size_t>(cnt);
             }
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "quadset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             const bool ccw = DetailX3d::ReadX3dBoolAttr(gn, "ccw", true);
@@ -520,7 +424,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                 lt.push_back({ i, i + 1u, i + 2u });
                 lt.push_back({ i, i + 2u, i + 3u });
             }
-            DetailX3d::EmitX3dLocalTris(outMesh, mat, pts, lt, !ccw);
+            DetailWrl::EmitWrlLocalTris(outMesh, mat, pts, lt, !ccw);
         } else if (tp == "indexedlineset") {
             std::vector<Vec3f> pts = dom.ExtractCoordinates(gn);
             std::vector<int64_t> idx;
@@ -584,7 +488,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
                         lt.push_back({ i00, i11, i10 });
                     }
                 }
-                DetailX3d::EmitX3dLocalTris(outMesh, mat, lv, lt, !ccw);
+                DetailWrl::EmitWrlLocalTris(outMesh, mat, lv, lt, !ccw);
             }
         } else if (tp == "box") {
             float sz[3] = { 2.0f, 2.0f, 2.0f };
@@ -592,14 +496,14 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
             if (sz[0] > 0.0f && sz[1] > 0.0f && sz[2] > 0.0f) {
                 std::vector<Vec3f> lv; std::vector<std::array<uint32_t, 3>> lt;
                 DetailWrl::BuildWrlBox(sz[0], sz[1], sz[2], lv, lt);
-                DetailX3d::EmitX3dLocalTris(outMesh, mat, lv, lt);
+                DetailWrl::EmitWrlLocalTris(outMesh, mat, lv, lt);
             }
         } else if (tp == "sphere") {
             float rad = DetailX3d::ReadX3dFloatAttr(gn, "radius", 1.0f);
             if (rad > 0.0f) {
                 std::vector<Vec3f> lv; std::vector<std::array<uint32_t, 3>> lt;
                 DetailWrl::BuildWrlSphere(rad, lv, lt);
-                DetailX3d::EmitX3dLocalTris(outMesh, mat, lv, lt);
+                DetailWrl::EmitWrlLocalTris(outMesh, mat, lv, lt);
             }
         } else if (tp == "cylinder") {
             float rad = DetailX3d::ReadX3dFloatAttr(gn, "radius", 1.0f);
@@ -610,7 +514,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
             if (rad > 0.0f && hgt > 0.0f) {
                 std::vector<Vec3f> lv; std::vector<std::array<uint32_t, 3>> lt;
                 DetailWrl::BuildWrlCylinder(rad, hgt, side, top, bot, lv, lt);
-                DetailX3d::EmitX3dLocalTris(outMesh, mat, lv, lt);
+                DetailWrl::EmitWrlLocalTris(outMesh, mat, lv, lt);
             }
         } else if (tp == "cone") {
             float rad = DetailX3d::ReadX3dFloatAttr(gn, "bottomradius", 1.0f);
@@ -620,7 +524,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
             if (rad > 0.0f && hgt > 0.0f) {
                 std::vector<Vec3f> lv; std::vector<std::array<uint32_t, 3>> lt;
                 DetailWrl::BuildWrlCone(rad, hgt, side, bot, lv, lt);
-                DetailX3d::EmitX3dLocalTris(outMesh, mat, lv, lt);
+                DetailWrl::EmitWrlLocalTris(outMesh, mat, lv, lt);
             }
         }
     };
@@ -710,7 +614,7 @@ inline bool ParseX3dMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
         float span = std::max({ bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z, 1e-4f });
         float rad = span * 0.008f;
         for (const auto& seg : worldLines) {
-            DetailWrl::EmitWrlStrut(outMesh, seg.first, seg.second, rad);
+            MeshBuild3D::EmitEdgeStrut(outMesh, seg.first, seg.second, rad);
         }
     }
 

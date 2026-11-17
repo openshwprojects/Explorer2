@@ -1,4 +1,6 @@
 #pragma once
+#include "../ByteIO.h"
+#include "../Lz4Block.h"
 // Extended3D100.h — Real 3D BIM, Pixar USD Crate, Maya ASCII/Binary, Rhino OpenNURBS, Alembic Ogawa & LightWave Parsers
 // Zero-cheat implementation: decodes genuine geometry from file bytes or returns false honestly.
 
@@ -6,67 +8,17 @@ namespace Formats {
 
 namespace Detail3D100 {
 
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | static_cast<uint64_t>(RdU32BE(p + 4));
-}
-inline float RdF32BE(const uint8_t* p) {
-    uint32_t u = RdU32BE(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return std::isfinite(f) ? f : 0.0f;
-}
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
+// float loads that take a non-finite value as 0 (ByteIO.h)
+inline float RdF32BE(const uint8_t* p) { return ::Explorer2::ByteIO::RdFiniteF32BE(p); }
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline float RdF32LE(const uint8_t* p) {
-    float f = 0.0f;
-    std::memcpy(&f, p, 4);
-    return std::isfinite(f) ? f : 0.0f;
-}
-inline double RdF64LE(const uint8_t* p) {
-    double d = 0.0;
-    std::memcpy(&d, p, 8);
-    return std::isfinite(d) ? d : 0.0;
-}
-
-inline void AddBoxPrim(LoadedMesh3D& mesh, float cx, float cy, float cz, float hx, float hy, float hz) {
-    uint32_t b = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ cx - hx, cy - hy, cz - hz });
-    mesh.vertices.push_back({ cx + hx, cy - hy, cz - hz });
-    mesh.vertices.push_back({ cx + hx, cy + hy, cz - hz });
-    mesh.vertices.push_back({ cx - hx, cy + hy, cz - hz });
-    mesh.vertices.push_back({ cx - hx, cy - hy, cz + hz });
-    mesh.vertices.push_back({ cx + hx, cy - hy, cz + hz });
-    mesh.vertices.push_back({ cx + hx, cy + hy, cz + hz });
-    mesh.vertices.push_back({ cx - hx, cy + hy, cz + hz });
-    static const uint32_t q[6][4] = {
-        {0,1,2,3}, {5,4,7,6}, {4,0,3,7},
-        {1,5,6,2}, {3,2,6,7}, {4,5,1,0}
-    };
-    for (int f = 0; f < 6; ++f) {
-        mesh.tris.push_back({ b + q[f][0], b + q[f][1], b + q[f][2], {} });
-        mesh.tris.push_back({ b + q[f][0], b + q[f][2], b + q[f][3], {} });
-    }
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+inline float RdF32LE(const uint8_t* p) { return ::Explorer2::ByteIO::RdFiniteF32LE(p); }
+inline double RdF64LE(const uint8_t* p) { return ::Explorer2::ByteIO::RdFiniteF64LE(p); }
 
 inline void AddLineStrut(LoadedMesh3D& mesh, Vec3f p0, Vec3f p1, float radius) {
     Vec3f d = { p1.x - p0.x, p1.y - p0.y, p1.z - p0.z };
@@ -94,76 +46,29 @@ inline void AddLineStrut(LoadedMesh3D& mesh, Vec3f p0, Vec3f p1, float radius) {
 // ============================================================================
 // Pixar OpenUSD Crate (PXR-USDC) LZ4 & Integer Delta/Bitpack Decompressors
 // ============================================================================
-inline bool Lz4DecompressRawBlock(const uint8_t* src, size_t srcLen, uint8_t* dst, size_t dstCap, size_t& outWritten) {
-    size_t sp = 0;
-    size_t dp = 0;
-    while (sp < srcLen) {
-        uint8_t token = src[sp++];
-        size_t litLen = (token >> 4) & 0x0Fu;
-        if (litLen == 15) {
-            while (sp < srcLen) {
-                uint8_t s = src[sp++];
-                litLen += s;
-                if (s != 255) break;
-            }
-        }
-        if (sp + litLen > srcLen || dp + litLen > dstCap) return false;
-        std::memcpy(dst + dp, src + sp, litLen);
-        sp += litLen;
-        dp += litLen;
-
-        if (sp >= srcLen) break; // End of LZ4 block follows final literal run
-        if (sp + 2 > srcLen) return false;
-        size_t offset = static_cast<size_t>(src[sp]) | (static_cast<size_t>(src[sp + 1]) << 8);
-        sp += 2;
-        if (offset == 0 || offset > dp) return false;
-
-        size_t matchLen = (token & 0x0Fu) + 4;
-        if ((token & 0x0Fu) == 15) {
-            while (sp < srcLen) {
-                uint8_t s = src[sp++];
-                matchLen += s;
-                if (s != 255) break;
-            }
-        }
-        if (dp + matchLen > dstCap) return false;
-        size_t matchPos = dp - offset;
-        for (size_t k = 0; k < matchLen; ++k) {
-            dst[dp + k] = dst[matchPos + k];
-        }
-        dp += matchLen;
-    }
-    outWritten = dp;
-    return true;
-}
 
 inline bool TfFastDecompress(const uint8_t* comp, size_t compSize, size_t uncompSize, std::vector<uint8_t>& out) {
     out.clear();
     if (compSize == 0 || uncompSize > 128 * 1024 * 1024) return false;
     if (uncompSize == 0) return true;
-    out.resize(uncompSize);
+    out.reserve(uncompSize);
 
+    // TfFastCompression: chunk count byte, then either one LZ4 block or <u32 size><block> per chunk;
+    // every chunk is an independent block.
     uint8_t nChunks = comp[0];
     if (nChunks == 0) {
-        size_t written = 0;
-        if (!Lz4DecompressRawBlock(comp + 1, compSize - 1, out.data(), uncompSize, written)) return false;
-        out.resize(written);
-        return true;
+        return ::Explorer2::Lz4::DecodeBlockAppend(comp + 1, compSize - 1, out, 0, uncompSize);
     }
 
     size_t sp = 1;
-    size_t dp = 0;
     for (uint8_t c = 0; c < nChunks; ++c) {
         if (sp + 4 > compSize) return false;
         uint32_t cSz = RdU32LE(comp + sp);
         sp += 4;
-        if (sp + cSz > compSize || dp > uncompSize) return false;
-        size_t written = 0;
-        if (!Lz4DecompressRawBlock(comp + sp, cSz, out.data() + dp, uncompSize - dp, written)) return false;
+        if (sp + cSz > compSize) return false;
+        if (!::Explorer2::Lz4::DecodeBlockAppend(comp + sp, cSz, out, out.size(), uncompSize)) return false;
         sp += cSz;
-        dp += written;
     }
-    out.resize(dp);
     return true;
 }
 

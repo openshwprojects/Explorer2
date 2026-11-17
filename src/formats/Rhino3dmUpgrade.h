@@ -1,4 +1,6 @@
 #pragma once
+#include "MeshBuild3D.h"
+#include "../ByteIO.h"
 // Rhino3dmUpgrade.h — #12 Rhinoceros OpenNURBS (.3dm) ON_Brep, ON_Extrusion, ON_NurbsSurface & ON_InstanceRef
 //
 // Pure C++20 zero-cheat implementation:
@@ -12,11 +14,11 @@ namespace Formats {
 
 namespace Rhino3dmDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
-inline uint32_t RdU32LE(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline uint64_t RdU64LE(const uint8_t* p) { uint64_t v = 0; std::memcpy(&v, p, 8); return v; }
-inline float    RdF32LE(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
-inline double   RdF64LE(const uint8_t* p) { double   v = 0.0; std::memcpy(&v, p, 8); return v; }
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdF32LE;
+using ::Explorer2::ByteIO::RdF64LE;
 
 struct Uuid16 {
     std::array<uint8_t, 16> b = {};
@@ -100,23 +102,8 @@ inline void EvalBsplineBasis(int n, int order, const std::vector<double>& fullKn
         }
     }
 
-    std::vector<double> N(static_cast<size_t>(order), 0.0);
-    std::vector<double> left(static_cast<size_t>(order), 0.0);
-    std::vector<double> right(static_cast<size_t>(order), 0.0);
-    N[0] = 1.0;
-
-    for (int j = 1; j <= p; ++j) {
-        left[static_cast<size_t>(j)]  = t - fullKnots[static_cast<size_t>(span + 1 - j)];
-        right[static_cast<size_t>(j)] = fullKnots[static_cast<size_t>(span + j)] - t;
-        double saved = 0.0;
-        for (int r = 0; r < j; ++r) {
-            double denom = right[static_cast<size_t>(r + 1)] + left[static_cast<size_t>(j - r)];
-            double temp = (std::fabs(denom) > 1e-15) ? (N[static_cast<size_t>(r)] / denom) : 0.0;
-            N[static_cast<size_t>(r)] = saved + right[static_cast<size_t>(r + 1)] * temp;
-            saved = left[static_cast<size_t>(j - r)] * temp;
-        }
-        N[static_cast<size_t>(j)] = saved;
-    }
+    std::vector<double> N, left, right;
+    MeshBuild3D::BsplineBasisFuns(span, t, p, fullKnots, N, left, right);
 
     for (int j = 0; j <= p; ++j) {
         int idx = span - p + j;

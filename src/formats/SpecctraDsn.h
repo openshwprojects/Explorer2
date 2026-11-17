@@ -557,19 +557,11 @@ inline bool ParseSpecctraSExprBoard(std::string_view sv, ParsedEdaBoard& out) {
 // ============================================================================
 namespace DetailOrCadBin {
 
-inline uint16_t RdU16(const uint8_t* p) noexcept {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline int16_t RdI16(const uint8_t* p) noexcept {
-    return static_cast<int16_t>(RdU16(p));
-}
-inline uint32_t RdU32(const uint8_t* p) noexcept {
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-}
-inline int32_t RdI32(const uint8_t* p) noexcept {
-    return static_cast<int32_t>(RdU32(p));
-}
+// little-endian loads (ByteIO.h)
+inline uint16_t RdU16(const uint8_t* p) noexcept { return ::Explorer2::ByteIO::RdU16LE(p); }
+inline int16_t RdI16(const uint8_t* p) noexcept { return ::Explorer2::ByteIO::RdI16LE(p); }
+inline uint32_t RdU32(const uint8_t* p) noexcept { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline int32_t RdI32(const uint8_t* p) noexcept { return ::Explorer2::ByteIO::RdI32LE(p); }
 
 inline std::string UpperKey(std::string_view sv) {
     std::string r;
@@ -1845,10 +1837,6 @@ inline bool ParseOrCadOrSpecctraDsn(const uint8_t* data, size_t size, ParsedEdaB
     }
     std::string_view sv(reinterpret_cast<const char*>(data), size);
     return ParseSpecctraSExprBoard(sv, out);
-}
-
-inline bool ParseSpecctraDsn(std::string_view sv, ParsedEdaBoard& out) {
-    return ParseOrCadOrSpecctraDsn(reinterpret_cast<const uint8_t*>(sv.data()), sv.size(), out);
 }
 
 } // namespace Formats

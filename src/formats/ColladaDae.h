@@ -1,190 +1,24 @@
 #pragma once
+#include "../XmlTagScan.h"
 // ColladaDae.h — COLLADA 1.4 / 1.5 (.dae) XML Geometry, Controller & Visual-Scene 3D Parser
 
 namespace Formats {
 
 namespace DetailDae {
 
-struct XmlTag {
-    std::string_view localName;
-    std::string_view attrs;
-    size_t tagStart = 0;
-    size_t afterTag = 0;
-    bool isClosing = false;
-    bool isSelfClosing = false;
-};
-
-inline bool IsNameChar(char c) {
-    unsigned char u = static_cast<unsigned char>(c);
-    return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') ||
-           (u >= '0' && u <= '9') || c == '_' || c == '-' || c == ':' || c == '.';
-}
-
-inline bool IsWs(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-}
-
-inline std::string_view TrimWs(std::string_view s) {
-    while (!s.empty() && IsWs(s.front())) s.remove_prefix(1);
-    while (!s.empty() && IsWs(s.back())) s.remove_suffix(1);
-    return s;
-}
+// XML tag scanning lives in XmlTagScan.h (shared with the other XML-based 3D readers)
+using ::Explorer2::XmlTagScan::XmlTag;
+using ::Explorer2::XmlTagScan::IsWs;
+using ::Explorer2::XmlTagScan::IsNameChar;
+using ::Explorer2::XmlTagScan::TrimWs;
+using ::Explorer2::XmlTagScan::NextTag;
+using ::Explorer2::XmlTagScan::FindElementBody;
+using ::Explorer2::XmlTagScan::GetAttr;
 
 inline std::string_view StripHash(std::string_view s) {
     s = TrimWs(s);
     if (!s.empty() && s.front() == '#') s.remove_prefix(1);
     return s;
-}
-
-inline bool NextTag(std::string_view sv, size_t& pos, XmlTag& out) {
-    const size_t n = sv.size();
-    while (pos < n) {
-        size_t lt = sv.find('<', pos);
-        if (lt == std::string_view::npos || lt + 1 >= n) {
-            pos = n;
-            return false;
-        }
-        // Skip comments <!-- ... -->
-        if (lt + 4 <= n && sv.substr(lt, 4) == "<!--") {
-            size_t endC = sv.find("-->", lt + 4);
-            pos = (endC == std::string_view::npos) ? n : (endC + 3);
-            continue;
-        }
-        // Skip CDATA <![CDATA[ ... ]]>
-        if (lt + 9 <= n && sv.substr(lt, 9) == "<![CDATA[") {
-            size_t endCd = sv.find("]]>", lt + 9);
-            pos = (endCd == std::string_view::npos) ? n : (endCd + 3);
-            continue;
-        }
-        // Skip processing instructions <? ... ?>
-        if (sv[lt + 1] == '?') {
-            size_t endPi = sv.find("?>", lt + 2);
-            pos = (endPi == std::string_view::npos) ? n : (endPi + 2);
-            continue;
-        }
-        // Skip <!DOCTYPE ... > or other declarations
-        if (sv[lt + 1] == '!') {
-            size_t gt = sv.find('>', lt + 2);
-            pos = (gt == std::string_view::npos) ? n : (gt + 1);
-            continue;
-        }
-
-        // Find matching '>' respecting quoted attribute values
-        size_t gt = lt + 1;
-        char quote = 0;
-        while (gt < n) {
-            char c = sv[gt];
-            if (quote != 0) {
-                if (c == quote) quote = 0;
-            } else {
-                if (c == '"' || c == '\'') quote = c;
-                else if (c == '>') break;
-            }
-            ++gt;
-        }
-        if (gt >= n) {
-            pos = n;
-            return false;
-        }
-
-        size_t cur = lt + 1;
-        bool closing = false;
-        if (cur < gt && sv[cur] == '/') {
-            closing = true;
-            ++cur;
-        }
-        while (cur < gt && IsWs(sv[cur])) ++cur;
-        size_t nameStart = cur;
-        while (cur < gt && IsNameChar(sv[cur])) ++cur;
-        if (cur == nameStart) {
-            pos = gt + 1;
-            continue;
-        }
-
-        std::string_view rawName = sv.substr(nameStart, cur - nameStart);
-        size_t colon = rawName.rfind(':');
-        std::string_view localName = (colon == std::string_view::npos) ? rawName : rawName.substr(colon + 1);
-
-        size_t attrEnd = gt;
-        bool selfClosing = false;
-        if (!closing) {
-            size_t back = gt;
-            while (back > cur && IsWs(sv[back - 1])) --back;
-            if (back > cur && sv[back - 1] == '/') {
-                selfClosing = true;
-                attrEnd = back - 1;
-            }
-        }
-
-        out.localName = localName;
-        out.attrs = (cur <= attrEnd) ? sv.substr(cur, attrEnd - cur) : std::string_view{};
-        out.tagStart = lt;
-        out.afterTag = gt + 1;
-        out.isClosing = closing;
-        out.isSelfClosing = selfClosing;
-        pos = gt + 1;
-        return true;
-    }
-    return false;
-}
-
-inline bool FindElementBody(
-    std::string_view sv,
-    size_t afterOpenPos,
-    std::string_view localName,
-    std::string_view& bodyOut,
-    size_t& afterClosePos)
-{
-    size_t cur = afterOpenPos;
-    int depth = 1;
-    XmlTag t;
-    while (NextTag(sv, cur, t)) {
-        if (t.localName == localName) {
-            if (t.isClosing) {
-                --depth;
-                if (depth == 0) {
-                    bodyOut = sv.substr(afterOpenPos, t.tagStart - afterOpenPos);
-                    afterClosePos = cur;
-                    return true;
-                }
-            } else if (!t.isSelfClosing) {
-                ++depth;
-            }
-        }
-    }
-    return false;
-}
-
-inline std::string_view GetAttr(std::string_view attrs, std::string_view wantName) {
-    size_t i = 0;
-    const size_t n = attrs.size();
-    while (i < n) {
-        while (i < n && IsWs(attrs[i])) ++i;
-        size_t nameStart = i;
-        while (i < n && IsNameChar(attrs[i])) ++i;
-        if (i == nameStart) {
-            ++i;
-            continue;
-        }
-        std::string_view rawName = attrs.substr(nameStart, i - nameStart);
-        while (i < n && IsWs(attrs[i])) ++i;
-        if (i >= n || attrs[i] != '=') continue;
-        ++i;
-        while (i < n && IsWs(attrs[i])) ++i;
-        if (i >= n || (attrs[i] != '"' && attrs[i] != '\'')) continue;
-        char q = attrs[i++];
-        size_t valStart = i;
-        while (i < n && attrs[i] != q) ++i;
-        std::string_view val = attrs.substr(valStart, i - valStart);
-        if (i < n && attrs[i] == q) ++i;
-
-        if (rawName == wantName) return val;
-        size_t colon = rawName.rfind(':');
-        if (colon != std::string_view::npos && rawName.substr(colon + 1) == wantName) {
-            return val;
-        }
-    }
-    return {};
 }
 
 inline bool ParseOneFloat(std::string_view s, float& out) {

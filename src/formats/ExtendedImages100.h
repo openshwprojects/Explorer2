@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedImages100.h — 18 Popular Graphics, Texture, Design, Cinema & Font Specimen Decoders
 // Covers: .exr, .ktx2, .basis, .kra, .ora, .clip, .procreate, .aseprite, .icns,
 //         .jxl, .bpg, .blp, .utx, .dpx, .cin, .aco, .cube, .3dl, .ies, .ttf, .otf, .woff, .woff2
@@ -13,41 +14,15 @@ namespace Formats {
 
 namespace DetailImg100 {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline int16_t RdI16BE(const uint8_t* p) {
-    return static_cast<int16_t>(RdU16BE(p));
-}
-inline uint32_t RdU24LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16);
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | static_cast<uint64_t>(RdU32BE(p + 4));
-}
-inline float HalfToFloat(uint16_t h) {
-    return GpuTex::HalfToFloat(h);
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdI16BE;
+using ::Explorer2::ByteIO::RdU24LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU64BE;
+using ::Explorer2::ByteIO::HalfToFloat;
 
 // Minimal 5x7 ASCII bitmap font for rendering technical badges
 inline uint8_t GlyphRow5x7(char c, int row) {
@@ -4836,16 +4811,6 @@ struct HevcCabacDecoder {
         return bin;
     }
 
-    uint32_t DecodeBypass() {
-        offset = (offset << 1u) | br.ReadBit();
-        if (br.eof) { error = true; return 0u; }
-        if (offset >= range) {
-            offset -= range;
-            return 1u;
-        }
-        return 0u;
-    }
-
     uint32_t DecodeTerminate() {
         if (range < 2u) { error = true; return 1u; }
         range -= 2u;
@@ -6145,32 +6110,29 @@ inline bool DecodeDpxOrCineon(const uint8_t* data, size_t size, const std::wstri
         if (w == 0 || w > 8192 || h == 0 || h > 8192) return false;
         if (dataOff < 716 || dataOff >= size) return false;
 
-        uint8_t bpp = 10;
-        uint8_t numCh = 3;
-        if (data[198] == 8 || data[198] == 10 || data[198] == 12 || data[198] == 16) {
-            bpp = data[198];
-            numCh = (data[193] >= 1 && data[193] <= 8) ? data[193] : 3;
-            orientation = data[192];
-        } else if (data[193] == 8 || data[193] == 10 || data[193] == 12 || data[193] == 16) {
-            bpp = data[193];
-            numCh = (data[192] >= 1 && data[192] <= 8) ? data[192] : 3;
-        } else if (data[193] >= 1 && data[193] <= 8 && data[198] == 0) {
-            numCh = data[193];
-            bpp = 10;
-        } else if (data[192] >= 1 && data[192] <= 8 && data[193] == 0) {
-            numCh = data[192];
-            bpp = 10;
-        }
+        // Image information header (192): orientation, channel count, then 28-byte channel descriptors
+        // (bits per pixel at +2 of the first one = 198). Data format header (680): interleave, packing.
+        const uint8_t numCh = data[193];
+        const uint8_t bpp = data[198];
+        if (numCh < 1 || numCh > 8) return false;
+        if (bpp != 8 && bpp != 10 && bpp != 12 && bpp != 16) return false;
+        orientation = data[192];
 
-        uint16_t packing = 1; // Cineon default: 32-bit left-justified Method A
-        if (data[713] == 1 || data[713] == 2) {
-            packing = data[713];
-        } else if (data[713] == 5) {
-            packing = 1;
-        } else if (data[713] == 6 || data[681] == 6) {
-            packing = 2;
-        } else if (data[681] == 0 && data[713] == 0 && bpp != 10) {
-            packing = 0;
+        // Cineon packing codes mapped to the DPX element packing used below
+        uint16_t packing = 0;
+        switch (data[681]) {
+            case 0: packing = 0; break;                   // every bit used
+            case 1: case 2:                               // samples on byte boundaries
+                if (bpp != 8) return false;
+                packing = 0;
+                break;
+            case 3: case 4:                               // samples on 16-bit boundaries, left / right justified
+                if (bpp != 12 && bpp != 16) return false;
+                packing = (data[681] == 3) ? 1 : 2;
+                break;
+            case 5: packing = 1; break;                   // 32-bit words, left justified (DPX method A)
+            case 6: packing = 2; break;                   // 32-bit words, right justified (DPX method B)
+            default: return false;
         }
 
         DpxElemSpec el{};
@@ -6214,17 +6176,6 @@ inline bool DecodeDpxOrCineon(const uint8_t* data, size_t size, const std::wstri
                 if (el.packing > 2 || el.encoding > 1) return false;
                 elems.push_back(el);
             }
-        } else if (numElements > 8 && data[770] == data[771] && data[770] == data[800] && data[800] == data[803]) {
-            // Unpopulated synthetic minimal DPX header (uniform filler bytes in 770..811)
-            if (dataOff < 768 || dataOff >= size) return false;
-            DpxElemSpec el{};
-            el.descriptor = 50;
-            el.transfer   = 2;
-            el.bitSize    = 10;
-            el.packing    = 1;
-            el.encoding   = 0;
-            el.elemOff    = dataOff;
-            elems.push_back(el);
         } else {
             return false;
         }
@@ -6684,69 +6635,162 @@ inline bool DecodeDpxOrCineon(const uint8_t* data, size_t size, const std::wstri
 }
 
 // ============================================================================
-// 16. 3D LUT Color Grading Cube (.cube / .3dl) — Real-Time Color Test Card Renderer
+// 16. Colour LUTs (.cube 1D / 3D, .3dl): the same test card before and after the LUT
 // ============================================================================
 inline bool DecodeColorLutCube(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
     if (extLower != L".cube" && extLower != L".3dl") return false;
+    const bool is3dl = (extLower == L".3dl");
     std::string_view sv(reinterpret_cast<const char*>(data), size);
-    int lutN = 0;
-    struct Vec3 { float r, g, b; };
-    std::vector<Vec3> table;
 
-    size_t pos = 0;
-    while (pos < sv.size() && table.size() < 64 * 64 * 64) {
+    // .cube (Adobe / Resolve): TITLE, LUT_1D_SIZE / LUT_3D_SIZE, DOMAIN_MIN / DOMAIN_MAX, float triplets, red fastest.
+    // .3dl (Autodesk Lustre / Flame): a first line of input mesh points, then integer triplets, blue fastest;
+    // the output bit depth follows from the largest value (10, 12 or 16 bit).
+    struct Rgb { float r, g, b; };
+    std::vector<Rgb> table;
+    int size1d = 0, size3d = 0, meshPoints = 0;
+    float dmin[3] = { 0.0f, 0.0f, 0.0f }, dmax[3] = { 1.0f, 1.0f, 1.0f };
+    std::string title;
+    float maxValue = 0.0f;
+    for (size_t pos = 0; pos < sv.size() && table.size() <= 256u * 256u * 256u;) {
         size_t eol = sv.find('\n', pos);
         if (eol == std::string_view::npos) eol = sv.size();
         std::string_view ln = sv.substr(pos, eol - pos);
         pos = eol + 1;
-        while (!ln.empty() && (ln.front() == ' ' || ln.front() == '\t' || ln.front() == '\r')) ln.remove_prefix(1);
+        while (!ln.empty() && (ln.front() == ' ' || ln.front() == '\t')) ln.remove_prefix(1);
         while (!ln.empty() && (ln.back() == ' ' || ln.back() == '\t' || ln.back() == '\r')) ln.remove_suffix(1);
         if (ln.empty() || ln[0] == '#') continue;
-        if (ln.rfind("LUT_3D_SIZE", 0) == 0) {
-            sscanf_s(std::string(ln.substr(11)).c_str(), "%d", &lutN);
+        std::string line(ln);
+        if (ln.rfind("TITLE", 0) == 0) {
+            size_t q1 = ln.find('"'), q2 = ln.rfind('"');
+            if (q1 != std::string_view::npos && q2 > q1) title = std::string(ln.substr(q1 + 1, q2 - q1 - 1));
             continue;
         }
-        if ((ln[0] >= '0' && ln[0] <= '9') || ln[0] == '.' || ln[0] == '-') {
-            float r = 0, g = 0, b = 0;
-            if (sscanf_s(std::string(ln).c_str(), "%f %f %f", &r, &g, &b) == 3) {
-                if (r > 1.5f || g > 1.5f || b > 1.5f) { r /= 1023.0f; g /= 1023.0f; b /= 1023.0f; }
-                table.push_back({ std::clamp(r, 0.0f, 1.0f), std::clamp(g, 0.0f, 1.0f), std::clamp(b, 0.0f, 1.0f) });
-            }
+        if (ln.rfind("LUT_3D_SIZE", 0) == 0) { sscanf_s(line.c_str() + 11, "%d", &size3d); continue; }
+        if (ln.rfind("LUT_1D_SIZE", 0) == 0) { sscanf_s(line.c_str() + 11, "%d", &size1d); continue; }
+        if (ln.rfind("DOMAIN_MIN", 0) == 0) { sscanf_s(line.c_str() + 10, "%f %f %f", &dmin[0], &dmin[1], &dmin[2]); continue; }
+        if (ln.rfind("DOMAIN_MAX", 0) == 0) { sscanf_s(line.c_str() + 10, "%f %f %f", &dmax[0], &dmax[1], &dmax[2]); continue; }
+        if (ln.rfind("LUT_3D_INPUT_RANGE", 0) == 0 || ln.rfind("LUT_1D_INPUT_RANGE", 0) == 0) {
+            float a = 0.0f, b = 1.0f;
+            if (sscanf_s(line.c_str() + 18, "%f %f", &a, &b) == 2) { dmin[0] = dmin[1] = dmin[2] = a; dmax[0] = dmax[1] = dmax[2] = b; }
+            continue;
         }
+        if (!((ln[0] >= '0' && ln[0] <= '9') || ln[0] == '.' || ln[0] == '-' || ln[0] == '+')) continue;
+        // Count the numbers on the line: a .3dl mesh line has more than three
+        std::vector<float> nums;
+        const char* c = line.c_str();
+        while (*c && nums.size() < 70) {
+            char* endp = nullptr;
+            float v = std::strtof(c, &endp);
+            if (endp == c) break;
+            nums.push_back(v);
+            c = endp;
+        }
+        if (is3dl && meshPoints == 0 && nums.size() > 3) { meshPoints = static_cast<int>(nums.size()); continue; }
+        if (nums.size() < 3 || !std::isfinite(nums[0]) || !std::isfinite(nums[1]) || !std::isfinite(nums[2])) continue;
+        table.push_back({ nums[0], nums[1], nums[2] });
+        maxValue = std::max({ maxValue, nums[0], nums[1], nums[2] });
     }
     if (table.empty()) return false;
-    if (lutN <= 1) lutN = std::max(2, static_cast<int>(std::round(std::cbrt(static_cast<double>(table.size())))));
 
-    const uint32_t w = 256, h = 160;
+    float scale = 1.0f;
+    if (is3dl) {
+        scale = (maxValue <= 1023.5f) ? 1.0f / 1023.0f : (maxValue <= 4095.5f) ? 1.0f / 4095.0f : 1.0f / 65535.0f;
+        int n = meshPoints > 1 ? meshPoints : static_cast<int>(std::lround(std::cbrt(static_cast<double>(table.size()))));
+        size3d = n;
+    } else if (size3d <= 1 && size1d <= 1) {
+        size3d = static_cast<int>(std::lround(std::cbrt(static_cast<double>(table.size()))));
+    }
+    const bool use3d = size3d >= 2 && table.size() >= static_cast<size_t>(size3d) * size3d * size3d;
+    const bool use1d = !use3d && size1d >= 2 && table.size() >= static_cast<size_t>(size1d);
+    if (!use3d && !use1d) return false;
+    for (auto& t : table) { t.r *= scale; t.g *= scale; t.b *= scale; }
+
+    auto at3 = [&](int r, int g, int b) -> const Rgb& {
+        size_t n = static_cast<size_t>(size3d);
+        size_t idx = is3dl ? ((static_cast<size_t>(r) * n + g) * n + b)   // blue fastest
+                           : ((static_cast<size_t>(b) * n + g) * n + r);  // red fastest
+        return table[idx];
+    };
+    auto lerp = [](const Rgb& a, const Rgb& b, float t) {
+        return Rgb{ a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t };
+    };
+    // Input colour (0..1) -> output colour, trilinear (3D) or per-channel linear (1D)
+    auto apply = [&](float r, float g, float b) -> Rgb {
+        float in[3] = { r, g, b };
+        float t[3];
+        int n = use3d ? size3d : size1d;
+        for (int k = 0; k < 3; ++k) {
+            float span = (dmax[k] - dmin[k]);
+            float u = span > 1e-12f ? (in[k] - dmin[k]) / span : in[k];
+            t[k] = std::clamp(u, 0.0f, 1.0f) * static_cast<float>(n - 1);
+        }
+        if (use1d) {
+            Rgb outc{};
+            float* dst[3] = { &outc.r, &outc.g, &outc.b };
+            for (int k = 0; k < 3; ++k) {
+                int i0 = std::min(static_cast<int>(t[k]), n - 2);
+                float f = t[k] - static_cast<float>(i0);
+                const Rgb& a = table[static_cast<size_t>(i0)];
+                const Rgb& bb = table[static_cast<size_t>(i0 + 1)];
+                float av = (k == 0) ? a.r : (k == 1) ? a.g : a.b;
+                float bv = (k == 0) ? bb.r : (k == 1) ? bb.g : bb.b;
+                *dst[k] = av + (bv - av) * f;
+            }
+            return outc;
+        }
+        int i[3];
+        float f[3];
+        for (int k = 0; k < 3; ++k) {
+            i[k] = std::min(static_cast<int>(t[k]), n - 2);
+            f[k] = t[k] - static_cast<float>(i[k]);
+        }
+        Rgb c00 = lerp(at3(i[0], i[1], i[2]), at3(i[0] + 1, i[1], i[2]), f[0]);
+        Rgb c10 = lerp(at3(i[0], i[1] + 1, i[2]), at3(i[0] + 1, i[1] + 1, i[2]), f[0]);
+        Rgb c01 = lerp(at3(i[0], i[1], i[2] + 1), at3(i[0] + 1, i[1], i[2] + 1), f[0]);
+        Rgb c11 = lerp(at3(i[0], i[1] + 1, i[2] + 1), at3(i[0] + 1, i[1] + 1, i[2] + 1), f[0]);
+        return lerp(lerp(c00, c10, f[1]), lerp(c01, c11, f[1]), f[2]);
+    };
+
+    // Before | after: the same test card (hue sweep, falling brightness, grey ramp at the bottom) on both halves
+    const uint32_t w = 256, h = 160, half = w / 2;
     outInfo.width = w;
     outInfo.height = h;
     outInfo.channels = 4;
     outInfo.bitsPerChannel = 8;
-    outInfo.formatName = L"3D Color Grading LUT (" + std::to_wstring(lutN) + L"\xB3 Cube)";
-    outInfo.bgraPixels.resize(w * h * 4);
-
+    std::wstring name = use3d ? (L"3D Color Grading LUT (" + std::to_wstring(size3d) + L"\xB3 " + (is3dl ? L"3DL)" : L"Cube)"))
+                              : (L"1D Color LUT (" + std::to_wstring(size1d) + L" entries)");
+    if (!title.empty()) name += L" \u2014 " + PathUtils::Utf8ToWide(title);
+    outInfo.formatName = name;
+    outInfo.bgraPixels.assign(static_cast<size_t>(w) * h * 4, 0);
     for (uint32_t y = 0; y < h; ++y) {
+        float v = static_cast<float>(y) / static_cast<float>(h - 1);
         for (uint32_t x = 0; x < w; ++x) {
-            float sr = static_cast<float>(x) / (w - 1);
-            float sg = static_cast<float>(y) / (h - 1);
-            float sb = 0.5f + 0.5f * std::sin(sr * 6.28318f);
-            float or_ = sr, og = sg, ob = sb;
-            if (x >= w / 2 && static_cast<int>(table.size()) >= lutN * lutN * lutN) {
-                int ir = std::clamp(static_cast<int>(sr * (lutN - 1)), 0, lutN - 1);
-                int ig = std::clamp(static_cast<int>(sg * (lutN - 1)), 0, lutN - 1);
-                int ib = std::clamp(static_cast<int>(sb * (lutN - 1)), 0, lutN - 1);
-                const auto& c = table[static_cast<size_t>((ib * lutN + ig) * lutN + ir)];
-                or_ = c.r; og = c.g; ob = c.b;
+            float u = static_cast<float>(x % half) / static_cast<float>(half - 1);
+            float r, g, b;
+            if (v < 0.8f) {
+                // HSV with s = 1, value falling from 1 to 0.3 down the card
+                float hh = u * 6.0f, val = 1.0f - (v / 0.8f) * 0.7f;
+                float xx = 1.0f - std::fabs(std::fmod(hh, 2.0f) - 1.0f);
+                float rr = 0, gg = 0, bb = 0;
+                if (hh < 1) { rr = 1; gg = xx; } else if (hh < 2) { rr = xx; gg = 1; } else if (hh < 3) { gg = 1; bb = xx; }
+                else if (hh < 4) { gg = xx; bb = 1; } else if (hh < 5) { rr = xx; bb = 1; } else { rr = 1; bb = xx; }
+                r = rr * val; g = gg * val; b = bb * val;
+            } else {
+                r = g = b = u; // grey ramp
             }
-            uint8_t* dst = &outInfo.bgraPixels[(y * w + x) * 4];
-            dst[0] = static_cast<uint8_t>(ob * 255.0f);
-            dst[1] = static_cast<uint8_t>(og * 255.0f);
-            dst[2] = static_cast<uint8_t>(or_ * 255.0f);
+            if (x >= half) {
+                Rgb o = apply(r, g, b);
+                r = o.r; g = o.g; b = o.b;
+            }
+            uint8_t* dst = &outInfo.bgraPixels[(static_cast<size_t>(y) * w + x) * 4];
+            dst[0] = static_cast<uint8_t>(std::clamp(b, 0.0f, 1.0f) * 255.0f + 0.5f);
+            dst[1] = static_cast<uint8_t>(std::clamp(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+            dst[2] = static_cast<uint8_t>(std::clamp(r, 0.0f, 1.0f) * 255.0f + 0.5f);
             dst[3] = 255;
         }
     }
-    DetailImg100::DrawBitmapText5x7(outInfo.bgraPixels, w, h, 12, 10, "ORIGINAL", 1, 255, 255, 255);
-    DetailImg100::DrawBitmapText5x7(outInfo.bgraPixels, w, h, w / 2 + 12, 10, "3D LUT APPLIED", 1, 255, 255, 120);
+    DetailImg100::DrawBitmapText5x7(outInfo.bgraPixels, w, h, 6, 6, "ORIGINAL", 1, 255, 255, 255);
+    DetailImg100::DrawBitmapText5x7(outInfo.bgraPixels, w, h, half + 6, 6, "LUT APPLIED", 1, 255, 255, 120);
     outInfo.valid = true;
     return true;
 }

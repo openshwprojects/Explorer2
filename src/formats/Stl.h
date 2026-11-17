@@ -1,4 +1,15 @@
 #pragma once
+#include "MeshBuild3D.h"
+// Stl.h — STL, binary and ASCII (.stl) reader for the 3D viewer.
+
+namespace Formats {
+
+// Returns true when the file was handled here; `mesh` then holds the result (or its status message).
+// false: not this format, the caller tries the next reader.
+inline bool ParseStlFile(const std::wstring& ext, const std::vector<uint8_t>& buf, uint64_t fileSize, LoadedMesh3D& mesh,
+                 uint64_t generation, const std::atomic<uint64_t>* activeGen) {
+    using MeshBuild3D::FinalizeMeshBoundsAndNormals;
+    (void)ext; (void)fileSize; (void)generation; (void)activeGen;
     // 1. STL Parser (Binary STL vs ASCII STL)
     if (ext == L".stl") {
         bool isBinaryStl = false;
@@ -21,7 +32,7 @@
             mesh.tris.reserve(availTris / stride);
 
             for (size_t t = 0; t < availTris; t += stride) {
-                if (activeGen && activeGen->load() != generation) return mesh;
+                if (activeGen && activeGen->load() != generation) return true;
                 const uint8_t* rec = buf.data() + 84 + t * 50;
                 float v[12] = {};
                 std::memcpy(v, rec, 48);
@@ -35,7 +46,7 @@
             FinalizeMeshBoundsAndNormals(mesh);
             mesh.rawTriangleCount = availTris;
             mesh.rawVertexCount = availTris * 3;
-            return mesh;
+            return true;
         } else {
             mesh.formatName = L"STL (ASCII)";
             const char* p = reinterpret_cast<const char*>(buf.data());
@@ -57,7 +68,10 @@
                 while (p < end && *p != '\n') ++p;
             }
             FinalizeMeshBoundsAndNormals(mesh);
-            return mesh;
+            return true;
         }
     }
+    return false;
+}
 
+} // namespace Formats

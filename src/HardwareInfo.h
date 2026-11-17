@@ -378,15 +378,12 @@ public:
 
     const std::vector<float>& GetGpuLoadHistory() const { return m_gpuLoadHistory; }
     const std::vector<float>& GetNetRxHistoryKBps() const { return m_netRxHistoryKBps; }
-    const std::vector<float>& GetNetTxHistoryKBps() const { return m_netTxHistoryKBps; }
 
     // Temperatures
     const std::vector<HwThermalSensor>& GetAcpiThermalZones() const { return m_thermalZones; }
     const std::vector<float>& GetAcpiTempHistory() const { return m_acpiTempHistory; }
     const std::vector<float>& GetGpuTempHistory() const { return m_gpuTempHistory; }
 
-    // Reads SMART health + thermal data for one physical disk (synchronous helper for CLI/daemon; UI uses RequestAsyncRefresh).
-    void RefreshDiskSmart(int physIndex);
     static bool IsProcessElevated();
     // Opens the classic Windows "Properties" dialog of a network connection (same as ncpa.cpl > right click > Properties).
     // Falls back to opening the Network Connections folder when the adapter cannot be matched.

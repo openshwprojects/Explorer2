@@ -12,10 +12,11 @@ namespace Formats {
 
 namespace SolidWorksDetail {
 
-inline uint16_t RdU16(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
-inline uint32_t RdU32(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline float    RdF32(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
-inline double   RdF64(const uint8_t* p) { double   v = 0.0; std::memcpy(&v, p, 8); return v; }
+// little-endian loads (ByteIO.h)
+inline uint16_t RdU16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
+inline uint32_t RdU32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline float RdF32(const uint8_t* p) { return ::Explorer2::ByteIO::RdF32LE(p); }
+inline double RdF64(const uint8_t* p) { return ::Explorer2::ByteIO::RdF64LE(p); }
 
 inline void AppendTransformedPart(const LoadedMesh3D& src, const double m[16], LoadedMesh3D& dst) {
     if (src.vertices.empty() || src.tris.empty()) return;

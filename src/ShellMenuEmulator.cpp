@@ -356,12 +356,6 @@ bool ShellMenuEmulator::Has7Zip(std::wstring* out7zGuiExe, std::wstring* out7zFm
     return !m_7zGPath.empty();
 }
 
-bool ShellMenuEmulator::HasWinRAR(std::wstring* outWinRarExe) const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (outWinRarExe) *outWinRarExe = m_winRarPath;
-    return !m_winRarPath.empty();
-}
-
 std::vector<EmulatedShellVerb> ShellMenuEmulator::GetDiscoveredVerbs(bool isFile, bool isFolder, bool isBackground) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<EmulatedShellVerb> result;

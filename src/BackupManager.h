@@ -95,7 +95,6 @@ public:
     void StartJobAsync(int jobId, bool dryRun = false);
     void TickScheduler(uint64_t nowEpochSec = 0);
     bool IsBusy() const { return m_busy.load(); }
-    int GetRunningJobId() const { return m_runningJobId.load(); }
     std::wstring GetProgressStatus() const;
 
     static uint64_t CurrentEpochSeconds();

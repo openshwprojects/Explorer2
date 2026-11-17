@@ -27,26 +27,7 @@ inline bool EndsWithWideCI(std::wstring_view s, std::wstring_view suffix) {
     return true;
 }
 
-inline std::string_view TrimAsciiSV(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) {
-        s.remove_prefix(1);
-    }
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) {
-        s.remove_suffix(1);
-    }
-    return s;
-}
-
-inline void AppendCodePointUtf16(std::wstring& out, uint32_t cp) {
-    if (cp == 0 || (cp >= 0xD800u && cp <= 0xDFFFu) || cp > 0x10FFFFu) return;
-    if (cp <= 0xFFFFu) {
-        out.push_back(static_cast<wchar_t>(cp));
-    } else {
-        uint32_t v = cp - 0x10000u;
-        out.push_back(static_cast<wchar_t>(0xD800u + (v >> 10)));
-        out.push_back(static_cast<wchar_t>(0xDC00u + (v & 0x3FFu)));
-    }
-}
+inline std::string_view TrimAsciiSV(std::string_view s) { return ::Explorer2::PathUtils::TrimAscii(s); }
 
 inline int HexValChar(wchar_t c) {
     if (c >= L'0' && c <= L'9') return static_cast<int>(c - L'0');
@@ -58,56 +39,13 @@ inline int HexValChar(wchar_t c) {
 // Single-pass XML entity + ECMA-376 ST_Xstring control escape decoder
 inline std::wstring DecodeSpreadsheetXml(std::string_view utf8Raw, bool decodeOoxmlXstr = false) {
     if (utf8Raw.empty()) return {};
-    std::wstring w = PathUtils::Utf8ToWide(utf8Raw);
+    const std::wstring w = ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Utf8ToWide(utf8Raw));
     std::wstring unent;
     unent.reserve(w.size());
 
     size_t i = 0;
     while (i < w.size()) {
-        if (w[i] == L'&') {
-            size_t semi = w.find(L';', i + 1);
-            if (semi != std::wstring::npos && semi > i + 1 && (semi - i) <= 12) {
-                std::wstring_view ent(w.data() + i + 1, semi - (i + 1));
-                if (ent == L"lt") { unent.push_back(L'<'); i = semi + 1; continue; }
-                if (ent == L"gt") { unent.push_back(L'>'); i = semi + 1; continue; }
-                if (ent == L"amp") { unent.push_back(L'&'); i = semi + 1; continue; }
-                if (ent == L"quot") { unent.push_back(L'"'); i = semi + 1; continue; }
-                if (ent == L"apos") { unent.push_back(L'\''); i = semi + 1; continue; }
-                if (ent == L"nbsp") { unent.push_back(L' '); i = semi + 1; continue; }
-                if (!ent.empty() && ent[0] == L'#') {
-                    uint32_t cp = 0;
-                    bool ok = false;
-                    if (ent.size() >= 2 && (ent[1] == L'x' || ent[1] == L'X')) {
-                        ok = ent.size() > 2;
-                        for (size_t k = 2; k < ent.size() && ok; ++k) {
-                            int hv = HexValChar(ent[k]);
-                            if (hv < 0) { ok = false; break; }
-                            cp = (cp << 4) | static_cast<uint32_t>(hv);
-                            if (cp > 0x10FFFFu) { ok = false; break; }
-                        }
-                    } else {
-                        ok = ent.size() > 1;
-                        for (size_t k = 1; k < ent.size() && ok; ++k) {
-                            if (ent[k] < L'0' || ent[k] > L'9') { ok = false; break; }
-                            cp = cp * 10u + static_cast<uint32_t>(ent[k] - L'0');
-                            if (cp > 0x10FFFFu) { ok = false; break; }
-                        }
-                    }
-                    if (ok && cp > 0) {
-                        AppendCodePointUtf16(unent, cp);
-                        i = semi + 1;
-                        continue;
-                    }
-                }
-            }
-            // Fallback to outer DecodeXmlEntities if unrecognized named entity
-            size_t fallbackEnd = (semi != std::wstring::npos && (semi - i) <= 16) ? (semi + 1) : (i + 1);
-            if (fallbackEnd > i + 1) {
-                unent += DecodeXmlEntities(w.substr(i, fallbackEnd - i));
-                i = fallbackEnd;
-                continue;
-            }
-        }
+        // OOXML ST_Xstring: _xHHHH_ stands for a character XML text cannot carry (tab, CR, LF)
         if (decodeOoxmlXstr && w[i] == L'_' && i + 6 < w.size() && (w[i + 1] == L'x' || w[i + 1] == L'X') && w[i + 6] == L'_') {
             int h0 = HexValChar(w[i + 2]), h1 = HexValChar(w[i + 3]), h2 = HexValChar(w[i + 4]), h3 = HexValChar(w[i + 5]);
             if (h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0) {
@@ -296,48 +234,7 @@ inline bool FindXmlElemClose(
 
 // Tokenized XML attribute lookup (never matches substrings of other attributes!)
 inline bool GetXmlAttr(std::string_view openTag, std::string_view attrName, std::string_view& outVal, bool allowAnyNsForLocal = false) {
-    if (openTag.size() < 3 || openTag.front() != '<') return false;
-    size_t p = 1;
-    while (p < openTag.size() && !IsTagNameStop(openTag[p])) ++p;
-
-    while (p < openTag.size()) {
-        while (p < openTag.size() && (openTag[p] == ' ' || openTag[p] == '\t' || openTag[p] == '\r' || openTag[p] == '\n' || openTag[p] == '/')) {
-            ++p;
-        }
-        if (p >= openTag.size() || openTag[p] == '>') break;
-
-        size_t nameStart = p;
-        while (p < openTag.size() && openTag[p] != '=' && !IsTagNameStop(openTag[p])) ++p;
-        std::string_view curName = openTag.substr(nameStart, p - nameStart);
-
-        while (p < openTag.size() && (openTag[p] == ' ' || openTag[p] == '\t' || openTag[p] == '\r' || openTag[p] == '\n')) ++p;
-        if (p >= openTag.size() || openTag[p] != '=') continue;
-        ++p; // skip '='
-        while (p < openTag.size() && (openTag[p] == ' ' || openTag[p] == '\t' || openTag[p] == '\r' || openTag[p] == '\n')) ++p;
-        if (p >= openTag.size()) break;
-
-        char quote = openTag[p];
-        if (quote != '"' && quote != '\'') {
-            size_t valStart = p;
-            while (p < openTag.size() && !IsTagNameStop(openTag[p])) ++p;
-            if (curName == attrName || (allowAnyNsForLocal && StripXmlNsPrefix(curName) == attrName)) {
-                outVal = openTag.substr(valStart, p - valStart);
-                return true;
-            }
-            continue;
-        }
-        ++p; // skip opening quote
-        size_t valStart = p;
-        while (p < openTag.size() && openTag[p] != quote) ++p;
-        std::string_view curVal = openTag.substr(valStart, p - valStart);
-        if (p < openTag.size() && openTag[p] == quote) ++p;
-
-        if (curName == attrName || (allowAnyNsForLocal && StripXmlNsPrefix(curName) == attrName)) {
-            outVal = curVal;
-            return true;
-        }
-    }
-    return false;
+    return ::Explorer2::XmlTagScan::FindAttr(openTag, attrName, outVal, allowAnyNsForLocal);
 }
 
 inline int64_t ParseIntSV(std::string_view s, int64_t defVal = 0) {

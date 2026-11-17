@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedAiData100.h — Binary Decoders for AI/ML Models, Tensors, Columnar IPC & Statistical Datasets
 // Covers: .npy, .npz, .ipynb, .cbor, .msgpack/.mpk, .onnx, .pt/.pth/.ckpt, .tflite,
 //         .feather/.arrow/.ipc, .orc, .h5/.hdf5, .mat, .sav, .dta, .sas7bdat, .rds, .duckdb
@@ -7,97 +8,26 @@ namespace Formats {
 
 namespace AiDataDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline int16_t RdI16LE(const uint8_t* p) { return static_cast<int16_t>(RdU16LE(p)); }
-inline int16_t RdI16BE(const uint8_t* p) { return static_cast<int16_t>(RdU16BE(p)); }
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdI16LE;
+using ::Explorer2::ByteIO::RdI16BE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdI32BE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU64BE;
+using ::Explorer2::ByteIO::RdI64LE;
+using ::Explorer2::ByteIO::RdI64BE;
+using ::Explorer2::ByteIO::RdF32LE;
+using ::Explorer2::ByteIO::RdF32BE;
+using ::Explorer2::ByteIO::RdF64LE;
+using ::Explorer2::ByteIO::RdF64BE;
 
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline int32_t RdI32LE(const uint8_t* p) { return static_cast<int32_t>(RdU32LE(p)); }
-inline int32_t RdI32BE(const uint8_t* p) { return static_cast<int32_t>(RdU32BE(p)); }
+using ::Explorer2::ByteIO::HalfToFloat;
 
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | static_cast<uint64_t>(RdU32BE(p + 4));
-}
-inline int64_t RdI64LE(const uint8_t* p) { return static_cast<int64_t>(RdU64LE(p)); }
-inline int64_t RdI64BE(const uint8_t* p) { return static_cast<int64_t>(RdU64BE(p)); }
-
-inline float RdF32LE(const uint8_t* p) {
-    uint32_t u = RdU32LE(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-inline float RdF32BE(const uint8_t* p) {
-    uint32_t u = RdU32BE(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-inline double RdF64LE(const uint8_t* p) {
-    uint64_t u = RdU64LE(p);
-    double d = 0.0;
-    std::memcpy(&d, &u, 8);
-    return d;
-}
-inline double RdF64BE(const uint8_t* p) {
-    uint64_t u = RdU64BE(p);
-    double d = 0.0;
-    std::memcpy(&d, &u, 8);
-    return d;
-}
-
-inline float HalfToFloat(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x03FFu;
-    uint32_t outBits = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            outBits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400u) == 0) {
-                mant <<= 1;
-                --exp;
-            }
-            mant &= 0x03FFu;
-            outBits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        outBits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        outBits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    }
-    float f = 0.0f;
-    std::memcpy(&f, &outBits, 4);
-    return f;
-}
-
-inline float BFloat16ToFloat(uint16_t bf) {
-    uint32_t u = static_cast<uint32_t>(bf) << 16;
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
+using ::Explorer2::ByteIO::BFloat16ToFloat;
 
 inline std::wstring FmtDouble(double v) {
     if (std::isnan(v)) return L"NaN";
@@ -127,11 +57,6 @@ inline std::wstring CleanAsciiFixed(const uint8_t* p, size_t n) {
     return PathUtils::Utf8ToWide(s);
 }
 
-inline void FinalizeSheetCols(SpreadsheetSheet& sh) {
-    size_t mc = 0;
-    for (const auto& r : sh.rows) mc = std::max(mc, r.size());
-    sh.maxCols = mc;
-}
 
 // ============================================================================
 // Minimal Protobuf Wire Reader (for .onnx and .orc)
@@ -552,8 +477,26 @@ inline bool ParseSingleNpyBuffer(
 
 inline bool ParseNumPyNpz(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 22 || raw[0] != 'P' || raw[1] != 'K') return false;
+    // The ZIP directory closes the archive: for a file larger than the bytes handed in, it and the arrays are read
+    // from the file, a stored array (np.savez) only as far as its preview needs
+    SourceBytes src(raw, out);
+    const bool fromFile = src.HasMoreThanHead();
     std::vector<ZipDeflate::ArchiveItemMeta> entries;
-    if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries) || entries.empty()) return false;
+    const bool listed = fromFile ? ZipDeflate::ListZipEntriesFromFile(out.filePath, entries)
+                                 : ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries);
+    if (!listed || entries.empty()) return false;
+    auto entryFromFile = [&](const ZipDeflate::ArchiveItemMeta& e, std::vector<uint8_t>& bytes) -> bool {
+        if (e.compressionMethod != 0 || e.isEncrypted) return ZipDeflate::ExtractZipEntryFromFile(out.filePath, e, bytes);
+        std::vector<uint8_t> lh;
+        const uint8_t* h = src.Read(e.localHeaderOffset, 30, lh);
+        if (!h || RdU32LE(h) != 0x04034B50u) return false;
+        const uint64_t dataOff = e.localHeaderOffset + 30 + RdU16LE(h + 26) + RdU16LE(h + 28);
+        size_t got = 0;
+        const uint8_t* p = src.ReadSome(dataOff, e.uncompressedSize, 4u << 20, bytes, got);
+        if (!p) return false;
+        if (p != bytes.data()) bytes.assign(p, p + got); // (bytes handed in come back as a pointer into them)
+        return true;
+    };
 
     SpreadsheetSheet summary;
     summary.name = L"NPZ_Archive";
@@ -565,7 +508,8 @@ inline bool ParseNumPyNpz(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
         std::wstring ext = PathUtils::ToLower(PathUtils::GetExtension(e.pathInArchive));
         if (ext != L".npy") continue;
         std::vector<uint8_t> npyBytes;
-        if (!ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, npyBytes) || npyBytes.empty()) continue;
+        const bool extracted = fromFile ? entryFromFile(e, npyBytes) : ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, npyBytes);
+        if (!extracted || npyBytes.empty()) continue;
 
         std::wstring key = e.name.empty() ? e.pathInArchive : e.name;
         if (key.size() > 4 && PathUtils::ToLower(key.substr(key.size() - 4)) == L".npy") {
@@ -589,6 +533,7 @@ inline bool ParseNumPyNpz(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
     out.formatTitle = L"NumPy Compressed Tensor Archive (.npz)";
     out.sheets.push_back(std::move(summary));
     for (auto& s : arraySheets) out.sheets.push_back(std::move(s));
+    if (fromFile && !src.ReadFailed()) out.sourceReadFully = true; // the listing and the previews came from the file
     out.valid = true;
     return true;
 }
@@ -596,235 +541,126 @@ inline bool ParseNumPyNpz(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
 // ============================================================================
 // 2. Jupyter Notebook (.ipynb) Strict JSON Parser
 // ============================================================================
-struct MiniJsonVal {
-    enum Type { Null, Bool, Num, Str, Arr, Obj } type = Null;
-    std::string str;
-    double num = 0.0;
-    bool bval = false;
-    std::vector<MiniJsonVal> arr;
-    std::vector<std::pair<std::string, MiniJsonVal>> obj;
 
-    const MiniJsonVal* Find(std::string_view k) const {
-        if (type != Obj) return nullptr;
-        for (const auto& kv : obj) {
-            if (kv.first == k) return &kv.second;
-        }
-        return nullptr;
-    }
-};
-
-struct MiniJsonParser {
-    const char* s = nullptr;
-    size_t len = 0;
-    size_t pos = 0;
-
-    void SkipWs() {
-        while (pos < len && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n')) ++pos;
-    }
-
-    bool ParseString(std::string& out) {
-        SkipWs();
-        if (pos >= len || s[pos] != '"') return false;
-        ++pos;
-        out.clear();
-        while (pos < len) {
-            char c = s[pos++];
-            if (c == '"') return true;
-            if (c == '\\') {
-                if (pos >= len) return false;
-                char e = s[pos++];
-                switch (e) {
-                    case '"': out.push_back('"'); break;
-                    case '\\': out.push_back('\\'); break;
-                    case '/': out.push_back('/'); break;
-                    case 'b': out.push_back('\b'); break;
-                    case 'f': out.push_back('\f'); break;
-                    case 'n': out.push_back('\n'); break;
-                    case 'r': out.push_back('\r'); break;
-                    case 't': out.push_back('\t'); break;
-                    case 'u': {
-                        if (pos + 4 > len) return false;
-                        char hex[5] = { s[pos], s[pos + 1], s[pos + 2], s[pos + 3], 0 };
-                        pos += 4;
-                        uint32_t cp = static_cast<uint32_t>(std::strtoul(hex, nullptr, 16));
-                        if (cp < 0x80u) out.push_back(static_cast<char>(cp));
-                        else if (cp < 0x800u) {
-                            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
-                            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-                        } else {
-                            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
-                            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-                            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-                        }
-                        break;
-                    }
-                    default: out.push_back(e); break;
-                }
-            } else {
-                out.push_back(c);
-            }
-        }
-        return false;
-    }
-
-    bool ParseVal(MiniJsonVal& out, int depth = 0) {
-        if (depth > 64) return false;
-        SkipWs();
-        if (pos >= len) return false;
-        char c = s[pos];
-        if (c == '"') {
-            out.type = MiniJsonVal::Str;
-            return ParseString(out.str);
-        }
-        if (c == '{') {
-            out.type = MiniJsonVal::Obj;
-            ++pos;
-            SkipWs();
-            if (pos < len && s[pos] == '}') { ++pos; return true; }
-            while (pos < len) {
-                std::string k;
-                if (!ParseString(k)) return false;
-                SkipWs();
-                if (pos >= len || s[pos] != ':') return false;
-                ++pos;
-                MiniJsonVal v;
-                if (!ParseVal(v, depth + 1)) return false;
-                out.obj.emplace_back(std::move(k), std::move(v));
-                SkipWs();
-                if (pos < len && s[pos] == ',') { ++pos; continue; }
-                if (pos < len && s[pos] == '}') { ++pos; return true; }
-                return false;
-            }
-            return false;
-        }
-        if (c == '[') {
-            out.type = MiniJsonVal::Arr;
-            ++pos;
-            SkipWs();
-            if (pos < len && s[pos] == ']') { ++pos; return true; }
-            while (pos < len) {
-                MiniJsonVal v;
-                if (!ParseVal(v, depth + 1)) return false;
-                out.arr.push_back(std::move(v));
-                SkipWs();
-                if (pos < len && s[pos] == ',') { ++pos; continue; }
-                if (pos < len && s[pos] == ']') { ++pos; return true; }
-                return false;
-            }
-            return false;
-        }
-        if (c == 't' && pos + 4 <= len && std::memcmp(s + pos, "true", 4) == 0) {
-            out.type = MiniJsonVal::Bool; out.bval = true; pos += 4; return true;
-        }
-        if (c == 'f' && pos + 5 <= len && std::memcmp(s + pos, "false", 5) == 0) {
-            out.type = MiniJsonVal::Bool; out.bval = false; pos += 5; return true;
-        }
-        if (c == 'n' && pos + 4 <= len && std::memcmp(s + pos, "null", 4) == 0) {
-            out.type = MiniJsonVal::Null; pos += 4; return true;
-        }
-        if (c == '-' || (c >= '0' && c <= '9')) {
-            char* endPtr = nullptr;
-            out.num = std::strtod(s + pos, &endPtr);
-            if (endPtr == s + pos) return false;
-            out.type = MiniJsonVal::Num;
-            pos = static_cast<size_t>(endPtr - s);
-            return true;
-        }
-        return false;
-    }
-};
 
 inline bool ParseIpynbNotebook(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    size_t start = 0;
-    if (raw.size() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) start = 3;
-    MiniJsonParser jp{ reinterpret_cast<const char*>(raw.data() + start), raw.size() - start, 0 };
-    MiniJsonVal root;
-    if (!jp.ParseVal(root)) return false;
-    jp.SkipWs();
-    if (jp.pos != jp.len || root.type != MiniJsonVal::Obj) return false;
+    using JVal = ::Explorer2::Json::Value;
+    JVal root;
+    std::string_view text(reinterpret_cast<const char*>(raw.data()), raw.size());
+    if (!::Explorer2::Json::ParseDocument(text, root) || !root.IsObject()) return false;
 
-    const MiniJsonVal* cells = root.Find("cells");
-    const MiniJsonVal* nbf = root.Find("nbformat");
+    const JVal* cells = root.Find("cells");
+    const JVal* nbf = root.Find("nbformat");
     if (!cells && !nbf) return false;
+    if (cells && !cells->IsArray()) return false;
 
     out.kind = OfficeFileKind::WordDocx;
     out.isSpreadsheet = false;
     out.formatTitle = L"Jupyter Interactive Notebook (.ipynb)";
 
     std::wstring hdr = L"Jupyter Interactive Notebook";
-    if (nbf && nbf->type == MiniJsonVal::Num) {
-        hdr += L" (nbformat v" + std::to_wstring(static_cast<int>(nbf->num));
-        const MiniJsonVal* nbfMin = root.Find("nbformat_minor");
-        if (nbfMin && nbfMin->type == MiniJsonVal::Num) hdr += L"." + std::to_wstring(static_cast<int>(nbfMin->num));
+    if (nbf && nbf->IsNumber()) {
+        hdr += L" (nbformat v" + std::to_wstring(static_cast<int>(nbf->numVal));
+        const JVal* nbfMin = root.Find("nbformat_minor");
+        if (nbfMin && nbfMin->IsNumber()) hdr += L"." + std::to_wstring(static_cast<int>(nbfMin->numVal));
         hdr += L")";
     }
     out.paragraphs.push_back({ hdr, 1, false, false });
 
-    if (const MiniJsonVal* meta = root.Find("metadata")) {
-        if (const MiniJsonVal* ks = meta->Find("kernelspec")) {
-            const MiniJsonVal* dn = ks->Find("display_name");
-            const MiniJsonVal* lang = ks->Find("language");
-            std::string kinfo;
-            if (dn && dn->type == MiniJsonVal::Str) kinfo += "Kernel: " + dn->str;
-            if (lang && lang->type == MiniJsonVal::Str) {
-                if (!kinfo.empty()) kinfo += " | ";
-                kinfo += "Language: " + lang->str;
-            }
-            if (!kinfo.empty()) out.paragraphs.push_back({ PathUtils::Utf8ToWide(kinfo), 3, false, false });
+    if (const JVal* meta = root.Find("metadata")) {
+        std::string kinfo;
+        if (const JVal* ks = meta->Find("kernelspec")) {
+            std::string dn = ks->GetString("display_name");
+            std::string lang = ks->GetString("language");
+            if (!dn.empty()) kinfo += "Kernel: " + dn;
+            if (!lang.empty()) kinfo += (kinfo.empty() ? "" : " | ") + std::string("Language: ") + lang;
         }
+        if (const JVal* li = meta->Find("language_info")) {
+            std::string ver = li->GetString("version");
+            if (!ver.empty()) kinfo += (kinfo.empty() ? "" : " | ") + std::string("Version: ") + ver;
+        }
+        if (!kinfo.empty()) out.paragraphs.push_back({ PathUtils::Utf8ToWide(kinfo), 3, false, false });
     }
 
-    auto joinLines = [](const MiniJsonVal* v) -> std::string {
+    // nbformat stores multi-line text either as one string or as an array of line strings
+    auto joinLines = [](const JVal* v) -> std::string {
         if (!v) return {};
-        if (v->type == MiniJsonVal::Str) return v->str;
-        if (v->type == MiniJsonVal::Arr) {
-            std::string res;
-            for (const auto& item : v->arr) {
-                if (item.type == MiniJsonVal::Str) res += item.str;
+        if (v->IsString()) return v->strVal;
+        std::string res;
+        if (v->IsArray()) {
+            for (const auto& item : v->arrVal) {
+                if (item.IsString()) res += item.strVal;
             }
-            return res;
         }
-        return {};
+        return res;
+    };
+    auto addText = [&](const std::wstring& prefix, const std::string& txt, bool bullet) {
+        std::wstring w = PathUtils::Trim(PathUtils::Utf8ToWide(txt));
+        if (!w.empty()) out.paragraphs.push_back({ prefix + w, 0, bullet, false });
     };
 
-    if (cells && cells->type == MiniJsonVal::Arr) {
-        size_t idx = 1;
-        for (const auto& cell : cells->arr) {
-            if (cell.type != MiniJsonVal::Obj) continue;
-            const MiniJsonVal* ct = cell.Find("cell_type");
-            std::string ctype = (ct && ct->type == MiniJsonVal::Str) ? ct->str : "code";
-            out.paragraphs.push_back({ L"Cell [" + std::to_wstring(idx++) + L"] — " + PathUtils::Utf8ToWide(ctype), 2, false, false });
-
-            std::string src = joinLines(cell.Find("source"));
-            if (!src.empty()) {
-                out.paragraphs.push_back({ PathUtils::Trim(PathUtils::Utf8ToWide(src)), 0, false, false });
+    size_t idx = 1;
+    size_t codeCells = 0, markdownCells = 0, outputsShown = 0;
+    if (cells) {
+        for (const auto& cell : cells->arrVal) {
+            if (!cell.IsObject()) continue;
+            std::string ctype = cell.GetString("cell_type", "code");
+            std::wstring title = L"Cell [" + std::to_wstring(idx++) + L"] — " + PathUtils::Utf8ToWide(ctype);
+            if (ctype == "code") {
+                ++codeCells;
+                if (const JVal* ec = cell.Find("execution_count"); ec && ec->IsNumber()) {
+                    title += L"  In [" + std::to_wstring(static_cast<long long>(ec->numVal)) + L"]";
+                }
+            } else if (ctype == "markdown") {
+                ++markdownCells;
             }
+            out.paragraphs.push_back({ title, 2, false, false });
+            addText(L"", joinLines(cell.Find("source")), false);
 
-            if (const MiniJsonVal* outs = cell.Find("outputs")) {
-                if (outs->type == MiniJsonVal::Arr) {
-                    for (const auto& o : outs->arr) {
-                        std::string txt = joinLines(o.Find("text"));
-                        if (!txt.empty()) {
-                            out.paragraphs.push_back({ L"Output: " + PathUtils::Trim(PathUtils::Utf8ToWide(txt)), 0, true, false });
+            const JVal* outs = cell.Find("outputs");
+            if (outs && outs->IsArray()) {
+                for (const auto& o : outs->arrVal) {
+                    if (!o.IsObject()) continue;
+                    std::string otype = o.GetString("output_type");
+                    if (otype == "error") {
+                        addText(L"Error: ", o.GetString("ename") + ": " + o.GetString("evalue"), true);
+                        ++outputsShown;
+                        continue;
+                    }
+                    // stream outputs (and nbformat 3 / minimal writers) carry "text"
+                    std::string txt = joinLines(o.Find("text"));
+                    const JVal* data = o.Find("data");
+                    if (txt.empty() && data && data->IsObject()) {
+                        txt = joinLines(data->Find("text/plain"));
+                        if (txt.empty()) {
+                            for (const char* mime : { "image/png", "image/jpeg", "image/svg+xml", "text/html", "application/json" }) {
+                                if (data->Find(mime)) {
+                                    txt = std::string("[") + mime + " output]";
+                                    break;
+                                }
+                            }
                         }
+                    }
+                    if (!txt.empty()) {
+                        std::wstring prefix = L"Output: ";
+                        if (const JVal* ec = o.Find("execution_count"); ec && ec->IsNumber()) {
+                            prefix = L"Out [" + std::to_wstring(static_cast<long long>(ec->numVal)) + L"]: ";
+                        }
+                        addText(prefix, txt, true);
+                        ++outputsShown;
                     }
                 }
             }
             if (out.paragraphs.size() >= 300) break;
         }
     }
-
-    size_t words = 0, chars = 0;
-    for (const auto& p : out.paragraphs) {
-        chars += p.text.size();
-        bool inW = false;
-        for (wchar_t ch : p.text) {
-            if (ch > 32) { if (!inW) { ++words; inW = true; } }
-            else inW = false;
-        }
+    if (cells) {
+        out.paragraphs.insert(out.paragraphs.begin() + 1, DocParagraph{ std::to_wstring(cells->arrVal.size()) + L" cells (" +
+            std::to_wstring(codeCells) + L" code, " + std::to_wstring(markdownCells) + L" markdown), " +
+            std::to_wstring(outputsShown) + L" outputs shown", 3, false, false });
     }
-    out.wordCount = words;
-    out.charCount = chars;
+
+    RecountDocText(out);
     out.valid = !out.paragraphs.empty();
     return out.valid;
 }
@@ -2575,11 +2411,20 @@ inline bool DecompressOrcStream(const uint8_t* src, size_t srcLen, uint64_t code
 
 inline bool ParseApacheOrc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 6) return false;
-    uint8_t psLen = raw.back();
-    if (psLen == 0 || static_cast<size_t>(psLen) + 1 >= raw.size()) return false;
+    // The postscript and the footer close the file: read from its end, past the bytes handed in for a large file
+    // (ORC files are seldom smaller than the 32 MB a reader gets)
+    SourceBytes src(raw, out);
+    const uint64_t fileSize = src.Size();
+    std::vector<uint8_t> psBuf, footerBuf;
+    const uint8_t* lastByte = src.Read(fileSize - 1, 1, psBuf);
+    if (!lastByte) return false;
+    const uint8_t psLen = *lastByte;
+    if (psLen == 0 || static_cast<uint64_t>(psLen) + 1 >= fileSize) return false;
 
-    size_t psPos = raw.size() - 1 - psLen;
-    PbReader ps(raw.data() + psPos, psLen);
+    const uint64_t psPos = fileSize - 1 - psLen;
+    const uint8_t* psBytes = src.Read(psPos, psLen, psBuf);
+    if (!psBytes) return false;
+    PbReader ps(psBytes, psLen);
     uint64_t footerLength = 0, compression = 0, compBlockSize = 0;
     std::vector<uint64_t> version;
     std::string magic;
@@ -2604,12 +2449,13 @@ inline bool ParseApacheOrc(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     if (magic != "ORC" && !headerMagic) return false;
     if (footerLength == 0 || footerLength > psPos) return false;
 
-    size_t footerPos = psPos - static_cast<size_t>(footerLength);
+    const uint64_t footerPos = psPos - footerLength;
     std::vector<uint8_t> footerBytes;
     const wchar_t* codecNames[] = { L"NONE", L"ZLIB", L"SNAPPY", L"LZO", L"LZ4", L"ZSTD" };
     std::wstring codecStr = (compression < 6) ? codecNames[compression] : L"CODEC";
 
-    bool footerDecoded = DecompressOrcStream(raw.data() + footerPos, static_cast<size_t>(footerLength), compression, footerBytes);
+    const uint8_t* footerRaw = footerLength <= (64u << 20) ? src.Read(footerPos, static_cast<size_t>(footerLength), footerBuf) : nullptr;
+    bool footerDecoded = footerRaw && DecompressOrcStream(footerRaw, static_cast<size_t>(footerLength), compression, footerBytes);
 
     uint64_t numberOfRows = 0;
     struct OrcTypeNode {
@@ -2749,6 +2595,7 @@ inline bool ParseApacheOrc(const std::vector<uint8_t>& raw, ParsedOfficeDocument
         FinalizeSheetCols(stSh);
         out.sheets.push_back(std::move(stSh));
     }
+    if (footerDecoded) out.sourceReadFully = true; // schema, stripes and statistics all come from the footer
     out.valid = true;
     return true;
 }
@@ -3510,7 +3357,7 @@ inline bool ParseHdf5Doc(const std::vector<uint8_t>& raw, const std::wstring& ex
     overview.rows.push_back({ L"Object Path", L"Type", L"Shape", L"Storage / Preview" });
     overview.rows.push_back({ L"(superblock)", L"HDF5 v" + std::to_wstring(sbVer),
         L"off=" + std::to_wstring(ctx.offSize) + L"B, len=" + std::to_wstring(ctx.lenSize) + L"B",
-        PathUtils::FormatByteSize(raw.size()) });
+        PathUtils::FormatByteSize(std::max<uint64_t>(out.sourceFileSize, raw.size())) });
 
     std::vector<SpreadsheetSheet> dsSheets;
     std::vector<double> ncLatVals, ncLonVals;
@@ -4456,6 +4303,12 @@ inline bool ParseStataDta(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
         if (findTagSpan("<data>", "</data>", s, l)) {
             dataStart = s;
             dataEnd = s + l;
+        } else {
+            // The bytes handed in end inside the observations (a file past 32 MB): the rows they hold are previewed;
+            // without a <data> tag there are none
+            const size_t d = sv.find("<data>");
+            dataStart = (d == std::string_view::npos) ? 0 : d + 6;
+            dataEnd = (d == std::string_view::npos) ? 0 : raw.size();
         }
     } else if (raw.size() >= 118 && (raw[0] == 113 || raw[0] == 114 || raw[0] == 115) &&
                (raw[1] == 1 || raw[1] == 2) && (raw[2] == 1 || raw[2] == 2))

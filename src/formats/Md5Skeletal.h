@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // Md5Skeletal.h — id Tech 4 (Doom 3 / Quake 4 / Prey) Skeletal Mesh (.md5mesh) & Animation (.md5anim)
 
 namespace Formats {
@@ -24,26 +25,9 @@ inline Quat4f QuatNormalize(const Quat4f& q) {
     return { 0.0f, 0.0f, 0.0f, -1.0f };
 }
 
-inline Quat4f QuatMul(const Quat4f& a, const Quat4f& b) {
-    return {
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
-    };
-}
+using MeshBuild3D::QuatMul;
 
-inline Vec3f QuatRotate(const Quat4f& q, const Vec3f& v) {
-    // Standard Hamilton rotation q * (0, v) * conj(q)
-    float tx = 2.0f * (q.y * v.z - q.z * v.y);
-    float ty = 2.0f * (q.z * v.x - q.x * v.z);
-    float tz = 2.0f * (q.x * v.y - q.y * v.x);
-    return {
-        v.x + q.w * tx + (q.y * tz - q.z * ty),
-        v.y + q.w * ty + (q.z * tx - q.x * tz),
-        v.z + q.w * tz + (q.x * ty - q.y * tx)
-    };
-}
+using MeshBuild3D::QuatRotate;
 
 // Convert id Tech Z-up right-handed coords to Explorer2 Y-up viewport
 inline Vec3f IdTechToViewport(const Vec3f& p) {

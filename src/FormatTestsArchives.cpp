@@ -1,5 +1,7 @@
 // FormatTestsArchives.cpp: self-tests of the archive readers (ArchiveExplorer, ZipDeflate, formats/), stage 15 ("15.archives" runs these alone)
+#include "Crc32.h"
 #include "SelfTestCommon.h"
+#include "TestBytes.h"
 #include "ArchiveExplorer.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
@@ -41,70 +43,9 @@ void RemoveDirTreeForStage15(const std::wstring& dir) {
     RemoveDirectoryW(ext.c_str());
 }
 
-inline void PushU16LE(std::vector<uint8_t>& b, uint16_t v) {
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-}
-inline void PushU32LE(std::vector<uint8_t>& b, uint32_t v) {
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
-}
-inline void PushU64LE(std::vector<uint8_t>& b, uint64_t v) {
-    PushU32LE(b, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
-    PushU32LE(b, static_cast<uint32_t>(v >> 32));
-}
-inline void PushU16BE(std::vector<uint8_t>& b, uint16_t v) {
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-}
-inline void PushU32BE(std::vector<uint8_t>& b, uint32_t v) {
-    b.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-}
-inline void PushU64BE(std::vector<uint8_t>& b, uint64_t v) {
-    PushU32BE(b, static_cast<uint32_t>(v >> 32));
-    PushU32BE(b, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
-}
+using namespace ::Explorer2::TestBytes; // byte writers (TestBytes.h)
 
-inline void PutU16LE(uint8_t* p, uint16_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-}
-inline void PutU32LE(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    p[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-    p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-}
-inline void PutU64LE(uint8_t* p, uint64_t v) {
-    PutU32LE(p, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
-    PutU32LE(p + 4, static_cast<uint32_t>(v >> 32));
-}
-inline void PutU32BE(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-    p[2] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    p[3] = static_cast<uint8_t>(v & 0xFFu);
-}
-inline void PutU64BE(uint8_t* p, uint64_t v) {
-    PutU32BE(p, static_cast<uint32_t>(v >> 32));
-    PutU32BE(p + 4, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
-}
 
-uint32_t CalcCrc32(const uint8_t* data, size_t len) {
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        c ^= data[i];
-        for (int k = 0; k < 8; ++k) {
-            c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
-        }
-    }
-    return ~c;
-}
 
 uint32_t CalcAdler32(const uint8_t* data, size_t len) {
     uint32_t s1 = 1u, s2 = 0u;
@@ -232,7 +173,7 @@ std::vector<uint8_t> CompressZlib(const uint8_t* data, size_t len) {
     std::vector<uint8_t> z = { 0x78u, 0x9Cu };
     auto def = CompressDeflateFixed(data, len);
     z.insert(z.end(), def.begin(), def.end());
-    PushU32BE(z, CalcAdler32(data, len));
+    AppendU32BE(z, CalcAdler32(data, len));
     return z;
 }
 
@@ -240,8 +181,8 @@ std::vector<uint8_t> CompressGzip(const uint8_t* data, size_t len) {
     std::vector<uint8_t> gz = { 0x1Fu, 0x8Bu, 0x08u, 0x00u, 0,0,0,0, 0x00u, 0x03u };
     auto def = CompressDeflateFixed(data, len);
     gz.insert(gz.end(), def.begin(), def.end());
-    PushU32LE(gz, CalcCrc32(data, len));
-    PushU32LE(gz, static_cast<uint32_t>(len));
+    AppendU32LE(gz, Checksum::Crc32(data, len));
+    AppendU32LE(gz, static_cast<uint32_t>(len));
     return gz;
 }
 
@@ -551,7 +492,7 @@ std::vector<uint8_t> BuildXzStream(const uint8_t* rawData, size_t rawLen, bool u
     auto lzma2 = EncodeTestLzma2(filtered.data(), filtered.size());
 
     std::vector<uint8_t> xz = { 0xFD, '7', 'z', 'X', 'Z', 0x00, 0x00, 0x01 }; // CRC32 check (4 bytes)
-    PushU32LE(xz, CalcCrc32(xz.data() + 6, 2));
+    AppendU32LE(xz, Checksum::Crc32(xz.data() + 6, 2));
 
     // Block Header
     std::vector<uint8_t> blkHdr = { 0x00, static_cast<uint8_t>(useBcjX86 ? 0x01u : 0x00u) };
@@ -564,14 +505,14 @@ std::vector<uint8_t> BuildXzStream(const uint8_t* rawData, size_t rawLen, bool u
     blkHdr.push_back(0x14u); // dictProp = 20 (1 MB dictionary)
     while ((blkHdr.size() + 4) % 4 != 0) blkHdr.push_back(0x00u);
     blkHdr[0] = static_cast<uint8_t>(((blkHdr.size() + 4) / 4) - 1);
-    uint32_t blkHdrCrc = CalcCrc32(blkHdr.data(), blkHdr.size());
-    PushU32LE(blkHdr, blkHdrCrc);
+    uint32_t blkHdrCrc = Checksum::Crc32(blkHdr.data(), blkHdr.size());
+    AppendU32LE(blkHdr, blkHdrCrc);
 
     size_t unpaddedBlockSize = blkHdr.size() + lzma2.size() + 4; // +4 for CRC32 check
     xz.insert(xz.end(), blkHdr.begin(), blkHdr.end());
     xz.insert(xz.end(), lzma2.begin(), lzma2.end());
     while (xz.size() % 4 != 0) xz.push_back(0x00u);
-    PushU32LE(xz, CalcCrc32(rawData, rawLen)); // Block Check (CRC32)
+    AppendU32LE(xz, Checksum::Crc32(rawData, rawLen)); // Block Check (CRC32)
 
     // Index
     std::vector<uint8_t> index = { 0x00u };
@@ -579,8 +520,8 @@ std::vector<uint8_t> BuildXzStream(const uint8_t* rawData, size_t rawLen, bool u
     PushXzVli(index, unpaddedBlockSize);
     PushXzVli(index, rawLen);
     while (index.size() % 4 != 0) index.push_back(0x00u);
-    uint32_t idxCrc = CalcCrc32(index.data(), index.size());
-    PushU32LE(index, idxCrc);
+    uint32_t idxCrc = Checksum::Crc32(index.data(), index.size());
+    AppendU32LE(index, idxCrc);
     xz.insert(xz.end(), index.begin(), index.end());
 
     // Stream Footer: CRC32(BackwardSize + StreamFlags) + BackwardSize(u32) + Flags(0x00, 0x01) + "YZ"
@@ -589,7 +530,7 @@ std::vector<uint8_t> BuildXzStream(const uint8_t* rawData, size_t rawLen, bool u
     PutU32LE(footerBody, backwardVal);
     footerBody[4] = 0x00u;
     footerBody[5] = 0x01u;
-    PushU32LE(xz, CalcCrc32(footerBody, 6));
+    AppendU32LE(xz, Checksum::Crc32(footerBody, 6));
     xz.insert(xz.end(), footerBody, footerBody + 6);
     xz.push_back('Y');
     xz.push_back('Z');
@@ -605,7 +546,7 @@ void Push7zNum(std::vector<uint8_t>& b, uint64_t val) {
     while (extra < 8 && val >= (1ULL << ((extra + 1) * 7))) ++extra;
     if (extra >= 8) {
         b.push_back(0xFFu);
-        PushU64LE(b, val);
+        AppendU64LE(b, val);
         return;
     }
     uint8_t first = static_cast<uint8_t>(0xFFu << (8 - extra));
@@ -688,8 +629,8 @@ std::vector<uint8_t> Build7zWithEncodedHeader(
     Push7zNum(kHdr, files.size());
     std::vector<uint8_t> namesProp = { 0x00u }; // external = 0
     for (const auto& kv : files) {
-        for (wchar_t wc : kv.first) PushU16LE(namesProp, static_cast<uint16_t>(wc));
-        PushU16LE(namesProp, 0);
+        for (wchar_t wc : kv.first) AppendU16LE(namesProp, static_cast<uint16_t>(wc));
+        AppendU16LE(namesProp, 0);
     }
     kHdr.push_back(0x11u); // kName
     Push7zNum(kHdr, namesProp.size());
@@ -717,7 +658,7 @@ std::vector<uint8_t> Build7zWithEncodedHeader(
     encHdr.insert(encHdr.end(), { 0x03u, 0x01u, 0x01u });
     Push7zNum(encHdr, 5);    // 5-byte LZMA1 props (propsByte=0x5D + u32 dictSize=65536)
     encHdr.push_back(0x5Du);
-    PushU32LE(encHdr, 65536u);
+    AppendU32LE(encHdr, 65536u);
     encHdr.push_back(0x0Cu); // kCodersUnPackSize
     Push7zNum(encHdr, kHdr.size());
     encHdr.push_back(0x00u); // kEnd UnPackInfo
@@ -728,8 +669,8 @@ std::vector<uint8_t> Build7zWithEncodedHeader(
     uint8_t startHdr[20] = {};
     PutU64LE(startHdr + 0, mainPacked.size() + packedHdr.size()); // NextHeaderOffset
     PutU64LE(startHdr + 8, encHdr.size());                        // NextHeaderSize
-    PutU32LE(startHdr + 16, CalcCrc32(encHdr.data(), encHdr.size()));
-    PushU32LE(arc, CalcCrc32(startHdr, 20));
+    PutU32LE(startHdr + 16, Checksum::Crc32(encHdr.data(), encHdr.size()));
+    AppendU32LE(arc, Checksum::Crc32(startHdr, 20));
     arc.insert(arc.end(), startHdr, startHdr + 20);
     arc.insert(arc.end(), mainPacked.begin(), mainPacked.end());
     arc.insert(arc.end(), packedHdr.begin(), packedHdr.end());
@@ -937,7 +878,7 @@ std::vector<uint8_t> BuildLz4Frame(const uint8_t* raw, size_t len) {
                 blk.push_back(static_cast<uint8_t>(rem));
             }
             blk.insert(blk.end(), raw + anchor, raw + pos);
-            PushU16LE(blk, static_cast<uint16_t>(bestDist));
+            AppendU16LE(blk, static_cast<uint16_t>(bestDist));
             if (mCode >= 15) {
                 size_t rem = mCode - 15;
                 while (rem >= 255) { blk.push_back(255); rem -= 255; }
@@ -961,14 +902,14 @@ std::vector<uint8_t> BuildLz4Frame(const uint8_t* raw, size_t len) {
     blk.insert(blk.end(), raw + anchor, raw + len);
 
     std::vector<uint8_t> frm;
-    PushU32LE(frm, 0x184D2204u);
+    AppendU32LE(frm, 0x184D2204u);
     frm.push_back(0x68u); // Version 01, B.Indep=1, C.Size=1
     frm.push_back(0x70u); // BD: 4MB max block
-    PushU64LE(frm, len);
+    AppendU64LE(frm, len);
     frm.push_back(0x00u); // HC byte
-    PushU32LE(frm, static_cast<uint32_t>(blk.size()));
+    AppendU32LE(frm, static_cast<uint32_t>(blk.size()));
     frm.insert(frm.end(), blk.begin(), blk.end());
-    PushU32LE(frm, 0u); // EndMark
+    AppendU32LE(frm, 0u); // EndMark
     return frm;
 }
 
@@ -976,9 +917,9 @@ std::vector<uint8_t> BuildLz4Frame(const uint8_t* raw, size_t len) {
 // followed by a final Raw_Block so both Compressed_Block (sequences + offsets) and Raw_Block paths are tested!
 std::vector<uint8_t> BuildZstdCompressedFrame(const uint8_t* raw, size_t len) {
     std::vector<uint8_t> zst;
-    PushU32LE(zst, 0xFD2FB528u);
+    AppendU32LE(zst, 0xFD2FB528u);
     zst.push_back(0xA0u); // fcsFlag=2 (4B content size), singleSegment=1
-    PushU32LE(zst, static_cast<uint32_t>(len));
+    AppendU32LE(zst, static_cast<uint32_t>(len));
 
     // Check if we have a repeating prefix or build a Compressed_Block when len >= 16 and there is a >=4B match,
     // else emit a Compressed_Block with numSeq=0 + Raw_Literals!
@@ -1093,7 +1034,7 @@ std::vector<uint8_t> BuildCabinetMscf(
         PutU16LE(lenHdr + 0, static_cast<uint16_t>(compPayload.size()));
         PutU16LE(lenHdr + 2, static_cast<uint16_t>(chunk));
         uint32_t csum = ComputeCabCsum(lenHdr, 4, ComputeCabCsum(compPayload.data(), compPayload.size(), 0));
-        PushU32LE(cfDataBytes, csum);
+        AppendU32LE(cfDataBytes, csum);
         cfDataBytes.insert(cfDataBytes.end(), lenHdr, lenHdr + 4);
         cfDataBytes.insert(cfDataBytes.end(), compPayload.begin(), compPayload.end());
         ++numBlocks;
@@ -1105,12 +1046,12 @@ std::vector<uint8_t> BuildCabinetMscf(
     std::vector<uint8_t> cfFileBytes;
     uint32_t uoff = 0;
     for (const auto& kv : files) {
-        PushU32LE(cfFileBytes, static_cast<uint32_t>(kv.second.size())); // cbFile
-        PushU32LE(cfFileBytes, uoff);                                    // uoffFolderStart
-        PushU16LE(cfFileBytes, 0);                                       // iFolder = 0
-        PushU16LE(cfFileBytes, 0x596Fu);                                 // date
-        PushU16LE(cfFileBytes, 0x6000u);                                 // time
-        PushU16LE(cfFileBytes, 0x0020u);                                 // attribs
+        AppendU32LE(cfFileBytes, static_cast<uint32_t>(kv.second.size())); // cbFile
+        AppendU32LE(cfFileBytes, uoff);                                    // uoffFolderStart
+        AppendU16LE(cfFileBytes, 0);                                       // iFolder = 0
+        AppendU16LE(cfFileBytes, 0x596Fu);                                 // date
+        AppendU16LE(cfFileBytes, 0x6000u);                                 // time
+        AppendU16LE(cfFileBytes, 0x0020u);                                 // attribs
         for (char c : kv.first) cfFileBytes.push_back(static_cast<uint8_t>(c == '/' ? '\\' : c));
         cfFileBytes.push_back(0);
         uoff += static_cast<uint32_t>(kv.second.size());
@@ -1121,22 +1062,22 @@ std::vector<uint8_t> BuildCabinetMscf(
     uint32_t cbCabinet = coffData + static_cast<uint32_t>(cfDataBytes.size());
 
     std::vector<uint8_t> cab = { 'M', 'S', 'C', 'F', 0, 0, 0, 0 };
-    PushU32LE(cab, cbCabinet);
-    PushU32LE(cab, 0);
-    PushU32LE(cab, coffFiles);
-    PushU32LE(cab, 0);
+    AppendU32LE(cab, cbCabinet);
+    AppendU32LE(cab, 0);
+    AppendU32LE(cab, coffFiles);
+    AppendU32LE(cab, 0);
     cab.push_back(3); // versionMinor
     cab.push_back(1); // versionMajor
-    PushU16LE(cab, 1); // cFolders = 1
-    PushU16LE(cab, static_cast<uint16_t>(files.size()));
-    PushU16LE(cab, 0); // flags
-    PushU16LE(cab, 0x1234u);
-    PushU16LE(cab, 0);
+    AppendU16LE(cab, 1); // cFolders = 1
+    AppendU16LE(cab, static_cast<uint16_t>(files.size()));
+    AppendU16LE(cab, 0); // flags
+    AppendU16LE(cab, 0x1234u);
+    AppendU16LE(cab, 0);
 
     // CFFOLDER
-    PushU32LE(cab, coffData);
-    PushU16LE(cab, numBlocks);
-    PushU16LE(cab, useMszip ? 0x0001u : 0x0000u);
+    AppendU32LE(cab, coffData);
+    AppendU16LE(cab, numBlocks);
+    AppendU16LE(cab, useMszip ? 0x0001u : 0x0000u);
 
     cab.insert(cab.end(), cfFileBytes.begin(), cfFileBytes.end());
     cab.insert(cab.end(), cfDataBytes.begin(), cfDataBytes.end());
@@ -1178,7 +1119,7 @@ std::vector<uint8_t> BuildBethesdaBsaV104(
             block.insert(block.end(), fullEmbedded.begin(), fullEmbedded.end());
         }
         if (compressedByDefault) {
-            PushU32LE(block, static_cast<uint32_t>(kv.second.size()));
+            AppendU32LE(block, static_cast<uint32_t>(kv.second.size()));
             auto z = CompressZlib(reinterpret_cast<const uint8_t*>(kv.second.data()), kv.second.size());
             block.insert(block.end(), z.begin(), z.end());
         } else {
@@ -1189,28 +1130,28 @@ std::vector<uint8_t> BuildBethesdaBsaV104(
     }
 
     std::vector<uint8_t> bsa = { 'B', 'S', 'A', 0 };
-    PushU32LE(bsa, 104u); // version 104
-    PushU32LE(bsa, 36u);  // folderOffset
-    PushU32LE(bsa, archiveFlags);
-    PushU32LE(bsa, 1u);   // folderCount = 1
-    PushU32LE(bsa, static_cast<uint32_t>(files.size()));
-    PushU32LE(bsa, totalFolderNameLen);
-    PushU32LE(bsa, totalFileNameLen);
-    PushU32LE(bsa, 0u);   // fileFlags
+    AppendU32LE(bsa, 104u); // version 104
+    AppendU32LE(bsa, 36u);  // folderOffset
+    AppendU32LE(bsa, archiveFlags);
+    AppendU32LE(bsa, 1u);   // folderCount = 1
+    AppendU32LE(bsa, static_cast<uint32_t>(files.size()));
+    AppendU32LE(bsa, totalFolderNameLen);
+    AppendU32LE(bsa, totalFileNameLen);
+    AppendU32LE(bsa, 0u);   // fileFlags
 
     // Folder record (16 bytes)
-    PushU64LE(bsa, 0x1122334455667788ULL);
-    PushU32LE(bsa, static_cast<uint32_t>(files.size()));
-    PushU32LE(bsa, folderRecordStoredOff);
+    AppendU64LE(bsa, 0x1122334455667788ULL);
+    AppendU32LE(bsa, static_cast<uint32_t>(files.size()));
+    AppendU32LE(bsa, folderRecordStoredOff);
 
     // Folder block
     bsa.push_back(static_cast<uint8_t>(totalFolderNameLen)); // includes trailing NUL
     for (char c : folderName) bsa.push_back(static_cast<uint8_t>(c == '/' ? '\\' : c));
     bsa.push_back(0);
     for (size_t i = 0; i < files.size(); ++i) {
-        PushU64LE(bsa, 0xAAAABBBB00000000ULL + i);
-        PushU32LE(bsa, sizeAndOff[i].first);
-        PushU32LE(bsa, sizeAndOff[i].second);
+        AppendU64LE(bsa, 0xAAAABBBB00000000ULL + i);
+        AppendU32LE(bsa, sizeAndOff[i].first);
+        AppendU32LE(bsa, sizeAndOff[i].second);
     }
 
     bsa.insert(bsa.end(), fileNamesBlob.begin(), fileNamesBlob.end());
@@ -1229,26 +1170,26 @@ std::vector<uint8_t> BuildBethesdaBa2Gnrl(const std::vector<std::pair<std::strin
         uint64_t fOff = dataBase + payloads.size();
         payloads.insert(payloads.end(), z.begin(), z.end());
 
-        PushU32LE(recs, static_cast<uint32_t>(0x1000u + i)); // nameHash
+        AppendU32LE(recs, static_cast<uint32_t>(0x1000u + i)); // nameHash
         recs.insert(recs.end(), { 't', 'x', 't', 0 });       // ext[4]
-        PushU32LE(recs, 0x2000u);                            // dirHash
-        PushU32LE(recs, 0u);                                 // flags
-        PushU64LE(recs, fOff);
-        PushU32LE(recs, static_cast<uint32_t>(z.size()));    // packedSize
-        PushU32LE(recs, static_cast<uint32_t>(kv.second.size())); // unpackedSize
-        PushU32LE(recs, 0xBAADF00Du);
+        AppendU32LE(recs, 0x2000u);                            // dirHash
+        AppendU32LE(recs, 0u);                                 // flags
+        AppendU64LE(recs, fOff);
+        AppendU32LE(recs, static_cast<uint32_t>(z.size()));    // packedSize
+        AppendU32LE(recs, static_cast<uint32_t>(kv.second.size())); // unpackedSize
+        AppendU32LE(recs, 0xBAADF00Du);
     }
 
     uint64_t nameTableOff = dataBase + payloads.size();
     std::vector<uint8_t> ba2 = { 'B', 'T', 'D', 'X' };
-    PushU32LE(ba2, 1u); // version 1
+    AppendU32LE(ba2, 1u); // version 1
     ba2.insert(ba2.end(), { 'G', 'N', 'R', 'L' });
-    PushU32LE(ba2, static_cast<uint32_t>(files.size()));
-    PushU64LE(ba2, nameTableOff);
+    AppendU32LE(ba2, static_cast<uint32_t>(files.size()));
+    AppendU64LE(ba2, nameTableOff);
     ba2.insert(ba2.end(), recs.begin(), recs.end());
     ba2.insert(ba2.end(), payloads.begin(), payloads.end());
     for (const auto& kv : files) {
-        PushU16LE(ba2, static_cast<uint16_t>(kv.first.size()));
+        AppendU16LE(ba2, static_cast<uint16_t>(kv.first.size()));
         ba2.insert(ba2.end(), kv.first.begin(), kv.first.end());
     }
     return ba2;
@@ -1261,34 +1202,34 @@ std::vector<uint8_t> BuildBethesdaBa2Dx10(const std::string& texPath, uint16_t w
     uint64_t nameTableOff = chunkDataOff + zMip.size();
 
     std::vector<uint8_t> ba2 = { 'B', 'T', 'D', 'X' };
-    PushU32LE(ba2, 1u);
+    AppendU32LE(ba2, 1u);
     ba2.insert(ba2.end(), { 'D', 'X', '1', '0' });
-    PushU32LE(ba2, 1u); // 1 texture
-    PushU64LE(ba2, nameTableOff);
+    AppendU32LE(ba2, 1u); // 1 texture
+    AppendU64LE(ba2, nameTableOff);
 
     // 24B Texture header
-    PushU32LE(ba2, 0xABCDE001u);
+    AppendU32LE(ba2, 0xABCDE001u);
     ba2.insert(ba2.end(), { 'd', 'd', 's', 0 });
-    PushU32LE(ba2, 0x12345678u);
+    AppendU32LE(ba2, 0x12345678u);
     ba2.push_back(0u);  // unk
     ba2.push_back(1u);  // numChunks = 1
-    PushU16LE(ba2, 24u);// chunkHdrSize = 24
-    PushU16LE(ba2, h);
-    PushU16LE(ba2, w);
+    AppendU16LE(ba2, 24u);// chunkHdrSize = 24
+    AppendU16LE(ba2, h);
+    AppendU16LE(ba2, w);
     ba2.push_back(1u);  // numMips = 1
     ba2.push_back(28u); // DXGI_FORMAT_R8G8B8A8_UNORM = 28
-    PushU16LE(ba2, 8u); // tileMode
+    AppendU16LE(ba2, 8u); // tileMode
 
     // 24B Chunk record
-    PushU64LE(ba2, chunkDataOff);
-    PushU32LE(ba2, static_cast<uint32_t>(zMip.size()));
-    PushU32LE(ba2, static_cast<uint32_t>(mipPixels.size()));
-    PushU16LE(ba2, 0u); // startMip
-    PushU16LE(ba2, 0u); // endMip
-    PushU32LE(ba2, 0xBAADF00Du);
+    AppendU64LE(ba2, chunkDataOff);
+    AppendU32LE(ba2, static_cast<uint32_t>(zMip.size()));
+    AppendU32LE(ba2, static_cast<uint32_t>(mipPixels.size()));
+    AppendU16LE(ba2, 0u); // startMip
+    AppendU16LE(ba2, 0u); // endMip
+    AppendU32LE(ba2, 0xBAADF00Du);
 
     ba2.insert(ba2.end(), zMip.begin(), zMip.end());
-    PushU16LE(ba2, static_cast<uint16_t>(texPath.size()));
+    AppendU16LE(ba2, static_cast<uint16_t>(texPath.size()));
     ba2.insert(ba2.end(), texPath.begin(), texPath.end());
     return ba2;
 }
@@ -1332,9 +1273,9 @@ std::vector<uint8_t> BuildRedHatRpm(
 
     // Signature Header (1 dummy tag so size is non-8B-aligned 5 bytes -> tests 8-byte alignment padding!)
     std::vector<uint8_t> sigHdr = { 0x8Eu, 0xADu, 0xE8u, 0x01u, 0,0,0,0 };
-    PushU32BE(sigHdr, 1u); // nindex = 1
-    PushU32BE(sigHdr, 5u); // hsize = 5 (requires 3 padding bytes to 8-byte boundary!)
-    PushU32BE(sigHdr, 1000u); PushU32BE(sigHdr, 7u); PushU32BE(sigHdr, 0u); PushU32BE(sigHdr, 5u);
+    AppendU32BE(sigHdr, 1u); // nindex = 1
+    AppendU32BE(sigHdr, 5u); // hsize = 5 (requires 3 padding bytes to 8-byte boundary!)
+    AppendU32BE(sigHdr, 1000u); AppendU32BE(sigHdr, 7u); AppendU32BE(sigHdr, 0u); AppendU32BE(sigHdr, 5u);
     sigHdr.insert(sigHdr.end(), { 1, 2, 3, 4, 5 });
     while (sigHdr.size() % 8 != 0) sigHdr.push_back(0); // Pad signature header to 8B boundary!
     rpm.insert(rpm.end(), sigHdr.begin(), sigHdr.end());
@@ -1372,17 +1313,17 @@ std::vector<uint8_t> BuildRedHatRpm(
     // 1097 = FILESIZES (INT32 = 4)
     alignStore(4);
     idxList.push_back({ 1028u, 4u, static_cast<uint32_t>(store.size()), static_cast<uint32_t>(fileSizes.size()) });
-    for (uint32_t sz : fileSizes) PushU32BE(store, sz);
+    for (uint32_t sz : fileSizes) AppendU32BE(store, sz);
 
     // 1030 = FILEMODES (INT16 = 3)
     alignStore(2);
     idxList.push_back({ 1030u, 3u, static_cast<uint32_t>(store.size()), static_cast<uint32_t>(fileModes.size()) });
-    for (uint16_t m : fileModes) PushU16BE(store, m);
+    for (uint16_t m : fileModes) AppendU16BE(store, m);
 
     // 1116 = DIRINDEXES (INT32 = 4)
     alignStore(4);
     idxList.push_back({ 1116u, 4u, static_cast<uint32_t>(store.size()), static_cast<uint32_t>(dirIndexes.size()) });
-    for (uint32_t di : dirIndexes) PushU32BE(store, di);
+    for (uint32_t di : dirIndexes) AppendU32BE(store, di);
 
     // 1117 = BASENAMES (STRING_ARRAY = 8)
     idxList.push_back({ 1117u, 8u, static_cast<uint32_t>(store.size()), static_cast<uint32_t>(baseNames.size()) });
@@ -1399,13 +1340,13 @@ std::vector<uint8_t> BuildRedHatRpm(
     store.push_back(0);
 
     std::vector<uint8_t> metaHdr = { 0x8Eu, 0xADu, 0xE8u, 0x01u, 0,0,0,0 };
-    PushU32BE(metaHdr, static_cast<uint32_t>(idxList.size()));
-    PushU32BE(metaHdr, static_cast<uint32_t>(store.size()));
+    AppendU32BE(metaHdr, static_cast<uint32_t>(idxList.size()));
+    AppendU32BE(metaHdr, static_cast<uint32_t>(store.size()));
     for (const auto& ix : idxList) {
-        PushU32BE(metaHdr, ix.tag);
-        PushU32BE(metaHdr, ix.type);
-        PushU32BE(metaHdr, ix.off);
-        PushU32BE(metaHdr, ix.count);
+        AppendU32BE(metaHdr, ix.tag);
+        AppendU32BE(metaHdr, ix.type);
+        AppendU32BE(metaHdr, ix.off);
+        AppendU32BE(metaHdr, ix.count);
     }
     metaHdr.insert(metaHdr.end(), store.begin(), store.end());
     rpm.insert(rpm.end(), metaHdr.begin(), metaHdr.end());
@@ -1857,7 +1798,7 @@ std::vector<uint8_t> BuildWindowsWim(const std::wstring& imageName, const std::w
     std::wstring xmlStr = L"\xFEFF<WIM><IMAGE INDEX=\"1\"><NAME>" + imageName + L"</NAME></IMAGE></WIM>";
     uint64_t xmlOff = wim.size();
     size_t xmlBytes = xmlStr.size() * 2;
-    for (wchar_t wc : xmlStr) PushU16LE(wim, static_cast<uint16_t>(wc));
+    for (wchar_t wc : xmlStr) AppendU16LE(wim, static_cast<uint16_t>(wc));
 
     writeResHdr(wim.data() + 48, lut.size(), 0x02u, lutOff, lut.size()); // rhOffsetTable @ 48
     writeResHdr(wim.data() + 72, xmlBytes,   0x02u, xmlOff, xmlBytes);   // rhXmlData @ 72
@@ -1891,7 +1832,7 @@ std::vector<uint8_t> EncodeRawLz4Block(const uint8_t* raw, size_t len) {
                 blk.push_back(static_cast<uint8_t>(rem));
             }
             blk.insert(blk.end(), raw + anchor, raw + pos);
-            PushU16LE(blk, static_cast<uint16_t>(bestDist));
+            AppendU16LE(blk, static_cast<uint16_t>(bestDist));
             if (mCode >= 15) {
                 size_t rem = mCode - 15;
                 while (rem >= 255) { blk.push_back(255); rem -= 255; }
@@ -1935,18 +1876,18 @@ std::vector<uint8_t> BuildUnityFsBundle(
     }
 
     std::vector<uint8_t> infoRaw(16, 0); // 16-byte uncompressedDataHash
-    PushU32BE(infoRaw, static_cast<uint32_t>(blks.size()));
+    AppendU32BE(infoRaw, static_cast<uint32_t>(blks.size()));
     for (const auto& b : blks) {
-        PushU32BE(infoRaw, b.uSz);
-        PushU32BE(infoRaw, b.cSz);
-        PushU16BE(infoRaw, b.flags);
+        AppendU32BE(infoRaw, b.uSz);
+        AppendU32BE(infoRaw, b.cSz);
+        AppendU16BE(infoRaw, b.flags);
     }
-    PushU32BE(infoRaw, static_cast<uint32_t>(files.size()));
+    AppendU32BE(infoRaw, static_cast<uint32_t>(files.size()));
     uint64_t nOff = 0;
     for (const auto& kv : files) {
-        PushU64BE(infoRaw, nOff);
-        PushU64BE(infoRaw, kv.second.size());
-        PushU32BE(infoRaw, 0x00000004u);
+        AppendU64BE(infoRaw, nOff);
+        AppendU64BE(infoRaw, kv.second.size());
+        AppendU32BE(infoRaw, 0x00000004u);
         infoRaw.insert(infoRaw.end(), kv.first.begin(), kv.first.end());
         infoRaw.push_back(0);
         nOff += kv.second.size();
@@ -1955,18 +1896,18 @@ std::vector<uint8_t> BuildUnityFsBundle(
     auto infoComp = EncodeRawLz4Block(infoRaw.data(), infoRaw.size());
 
     std::vector<uint8_t> out = { 'U','n','i','t','y','F','S', 0 };
-    PushU32BE(out, fmtVer);
+    AppendU32BE(out, fmtVer);
     const char* pVer = "5.x.x";
     out.insert(out.end(), pVer, pVer + 6);
     out.insert(out.end(), engineVer.begin(), engineVer.end());
     out.push_back(0);
 
     size_t bundleSzPos = out.size();
-    PushU64BE(out, 0ULL); // patched below
-    PushU32BE(out, static_cast<uint32_t>(infoComp.size()));
-    PushU32BE(out, static_cast<uint32_t>(infoRaw.size()));
+    AppendU64BE(out, 0ULL); // patched below
+    AppendU32BE(out, static_cast<uint32_t>(infoComp.size()));
+    AppendU32BE(out, static_cast<uint32_t>(infoRaw.size()));
     uint32_t flags = 0x00000043u | ((fmtVer >= 7) ? 0x00000200u : 0u); // LZ4HC blocksInfo + combined dir
-    PushU32BE(out, flags);
+    AppendU32BE(out, flags);
 
     if (fmtVer >= 7) {
         while ((out.size() & 15u) != 0) out.push_back(0);
@@ -2134,7 +2075,7 @@ std::vector<uint8_t> BuildRpgMakerRgss3a(const std::vector<std::pair<std::string
     const uint32_t rawSeed = 0x13572468u;
     const uint32_t masterKey = rawSeed * 9u + 3u;
     std::vector<uint8_t> out = { 'R','G','S','S','A','D', 0, 3 };
-    PushU32LE(out, rawSeed);
+    AppendU32LE(out, rawSeed);
 
     // Compute exact TOC byte size: each entry is 16 + nameLen, followed by 16-byte sentinel (fOff == 0)
     size_t tocEnd = 12 + 16;
@@ -2148,10 +2089,10 @@ std::vector<uint8_t> BuildRpgMakerRgss3a(const std::vector<std::pair<std::string
         uint32_t subKey = 0xA5A50001u + static_cast<uint32_t>(idx) * 0x11111111u;
         uint32_t nLen   = static_cast<uint32_t>(kv.first.size());
 
-        PushU32LE(out, fOff   ^ masterKey);
-        PushU32LE(out, fSize  ^ masterKey);
-        PushU32LE(out, subKey ^ masterKey);
-        PushU32LE(out, nLen   ^ masterKey);
+        AppendU32LE(out, fOff   ^ masterKey);
+        AppendU32LE(out, fSize  ^ masterKey);
+        AppendU32LE(out, subKey ^ masterKey);
+        AppendU32LE(out, nLen   ^ masterKey);
         for (uint32_t i = 0; i < nLen; ++i) {
             out.push_back(static_cast<uint8_t>(kv.first[i] ^ ((masterKey >> (8u * (i & 3u))) & 0xFFu)));
         }
@@ -2163,10 +2104,10 @@ std::vector<uint8_t> BuildRpgMakerRgss3a(const std::vector<std::pair<std::string
         }
     }
     // End-of-TOC sentinel (fOff == 0 => encrypted = 0 ^ masterKey)
-    PushU32LE(out, 0u ^ masterKey);
-    PushU32LE(out, 0u ^ masterKey);
-    PushU32LE(out, 0u ^ masterKey);
-    PushU32LE(out, 0u ^ masterKey);
+    AppendU32LE(out, 0u ^ masterKey);
+    AppendU32LE(out, 0u ^ masterKey);
+    AppendU32LE(out, 0u ^ masterKey);
+    AppendU32LE(out, 0u ^ masterKey);
     out.insert(out.end(), payloads.begin(), payloads.end());
     return out;
 }
@@ -2176,14 +2117,14 @@ std::vector<uint8_t> BuildRpgMakerRgssV1(const std::vector<std::pair<std::string
     uint32_t key = 0xDEADCAFEu;
     for (const auto& kv : files) {
         uint32_t nLen = static_cast<uint32_t>(kv.first.size());
-        PushU32LE(out, nLen ^ key);
+        AppendU32LE(out, nLen ^ key);
         key = key * 7u + 3u;
         for (uint32_t i = 0; i < nLen; ++i) {
             out.push_back(static_cast<uint8_t>(static_cast<uint8_t>(kv.first[i]) ^ (key & 0xFFu)));
             key = key * 7u + 3u;
         }
         uint32_t fSize = static_cast<uint32_t>(kv.second.size());
-        PushU32LE(out, fSize ^ key);
+        AppendU32LE(out, fSize ^ key);
         key = key * 7u + 3u;
 
         uint32_t curKey = key;
@@ -2203,15 +2144,15 @@ std::vector<uint8_t> BuildSquashFs4ZlibImage(const std::string& readmeBody, cons
 
     auto buildDirBlob = [](uint32_t baseIno, const std::vector<std::tuple<uint16_t, int16_t, uint16_t, std::string>>& ents) {
         std::vector<uint8_t> d;
-        PushU32LE(d, static_cast<uint32_t>(ents.size() - 1u));
-        PushU32LE(d, 0u); // start_block = 0
-        PushU32LE(d, baseIno);
+        AppendU32LE(d, static_cast<uint32_t>(ents.size() - 1u));
+        AppendU32LE(d, 0u); // start_block = 0
+        AppendU32LE(d, baseIno);
         for (const auto& t : ents) {
-            PushU16LE(d, std::get<0>(t)); // inode inner offset
-            PushU16LE(d, static_cast<uint16_t>(std::get<1>(t)));
-            PushU16LE(d, std::get<2>(t)); // type (1=dir, 2=reg)
+            AppendU16LE(d, std::get<0>(t)); // inode inner offset
+            AppendU16LE(d, static_cast<uint16_t>(std::get<1>(t)));
+            AppendU16LE(d, std::get<2>(t)); // type (1=dir, 2=reg)
             const std::string& nm = std::get<3>(t);
-            PushU16LE(d, static_cast<uint16_t>(nm.size() - 1u));
+            AppendU16LE(d, static_cast<uint16_t>(nm.size() - 1u));
             d.insert(d.end(), nm.begin(), nm.end());
         }
         return d;
@@ -2264,11 +2205,11 @@ std::vector<uint8_t> BuildSquashFs4ZlibImage(const std::string& readmeBody, cons
     img.insert(img.end(), zFile2.begin(), zFile2.end());
 
     uint64_t inodeTblStart = img.size();
-    PushU16LE(img, static_cast<uint16_t>(zInodeMeta.size() & 0x7FFFu));
+    AppendU16LE(img, static_cast<uint16_t>(zInodeMeta.size() & 0x7FFFu));
     img.insert(img.end(), zInodeMeta.begin(), zInodeMeta.end());
 
     uint64_t dirTblStart = img.size();
-    PushU16LE(img, static_cast<uint16_t>(zDirMeta.size() & 0x7FFFu));
+    AppendU16LE(img, static_cast<uint16_t>(zDirMeta.size() & 0x7FFFu));
     img.insert(img.end(), zDirMeta.begin(), zDirMeta.end());
 
     std::memcpy(img.data() + 0, "hsqs", 4);
@@ -2357,10 +2298,6 @@ std::vector<uint8_t> BuildErofsTestImage(const std::string& bootPlain, const std
 //     .asar (Nested Recursive JSON + .asar.unpacked),
 //     .big (EA BIGF + RefPack 0x10FB Compressed Stream)
 // ============================================================================
-inline void PutU16BE(uint8_t* p, uint16_t v) {
-    p[0] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    p[1] = static_cast<uint8_t>(v & 0xFFu);
-}
 
 std::string EncodeBase64ForDmg(const uint8_t* src, size_t len) {
     static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -2905,7 +2842,7 @@ std::vector<uint8_t> CompressXpressHuffmanChunkForTest(const uint8_t* raw, size_
                     out.push_back(static_cast<uint8_t>(rem));
                 } else {
                     out.push_back(255u);
-                    PushU16LE(out, static_cast<uint16_t>(t.matchLenMinus3));
+                    AppendU16LE(out, static_cast<uint16_t>(t.matchLenMinus3));
                 }
             }
             emitBits(t.lowOff, t.offsetBits);
@@ -2932,7 +2869,7 @@ std::vector<uint8_t> CompressWimResourceXpress(const uint8_t* raw, size_t origLe
     uint32_t runningOff = 0;
     for (size_t c = 0; c + 1 < numChunks; ++c) {
         runningOff += static_cast<uint32_t>(chunks[c].size());
-        PushU32LE(res, runningOff); // (numChunks - 1) u32 chunk end/start offsets
+        AppendU32LE(res, runningOff); // (numChunks - 1) u32 chunk end/start offsets
     }
     for (const auto& ch : chunks) {
         res.insert(res.end(), ch.begin(), ch.end());
@@ -3019,7 +2956,7 @@ std::vector<uint8_t> BuildXpressWindowsWim(
     // 4. UTF-16LE XML Manifest
     std::wstring xmlStr = L"\xFEFF<WIM><IMAGE INDEX=\"1\"><NAME>" + imageName + L"</NAME></IMAGE></WIM>";
     uint64_t xmlOff = wim.size();
-    for (wchar_t wc : xmlStr) PushU16LE(wim, static_cast<uint16_t>(wc));
+    for (wchar_t wc : xmlStr) AppendU16LE(wim, static_cast<uint16_t>(wc));
     size_t xmlBytes = xmlStr.size() * 2;
 
     writeResHdr(wim.data() + 48, lut.size(), 0x02u, lutOff, lut.size());
@@ -3049,12 +2986,12 @@ void BuildMultiChunkValveVpk(
         tree.insert(tree.end(), s, s + std::strlen(s) + 1);
     };
     auto pushVpkEntry = [&](uint32_t crc, uint16_t preloadSz, uint16_t arcIdx, uint32_t eOff, uint32_t eLen, const uint8_t* preloadBytes) {
-        PushU32LE(tree, crc);
-        PushU16LE(tree, preloadSz);
-        PushU16LE(tree, arcIdx);
-        PushU32LE(tree, eOff);
-        PushU32LE(tree, eLen);
-        PushU16LE(tree, 0xFFFFu);
+        AppendU32LE(tree, crc);
+        AppendU16LE(tree, preloadSz);
+        AppendU16LE(tree, arcIdx);
+        AppendU32LE(tree, eOff);
+        AppendU32LE(tree, eLen);
+        AppendU16LE(tree, 0xFFFFu);
         if (preloadSz > 0) tree.insert(tree.end(), preloadBytes, preloadBytes + preloadSz);
     };
 
@@ -3063,7 +3000,7 @@ void BuildMultiChunkValveVpk(
     pushCStr("materials/brick");
     pushCStr("wall01");
     pushVpkEntry(
-        CalcCrc32(reinterpret_cast<const uint8_t*>(inlineVmt.data()), inlineVmt.size()),
+        Checksum::Crc32(reinterpret_cast<const uint8_t*>(inlineVmt.data()), inlineVmt.size()),
         static_cast<uint16_t>(preloadVmt), 0x7FFFu, 0u, inlineTailLen,
         reinterpret_cast<const uint8_t*>(inlineVmt.data()));
     pushCStr(""); // end files
@@ -3074,7 +3011,7 @@ void BuildMultiChunkValveVpk(
     pushCStr("models/props");
     pushCStr("crate01");
     pushVpkEntry(
-        CalcCrc32(reinterpret_cast<const uint8_t*>(chunkedMdl.data()), chunkedMdl.size()),
+        Checksum::Crc32(reinterpret_cast<const uint8_t*>(chunkedMdl.data()), chunkedMdl.size()),
         static_cast<uint16_t>(preloadMdl), 0u, chunkEntryOff, chunkEntryLen,
         reinterpret_cast<const uint8_t*>(chunkedMdl.data()));
     pushCStr(""); // end files
@@ -3083,13 +3020,13 @@ void BuildMultiChunkValveVpk(
 
     // VPK v2 28-byte header
     outDirVpk.clear();
-    PushU32LE(outDirVpk, 0x55AA1234u);
-    PushU32LE(outDirVpk, 2u); // version 2
-    PushU32LE(outDirVpk, static_cast<uint32_t>(tree.size()));
-    PushU32LE(outDirVpk, inlineTailLen); // FileDataSectionSize
-    PushU32LE(outDirVpk, 0u);
-    PushU32LE(outDirVpk, 0u);
-    PushU32LE(outDirVpk, 0u);
+    AppendU32LE(outDirVpk, 0x55AA1234u);
+    AppendU32LE(outDirVpk, 2u); // version 2
+    AppendU32LE(outDirVpk, static_cast<uint32_t>(tree.size()));
+    AppendU32LE(outDirVpk, inlineTailLen); // FileDataSectionSize
+    AppendU32LE(outDirVpk, 0u);
+    AppendU32LE(outDirVpk, 0u);
+    AppendU32LE(outDirVpk, 0u);
     outDirVpk.insert(outDirVpk.end(), tree.begin(), tree.end());
     outDirVpk.insert(outDirVpk.end(), inlineVmt.begin() + preloadVmt, inlineVmt.end());
 }
@@ -3101,10 +3038,10 @@ std::vector<uint8_t> BuildElectronAsarArchive(const std::string& jsonStr, const 
     uint32_t headerSz  = 4u + pickleSz; // payloadBase = 8 + headerSz = 16 + alignedJs
 
     std::vector<uint8_t> asar;
-    PushU32LE(asar, 4u);
-    PushU32LE(asar, headerSz);
-    PushU32LE(asar, pickleSz);
-    PushU32LE(asar, jsonLen);
+    AppendU32LE(asar, 4u);
+    AppendU32LE(asar, headerSz);
+    AppendU32LE(asar, pickleSz);
+    AppendU32LE(asar, jsonLen);
     asar.insert(asar.end(), jsonStr.begin(), jsonStr.end());
     while ((asar.size() % 4u) != 0) asar.push_back(0);
     asar.insert(asar.end(), concatPayload.begin(), concatPayload.end());
@@ -3183,14 +3120,14 @@ std::vector<uint8_t> BuildEaBigTestArchive(
     const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries)
 {
     std::vector<uint8_t> hdr = { 'B','I','G','F', 0,0,0,0 };
-    PushU32BE(hdr, static_cast<uint32_t>(entries.size()));
-    PushU32BE(hdr, 0u); // patched below
+    AppendU32BE(hdr, static_cast<uint32_t>(entries.size()));
+    AppendU32BE(hdr, 0u); // patched below
 
     std::vector<size_t> patchOffs;
     for (const auto& kv : entries) {
         patchOffs.push_back(hdr.size());
-        PushU32BE(hdr, 0u); // offset patched below
-        PushU32BE(hdr, static_cast<uint32_t>(kv.second.size()));
+        AppendU32BE(hdr, 0u); // offset patched below
+        AppendU32BE(hdr, static_cast<uint32_t>(kv.second.size()));
         hdr.insert(hdr.end(), kv.first.begin(), kv.first.end());
         hdr.push_back(0);
     }

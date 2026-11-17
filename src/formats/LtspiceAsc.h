@@ -649,8 +649,4 @@ inline bool ParseLtspiceBytes(const uint8_t* data, size_t size, const std::wstri
     return ParseLtspiceTextInternal(utf8, fullPath, ext, out);
 }
 
-inline bool ParseLtspiceAsc(std::string_view sv, ParsedEdaBoard& out) {
-    return ParseLtspiceTextInternal(sv, out.filePath, L".asc", out);
-}
-
 } // namespace Formats

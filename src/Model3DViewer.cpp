@@ -1,4 +1,5 @@
 #include "Model3DViewer.h"
+#include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
@@ -24,12 +25,13 @@
 
 namespace Explorer2 {
 
-namespace StreamCodecs {
-    bool DecompressZstdFrame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut);
-    bool DecompressLzma1(uint8_t propsByte, uint32_t dictSize, const uint8_t* src, size_t srcLen,
-                         std::vector<uint8_t>& out, uint64_t uncompressedLen, bool hasKnownSize, size_t maxOut);
-}
-
+#include "formats/Stl.h"
+#include "formats/Obj.h"
+#include "formats/Off.h"
+#include "formats/Md2.h"
+#include "formats/Md3.h"
+#include "formats/Autodesk3ds.h"
+#include "formats/Blender.h"
 #include "formats/Amf.h"
 #include "formats/ThreeMf.h"
 #include "formats/ColladaDae.h"
@@ -89,18 +91,6 @@ static D2D1_COLOR_F M3DColor(uint32_t rgb, float a = 1.0f) {
         ((rgb >> 8) & 0xFF) / 255.0f,
         (rgb & 0xFF) / 255.0f,
         a);
-}
-
-static inline Vec3f VecSub(const Vec3f& a, const Vec3f& b) {
-    return { a.x - b.x, a.y - b.y, a.z - b.z };
-}
-
-static inline Vec3f VecCross(const Vec3f& a, const Vec3f& b) {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
 }
 
 static inline float VecDot(const Vec3f& a, const Vec3f& b) {
@@ -261,45 +251,8 @@ void Model3DViewer::LoadFile(const std::wstring& fullPath, bool forceReload) {
     }).detach();
 }
 
-static void FinalizeMeshBoundsAndNormals(LoadedMesh3D& mesh) {
-    mesh.rawVertexCount = mesh.vertices.size();
-    mesh.rawTriangleCount = mesh.tris.size();
-    if (mesh.vertices.empty() || mesh.tris.empty()) return;
 
-    Vec3f bmin = mesh.vertices[0];
-    Vec3f bmax = mesh.vertices[0];
-    for (const auto& v : mesh.vertices) {
-        bmin.x = std::min(bmin.x, v.x); bmin.y = std::min(bmin.y, v.y); bmin.z = std::min(bmin.z, v.z);
-        bmax.x = std::max(bmax.x, v.x); bmax.y = std::max(bmax.y, v.y); bmax.z = std::max(bmax.z, v.z);
-    }
-    mesh.bboxMin = bmin;
-    mesh.bboxMax = bmax;
-    mesh.bboxSize = VecSub(bmax, bmin);
-
-    Vec3f center = {
-        (bmin.x + bmax.x) * 0.5f,
-        (bmin.y + bmax.y) * 0.5f,
-        (bmin.z + bmax.z) * 0.5f
-    };
-    float maxSpan = std::max({ mesh.bboxSize.x, mesh.bboxSize.y, mesh.bboxSize.z, 1e-5f });
-    float invScale = 2.0f / maxSpan;
-    for (auto& v : mesh.vertices) {
-        v.x = (v.x - center.x) * invScale;
-        v.y = (v.y - center.y) * invScale;
-        v.z = (v.z - center.z) * invScale;
-    }
-
-    // Recompute unit face normals in normalized space
-    size_t vCount = mesh.vertices.size();
-    for (auto& t : mesh.tris) {
-        if (t.i0 < vCount && t.i1 < vCount && t.i2 < vCount) {
-            Vec3f e1 = VecSub(mesh.vertices[t.i1], mesh.vertices[t.i0]);
-            Vec3f e2 = VecSub(mesh.vertices[t.i2], mesh.vertices[t.i0]);
-            t.normal = VecNormalize(VecCross(e1, e2));
-        }
-    }
-    mesh.loadedOk = true;
-}
+using Formats::MeshBuild3D::FinalizeMeshBoundsAndNormals;
 
 LoadedMesh3D Model3DViewer::ParseMeshFromDisk(
     const std::wstring& fullPath,
@@ -339,9 +292,11 @@ try {
         mesh.statusMessage = L"Pusty plik (0 B)";
         return mesh;
     }
+    // Another file was selected while this one was being read: skip the parse (the result would be dropped)
+    if (activeGen && activeGen->load() != generation) return mesh;
 
-    #include "formats/Stl.h"
-    #include "formats/Obj.h"
+    if (Formats::ParseStlFile(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
+    if (Formats::ParseObjFile(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
     if (ext == L".ply") {
         if (Formats::Parse3DGaussianPlyIfPresent(buf.data(), buf.size(), mesh) ||
             Formats::ParsePlyMesh(buf.data(), buf.size(), mesh)) {
@@ -354,11 +309,11 @@ try {
         unreadable.statusMessage = L"Nie udało się odczytać modelu PLY";
         return unreadable;
     }
-    #include "formats/Off.h"
-    #include "formats/Md2.h"
-    #include "formats/Md3.h"
-    #include "formats/Autodesk3ds.h"
-    #include "formats/Blender.h"
+    if (Formats::ParseOffFile(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
+    if (Formats::ParseMd2File(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
+    if (Formats::ParseMd3File(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
+    if (Formats::Parse3dsFile(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
+    if (Formats::ParseBlendFile(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
     if (ext == L".glb" || ext == L".gltf") {
         if (Formats::ParseGltfOrGlbMesh(buf.data(), buf.size(), fullPath, ext, mesh)) {
             FinalizeMeshBoundsAndNormals(mesh);

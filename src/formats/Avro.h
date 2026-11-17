@@ -1,4 +1,5 @@
 #pragma once
+#include "../JsonDom.h"
 // Avro.h — Apache Avro Object Container File (.avro, Obj\x01) Schema & Binary Data Block Decoder
 
 namespace Formats {
@@ -30,148 +31,8 @@ inline bool ReadAvroBytes(const uint8_t* data, size_t size, size_t& pos, std::st
     return true;
 }
 
-// Minimal recursive JSON value parser for avro.schema
-struct JsonNode {
-    enum Kind { Null, Bool, Number, String, Array, Object } kind = Null;
-    bool boolVal = false;
-    int64_t intVal = 0;
-    std::string strVal;
-    std::vector<JsonNode> arr;
-    std::vector<std::pair<std::string, JsonNode>> obj;
+using JsonNode = ::Explorer2::Json::Value; // avro.schema is parsed with the shared JSON reader
 
-    const JsonNode* Find(std::string_view key) const {
-        if (kind != Object) return nullptr;
-        for (const auto& kv : obj) {
-            if (kv.first == key) return &kv.second;
-        }
-        return nullptr;
-    }
-};
-
-class SchemaJsonParser {
-public:
-    std::string_view sv;
-    size_t pos = 0;
-
-    explicit SchemaJsonParser(std::string_view s) : sv(s), pos(0) {}
-
-    void SkipWs() {
-        while (pos < sv.size() && (sv[pos] == ' ' || sv[pos] == '\t' || sv[pos] == '\r' || sv[pos] == '\n')) {
-            ++pos;
-        }
-    }
-
-    bool ParseString(std::string& out) {
-        SkipWs();
-        if (pos >= sv.size() || sv[pos] != '"') return false;
-        ++pos;
-        out.clear();
-        while (pos < sv.size()) {
-            char c = sv[pos++];
-            if (c == '"') return true;
-            if (c == '\\') {
-                if (pos >= sv.size()) return false;
-                char esc = sv[pos++];
-                switch (esc) {
-                    case '"': case '\\': case '/': out.push_back(esc); break;
-                    case 'b': out.push_back('\b'); break;
-                    case 'f': out.push_back('\f'); break;
-                    case 'n': out.push_back('\n'); break;
-                    case 'r': out.push_back('\r'); break;
-                    case 't': out.push_back('\t'); break;
-                    case 'u': {
-                        if (pos + 4 > sv.size()) return false;
-                        uint32_t cp = 0;
-                        for (int i = 0; i < 4; ++i) {
-                            char h = sv[pos++];
-                            cp <<= 4;
-                            if (h >= '0' && h <= '9') cp |= static_cast<uint32_t>(h - '0');
-                            else if (h >= 'a' && h <= 'f') cp |= static_cast<uint32_t>(h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') cp |= static_cast<uint32_t>(h - 'A' + 10);
-                            else return false;
-                        }
-                        if (cp < 0x80) out.push_back(static_cast<char>(cp));
-                        else if (cp < 0x800) {
-                            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-                            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                        } else {
-                            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-                            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-                            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                        }
-                        break;
-                    }
-                    default: out.push_back(esc); break;
-                }
-            } else {
-                out.push_back(c);
-            }
-        }
-        return false;
-    }
-
-    bool ParseValue(JsonNode& out, int depth = 0) {
-        if (depth > 32) return false;
-        SkipWs();
-        if (pos >= sv.size()) return false;
-        char c = sv[pos];
-        if (c == '"') {
-            out.kind = JsonNode::String;
-            return ParseString(out.strVal);
-        }
-        if (c == '{') {
-            ++pos;
-            out.kind = JsonNode::Object;
-            SkipWs();
-            if (pos < sv.size() && sv[pos] == '}') { ++pos; return true; }
-            for (;;) {
-                std::string k;
-                if (!ParseString(k)) return false;
-                SkipWs();
-                if (pos >= sv.size() || sv[pos] != ':') return false;
-                ++pos;
-                JsonNode v;
-                if (!ParseValue(v, depth + 1)) return false;
-                out.obj.push_back({ std::move(k), std::move(v) });
-                SkipWs();
-                if (pos >= sv.size()) return false;
-                if (sv[pos] == '}') { ++pos; return true; }
-                if (sv[pos] != ',') return false;
-                ++pos;
-            }
-        }
-        if (c == '[') {
-            ++pos;
-            out.kind = JsonNode::Array;
-            SkipWs();
-            if (pos < sv.size() && sv[pos] == ']') { ++pos; return true; }
-            for (;;) {
-                JsonNode elem;
-                if (!ParseValue(elem, depth + 1)) return false;
-                out.arr.push_back(std::move(elem));
-                SkipWs();
-                if (pos >= sv.size()) return false;
-                if (sv[pos] == ']') { ++pos; return true; }
-                if (sv[pos] != ',') return false;
-                ++pos;
-            }
-        }
-        if (sv.substr(pos, 4) == "true") { pos += 4; out.kind = JsonNode::Bool; out.boolVal = true; return true; }
-        if (sv.substr(pos, 5) == "false") { pos += 5; out.kind = JsonNode::Bool; out.boolVal = false; return true; }
-        if (sv.substr(pos, 4) == "null") { pos += 4; out.kind = JsonNode::Null; return true; }
-        if (c == '-' || (c >= '0' && c <= '9')) {
-            size_t st = pos;
-            if (sv[pos] == '-') ++pos;
-            while (pos < sv.size() && ((sv[pos] >= '0' && sv[pos] <= '9') || sv[pos] == '.' || sv[pos] == 'e' || sv[pos] == 'E' || sv[pos] == '+' || sv[pos] == '-')) {
-                ++pos;
-            }
-            out.kind = JsonNode::Number;
-            out.intVal = std::strtoll(std::string(sv.substr(st, pos - st)).c_str(), nullptr, 10);
-            return true;
-        }
-        return false;
-    }
-};
 
 struct AvroType;
 
@@ -231,7 +92,7 @@ inline std::shared_ptr<AvroType> BuildAvroType(
 {
     if (depth > 32) return nullptr;
 
-    if (node.kind == JsonNode::String) {
+    if (node.kind == JsonNode::Kind::String) {
         const std::string& s = node.strVal;
         auto mk = [](AvroType::Kind k) {
             auto p = std::make_shared<AvroType>();
@@ -256,11 +117,11 @@ inline std::shared_ptr<AvroType> BuildAvroType(
         return nullptr;
     }
 
-    if (node.kind == JsonNode::Array) {
-        if (node.arr.empty()) return nullptr;
+    if (node.kind == JsonNode::Kind::Array) {
+        if (node.arrVal.empty()) return nullptr;
         auto u = std::make_shared<AvroType>();
         u->kind = AvroType::Union;
-        for (const auto& elem : node.arr) {
+        for (const auto& elem : node.arrVal) {
             auto br = BuildAvroType(elem, namedTypes, curNamespace, depth + 1);
             if (!br) return nullptr;
             u->branches.push_back(std::move(br));
@@ -268,20 +129,20 @@ inline std::shared_ptr<AvroType> BuildAvroType(
         return u;
     }
 
-    if (node.kind == JsonNode::Object) {
+    if (node.kind == JsonNode::Kind::Object) {
         const JsonNode* tNode = node.Find("type");
         if (!tNode) return nullptr;
-        if (tNode->kind != JsonNode::String) {
+        if (tNode->kind != JsonNode::Kind::String) {
             return BuildAvroType(*tNode, namedTypes, curNamespace, depth + 1);
         }
 
         const std::string& tName = tNode->strVal;
         std::string ns = curNamespace;
-        if (const JsonNode* nsNode = node.Find("namespace"); nsNode && nsNode->kind == JsonNode::String) {
+        if (const JsonNode* nsNode = node.Find("namespace"); nsNode && nsNode->kind == JsonNode::Kind::String) {
             ns = nsNode->strVal;
         }
         std::string recName;
-        if (const JsonNode* nNode = node.Find("name"); nNode && nNode->kind == JsonNode::String) {
+        if (const JsonNode* nNode = node.Find("name"); nNode && nNode->kind == JsonNode::Kind::String) {
             recName = nNode->strVal;
         }
 
@@ -296,15 +157,15 @@ inline std::shared_ptr<AvroType> BuildAvroType(
 
         if (tName == "record" || tName == "error") {
             const JsonNode* fNode = node.Find("fields");
-            if (!fNode || fNode->kind != JsonNode::Array) return nullptr;
+            if (!fNode || fNode->kind != JsonNode::Kind::Array) return nullptr;
             auto rec = std::make_shared<AvroType>();
             rec->kind = AvroType::Record;
             rec->name = recName;
             registerNamed(rec);
-            for (const auto& fItem : fNode->arr) {
+            for (const auto& fItem : fNode->arrVal) {
                 const JsonNode* fn = fItem.Find("name");
                 const JsonNode* ft = fItem.Find("type");
-                if (!fn || fn->kind != JsonNode::String || !ft) return nullptr;
+                if (!fn || fn->kind != JsonNode::Kind::String || !ft) return nullptr;
                 auto fType = BuildAvroType(*ft, namedTypes, ns, depth + 1);
                 if (!fType) return nullptr;
                 rec->fields.push_back({ fn->strVal, std::move(fType) });
@@ -313,12 +174,12 @@ inline std::shared_ptr<AvroType> BuildAvroType(
         }
         if (tName == "enum") {
             const JsonNode* sNode = node.Find("symbols");
-            if (!sNode || sNode->kind != JsonNode::Array) return nullptr;
+            if (!sNode || sNode->kind != JsonNode::Kind::Array) return nullptr;
             auto en = std::make_shared<AvroType>();
             en->kind = AvroType::Enum;
             en->name = recName;
-            for (const auto& sym : sNode->arr) {
-                if (sym.kind == JsonNode::String) en->symbols.push_back(sym.strVal);
+            for (const auto& sym : sNode->arrVal) {
+                if (sym.kind == JsonNode::Kind::String) en->symbols.push_back(sym.strVal);
             }
             registerNamed(en);
             return en;
@@ -341,20 +202,21 @@ inline std::shared_ptr<AvroType> BuildAvroType(
         }
         if (tName == "fixed") {
             const JsonNode* szNode = node.Find("size");
-            if (!szNode || szNode->kind != JsonNode::Number || szNode->intVal <= 0 || szNode->intVal > 1048576) {
+            int64_t fixedSz = 0;
+            if (!szNode || !szNode->AsInt64(fixedSz) || fixedSz <= 0 || fixedSz > 1048576) {
                 return nullptr;
             }
             auto fx = std::make_shared<AvroType>();
             fx->kind = AvroType::Fixed;
             fx->name = recName;
-            fx->fixedSize = static_cast<size_t>(szNode->intVal);
+            fx->fixedSize = static_cast<size_t>(fixedSz);
             registerNamed(fx);
             return fx;
         }
 
         // Logical type wrapper around primitive (e.g. {"type":"long","logicalType":"timestamp-millis"})
         JsonNode prim;
-        prim.kind = JsonNode::String;
+        prim.kind = JsonNode::Kind::String;
         prim.strVal = tName;
         return BuildAvroType(prim, namedTypes, ns, depth + 1);
     }
@@ -590,13 +452,10 @@ inline bool ParseApacheAvro(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
     }
 
     // 2. Parse avro.schema JSON into recursive AvroType tree
-    AvroDetail::SchemaJsonParser jp(schemaJson);
     AvroDetail::JsonNode rootJson;
-    if (!jp.ParseValue(rootJson)) {
-        return false;
-    }
-    jp.SkipWs();
-    if (jp.pos != schemaJson.size()) {
+    ::Explorer2::Json::Limits schemaLimits;
+    schemaLimits.maxDepth = 32;
+    if (!::Explorer2::Json::ParseDocument(schemaJson, rootJson, schemaLimits)) {
         return false;
     }
 

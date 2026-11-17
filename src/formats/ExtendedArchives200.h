@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedArchives200.h — 20 Game Bundles, Linux/Container FS, Mobile Packages & Retro Archives (#21–#40)
 // Covers:
 //   Game Bundles (#21–#30): .unitypackage, .bundle/.unity3d, .pck, .rgss3a/.rgssad, .xp3, .mpq, .big, .grp, .pbo, .scs
@@ -7,6 +8,7 @@
 
 #include "../ArchiveExplorer.h"
 #include "../ZipDeflate.h"
+#include "../Lz4Block.h"
 #include "../PathUtils.h"
 #include <cstdint>
 #include <cstring>
@@ -22,135 +24,14 @@ namespace Explorer2::Formats {
 
 namespace DetailArc200 {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) |
-           (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | RdU32BE(p + 4);
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
 
-inline std::wstring NormPath(std::wstring p) {
-    for (wchar_t& ch : p) {
-        if (ch == L'\\') ch = L'/';
-    }
-    while (!p.empty() && p.front() == L'/') p.erase(p.begin());
-    while (!p.empty() && p.back() == L'/') p.pop_back();
-    while (p.rfind(L"./", 0) == 0) p.erase(0, 2);
-    return p;
-}
 
-inline std::wstring BaseName(const std::wstring& p) {
-    size_t s = p.find_last_of(L'/');
-    return (s == std::wstring::npos) ? p : p.substr(s + 1);
-}
-
-// Fast native LZ4 raw block decompressor (exact known uncompressed length)
-inline bool DecompressLz4RawBlock(const uint8_t* src, size_t srcLen, size_t uncompLen, std::vector<uint8_t>& out) {
-    if (uncompLen > 128 * 1024 * 1024) return false;
-    out.clear();
-    out.reserve(uncompLen);
-    size_t sp = 0;
-    while (sp < srcLen && out.size() < uncompLen) {
-        uint8_t token = src[sp++];
-        size_t litLen = (token >> 4) & 0x0Fu;
-        if (litLen == 15) {
-            while (sp < srcLen) {
-                uint8_t s = src[sp++];
-                litLen += s;
-                if (litLen > uncompLen) return false;
-                if (s != 255) break;
-            }
-        }
-        if (sp + litLen > srcLen || out.size() + litLen > uncompLen) return false;
-        out.insert(out.end(), src + sp, src + sp + litLen);
-        sp += litLen;
-        if (sp >= srcLen || out.size() >= uncompLen) break;
-
-        if (sp + 2 > srcLen) return false;
-        uint16_t offset = RdU16LE(src + sp);
-        sp += 2;
-        if (offset == 0 || offset > out.size()) return false;
-
-        size_t matchLen = (token & 0x0Fu) + 4;
-        if ((token & 0x0Fu) == 15) {
-            while (sp < srcLen) {
-                uint8_t s = src[sp++];
-                matchLen += s;
-                if (matchLen > uncompLen) return false;
-                if (s != 255) break;
-            }
-        }
-        if (out.size() + matchLen > uncompLen) return false;
-        size_t matchPos = out.size() - offset;
-        for (size_t i = 0; i < matchLen; ++i) {
-            out.push_back(out[matchPos + i]);
-        }
-    }
-    return (out.size() == uncompLen);
-}
-
-// LZ4 raw block decompressor bounded by maxOut when exact uncompressed size is not stored in header (e.g. SquashFS LZ4)
-inline bool DecompressLz4RawBlockBounded(const uint8_t* src, size_t srcLen, size_t maxOut, std::vector<uint8_t>& out) {
-    out.clear();
-    size_t sp = 0;
-    while (sp < srcLen) {
-        uint8_t token = src[sp++];
-        size_t litLen = (token >> 4) & 0x0Fu;
-        if (litLen == 15) {
-            uint8_t s = 0;
-            do {
-                if (sp >= srcLen) return false;
-                s = src[sp++];
-                litLen += s;
-                if (litLen > maxOut) return false;
-            } while (s == 255);
-        }
-        if (sp + litLen > srcLen || out.size() + litLen > maxOut) return false;
-        out.insert(out.end(), src + sp, src + sp + litLen);
-        sp += litLen;
-        if (sp == srcLen) return true;
-
-        if (sp + 2 > srcLen) return false;
-        uint16_t offset = RdU16LE(src + sp);
-        sp += 2;
-        if (offset == 0 || offset > out.size()) return false;
-
-        size_t matchLen = (token & 0x0Fu) + 4;
-        if ((token & 0x0Fu) == 15) {
-            uint8_t s = 0;
-            do {
-                if (sp >= srcLen) return false;
-                s = src[sp++];
-                matchLen += s;
-                if (matchLen > maxOut) return false;
-            } while (s == 255);
-        }
-        if (out.size() + matchLen > maxOut) return false;
-        for (size_t i = 0; i < matchLen; ++i) {
-            out.push_back(out[out.size() - offset]);
-        }
-    }
-    return true;
-}
 
 // ============================================================================
 // #21. Unity Asset Package (.unitypackage — TAR/TAR.GZ with <GUID>/pathname -> <GUID>/asset)
@@ -201,7 +82,7 @@ inline bool ParseUnityPackageFromMemory(
                 std::string rawP(reinterpret_cast<const char*>(tarBuf + pos), static_cast<size_t>(fsize));
                 size_t nl = rawP.find_first_of("\r\n\0", 0, 3);
                 if (nl != std::string::npos) rawP.resize(nl);
-                guidMap[guid].realPath = NormPath(PathUtils::Utf8ToWide(rawP));
+                guidMap[guid].realPath = ArchivePath::Normalize(PathUtils::Utf8ToWide(rawP));
             } else if (leaf == "asset") {
                 auto& slot = guidMap[guid];
                 slot.assetOff = pos;
@@ -215,7 +96,7 @@ inline bool ParseUnityPackageFromMemory(
     if (guidMap.empty()) return false;
 
     if (extractTargetPath && outExtractedBytes) {
-        std::wstring want = NormPath(*extractTargetPath);
+        std::wstring want = ArchivePath::Normalize(*extractTargetPath);
         for (const auto& kv : guidMap) {
             if (kv.second.hasAsset && _wcsicmp(kv.second.realPath.c_str(), want.c_str()) == 0) {
                 outExtractedBytes->assign(
@@ -232,7 +113,7 @@ inline bool ParseUnityPackageFromMemory(
         if (kv.second.realPath.empty()) continue;
         ArchiveItemEntry item;
         item.pathInArchive = kv.second.realPath;
-        item.name = BaseName(item.pathInArchive);
+        item.name = ArchivePath::BaseName(item.pathInArchive);
         item.isDirectory = !kv.second.hasAsset;
         item.uncompressedSize = kv.second.assetSize;
         item.compressedSize = kv.second.assetSize;
@@ -273,7 +154,7 @@ inline bool DecompressUnityBlock(
             static_cast<uint64_t>(uncompLen), true, std::max<size_t>(uncompLen + 64, 1024));
     }
     if (compMode == 2 || compMode == 3) { // LZ4 / LZ4HC raw block
-        return DecompressLz4RawBlock(src, compLen, uncompLen, out);
+        return uncompLen <= 128u * 1024u * 1024u && ::Explorer2::Lz4::DecodeBlockExact(src, compLen, uncompLen, out);
     }
     return false;
 }
@@ -384,7 +265,7 @@ inline bool ParseOrExtractUnityFsBundle(
     uint32_t nodeCount = RdU32BE(blocksInfo.data() + bp); bp += 4;
     if (nodeCount == 0 || nodeCount > 100000) return false;
 
-    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+    std::wstring wantNorm = extractTargetPath ? ArchivePath::Normalize(*extractTargetPath) : std::wstring{};
 
     for (uint32_t n = 0; n < nodeCount && n < 32768u; ++n) {
         if (bp + 21 > blocksInfo.size()) return false;
@@ -403,7 +284,7 @@ inline bool ParseOrExtractUnityFsBundle(
         if (nodeName.empty()) continue;
         if (nOff > totalUncomp || nSize > totalUncomp - nOff) return false;
 
-        std::wstring normP = NormPath(PathUtils::Utf8ToWide(nodeName));
+        std::wstring normP = ArchivePath::Normalize(PathUtils::Utf8ToWide(nodeName));
         if (normP.empty()) continue;
 
         if (extractTargetPath && outExtractedBytes) {
@@ -478,7 +359,7 @@ inline bool ParseOrExtractUnityFsBundle(
 
             ArchiveItemEntry item;
             item.pathInArchive = std::move(normP);
-            item.name = BaseName(item.pathInArchive);
+            item.name = ArchivePath::BaseName(item.pathInArchive);
             item.uncompressedSize = nSize;
             item.compressedSize = allRaw ? nSize : (estCompSz > 0 ? estCompSz : nSize);
             if (allRaw && sawFirst && rawStartOff + nSize <= size) {
@@ -544,8 +425,8 @@ inline bool ParseGodotPck(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
 
         if (!rawP.empty()) {
             ArchiveItemEntry item;
-            item.pathInArchive = NormPath(PathUtils::Utf8ToWide(rawP));
-            item.name = BaseName(item.pathInArchive);
+            item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(rawP));
+            item.name = ArchivePath::BaseName(item.pathInArchive);
             item.uncompressedSize = fSize;
             item.compressedSize = fSize;
             item.rawDataOffset = fileBase + fOff;
@@ -585,7 +466,7 @@ inline bool ParseOrExtractRpgMakerRgss(
         outInfo->formatName = (ver == 3) ? L"RPG Maker VX Ace Archive (.rgss3a)" : L"RPG Maker Archive (.rgssad)";
     }
 
-    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+    std::wstring wantNorm = extractTargetPath ? ArchivePath::Normalize(*extractTargetPath) : std::wstring{};
 
     if (ver == 3) {
         uint32_t masterKey = RdU32LE(data + 8) * 9u + 3u;
@@ -607,7 +488,7 @@ inline bool ParseOrExtractRpgMakerRgss(
             }
             pos += nameLen;
 
-            std::wstring normP = NormPath(PathUtils::Utf8ToWide(decName));
+            std::wstring normP = ArchivePath::Normalize(PathUtils::Utf8ToWide(decName));
             if (normP.empty()) continue;
             ++count;
 
@@ -623,7 +504,7 @@ inline bool ParseOrExtractRpgMakerRgss(
             if (outInfo) {
                 ArchiveItemEntry item;
                 item.pathInArchive = std::move(normP);
-                item.name = BaseName(item.pathInArchive);
+                item.name = ArchivePath::BaseName(item.pathInArchive);
                 item.uncompressedSize = fSize;
                 item.compressedSize = fSize;
                 item.rawDataOffset = fOff;
@@ -652,7 +533,7 @@ inline bool ParseOrExtractRpgMakerRgss(
             if (pos + fSize > size) break;
 
             uint32_t subKey = key; // Initial per-file stream key in RGSS v1/v2
-            std::wstring normP = NormPath(PathUtils::Utf8ToWide(decName));
+            std::wstring normP = ArchivePath::Normalize(PathUtils::Utf8ToWide(decName));
             if (!normP.empty()) {
                 ++count;
                 if (extractTargetPath && outExtractedBytes) {
@@ -664,7 +545,7 @@ inline bool ParseOrExtractRpgMakerRgss(
                 } else if (outInfo) {
                     ArchiveItemEntry item;
                     item.pathInArchive = std::move(normP);
-                    item.name = BaseName(item.pathInArchive);
+                    item.name = ArchivePath::BaseName(item.pathInArchive);
                     item.uncompressedSize = fSize;
                     item.compressedSize = fSize;
                     item.rawDataOffset = pos;
@@ -736,7 +617,7 @@ inline bool ParseOrExtractKiriKiriXp3(
         uint64_t compSz = 0;
     };
 
-    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+    std::wstring wantNorm = extractTargetPath ? ArchivePath::Normalize(*extractTargetPath) : std::wstring{};
     size_t p = 0;
     size_t count = 0;
     while (p + 12 <= idxLen && count < 40000) {
@@ -785,7 +666,7 @@ inline bool ParseOrExtractKiriKiriXp3(
                 }
                 sp += 12 + static_cast<size_t>(subSz);
             }
-            std::wstring normP = NormPath(fname);
+            std::wstring normP = ArchivePath::Normalize(fname);
             if (!normP.empty()) {
                 ++count;
                 if (extractTargetPath && outExtractedBytes) {
@@ -813,7 +694,7 @@ inline bool ParseOrExtractKiriKiriXp3(
                 } else if (outInfo) {
                     ArchiveItemEntry item;
                     item.pathInArchive = std::move(normP);
-                    item.name = BaseName(item.pathInArchive);
+                    item.name = ArchivePath::BaseName(item.pathInArchive);
                     item.uncompressedSize = origSz;
                     item.compressedSize = compSz;
                     item.rawDataOffset = rawStart;
@@ -1218,7 +1099,7 @@ inline bool ParseOrExtractBlizzardMpq(
         }
     }
 
-    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+    std::wstring wantNorm = extractTargetPath ? ArchivePath::Normalize(*extractTargetPath) : std::wstring{};
 
     for (uint32_t i = 0; i < blockCount; ++i) {
         if (static_cast<int32_t>(i) == lfBlock ||
@@ -1237,7 +1118,7 @@ inline bool ParseOrExtractBlizzardMpq(
 
         std::wstring displayPath;
         if (!blockToName[i].empty()) {
-            displayPath = NormPath(PathUtils::Utf8ToWide(blockToName[i]));
+            displayPath = ArchivePath::Normalize(PathUtils::Utf8ToWide(blockToName[i]));
         } else {
             wchar_t nb[64] = {};
             swprintf_s(nb, L"Files/Block_%04u.dat", i);
@@ -1254,7 +1135,7 @@ inline bool ParseOrExtractBlizzardMpq(
         if (outInfo) {
             ArchiveItemEntry item;
             item.pathInArchive = std::move(displayPath);
-            item.name = BaseName(item.pathInArchive);
+            item.name = ArchivePath::BaseName(item.pathInArchive);
             item.compressedSize = cSz;
             item.uncompressedSize = fSz;
             item.rawDataOffset = absP;
@@ -1422,7 +1303,7 @@ inline bool ParseOrExtractEaBigArchive(
             return false;
         }
 
-        std::wstring fullPath = NormPath(PathUtils::Utf8ToWide(fname));
+        std::wstring fullPath = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
         if (fullPath.empty()) continue;
 
         const uint8_t* payload = data + fOff;
@@ -1442,7 +1323,7 @@ inline bool ParseOrExtractEaBigArchive(
         } else if (outInfo) {
             ArchiveItemEntry item;
             item.pathInArchive     = fullPath;
-            item.name              = BaseName(fullPath);
+            item.name              = ArchivePath::BaseName(fullPath);
             item.uncompressedSize  = isRefPack ? refUncompSz : fSize;
             item.compressedSize    = fSize;
             item.rawDataOffset     = fOff;
@@ -1480,8 +1361,8 @@ inline bool ParseBuildGrp(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
         uint32_t fSize = RdU32LE(ent + 12);
         if (!fname.empty() && dataOff + fSize <= size) {
             ArchiveItemEntry item;
-            item.pathInArchive = NormPath(PathUtils::Utf8ToWide(fname));
-            item.name = BaseName(item.pathInArchive);
+            item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
+            item.name = ArchivePath::BaseName(item.pathInArchive);
             item.uncompressedSize = fSize;
             item.compressedSize = fSize;
             item.rawDataOffset = dataOff;
@@ -1533,7 +1414,7 @@ inline bool ParseBohemiaPbo(const uint8_t* data, size_t size, ArchiveSummaryInfo
                 while (pos < size && data[pos] != 0) ++pos;
                 std::string v(reinterpret_cast<const char*>(data + vs), pos - vs);
                 if (pos < size) ++pos;
-                if (_stricmp(k.c_str(), "prefix") == 0) prefixDir = NormPath(PathUtils::Utf8ToWide(v));
+                if (_stricmp(k.c_str(), "prefix") == 0) prefixDir = ArchivePath::Normalize(PathUtils::Utf8ToWide(v));
             }
             continue;
         }
@@ -1542,7 +1423,7 @@ inline bool ParseBohemiaPbo(const uint8_t* data, size_t size, ArchiveSummaryInfo
         }
         if (fname.empty()) return false;
         sawHeaderOrEntry = true;
-        recs.push_back({ NormPath(PathUtils::Utf8ToWide(fname)), mime, origSz, dataSz });
+        recs.push_back({ ArchivePath::Normalize(PathUtils::Utf8ToWide(fname)), mime, origSz, dataSz });
     }
 
     if (!sawHeaderOrEntry || recs.empty()) return false;
@@ -1550,7 +1431,7 @@ inline bool ParseBohemiaPbo(const uint8_t* data, size_t size, ArchiveSummaryInfo
     for (const auto& r : recs) {
         ArchiveItemEntry item;
         item.pathInArchive = prefixDir.empty() ? r.path : (prefixDir + L"/" + r.path);
-        item.name = BaseName(item.pathInArchive);
+        item.name = ArchivePath::BaseName(item.pathInArchive);
         item.compressedSize = r.dataSz;
         item.uncompressedSize = (r.origSz > 0) ? r.origSz : r.dataSz;
         item.rawDataOffset = curDataOff;
@@ -1637,7 +1518,8 @@ inline bool DecompressSqfsChunk(
         if (compLen >= 4 && RdU32LE(src) == 0x184D2204u) {
             return StreamCodecs::DecompressLz4Frame(src, compLen, out, maxOut + 64);
         }
-        return DecompressLz4RawBlockBounded(src, compLen, maxOut, out);
+        out.clear(); // no stored decoded size (e.g. SquashFS LZ4): bounded by maxOut
+        return ::Explorer2::Lz4::DecodeBlockAppend(src, compLen, out, 0, maxOut);
     }
     if (compId == 6) { // Zstd
         return StreamCodecs::DecompressZstdFrame(src, compLen, out, maxOut + 64);
@@ -1653,7 +1535,7 @@ inline bool ParseOrExtractSquashFsOrErofs(
     const std::wstring* extractTargetPath,
     std::vector<uint8_t>* outExtractedBytes)
 {
-    std::wstring wantNorm = extractTargetPath ? NormPath(*extractTargetPath) : std::wstring{};
+    std::wstring wantNorm = extractTargetPath ? ArchivePath::Normalize(*extractTargetPath) : std::wstring{};
 
     // Search offset 0 (or ELF trailer up to 4 MB for .appimage/.snap/.squashfs) for SquashFS 4.0 "hsqs"
     size_t sqOff = SIZE_MAX;
@@ -1913,7 +1795,7 @@ inline bool ParseOrExtractSquashFsOrErofs(
                     if (childUtf8.empty() || childUtf8 == "." || childUtf8 == "..") continue;
 
                     std::wstring childW = PathUtils::Utf8ToWide(childUtf8);
-                    std::wstring fullP  = NormPath(prefix.empty() ? childW : (prefix + L"/" + childW));
+                    std::wstring fullP  = ArchivePath::Normalize(prefix.empty() ? childW : (prefix + L"/" + childW));
                     if (fullP.empty()) continue;
 
                     uint64_t childRef = (static_cast<uint64_t>(hdrStartBlk) << 16) | entOff;
@@ -1929,7 +1811,7 @@ inline bool ParseOrExtractSquashFsOrErofs(
                         if (outInfo && !extractTargetPath) {
                             ArchiveItemEntry item;
                             item.pathInArchive = fullP;
-                            item.name = BaseName(fullP);
+                            item.name = ArchivePath::BaseName(fullP);
                             item.isDirectory = true;
                             item.compressionMethod = 0;
                             outInfo->entries.push_back(std::move(item));
@@ -1969,7 +1851,7 @@ inline bool ParseOrExtractSquashFsOrErofs(
                         } else if (outInfo) {
                             ArchiveItemEntry item;
                             item.pathInArchive = fullP;
-                            item.name = BaseName(fullP);
+                            item.name = ArchivePath::BaseName(fullP);
                             item.isDirectory = false;
                             item.uncompressedSize = fileSize;
                             item.compressedSize = fileSize;
@@ -2130,7 +2012,7 @@ inline bool ParseOrExtractSquashFsOrErofs(
                     if (dn.empty() || dn == "." || dn == "..") continue;
 
                     std::wstring wName = PathUtils::Utf8ToWide(dn);
-                    std::wstring fullP = NormPath(prefix.empty() ? wName : (prefix + L"/" + wName));
+                    std::wstring fullP = ArchivePath::Normalize(prefix.empty() ? wName : (prefix + L"/" + wName));
                     if (fullP.empty()) continue;
 
                     ErofsInodeInfo cInf;
@@ -2141,7 +2023,7 @@ inline bool ParseOrExtractSquashFsOrErofs(
                         if (outInfo && !extractTargetPath) {
                             ArchiveItemEntry item;
                             item.pathInArchive = fullP;
-                            item.name = BaseName(fullP);
+                            item.name = ArchivePath::BaseName(fullP);
                             item.isDirectory = true;
                             item.compressionMethod = 0;
                             outInfo->entries.push_back(std::move(item));
@@ -2164,7 +2046,7 @@ inline bool ParseOrExtractSquashFsOrErofs(
                     } else if (outInfo) {
                         ArchiveItemEntry item;
                         item.pathInArchive = fullP;
-                        item.name = BaseName(fullP);
+                        item.name = ArchivePath::BaseName(fullP);
                         item.isDirectory = false;
                         item.uncompressedSize = cInf.iSize;
                         item.compressedSize = cInf.iSize;
@@ -2236,8 +2118,8 @@ inline bool ParsePosixCpio(const uint8_t* data, size_t size, ArchiveSummaryInfo&
 
             if (!fname.empty() && fname != ".") {
                 ArchiveItemEntry item;
-                item.pathInArchive = NormPath(PathUtils::Utf8ToWide(fname));
-                item.name = BaseName(item.pathInArchive);
+                item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
+                item.name = ArchivePath::BaseName(item.pathInArchive);
                 item.isDirectory = ((mode & 0170000u) == 0040000u);
                 item.uncompressedSize = item.isDirectory ? 0 : fSize;
                 item.compressedSize = item.uncompressedSize;
@@ -2266,8 +2148,8 @@ inline bool ParsePosixCpio(const uint8_t* data, size_t size, ArchiveSummaryInfo&
             if (dataStart + fSize > size) break;
             if (!fname.empty() && fname != ".") {
                 ArchiveItemEntry item;
-                item.pathInArchive = NormPath(PathUtils::Utf8ToWide(fname));
-                item.name = BaseName(item.pathInArchive);
+                item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
+                item.name = ArchivePath::BaseName(item.pathInArchive);
                 item.isDirectory = ((mode & 0170000u) == 0040000u);
                 item.uncompressedSize = item.isDirectory ? 0 : fSize;
                 item.compressedSize = item.uncompressedSize;
@@ -2326,8 +2208,8 @@ inline bool ParseUnixCoffAr(const uint8_t* data, size_t size, const std::wstring
 
             if (!cleanName.empty()) {
                 ArchiveItemEntry item;
-                item.pathInArchive = NormPath(PathUtils::Utf8ToWide(cleanName));
-                item.name = BaseName(item.pathInArchive);
+                item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(cleanName));
+                item.name = ArchivePath::BaseName(item.pathInArchive);
                 item.uncompressedSize = payloadSz;
                 item.compressedSize = payloadSz;
                 item.rawDataOffset = payloadOff;
@@ -2398,7 +2280,7 @@ inline bool ParseXarPkg(const uint8_t* data, size_t size, const std::wstring& ex
         std::wstring fullRel = dirStack.empty() ? wName : (dirStack.back() + L"/" + wName);
         if (!wName.empty()) {
             ArchiveItemEntry item;
-            item.pathInArchive = NormPath(fullRel);
+            item.pathInArchive = ArchivePath::Normalize(fullRel);
             item.name = wName;
             item.isDirectory = isDir;
             item.uncompressedSize = sz.empty() ? 0 : std::strtoull(std::string(sz).c_str(), nullptr, 10);
@@ -2477,8 +2359,8 @@ inline bool ParseLzhArjAce(const uint8_t* data, size_t size, const std::wstring&
             std::string fullP = dirName + fname;
             if (!fullP.empty()) {
                 ArchiveItemEntry item;
-                item.pathInArchive = NormPath(PathUtils::Utf8ToWide(fullP));
-                item.name = BaseName(item.pathInArchive);
+                item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(fullP));
+                item.name = ArchivePath::BaseName(item.pathInArchive);
                 item.isDirectory = (method == "-lhd-");
                 item.compressedSize = packSz;
                 item.uncompressedSize = origSz;
@@ -2536,8 +2418,8 @@ inline bool ParseLzhArjAce(const uint8_t* data, size_t size, const std::wstring&
             if (extPos + compSz > size) break;
             if (!fname.empty()) {
                 ArchiveItemEntry item;
-                item.pathInArchive = NormPath(PathUtils::Utf8ToWide(fname));
-                item.name = BaseName(item.pathInArchive);
+                item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
+                item.name = ArchivePath::BaseName(item.pathInArchive);
                 item.isDirectory = (fileType == 3);
                 item.compressedSize = compSz;
                 item.uncompressedSize = origSz;
@@ -2577,8 +2459,8 @@ inline bool ParseLzhArjAce(const uint8_t* data, size_t size, const std::wstring&
                 if (31 + fnLen <= hdrSz) {
                     std::string fname(reinterpret_cast<const char*>(fh + 31), fnLen);
                     ArchiveItemEntry item;
-                    item.pathInArchive = NormPath(PathUtils::Utf8ToWide(fname));
-                    item.name = BaseName(item.pathInArchive);
+                    item.pathInArchive = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
+                    item.name = ArchivePath::BaseName(item.pathInArchive);
                     item.isDirectory = (attr & 0x10u) != 0;
                     item.compressedSize = packSz;
                     item.uncompressedSize = origSz;
@@ -2642,7 +2524,7 @@ inline bool ExtractExtendedArchive200Entry(
     (void)archivePath;
     if (!data || size < 4 || normTarget.empty()) return false;
 
-    std::wstring want = DetailArc200::NormPath(normTarget);
+    std::wstring want = ArchivePath::Normalize(normTarget);
     if (want.empty()) return false;
 
     // 1. UnityPackage (.unitypackage)

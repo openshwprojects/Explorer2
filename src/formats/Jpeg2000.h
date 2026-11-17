@@ -21,14 +21,10 @@ namespace Formats {
 
 namespace J2kDetail {
 
-inline uint16_t RdBE16(const uint8_t* p) { return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]); }
-inline uint32_t RdBE32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8)  | static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdBE64(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdBE32(p)) << 32) | static_cast<uint64_t>(RdBE32(p + 4));
-}
+// big-endian loads (ByteIO.h)
+inline uint16_t RdBE16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16BE(p); }
+inline uint32_t RdBE32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32BE(p); }
+inline uint64_t RdBE64(const uint8_t* p) { return ::Explorer2::ByteIO::RdU64BE(p); }
 
 inline int32_t CeilDivI32(int32_t a, int32_t b) {
     if (b <= 0) return 0;

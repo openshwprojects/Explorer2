@@ -1,4 +1,15 @@
 #pragma once
+#include "MeshBuild3D.h"
+// Md2.h — Quake II MD2 (.md2, or any file starting with "IDP2") reader for the 3D viewer.
+
+namespace Formats {
+
+// Returns true when the file was handled here; `mesh` then holds the result (or its status message).
+// false: not this format, the caller tries the next reader.
+inline bool ParseMd2File(const std::wstring& ext, const std::vector<uint8_t>& buf, uint64_t fileSize, LoadedMesh3D& mesh,
+                 uint64_t generation, const std::atomic<uint64_t>* activeGen) {
+    using MeshBuild3D::FinalizeMeshBoundsAndNormals;
+    (void)ext; (void)fileSize; (void)generation; (void)activeGen;
     // 5. Quake II MD2 Parser (.md2 - magic "IDP2" 0x32504449, version 8)
     if (ext == L".md2" || (buf.size() >= 68 && std::memcmp(buf.data(), "IDP2", 4) == 0)) {
         if (buf.size() >= 68 && std::memcmp(buf.data(), "IDP2", 4) == 0) {
@@ -43,8 +54,11 @@
                     }
                 }
                 FinalizeMeshBoundsAndNormals(mesh);
-                return mesh;
+                return true;
             }
         }
     }
+    return false;
+}
 
+} // namespace Formats

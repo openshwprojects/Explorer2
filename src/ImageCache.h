@@ -77,7 +77,6 @@ public:
     // Remove a deleted file from caches
     void EvictPath(const std::wstring& path);
 
-    void ClearFullImageCache();
 
     // Async non-blocking image rotation & transformation with per-item status tracking
     void QueueRotateImages(const std::vector<std::wstring>& paths, bool clockwise);

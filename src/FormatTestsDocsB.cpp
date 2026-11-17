@@ -1,5 +1,7 @@
 // FormatTestsDocsB.cpp: self-tests of the binary, media and system document readers (SpreadsheetDocViewer, formats/Extended*), stage 15 ("15.docsb" runs these alone)
+#include "Crc32.h"
 #include "SelfTestCommon.h"
+#include "TestBytes.h"
 #include "SpreadsheetDocViewer.h"
 #include "PathUtils.h"
 #include <cstdint>
@@ -83,31 +85,12 @@ struct ByteBuf {
     }
 };
 
-static void PutU16LE(uint8_t* p, uint16_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-}
-static void PutU32LE(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v & 0xFFu);
-    p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-    p[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-    p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-}
+using namespace ::Explorer2::TestBytes; // byte writers (TestBytes.h)
 
-static uint32_t CalcCrc32(const uint8_t* data, size_t len) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int k = 0; k < 8; ++k) {
-            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-        }
-    }
-    return ~crc;
-}
 
 static std::vector<uint8_t> BuildStoredZipSingle(std::string_view innerPath, std::string_view content) {
     const auto* payload = reinterpret_cast<const uint8_t*>(content.data());
-    uint32_t crc = CalcCrc32(payload, content.size());
+    uint32_t crc = Checksum::Crc32(payload, content.size());
     uint32_t sz  = static_cast<uint32_t>(content.size());
 
     ByteBuf z;
@@ -162,7 +145,7 @@ static std::vector<uint8_t> BuildStoredZipSingle(std::string_view innerPath, std
 
 static std::vector<uint8_t> BuildStoredGzip(std::string_view content) {
     const auto* payload = reinterpret_cast<const uint8_t*>(content.data());
-    uint32_t crc = CalcCrc32(payload, content.size());
+    uint32_t crc = Checksum::Crc32(payload, content.size());
     uint16_t len = static_cast<uint16_t>(content.size());
 
     ByteBuf gz;
@@ -270,7 +253,7 @@ static void VerifyPairAndCorrupt(
 // ----------------------------------------------------------------------------
 
 // 1. ELF64 with .shstrtab, .dynstr, .dynsym, .dynamic (DT_NEEDED), PT_INTERP
-static std::vector<uint8_t> MakeElf64(std::string_view neededSo, std::string_view symFuncName) {
+static std::vector<uint8_t> MakeElf64(std::string_view neededSo, std::string_view symFuncName, size_t padBeforeTables = 0) {
     std::string shstr;
     shstr.push_back('\0');
     uint32_t shIdxStrtab = static_cast<uint32_t>(shstr.size()); shstr += ".shstrtab"; shstr.push_back('\0');
@@ -331,6 +314,7 @@ static std::vector<uint8_t> MakeElf64(std::string_view neededSo, std::string_vie
 
     f.Str(interp);
     f.PadTo((f.b.size() + 7) & ~size_t(7));
+    f.Zeros(padBeforeTables & ~size_t(7));
 
     uint64_t offShstr = f.b.size(); f.Str(shstr);
     uint64_t offDynstr = f.b.size(); f.Str(dynstr);
@@ -535,7 +519,8 @@ static std::vector<uint8_t> MakeSf2(std::string_view bankName, std::string_view 
 }
 
 // 6. Outlook .msg (Valid 512B-sector OLE2 Compound File Binary)
-static std::vector<uint8_t> MakeOutlookMsg(std::wstring_view subject, std::wstring_view sender, std::wstring_view body, std::wstring_view attachName) {
+static std::vector<uint8_t> MakeOutlookMsg(std::wstring_view subject, std::wstring_view sender, std::wstring_view body, std::wstring_view attachName,
+                                           const std::vector<uint8_t>& rtfCompressedBody = {}) {
     struct StreamDef {
         std::wstring name;
         uint8_t objType;
@@ -556,6 +541,7 @@ static std::vector<uint8_t> MakeOutlookMsg(std::wstring_view subject, std::wstri
         { L"__substg1.0_3707001F",          2, 0xFFFFFFFFu, 6, utf16Vec(attachName) },
         { L"__substg1.0_37010102",          2, 0xFFFFFFFFu, 0xFFFFFFFFu, { 0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x37 } }
     };
+    if (!rtfCompressedBody.empty()) dirs[3] = { L"__substg1.0_10090102", 2, 0xFFFFFFFFu, 4, rtfCompressedBody };
 
     // Sector 0 = FAT, Sectors 1..2 = Directory (8 entries), Sectors 3.. = stream data
     ByteBuf cfb;
@@ -786,6 +772,111 @@ static std::vector<uint8_t> MakeChm(std::string_view topicPath, std::string_view
     return chm.b;
 }
 
+// 8b. CHM whose topics are in section 1: an LZX stream (32 KB window) of a verbatim block that holds only literals
+// (main tree: every byte value an 8-bit code, sent through the pretree as deltas) and then a stored block, plus the
+// LZXC control data and the reset table that describe it
+struct LzxBitWriter { // 16-bit little-endian words, filled from the most significant bit
+    std::vector<uint8_t> out;
+    uint32_t acc = 0;
+    int n = 0;
+    void Put(uint32_t v, int bits) {
+        for (int i = bits - 1; i >= 0; --i) {
+            acc = (acc << 1) | ((v >> i) & 1u);
+            if (++n == 16) {
+                out.push_back(static_cast<uint8_t>(acc));
+                out.push_back(static_cast<uint8_t>(acc >> 8));
+                acc = 0;
+                n = 0;
+            }
+        }
+    }
+};
+
+static std::vector<uint8_t> MakeChmLzx(std::string_view pageA, std::string_view pageB) {
+    LzxBitWriter w;
+    // pretree: symbol 9 ("0"), 17 ("10"), 18 ("11"); 9 turns a length of 0 into 8, 18 writes 20..51 zeros
+    auto pretree = [&]() {
+        for (int s = 0; s < 20; ++s) w.Put(s == 9 ? 1u : (s == 17 || s == 18) ? 2u : 0u, 4);
+    };
+    auto zeros = [&](uint32_t count) {
+        while (count >= 20) {
+            const uint32_t run = std::min<uint32_t>(count, 51);
+            w.Put(3, 2); // symbol 18
+            w.Put(run - 20, 5);
+            count -= run;
+        }
+        if (count > 0) { // 4..19 left: symbol 17 (a last run under 4 cannot happen with these counts)
+            w.Put(2, 2);
+            w.Put(count - 4, 4);
+        }
+    };
+    w.Put(0, 1);                                     // no E8 translation
+    w.Put(1, 3);                                     // verbatim block
+    w.Put(static_cast<uint32_t>(pageA.size()) >> 8, 16);
+    w.Put(static_cast<uint32_t>(pageA.size()) & 0xFF, 8);
+    pretree();
+    for (int s = 0; s < 256; ++s) w.Put(0, 1);       // 256 x symbol 9: every literal 8 bits long
+    pretree();
+    zeros(30 * 8);                                   // no match symbols (30 position slots for a 32 KB window)
+    pretree();
+    zeros(249);                                      // empty length tree
+    for (unsigned char c : pageA) w.Put(c, 8);       // canonical 8-bit codes: a byte's code is the byte
+    w.Put(3, 3);                                     // stored block
+    w.Put(static_cast<uint32_t>(pageB.size()) >> 8, 16);
+    w.Put(static_cast<uint32_t>(pageB.size()) & 0xFF, 8);
+    w.Put(0, w.n == 0 ? 16 : 16 - w.n);              // 1..16 bits to the next word
+    std::vector<uint8_t> stream = w.out;
+    for (int r = 0; r < 3; ++r) { stream.push_back(1); stream.push_back(0); stream.push_back(0); stream.push_back(0); } // R0..R2
+    stream.insert(stream.end(), pageB.begin(), pageB.end());
+    if (pageB.size() & 1) stream.push_back(0);
+
+    ByteBuf ctl; // LZXC v2: reset every 2 frames, 32 KB window
+    ctl.U32LE(6); ctl.Str("LZXC"); ctl.U32LE(2); ctl.U32LE(2); ctl.U32LE(1); ctl.U32LE(1); ctl.U32LE(0);
+    ByteBuf rt;  // reset table: one frame at offset 0
+    rt.U32LE(2); rt.U32LE(1); rt.U32LE(8); rt.U32LE(40);
+    rt.U64LE(pageA.size() + pageB.size()); rt.U64LE(stream.size()); rt.U64LE(0x8000); rt.U64LE(0);
+
+    const std::string ctlPath = "::DataSpace/Storage/MSCompressed/ControlData";
+    const std::string rtPath = "::DataSpace/Storage/MSCompressed/Transform/{7FC28940-9D31-11D0-9B27-00A0C91E9C7C}/InstanceData/ResetTable";
+    const std::string contPath = "::DataSpace/Storage/MSCompressed/Content";
+    ByteBuf entries;
+    auto addEntry = [&](std::string_view path, uint64_t sec, uint64_t off, uint64_t len) {
+        entries.EncInt(path.size());
+        entries.Str(path);
+        entries.EncInt(sec);
+        entries.EncInt(off);
+        entries.EncInt(len);
+    };
+    addEntry(ctlPath, 0, 0, ctl.b.size());
+    addEntry(rtPath, 0, ctl.b.size(), rt.b.size());
+    addEntry(contPath, 0, ctl.b.size() + rt.b.size(), stream.size());
+    addEntry("/intro.htm", 1, 0, pageA.size());
+    addEntry("/details.htm", 1, pageA.size(), pageB.size());
+
+    const uint32_t blkSize = 4096;
+    ByteBuf pmgl;
+    pmgl.Str("PMGL");
+    pmgl.U32LE(blkSize - 20 - static_cast<uint32_t>(entries.b.size()));
+    pmgl.U32LE(0); pmgl.U32LE(0xFFFFFFFFu); pmgl.U32LE(0xFFFFFFFFu);
+    pmgl.Bytes(entries.b.data(), entries.b.size());
+    pmgl.PadTo(blkSize);
+    ByteBuf itsp;
+    itsp.Str("ITSP"); itsp.U32LE(1); itsp.U32LE(84); itsp.U32LE(0x0A); itsp.U32LE(blkSize); itsp.U32LE(2); itsp.U32LE(1);
+    itsp.U32LE(0xFFFFFFFFu); itsp.U32LE(0); itsp.U32LE(0); itsp.U32LE(0xFFFFFFFFu); itsp.U32LE(1);
+    itsp.PadTo(84);
+    const uint64_t dirOff = 96, dirLen = itsp.b.size() + pmgl.b.size(), dataOff = dirOff + dirLen;
+    ByteBuf chm;
+    chm.Str("ITSF"); chm.U32LE(3); chm.U32LE(96); chm.U32LE(1); chm.U32LE(0); chm.U32LE(0x0409);
+    chm.PadTo(56);
+    chm.U64LE(dataOff); chm.U64LE(ctl.b.size() + rt.b.size() + stream.size()); chm.U64LE(dirOff); chm.U64LE(dirLen); chm.U64LE(dataOff);
+    chm.Bytes(itsp.b.data(), itsp.b.size());
+    chm.Bytes(pmgl.b.data(), pmgl.b.size());
+    chm.Bytes(ctl.b.data(), ctl.b.size());
+    chm.Bytes(rt.b.data(), rt.b.size());
+    chm.Bytes(stream.data(), stream.size());
+    return chm.b;
+}
+
 // 9. PE32+ (.dll) with Real Import & Export Tables
 static std::vector<uint8_t> MakePe64WithImpExp(std::string_view importDll, std::string_view importFunc, std::string_view exportFunc) {
     ByteBuf pe;
@@ -1000,9 +1091,10 @@ static std::vector<uint8_t> MakeEvtx(uint64_t recordId, std::wstring_view provid
 }
 
 // 13. PDB v7.00 (MSF 7.00 with Stream 1 PDB GUID + Stream 3 DBI Module)
-static std::vector<uint8_t> MakePdbMsf7(uint8_t guidLastByte, std::string_view objPath) {
+static std::vector<uint8_t> MakePdbMsf7(uint8_t guidLastByte, std::string_view objPath, uint32_t firstBlock = 3) {
     const uint32_t blkSz = 512;
     // Blocks: 0=SuperBlock, 1=FPM1, 2=FPM2, 3=BlockMapAddr, 4=StreamDir, 5=Stream1(PDB), 6=Stream3(DBI)
+    // (the last four from firstBlock on)
     ByteBuf s1; // Stream 1: PDB Info
     s1.U32LE(20000404u); // VC70
     s1.U32LE(0x65123456u);
@@ -1029,6 +1121,8 @@ static std::vector<uint8_t> MakePdbMsf7(uint8_t guidLastByte, std::string_view o
     s3.U16LE(0);
     s3.U16LE(0);
     s3.U32LE(static_cast<uint32_t>(modSub.b.size())); // modInfoSize @ offset 24
+    s3.PadTo(60);
+    s3.U16LE(0x8664); // Machine @ offset 60
     s3.PadTo(64);
     s3.Bytes(modSub.b.data(), modSub.b.size());
     uint32_t s3Len = static_cast<uint32_t>(s3.b.size());
@@ -1040,8 +1134,8 @@ static std::vector<uint8_t> MakePdbMsf7(uint8_t guidLastByte, std::string_view o
     dir.U32LE(s1Len);
     dir.U32LE(0);
     dir.U32LE(s3Len);
-    dir.U32LE(5); // Stream 1 -> block 5
-    dir.U32LE(6); // Stream 3 -> block 6
+    dir.U32LE(firstBlock + 2); // Stream 1 -> block 5
+    dir.U32LE(firstBlock + 3); // Stream 3 -> block 6
     uint32_t dirLen = static_cast<uint32_t>(dir.b.size());
     dir.PadTo(blkSz);
 
@@ -1049,15 +1143,16 @@ static std::vector<uint8_t> MakePdbMsf7(uint8_t guidLastByte, std::string_view o
     pdb.Bytes("Microsoft C/C++ MSF 7.00\r\n\x1A\x44\x53\0\0\0", 32);
     pdb.U32LE(blkSz);
     pdb.U32LE(1); // freeBlockMapBlock
-    pdb.U32LE(7); // numBlocks
+    pdb.U32LE(firstBlock + 4); // numBlocks
     pdb.U32LE(dirLen);
     pdb.U32LE(0);
-    pdb.U32LE(3); // blockMapAddr = block 3
+    pdb.U32LE(firstBlock); // blockMapAddr = block 3
     pdb.PadTo(blkSz);
     pdb.Zeros(blkSz * 2); // blocks 1 & 2 (FPM)
+    pdb.PadTo(static_cast<size_t>(blkSz) * firstBlock);
     // Block 3: blockMapAddr -> points to block 4
-    pdb.U32LE(4);
-    pdb.PadTo(blkSz * 4);
+    pdb.U32LE(firstBlock + 1);
+    pdb.PadTo(static_cast<size_t>(blkSz) * (firstBlock + 1));
     // Block 4: StreamDir, Block 5: Stream 1, Block 6: Stream 3
     pdb.Bytes(dir.b.data(), dir.b.size());
     pdb.Bytes(s1.b.data(), s1.b.size());
@@ -1434,6 +1529,24 @@ void RunFormatTestsDocsB(TestCounter& tc) {
         MakeElf64("libvulkan.so.1", "beta_render"), L"beta_render",
         kGarbage);
 
+    // An ELF larger than the 32 MB a reader is handed, its section header table and string, symbol and dynamic
+    // tables past that (as at the end of a large binary): all read from the file, and the title does not claim
+    // only the start was read
+    {
+        std::vector<uint8_t> big = MakeElf64("libfar.so.3", "far_away_symbol", 33u * 1024 * 1024);
+        std::wstring bigPath = dir + L"\\far_tables.elf";
+        PathUtils::WriteFileBytes(bigPath, big.data(), big.size());
+        big.clear();
+        big.shrink_to_fit();
+        ParsedOfficeDocument dBig;
+        bool bigOk = SpreadsheetDocViewer::InspectOfficeFile(bigPath, dBig) && dBig.valid &&
+                     DocContainsToken(dBig, L"far_away_symbol") && DocContainsToken(dBig, L"libfar.so.3") &&
+                     DocContainsToken(dBig, L".dynamic") && DocContainsToken(dBig, L"/lib64/ld-linux-x86-64.so.2") &&
+                     dBig.formatTitle.find(L"only the first") == std::wstring::npos;
+        DeleteFileW(bigPath.c_str());
+        tc.Record(bigOk, L"DocsB.Elf.Over32MbTablesReadFromTheFile", dBig.formatTitle);
+    }
+
     VerifyPairAndCorrupt(tc, dir, L"DocsB .wasm (Imports, Exports & Signatures)", L".wasm",
         MakeWasmModule("env", "log_i32", "calc_sum", 0x7F), L"calc_sum",
         MakeWasmModule("wasi", "fd_write", "transform_f64", 0x7C), L"transform_f64",
@@ -1462,6 +1575,80 @@ void RunFormatTestsDocsB(TestCounter& tc) {
             kGarbage);
     }
 
+    // E-mail as mailers send it: multipart/mixed holding multipart/alternative (whose Content-Type header is folded)
+    // and an attachment named the RFC 2231 way; an ISO-8859-2 subject (RFC 2047) and body; the plain text wins over
+    // the HTML alternative
+    {
+        const std::string eml =
+            "From: Ewa <ewa@example.pl>\r\nTo: Jan <jan@example.pl>\r\n"
+            "Subject: =?iso-8859-2?Q?Za=BF=F3=B3=E6?=\r\nMIME-Version: 1.0\r\n"
+            "Content-Type: multipart/mixed; boundary=\"MIX\"\r\n\r\n"
+            "--MIX\r\nContent-Type: multipart/alternative;\r\n\tboundary=\"ALT\"\r\n\r\n"
+            "--ALT\r\nContent-Type: text/plain; charset=iso-8859-2\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n"
+            "G=EAsi jazd=B1.\r\n"
+            "--ALT\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML version</p>\r\n--ALT--\r\n\r\n"
+            "--MIX\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment;\r\n"
+            " filename*=UTF-8''Raport%20Q4%20%C5%BC%C3%B3%C5%82ty.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+            "JVBERi0=\r\n--MIX--\r\n";
+        std::wstring emlPath = dir + L"\\nested.eml";
+        PathUtils::WriteFileBytes(emlPath, eml.data(), eml.size());
+        ParsedOfficeDocument dEml;
+        bool ok = SpreadsheetDocViewer::InspectOfficeFile(emlPath, dEml) && dEml.valid &&
+                  DocContainsToken(dEml, L"Za\u017C\u00F3\u0142\u0107") &&
+                  DocContainsToken(dEml, L"G\u0119si jazd\u0105.") &&
+                  DocContainsToken(dEml, L"Raport Q4 \u017C\u00F3\u0142ty.pdf") &&
+                  !DocContainsToken(dEml, L"HTML version");
+        DeleteFileW(emlPath.c_str());
+        std::wstring dump;
+        for (const auto& para : dEml.paragraphs) dump += para.text.substr(0, 40) + L" | ";
+        tc.Record(ok, L"DocsB.Email.NestedMultipartCharsetsAndRfc2231Names", dump.substr(0, 300));
+    }
+
+    // .msg whose body exists only as compressed RTF (MS-OXRTFCP "LZFu": literal runs, a back reference into the
+    // preset dictionary preamble, the end marker)
+    {
+        const std::string rtfText = "{\\rtf1\\ansi Quarterly figures attached\\par}";
+        // tokens: "{" (literal), "\\rtf1\\ansi" copied from dictionary offset 1 (10 bytes), then the rest as literals
+        std::vector<uint8_t> tokens, flags;
+        tokens.push_back('{');
+        flags.push_back(0);
+        tokens.push_back(static_cast<uint8_t>((1 << 4) >> 8));
+        tokens.push_back(static_cast<uint8_t>(((1 << 4) | (10 - 2)) & 0xFF));
+        flags.push_back(1);
+        for (size_t i = 11; i < rtfText.size(); ++i) { tokens.push_back(static_cast<uint8_t>(rtfText[i])); flags.push_back(0); }
+        const size_t writePos = (207 + rtfText.size()) & 0xFFF; // end marker: a reference to the write position
+        tokens.push_back(static_cast<uint8_t>((writePos << 4) >> 8));
+        tokens.push_back(static_cast<uint8_t>((writePos << 4) & 0xFF));
+        flags.push_back(1);
+        std::vector<uint8_t> data;
+        size_t t = 0;
+        for (size_t f = 0; f < flags.size(); f += 8) {
+            uint8_t control = 0;
+            for (size_t b = 0; b < 8 && f + b < flags.size(); ++b) if (flags[f + b]) control |= static_cast<uint8_t>(1u << b);
+            data.push_back(control);
+            for (size_t b = 0; b < 8 && f + b < flags.size(); ++b) {
+                size_t n = flags[f + b] ? 2 : 1;
+                data.insert(data.end(), tokens.begin() + static_cast<std::ptrdiff_t>(t), tokens.begin() + static_cast<std::ptrdiff_t>(t + n));
+                t += n;
+            }
+        }
+        std::vector<uint8_t> lzfu;
+        auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) lzfu.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+        u32(static_cast<uint32_t>(data.size() + 12));
+        u32(static_cast<uint32_t>(rtfText.size()));
+        u32(0x75465A4Cu); // "LZFu"
+        u32(0);           // CRC (not checked)
+        lzfu.insert(lzfu.end(), data.begin(), data.end());
+        std::vector<uint8_t> msg = MakeOutlookMsg(L"Figures", L"Finance", L"", L"q3.xlsx", lzfu);
+        std::wstring msgPath = dir + L"\\rtf_only.msg";
+        PathUtils::WriteFileBytes(msgPath, msg.data(), msg.size());
+        ParsedOfficeDocument dMsg;
+        bool ok = SpreadsheetDocViewer::InspectOfficeFile(msgPath, dMsg) && dMsg.valid &&
+                  DocContainsToken(dMsg, L"Quarterly figures attached") && !DocContainsToken(dMsg, L"rtf1");
+        DeleteFileW(msgPath.c_str());
+        tc.Record(ok, L"DocsB.OutlookMsg.CompressedRtfOnlyBody");
+    }
+
     VerifyPairAndCorrupt(tc, dir, L"DocsB .msg (OLE2 MAPI Subject, Body & Attachment)", L".msg",
         MakeOutlookMsg(L"Architecture Review", L"Dr. Vance", L"Please review the propulsion schematic.", L"schematic_v1.pdf"), L"schematic_v1.pdf",
         MakeOutlookMsg(L"Budget Sign-Off Q4", L" CFO Office", L"Approved capital expenditure table.", L"capex_q4.xlsx"), L"capex_q4.xlsx",
@@ -1477,6 +1664,61 @@ void RunFormatTestsDocsB(TestCounter& tc) {
         MakeOggVorbis(0x11223344u, 44100, 44100LL * 125, "Aurora Borealis"), L"Aurora Borealis",
         MakeOggVorbis(0x99887766u, 48000, 48000LL * 63, "Deep Ocean Echo"), L"Deep Ocean Echo",
         kGarbage);
+
+    // Media files larger than the 32 MB a reader is handed: a CBR MP3's duration and its ID3v1 tag come from the whole
+    // file (size, tail), and an Ogg stream's duration from its last page, at the end of the file
+    {
+        std::vector<uint8_t> mp3;
+        const size_t kFrame = 417; // MPEG-1 Layer III, 128 kbps, 44.1 kHz, no padding
+        mp3.reserve(34u * 1024 * 1024);
+        while (mp3.size() < 33u * 1024 * 1024) {
+            const uint8_t hdr[4] = { 0xFF, 0xFB, 0x90, 0x00 };
+            mp3.insert(mp3.end(), hdr, hdr + 4);
+            mp3.resize(mp3.size() + kFrame - 4, 0);
+        }
+        const size_t audioBytes = mp3.size();
+        std::vector<uint8_t> id3v1(128, 0);
+        std::memcpy(id3v1.data(), "TAGBig Show", 11);
+        mp3.insert(mp3.end(), id3v1.begin(), id3v1.end());
+        auto durationText = [](double sec) { // the reader's mm:ss
+            int totalSec = static_cast<int>(sec * 1000.0 + 0.5) / 1000;
+            wchar_t b[32];
+            swprintf_s(b, L"%02d:%02d", totalSec / 60, totalSec % 60);
+            return std::wstring(b);
+        };
+        const std::wstring mp3Expected = durationText(static_cast<double>(audioBytes) * 8.0 / 128000.0);
+        std::wstring mp3Path = dir + L"\\long_show.mp3";
+        PathUtils::WriteFileBytes(mp3Path, mp3.data(), mp3.size());
+        mp3.clear();
+        mp3.shrink_to_fit();
+        ParsedOfficeDocument dMp3;
+        bool mp3Ok = SpreadsheetDocViewer::InspectOfficeFile(mp3Path, dMp3) && dMp3.valid &&
+                     DocContainsToken(dMp3, mp3Expected) && DocContainsToken(dMp3, L"Big Show") &&
+                     dMp3.formatTitle.find(L"only the first") != std::wstring::npos;
+        DeleteFileW(mp3Path.c_str());
+
+        // Ogg: the usual header pages, 33 MB of other data, then the stream's last page (granule = 1 hour at 44.1 kHz)
+        std::vector<uint8_t> ogg = MakeOggVorbis(0x5151A0A0u, 44100, 44100LL * 10, "Night Drive");
+        ogg.resize(ogg.size() + 33u * 1024 * 1024, 0);
+        const uint64_t lastGranule = 44100ULL * 3600;
+        uint8_t page[28] = { 'O', 'g', 'g', 'S', 0, 0x04 };
+        for (int i = 0; i < 8; ++i) page[6 + i] = static_cast<uint8_t>(lastGranule >> (8 * i));
+        for (int i = 0; i < 4; ++i) page[14 + i] = static_cast<uint8_t>(0x5151A0A0u >> (8 * i));
+        page[18] = 9;  // page sequence
+        page[26] = 1;  // one segment
+        page[27] = 1;  // of one byte
+        ogg.insert(ogg.end(), page, page + 28);
+        ogg.push_back(0);
+        std::wstring oggPath = dir + L"\\long_drive.ogg";
+        PathUtils::WriteFileBytes(oggPath, ogg.data(), ogg.size());
+        ogg.clear();
+        ogg.shrink_to_fit();
+        ParsedOfficeDocument dOgg;
+        bool oggOk = SpreadsheetDocViewer::InspectOfficeFile(oggPath, dOgg) && dOgg.valid && DocContainsToken(dOgg, L"1:00:00");
+        DeleteFileW(oggPath.c_str());
+        tc.Record(mp3Ok && oggOk, L"DocsB.Media.Over32MbDurationAndTrailingTagsFromWholeFile",
+                  L"mp3=" + std::to_wstring(mp3Ok) + L" (" + mp3Expected + L") ogg=" + std::to_wstring(oggOk));
+    }
 
     {
         auto makeMod = [](std::string_view title, const char* tag, std::string_view smpName, uint16_t words) {
@@ -1630,6 +1872,40 @@ void RunFormatTestsDocsB(TestCounter& tc) {
                         "</Tracks></LiveSet></Ableton>"),
         L"Amen Break Drum",
         kGarbage);
+
+    // Ableton tracks in project order with their group; session clips (clip slots) and arrangement clips are counted
+    // apart, frozen copies are not; the tempo comes from the master track's mixer, not from another device's "Tempo"
+    {
+        const std::string set =
+            "<?xml version=\"1.0\"?><Ableton MajorVersion=\"5\" MinorVersion=\"11.0\" Creator=\"Ableton Live 11.3\"><LiveSet><Tracks>"
+            "<GroupTrack Id=\"10\"><Name><EffectiveName Value=\"Drums\"/></Name><TrackGroupId Value=\"-1\"/></GroupTrack>"
+            "<AudioTrack Id=\"11\"><Name><EffectiveName Value=\"Kick\"/></Name><TrackGroupId Value=\"10\"/><DeviceChain><MainSequencer>"
+            "<ClipSlotList><ClipSlot><ClipSlot><Value><AudioClip/></Value></ClipSlot></ClipSlot><ClipSlot><ClipSlot><Value/></ClipSlot></ClipSlot></ClipSlotList>"
+            "<Sample><ArrangerAutomation><Events><AudioClip/><AudioClip/></Events></ArrangerAutomation></Sample></MainSequencer>"
+            "<FreezeSequencer><ClipSlotList><ClipSlot><ClipSlot><Value><AudioClip/></Value></ClipSlot></ClipSlot></ClipSlotList></FreezeSequencer>"
+            "<DeviceChain><Devices><Compressor2/><Eq8/></Devices></DeviceChain></DeviceChain></AudioTrack>"
+            "<MidiTrack Id=\"12\"><Name><EffectiveName Value=\"Bass\"/></Name><TrackGroupId Value=\"-1\"/><DeviceChain><MainSequencer>"
+            "<ClipTimeable><ArrangerAutomation><Events><MidiClip/></Events></ArrangerAutomation></ClipTimeable></MainSequencer>"
+            "<DeviceChain><Devices><InstrumentVector><Tempo><Manual Value=\"99\"/></Tempo></InstrumentVector></Devices></DeviceChain></DeviceChain></MidiTrack>"
+            "<ReturnTrack Id=\"13\"><Name><EffectiveName Value=\"A-Reverb\"/></Name></ReturnTrack>"
+            "</Tracks><MasterTrack><DeviceChain><Mixer><Tempo><Manual Value=\"128\"/></Tempo></Mixer></DeviceChain></MasterTrack>"
+            "<Scenes><Scene/><Scene/></Scenes></LiveSet></Ableton>";
+        std::wstring alsPath = dir + L"\\order.als";
+        std::vector<uint8_t> gz = BuildStoredGzip(set);
+        PathUtils::WriteFileBytes(alsPath, gz.data(), gz.size());
+        ParsedOfficeDocument als;
+        bool ok = SpreadsheetDocViewer::InspectOfficeFile(alsPath, als) && als.valid && als.sheets.size() == 2;
+        DeleteFileW(alsPath.c_str());
+        const SpreadsheetSheet* tr = ok ? &als.sheets[1] : nullptr;
+        auto cell = [&](size_t r, size_t c) { return (tr && r < tr->rows.size() && c < tr->rows[r].size()) ? tr->rows[r][c] : std::wstring(L"<none>"); };
+        ok = ok && tr->rows.size() == 5 &&
+             cell(1, 2) == L"Drums" && cell(2, 2) == L"Kick" && cell(3, 2) == L"Bass" && cell(4, 2) == L"A-Reverb" &&
+             cell(2, 3) == L"Drums" && cell(2, 4) == L"1" && cell(2, 5) == L"2" && cell(2, 6) == L"2" &&
+             cell(3, 3) == L"" && cell(3, 5) == L"1" && DocContainsToken(als, L"128 BPM") && !DocContainsToken(als, L"99 BPM") &&
+             DocContainsToken(als, L"Scenes");
+        tc.Record(ok, L"DocsB.Ableton.TracksInOrderGroupsClipsAndMasterTempo",
+                  L"kick=" + cell(2, 4) + L"/" + cell(2, 5) + L"/" + cell(2, 6) + L" group=" + cell(2, 3));
+    }
 
     {
         auto makeFlp = [](std::string_view ver, uint32_t tempoMilli, std::wstring_view title, std::wstring_view plugin) {
@@ -1810,6 +2086,24 @@ void RunFormatTestsDocsB(TestCounter& tc) {
         MakeChm("/tutorials/shader_graph.htm", "<html><body>PBR Shader Graph Guide</body></html>"), L"shader_graph.htm",
         kGarbage);
 
+    // Topics in the LZX section are decoded: titles and text of a page from a verbatim block and one from a stored block
+    {
+        const std::vector<uint8_t> lzxChm = MakeChmLzx(
+            "<html><head><title>Introduction &amp; Setup</title></head><body><p>Explorer2 help body text.</p></body></html>",
+            "<html><head><title>Details</title></head><body><p>Stored block topic.</p></body></html>");
+        std::wstring lzxPath = dir + L"\\lzx_topics.chm";
+        PathUtils::WriteFileBytes(lzxPath, lzxChm.data(), lzxChm.size());
+        ParsedOfficeDocument dChm;
+        bool lzxOk = SpreadsheetDocViewer::InspectOfficeFile(lzxPath, dChm) && dChm.valid && !dChm.sheets.empty() &&
+                     dChm.sheets[0].name == L"CHM_Topics" && dChm.sheets[0].rows.size() == 3 &&
+                     dChm.sheets[0].rows[1][1] == L"Introduction & Setup" &&
+                     dChm.sheets[0].rows[1][2].find(L"Explorer2 help body text.") != std::wstring::npos &&
+                     dChm.sheets[0].rows[2][1] == L"Details" && dChm.sheets[0].rows[2][2].find(L"Stored block topic.") != std::wstring::npos;
+        DeleteFileW(lzxPath.c_str());
+        tc.Record(lzxOk, L"DocsB.Chm.LzxSectionTopicsDecoded",
+                  dChm.sheets.empty() ? std::wstring(L"no sheets") : dChm.sheets[0].name + L" rows=" + std::to_wstring(dChm.sheets[0].rows.size()));
+    }
+
     // 7. System, Forensics, Runtime & Security (.dll, .lnk, .pf, .evtx, .pdb, .class, .dex, .macho, .cer, .pem, .kdbx, .pcapng, .uf2)
     VerifyPairAndCorrupt(tc, dir, L"DocsB .dll (PE32+ Import & Export Tables)", L".dll",
         MakePe64WithImpExp("KERNEL32.dll", "CreateFileW", "InitializePhysicsEngine"), L"InitializePhysicsEngine",
@@ -1870,6 +2164,23 @@ void RunFormatTestsDocsB(TestCounter& tc) {
         MakePdbMsf7(0xB2, "W:\\build\\obj\\AudioMixerWasapi.obj"), L"AudioMixerWasapi.obj",
         kGarbage);
 
+    // A PDB larger than the 32 MB a reader is handed, its block map, stream directory and streams past that (large
+    // PDBs keep the directory near the end): all read from the file, and the title does not claim only the start
+    // was read
+    {
+        std::vector<uint8_t> big = MakePdbMsf7(0xC3, "W:\\build\\obj\\FarAwayModule.obj", 67600); // 33 MB in
+        std::wstring bigPath = dir + L"\\far_streams.pdb";
+        PathUtils::WriteFileBytes(bigPath, big.data(), big.size());
+        big.clear();
+        big.shrink_to_fit();
+        ParsedOfficeDocument dBig;
+        bool bigOk = SpreadsheetDocViewer::InspectOfficeFile(bigPath, dBig) && dBig.valid &&
+                     DocContainsToken(dBig, L"FarAwayModule.obj") && DocContainsToken(dBig, L"x64 / AMD64") &&
+                     dBig.formatTitle.find(L"only the first") == std::wstring::npos;
+        DeleteFileW(bigPath.c_str());
+        tc.Record(bigOk, L"DocsB.Pdb.Over32MbStreamsReadFromTheFile", dBig.formatTitle);
+    }
+
     VerifyPairAndCorrupt(tc, dir, L"DocsB .class (JVM Constant Pool & Methods)", L".class",
         MakeJavaClass("com/explorer2/OrderMatcher", "matchLimitOrder"), L"matchLimitOrder",
         MakeJavaClass("org/analytics/TensorKernel", "dispatchMatMul"), L"dispatchMatMul",
@@ -1884,6 +2195,33 @@ void RunFormatTestsDocsB(TestCounter& tc) {
         MakeMachO64(0x0100000Cu, "/usr/lib/libSystem.B.dylib", "_metal_encode_frame"), L"_metal_encode_frame",
         MakeMachO64(0x01000007u, "/System/Library/Frameworks/CoreAudio.framework/CoreAudio", "_audio_unit_render"), L"_audio_unit_render",
         kGarbage);
+
+    // A universal binary larger than the 32 MB a reader is handed, its second slice past that: the slice's load
+    // commands and symbols are read from the file, and the title does not claim only the start was read
+    {
+        const std::vector<uint8_t> nearSlice = MakeMachO64(0x0100000Cu, "/usr/lib/libSystem.B.dylib", "_near_symbol");
+        const std::vector<uint8_t> farSlice = MakeMachO64(0x01000007u, "/usr/lib/libc++.1.dylib", "_far_symbol");
+        const uint32_t nearOff = 4096, farOff = 33u * 1024 * 1024;
+        ByteBuf fat;
+        fat.U32BE(0xCAFEBABEu);
+        fat.U32BE(2);
+        fat.U32BE(0x0100000Cu); fat.U32BE(0); fat.U32BE(nearOff); fat.U32BE(static_cast<uint32_t>(nearSlice.size())); fat.U32BE(12);
+        fat.U32BE(0x01000007u); fat.U32BE(3); fat.U32BE(farOff); fat.U32BE(static_cast<uint32_t>(farSlice.size())); fat.U32BE(12);
+        fat.PadTo(nearOff);
+        fat.Bytes(nearSlice.data(), nearSlice.size());
+        fat.PadTo(farOff);
+        fat.Bytes(farSlice.data(), farSlice.size());
+        std::wstring fatPath = dir + L"\\universal.macho";
+        PathUtils::WriteFileBytes(fatPath, fat.b.data(), fat.b.size());
+        fat.b.clear();
+        fat.b.shrink_to_fit();
+        ParsedOfficeDocument dFat;
+        bool fatOk = SpreadsheetDocViewer::InspectOfficeFile(fatPath, dFat) && dFat.valid &&
+                     DocContainsToken(dFat, L"_near_symbol") && DocContainsToken(dFat, L"_far_symbol") &&
+                     DocContainsToken(dFat, L"libc++.1.dylib") && dFat.formatTitle.find(L"only the first") == std::wstring::npos;
+        DeleteFileW(fatPath.c_str());
+        tc.Record(fatOk, L"DocsB.MachO.Over32MbUniversalSliceReadFromTheFile", dFat.formatTitle);
+    }
 
     {
         auto derA = MakeX509Der(0x11, "api.alpha-cloud.internal", "api.alpha-cloud.internal");

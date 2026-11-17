@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // DwgDxf3DUpgrade.h — #13 Modern AutoCAD .dwg (AC1009, AC1012-AC1015, AC1018-AC1032) & 3D / Binary .dxf
 //
 // Pure C++20 zero-cheat implementation:
@@ -18,13 +19,13 @@ namespace Formats {
 
 namespace DwgDxfDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
-inline int16_t  RdI16LE(const uint8_t* p) { int16_t  v = 0; std::memcpy(&v, p, 2); return v; }
-inline uint32_t RdU32LE(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline int32_t  RdI32LE(const uint8_t* p) { int32_t  v = 0; std::memcpy(&v, p, 4); return v; }
-inline uint64_t RdU64LE(const uint8_t* p) { uint64_t v = 0; std::memcpy(&v, p, 8); return v; }
-inline double   RdF64LE(const uint8_t* p) { double   v = 0.0; std::memcpy(&v, p, 8); return v; }
-inline uint16_t RdU16BE(const uint8_t* p) { return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]); }
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdI16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdF64LE;
+using ::Explorer2::ByteIO::RdU16BE;
 
 inline Vec3f CadZUpToYUp(double x, double y, double z) {
     return { static_cast<float>(x), static_cast<float>(z), static_cast<float>(-y) };

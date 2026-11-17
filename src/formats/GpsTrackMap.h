@@ -14,6 +14,45 @@ inline double HaversineKm(double lat1, double lon1, double lat2, double lon2) {
     return 6371.0 * c;
 }
 
+// A finite number written in text (surrounding whitespace allowed): "52.2297", " -0.5 ", "1e3"
+inline bool ParseGeoNumber(std::string_view s, double& out) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.remove_suffix(1);
+    if (!s.empty() && s.front() == '+') s.remove_prefix(1);
+    if (s.empty()) return false;
+    double v = 0.0;
+    auto res = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (res.ec != std::errc{} || res.ptr != s.data() + s.size() || !std::isfinite(v)) return false;
+    out = v;
+    return true;
+}
+
+// Adds a map point when lat/lon are valid WGS84 degrees (false otherwise); rowIndex links it to its table row (-1: none).
+// Past maxPoints the track is thinned evenly rather than
+// cut off: every other kept point goes and from then on only every second offered point is kept (again each time the
+// cap is reached), so a long recording still shows from end to end.
+inline bool AddGeoPoint(ParsedOfficeDocument& doc, double lat, double lon, double elevM, int rowIndex,
+                        const std::wstring& label = {}, size_t maxPoints = 50000) {
+    if (!std::isfinite(lat) || !std::isfinite(lon) || std::fabs(lat) > 90.0 || std::fabs(lon) > 180.0) return false;
+    const uint64_t seq = doc.geoPointsOffered++;
+    if (seq % doc.geoPointStride != 0) return true;
+    if (doc.geoPoints.size() >= std::max<size_t>(maxPoints, 2)) {
+        size_t kept = 0;
+        for (size_t i = 0; i < doc.geoPoints.size(); i += 2) doc.geoPoints[kept++] = std::move(doc.geoPoints[i]);
+        doc.geoPoints.resize(kept);
+        doc.geoPointStride *= 2;
+        if (seq % doc.geoPointStride != 0) return true;
+    }
+    GpsTrackPoint pt;
+    pt.lat = lat;
+    pt.lon = lon;
+    pt.elevM = std::isfinite(elevM) ? static_cast<float>(elevM) : 0.0f;
+    pt.rowIndex = rowIndex;
+    pt.label = label;
+    doc.geoPoints.push_back(std::move(pt));
+    return true;
+}
+
 inline void ExtractGeoTrackFromSheets(ParsedOfficeDocument& doc) {
     doc.geoPoints.clear();
     doc.hasGeoTrack = false;

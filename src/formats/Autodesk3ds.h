@@ -1,4 +1,15 @@
 #pragma once
+#include "MeshBuild3D.h"
+// Autodesk3ds.h — 3D Studio (.3ds) reader for the 3D viewer.
+
+namespace Formats {
+
+// Returns true when the file was handled here; `mesh` then holds the result (or its status message).
+// false: not this format, the caller tries the next reader.
+inline bool Parse3dsFile(const std::wstring& ext, const std::vector<uint8_t>& buf, uint64_t fileSize, LoadedMesh3D& mesh,
+                 uint64_t generation, const std::atomic<uint64_t>* activeGen) {
+    using MeshBuild3D::FinalizeMeshBoundsAndNormals;
+    (void)ext; (void)fileSize; (void)generation; (void)activeGen;
     // 7. 3D Studio Mesh Parser (.3ds - Main Chunk 0x4D4D)
     if (ext == L".3ds" && buf.size() >= 16) {
         uint16_t mainId = 0;
@@ -54,7 +65,10 @@
                 }
             }
             FinalizeMeshBoundsAndNormals(mesh);
-            if (mesh.loadedOk) return mesh;
+            if (mesh.loadedOk) return true;
         }
     }
+    return false;
+}
 
+} // namespace Formats

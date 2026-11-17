@@ -18,6 +18,24 @@
 
 namespace Explorer2 {
 
+// Paths of entries inside archives: forward slashes, no leading or trailing slash, no leading "./"
+namespace ArchivePath {
+inline std::wstring Normalize(std::wstring p) {
+    for (wchar_t& ch : p) {
+        if (ch == L'\\') ch = L'/';
+    }
+    while (!p.empty() && p.front() == L'/') p.erase(p.begin());
+    while (!p.empty() && p.back() == L'/') p.pop_back();
+    while (p.rfind(L"./", 0) == 0) p.erase(0, 2);
+    return p;
+}
+
+inline std::wstring BaseName(const std::wstring& p) {
+    size_t slash = p.find_last_of(L'/');
+    return (slash == std::wstring::npos) ? p : p.substr(slash + 1);
+}
+} // namespace ArchivePath
+
 struct ArchiveItemEntry {
     std::wstring pathInArchive; // Forward-slash normalized relative path, no leading/trailing slash
     std::wstring name;          // Base name

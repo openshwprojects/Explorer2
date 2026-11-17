@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // DracoEdgebreaker.h — #11 Google Draco Edgebreaker / Valence / KD-Tree (.drc),
 //                      glTF 2.0 KHR_draco_mesh_compression, & EXT_meshopt_compression / KHR_meshopt_compression
 //
@@ -33,13 +34,13 @@ namespace DracoMeshoptDetail {
 #define E2_DRACO_NOINLINE
 #endif
 
-inline uint16_t RdU16LE(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
-inline int16_t  RdI16LE(const uint8_t* p) { int16_t  v = 0; std::memcpy(&v, p, 2); return v; }
-inline uint32_t RdU32LE(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline int32_t  RdI32LE(const uint8_t* p) { int32_t  v = 0; std::memcpy(&v, p, 4); return v; }
-inline uint64_t RdU64LE(const uint8_t* p) { uint64_t v = 0; std::memcpy(&v, p, 8); return v; }
-inline float    RdF32LE(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
-inline double   RdF64LE(const uint8_t* p) { double   v = 0.0; std::memcpy(&v, p, 8); return v; }
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdI16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdF32LE;
+using ::Explorer2::ByteIO::RdF64LE;
 
 constexpr uint16_t DracoVer(uint8_t maj, uint8_t min) {
     return static_cast<uint16_t>((static_cast<uint16_t>(maj) << 8) | min);
@@ -57,30 +58,13 @@ inline int DracoMostSignificantBit(uint32_t n) {
 }
 
 inline bool ReadLeb128U32(const uint8_t* data, size_t size, size_t& pos, uint32_t& out) {
-    out = 0;
-    uint32_t shift = 0;
-    for (int i = 0; i < 5; ++i) {
-        if (pos >= size) return false;
-        uint8_t b = data[pos++];
-        out |= static_cast<uint32_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) return true;
-        shift += 7;
-    }
-    return false;
+    uint64_t v = 0;
+    bool ok = ::Explorer2::ByteIO::RdLeb128(data, size, pos, v, 5);
+    out = static_cast<uint32_t>(v);
+    return ok;
 }
 
-inline bool ReadLeb128U64(const uint8_t* data, size_t size, size_t& pos, uint64_t& out) {
-    out = 0;
-    uint32_t shift = 0;
-    for (int i = 0; i < 10; ++i) {
-        if (pos >= size) return false;
-        uint8_t b = data[pos++];
-        out |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) return true;
-        shift += 7;
-    }
-    return false;
-}
+inline bool ReadLeb128U64(const uint8_t* data, size_t size, size_t& pos, uint64_t& out) { return ::Explorer2::ByteIO::RdLeb128(data, size, pos, out, 10); }
 
 inline bool ReadDracoU32OrVarint(const uint8_t* data, size_t size, size_t& pos, uint16_t ver, uint32_t minVer, uint32_t& out) {
     if (ver < minVer) {

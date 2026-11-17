@@ -107,97 +107,28 @@ inline EdaLayerId MapEasyEdaProLayer(int layerId) {
     return EdaLayerId::TopCopper;
 }
 
-// Lightweight JSON value node for EasyEDA Pro JSON-Lines records: ["CMD", arg1, arg2, ...]
-struct JVal {
-    enum Kind { Null, Str, Num, Bool, Arr, Obj } kind = Null;
-    std::string str;
-    double num = 0.0;
-    std::vector<JVal> arr;
-    std::vector<std::pair<std::string, JVal>> obj;
+// EasyEDA documents and JSON-Lines records are read with the shared JSON reader (JsonDom.h)
+using JVal = ::Explorer2::Json::Value;
 
-    const JVal* GetKey(std::string_view k) const {
-        for (const auto& kv : obj) {
-            if (kv.first == k) return &kv.second;
-        }
-        return nullptr;
-    }
-};
+// EasyEDA's readers treat a JSON boolean as the number 1 / 0 (e.g. layer visibility flags)
+inline void BoolsAsNumbers(JVal& v, int depth = 0) {
+    if (depth > 64) return;
+    if (v.kind == JVal::Kind::Bool) v.numVal = v.boolVal ? 1.0 : 0.0;
+    for (auto& e : v.arrVal) BoolsAsNumbers(e, depth + 1);
+    for (auto& kv : v.objVal) BoolsAsNumbers(kv.second, depth + 1);
+}
 
+// One JSON value starting at sv[p] (leading whitespace skipped); p moves past it
 inline bool ParseJsonValue(std::string_view sv, size_t& p, int depth, JVal& out) {
-    if (depth > 48) return false;
-    while (p < sv.size() && static_cast<unsigned char>(sv[p]) <= 0x20u) ++p;
-    if (p >= sv.size()) return false;
-    char c = sv[p];
-    if (c == '"') {
-        ++p;
-        out.kind = JVal::Str;
-        while (p < sv.size()) {
-            char ch = sv[p++];
-            if (ch == '"') return true;
-            if (ch == '\\' && p < sv.size()) {
-                char esc = sv[p++];
-                if (esc == 'n') out.str.push_back('\n');
-                else if (esc == 't') out.str.push_back('\t');
-                else if (esc == 'r') out.str.push_back('\r');
-                else out.str.push_back(esc);
-            } else {
-                out.str.push_back(ch);
-            }
-        }
-        return false;
-    }
-    if (c == '[') {
-        ++p;
-        out.kind = JVal::Arr;
-        for (;;) {
-            while (p < sv.size() && static_cast<unsigned char>(sv[p]) <= 0x20u) ++p;
-            if (p >= sv.size()) return false;
-            if (sv[p] == ']') { ++p; return true; }
-            JVal elem;
-            if (!ParseJsonValue(sv, p, depth + 1, elem)) return false;
-            out.arr.push_back(std::move(elem));
-            while (p < sv.size() && static_cast<unsigned char>(sv[p]) <= 0x20u) ++p;
-            if (p < sv.size() && sv[p] == ',') { ++p; continue; }
-            if (p < sv.size() && sv[p] == ']') { ++p; return true; }
-            return false;
-        }
-    }
-    if (c == '{') {
-        ++p;
-        out.kind = JVal::Obj;
-        for (;;) {
-            while (p < sv.size() && static_cast<unsigned char>(sv[p]) <= 0x20u) ++p;
-            if (p >= sv.size()) return false;
-            if (sv[p] == '}') { ++p; return true; }
-            JVal kNode;
-            if (!ParseJsonValue(sv, p, depth + 1, kNode) || kNode.kind != JVal::Str) return false;
-            while (p < sv.size() && static_cast<unsigned char>(sv[p]) <= 0x20u) ++p;
-            if (p >= sv.size() || sv[p] != ':') return false;
-            ++p;
-            JVal vNode;
-            if (!ParseJsonValue(sv, p, depth + 1, vNode)) return false;
-            out.obj.push_back({ std::move(kNode.str), std::move(vNode) });
-            while (p < sv.size() && static_cast<unsigned char>(sv[p]) <= 0x20u) ++p;
-            if (p < sv.size() && sv[p] == ',') { ++p; continue; }
-            if (p < sv.size() && sv[p] == '}') { ++p; return true; }
-            return false;
-        }
-    }
-    if (sv.substr(p, 4) == "true")  { p += 4; out.kind = JVal::Bool; out.num = 1.0; return true; }
-    if (sv.substr(p, 5) == "false") { p += 5; out.kind = JVal::Bool; out.num = 0.0; return true; }
-    if (sv.substr(p, 4) == "null")  { p += 4; out.kind = JVal::Null; return true; }
-    if ((c >= '0' && c <= '9') || c == '-' || c == '+') {
-        size_t s = p;
-        while (p < sv.size() && ((sv[p] >= '0' && sv[p] <= '9') || sv[p] == '.' || sv[p] == '-' || sv[p] == '+' || sv[p] == 'e' || sv[p] == 'E')) ++p;
-        char b[64] = {};
-        std::memcpy(b, sv.data() + s, std::min<size_t>(p - s, 63));
-        char* endp = nullptr;
-        out.num = std::strtod(b, &endp);
-        if (endp == b || !std::isfinite(out.num)) return false;
-        out.kind = JVal::Num;
-        return true;
-    }
-    return false;
+    if (p > sv.size()) return false;
+    ::Explorer2::Json::Limits limits;
+    limits.maxDepth = std::max(1, 48 - depth);
+    limits.maxNodes = 8000000;
+    ::Explorer2::Json::Parser parser(sv.substr(p), limits);
+    if (!parser.ParseValue(out)) return false;
+    p += parser.Position();
+    BoolsAsNumbers(out);
+    return true;
 }
 
 } // namespace DetailEasyEda
@@ -227,33 +158,33 @@ inline bool ParseEasyEdaStandardJson(std::string_view sv, ParsedEdaBoard& out) {
 
     size_t p = 0;
     JVal root;
-    if (!ParseJsonValue(sv, p, 0, root) || root.kind != JVal::Obj) return false;
+    if (!ParseJsonValue(sv, p, 0, root) || root.kind != JVal::Kind::Object) return false;
 
     // Support both single-doc {"head":..., "shape":[...]} and multi-doc {"schematics":[{"dataStr":{...}}], "pcbs":[...]}
     const JVal* docObj = &root;
-    if (const JVal* pcbs = root.GetKey("pcbs"); pcbs && pcbs->kind == JVal::Arr && !pcbs->arr.empty()) {
-        if (const JVal* ds = pcbs->arr[0].GetKey("dataStr"); ds && ds->kind == JVal::Obj) docObj = ds;
-    } else if (const JVal* schs = root.GetKey("schematics"); schs && schs->kind == JVal::Arr && !schs->arr.empty()) {
-        if (const JVal* ds = schs->arr[0].GetKey("dataStr"); ds && ds->kind == JVal::Obj) docObj = ds;
+    if (const JVal* pcbs = root.Find("pcbs"); pcbs && pcbs->kind == JVal::Kind::Array && !pcbs->arrVal.empty()) {
+        if (const JVal* ds = pcbs->arrVal[0].Find("dataStr"); ds && ds->kind == JVal::Kind::Object) docObj = ds;
+    } else if (const JVal* schs = root.Find("schematics"); schs && schs->kind == JVal::Kind::Array && !schs->arrVal.empty()) {
+        if (const JVal* ds = schs->arrVal[0].Find("dataStr"); ds && ds->kind == JVal::Kind::Object) docObj = ds;
     }
 
-    const JVal* head = docObj->GetKey("head");
-    const JVal* shapes = docObj->GetKey("shape");
-    if (!head || head->kind != JVal::Obj || !shapes || shapes->kind != JVal::Arr || shapes->arr.empty()) {
+    const JVal* head = docObj->Find("head");
+    const JVal* shapes = docObj->Find("shape");
+    if (!head || head->kind != JVal::Kind::Object || !shapes || shapes->kind != JVal::Kind::Array || shapes->arrVal.empty()) {
         return false;
     }
 
     int docType = 3;
-    if (const JVal* dt = head->GetKey("docType")) {
-        docType = (dt->kind == JVal::Num) ? static_cast<int>(dt->num) : std::atoi(dt->str.c_str());
+    if (const JVal* dt = head->Find("docType")) {
+        docType = (dt->kind == JVal::Kind::Number) ? static_cast<int>(dt->numVal) : std::atoi(dt->strVal.c_str());
     }
     const bool isSch = (docType == 1 || docType == 2 || docType == 5);
     const float kScale = 0.254f; // 1 EasyEDA unit = 10 mil = 0.254 mm
 
     std::string projTitle;
-    if (const JVal* cp = head->GetKey("c_para"); cp && cp->kind == JVal::Obj) {
-        if (const JVal* nm = cp->GetKey("name"); nm && nm->kind == JVal::Str) projTitle = nm->str;
-        else if (const JVal* pk = cp->GetKey("package"); pk && pk->kind == JVal::Str) projTitle = pk->str;
+    if (const JVal* cp = head->Find("c_para"); cp && cp->kind == JVal::Kind::Object) {
+        if (const JVal* nm = cp->Find("name"); nm && nm->kind == JVal::Kind::String) projTitle = nm->strVal;
+        else if (const JVal* pk = cp->Find("package"); pk && pk->kind == JVal::Kind::String) projTitle = pk->strVal;
     }
 
     out.kind = isSch ? EdaDocKind::KiCadSch : EdaDocKind::KiCadPcb;
@@ -423,9 +354,9 @@ inline bool ParseEasyEdaStandardJson(std::string_view sv, ParsedEdaBoard& out) {
         }
     };
 
-    for (const auto& item : shapes->arr) {
-        if (item.kind != JVal::Str || item.str.empty()) continue;
-        std::string_view s = item.str;
+    for (const auto& item : shapes->arrVal) {
+        if (item.kind != JVal::Kind::String || item.strVal.empty()) continue;
+        std::string_view s = item.strVal;
         if (s.rfind("LIB~", 0) == 0) {
             auto parts = SplitBySubstr(s, "#@$");
             auto libHdr = SplitByChar(parts[0], '~');
@@ -506,35 +437,35 @@ inline bool ParseEasyEdaProJsonLines(std::string_view sv, ParsedEdaBoard& out, f
 
         size_t lp = 0;
         JVal rec;
-        if (!ParseJsonValue(ln, lp, 0, rec) || rec.kind != JVal::Arr || rec.arr.empty() || rec.arr[0].kind != JVal::Str) {
+        if (!ParseJsonValue(ln, lp, 0, rec) || rec.kind != JVal::Kind::Array || rec.arrVal.empty() || rec.arrVal[0].kind != JVal::Kind::String) {
             if (!sawDocType) return false;
             continue;
         }
         ++validLines;
-        const std::string& cmd = rec.arr[0].str;
+        const std::string& cmd = rec.arrVal[0].strVal;
 
-        if (cmd == "DOCTYPE" && rec.arr.size() >= 2) {
+        if (cmd == "DOCTYPE" && rec.arrVal.size() >= 2) {
             sawDocType = true;
-            const std::string& dt = rec.arr[1].str;
+            const std::string& dt = rec.arrVal[1].strVal;
             isSch = (dt == "SCH" || dt == "SYMBOL" || dt == "SCHLIB");
             out.kind = isSch ? EdaDocKind::KiCadSch : EdaDocKind::KiCadPcb;
             out.formatTitle = isSch ? L"EasyEDA Pro Schematic (.esch)" : L"EasyEDA Pro 3D PCB (.epcb)";
-        } else if (cmd == "NET" && rec.arr.size() >= 2 && rec.arr[1].kind == JVal::Str) {
-            getNetId(rec.arr[1].str);
-        } else if (!isSch && cmd == "COMPONENT" && rec.arr.size() >= 7) {
+        } else if (cmd == "NET" && rec.arrVal.size() >= 2 && rec.arrVal[1].kind == JVal::Kind::String) {
+            getNetId(rec.arrVal[1].strVal);
+        } else if (!isSch && cmd == "COMPONENT" && rec.arrVal.size() >= 7) {
             // ["COMPONENT", id, fpName, layer, x_mil, y_mil, rot, {"Designator":"U1","Value":"ESP32"}]
-            std::string cid = rec.arr[1].str;
-            std::string fp  = rec.arr[2].str;
-            int lyr = static_cast<int>(rec.arr[3].num);
-            float cx = sheetOffX + static_cast<float>(rec.arr[4].num) * kMilToMm;
-            float cy = static_cast<float>(rec.arr[5].num) * kMilToMm;
-            float rot = static_cast<float>(rec.arr[6].num);
+            std::string cid = rec.arrVal[1].strVal;
+            std::string fp  = rec.arrVal[2].strVal;
+            int lyr = static_cast<int>(rec.arrVal[3].numVal);
+            float cx = sheetOffX + static_cast<float>(rec.arrVal[4].numVal) * kMilToMm;
+            float cy = static_cast<float>(rec.arrVal[5].numVal) * kMilToMm;
+            float rot = static_cast<float>(rec.arrVal[6].numVal);
 
             std::string des, val;
-            if (rec.arr.size() >= 8 && rec.arr[7].kind == JVal::Obj) {
-                if (const JVal* d = rec.arr[7].GetKey("Designator")) des = d->str;
-                if (const JVal* v = rec.arr[7].GetKey("Value")) val = v->str;
-                else if (const JVal* m = rec.arr[7].GetKey("Manufacturer Part")) val = m->str;
+            if (rec.arrVal.size() >= 8 && rec.arrVal[7].kind == JVal::Kind::Object) {
+                if (const JVal* d = rec.arrVal[7].Find("Designator")) des = d->strVal;
+                if (const JVal* v = rec.arrVal[7].Find("Value")) val = v->strVal;
+                else if (const JVal* m = rec.arrVal[7].Find("Manufacturer Part")) val = m->strVal;
             }
             EdaComponent3D comp;
             comp.refDes = PathUtils::Utf8ToWide(des.empty() ? cid : des);
@@ -547,78 +478,78 @@ inline bool ParseEasyEdaProJsonLines(std::string_view sv, ParsedEdaBoard& out, f
             compIdxById[cid] = out.components.size();
             out.labels.push_back({ cx, cy, 0.9f, comp.bottomSide ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk, comp.refDes });
             out.components.push_back(std::move(comp));
-        } else if (!isSch && cmd == "PAD" && rec.arr.size() >= 10) {
+        } else if (!isSch && cmd == "PAD" && rec.arrVal.size() >= 10) {
             // ["PAD", id, compId, net, layer, pinNum, x_mil, y_mil, rot, ["RECT"|"ELLIPSE"|"OVAL", w_mil, h_mil], holeDiam_mil]
-            int nid = getNetId(rec.arr[3].str);
+            int nid = getNetId(rec.arrVal[3].strVal);
             (void)nid;
-            int lyr = static_cast<int>(rec.arr[4].num);
-            std::string pinNum = rec.arr[5].str;
-            float px = sheetOffX + static_cast<float>(rec.arr[6].num) * kMilToMm;
-            float py = static_cast<float>(rec.arr[7].num) * kMilToMm;
-            float rot = static_cast<float>(rec.arr[8].num);
+            int lyr = static_cast<int>(rec.arrVal[4].numVal);
+            std::string pinNum = rec.arrVal[5].strVal;
+            float px = sheetOffX + static_cast<float>(rec.arrVal[6].numVal) * kMilToMm;
+            float py = static_cast<float>(rec.arrVal[7].numVal) * kMilToMm;
+            float rot = static_cast<float>(rec.arrVal[8].numVal);
             float pw = 1.2f, ph = 1.2f;
             uint8_t sh = 1;
-            if (rec.arr[9].kind == JVal::Arr && rec.arr[9].arr.size() >= 3) {
-                const std::string& st = rec.arr[9].arr[0].str;
+            if (rec.arrVal[9].kind == JVal::Kind::Array && rec.arrVal[9].arrVal.size() >= 3) {
+                const std::string& st = rec.arrVal[9].arrVal[0].strVal;
                 sh = (st == "ELLIPSE" || st == "CIRCLE") ? 0 : ((st == "OVAL") ? 3 : 1);
-                pw = std::max(0.15f, static_cast<float>(rec.arr[9].arr[1].num) * kMilToMm);
-                ph = std::max(0.15f, static_cast<float>(rec.arr[9].arr[2].num) * kMilToMm);
+                pw = std::max(0.15f, static_cast<float>(rec.arrVal[9].arrVal[1].numVal) * kMilToMm);
+                ph = std::max(0.15f, static_cast<float>(rec.arrVal[9].arrVal[2].numVal) * kMilToMm);
             }
             float holeD = 0.0f;
-            if (rec.arr.size() >= 11) {
-                if (rec.arr[10].kind == JVal::Num) holeD = static_cast<float>(rec.arr[10].num) * kMilToMm;
-                else if (rec.arr[10].kind == JVal::Arr && rec.arr[10].arr.size() >= 2) holeD = static_cast<float>(rec.arr[10].arr[1].num) * kMilToMm;
+            if (rec.arrVal.size() >= 11) {
+                if (rec.arrVal[10].kind == JVal::Kind::Number) holeD = static_cast<float>(rec.arrVal[10].numVal) * kMilToMm;
+                else if (rec.arrVal[10].kind == JVal::Kind::Array && rec.arrVal[10].arrVal.size() >= 2) holeD = static_cast<float>(rec.arrVal[10].arrVal[1].numVal) * kMilToMm;
             }
             EdaPadPrim pad{};
             pad.x = px; pad.y = py; pad.w = pw; pad.h = ph;
             pad.rotDeg = rot; pad.drill = std::max(0.0f, holeD); pad.shape = sh;
             pad.layer = (pad.drill > 0.05f || lyr == 12) ? EdaLayerId::PadsThrough : MapEasyEdaProLayer(lyr);
             pad.pinName = PathUtils::Utf8ToWide(pinNum);
-            pad.netName = PathUtils::Utf8ToWide(rec.arr[3].str);
+            pad.netName = PathUtils::Utf8ToWide(rec.arrVal[3].strVal);
             out.pads.push_back(std::move(pad));
-        } else if (!isSch && cmd == "VIA" && rec.arr.size() >= 7) {
+        } else if (!isSch && cmd == "VIA" && rec.arrVal.size() >= 7) {
             // ["VIA", id, net, x_mil, y_mil, hole_mil, diam_mil]
-            int nid = getNetId(rec.arr[2].str);
-            float vx = sheetOffX + static_cast<float>(rec.arr[3].num) * kMilToMm;
-            float vy = static_cast<float>(rec.arr[4].num) * kMilToMm;
-            float hole = std::max(0.12f, static_cast<float>(rec.arr[5].num) * kMilToMm);
-            float diam = std::max(hole * 1.4f, static_cast<float>(rec.arr[6].num) * kMilToMm);
+            int nid = getNetId(rec.arrVal[2].strVal);
+            float vx = sheetOffX + static_cast<float>(rec.arrVal[3].numVal) * kMilToMm;
+            float vy = static_cast<float>(rec.arrVal[4].numVal) * kMilToMm;
+            float hole = std::max(0.12f, static_cast<float>(rec.arrVal[5].numVal) * kMilToMm);
+            float diam = std::max(hole * 1.4f, static_cast<float>(rec.arrVal[6].numVal) * kMilToMm);
             out.vias.push_back({ vx, vy, diam, hole, nid });
-        } else if (!isSch && cmd == "LINE" && rec.arr.size() >= 9) {
+        } else if (!isSch && cmd == "LINE" && rec.arrVal.size() >= 9) {
             // ["LINE", id, net, layer, x1, y1, x2, y2, width]
-            int nid = getNetId(rec.arr[2].str);
-            EdaLayerId lid = MapEasyEdaProLayer(static_cast<int>(rec.arr[3].num));
-            float x1 = sheetOffX + static_cast<float>(rec.arr[4].num) * kMilToMm;
-            float y1 = static_cast<float>(rec.arr[5].num) * kMilToMm;
-            float x2 = sheetOffX + static_cast<float>(rec.arr[6].num) * kMilToMm;
-            float y2 = static_cast<float>(rec.arr[7].num) * kMilToMm;
-            float w  = std::clamp(static_cast<float>(rec.arr[8].num) * kMilToMm, 0.08f, 4.0f);
+            int nid = getNetId(rec.arrVal[2].strVal);
+            EdaLayerId lid = MapEasyEdaProLayer(static_cast<int>(rec.arrVal[3].numVal));
+            float x1 = sheetOffX + static_cast<float>(rec.arrVal[4].numVal) * kMilToMm;
+            float y1 = static_cast<float>(rec.arrVal[5].numVal) * kMilToMm;
+            float x2 = sheetOffX + static_cast<float>(rec.arrVal[6].numVal) * kMilToMm;
+            float y2 = static_cast<float>(rec.arrVal[7].numVal) * kMilToMm;
+            float w  = std::clamp(static_cast<float>(rec.arrVal[8].numVal) * kMilToMm, 0.08f, 4.0f);
             out.traces.push_back({ x1, y1, x2, y2, w, lid, nid });
-        } else if (!isSch && (cmd == "POLY" || cmd == "POUR" || cmd == "FILL") && rec.arr.size() >= 5) {
+        } else if (!isSch && (cmd == "POLY" || cmd == "POUR" || cmd == "FILL") && rec.arrVal.size() >= 5) {
             // ["POLY", id, net, layer, width, [x0, y0, x1, y1, ...]]
-            int nid = getNetId(rec.arr[2].str);
-            EdaLayerId lid = MapEasyEdaProLayer(static_cast<int>(rec.arr[3].num));
-            size_t arrIdx = (rec.arr[4].kind == JVal::Arr) ? 4 : 5;
-            float w = (arrIdx == 5 && rec.arr[4].kind == JVal::Num) ? std::clamp(static_cast<float>(rec.arr[4].num) * kMilToMm, 0.12f, 2.0f) : 0.22f;
-            if (arrIdx < rec.arr.size() && rec.arr[arrIdx].kind == JVal::Arr) {
-                const auto& pts = rec.arr[arrIdx].arr;
+            int nid = getNetId(rec.arrVal[2].strVal);
+            EdaLayerId lid = MapEasyEdaProLayer(static_cast<int>(rec.arrVal[3].numVal));
+            size_t arrIdx = (rec.arrVal[4].kind == JVal::Kind::Array) ? 4 : 5;
+            float w = (arrIdx == 5 && rec.arrVal[4].kind == JVal::Kind::Number) ? std::clamp(static_cast<float>(rec.arrVal[4].numVal) * kMilToMm, 0.12f, 2.0f) : 0.22f;
+            if (arrIdx < rec.arrVal.size() && rec.arrVal[arrIdx].kind == JVal::Kind::Array) {
+                const auto& pts = rec.arrVal[arrIdx].arrVal;
                 for (size_t i = 0; i + 3 < pts.size() && out.traces.size() < 120000; i += 2) {
                     out.traces.push_back({
-                        sheetOffX + static_cast<float>(pts[i].num) * kMilToMm,
-                        static_cast<float>(pts[i + 1].num) * kMilToMm,
-                        sheetOffX + static_cast<float>(pts[i + 2].num) * kMilToMm,
-                        static_cast<float>(pts[i + 3].num) * kMilToMm,
+                        sheetOffX + static_cast<float>(pts[i].numVal) * kMilToMm,
+                        static_cast<float>(pts[i + 1].numVal) * kMilToMm,
+                        sheetOffX + static_cast<float>(pts[i + 2].numVal) * kMilToMm,
+                        static_cast<float>(pts[i + 3].numVal) * kMilToMm,
                         w, lid, nid
                     });
                 }
             }
-        } else if (isSch && cmd == "COMPONENT" && rec.arr.size() >= 6) {
+        } else if (isSch && cmd == "COMPONENT" && rec.arrVal.size() >= 6) {
             // ["COMPONENT", id, symName, x, y, rot]
-            std::string cid = rec.arr[1].str;
-            std::string sym = rec.arr[2].str;
-            float cx = sheetOffX + static_cast<float>(rec.arr[3].num) * kMilToMm;
-            float cy = static_cast<float>(rec.arr[4].num) * kMilToMm;
-            float rot = static_cast<float>(rec.arr[5].num);
+            std::string cid = rec.arrVal[1].strVal;
+            std::string sym = rec.arrVal[2].strVal;
+            float cx = sheetOffX + static_cast<float>(rec.arrVal[3].numVal) * kMilToMm;
+            float cy = static_cast<float>(rec.arrVal[4].numVal) * kMilToMm;
+            float rot = static_cast<float>(rec.arrVal[5].numVal);
 
             EdaComponent3D comp;
             comp.refDes = PathUtils::Utf8ToWide(cid);
@@ -632,13 +563,13 @@ inline bool ParseEasyEdaProJsonLines(std::string_view sv, ParsedEdaBoard& out, f
             out.traces.push_back({ cx - hw, cy + hh, cx - hw, cy - hh, 0.26f, EdaLayerId::SchSymbol, 0 });
             compIdxById[cid] = out.components.size();
             out.components.push_back(std::move(comp));
-        } else if (isSch && cmd == "ATTR" && rec.arr.size() >= 5) {
+        } else if (isSch && cmd == "ATTR" && rec.arrVal.size() >= 5) {
             // ["ATTR", id, parentId, key, val]
-            auto it = compIdxById.find(rec.arr[2].str);
+            auto it = compIdxById.find(rec.arrVal[2].strVal);
             if (it != compIdxById.end()) {
                 auto& c = out.components[it->second];
-                const std::string& k = rec.arr[3].str;
-                const std::string& v = rec.arr[4].str;
+                const std::string& k = rec.arrVal[3].strVal;
+                const std::string& v = rec.arrVal[4].strVal;
                 if (k == "Designator" && !v.empty()) {
                     c.refDes = PathUtils::Utf8ToWide(v);
                     out.labels.push_back({ c.x - 2.5f, c.y + 2.8f, 0.95f, EdaLayerId::SchLabel, c.refDes });
@@ -646,42 +577,42 @@ inline bool ParseEasyEdaProJsonLines(std::string_view sv, ParsedEdaBoard& out, f
                     c.value = PathUtils::Utf8ToWide(v);
                 }
             }
-        } else if (isSch && cmd == "PIN" && rec.arr.size() >= 7) {
+        } else if (isSch && cmd == "PIN" && rec.arrVal.size() >= 7) {
             // ["PIN", id, parentId, pinNum, pinName, x, y]
-            float px = sheetOffX + static_cast<float>(rec.arr[5].num) * kMilToMm;
-            float py = static_cast<float>(rec.arr[6].num) * kMilToMm;
+            float px = sheetOffX + static_cast<float>(rec.arrVal[5].numVal) * kMilToMm;
+            float py = static_cast<float>(rec.arrVal[6].numVal) * kMilToMm;
             EdaPadPrim pad{};
             pad.x = px; pad.y = py; pad.w = 0.65f; pad.h = 0.65f;
             pad.layer = EdaLayerId::SchSymbol;
-            pad.pinName = PathUtils::Utf8ToWide(rec.arr[4].str.empty() ? rec.arr[3].str : rec.arr[4].str);
+            pad.pinName = PathUtils::Utf8ToWide(rec.arrVal[4].strVal.empty() ? rec.arrVal[3].strVal : rec.arrVal[4].strVal);
             out.pads.push_back(std::move(pad));
-            auto it = compIdxById.find(rec.arr[2].str);
+            auto it = compIdxById.find(rec.arrVal[2].strVal);
             if (it != compIdxById.end()) {
                 const auto& c = out.components[it->second];
                 float bx = std::clamp(px, c.x - 3.0f, c.x + 3.0f);
                 float by = std::clamp(py, c.y - 2.25f, c.y + 2.25f);
                 out.traces.push_back({ bx, by, px, py, 0.22f, EdaLayerId::SchSymbol, 0 });
             }
-        } else if (isSch && cmd == "WIRE" && rec.arr.size() >= 3 && rec.arr[2].kind == JVal::Arr) {
+        } else if (isSch && cmd == "WIRE" && rec.arrVal.size() >= 3 && rec.arrVal[2].kind == JVal::Kind::Array) {
             // ["WIRE", id, [[x1, y1, x2, y2], ...], netName]
-            int nid = (rec.arr.size() >= 4 && rec.arr[3].kind == JVal::Str) ? getNetId(rec.arr[3].str) : 1;
-            for (const auto& seg : rec.arr[2].arr) {
-                if (seg.kind == JVal::Arr && seg.arr.size() >= 4) {
+            int nid = (rec.arrVal.size() >= 4 && rec.arrVal[3].kind == JVal::Kind::String) ? getNetId(rec.arrVal[3].strVal) : 1;
+            for (const auto& seg : rec.arrVal[2].arrVal) {
+                if (seg.kind == JVal::Kind::Array && seg.arrVal.size() >= 4) {
                     out.traces.push_back({
-                        sheetOffX + static_cast<float>(seg.arr[0].num) * kMilToMm,
-                        static_cast<float>(seg.arr[1].num) * kMilToMm,
-                        sheetOffX + static_cast<float>(seg.arr[2].num) * kMilToMm,
-                        static_cast<float>(seg.arr[3].num) * kMilToMm,
+                        sheetOffX + static_cast<float>(seg.arrVal[0].numVal) * kMilToMm,
+                        static_cast<float>(seg.arrVal[1].numVal) * kMilToMm,
+                        sheetOffX + static_cast<float>(seg.arrVal[2].numVal) * kMilToMm,
+                        static_cast<float>(seg.arrVal[3].numVal) * kMilToMm,
                         0.25f, EdaLayerId::SchWire, nid
                     });
                 }
             }
-        } else if (isSch && (cmd == "NETLABEL" || cmd == "FLAG") && rec.arr.size() >= 5) {
+        } else if (isSch && (cmd == "NETLABEL" || cmd == "FLAG") && rec.arrVal.size() >= 5) {
             // ["NETLABEL", id, netName, x, y]
-            std::string nn = rec.arr[2].str;
+            std::string nn = rec.arrVal[2].strVal;
             getNetId(nn);
-            float nx = sheetOffX + static_cast<float>(rec.arr[3].num) * kMilToMm;
-            float ny = static_cast<float>(rec.arr[4].num) * kMilToMm;
+            float nx = sheetOffX + static_cast<float>(rec.arrVal[3].numVal) * kMilToMm;
+            float ny = static_cast<float>(rec.arrVal[4].numVal) * kMilToMm;
             out.vias.push_back({ nx, ny, 0.6f, 0.0f, 0 });
             out.labels.push_back({ nx + 0.3f, ny + 0.5f, 0.9f, EdaLayerId::SchLabel, PathUtils::Utf8ToWide(nn) });
         }
@@ -717,8 +648,8 @@ inline bool ParseEasyEdaFile(const uint8_t* data, size_t size, const std::wstrin
                     size_t p = 0;
                     DetailEasyEda::JVal jv;
                     std::string_view psv(reinterpret_cast<const char*>(pj.data()), pj.size());
-                    if (DetailEasyEda::ParseJsonValue(psv, p, 0, jv) && jv.kind == DetailEasyEda::JVal::Obj) {
-                        if (const auto* t = jv.GetKey("title"); t && t->kind == DetailEasyEda::JVal::Str) projTitle = t->str;
+                    if (DetailEasyEda::ParseJsonValue(psv, p, 0, jv) && jv.kind == DetailEasyEda::JVal::Kind::Object) {
+                        if (const auto* t = jv.Find("title"); t && t->kind == DetailEasyEda::JVal::Kind::String) projTitle = t->strVal;
                     }
                 }
             }
@@ -761,10 +692,10 @@ inline bool ParseEasyEdaFile(const uint8_t* data, size_t size, const std::wstrin
         if (!DetailEasyEda::IsBalancedJsonText(sv)) return false;
         size_t p = 0;
         DetailEasyEda::JVal root;
-        if (!DetailEasyEda::ParseJsonValue(sv, p, 0, root) || root.kind != DetailEasyEda::JVal::Obj) return false;
-        const auto* boards = root.GetKey("boards");
-        const auto* schs   = root.GetKey("schematics");
-        if (!boards && !schs && !root.GetKey("config")) return false;
+        if (!DetailEasyEda::ParseJsonValue(sv, p, 0, root) || root.kind != DetailEasyEda::JVal::Kind::Object) return false;
+        const auto* boards = root.Find("boards");
+        const auto* schs   = root.Find("schematics");
+        if (!boards && !schs && !root.Find("config")) return false;
 
         // Try loading companion PCB/*.epcb from disk if present alongside .eprj
         if (!fullPath.empty()) {
@@ -790,7 +721,7 @@ inline bool ParseEasyEdaFile(const uint8_t* data, size_t size, const std::wstrin
 
         // Render structured project hierarchy card diagram from .eprj manifest
         std::string title;
-        if (const auto* t = root.GetKey("title"); t && t->kind == DetailEasyEda::JVal::Str) title = t->str;
+        if (const auto* t = root.Find("title"); t && t->kind == DetailEasyEda::JVal::Kind::String) title = t->strVal;
         out.kind = EdaDocKind::KiCadSch;
         out.formatTitle = L"EasyEDA Pro Project Manifest (.eprj" + (title.empty() ? std::wstring(L")") : (L" — " + PathUtils::Utf8ToWide(title) + L")"));
 
@@ -812,11 +743,11 @@ inline bool ParseEasyEdaFile(const uint8_t* data, size_t size, const std::wstrin
             y -= 10.0f;
             ++nodeCnt;
         };
-        if (boards && boards->kind == DetailEasyEda::JVal::Obj) {
-            for (const auto& kv : boards->obj) addProjBlock("PCB", kv.first);
+        if (boards && boards->kind == DetailEasyEda::JVal::Kind::Object) {
+            for (const auto& kv : boards->objVal) addProjBlock("PCB", kv.first);
         }
-        if (schs && schs->kind == DetailEasyEda::JVal::Obj) {
-            for (const auto& kv : schs->obj) addProjBlock("SCH", kv.first);
+        if (schs && schs->kind == DetailEasyEda::JVal::Kind::Object) {
+            for (const auto& kv : schs->objVal) addProjBlock("SCH", kv.first);
         }
         if (nodeCnt == 0) return false;
         out.netCount = nodeCnt;

@@ -1,4 +1,15 @@
 #pragma once
+#include "MeshBuild3D.h"
+// Md3.h — Quake III MD3 (.md3) reader for the 3D viewer.
+
+namespace Formats {
+
+// Returns true when the file was handled here; `mesh` then holds the result (or its status message).
+// false: not this format, the caller tries the next reader.
+inline bool ParseMd3File(const std::wstring& ext, const std::vector<uint8_t>& buf, uint64_t fileSize, LoadedMesh3D& mesh,
+                 uint64_t generation, const std::atomic<uint64_t>* activeGen) {
+    using MeshBuild3D::FinalizeMeshBoundsAndNormals;
+    (void)ext; (void)fileSize; (void)generation; (void)activeGen;
     // 6. Quake III MD3 Parser (.md3 - magic "IDP3" 0x33504449, version 15)
     // Header: ident, version, name[64], flags (72), frames (76), tags (80), surfaces (84), skins (88),
     // then the offsets of frames (92), tags (96), surfaces (100) and the end (104). A surface: ident,
@@ -50,8 +61,11 @@
                     surfOff += static_cast<size_t>(ofsEnd);
                 }
                 FinalizeMeshBoundsAndNormals(mesh);
-                if (mesh.loadedOk) return mesh;
+                if (mesh.loadedOk) return true;
             }
         }
     }
+    return false;
+}
 
+} // namespace Formats

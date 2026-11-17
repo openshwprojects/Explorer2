@@ -51,11 +51,7 @@ inline std::string LowerSvdTag(std::string_view raw) {
     if (colon != std::string_view::npos && colon + 1 < raw.size()) {
         raw.remove_prefix(colon + 1);
     }
-    std::string s(raw);
-    for (char& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return s;
+    return ::Explorer2::PathUtils::ToLowerAscii(raw);
 }
 
 inline std::string UnescapeXmlEntities(std::string_view sv) {

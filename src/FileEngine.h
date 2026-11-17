@@ -148,7 +148,6 @@ public:
     // Clipboard operations (compatible with Windows Explorer CF_HDROP)
     static bool CopyFilesToClipboard(HWND hwnd, const std::vector<std::wstring>& paths, bool isCut);
     static bool ReadFilesFromClipboard(HWND hwnd, std::vector<std::wstring>& outPaths, bool& outIsMove);
-    static bool PasteFilesFromClipboard(HWND hwnd, const std::wstring& targetDir, bool& outWasCut);
     static bool CopyTextToClipboard(HWND hwnd, const std::wstring& text);
 
     // File management operations

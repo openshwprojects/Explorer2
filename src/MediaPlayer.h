@@ -32,7 +32,6 @@ public:
     double GetCurrentTimeSec() const;
     double GetDurationSec() const;
     void SeekToSeconds(double sec);
-    void SeekRelative(double deltaSec);
 
     // Updates and returns the current video frame as a Direct2D bitmap
     ID2D1Bitmap* GetCurrentVideoFrame(ID2D1RenderTarget* rt, uint32_t& outW, uint32_t& outH);

@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // ThreeMf.h — 3D Manufacturing Format (.3mf) Multi-Object, Production Sub-Model & Build-Transform Parser
 
 namespace Formats {
@@ -57,15 +58,7 @@ struct Mat4 {
 
     static Mat4 Mul(const Mat4& a, const Mat4& b) {
         Mat4 r;
-        for (int row = 0; row < 4; ++row) {
-            for (int col = 0; col < 4; ++col) {
-                r.m[row * 4 + col] =
-                    a.m[row * 4 + 0] * b.m[0 * 4 + col] +
-                    a.m[row * 4 + 1] * b.m[1 * 4 + col] +
-                    a.m[row * 4 + 2] * b.m[2 * 4 + col] +
-                    a.m[row * 4 + 3] * b.m[3 * 4 + col];
-            }
-        }
+        MeshBuild3D::MatMul4RowMajor(a.m.data(), b.m.data(), r.m.data());
         return r;
     }
 
@@ -333,36 +326,19 @@ inline bool ParseThreeMfMesh(
         return false;
     }
 
-    std::vector<DetailPkZip::ZipEntryInfo> zipEntries;
-    DetailPkZip::ListZipEntries(data, size, zipEntries);
+    // Parts come from the bytes already read; the file on disk is the fallback for packages larger than
+    // the viewer's read cap (their central directory lies beyond the bytes in memory)
+    DetailPkZip::ZipIndex zip;
+    zip.Open(data, size);
 
     auto readPartFromZip = [&](std::string_view rawPath, std::vector<uint8_t>& outBytes) -> bool {
         outBytes.clear();
         std::string cleanRel = StripLeadingSlashesKeepCase(rawPath);
         if (cleanRel.empty()) return false;
-        std::string wantNorm = DetailPkZip::NormalizeZipPath(cleanRel);
-
-        // 1. Try ZipDeflate::ExtractZipFileByName (stripping leading '/')
-        if (!fullPath.empty()) {
-            int wLen = MultiByteToWideChar(CP_UTF8, 0, cleanRel.data(), static_cast<int>(cleanRel.size()), nullptr, 0);
-            if (wLen > 0) {
-                std::wstring wideRel(static_cast<size_t>(wLen), L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, cleanRel.data(), static_cast<int>(cleanRel.size()), wideRel.data(), wLen);
-                if (ZipDeflate::ExtractZipFileByName(fullPath, wideRel, outBytes) && !outBytes.empty()) {
-                    return true;
-                }
-            }
-        }
-
-        // 2. Try case-insensitive normalized match in DetailPkZip in-memory directory
-        for (const auto& e : zipEntries) {
-            if (DetailPkZip::NormalizeZipPath(e.name) == wantNorm) {
-                if (DetailPkZip::ExtractZipEntry(data, size, e, outBytes) && !outBytes.empty()) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        if (zip.Read(cleanRel, outBytes)) return true;
+        if (fullPath.empty()) return false;
+        std::wstring wideRel = PathUtils::Utf8ToWide(cleanRel);
+        return ZipDeflate::ExtractZipFileByName(fullPath, wideRel, outBytes) && !outBytes.empty();
     };
 
     // Locate root .model part:
@@ -395,10 +371,10 @@ inline bool ParseThreeMfMesh(
             }
         }
         if (rootXml.empty()) {
-            for (const auto& e : zipEntries) {
-                std::string norm = DetailPkZip::NormalizeZipPath(e.name);
+            for (const auto& name : zip.names) {
+                std::string norm = DetailPkZip::NormalizeZipPath(name);
                 if (norm.size() >= 6 && norm.substr(norm.size() - 6) == ".model") {
-                    std::string cand = StripLeadingSlashesKeepCase(e.name);
+                    std::string cand = StripLeadingSlashesKeepCase(name);
                     if (readPartFromZip(cand, rootXml)) {
                         rootRawPath = cand;
                         break;

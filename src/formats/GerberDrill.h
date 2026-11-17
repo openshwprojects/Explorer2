@@ -136,187 +136,131 @@ static bool ParseGerberCoordField(
     return std::isfinite(outValMm);
 }
 
+// Gerber X2 job file (.gbrjob, Ucamco): a JSON manifest (Header.GenerationSoftware, GeneralSpecs with ProjectId,
+// Size, LayerNumber, BoardThickness, FilesAttributes [Path, FileFunction], MaterialStackup [Type, Name,
+// Thickness]). Shown as the board outline (when Size is given), a stackup cross-section and the file list.
 static bool ParseGerberJobJson(std::string_view txt, ParsedEdaBoard& out) {
-    // Reject binary data
-    for (unsigned char c : txt) {
-        if (c == 0) return false;
-    }
-    if (txt.find("\"GeneralSpecs\"") == std::string_view::npos &&
-        txt.find("\"FilesAttributes\"") == std::string_view::npos &&
-        txt.find("\"MaterialStackup\"") == std::string_view::npos) {
-        return false;
-    }
-    // Check balanced JSON braces & quotes
-    int braceDepth = 0;
-    bool inStr = false;
-    bool sawOpenBrace = false;
-    for (size_t i = 0; i < txt.size(); ++i) {
-        char c = txt[i];
-        if (inStr) {
-            if (c == '\\' && i + 1 < txt.size()) { ++i; continue; }
-            if (c == '"') inStr = false;
-        } else {
-            if (c == '"') inStr = true;
-            else if (c == '{') { ++braceDepth; sawOpenBrace = true; }
-            else if (c == '}') { --braceDepth; if (braceDepth < 0) return false; }
+    using JVal = ::Explorer2::Json::Value;
+    JVal root;
+    if (!::Explorer2::Json::ParseDocument(txt, root) || !root.IsObject()) return false;
+    const JVal* general = root.Find("GeneralSpecs");
+    const JVal* files = root.Find("FilesAttributes");
+    const JVal* stack = root.Find("MaterialStackup");
+    if ((!general || !general->IsObject()) && (!files || !files->IsArray()) && (!stack || !stack->IsArray())) return false;
+    auto num = [](const JVal* v, double defVal) { return (v && v->IsNumber() && std::isfinite(v->numVal)) ? v->numVal : defVal; };
+
+    double sizeX = -1.0, sizeY = -1.0, boardThick = 0.0;
+    int layerNumber = 0;
+    std::string projName, revision;
+    if (general && general->IsObject()) {
+        if (const JVal* size = general->Find("Size")) {
+            sizeX = num(size->Find("X"), -1.0);
+            sizeY = num(size->Find("Y"), -1.0);
+        }
+        layerNumber = general->GetInt("LayerNumber", 0);
+        boardThick = num(general->Find("BoardThickness"), 0.0);
+        if (const JVal* pid = general->Find("ProjectId")) {
+            projName = pid->IsObject() ? pid->GetString("Name") : (pid->IsString() ? pid->strVal : std::string());
+            if (pid->IsObject()) revision = pid->GetString("Revision");
         }
     }
-    if (!sawOpenBrace || inStr || braceDepth != 0) return false;
-
-    auto findJsonStr = [&](std::string_view scope, std::string_view key) -> std::string {
-        std::string pat = "\"" + std::string(key) + "\"";
-        size_t kp = scope.find(pat);
-        if (kp == std::string_view::npos) return {};
-        size_t colon = scope.find(':', kp + pat.size());
-        if (colon == std::string_view::npos) return {};
-        size_t q1 = colon + 1;
-        while (q1 < scope.size() && (scope[q1] == ' ' || scope[q1] == '\t' || scope[q1] == '\r' || scope[q1] == '\n')) ++q1;
-        if (q1 >= scope.size() || scope[q1] != '"') return {};
-        std::string val;
-        for (size_t i = q1 + 1; i < scope.size(); ++i) {
-            if (scope[i] == '\\' && i + 1 < scope.size()) { val.push_back(scope[++i]); continue; }
-            if (scope[i] == '"') return val;
-            val.push_back(scope[i]);
-        }
-        return {};
-    };
-    auto findJsonNum = [&](std::string_view scope, std::string_view key, double defVal) -> double {
-        std::string pat = "\"" + std::string(key) + "\"";
-        size_t kp = scope.find(pat);
-        if (kp == std::string_view::npos) return defVal;
-        size_t colon = scope.find(':', kp + pat.size());
-        if (colon == std::string_view::npos) return defVal;
-        size_t p = colon + 1;
-        while (p < scope.size() && (scope[p] == ' ' || scope[p] == '\t' || scope[p] == '\r' || scope[p] == '\n')) ++p;
-        size_t e = p;
-        while (e < scope.size() && ((scope[e] >= '0' && scope[e] <= '9') || scope[e] == '.' || scope[e] == '-' || scope[e] == '+')) ++e;
-        if (e == p) return defVal;
-        char buf[64] = {};
-        std::memcpy(buf, scope.data() + p, std::min<size_t>(e - p, 63));
-        return std::strtod(buf, nullptr);
-    };
-
-    float sizeX = 50.0f, sizeY = 40.0f;
-    bool hasSize = false;
-    size_t szPos = txt.find("\"Size\"");
-    if (szPos != std::string_view::npos) {
-        size_t b1 = txt.find('{', szPos);
-        size_t b2 = (b1 != std::string_view::npos) ? txt.find('}', b1) : std::string_view::npos;
-        if (b1 != std::string_view::npos && b2 != std::string_view::npos) {
-            std::string_view szScope = txt.substr(b1, b2 - b1 + 1);
-            double sx = findJsonNum(szScope, "X", -1.0);
-            double sy = findJsonNum(szScope, "Y", -1.0);
-            if (sx > 0.1 && sy > 0.1 && sx <= 5000.0 && sy <= 5000.0) {
-                sizeX = static_cast<float>(sx);
-                sizeY = static_cast<float>(sy);
-                hasSize = true;
-            }
+    const bool hasSize = sizeX > 0.1 && sizeY > 0.1 && sizeX <= 5000.0 && sizeY <= 5000.0;
+    std::string vendor, appName;
+    if (const JVal* hdr = root.Find("Header")) {
+        if (const JVal* gs = hdr->Find("GenerationSoftware")) {
+            vendor = gs->GetString("Vendor");
+            appName = gs->GetString("Application");
+            std::string ver = gs->GetString("Version");
+            if (!ver.empty()) appName += (appName.empty() ? "" : " ") + ver;
         }
     }
 
-    int layerNumber = static_cast<int>(findJsonNum(txt, "LayerNumber", 0.0));
-    double boardThick = findJsonNum(txt, "BoardThickness", 1.6);
-    std::string projName = findJsonStr(txt, "ProjectId");
-    if (projName.empty()) projName = findJsonStr(txt, "Name");
-    std::string vendor = findJsonStr(txt, "Vendor");
-    std::string appName = findJsonStr(txt, "Application");
-
-    // Collect FilesAttributes entries and MaterialStackup layers
     std::vector<std::pair<std::string, std::string>> fileAttrs;
-    size_t faPos = txt.find("\"FilesAttributes\"");
-    if (faPos != std::string_view::npos) {
-        size_t arrStart = txt.find('[', faPos);
-        size_t arrEnd = (arrStart != std::string_view::npos) ? txt.find(']', arrStart) : std::string_view::npos;
-        if (arrStart != std::string_view::npos && arrEnd != std::string_view::npos) {
-            size_t cur = arrStart;
-            while (cur < arrEnd && fileAttrs.size() < 64) {
-                size_t o1 = txt.find('{', cur);
-                if (o1 == std::string_view::npos || o1 >= arrEnd) break;
-                size_t o2 = txt.find('}', o1);
-                if (o2 == std::string_view::npos || o2 > arrEnd) break;
-                std::string_view item = txt.substr(o1, o2 - o1 + 1);
-                std::string fp = findJsonStr(item, "FilePath");
-                std::string ff = findJsonStr(item, "FileFunction");
-                if (!fp.empty() || !ff.empty()) fileAttrs.push_back({ fp, ff });
-                cur = o2 + 1;
-            }
+    if (files && files->IsArray()) {
+        for (const auto& f : files->arrVal) {
+            std::string path = f.GetString("Path", f.GetString("FilePath"));
+            std::string fn = f.GetString("FileFunction");
+            if (!path.empty() || !fn.empty()) fileAttrs.push_back({ path, fn });
+            if (fileAttrs.size() >= 256) break;
         }
     }
-
-    struct StackLayer { std::string type; std::string name; double thickMm = 0.0; };
+    struct StackLayer { std::string type, name; double thickMm = 0.0; };
     std::vector<StackLayer> stackLayers;
-    size_t msPos = txt.find("\"MaterialStackup\"");
-    if (msPos != std::string_view::npos) {
-        size_t arrStart = txt.find('[', msPos);
-        size_t arrEnd = (arrStart != std::string_view::npos) ? txt.find(']', arrStart) : std::string_view::npos;
-        if (arrStart != std::string_view::npos && arrEnd != std::string_view::npos) {
-            size_t cur = arrStart;
-            while (cur < arrEnd && stackLayers.size() < 48) {
-                size_t o1 = txt.find('{', cur);
-                if (o1 == std::string_view::npos || o1 >= arrEnd) break;
-                size_t o2 = txt.find('}', o1);
-                if (o2 == std::string_view::npos || o2 > arrEnd) break;
-                std::string_view item = txt.substr(o1, o2 - o1 + 1);
-                StackLayer sl;
-                sl.type = findJsonStr(item, "Type");
-                sl.name = findJsonStr(item, "Name");
-                sl.thickMm = findJsonNum(item, "Thickness", 0.035);
-                if (!sl.type.empty() || !sl.name.empty()) stackLayers.push_back(std::move(sl));
-                cur = o2 + 1;
-            }
+    if (stack && stack->IsArray()) {
+        for (const auto& l : stack->arrVal) {
+            StackLayer sl;
+            sl.type = l.GetString("Type");
+            sl.name = l.GetString("Name");
+            sl.thickMm = num(l.Find("Thickness"), 0.0);
+            std::string material = l.GetString("Material");
+            if (!material.empty() && sl.name.find(material) == std::string::npos) sl.name += (sl.name.empty() ? "" : ", ") + material;
+            if (!sl.type.empty() || !sl.name.empty()) stackLayers.push_back(std::move(sl));
+            if (stackLayers.size() >= 128) break;
         }
     }
-
-    if (!hasSize && fileAttrs.empty() && stackLayers.empty() && layerNumber <= 0) {
-        return false;
-    }
+    if (!hasSize && fileAttrs.empty() && stackLayers.empty() && layerNumber <= 0) return false;
 
     out.kind = EdaDocKind::GerberLayer;
     out.formatTitle = L"Gerber X2 Job Specification (.gbrjob)";
-    if (!projName.empty()) {
-        out.formatTitle += L" — " + PathUtils::Utf8ToWide(projName);
+    if (!projName.empty()) out.formatTitle += L" \u2014 " + PathUtils::Utf8ToWide(projName + (revision.empty() ? "" : " " + revision));
+
+    // Without a declared size there is no outline; the text is laid out on a nominal 60 mm width
+    const float boardW = hasSize ? static_cast<float>(sizeX) : 60.0f;
+    const float topY = hasSize ? static_cast<float>(sizeY) : 0.0f;
+    if (hasSize) {
+        const float w = boardW, h = topY;
+        out.traces.push_back({ 0.0f, 0.0f, w, 0.0f, 0.25f, EdaLayerId::EdgeCuts, 0 });
+        out.traces.push_back({ w, 0.0f, w, h, 0.25f, EdaLayerId::EdgeCuts, 0 });
+        out.traces.push_back({ w, h, 0.0f, h, 0.25f, EdaLayerId::EdgeCuts, 0 });
+        out.traces.push_back({ 0.0f, h, 0.0f, 0.0f, 0.25f, EdaLayerId::EdgeCuts, 0 });
     }
-
-    // Board outline rectangle on EdgeCuts
-    out.traces.push_back({ 0.0f,  0.0f,  sizeX, 0.0f,  0.25f, EdaLayerId::EdgeCuts, 0 });
-    out.traces.push_back({ sizeX, 0.0f,  sizeX, sizeY, 0.25f, EdaLayerId::EdgeCuts, 0 });
-    out.traces.push_back({ sizeX, sizeY, 0.0f,  sizeY, 0.25f, EdaLayerId::EdgeCuts, 0 });
-    out.traces.push_back({ 0.0f,  sizeY, 0.0f,  0.0f,  0.25f, EdaLayerId::EdgeCuts, 0 });
-
-    // Fiducial / corner mounting indicators + stackup visualization bars inside board
-    wchar_t hdrBuf[192] = {};
-    swprintf_s(hdrBuf, L"Board %.2f x %.2f mm | %d Copper Layers | Thickness %.2f mm",
-               sizeX, sizeY, std::max(1, layerNumber), boardThick);
-    out.labels.push_back({ 2.0f, sizeY - 3.0f, 1.4f, EdaLayerId::TopSilk, hdrBuf });
+    std::wstring header;
+    if (hasSize) {
+        wchar_t buf[96] = {};
+        swprintf_s(buf, L"Board %.2f x %.2f mm", sizeX, sizeY);
+        header = buf;
+    }
+    if (layerNumber > 0) header += (header.empty() ? L"" : L" | ") + std::to_wstring(layerNumber) + L" copper layers";
+    if (boardThick > 0.0) {
+        wchar_t buf[48] = {};
+        swprintf_s(buf, L"thickness %.2f mm", boardThick);
+        header += (header.empty() ? L"" : L" | ") + std::wstring(buf);
+    }
+    if (!header.empty()) out.labels.push_back({ 2.0f, topY - 3.0f, 1.4f, EdaLayerId::TopSilk, header });
     if (!vendor.empty() || !appName.empty()) {
-        out.labels.push_back({ 2.0f, sizeY - 5.5f, 1.1f, EdaLayerId::TopSilk,
-            PathUtils::Utf8ToWide("Generator: " + vendor + (appName.empty() ? "" : (" " + appName))) });
+        out.labels.push_back({ 2.0f, topY - 5.5f, 1.1f, EdaLayerId::TopSilk,
+            PathUtils::Utf8ToWide("Generator: " + vendor + (appName.empty() ? "" : " " + appName)) });
     }
 
-    // Draw stackup cross-section bars along left half
-    float sy = sizeY - 9.0f;
-    const float barW = std::max(10.0f, sizeX * 0.42f);
-    for (size_t i = 0; i < stackLayers.size() && sy > 3.0f; ++i) {
+    // Stackup cross-section, top to bottom; the lists continue below the outline when the board is small
+    float y = topY - 9.0f;
+    const float barW = std::max(10.0f, boardW * 0.42f);
+    size_t copperSeen = 0, copperTotal = 0;
+    for (const auto& sl : stackLayers) copperTotal += (sl.type == "Copper") ? 1 : 0;
+    for (size_t i = 0; i < stackLayers.size(); ++i) {
         const auto& sl = stackLayers[i];
         EdaLayerId lid = EdaLayerId::InnerCopper;
         if (sl.type == "Copper") {
-            lid = (i <= 2) ? EdaLayerId::TopCopper : ((i + 3 >= stackLayers.size()) ? EdaLayerId::BottomCopper : EdaLayerId::InnerCopper);
+            ++copperSeen;
+            lid = (copperSeen == 1) ? EdaLayerId::TopCopper : (copperSeen == copperTotal ? EdaLayerId::BottomCopper : EdaLayerId::InnerCopper);
         } else if (sl.type.find("Legend") != std::string::npos || sl.type.find("Silk") != std::string::npos) {
             lid = EdaLayerId::TopSilk;
         }
         float strokeW = std::clamp(static_cast<float>(sl.thickMm) * 1.5f, 0.18f, 1.2f);
-        out.traces.push_back({ 2.5f, sy, 2.5f + barW, sy, strokeW, lid, static_cast<int>(i + 1) });
-        std::string desc = sl.type + (sl.name.empty() ? "" : (" (" + sl.name + ")"));
-        out.labels.push_back({ 3.5f + barW, sy - 0.3f, 0.95f, EdaLayerId::TopSilk, PathUtils::Utf8ToWide(desc) });
-        sy -= 2.4f;
+        out.traces.push_back({ 2.5f, y, 2.5f + barW, y, strokeW, lid, static_cast<int>(i + 1) });
+        std::string desc = sl.type + (sl.name.empty() ? "" : " (" + sl.name + ")");
+        if (sl.thickMm > 0.0) {
+            char t[32] = {};
+            snprintf(t, sizeof(t), " %.3f mm", sl.thickMm);
+            desc += t;
+        }
+        out.labels.push_back({ 3.5f + barW, y - 0.3f, 0.95f, EdaLayerId::TopSilk, PathUtils::Utf8ToWide(desc) });
+        y -= 2.4f;
     }
-
-    // List FilesAttributes on bottom/right
-    float fy = std::min(sy - 1.5f, sizeY * 0.48f);
-    for (size_t i = 0; i < fileAttrs.size() && fy > 1.5f; ++i) {
-        std::string line = fileAttrs[i].first + " [" + fileAttrs[i].second + "]";
-        out.labels.push_back({ 2.5f, fy, 0.9f, EdaLayerId::BottomSilk, PathUtils::Utf8ToWide(line) });
-        fy -= 2.0f;
+    y -= 1.5f;
+    for (const auto& fa : fileAttrs) {
+        out.labels.push_back({ 2.5f, y, 0.9f, EdaLayerId::BottomSilk, PathUtils::Utf8ToWide(fa.first + " [" + fa.second + "]") });
+        y -= 2.0f;
     }
 
     out.netCount = std::max<size_t>(1, stackLayers.size() + fileAttrs.size());

@@ -793,20 +793,6 @@ void ImageCache::EvictPath(const std::wstring& path) {
     }
 }
 
-void ImageCache::ClearFullImageCache() {
-    std::lock_guard<std::mutex> lock(m_fullImgMutex);
-    for (auto& kv : m_fullImgBitmaps) {
-        if (kv.second) kv.second->Release();
-    }
-    m_fullImgBitmaps.clear();
-    m_fullImgCpu.clear();
-    m_fullImgFailed.clear();
-    m_fullImgOrigDims.clear();
-    m_fullImgLru.clear();
-    m_fullImgQueue.clear();
-    m_fullImgInFlight.clear();
-}
-
 void ImageCache::QueueRotateImages(const std::vector<std::wstring>& paths, bool clockwise) {
     if (paths.empty()) return;
 

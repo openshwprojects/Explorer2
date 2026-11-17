@@ -2241,6 +2241,40 @@ void RunFormatTestsImages(TestCounter& tc) {
         }
     } cleaner{ createdFiles, scratchRoot };
 
+    // Colour LUT card: the right half is the left half put through the LUT (same input colours).
+    // Identity 3D cube -> halves equal; inverting .cube -> halves complementary; 1D LUT; 12-bit .3dl.
+    {
+        auto halvesMatch = [](const ExtendedImageInfo& im, bool inverted) {
+            if (!im.valid || im.width != 256 || im.height != 160 || im.bgraPixels.size() != 256u * 160u * 4u) return false;
+            int worst = 0;
+            for (uint32_t y = 20; y < 160; ++y) {        // below the labels
+                for (uint32_t x = 0; x < 128; ++x) {
+                    const uint8_t* a = &im.bgraPixels[(static_cast<size_t>(y) * 256 + x) * 4];
+                    const uint8_t* b = &im.bgraPixels[(static_cast<size_t>(y) * 256 + x + 128) * 4];
+                    for (int c = 0; c < 3; ++c) {
+                        int want = inverted ? 255 - a[c] : a[c];
+                        worst = std::max(worst, std::abs(want - static_cast<int>(b[c])));
+                    }
+                }
+            }
+            return worst <= 2;
+        };
+        const char* identity = "TITLE \"Id\"\nLUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        const char* invert = "LUT_3D_SIZE 2\n1 1 1\n0 1 1\n1 0 1\n0 0 1\n1 1 0\n0 1 0\n1 0 0\n0 0 0\n";
+        const char* invert1d = "LUT_1D_SIZE 3\n1 1 1\n0.5 0.5 0.5\n0 0 0\n";
+        // .3dl: mesh line, 12-bit values, blue fastest; this table inverts colours
+        std::string lut3dl = "0 4095\n";
+        for (int r = 0; r < 2; ++r) for (int g = 0; g < 2; ++g) for (int b = 0; b < 2; ++b)
+            lut3dl += std::to_string((1 - r) * 4095) + " " + std::to_string((1 - g) * 4095) + " " + std::to_string((1 - b) * 4095) + "\n";
+        ExtendedImageInfo iId, iInv, i1d, i3dl;
+        bool okId = ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(identity), std::strlen(identity), L".cube", 0, iId) && halvesMatch(iId, false);
+        bool okInv = ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(invert), std::strlen(invert), L".cube", 0, iInv) && halvesMatch(iInv, true);
+        bool ok1d = ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(invert1d), std::strlen(invert1d), L".cube", 0, i1d) && halvesMatch(i1d, true);
+        bool ok3dl = ImageFormatLoader::DecodeImageMemory(reinterpret_cast<const uint8_t*>(lut3dl.data()), lut3dl.size(), L".3dl", 0, i3dl) && halvesMatch(i3dl, true);
+        tc.Record(okId && okInv && ok1d && ok3dl, L"Images.ColorLut.SameColoursBeforeAfter",
+                  L"id=" + std::to_wstring(okId) + L" inv=" + std::to_wstring(okInv) + L" 1d=" + std::to_wstring(ok1d) + L" 3dl=" + std::to_wstring(ok3dl));
+    }
+
     auto writeTemp = [&](const wchar_t* name, const std::vector<uint8_t>& bytes) -> std::wstring {
         std::wstring p = scratchRoot + L"\\" + name;
         if (PathUtils::WriteFileBytes(p, bytes.data(), bytes.size())) {
@@ -3624,7 +3658,6 @@ void RunFormatTestsImages(TestCounter& tc) {
             wr32(200, 4u);        // pixelsPerLine = 4
             wr32(204, 4u);        // linesPerImage = 4
             cin[681] = 5u;        // 32-bit left-justified Method A
-            cin[713] = 1u;
             for (int i = 0; i < 16; ++i) {
                 uint32_t code = (i == 0) ? c0 : ((i == 1) ? c1 : c2);
                 PushU32BE(cin, (code << 22) | (code << 12) | (code << 2));

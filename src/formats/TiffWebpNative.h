@@ -24,32 +24,12 @@ namespace Formats {
 
 namespace TiffWebpDetail {
 
-inline uint16_t Rd16(const uint8_t* p, bool be) {
-    return be ? static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1])
-              : static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t Rd32(const uint8_t* p, bool be) {
-    return be ? ((static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
-                 (static_cast<uint32_t>(p[2]) << 8)  | static_cast<uint32_t>(p[3]))
-              : (static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-                 (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
-}
-inline uint64_t Rd64(const uint8_t* p, bool be) {
-    return be ? ((static_cast<uint64_t>(Rd32(p, true)) << 32) | Rd32(p + 4, true))
-              : (static_cast<uint64_t>(Rd32(p, false)) | (static_cast<uint64_t>(Rd32(p + 4, false)) << 32));
-}
-inline float RdF32(const uint8_t* p, bool be) {
-    uint32_t u = Rd32(p, be);
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-inline double RdF64(const uint8_t* p, bool be) {
-    uint64_t u = Rd64(p, be);
-    double d = 0.0;
-    std::memcpy(&d, &u, 8);
-    return d;
-}
+// loads in the file's byte order (ByteIO.h)
+inline uint16_t Rd16(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU16(p, be); }
+inline uint32_t Rd32(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU32(p, be); }
+inline uint64_t Rd64(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU64(p, be); }
+using ::Explorer2::ByteIO::RdF32;
+using ::Explorer2::ByteIO::RdF64;
 
 // ============================================================================
 // 1. Pure-C++ PackBits & TIFF MSB-First LZW Decompressors
@@ -1655,15 +1635,6 @@ inline bool DecodeWebpPureCpp(const uint8_t* data, size_t size, ExtendedImageInf
 }
 
 } // namespace TiffWebpDetail
-
-inline bool IsLikelyTiffOrBigTiffSignature(const uint8_t* data, size_t size) {
-    if (!data || size < 16) return false;
-    bool le = (data[0] == 'I' && data[1] == 'I');
-    bool be = (data[0] == 'M' && data[1] == 'M');
-    if (!le && !be) return false;
-    uint16_t magic = TiffWebpDetail::Rd16(data + 2, be);
-    return magic == 42u || magic == 43u;
-}
 
 inline bool DecodeTiffOrBigTiff(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
     if (TiffWebpDetail::DecodeTiffPureCpp(data, size, extLower, outInfo)) return true;

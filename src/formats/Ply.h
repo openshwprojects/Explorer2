@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // Ply.h — Stanford Polygon File Format (.ply) 3D Mesh & Point Cloud Parser
 // Supports format ascii, format binary_little_endian, and format binary_big_endian,
 // exact element/property schemas (all scalar widths + list properties), tristrips, edges,
@@ -228,31 +229,6 @@ inline void SplitPlyHeaderTokens(std::string_view line, std::vector<std::string_
         while (i < line.size() && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') ++i;
         out.push_back(line.substr(s, i - s));
     }
-}
-
-inline void EmitPlyEdgeStrut(LoadedMesh3D& mesh, const Vec3f& a, const Vec3f& b, float rad) {
-    Vec3f d = { b.x - a.x, b.y - a.y, b.z - a.z };
-    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (len < 1e-6f) return;
-    Vec3f u = { d.x / len, d.y / len, d.z / len };
-    Vec3f ref = (std::fabs(u.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    Vec3f s = { u.y * ref.z - u.z * ref.y, u.z * ref.x - u.x * ref.z, u.x * ref.y - u.y * ref.x };
-    float sl = std::sqrt(s.x * s.x + s.y * s.y + s.z * s.z);
-    if (sl < 1e-6f) return;
-    s = { s.x / sl * rad, s.y / sl * rad, s.z / sl * rad };
-    Vec3f t = { u.y * s.z - u.z * s.y, u.z * s.x - u.x * s.z, u.x * s.y - u.y * s.x };
-
-    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ a.x + s.x, a.y + s.y, a.z + s.z });
-    mesh.vertices.push_back({ a.x - s.x, a.y - s.y, a.z - s.z });
-    mesh.vertices.push_back({ a.x + t.x, a.y + t.y, a.z + t.z });
-    mesh.vertices.push_back({ b.x + s.x, b.y + s.y, b.z + s.z });
-    mesh.vertices.push_back({ b.x - s.x, b.y - s.y, b.z - s.z });
-    mesh.vertices.push_back({ b.x + t.x, b.y + t.y, b.z + t.z });
-    mesh.tris.push_back({ base + 0, base + 3, base + 2, {} });
-    mesh.tris.push_back({ base + 2, base + 3, base + 5, {} });
-    mesh.tris.push_back({ base + 2, base + 5, base + 1, {} });
-    mesh.tris.push_back({ base + 1, base + 5, base + 4, {} });
 }
 
 } // namespace DetailPly
@@ -675,7 +651,7 @@ inline bool ParsePlyMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh, b
         std::vector<Vec3f> baseVerts = std::move(mesh.vertices);
         mesh.vertices.clear();
         for (const auto& e : parsedEdges) {
-            DetailPly::EmitPlyEdgeStrut(mesh, baseVerts[e.first], baseVerts[e.second], rad);
+            MeshBuild3D::EmitEdgeStrut(mesh, baseVerts[e.first], baseVerts[e.second], rad);
         }
     } else if (mesh.tris.empty() && allowPointCloudSplats) {
         // Point-cloud PLY (numFaces == 0 && numVerts > 0): emit micro-tetrahedra splats

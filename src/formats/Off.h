@@ -1,4 +1,15 @@
 #pragma once
+#include "MeshBuild3D.h"
+// Off.h — Object File Format (.off) reader for the 3D viewer.
+
+namespace Formats {
+
+// Returns true when the file was handled here; `mesh` then holds the result (or its status message).
+// false: not this format, the caller tries the next reader.
+inline bool ParseOffFile(const std::wstring& ext, const std::vector<uint8_t>& buf, uint64_t fileSize, LoadedMesh3D& mesh,
+                 uint64_t generation, const std::atomic<uint64_t>* activeGen) {
+    using MeshBuild3D::FinalizeMeshBoundsAndNormals;
+    (void)ext; (void)fileSize; (void)generation; (void)activeGen;
     // 4. OFF (Object File Format) Parser (.off)
     if (ext == L".off") {
         mesh.formatName = L"OFF 3D Mesh";
@@ -39,7 +50,10 @@
                 p = (next < end) ? (next + 1) : end;
             }
             FinalizeMeshBoundsAndNormals(mesh);
-            return mesh;
+            return true;
         }
     }
+    return false;
+}
 
+} // namespace Formats

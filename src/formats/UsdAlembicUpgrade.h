@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // UsdAlembicUpgrade.h — #17 Pixar OpenUSD (.usd, .usda, .usdc, .usdz) & Alembic Ogawa (.abc)
 //                       Full Xform Scene-Graph Hierarchy, Sublayer/USDZ References & PointInstancer
 //
@@ -21,27 +22,8 @@ namespace UsdAbcDetail {
 using DetailScad::Mat4;
 
 inline float HalfToFloat17(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x03FFu;
-    uint32_t bits = 0;
-    if (exp == 0) {
-        if (mant != 0) {
-            exp = 1;
-            while ((mant & 0x0400u) == 0) { mant <<= 1; --exp; }
-            mant &= 0x03FFu;
-            bits = sign | ((exp + 112u) << 23) | (mant << 13);
-        } else {
-            bits = sign;
-        }
-    } else if (exp == 31u) {
-        bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float f = 0.0f;
-    std::memcpy(&f, &bits, 4);
-    return std::isfinite(f) ? f : 0.0f;
+    float f = ::Explorer2::ByteIO::HalfToFloat(h);
+    return std::isfinite(f) ? f : 0.0f; // this reader maps Inf/NaN halves to 0
 }
 
 inline Mat4 QuatToMat4(float w, float x, float y, float z) {

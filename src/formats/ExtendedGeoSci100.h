@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedGeoSci100.h — Binary Decoders for GIS Vector, Garmin FIT, NetCDF, WMO GRIB & NIfTI Volumes
 // Covers: .shp/.shx, .gpkg, .fit (Garmin), .kmz, .nc/.cdf, .grib/.grib2/.grb, .nii/.nii.gz
 
@@ -6,57 +7,29 @@ namespace Formats {
 
 namespace GeoSciDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline int16_t RdI16LE(const uint8_t* p) { return static_cast<int16_t>(RdU16LE(p)); }
-inline int16_t RdI16BE(const uint8_t* p) { return static_cast<int16_t>(RdU16BE(p)); }
-
-inline uint32_t RdU24BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 16) | (static_cast<uint32_t>(p[1]) << 8) | p[2];
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline int32_t RdI32LE(const uint8_t* p) { return static_cast<int32_t>(RdU32LE(p)); }
-inline int32_t RdI32BE(const uint8_t* p) { return static_cast<int32_t>(RdU32BE(p)); }
-
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | static_cast<uint64_t>(RdU32BE(p + 4));
-}
-inline int64_t RdI64LE(const uint8_t* p) { return static_cast<int64_t>(RdU64LE(p)); }
-inline int64_t RdI64BE(const uint8_t* p) { return static_cast<int64_t>(RdU64BE(p)); }
-
-inline float RdF32LE(const uint8_t* p) { uint32_t u = RdU32LE(p); float f = 0.0f; std::memcpy(&f, &u, 4); return f; }
-inline float RdF32BE(const uint8_t* p) { uint32_t u = RdU32BE(p); float f = 0.0f; std::memcpy(&f, &u, 4); return f; }
-inline double RdF64LE(const uint8_t* p) { uint64_t u = RdU64LE(p); double d = 0.0; std::memcpy(&d, &u, 8); return d; }
-inline double RdF64BE(const uint8_t* p) { uint64_t u = RdU64BE(p); double d = 0.0; std::memcpy(&d, &u, 8); return d; }
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdI16LE;
+using ::Explorer2::ByteIO::RdI16BE;
+using ::Explorer2::ByteIO::RdU24BE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdI32BE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU64BE;
+using ::Explorer2::ByteIO::RdI64LE;
+using ::Explorer2::ByteIO::RdI64BE;
+using ::Explorer2::ByteIO::RdF32LE;
+using ::Explorer2::ByteIO::RdF32BE;
+using ::Explorer2::ByteIO::RdF64LE;
+using ::Explorer2::ByteIO::RdF64BE;
 
 // WMO GRIB sign-magnitude integer decoders (MSB = sign bit, remaining bits = magnitude)
 inline int16_t RdGribSignMag16(const uint8_t* p) {
     uint16_t u = RdU16BE(p);
     int16_t mag = static_cast<int16_t>(u & 0x7FFFu);
     return (u & 0x8000u) ? static_cast<int16_t>(-mag) : mag;
-}
-inline int32_t RdGribSignMag24(const uint8_t* p) {
-    uint32_t u = RdU24BE(p);
-    int32_t mag = static_cast<int32_t>(u & 0x7FFFFFu);
-    return (u & 0x800000u) ? -mag : mag;
 }
 inline int32_t RdGribSignMag32(const uint8_t* p) {
     uint32_t u = RdU32BE(p);
@@ -1401,93 +1374,25 @@ inline bool ParseExtendedGeoSciDoc(const std::vector<uint8_t>& raw, const std::w
         return GeoSciDetail::ParseGarminFit(raw, out);
     }
 
-    // 4. Zipped Keyhole Markup Language (.kmz)
+    // 4. Zipped Keyhole Markup Language (.kmz): the KML reader runs on the archive's main document
+    //    (doc.kml at the root by convention, otherwise the first .kml entry)
     if (extLower == L".kmz") {
         if (raw.size() < 22 || raw[0] != 'P' || raw[1] != 'K') return false;
         std::vector<ZipDeflate::ArchiveItemMeta> entries;
         if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries)) return false;
+        const ZipDeflate::ArchiveItemMeta* mainKml = nullptr;
         for (const auto& e : entries) {
-            if (PathUtils::ToLower(PathUtils::GetExtension(e.pathInArchive)) == L".kml") {
-                std::vector<uint8_t> kmlBytes;
-                if (ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, kmlBytes) && !kmlBytes.empty()) {
-                    bool ok = ParseKmlGeography(kmlBytes, out);
-                    std::string_view sv(reinterpret_cast<const char*>(kmlBytes.data()), kmlBytes.size());
-                    // Extract all multi-vertex <coordinates>lon,lat[,alt] ...</coordinates> & <gx:coord>lon lat [alt]</gx:coord>
-                    size_t pos = 0;
-                    int rowIdx = 1;
-                    while ((pos = sv.find("<coordinates>", pos)) != std::string_view::npos && out.geoPoints.size() < 20000) {
-                        pos += 13;
-                        size_t endC = sv.find("</coordinates>", pos);
-                        if (endC == std::string_view::npos) break;
-                        std::string_view blk = sv.substr(pos, endC - pos);
-                        size_t k = 0;
-                        while (k < blk.size() && out.geoPoints.size() < 20000) {
-                            while (k < blk.size() && (blk[k] == ' ' || blk[k] == '\t' || blk[k] == '\r' || blk[k] == '\n')) ++k;
-                            if (k >= blk.size()) break;
-                            size_t tokEnd = k;
-                            while (tokEnd < blk.size() && blk[tokEnd] != ' ' && blk[tokEnd] != '\t' && blk[tokEnd] != '\r' && blk[tokEnd] != '\n') ++tokEnd;
-                            std::string tok(blk.substr(k, tokEnd - k));
-                            double lon = 0.0, lat = 0.0, alt = 0.0;
-                            int n = sscanf_s(tok.c_str(), "%lf,%lf,%lf", &lon, &lat, &alt);
-                            if (n >= 2 && std::isfinite(lat) && std::isfinite(lon) && std::fabs(lat) <= 90.0 && std::fabs(lon) <= 180.0) {
-                                GpsTrackPoint pt;
-                                pt.lat = lat;
-                                pt.lon = lon;
-                                pt.elevM = (n >= 3 && std::isfinite(alt)) ? static_cast<float>(alt) : 0.0f;
-                                pt.rowIndex = rowIdx;
-                                out.geoPoints.push_back(std::move(pt));
-                            }
-                            k = tokEnd;
-                        }
-                        ++rowIdx;
-                        pos = endC + 14;
-                    }
-                    pos = 0;
-                    while ((pos = sv.find("<gx:coord>", pos)) != std::string_view::npos && out.geoPoints.size() < 20000) {
-                        pos += 10;
-                        size_t endG = sv.find("</gx:coord>", pos);
-                        if (endG == std::string_view::npos) break;
-                        std::string tok(sv.substr(pos, endG - pos));
-                        double lon = 0.0, lat = 0.0, alt = 0.0;
-                        int n = sscanf_s(tok.c_str(), "%lf %lf %lf", &lon, &lat, &alt);
-                        if (n >= 2 && std::isfinite(lat) && std::isfinite(lon) && std::fabs(lat) <= 90.0 && std::fabs(lon) <= 180.0) {
-                            GpsTrackPoint pt;
-                            pt.lat = lat;
-                            pt.lon = lon;
-                            pt.elevM = (n >= 3 && std::isfinite(alt)) ? static_cast<float>(alt) : 0.0f;
-                            pt.rowIndex = 1;
-                            out.geoPoints.push_back(std::move(pt));
-                        }
-                        pos = endG + 11;
-                    }
-                    if (!ok && !out.geoPoints.empty()) {
-                        out.kind = OfficeFileKind::CsvTable;
-                        out.isSpreadsheet = true;
-                        SpreadsheetSheet sh;
-                        sh.name = L"KMZ_Track";
-                        sh.rows.push_back({ L"#", L"Latitude", L"Longitude", L"Elevation (m)" });
-                        for (size_t i = 0; i < std::min<size_t>(out.geoPoints.size(), 500); ++i) {
-                            sh.rows.push_back({
-                                std::to_wstring(i + 1),
-                                GeoSciDetail::FmtNum(out.geoPoints[i].lat, 6),
-                                GeoSciDetail::FmtNum(out.geoPoints[i].lon, 6),
-                                GeoSciDetail::FmtNum(out.geoPoints[i].elevM, 2)
-                            });
-                        }
-                        sh.maxCols = 4;
-                        out.sheets.push_back(std::move(sh));
-                        out.valid = true;
-                        ok = true;
-                    }
-                    if (ok) {
-                        out.formatTitle = L"Google Earth Zipped KMZ (.kmz)";
-                        out.hasGeoTrack = (out.geoPoints.size() >= 2);
-                        return true;
-                    }
-                }
-            }
+            if (e.isDirectory || PathUtils::ToLower(PathUtils::GetExtension(e.pathInArchive)) != L".kml") continue;
+            if (PathUtils::ToLower(e.pathInArchive) == L"doc.kml") { mainKml = &e; break; }
+            if (!mainKml) mainKml = &e;
         }
-        return false;
+        if (!mainKml) return false;
+        std::vector<uint8_t> kmlBytes;
+        if (!ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), *mainKml, kmlBytes) || kmlBytes.empty()) return false;
+        if (!ParseKmlGeography(kmlBytes, out)) return false;
+        out.formatTitle = L"Google Earth Zipped KMZ (.kmz)";
+        out.hasGeoTrack = (out.geoPoints.size() >= 2);
+        return true;
     }
 
     // 5. NetCDF (.nc / .cdf)

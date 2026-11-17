@@ -1,4 +1,5 @@
 #include "SpreadsheetDocViewer.h"
+#include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
@@ -27,22 +28,6 @@ namespace {
 
 static D2D1_COLOR_F SdvColor(uint32_t rgb, float a = 1.0f) {
     return PathUtils::ColorFromRgb(rgb, a);
-}
-
-static std::wstring DecodeXmlEntities(std::wstring_view in) {
-    std::wstring out;
-    out.reserve(in.size());
-    for (size_t i = 0; i < in.size(); ++i) {
-        if (in[i] == L'&') {
-            if (in.substr(i, 5) == L"&amp;")  { out.push_back(L'&');  i += 4; continue; }
-            if (in.substr(i, 4) == L"&lt;")   { out.push_back(L'<');  i += 3; continue; }
-            if (in.substr(i, 4) == L"&gt;")   { out.push_back(L'>');  i += 3; continue; }
-            if (in.substr(i, 6) == L"&quot;") { out.push_back(L'"');  i += 5; continue; }
-            if (in.substr(i, 6) == L"&apos;") { out.push_back(L'\''); i += 5; continue; }
-        }
-        out.push_back(in[i]);
-    }
-    return out;
 }
 
 static std::wstring ColIndexToExcelLetters(int colIdx) {
@@ -83,11 +68,6 @@ static int ExcelCellRefToColIndex(std::string_view cellRef, int* outRowIdx = nul
 #include "formats/Sylk.h"
 
 } // namespace
-
-namespace StreamCodecs {
-    bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut);
-    bool DecompressZstdFrame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut);
-}
 
 #include "formats/Parquet.h"
 #include "formats/Avro.h"
@@ -189,24 +169,35 @@ bool SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(const std::wstring& extLo
            extLower == L".vmt";
 }
 
-static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc);
+// How much of a file the in-memory document readers get (the container readers open the file themselves)
+constexpr size_t kDocReadLimit = 32 * 1024 * 1024;
+
+// The last `want` bytes of a file (all of it when it is shorter)
+static std::vector<uint8_t> ReadFileTail(const std::wstring& path, uint64_t fileSize, size_t want) {
+    std::vector<uint8_t> tail;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return tail;
+    const uint64_t start = (fileSize > want) ? fileSize - want : 0;
+    LARGE_INTEGER at;
+    at.QuadPart = static_cast<LONGLONG>(start);
+    if (SetFilePointerEx(h, at, nullptr, FILE_BEGIN)) {
+        tail.resize(static_cast<size_t>(fileSize - start));
+        DWORD got = 0;
+        if (!ReadFile(h, tail.data(), static_cast<DWORD>(tail.size()), &got, nullptr)) got = 0;
+        tail.resize(got);
+    }
+    CloseHandle(h);
+    return tail;
+}
+static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc, uint64_t& bytesNotRead);
 
 namespace BiffXlsDetail {
 
-inline uint16_t Rd16(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t Rd32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline double RdF64(const uint8_t* p) {
-    double d = 0.0;
-    std::memcpy(&d, p, 8);
-    return d;
-}
+// little-endian loads (ByteIO.h)
+inline uint16_t Rd16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
+inline uint32_t Rd32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline double RdF64(const uint8_t* p) { return ::Explorer2::ByteIO::RdF64LE(p); }
 
 inline double DecodeBiffRk(uint32_t rk) {
     double v = 0.0;
@@ -748,7 +739,13 @@ inline bool ParseBiffWorkbook(const std::vector<uint8_t>& raw, ParsedOfficeDocum
 } // namespace BiffXlsDetail
 
 bool SpreadsheetDocViewer::InspectOfficeFile(const std::wstring& fullPath, ParsedOfficeDocument& outDoc) try {
-    bool ok = InspectOfficeFileRaw(fullPath, outDoc);
+    uint64_t bytesNotRead = 0;
+    bool ok = InspectOfficeFileRaw(fullPath, outDoc, bytesNotRead);
+    if (ok && outDoc.valid && bytesNotRead > 0 && !outDoc.sourceReadFully) {
+        // The reader saw only the start of the file: the title says so, whatever the reader made of it
+        outDoc.formatTitle += L" — only the first " + PathUtils::FormatByteSize(kDocReadLimit) + L" of " +
+                              PathUtils::FormatByteSize(kDocReadLimit + bytesNotRead) + L" read";
+    }
     if (ok && outDoc.valid) {
         if (outDoc.geoPoints.empty()) {
             Formats::ExtractGeoTrackFromSheets(outDoc);
@@ -775,7 +772,8 @@ bool SpreadsheetDocViewer::InspectOfficeFile(const std::wstring& fullPath, Parse
     return ok;
 } E2_READER_CATCH(L"Document reader", fullPath, { outDoc = ParsedOfficeDocument(); return false; })
 
-static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc) {
+static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc, uint64_t& bytesNotRead) {
+    bytesNotRead = 0;
     outDoc = ParsedOfficeDocument{};
     outDoc.filePath = fullPath;
     std::wstring ext = PathUtils::GetExtension(fullPath);
@@ -810,8 +808,29 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     }
 
     std::vector<uint8_t> raw;
-    if (!PathUtils::ReadFileBytes(fullPath, 32 * 1024 * 1024, raw) || raw.empty()) {
+    if (!PathUtils::ReadFileBytes(fullPath, kDocReadLimit, raw) || raw.empty()) {
         return false;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(fullPath.c_str(), GetFileExInfoStandard, &fad)) {
+        const uint64_t fileSize = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        outDoc.sourceFileSize = std::max<uint64_t>(fileSize, raw.size());
+        if (raw.size() >= kDocReadLimit && fileSize > raw.size()) {
+            bytesNotRead = fileSize - raw.size();
+            outDoc.sourceTail = ReadFileTail(fullPath, fileSize, 256 * 1024);
+        }
+    }
+    // A compound file (.xls, .doc, .ppt, .msg, ...) keeps its sector tables and streams anywhere in the file, so one
+    // up to 256 MB is read whole rather than only its start
+    static const uint8_t kOle2Magic[8] = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+    if (bytesNotRead > 0 && raw.size() >= 8 && std::memcmp(raw.data(), kOle2Magic, 8) == 0 &&
+        outDoc.sourceFileSize <= 256ull * 1024 * 1024) {
+        std::vector<uint8_t> whole;
+        if (PathUtils::ReadFileBytes(fullPath, static_cast<size_t>(outDoc.sourceFileSize), whole) && whole.size() == outDoc.sourceFileSize) {
+            raw.swap(whole);
+            bytesNotRead = 0;
+            outDoc.sourceTail.clear();
+        }
     }
 
     if (ext == L".vmt")     return Formats::ParseValveMaterialVmt(raw, outDoc);

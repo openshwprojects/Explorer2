@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // LegacyOfficeOle.h — Native Binary Decoders for Legacy Microsoft Office OLE2 Documents
 //   1. Microsoft Word 97–2003 & 6.0/95 ([MS-DOC]: .doc, .dot) — FIB + Clx Piece Table (CP1252 & UTF-16LE) + Fields + Tables
 //   2. Microsoft PowerPoint 97–2003 ([MS-PPT] & [MS-ODRAW]: .ppt, .pps) — RecordHeader Tree + SlideListWithText + Escher Shapes
@@ -7,24 +8,10 @@ namespace Formats {
 
 namespace LegacyOfficeDetail {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-
-inline int16_t RdI16LE(const uint8_t* p) {
-    return static_cast<int16_t>(RdU16LE(p));
-}
-
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-inline int32_t RdI32LE(const uint8_t* p) {
-    return static_cast<int32_t>(RdU32LE(p));
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdI16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
 
 inline bool ReadStreamByName(const Ole2::CompoundFile& cf, std::wstring_view streamName, std::vector<uint8_t>& outBytes) {
     const Ole2::DirEntry* entry = Ole2::FindStreamCaseInsensitive(cf, streamName);
@@ -46,33 +33,12 @@ inline wchar_t Cp1252ToWide(uint8_t b) {
     return static_cast<wchar_t>(b);
 }
 
-inline std::wstring TrimWideParagraph(std::wstring_view sv) {
-    size_t first = 0;
-    while (first < sv.size() && (sv[first] == L' ' || sv[first] == L'\t' || sv[first] == L'\r' || sv[first] == L'\n')) {
-        ++first;
-    }
-    size_t last = sv.size();
-    while (last > first && (sv[last - 1] == L' ' || sv[last - 1] == L'\t' || sv[last - 1] == L'\r' || sv[last - 1] == L'\n')) {
-        --last;
-    }
-    return (first < last) ? std::wstring(sv.substr(first, last - first)) : std::wstring();
-}
+inline std::wstring TrimWideParagraph(std::wstring_view sv) { return ::Explorer2::PathUtils::Trim(sv); }
 
 inline void PushOfficeParagraph(ParsedOfficeDocument& out, std::wstring text, int headingLevel, bool isBullet, bool isTableRow) {
     std::wstring clean = TrimWideParagraph(text);
     if (clean.empty()) return;
-    out.charCount += clean.size();
-    bool inWord = false;
-    for (wchar_t ch : clean) {
-        if (ch > L' ') {
-            if (!inWord) {
-                ++out.wordCount;
-                inWord = true;
-            }
-        } else {
-            inWord = false;
-        }
-    }
+    CountDocText(out, clean);
     out.paragraphs.push_back({ std::move(clean), headingLevel, isBullet, isTableRow });
 }
 

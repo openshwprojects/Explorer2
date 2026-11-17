@@ -248,10 +248,6 @@ void MediaPlayer::SeekToSeconds(double sec) {
     }
 }
 
-void MediaPlayer::SeekRelative(double deltaSec) {
-    SeekToSeconds(GetCurrentTimeSec() + deltaSec);
-}
-
 ID2D1Bitmap* MediaPlayer::GetCurrentVideoFrame(ID2D1RenderTarget* rt, uint32_t& outW, uint32_t& outH) {
     outW = m_videoW;
     outH = m_videoH;

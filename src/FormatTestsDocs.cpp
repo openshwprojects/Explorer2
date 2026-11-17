@@ -1,5 +1,6 @@
 // FormatTestsDocs.cpp: self-tests of the office, data and text document readers (SpreadsheetDocViewer, formats/), stage 15 ("15.docsa" runs these alone)
 #include "SelfTestCommon.h"
+#include "TestBytes.h"
 #include "SpreadsheetDocViewer.h"
 #include "FileContentPane.h"
 #include "PathUtils.h"
@@ -20,77 +21,11 @@ namespace {
 // ============================================================================
 // Binary Writer & Checksum Helpers
 // ============================================================================
-inline void AppendU8(std::vector<uint8_t>& b, uint8_t v) { b.push_back(v); }
-inline void AppendBytes(std::vector<uint8_t>& b, const void* p, size_t n) {
-    const auto* u = static_cast<const uint8_t*>(p);
-    b.insert(b.end(), u, u + n);
-}
-inline void AppendStr(std::vector<uint8_t>& b, std::string_view s) {
-    AppendBytes(b, s.data(), s.size());
-}
+using namespace ::Explorer2::TestBytes; // byte writers (TestBytes.h)
 
-inline void AppendU16LE(std::vector<uint8_t>& b, uint16_t v) {
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-}
-inline void AppendU32LE(std::vector<uint8_t>& b, uint32_t v) {
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
-}
-inline void AppendI32LE(std::vector<uint8_t>& b, int32_t v) { AppendU32LE(b, static_cast<uint32_t>(v)); }
-inline void AppendU64LE(std::vector<uint8_t>& b, uint64_t v) {
-    AppendU32LE(b, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
-    AppendU32LE(b, static_cast<uint32_t>(v >> 32));
-}
-inline void AppendI64LE(std::vector<uint8_t>& b, int64_t v) { AppendU64LE(b, static_cast<uint64_t>(v)); }
-inline void AppendF32LE(std::vector<uint8_t>& b, float f) {
-    uint32_t u = 0; std::memcpy(&u, &f, 4); AppendU32LE(b, u);
-}
-inline void AppendF64LE(std::vector<uint8_t>& b, double d) {
-    uint64_t u = 0; std::memcpy(&u, &d, 8); AppendU64LE(b, u);
-}
 
-inline void AppendU16BE(std::vector<uint8_t>& b, uint16_t v) {
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-}
-inline void AppendU32BE(std::vector<uint8_t>& b, uint32_t v) {
-    b.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
-    b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-    b.push_back(static_cast<uint8_t>(v & 0xFFu));
-}
-inline void AppendI32BE(std::vector<uint8_t>& b, int32_t v) { AppendU32BE(b, static_cast<uint32_t>(v)); }
-inline void AppendU64BE(std::vector<uint8_t>& b, uint64_t v) {
-    AppendU32BE(b, static_cast<uint32_t>(v >> 32));
-    AppendU32BE(b, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
-}
-inline void AppendF32BE(std::vector<uint8_t>& b, float f) {
-    uint32_t u = 0; std::memcpy(&u, &f, 4); AppendU32BE(b, u);
-}
-inline void AppendF64BE(std::vector<uint8_t>& b, double d) {
-    uint64_t u = 0; std::memcpy(&u, &d, 8); AppendU64BE(b, u);
-}
 
-inline void PutU16LE(uint8_t* p, uint16_t v) { p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8); }
-inline void PutU32LE(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8);
-    p[2] = static_cast<uint8_t>(v >> 16); p[3] = static_cast<uint8_t>(v >> 24);
-}
-inline void PutU64LE(uint8_t* p, uint64_t v) {
-    PutU32LE(p, static_cast<uint32_t>(v));
-    PutU32LE(p + 4, static_cast<uint32_t>(v >> 32));
-}
-inline void PutF32LE(uint8_t* p, float f) { uint32_t u = 0; std::memcpy(&u, &f, 4); PutU32LE(p, u); }
-inline void PutF64LE(uint8_t* p, double d) { uint64_t u = 0; std::memcpy(&u, &d, 8); PutU64LE(p, u); }
 
-inline void PutU16BE(uint8_t* p, uint16_t v) { p[0] = static_cast<uint8_t>(v >> 8); p[1] = static_cast<uint8_t>(v); }
-inline void PutU32BE(uint8_t* p, uint32_t v) {
-    p[0] = static_cast<uint8_t>(v >> 24); p[1] = static_cast<uint8_t>(v >> 16);
-    p[2] = static_cast<uint8_t>(v >> 8);  p[3] = static_cast<uint8_t>(v);
-}
 
 inline uint32_t ComputeCrc32(const uint8_t* data, size_t len) {
     uint32_t crc = 0xFFFFFFFFu;
@@ -267,6 +202,56 @@ inline std::vector<uint8_t> MakeOle2SingleStream(std::wstring_view streamName, c
     if (!streamData.empty()) {
         std::memcpy(cfb.data() + 1536, streamData.data(), streamData.size());
     }
+    return cfb;
+}
+
+// A version 4 compound file (4096-byte sectors) holding one stream, its directory and the stream after padSectors
+// unused sectors: past the 32 MB a reader is handed when padSectors is large enough
+inline std::vector<uint8_t> MakeOle2V4SingleStreamAt(std::wstring_view streamName, const std::vector<uint8_t>& streamData, uint32_t padSectors) {
+    const uint32_t kSec = 4096, kPerFat = kSec / 4;
+    const uint32_t dataSectors = std::max<uint32_t>(1, static_cast<uint32_t>((streamData.size() + kSec - 1) / kSec));
+    uint32_t fatSectors = 1;
+    while (static_cast<uint64_t>(fatSectors) * kPerFat < static_cast<uint64_t>(fatSectors) + padSectors + 1 + dataSectors) ++fatSectors;
+    const uint32_t dirSec = fatSectors + padSectors, firstData = dirSec + 1;
+    std::vector<uint8_t> cfb((static_cast<size_t>(firstData) + dataSectors + 1) * kSec, 0);
+    auto sectorAt = [&](uint32_t sec) { return cfb.data() + (static_cast<size_t>(sec) + 1) * kSec; };
+
+    static const uint8_t kMagic[8] = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+    std::memcpy(cfb.data(), kMagic, 8);
+    PutU16LE(cfb.data() + 24, 0x003Eu);
+    PutU16LE(cfb.data() + 26, 0x0004u); // major version 4 (4096-byte sectors)
+    PutU16LE(cfb.data() + 28, 0xFFFEu);
+    PutU16LE(cfb.data() + 30, 12);
+    PutU16LE(cfb.data() + 32, 6);
+    PutU32LE(cfb.data() + 40, 1);       // directory sectors
+    PutU32LE(cfb.data() + 44, fatSectors);
+    PutU32LE(cfb.data() + 48, dirSec);
+    PutU32LE(cfb.data() + 56, 4096);
+    PutU32LE(cfb.data() + 60, 0xFFFFFFFEu);
+    PutU32LE(cfb.data() + 68, 0xFFFFFFFEu);
+    for (uint32_t i = 0; i < 109; ++i) PutU32LE(cfb.data() + 76 + i * 4, i < fatSectors ? i : 0xFFFFFFFFu);
+
+    auto setFat = [&](uint32_t sec, uint32_t value) { PutU32LE(sectorAt(sec / kPerFat) + (sec % kPerFat) * 4, value); };
+    for (uint32_t s = 0; s < fatSectors * kPerFat; ++s) setFat(s, s < fatSectors ? 0xFFFFFFFDu : 0xFFFFFFFFu);
+    setFat(dirSec, 0xFFFFFFFEu);
+    for (uint32_t s = 0; s < dataSectors; ++s) setFat(firstData + s, s + 1 < dataSectors ? firstData + s + 1 : 0xFFFFFFFEu);
+
+    auto writeEntry = [](uint8_t* ent, std::wstring_view nm, uint8_t type, uint32_t child, uint32_t start, uint64_t size) {
+        const size_t n = std::min<size_t>(nm.size(), 31);
+        for (size_t i = 0; i < n; ++i) PutU16LE(ent + i * 2, static_cast<uint16_t>(nm[i]));
+        PutU16LE(ent + 64, static_cast<uint16_t>((n + 1) * 2));
+        ent[66] = type;
+        ent[67] = 1;
+        PutU32LE(ent + 68, 0xFFFFFFFFu);
+        PutU32LE(ent + 72, 0xFFFFFFFFu);
+        PutU32LE(ent + 76, child);
+        PutU32LE(ent + 116, start);
+        PutU32LE(ent + 120, static_cast<uint32_t>(size));
+        PutU32LE(ent + 124, static_cast<uint32_t>(size >> 32));
+    };
+    writeEntry(sectorAt(dirSec), L"Root Entry", 5, 1, 0xFFFFFFFEu, 0);
+    writeEntry(sectorAt(dirSec) + 128, streamName, 2, 0xFFFFFFFFu, firstData, streamData.size());
+    if (!streamData.empty()) std::memcpy(sectorAt(firstData), streamData.data(), streamData.size());
     return cfb;
 }
 
@@ -667,7 +652,7 @@ struct ForwardFbBuilder {
 // ============================================================================
 
 // 1. Legacy Excel OLE2 BIFF8 Workbook (.xls) with SST CONTINUE boundary spanning
-static std::vector<uint8_t> BuildBiff8Xls(
+static std::vector<uint8_t> BuildBiff8Workbook(
     std::string_view sheetNameAscii,
     std::string_view sstStr0,
     std::string_view sstSplitPartA,
@@ -804,7 +789,14 @@ static std::vector<uint8_t> BuildBiff8Xls(
 
     // Worksheet EOF
     emitRec(0x000A, {});
-    return MakeOle2SingleStream(L"Workbook", wb);
+    return wb;
+}
+
+static std::vector<uint8_t> BuildBiff8Xls(std::string_view sheetNameAscii, std::string_view sstStr0, std::string_view sstSplitPartA,
+                                          std::string_view sstSplitPartB, double numVal, int32_t rkIntVal,
+                                          std::string_view formulaCachedStr, bool boolVal) {
+    return MakeOle2SingleStream(L"Workbook", BuildBiff8Workbook(sheetNameAscii, sstStr0, sstSplitPartA, sstSplitPartB, numVal,
+                                                                rkIntVal, formulaCachedStr, boolVal));
 }
 
 // 2. SQLite 3 Multi-Page B-Tree Database (.sqlite & .gpkg)
@@ -2470,6 +2462,22 @@ void RunFormatTestsDocs(TestCounter& tc) {
             HashParsedDoc(dA) != HashParsedDoc(dB) &&
             InspectFails(pBad);
         tc.Record(cellsOk, L"DocsA.Biff8Xls.Ole2SstContinueAndRecords");
+
+        // A workbook larger than the 32 MB a reader is handed, its directory and Workbook stream past that: a
+        // compound file is read whole, so the sheet is found and the title does not claim only the start was read
+        {
+            std::vector<uint8_t> big = MakeOle2V4SingleStreamAt(
+                L"Workbook", BuildBiff8Workbook("FarSheet", "FarAwayLabel", "Split_", "Tail", 31337.5, 77, "FX_FAR", true), 8460);
+            std::wstring pBig = tmp.Write(L"book_big.xls", big);
+            big.clear();
+            big.shrink_to_fit();
+            ParsedOfficeDocument dBig;
+            bool bigOk = SpreadsheetDocViewer::InspectOfficeFile(pBig, dBig) && dBig.valid &&
+                         SheetContains(dBig, L"FarSheet", L"FarAwayLabel") && SheetContains(dBig, L"FarSheet", L"31337.5") &&
+                         dBig.formatTitle.find(L"only the first") == std::wstring::npos;
+            DeleteFileW(pBig.c_str());
+            tc.Record(bigOk, L"DocsA.Biff8Xls.Over32MbCompoundFileReadWhole", dBig.formatTitle);
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -2603,6 +2611,24 @@ void RunFormatTestsDocs(TestCounter& tc) {
                   HashParsedDoc(nzA) != HashParsedDoc(nzB) && InspectFails(pNpzBad),
             L"DocsA.NumPy.NpzArchive");
 
+        // An .npz larger than the 32 MB a reader is handed, an array stored past that and the ZIP directory at the
+        // end: both come from the file, and the title does not claim only the start was read
+        {
+            std::vector<uint8_t> filler(33u * 1024 * 1024, 0);
+            std::vector<uint8_t> npz = MakeZipStoreArchive({ { "filler.bin", filler }, { "tail_layer.npy", BuildNpy2D(7.5, 8.25, 9.0, 9.75) } });
+            filler.clear();
+            filler.shrink_to_fit();
+            std::wstring pNpzBig = tmp.Write(L"arch_big.npz", npz);
+            npz.clear();
+            npz.shrink_to_fit();
+            ParsedOfficeDocument nzBig;
+            bool npzBigOk = SpreadsheetDocViewer::InspectOfficeFile(pNpzBig, nzBig) && nzBig.valid &&
+                            DocContains(nzBig, L"tail_layer") && DocContains(nzBig, L"9.75") &&
+                            nzBig.formatTitle.find(L"only the first") == std::wstring::npos;
+            DeleteFileW(pNpzBig.c_str());
+            tc.Record(npzBigOk, L"DocsA.NumPy.Over32MbNpzReadFromTheFile", nzBig.formatTitle);
+        }
+
         std::wstring nbA = tmp.WriteText(L"nb_a.ipynb",
             R"({"nbformat":4,"nbformat_minor":5,"metadata":{"kernelspec":{"display_name":"Python 3.12"}},"cells":[{"cell_type":"markdown","source":["# Gradient Descent Report"]},{"cell_type":"code","execution_count":1,"source":["loss = 0.0125"],"outputs":[{"text":["converged_ok\n"]}]}]})");
         std::wstring nbB = tmp.WriteText(L"nb_b.ipynb",
@@ -2616,6 +2642,692 @@ void RunFormatTestsDocs(TestCounter& tc) {
                   DocContains(inB, L"Spectral FFT Analysis") &&
                   HashParsedDoc(inA) != HashParsedDoc(inB) && InspectFails(nbBad),
             L"DocsA.Jupyter.IpynbStructuredCells");
+
+        // Jupyter outputs beyond plain streams: execute_result text/plain, errors, image-only display data
+        std::wstring nbOut = tmp.WriteText(L"nb_out.ipynb",
+            R"({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[{"cell_type":"code","execution_count":7,"source":"x = 6*7\nx","outputs":[)"
+            R"({"output_type":"execute_result","execution_count":7,"data":{"text/plain":["42"]},"metadata":{}},)"
+            R"({"output_type":"error","ename":"ZeroDivisionError","evalue":"division by zero","traceback":[]},)"
+            R"({"output_type":"display_data","data":{"image/png":"iVBORw0KGgo="},"metadata":{}}]}]})");
+        ParsedOfficeDocument inOut;
+        tc.Record(SpreadsheetDocViewer::InspectOfficeFile(nbOut, inOut) && inOut.valid &&
+                  DocContains(inOut, L"Out [7]: 42") && DocContains(inOut, L"ZeroDivisionError: division by zero") &&
+                  DocContains(inOut, L"[image/png output]") && DocContains(inOut, L"In [7]"),
+            L"DocsA.Jupyter.ExecuteResultErrorAndImageOutputs");
+
+        // GeoJSON is parsed as JSON: MultiPolygon is not mistaken for Polygon, escaped strings and
+        // property columns come through, every vertex reaches the map, bare geometries are accepted
+        std::wstring gjA = tmp.WriteText(L"multi.geojson",
+            R"({"type":"FeatureCollection","features":[)"
+            R"({"type":"Feature","id":"lake-7","geometry":{"type":"MultiPolygon","coordinates":[[[[10,50],[11,50],[11,51],[10,50]]],[[[12,52],[13,52],[13,53],[12,52]]]]},"properties":{"name":"Twin \"Lakes\"","area_km2":12.5}},)"
+            R"({"type":"Feature","geometry":{"type":"LineString","coordinates":[[19.94,50.06,210],[21.01,52.22,95]]},"properties":{"name":"Rail \u0141\u00f3d\u017a","operator":"PKP"}},)"
+            R"({"type":"Feature","geometry":null,"properties":{"name":"No geometry"}}]})");
+        std::wstring gjB = tmp.WriteText(L"bare.geojson", R"({"type":"Point","coordinates":[2.35,48.86]})");
+        std::wstring gjBad = tmp.WriteText(L"bad.geojson", R"({"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},)");
+        std::wstring gjNot = tmp.WriteText(L"not.geojson", R"({"hello":"Feature coordinates Point"})");
+        ParsedOfficeDocument gA, gB;
+        bool gOk = SpreadsheetDocViewer::InspectOfficeFile(gjA, gA) && gA.valid &&
+                   SheetContains(gA, L"GeoJSON_Features", L"MultiPolygon") &&
+                   SheetContains(gA, L"GeoJSON_Features", L"Twin \"Lakes\"") &&
+                   SheetContains(gA, L"GeoJSON_Features", L"12.5") &&
+                   SheetContains(gA, L"GeoJSON_Features", L"lake-7") &&
+                   SheetContains(gA, L"GeoJSON_Features", L"Rail \u0141\u00f3d\u017a") &&
+                   SheetContains(gA, L"GeoJSON_Features", L"(no geometry)") &&
+                   SheetContains(gA, L"GeoJSON_Summary", L"Geometry: MultiPolygon") &&
+                   gA.geoPoints.size() == 10 && gA.hasGeoTrack &&
+                   SpreadsheetDocViewer::InspectOfficeFile(gjB, gB) && gB.valid &&
+                   SheetContains(gB, L"GeoJSON_Features", L"[2.35, 48.86]") &&
+                   InspectFails(gjBad) && InspectFails(gjNot);
+        tc.Record(gOk, L"DocsA.GeoJson.Rfc7946ParsedNotScanned",
+                  L"points=" + std::to_wstring(gA.geoPoints.size()));
+
+        // JSON Lines: nested values stay in their own cell, escaped quotes do not split records,
+        // a broken line is counted, a pretty-printed array falls back to whole-document parsing
+        std::wstring ndA = tmp.WriteText(L"events.jsonl",
+            "{\"id\":1,\"msg\":\"say \\\"hi\\\", then go\",\"tags\":[\"a\",\"b\"]}\r\n"
+            "\n"
+            "{\"id\":2,\"nested\":{\"k\":\"v,}\"},\"msg\":\"second\"}\n"
+            "{\"id\":3,\"msg\":\"broken\"\n"
+            "17\n");
+        std::wstring ndB = tmp.WriteText(L"pretty.jsonl", "[\n  {\"sensor\": \"t1\", \"value\": 21.5},\n  {\"sensor\": \"t2\", \"value\": 19}\n]\n");
+        std::wstring ndBad = tmp.WriteText(L"bad.jsonl", "this is not json\n{\"a\":1}\n");
+        ParsedOfficeDocument nA, nB;
+        bool nOk = SpreadsheetDocViewer::InspectOfficeFile(ndA, nA) && nA.valid &&
+                   SheetContains(nA, L"JSON_Lines", L"say \"hi\", then go") &&
+                   SheetContains(nA, L"JSON_Lines", L"[\"a\", \"b\"]") &&
+                   SheetContains(nA, L"JSON_Lines", L"{\"k\": \"v,}\"}") &&
+                   SheetContains(nA, L"JSON_Lines", L"17") &&
+                   SheetContains(nA, L"JSON_Lines_Summary", L"1 (first at line 4)") &&
+                   SpreadsheetDocViewer::InspectOfficeFile(ndB, nB) && nB.valid &&
+                   SheetContains(nB, L"JSON_Lines", L"21.5") && SheetContains(nB, L"JSON_Lines", L"t2") &&
+                   InspectFails(ndBad);
+        tc.Record(nOk, L"DocsA.JsonLines.PerLineJsonParsing");
+
+        // HAR: the time and status of each row belong to the same entry (not the next entry's)
+        std::wstring harA = tmp.WriteText(L"trace.har",
+            R"({"log":{"version":"1.2","creator":{"name":"WebInspector","version":"537.36"},"pages":[{"id":"p1","title":"Checkout"}],"entries":[)"
+            R"({"startedDateTime":"2026-11-17T00:00:00.000Z","time":12.5,"request":{"method":"GET","url":"https://shop.example/cart"},"response":{"status":200,"statusText":"OK","content":{"size":5120,"mimeType":"text/html"}},"serverIPAddress":"192.0.2.10"},)"
+            R"({"startedDateTime":"2026-11-17T00:00:01.000Z","time":480,"request":{"method":"POST","url":"https://shop.example/pay"},"response":{"status":502,"statusText":"Bad Gateway","content":{"size":0,"mimeType":"application/json"}}}]}})");
+        std::wstring harBad = tmp.WriteText(L"bad.har", R"({"log":{"entries":"nope"}})");
+        ParsedOfficeDocument hA;
+        bool hOk = SpreadsheetDocViewer::InspectOfficeFile(harA, hA) && hA.valid && !hA.sheets.empty() &&
+                   hA.sheets[0].rows.size() == 3 &&
+                   hA.sheets[0].rows[1][2] == L"GET" && hA.sheets[0].rows[1][7] == L"12.5" &&
+                   hA.sheets[0].rows[2][3] == L"502 Bad Gateway" && hA.sheets[0].rows[2][7] == L"480.0" &&
+                   SheetContains(hA, L"HAR_Summary", L"WebInspector 537.36") &&
+                   SheetContains(hA, L"HAR_Summary", L"Checkout") &&
+                   SheetContains(hA, L"HAR_Summary", L"5120") &&
+                   InspectFails(harBad);
+        tc.Record(hOk, L"DocsA.Har.EntriesFromParsedLog");
+
+        // Streamed JSON: a collection / log cut short (e.g. by the 32 MB read limit) still shows what came before
+        // the cut, marked incomplete; a cut inside the first feature, or an untyped complete document, is rejected
+        std::wstring gjCut = tmp.WriteText(L"cut.geojson",
+            R"({"type":"FeatureCollection","features":[)"
+            R"({"type":"Feature","geometry":{"type":"Point","coordinates":[19.94,50.06]},"properties":{"name":"Krakow"}},)"
+            R"({"type":"Feature","geometry":{"type":"Point","coordinates":[21.01,52.23]},"properties":{"name":"Warsaw"}},)"
+            R"({"type":"Feature","geometry":{"type":"LineStr)");
+        std::wstring gjCutEarly = tmp.WriteText(L"cut_early.geojson", R"({"type":"FeatureCollection","features":[{"type":"Feature","geom)");
+        std::wstring gjEmpty = tmp.WriteText(L"empty.geojson", R"({"type":"FeatureCollection","features":[]})");
+        std::wstring gjUntyped = tmp.WriteText(L"untyped.geojson", R"({"features":[{"type":"Feature","geometry":null,"properties":{}}]})");
+        std::wstring harCut = tmp.WriteText(L"cut.har",
+            R"({"log":{"version":"1.2","creator":{"name":"Firefox","version":"140"},"entries":[)"
+            R"({"startedDateTime":"2026-11-17T00:00:00.000Z","time":3,"request":{"method":"GET","url":"https://a.example/"},"response":{"status":304,"content":{"size":0}}},)"
+            R"({"startedDateTime":"2026-11-17T00:00:01.000Z","time":4,"request":{"method":"GET","url":"https://a.exa)");
+        ParsedOfficeDocument gCut, gEmpty, hCut;
+        bool cutOk = SpreadsheetDocViewer::InspectOfficeFile(gjCut, gCut) && gCut.valid &&
+                     gCut.sheets.size() == 2 && gCut.sheets[0].rows.size() == 3 &&
+                     SheetContains(gCut, L"GeoJSON_Features", L"Warsaw") &&
+                     SheetContains(gCut, L"GeoJSON_Summary", L"incomplete") && gCut.geoPoints.size() == 2 &&
+                     SpreadsheetDocViewer::InspectOfficeFile(gjEmpty, gEmpty) && gEmpty.valid &&
+                     !SheetContains(gEmpty, L"GeoJSON_Summary", L"incomplete") &&
+                     InspectFails(gjCutEarly) && InspectFails(gjUntyped) &&
+                     SpreadsheetDocViewer::InspectOfficeFile(harCut, hCut) && hCut.valid && !hCut.sheets.empty() &&
+                     hCut.sheets[0].rows.size() == 2 && hCut.sheets[0].rows[1][3] == L"304" &&
+                     SheetContains(hCut, L"HAR_Summary", L"Firefox 140") &&
+                     SheetContains(hCut, L"HAR_Summary", L"incomplete");
+        tc.Record(cutOk, L"DocsA.GeoJsonHar.StreamedUpToTheCut",
+                  L"gjRows=" + std::to_wstring(gCut.sheets.empty() ? 0 : gCut.sheets[0].rows.size()) +
+                  L" harRows=" + std::to_wstring(hCut.sheets.empty() ? 0 : hCut.sheets[0].rows.size()));
+
+        // GPX read element by element: entities decoded, commented-out points ignored, segments numbered,
+        // tracks / routes / waypoints all reach the map
+        std::wstring gpxA = tmp.WriteText(L"ride.gpx",
+            "<?xml version=\"1.0\"?>\n<gpx version=\"1.1\" creator=\"UnitTest &amp; Co\">\n"
+            " <metadata><name>Ride &lt;Morning&gt;</name></metadata>\n"
+            " <wpt lat=\"50.0\" lon=\"19.9\"><name>Start Caf\xC3\xA9</name></wpt>\n"
+            " <trk><name>Loop</name>\n"
+            "  <trkseg><trkpt lat=\"50.01\" lon=\"19.91\"><ele>210.5</ele><time>2026-01-01T08:00:00Z</time></trkpt>\n"
+            "          <trkpt lat=\"50.02\" lon=\"19.92\"><ele>215</ele></trkpt></trkseg>\n"
+            "  <trkseg><trkpt lat=\"50.03\" lon=\"19.93\"/></trkseg>\n"
+            " </trk>\n"
+            " <!-- <trk><trkseg><trkpt lat=\"1\" lon=\"1\"/></trkseg></trk> -->\n"
+            " <rte><name>Plan</name><rtept lat=\"50.05\" lon=\"19.95\"/></rte>\n"
+            "</gpx>\n");
+        std::wstring gpxBad = tmp.WriteText(L"cut.gpx", "<gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"1\" lon=\"2\">");
+        ParsedOfficeDocument gpA;
+        bool gpOk = SpreadsheetDocViewer::InspectOfficeFile(gpxA, gpA) && gpA.valid &&
+                    gpA.geoPoints.size() == 5 && gpA.hasGeoTrack &&
+                    SheetContains(gpA, L"GPX_Summary", L"UnitTest & Co") &&
+                    SheetContains(gpA, L"GPX_Summary", L"Ride <Morning>") &&
+                    SheetContains(gpA, L"GPX_Summary", L"2 segments, 3 points") &&
+                    SheetContains(gpA, L"GPS_Points", L"Start Caf\u00e9") &&
+                    SheetContains(gpA, L"GPS_Points", L"210.5") &&
+                    gpA.sheets[0].rows.size() == 6 && gpA.sheets[0].rows[3][3] == L"2" &&
+                    InspectFails(gpxBad);
+        tc.Record(gpOk, L"DocsA.Gpx.ElementParsedTracksRoutesWaypoints",
+                  L"points=" + std::to_wstring(gpA.geoPoints.size()));
+
+        // A 60000-point recording (beyond both the 20000-row table and the 50000-point map): the map keeps the whole
+        // track, thinned evenly, from its first point to (nearly) its last, and the summary still counts every point
+        {
+            std::string big = "<gpx version=\"1.1\"><trk><name>Long</name><trkseg>";
+            big.reserve(60000 * 64 + 64);
+            char pt[96];
+            for (int i = 0; i < 60000; ++i) {
+                sprintf_s(pt, "<trkpt lat=\"%.6f\" lon=\"19.900000\"><ele>%d</ele></trkpt>", 50.0 + i * 1e-5, 200 + i % 50);
+                big += pt;
+            }
+            big += "</trkseg></trk></gpx>";
+            std::wstring gpxLong = tmp.WriteText(L"long_ride.gpx", big.c_str());
+            ParsedOfficeDocument gpL;
+            const bool loaded = SpreadsheetDocViewer::InspectOfficeFile(gpxLong, gpL) && gpL.valid && gpL.geoPoints.size() >= 2;
+            bool longOk = loaded && gpL.geoPoints.size() <= 50000 && gpL.geoPoints.size() >= 25000 &&
+                          std::fabs(gpL.geoPoints.front().lat - 50.0) < 1e-9 && gpL.geoPoints.back().lat > 50.59 &&
+                          SheetContains(gpL, L"GPX_Summary", L"60000 points") && gpL.sheets[0].rows.size() <= 20002;
+            tc.Record(longOk, L"DocsA.Gpx.LongTrackThinnedNotCutOnTheMap",
+                      loaded ? L"kept=" + std::to_wstring(gpL.geoPoints.size()) + L" lastLat=" + std::to_wstring(gpL.geoPoints.back().lat)
+                             : std::wstring(L"not read"));
+        }
+
+        // KML: folder path, CDATA description without markup, tolerant coordinate tuples, Polygon rings,
+        // gx:Track samples; every vertex on the map
+        std::wstring kmlA = tmp.WriteText(L"survey.kml",
+            "<kml xmlns=\"http://www.opengis.net/kml/2.2\" xmlns:gx=\"http://www.google.com/kml/ext/2.2\"><Document><name>Survey</name>\n"
+            " <Folder><name>Rivers</name>\n"
+            "  <Placemark><name>Vistula</name><description><![CDATA[<b>Longest</b> river]]></description>\n"
+            "   <LineString><coordinates>21.0,52.2,80 21.1, 52.3 ,81\n   21.2,52.4</coordinates></LineString></Placemark>\n"
+            " </Folder>\n"
+            " <Placemark><name>Lake</name><Polygon><outerBoundaryIs><LinearRing><coordinates>19,50 19.1,50 19.1,50.1 19,50</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>\n"
+            " <Placemark><name>Run</name><gx:Track><when>2026-01-01T00:00:00Z</when><gx:coord>18.5 49.5 300</gx:coord><gx:coord>18.6 49.6 310</gx:coord></gx:Track></Placemark>\n"
+            "</Document></kml>\n");
+        std::wstring kmlNone = tmp.WriteText(L"empty.kml", "<kml><Document><name>Nothing here</name></Document></kml>");
+        ParsedOfficeDocument kmA;
+        bool kmOk = SpreadsheetDocViewer::InspectOfficeFile(kmlA, kmA) && kmA.valid &&
+                    kmA.geoPoints.size() == 9 &&
+                    kmA.sheets[0].rows.size() == 4 &&
+                    kmA.sheets[0].rows[1][2] == L"Survey / Rivers" && kmA.sheets[0].rows[1][4] == L"3" &&
+                    kmA.sheets[0].rows[1][6] == L"Longest river" &&
+                    kmA.sheets[0].rows[2][3] == L"Polygon" && kmA.sheets[0].rows[2][4] == L"4" &&
+                    SheetContains(kmA, L"KML_Summary", L"Geometry: gx:Track") &&
+                    InspectFails(kmlNone);
+        tc.Record(kmOk, L"DocsA.Kml.PlacemarksFoldersAndAllVertices",
+                  L"points=" + std::to_wstring(kmA.geoPoints.size()));
+
+        // TCX: laps with totals, extension speed / power, indoor trackpoints without position stay off the map
+        std::wstring tcxA = tmp.WriteText(L"ride.tcx",
+            "<TrainingCenterDatabase xmlns:ns3=\"http://www.garmin.com/xmlschemas/ActivityExtension/v2\"><Activities><Activity Sport=\"Biking\"><Id>2026-01-01T07:00:00Z</Id>\n"
+            "<Lap StartTime=\"2026-01-01T07:00:00Z\"><TotalTimeSeconds>600</TotalTimeSeconds><DistanceMeters>5000</DistanceMeters><Calories>150</Calories>"
+            "<AverageHeartRateBpm><Value>131</Value></AverageHeartRateBpm><Track>\n"
+            "<Trackpoint><Time>2026-01-01T07:00:00Z</Time><Position><LatitudeDegrees>45.0</LatitudeDegrees><LongitudeDegrees>7.0</LongitudeDegrees></Position>"
+            "<AltitudeMeters>240</AltitudeMeters><HeartRateBpm><Value>120</Value></HeartRateBpm><Cadence>85</Cadence>"
+            "<Extensions><ns3:TPX><ns3:Speed>8.5</ns3:Speed><ns3:Watts>210</ns3:Watts></ns3:TPX></Extensions></Trackpoint>\n"
+            "<Trackpoint><Time>2026-01-01T07:00:05Z</Time><HeartRateBpm><Value>122</Value></HeartRateBpm></Trackpoint>\n"
+            "<Trackpoint><Time>2026-01-01T07:00:10Z</Time><Position><LatitudeDegrees>45.001</LatitudeDegrees><LongitudeDegrees>7.001</LongitudeDegrees></Position></Trackpoint>\n"
+            "</Track></Lap></Activity></Activities></TrainingCenterDatabase>\n");
+        std::wstring tcxNone = tmp.WriteText(L"none.tcx", "<TrainingCenterDatabase><Activities></Activities></TrainingCenterDatabase>");
+        ParsedOfficeDocument tcA;
+        bool tcOk = SpreadsheetDocViewer::InspectOfficeFile(tcxA, tcA) && tcA.valid &&
+                    tcA.geoPoints.size() == 2 && tcA.sheets[0].rows.size() == 4 &&
+                    SheetContains(tcA, L"TCX_Trackpoints", L"8.5") && SheetContains(tcA, L"TCX_Trackpoints", L"210") &&
+                    SheetContains(tcA, L"TCX_Trackpoints", L"Biking 2026-01-01T07:00:00Z") &&
+                    SheetContains(tcA, L"TCX_Laps", L"131") && SheetContains(tcA, L"TCX_Laps", L"5000") &&
+                    InspectFails(tcxNone);
+        tc.Record(tcOk, L"DocsA.Tcx.LapsTrackpointsExtensions",
+                  L"points=" + std::to_wstring(tcA.geoPoints.size()));
+
+        // iCalendar: folded lines joined, TEXT escapes removed, quoted parameter values, TZID / all-day dates,
+        // VALARM properties kept out of the event, VTODO rows
+        std::wstring icsA = tmp.WriteText(L"team.ics",
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Test//EN\r\nX-WR-CALNAME:Team\\, Ops\r\n"
+            "BEGIN:VTIMEZONE\r\nTZID:Europe/Warsaw\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+            "BEGIN:VEVENT\r\nSUMMARY:Quarterly review: budget\\, staffing\\; risks\r\n"
+            "DTSTART;TZID=Europe/Warsaw:20261201T090000\r\nDTEND;TZID=Europe/Warsaw:20261201T103000\r\n"
+            "DESCRIPTION:Line one\\nLine two that is folded across the 75 octet boundar\r\n y of the content line\r\n"
+            "ORGANIZER;CN=\"Kowalski, Jan\":mailto:jan@example.com\r\n"
+            "ATTENDEE;CN=A:mailto:a@example.com\r\nATTENDEE;CN=B:mailto:b@example.com\r\n"
+            "RRULE:FREQ=WEEKLY;BYDAY=MO\r\n"
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Alarm text\r\nEND:VALARM\r\n"
+            "END:VEVENT\r\n"
+            "BEGIN:VTODO\r\nSUMMARY:File report\r\nDUE;VALUE=DATE:20261205\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\n"
+            "END:VCALENDAR\r\n");
+        std::wstring icsBad = tmp.WriteText(L"bad.ics", "BEGIN:VCARD\r\nFN:Not a calendar\r\nEND:VCARD\r\n");
+        ParsedOfficeDocument icA;
+        bool icOk = SpreadsheetDocViewer::InspectOfficeFile(icsA, icA) && icA.valid && icA.sheets[0].rows.size() == 3 &&
+                    icA.sheets[0].rows[1][1] == L"Quarterly review: budget, staffing; risks" &&
+                    icA.sheets[0].rows[1][2] == L"2026-12-01 09:00:00 (Europe/Warsaw)" &&
+                    icA.sheets[0].rows[1][6] == L"FREQ=WEEKLY;BYDAY=MO" &&
+                    icA.sheets[0].rows[1][7] == L"Kowalski, Jan <jan@example.com>" &&
+                    icA.sheets[0].rows[1][8] == L"2" &&
+                    icA.sheets[0].rows[1][9].find(L"boundary of the content line") != std::wstring::npos &&
+                    icA.sheets[0].rows[1][9].find(L"Alarm") == std::wstring::npos &&
+                    icA.sheets[0].rows[2][0] == L"To-do" && icA.sheets[0].rows[2][3] == L"2026-12-05" &&
+                    SheetContains(icA, L"Calendar", L"Team, Ops") &&
+                    InspectFails(icsBad);
+        tc.Record(icOk, L"DocsA.ICalendar.UnfoldedEscapedComponents");
+
+        // vCard: 2.1 quoted-printable with soft line breaks and CHARSET, structured N / ADR / ORG,
+        // every TEL / EMAIL with its types, property groups, 3.0 escapes
+        std::wstring vcfA = tmp.WriteText(L"contacts.vcf",
+            "BEGIN:VCARD\r\nVERSION:2.1\r\nN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=C5=81ukasz;Jan;;Dr.;\r\n"
+            "TEL;CELL:+48 600 100 200\r\nTEL;WORK;VOICE:+48 22 100 20 30\r\nEMAIL;INTERNET:jan@example.com\r\n"
+            "ADR;HOME:;;ul. Prosta 1;Warszawa;;00-001;Polska\r\n"
+            "NOTE;ENCODING=QUOTED-PRINTABLE:Pierwsza linia=0D=0A=\r\ndruga linia\r\nEND:VCARD\r\n"
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Anna Nowak\r\nORG:Acme Corp;R&D\r\nTEL;TYPE=HOME,VOICE:+1 555 0100\r\n"
+            "item1.EMAIL;TYPE=INTERNET:anna@acme.example\r\nNOTE:Comma\\, semicolon\\; backslash\\\\ done\r\nEND:VCARD\r\n");
+        ParsedOfficeDocument vcA;
+        bool vcOk = SpreadsheetDocViewer::InspectOfficeFile(vcfA, vcA) && vcA.valid && vcA.sheets[0].rows.size() == 3 &&
+                    vcA.sheets[0].rows[1][0] == L"Dr. Jan \u0141ukasz" &&
+                    vcA.sheets[0].rows[1][3] == L"+48 600 100 200 (cell); +48 22 100 20 30 (work,voice)" &&
+                    vcA.sheets[0].rows[1][5] == L"ul. Prosta 1, Warszawa, 00-001, Polska (home)" &&
+                    vcA.sheets[0].rows[1][8].find(L"druga linia") != std::wstring::npos &&
+                    vcA.sheets[0].rows[2][0] == L"Anna Nowak" && vcA.sheets[0].rows[2][1] == L"Acme Corp, R&D" &&
+                    vcA.sheets[0].rows[2][3] == L"+1 555 0100 (home,voice)" &&
+                    vcA.sheets[0].rows[2][4] == L"anna@acme.example (internet)" &&
+                    vcA.sheets[0].rows[2][8] == L"Comma, semicolon; backslash\\ done";
+        tc.Record(vcOk, L"DocsA.VCard.QuotedPrintableStructuredMultiValue");
+
+        // Legacy 8-bit text (Windows-1250 / ANSI) is not shown as replacement characters; a UTF-8 character
+        // cut off at the end of a truncated string does not switch the whole string to ANSI
+        const char ansiPl[] = { 'Z', static_cast<char>(0xB3), 'o', 't', 'y', 0 }; // "Zloty" with l-stroke in cp1250
+        std::wstring ansiW = PathUtils::Utf8ToWide(ansiPl);
+        std::wstring cutW = PathUtils::Utf8ToWide(std::string_view("\xC5\x81\xC3\xB3" "d\xC5", 6)); // "Lod" + half of z-acute
+        tc.Record(ansiW.size() == 5 && ansiW.find(L'\uFFFD') == std::wstring::npos && ansiW[0] == L'Z' &&
+                  cutW == L"\u0141\u00f3d",
+                  L"DocsA.Utf8ToWide.AnsiFallbackAndTruncatedTail");
+
+        // SubRip: BOM, styling tags removed, cue without index, timing with position, durations, legacy ANSI text
+        std::wstring srtA = tmp.WriteText(L"movie.srt",
+            "\xEF\xBB\xBF" "1\r\n00:00:01,000 --> 00:00:03,500\r\n<i>Hello</i> {\\an8}there\r\nsecond line\r\n\r\n"
+            "00:00:04,000 --> 00:00:05,250 X1:10 X2:20 Y1:5 Y2:9\r\n<font color=\"#ff0\">Yellow</font> &amp; done\r\n\r\n"
+            "3\r\n00:00:05,000 --> 00:00:07,000\r\nOverlap\r\n");
+        std::wstring srtAnsi = tmp.Write(L"legacy.srt",
+            { '1', '\r', '\n', '0', '0', ':', '0', '0', ':', '0', '1', ',', '0', '0', '0', ' ', '-', '-', '>', ' ',
+              '0', '0', ':', '0', '0', ':', '0', '2', ',', '0', '0', '0', '\r', '\n', 'Z', 0xB3, 'o', 't', 'y', '\r', '\n' });
+        std::wstring srtBad = tmp.WriteText(L"bad.srt", "1\nnot a timing --> line\ntext\n");
+        ParsedOfficeDocument sA, sAnsi;
+        bool sOk = SpreadsheetDocViewer::InspectOfficeFile(srtA, sA) && sA.valid && sA.sheets[0].rows.size() == 4 &&
+                   sA.sheets[0].rows[1][0] == L"1" && sA.sheets[0].rows[1][4] == L"Hello there / second line" &&
+                   sA.sheets[0].rows[1][3] == L"2.500" &&
+                   sA.sheets[0].rows[2][4] == L"Yellow & done" && sA.sheets[0].rows[2][2] == L"00:00:05.250" &&
+                   SheetContains(sA, L"SRT_Summary", L"Cues starting before the previous one ends") &&
+                   SpreadsheetDocViewer::InspectOfficeFile(srtAnsi, sAnsi) && sAnsi.valid &&
+                   sAnsi.sheets[0].rows.size() == 2 && sAnsi.sheets[0].rows[1][4].find(L'\uFFFD') == std::wstring::npos &&
+                   InspectFails(srtBad);
+        tc.Record(sOk, L"DocsA.Srt.CuesTimingMarkupAndEncoding");
+
+        // WebVTT: header text, NOTE / STYLE blocks skipped, cue ids, settings, short timestamps, voice spans
+        std::wstring vttA = tmp.WriteText(L"talk.vtt",
+            "WEBVTT - Conference talk\n\nNOTE This is a comment\nspanning lines\n\nSTYLE\n::cue { color: lime }\n\n"
+            "intro\n00:01.000 --> 00:04.000 align:start line:0\n<v Roger Bingham>We are in New York City\n\n"
+            "00:00:05.000 --> 00:00:06.500\n<c.loud>Two</c> lines <00:00:06.000>here\nend\n");
+        std::wstring vttBad = tmp.WriteText(L"bad.vtt", "WEBVTTX\n\n00:01.000 --> 00:02.000\nnope\n");
+        ParsedOfficeDocument vA;
+        bool vOk = SpreadsheetDocViewer::InspectOfficeFile(vttA, vA) && vA.valid && vA.sheets[0].rows.size() == 3 &&
+                   vA.sheets[0].rows[1][1] == L"intro" && vA.sheets[0].rows[1][2] == L"00:00:01.000" &&
+                   vA.sheets[0].rows[1][5] == L"Roger Bingham" && vA.sheets[0].rows[1][6] == L"We are in New York City" &&
+                   vA.sheets[0].rows[1][7] == L"align:start line:0" &&
+                   vA.sheets[0].rows[2][6] == L"Two lines here / end" &&
+                   SheetContains(vA, L"VTT_Summary", L"Conference talk") && SheetContains(vA, L"VTT_Summary", L"NOTE blocks") &&
+                   InspectFails(vttBad);
+        tc.Record(vOk, L"DocsA.WebVtt.BlocksCueIdsVoicesSettings");
+
+        // SSA/ASS: columns follow the [Events] Format line (here reordered), Text keeps its commas,
+        // override blocks removed, \N line breaks, Comment lines kept apart, style names listed
+        std::wstring assA = tmp.WriteText(L"show.ass",
+            "[Script Info]\nTitle: Pilot\nScriptType: v4.00+\nPlayResX: 1920\n\n"
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,20\nStyle: Sign,Impact,28\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.50,0:00:03.00,Default,Ann,0,0,0,,{\\i1}Wait,{\\i0} what?\\NNo way, really.\n"
+            "Comment: 0,0:00:04.00,0:00:05.00,Sign,,0,0,0,,translator note\n");
+        ParsedOfficeDocument aA;
+        bool aOk = SpreadsheetDocViewer::InspectOfficeFile(assA, aA) && aA.valid && aA.sheets[0].rows.size() == 3 &&
+                   aA.sheets[0].rows[1][0] == L"00:00:01.500" && aA.sheets[0].rows[1][3] == L"Ann" &&
+                   aA.sheets[0].rows[1][4] == L"Wait, what? No way, really." &&
+                   aA.sheets[0].rows[2][5] == L"Comment" &&
+                   SheetContains(aA, L"Script_Info", L"Pilot") && SheetContains(aA, L"Script_Info", L"Default, Sign");
+        tc.Record(aOk, L"DocsA.Ass.FormatLineOverridesComments");
+
+        // BibTeX: nested braces, @string macros with # concatenation, unbraced numbers, parentheses entries,
+        // @preamble / @comment skipped, LaTeX accents to Unicode, URLs kept verbatim, a broken entry skipped
+        std::wstring bibA = tmp.WriteText(L"refs.bib",
+            "% header comment\n@string{acm = \"ACM Press\"}\n@preamble{\"\\newcommand{\\noop}[1]{}\"}\n@comment{ignore me {nested} }\n"
+            "@Article{knuth:tex,\n  title = {The {\\TeX}book and {DNA} models},\n"
+            "  author = \"Donald E. Knuth and Leslie {\\L}amport and Zo{\\\"e} {\\.Z}{\\'o}{\\l}w\",\n"
+            "  year = 1984,\n  month = feb,\n  journal = acm # \" Journal\",\n  url = {http://example.com/~knuth},\n  pages = {1--10},\n}\n"
+            "@inproceedings(conf1, booktitle = \"Proc. of {X}\", year = \"2020\")\n"
+            "@misc{broken, title = {unterminated\n");
+        ParsedOfficeDocument bA;
+        bool bOk = SpreadsheetDocViewer::InspectOfficeFile(bibA, bA) && bA.valid && bA.sheets[0].rows.size() == 3 &&
+                   bA.sheets[0].rows[1][1] == L"knuth:tex" &&
+                   bA.sheets[0].rows[1][2] == L"The TeXbook and DNA models" &&
+                   bA.sheets[0].rows[1][3] == L"Donald E. Knuth; Leslie \u0141amport; Zo\u00eb \u017b\u00f3\u0142w" &&
+                   bA.sheets[0].rows[1][4] == L"1984" && bA.sheets[0].rows[1][5] == L"ACM Press Journal" &&
+                   bA.sheets[0].rows[1][9] == L"http://example.com/~knuth" &&
+                   bA.sheets[0].rows[2][5] == L"Proc. of X" && bA.sheets[0].rows[2][4] == L"2020" &&
+                   SheetContains(bA, L"BibTeX_Summary", L"Unreadable entries (skipped)");
+        tc.Record(bOk, L"DocsA.BibTex.NestingMacrosAccents");
+
+        // OSM: way geometry resolved through the node table, untagged vertices not listed, entities decoded,
+        // relations with member counts, references to nodes outside the extract counted
+        std::wstring osmA = tmp.WriteText(L"town.osm",
+            "<?xml version=\"1.0\"?>\n<osm version=\"0.6\" generator=\"UnitTest\">\n"
+            " <bounds minlat=\"50.0\" minlon=\"19.0\" maxlat=\"50.1\" maxlon=\"19.1\"/>\n"
+            " <node id=\"1\" lat=\"50.01\" lon=\"19.01\"/>\n <node id=\"2\" lat=\"50.02\" lon=\"19.02\"/>\n"
+            " <node id=\"3\" lat=\"50.03\" lon=\"19.03\"><tag k=\"amenity\" v=\"cafe\"/><tag k=\"name\" v=\"Kawiarnia &quot;Pod Lip\xC4\x85&quot;\"/></node>\n"
+            " <way id=\"10\"><nd ref=\"1\"/><nd ref=\"2\"/><nd ref=\"3\"/><nd ref=\"99\"/><tag k=\"highway\" v=\"footway\"/></way>\n"
+            " <relation id=\"100\"><member type=\"way\" ref=\"10\" role=\"outer\"/><member type=\"node\" ref=\"3\" role=\"\"/>"
+            "<tag k=\"type\" v=\"route\"/><tag k=\"name\" v=\"Trail\"/></relation>\n</osm>\n");
+        ParsedOfficeDocument oA;
+        bool oOk = SpreadsheetDocViewer::InspectOfficeFile(osmA, oA) && oA.valid && oA.sheets[0].rows.size() == 4 &&
+                   oA.sheets[0].rows[1][0] == L"node" && oA.sheets[0].rows[1][2] == L"Kawiarnia \"Pod Lip\u0105\"" &&
+                   oA.sheets[0].rows[1][3] == L"amenity=cafe" &&
+                   oA.sheets[0].rows[2][0] == L"way" && oA.sheets[0].rows[2][3] == L"highway=footway" &&
+                   oA.sheets[0].rows[2][6] == L"4" &&
+                   oA.sheets[0].rows[3][0] == L"relation" && oA.sheets[0].rows[3][2] == L"Trail" && oA.sheets[0].rows[3][6] == L"2" &&
+                   oA.geoPoints.size() == 4 &&
+                   SheetContains(oA, L"OSM_Summary", L"Way node references outside this file");
+        tc.Record(oOk, L"DocsA.Osm.NodesWaysRelationsGeometry", L"points=" + std::to_wstring(oA.geoPoints.size()));
+
+        // Playlists: PLS keys per entry, IPTV #EXTINF attributes kept out of the duration, HLS master variants,
+        // free text rejected
+        std::wstring plsA = tmp.WriteText(L"radio.pls",
+            "[playlist]\r\nFile1=http://stream.example/live.mp3\r\nTitle1=Radio One\r\nLength1=-1\r\n"
+            "File2=C:\\Music\\song.flac\r\nTitle2=Song, With Comma\r\nLength2=245\r\nNumberOfEntries=2\r\nVersion=2\r\n");
+        std::wstring m3uA = tmp.WriteText(L"tv.m3u",
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"one.pl\" tvg-name=\"Kanal, Jeden\" group-title=\"News\",Kanal 1 HD\nhttp://iptv.example/1.ts\n"
+            "#EXTINF:180.5,Clip\nclips/clip.mp4\n");
+        std::wstring hlsA = tmp.WriteText(L"master.m3u8",
+            "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\"\nhd/index.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=640000,RESOLUTION=640x360\nsd/index.m3u8\n");
+        std::wstring m3uBad = tmp.WriteText(L"notes.m3u", "Dear diary\nToday nothing happened\nThe end\n");
+        ParsedOfficeDocument plA, muA, hlA;
+        bool plOk = SpreadsheetDocViewer::InspectOfficeFile(plsA, plA) && plA.valid && plA.sheets[0].rows.size() == 3 &&
+                    plA.sheets[0].rows[1][2] == L"Radio One" && plA.sheets[0].rows[1][1] == L"(stream)" &&
+                    plA.sheets[0].rows[2][1] == L"4:05" && plA.sheets[0].rows[2][2] == L"Song, With Comma" &&
+                    SpreadsheetDocViewer::InspectOfficeFile(m3uA, muA) && muA.valid && muA.sheets[0].rows.size() == 3 &&
+                    muA.sheets[0].rows[1][2] == L"Kanal 1 HD" && muA.sheets[0].rows[1][1] == L"(stream)" &&
+                    muA.sheets[0].rows[1][4].find(L"tvg-name=Kanal, Jeden") != std::wstring::npos &&
+                    muA.sheets[0].rows[2][1] == L"3:01" &&
+                    SpreadsheetDocViewer::InspectOfficeFile(hlsA, hlA) && hlA.valid && hlA.sheets[0].rows.size() == 3 &&
+                    hlA.sheets[0].rows[1][1] == L"1280000" && hlA.sheets[0].rows[1][2] == L"1280x720" &&
+                    hlA.sheets[0].rows[1][3] == L"avc1.4d401f,mp4a.40.2" &&
+                    InspectFails(m3uBad);
+        tc.Record(plOk, L"DocsA.Playlists.PlsM3uIptvHlsMaster");
+
+        // CUE: disc fields kept apart from tracks, lengths from consecutive INDEX 01 positions, pregaps
+        std::wstring cueA = tmp.WriteText(L"album.cue",
+            "REM GENRE Rock\nREM DATE 1999\nPERFORMER \"The Band\"\nTITLE \"Album\"\nFILE \"album.wav\" WAVE\n"
+            "  TRACK 01 AUDIO\n    TITLE \"Intro\"\n    INDEX 01 00:00:00\n"
+            "  TRACK 02 AUDIO\n    TITLE \"Song\"\n    PERFORMER \"Guest\"\n    ISRC USRC17607839\n    INDEX 00 03:10:00\n    INDEX 01 03:12:00\n"
+            "  TRACK 03 AUDIO\n    TITLE \"Outro\"\n    INDEX 01 07:00:30\n");
+        ParsedOfficeDocument cuA;
+        bool cuOk = SpreadsheetDocViewer::InspectOfficeFile(cueA, cuA) && cuA.valid && cuA.sheets[0].rows.size() == 4 &&
+                    cuA.sheets[0].rows[1][2] == L"Intro" && cuA.sheets[0].rows[1][3] == L"The Band" &&
+                    cuA.sheets[0].rows[1][5] == L"03:10:00" &&
+                    cuA.sheets[0].rows[2][3] == L"Guest" && cuA.sheets[0].rows[2][6] == L"00:02:00" &&
+                    cuA.sheets[0].rows[2][5] == L"03:48:30" && cuA.sheets[0].rows[2][8] == L"USRC17607839" &&
+                    SheetContains(cuA, L"CUE_Disc", L"Album") && SheetContains(cuA, L"CUE_Disc", L"REM GENRE");
+        tc.Record(cuOk, L"DocsA.Cue.DiscFieldsLengthsPregaps");
+
+        // NMEA: checksums verified, GGA + RMC of one epoch merged (speed no longer lands in the altitude column),
+        // void fixes skipped, any talker (GN, GL) accepted
+        std::wstring nmA = tmp.WriteText(L"drive.nmea", "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A\r\n$GPGGA,123520,4807.100,N,01131.100,E,1,08,0.9,546.0,M,46.9,M,,*00\r\n$GNGGA,123521,4807.200,N,01131.200,E,1,09,0.8,547.5,M,46.9,M,,*5A\r\n$GPRMC,123522,V,,,,,,,230394,,*3B\r\n$GLGLL,4807.300,N,01131.300,E,123523,A*3B\r\n");
+        ParsedOfficeDocument nmDoc;
+        bool nmOk = SpreadsheetDocViewer::InspectOfficeFile(nmA, nmDoc) && nmDoc.valid && nmDoc.sheets[0].rows.size() == 4 &&
+                    nmDoc.sheets[0].rows[1][1] == L"12:35:19" && nmDoc.sheets[0].rows[1][2] == L"1994-03-23" &&
+                    nmDoc.sheets[0].rows[1][3] == L"48.117300" && nmDoc.sheets[0].rows[1][4] == L"11.516667" &&
+                    nmDoc.sheets[0].rows[1][5] == L"545.4" && nmDoc.sheets[0].rows[1][6] == L"41.5" &&
+                    nmDoc.sheets[0].rows[1][9] == L"08" &&
+                    nmDoc.geoPoints.size() == 3 && std::fabs(nmDoc.geoPoints[0].elevM - 545.4f) < 0.01f &&
+                    SheetContains(nmDoc, L"NMEA_Summary", L"Bad checksums (skipped)") &&
+                    SheetContains(nmDoc, L"NMEA_Summary", L"Sentences without a fix");
+        tc.Record(nmOk, L"DocsA.Nmea.ChecksumsMergedFixesTalkers");
+
+        // IGC: header records, fixed-column B records with validity and pressure altitude, malformed records skipped
+        std::wstring igcA = tmp.WriteText(L"flight.igc",
+            "AXXXABC Logger\r\nHFDTE160721\r\nHFPLTPILOTINCHARGE:Jan Kowalski\r\nHFGTYGLIDERTYPE:ASK 21\r\n"
+            "B1101355206343N00006198WA0058700558\r\nB1101455206259N00006295WA0059300561\r\n"
+            "B1101555206300N00006300WV0059900000\r\nBgarbage\r\n");
+        ParsedOfficeDocument igDoc;
+        bool igOk = SpreadsheetDocViewer::InspectOfficeFile(igcA, igDoc) && igDoc.valid && igDoc.sheets[0].rows.size() == 4 &&
+                    igDoc.sheets[0].rows[1][1] == L"52.105717" && igDoc.sheets[0].rows[1][2] == L"-0.103300" &&
+                    igDoc.sheets[0].rows[1][3] == L"558" && igDoc.sheets[0].rows[1][5] == L"587" &&
+                    igDoc.sheets[0].rows[3][6] == L"2D / invalid" &&
+                    igDoc.geoPoints.size() == 2 &&
+                    SheetContains(igDoc, L"IGC_Flight", L"Jan Kowalski") && SheetContains(igDoc, L"IGC_Flight", L"ASK 21") &&
+                    SheetContains(igDoc, L"IGC_Flight", L"3 (1 not 3D-valid)") &&
+                    SheetContains(igDoc, L"IGC_Flight", L"Malformed B records (skipped)");
+        tc.Record(igOk, L"DocsA.Igc.HeadersFixValidityPressureAltitude");
+
+        // EPUB: package found through container.xml, chapters in spine order (not ZIP order), %20 and ../ in hrefs,
+        // HTML entities, containers descended into, inline markup removed
+        auto bytesOf = [](std::string_view t) { return std::vector<uint8_t>(t.begin(), t.end()); };
+        std::wstring epubA = tmp.Write(L"order.epub", MakeZipStoreArchive({
+            { "mimetype", bytesOf("application/epub+zip") },
+            { "META-INF/container.xml", bytesOf("<container><rootfiles><rootfile full-path=\"OPS/package.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>") },
+            { "OPS/package.opf", bytesOf("<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
+                                         "<dc:title>Test &amp; Book</dc:title><dc:creator>Ann Author</dc:creator><dc:creator>Bob Writer</dc:creator><dc:language>pl</dc:language>"
+                                         "</metadata><manifest><item id=\"c1\" href=\"text/chapter%201.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                                         "<item id=\"c2\" href=\"text/../text/chapter2.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>"
+                                         "<spine><itemref idref=\"c2\"/><itemref idref=\"c1\"/></spine></package>") },
+            { "OPS/text/chapter 1.xhtml", bytesOf("<html><body><h1>One</h1><p>First&nbsp;chapter &mdash; text</p></body></html>") },
+            { "OPS/text/chapter2.xhtml", bytesOf("<html><body><h2>Two</h2><blockquote><p>Quoted</p><p>lines</p></blockquote><ul><li>Item <b>bold</b></li></ul></body></html>") },
+        }));
+        ParsedOfficeDocument epA;
+        auto paraIndex = [](const ParsedOfficeDocument& d, std::wstring_view text) -> int {
+            for (size_t i = 0; i < d.paragraphs.size(); ++i) if (d.paragraphs[i].text == text) return static_cast<int>(i);
+            return -1;
+        };
+        bool epOk = SpreadsheetDocViewer::InspectOfficeFile(epubA, epA) && epA.valid &&
+                    paraIndex(epA, L"Test & Book") == 0 &&
+                    paraIndex(epA, L"Autor / Author: Ann Author, Bob Writer") == 1 &&
+                    paraIndex(epA, L"Two") >= 0 && paraIndex(epA, L"One") > paraIndex(epA, L"Two") &&
+                    paraIndex(epA, L"Quoted") >= 0 && paraIndex(epA, L"lines") == paraIndex(epA, L"Quoted") + 1 &&
+                    paraIndex(epA, L"Item bold") >= 0 &&
+                    paraIndex(epA, L"First\u00a0chapter \u2014 text") > paraIndex(epA, L"One");
+        tc.Record(epOk, L"DocsA.Epub.SpineOrderContainerEntities");
+
+        // FB2: declared windows-1251 encoding, poems verse by verse, subtitles, notes body after the main text
+        std::string fb2Text = "<?xml version=\"1.0\" encoding=\"windows-1251\"?><FictionBook><description><title-info><book-title>"
+                              "\xCF\xF0\xE8\xE2\xE5\xF2" "</book-title><genre>sf</genre><author><first-name>A</first-name><last-name>B</last-name></author>"
+                              "</title-info></description><body><section><title><p>T1</p></title><poem><stanza><v>Line one</v><v>Line two</v></stanza></poem>"
+                              "<subtitle>Sub</subtitle><p>Para</p></section></body><body name=\"notes\"><section><p>Note 1</p></section></body></FictionBook>";
+        std::wstring fb2A = tmp.Write(L"cp1251.fb2", std::vector<uint8_t>(fb2Text.begin(), fb2Text.end()));
+        ParsedOfficeDocument fbA;
+        bool fbOk = SpreadsheetDocViewer::InspectOfficeFile(fb2A, fbA) && fbA.valid &&
+                    paraIndex(fbA, L"\u041f\u0440\u0438\u0432\u0435\u0442") == 0 &&
+                    paraIndex(fbA, L"Autor / Author: A B") == 1 &&
+                    paraIndex(fbA, L"Line one") >= 0 && paraIndex(fbA, L"Line two") == paraIndex(fbA, L"Line one") + 1 &&
+                    paraIndex(fbA, L"Sub") > paraIndex(fbA, L"Line two") &&
+                    paraIndex(fbA, L"notes") > paraIndex(fbA, L"Para") && paraIndex(fbA, L"Note 1") > paraIndex(fbA, L"notes");
+        tc.Record(fbOk, L"DocsA.Fb2.DeclaredEncodingPoemsNotes");
+
+        // ARFF: case-insensitive keywords, quoted names / values with commas, sparse rows, missing values
+        std::wstring arffA = tmp.WriteText(L"weather.arff",
+            "% comment\n@RELATION 'weather data'\n@Attribute 'outlook type' {sunny,overcast,rainy}\n@ATTRIBUTE temp NUMERIC\n"
+            "@attribute note STRING\n@data\nsunny,85,'hot, dry'\n{1 70, 2 \"mild\"}\n?,?,?\n");
+        std::wstring arffBad = tmp.WriteText(L"bad.arff", "@relation x\nthis is not a header line\n@data\n1\n");
+        ParsedOfficeDocument arA;
+        bool arOk = SpreadsheetDocViewer::InspectOfficeFile(arffA, arA) && arA.valid && arA.sheets[0].rows.size() == 4 &&
+                    arA.sheets[0].rows[0][0] == L"outlook type" &&
+                    arA.sheets[0].rows[1][2] == L"hot, dry" &&
+                    arA.sheets[0].rows[2][0] == L"0" && arA.sheets[0].rows[2][1] == L"70" && arA.sheets[0].rows[2][2] == L"mild" &&
+                    SheetContains(arA, L"ARFF_Attributes", L"weather data") &&
+                    SheetContains(arA, L"ARFF_Attributes", L"{sunny,overcast,rainy}") &&
+                    SheetContains(arA, L"ARFF_Attributes", L"3 (1 sparse)") &&
+                    InspectFails(arffBad);
+        tc.Record(arOk, L"DocsA.Arff.QuotedSparseTypes");
+
+        // RIS: named type codes, all authors, year from a full date, pages, DOI, keywords, a record without ER
+        std::wstring risA = tmp.WriteText(L"refs.ris",
+            "TY  - JOUR\r\nTI  - Deep Learning\r\nAU  - LeCun, Yann\r\nAU  - Bengio, Yoshua\r\nA2  - Hinton, Geoffrey\r\n"
+            "DA  - 2015/05/28/\r\nJO  - Nature\r\nVL  - 521\r\nIS  - 7553\r\nSP  - 436\r\nEP  - 444\r\nDO  - 10.1038/nature14539\r\n"
+            "KW  - neural networks\r\nKW  - representation learning\r\nER  - \r\n"
+            "TY  - CHAP\r\nT1  - A Chapter\r\nPY  - 1999\r\n");
+        ParsedOfficeDocument riA;
+        bool riOk = SpreadsheetDocViewer::InspectOfficeFile(risA, riA) && riA.valid && riA.sheets[0].rows.size() == 3 &&
+                    riA.sheets[0].rows[1][0] == L"Journal article (JOUR)" &&
+                    riA.sheets[0].rows[1][2] == L"LeCun, Yann; Bengio, Yoshua; Hinton, Geoffrey" &&
+                    riA.sheets[0].rows[1][3] == L"2015" && riA.sheets[0].rows[1][7] == L"436-444" &&
+                    riA.sheets[0].rows[1][9] == L"10.1038/nature14539" &&
+                    riA.sheets[0].rows[1][10] == L"neural networks; representation learning" &&
+                    riA.sheets[0].rows[2][0] == L"Book chapter (CHAP)" && riA.sheets[0].rows[2][3] == L"1999";
+        tc.Record(riOk, L"DocsA.Ris.TypesAuthorsDatesPages");
+
+        // Matrix Market: complex hermitian coordinates (conjugate mirror in the dense view), symmetric arrays
+        // stored as the lower triangle in column-major order, out-of-range entries skipped
+        std::wstring mtxA = tmp.WriteText(L"herm.mtx",
+            "%%MatrixMarket matrix coordinate complex hermitian\n% comment\n3 3 4\n1 1 2.0 0.0\n2 1 1.5 -0.5\n3 3 4 0\n9 9 1 1\n");
+        std::wstring mtxB = tmp.WriteText(L"sym.mtx", "%%MatrixMarket matrix array real symmetric\n3 3\n1\n2\n3\n4\n5\n6\n");
+        ParsedOfficeDocument mxA, mxB;
+        bool mxOk = SpreadsheetDocViewer::InspectOfficeFile(mtxA, mxA) && mxA.valid && mxA.sheets.size() == 3 &&
+                    mxA.sheets[0].rows.size() == 4 && mxA.sheets[0].rows[2][3] == L"1.5 - 0.5i" &&
+                    mxA.sheets[1].name == L"Matrix_Dense" && mxA.sheets[1].rows[1][2] == L"1.5 + 0.5i" &&
+                    SheetContains(mxA, L"Matrix_Info", L"Malformed / out-of-range lines (skipped)") &&
+                    SpreadsheetDocViewer::InspectOfficeFile(mtxB, mxB) && mxB.valid &&
+                    mxB.sheets[0].rows.size() == 7 && mxB.sheets[0].rows[4][1] == L"2" && mxB.sheets[0].rows[4][2] == L"2" &&
+                    mxB.sheets[1].rows[1][3] == L"3" && mxB.sheets[1].rows[2][3] == L"5" && mxB.sheets[1].rows[3][3] == L"6";
+        tc.Record(mxOk, L"DocsA.MatrixMarket.ComplexHermitianSymmetricArray");
+
+        // Audio properties: WAVE_FORMAT_EXTENSIBLE + LIST/INFO + duration from the data chunk; FLAC metadata blocks
+        // with STREAMINFO duration and Vorbis comments; AIFF COMM with its 80-bit sample rate
+        {
+            auto le16 = [](std::vector<uint8_t>& b, uint16_t v) { b.push_back(v & 0xFF); b.push_back(v >> 8); };
+            auto le32 = [](std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back((v >> (8 * i)) & 0xFF); };
+            auto be16 = [](std::vector<uint8_t>& b, uint16_t v) { b.push_back(v >> 8); b.push_back(v & 0xFF); };
+            auto be32 = [](std::vector<uint8_t>& b, uint32_t v) { for (int i = 3; i >= 0; --i) b.push_back((v >> (8 * i)) & 0xFF); };
+            auto str = [](std::vector<uint8_t>& b, std::string_view t) { b.insert(b.end(), t.begin(), t.end()); };
+
+            std::vector<uint8_t> wav;
+            str(wav, "RIFF"); le32(wav, 0); str(wav, "WAVE");
+            str(wav, "fmt "); le32(wav, 40);
+            le16(wav, 0xFFFE); le16(wav, 2); le32(wav, 48000); le32(wav, 288000); le16(wav, 6); le16(wav, 24);
+            le16(wav, 22); le16(wav, 24); le32(wav, 3); le16(wav, 1);
+            for (int i = 0; i < 14; ++i) wav.push_back(0);
+            str(wav, "LIST"); le32(wav, 4 + 8 + 6 + 8 + 4); str(wav, "INFO");
+            str(wav, "INAM"); le32(wav, 6); str(wav, "Hello"); wav.push_back(0);
+            str(wav, "IART"); le32(wav, 4); str(wav, "Band");
+            str(wav, "data"); le32(wav, 288000); for (int i = 0; i < 12; ++i) wav.push_back(0);
+            std::wstring wavA = tmp.Write(L"tone.wav", wav);
+
+            std::vector<uint8_t> flac;
+            str(flac, "fLaC");
+            flac.push_back(0x00); flac.push_back(0); flac.push_back(0); flac.push_back(34);
+            be16(flac, 4096); be16(flac, 4096); for (int i = 0; i < 6; ++i) flac.push_back(0);
+            const uint8_t si[8] = { 0x0A, 0xC4, 0x42, 0xF0, 0x00, 0x01, 0x58, 0x88 };
+            flac.insert(flac.end(), si, si + 8);
+            for (int i = 0; i < 16; ++i) flac.push_back(0);
+            std::vector<uint8_t> vc;
+            le32(vc, 3); str(vc, "ref"); le32(vc, 2); le32(vc, 10); str(vc, "TITLE=Song"); le32(vc, 9); str(vc, "artist=Me");
+            flac.push_back(0x84); flac.push_back(0); flac.push_back(0); flac.push_back(static_cast<uint8_t>(vc.size()));
+            flac.insert(flac.end(), vc.begin(), vc.end());
+            std::wstring flacA = tmp.Write(L"song.flac", flac);
+
+            std::vector<uint8_t> aiff;
+            str(aiff, "FORM"); be32(aiff, 0); str(aiff, "AIFF");
+            str(aiff, "COMM"); be32(aiff, 18); be16(aiff, 1); be32(aiff, 22050); be16(aiff, 16);
+            const uint8_t rate[10] = { 0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0 };
+            aiff.insert(aiff.end(), rate, rate + 10);
+            str(aiff, "NAME"); be32(aiff, 4); str(aiff, "Test");
+            std::wstring aiffA = tmp.Write(L"clip.aiff", aiff);
+
+            ParsedOfficeDocument wA, fA, aA;
+            bool auOk = SpreadsheetDocViewer::InspectOfficeFile(wavA, wA) && wA.valid &&
+                        SheetContains(wA, L"Audio_Properties", L"PCM integer (WAVE_FORMAT_EXTENSIBLE)") &&
+                        SheetContains(wA, L"Audio_Properties", L"0:01.000") && SheetContains(wA, L"Audio_Properties", L"Hello") &&
+                        SheetContains(wA, L"Audio_Properties", L"Band") && SheetContains(wA, L"Audio_Properties", L"48000 Hz") &&
+                        SpreadsheetDocViewer::InspectOfficeFile(flacA, fA) && fA.valid &&
+                        SheetContains(fA, L"Audio_Properties", L"44100 Hz") && SheetContains(fA, L"Audio_Properties", L"0:02.000") &&
+                        SheetContains(fA, L"Audio_Properties", L"Tag ARTIST") && SheetContains(fA, L"Audio_Properties", L"Song") &&
+                        SpreadsheetDocViewer::InspectOfficeFile(aiffA, aA) && aA.valid &&
+                        SheetContains(aA, L"Audio_Properties", L"44100 Hz") && SheetContains(aA, L"Audio_Properties", L"0:00.500") &&
+                        SheetContains(aA, L"Audio_Properties", L"Test");
+            tc.Record(auOk, L"DocsA.Audio.WavExtensibleFlacTagsAiffComm");
+        }
+
+        // A WAV larger than the 32 MB a reader is handed, its LIST INFO tags after the data chunk (as many editors
+        // write them): the tags are read from the file, the duration comes from the data chunk's size, and the title
+        // does not claim only the start was read
+        {
+            const uint32_t dataLen = 33u * 1024 * 1024;
+            const std::string title = "Long Take";
+            const uint32_t infoLen = 4 + 8 + static_cast<uint32_t>(title.size() + 1 + 1); // "INFO" + INAM (padded to even)
+            std::vector<uint8_t> wav;
+            auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) wav.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+            auto u16 = [&](uint16_t v) { wav.push_back(static_cast<uint8_t>(v)); wav.push_back(static_cast<uint8_t>(v >> 8)); };
+            wav.insert(wav.end(), { 'R', 'I', 'F', 'F' });
+            u32(4 + (8 + 16) + (8 + dataLen) + (8 + infoLen));
+            wav.insert(wav.end(), { 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ' });
+            u32(16); u16(1); u16(2); u32(44100); u32(44100 * 4); u16(4); u16(16);
+            wav.insert(wav.end(), { 'd', 'a', 't', 'a' });
+            u32(dataLen);
+            wav.resize(wav.size() + dataLen, 0);
+            wav.insert(wav.end(), { 'L', 'I', 'S', 'T' });
+            u32(infoLen);
+            wav.insert(wav.end(), { 'I', 'N', 'F', 'O', 'I', 'N', 'A', 'M' });
+            u32(static_cast<uint32_t>(title.size() + 1));
+            wav.insert(wav.end(), title.begin(), title.end());
+            wav.push_back(0);
+            wav.push_back(0); // pad byte
+            std::wstring pWav = tmp.Write(L"long_take.wav", wav);
+            wav.clear();
+            wav.shrink_to_fit();
+            ParsedOfficeDocument dWav;
+            bool wavOk = SpreadsheetDocViewer::InspectOfficeFile(pWav, dWav) && dWav.valid &&
+                         SheetContains(dWav, L"Audio_Properties", L"Long Take") &&
+                         SheetContains(dWav, L"Audio_Properties", L"3:16.162") && // 34603008 B at 176400 B/s
+                         dWav.formatTitle.find(L"only the first") == std::wstring::npos;
+            DeleteFileW(pWav.c_str());
+            tc.Record(wavOk, L"DocsA.Audio.Over32MbWavTagsAfterTheData", dWav.formatTitle);
+        }
+
+        // EDF: record duration -> sampling rate, EDF+ detection, first data record in physical units
+        {
+            auto pad = [](std::string v, size_t width) { v.resize(width, ' '); return v; };
+            std::string hdr = pad("0", 8) + pad("X M 01-JAN-1990 Pat", 80) + pad("Startdate 01-JAN-2026 Lab", 80) +
+                              pad("01.01.26", 8) + pad("10.00.00", 8) + pad("768", 8) + pad("EDF+C", 44) + pad("1", 8) +
+                              pad("0.5", 8) + pad("2", 4);
+            std::string sigHdr = pad("EEG Fp1", 16) + pad("Temp", 16) + pad("AgAgCl", 80) + pad("Thermistor", 80) +
+                                 pad("uV", 8) + pad("degC", 8) + pad("-100", 8) + pad("30", 8) + pad("100", 8) + pad("40", 8) +
+                                 pad("-32768", 8) + pad("0", 8) + pad("32767", 8) + pad("1000", 8) +
+                                 pad("HP:0.1Hz", 80) + pad("", 80) + pad("4", 8) + pad("1", 8) + pad("", 32) + pad("", 32);
+            std::vector<uint8_t> edf(hdr.begin(), hdr.end());
+            edf.insert(edf.end(), sigHdr.begin(), sigHdr.end());
+            const int16_t samples[5] = { -32768, 0, 32767, 16384, 500 }; // 4 EEG samples, then 1 temperature sample
+            for (int16_t v : samples) { edf.push_back(static_cast<uint8_t>(v & 0xFF)); edf.push_back(static_cast<uint8_t>((v >> 8) & 0xFF)); }
+            std::wstring edfA = tmp.Write(L"eeg.edf", edf);
+            ParsedOfficeDocument eA;
+            bool edOk = SpreadsheetDocViewer::InspectOfficeFile(edfA, eA) && eA.valid && eA.sheets.size() == 2 &&
+                        eA.formatTitle.find(L"Format+") != std::wstring::npos &&
+                        SheetContains(eA, L"EDF_Biosignals", L"8 Hz") && SheetContains(eA, L"EDF_Biosignals", L"2 Hz") &&
+                        SheetContains(eA, L"EDF_Biosignals", L"HP:0.1Hz") &&
+                        eA.sheets[1].name == L"EDF_First_Record" && eA.sheets[1].rows.size() == 5 &&
+                        eA.sheets[1].rows[1][1] == L"-100" && eA.sheets[1].rows[3][1] == L"100" &&
+                        eA.sheets[1].rows[1][2] == L"35" && eA.sheets[1].rows[2][2].empty();
+            tc.Record(edOk, L"DocsA.Edf.RatesEdfPlusPhysicalPreview");
+        }
+
+        // DBF: text in the code page of the language driver byte (0x64 = DOS 852), typed fields, deleted records
+        {
+            std::vector<uint8_t> dbf(32, 0);
+            dbf[0] = 0x03; dbf[1] = 126; dbf[2] = 11; dbf[3] = 17;
+            dbf[4] = 2;                                   // records
+            const uint16_t hdrSize = 32 + 4 * 32 + 1, recSize = 1 + 10 + 8 + 8 + 1;
+            dbf[8] = hdrSize & 0xFF; dbf[9] = hdrSize >> 8; dbf[10] = recSize & 0xFF; dbf[11] = recSize >> 8;
+            dbf[29] = 0x64;                               // DOS code page 852
+            auto field = [&](const char* name, char type, uint8_t len, uint8_t dec) {
+                std::vector<uint8_t> f(32, 0);
+                std::memcpy(f.data(), name, std::strlen(name));
+                f[11] = static_cast<uint8_t>(type); f[16] = len; f[17] = dec;
+                dbf.insert(dbf.end(), f.begin(), f.end());
+            };
+            field("NAME", 'C', 10, 0); field("BORN", 'D', 8, 0); field("AMOUNT", 'N', 8, 2); field("OK", 'L', 1, 0);
+            dbf.push_back(0x0D);
+            auto rec = [&](char del, std::string name, const char* date, const char* amount, char ok) {
+                dbf.push_back(static_cast<uint8_t>(del));
+                name.resize(10, ' ');
+                dbf.insert(dbf.end(), name.begin(), name.end());
+                dbf.insert(dbf.end(), date, date + 8);
+                dbf.insert(dbf.end(), amount, amount + 8);
+                dbf.push_back(static_cast<uint8_t>(ok));
+            };
+            rec(' ', "\x9D\xA2" "d\xAB", "20261117", "   12.50", 'T');
+            rec('*', "gone", "20000101", "    0.00", 'F');
+            dbf.push_back(0x1A);
+            std::wstring dbfA = tmp.Write(L"cp852.dbf", dbf);
+            ParsedOfficeDocument dA;
+            bool dbOk = SpreadsheetDocViewer::InspectOfficeFile(dbfA, dA) && dA.valid && dA.sheets[0].rows.size() == 2 &&
+                        dA.sheets[0].rows[1][0] == L"\u0141\u00f3d\u017a" && dA.sheets[0].rows[1][1] == L"2026-11-17" &&
+                        dA.sheets[0].rows[1][2] == L"12.50" && dA.sheets[0].rows[1][3] == L"true" &&
+                        SheetContains(dA, L"DBF_Header", L"2 (1 deleted)") && SheetContains(dA, L"DBF_Header", L"852");
+            tc.Record(dbOk, L"DocsA.Dbf.CodePageTypedFieldsDeleted");
+        }
+
+        // CSV: Excel's "sep=" hint line names the delimiter (and is not a row); UTF-16 BE text; cp1250 bytes
+        {
+            std::wstring csvHint = tmp.WriteText(L"hint.csv", "sep=|\r\nname|city\r\nAnna|Krak\xF3w\r\n");
+            std::vector<uint8_t> be = { 0xFE, 0xFF };
+            for (wchar_t c : std::wstring(L"x,y\n1,2\n")) { be.push_back(static_cast<uint8_t>(c >> 8)); be.push_back(static_cast<uint8_t>(c & 0xFF)); }
+            std::wstring csvBe = tmp.Write(L"utf16be.csv", be);
+            ParsedOfficeDocument cA, cB;
+            bool csvOk = SpreadsheetDocViewer::InspectOfficeFile(csvHint, cA) && cA.valid && cA.sheets[0].rows.size() == 2 &&
+                         cA.formatTitle == L"CSV Table (Pipe |)" && cA.sheets[0].rows[0][1] == L"city" &&
+                         cA.sheets[0].rows[1][1].size() == 6 && cA.sheets[0].rows[1][1].find(L'\uFFFD') == std::wstring::npos &&
+                         SpreadsheetDocViewer::InspectOfficeFile(csvBe, cB) && cB.valid && cB.sheets[0].rows.size() == 2 &&
+                         cB.sheets[0].rows[1][1] == L"2";
+            tc.Record(csvOk, L"DocsA.Csv.SepHintUtf16BeAnsi");
+        }
 
         std::wstring cbA = tmp.Write(L"a.cbor", BuildCborArray("turbine_1", 3600, "turbine_2", 3650));
         std::wstring cbB = tmp.Write(L"b.cbor", BuildCborArray("pump_west", 1450, "pump_east", 1500));
@@ -2711,6 +3423,23 @@ void RunFormatTestsDocs(TestCounter& tc) {
                   HashParsedDoc(orcA) != HashParsedDoc(orcB) && InspectFails(orBad),
             L"DocsA.Orc.ProtobufFooterAndStripes");
 
+        // An ORC file larger than the 32 MB a reader is handed: the postscript and footer that close it are read
+        // from the file's end, and the title does not claim only the start was read
+        {
+            std::vector<uint8_t> orc = BuildOrcFile("far_amount", 777, 1, 4242);
+            orc.insert(orc.begin() + 3, 33u * 1024 * 1024, 0);
+            std::wstring orBig = tmp.Write(L"warehouse_big.orc", orc);
+            orc.clear();
+            orc.shrink_to_fit();
+            ParsedOfficeDocument orcBig;
+            bool orcBigOk = SpreadsheetDocViewer::InspectOfficeFile(orBig, orcBig) && orcBig.valid &&
+                            SheetContains(orcBig, L"ORC_Schema_And_Stats", L"far_amount") &&
+                            SheetContains(orcBig, L"ORC_Schema_And_Stats", L"4242") &&
+                            orcBig.formatTitle.find(L"only the first") == std::wstring::npos;
+            DeleteFileW(orBig.c_str());
+            tc.Record(orcBigOk, L"DocsA.Orc.Over32MbFooterReadFromTheFileEnd", orcBig.formatTitle);
+        }
+
         std::wstring h5A = tmp.Write(L"sim_a.h5", BuildHdf5File("velocity", 1.5, 2.5, 3.5, 4.5));
         std::wstring h5B = tmp.Write(L"sim_b.h5", BuildHdf5File("pressure", 101.25, 102.5, 103.75, 105.0));
         std::wstring h5Bad = tmp.Write(L"bad.h5", kGarbage);
@@ -2765,6 +3494,21 @@ void RunFormatTestsDocs(TestCounter& tc) {
                   SheetContains(ddB, L"Stata_Data", L"POL") &&
                   HashParsedDoc(ddA) != HashParsedDoc(ddB) && InspectFails(dtBad),
             L"DocsA.Stata.Dta118TypedObservations");
+
+        // A dataset larger than the 32 MB a reader is handed, its </data> past that: the rows previewed are the first
+        // observations, not the file's header read as data
+        {
+            std::vector<uint8_t> dtaBig = BuildStataDta118(77.5, "NOR", 12.25, "SWE");
+            dtaBig.insert(dtaBig.end() - 19, 33u * 1024 * 1024, 0); // more observations before "</data></stata_dta>"
+            std::wstring dtBig = tmp.Write(L"panel_big.dta", dtaBig);
+            dtaBig.clear();
+            dtaBig.shrink_to_fit();
+            ParsedOfficeDocument ddBig;
+            bool dtaBigOk = SpreadsheetDocViewer::InspectOfficeFile(dtBig, ddBig) && ddBig.valid &&
+                            SheetContains(ddBig, L"Stata_Data", L"77.5") && SheetContains(ddBig, L"Stata_Data", L"NOR");
+            DeleteFileW(dtBig.c_str());
+            tc.Record(dtaBigOk, L"DocsA.Stata.Over32MbRowsFromTheDataTag", ddBig.formatTitle);
+        }
 
         std::wstring saA = tmp.Write(L"trial_a.sas7bdat", BuildSas7bdat("ONCOLOGY", 25.0, "ACTIVE", 0.0, "PLACEBO"));
         std::wstring saB = tmp.Write(L"trial_b.sas7bdat", BuildSas7bdat("CARDIO", 150.5, "HIGHDOSE", 75.25, "LOWDOSE"));
@@ -2965,12 +3709,348 @@ void RunFormatTestsDocs(TestCounter& tc) {
                      odDocA.paragraphs[1].text == L"Telemetry:   Nominal & \x26A1 Ready" &&
                      odDocA.paragraphs[2].isBullet &&
                      odDocA.paragraphs[2].text == L"Gimbal Actuator Verified" &&
-                     odDocA.paragraphs[3].text == L"Orbit | 408 km" &&
+                     odDocA.paragraphs[3].text == L"Orbit | 408 km" && odDocA.paragraphs[3].isTableRow &&
                      DocContains(odDocB, L"Bathymetry Expedition") &&
                      DocContains(odDocB, L"Trench | Mariana") &&
                      HashParsedDoc(odDocA) != HashParsedDoc(odDocB) &&
                      InspectFails(odtBad) && InspectFails(odtWrongZip);
         tc.Record(odtOk, L"DocsA.OdfWriterOdt.ContentXmlParagraphsAndTables");
+
+        // Word (.docx): the officeDocument relationship names the main part, styles.xml gives heading levels
+        // (a localized style id named "heading 2", one based on it, Title by name) and list numbering (turned off
+        // by numId 0); the word "Title" in body text is no heading, a text box's alternate content is read once,
+        // tracked deletions and tab stops are not text, table rows become "a | b" rows
+        const std::string wRels =
+            R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">)"
+            R"(<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="/word/main.xml"/>)"
+            R"(</Relationships>)";
+        const std::string wMainRels =
+            R"(<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">)"
+            R"(<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="theme/../styl.xml"/>)"
+            R"(</Relationships>)";
+        const std::string wStyles =
+            R"(<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">)"
+            R"(<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>)"
+            R"(<w:style w:type="paragraph" w:styleId="Nagwek2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr></w:style>)"
+            R"(<w:style w:type="paragraph" w:styleId="Tytu"><w:name w:val="Title"/><w:basedOn w:val="Normal"/></w:style>)"
+            R"(<w:style w:type="paragraph" w:styleId="Akapitzlist"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr></w:style>)"
+            R"(<w:style w:type="paragraph" w:styleId="MojNaglowek"><w:name w:val="Moj naglowek"/><w:basedOn w:val="Nagwek2"/></w:style>)"
+            R"(</w:styles>)";
+        const std::string wMain =
+            R"(<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" )"
+            R"(xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:v="urn:schemas-microsoft-com:vml"><w:body>)"
+            R"(<w:p><w:pPr><w:pStyle w:val="Tytu"/></w:pPr><w:r><w:t>Quarterly Report</w:t></w:r></w:p>)"
+            R"(<w:p><w:r><w:t xml:space="preserve">Title </w:t></w:r><w:r><w:t>insurance overview</w:t></w:r></w:p>)"
+            R"(<w:p><w:pPr><w:pStyle w:val="Nagwek2"/><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr><w:r><w:t>Revenue</w:t></w:r></w:p>)"
+            R"(<w:p><w:pPr><w:pStyle w:val="MojNaglowek"/></w:pPr><w:r><w:t>Costs</w:t></w:r></w:p>)"
+            R"(<w:p><w:pPr><w:pStyle w:val="Akapitzlist"/></w:pPr><w:r><w:t>First point</w:t></w:r></w:p>)"
+            R"(<w:p><w:pPr><w:pStyle w:val="Akapitzlist"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>Not numbered</w:t></w:r></w:p>)"
+            R"(<w:p><w:r><w:t xml:space="preserve">Kept </w:t></w:r><w:del w:id="1" w:author="A"><w:r><w:delText>removed </w:delText></w:r></w:del>)"
+            R"(<w:ins w:id="2" w:author="A"><w:r><w:t>added</w:t></w:r></w:ins></w:p>)"
+            R"(<w:p><w:r><w:t>Before box</w:t></w:r><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wps:wsp><wps:txbx><w:txbxContent>)"
+            R"(<w:p><w:r><w:t>Box text</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></w:drawing></mc:Choice><mc:Fallback><w:pict><v:textbox><w:txbxContent>)"
+            R"(<w:p><w:r><w:t>Box text</w:t></w:r></w:p></w:txbxContent></v:textbox></w:pict></mc:Fallback></mc:AlternateContent></w:r>)"
+            R"(<w:r><w:t xml:space="preserve"> after box</w:t></w:r></w:p>)"
+            R"(<w:tbl><w:tblPr/><w:tr><w:tc><w:p><w:r><w:t>Region</w:t></w:r></w:p></w:tc>)"
+            R"(<w:tc><w:p><w:r><w:t>North</w:t></w:r></w:p><w:p><w:r><w:t>East</w:t></w:r></w:p></w:tc></w:tr></w:tbl>)"
+            R"(<w:p><w:r><w:t>Line one</w:t><w:br/><w:t>Line two</w:t><w:tab/><w:t>end</w:t></w:r></w:p>)"
+            R"(<w:sectPr/></w:body></w:document>)";
+        auto bytesOf = [](const std::string& x) { return std::vector<uint8_t>(x.begin(), x.end()); };
+        std::wstring docxA = tmp.Write(L"report.docx", MakeZipStoreArchive({
+            { "_rels/.rels", bytesOf(wRels) }, { "word/_rels/main.xml.rels", bytesOf(wMainRels) },
+            { "word/styl.xml", bytesOf(wStyles) }, { "word/main.xml", bytesOf(wMain) } }));
+        std::wstring docxNot = tmp.Write(L"not_word.docx", MakeZipStoreArchive({
+            { "word/document.xml", bytesOf(R"(<?xml version="1.0"?><svg><body><p>x</p></body></svg>)") } }));
+        ParsedOfficeDocument dx;
+        auto para = [&](size_t i) -> const DocParagraph& {
+            static const DocParagraph none;
+            return i < dx.paragraphs.size() ? dx.paragraphs[i] : none;
+        };
+        bool docxOk = SpreadsheetDocViewer::InspectOfficeFile(docxA, dx) && dx.valid && dx.paragraphs.size() == 11 &&
+                      para(0).text == L"Quarterly Report" && para(0).headingLevel == 1 &&
+                      para(1).text == L"Title insurance overview" && para(1).headingLevel == 0 &&
+                      para(2).text == L"Revenue" && para(2).headingLevel == 2 &&
+                      para(3).text == L"Costs" && para(3).headingLevel == 2 &&
+                      para(4).text == L"First point" && para(4).isBullet &&
+                      para(5).text == L"Not numbered" && !para(5).isBullet &&
+                      para(6).text == L"Kept added" &&
+                      para(7).text == L"Box text" && para(8).text == L"Before box after box" &&
+                      para(9).text == L"Region | North East" && para(9).isTableRow &&
+                      para(10).text == L"Line one\nLine two\tend" &&
+                      InspectFails(docxNot);
+        std::wstring docxDump;
+        for (const auto& dp : dx.paragraphs) docxDump += L"[" + std::to_wstring(dp.headingLevel) + (dp.isBullet ? L"b" : L"") + L"]" + dp.text + L" ";
+        tc.Record(docxOk, L"DocsA.Docx.RelationshipsStylesTextBoxesRevisionsTables", docxDump.substr(0, 400));
+
+        // SYLK: ";;" is a semicolon, quotes double inside K"..", F records move the current cell, ID comes first.
+        // DIF: empty tuples keep their row, TRUE / NA indicators, doubled quotes, the TABLE header is required.
+        std::wstring slkA = tmp.WriteText(L"esc.slk",
+            "ID;PWXL;N;E\r\nC;Y1;X1;K\"a;;b\"\r\nC;X2;K\"say \"\"hi\"\"\"\r\nF;P0;FG0G;Y3;X2\r\nC;K7\r\nE\r\n");
+        std::wstring slkNoId = tmp.WriteText(L"noid.slk", "C;Y1;X1;K\"x\"\r\nE\r\n");
+        std::wstring difA = tmp.WriteText(L"gaps.dif",
+            "TABLE\r\n0,1\r\n\"\"\r\nDATA\r\n0,0\r\n\"\"\r\n"
+            "-1,0\r\nBOT\r\n1,0\r\n\"Q \"\"x\"\"\"\r\n0,1\r\nTRUE\r\n"
+            "-1,0\r\nBOT\r\n"
+            "-1,0\r\nBOT\r\n0,0\r\nNA\r\n0,2.5\r\nV\r\n-1,0\r\nEOD\r\n");
+        std::wstring difNoTable = tmp.WriteText(L"notable.dif", "DATA\r\n0,0\r\n\"\"\r\n-1,0\r\nBOT\r\n1,0\r\n\"x\"\r\n-1,0\r\nEOD\r\n");
+        ParsedOfficeDocument sA, dA;
+        bool sdOk = SpreadsheetDocViewer::InspectOfficeFile(slkA, sA) && sA.valid && !sA.sheets.empty() &&
+                    sA.sheets[0].rows.size() == 3 && sA.sheets[0].rows[0].size() == 2 &&
+                    sA.sheets[0].rows[0][0] == L"a;b" && sA.sheets[0].rows[0][1] == L"say \"hi\"" &&
+                    sA.sheets[0].rows[2].size() == 2 && sA.sheets[0].rows[2][1] == L"7" &&
+                    InspectFails(slkNoId) &&
+                    SpreadsheetDocViewer::InspectOfficeFile(difA, dA) && dA.valid && !dA.sheets.empty() &&
+                    dA.sheets[0].rows.size() == 3 && dA.sheets[0].rows[0].size() == 2 &&
+                    dA.sheets[0].rows[0][0] == L"Q \"x\"" && dA.sheets[0].rows[0][1] == L"TRUE" &&
+                    dA.sheets[0].rows[1].empty() && dA.sheets[0].rows[2].size() == 2 &&
+                    dA.sheets[0].rows[2][0] == L"#N/A" && dA.sheets[0].rows[2][1] == L"2.5" &&
+                    InspectFails(difNoTable);
+        tc.Record(sdOk, L"DocsA.SylkDif.RecordGrammar");
+
+        // SecOps JSON read as JSON. SARIF: levels from rule defaults (the tool is written after the results),
+        // kind "pass" -> none, message ids with arguments, artifact indexes. CycloneDX: nested components and
+        // licenses, no rows made from metadata / supplier "name" keys. SPDX: purl refs, declared license for
+        // NOASSERTION. Terraform: one row per instance (index keys, modules, data sources, provider aliases),
+        // sensitive outputs hidden, the legacy modules layout.
+        const std::string sarifTxt =
+            R"({"version":"2.1.0","runs":[{"results":[)"
+            R"({"ruleIndex":0,"message":{"id":"default","arguments":["tmp"]},"locations":[{"physicalLocation":{"artifactLocation":{"index":0},"region":{"startLine":7,"startColumn":3}}}]},)"
+            R"({"ruleId":"R2","kind":"pass","message":{"text":"ok"}}],)"
+            R"("artifacts":[{"location":{"uri":"src/main.c"}}],)"
+            R"("tool":{"driver":{"name":"Analyzer","version":"2.0","rules":[{"id":"R1","defaultConfiguration":{"level":"error"},"messageStrings":{"default":{"text":"'{0}' is unused"}}},{"id":"R2"}]}}}]})";
+        const std::string cdxTxt =
+            R"({"bomFormat":"CycloneDX","specVersion":"1.5","metadata":{"tools":{"components":[{"name":"syft","version":"1.0"}]},"component":{"name":"app","version":"3.1"}},)"
+            R"("components":[{"type":"library","group":"org.acme","name":"core","version":"2.4","purl":"pkg:maven/org.acme/core@2.4",)"
+            R"("licenses":[{"license":{"id":"Apache-2.0"}},{"expression":"MIT OR BSD-3-Clause"}],"supplier":{"name":"Acme"},)"
+            R"("components":[{"type":"library","name":"core-util","version":"2.4"}]},{"type":"framework","name":"web","version":"9"}]})";
+        const std::string cdxXmlTxt =
+            R"(<?xml version="1.0"?><bom xmlns="http://cyclonedx.org/schema/bom/1.4" serialNumber="urn:uuid:1" version="1">)"
+            R"(<metadata><component type="application"><name>svc</name><version>1</version></component></metadata>)"
+            R"(<components><component type="library"><name>zlib</name><version>1.3</version><licenses><license><id>Zlib</id></license></licenses>)"
+            R"(<purl>pkg:generic/zlib@1.3</purl></component></components></bom>)";
+        const std::string spdxTxt =
+            R"({"spdxVersion":"SPDX-2.3","dataLicense":"CC0-1.0","SPDXID":"SPDXRef-DOCUMENT","name":"img","documentNamespace":"https://x/1",)"
+            R"("creationInfo":{"created":"2026-01-01T00:00:00Z","creators":["Tool: trivy"]},)"
+            R"("packages":[{"name":"openssl","SPDXID":"SPDXRef-1","versionInfo":"3.0.13","licenseConcluded":"NOASSERTION","licenseDeclared":"Apache-2.0",)"
+            R"("downloadLocation":"NOASSERTION","externalRefs":[{"referenceCategory":"PACKAGE-MANAGER","referenceType":"purl","referenceLocator":"pkg:deb/debian/openssl@3.0.13"}]}]})";
+        const std::string tfTxt =
+            R"({"version":4,"terraform_version":"1.7.0","serial":3,"lineage":"abc","outputs":{"ip":{"value":"10.0.0.1","type":"string"},"pw":{"value":"hunter2","type":"string","sensitive":true}},)"
+            R"("resources":[{"module":"module.net","mode":"managed","type":"aws_subnet","name":"a","provider":"provider[\"registry.terraform.io/hashicorp/aws\"].west",)"
+            R"("instances":[{"index_key":0,"attributes":{"id":"subnet-1"}},{"index_key":1,"attributes":{"id":"subnet-2"}}]},)"
+            R"({"mode":"data","type":"aws_ami","name":"ubuntu","provider":"provider[\"registry.terraform.io/hashicorp/aws\"]","instances":[{"attributes":{"id":"ami-9"}}]}]})";
+        const std::string tfOldTxt =
+            R"({"version":3,"terraform_version":"0.11.14","serial":1,"lineage":"z","modules":[{"path":["root"],"resources":{"aws_instance.web":{"type":"aws_instance","provider":"provider.aws","primary":{"id":"i-1"}}}},)"
+            R"({"path":["root","vpc"],"resources":{"data.aws_vpc.main":{"type":"aws_vpc","primary":{"id":"vpc-1"}}}}]})";
+        std::wstring pSarif = tmp.WriteText(L"scan.sarif", sarifTxt.c_str());
+        std::wstring pCdx = tmp.WriteText(L"bom.cdx", cdxTxt.c_str());
+        std::wstring pCdxXml = tmp.WriteText(L"bomx.cdx", cdxXmlTxt.c_str());
+        std::wstring pSpdx = tmp.WriteText(L"img.spdx", spdxTxt.c_str());
+        std::wstring pTf = tmp.WriteText(L"main.tfstate", tfTxt.c_str());
+        std::wstring pTfOld = tmp.WriteText(L"old.tfstate", tfOldTxt.c_str());
+        std::wstring pSarifBad = tmp.WriteText(L"bad.sarif", R"({"version":"2.1.0","runs":5})");
+        std::wstring pCdxBad = tmp.WriteText(L"bad.cdx", R"({"name":"x","components":[]})");
+        std::wstring pSpdxBad = tmp.WriteText(L"bad.spdx", "PackageName: zlib\nPackageVersion: 1\n");
+        ParsedOfficeDocument dS, dC, dX, dP, dT, dO;
+        auto cell = [](const ParsedOfficeDocument& d, size_t r, size_t col) -> std::wstring {
+            if (d.sheets.empty() || r >= d.sheets[0].rows.size() || col >= d.sheets[0].rows[r].size()) return L"<none>";
+            return d.sheets[0].rows[r][col];
+        };
+        bool sarifOk = SpreadsheetDocViewer::InspectOfficeFile(pSarif, dS) && dS.valid && dS.sheets[0].rows.size() == 3 &&
+                       cell(dS, 1, 0) == L"error" && cell(dS, 1, 1) == L"R1" && cell(dS, 1, 2) == L"src/main.c" &&
+                       cell(dS, 1, 3) == L"7:3" && cell(dS, 1, 4) == L"'tmp' is unused" && cell(dS, 1, 5) == L"Analyzer 2.0" &&
+                       cell(dS, 2, 0) == L"none" && InspectFails(pSarifBad);
+        bool cdxOk = SpreadsheetDocViewer::InspectOfficeFile(pCdx, dC) && dC.valid && dC.sheets[0].rows.size() == 4 &&
+                     cell(dC, 1, 0) == L"org.acme/core" && cell(dC, 1, 3) == L"Apache-2.0, MIT OR BSD-3-Clause" &&
+                     cell(dC, 1, 5) == L"Acme" && cell(dC, 2, 0) == L"core-util" && cell(dC, 3, 2) == L"framework" &&
+                     SheetContains(dC, L"SBOM_Summary", L"syft 1.0") && SheetContains(dC, L"SBOM_Summary", L"app 3.1") &&
+                     SpreadsheetDocViewer::InspectOfficeFile(pCdxXml, dX) && dX.valid && dX.sheets[0].rows.size() == 2 &&
+                     cell(dX, 1, 0) == L"zlib" && cell(dX, 1, 3) == L"Zlib" && SheetContains(dX, L"SBOM_Summary", L"CycloneDX 1.4") &&
+                     InspectFails(pCdxBad);
+        bool spdxOk = SpreadsheetDocViewer::InspectOfficeFile(pSpdx, dP) && dP.valid && dP.sheets[0].rows.size() == 2 &&
+                      cell(dP, 1, 0) == L"openssl" && cell(dP, 1, 1) == L"3.0.13" && cell(dP, 1, 3) == L"Apache-2.0" &&
+                      cell(dP, 1, 4) == L"pkg:deb/debian/openssl@3.0.13" && InspectFails(pSpdxBad);
+        bool tfOk = SpreadsheetDocViewer::InspectOfficeFile(pTf, dT) && dT.valid && dT.sheets[0].rows.size() == 4 &&
+                    cell(dT, 1, 0) == L"module.net.aws_subnet.a[0]" && cell(dT, 2, 5) == L"subnet-2" &&
+                    cell(dT, 1, 4) == L"registry.terraform.io/hashicorp/aws (west)" && cell(dT, 3, 0) == L"data.aws_ami.ubuntu" &&
+                    SheetContains(dT, L"State", L"10.0.0.1") && SheetContains(dT, L"State", L"(sensitive)") &&
+                    !SheetContains(dT, L"State", L"hunter2") &&
+                    SpreadsheetDocViewer::InspectOfficeFile(pTfOld, dO) && dO.valid && dO.sheets[0].rows.size() == 3 &&
+                    cell(dO, 2, 0) == L"module.vpc.data.aws_vpc.main" && cell(dO, 2, 1) == L"data" && cell(dO, 1, 5) == L"i-1";
+        // LevelDB table: the index block lists two data blocks, one Snappy-compressed and one stored plain; every entry
+        // of both is listed with its operation and sequence number (internal keys), nothing is made up
+        {
+            auto varint = [](std::vector<uint8_t>& v, uint64_t x) {
+                while (x >= 0x80) { v.push_back(static_cast<uint8_t>(x | 0x80)); x >>= 7; }
+                v.push_back(static_cast<uint8_t>(x));
+            };
+            auto u32 = [](std::vector<uint8_t>& v, uint32_t x) { for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i))); };
+            auto entry = [&](std::vector<uint8_t>& blk, const std::string& userKey, uint64_t seq, uint8_t type, const std::string& val) {
+                std::string ikey = userKey;
+                uint64_t tag = (seq << 8) | type;
+                for (int i = 0; i < 8; ++i) ikey.push_back(static_cast<char>(tag >> (8 * i)));
+                varint(blk, 0);
+                varint(blk, ikey.size());
+                varint(blk, val.size());
+                blk.insert(blk.end(), ikey.begin(), ikey.end());
+                blk.insert(blk.end(), val.begin(), val.end());
+            };
+            auto finishBlock = [&](std::vector<uint8_t>& blk) { u32(blk, 0); u32(blk, 1); };
+            std::vector<uint8_t> file;
+            auto store = [&](const std::vector<uint8_t>& bytes, uint8_t type) {
+                uint64_t off = file.size();
+                file.insert(file.end(), bytes.begin(), bytes.end());
+                file.push_back(type);
+                u32(file, 0); // checksum (not verified)
+                return std::make_pair(off, static_cast<uint64_t>(bytes.size()));
+            };
+            std::vector<uint8_t> b1, b2, idx, meta, snappy;
+            entry(b1, "apple", 1, 1, "red");
+            entry(b1, "banana", 2, 1, "yellow");
+            finishBlock(b1);
+            varint(snappy, b1.size()); // Snappy: the length, then one literal element
+            snappy.push_back(static_cast<uint8_t>((b1.size() - 1) << 2));
+            snappy.insert(snappy.end(), b1.begin(), b1.end());
+            auto h1 = store(snappy, 1);
+            entry(b2, "cherry", 3, 0, "");
+            finishBlock(b2);
+            auto h2 = store(b2, 0);
+            for (const auto& [k, h] : { std::make_pair(std::string("banana"), h1), std::make_pair(std::string("cherry"), h2) }) {
+                std::vector<uint8_t> hv;
+                varint(hv, h.first);
+                varint(hv, h.second);
+                varint(idx, 0);
+                varint(idx, k.size());
+                varint(idx, hv.size());
+                idx.insert(idx.end(), k.begin(), k.end());
+                idx.insert(idx.end(), hv.begin(), hv.end());
+            }
+            finishBlock(idx);
+            finishBlock(meta);
+            auto hi = store(idx, 0);
+            auto hm = store(meta, 0);
+            size_t footer = file.size();
+            varint(file, hm.first); varint(file, hm.second); varint(file, hi.first); varint(file, hi.second);
+            while (file.size() < footer + 40) file.push_back(0);
+            for (int i = 0; i < 8; ++i) file.push_back(static_cast<uint8_t>(0xDB4775248B80FB57ULL >> (8 * i)));
+            std::wstring pSst = tmp.Write(L"000005.ldb", file);
+            ParsedOfficeDocument dL;
+            bool sstOk = SpreadsheetDocViewer::InspectOfficeFile(pSst, dL) && dL.valid && dL.sheets.size() == 2 &&
+                         dL.sheets[0].rows.size() == 4 &&
+                         dL.sheets[0].rows[1][0] == L"apple" && dL.sheets[0].rows[1][1] == L"Put" && dL.sheets[0].rows[1][2] == L"1" &&
+                         dL.sheets[0].rows[1][3] == L"red" && dL.sheets[0].rows[2][3] == L"yellow" &&
+                         dL.sheets[0].rows[3][0] == L"cherry" && dL.sheets[0].rows[3][1] == L"Delete" &&
+                         SheetContains(dL, L"SST_Footer", L"2 in the index, 2 read");
+            tc.Record(sstOk, L"DocsA.LevelDbSst.IndexDrivenSnappyAndPlainBlocks",
+                      dL.sheets.empty() ? std::wstring(L"no sheets") : L"rows=" + std::to_wstring(dL.sheets[0].rows.size()));
+        }
+
+        // A table larger than the 32 MB a reader is handed (RocksDB writes 64 MB ones): footer, index and data block
+        // all lie past that and are read from the file; the title does not claim only the start was read
+        {
+            std::vector<uint8_t> file(33u * 1024 * 1024, 0); // bytes no block handle points at
+            auto varint = [](std::vector<uint8_t>& v, uint64_t x) {
+                while (x >= 0x80) { v.push_back(static_cast<uint8_t>(x | 0x80)); x >>= 7; }
+                v.push_back(static_cast<uint8_t>(x));
+            };
+            auto u32 = [](std::vector<uint8_t>& v, uint32_t x) { for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i))); };
+            auto store = [&](const std::vector<uint8_t>& bytes) {
+                uint64_t off = file.size();
+                file.insert(file.end(), bytes.begin(), bytes.end());
+                file.push_back(0); // stored plain
+                u32(file, 0);
+                return std::make_pair(off, static_cast<uint64_t>(bytes.size()));
+            };
+            std::string ikey = "zebra";
+            for (int i = 0; i < 8; ++i) ikey.push_back(static_cast<char>(((9ull << 8) | 1ull) >> (8 * i)));
+            std::vector<uint8_t> data, idx, meta;
+            varint(data, 0); varint(data, ikey.size()); varint(data, 3);
+            data.insert(data.end(), ikey.begin(), ikey.end());
+            data.insert(data.end(), { 'f', 'a', 'r' });
+            u32(data, 0); u32(data, 1);
+            auto hd = store(data);
+            std::vector<uint8_t> hv;
+            varint(hv, hd.first); varint(hv, hd.second);
+            varint(idx, 0); varint(idx, 5); varint(idx, hv.size());
+            idx.insert(idx.end(), { 'z', 'e', 'b', 'r', 'a' });
+            idx.insert(idx.end(), hv.begin(), hv.end());
+            u32(idx, 0); u32(idx, 1);
+            auto hi = store(idx);
+            u32(meta, 0); u32(meta, 1);
+            auto hm = store(meta);
+            size_t footer = file.size();
+            varint(file, hm.first); varint(file, hm.second); varint(file, hi.first); varint(file, hi.second);
+            while (file.size() < footer + 40) file.push_back(0);
+            for (int i = 0; i < 8; ++i) file.push_back(static_cast<uint8_t>(0xDB4775248B80FB57ULL >> (8 * i)));
+            std::wstring pBigSst = tmp.Write(L"000042.ldb", file);
+            file.clear();
+            file.shrink_to_fit();
+            ParsedOfficeDocument dBigSst;
+            bool bigSstOk = SpreadsheetDocViewer::InspectOfficeFile(pBigSst, dBigSst) && dBigSst.valid && !dBigSst.sheets.empty() &&
+                            dBigSst.sheets[0].rows.size() == 2 && dBigSst.sheets[0].rows[1][0] == L"zebra" &&
+                            dBigSst.sheets[0].rows[1][3] == L"far" &&
+                            dBigSst.formatTitle.find(L"only the first") == std::wstring::npos;
+            DeleteFileW(pBigSst.c_str());
+            tc.Record(bigSstOk, L"DocsA.LevelDbSst.Over32MbBlocksReadFromTheFile", dBigSst.formatTitle);
+        }
+
+        // A file larger than the 32 MB the in-memory document readers are given: the title says only its start was read
+        {
+            std::string big;
+            big.reserve(34u * 1024 * 1024);
+            for (int i = 0; big.size() < 33u * 1024 * 1024; ++i) {
+                big += "{\"i\":" + std::to_string(i) + ",\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\n";
+            }
+            std::wstring pBig = tmp.Write(L"big.jsonl", std::vector<uint8_t>(big.begin(), big.end()));
+            big.clear();
+            big.shrink_to_fit();
+            ParsedOfficeDocument dBig;
+            bool bigOk = SpreadsheetDocViewer::InspectOfficeFile(pBig, dBig) && dBig.valid &&
+                         dBig.formatTitle.find(L"only the first") != std::wstring::npos;
+            DeleteFileW(pBig.c_str());
+            tc.Record(bigOk, L"DocsA.ReadLimit.TitleSaysOnlyTheStartWasRead", dBig.formatTitle);
+        }
+
+        // A SQLite database larger than the 32 MB a reader is handed: the table whose pages lie past that is read
+        // from the file itself, and the title does not claim that only the start was read
+        {
+            const uint32_t kPage = 4096, kRoot = 8500; // page 8500 starts past 33 MB
+            std::vector<uint8_t> db(static_cast<size_t>(kRoot) * kPage, 0);
+            std::memcpy(db.data(), "SQLite format 3\0", 16);
+            PutU16BE(db.data() + 16, 4096);
+            db[18] = 1; db[19] = 1; db[21] = 64; db[22] = 32; db[23] = 32;
+            PutU32BE(db.data() + 28, kRoot);
+            PutU32BE(db.data() + 44, 4);
+            PutU32BE(db.data() + 56, 1);
+            auto textCol = [](std::string_view t) -> std::pair<uint64_t, std::vector<uint8_t>> {
+                return { 13ULL + 2ULL * t.size(), std::vector<uint8_t>(t.begin(), t.end()) };
+            };
+            std::vector<uint8_t> master = MakeSqliteRecord({ textCol("table"), textCol("far_away"), textCol("far_away"),
+                { 2ULL, { static_cast<uint8_t>(kRoot >> 8), static_cast<uint8_t>(kRoot & 0xFFu) } },
+                textCol("CREATE TABLE far_away (id INTEGER PRIMARY KEY, label TEXT)") });
+            WriteSqliteLeafPageCells(db.data(), 100, { { 1, master } });
+            std::vector<uint8_t> r0 = MakeSqliteRecord({ { 0ULL, {} }, textCol("north") });
+            std::vector<uint8_t> r1 = MakeSqliteRecord({ { 0ULL, {} }, textCol("south") });
+            WriteSqliteLeafPageCells(db.data() + static_cast<size_t>(kRoot - 1) * kPage, 0, { { 1, r0 }, { 2, r1 } });
+            std::wstring pDb = tmp.Write(L"far.sqlite", db);
+            db.clear();
+            db.shrink_to_fit();
+            ParsedOfficeDocument dDb;
+            bool dbOk = SpreadsheetDocViewer::InspectOfficeFile(pDb, dDb) && dDb.valid;
+            const SpreadsheetSheet* farSheet = nullptr; // ("far" is a macro in the Windows headers)
+            for (const auto& sh : dDb.sheets) {
+                if (sh.name == L"far_away") farSheet = &sh;
+            }
+            dbOk = dbOk && farSheet && farSheet->rows.size() == 3 && farSheet->rows[1].size() >= 2 &&
+                   farSheet->rows[1][1] == L"north" && farSheet->rows[2][1] == L"south" &&
+                   dDb.formatTitle.find(L"only the first") == std::wstring::npos;
+            DeleteFileW(pDb.c_str());
+            tc.Record(dbOk, L"DocsA.Sqlite.PagesPast32MbReadFromTheFile",
+                      farSheet ? L"rows=" + std::to_wstring(farSheet->rows.size()) : std::wstring(L"no far_away sheet"));
+        }
+
+        tc.Record(sarifOk && cdxOk && spdxOk && tfOk, L"DocsA.SecOpsJson.SarifSbomTerraformParsedAsJson",
+                  L"sarif=" + std::to_wstring(sarifOk) + L" sbom=" + std::to_wstring(cdxOk) + L"/" + std::to_wstring(spdxOk) +
+                  L" tf=" + std::to_wstring(tfOk) + L" [" + cell(dS, 1, 4) + L"|" + cell(dT, 1, 0) + L"]");
 
         std::wstring repoOdt = tdDir + L"\\writer_document.odt";
         if (GetFileAttributesW(repoOdt.c_str()) != INVALID_FILE_ATTRIBUTES) {

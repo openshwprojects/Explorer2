@@ -18,37 +18,16 @@ namespace Formats {
 
 namespace SplatVdbDetail {
 
-inline uint16_t RdU16(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
-inline uint32_t RdU32(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline int32_t  RdI32(const uint8_t* p) { int32_t  v = 0; std::memcpy(&v, p, 4); return v; }
-inline uint64_t RdU64(const uint8_t* p) { uint64_t v = 0; std::memcpy(&v, p, 8); return v; }
-inline int64_t  RdI64(const uint8_t* p) { int64_t  v = 0; std::memcpy(&v, p, 8); return v; }
-inline float    RdF32(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
-inline double   RdF64(const uint8_t* p) { double   v = 0.0;  std::memcpy(&v, p, 8); return v; }
+// little-endian loads (ByteIO.h)
+inline uint16_t RdU16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
+inline uint32_t RdU32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline int32_t RdI32(const uint8_t* p) { return ::Explorer2::ByteIO::RdI32LE(p); }
+inline uint64_t RdU64(const uint8_t* p) { return ::Explorer2::ByteIO::RdU64LE(p); }
+inline int64_t RdI64(const uint8_t* p) { return ::Explorer2::ByteIO::RdI64LE(p); }
+inline float RdF32(const uint8_t* p) { return ::Explorer2::ByteIO::RdF32LE(p); }
+inline double RdF64(const uint8_t* p) { return ::Explorer2::ByteIO::RdF64LE(p); }
 
-inline float HalfToF32Splat(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x03FFu;
-    uint32_t bits = 0;
-    if (exp == 0) {
-        if (mant != 0) {
-            exp = 1;
-            while ((mant & 0x0400u) == 0) { mant <<= 1; --exp; }
-            mant &= 0x03FFu;
-            bits = sign | ((exp + 112u) << 23) | (mant << 13);
-        } else {
-            bits = sign;
-        }
-    } else if (exp == 31u) {
-        bits = (mant == 0) ? (sign | 0x7F800000u) : 0x7FC00000u;
-    } else {
-        bits = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float f = 0.0f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
+inline float HalfToF32Splat(uint16_t h) { return ::Explorer2::ByteIO::HalfToFloat(h); }
 
 struct GaussianPrim {
     Vec3f pos = { 0, 0, 0 };

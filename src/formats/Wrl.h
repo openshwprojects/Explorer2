@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // Wrl.h — VRML 1.0 & VRML 2.0 / VRML97 (.wrl, plain & gzipped) Scene-Graph 3D Parser
 // Supports #VRML V2.0 utf8, #VRML V1.0 ascii, and #Inventor V2.x, gzip inflation (0x1F 0x8B),
 // DEF / USE instancing, 4x4 Transform & VRML 1.0 Separator matrix stacks, IndexedFaceSet,
@@ -473,31 +474,6 @@ struct WrlAst {
         return nullptr;
     }
 };
-
-inline void EmitWrlStrut(LoadedMesh3D& mesh, const Vec3f& a, const Vec3f& b, float rad) {
-    Vec3f d = { b.x - a.x, b.y - a.y, b.z - a.z };
-    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (len < 1e-6f) return;
-    Vec3f u = { d.x / len, d.y / len, d.z / len };
-    Vec3f ref = (std::fabs(u.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    Vec3f s = { u.y * ref.z - u.z * ref.y, u.z * ref.x - u.x * ref.z, u.x * ref.y - u.y * ref.x };
-    float sl = std::sqrt(s.x * s.x + s.y * s.y + s.z * s.z);
-    if (sl < 1e-6f) return;
-    s = { s.x / sl * rad, s.y / sl * rad, s.z / sl * rad };
-    Vec3f t = { u.y * s.z - u.z * s.y, u.z * s.x - u.x * s.z, u.x * s.y - u.y * s.x };
-
-    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back({ a.x + s.x, a.y + s.y, a.z + s.z });
-    mesh.vertices.push_back({ a.x - s.x, a.y - s.y, a.z - s.z });
-    mesh.vertices.push_back({ a.x + t.x, a.y + t.y, a.z + t.z });
-    mesh.vertices.push_back({ b.x + s.x, b.y + s.y, b.z + s.z });
-    mesh.vertices.push_back({ b.x - s.x, b.y - s.y, b.z - s.z });
-    mesh.vertices.push_back({ b.x + t.x, b.y + t.y, b.z + t.z });
-    mesh.tris.push_back({ base + 0, base + 3, base + 2, {} });
-    mesh.tris.push_back({ base + 2, base + 3, base + 5, {} });
-    mesh.tris.push_back({ base + 2, base + 5, base + 1, {} });
-    mesh.tris.push_back({ base + 1, base + 5, base + 4, {} });
-}
 
 inline void EmitWrlLocalTris(
     LoadedMesh3D& outMesh, const WrlMat4& mat,
@@ -1083,7 +1059,7 @@ inline bool ParseWrlMesh(const uint8_t* data, size_t size, LoadedMesh3D& outMesh
         float span = std::max({ bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z, 1e-4f });
         float rad = span * 0.008f;
         for (const auto& seg : worldLineSegs) {
-            DetailWrl::EmitWrlStrut(outMesh, seg.first, seg.second, rad);
+            MeshBuild3D::EmitEdgeStrut(outMesh, seg.first, seg.second, rad);
         }
     }
 

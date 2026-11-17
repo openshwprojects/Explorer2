@@ -1749,51 +1749,6 @@ bool FileEngine::ReadFilesFromClipboard(HWND hwnd, std::vector<std::wstring>& ou
     return !outPaths.empty();
 }
 
-bool FileEngine::PasteFilesFromClipboard(HWND hwnd, const std::wstring& targetDir, bool& outWasCut) {
-    outWasCut = false;
-    if (targetDir.empty() || IsVirtualFolder(targetDir)) return false;
-
-    bool isMove = false;
-    std::vector<std::wstring> srcPaths;
-    if (!ReadFilesFromClipboard(hwnd, srcPaths, isMove)) return false;
-
-    if (FtpClient::IsFtpPath(targetDir)) {
-        bool allOk = true;
-        for (const auto& p : srcPaths) {
-            if (!FtpClient::IsFtpPath(p)) {
-                if (FtpClient::UploadLocalTreeToFtp(p, targetDir, nullptr)) {
-                    if (isMove) DeletePathPermanently(p, nullptr);
-                } else {
-                    allOk = false;
-                }
-            }
-        }
-        outWasCut = isMove;
-        return allOk;
-    }
-
-    std::vector<wchar_t> fromBuf;
-    for (const auto& p : srcPaths) {
-        fromBuf.insert(fromBuf.end(), p.begin(), p.end());
-        fromBuf.push_back(L'\0');
-    }
-    fromBuf.push_back(L'\0');
-
-    std::vector<wchar_t> toBuf(targetDir.begin(), targetDir.end());
-    toBuf.push_back(L'\0');
-    toBuf.push_back(L'\0');
-
-    SHFILEOPSTRUCTW op = {};
-    op.hwnd = hwnd;
-    op.wFunc = isMove ? FO_MOVE : FO_COPY;
-    op.pFrom = fromBuf.data();
-    op.pTo = toBuf.data();
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR | FOF_RENAMEONCOLLISION;
-    int res = SHFileOperationW(&op);
-    outWasCut = isMove;
-    return (res == 0 && !op.fAnyOperationsAborted);
-}
-
 bool FileEngine::CopyTextToClipboard(HWND hwnd, const std::wstring& text) {
     if (!OpenClipboard(hwnd)) return false;
     EmptyClipboard();

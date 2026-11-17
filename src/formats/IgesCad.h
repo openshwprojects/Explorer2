@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // IgesCad.h — IGES 5.3 (.iges / .igs) Initial Graphics Exchange Specification 3D CAD Parser & NURBS Evaluator
 
 namespace Formats {
@@ -273,32 +274,9 @@ inline int FindKnotSpan(int K, int M, double u, const std::vector<double>& U) {
     return mid;
 }
 
-inline void EvalBsplineBasis(
-    int span,
-    double u,
-    int M,
-    const std::vector<double>& U,
-    std::vector<double>& N,
-    std::vector<double>& left,
-    std::vector<double>& right)
-{
-    N.assign(static_cast<size_t>(M + 1), 0.0);
-    left.assign(static_cast<size_t>(M + 1), 0.0);
-    right.assign(static_cast<size_t>(M + 1), 0.0);
-    N[0] = 1.0;
-
-    for (int j = 1; j <= M; ++j) {
-        left[static_cast<size_t>(j)]  = u - U[static_cast<size_t>(span + 1 - j)];
-        right[static_cast<size_t>(j)] = U[static_cast<size_t>(span + j)] - u;
-        double saved = 0.0;
-        for (int r = 0; r < j; ++r) {
-            double denom = right[static_cast<size_t>(r + 1)] + left[static_cast<size_t>(j - r)];
-            double temp = (std::abs(denom) > 1e-30) ? (N[static_cast<size_t>(r)] / denom) : 0.0;
-            N[static_cast<size_t>(r)] = saved + right[static_cast<size_t>(r + 1)] * temp;
-            saved = left[static_cast<size_t>(j - r)] * temp;
-        }
-        N[static_cast<size_t>(j)] = saved;
-    }
+inline void EvalBsplineBasis(int span, double u, int M, const std::vector<double>& U, std::vector<double>& N,
+                             std::vector<double>& left, std::vector<double>& right) {
+    MeshBuild3D::BsplineBasisFuns(span, u, M, U, N, left, right);
 }
 
 struct IgesEntity {

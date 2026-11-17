@@ -39,63 +39,25 @@ struct XmlNode {
         return nullptr;
     }
 
-    const XmlNode* FindFirstFull(std::string_view full) const {
-        for (const auto& ch : children) {
-            if (!ch.isText && ch.fullTag == full) return &ch;
-        }
-        return nullptr;
-    }
 };
 
-inline std::string LowerAsciiStr(std::string_view sv) {
-    std::string r;
-    r.reserve(sv.size());
-    for (unsigned char c : sv) {
-        r.push_back((c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c));
-    }
-    return r;
-}
+inline std::string LowerAsciiStr(std::string_view sv) { return ::Explorer2::PathUtils::ToLowerAscii(sv); }
 
 inline std::string LocalXmlName(const std::string& fullLower) {
     size_t col = fullLower.find(':');
     return (col == std::string::npos) ? fullLower : fullLower.substr(col + 1);
 }
 
-inline std::wstring TrimWideWs(std::wstring_view sv) {
-    while (!sv.empty() && (sv.front() == L' ' || sv.front() == L'\t' || sv.front() == L'\r' || sv.front() == L'\n')) {
-        sv.remove_prefix(1);
-    }
-    while (!sv.empty() && (sv.back() == L' ' || sv.back() == L'\t' || sv.back() == L'\r' || sv.back() == L'\n')) {
-        sv.remove_suffix(1);
-    }
-    return std::wstring(sv);
-}
+inline std::wstring TrimWideWs(std::wstring_view sv) { return ::Explorer2::PathUtils::Trim(sv); }
 
+// BOM / UTF-16 / declared encoding handled by the shared XML helper
 inline std::string XmlBytesToUtf8(const std::vector<uint8_t>& raw) {
-    if (raw.empty()) return {};
-    const uint8_t* d = raw.data();
-    size_t n = raw.size();
-    if (n >= 3 && d[0] == 0xEFu && d[1] == 0xBBu && d[2] == 0xBFu) {
-        return std::string(reinterpret_cast<const char*>(d + 3), n - 3);
-    }
-    if (n >= 2 && ((d[0] == 0xFFu && d[1] == 0xFEu) || (d[0] == 0xFEu && d[1] == 0xFFu))) {
-        bool le = (d[0] == 0xFFu);
-        std::wstring ws;
-        ws.reserve((n - 2) / 2);
-        for (size_t i = 2; i + 1 < n; i += 2) {
-            uint16_t u = le
-                ? static_cast<uint16_t>(d[i] | (static_cast<uint16_t>(d[i + 1]) << 8))
-                : static_cast<uint16_t>((static_cast<uint16_t>(d[i]) << 8) | d[i + 1]);
-            if (u != 0) ws.push_back(static_cast<wchar_t>(u));
-        }
-        return PathUtils::WideToUtf8(ws);
-    }
-    return std::string(reinterpret_cast<const char*>(d), n);
+    return ::Explorer2::XmlTagScan::DocumentToUtf8(raw.data(), raw.size());
 }
 
 inline std::string DecodeXmlUtf8(std::string_view raw) {
     if (raw.find('&') == std::string_view::npos) return std::string(raw);
-    return PathUtils::WideToUtf8(DetailWordOdt::DecodeRichXmlEntities(PathUtils::Utf8ToWide(raw)));
+    return ::Explorer2::XmlTagScan::DecodeText(raw);
 }
 
 // Fast iterative XML tree parser (preserves mixed-content text nodes & element hierarchy)

@@ -1,4 +1,5 @@
 #include "FileContentPane.h"
+#include "FormatSupport.h"
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FileEngine.h"
@@ -383,19 +384,7 @@ static bool ComputeFileHashes(const std::wstring& path, std::wstring& outSummary
         nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
-    // 1. CRC32 table
-    static uint32_t crcTable[256] = {};
-    static bool crcInit = false;
-    if (!crcInit) {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            crcTable[i] = c;
-        }
-        crcInit = true;
-    }
-
-    // 2. Windows BCrypt SHA-256
+    // Windows BCrypt SHA-256
     BCRYPT_ALG_HANDLE hAlg = nullptr;
     BCRYPT_HASH_HANDLE hHash = nullptr;
     std::vector<uint8_t> hashObj;
@@ -407,18 +396,25 @@ static bool ComputeFileHashes(const std::wstring& path, std::wstring& outSummary
         }
     }
 
-    uint32_t crc = 0xFFFFFFFFu;
+    uint32_t crc = 0;
     uint64_t fnv64 = 14695981039346656037ULL;
     std::vector<uint8_t> buf(256 * 1024);
     DWORD got = 0;
     uint64_t totalRead = 0;
     const uint64_t kMaxSyncBytes = 512ULL * 1024 * 1024; // cap synchronous UI hash at 512 MB
+    LARGE_INTEGER fileSize = {};
+    GetFileSizeEx(hFile, &fileSize);
+    bool readFailed = false;
 
-    while (ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got > 0) {
+    while (true) {
+        if (!ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
+            readFailed = true;
+            break;
+        }
+        if (got == 0) break;
+        crc = Checksum::Crc32(buf.data(), got, crc);
         for (DWORD i = 0; i < got; ++i) {
-            uint8_t b = buf[i];
-            crc = crcTable[(crc ^ b) & 0xFFu] ^ (crc >> 8);
-            fnv64 ^= static_cast<uint64_t>(b);
+            fnv64 ^= static_cast<uint64_t>(buf[i]);
             fnv64 *= 1099511628211ULL;
         }
         if (hHash) {
@@ -428,7 +424,8 @@ static bool ComputeFileHashes(const std::wstring& path, std::wstring& outSummary
         if (totalRead >= kMaxSyncBytes) break;
     }
     CloseHandle(hFile);
-    crc ^= 0xFFFFFFFFu;
+    // Digests of part of the file (size cap, read error) must not pass for the file's digests
+    const bool partial = readFailed || totalRead < static_cast<uint64_t>(std::max<LONGLONG>(0, fileSize.QuadPart));
 
     uint8_t sha256[32] = {};
     bool hasSha = false;
@@ -457,6 +454,12 @@ static bool ComputeFileHashes(const std::wstring& path, std::wstring& outSummary
     outSummary = std::wstring(L"CRC32: ") + crcBuf + L"   \x2022   Hash64: " + fnvBuf;
     if (!outSha256Hex.empty()) {
         outSummary += L"   \x2022   SHA-256: " + outSha256Hex;
+    }
+    if (partial) {
+        outSummary = L"PARTIAL \x2014 first " + std::to_wstring(totalRead / (1024 * 1024)) + L" MB of " +
+                     std::to_wstring(static_cast<uint64_t>(fileSize.QuadPart) / (1024 * 1024)) + L" MB" +
+                     (readFailed ? L" (read error)" : L"") + L": " + outSummary;
+        outSha256Hex.clear(); // the caller copies the full SHA-256 when there is one; here there is not
     }
     return true;
 }

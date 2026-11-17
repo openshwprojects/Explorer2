@@ -208,16 +208,10 @@ struct LazArithmeticDecoder {
     }
 
     uint8_t ReadByte() { return static_cast<uint8_t>(ReadBits(8u)); }
-    uint16_t ReadShort() { return static_cast<uint16_t>(ReadBits(16u)); }
     uint32_t ReadInt() {
         uint32_t lo = ReadBits(16u);
         uint32_t hi = ReadBits(16u);
         return (hi << 16) | lo;
-    }
-    uint64_t ReadInt64() {
-        uint64_t lo = ReadInt();
-        uint64_t hi = ReadInt();
-        return (hi << 32) | lo;
     }
 };
 

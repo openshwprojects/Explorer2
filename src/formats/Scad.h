@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // Scad.h — OpenSCAD Parametric CSG Script (.scad) Recursive-Descent Parser & 4x4 CSG Mesh Evaluator
 
 namespace Formats {
@@ -22,15 +23,7 @@ struct Mat4 {
 
     static Mat4 Mul(const Mat4& a, const Mat4& b) {
         Mat4 r;
-        for (int row = 0; row < 4; ++row) {
-            for (int col = 0; col < 4; ++col) {
-                r.m[row * 4 + col] =
-                    a.m[row * 4 + 0] * b.m[0 * 4 + col] +
-                    a.m[row * 4 + 1] * b.m[1 * 4 + col] +
-                    a.m[row * 4 + 2] * b.m[2 * 4 + col] +
-                    a.m[row * 4 + 3] * b.m[3 * 4 + col];
-            }
-        }
+        MeshBuild3D::MatMul4RowMajor(a.m, b.m, r.m);
         return r;
     }
 

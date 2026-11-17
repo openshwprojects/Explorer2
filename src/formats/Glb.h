@@ -1,336 +1,29 @@
 #pragma once
+#include "../JsonDom.h"
+#include "../ByteIO.h"
 // Glb.h — Spec-compliant glTF 2.0 (.glb, .gltf, .vrm) JSON + Binary Scene-Graph 3D Mesh Parser
 
 namespace Formats {
 
 namespace DetailGltf {
 
-inline uint32_t RdU32LE(const uint8_t* p) {
-    uint32_t v = 0;
-    std::memcpy(&v, p, 4);
-    return v;
-}
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdI16LE;
+using ::Explorer2::ByteIO::RdF32LE;
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    uint16_t v = 0;
-    std::memcpy(&v, p, 2);
-    return v;
-}
+using JsonVal = ::Explorer2::Json::Value; // shared RFC 8259 DOM (JsonDom.h)
 
-inline int16_t RdI16LE(const uint8_t* p) {
-    int16_t v = 0;
-    std::memcpy(&v, p, 2);
-    return v;
-}
-
-inline float RdF32LE(const uint8_t* p) {
-    float v = 0.0f;
-    std::memcpy(&v, p, 4);
-    return v;
-}
-
-struct JsonVal {
-    enum class Kind : uint8_t { Null, Bool, Number, String, Array, Object };
-    Kind kind = Kind::Null;
-    bool boolVal = false;
-    double numVal = 0.0;
-    std::string strVal;
-    std::vector<JsonVal> arrVal;
-    std::vector<std::pair<std::string, JsonVal>> objVal;
-
-    bool IsNull()   const { return kind == Kind::Null; }
-    bool IsBool()   const { return kind == Kind::Bool; }
-    bool IsNumber() const { return kind == Kind::Number; }
-    bool IsString() const { return kind == Kind::String; }
-    bool IsArray()  const { return kind == Kind::Array; }
-    bool IsObject() const { return kind == Kind::Object; }
-
-    const JsonVal* Find(std::string_view key) const {
-        if (kind != Kind::Object) return nullptr;
-        for (const auto& kv : objVal) {
-            if (kv.first == key) return &kv.second;
-        }
-        return nullptr;
-    }
-
-    int GetInt(std::string_view key, int defVal) const {
-        const JsonVal* v = Find(key);
-        if (!v || !v->IsNumber() || !std::isfinite(v->numVal)) return defVal;
-        if (v->numVal < -2147483648.0 || v->numVal > 2147483647.0) return defVal;
-        return static_cast<int>(std::llround(v->numVal));
-    }
-
-    int64_t GetInt64(std::string_view key, int64_t defVal) const {
-        const JsonVal* v = Find(key);
-        if (!v || !v->IsNumber() || !std::isfinite(v->numVal)) return defVal;
-        if (v->numVal < -9.0e15 || v->numVal > 9.0e15) return defVal;
-        return static_cast<int64_t>(std::llround(v->numVal));
-    }
-
-    bool GetBool(std::string_view key, bool defVal) const {
-        const JsonVal* v = Find(key);
-        if (!v || !v->IsBool()) return defVal;
-        return v->boolVal;
-    }
-
-    std::string GetString(std::string_view key, std::string_view defVal = {}) const {
-        const JsonVal* v = Find(key);
-        if (!v || !v->IsString()) return std::string(defVal);
-        return v->strVal;
-    }
-};
-
-struct JsonParser {
-    const char* cur = nullptr;
-    const char* end = nullptr;
-
-    void SkipWs() {
-        while (cur < end) {
-            unsigned char c = static_cast<unsigned char>(*cur);
-            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-                ++cur;
-            } else {
-                break;
-            }
-        }
-    }
-
-    static int HexDigit(char c) {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    }
-
-    bool ReadHex4(uint32_t& out) {
-        if (end - cur < 4) return false;
-        uint32_t v = 0;
-        for (int i = 0; i < 4; ++i) {
-            int h = HexDigit(cur[i]);
-            if (h < 0) return false;
-            v = (v << 4) | static_cast<uint32_t>(h);
-        }
-        cur += 4;
-        out = v;
-        return true;
-    }
-
-    static void AppendUtf8(std::string& s, uint32_t cp) {
-        if (cp <= 0x7Fu) {
-            s.push_back(static_cast<char>(cp));
-        } else if (cp <= 0x7FFu) {
-            s.push_back(static_cast<char>(0xC0u | (cp >> 6)));
-            s.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-        } else if (cp <= 0xFFFFu) {
-            s.push_back(static_cast<char>(0xE0u | (cp >> 12)));
-            s.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-            s.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-        } else if (cp <= 0x10FFFFu) {
-            s.push_back(static_cast<char>(0xF0u | (cp >> 18)));
-            s.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
-            s.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-            s.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-        }
-    }
-
-    bool ParseString(std::string& out) {
-        if (cur >= end || *cur != '"') return false;
-        ++cur;
-        out.clear();
-        while (cur < end) {
-            char c = *cur++;
-            if (c == '"') return true;
-            if (static_cast<unsigned char>(c) < 0x20u) return false;
-            if (c == '\\') {
-                if (cur >= end) return false;
-                char esc = *cur++;
-                switch (esc) {
-                    case '"':  out.push_back('"'); break;
-                    case '\\': out.push_back('\\'); break;
-                    case '/':  out.push_back('/'); break;
-                    case 'b':  out.push_back('\b'); break;
-                    case 'f':  out.push_back('\f'); break;
-                    case 'n':  out.push_back('\n'); break;
-                    case 'r':  out.push_back('\r'); break;
-                    case 't':  out.push_back('\t'); break;
-                    case 'u': {
-                        uint32_t cp = 0;
-                        if (!ReadHex4(cp)) return false;
-                        if (cp >= 0xD800u && cp <= 0xDBFFu) {
-                            if (end - cur >= 6 && cur[0] == '\\' && cur[1] == 'u') {
-                                const char* save = cur;
-                                cur += 2;
-                                uint32_t lo = 0;
-                                if (ReadHex4(lo) && lo >= 0xDC00u && lo <= 0xDFFFu) {
-                                    cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u));
-                                } else {
-                                    cur = save;
-                                }
-                            }
-                        }
-                        AppendUtf8(out, cp);
-                        break;
-                    }
-                    default:
-                        return false;
-                }
-            } else {
-                out.push_back(c);
-            }
-        }
-        return false;
-    }
-
-    bool ParseNumber(double& out) {
-        const char* start = cur;
-        if (cur < end && *cur == '-') ++cur;
-        if (cur >= end) return false;
-        if (*cur == '0') {
-            ++cur;
-        } else if (*cur >= '1' && *cur <= '9') {
-            while (cur < end && *cur >= '0' && *cur <= '9') ++cur;
-        } else {
-            return false;
-        }
-        if (cur < end && *cur == '.') {
-            ++cur;
-            if (cur >= end || *cur < '0' || *cur > '9') return false;
-            while (cur < end && *cur >= '0' && *cur <= '9') ++cur;
-        }
-        if (cur < end && (*cur == 'e' || *cur == 'E')) {
-            ++cur;
-            if (cur < end && (*cur == '+' || *cur == '-')) ++cur;
-            if (cur >= end || *cur < '0' || *cur > '9') return false;
-            while (cur < end && *cur >= '0' && *cur <= '9') ++cur;
-        }
-        size_t len = static_cast<size_t>(cur - start);
-        if (len == 0 || len > 64) return false;
-        char tmp[72];
-        std::memcpy(tmp, start, len);
-        tmp[len] = '\0';
-        char* endPtr = nullptr;
-        double val = std::strtod(tmp, &endPtr);
-        if (endPtr != tmp + len || !std::isfinite(val)) return false;
-        out = val;
-        return true;
-    }
-
-    bool ParseValue(JsonVal& out, int depth) {
-        if (depth > 64) return false;
-        SkipWs();
-        if (cur >= end) return false;
-        char c = *cur;
-        if (c == '{') {
-            ++cur;
-            out = JsonVal{};
-            out.kind = JsonVal::Kind::Object;
-            SkipWs();
-            if (cur < end && *cur == '}') {
-                ++cur;
-                return true;
-            }
-            while (cur < end) {
-                SkipWs();
-                std::string key;
-                if (!ParseString(key)) return false;
-                SkipWs();
-                if (cur >= end || *cur != ':') return false;
-                ++cur;
-                JsonVal child;
-                if (!ParseValue(child, depth + 1)) return false;
-                out.objVal.emplace_back(std::move(key), std::move(child));
-                SkipWs();
-                if (cur >= end) return false;
-                if (*cur == ',') {
-                    ++cur;
-                } else if (*cur == '}') {
-                    ++cur;
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-            return false;
-        }
-        if (c == '[') {
-            ++cur;
-            out = JsonVal{};
-            out.kind = JsonVal::Kind::Array;
-            SkipWs();
-            if (cur < end && *cur == ']') {
-                ++cur;
-                return true;
-            }
-            while (cur < end) {
-                JsonVal elem;
-                if (!ParseValue(elem, depth + 1)) return false;
-                out.arrVal.push_back(std::move(elem));
-                SkipWs();
-                if (cur >= end) return false;
-                if (*cur == ',') {
-                    ++cur;
-                } else if (*cur == ']') {
-                    ++cur;
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-            return false;
-        }
-        if (c == '"') {
-            out = JsonVal{};
-            out.kind = JsonVal::Kind::String;
-            return ParseString(out.strVal);
-        }
-        if (c == 't') {
-            if (end - cur < 4 || std::memcmp(cur, "true", 4) != 0) return false;
-            cur += 4;
-            out = JsonVal{};
-            out.kind = JsonVal::Kind::Bool;
-            out.boolVal = true;
-            return true;
-        }
-        if (c == 'f') {
-            if (end - cur < 5 || std::memcmp(cur, "false", 5) != 0) return false;
-            cur += 5;
-            out = JsonVal{};
-            out.kind = JsonVal::Kind::Bool;
-            out.boolVal = false;
-            return true;
-        }
-        if (c == 'n') {
-            if (end - cur < 4 || std::memcmp(cur, "null", 4) != 0) return false;
-            cur += 4;
-            out = JsonVal{};
-            out.kind = JsonVal::Kind::Null;
-            return true;
-        }
-        if (c == '-' || (c >= '0' && c <= '9')) {
-            out = JsonVal{};
-            out.kind = JsonVal::Kind::Number;
-            return ParseNumber(out.numVal);
-        }
-        return false;
-    }
-};
 
 inline bool ParseJsonDocument(const char* data, size_t len, JsonVal& root) {
     if (!data || len == 0) return false;
-    // Strip optional UTF-8 BOM
-    if (len >= 3 &&
-        static_cast<uint8_t>(data[0]) == 0xEFu &&
-        static_cast<uint8_t>(data[1]) == 0xBBu &&
-        static_cast<uint8_t>(data[2]) == 0xBFu) {
-        data += 3;
-        len -= 3;
+    std::string_view text(data, len);
+    // GLB JSON chunks are padded to 4 bytes; some writers pad with NULs instead of spaces
+    while (!text.empty() && (text.back() == '\0' || text.back() == ' ' || text.back() == '\t' ||
+                             text.back() == '\r' || text.back() == '\n')) {
+        text.remove_suffix(1);
     }
-    JsonParser p{ data, data + len };
-    if (!p.ParseValue(root, 0) || !root.IsObject()) return false;
-    p.SkipWs();
-    while (p.cur < p.end && *p.cur == '\0') ++p.cur;
-    p.SkipWs();
-    return p.cur == p.end;
+    return ::Explorer2::Json::ParseDocument(text, root) && root.IsObject();
 }
 
 inline bool DecodeBase64DataUri(std::string_view uri, std::vector<uint8_t>& out, size_t maxBytes) {
@@ -365,31 +58,7 @@ inline bool DecodeBase64DataUri(std::string_view uri, std::vector<uint8_t>& out,
     std::string_view b64 = uri.substr(comma + 1);
     size_t est = (b64.size() * 3) / 4;
     if (est > maxBytes) return false;
-    out.clear();
-    out.reserve(est);
-
-    uint32_t acc = 0;
-    int bits = -8;
-    for (char c : b64) {
-        if (c == '=') break;
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
-        int d = -1;
-        if (c >= 'A' && c <= 'Z') d = c - 'A';
-        else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
-        else if (c >= '0' && c <= '9') d = c - '0' + 52;
-        else if (c == '+') d = 62;
-        else if (c == '/') d = 63;
-        else return false;
-
-        acc = (acc << 6) | static_cast<uint32_t>(d);
-        bits += 6;
-        if (bits >= 0) {
-            if (out.size() >= maxBytes) return false;
-            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFFu));
-            bits -= 8;
-        }
-    }
-    return true;
+    return ::Explorer2::Base64::Decode(b64, out, ::Explorer2::Base64::Mode::Strict, maxBytes);
 }
 
 inline bool ReadSafeRelativeBinFile(
@@ -414,8 +83,8 @@ inline bool ReadSafeRelativeBinFile(
         char c = rawUri[i];
         if (c == '%') {
             if (i + 2 >= rawUri.size()) return false;
-            int hi = JsonParser::HexDigit(rawUri[i + 1]);
-            int lo = JsonParser::HexDigit(rawUri[i + 2]);
+            int hi = ::Explorer2::Json::HexDigitValue(rawUri[i + 1]);
+            int lo = ::Explorer2::Json::HexDigitValue(rawUri[i + 2]);
             if (hi < 0 || lo < 0) return false;
             uint8_t b = static_cast<uint8_t>((hi << 4) | lo);
             if (b == 0) return false;

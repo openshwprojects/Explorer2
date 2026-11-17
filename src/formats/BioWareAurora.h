@@ -14,7 +14,6 @@ namespace BioWareDetail {
 
 inline uint16_t BwU16(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
 inline uint32_t BwU32(const uint8_t* p) { uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
-inline int32_t  BwI32(const uint8_t* p) { int32_t  v = 0; std::memcpy(&v, p, 4); return v; }
 inline float    BwF32(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
 
 inline std::wstring ResTypeToExtension(uint16_t rt) {

@@ -36,18 +36,6 @@ namespace {
         WriteFile(g_file, u.data(), static_cast<DWORD>(u.size()), &written, nullptr);   // unbuffered: survives a crash
     }
 
-    bool IsElevated() {
-        HANDLE tok = nullptr;
-        bool elevated = false;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
-            TOKEN_ELEVATION te = {};
-            DWORD sz = 0;
-            if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &sz)) elevated = te.TokenIsElevated != 0;
-            CloseHandle(tok);
-        }
-        return elevated;
-    }
-
     void PruneOldFiles() {
         struct F { std::wstring path; FILETIME ft; };
         std::vector<F> files;

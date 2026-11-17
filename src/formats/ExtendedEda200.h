@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedEda200.h — 20 Schematics, Silicon OASIS, Signal Integrity, FPGA, Scope/Logic, Automotive & PLC Viewers (#61–#80)
 // Covers:
 //   PCB/RF/Silicon (#61–#66): .kicad_sym, .ses, .pos/.cpl/.mnt, .ibs, .s4p/.s3p/.s8p, .oas
@@ -9,28 +10,11 @@ namespace Formats {
 
 namespace DetailEda200 {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) |
-           (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
 
 struct JtagBitCycle {
     uint8_t tms = 0;
@@ -232,25 +216,6 @@ inline void RenderJtag4LaneWaveforms(
     out.netCount = 4;
 }
 
-inline uint64_t ReadOasisVarUInt(const uint8_t* data, size_t size, size_t& pos) {
-    uint64_t val = 0;
-    int shift = 0;
-    while (pos < size && shift < 63) {
-        uint8_t b = data[pos++];
-        val |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) break;
-        shift += 7;
-    }
-    return val;
-}
-
-inline int64_t ReadOasisVarSInt(const uint8_t* data, size_t size, size_t& pos) {
-    uint64_t u = ReadOasisVarUInt(data, size, pos);
-    bool neg = (u & 1ULL) != 0;
-    int64_t mag = static_cast<int64_t>(u >> 1);
-    return neg ? -mag : mag;
-}
-
 // Parse BGA pin coordinate like "A1", "B12", "AA14" into (row, col)
 inline bool ParseBgaBallCoord(std::string_view pin, int& outRow, int& outCol) {
     while (!pin.empty() && (pin.front() == '"' || pin.front() == ' ' || pin.front() == '\t')) pin.remove_prefix(1);
@@ -286,13 +251,7 @@ inline bool ParseBgaBallCoord(std::string_view pin, int& outRow, int& outCol) {
 // ============================================================================
 namespace DetailKiCadSymSesPos {
 
-inline std::string LowerAsciiSymSes(std::string_view sv) {
-    std::string s(sv);
-    for (char& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return s;
-}
+inline std::string LowerAsciiSymSes(std::string_view sv) { return ::Explorer2::PathUtils::ToLowerAscii(sv); }
 
 inline void TessellateKiCad3PtArc(
     float x1, float y1, float xm, float ym, float x2, float y2,

@@ -143,7 +143,6 @@ public:
     };
     PreviewTestState GetPreviewStateForTesting() const;
 
-    bool HasNotepadFocus() const { return m_notepad.HasFocus(); }
     HWND GetNotepadEditHwnd() const { return m_notepad.GetEditHwnd(); }
     void OnNotepadEditChanged() { m_notepad.OnEditChanged(); }
     bool NeedsAnimationTick() const {

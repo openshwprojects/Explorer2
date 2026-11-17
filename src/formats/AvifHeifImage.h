@@ -20,14 +20,10 @@ namespace Formats {
 
 namespace AvifHeifDetail {
 
-inline uint16_t RdBE16(const uint8_t* p) { return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]); }
-inline uint32_t RdBE32(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8)  | static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdBE64(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdBE32(p)) << 32) | static_cast<uint64_t>(RdBE32(p + 4));
-}
+// big-endian loads (ByteIO.h)
+inline uint16_t RdBE16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16BE(p); }
+inline uint32_t RdBE32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32BE(p); }
+inline uint64_t RdBE64(const uint8_t* p) { return ::Explorer2::ByteIO::RdU64BE(p); }
 
 inline uint64_t RdVarBE(const uint8_t* p, uint8_t nBytes) {
     uint64_t v = 0;
@@ -73,7 +69,6 @@ struct BitReader {
     BitReader(const uint8_t* b, size_t n) : buf(b), len(n) {}
 
     bool Eof() const { return bytePos >= len; }
-    bool ByteAligned() const { return bitPos == 0; }
 
     void AlignToByte() {
         if (bitPos != 0) { bitPos = 0; ++bytePos; }
@@ -905,35 +900,9 @@ struct Av1MsacReader {
         return x;
     }
 
-    // Decodes an N-symbol icdf (where icdf[s] = 32768 - CDF[s], icdf[N-1] = 0, per AV1 Section 8.2.5)
-    uint32_t DecodeSymbolIcdf(const uint16_t* icdf, uint32_t nSyms) {
-        uint32_t u = 0, v = rng;
-        uint32_t val = dif >> 17;
-        uint32_t sym = 0;
-        for (; sym < nSyms; ++sym) {
-            u = v;
-            v = ((rng >> 8) * (static_cast<uint32_t>(icdf[sym]) >> 6) >> (7 - 6)) + 4u * (nSyms - 1u - sym);
-            if (sym + 1 == nSyms) v = 0;
-            if (val >= v) break;
-        }
-        dif -= (v << 17);
-        rng = u - v;
-        while (rng < 0x8000u) { rng <<= 1; dif <<= 1; --cnt; }
-        Refill();
-        return sym;
-    }
 };
 
-inline bool ReadLeb128Av1(const uint8_t* data, size_t size, size_t& pos, uint64_t& outVal) {
-    outVal = 0;
-    for (int i = 0; i < 8; ++i) {
-        if (pos >= size) return false;
-        uint8_t b = data[pos++];
-        outVal |= (static_cast<uint64_t>(b & 0x7Fu) << (i * 7));
-        if ((b & 0x80u) == 0) return true;
-    }
-    return false;
-}
+inline bool ReadLeb128Av1(const uint8_t* data, size_t size, size_t& pos, uint64_t& outVal) { return ::Explorer2::ByteIO::RdLeb128(data, size, pos, outVal, 8); }
 
 inline bool DecodeAv01StillItem(
     const uint8_t* itemData, size_t itemLen,

@@ -88,9 +88,6 @@ public:
     static bool AppendSmart(const MonitorSmartPoint& p);  // recorder process only
     static void PruneOldFiles(int retentionDays);
 
-    // Reads every sample with fromTs <= ts <= toTs (ascending). Safe while the recorder is writing.
-    // (The UI uses MonitorHistory below, which is incremental; this stays for tools / tests.)
-    static std::vector<MonitorSample> LoadRange(int64_t fromTs, int64_t toTs);
     static std::vector<MonitorSmartPoint> LoadSmartRange(int64_t fromTs, int64_t toTs);
     static uint64_t TotalBytesOnDisk();
 };

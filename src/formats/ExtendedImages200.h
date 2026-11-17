@@ -9,13 +9,9 @@ namespace Formats {
 
 namespace DetailImg200 {
 
-inline uint16_t Rd16(const uint8_t* p, bool be) {
-    return be ? DetailImg100::RdU16BE(p) : DetailImg100::RdU16LE(p);
-}
+inline uint16_t Rd16(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU16(p, be); }
 
-inline uint32_t Rd32(const uint8_t* p, bool be) {
-    return be ? DetailImg100::RdU32BE(p) : DetailImg100::RdU32LE(p);
-}
+inline uint32_t Rd32(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU32(p, be); }
 
 inline int16_t RdS16(const uint8_t* p, bool be) {
     return static_cast<int16_t>(Rd16(p, be));
@@ -2186,10 +2182,6 @@ inline bool DecodeCameraRaw200(const uint8_t* data, size_t size, const std::wstr
     else return false;
 
     return DetailImg200::ParseTiffRawIfds(data, size, label, outInfo);
-}
-
-inline bool DecodeCameraRawOrPreview(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
-    return DecodeCameraRaw200(data, size, extLower, outInfo);
 }
 
 inline bool DecodeEmfOrWmf(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo);

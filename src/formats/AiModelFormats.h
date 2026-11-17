@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // AiModelFormats.h — Unified streaming SafeTensors (.safetensors), GGUF (.gguf), and ONNX (.onnx)
 // inspector shared by both FileContentPane (AI Model card view) and SpreadsheetDocViewer (Sheet/Doc tables).
 // Streams directly from disk (with O(1) SetFilePointerEx skipping over multi-GB tensor payloads) or memory.
@@ -220,62 +221,15 @@ private:
 
 namespace Detail {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline int32_t RdI32LE(const uint8_t* p) {
-    return static_cast<int32_t>(RdU32LE(p));
-}
-inline int64_t RdI64LE(const uint8_t* p) {
-    uint64_t u = static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-    return static_cast<int64_t>(u);
-}
-inline float RdF32LE(const uint8_t* p) {
-    uint32_t u = RdU32LE(p);
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdI64LE;
+using ::Explorer2::ByteIO::RdF32LE;
 
-inline float HalfToFloat(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x03FFu;
-    uint32_t outBits = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            outBits = sign;
-        } else {
-            exp = 1;
-            while ((mant & 0x0400u) == 0) {
-                mant <<= 1;
-                --exp;
-            }
-            mant &= 0x03FFu;
-            outBits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        outBits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        outBits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-    }
-    float f = 0.0f;
-    std::memcpy(&f, &outBits, 4);
-    return f;
-}
+using ::Explorer2::ByteIO::HalfToFloat;
 
-inline float BFloat16ToFloat(uint16_t bf) {
-    uint32_t u = static_cast<uint32_t>(bf) << 16;
-    float f = 0.0f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
+using ::Explorer2::ByteIO::BFloat16ToFloat;
 
 inline std::wstring FormatScalarDouble(double v) {
     if (std::isnan(v)) return L"NaN";
@@ -285,11 +239,6 @@ inline std::wstring FormatScalarDouble(double v) {
     return buf;
 }
 
-inline void FinalizeSheetCols(SpreadsheetSheet& sh) {
-    size_t mc = 0;
-    for (const auto& r : sh.rows) mc = std::max(mc, r.size());
-    sh.maxCols = mc;
-}
 
 inline std::wstring TruncateWithEllipsis(const std::wstring& s, size_t maxLen) {
     return (s.size() > maxLen) ? (s.substr(0, maxLen) + L"...") : s;

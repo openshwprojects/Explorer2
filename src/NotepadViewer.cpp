@@ -537,10 +537,6 @@ void NotepadViewer::HideWindow() {
     }
 }
 
-bool NotepadViewer::HasFocus() const {
-    return m_editHwnd && ::GetFocus() == m_editHwnd;
-}
-
 bool NotepadViewer::IsLikelyTextFile(const std::wstring& fullPath, const std::wstring& extLower, uint64_t fileSize) {
     if (extLower == L".txt"  || extLower == L".md"   || extLower == L".log"  || extLower == L".ini"  ||
         extLower == L".cfg"  || extLower == L".conf" || extLower == L".json" || extLower == L".xml"  ||

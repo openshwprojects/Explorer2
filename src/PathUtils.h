@@ -68,6 +68,13 @@ inline std::wstring Trim(std::wstring_view sv) {
     return std::wstring(sv.substr(start, end - start));
 }
 
+// ASCII whitespace (space, tab, CR, LF) removed from both ends of a narrow string
+inline std::string_view TrimAscii(std::string_view s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.remove_suffix(1);
+    return s;
+}
+
 inline std::wstring TrimTrailingSlashes(std::wstring_view sv) {
     std::wstring out(sv);
     while (!out.empty() && (out.back() == L'\\' || out.back() == L'/')) {
@@ -123,20 +130,76 @@ inline std::wstring GetStem(const std::wstring& fileName, bool isDirectory) {
     return (dot != std::wstring::npos && dot > 0) ? fileName.substr(0, dot) : fileName;
 }
 
-// Fast UTF-8 <-> UTF-16 conversions
+// Number of leading bytes of s that form complete, valid UTF-8 sequences
+inline size_t ValidUtf8PrefixLength(std::string_view s) {
+    size_t i = 0;
+    const size_t n = s.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80u) { ++i; continue; }
+        size_t len = 0;
+        uint32_t minCp = 0;
+        if (c >= 0xC2u && c <= 0xDFu) { len = 2; minCp = 0x80u; }
+        else if (c >= 0xE0u && c <= 0xEFu) { len = 3; minCp = 0x800u; }
+        else if (c >= 0xF0u && c <= 0xF4u) { len = 4; minCp = 0x10000u; }
+        else return i;
+        if (i + len > n) return i;
+        uint32_t cp = c & (0xFFu >> (len + 1));
+        for (size_t k = 1; k < len; ++k) {
+            unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            if ((cc & 0xC0u) != 0x80u) return i;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        if (cp < minCp || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return i;
+        i += len;
+    }
+    return n;
+}
+
+// UTF-8 -> UTF-16. Text that is not UTF-8 (legacy 8-bit files: Windows-1250 subtitles, CUE sheets,
+// CSV exports, FTP listings) is decoded with the system ANSI code page instead of turning every
+// accented letter into U+FFFD. A multi-byte character cut off at the very end (a reader truncated the
+// text) still counts as UTF-8.
+// Appends one Unicode code point as UTF-16 (a surrogate pair above U+FFFF); 0, surrogates and values past
+// U+10FFFF are dropped
+inline void AppendUtf16(std::wstring& out, uint32_t cp) {
+    if (cp == 0 || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return;
+    if (cp <= 0xFFFFu) {
+        out.push_back(static_cast<wchar_t>(cp));
+    } else {
+        cp -= 0x10000u;
+        out.push_back(static_cast<wchar_t>(0xD800u + (cp >> 10)));
+        out.push_back(static_cast<wchar_t>(0xDC00u + (cp & 0x3FFu)));
+    }
+}
+
 inline std::wstring Utf8ToWide(std::string_view utf8) {
     if (utf8.empty()) return L"";
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
-    if (wlen <= 0) {
-        wlen = MultiByteToWideChar(CP_ACP, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
-        if (wlen <= 0) return L"";
+    auto convert = [](UINT cp, DWORD flags, std::string_view s) -> std::wstring {
+        int wlen = MultiByteToWideChar(cp, flags, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        if (wlen <= 0) return std::wstring();
         std::wstring out(static_cast<size_t>(wlen), L'\0');
-        MultiByteToWideChar(CP_ACP, 0, utf8.data(), static_cast<int>(utf8.size()), out.data(), wlen);
+        MultiByteToWideChar(cp, flags, s.data(), static_cast<int>(s.size()), out.data(), wlen);
         return out;
+    };
+    std::wstring w = convert(CP_UTF8, MB_ERR_INVALID_CHARS, utf8);
+    if (!w.empty()) return w;
+    size_t valid = ValidUtf8PrefixLength(utf8);
+    size_t tail = utf8.size() - valid;
+    if (tail < 4) {
+        unsigned char lead = static_cast<unsigned char>(utf8[valid]);
+        size_t need = (lead >= 0xC2u && lead <= 0xDFu) ? 2 : (lead >= 0xE0u && lead <= 0xEFu) ? 3 : (lead >= 0xF0u && lead <= 0xF4u) ? 4 : 0;
+        bool contOnly = true;
+        for (size_t k = valid + 1; k < utf8.size(); ++k) {
+            if ((static_cast<unsigned char>(utf8[k]) & 0xC0u) != 0x80u) contOnly = false;
+        }
+        if (need > tail && contOnly) {
+            // Cut-off final character: keep the UTF-8 text, drop the partial character
+            return valid ? convert(CP_UTF8, 0, utf8.substr(0, valid)) : std::wstring();
+        }
     }
-    std::wstring out(static_cast<size_t>(wlen), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), out.data(), wlen);
-    return out;
+    w = convert(CP_ACP, 0, utf8);
+    return w.empty() ? convert(CP_UTF8, 0, utf8) : w;
 }
 
 inline std::string WideToUtf8(std::wstring_view wide) {
@@ -149,6 +212,21 @@ inline std::string WideToUtf8(std::wstring_view wide) {
 }
 
 // Non-locking shared file reader
+// Bytes as hex pairs ("4D 5A 90"), sep between them (0 for none); past maxBytes, " ..." ends the text
+inline std::wstring HexBytes(const uint8_t* p, size_t n, wchar_t sep = L' ', size_t maxBytes = SIZE_MAX) {
+    static const wchar_t kHex[] = L"0123456789ABCDEF";
+    const size_t lim = (n < maxBytes) ? n : maxBytes;
+    std::wstring s;
+    s.reserve(lim * 3 + 4);
+    for (size_t i = 0; i < lim; ++i) {
+        if (i > 0 && sep) s.push_back(sep);
+        s.push_back(kHex[p[i] >> 4]);
+        s.push_back(kHex[p[i] & 0x0F]);
+    }
+    if (n > lim) s += L" ...";
+    return s;
+}
+
 inline bool ReadFileBytes(const std::wstring& fullPath, size_t maxBytes, std::vector<uint8_t>& outBytes, uint64_t* outTotalFileSize = nullptr) {
     outBytes.clear();
     if (outTotalFileSize) *outTotalFileSize = 0;

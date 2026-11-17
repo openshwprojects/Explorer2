@@ -31,10 +31,19 @@ if exist Explorer2.exe move /Y Explorer2.exe build\Explorer2.running.%RANDOM%_%T
 rc.exe /nologo %E2_VER_RC% /fo build\Explorer2.res src\Explorer2.rc
 if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 
+rem The slowest translation units come first: /MP compiles the list in order, so a heavy file at the end would start only when everything else is done.
 cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
+    src\Model3DViewer.cpp ^
+    src\EdaViewer.cpp ^
+    src\SpreadsheetDocViewer.cpp ^
+    src\ExplorerApp.cpp ^
+    src\ExplorerAppRender.cpp ^
+    src\ImageFormatLoader.cpp ^
+    src\ArchiveExplorer.cpp ^
+    src\SelfTestSuite.cpp ^
+    src\FormatTestsDocs.cpp ^
     src\main.cpp ^
     src\FileEngine.cpp ^
-    src\ImageFormatLoader.cpp ^
     src\ImageCache.cpp ^
     src\ShellMenuEmulator.cpp ^
     src\MediaPlayer.cpp ^
@@ -47,10 +56,6 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\ZipDeflate.cpp ^
     src\NotepadViewer.cpp ^
     src\HexViewer.cpp ^
-    src\Model3DViewer.cpp ^
-    src\EdaViewer.cpp ^
-    src\SpreadsheetDocViewer.cpp ^
-    src\ArchiveExplorer.cpp ^
     src\PdfViewer.cpp ^
     src\WinRtShim.cpp ^
     src\Win7ApiShims.cpp ^
@@ -58,16 +63,12 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\TransferManager.cpp ^
     src\FtpClient.cpp ^
     src\FileContentPane.cpp ^
-    src\SelfTestSuite.cpp ^
     src\FormatTests3D.cpp ^
     src\FormatTestsEda.cpp ^
     src\FormatTestsImages.cpp ^
-    src\FormatTestsDocs.cpp ^
     src\FormatTestsDocsB.cpp ^
     src\FormatTestsArchives.cpp ^
     src\FormatTestsBatch70.cpp ^
-    src\ExplorerApp.cpp ^
-    src\ExplorerAppRender.cpp ^
     /Fo:build\ ^
     /Fe:Explorer2.exe ^
     /link /SUBSYSTEM:WINDOWS build\Explorer2.res ^

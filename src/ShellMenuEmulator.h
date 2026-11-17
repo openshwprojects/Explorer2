@@ -84,7 +84,6 @@ public:
     void InitializeAsync();
 
     bool Has7Zip(std::wstring* out7zGuiExe = nullptr, std::wstring* out7zFmExe = nullptr) const;
-    bool HasWinRAR(std::wstring* outWinRarExe = nullptr) const;
 
     std::vector<EmulatedShellVerb> GetDiscoveredVerbs(bool isFile, bool isFolder, bool isBackground) const;
     std::vector<OpenWithApp> GetOpenWithApps(bool isImage) const;

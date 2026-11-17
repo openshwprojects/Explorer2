@@ -1,4 +1,5 @@
 #pragma once
+#include "../Lz4Block.h"
 // VtkXml3D.h — #18 Visualization Toolkit XML Scientific / FEM Suite
 //              (.vtu, .vtp, .vti, .vtr, .vts, and ParaView Collection .pvd)
 //
@@ -17,60 +18,14 @@ namespace Formats {
 namespace VtkXmlDetail {
 
 inline std::string GetXmlAttr(std::string_view tag, std::string_view attrName) {
-    size_t pos = 0;
-    while (pos < tag.size()) {
-        size_t hit = tag.find(attrName, pos);
-        if (hit == std::string_view::npos) return {};
-        bool prevOk = (hit == 0) || std::isspace(static_cast<unsigned char>(tag[hit - 1]));
-        size_t eq = hit + attrName.size();
-        while (eq < tag.size() && std::isspace(static_cast<unsigned char>(tag[eq]))) ++eq;
-        if (prevOk && eq < tag.size() && tag[eq] == '=') {
-            size_t q = eq + 1;
-            while (q < tag.size() && std::isspace(static_cast<unsigned char>(tag[q]))) ++q;
-            if (q < tag.size() && (tag[q] == '"' || tag[q] == '\'')) {
-                char qc = tag[q++];
-                size_t qe = tag.find(qc, q);
-                if (qe != std::string_view::npos) {
-                    return std::string(tag.substr(q, qe - q));
-                }
-            }
-        }
-        pos = hit + attrName.size();
-    }
-    return {};
+    std::string_view v;
+    return ::Explorer2::XmlTagScan::FindAttr(tag, attrName, v, false) ? std::string(v) : std::string();
 }
 
 // Decodes VTK Base64 streams, explicitly supporting mid-stream '=' padding (VTK's split header+payload Base64)
+// VTK writes each data block (header, then data) as its own padded base64 run
 inline bool DecodeVtkBase64(std::string_view b64, std::vector<uint8_t>& out, size_t maxBytes = 128 * 1024 * 1024) {
-    out.clear();
-    uint32_t acc = 0;
-    int bits = 0;
-    for (size_t i = 0; i < b64.size(); ++i) {
-        unsigned char c = static_cast<unsigned char>(b64[i]);
-        if (c <= 32) continue;
-        if (c == '=') {
-            // Flush current quantum boundary so concatenated Base64 blocks align cleanly
-            acc = 0;
-            bits = 0;
-            continue;
-        }
-        int val = -1;
-        if (c >= 'A' && c <= 'Z') val = c - 'A';
-        else if (c >= 'a' && c <= 'z') val = c - 'a' + 26;
-        else if (c >= '0' && c <= '9') val = c - '0' + 52;
-        else if (c == '+') val = 62;
-        else if (c == '/') val = 63;
-        else continue;
-
-        acc = (acc << 6) | static_cast<uint32_t>(val);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFFu));
-            if (out.size() > maxBytes) return false;
-        }
-    }
-    return true;
+    return ::Explorer2::Base64::Decode(b64, out, ::Explorer2::Base64::Mode::Concatenated, maxBytes);
 }
 
 enum class VtkXmlCompressor { None, Zlib, Lz4 };
@@ -135,10 +90,10 @@ inline bool UnpackFramedVtkPayload(
                 blk.size() < static_cast<size_t>(uSz)) return false;
             std::memcpy(outRaw.data() + dp, blk.data(), static_cast<size_t>(uSz));
         } else if (cfg.comp == VtkXmlCompressor::Lz4) {
-            size_t written = 0;
-            if (!Detail3D100::Lz4DecompressRawBlock(framed + sp, static_cast<size_t>(cSz),
-                                                    outRaw.data() + dp, static_cast<size_t>(uSz), written) ||
-                written != static_cast<size_t>(uSz)) return false;
+            std::vector<uint8_t> blk;
+            if (!::Explorer2::Lz4::DecodeBlockExact(framed + sp, static_cast<size_t>(cSz), static_cast<size_t>(uSz), blk))
+                return false;
+            std::memcpy(outRaw.data() + dp, blk.data(), static_cast<size_t>(uSz));
         }
         sp += static_cast<size_t>(cSz);
         dp += static_cast<size_t>(uSz);
@@ -729,7 +684,7 @@ inline bool ParseVtkXmlMesh(
                     size_t b = lines.offsets[c], e = lines.offsets[c + 1];
                     for (size_t k = b; k + 1 < e; ++k) {
                         if (lines.conn[k] < nv && lines.conn[k + 1] < nv) {
-                            DetailVtk::EmitStrutVtk(mesh, pts[lines.conn[k]], pts[lines.conn[k + 1]], 0.05f);
+                            MeshBuild3D::EmitEdgeStrut(mesh, pts[lines.conn[k]], pts[lines.conn[k + 1]], 0.05f);
                         }
                     }
                 }

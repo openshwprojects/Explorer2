@@ -1,4 +1,15 @@
 #pragma once
+#include "MeshBuild3D.h"
+// Blender.h — Blender (.blend) reader for the 3D viewer.
+
+namespace Formats {
+
+// Returns true when the file was handled here; `mesh` then holds the result (or its status message).
+// false: not this format, the caller tries the next reader.
+inline bool ParseBlendFile(const std::wstring& ext, const std::vector<uint8_t>& buf, uint64_t fileSize, LoadedMesh3D& mesh,
+                 uint64_t generation, const std::atomic<uint64_t>* activeGen) {
+    using MeshBuild3D::FinalizeMeshBoundsAndNormals;
+    (void)ext; (void)fileSize; (void)generation; (void)activeGen;
     // 8. Blender .blend Full DNA1 / SDNA Mesh Parser (Legacy <=2.79, 2.80-3.5, 3.6-4.x SoA, 5.0+ LargeBHead8, Gzip)
     if (ext == L".blend") {
         std::vector<uint8_t> decompBlend;
@@ -722,8 +733,12 @@
                     }
 
                     FinalizeMeshBoundsAndNormals(mesh);
-                    if (mesh.loadedOk) return mesh;
+                    if (mesh.loadedOk) return true;
                 }
             }
         }
     }
+    return false;
+}
+
+} // namespace Formats

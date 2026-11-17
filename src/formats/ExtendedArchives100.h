@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // ExtendedArchives100.h — Popular Archive, Disk Image, Installer & Game Container Parsers + Extractors
 // Covers: .iso, .zst/.tzst, .xz/.txz, .bz2/.tbz2, .lz4, .cab, .msi/.msp, .deb, .rpm,
 //         .dmg, .vhd/.vhdx, .vmdk/.vdi, .qcow2, .wim/.esd, .pak/.wad, .vpk, .bsa/.ba2, .asar
@@ -7,6 +8,7 @@
 #include "../ZipDeflate.h"
 #include "../Ole2Compound.h"
 #include "../PathUtils.h"
+#include "../StreamCodecs.h"
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -21,33 +23,6 @@
 #include <memory>
 
 namespace Explorer2::StreamCodecs {
-
-bool DecompressLzma1(
-    uint8_t propsByte,
-    uint32_t dictSize,
-    const uint8_t* src,
-    size_t srcLen,
-    std::vector<uint8_t>& out,
-    uint64_t uncompressedLen,
-    bool hasKnownSize = true,
-    size_t maxOut = 128 * 1024 * 1024);
-
-bool DecompressLzma2(
-    uint8_t dictPropByte,
-    const uint8_t* src,
-    size_t srcLen,
-    std::vector<uint8_t>& out,
-    size_t maxOut = 128 * 1024 * 1024,
-    size_t* outBytesConsumed = nullptr,
-    uint64_t expectedOut = 0);
-
-void ApplyBcjX86Decode(uint8_t* data, size_t size, uint32_t ip = 0);
-void ApplyXzDeltaDecode(uint8_t* data, size_t size, size_t dist);
-
-bool DecompressXzStream(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
-bool DecompressBzip2Stream(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
-bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
-bool DecompressZstdFrame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
 
 bool ParsePosixTarFromMemory(
     const uint8_t* buf,
@@ -73,51 +48,17 @@ namespace Explorer2::Formats {
 
 namespace DetailArc100 {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) |
-           (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-inline uint16_t RdU16BE(const uint8_t* p) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
-inline uint32_t RdU32BE(const uint8_t* p) {
-    return (static_cast<uint32_t>(p[0]) << 24) |
-           (static_cast<uint32_t>(p[1]) << 16) |
-           (static_cast<uint32_t>(p[2]) << 8) |
-           static_cast<uint32_t>(p[3]);
-}
-inline uint64_t RdU64BE(const uint8_t* p) {
-    return (static_cast<uint64_t>(RdU32BE(p)) << 32) | RdU32BE(p + 4);
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdU16BE;
+using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
 inline void WrU32LE(uint8_t* p, uint32_t v) {
     p[0] = static_cast<uint8_t>(v & 0xFFu);
     p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
     p[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
     p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-}
-
-inline std::wstring NormPath(std::wstring p) {
-    for (wchar_t& ch : p) {
-        if (ch == L'\\') ch = L'/';
-    }
-    while (!p.empty() && p.front() == L'/') p.erase(p.begin());
-    while (!p.empty() && p.back() == L'/') p.pop_back();
-    while (p.rfind(L"./", 0) == 0) p.erase(0, 2);
-    return p;
-}
-
-inline std::wstring BaseName(const std::wstring& p) {
-    size_t s = p.find_last_of(L'/');
-    return (s == std::wstring::npos) ? p : p.substr(s + 1);
 }
 
 inline bool PathEqualsCI(const std::wstring& a, const std::wstring& b) {
@@ -235,7 +176,7 @@ inline void WalkIsoDirectoryReader(
         uint8_t  flags    = rec[25];
         std::wstring wname = DecodeIsoEntryName(rec, recLen, isJoliet);
         if (!wname.empty()) {
-            std::wstring fullRel = NormPath(parentDir.empty() ? wname : (parentDir + L"/" + wname));
+            std::wstring fullRel = ArchivePath::Normalize(parentDir.empty() ? wname : (parentDir + L"/" + wname));
             bool isDir = (flags & 0x02u) != 0;
 
             if (extractTarget && outExtracted && outFoundExtract) {
@@ -253,7 +194,7 @@ inline void WalkIsoDirectoryReader(
             } else {
                 ArchiveItemEntry item;
                 item.pathInArchive = fullRel;
-                item.name = BaseName(fullRel);
+                item.name = ArchivePath::BaseName(fullRel);
                 item.isDirectory = isDir;
                 item.uncompressedSize = isDir ? 0 : dataLen;
                 item.compressedSize   = isDir ? 0 : dataLen;
@@ -389,14 +330,14 @@ inline bool ParseCabinetMscf(const uint8_t* data, size_t size, ArchiveSummaryInf
         std::string rawName(reinterpret_cast<const char*>(data + pos), nameEnd - pos);
         pos = nameEnd + 1;
 
-        std::wstring wpath = NormPath((attribs & 0x80u)
+        std::wstring wpath = ArchivePath::Normalize((attribs & 0x80u)
             ? PathUtils::Utf8ToWide(rawName)
             : PathUtils::Utf8ToWide(rawName));
         if (!wpath.empty()) {
-            std::wstring full = prefix.empty() ? wpath : NormPath(prefix + L"/" + wpath);
+            std::wstring full = prefix.empty() ? wpath : ArchivePath::Normalize(prefix + L"/" + wpath);
             ArchiveItemEntry item;
             item.pathInArchive = full;
-            item.name = BaseName(full);
+            item.name = ArchivePath::BaseName(full);
             item.uncompressedSize = cbFile;
             item.compressedSize = (totalUnp > 0) ? ((payloadPool * cbFile) / totalUnp) : cbFile;
             item.dosDate = date;
@@ -427,12 +368,12 @@ inline bool ParseOle2Archive(const uint8_t* data, size_t size, const std::wstrin
     outInfo.formatName = (extLower == L".msp") ? L"Windows Installer Patch (MSP)" : L"Windows Installer (MSI)";
     for (const auto& de : cf.entries) {
         if (de.objectType != 1 && de.objectType != 2) continue;
-        std::wstring path = NormPath(de.fullPath);
+        std::wstring path = ArchivePath::Normalize(de.fullPath);
         if (path.empty()) continue;
 
         ArchiveItemEntry item;
         item.pathInArchive = path;
-        item.name = BaseName(path);
+        item.name = ArchivePath::BaseName(path);
         item.isDirectory = (de.objectType == 1);
         item.uncompressedSize = item.isDirectory ? 0 : de.size;
         item.compressedSize   = item.uncompressedSize;
@@ -477,7 +418,7 @@ inline bool ExtractOle2ArchiveEntry(
     // 1. Direct MSI/MSP stream match
     for (const auto& de : cf.entries) {
         if (de.objectType != 2) continue;
-        std::wstring path = NormPath(de.fullPath);
+        std::wstring path = ArchivePath::Normalize(de.fullPath);
         if (PathEqualsCI(path, targetNorm)) {
             return Ole2::ExtractStream(cf, de, outBytes);
         }
@@ -486,7 +427,7 @@ inline bool ExtractOle2ArchiveEntry(
     // 2. Inner file inside an embedded MSCF Cabinet stream ("<CabStream>/<innerPath>")
     for (const auto& de : cf.entries) {
         if (de.objectType != 2 || de.size < 36) continue;
-        std::wstring cabPath = NormPath(de.fullPath);
+        std::wstring cabPath = ArchivePath::Normalize(de.fullPath);
         if (cabPath.empty() || targetNorm.size() <= cabPath.size() + 1) continue;
         if (_wcsnicmp(targetNorm.c_str(), cabPath.c_str(), cabPath.size()) == 0 &&
             targetNorm[cabPath.size()] == L'/')
@@ -619,7 +560,7 @@ inline bool WalkCpioBuffer(
             if (fname == "TRAILER!!!") break;
             if (dataStart + fSize > cpioLen) break;
 
-            std::wstring norm = NormPath(PathUtils::Utf8ToWide(fname));
+            std::wstring norm = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
             bool isDir = ((mode & 0170000u) == 0040000u);
             if (!norm.empty() && norm != L".") {
                 if (extractTargetNorm && outExtracted) {
@@ -630,7 +571,7 @@ inline bool WalkCpioBuffer(
                 } else if (outInfo) {
                     ArchiveItemEntry item;
                     item.pathInArchive = norm;
-                    item.name = BaseName(norm);
+                    item.name = ArchivePath::BaseName(norm);
                     item.isDirectory = isDir;
                     item.uncompressedSize = isDir ? 0 : fSize;
                     item.compressedSize   = item.uncompressedSize;
@@ -660,7 +601,7 @@ inline bool WalkCpioBuffer(
             size_t dataStart = pos + 76 + static_cast<size_t>(nameSize);
             if (dataStart + fSize > cpioLen) break;
 
-            std::wstring norm = NormPath(PathUtils::Utf8ToWide(fname));
+            std::wstring norm = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
             bool isDir = ((mode & 0170000u) == 0040000u);
             if (!norm.empty() && norm != L".") {
                 if (extractTargetNorm && outExtracted) {
@@ -671,7 +612,7 @@ inline bool WalkCpioBuffer(
                 } else if (outInfo) {
                     ArchiveItemEntry item;
                     item.pathInArchive = norm;
-                    item.name = BaseName(norm);
+                    item.name = ArchivePath::BaseName(norm);
                     item.isDirectory = isDir;
                     item.uncompressedSize = isDir ? 0 : fSize;
                     item.compressedSize   = item.uncompressedSize;
@@ -832,7 +773,7 @@ inline bool ParseOrExtractRedHatRpm(
             fullUtf8 = oldFileNames[i];
         }
 
-        std::wstring norm = NormPath(PathUtils::Utf8ToWide(fullUtf8));
+        std::wstring norm = ArchivePath::Normalize(PathUtils::Utf8ToWide(fullUtf8));
         if (norm.empty()) continue;
 
         bool isDir = (i < fileModes.size()) && ((fileModes[i] & 0170000u) == 0040000u);
@@ -840,7 +781,7 @@ inline bool ParseOrExtractRedHatRpm(
 
         ArchiveItemEntry item;
         item.pathInArchive = norm;
-        item.name = BaseName(norm);
+        item.name = ArchivePath::BaseName(norm);
         item.isDirectory = isDir;
         item.uncompressedSize = fsz;
         item.compressedSize = (!isDir && sumUnp > 0) ? ((payloadBytes * fsz) / sumUnp) : 0;
@@ -872,26 +813,7 @@ inline bool ParseRedHatRpm(const uint8_t* data, size_t size, ArchiveSummaryInfo&
 // ============================================================================
 
 inline bool Base64DecodeBlock(std::string_view in, std::vector<uint8_t>& out) {
-    out.clear();
-    out.reserve(in.size() * 3 / 4);
-    uint32_t val = 0;
-    int bits = -8;
-    for (char ch : in) {
-        int d = -1;
-        if (ch >= 'A' && ch <= 'Z') d = ch - 'A';
-        else if (ch >= 'a' && ch <= 'z') d = ch - 'a' + 26;
-        else if (ch >= '0' && ch <= '9') d = ch - '0' + 52;
-        else if (ch == '+') d = 62;
-        else if (ch == '/') d = 63;
-        else if (ch == '=') break;
-        else continue;
-        val = (val << 6) | static_cast<uint32_t>(d);
-        bits += 6;
-        if (bits >= 0) {
-            out.push_back(static_cast<uint8_t>((val >> bits) & 0xFFu));
-            bits -= 8;
-        }
-    }
+    ::Explorer2::Base64::Decode(in, out);
     return !out.empty();
 }
 
@@ -1630,7 +1552,7 @@ inline void WalkFatDirectoryBuffer(
         uint32_t fSize     = RdU32LE(ent + 28);
         uint16_t wrtTime   = RdU16LE(ent + 22);
         uint16_t wrtDate   = RdU16LE(ent + 24);
-        std::wstring fullRel = NormPath(parentDir.empty() ? entryName : (parentDir + L"/" + entryName));
+        std::wstring fullRel = ArchivePath::Normalize(parentDir.empty() ? entryName : (parentDir + L"/" + entryName));
 
         if (extractTarget && outExtracted && outFound) {
             if (!isDir && PathEqualsCI(fullRel, *extractTarget)) {
@@ -1642,7 +1564,7 @@ inline void WalkFatDirectoryBuffer(
         } else {
             ArchiveItemEntry item;
             item.pathInArchive = fullRel;
-            item.name = BaseName(fullRel);
+            item.name = ArchivePath::BaseName(fullRel);
             item.isDirectory = isDir;
             item.uncompressedSize = isDir ? 0 : fSize;
             item.compressedSize   = isDir ? 0 : fSize;
@@ -1867,7 +1789,7 @@ inline bool InspectOrExtractNtfsOnReader(
         for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
             out = out.empty() ? *it : (out + L"/" + *it);
         }
-        return NormPath(out);
+        return ArchivePath::Normalize(out);
     };
 
     // Prefer user files first; if disk only has NTFS system files ($MFT, etc.), include them so volume isn't blank
@@ -1910,7 +1832,7 @@ inline bool InspectOrExtractNtfsOnReader(
         } else {
             ArchiveItemEntry item;
             item.pathInArchive = fullRel;
-            item.name = BaseName(fullRel);
+            item.name = ArchivePath::BaseName(fullRel);
             item.isDirectory = kv.second.isDir;
             item.uncompressedSize = kv.second.isDir ? 0 : kv.second.fileSize;
             item.compressedSize   = item.uncompressedSize;
@@ -2164,7 +2086,7 @@ inline bool InspectOrExtractExtFsOnReader(
 
                         if (isDir || isReg) {
                             std::wstring wnm = PathUtils::Utf8ToWide(nm);
-                            std::wstring full = NormPath(curPrefix.empty() ? wnm : (curPrefix + L"/" + wnm));
+                            std::wstring full = ArchivePath::Normalize(curPrefix.empty() ? wnm : (curPrefix + L"/" + wnm));
 
                             if (extractTargetNorm && outExtracted) {
                                 if (!isDir && PathEqualsCI(full, *extractTargetNorm)) {
@@ -2175,7 +2097,7 @@ inline bool InspectOrExtractExtFsOnReader(
                             } else {
                                 ArchiveItemEntry item;
                                 item.pathInArchive = full;
-                                item.name = BaseName(full);
+                                item.name = ArchivePath::BaseName(full);
                                 item.isDirectory = isDir;
                                 item.uncompressedSize = isDir ? 0 : getInodeSize(childIno);
                                 item.compressedSize = item.uncompressedSize;
@@ -2454,7 +2376,7 @@ inline bool InspectOrExtractHfsPlusOnReader(
             if (!joined.empty()) joined.push_back(L'/');
             joined += *it;
         }
-        outFull = NormPath(std::move(joined));
+        outFull = ArchivePath::Normalize(std::move(joined));
         return !outFull.empty();
     };
 
@@ -2484,7 +2406,7 @@ inline bool InspectOrExtractHfsPlusOnReader(
         if (!buildFullPath(fld.parentId, fld.name, full)) continue;
         ArchiveItemEntry item;
         item.pathInArchive = full;
-        item.name = BaseName(full);
+        item.name = ArchivePath::BaseName(full);
         item.isDirectory = true;
         HfsTimeU32ToDos(fld.modDate, item.dosDate, item.dosTime);
         outInfo.entries.push_back(std::move(item));
@@ -2497,7 +2419,7 @@ inline bool InspectOrExtractHfsPlusOnReader(
         if (!buildFullPath(fl.parentId, fl.name, full)) continue;
         ArchiveItemEntry item;
         item.pathInArchive = full;
-        item.name = BaseName(full);
+        item.name = ArchivePath::BaseName(full);
         item.isDirectory = false;
         item.uncompressedSize = fl.dataFork.logicalSize;
         uint64_t allocBytes = static_cast<uint64_t>(fl.dataFork.totalBlocks) * blockSize;
@@ -2768,7 +2690,7 @@ inline bool InspectOrExtractVirtualDisk(
         } else if (outInfo) {
             ArchiveItemEntry item;
             item.pathInArchive = rawEntryName;
-            item.name = BaseName(rawEntryName);
+            item.name = ArchivePath::BaseName(rawEntryName);
             item.uncompressedSize = p.byteLength;
             item.compressedSize   = std::min<uint64_t>(p.byteLength, size);
             item.rawDataOffset    = p.byteOffset;
@@ -3366,7 +3288,7 @@ inline bool WalkOrExtractWimDirEntryTree(
         bool isDir = (attrs & 0x10u) != 0;
         std::wstring curPath = fname.empty()
             ? parentPath
-            : NormPath(parentPath.empty() ? fname : (parentPath + L"/" + fname));
+            : ArchivePath::Normalize(parentPath.empty() ? fname : (parentPath + L"/" + fname));
 
         if (!fname.empty()) {
             bool zeroHash = true;
@@ -3398,7 +3320,7 @@ inline bool WalkOrExtractWimDirEntryTree(
             } else if (outInfo) {
                 ArchiveItemEntry item;
                 item.pathInArchive = curPath;
-                item.name = BaseName(curPath);
+                item.name = ArchivePath::BaseName(curPath);
                 item.isDirectory = isDir;
                 FileTimeU64ToDos(lastWrite, item.dosDate, item.dosTime);
                 if (!isDir && matchedRes) {
@@ -3630,10 +3552,10 @@ inline bool ParsePakOrWad(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
             uint32_t fOff = RdU32LE(rec + 56);
             uint32_t fLen = RdU32LE(rec + 60);
             if (rawName.empty() || fOff + fLen > size) continue;
-            std::wstring wp = NormPath(PathUtils::Utf8ToWide(rawName));
+            std::wstring wp = ArchivePath::Normalize(PathUtils::Utf8ToWide(rawName));
             ArchiveItemEntry item;
             item.pathInArchive = wp;
-            item.name = BaseName(wp);
+            item.name = ArchivePath::BaseName(wp);
             item.uncompressedSize = fLen;
             item.compressedSize = fLen;
             item.rawDataOffset = fOff;
@@ -3674,27 +3596,6 @@ inline bool ParsePakOrWad(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
 // 34. Valve Pak (.vpk 0x55AA1234)
 // 35. Bethesda Archive (.bsa "BSA\0" v103/104/105 & .ba2 "BTDX" GNRL/DX10)
 // ============================================================================
-inline uint32_t ComputeIeeeCrc32(const uint8_t* p, size_t len) {
-    static const struct CrcTbl {
-        uint32_t t[256] = {};
-        CrcTbl() {
-            for (uint32_t i = 0; i < 256u; ++i) {
-                uint32_t c = i;
-                for (int b = 0; b < 8; ++b) {
-                    c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
-                }
-                t[i] = c;
-            }
-        }
-    } s_tbl;
-
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc = s_tbl.t[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    }
-    return ~crc;
-}
-
 inline std::wstring ResolveVpkChunkPath(const std::wstring& dirVpkPath, uint16_t archiveIdx) {
     if (dirVpkPath.empty()) return L"";
     size_t slashPos = dirVpkPath.find_last_of(L"\\/");
@@ -3830,7 +3731,7 @@ inline bool ParseOrExtractValveVpk(
 
                 std::string full = (pathStr == " " ? "" : (pathStr + "/")) + fileStr +
                                    (extStr == " " ? "" : ("." + extStr));
-                std::wstring wp = NormPath(PathUtils::Utf8ToWide(full));
+                std::wstring wp = ArchivePath::Normalize(PathUtils::Utf8ToWide(full));
                 if (wp.empty()) continue;
 
                 uint64_t totalBytes = static_cast<uint64_t>(preloadBytes) + static_cast<uint64_t>(entryLen);
@@ -3861,7 +3762,7 @@ inline bool ParseOrExtractValveVpk(
                                 }
                             }
                         }
-                        if (ComputeIeeeCrc32(outExtracted->data(), outExtracted->size()) != crc) {
+                        if (::Explorer2::Checksum::Crc32(outExtracted->data(), outExtracted->size()) != crc) {
                             outExtracted->clear();
                             return false;
                         }
@@ -3870,7 +3771,7 @@ inline bool ParseOrExtractValveVpk(
                 } else if (outInfo) {
                     ArchiveItemEntry item;
                     item.pathInArchive    = wp;
-                    item.name             = BaseName(wp);
+                    item.name             = ArchivePath::BaseName(wp);
                     item.crc32            = crc;
                     item.uncompressedSize = totalBytes;
                     item.compressedSize   = totalBytes;
@@ -3969,7 +3870,7 @@ inline bool ParseOrExtractBethesdaBsa(
             if (bp + bzLen > size) return false;
             if (bzLen > 0) {
                 std::string ds(reinterpret_cast<const char*>(data + bp), strnlen(reinterpret_cast<const char*>(data + bp), bzLen));
-                dirPath = NormPath(PathUtils::Utf8ToWide(ds));
+                dirPath = ArchivePath::Normalize(PathUtils::Utf8ToWide(ds));
             }
             bp += bzLen;
         } else {
@@ -4004,7 +3905,7 @@ inline bool ParseOrExtractBethesdaBsa(
             size_t e = np;
             while (e < npEnd && data[e] != 0) ++e;
             std::string fn(reinterpret_cast<const char*>(data + np), e - np);
-            fileNames.push_back(NormPath(PathUtils::Utf8ToWide(fn)));
+            fileNames.push_back(ArchivePath::Normalize(PathUtils::Utf8ToWide(fn)));
             np = (e < npEnd) ? (e + 1) : npEnd;
         }
     }
@@ -4023,7 +3924,7 @@ inline bool ParseOrExtractBethesdaBsa(
             swprintf_s(hb, L"file_%016llx.bin", static_cast<unsigned long long>(fr.fileHash));
             leaf = hb;
         }
-        std::wstring full = NormPath(fr.dirPath.empty() ? leaf : (fr.dirPath + L"/" + leaf));
+        std::wstring full = ArchivePath::Normalize(fr.dirPath.empty() ? leaf : (fr.dirPath + L"/" + leaf));
         if (full.empty()) continue;
 
         // Inspect exact payload slice (accounting for optional bString embedded name and compressed 4B size prefix)
@@ -4065,7 +3966,7 @@ inline bool ParseOrExtractBethesdaBsa(
         } else if (outInfo) {
             ArchiveItemEntry item;
             item.pathInArchive = full;
-            item.name = BaseName(full);
+            item.name = ArchivePath::BaseName(full);
             item.uncompressedSize = unpSz;
             item.compressedSize   = fr.rawSize;
             item.rawDataOffset    = p;
@@ -4146,7 +4047,7 @@ inline bool ParseOrExtractBethesdaBa2(
             np += 2;
             if (np + nLen > size) break;
             std::string raw(reinterpret_cast<const char*>(data + np), nLen);
-            names.push_back(NormPath(PathUtils::Utf8ToWide(raw)));
+            names.push_back(ArchivePath::Normalize(PathUtils::Utf8ToWide(raw)));
             np += nLen;
         }
     }
@@ -4194,7 +4095,7 @@ inline bool ParseOrExtractBethesdaBa2(
             } else if (outInfo) {
                 ArchiveItemEntry item;
                 item.pathInArchive = full;
-                item.name = BaseName(full);
+                item.name = ArchivePath::BaseName(full);
                 item.uncompressedSize = unpSz;
                 item.compressedSize   = (packSz > 0) ? packSz : unpSz;
                 item.rawDataOffset    = offset;
@@ -4264,7 +4165,7 @@ inline bool ParseOrExtractBethesdaBa2(
             } else if (outInfo) {
                 ArchiveItemEntry item;
                 item.pathInArchive = full;
-                item.name = BaseName(full);
+                item.name = ArchivePath::BaseName(full);
                 item.uncompressedSize = sumUnp;
                 item.compressedSize   = sumPack;
                 item.compressionMethod = 8; // Prepends 148-byte DDS+DX10 header on extraction
@@ -4291,231 +4192,8 @@ inline bool ParseVpkOrBsa(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
 // ============================================================================
 // 36. Electron App Archive (.asar — Chromium Pickle + Recursive JSON Virtual FS)
 // ============================================================================
-struct AsarJsonNode {
-    enum class Kind { Null, Bool, Number, String, Array, Object };
-    Kind kind = Kind::Null;
-    bool boolVal = false;
-    uint64_t uintVal = 0;
-    bool isUintValid = false;
-    std::string strVal;
-    std::vector<AsarJsonNode> elements;
-    std::vector<std::pair<std::string, AsarJsonNode>> members;
+using AsarJsonNode = ::Explorer2::Json::Value; // ASAR header JSON uses the shared reader
 
-    bool IsObject() const { return kind == Kind::Object; }
-    bool IsString() const { return kind == Kind::String; }
-    bool IsBool()   const { return kind == Kind::Bool; }
-    bool IsNumber() const { return kind == Kind::Number; }
-
-    const AsarJsonNode* Find(std::string_view key) const {
-        if (kind != Kind::Object) return nullptr;
-        for (const auto& kv : members) {
-            if (kv.first == key) return &kv.second;
-        }
-        return nullptr;
-    }
-};
-
-struct AsarJsonParser {
-    std::string_view s;
-    size_t p = 0;
-
-    void SkipWs() {
-        while (p < s.size()) {
-            char c = s[p];
-            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') ++p;
-            else break;
-        }
-    }
-
-    static void AppendCodepointUtf8(uint32_t cp, std::string& out) {
-        if (cp <= 0x7Fu) {
-            out.push_back(static_cast<char>(cp));
-        } else if (cp <= 0x7FFu) {
-            out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
-            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-        } else if (cp <= 0xFFFFu) {
-            out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
-            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-        } else if (cp <= 0x10FFFFu) {
-            out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
-            out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
-            out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-            out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-        }
-    }
-
-    bool ParseHex4(uint32_t& outHex) {
-        if (p + 4 > s.size()) return false;
-        uint32_t v = 0;
-        for (int i = 0; i < 4; ++i) {
-            char c = s[p++];
-            v <<= 4;
-            if (c >= '0' && c <= '9') v |= static_cast<uint32_t>(c - '0');
-            else if (c >= 'a' && c <= 'f') v |= static_cast<uint32_t>(10 + (c - 'a'));
-            else if (c >= 'A' && c <= 'F') v |= static_cast<uint32_t>(10 + (c - 'A'));
-            else return false;
-        }
-        outHex = v;
-        return true;
-    }
-
-    bool ParseString(std::string& out) {
-        if (p >= s.size() || s[p] != '"') return false;
-        ++p;
-        out.clear();
-        while (p < s.size()) {
-            uint8_t ch = static_cast<uint8_t>(s[p++]);
-            if (ch == '"') return true;
-            if (ch < 0x20u) return false;
-            if (ch != '\\') {
-                out.push_back(static_cast<char>(ch));
-                continue;
-            }
-            if (p >= s.size()) return false;
-            char esc = s[p++];
-            switch (esc) {
-            case '"':  out.push_back('"');  break;
-            case '\\': out.push_back('\\'); break;
-            case '/':  out.push_back('/');  break;
-            case 'b':  out.push_back('\b'); break;
-            case 'f':  out.push_back('\f'); break;
-            case 'n':  out.push_back('\n'); break;
-            case 'r':  out.push_back('\r'); break;
-            case 't':  out.push_back('\t'); break;
-            case 'u': {
-                uint32_t u1 = 0;
-                if (!ParseHex4(u1)) return false;
-                if (u1 >= 0xD800u && u1 <= 0xDBFFu && p + 2 <= s.size() && s[p] == '\\' && s[p + 1] == 'u') {
-                    p += 2;
-                    uint32_t u2 = 0;
-                    if (!ParseHex4(u2)) return false;
-                    if (u2 >= 0xDC00u && u2 <= 0xDFFFu) {
-                        uint32_t cp = 0x10000u + (((u1 - 0xD800u) << 10) | (u2 - 0xDC00u));
-                        AppendCodepointUtf8(cp, out);
-                    } else {
-                        AppendCodepointUtf8(u1, out);
-                        AppendCodepointUtf8(u2, out);
-                    }
-                } else {
-                    AppendCodepointUtf8(u1, out);
-                }
-                break;
-            }
-            default:
-                return false;
-            }
-        }
-        return false;
-    }
-
-    bool ParseValue(AsarJsonNode& out, int depth) {
-        if (depth > 64) return false;
-        SkipWs();
-        if (p >= s.size()) return false;
-        char c = s[p];
-
-        if (c == '{') {
-            ++p;
-            out.kind = AsarJsonNode::Kind::Object;
-            out.members.clear();
-            SkipWs();
-            if (p < s.size() && s[p] == '}') { ++p; return true; }
-            while (p < s.size()) {
-                SkipWs();
-                std::string key;
-                if (!ParseString(key)) return false;
-                SkipWs();
-                if (p >= s.size() || s[p] != ':') return false;
-                ++p;
-                AsarJsonNode val;
-                if (!ParseValue(val, depth + 1)) return false;
-                out.members.emplace_back(std::move(key), std::move(val));
-                SkipWs();
-                if (p >= s.size()) return false;
-                if (s[p] == ',') { ++p; continue; }
-                if (s[p] == '}') { ++p; return true; }
-                return false;
-            }
-            return false;
-        }
-
-        if (c == '[') {
-            ++p;
-            out.kind = AsarJsonNode::Kind::Array;
-            out.elements.clear();
-            SkipWs();
-            if (p < s.size() && s[p] == ']') { ++p; return true; }
-            while (p < s.size()) {
-                AsarJsonNode elem;
-                if (!ParseValue(elem, depth + 1)) return false;
-                out.elements.push_back(std::move(elem));
-                SkipWs();
-                if (p >= s.size()) return false;
-                if (s[p] == ',') { ++p; continue; }
-                if (s[p] == ']') { ++p; return true; }
-                return false;
-            }
-            return false;
-        }
-
-        if (c == '"') {
-            out.kind = AsarJsonNode::Kind::String;
-            return ParseString(out.strVal);
-        }
-
-        if (c == 't' && p + 4 <= s.size() && s.substr(p, 4) == "true") {
-            p += 4;
-            out.kind = AsarJsonNode::Kind::Bool;
-            out.boolVal = true;
-            return true;
-        }
-        if (c == 'f' && p + 5 <= s.size() && s.substr(p, 5) == "false") {
-            p += 5;
-            out.kind = AsarJsonNode::Kind::Bool;
-            out.boolVal = false;
-            return true;
-        }
-        if (c == 'n' && p + 4 <= s.size() && s.substr(p, 4) == "null") {
-            p += 4;
-            out.kind = AsarJsonNode::Kind::Null;
-            return true;
-        }
-
-        if (c == '-' || (c >= '0' && c <= '9')) {
-            out.kind = AsarJsonNode::Kind::Number;
-            bool neg = (c == '-');
-            if (neg) ++p;
-            if (p >= s.size() || s[p] < '0' || s[p] > '9') return false;
-            uint64_t uv = 0;
-            bool overflow = false;
-            while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
-                uint32_t d = static_cast<uint32_t>(s[p++] - '0');
-                if (uv > (UINT64_MAX - d) / 10ULL) overflow = true;
-                else uv = uv * 10ULL + d;
-            }
-            bool fracOrExp = false;
-            if (p < s.size() && s[p] == '.') {
-                fracOrExp = true;
-                ++p;
-                if (p >= s.size() || s[p] < '0' || s[p] > '9') return false;
-                while (p < s.size() && s[p] >= '0' && s[p] <= '9') ++p;
-            }
-            if (p < s.size() && (s[p] == 'e' || s[p] == 'E')) {
-                fracOrExp = true;
-                ++p;
-                if (p < s.size() && (s[p] == '+' || s[p] == '-')) ++p;
-                if (p >= s.size() || s[p] < '0' || s[p] > '9') return false;
-                while (p < s.size() && s[p] >= '0' && s[p] <= '9') ++p;
-            }
-            out.isUintValid = (!neg && !overflow && !fracOrExp);
-            out.uintVal     = out.isUintValid ? uv : 0;
-            return true;
-        }
-
-        return false;
-    }
-};
 
 inline bool ParseStrictDecimalU64(std::string_view sv, uint64_t& outVal) {
     if (sv.empty()) return false;
@@ -4549,12 +4227,11 @@ inline bool ParseOrExtractElectronAsar(
     if (jsonLen > 64u * 1024u * 1024u) return false;
 
     std::string_view jsonSv(reinterpret_cast<const char*>(data + 16), jsonLen);
-    AsarJsonParser parser{ jsonSv, 0 };
+    while (!jsonSv.empty() && jsonSv.back() == '\0') jsonSv.remove_suffix(1); // pickle padding
     AsarJsonNode root;
-    if (!parser.ParseValue(root, 0)) return false;
-    parser.SkipWs();
-    while (parser.p < jsonSv.size() && jsonSv[parser.p] == '\0') ++parser.p;
-    if (parser.p != jsonSv.size() || !root.IsObject()) return false;
+    ::Explorer2::Json::Limits asarLimits;
+    asarLimits.maxNodes = 8000000; // big Electron apps list hundreds of thousands of files
+    if (!::Explorer2::Json::ParseDocument(jsonSv, root, asarLimits) || !root.IsObject()) return false;
 
     const AsarJsonNode* rootFiles = root.Find("files");
     if (!rootFiles || !rootFiles->IsObject()) return false;
@@ -4568,7 +4245,7 @@ inline bool ParseOrExtractElectronAsar(
 
     auto walkFiles = [&](auto& self, const AsarJsonNode& filesObj, const std::wstring& prefixPath, int depth) -> bool {
         if (depth > 48 || !filesObj.IsObject()) return false;
-        for (const auto& kv : filesObj.members) {
+        for (const auto& kv : filesObj.objVal) {
             if (entryCount >= 50000) break;
             const std::string& keyUtf8 = kv.first;
             const AsarJsonNode& node   = kv.second;
@@ -4579,7 +4256,7 @@ inline bool ParseOrExtractElectronAsar(
             if (!node.IsObject()) return false;
 
             std::wstring wname = PathUtils::Utf8ToWide(keyUtf8);
-            std::wstring fullPath = NormPath(prefixPath.empty() ? wname : (prefixPath + L"/" + wname));
+            std::wstring fullPath = ArchivePath::Normalize(prefixPath.empty() ? wname : (prefixPath + L"/" + wname));
             if (fullPath.empty()) continue;
 
             const AsarJsonNode* subFiles = node.Find("files");
@@ -4588,7 +4265,7 @@ inline bool ParseOrExtractElectronAsar(
                 if (outInfo) {
                     ArchiveItemEntry dirItem;
                     dirItem.pathInArchive = fullPath;
-                    dirItem.name          = BaseName(fullPath);
+                    dirItem.name          = ArchivePath::BaseName(fullPath);
                     dirItem.isDirectory   = true;
                     outInfo->entries.push_back(std::move(dirItem));
                 }
@@ -4603,8 +4280,8 @@ inline bool ParseOrExtractElectronAsar(
             }
 
             const AsarJsonNode* szNode = node.Find("size");
-            if (!szNode || !szNode->IsNumber() || !szNode->isUintValid) return false;
-            uint64_t fsize = szNode->uintVal;
+            uint64_t fsize = 0;
+            if (!szNode || !szNode->AsUint64(fsize)) return false;
 
             const AsarJsonNode* unpackedNode = node.Find("unpacked");
             bool isUnpacked = (unpackedNode && unpackedNode->IsBool() && unpackedNode->boolVal);
@@ -4615,8 +4292,7 @@ inline bool ParseOrExtractElectronAsar(
                 if (!offNode) return false;
                 if (offNode->IsString()) {
                     if (!ParseStrictDecimalU64(offNode->strVal, foff)) return false;
-                } else if (offNode->IsNumber() && offNode->isUintValid) {
-                    foff = offNode->uintVal;
+                } else if (offNode->AsUint64(foff)) {
                 } else {
                     return false;
                 }
@@ -4644,7 +4320,7 @@ inline bool ParseOrExtractElectronAsar(
             if (outInfo) {
                 ArchiveItemEntry item;
                 item.pathInArchive     = fullPath;
-                item.name              = BaseName(fullPath);
+                item.name              = ArchivePath::BaseName(fullPath);
                 item.uncompressedSize  = fsize;
                 item.compressedSize    = fsize;
                 item.rawDataOffset     = isUnpacked ? 0 : (payloadBase + foff);

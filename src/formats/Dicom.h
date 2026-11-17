@@ -5,26 +5,11 @@ namespace Formats {
 
 namespace DetailDicom {
 
-inline uint16_t RdU16(const uint8_t* p, bool be) {
-    return be ? static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1])
-              : static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
+using ::Explorer2::ByteIO::RdU16; // (p, bigEndian): ByteIO.h
 
-inline uint32_t RdU32(const uint8_t* p, bool be) {
-    return be ? ((static_cast<uint32_t>(p[0]) << 24) |
-                 (static_cast<uint32_t>(p[1]) << 16) |
-                 (static_cast<uint32_t>(p[2]) << 8)  |
-                  static_cast<uint32_t>(p[3]))
-              : ( static_cast<uint32_t>(p[0])        |
-                 (static_cast<uint32_t>(p[1]) << 8)  |
-                 (static_cast<uint32_t>(p[2]) << 16) |
-                 (static_cast<uint32_t>(p[3]) << 24));
-}
+using ::Explorer2::ByteIO::RdU32;
 
-inline uint64_t RdU64(const uint8_t* p, bool be) {
-    return be ? ((static_cast<uint64_t>(RdU32(p, true)) << 32) | RdU32(p + 4, true))
-              : (static_cast<uint64_t>(RdU32(p, false)) | (static_cast<uint64_t>(RdU32(p + 4, false)) << 32));
-}
+using ::Explorer2::ByteIO::RdU64;
 
 inline void StoreBgraOpaque(uint8_t* dst, uint8_t r, uint8_t g, uint8_t b) {
     dst[0] = b;

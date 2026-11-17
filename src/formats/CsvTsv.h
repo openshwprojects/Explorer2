@@ -8,14 +8,29 @@ static bool ParseCsvOrTsv(const std::vector<uint8_t>& raw, const std::wstring& e
         size_t wlen = (raw.size() - 2) / 2;
         text.resize(wlen);
         std::memcpy(text.data(), raw.data() + 2, wlen * 2);
+    } else if (raw.size() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF) {
+        size_t wlen = (raw.size() - 2) / 2;
+        text.resize(wlen);
+        for (size_t i = 0; i < wlen; ++i) text[i] = static_cast<wchar_t>((raw[2 + 2 * i] << 8) | raw[3 + 2 * i]);
     } else {
         size_t start = (raw.size() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) ? 3 : 0;
         text = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(raw.data() + start), raw.size() - start));
     }
 
-    // Auto-detect delimiter from first line outside quotes
+    // Excel writes a "sep=;" first line to name the delimiter
     wchar_t delim = (extLower == L".tsv") ? L'\t' : L',';
-    if (extLower != L".tsv") {
+    bool delimFromHint = false;
+    if (text.size() >= 5 && (text.compare(0, 4, L"sep=") == 0 || text.compare(0, 4, L"SEP=") == 0) &&
+        text[4] != L'\r' && text[4] != L'\n' &&
+        (text.size() == 5 || text[5] == L'\r' || text[5] == L'\n')) {
+        delim = text[4];
+        delimFromHint = true;
+        size_t eol = text.find(L'\n');
+        text.erase(0, eol == std::wstring::npos ? text.size() : eol + 1);
+    }
+
+    // Auto-detect delimiter from first line outside quotes
+    if (extLower != L".tsv" && !delimFromHint) {
         int commas = 0, semis = 0, tabs = 0, pipes = 0;
         bool inQ = false;
         for (size_t i = 0; i < std::min<size_t>(text.size(), 2048); ++i) {
@@ -36,7 +51,10 @@ static bool ParseCsvOrTsv(const std::vector<uint8_t>& raw, const std::wstring& e
     }
 
     out.formatTitle = (delim == L'\t') ? L"TSV Table (Tab-Separated)"
-                    : ((delim == L';') ? L"CSV Table (Semicolon ;)" : L"CSV Table (Comma ,)");
+                    : (delim == L';') ? L"CSV Table (Semicolon ;)"
+                    : (delim == L',') ? L"CSV Table (Comma ,)"
+                    : (delim == L'|') ? L"CSV Table (Pipe |)"
+                    : L"CSV Table (Delimiter " + std::wstring(1, delim) + L")";
 
     SpreadsheetSheet sheet;
     sheet.name = L"CSV";

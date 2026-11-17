@@ -1,5 +1,7 @@
 #pragma once
 // ElfBinary.h — Executable and Linkable Format (.elf / .so / .o) Binary Header, Program, Section, Dynamic & Symbol Inspector
+// The section header table and the string and symbol tables usually lie at the end of the file, past the 32 MB a
+// reader is handed for a large binary: every table is read through SourceBytes
 
 namespace Formats {
 
@@ -16,36 +18,30 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     const bool isLE = (eiData == 1);
     if (is64 && raw.size() < 64) return false;
 
-    auto rdU16 = [&](size_t off) -> uint16_t {
-        if (off + 2 > raw.size()) return 0;
-        uint16_t v = 0;
-        std::memcpy(&v, raw.data() + off, 2);
-        return isLE ? v : _byteswap_ushort(v);
-    };
-    auto rdU32 = [&](size_t off) -> uint32_t {
-        if (off + 4 > raw.size()) return 0;
-        uint32_t v = 0;
-        std::memcpy(&v, raw.data() + off, 4);
-        return isLE ? v : _byteswap_ulong(v);
-    };
-    auto rdU64 = [&](size_t off) -> uint64_t {
-        if (off + 8 > raw.size()) return 0;
-        uint64_t v = 0;
-        std::memcpy(&v, raw.data() + off, 8);
-        return isLE ? v : _byteswap_uint64(v);
-    };
+    auto ld16 = [&](const uint8_t* p) -> uint16_t { uint16_t v; std::memcpy(&v, p, 2); return isLE ? v : _byteswap_ushort(v); };
+    auto ld32 = [&](const uint8_t* p) -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); return isLE ? v : _byteswap_ulong(v); };
+    auto ld64 = [&](const uint8_t* p) -> uint64_t { uint64_t v; std::memcpy(&v, p, 8); return isLE ? v : _byteswap_uint64(v); };
+    // ELF header fields (the header lies within the bytes handed in)
+    auto rdU16 = [&](size_t off) -> uint16_t { return off + 2 <= raw.size() ? ld16(raw.data() + off) : 0; };
+    auto rdU32 = [&](size_t off) -> uint32_t { return off + 4 <= raw.size() ? ld32(raw.data() + off) : 0; };
+    auto rdU64 = [&](size_t off) -> uint64_t { return off + 8 <= raw.size() ? ld64(raw.data() + off) : 0; };
     auto hexAddr = [&](uint64_t v) -> std::wstring {
         wchar_t buf[32] = {};
         if (is64) swprintf_s(buf, L"0x%016llX", static_cast<unsigned long long>(v));
         else      swprintf_s(buf, L"0x%08X", static_cast<uint32_t>(v));
         return buf;
     };
-    auto readCStrAt = [&](size_t off, size_t maxLen = 512) -> std::string {
-        if (off >= raw.size()) return {};
-        const size_t lim = std::min<size_t>(raw.size() - off, maxLen);
-        size_t n = 0;
-        while (n < lim && raw[off + n] != 0) ++n;
-        return std::string(reinterpret_cast<const char*>(raw.data() + off), n);
+
+    SourceBytes src(raw, out);
+    const uint64_t fileSize = src.Size();
+    auto cstrAt = [&](uint64_t off, uint64_t maxLen) -> std::string {
+        std::vector<uint8_t> buf;
+        size_t got = 0;
+        const uint8_t* p = src.ReadSome(off, maxLen, 512, buf, got);
+        if (!p) return {};
+        size_t k = 0;
+        while (k < got && p[k] != 0) ++k;
+        return std::string(reinterpret_cast<const char*>(p), k);
     };
 
     const uint16_t e_type      = rdU16(16);
@@ -67,17 +63,22 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     const size_t minPhEnt = is64 ? 56 : 32;
     const size_t minShEnt = is64 ? 64 : 40;
     if (e_phnum > 0) {
-        if (e_phentsize < minPhEnt || e_phoff > raw.size() ||
-            static_cast<uint64_t>(e_phnum) * e_phentsize > raw.size() - static_cast<size_t>(e_phoff)) {
+        if (e_phentsize < minPhEnt || e_phoff > fileSize || static_cast<uint64_t>(e_phnum) * e_phentsize > fileSize - e_phoff) {
             return false;
         }
     }
     if (e_shnum > 0) {
-        if (e_shentsize < minShEnt || e_shoff > raw.size() ||
-            static_cast<uint64_t>(e_shnum) * e_shentsize > raw.size() - static_cast<size_t>(e_shoff)) {
+        if (e_shentsize < minShEnt || e_shoff > fileSize || static_cast<uint64_t>(e_shnum) * e_shentsize > fileSize - e_shoff) {
             return false;
         }
     }
+    const uint16_t phCount = std::min<uint16_t>(e_phnum, 512);
+    const uint16_t shCount = std::min<uint16_t>(e_shnum, 2048);
+    std::vector<uint8_t> phBuf, shBuf;
+    size_t phGot = 0, shGot = 0;
+    const uint8_t* phTab = phCount ? src.ReadSome(e_phoff, static_cast<uint64_t>(phCount) * e_phentsize, UINT64_MAX, phBuf, phGot) : nullptr;
+    const uint8_t* shTab = shCount ? src.ReadSome(e_shoff, static_cast<uint64_t>(shCount) * e_shentsize, UINT64_MAX, shBuf, shGot) : nullptr;
+    if ((phCount && !phTab) || (shCount && !shTab)) return false;
 
     std::wstring osAbiName = L"UNIX - System V (0)";
     switch (eiOsAbi) {
@@ -132,15 +133,15 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     phSheet.maxCols = 7;
     phSheet.rows.push_back({ L"Index", L"Type", L"Flags", L"Offset", L"VirtAddr", L"FileSz / MemSz", L"Details" });
 
-    for (uint16_t i = 0; i < e_phnum && i < 512; ++i) {
-        const size_t p = static_cast<size_t>(e_phoff) + static_cast<size_t>(i) * e_phentsize;
-        const uint32_t p_type   = rdU32(p + 0);
-        const uint32_t p_flags  = is64 ? rdU32(p + 4)  : rdU32(p + 24);
-        const uint64_t p_offset = is64 ? rdU64(p + 8)  : rdU32(p + 4);
-        const uint64_t p_vaddr  = is64 ? rdU64(p + 16) : rdU32(p + 8);
-        const uint64_t p_filesz = is64 ? rdU64(p + 32) : rdU32(p + 16);
-        const uint64_t p_memsz  = is64 ? rdU64(p + 40) : rdU32(p + 20);
-        const uint64_t p_align  = is64 ? rdU64(p + 48) : rdU32(p + 28);
+    for (uint16_t i = 0; i < phCount; ++i) {
+        const uint8_t* p = phTab + static_cast<size_t>(i) * e_phentsize;
+        const uint32_t p_type   = ld32(p + 0);
+        const uint32_t p_flags  = is64 ? ld32(p + 4)  : ld32(p + 24);
+        const uint64_t p_offset = is64 ? ld64(p + 8)  : ld32(p + 4);
+        const uint64_t p_vaddr  = is64 ? ld64(p + 16) : ld32(p + 8);
+        const uint64_t p_filesz = is64 ? ld64(p + 32) : ld32(p + 16);
+        const uint64_t p_memsz  = is64 ? ld64(p + 40) : ld32(p + 20);
+        const uint64_t p_align  = is64 ? ld64(p + 48) : ld32(p + 28);
 
         std::wstring ptName;
         switch (p_type) {
@@ -170,13 +171,13 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
         perm += (p_flags & 1u) ? L"X" : L"-";
 
         std::wstring detail = L"Align " + hexAddr(p_align);
-        if (p_type == 1 && p_filesz > 0 && p_offset < raw.size()) {
+        if (p_type == 1 && p_filesz > 0 && p_offset < fileSize) {
             loadSegs.push_back({ p_vaddr, p_filesz, p_offset });
-        } else if (p_type == 2 && p_filesz > 0 && p_offset < raw.size()) {
+        } else if (p_type == 2 && p_filesz > 0 && p_offset < fileSize) {
             ptDynOff = p_offset;
             ptDynSz  = p_filesz;
-        } else if (p_type == 3 && p_filesz > 0 && p_offset < raw.size()) {
-            std::string ip = readCStrAt(static_cast<size_t>(p_offset), static_cast<size_t>(std::min<uint64_t>(p_filesz, 512)));
+        } else if (p_type == 3 && p_filesz > 0 && p_offset < fileSize) {
+            std::string ip = cstrAt(p_offset, p_filesz);
             interpPath = PathUtils::Utf8ToWide(ip);
             if (!interpPath.empty()) detail = L"Interpreter: " + interpPath;
         }
@@ -192,14 +193,14 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
         });
     }
 
-    auto vaddrToFileOff = [&](uint64_t vma) -> size_t {
+    auto vaddrToFileOff = [&](uint64_t vma) -> uint64_t {
         for (const auto& seg : loadSegs) {
             if (vma >= seg.vaddr && vma < seg.vaddr + seg.filesz) {
                 const uint64_t fo = seg.offset + (vma - seg.vaddr);
-                if (fo < raw.size()) return static_cast<size_t>(fo);
+                if (fo < fileSize) return fo;
             }
         }
-        return raw.size();
+        return fileSize;
     };
 
     // Parse Section Headers
@@ -216,30 +217,45 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
         uint64_t sh_entsize = 0;
     };
     std::vector<ElfSec> secs;
-    secs.reserve(std::min<uint16_t>(e_shnum, 2048));
-    for (uint16_t i = 0; i < e_shnum && i < 2048; ++i) {
-        const size_t s = static_cast<size_t>(e_shoff) + static_cast<size_t>(i) * e_shentsize;
+    secs.reserve(shCount);
+    for (uint16_t i = 0; i < shCount; ++i) {
+        const uint8_t* s = shTab + static_cast<size_t>(i) * e_shentsize;
         ElfSec es;
-        es.sh_name    = rdU32(s + 0);
-        es.sh_type    = rdU32(s + 4);
-        es.sh_flags   = is64 ? rdU64(s + 8)  : rdU32(s + 8);
-        es.sh_addr    = is64 ? rdU64(s + 16) : rdU32(s + 12);
-        es.sh_offset  = is64 ? rdU64(s + 24) : rdU32(s + 16);
-        es.sh_size    = is64 ? rdU64(s + 32) : rdU32(s + 20);
-        es.sh_link    = is64 ? rdU32(s + 40) : rdU32(s + 24);
-        es.sh_info    = is64 ? rdU32(s + 44) : rdU32(s + 28);
-        es.sh_entsize = is64 ? rdU64(s + 56) : rdU32(s + 36);
+        es.sh_name    = ld32(s + 0);
+        es.sh_type    = ld32(s + 4);
+        es.sh_flags   = is64 ? ld64(s + 8)  : ld32(s + 8);
+        es.sh_addr    = is64 ? ld64(s + 16) : ld32(s + 12);
+        es.sh_offset  = is64 ? ld64(s + 24) : ld32(s + 16);
+        es.sh_size    = is64 ? ld64(s + 32) : ld32(s + 20);
+        es.sh_link    = is64 ? ld32(s + 40) : ld32(s + 24);
+        es.sh_info    = is64 ? ld32(s + 44) : ld32(s + 28);
+        es.sh_entsize = is64 ? ld64(s + 56) : ld32(s + 36);
         secs.push_back(es);
     }
 
+    // A string table up to 4 MB is read once, a larger one's strings one at a time
+    struct StrTab {
+        std::vector<uint8_t> buf;
+        const uint8_t* p = nullptr;
+        size_t n = 0;
+        bool loaded = false;
+    };
+    std::vector<StrTab> strTabs(secs.size());
     auto readStrFromSec = [&](uint32_t secIdx, uint32_t strOff) -> std::string {
         if (secIdx >= secs.size()) return {};
         const auto& st = secs[secIdx];
-        if (st.sh_type == 8 || st.sh_offset >= raw.size() || strOff >= st.sh_size) return {};
-        const uint64_t absOff = st.sh_offset + strOff;
-        if (absOff >= raw.size()) return {};
-        const size_t maxAvail = static_cast<size_t>(std::min<uint64_t>(st.sh_size - strOff, raw.size() - static_cast<size_t>(absOff)));
-        return readCStrAt(static_cast<size_t>(absOff), std::min<size_t>(maxAvail, 512));
+        if (st.sh_type == 8 || st.sh_offset >= fileSize || strOff >= st.sh_size) return {};
+        StrTab& tab = strTabs[secIdx];
+        if (!tab.loaded) {
+            tab.loaded = true;
+            if (st.sh_size <= (4u << 20)) tab.p = src.ReadSome(st.sh_offset, st.sh_size, UINT64_MAX, tab.buf, tab.n);
+        }
+        if (!tab.p) return cstrAt(st.sh_offset + strOff, st.sh_size - strOff);
+        if (strOff >= tab.n) return {};
+        const size_t lim = std::min<size_t>(tab.n - strOff, 512);
+        size_t k = 0;
+        while (k < lim && tab.p[strOff + k] != 0) ++k;
+        return std::string(reinterpret_cast<const char*>(tab.p + strOff), k);
     };
 
     if (e_shstrndx < secs.size()) {
@@ -293,13 +309,13 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
         if (es.sh_flags & 0x400u) flg += L"T";
         if (flg.empty()) flg = L"-";
 
-        if (es.sh_type == 6 && es.sh_offset < raw.size() && es.sh_size > 0) {
+        if (es.sh_type == 6 && es.sh_offset < fileSize && es.sh_size > 0) {
             shDynOff = es.sh_offset;
             shDynSz  = es.sh_size;
             shDynStrIdx = es.sh_link;
         }
-        if (es.name == ".interp" && interpPath.empty() && es.sh_offset < raw.size() && es.sh_size > 0) {
-            interpPath = PathUtils::Utf8ToWide(readCStrAt(static_cast<size_t>(es.sh_offset), static_cast<size_t>(std::min<uint64_t>(es.sh_size, 512))));
+        if (es.name == ".interp" && interpPath.empty() && es.sh_offset < fileSize && es.sh_size > 0) {
+            interpPath = PathUtils::Utf8ToWide(cstrAt(es.sh_offset, es.sh_size));
         }
 
         shSheet.rows.push_back({
@@ -322,14 +338,17 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
 
     const uint64_t dynOff = (shDynOff > 0) ? shDynOff : ptDynOff;
     const uint64_t dynSz  = (shDynOff > 0) ? shDynSz  : ptDynSz;
-    if (dynOff > 0 && dynOff < raw.size() && dynSz >= (is64 ? 16u : 8u)) {
-        const size_t entSz = is64 ? 16 : 8;
-        const size_t maxDyn = static_cast<size_t>(std::min<uint64_t>(dynSz, raw.size() - static_cast<size_t>(dynOff))) / entSz;
-        size_t fallbackDynStrFileOff = raw.size();
-        for (size_t i = 0; i < maxDyn && i < 1024; ++i) {
-            const size_t dp = static_cast<size_t>(dynOff) + i * entSz;
-            const uint64_t d_tag = is64 ? rdU64(dp) : rdU32(dp);
-            const uint64_t d_val = is64 ? rdU64(dp + 8) : rdU32(dp + 4);
+    const size_t entSz = is64 ? 16 : 8;
+    std::vector<uint8_t> dynBuf;
+    size_t dynGot = 0;
+    const uint8_t* dyn = (dynOff > 0 && dynSz >= entSz) ? src.ReadSome(dynOff, dynSz, 1024 * entSz, dynBuf, dynGot) : nullptr;
+    if (dyn) {
+        const size_t maxDyn = dynGot / entSz;
+        uint64_t fallbackDynStrFileOff = fileSize;
+        for (size_t i = 0; i < maxDyn; ++i) {
+            const uint8_t* dp = dyn + i * entSz;
+            const uint64_t d_tag = is64 ? ld64(dp) : ld32(dp);
+            const uint64_t d_val = is64 ? ld64(dp + 8) : ld32(dp + 4);
             if (d_tag == 0) break;
             if (d_tag == 5) { // DT_STRTAB
                 fallbackDynStrFileOff = vaddrToFileOff(d_val);
@@ -340,16 +359,16 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
                 std::string s = readStrFromSec(shDynStrIdx, static_cast<uint32_t>(strOff));
                 if (!s.empty()) return PathUtils::Utf8ToWide(s);
             }
-            if (fallbackDynStrFileOff < raw.size() && fallbackDynStrFileOff + strOff < raw.size()) {
-                return PathUtils::Utf8ToWide(readCStrAt(fallbackDynStrFileOff + static_cast<size_t>(strOff), 512));
+            if (fallbackDynStrFileOff < fileSize && strOff < fileSize - fallbackDynStrFileOff) {
+                return PathUtils::Utf8ToWide(cstrAt(fallbackDynStrFileOff + strOff, 512));
             }
             return {};
         };
 
-        for (size_t i = 0; i < maxDyn && i < 1024; ++i) {
-            const size_t dp = static_cast<size_t>(dynOff) + i * entSz;
-            const uint64_t d_tag = is64 ? rdU64(dp) : rdU32(dp);
-            const uint64_t d_val = is64 ? rdU64(dp + 8) : rdU32(dp + 4);
+        for (size_t i = 0; i < maxDyn; ++i) {
+            const uint8_t* dp = dyn + i * entSz;
+            const uint64_t d_tag = is64 ? ld64(dp) : ld32(dp);
+            const uint64_t d_val = is64 ? ld64(dp + 8) : ld32(dp + 4);
             if (d_tag == 0) break;
 
             std::wstring tagName;
@@ -379,24 +398,27 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     symSheet.rows.push_back({ L"Table", L"Symbol Name", L"Value", L"Size", L"Bind", L"Type", L"Section" });
 
     size_t totalSymsDecoded = 0;
-    for (size_t si = 0; si < secs.size(); ++si) {
+    for (size_t si = 0; si < secs.size() && symSheet.rows.size() <= 2000; ++si) {
         const auto& es = secs[si];
         if (es.sh_type != 2 && es.sh_type != 11) continue;
-        if (es.sh_offset >= raw.size() || es.sh_size == 0) continue;
+        if (es.sh_offset >= fileSize || es.sh_size == 0) continue;
 
         const size_t symEntSz = is64 ? 24 : 16;
         const size_t stride = (es.sh_entsize >= symEntSz) ? static_cast<size_t>(es.sh_entsize) : symEntSz;
-        const size_t availBytes = static_cast<size_t>(std::min<uint64_t>(es.sh_size, raw.size() - static_cast<size_t>(es.sh_offset)));
+        std::vector<uint8_t> symBuf;
+        size_t availBytes = 0;
+        const uint8_t* symTab = src.ReadSome(es.sh_offset, es.sh_size, 4u << 20, symBuf, availBytes); // far more entries than rows shown
+        if (!symTab) continue;
         const size_t count = availBytes / stride;
         const std::wstring tblLabel = (es.sh_type == 11) ? L".dynsym" : L".symtab";
 
         for (size_t k = 0; k < count && symSheet.rows.size() <= 2000; ++k) {
-            const size_t sp = static_cast<size_t>(es.sh_offset) + k * stride;
-            const uint32_t st_name  = rdU32(sp + 0);
-            const uint8_t  st_info  = is64 ? raw[sp + 4] : raw[sp + 12];
-            const uint16_t st_shndx = is64 ? rdU16(sp + 6) : rdU16(sp + 14);
-            const uint64_t st_value = is64 ? rdU64(sp + 8) : rdU32(sp + 4);
-            const uint64_t st_size  = is64 ? rdU64(sp + 16) : rdU32(sp + 8);
+            const uint8_t* sp = symTab + k * stride;
+            const uint32_t st_name  = ld32(sp + 0);
+            const uint8_t  st_info  = is64 ? sp[4] : sp[12];
+            const uint16_t st_shndx = is64 ? ld16(sp + 6) : ld16(sp + 14);
+            const uint64_t st_value = is64 ? ld64(sp + 8) : ld32(sp + 4);
+            const uint64_t st_size  = is64 ? ld64(sp + 16) : ld32(sp + 8);
 
             if (k == 0 && st_name == 0 && st_value == 0 && st_info == 0) continue;
 
@@ -448,7 +470,9 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     sheet.rows.push_back({ L"Object Type", typeName });
     sheet.rows.push_back({ L"Architecture", machName });
     sheet.rows.push_back({ L"Entry Point Address", hexAddr(e_entry) });
-    sheet.rows.push_back({ L"Header Flags", L"0x" + std::to_wstring(e_flags) });
+    wchar_t flagsHex[16];
+    swprintf_s(flagsHex, L"0x%08X", e_flags);
+    sheet.rows.push_back({ L"Header Flags", flagsHex });
     sheet.rows.push_back({ L"Program Headers", std::to_wstring(e_phnum) + L" (offset " + std::to_wstring(e_phoff) + L")" });
     sheet.rows.push_back({ L"Section Headers", std::to_wstring(e_shnum) + L" (offset " + std::to_wstring(e_shoff) + L")" });
     sheet.rows.push_back({ L"Decoded Symbols", std::to_wstring(totalSymsDecoded) });
@@ -476,6 +500,7 @@ inline bool ParseElfBinaryDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     if (dynSheet.rows.size() > 1) out.sheets.push_back(std::move(dynSheet));
     if (symSheet.rows.size() > 1) out.sheets.push_back(std::move(symSheet));
 
+    if (!src.ReadFailed()) out.sourceReadFully = true; // every table shown was read, wherever it lies in the file
     out.valid = !out.sheets.empty();
     return out.valid;
 }

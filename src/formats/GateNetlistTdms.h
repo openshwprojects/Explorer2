@@ -269,11 +269,7 @@ inline std::string EdifIdName(const DetailSpecctra::SNode& n) {
     return (!n.list.empty() && !n.list[0].isList) ? n.list[0].atom : "";
 }
 
-inline std::string LowerAsciiCopy(std::string_view sv) {
-    std::string s(sv);
-    for (char& c : s) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    return s;
-}
+inline std::string LowerAsciiCopy(std::string_view sv) { return ::Explorer2::PathUtils::ToLowerAscii(sv); }
 
 } // namespace DetailGateTdms
 

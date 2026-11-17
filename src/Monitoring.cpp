@@ -404,17 +404,6 @@ std::wstring SelfExePath() {
     return exe;
 }
 
-bool RunHiddenAndWait(std::wstring cmdLine, DWORD& exitCode, DWORD timeoutMs) {
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = {};
-    if (!CreateProcessW(nullptr, cmdLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
-    bool ok = WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return ok;
-}
-
 // Runs a program elevated (UAC prompt) and waits for it
 bool RunElevatedAndWait(const std::wstring& file, const std::wstring& params, DWORD& exitCode) {
     SHELLEXECUTEINFOW sei = {};
@@ -511,31 +500,6 @@ void MonitorStore::PruneOldFiles(int retentionDays) {
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-}
-
-std::vector<MonitorSample> MonitorStore::LoadRange(int64_t fromTs, int64_t toTs) {
-    std::vector<MonitorSample> out;
-    if (toTs < fromTs) return out;
-
-    tm cur = LocalTime(fromTs);
-    cur.tm_hour = 0; cur.tm_min = 0; cur.tm_sec = 0; cur.tm_isdst = -1;
-    for (int guard = 0; guard < 4000; ++guard) {
-        time_t dayStart = mktime(&cur);            // also normalises tm_mday overflow
-        if (dayStart == static_cast<time_t>(-1) || static_cast<int64_t>(dayStart) > toTs) break;
-
-        std::ifstream in(DayFilePath(L"samples", cur), std::ios::binary);
-        if (in) {
-            std::string line;
-            while (std::getline(in, line)) {
-                MonitorSample s;
-                if (ParseLine(line, s) && s.ts >= fromTs && s.ts <= toTs) out.push_back(std::move(s));
-            }
-        }
-        cur.tm_mday += 1;
-        cur.tm_isdst = -1;
-    }
-    std::sort(out.begin(), out.end(), [](const MonitorSample& a, const MonitorSample& b) { return a.ts < b.ts; });
-    return out;
 }
 
 std::vector<MonitorSmartPoint> MonitorStore::LoadSmartRange(int64_t fromTs, int64_t toTs) {

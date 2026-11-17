@@ -243,8 +243,6 @@ public:
     // Deterministic low-disk simulation hook for SelfTestSuite
     void SetSimulatedFreeSpaceForTesting(uint64_t freeBytes, bool enabled);
 
-    // Fast polling / UI state snapshots
-    bool HasActiveOrPausedJobs() const;
     bool HasRunningJobs() const;
     bool GetPrimaryHudJob(TransferJobSnapshot& outSnap, size_t* outTotalActiveAndQueued = nullptr) const;
     std::vector<TransferJobSnapshot> SnapshotJobs() const;

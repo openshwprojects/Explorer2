@@ -1,28 +1,15 @@
 #pragma once
+#include "../ByteIO.h"
 // Bson.h — Complete Recursive & Multi-Document MongoDB Binary JSON (.bson) Decoder
 
 namespace Formats {
 
 namespace BsonDetail {
 
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           static_cast<uint32_t>(p[3]) << 24;
-}
-
-inline int32_t RdI32LE(const uint8_t* p) {
-    return static_cast<int32_t>(RdU32LE(p));
-}
-
-inline uint64_t RdU64LE(const uint8_t* p) {
-    return static_cast<uint64_t>(RdU32LE(p)) | (static_cast<uint64_t>(RdU32LE(p + 4)) << 32);
-}
-
-inline int64_t RdI64LE(const uint8_t* p) {
-    return static_cast<int64_t>(RdU64LE(p));
-}
+using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
+using ::Explorer2::ByteIO::RdU64LE;
+using ::Explorer2::ByteIO::RdI64LE;
 
 // Formats signed Unix epoch milliseconds as "YYYY-MM-DD HH:MM:SS UTC" (all dates incl. pre-1970 & post-2038)
 inline std::wstring FormatUtcMillis(int64_t ms) {

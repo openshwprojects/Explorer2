@@ -1,20 +1,13 @@
 #pragma once
+#include "../ByteIO.h"
 // Ani.h — Windows Animated Cursor RIFF Container (.ani) Decoder
 
 namespace Formats {
 
 namespace DetailAni {
 
-inline uint16_t RdU16LE(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
-
-inline uint32_t RdU32LE(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
+using ::Explorer2::ByteIO::RdU16LE;
+using ::Explorer2::ByteIO::RdU32LE;
 
 inline void StorePremulBgra(uint8_t* dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     if (a == 255u) {

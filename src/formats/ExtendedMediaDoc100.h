@@ -1,4 +1,5 @@
 #pragma once
+#include "ContentLines.h"
 // ExtendedMediaDoc100.h — Audio, Tracker, SoundFont, DAW/Score, NLE, Subtitle, Email, E-Book & Help Readers
 // Covers: .eml/.mbox, .mp3, .ogg/.opus/.spx, .mod/.xm/.s3m/.it, .sf2/.sfz,
 //         .mscz, .als, .flp, .gp/.gp3/.gp4/.gp5, .rpp, .edl, .fcpxml, .otio,
@@ -86,74 +87,8 @@ inline std::wstring FormatPts90kHz(uint64_t pts90k) {
     return buf;
 }
 
-inline void FinalizeSheetCols(SpreadsheetSheet& sh) {
-    size_t mc = sh.maxCols;
-    for (const auto& r : sh.rows) {
-        if (r.size() > mc) mc = r.size();
-    }
-    sh.maxCols = mc;
-}
 
-inline void ComputeDocCounts(ParsedOfficeDocument& out) {
-    size_t words = 0;
-    size_t chars = 0;
-    for (const auto& p : out.paragraphs) {
-        chars += p.text.size();
-        bool inW = false;
-        for (wchar_t ch : p.text) {
-            bool sp = (ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n');
-            if (!sp && !inW) { ++words; inW = true; }
-            else if (sp) { inW = false; }
-        }
-    }
-    out.wordCount = words;
-    out.charCount = chars;
-}
-
-inline std::wstring DecodeHtmlEntitiesMedia(std::wstring_view in) {
-    std::wstring out;
-    out.reserve(in.size());
-    for (size_t i = 0; i < in.size(); ++i) {
-        if (in[i] == L'&') {
-            size_t semi = in.find(L';', i + 1);
-            if (semi != std::wstring_view::npos && semi - i <= 12) {
-                std::wstring_view ent = in.substr(i + 1, semi - i - 1);
-                if (ent == L"amp")   { out.push_back(L'&');  i = semi; continue; }
-                if (ent == L"lt")    { out.push_back(L'<');  i = semi; continue; }
-                if (ent == L"gt")    { out.push_back(L'>');  i = semi; continue; }
-                if (ent == L"quot")  { out.push_back(L'"');  i = semi; continue; }
-                if (ent == L"apos")  { out.push_back(L'\''); i = semi; continue; }
-                if (ent == L"nbsp")  { out.push_back(L' ');  i = semi; continue; }
-                if (ent == L"ndash") { out.push_back(0x2013); i = semi; continue; }
-                if (ent == L"mdash") { out.push_back(0x2014); i = semi; continue; }
-                if (ent == L"copy")  { out.push_back(0x00A9); i = semi; continue; }
-                if (!ent.empty() && ent[0] == L'#') {
-                    uint32_t cp = 0;
-                    if (ent.size() > 2 && (ent[1] == L'x' || ent[1] == L'X')) {
-                        for (size_t k = 2; k < ent.size(); ++k) {
-                            wchar_t c = ent[k];
-                            cp <<= 4;
-                            if (c >= L'0' && c <= L'9') cp |= static_cast<uint32_t>(c - L'0');
-                            else if (c >= L'a' && c <= L'f') cp |= static_cast<uint32_t>(c - L'a' + 10);
-                            else if (c >= L'A' && c <= L'F') cp |= static_cast<uint32_t>(c - L'A' + 10);
-                        }
-                    } else {
-                        for (size_t k = 1; k < ent.size(); ++k) {
-                            if (ent[k] >= L'0' && ent[k] <= L'9') cp = cp * 10u + static_cast<uint32_t>(ent[k] - L'0');
-                        }
-                    }
-                    if (cp >= 32 && cp <= 0xFFFF) {
-                        out.push_back(static_cast<wchar_t>(cp));
-                        i = semi;
-                        continue;
-                    }
-                }
-            }
-        }
-        out.push_back(in[i]);
-    }
-    return out;
-}
+inline void ComputeDocCounts(ParsedOfficeDocument& out) { RecountDocText(out); }
 
 inline std::vector<std::wstring> StripHtmlToParagraphs(std::wstring_view html, size_t maxParas = 600) {
     std::vector<std::wstring> paras;
@@ -174,7 +109,7 @@ inline std::vector<std::wstring> StripHtmlToParagraphs(std::wstring_view html, s
                 prevSp = false;
             }
         }
-        clean = PathUtils::Trim(DecodeHtmlEntitiesMedia(clean));
+        clean = PathUtils::Trim(::Explorer2::XmlTagScan::DecodeEntitiesWide(clean));
         if (!clean.empty() && paras.size() < maxParas) {
             paras.push_back(std::move(clean));
         }
@@ -231,54 +166,23 @@ inline std::vector<std::wstring> StripHtmlToParagraphs(std::wstring_view html, s
 
 inline std::vector<uint8_t> DecodeBase64Media(std::string_view in) {
     std::vector<uint8_t> out;
-    out.reserve((in.size() * 3) / 4 + 4);
-    uint32_t acc = 0;
-    int bits = 0;
-    for (char ch : in) {
-        int v = -1;
-        if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
-        else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
-        else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
-        else if (ch == '+') v = 62;
-        else if (ch == '/') v = 63;
-        else if (ch == '=') break;
-        if (v < 0) continue;
-        acc = (acc << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFFu));
-        }
-    }
+    ::Explorer2::Base64::Decode(in, out);
     return out;
 }
 
-inline std::string DecodeQuotedPrintable(std::string_view in) {
-    auto hexNib = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        return -1;
-    };
-    std::string out;
-    out.reserve(in.size());
-    for (size_t i = 0; i < in.size(); ++i) {
-        if (in[i] == '=') {
-            if (i + 1 < in.size() && in[i + 1] == '\n') { i += 1; continue; }
-            if (i + 2 < in.size() && in[i + 1] == '\r' && in[i + 2] == '\n') { i += 2; continue; }
-            if (i + 2 < in.size()) {
-                int hi = hexNib(in[i + 1]);
-                int lo = hexNib(in[i + 2]);
-                if (hi >= 0 && lo >= 0) {
-                    out.push_back(static_cast<char>((hi << 4) | lo));
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        out.push_back(in[i]);
-    }
-    return out;
+inline std::string DecodeQuotedPrintable(std::string_view in) { return ContentLines::DecodeQuotedPrintable(in); }
+
+// Bytes in a named charset (MIME / RFC 2047) as text; unknown names are read as UTF-8 (with the ANSI fallback)
+inline std::wstring DecodeCharsetText(std::string_view bytes, std::string_view charsetName) {
+    std::string cs = PathUtils::ToLowerAscii(PathUtils::TrimAscii(charsetName));
+    if (cs.size() >= 2 && (cs.front() == '"' || cs.front() == '\'')) cs = cs.substr(1, cs.size() - 2);
+    const unsigned cp = ::Explorer2::XmlTagScan::CodePageForCharset(cs);
+    if (cp == 0 || cp == 65001 || cp == 20127 || bytes.empty()) return PathUtils::Utf8ToWide(bytes);
+    int wn = MultiByteToWideChar(cp, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+    if (wn <= 0) return PathUtils::Utf8ToWide(bytes);
+    std::wstring w(static_cast<size_t>(wn), L'\0');
+    MultiByteToWideChar(cp, 0, bytes.data(), static_cast<int>(bytes.size()), w.data(), wn);
+    return w;
 }
 
 inline std::wstring DecodeRfc2047Header(std::string_view rawHdr) {
@@ -317,11 +221,7 @@ inline std::wstring DecodeRfc2047Header(std::string_view rawHdr) {
         } else {
             decodedBytes.assign(payload.data(), payload.size());
         }
-        if (charset.find("8859-1") != std::string::npos || charset.find("1252") != std::string::npos || charset == "latin1") {
-            result += Latin1OrCp1252ToWide(reinterpret_cast<const uint8_t*>(decodedBytes.data()), decodedBytes.size());
-        } else {
-            result += PathUtils::Utf8ToWide(decodedBytes);
-        }
+        result += DecodeCharsetText(decodedBytes, charset);
         pos = end + 2;
     }
     return PathUtils::Trim(result);
@@ -329,24 +229,8 @@ inline std::wstring DecodeRfc2047Header(std::string_view rawHdr) {
 
 // Lightweight XML helpers for .mscz, .als, .gp, .fcpxml
 inline std::string ExtractXmlAttr(std::string_view tag, std::string_view attrName) {
-    std::string needle = std::string(attrName) + "=";
-    size_t p = 0;
-    while (p < tag.size()) {
-        size_t hit = tag.find(needle, p);
-        if (hit == std::string_view::npos) return {};
-        if (hit == 0 || tag[hit - 1] == ' ' || tag[hit - 1] == '\t' || tag[hit - 1] == '\r' || tag[hit - 1] == '\n') {
-            size_t vPos = hit + needle.size();
-            if (vPos < tag.size() && (tag[vPos] == '"' || tag[vPos] == '\'')) {
-                char q = tag[vPos++];
-                size_t endQ = tag.find(q, vPos);
-                if (endQ != std::string_view::npos) {
-                    return std::string(tag.substr(vPos, endQ - vPos));
-                }
-            }
-        }
-        p = hit + needle.size();
-    }
-    return {};
+    std::string_view v;
+    return ::Explorer2::XmlTagScan::FindAttr(tag, attrName, v, false) ? std::string(v) : std::string();
 }
 
 inline std::wstring ExtractFirstXmlTagText(std::string_view xml, std::string_view tagName, size_t searchFrom = 0) {
@@ -361,7 +245,204 @@ inline std::wstring ExtractFirstXmlTagText(std::string_view xml, std::string_vie
     if (gt == std::string_view::npos || (gt > p && xml[gt - 1] == '/')) return {};
     size_t c = xml.find(closeTag, gt + 1);
     if (c == std::string_view::npos) return {};
-    return DecodeHtmlEntitiesMedia(PathUtils::Trim(PathUtils::Utf8ToWide(xml.substr(gt + 1, c - gt - 1))));
+    return ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Trim(PathUtils::Utf8ToWide(xml.substr(gt + 1, c - gt - 1))));
+}
+
+// ---- MIME (RFC 2045-2047, 2231) ----
+
+// Header block / body of an entity, split at the first empty line
+inline void SplitMimeEntity(std::string_view entity, std::string_view& headers, std::string_view& body) {
+    size_t crlf = entity.find("\r\n\r\n"), lf = entity.find("\n\n");
+    size_t end = crlf, sep = 4;
+    if (lf != std::string_view::npos && (crlf == std::string_view::npos || lf < crlf)) { end = lf; sep = 2; }
+    if (entity.rfind("\r\n", 0) == 0 || entity.rfind("\n", 0) == 0) { // no headers at all
+        headers = {};
+        body = entity.substr(entity[0] == '\r' ? 2 : 1);
+        return;
+    }
+    headers = (end == std::string_view::npos) ? entity : entity.substr(0, end);
+    body = (end == std::string_view::npos) ? std::string_view() : entity.substr(end + sep);
+}
+
+// Header fields (lower-case names), folded lines unfolded
+inline std::vector<std::pair<std::string, std::string>> ParseMimeHeaders(std::string_view block) {
+    std::vector<std::pair<std::string, std::string>> headers;
+    size_t ls = 0;
+    while (ls < block.size() && headers.size() < 512) {
+        size_t le = block.find('\n', ls);
+        if (le == std::string_view::npos) le = block.size();
+        std::string_view line = block.substr(ls, le - ls);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        ls = (le < block.size()) ? (le + 1) : block.size();
+        if (line.empty()) continue;
+        if ((line[0] == ' ' || line[0] == '\t') && !headers.empty()) {
+            headers.back().second.push_back(' ');
+            size_t t = 0;
+            while (t < line.size() && (line[t] == ' ' || line[t] == '\t')) ++t;
+            headers.back().second.append(line.substr(t));
+            continue;
+        }
+        size_t colon = line.find(':');
+        if (colon == std::string_view::npos || colon == 0 || colon > 64) continue;
+        bool validKey = true;
+        for (size_t k = 0; k < colon; ++k) {
+            unsigned char ch = static_cast<unsigned char>(line[k]);
+            if (ch <= 32 || ch >= 127) { validKey = false; break; }
+        }
+        if (!validKey) continue;
+        std::string_view val = line.substr(colon + 1);
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.remove_prefix(1);
+        headers.push_back({ PathUtils::ToLowerAscii(line.substr(0, colon)), std::string(val) });
+    }
+    return headers;
+}
+
+inline std::string MimeHeader(const std::vector<std::pair<std::string, std::string>>& headers, std::string_view name) {
+    for (const auto& kv : headers) {
+        if (kv.first == name) return kv.second;
+    }
+    return {};
+}
+
+// A parameter of a structured field ("text/plain; charset=utf-8; name=\"a b.txt\""); RFC 2231 "name*=utf-8''a%20b"
+// values are percent-decoded and their charset applied. Empty when absent.
+inline std::wstring MimeParam(std::string_view value, std::string_view name) {
+    size_t i = 0;
+    bool inQuote = false;
+    // walk the ';'-separated parameters after the first item
+    while (i < value.size()) {
+        if (value[i] == '"') inQuote = !inQuote;
+        if (value[i] != ';' || inQuote) { ++i; continue; }
+        ++i;
+        while (i < value.size() && (value[i] == ' ' || value[i] == '\t')) ++i;
+        size_t eq = value.find('=', i);
+        if (eq == std::string_view::npos) break;
+        std::string key = PathUtils::ToLowerAscii(PathUtils::TrimAscii(value.substr(i, eq - i)));
+        size_t v = eq + 1;
+        while (v < value.size() && (value[v] == ' ' || value[v] == '\t')) ++v;
+        std::string val;
+        if (v < value.size() && value[v] == '"') {
+            ++v;
+            while (v < value.size() && value[v] != '"') {
+                if (value[v] == '\\' && v + 1 < value.size()) ++v;
+                val.push_back(value[v++]);
+            }
+            if (v < value.size()) ++v;
+        } else {
+            while (v < value.size() && value[v] != ';' && value[v] != ' ' && value[v] != '\t') val.push_back(value[v++]);
+        }
+        i = v;
+        if (key == name) return DecodeRfc2047Header(val); // (mailers often put encoded words in names)
+        if (key.size() == name.size() + 1 && key.compare(0, name.size(), name) == 0 && key.back() == '*') {
+            size_t q1 = val.find('\''), q2 = (q1 == std::string::npos) ? q1 : val.find('\'', q1 + 1);
+            std::string charset = (q2 == std::string::npos) ? std::string() : val.substr(0, q1);
+            std::string enc = (q2 == std::string::npos) ? val : val.substr(q2 + 1), bytes;
+            auto hexv = [](char ch) {
+                return (ch >= '0' && ch <= '9') ? ch - '0' : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10
+                     : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10 : -1;
+            };
+            for (size_t k = 0; k < enc.size(); ++k) {
+                int h1 = (enc[k] == '%' && k + 2 < enc.size()) ? hexv(enc[k + 1]) : -1;
+                int h2 = (h1 >= 0) ? hexv(enc[k + 2]) : -1;
+                if (h1 >= 0 && h2 >= 0) { bytes.push_back(static_cast<char>(h1 * 16 + h2)); k += 2; }
+                else bytes.push_back(enc[k]);
+            }
+            return DecodeCharsetText(bytes, charset);
+        }
+    }
+    return {};
+}
+
+struct MimeContent {
+    std::wstring plain, html;
+    std::vector<std::wstring> attachments;
+};
+
+// One entity: a multipart's parts are walked (8 levels at most); inline text/plain and text/html parts are
+// collected, everything else (and text marked as an attachment) is listed with its name and size
+inline void WalkMimeEntity(const std::vector<std::pair<std::string, std::string>>& headers, std::string_view body,
+                           int depth, MimeContent& mc) {
+    const std::string ctype = MimeHeader(headers, "content-type");
+    std::string media = PathUtils::ToLowerAscii(PathUtils::TrimAscii(std::string_view(ctype).substr(0, ctype.find(';'))));
+    if (media.empty()) media = "text/plain";
+    const std::string disp = MimeHeader(headers, "content-disposition");
+    const bool asAttachment = PathUtils::ToLowerAscii(disp).rfind("attachment", 0) == 0;
+
+    if (media.rfind("multipart/", 0) == 0 && depth < 8) {
+        const std::string boundary = PathUtils::WideToUtf8(MimeParam(ctype, "boundary"));
+        if (boundary.empty()) return;
+        const std::string delim = "--" + boundary;
+        // delimiter lines start a line; the closing one ends with "--"
+        size_t pos = 0;
+        auto nextDelim = [&](size_t from) {
+            size_t p = body.find(delim, from);
+            while (p != std::string_view::npos && p > 0 && body[p - 1] != '\n') p = body.find(delim, p + 1);
+            return p;
+        };
+        pos = nextDelim(0);
+        while (pos != std::string_view::npos) {
+            size_t after = pos + delim.size();
+            if (body.compare(after, 2, "--") == 0) break; // closing delimiter
+            size_t partStart = body.find('\n', after);
+            if (partStart == std::string_view::npos) break;
+            ++partStart;
+            size_t next = nextDelim(partStart);
+            size_t partEnd = (next == std::string_view::npos) ? body.size() : next;
+            // the line break before a delimiter belongs to the delimiter
+            if (partEnd > partStart && body[partEnd - 1] == '\n') --partEnd;
+            if (partEnd > partStart && body[partEnd - 1] == '\r') --partEnd;
+            std::string_view partHeaders, partBody;
+            SplitMimeEntity(body.substr(partStart, partEnd - partStart), partHeaders, partBody);
+            WalkMimeEntity(ParseMimeHeaders(partHeaders), partBody, depth + 1, mc);
+            pos = next;
+        }
+        return;
+    }
+
+    const std::string cte = PathUtils::ToLowerAscii(PathUtils::TrimAscii(MimeHeader(headers, "content-transfer-encoding")));
+    auto decoded = [&]() {
+        if (cte == "base64") {
+            auto b = DecodeBase64Media(body);
+            return std::string(reinterpret_cast<const char*>(b.data()), b.size());
+        }
+        if (cte == "quoted-printable") return DecodeQuotedPrintable(body);
+        return std::string(body);
+    };
+    const bool isText = media == "text/plain" || media == "text/html";
+    if (isText && !asAttachment) {
+        std::wstring text = DecodeCharsetText(decoded(), PathUtils::WideToUtf8(MimeParam(ctype, "charset")));
+        std::wstring& dst = (media == "text/plain") ? mc.plain : mc.html;
+        if (media == "text/html") {
+            std::wstring joined;
+            for (const auto& p : StripHtmlToParagraphs(text, 400)) {
+                if (!joined.empty()) joined += L"\n";
+                joined += p;
+            }
+            text = std::move(joined);
+        } else {
+            text = PathUtils::Trim(text);
+        }
+        constexpr size_t kMaxPartChars = 1u << 20; // one paragraph in the view: keep it to the first million characters
+        if (text.size() > kMaxPartChars) {
+            text.resize(kMaxPartChars);
+            text += L"\n[…]";
+        }
+        if (!text.empty() && dst.size() < 4 * kMaxPartChars) {
+            if (!dst.empty()) dst += L"\n\n";
+            dst += text;
+        }
+        return;
+    }
+    std::wstring name = MimeParam(disp, "filename");
+    if (name.empty()) name = MimeParam(ctype, "name");
+    if (media == "message/rfc822") {
+        std::string_view innerHeaders, innerBody;
+        SplitMimeEntity(body, innerHeaders, innerBody);
+        std::wstring subject = DecodeRfc2047Header(MimeHeader(ParseMimeHeaders(innerHeaders), "subject"));
+        if (name.empty()) name = L"(attached message) " + subject;
+    }
+    if (name.empty()) name = L"(unnamed " + PathUtils::Utf8ToWide(media) + L")";
+    if (mc.attachments.size() < 256) mc.attachments.push_back(name + L" (" + PathUtils::FormatByteSize(decoded().size()) + L")");
 }
 
 // ============================================================================
@@ -386,49 +467,10 @@ inline bool ParseEmlOrMbox(const std::vector<uint8_t>& raw, const std::wstring& 
             msgSv.remove_prefix(nl + 1);
         }
 
-        size_t hdrEnd = msgSv.find("\r\n\r\n");
-        size_t sepLen = 4;
-        size_t altEnd = msgSv.find("\n\n");
-        if (altEnd != std::string_view::npos && (hdrEnd == std::string_view::npos || altEnd < hdrEnd)) {
-            hdrEnd = altEnd;
-            sepLen = 2;
-        }
-        std::string_view hdrBlock = (hdrEnd != std::string_view::npos) ? msgSv.substr(0, hdrEnd) : msgSv;
-        std::string_view bodyBlock = (hdrEnd != std::string_view::npos) ? msgSv.substr(hdrEnd + sepLen) : std::string_view{};
+        std::string_view hdrBlock, bodyBlock;
+        SplitMimeEntity(msgSv, hdrBlock, bodyBlock);
 
-        // Unfold RFC 5322 header lines
-        std::vector<std::pair<std::string, std::string>> headers;
-        size_t ls = 0;
-        while (ls < hdrBlock.size()) {
-            size_t le = hdrBlock.find('\n', ls);
-            if (le == std::string_view::npos) le = hdrBlock.size();
-            std::string_view line = hdrBlock.substr(ls, le - ls);
-            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-            ls = (le < hdrBlock.size()) ? (le + 1) : hdrBlock.size();
-            if (line.empty()) continue;
-
-            if ((line[0] == ' ' || line[0] == '\t') && !headers.empty()) {
-                headers.back().second.push_back(' ');
-                size_t t = 0;
-                while (t < line.size() && (line[t] == ' ' || line[t] == '\t')) ++t;
-                headers.back().second.append(line.substr(t));
-            } else {
-                size_t colon = line.find(':');
-                if (colon != std::string_view::npos && colon > 0 && colon <= 64) {
-                    bool validKey = true;
-                    for (size_t k = 0; k < colon; ++k) {
-                        unsigned char ch = static_cast<unsigned char>(line[k]);
-                        if (ch <= 32 || ch >= 127) { validKey = false; break; }
-                    }
-                    if (validKey) {
-                        std::string key = PathUtils::ToLowerAscii(line.substr(0, colon));
-                        std::string_view val = line.substr(colon + 1);
-                        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.remove_prefix(1);
-                        headers.push_back({ std::move(key), std::string(val) });
-                    }
-                }
-            }
-        }
+        const std::vector<std::pair<std::string, std::string>> headers = ParseMimeHeaders(hdrBlock);
 
         if (headers.empty() && mboxEnvelope.empty()) return false;
         bool hasKnownHdr = !mboxEnvelope.empty();
@@ -453,8 +495,6 @@ inline bool ParseEmlOrMbox(const std::vector<uint8_t>& raw, const std::wstring& 
         std::wstring cc      = DecodeRfc2047Header(getHdr("cc"));
         std::wstring date    = DecodeRfc2047Header(getHdr("date"));
         std::wstring msgId   = DecodeRfc2047Header(getHdr("message-id"));
-        std::string ctype    = getHdr("content-type");
-        std::string cte      = PathUtils::ToLowerAscii(getHdr("content-transfer-encoding"));
 
         if (msgIndex > 0) {
             out.paragraphs.push_back({ L"────────────────────────────────────────", 2, false, false });
@@ -467,122 +507,11 @@ inline bool ParseEmlOrMbox(const std::vector<uint8_t>& raw, const std::wstring& 
         if (!date.empty())  out.paragraphs.push_back({ L"Date: " + date, 2, false, false });
         if (!msgId.empty()) out.paragraphs.push_back({ L"Message-ID: " + msgId, 3, false, false });
 
-        auto decodePartBody = [](std::string_view rawPart, const std::string& partCte, const std::string& partCt) -> std::wstring {
-            std::string bytes;
-            if (partCte.find("quoted-printable") != std::string::npos) {
-                bytes = DecodeQuotedPrintable(rawPart);
-            } else if (partCte.find("base64") != std::string::npos) {
-                auto b = DecodeBase64Media(rawPart);
-                bytes.assign(reinterpret_cast<const char*>(b.data()), b.size());
-            } else {
-                bytes.assign(rawPart.data(), std::min<size_t>(rawPart.size(), 65536));
-            }
-            std::string ctLow = PathUtils::ToLowerAscii(partCt);
-            std::wstring w = (ctLow.find("8859-1") != std::string::npos || ctLow.find("1252") != std::string::npos)
-                ? Latin1OrCp1252ToWide(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size())
-                : PathUtils::Utf8ToWide(bytes);
-            if (ctLow.find("text/html") != std::string::npos) {
-                auto ps = StripHtmlToParagraphs(w, 120);
-                std::wstring joined;
-                for (const auto& p : ps) {
-                    if (!joined.empty()) joined += L"\n";
-                    joined += p;
-                }
-                return joined;
-            }
-            return PathUtils::Trim(w);
-        };
-
-        std::string ctLower = PathUtils::ToLowerAscii(ctype);
-        size_t bndPos = ctLower.find("boundary=");
-        if (bndPos != std::string::npos && !bodyBlock.empty()) {
-            std::string_view bVal = std::string_view(ctype).substr(bndPos + 9);
-            if (!bVal.empty() && (bVal.front() == '"' || bVal.front() == '\'')) {
-                char q = bVal.front();
-                bVal.remove_prefix(1);
-                size_t eq = bVal.find(q);
-                if (eq != std::string_view::npos) bVal = bVal.substr(0, eq);
-            } else {
-                size_t semi = bVal.find_first_of("; \t\r\n");
-                if (semi != std::string_view::npos) bVal = bVal.substr(0, semi);
-            }
-            std::string delim = "--" + std::string(bVal);
-            size_t pPos = bodyBlock.find(delim);
-            std::wstring plainFound;
-            std::wstring htmlFallback;
-            while (pPos != std::string_view::npos) {
-                size_t afterDelim = pPos + delim.size();
-                if (afterDelim + 2 <= bodyBlock.size() && bodyBlock.substr(afterDelim, 2) == "--") break;
-                size_t partStart = bodyBlock.find('\n', afterDelim);
-                if (partStart == std::string_view::npos) break;
-                ++partStart;
-                size_t nextDelim = bodyBlock.find(delim, partStart);
-                std::string_view partSv = (nextDelim != std::string_view::npos)
-                    ? bodyBlock.substr(partStart, nextDelim - partStart)
-                    : bodyBlock.substr(partStart);
-
-                size_t phEnd = partSv.find("\r\n\r\n");
-                size_t pSep = 4;
-                size_t phAlt = partSv.find("\n\n");
-                if (phAlt != std::string_view::npos && (phEnd == std::string_view::npos || phAlt < phEnd)) {
-                    phEnd = phAlt; pSep = 2;
-                }
-                std::string_view pHdr = (phEnd != std::string_view::npos) ? partSv.substr(0, phEnd) : std::string_view{};
-                std::string_view pBody = (phEnd != std::string_view::npos) ? partSv.substr(phEnd + pSep) : partSv;
-
-                std::string pHdrLow = PathUtils::ToLowerAscii(pHdr);
-                std::string pCt = "text/plain";
-                std::string pCte;
-                std::string pDisp;
-                {
-                    size_t cti = pHdrLow.find("content-type:");
-                    if (cti != std::string::npos) {
-                        size_t e = pHdr.find('\n', cti);
-                        pCt = std::string(pHdr.substr(cti + 13, (e == std::string_view::npos ? pHdr.size() : e) - (cti + 13)));
-                    }
-                    size_t ctei = pHdrLow.find("content-transfer-encoding:");
-                    if (ctei != std::string::npos) {
-                        size_t e = pHdrLow.find('\n', ctei);
-                        pCte = pHdrLow.substr(ctei + 26, (e == std::string::npos ? pHdrLow.size() : e) - (ctei + 26));
-                    }
-                    size_t cdi = pHdrLow.find("content-disposition:");
-                    if (cdi != std::string::npos) {
-                        size_t e = pHdr.find('\n', cdi);
-                        pDisp = std::string(pHdr.substr(cdi + 20, (e == std::string_view::npos ? pHdr.size() : e) - (cdi + 20)));
-                    }
-                }
-                std::string pCtLow = PathUtils::ToLowerAscii(pCt);
-                size_t fnPos = pHdrLow.find("filename=");
-                if (fnPos == std::string::npos) fnPos = pHdrLow.find("name=");
-                if (fnPos != std::string::npos || pDisp.find("attachment") != std::string::npos) {
-                    std::wstring attName = L"(attachment)";
-                    if (fnPos != std::string::npos) {
-                        size_t eq = pHdr.find('=', fnPos);
-                        std::string_view fnv = pHdr.substr(eq + 1);
-                        size_t eol = fnv.find_first_of(";\r\n");
-                        if (eol != std::string_view::npos) fnv = fnv.substr(0, eol);
-                        while (!fnv.empty() && (fnv.front() == ' ' || fnv.front() == '"')) fnv.remove_prefix(1);
-                        while (!fnv.empty() && (fnv.back() == ' ' || fnv.back() == '"')) fnv.remove_suffix(1);
-                        attName = DecodeRfc2047Header(fnv);
-                    }
-                    out.paragraphs.push_back({ L"Attachment: " + attName + L" (" + PathUtils::FormatByteSize(pBody.size()) + L")", 3, true, false });
-                } else if (pCtLow.find("text/plain") != std::string::npos) {
-                    plainFound = decodePartBody(pBody, pCte, pCt);
-                } else if (pCtLow.find("text/html") != std::string::npos) {
-                    htmlFallback = decodePartBody(pBody, pCte, pCt);
-                }
-                pPos = nextDelim;
-            }
-            const std::wstring& chosen = !plainFound.empty() ? plainFound : htmlFallback;
-            if (!chosen.empty()) {
-                out.paragraphs.push_back({ chosen, 0, false, false });
-            }
-        } else if (!bodyBlock.empty()) {
-            std::wstring bodyText = decodePartBody(bodyBlock, cte, ctype);
-            if (!bodyText.empty()) {
-                out.paragraphs.push_back({ bodyText, 0, false, false });
-            }
-        }
+        MimeContent mc;
+        WalkMimeEntity(headers, bodyBlock, 0, mc);
+        for (const auto& a : mc.attachments) out.paragraphs.push_back({ L"Attachment: " + a, 3, true, false });
+        const std::wstring& text = !mc.plain.empty() ? mc.plain : mc.html;
+        if (!text.empty()) out.paragraphs.push_back({ text, 0, false, false });
         return true;
     };
 
@@ -816,11 +745,13 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
         }
     }
 
-    // Check trailing 128-byte ID3v1 tag
+    // Trailing 128-byte ID3v1 tag (in the file's tail when the reader was handed only its start)
+    const std::vector<uint8_t>& tailBytes = out.sourceTail.empty() ? raw : out.sourceTail;
+    const uint64_t fileSize = std::max<uint64_t>(out.sourceFileSize, raw.size());
     bool hasId3v1 = false;
-    if (raw.size() >= 128 && std::memcmp(raw.data() + raw.size() - 128, "TAG", 3) == 0) {
+    if (tailBytes.size() >= 128 && std::memcmp(tailBytes.data() + tailBytes.size() - 128, "TAG", 3) == 0) {
         hasId3v1 = true;
-        const uint8_t* t1 = raw.data() + raw.size() - 128;
+        const uint8_t* t1 = tailBytes.data() + tailBytes.size() - 128;
         std::wstring title1   = Latin1OrCp1252ToWide(t1 + 3, 30);
         std::wstring artist1  = Latin1OrCp1252ToWide(t1 + 33, 30);
         std::wstring album1   = Latin1OrCp1252ToWide(t1 + 63, 30);
@@ -896,7 +827,9 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
     int mpegVerBits = 3, layerNum = 3, bitrateKbps = 0, sampleRateHz = 0, chanMode = 0;
     size_t firstFrameLen = 0;
 
-    const size_t audioLimit = hasId3v1 && raw.size() >= 128 ? (raw.size() - 128) : raw.size();
+    // Frames are looked for in the bytes at hand; the audio itself runs to the end of the file (less an ID3v1 tag)
+    const size_t audioLimit = (hasId3v1 && out.sourceTail.empty() && raw.size() >= 128) ? (raw.size() - 128) : raw.size();
+    const uint64_t audioEnd = fileSize - (hasId3v1 ? 128u : 0u);
     const size_t scanMax = std::min<size_t>(audioLimit, audioStart + 131072);
     size_t fallbackOff = 0;
     bool hasFallback = false;
@@ -941,7 +874,7 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
     SpreadsheetSheet info;
     info.name = L"Audio_&_Tags";
     info.rows.push_back({ L"Property", L"Value" });
-    info.rows.push_back({ L"File Size", PathUtils::FormatByteSize(raw.size()) });
+    info.rows.push_back({ L"File Size", PathUtils::FormatByteSize(fileSize) });
 
     if (hasId3v2) {
         info.rows.push_back({ L"ID3v2 Tag", L"ID3v2." + std::to_wstring(id3Major) + L"." + std::to_wstring(id3Minor) +
@@ -983,11 +916,11 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
         if (vbrFrames > 0 && sampleRateHz > 0) {
             durationSec = (static_cast<double>(vbrFrames) * samplesPerFrame) / static_cast<double>(sampleRateHz);
             if (durationSec > 0.0) {
-                uint64_t streamBytes = (vbrBytes > 0) ? vbrBytes : (audioLimit > frameOff ? (audioLimit - frameOff) : 0);
+                uint64_t streamBytes = (vbrBytes > 0) ? vbrBytes : (audioEnd > frameOff ? (audioEnd - frameOff) : 0);
                 bitrateKbps = static_cast<int>((static_cast<double>(streamBytes) * 8.0) / (durationSec * 1000.0) + 0.5);
             }
-        } else if (bitrateKbps > 0 && audioLimit > frameOff) {
-            durationSec = (static_cast<double>(audioLimit - frameOff) * 8.0) / (static_cast<double>(bitrateKbps) * 1000.0);
+        } else if (bitrateKbps > 0 && audioEnd > frameOff) {
+            durationSec = (static_cast<double>(audioEnd - frameOff) * 8.0) / (static_cast<double>(bitrateKbps) * 1000.0);
         }
 
         info.rows.push_back({ L"Codec Profile", verStr + L" " + layStr });
@@ -1036,6 +969,7 @@ inline bool ParseOggContainer(const std::vector<uint8_t>& raw, const std::wstrin
 
     std::vector<uint8_t> curPkt;
     std::vector<std::vector<uint8_t>> headerPackets;
+    std::set<uint32_t> streamSerials;
 
     while (pos + 27 <= raw.size()) {
         if (std::memcmp(raw.data() + pos, "OggS", 4) != 0 || raw[pos + 4] != 0) {
@@ -1051,8 +985,11 @@ inline bool ParseOggContainer(const std::vector<uint8_t>& raw, const std::wstrin
             }
             if (!resynced) break;
         }
+        // Only the first logical stream is read (pages of multiplexed streams, e.g. video, are skipped)
+        const bool ours = DetailSys100::RdU32LE(raw.data() + pos + 14) == serial;
+        if ((raw[pos + 5] & 0x02u) != 0) streamSerials.insert(DetailSys100::RdU32LE(raw.data() + pos + 14));
         uint64_t gpU = DetailSys100::RdU64LE(raw.data() + pos + 6);
-        if (gpU != 0xFFFFFFFFFFFFFFFFULL) {
+        if (ours && gpU != 0xFFFFFFFFFFFFFFFFULL) {
             int64_t gp = static_cast<int64_t>(gpU);
             if (gp > maxGranule) maxGranule = gp;
         }
@@ -1065,11 +1002,11 @@ inline bool ParseOggContainer(const std::vector<uint8_t>& raw, const std::wstrin
         for (uint8_t s = 0; s < numSegs; ++s) {
             uint8_t segLen = segTab[s];
             if (dataPos + segLen > raw.size()) { dataPos = raw.size(); break; }
-            if (headerPackets.size() < 3 && curPkt.size() < 262144) {
+            if (ours && headerPackets.size() < 3 && curPkt.size() < 262144) {
                 curPkt.insert(curPkt.end(), raw.data() + dataPos, raw.data() + dataPos + segLen);
             }
             dataPos += segLen;
-            if (segLen < 255) {
+            if (segLen < 255 && ours) {
                 ++packetCount;
                 if (headerPackets.size() < 3) {
                     headerPackets.push_back(std::move(curPkt));
@@ -1084,6 +1021,16 @@ inline bool ParseOggContainer(const std::vector<uint8_t>& raw, const std::wstrin
         headerPackets.push_back(std::move(curPkt));
     }
     if (pageCount == 0 || headerPackets.empty()) return false;
+    // The stream's last page carries its final granule position; for a file read only in part it is in the tail
+    if (!out.sourceTail.empty()) {
+        const auto& t = out.sourceTail;
+        for (size_t p = 0; p + 27 <= t.size(); ++p) {
+            if (t[p] != 'O' || std::memcmp(t.data() + p, "OggS", 4) != 0 || t[p + 4] != 0) continue;
+            if (DetailSys100::RdU32LE(t.data() + p + 14) != serial) continue;
+            const uint64_t g = DetailSys100::RdU64LE(t.data() + p + 6);
+            if (g != 0xFFFFFFFFFFFFFFFFULL && static_cast<int64_t>(g) > maxGranule) maxGranule = static_cast<int64_t>(g);
+        }
+    }
 
     std::wstring codec = L"Ogg Bitstream";
     uint32_t channels = 0;
@@ -1177,6 +1124,7 @@ inline bool ParseOggContainer(const std::vector<uint8_t>& raw, const std::wstrin
     info.rows.push_back({ L"Codec", codec });
     info.rows.push_back({ L"Bitstream Serial", DetailSys100::Hex32(serial) });
     info.rows.push_back({ L"Ogg Pages / Packets", std::to_wstring(pageCount) + L" / " + std::to_wstring(packetCount) });
+    if (streamSerials.size() > 1) info.rows.push_back({ L"Logical Streams", std::to_wstring(streamSerials.size()) + L" (the first is described)" });
     if (channels > 0) info.rows.push_back({ L"Channels", std::to_wstring(channels) });
     if (sampleRate > 0) info.rows.push_back({ L"Sample Rate", std::to_wstring(sampleRate) + L" Hz" });
     if (nominalBitrate > 0) info.rows.push_back({ L"Nominal Bitrate", std::to_wstring(nominalBitrate / 1000) + L" kbps" });
@@ -1472,7 +1420,7 @@ inline bool ParseSoundFontSf2(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     SpreadsheetSheet info;
     info.name = L"SF2_Info";
     info.rows.push_back({ L"Chunk / Field", L"Value" });
-    info.rows.push_back({ L"File Size", PathUtils::FormatByteSize(raw.size()) });
+    info.rows.push_back({ L"File Size", PathUtils::FormatByteSize(std::max<uint64_t>(out.sourceFileSize, raw.size())) });
 
     SpreadsheetSheet presets;
     presets.name = L"Presets";
@@ -1754,7 +1702,7 @@ inline bool ParseMuseScoreMscz(const std::vector<uint8_t>& raw, ParsedOfficeDocu
         size_t cl = (gt != std::string_view::npos) ? xml.find("</metaTag>", gt) : std::string_view::npos;
         if (gt == std::string_view::npos || cl == std::string_view::npos) break;
         std::string name = ExtractXmlAttr(xml.substr(p, gt - p), "name");
-        std::wstring val = DecodeHtmlEntitiesMedia(PathUtils::Trim(PathUtils::Utf8ToWide(xml.substr(gt + 1, cl - gt - 1))));
+        std::wstring val = ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Trim(PathUtils::Utf8ToWide(xml.substr(gt + 1, cl - gt - 1))));
         if (!name.empty() && !val.empty()) {
             meta.rows.push_back({ L"Meta: " + PathUtils::Utf8ToWide(name), val });
         }
@@ -1825,98 +1773,122 @@ inline bool ParseMuseScoreMscz(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     return true;
 }
 
+// Ableton Live Set (.als, gzip-compressed XML): <Ableton> <LiveSet> <Tracks> lists the tracks in the order Live
+// shows them (audio / MIDI / group / return). Each row: the track's own Name/EffectiveName, the group it sits in
+// (TrackGroupId), its session clips (MainSequencer/ClipSlotList) and arrangement clips (ArrangerAutomation) -
+// frozen copies in the FreezeSequencer are not counted - and its devices. Tempo from the master track's mixer.
 inline bool ParseAbletonAls(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
+    namespace X = ::Explorer2::XmlTagScan;
     std::vector<uint8_t> uncomp;
     std::string_view xml;
     if (raw.size() >= 2 && raw[0] == 0x1F && raw[1] == 0x8B) {
-        if (!ZipDeflate::InflateGzip(raw.data(), raw.size(), uncomp, 64 * 1024 * 1024) || uncomp.empty()) return false;
+        if (!ZipDeflate::InflateGzip(raw.data(), raw.size(), uncomp, 256 * 1024 * 1024) || uncomp.empty()) return false;
         xml = std::string_view(reinterpret_cast<const char*>(uncomp.data()), uncomp.size());
     } else {
         xml = std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size());
     }
+    X::Element root, liveSet;
+    if (!X::FindChild(xml, "Ableton", root) || !X::FindChild(root.body, "LiveSet", liveSet)) return false;
 
-    size_t abPos = xml.find("<Ableton");
-    if (abPos == std::string_view::npos) return false;
-    size_t abGt = xml.find('>', abPos);
-    if (abGt == std::string_view::npos) return false;
-
-    std::string_view rootTag = xml.substr(abPos, abGt - abPos);
-    std::string creator  = ExtractXmlAttr(rootTag, "Creator");
-    std::string majVer   = ExtractXmlAttr(rootTag, "MajorVersion");
-    std::string minVer   = ExtractXmlAttr(rootTag, "MinorVersion");
-
-    std::string tempoVal;
-    size_t tPos = xml.find("<Tempo>");
-    if (tPos != std::string_view::npos) {
-        size_t mPos = xml.find("<Manual", tPos);
-        size_t tEnd = xml.find("</Tempo>", tPos);
-        if (mPos != std::string_view::npos && (tEnd == std::string_view::npos || mPos < tEnd)) {
-            size_t mGt = xml.find('>', mPos);
-            if (mGt != std::string_view::npos) tempoVal = ExtractXmlAttr(xml.substr(mPos, mGt - mPos), "Value");
+    auto valueOf = [](std::string_view body, std::string_view child) {
+        X::Element e;
+        return X::FindChild(body, child, e) ? X::AttrText(e.attrs, "Value") : std::string();
+    };
+    auto countClips = [](std::string_view body) {
+        size_t n = 0;
+        for (const char* tag : { "AudioClip", "MidiClip" }) {
+            X::ForEachElement(body, tag, [&](const X::Element&) { ++n; return true; });
         }
+        return n;
+    };
+
+    std::string tempo;
+    X::Element master, chain, mixer, tempoEl;
+    if (X::FindChild(liveSet.body, "MasterTrack", master) && X::FindChild(master.body, "DeviceChain", chain) &&
+        X::FindChild(chain.body, "Mixer", mixer) && X::FindChild(mixer.body, "Tempo", tempoEl)) {
+        tempo = valueOf(tempoEl.body, "Manual");
+    }
+    if (tempo.empty()) { // older or reduced sets: the first tempo parameter in the set
+        X::ForEachElement(liveSet.body, "Tempo", [&](const X::Element& t) {
+            tempo = valueOf(t.body, "Manual");
+            return tempo.empty();
+        });
+    }
+
+    struct TrackRow { std::string type, id, name, groupId; size_t session = 0, arrangement = 0, devices = 0; };
+    std::vector<TrackRow> tracks;
+    X::Element tracksEl;
+    if (X::FindChild(liveSet.body, "Tracks", tracksEl)) {
+        X::ForEachChild(tracksEl.body, [&](std::string_view tag, const X::Element& t) {
+            if (tracks.size() >= 2000) return false;
+            TrackRow r;
+            r.type = std::string(tag);
+            r.id = X::AttrText(t.attrs, "Id");
+            X::Element nameEl;
+            if (X::FindChild(t.body, "Name", nameEl)) {
+                r.name = valueOf(nameEl.body, "EffectiveName");
+                if (r.name.empty()) r.name = valueOf(nameEl.body, "UserName");
+            }
+            r.groupId = valueOf(t.body, "TrackGroupId");
+            X::Element devChain, seq, slots, inner, devices;
+            if (X::FindChild(t.body, "DeviceChain", devChain) && X::FindChild(devChain.body, "MainSequencer", seq)) {
+                if (X::FindChild(seq.body, "ClipSlotList", slots)) r.session = countClips(slots.body);
+                X::ForEachElement(seq.body, "ArrangerAutomation", [&](const X::Element& a) { r.arrangement += countClips(a.body); return true; });
+                if (X::FindChild(devChain.body, "DeviceChain", inner) && X::FindChild(inner.body, "Devices", devices)) {
+                    X::ForEachChild(devices.body, [&](std::string_view, const X::Element&) { ++r.devices; return true; });
+                }
+            } else {
+                r.arrangement = countClips(t.body); // a reduced set without sequencers: the clips it holds
+            }
+            tracks.push_back(std::move(r));
+            return true;
+        });
     }
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
     out.formatTitle = L"Ableton Live Set (.als)";
 
+    std::map<std::string, size_t> byType;
+    SpreadsheetSheet trackSheet;
+    trackSheet.name = L"Tracks";
+    trackSheet.rows.push_back({ L"#", L"Track Type", L"Track Name", L"Group", L"Session Clips", L"Arrangement Clips", L"Devices" });
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        const TrackRow& r = tracks[i];
+        ++byType[r.type];
+        std::string group;
+        if (!r.groupId.empty() && r.groupId != "-1") {
+            for (const auto& g : tracks) {
+                if (g.type == "GroupTrack" && g.id == r.groupId) { group = g.name; break; }
+            }
+        }
+        trackSheet.rows.push_back({ std::to_wstring(i + 1), PathUtils::Utf8ToWide(r.type), PathUtils::Utf8ToWide(r.name.empty() ? std::string("(Track)") : r.name),
+                                    PathUtils::Utf8ToWide(group), std::to_wstring(r.session), std::to_wstring(r.arrangement), std::to_wstring(r.devices) });
+    }
+
     SpreadsheetSheet info;
     info.name = L"Ableton_Project";
     info.rows.push_back({ L"Property", L"Value" });
-    info.rows.push_back({ L"Creator", creator.empty() ? L"Ableton Live" : DecodeHtmlEntitiesMedia(PathUtils::Utf8ToWide(creator)) });
+    std::string creator = X::AttrText(root.attrs, "Creator");
+    info.rows.push_back({ L"Creator", creator.empty() ? L"Ableton Live" : PathUtils::Utf8ToWide(creator) });
+    std::string majVer = X::AttrText(root.attrs, "MajorVersion"), minVer = X::AttrText(root.attrs, "MinorVersion");
     if (!majVer.empty()) info.rows.push_back({ L"Schema Version", PathUtils::Utf8ToWide(majVer + "." + minVer) });
-    if (!tempoVal.empty()) info.rows.push_back({ L"Master Tempo", PathUtils::Utf8ToWide(tempoVal) + L" BPM" });
-    info.rows.push_back({ L"Uncompressed XML Size", PathUtils::FormatByteSize(xml.size()) });
-
-    SpreadsheetSheet tracks;
-    tracks.name = L"Tracks";
-    tracks.rows.push_back({ L"#", L"Track Type", L"Track Name", L"Clips" });
-
-    static const char* kTrackTags[] = { "AudioTrack", "MidiTrack", "ReturnTrack", "GroupTrack" };
-    int trkIdx = 0;
-    for (const char* tTag : kTrackTags) {
-        std::string openT = std::string("<") + tTag;
-        std::string closeT = std::string("</") + tTag + ">";
-        size_t p = 0;
-        while ((p = xml.find(openT, p)) != std::string_view::npos) {
-            char nextC = (p + openT.size() < xml.size()) ? xml[p + openT.size()] : 0;
-            if (nextC != ' ' && nextC != '>') { p += openT.size(); continue; }
-            size_t cl = xml.find(closeT, p);
-            if (cl == std::string_view::npos) break;
-            std::string_view blk = xml.substr(p, cl - p);
-
-            std::string effName;
-            size_t en = blk.find("<EffectiveName");
-            if (en != std::string_view::npos) {
-                size_t gt = blk.find('>', en);
-                if (gt != std::string_view::npos) effName = ExtractXmlAttr(blk.substr(en, gt - en), "Value");
-            }
-            if (effName.empty()) {
-                size_t un = blk.find("<UserName");
-                if (un != std::string_view::npos) {
-                    size_t gt = blk.find('>', un);
-                    if (gt != std::string_view::npos) effName = ExtractXmlAttr(blk.substr(un, gt - un), "Value");
-                }
-            }
-            size_t clips = 0;
-            size_t cp = 0;
-            while ((cp = blk.find("<AudioClip", cp)) != std::string_view::npos) { ++clips; cp += 10; }
-            cp = 0;
-            while ((cp = blk.find("<MidiClip", cp)) != std::string_view::npos) { ++clips; cp += 9; }
-
-            tracks.rows.push_back({
-                std::to_wstring(++trkIdx),
-                PathUtils::Utf8ToWide(tTag),
-                effName.empty() ? L"(Track)" : DecodeHtmlEntitiesMedia(PathUtils::Utf8ToWide(effName)),
-                std::to_wstring(clips)
-            });
-            p = cl + closeT.size();
-        }
+    if (!tempo.empty()) info.rows.push_back({ L"Master Tempo", PathUtils::Utf8ToWide(tempo) + L" BPM" });
+    info.rows.push_back({ L"Total Tracks", std::to_wstring(tracks.size()) });
+    for (const auto& kv : byType) info.rows.push_back({ L"Tracks: " + PathUtils::Utf8ToWide(kv.first), std::to_wstring(kv.second) });
+    X::Element scenes;
+    if (X::FindChild(liveSet.body, "Scenes", scenes)) {
+        size_t n = 0;
+        X::ForEachChild(scenes.body, [&](std::string_view, const X::Element&) { ++n; return true; });
+        info.rows.push_back({ L"Scenes", std::to_wstring(n) });
     }
-    info.rows.push_back({ L"Total Tracks", std::to_wstring(trkIdx) });
+    info.rows.push_back({ L"Uncompressed XML Size", PathUtils::FormatByteSize(xml.size()) });
     FinalizeSheetCols(info);
     out.sheets.push_back(std::move(info));
-    if (tracks.rows.size() > 1) { FinalizeSheetCols(tracks); out.sheets.push_back(std::move(tracks)); }
+    if (trackSheet.rows.size() > 1) {
+        FinalizeSheetCols(trackSheet);
+        out.sheets.push_back(std::move(trackSheet));
+    }
     out.valid = true;
     return true;
 }
@@ -2498,7 +2470,7 @@ inline bool ParseFcpXml(const std::vector<uint8_t>& raw, ParsedOfficeDocument& o
         assets.rows.push_back({
             L"Format",
             PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "id")),
-            DecodeHtmlEntitiesMedia(PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "name"))),
+            ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "name"))),
             PathUtils::Utf8ToWide(w + "x" + h),
             PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "frameDuration"))
         });
@@ -2524,8 +2496,8 @@ inline bool ParseFcpXml(const std::vector<uint8_t>& raw, ParsedOfficeDocument& o
         assets.rows.push_back({
             L"Asset",
             PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "id")),
-            DecodeHtmlEntitiesMedia(PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "name"))),
-            DecodeHtmlEntitiesMedia(PathUtils::Utf8ToWide(src)),
+            ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "name"))),
+            ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Utf8ToWide(src)),
             PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "duration"))
         });
         p = gt + 1;
@@ -2544,7 +2516,7 @@ inline bool ParseFcpXml(const std::vector<uint8_t>& raw, ParsedOfficeDocument& o
             std::string_view tag = xml.substr(cp, gt - cp);
             clips.rows.push_back({
                 PathUtils::Utf8ToWide(ct),
-                DecodeHtmlEntitiesMedia(PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "name"))),
+                ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "name"))),
                 PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "ref")),
                 PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "offset")),
                 PathUtils::Utf8ToWide(ExtractXmlAttr(tag, "start")),
@@ -2561,133 +2533,99 @@ inline bool ParseFcpXml(const std::vector<uint8_t>& raw, ParsedOfficeDocument& o
     return true;
 }
 
+// OpenTimelineIO (.otio): a JSON tree of schema objects, Timeline -> tracks (Stack) -> Track -> Clip / Gap /
+// Transition / nested Stack, with markers on any item. Walked in document order; each item is one row, indented
+// by its depth, with its own source range (value@rate) and its media reference.
+inline void OtioWalk(const ::Explorer2::Json::Value& node, int depth, SpreadsheetSheet& sh, std::map<std::string, size_t>& counts) {
+    using JVal = ::Explorer2::Json::Value;
+    if (!node.IsObject() || depth > 32) return;
+    std::string schema = node.GetString("OTIO_SCHEMA");
+    std::string family = schema.substr(0, schema.find('.'));
+    if (family.empty()) return;
+    ++counts[family];
+
+    auto rationalTime = [](const JVal* rt) -> std::string { // { value, rate } -> "value@rate"
+        const JVal* v = rt ? rt->Find("value") : nullptr;
+        if (!v || !v->IsNumber()) return {};
+        const JVal* r = rt->Find("rate");
+        return v->strVal + ((r && r->IsNumber()) ? "@" + r->strVal : std::string());
+    };
+    const JVal* range = node.Find(family == "Marker" ? "marked_range" : "source_range");
+    std::string start = range ? rationalTime(range->Find("start_time")) : std::string();
+    std::string duration = range ? rationalTime(range->Find("duration")) : std::string();
+    std::string detail;
+    if (family == "Track") {
+        detail = node.GetString("kind");
+    } else if (family == "Clip") {
+        const JVal* ref = node.Find("media_reference");
+        if (!ref) { // Clip.2: a map of references and the key of the active one
+            const JVal* refs = node.Find("media_references");
+            if (refs) ref = refs->Find(node.GetString("active_media_reference_key", "DEFAULT_MEDIA"));
+        }
+        if (ref && ref->IsObject()) {
+            detail = ref->GetString("target_url");
+            if (detail.empty() && !ref->GetString("target_url_base").empty()) {
+                detail = ref->GetString("target_url_base") + ref->GetString("name_prefix") + "#" + ref->GetString("name_suffix");
+            }
+            if (detail.empty()) detail = ref->GetString("OTIO_SCHEMA");
+        }
+    } else if (family == "Transition") {
+        detail = node.GetString("transition_type");
+        std::string in = rationalTime(node.Find("in_offset")), outOff = rationalTime(node.Find("out_offset"));
+        if (!in.empty() || !outOff.empty()) detail += " (in " + in + ", out " + outOff + ")";
+    } else if (family == "Marker") {
+        detail = node.GetString("color");
+    }
+    if (family != "TimeRange" && family != "RationalTime" && sh.rows.size() <= 5000) {
+        sh.rows.push_back({ std::wstring(static_cast<size_t>(depth) * 2, L' ') + PathUtils::Utf8ToWide(schema),
+                            PathUtils::Utf8ToWide(node.GetString("name")), PathUtils::Utf8ToWide(detail),
+                            PathUtils::Utf8ToWide(start), PathUtils::Utf8ToWide(duration) });
+    }
+    if (const JVal* tracks = node.Find("tracks")) OtioWalk(*tracks, depth + 1, sh, counts);
+    if (const JVal* children = node.Find("children"); children && children->IsArray()) {
+        for (const auto& ch : children->arrVal) OtioWalk(ch, depth + 1, sh, counts);
+    }
+    if (const JVal* markers = node.Find("markers"); markers && markers->IsArray()) {
+        for (const auto& m : markers->arrVal) OtioWalk(m, depth + 1, sh, counts);
+    }
+}
+
 inline bool ParseOpenTimelineOtio(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    std::string_view js(reinterpret_cast<const char*>(raw.data()), raw.size());
-    if (js.find("\"OTIO_SCHEMA\"") == std::string_view::npos) return false;
-
-    // Minimal recursive JSON object walker tailored for OTIO schemas
-    auto findJsonStrField = [](std::string_view obj, std::string_view key) -> std::string {
-        std::string needle = "\"" + std::string(key) + "\"";
-        size_t p = obj.find(needle);
-        if (p == std::string_view::npos) return {};
-        size_t col = obj.find(':', p + needle.size());
-        if (col == std::string_view::npos) return {};
-        size_t q1 = obj.find('"', col + 1);
-        if (q1 == std::string_view::npos) return {};
-        std::string res;
-        for (size_t i = q1 + 1; i < obj.size(); ++i) {
-            if (obj[i] == '\\' && i + 1 < obj.size()) { res.push_back(obj[++i]); continue; }
-            if (obj[i] == '"') break;
-            res.push_back(obj[i]);
-        }
-        return res;
-    };
-    auto findJsonNumField = [](std::string_view obj, std::string_view key) -> std::string {
-        std::string needle = "\"" + std::string(key) + "\"";
-        size_t p = obj.find(needle);
-        if (p == std::string_view::npos) return {};
-        size_t col = obj.find(':', p + needle.size());
-        if (col == std::string_view::npos) return {};
-        size_t s = col + 1;
-        while (s < obj.size() && (obj[s] == ' ' || obj[s] == '\t' || obj[s] == '\r' || obj[s] == '\n')) ++s;
-        size_t e = s;
-        while (e < obj.size() && ((obj[e] >= '0' && obj[e] <= '9') || obj[e] == '.' || obj[e] == '-')) ++e;
-        return std::string(obj.substr(s, e - s));
-    };
-    auto extractBalancedObj = [](std::string_view s, size_t openBrace) -> std::string_view {
-        int depth = 0;
-        bool inStr = false;
-        for (size_t i = openBrace; i < s.size(); ++i) {
-            char c = s[i];
-            if (inStr) {
-                if (c == '\\') { ++i; continue; }
-                if (c == '"') inStr = false;
-                continue;
-            }
-            if (c == '"') inStr = true;
-            else if (c == '{') ++depth;
-            else if (c == '}') {
-                --depth;
-                if (depth == 0) return s.substr(openBrace, i - openBrace + 1);
-            }
-        }
-        return s.substr(openBrace);
-    };
-
-    out.kind = OfficeFileKind::SqliteDb;
-    out.isSpreadsheet = true;
-    out.formatTitle = L"OpenTimelineIO JSON (.otio)";
+    using JVal = ::Explorer2::Json::Value;
+    JVal root;
+    ::Explorer2::Json::Limits limits;
+    limits.maxNodes = 4000000;
+    std::string_view text(reinterpret_cast<const char*>(raw.data()), raw.size());
+    if (!::Explorer2::Json::ParseDocument(text, root, limits) || !root.IsObject()) return false;
+    if (root.GetString("OTIO_SCHEMA").empty()) return false;
 
     SpreadsheetSheet tlSh;
     tlSh.name = L"OTIO_Timeline";
     tlSh.rows.push_back({ L"Schema", L"Name", L"Kind / URL", L"Start", L"Duration" });
-
-    size_t p = 0;
-    while ((p = js.find("\"OTIO_SCHEMA\"", p)) != std::string_view::npos && tlSh.rows.size() < 2048) {
-        // Walk back to enclosing '{' at depth 0
-        size_t brace = p;
-        int d = 0;
-        while (brace > 0) {
-            --brace;
-            if (js[brace] == '}') ++d;
-            else if (js[brace] == '{') {
-                if (d == 0) break;
-                --d;
-            }
-        }
-        std::string_view obj = extractBalancedObj(js, brace);
-        // Header portion before nested "children" array so we read this object's own "name"
-        size_t chIdx = obj.find("\"children\"");
-        std::string_view headObj = (chIdx != std::string_view::npos) ? obj.substr(0, chIdx) : obj;
-
-        std::string schema = findJsonStrField(headObj, "OTIO_SCHEMA");
-        if (schema.empty()) schema = findJsonStrField(obj, "OTIO_SCHEMA");
-
-        if (schema.rfind("Timeline.", 0) == 0 || schema.rfind("Track.", 0) == 0 ||
-            schema.rfind("Clip.", 0) == 0 || schema.rfind("Gap.", 0) == 0 || schema.rfind("Transition.", 0) == 0)
-        {
-            std::string name = findJsonStrField(headObj, "name");
-            if (name.empty()) name = findJsonStrField(obj, "name");
-            std::string kind = findJsonStrField(headObj, "kind");
-            std::string url  = findJsonStrField(obj, "target_url");
-            std::string startStr, durStr;
-            size_t srPos = obj.find("\"source_range\"");
-            if (srPos != std::string_view::npos) {
-                size_t b2 = obj.find('{', srPos);
-                if (b2 != std::string_view::npos) {
-                    std::string_view srObj = extractBalancedObj(obj, b2);
-                    size_t stPos = srObj.find("\"start_time\"");
-                    if (stPos != std::string_view::npos) {
-                        size_t sb = srObj.find('{', stPos);
-                        if (sb != std::string_view::npos) {
-                            std::string_view stObj = extractBalancedObj(srObj, sb);
-                            startStr = findJsonNumField(stObj, "value") + "@" + findJsonNumField(stObj, "rate");
-                        }
-                    }
-                    size_t duPos = srObj.find("\"duration\"");
-                    if (duPos != std::string_view::npos) {
-                        size_t db = srObj.find('{', duPos);
-                        if (db != std::string_view::npos) {
-                            std::string_view duObj = extractBalancedObj(srObj, db);
-                            durStr = findJsonNumField(duObj, "value") + "@" + findJsonNumField(duObj, "rate");
-                        }
-                    }
-                }
-            }
-            tlSh.rows.push_back({
-                PathUtils::Utf8ToWide(schema),
-                PathUtils::Utf8ToWide(name),
-                PathUtils::Utf8ToWide(!url.empty() ? url : kind),
-                PathUtils::Utf8ToWide(startStr),
-                PathUtils::Utf8ToWide(durStr)
-            });
-        }
-        p += 13;
-    }
-
+    std::map<std::string, size_t> counts;
+    OtioWalk(root, 0, tlSh, counts);
     if (tlSh.rows.size() <= 1) return false;
+
+    out.kind = OfficeFileKind::SqliteDb;
+    out.isSpreadsheet = true;
+    out.formatTitle = L"OpenTimelineIO JSON (.otio)";
     FinalizeSheetCols(tlSh);
     out.sheets.push_back(std::move(tlSh));
+
+    SpreadsheetSheet summary;
+    summary.name = L"OTIO_Summary";
+    summary.rows.push_back({ L"Property", L"Value" });
+    summary.rows.push_back({ L"Root", PathUtils::Utf8ToWide(root.GetString("OTIO_SCHEMA")) + L" " + PathUtils::Utf8ToWide(root.GetString("name")) });
+    if (const JVal* gst = root.Find("global_start_time"); gst && gst->IsObject()) {
+        const JVal* v = gst->Find("value");
+        const JVal* r = gst->Find("rate");
+        if (v && v->IsNumber()) {
+            summary.rows.push_back({ L"Global start time", PathUtils::Utf8ToWide(v->strVal + ((r && r->IsNumber()) ? "@" + r->strVal : std::string())) });
+        }
+    }
+    for (const auto& kv : counts) summary.rows.push_back({ PathUtils::Utf8ToWide(kv.first), std::to_wstring(kv.second) });
+    FinalizeSheetCols(summary);
+    out.sheets.push_back(std::move(summary));
     out.valid = true;
     return true;
 }
@@ -2965,6 +2903,58 @@ inline bool ParseSubSubtitle(const std::vector<uint8_t>& raw, ParsedOfficeDocume
 // ============================================================================
 // 9. Microsoft Outlook MAPI Message (.msg — OLE2 CFB)
 // ============================================================================
+// MS-OXRTFCP: PR_RTF_COMPRESSED back to RTF. "LZFu" is LZ77 over a 4 KB dictionary that starts with a fixed RTF
+// preamble (control byte, then 8 tokens: a literal byte, or a big-endian offset:12 / length-2:4 reference; a
+// reference to the write position ends the stream); "MELA" is stored uncompressed.
+inline bool DecompressRtfLzfu(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
+    out.clear();
+    if (in.size() < 16) return false;
+    const uint32_t compSize = DetailSys100::RdU32LE(in.data());
+    const uint32_t rawSize = DetailSys100::RdU32LE(in.data() + 4);
+    const uint32_t compType = DetailSys100::RdU32LE(in.data() + 8);
+    if (rawSize > 64u * 1024 * 1024) return false;
+    const size_t end = std::min<size_t>(in.size(), static_cast<size_t>(compSize) + 4);
+    if (compType == 0x414C454Du) { // "MELA"
+        out.assign(in.begin() + 16, in.begin() + static_cast<std::ptrdiff_t>(std::min<size_t>(in.size(), 16 + static_cast<size_t>(rawSize))));
+        return !out.empty();
+    }
+    if (compType != 0x75465A4Cu) return false; // "LZFu"
+    static const char kPreamble[] =
+        "{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman \\fswiss \\fmodern \\fscript \\fdecor MS Sans "
+        "SerifSymbolArialTimes New RomanCourier{\\colortbl\\red0\\green0\\blue0\r\n\\par \\pard\\plain\\f0\\fs20\\b\\i\\u\\tab\\tx";
+    static_assert(sizeof(kPreamble) - 1 == 207, "MS-OXRTFCP dictionary preamble is 207 bytes");
+    uint8_t dict[4096] = {};
+    std::memcpy(dict, kPreamble, 207);
+    size_t wpos = 207;
+    out.reserve(rawSize);
+    size_t pos = 16;
+    while (pos < end && out.size() < rawSize) {
+        const uint8_t control = in[pos++];
+        for (int bit = 0; bit < 8 && out.size() < rawSize; ++bit) {
+            if ((control & (1u << bit)) == 0) {
+                if (pos >= end) return !out.empty();
+                const uint8_t ch = in[pos++];
+                out.push_back(ch);
+                dict[wpos] = ch;
+                wpos = (wpos + 1) & 0xFFFu;
+            } else {
+                if (pos + 2 > end) return !out.empty();
+                const uint16_t token = static_cast<uint16_t>((in[pos] << 8) | in[pos + 1]);
+                pos += 2;
+                const size_t offset = token >> 4, length = static_cast<size_t>(token & 0xFu) + 2;
+                if (offset == wpos) return true; // the end marker
+                for (size_t k = 0; k < length && out.size() < rawSize; ++k) {
+                    const uint8_t ch = dict[(offset + k) & 0xFFFu];
+                    out.push_back(ch);
+                    dict[wpos] = ch;
+                    wpos = (wpos + 1) & 0xFFFu;
+                }
+            }
+        }
+    }
+    return !out.empty();
+}
+
 inline bool ParseOutlookMsg(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     Ole2::CompoundFile cf;
     if (!Ole2::ParseCompoundFile(raw.data(), raw.size(), cf)) return false;
@@ -2996,7 +2986,7 @@ inline bool ParseOutlookMsg(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
     };
 
     std::map<std::wstring, std::wstring> rootProps;
-    std::vector<uint8_t> htmlBodyBin;
+    std::vector<uint8_t> htmlBodyBin, rtfCompressedBin;
 
     struct MsgRecip { std::wstring name, email; };
     struct MsgAttach { std::wstring filename, mime; uint64_t byteSize = 0; };
@@ -3022,6 +3012,8 @@ inline bool ParseOutlookMsg(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                     }
                 } else if (propId == L"1013" && propType == L"0102") {
                     Ole2::ExtractStream(cf, e, htmlBodyBin, 4 * 1024 * 1024);
+                } else if (propId == L"1009" && propType == L"0102") {
+                    Ole2::ExtractStream(cf, e, rtfCompressedBin, 8 * 1024 * 1024);
                 }
             } else if (parent.rfind(L"__recip_version1.0_", 0) == 0) {
                 auto& r = recips[parent];
@@ -3075,6 +3067,16 @@ inline bool ParseOutlookMsg(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
             for (const auto& p : ps) {
                 if (!plainBody.empty()) plainBody += L"\n";
                 plainBody += p;
+            }
+        }
+    }
+    if (plainBody.empty() && !rtfCompressedBin.empty()) { // only an RTF body (PR_RTF_COMPRESSED)
+        std::vector<uint8_t> rtf;
+        ParsedOfficeDocument rtfDoc;
+        if (DecompressRtfLzfu(rtfCompressedBin, rtf) && ParseRtfDocument(rtf, rtfDoc)) {
+            for (const auto& p : rtfDoc.paragraphs) {
+                if (!plainBody.empty()) plainBody += L"\n";
+                plainBody += p.text;
             }
         }
     }
@@ -3462,7 +3464,7 @@ inline bool ParseDjVuDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     sum.rows.push_back({ L"Property", L"Value" });
     sum.rows.push_back({ L"Root FORM Type", PathUtils::Utf8ToWide(rootType) });
     sum.rows.push_back({ L"Document Pages", std::to_wstring(std::max<size_t>(pageCount, dirmFiles)) });
-    sum.rows.push_back({ L"File Size", PathUtils::FormatByteSize(raw.size()) });
+    sum.rows.push_back({ L"File Size", PathUtils::FormatByteSize(std::max<uint64_t>(out.sourceFileSize, raw.size())) });
     FinalizeSheetCols(sum);
     FinalizeSheetCols(pages);
     out.sheets.push_back(std::move(sum));
@@ -3484,7 +3486,7 @@ inline bool ParseDjVuDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocum
 }
 
 // ============================================================================
-// 12. Microsoft Compiled HTML Help (.chm — ITSF / ITSP / PMGL)
+// 12. Microsoft Compiled HTML Help (.chm — ITSF / ITSP / PMGL, section 1 LZX-decoded)
 // ============================================================================
 inline bool ReadChmEncInt(const uint8_t*& p, const uint8_t* end, uint64_t& outVal) {
     outVal = 0;
@@ -3577,9 +3579,121 @@ inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
         }
     }
 
+    // Section 1 ("MSCompressed") is one LZX stream holding the topics: window and reset interval come from its LZXC
+    // control data, the compressed offset of every 32 KB frame from its reset table. The stream (whole-file access:
+    // a help file may be larger than the bytes handed in) is decoded up to 32 MB.
+    SourceBytes src(raw, out);
+    auto findSec0 = [&](std::wstring_view path) -> const ChmEntry* {
+        for (const auto& e : entries) if (e.section == 0 && e.path == path) return &e;
+        return nullptr;
+    };
+    auto sec0Bytes = [&](const ChmEntry* e, std::vector<uint8_t>& buf, uint64_t maxLen) -> const uint8_t* {
+        if (!e || e->length == 0 || e->length > maxLen) return nullptr;
+        return src.Read(dataOff + e->offset, static_cast<size_t>(e->length), buf);
+    };
+    const ChmEntry* ctlE = findSec0(L"::DataSpace/Storage/MSCompressed/ControlData");
+    const ChmEntry* rtE = findSec0(L"::DataSpace/Storage/MSCompressed/Transform/{7FC28940-9D31-11D0-9B27-00A0C91E9C7C}/InstanceData/ResetTable");
+    const ChmEntry* contE = findSec0(L"::DataSpace/Storage/MSCompressed/Content");
+    std::vector<uint8_t> ctlBuf, rtBuf, contBuf, sec1;
+    const uint8_t* ctl = sec0Bytes(ctlE, ctlBuf, 4096);
+    const uint8_t* rt = sec0Bytes(rtE, rtBuf, 16u << 20);
+    const uint8_t* cont = sec0Bytes(contE, contBuf, 64u << 20);
+    std::wstring lzxNote;
+    if (ctl && ctlE->length >= 24 && std::memcmp(ctl + 4, "LZXC", 4) == 0 && rt && rtE->length >= 40 && cont) {
+        const uint32_t ver = DetailSys100::RdU32LE(ctl + 8);
+        uint64_t resetInterval = DetailSys100::RdU32LE(ctl + 12), windowSize = DetailSys100::RdU32LE(ctl + 16);
+        if (ver == 2) {
+            resetInterval *= 0x8000;
+            windowSize *= 0x8000;
+        }
+        int windowBits = 0;
+        for (int b = 15; b <= 21; ++b) if (windowSize == (uint64_t(1) << b)) windowBits = b;
+        const uint32_t numFrames = DetailSys100::RdU32LE(rt + 4), entrySize = DetailSys100::RdU32LE(rt + 8);
+        const uint32_t tableOff = DetailSys100::RdU32LE(rt + 12);
+        const uint64_t uncompLen = DetailSys100::RdU64LE(rt + 16), frameLen = DetailSys100::RdU64LE(rt + 32);
+        std::vector<uint64_t> frameOffsets;
+        if (entrySize == 8) {
+            for (uint64_t i = 0; i < numFrames && tableOff + (i + 1) * 8 <= rtE->length && frameOffsets.size() < (1u << 20); ++i) {
+                frameOffsets.push_back(DetailSys100::RdU64LE(rt + tableOff + static_cast<size_t>(i) * 8));
+            }
+        }
+        if (windowBits && resetInterval && resetInterval % 0x8000 == 0 && frameLen == 0x8000 && uncompLen > 0) {
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(uncompLen, 32u << 20));
+            ::Explorer2::Lzx::Decoder dec(cont, static_cast<size_t>(contE->length), windowBits,
+                                          static_cast<uint32_t>(resetInterval / 0x8000), frameOffsets);
+            const bool whole = dec.Decode(want, sec1);
+            lzxNote = L"LZX, " + std::to_wstring(windowSize / 1024) + L" KB window, reset every " +
+                      std::to_wstring(resetInterval / 0x8000) + L" frames: " + PathUtils::FormatByteSize(contE->length) +
+                      L" \u2192 " + PathUtils::FormatByteSize(uncompLen);
+            if (!whole) lzxNote += L" (damaged: only the first " + PathUtils::FormatByteSize(sec1.size()) + L" decoded)";
+            else if (want < uncompLen) lzxNote += L" (the first " + PathUtils::FormatByteSize(want) + L" decoded)";
+        } else {
+            lzxNote = L"LZX parameters not understood (window " + std::to_wstring(windowSize) + L" B)";
+        }
+    }
+
+    // Topics: each HTML page in section 1 with its <title> and the start of its text, in the charset its <meta> names,
+    // else UTF-8 when it is valid UTF-8, else the code page of the help file's language
+    SpreadsheetSheet topics;
+    topics.name = L"CHM_Topics";
+    topics.rows.push_back({ L"Path", L"Title", L"Text" });
+    if (!sec1.empty()) {
+        unsigned ansiCp = 1252;
+        wchar_t cpBuf[8] = {};
+        if (GetLocaleInfoW(static_cast<LCID>(langId), LOCALE_IDEFAULTANSICODEPAGE, cpBuf, 8) > 0) {
+            const unsigned cp = static_cast<unsigned>(wcstoul(cpBuf, nullptr, 10));
+            if (cp != 0) ansiCp = cp;
+        }
+        auto topicText = [&](std::string_view html) -> std::wstring {
+            const std::string head = PathUtils::ToLowerAscii(html.substr(0, 4096));
+            const size_t cs = head.find("charset=");
+            if (cs != std::string::npos) {
+                size_t a = cs + 8, b = a;
+                while (b < head.size() && head[b] != '"' && head[b] != '\'' && head[b] != ';' && head[b] != '>' && head[b] != ' ' && head[b] != '/') ++b;
+                if (b > a) return DecodeCharsetText(html, head.substr(a, b - a));
+            }
+            if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, html.data(), static_cast<int>(html.size()), nullptr, 0) > 0) {
+                return PathUtils::Utf8ToWide(html);
+            }
+            const int wn = MultiByteToWideChar(ansiCp, 0, html.data(), static_cast<int>(html.size()), nullptr, 0);
+            std::wstring w(static_cast<size_t>(std::max(wn, 0)), L'\0');
+            if (wn > 0) MultiByteToWideChar(ansiCp, 0, html.data(), static_cast<int>(html.size()), w.data(), wn);
+            return w;
+        };
+        for (const auto& e : entries) {
+            if (e.section != 1 || e.length == 0 || e.offset + e.length > sec1.size()) continue;
+            const std::wstring lower = PathUtils::ToLower(e.path);
+            if (!(lower.size() > 4 && (lower.compare(lower.size() - 4, 4, L".htm") == 0 || lower.compare(lower.size() - 5, 5, L".html") == 0))) continue;
+            if (topics.rows.size() > 5000) break;
+            const std::string_view html(reinterpret_cast<const char*>(sec1.data() + e.offset), static_cast<size_t>(std::min<uint64_t>(e.length, 2u << 20)));
+            const std::wstring w = topicText(html);
+            std::wstring title;
+            const std::wstring wl = PathUtils::ToLower(w.substr(0, 8192));
+            const size_t t0 = wl.find(L"<title");
+            if (t0 != std::wstring::npos) {
+                const size_t gt = wl.find(L'>', t0);
+                const size_t t1 = (gt == std::wstring::npos) ? std::wstring::npos : wl.find(L"</title", gt);
+                if (t1 != std::wstring::npos) title = PathUtils::Trim(::Explorer2::XmlTagScan::DecodeEntitiesWide(w.substr(gt + 1, t1 - gt - 1)));
+            }
+            std::wstring text;
+            for (const auto& p : StripHtmlToParagraphs(w, 24)) {
+                if (p == title) continue;
+                if (!text.empty()) text += L' ';
+                text += p;
+                if (text.size() >= 400) break;
+            }
+            if (text.size() > 400) text = text.substr(0, 400) + L"\u2026";
+            topics.rows.push_back({ e.path, title, text });
+        }
+    }
+
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
     out.formatTitle = L"Microsoft Compiled HTML Help (.chm)";
+    if (topics.rows.size() > 1) {
+        FinalizeSheetCols(topics);
+        out.sheets.push_back(std::move(topics));
+    }
 
     SpreadsheetSheet hdr;
     hdr.name = L"CHM_Header";
@@ -3588,6 +3702,7 @@ inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
     hdr.rows.push_back({ L"Language LCID", DetailSys100::Hex32(langId) });
     hdr.rows.push_back({ L"Directory Block Size", std::to_wstring(dirBlockSize) + L" B (" + std::to_wstring(numDirBlocks) + L" blocks)" });
     hdr.rows.push_back({ L"Total Directory Entries", std::to_wstring(entries.size()) });
+    if (!lzxNote.empty()) hdr.rows.push_back({ L"Compressed Section", lzxNote });
     for (const auto& pv : sec0Previews) {
         hdr.rows.push_back({ L"Embedded String / Topic", pv });
     }

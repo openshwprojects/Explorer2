@@ -1,4 +1,5 @@
 // FormatTests3D.cpp: self-tests of the 3D model readers (Model3DViewer, formats/), stage 15 ("15.3d" runs these alone)
+#include "Crc32.h"
 #include "SelfTestCommon.h"
 #include "Model3DViewer.h"
 #include "PathUtils.h"
@@ -880,17 +881,6 @@ static std::vector<uint8_t> BuildSyntheticSabBarePoints(const std::vector<Vec3f>
     return w.buf;
 }
 
-// Castagnoli CRC32C (polynomial 0x82F63B78) for ASTM E2807 .e57 1024-byte physical pages.
-static uint32_t TfCalcCrc32C(const uint8_t* data, size_t len) {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; ++b) {
-            crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
-        }
-    }
-    return ~crc;
-}
 
 static std::vector<uint8_t> FinalizeE57LogicalToPhysicalPages(
     const std::vector<uint8_t>& cvAndPackets,
@@ -929,7 +919,7 @@ static std::vector<uint8_t> FinalizeE57LogicalToPhysicalPages(
     std::vector<uint8_t> phys(numPages * kPageSize, 0);
     for (size_t p = 0; p < numPages; ++p) {
         std::memcpy(phys.data() + p * kPageSize, logW.buf.data() + p * kUsable, kUsable);
-        uint32_t crc = TfCalcCrc32C(phys.data() + p * kPageSize, kUsable);
+        uint32_t crc = Checksum::Crc32C(phys.data() + p * kPageSize, kUsable);
         phys[p * kPageSize + kUsable + 0] = static_cast<uint8_t>((crc >> 24) & 0xFFu);
         phys[p * kPageSize + kUsable + 1] = static_cast<uint8_t>((crc >> 16) & 0xFFu);
         phys[p * kPageSize + kUsable + 2] = static_cast<uint8_t>((crc >>  8) & 0xFFu);
@@ -2482,6 +2472,151 @@ void RunFormatTests3D(TestCounter& tc) {
     };
 
     const std::wstring tdDir = TestDataDir();
+
+    // ========================================================================
+    // 0. G-code: only extruding moves form the part; relative positioning / extrusion, inches, arcs,
+    //    modal motion, G10 / G28 / G92 are not moves
+    // ========================================================================
+    {
+        const char* gcode =
+            "; printer file\nG21\nG90\nM83\nG28\n"
+            "G1 Z0.2 F3000\n"            // travel
+            "G1 X10 Y0 E0.5\n"           // extrude 1
+            "X10 Y10 E0.5\n"             // modal G1: extrude 2
+            "G0 X50 Y50\n"               // travel
+            "G1 X60 Y50 E-1\n"           // retract while moving: travel
+            "G91\nG1 Y10 E0.5\n"        // relative: extrude 3, to (60, 60)
+            "G10\nG90\nG20\n"          // firmware retract is not a move; inches from here
+            "G1 X3 Y3 E0.5\n"            // extrude 4, to (76.2, 76.2) mm
+            "G2 X3 Y3 I1 J0 E0.5\n"      // full clockwise circle: 37 arc segments
+            "G92 X0 Y0\nG28 X\n";       // position resets: no moves
+        LoadedMesh3D mG;
+        bool okG = Model3DViewer::InspectMeshFile(writeText(L"part.gcode", gcode), mG) && mG.loadedOk &&
+                   mG.rawTriangleCount == 41u * 4u;
+        // CNC program (no E words): every feed move cuts, rapids (G0) do not
+        const char* cnc = "G21 G90\nG0 X0 Y0 Z5\nG1 Z-1 F100\nG1 X20\nG1 Y20\nG0 Z5\nG0 X40\n";
+        LoadedMesh3D mC;
+        bool okC = Model3DViewer::InspectMeshFile(writeText(L"cut.nc", cnc), mC) && mC.loadedOk &&
+                   mC.rawTriangleCount == 3u * 4u;
+        tc.Record(okG && okC, L"Stage15.3D.Gcode.ExtrusionOnlyModesArcs",
+                  L"printTris=" + std::to_wstring(mG.rawTriangleCount) + L" cncTris=" + std::to_wstring(mC.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 0b. MagicaVoxel: a solid 3x3x3 block meshes as its 54 outer faces (108 triangles), not 27 cubes (324)
+    // ========================================================================
+    {
+        std::vector<uint8_t> vox = { 'V', 'O', 'X', ' ', 150, 0, 0, 0 };
+        auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) vox.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+        auto tag = [&](const char* t) { vox.insert(vox.end(), t, t + 4); };
+        const uint32_t sizeChunk = 12 + 12, xyziChunk = 12 + 4 + 27 * 4;
+        tag("MAIN"); u32(0); u32(sizeChunk + xyziChunk);
+        tag("SIZE"); u32(12); u32(0); u32(3); u32(3); u32(3);
+        tag("XYZI"); u32(4 + 27 * 4); u32(0); u32(27);
+        for (uint8_t z = 0; z < 3; ++z)
+            for (uint8_t y = 0; y < 3; ++y)
+                for (uint8_t x = 0; x < 3; ++x) { vox.push_back(x); vox.push_back(y); vox.push_back(z); vox.push_back(1); }
+        LoadedMesh3D mV;
+        bool okV = Model3DViewer::InspectMeshFile(writeBytes(L"block.vox", vox), mV) && mV.loadedOk && mV.rawTriangleCount == 108u;
+        std::vector<uint8_t> truncated(vox.begin(), vox.begin() + 40);
+        LoadedMesh3D mT;
+        bool rejT = !Model3DViewer::InspectMeshFile(writeBytes(L"cut.vox", truncated), mT) || !mT.loadedOk;
+        tc.Record(okV && rejT, L"Stage15.3D.MagicaVox.ExposedFacesOnly", L"tris=" + std::to_wstring(mV.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 0c. Wavefront OBJ polylines ("l") show up as struts; faces with v/vt/vn and negative indices still work
+    // ========================================================================
+    {
+        LoadedMesh3D mL, mF;
+        bool okL = Model3DViewer::InspectMeshFile(writeText(L"wire.obj", "v 0 0 0\nv 1 0 0\nv 1 1 0\nl 1 2 3\n"), mL) &&
+                   mL.loadedOk && mL.rawTriangleCount == 8u;
+        bool okF = Model3DViewer::InspectMeshFile(writeText(L"quad.obj",
+                       "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nvt 0 0\nvn 0 0 1\nf -4/1/1 -3/1/1 -2/1/1 -1/1/1\n"), mF) &&
+                   mF.loadedOk && mF.rawTriangleCount == 2u;
+        tc.Record(okL && okF, L"Stage15.3D.Obj.PolylinesAndFaces",
+                  L"lineTris=" + std::to_wstring(mL.rawTriangleCount) + L" faceTris=" + std::to_wstring(mF.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 0d. Molecules: bonds parallel to X are real struts (8 tris per atom, 4 per bond); PDB keeps the first
+    //     model, skips alternate locations, adds CONECT bonds; MOL bond numbers survive a damaged atom line; V3000
+    // ========================================================================
+    {
+        auto pdbAtom = [](const char* rec, int serial, char alt, float x, float y, float z) {
+            char line[96];
+            snprintf(line, sizeof(line), "%-6s%5d  CA %cALA A   1    %8.3f%8.3f%8.3f  1.00  0.00           C\n", rec, serial, alt, x, y, z);
+            return std::string(line);
+        };
+        std::string pdb = pdbAtom("ATOM", 1, ' ', 0.0f, 0.0f, 0.0f) + pdbAtom("ATOM", 2, ' ', 1.5f, 0.0f, 0.0f) +
+                          pdbAtom("ATOM", 3, 'B', 9.0f, 9.0f, 9.0f) + pdbAtom("HETATM", 4, ' ', 10.0f, 0.0f, 0.0f) +
+                          "CONECT    1    4\nENDMDL\n" + pdbAtom("ATOM", 5, ' ', 50.0f, 50.0f, 50.0f);
+        LoadedMesh3D mP;
+        bool okP = Model3DViewer::InspectMeshFile(writeText(L"mol.pdb", pdb.c_str()), mP) && mP.loadedOk && mP.rawTriangleCount == 3u * 8u + 2u * 4u;
+        const char* molV2 =
+            "ethanol-ish\n  test\n\n  3  1  0  0  0  0  0  0  0  0999 V2000\n"
+            "    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
+            "damaged atom line\n"
+            "    1.5000    0.0000    0.0000 O   0  0  0  0  0  0  0  0  0  0  0  0\n"
+            "  1  3  1  0\nM  END\n";
+        const char* molV3 =
+            "v3\n  test\n\n  0  0  0     0  0            999 V3000\nM  V30 BEGIN CTAB\nM  V30 COUNTS 2 1 0 0 0\n"
+            "M  V30 BEGIN ATOM\nM  V30 1 C 0 0 0 0\nM  V30 2 O 1.5 0 0 0\nM  V30 END ATOM\n"
+            "M  V30 BEGIN BOND\nM  V30 1 1 1 2\nM  V30 END BOND\nM  V30 END CTAB\nM  END\n";
+        LoadedMesh3D m2, m3;
+        bool ok2 = Model3DViewer::InspectMeshFile(writeText(L"v2.mol", molV2), m2) && m2.loadedOk && m2.rawTriangleCount == 2u * 8u + 4u;
+        bool ok3 = Model3DViewer::InspectMeshFile(writeText(L"v3.mol", molV3), m3) && m3.loadedOk && m3.rawTriangleCount == 2u * 8u + 4u;
+        tc.Record(okP && ok2 && ok3, L"Stage15.3D.Molecules.PdbModelsConectMolV2V3",
+                  L"pdb=" + std::to_wstring(mP.rawTriangleCount) + L" v2=" + std::to_wstring(m2.rawTriangleCount) +
+                  L" v3=" + std::to_wstring(m3.rawTriangleCount));
+    }
+
+    // ========================================================================
+    // 0e. Point clouds: 100 000 points are sampled over the whole file (the far end is present), not cut at 20 000
+    // ========================================================================
+    {
+        std::string cloud;
+        cloud.reserve(1500000);
+        for (int i = 0; i < 100000; ++i) cloud += std::to_string(i) + " 0 0\n";
+        LoadedMesh3D mX;
+        bool okX = Model3DViewer::InspectMeshFile(writeText(L"scan.xyz", cloud.c_str()), mX) && mX.loadedOk &&
+                   mX.rawTriangleCount == 25000u * 8u && mX.bboxMax.x > 99000.0f;
+        tc.Record(okX, L"Stage15.3D.Xyz.EvenSamplingWholeCloud",
+                  L"tris=" + std::to_wstring(mX.rawTriangleCount) + L" maxX=" + std::to_wstring(mX.bboxMax.x));
+    }
+
+    // ========================================================================
+    // 0f. 3D GeoJSON: a U-shaped footprint is extruded to its height in metres (not degrees) and its concave roof is
+    //     ear-clipped: the roof's projected area is 5/6 of its bounding rectangle (a fan from the first vertex would
+    //     also cover the notch); 16 wall + 6 roof triangles
+    // ========================================================================
+    {
+        const char* uBuilding =
+            R"({"type":"FeatureCollection","features":[{"type":"Feature","properties":{"height":10},"geometry":{"type":"Polygon","coordinates":[[)"
+            R"([13.4000,52.5000],[13.4003,52.5000],[13.4003,52.5002],[13.4002,52.5002],[13.4002,52.5001],[13.4001,52.5001],)"
+            R"([13.4001,52.5002],[13.4000,52.5002],[13.4000,52.5000]]]}}]})";
+        LoadedMesh3D mG;
+        bool okG = Model3DViewer::InspectMeshFile(writeText(L"block.geojson", uBuilding), mG) && mG.loadedOk && mG.rawTriangleCount == 22u;
+        double roofArea = 0.0;
+        float nMinX = 1e30f, nMaxX = -1e30f, nMinZ = 1e30f, nMaxZ = -1e30f;
+        for (const auto& v : mG.vertices) {
+            nMinX = std::min(nMinX, v.x); nMaxX = std::max(nMaxX, v.x);
+            nMinZ = std::min(nMinZ, v.z); nMaxZ = std::max(nMaxZ, v.z);
+        }
+        for (const auto& t : mG.tris) {
+            if (t.i0 >= mG.vertices.size() || t.i1 >= mG.vertices.size() || t.i2 >= mG.vertices.size()) continue;
+            const Vec3f& a = mG.vertices[t.i0];
+            const Vec3f& b = mG.vertices[t.i1];
+            const Vec3f& c = mG.vertices[t.i2];
+            roofArea += std::fabs(static_cast<double>(b.x - a.x) * (c.z - a.z) - static_cast<double>(c.x - a.x) * (b.z - a.z)) * 0.5;
+        }
+        double ratio = roofArea / std::max(1e-12, static_cast<double>(nMaxX - nMinX) * (nMaxZ - nMinZ));
+        float sizeX = mG.bboxMax.x - mG.bboxMin.x, sizeY = mG.bboxMax.y - mG.bboxMin.y;
+        okG = okG && std::fabs(ratio - 5.0 / 6.0) < 0.01 && sizeY > 9.9f && sizeY < 10.1f && sizeX > 19.5f && sizeX < 21.0f;
+        tc.Record(okG, L"Stage15.3D.GeoJson3D.ExtrudedConcaveFootprintInMetres",
+                  L"tris=" + std::to_wstring(mG.rawTriangleCount) + L" areaRatio=" + std::to_wstring(ratio) +
+                  L" size=" + std::to_wstring(sizeX) + L"x" + std::to_wstring(sizeY));
+    }
 
     // ========================================================================
     // 1. Blender (.blend): testdata/blender_box.blend + 3.0 Pyramid + 4.2 SoA Prism

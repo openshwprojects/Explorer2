@@ -113,12 +113,7 @@ static bool ParseRtfDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocume
             }
             joined += L" |";
             if (anyNonEmpty) {
-                out.charCount += joined.size();
-                bool inW = false;
-                for (wchar_t ch : joined) {
-                    if (ch > L' ') { if (!inW) { ++out.wordCount; inW = true; } }
-                    else inW = false;
-                }
+                CountDocText(out, joined);
                 out.paragraphs.push_back({ std::move(joined), 0, false, true });
                 if (curRowCells.size() > tableSheet.maxCols) tableSheet.maxCols = curRowCells.size();
                 tableSheet.rows.push_back(curRowCells);
@@ -486,36 +481,7 @@ static void AddDocParagraph(ParsedOfficeDocument& out, std::wstring text, int he
     while (last > first && (text[last - 1] == L' ' || text[last - 1] == L'\t' || text[last - 1] == L'\r' || text[last - 1] == L'\n')) --last;
     if (first >= last) return;
     std::wstring clean = text.substr(first, last - first);
-    out.charCount += clean.size();
-    bool inW = false;
-    for (wchar_t ch : clean) {
-        if (ch > L' ') { if (!inW) { ++out.wordCount; inW = true; } }
-        else inW = false;
-    }
+    CountDocText(out, clean);
     out.paragraphs.push_back({ std::move(clean), headingLevel, isBullet, false });
 }
 
-static std::wstring StripXmlHtmlTags(std::string_view sv) {
-    std::string plain;
-    plain.reserve(sv.size());
-    bool inTag = false;
-    for (size_t i = 0; i < sv.size(); ++i) {
-        char c = sv[i];
-        if (c == '<') {
-            inTag = true;
-            if (i + 3 < sv.size() && (sv.substr(i, 3) == "<br" || sv.substr(i, 3) == "<BR")) {
-                plain.push_back(' ');
-            }
-            continue;
-        }
-        if (c == '>') {
-            inTag = false;
-            continue;
-        }
-        if (!inTag) {
-            if (c == '\r' || c == '\n' || c == '\t') plain.push_back(' ');
-            else plain.push_back(c);
-        }
-    }
-    return DecodeXmlEntities(PathUtils::Utf8ToWide(plain));
-}

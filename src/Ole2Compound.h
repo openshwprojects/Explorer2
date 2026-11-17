@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include "ByteIO.h"
 
 namespace Explorer2::Ole2 {
 
@@ -39,20 +40,12 @@ struct CompoundFile {
 
 namespace Detail {
 
-inline uint16_t Rd16(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
+// little-endian loads (ByteIO.h)
+inline uint16_t Rd16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
 
-inline uint32_t Rd32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
+inline uint32_t Rd32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
 
-inline uint64_t Rd64(const uint8_t* p) {
-    return static_cast<uint64_t>(Rd32(p)) | (static_cast<uint64_t>(Rd32(p + 4)) << 32);
-}
+inline uint64_t Rd64(const uint8_t* p) { return ::Explorer2::ByteIO::RdU64LE(p); }
 
 constexpr uint32_t kEndOfChain = 0xFFFFFFFEu;
 constexpr uint32_t kFreeSect   = 0xFFFFFFFFu;

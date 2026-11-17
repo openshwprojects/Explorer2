@@ -17,6 +17,7 @@
 #include <icmpapi.h>
 
 #include "LanScanner.h"
+#include "XmlTagScan.h"
 
 #include <algorithm>
 #include <array>
@@ -437,33 +438,7 @@ bool HttpGetBody(const std::string& url, std::string& body) {
     return ok;
 }
 
-std::string DecodeXmlEntities(const std::string& s) {
-    if (s.find('&') == std::string::npos) return s;
-    std::string out;
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] != '&') { out.push_back(s[i]); continue; }
-        size_t semi = s.find(';', i);
-        if (semi == std::string::npos || semi - i > 10) { out.push_back(s[i]); continue; }
-        std::string ent = s.substr(i + 1, semi - i - 1);
-        if (ent == "amp") out.push_back('&');
-        else if (ent == "lt") out.push_back('<');
-        else if (ent == "gt") out.push_back('>');
-        else if (ent == "quot") out.push_back('"');
-        else if (ent == "apos") out.push_back('\'');
-        else if (!ent.empty() && ent[0] == '#') {
-            unsigned long cp = (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X'))
-                                   ? strtoul(ent.c_str() + 2, nullptr, 16) : strtoul(ent.c_str() + 1, nullptr, 10);
-            if (cp > 0 && cp < 0x110000) {   // encode as UTF-8
-                if (cp < 0x80) out.push_back((char)cp);
-                else if (cp < 0x800) { out.push_back((char)(0xC0 | (cp >> 6))); out.push_back((char)(0x80 | (cp & 0x3F))); }
-                else if (cp < 0x10000) { out.push_back((char)(0xE0 | (cp >> 12))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
-                else { out.push_back((char)(0xF0 | (cp >> 18))); out.push_back((char)(0x80 | ((cp >> 12) & 0x3F))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
-            }
-        } else { out.push_back('&'); continue; }
-        i = semi;
-    }
-    return out;
-}
+std::string DecodeXmlEntities(const std::string& s) { return ::Explorer2::XmlTagScan::DecodeText(s); }
 
 // First <tag>value</tag> (case-insensitive tag name, no namespace prefix). The root device always
 // precedes embedded devices in UPnP descriptions, so the first hit describes the device itself.

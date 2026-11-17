@@ -82,10 +82,8 @@ public:
     void OpenInExternalNotepad();
 
     void HideWindow();
-    bool HasFocus() const;
     HWND GetEditHwnd() const { return m_editHwnd; }
     const std::wstring& GetCurrentPath() const { return m_filePath; }
-    bool IsModified() const { return m_isModified; }
 
     void OnEditChanged();
 

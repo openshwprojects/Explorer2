@@ -1,4 +1,5 @@
 #pragma once
+#include "MeshBuild3D.h"
 // ActorXPsk.h — Unreal Engine ActorX Skeletal/Static Meshes (.psk, .pskx) & Animations (.psa)
 
 namespace Formats {
@@ -52,25 +53,9 @@ inline Quat4 QuatConj(const Quat4& q) {
     return { -q.x, -q.y, -q.z, q.w };
 }
 
-inline Quat4 QuatMul(const Quat4& a, const Quat4& b) {
-    return {
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
-    };
-}
+using MeshBuild3D::QuatMul;
 
-inline Vec3f QuatRot(const Quat4& q, const Vec3f& v) {
-    float tx = 2.0f * (q.y * v.z - q.z * v.y);
-    float ty = 2.0f * (q.z * v.x - q.x * v.z);
-    float tz = 2.0f * (q.x * v.y - q.y * v.x);
-    return {
-        v.x + q.w * tx + (q.y * tz - q.z * ty),
-        v.y + q.w * ty + (q.z * tx - q.x * tz),
-        v.z + q.w * tz + (q.x * ty - q.y * tx)
-    };
-}
+inline Vec3f QuatRot(const Quat4& q, const Vec3f& v) { return MeshBuild3D::QuatRotate(q, v); }
 
 // Unreal Z-up coords -> Explorer2 Y-up viewport
 inline Vec3f UnrealToViewport(const Vec3f& p) {

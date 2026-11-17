@@ -1,4 +1,5 @@
 #include "EdaViewer.h"
+#include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
@@ -152,33 +153,7 @@ static void FinalizeBoardBounds(ParsedEdaBoard& b) {
 
 // Helper for XML attribute extraction in Eagle .brd / .sch files
 static bool GetXmlAttr(std::string_view tag, std::string_view attrName, std::string_view& outVal) {
-    size_t pos = 0;
-    while (pos < tag.size()) {
-        size_t found = tag.find(attrName, pos);
-        if (found == std::string_view::npos) return false;
-        if (found > 0) {
-            char prev = tag[found - 1];
-            if (prev != ' ' && prev != '\t' && prev != '\r' && prev != '\n') {
-                pos = found + attrName.size();
-                continue;
-            }
-        }
-        size_t eq = found + attrName.size();
-        while (eq < tag.size() && (tag[eq] == ' ' || tag[eq] == '\t')) ++eq;
-        if (eq >= tag.size() || tag[eq] != '=') {
-            pos = eq;
-            continue;
-        }
-        ++eq;
-        while (eq < tag.size() && (tag[eq] == ' ' || tag[eq] == '\t')) ++eq;
-        if (eq >= tag.size() || (tag[eq] != '"' && tag[eq] != '\'')) return false;
-        char quote = tag[eq++];
-        size_t endQ = tag.find(quote, eq);
-        if (endQ == std::string_view::npos) return false;
-        outVal = tag.substr(eq, endQ - eq);
-        return true;
-    }
-    return false;
+    return XmlTagScan::FindAttr(tag, attrName, outVal, /*byLocalName=*/false);
 }
 
 static float GetXmlFloat(std::string_view tag, std::string_view attrName, float defVal = 0.0f) {

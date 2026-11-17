@@ -1,4 +1,5 @@
 #pragma once
+#include "../ByteIO.h"
 // UnrealAsset3DTex.h — Unreal Engine 4 & 5 Binary Package (.uasset / .umap + companion .uexp / .ubulk)
 //   - FPackageFileSummary (0x9E2A83C1) + NameMap + ExportTable + split .uexp / .ubulk stream assembly
 //   - Direct 3D UStaticMesh (FStaticMeshLODResources float32 & UE5 LWC float64 positions + 16/32-bit indices)
@@ -24,28 +25,7 @@ inline int64_t  UeI64(const uint8_t* p) { int64_t  v = 0; std::memcpy(&v, p, 8);
 inline float    UeF32(const uint8_t* p) { float    v = 0.0f; std::memcpy(&v, p, 4); return v; }
 inline double   UeF64(const uint8_t* p) { double   v = 0.0; std::memcpy(&v, p, 8); return v; }
 
-inline float HalfToFloatUe(uint16_t h) {
-    uint32_t sign = static_cast<uint32_t>(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x3FFu;
-    uint32_t bits = 0;
-    if (exp == 0) {
-        if (mant == 0) bits = sign;
-        else {
-            exp = 1;
-            while ((mant & 0x400u) == 0) { mant <<= 1; --exp; }
-            mant &= 0x3FFu;
-            bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-    float f = 0.0f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
+using ::Explorer2::ByteIO::HalfToFloat;
 
 inline bool ReadUeFString(const uint8_t* data, size_t size, size_t& pos, std::string& out) {
     out.clear();
@@ -634,10 +614,10 @@ inline bool DecodeUnrealTexture2D(
     } else if (fmt == UePixFmt::FloatRGBA) {
         const size_t nPix = static_cast<size_t>(imgW) * imgH;
         for (size_t i = 0; i < nPix; ++i) {
-            float rf = HalfToFloatUe(UeU16(mipBytes.data() + i * 8 + 0));
-            float gf = HalfToFloatUe(UeU16(mipBytes.data() + i * 8 + 2));
-            float bf = HalfToFloatUe(UeU16(mipBytes.data() + i * 8 + 4));
-            float af = HalfToFloatUe(UeU16(mipBytes.data() + i * 8 + 6));
+            float rf = HalfToFloat(UeU16(mipBytes.data() + i * 8 + 0));
+            float gf = HalfToFloat(UeU16(mipBytes.data() + i * 8 + 2));
+            float bf = HalfToFloat(UeU16(mipBytes.data() + i * 8 + 4));
+            float af = HalfToFloat(UeU16(mipBytes.data() + i * 8 + 6));
             auto toneMap = [](float c) -> uint8_t {
                 if (!std::isfinite(c) || c <= 0.0f) return 0;
                 float mapped = c / (1.0f + c);

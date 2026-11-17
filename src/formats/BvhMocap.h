@@ -34,7 +34,8 @@ inline bool ParseBvhSkeletonMesh(std::string_view sv, LoadedMesh3D& mesh) {
                 Vec3f parent = (stack.size() >= 2) ? stack[stack.size() - 2] : Vec3f{ 0, 0, 0 };
                 Vec3f cur = { parent.x + ox, parent.y + oy, parent.z + oz };
                 stack.back() = cur;
-                if (ox * ox + oy * oy + oz * oz > 1e-5f) {
+                // The ROOT's OFFSET only places the skeleton: there is no bone from the origin to it
+                if (stack.size() > 2 && ox * ox + oy * oy + oz * oz > 1e-5f) {
                     bones.push_back({ parent, cur });
                 }
             }

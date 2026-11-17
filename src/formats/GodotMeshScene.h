@@ -7,22 +7,10 @@ namespace Formats {
 
 namespace GodotDetail {
 
-inline uint16_t GdU16(const uint8_t* p, bool be) {
-    return be ? static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1])
-              : static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
-}
+// loads in the resource's byte order (ByteIO.h)
+inline uint16_t GdU16(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU16(p, be); }
 
-inline uint32_t GdU32(const uint8_t* p, bool be) {
-    if (be) {
-        return (static_cast<uint32_t>(p[0]) << 24) |
-               (static_cast<uint32_t>(p[1]) << 16) |
-               (static_cast<uint32_t>(p[2]) << 8)  |
-                static_cast<uint32_t>(p[3]);
-    }
-    uint32_t v = 0;
-    std::memcpy(&v, p, 4);
-    return v;
-}
+inline uint32_t GdU32(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU32(p, be); }
 
 inline uint64_t GdU64(const uint8_t* p, bool be) {
     if (be) return (static_cast<uint64_t>(GdU32(p, true)) << 32) | GdU32(p + 4, true);
@@ -44,28 +32,7 @@ inline double GdF64(const uint8_t* p, bool be) {
 }
 
 inline bool DecodeBase64Bytes(std::string_view b64, std::vector<uint8_t>& out) {
-    out.clear();
-    out.reserve((b64.size() * 3) / 4);
-    uint32_t val = 0;
-    int valb = -8;
-    for (unsigned char c : b64) {
-        if (c <= 0x20) continue;
-        if (c == '=') break;
-        int d = -1;
-        if (c >= 'A' && c <= 'Z') d = c - 'A';
-        else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
-        else if (c >= '0' && c <= '9') d = c - '0' + 52;
-        else if (c == '+') d = 62;
-        else if (c == '/') d = 63;
-        else return false;
-        val = (val << 6) | static_cast<uint32_t>(d);
-        valb += 6;
-        if (valb >= 0) {
-            out.push_back(static_cast<uint8_t>((val >> valb) & 0xFFu));
-            valb -= 8;
-        }
-    }
-    return true;
+    return ::Explorer2::Base64::Decode(b64, out, ::Explorer2::Base64::Mode::Strict);
 }
 
 struct GdXform3D {
