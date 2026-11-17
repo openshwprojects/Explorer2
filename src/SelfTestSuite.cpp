@@ -22,6 +22,8 @@
 #include "ImageCache.h"
 #include "FileContentPane.h"
 #include "GitIntegration.h"
+#include "OsCompat.h"
+#include "ProgramsInfo.h"
 #include "SelfTestCommon.h"
 #include "Version.h"
 #include <winver.h>
@@ -5684,6 +5686,99 @@ Objects:  {
                 mesh.bboxMin.x, mesh.bboxMin.y, mesh.bboxMin.z, mesh.bboxMax.x, mesh.bboxMax.y, mesh.bboxMax.z);
             tc.Record(read && countsOk, L"Stage13.Test41_RealFbx_ReadWhole", detail);
         }
+    }
+
+    // Test 13.42: Explorer2.exe declares DPI awareness (res\Explorer2.manifest). Without it Windows draws the window
+    // at 96 DPI and stretches it on every display above 100% scaling, and all text is blurry.
+    {
+        const BOOL aware = IsProcessDPIAware();
+        std::wstring detail = L"IsProcessDPIAware=" + std::to_wstring(aware);
+        bool perMonitor = true;
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        using GetContextFn = HANDLE(WINAPI*)();       // GetThreadDpiAwarenessContext (Windows 10 1607+)
+        using AwarenessFn = int(WINAPI*)(HANDLE);     // GetAwarenessFromDpiAwarenessContext
+        auto getContext = user32 ? reinterpret_cast<GetContextFn>(GetProcAddress(user32, "GetThreadDpiAwarenessContext")) : nullptr;
+        auto getAwareness = user32 ? reinterpret_cast<AwarenessFn>(GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext")) : nullptr;
+        if (getContext && getAwareness) {
+            const int awareness = getAwareness(getContext());   // 0 unaware, 1 system, 2 per monitor
+            perMonitor = (awareness == 2);
+            detail += L", awareness=" + std::to_wstring(awareness);
+        }
+        HWND probe = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        const UINT dpi = probe ? GetWindowDpiCompat(probe) : 0;
+        if (probe) DestroyWindow(probe);
+        detail += L", window DPI=" + std::to_wstring(dpi);
+        tc.Record(aware && perMonitor && dpi >= 96, L"Stage13.Test42_DpiAware_ManifestAndWindowDpi", detail);
+    }
+
+    // Test 13.43: a drag out of the window hands Windows a shell data object whose file list (CF_HDROP) is exactly
+    // the dragged files: files of one folder, and files from two folders (search results)
+    {
+        const std::wstring dirA = baseDir + L"\\t43_drag_a";
+        const std::wstring dirB = baseDir + L"\\t43_drag_b";
+        CreateDirectoryW(dirA.c_str(), nullptr);
+        CreateDirectoryW(dirB.c_str(), nullptr);
+        const std::wstring f1 = dirA + L"\\photo 1.png";
+        const std::wstring f2 = dirA + L"\\notes.txt";
+        const std::wstring f3 = dirB + L"\\other.bin";
+        for (const std::wstring& f : { f1, f2, f3 }) PathUtils::WriteFileBytes(f, "x", 1);
+
+        auto hdropPaths = [](IDataObject* data) {
+            std::vector<std::wstring> out;
+            if (!data) return out;
+            FORMATETC fmt = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            STGMEDIUM med = {};
+            if (SUCCEEDED(data->GetData(&fmt, &med))) {
+                HDROP drop = static_cast<HDROP>(GlobalLock(med.hGlobal));
+                if (drop) {
+                    const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+                    for (UINT i = 0; i < n; ++i) {
+                        wchar_t buf[MAX_PATH * 2] = {};
+                        DragQueryFileW(drop, i, buf, MAX_PATH * 2);
+                        out.push_back(buf);
+                    }
+                    GlobalUnlock(med.hGlobal);
+                }
+                ReleaseStgMedium(&med);
+            }
+            return out;
+        };
+        auto sameSet = [](std::vector<std::wstring> a, std::vector<std::wstring> b) {
+            for (auto& s : a) s = PathUtils::NormalizePathKey(s);
+            for (auto& s : b) s = PathUtils::NormalizePathKey(s);
+            std::sort(a.begin(), a.end());
+            std::sort(b.begin(), b.end());
+            return a == b;
+        };
+
+        IDataObject* oneFolder = FileEngine::CreateShellDataObject({ f1, f2 });
+        const std::vector<std::wstring> oneGot = hdropPaths(oneFolder);
+        if (oneFolder) oneFolder->Release();
+        IDataObject* twoFolders = FileEngine::CreateShellDataObject({ f1, f3 });
+        const std::vector<std::wstring> twoGot = hdropPaths(twoFolders);
+        if (twoFolders) twoFolders->Release();
+        IDataObject* missing = FileEngine::CreateShellDataObject({ baseDir + L"\\t43_missing\\nothing.txt" });
+        const bool missingGaveNothing = (missing == nullptr);
+        if (missing) missing->Release();
+
+        const bool okOne = sameSet(oneGot, { f1, f2 });
+        const bool okTwo = sameSet(twoGot, { f1, f3 });
+        const std::wstring detail = L"one folder: " + std::to_wstring(oneGot.size()) + (okOne ? L" path(s) ok" : L" path(s) WRONG") +
+                                    L"; two folders: " + std::to_wstring(twoGot.size()) + (okTwo ? L" path(s) ok" : L" path(s) WRONG") +
+                                    L"; missing file: " + (missingGaveNothing ? L"no object" : L"object made");
+        tc.Record(okOne && okTwo && missingGaveNothing, L"Stage13.Test43_DragOut_ShellDataObject_HDrop", detail);
+    }
+
+    // Test 13.44: the "Programy" list is read on a worker thread and the read ends (a registry error used to be
+    // skipped index by index, which never ends when the error repeats); a normal Windows has entries
+    {
+        const ULONGLONG t0 = GetTickCount64();
+        std::vector<InstalledProgram> programs;
+        std::thread reader([&programs]() { programs = ProgramInventory::ReadInstalled(); });
+        reader.join();
+        const ULONGLONG ms = GetTickCount64() - t0;
+        tc.Record(ms < 30000 && !programs.empty(), L"Stage13.Test44_Programs_ReadInstalled_OnWorkerThread",
+                  std::to_wstring(programs.size()) + L" entries in " + std::to_wstring(ms) + L" ms");
     }
 
     tm.Shutdown();

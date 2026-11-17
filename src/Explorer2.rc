@@ -3,6 +3,9 @@
 
 101 ICON "res\\Explorer2.ico"
 
+// Application manifest: per-monitor DPI awareness (sharp text at any display scaling) and asInvoker
+1 24 "res\\Explorer2.manifest"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    E2_VERSION_MAJOR,E2_VERSION_MINOR,E2_VERSION_PATCH,E2_VERSION_BUILD
  PRODUCTVERSION E2_VERSION_MAJOR,E2_VERSION_MINOR,E2_VERSION_PATCH,E2_VERSION_BUILD

@@ -107,6 +107,7 @@ void NotepadViewer::Shutdown() {
         DeleteObject(m_monoFont);
         m_monoFont = nullptr;
     }
+    m_monoFontDpi = 96;   // Initialize makes the 100% font again
     if (m_fmtCodeMono) {
         m_fmtCodeMono->Release();
         m_fmtCodeMono = nullptr;
@@ -1049,13 +1050,30 @@ void NotepadViewer::Draw(
         D2D1_RECT_F editR = D2D1::RectF(gutterR.right + 1.0f, bodyR.top, bodyR.right - 1.0f, bodyR.bottom);
         m_lastEditRect = editR;
         if (m_editHwnd) {
+            // The layout is in DIPs; the native edit box is placed in pixels at the render target's DPI
+            float dpiX = 96.0f, dpiY = 96.0f;
+            rt->GetDpi(&dpiX, &dpiY);
+            const float pxPerDip = (dpiX >= 48.0f) ? dpiX / 96.0f : 1.0f;
+            const UINT dpi = static_cast<UINT>(dpiX >= 48.0f ? dpiX + 0.5f : 96.0f);
+            if (dpi != m_monoFontDpi) {
+                HFONT scaled = CreateFontW(
+                    -MulDiv(13, static_cast<int>(dpi), 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+                if (scaled) {
+                    SendMessageW(m_editHwnd, WM_SETFONT, reinterpret_cast<WPARAM>(scaled), TRUE);
+                    if (m_monoFont) DeleteObject(m_monoFont);
+                    m_monoFont = scaled;
+                    m_monoFontDpi = dpi;
+                }
+            }
             RECT curRc = {};
             GetWindowRect(m_editHwnd, &curRc);
             MapWindowPoints(HWND_DESKTOP, m_parentHwnd, reinterpret_cast<LPPOINT>(&curRc), 2);
-            int targetX = static_cast<int>(editR.left);
-            int targetY = static_cast<int>(editR.top);
-            int targetW = std::max(20, static_cast<int>(editR.right - editR.left));
-            int targetH = std::max(20, static_cast<int>(editR.bottom - editR.top));
+            int targetX = static_cast<int>(editR.left * pxPerDip);
+            int targetY = static_cast<int>(editR.top * pxPerDip);
+            int targetW = std::max(20, static_cast<int>((editR.right - editR.left) * pxPerDip));
+            int targetH = std::max(20, static_cast<int>((editR.bottom - editR.top) * pxPerDip));
             if (!IsWindowVisible(m_editHwnd) ||
                 curRc.left != targetX || curRc.top != targetY ||
                 (curRc.right - curRc.left) != targetW || (curRc.bottom - curRc.top) != targetH)

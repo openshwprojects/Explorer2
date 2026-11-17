@@ -17,6 +17,7 @@
 #include "TransferManager.h"
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <string>
@@ -216,6 +217,10 @@ private:
     void DrawTabBar(const D2D1_RECT_F& barRect);
     std::wstring ResolveDropTargetFolder(float x, float y, std::wstring* outTargetLabel = nullptr) const;
     void ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, const std::wstring& targetDir, bool forceCopy, bool forceMove);
+    // A file drag that leaves the window continues as a Windows drag and drop, so the files can be dropped on other
+    // programs (a browser upload, a chat window, Windows Explorer, the desktop). Returns false when none of the
+    // paths is a file on disk (e.g. FTP), and the drag stays inside the window.
+    bool StartShellDragOut(const std::vector<std::wstring>& paths);
     void DrawDragOverlay();
     D2D1_RECT_F GetFullWorkspaceRect() const;
     D2D1_RECT_F GetSplitPaneOuterRect(int paneIdx) const;
@@ -301,6 +306,19 @@ private:
     HWND m_searchEdit = nullptr;
     HWND m_renameEdit = nullptr;
     HFONT m_editFont = nullptr;
+
+    // Display scaling. All layout, hit-testing and drawing works in DIPs (1/96 inch); the render target maps them to
+    // the window's pixels at m_dpi. Mouse messages arrive in pixels (PxToDip), while the native edit boxes, popup
+    // menus and dialogs need pixels (DipToPx). m_dpi follows the window between monitors (WM_DPICHANGED).
+    UINT m_dpi = 96;
+    std::map<HWND, D2D1_RECT_F> m_childDipRects;   // where each native edit box was last placed, in DIPs
+    float PxToDip(int px) const { return static_cast<float>(px) * 96.0f / static_cast<float>(m_dpi); }
+    int DipToPx(float dip) const { return static_cast<int>(dip * static_cast<float>(m_dpi) / 96.0f); }
+    D2D1_SIZE_F ClientSizeDip() const;
+    POINT ClientDipToScreen(float x, float y) const;
+    void PlaceChildDip(HWND child, float left, float top, float width, float height);
+    void ApplyDpi(UINT dpi);
+    void RecreateEditFont();
 
     ID2D1Factory* m_d2dFactory = nullptr;
     IDWriteFactory* m_dwriteFactory = nullptr;
@@ -492,7 +510,15 @@ private:
 
     // "Programy" tab state
     ProgramInventory m_programs;
-    bool m_progLoaded = false;
+    bool m_progLoaded = false;             // false: (re)read the list on the next paint
+    // The registry read behind the list runs on a worker thread; the paint takes its result once done is set
+    struct ProgramListLoad {
+        std::mutex mutex;
+        bool done = false;
+        std::vector<InstalledProgram> items;
+        ULONGLONG startTick = 0;
+    };
+    std::shared_ptr<ProgramListLoad> m_progLoad;   // the read in progress, if any
     int m_progSortCol = 0;
     bool m_progSortAsc = true;
     std::wstring m_progSelectedKey;

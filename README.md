@@ -97,6 +97,9 @@ Explorer2.exe [folder]
 | `--inspect-files <list> <result>` | Run the file readers on every file named in a list and record what each did (used by `tools/fuzz_samples.py`) |
 | `--monitor-daemon` | Run the background monitoring recorder. The app starts it when monitoring is enabled |
 
+To check the layout for high-DPI displays on a 100% one, set the environment variable
+`EXPLORER2_FORCE_DPI` (for example `144`, which is 150% scaling) before starting Explorer2.
+
 Settings, FTP bookmarks, backup jobs, monitoring data and logs are stored under
 `%LOCALAPPDATA%\Explorer2`.
 
@@ -116,6 +119,8 @@ Explorer2 uses these when they are installed, and works without them:
 
 ### Things to know
 
+- Files dragged out of the window can be dropped on other programs (a browser upload, a chat window,
+  Windows Explorer, the desktop). The program you drop them on decides whether they are copied or moved.
 - Delete moves items to the Recycle Bin and Shift+Delete removes them for good. Neither asks for
   confirmation unless you switch that on in the Delete button's menu.
 - Ctrl+Z after a Recycle Bin delete works from hidden copies (hard links, so they take no extra

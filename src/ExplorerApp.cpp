@@ -2,6 +2,7 @@
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
+#include "OsCompat.h"
 #include "Version.h"
 #include <windowsx.h>
 #include <shlobj.h>
@@ -88,6 +89,38 @@ static std::wstring DescribePaths(const std::vector<std::wstring>& paths) {
     if (paths.size() > 1) s += L" (+" + std::to_wstring(paths.size() - 1) + L" more)";
     return s + L"  in  " + PathUtils::GetParentPath(paths[0]);
 }
+
+// ---- Drag out of the window (OLE drag and drop to other programs) ----
+
+// Ends the drop when the left button is released and cancels it on Escape, like Windows Explorer
+class DragOutDropSource final : public IDropSource {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDropSource)) {
+            *ppv = static_cast<IDropSource*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refs)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG left = InterlockedDecrement(&m_refs);
+        if (left == 0) delete this;
+        return static_cast<ULONG>(left);
+    }
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override {
+        if (escapePressed) return DRAGDROP_S_CANCEL;
+        if (!(keyState & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
+
+private:
+    LONG m_refs = 1;
+};
 
 static std::wstring FormatNavFolderTitle(const std::wstring& path, Lang lang) {
     const Strings& s = GetStrings(lang);
@@ -196,10 +229,37 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     if (!m_hwnd) { AppLog::Error(L"App", L"Could not create the main window"); return false; }
     AppLog::SetNotify(m_hwnd, WM_APP_LOG_ADDED);
 
-    m_editFont = CreateFontW(
-        -13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    m_dpi = GetWindowDpiCompat(m_hwnd);
+    {
+        // Developer aid: EXPLORER2_FORCE_DPI=144 draws as on a 150% display, to check the DPI handling on a 100% one.
+        // Moving the window to another monitor (WM_DPICHANGED) returns to the real DPI.
+        wchar_t forced[16] = {};
+        if (GetEnvironmentVariableW(L"EXPLORER2_FORCE_DPI", forced, 16) > 0) {
+            const int v = _wtoi(forced);
+            if (v >= 72 && v <= 480) m_dpi = static_cast<UINT>(v);
+        }
+    }
+    if (m_dpi != 96) {
+        // CreateWindowExW took 1240 x 760 as pixels: give the window that size in DIPs instead, kept on its screen
+        RECT wr = {};
+        GetWindowRect(m_hwnd, &wr);
+        int w = DipToPx(1240.0f);
+        int h = DipToPx(760.0f);
+        int x = wr.left;
+        int y = wr.top;
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfoW(MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            const RECT& wa = mi.rcWork;
+            w = std::min<int>(w, wa.right - wa.left);
+            h = std::min<int>(h, wa.bottom - wa.top);
+            x = std::clamp<int>(x, wa.left, wa.right - w);
+            y = std::clamp<int>(y, wa.top, wa.bottom - h);
+        }
+        SetWindowPos(m_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    AppLog::Info(L"App", L"Display scaling: " + std::to_wstring(m_dpi) + L" DPI (" + std::to_wstring(m_dpi * 100 / 96) + L"%)");
+
+    RecreateEditFont();
 
     m_addressEdit = CreateWindowExW(
         0, L"EDIT", L"",
@@ -374,9 +434,10 @@ bool ExplorerApp::CreateDeviceResources() {
     GetClientRect(m_hwnd, &rc);
     D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
 
+    // Pixels are the client area's real ones; drawing code works in DIPs, which the target scales by m_dpi / 96
     D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties();
-    rtProps.dpiX = 96.0f;
-    rtProps.dpiY = 96.0f;
+    rtProps.dpiX = static_cast<float>(m_dpi);
+    rtProps.dpiY = static_cast<float>(m_dpi);
 
     HRESULT hr = m_d2dFactory->CreateHwndRenderTarget(
         rtProps,
@@ -406,6 +467,56 @@ void ExplorerApp::OnResize(UINT width, UINT height) {
         m_rt->Resize(D2D1::SizeU(width, height));
     }
     ClampScrollOffset();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+D2D1_SIZE_F ExplorerApp::ClientSizeDip() const {
+    RECT rc = {};
+    GetClientRect(m_hwnd, &rc);
+    return D2D1::SizeF(PxToDip(rc.right - rc.left), PxToDip(rc.bottom - rc.top));
+}
+
+// Screen pixels of a point given in client DIPs (where popup menus open)
+POINT ExplorerApp::ClientDipToScreen(float x, float y) const {
+    POINT pt = { DipToPx(x), DipToPx(y) };
+    ClientToScreen(m_hwnd, &pt);
+    return pt;
+}
+
+// Shows a native child window (edit box) over a rectangle of the D2D layout
+void ExplorerApp::PlaceChildDip(HWND child, float left, float top, float width, float height) {
+    if (!child) return;
+    m_childDipRects[child] = D2D1::RectF(left, top, left + width, top + height);
+    SetWindowPos(child, HWND_TOP, DipToPx(left), DipToPx(top), DipToPx(width), DipToPx(height), SWP_SHOWWINDOW);
+}
+
+void ExplorerApp::RecreateEditFont() {
+    HFONT oldFont = m_editFont;
+    m_editFont = CreateFontW(
+        -MulDiv(13, static_cast<int>(m_dpi), 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    for (HWND edit : { m_addressEdit, m_searchEdit, m_renameEdit }) {
+        if (edit) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(m_editFont), TRUE);
+    }
+    if (oldFont) DeleteObject(oldFont);
+}
+
+// The window moved to a monitor with another scale factor, or the user changed the scaling
+void ExplorerApp::ApplyDpi(UINT dpi) {
+    if (dpi < 48) dpi = 96;
+    if (dpi == m_dpi) return;
+    AppLog::Info(L"App", L"Display scaling changed: " + std::to_wstring(m_dpi) + L" -> " + std::to_wstring(dpi) + L" DPI");
+    m_dpi = dpi;
+    if (m_rt) m_rt->SetDpi(static_cast<float>(dpi), static_cast<float>(dpi));
+    RecreateEditFont();
+    // Open edit boxes keep their place in the layout (and what the user typed)
+    for (const auto& [child, r] : m_childDipRects) {
+        if (IsWindow(child) && IsWindowVisible(child)) {
+            SetWindowPos(child, nullptr, DipToPx(r.left), DipToPx(r.top), DipToPx(r.right - r.left), DipToPx(r.bottom - r.top),
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
@@ -549,7 +660,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         SetFocus(m_hwnd);
         CancelInlineEdits(false);
-        OnMouseDown(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)), false, wParam);
+        OnMouseDown(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), false, wParam);
         return 0;
 
     case WM_RBUTTONDOWN:
@@ -558,12 +669,12 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         SetFocus(m_hwnd);
         CancelInlineEdits(false);
-        OnMouseDown(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)), true, wParam);
+        OnMouseDown(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), true, wParam);
         return 0;
 
     case WM_MBUTTONDOWN: {
-        float mx = static_cast<float>(GET_X_LPARAM(lParam));
-        float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        float mx = PxToDip(GET_X_LPARAM(lParam));
+        float my = PxToDip(GET_Y_LPARAM(lParam));
         if (IsTabBarVisible()) {
             for (const auto& th : m_tabHits) {
                 if (!th.isNewTabBtn && PathUtils::PtInRectF(mx, my, th.tabRect)) {
@@ -620,7 +731,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         DragFinish(hDrop);
         if (!dropped.empty()) {
-            std::wstring dstDir = ResolveDropTargetFolder(static_cast<float>(pt.x), static_cast<float>(pt.y));
+            std::wstring dstDir = ResolveDropTargetFolder(PxToDip(pt.x), PxToDip(pt.y));
             if (dstDir.empty()) dstDir = m_currentPath;
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -646,7 +757,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             GetCursorPos(&pt);
             ScreenToClient(m_hwnd, &pt);
             if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0 ||
-                HitResizeHandle(static_cast<float>(pt.x), static_cast<float>(pt.y)) != 0) {
+                HitResizeHandle(PxToDip(pt.x), PxToDip(pt.y)) != 0) {
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return TRUE;
             }
@@ -654,25 +765,38 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
 
     case WM_MOUSEMOVE:
-        OnMouseMove(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)), wParam);
+        OnMouseMove(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), wParam);
         return 0;
 
     case WM_LBUTTONUP:
-        OnMouseUp(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)), false, wParam);
+        OnMouseUp(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), false, wParam);
         return 0;
 
     case WM_RBUTTONUP:
-        OnMouseUp(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)), true, wParam);
+        OnMouseUp(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), true, wParam);
         return 0;
 
     case WM_LBUTTONDBLCLK:
-        OnMouseDoubleClick(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)), wParam);
+        OnMouseDoubleClick(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), wParam);
         return 0;
 
     case WM_MOUSEWHEEL: {
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         ScreenToClient(m_hwnd, &pt);
-        OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam), static_cast<float>(pt.x), static_cast<float>(pt.y), GET_KEYSTATE_WPARAM(wParam));
+        OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam), PxToDip(pt.x), PxToDip(pt.y), GET_KEYSTATE_WPARAM(wParam));
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        // Moved to a monitor with another scale factor (or the scaling changed): draw at the new DPI and take the
+        // window size Windows suggests, which keeps the layout the same size in DIPs
+        ApplyDpi(HIWORD(wParam));
+        const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+        if (suggested) {
+            SetWindowPos(m_hwnd, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left, suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         return 0;
     }
 
@@ -1581,10 +1705,9 @@ void ExplorerApp::ApplyFilterAndSort() {
 }
 
 D2D1_RECT_F ExplorerApp::GetFullWorkspaceRect() const {
-    RECT rc = {};
-    GetClientRect(m_hwnd, &rc);
-    float w = static_cast<float>(rc.right - rc.left);
-    float h = static_cast<float>(rc.bottom - rc.top);
+    const D2D1_SIZE_F clientDip = ClientSizeDip();
+    float w = clientDip.width;
+    float h = clientDip.height;
 
     if (m_isFullScreen) {
         return D2D1::RectF(0.0f, 0.0f, w, h);
@@ -1872,6 +1995,63 @@ void ExplorerApp::StartManagedTransfer(
     }
 }
 
+bool ExplorerApp::StartShellDragOut(const std::vector<std::wstring>& paths) {
+    std::vector<std::wstring> local;
+    for (const auto& p : paths) {
+        if (!p.empty() && !FtpClient::IsFtpPath(p) && !IsVirtualFolder(p)) local.push_back(p);
+    }
+    if (local.empty()) return false;
+
+    IDataObject* data = FileEngine::CreateShellDataObject(local);
+    if (!data) {
+        AppLog::Warn(L"Drag", L"Could not hand the dragged items to Windows: " + DescribePaths(local));
+        return false;
+    }
+    AppLog::Info(L"Drag", L"Dragging out of the window: " + DescribePaths(local));
+    DragOutDropSource* source = new DragOutDropSource();
+    DWORD effect = DROPEFFECT_NONE;
+    // Runs its own message loop until the drop or Escape; the target decides between copy, move and shortcut.
+    // A target that moves files on disk (Windows Explorer) does the move itself.
+    const HRESULT hr = SHDoDragDrop(m_hwnd, data, source, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
+    source->Release();
+
+    if (hr == DRAGDROP_S_DROP) {
+        // After an "optimized move" (Windows Explorer moving the files itself) the target reports DROPEFFECT_NONE, so
+        // that the source does not delete anything; what really happened is in the data object
+        auto performed = [data](const wchar_t* formatName) -> DWORD {
+            FORMATETC fmt = { static_cast<CLIPFORMAT>(RegisterClipboardFormatW(formatName)), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            STGMEDIUM med = {};
+            DWORD value = DROPEFFECT_NONE;
+            if (SUCCEEDED(data->GetData(&fmt, &med))) {
+                if (const DWORD* p = static_cast<const DWORD*>(GlobalLock(med.hGlobal))) {
+                    value = *p;
+                    GlobalUnlock(med.hGlobal);
+                }
+                ReleaseStgMedium(&med);
+            }
+            return value;
+        };
+        DWORD done = effect;
+        if (done == DROPEFFECT_NONE) done = performed(L"Logical Performed DropEffect");   // CFSTR_LOGICALPERFORMEDDROPEFFECT
+        if (done == DROPEFFECT_NONE) done = performed(L"Performed DropEffect");           // CFSTR_PERFORMEDDROPEFFECT
+        const wchar_t* what = (done & DROPEFFECT_MOVE) ? L"moved" : (done & DROPEFFECT_LINK) ? L"linked"
+                            : (done & DROPEFFECT_COPY) ? L"copied" : L"declined by the target";
+        // Dropped back on this window: WM_DROPFILES does the copy or move here (ExecuteDropFiles)
+        POINT cursor = {};
+        GetCursorPos(&cursor);
+        const HWND under = WindowFromPoint(cursor);
+        const bool onThisWindow = under && GetAncestor(under, GA_ROOT) == m_hwnd;
+        AppLog::Info(L"Drag", std::wstring(onThisWindow ? L"Dropped back on this window (" : L"Dropped on another program (") + what + L")");
+        if ((done & DROPEFFECT_MOVE) && !onThisWindow) RefreshCurrentFolder();
+    } else if (FAILED(hr)) {
+        wchar_t hex[16] = {};
+        swprintf_s(hex, L"0x%08lX", static_cast<unsigned long>(hr));
+        AppLog::Warn(L"Drag", std::wstring(L"Windows drag and drop failed: ") + hex);
+    }
+    data->Release();
+    return true;
+}
+
 void ExplorerApp::ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, const std::wstring& targetDir, bool forceCopy, bool forceMove) {
     if (srcPaths.empty() || targetDir.empty() || targetDir == L"THIS_PC") return;
     if (targetDir == L"RECYCLE_BIN") {
@@ -2018,12 +2198,7 @@ void ExplorerApp::BeginPaneAddressEdit(int paneIdx) {
         r = m_paneHeaderAddressRect[m_activePane];
         if (r.right <= r.left + 20.0f) r = m_addressBarRect;
     }
-    SetWindowPos(m_addressEdit, HWND_TOP,
-        static_cast<int>(r.left),
-        static_cast<int>(r.top),
-        static_cast<int>(r.right - r.left),
-        static_cast<int>(r.bottom - r.top),
-        SWP_SHOWWINDOW);
+    PlaceChildDip(m_addressEdit, r.left, r.top, r.right - r.left, r.bottom - r.top);
     std::wstring addrText = (m_currentPath == L"THIS_PC")
         ? L""
         : ((m_currentPath == L"RECYCLE_BIN") ? std::wstring(GetStrings(m_lang).navRecycleBin) : m_currentPath);
@@ -2039,10 +2214,9 @@ void ExplorerApp::BeginPaneAddressEdit(int paneIdx) {
 }
 
 D2D1_RECT_F ExplorerApp::GetGitDockRect() const {
-    RECT rc = {};
-    GetClientRect(m_hwnd, &rc);
-    float w = static_cast<float>(rc.right - rc.left);
-    float h = static_cast<float>(rc.bottom - rc.top);
+    const D2D1_SIZE_F clientDip = ClientSizeDip();
+    float w = clientDip.width;
+    float h = clientDip.height;
     float topY = kRibbonTabsHeight + (m_ribbonCollapsed ? 0.0f : kRibbonBodyHeight) + kNavBarHeight;
     float bottomY = std::max(topY, h - kStatusBarHeight);
     float leftX = m_showNavPane ? m_treePaneWidth : 0.0f;
@@ -2052,10 +2226,9 @@ D2D1_RECT_F ExplorerApp::GetGitDockRect() const {
 }
 
 D2D1_RECT_F ExplorerApp::GetPreviewPaneRect() const {
-    RECT rc = {};
-    GetClientRect(m_hwnd, &rc);
-    float w = static_cast<float>(rc.right - rc.left);
-    float h = static_cast<float>(rc.bottom - rc.top);
+    const D2D1_SIZE_F clientDip = ClientSizeDip();
+    float w = clientDip.width;
+    float h = clientDip.height;
     float topY = kRibbonTabsHeight + (m_ribbonCollapsed ? 0.0f : kRibbonBodyHeight) + kNavBarHeight;
     float bottomY = std::max(topY, h - kStatusBarHeight);
     float leftX = m_showNavPane ? m_treePaneWidth : 0.0f;
@@ -2849,12 +3022,9 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                     }
                 }
                 if (PathUtils::PtInRectF(x, y, m_addressBarRect)) {
-                    SetWindowPos(m_addressEdit, HWND_TOP,
-                        static_cast<int>(m_addressBarRect.left),
-                        static_cast<int>(m_addressBarRect.top),
-                        static_cast<int>(m_addressBarRect.right - m_addressBarRect.left),
-                        static_cast<int>(m_addressBarRect.bottom - m_addressBarRect.top),
-                        SWP_SHOWWINDOW);
+                    PlaceChildDip(m_addressEdit, m_addressBarRect.left, m_addressBarRect.top,
+                                  m_addressBarRect.right - m_addressBarRect.left,
+                                  m_addressBarRect.bottom - m_addressBarRect.top);
                     std::wstring addrText = (m_currentPath == L"THIS_PC")
                         ? L""
                         : ((m_currentPath == L"RECYCLE_BIN") ? std::wstring(GetStrings(m_lang).navRecycleBin) : m_currentPath);
@@ -2878,12 +3048,9 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                     InvalidateRect(m_hwnd, nullptr, FALSE);
                 }
                 float navY = kRibbonTabsHeight + (m_ribbonCollapsed ? 0.0f : kRibbonBodyHeight) + 5.0f;
-                SetWindowPos(m_searchEdit, HWND_TOP,
-                    static_cast<int>(m_searchBarRect.left),
-                    static_cast<int>(navY),
-                    static_cast<int>(m_searchBarRect.right - m_searchBarRect.left - 44),
-                    static_cast<int>(m_searchBarRect.bottom - m_searchBarRect.top),
-                    SWP_SHOWWINDOW);
+                PlaceChildDip(m_searchEdit, m_searchBarRect.left, navY,
+                              m_searchBarRect.right - m_searchBarRect.left - 44.0f,
+                              m_searchBarRect.bottom - m_searchBarRect.top);
                 SetWindowTextW(m_searchEdit, IsProgramsView() ? m_progFilter.c_str() : m_filterText.c_str());
                 SetFocus(m_searchEdit);
                 SendMessageW(m_searchEdit, EM_SETSEL, 0, -1);
@@ -2965,8 +3132,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
             }
         }
         if (rightButton) {
-            POINT pt = { static_cast<LONG>(x), static_cast<LONG>(y) };
-            ClientToScreen(m_hwnd, &pt);
+            POINT pt = ClientDipToScreen(x, y);
             ShowTreeContextMenu(pt.x, pt.y, hitTreeIdx);
             return;
         }
@@ -3056,8 +3222,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                 }
             }
         } else {
-            POINT pt = { static_cast<LONG>(x), static_cast<LONG>(y) };
-            ClientToScreen(m_hwnd, &pt);
+            POINT pt = ClientDipToScreen(x, y);
             ShowContextMenu(pt.x, pt.y, m_focusedIndex);
         }
         return;
@@ -3189,8 +3354,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                 SelectNone();
             }
             InvalidateRect(m_hwnd, nullptr, FALSE);
-            POINT pt = { static_cast<LONG>(x), static_cast<LONG>(y) };
-            ClientToScreen(m_hwnd, &pt);
+            POINT pt = ClientDipToScreen(x, y);
             ShowContextMenu(pt.x, pt.y, hitIdx);
             return;
         }
@@ -3262,9 +3426,7 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
     }
 
     if (m_draggingPreviewSplitter) {
-        RECT rc = {};
-        GetClientRect(m_hwnd, &rc);
-        float w = static_cast<float>(rc.right - rc.left);
+        float w = ClientSizeDip().width;
         float leftX = m_showNavPane ? m_treePaneWidth : 0.0f;
         float maxW = std::max(260.0f, w - leftX - 220.0f);
         m_previewPaneWidth = std::clamp(w - x, 260.0f, std::min(1000.0f, maxW));
@@ -3326,6 +3488,22 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
             m_dragTargetLabel.clear();
             ReleaseCapture();
             InvalidateRect(m_hwnd, nullptr, FALSE);
+            return;
+        }
+        // The cursor left the window (the capture still reports it): continue as a Windows drag and drop.
+        // FTP items are not files Windows can take, so a drag of only those stays inside the window.
+        const D2D1_SIZE_F client = ClientSizeDip();
+        const bool outside = (x < 0.0f || y < 0.0f || x >= client.width || y >= client.height);
+        if (outside && std::any_of(m_dragPaths.begin(), m_dragPaths.end(),
+                                   [](const std::wstring& p) { return !p.empty() && !FtpClient::IsFtpPath(p) && !IsVirtualFolder(p); })) {
+            const std::vector<std::wstring> paths = m_dragPaths;
+            m_isDraggingItems = false;
+            m_dragPaths.clear();
+            m_dragTargetDir.clear();
+            m_dragTargetLabel.clear();
+            ReleaseCapture();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            StartShellDragOut(paths);
             return;
         }
         m_dragTargetDir = ResolveDropTargetFolder(x, y, &m_dragTargetLabel);
@@ -4108,8 +4286,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_DELETE_DROPDOWN: {
         for (const auto& btn : m_ribbonHits) {
             if (btn.id == CMD_DELETE_DROPDOWN) {
-                POINT pt = { static_cast<LONG>(btn.rect.left), static_cast<LONG>(btn.rect.bottom) };
-                ClientToScreen(m_hwnd, &pt);
+                POINT pt = ClientDipToScreen(btn.rect.left, btn.rect.bottom);
                 ShowDeleteDropdownMenu(pt.x, pt.y);
                 return;
             }
@@ -4431,8 +4608,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_SEARCH_TYPE_LIST_MENU:
         for (const auto& btn : m_ribbonHits) {
             if (btn.id == CMD_SEARCH_TYPE_LIST_MENU) {
-                POINT pt = { static_cast<LONG>(btn.rect.left), static_cast<LONG>(btn.rect.bottom) };
-                ClientToScreen(m_hwnd, &pt);
+                POINT pt = ClientDipToScreen(btn.rect.left, btn.rect.bottom);
                 ShowSearchTypeListMenu(pt.x, pt.y);
                 return;
             }
@@ -5528,8 +5704,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         GetCursorPos(&pt);
         for (const auto& hit : m_ribbonHits) {
             if (hit.id == CMD_IMG_TOOL_MENU) {
-                POINT bpt = { static_cast<LONG>(hit.rect.left), static_cast<LONG>(hit.rect.bottom) };
-                ClientToScreen(m_hwnd, &bpt);
+                POINT bpt = ClientDipToScreen(hit.rect.left, hit.rect.bottom);
                 pt = bpt;
                 break;
             }
@@ -5667,8 +5842,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         GetCursorPos(&pt);
         for (const auto& hit : m_ribbonHits) {
             if (hit.id == CMD_HOME_EASY_ACCESS) {
-                POINT bpt = { static_cast<LONG>(hit.rect.left), static_cast<LONG>(hit.rect.bottom) };
-                ClientToScreen(m_hwnd, &bpt);
+                POINT bpt = ClientDipToScreen(hit.rect.left, hit.rect.bottom);
                 pt = bpt;
                 break;
             }
@@ -6624,9 +6798,7 @@ void ExplorerApp::StartInlineRename() {
     float editTop  = (m_viewMode == ViewMode::Details) ? itemR.top : (itemR.bottom - 24.0f);
     float editW    = std::max(120.0f, (m_viewMode == ViewMode::Details ? m_colWidths[0] - 24.0f : (itemR.right - itemR.left - 4.0f)));
 
-    SetWindowPos(m_renameEdit, HWND_TOP,
-        static_cast<int>(editLeft), static_cast<int>(editTop),
-        static_cast<int>(editW), 22, SWP_SHOWWINDOW);
+    PlaceChildDip(m_renameEdit, editLeft, editTop, editW, 22.0f);
     SetWindowTextW(m_renameEdit, m_items[m_focusedIndex].name.c_str());
     SetFocus(m_renameEdit);
 
@@ -7092,8 +7264,7 @@ void ExplorerApp::ShowBreadcrumbSubfolderMenu(int breadcrumbIndex) {
         }
     }
 
-    POINT pt = { static_cast<LONG>(seg.hitRect.left), static_cast<LONG>(seg.arrowRect.bottom) };
-    ClientToScreen(m_hwnd, &pt);
+    POINT pt = ClientDipToScreen(seg.hitRect.left, seg.arrowRect.bottom);
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr);
     DestroyMenu(hMenu);
 
@@ -7183,11 +7354,7 @@ void ExplorerApp::ShowRecentDirsDropdown(int triggerCmdId) {
             // If clicked on the Ribbon "Historia" button (top < kRibbonTabsHeight + kRibbonBodyHeight), left-align;
             // if clicked on the [▾] dropdown button at the right end of the address bar, right-align to the button!
             bool isRibbonBtn = (hit.rect.bottom <= kRibbonTabsHeight + kRibbonBodyHeight + 2.0f);
-            POINT bpt = {
-                static_cast<LONG>(isRibbonBtn ? hit.rect.left : hit.rect.right),
-                static_cast<LONG>(hit.rect.bottom)
-            };
-            ClientToScreen(m_hwnd, &bpt);
+            POINT bpt = ClientDipToScreen(isRibbonBtn ? hit.rect.left : hit.rect.right, hit.rect.bottom);
             pt = bpt;
             alignFlags = TPM_RETURNCMD | TPM_TOPALIGN | (isRibbonBtn ? TPM_LEFTALIGN : TPM_RIGHTALIGN);
             break;
@@ -8238,12 +8405,9 @@ void ExplorerApp::BeginSearchFieldEdit(int fieldCmdId, const D2D1_RECT_F& fieldR
     else if (fieldCmdId == CMD_SEARCH_EDIT_SIZE_MAX) initVal = m_searchOpts.sizeMaxStr;
     else if (fieldCmdId == CMD_SEARCH_EDIT_CUSTOM_EXT) initVal = m_searchOpts.customExtList;
 
-    SetWindowPos(m_renameEdit, HWND_TOP,
-        static_cast<int>(fieldRect.left),
-        static_cast<int>(fieldRect.top),
-        static_cast<int>(std::max(64.0f, fieldRect.right - fieldRect.left)),
-        static_cast<int>(std::max(20.0f, fieldRect.bottom - fieldRect.top)),
-        SWP_SHOWWINDOW);
+    PlaceChildDip(m_renameEdit, fieldRect.left, fieldRect.top,
+                  std::max(64.0f, fieldRect.right - fieldRect.left),
+                  std::max(20.0f, fieldRect.bottom - fieldRect.top));
     SetWindowTextW(m_renameEdit, initVal.c_str());
     SetFocus(m_renameEdit);
     SendMessageW(m_renameEdit, EM_SETSEL, 0, -1);
@@ -8388,8 +8552,11 @@ static bool PromptCustomImageInput(
 
     RECT ownerRc = {};
     GetWindowRect(owner, &ownerRc);
-    int dlgW = 430;
-    int dlgH = 175;
+    // Sizes below are for 100% scaling; window coordinates are pixels, so scale them to the owner's DPI
+    const int dpi = static_cast<int>(GetWindowDpiCompat(owner));
+    auto S = [dpi](int v) { return MulDiv(v, dpi, 96); };
+    int dlgW = S(430);
+    int dlgH = S(175);
     int dlgX = ownerRc.left + ((ownerRc.right - ownerRc.left) - dlgW) / 2;
     int dlgY = ownerRc.top + ((ownerRc.bottom - ownerRc.top) - dlgH) / 2;
 
@@ -8405,16 +8572,16 @@ static bool PromptCustomImageInput(
     SetWindowLongPtrW(hDlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&st));
 
     HWND hLbl = CreateWindowExW(0, L"STATIC", promptText, WS_CHILD | WS_VISIBLE,
-        16, 14, dlgW - 40, 38, hDlg, nullptr, hInst, nullptr);
+        S(16), S(14), dlgW - S(40), S(38), hDlg, nullptr, hInst, nullptr);
     st.hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", initialVal,
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        16, 56, dlgW - 40, 26, hDlg, reinterpret_cast<HMENU>(1001), hInst, nullptr);
+        S(16), S(56), dlgW - S(40), S(26), hDlg, reinterpret_cast<HMENU>(1001), hInst, nullptr);
     HWND hOk = CreateWindowExW(0, L"BUTTON", L"OK",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        dlgW - 196, 94, 82, 28, hDlg, reinterpret_cast<HMENU>(IDOK), hInst, nullptr);
+        dlgW - S(196), S(94), S(82), S(28), hDlg, reinterpret_cast<HMENU>(IDOK), hInst, nullptr);
     HWND hCancel = CreateWindowExW(0, L"BUTTON", pl ? L"Anuluj" : L"Cancel",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        dlgW - 106, 94, 82, 28, hDlg, reinterpret_cast<HMENU>(IDCANCEL), hInst, nullptr);
+        dlgW - S(106), S(94), S(82), S(28), hDlg, reinterpret_cast<HMENU>(IDCANCEL), hInst, nullptr);
 
     if (hFont) {
         SendMessageW(hLbl, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);

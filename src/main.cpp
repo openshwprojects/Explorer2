@@ -5,6 +5,7 @@
 #include "SelfTestSuite.h"
 #include "Version.h"
 #include <objbase.h>
+#include <ole2.h>
 #include <shellapi.h>
 #include <cwchar>
 #include <cstring>
@@ -136,12 +137,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
         if (argv) LocalFree(argv);
     }
 
+    // OLE (on top of COM) for drag and drop out of the window: DoDragDrop needs it on the UI thread
+    const HRESULT oleHr = OleInitialize(nullptr);
+
     auto app = std::make_unique<Explorer2::ExplorerApp>();
     int exitCode = 0;
     if (app->Initialize(hInstance, nCmdShow, initialPath)) {
         exitCode = app->RunMessageLoop();
     }
     app.reset();
+    if (SUCCEEDED(oleHr)) OleUninitialize();
 
     // Unload what was only loaded on demand while the process is still whole (see PdfViewer::ReleaseRenderer)
     Explorer2::PdfViewer::ReleaseRenderer();

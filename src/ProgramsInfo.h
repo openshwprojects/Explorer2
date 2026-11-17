@@ -26,7 +26,11 @@ struct InstalledProgram {
 class ProgramInventory {
 public:
     // Column ids shared with the UI: 0 name, 1 publisher, 2 version, 3 size, 4 install date
-    void Refresh();
+    void Refresh();   // ReadInstalled() into this list, on the calling thread
+    // Reads every entry of the Uninstall registry keys. Thread-safe. The window runs it on a worker thread: on some
+    // machines it takes long, and the UI must keep answering meanwhile (SetItems hands the result over).
+    static std::vector<InstalledProgram> ReadInstalled();
+    void SetItems(std::vector<InstalledProgram> items) { m_items = std::move(items); }
     void Sort(int column, bool ascending);
 
     const std::vector<InstalledProgram>& Items() const { return m_items; }

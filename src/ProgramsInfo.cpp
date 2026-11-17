@@ -95,7 +95,11 @@ int CompareNoCase(const std::wstring& a, const std::wstring& b) {
 } // namespace
 
 void ProgramInventory::Refresh() {
-    m_items.clear();
+    m_items = ReadInstalled();
+}
+
+std::vector<InstalledProgram> ProgramInventory::ReadInstalled() {
+    std::vector<InstalledProgram> items;
 
     struct Source { HKEY root; REGSAM extra; bool perUser; bool is32; };
     const Source sources[] = {
@@ -110,12 +114,14 @@ void ProgramInventory::Refresh() {
         HKEY hUninstall = nullptr;
         if (RegOpenKeyExW(src.root, kUninstallKey, 0, KEY_READ | src.extra, &hUninstall) != ERROR_SUCCESS) continue;
 
-        for (DWORD i = 0;; ++i) {
+        for (DWORD i = 0; i < 200000; ++i) {
             wchar_t subName[512] = {};
             DWORD subLen = 512;
             LONG rc = RegEnumKeyExW(hUninstall, i, subName, &subLen, nullptr, nullptr, nullptr, nullptr);
-            if (rc == ERROR_NO_MORE_ITEMS) break;
-            if (rc != ERROR_SUCCESS) continue;
+            if (rc == ERROR_MORE_DATA) continue;   // a key name longer than any product id: skip just that one
+            // ERROR_NO_MORE_ITEMS ends the list. Any other error (e.g. the key was deleted by a running
+            // uninstaller) repeats for every later index, so skipping it would never end.
+            if (rc != ERROR_SUCCESS) break;
 
             HKEY hApp = nullptr;
             if (RegOpenKeyExW(hUninstall, subName, 0, KEY_READ | src.extra, &hApp) != ERROR_SUCCESS) continue;
@@ -153,13 +159,14 @@ void ProgramInventory::Refresh() {
 
                 std::wstring dedupe = Lower(p.name) + L"|" + Lower(p.version);
                 if (seen.insert(dedupe).second) {
-                    m_items.push_back(std::move(p));
+                    items.push_back(std::move(p));
                 }
             }
             RegCloseKey(hApp);
         }
         RegCloseKey(hUninstall);
     }
+    return items;
 }
 
 void ProgramInventory::Sort(int column, bool ascending) {

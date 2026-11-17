@@ -11,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <functional>
+#include <thread>
 
 namespace Explorer2 {
 
@@ -105,10 +106,9 @@ void ExplorerApp::OnPaint() {
     m_tabHits.clear();
     m_mediaSeekBarRect = {};
 
-    RECT rc = {};
-    GetClientRect(m_hwnd, &rc);
-    float w = static_cast<float>(rc.right - rc.left);
-    float h = static_cast<float>(rc.bottom - rc.top);
+    const D2D1_SIZE_F clientDip = ClientSizeDip();
+    float w = clientDip.width;
+    float h = clientDip.height;
 
     if (m_isFullScreen) {
         m_contentPane.HideNativeControls();
@@ -5220,19 +5220,54 @@ void ExplorerApp::DrawClippedText(const std::wstring& text, const D2D1_RECT_F& r
 void ExplorerApp::DrawProgramsView(const D2D1_RECT_F& rect) {
     const bool pl = (m_lang == Lang::PL);
 
-    // (Re)read the registry on first paint, on demand, and periodically while an (un)installer is running
+    // (Re)read the registry on first paint, on demand, and periodically while an (un)installer is running.
+    // The read runs on a worker thread: with many entries it can take long, and the window must keep answering
+    // (it used to run right here, inside the paint). A request made while a read runs waits for the next paint.
     ULONGLONG now = GetTickCount64();
     bool reload = !m_progLoaded;
     if (m_progRefreshAtTick != 0 && now >= m_progRefreshAtTick) {
         reload = true;
         m_progRefreshAtTick = (--m_progRefreshesLeft > 0) ? now + 4000 : 0;
     }
-    if (reload) {
-        m_programs.Refresh();
-        m_programs.Sort(m_progSortCol, m_progSortAsc);
+    if (reload && !m_progLoad) {
+        auto job = std::make_shared<ProgramListLoad>();
+        job->startTick = now;
+        m_progLoad = job;
         m_progLoaded = true;
-        if (!m_progSelectedKey.empty() && !m_programs.Find(m_progSelectedKey)) m_progSelectedKey.clear();
+        const HWND hwnd = m_hwnd;
+        std::thread([job, hwnd]() {
+            std::vector<InstalledProgram> items = ProgramInventory::ReadInstalled();
+            {
+                std::lock_guard<std::mutex> lk(job->mutex);
+                job->items = std::move(items);
+                job->done = true;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);   // the next paint takes the list
+        }).detach();
     }
+    if (m_progLoad) {
+        bool done = false;
+        std::vector<InstalledProgram> loaded;
+        {
+            std::lock_guard<std::mutex> lk(m_progLoad->mutex);
+            if (m_progLoad->done) {
+                done = true;
+                loaded = std::move(m_progLoad->items);
+            }
+        }
+        if (done) {
+            const ULONGLONG tookMs = now - m_progLoad->startTick;
+            m_progLoad.reset();
+            m_programs.SetItems(std::move(loaded));
+            m_programs.Sort(m_progSortCol, m_progSortAsc);
+            if (!m_progSelectedKey.empty() && !m_programs.Find(m_progSelectedKey)) m_progSelectedKey.clear();
+            if (tookMs >= 1000) {
+                AppLog::Warn(L"Programs", L"Reading the installed-programs list took " + std::to_wstring(tookMs) + L" ms (" +
+                                          std::to_wstring(m_programs.Items().size()) + L" entries)");
+            }
+        }
+    }
+    const bool progLoading = (m_progLoad != nullptr);
     if (m_progRefreshAtTick != 0) EnsureWorkAnimTimerState();
 
     // Apply the search-box filter
@@ -5268,6 +5303,7 @@ void ExplorerApp::DrawProgramsView(const D2D1_RECT_F& rect) {
         ? (pl ? L"Filtr: wpisz fragment nazwy w polu wyszukiwania (prawy górny róg). Kliknij nagłówek kolumny, aby sortować."
               : L"Filter: type part of a name in the search box (top right). Click a column header to sort.")
         : ((pl ? L"Filtr aktywny: \"" : L"Active filter: \"") + m_progFilter + L"\"");
+    if (progLoading) hint = (pl ? L"\x23F3 Wczytywanie listy z rejestru…   " : L"\x23F3 Reading the list from the registry…   ") + hint;
     DrawClippedText(hint, D2D1::RectF(topBar.left + 12.0f, topBar.top + 22.0f, refreshBtn.left - 10.0f, topBar.bottom - 1.0f), m_fmtSmall, flt.empty() ? 0x64748B : 0x0067B8);
     DrawCardTinyButton(refreshBtn, pl ? L"\x21BB Odśwież" : L"\x21BB Refresh", CMD_PROG_REFRESH, L"");
     DrawCardTinyButton(addBtn, pl ? L"\x2795 Dodaj program…" : L"\x2795 Add program…", CMD_PROG_ADD, L"");
@@ -5391,7 +5427,8 @@ void ExplorerApp::DrawProgramsView(const D2D1_RECT_F& rect) {
     if (rows.empty()) {
         m_fmtCenterSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         m_solidBrush->SetColor(HexColor(0x64748B));
-        const wchar_t* msg = flt.empty() ? (pl ? L"Nie znaleziono zainstalowanych programów." : L"No installed programs found.")
+        const wchar_t* msg = progLoading ? (pl ? L"Wczytywanie listy zainstalowanych programów…" : L"Reading the list of installed programs…")
+                           : flt.empty() ? (pl ? L"Nie znaleziono zainstalowanych programów." : L"No installed programs found.")
                                          : (pl ? L"Żaden program nie pasuje do filtra." : L"No program matches the filter.");
         DrawTextCached(msg, static_cast<UINT32>(wcslen(msg)), m_fmtCenterSmall, listR, m_solidBrush);
     }

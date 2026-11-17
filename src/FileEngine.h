@@ -12,6 +12,8 @@
 #include <atomic>
 #include <memory>
 
+struct IDataObject;
+
 namespace Explorer2 {
 
 // One item a delete could not remove (error = Win32 code, 0 = unknown)
@@ -149,6 +151,9 @@ public:
     static bool CopyFilesToClipboard(HWND hwnd, const std::vector<std::wstring>& paths, bool isCut);
     static bool ReadFilesFromClipboard(HWND hwnd, std::vector<std::wstring>& outPaths, bool& outIsMove);
     static bool CopyTextToClipboard(HWND hwnd, const std::wstring& text);
+    // The data object Windows Explorer puts on a file drag (CF_HDROP, shell ID list, file names...), for a drag out
+    // of the window. Paths may come from different folders. Caller releases it; nullptr when no path parses.
+    static IDataObject* CreateShellDataObject(const std::vector<std::wstring>& paths);
 
     // File management operations
     static std::wstring ResolveAddressInput(std::wstring_view rawInput, const std::wstring& currentDir = L"");

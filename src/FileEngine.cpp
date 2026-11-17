@@ -1767,6 +1767,42 @@ bool FileEngine::CopyTextToClipboard(HWND hwnd, const std::wstring& text) {
     return true;
 }
 
+// Items of one folder are passed relative to it, as Windows Explorer does; items from different folders (search
+// results) relative to the desktop, the root of the shell namespace.
+IDataObject* FileEngine::CreateShellDataObject(const std::vector<std::wstring>& paths) {
+    std::vector<PIDLIST_ABSOLUTE> absolute;
+    absolute.reserve(paths.size());
+    for (const auto& p : paths) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(p.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) absolute.push_back(pidl);
+    }
+    if (absolute.empty()) return nullptr;
+
+    IDataObject* data = nullptr;
+    PIDLIST_ABSOLUTE parent = ILClone(absolute[0]);
+    bool oneParent = parent && ILRemoveLastID(parent);
+    for (size_t i = 1; oneParent && i < absolute.size(); ++i) {
+        oneParent = ILIsParent(parent, absolute[i], TRUE) != FALSE;
+    }
+    std::vector<PCUITEMID_CHILD> children;
+    children.reserve(absolute.size());
+    if (oneParent) {
+        for (PIDLIST_ABSOLUTE pidl : absolute) children.push_back(ILFindLastID(pidl));
+        SHCreateDataObject(parent, static_cast<UINT>(children.size()), children.data(), nullptr, IID_PPV_ARGS(&data));
+    } else {
+        PIDLIST_ABSOLUTE desktop = static_cast<PIDLIST_ABSOLUTE>(CoTaskMemAlloc(sizeof(USHORT)));
+        if (desktop) {
+            desktop->mkid.cb = 0;   // the empty ID list is the desktop
+            for (PIDLIST_ABSOLUTE pidl : absolute) children.push_back(reinterpret_cast<PCUITEMID_CHILD>(pidl));
+            SHCreateDataObject(desktop, static_cast<UINT>(children.size()), children.data(), nullptr, IID_PPV_ARGS(&data));
+            CoTaskMemFree(desktop);
+        }
+    }
+    if (parent) ILFree(parent);
+    for (PIDLIST_ABSOLUTE pidl : absolute) ILFree(pidl);   // the data object keeps its own copies
+    return data;
+}
+
 std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const std::wstring& currentDir) {
     std::wstring s = PathUtils::Trim(rawInput);
     if (s.size() >= 2 && ((s.front() == L'"' && s.back() == L'"') || (s.front() == L'\'' && s.back() == L'\''))) {

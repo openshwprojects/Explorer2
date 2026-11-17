@@ -136,6 +136,7 @@ private:
     HINSTANCE m_hInstance = nullptr;
     HWND m_editHwnd = nullptr;
     HFONT m_monoFont = nullptr;
+    UINT m_monoFontDpi = 96;          // DPI m_monoFont was made for; the edit box follows the render target's DPI
     IDWriteFactory* m_dwriteFactory = nullptr;
     IDWriteTextFormat* m_fmtCodeMono = nullptr;
     IDWriteTextFormat* m_fmtCodeBold = nullptr;
