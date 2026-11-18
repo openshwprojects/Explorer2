@@ -41,6 +41,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#ifndef _WIN32
+#include <csignal>
+#include <dlfcn.h>
+#include <ucontext.h>
+#endif
 
 namespace Explorer2::SelfTestSuite {
 
@@ -2638,6 +2643,19 @@ static void RunStage12Tests(TestCounter& tc) {
                     PathUtils::ReadFileBytes(std::wstring(winDir) + L"\\Fonts\\segoeui.ttf", 8 * 1024 * 1024, ttfBytes);
                 }
             }
+#ifndef _WIN32
+            if (ttfBytes.empty()) {
+                static const wchar_t* kLinuxTestFonts[] = {
+                    L"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    L"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    L"/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+                    L"/usr/share/fonts/TTF/DejaVuSans.ttf"
+                };
+                for (const wchar_t* fp : kLinuxTestFonts) {
+                    if (PathUtils::ReadFileBytes(fp, 8 * 1024 * 1024, ttfBytes) && !ttfBytes.empty()) break;
+                }
+            }
+#endif
             (void)u32be;
 
             bool ok100Img =
@@ -2978,6 +2996,83 @@ static bool CreateTestJunction(const std::wstring& linkDir, const std::wstring& 
 // Looks up one original path in the current user's Recycle Bin on that path's drive (Windows 10+ record
 // layout). On success returns the bin's record file ($I...) and data file ($R...).
 static bool FindRecycleBinRecord(const std::wstring& originalPath, std::wstring& outInfoFile, std::wstring& outDataFile) {
+#ifndef _WIN32
+    const char* xdg = std::getenv("XDG_DATA_HOME");
+    const char* home = std::getenv("HOME");
+    std::string trashBase;
+    if (xdg && *xdg) trashBase = std::string(xdg) + "/Trash";
+    else if (home && *home) trashBase = std::string(home) + "/.local/share/Trash";
+    else trashBase = "/tmp/Trash-" + std::to_string(::geteuid());
+
+    const std::wstring infoDir = PathUtils::Utf8ToWide(trashBase + "/info");
+    const std::wstring filesDir = PathUtils::Utf8ToWide(trashBase + "/files");
+    const std::wstring wantKey = PathUtils::NormalizePathKey(originalPath);
+    wchar_t parentLong[1024] = {};
+    const std::wstring parentRaw = PathUtils::GetParentPath(originalPath);
+    const std::wstring parentResolved = (GetLongPathNameW(parentRaw.c_str(), parentLong, 1024) > 0)
+        ? std::wstring(parentLong) : parentRaw;
+    const std::wstring wantResolvedKey = PathUtils::NormalizePathKey(
+        PathUtils::EnsureTrailingSlash(parentResolved) + PathUtils::GetFileName(originalPath));
+
+    auto urlDecodeUtf8 = [](const std::string& enc) -> std::string {
+        std::string out;
+        out.reserve(enc.size());
+        auto hexVal = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+            return -1;
+        };
+        for (size_t i = 0; i < enc.size(); ++i) {
+            if (enc[i] == '%' && i + 2 < enc.size()) {
+                const int hi = hexVal(enc[i + 1]);
+                const int lo = hexVal(enc[i + 2]);
+                if (hi >= 0 && lo >= 0) {
+                    out.push_back(static_cast<char>((hi << 4) | lo));
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push_back(enc[i]);
+        }
+        return out;
+    };
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((infoDir + L"\\*.trashinfo").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const std::wstring infoName = fd.cFileName;
+        if (infoName.size() <= 10) continue;
+        const std::wstring infoPath = infoDir + L"\\" + infoName;
+        std::vector<uint8_t> raw;
+        if (!PathUtils::ReadFileBytes(infoPath, 16384, raw) || raw.empty()) continue;
+        const std::string text(raw.begin(), raw.end());
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t eol = text.find('\n', pos);
+            if (eol == std::string::npos) eol = text.size();
+            std::string line = text.substr(pos, eol - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            pos = eol + 1;
+            if (line.rfind("Path=", 0) == 0) {
+                const std::wstring recW = PathUtils::Utf8ToWide(urlDecodeUtf8(line.substr(5)));
+                const std::wstring recKey = PathUtils::NormalizePathKey(recW);
+                if (recKey == wantKey || recKey == wantResolvedKey) {
+                    const std::wstring stem = infoName.substr(0, infoName.size() - 10);
+                    outInfoFile = infoPath;
+                    outDataFile = filesDir + L"\\" + stem;
+                    found = true;
+                }
+                break;
+            }
+        }
+    } while (!found && FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+#else
     if (originalPath.size() < 3 || originalPath[1] != L':') return false;
 
     std::wstring sidStr;
@@ -3026,6 +3121,7 @@ static bool FindRecycleBinRecord(const std::wstring& originalPath, std::wstring&
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     return found;
+#endif
 }
 
 // A zlib stream that stores its data in plain blocks (what FBX writers do is pack them; the reader unpacks
@@ -4292,7 +4388,11 @@ static void RunStage13Tests(TestCounter& tc) {
         const bool have = FindJobSnapshot(tm, jid, snap);
         const bool gone = !existsOnDisk(sysDir);
         const bool ok = uncDetected && waited && have && snap.state == TransferJobState::Completed && gone && snap.errors.empty();
-        tc.Record(ok, L"Stage13.Test20b_Delete_NetworkNoRecycleBinAndSystemReadOnlyFolderTree");
+        std::wstring detail = L"unc=" + std::to_wstring(uncDetected) + L", waited=" + std::to_wstring(waited) +
+                              L", state=" + std::to_wstring(have ? static_cast<int>(snap.state) : -1) +
+                              L", gone=" + std::to_wstring(gone) +
+                              (have && !snap.errors.empty() ? (L", err=" + snap.errors[0].message) : std::wstring());
+        tc.Record(ok, L"Stage13.Test20b_Delete_NetworkNoRecycleBinAndSystemReadOnlyFolderTree", detail);
     }
 
     // Test 13.20c: Address-bar "Kosz" / "Recycle Bin" aliases, Win7 v1 + Win10/11 v2 $I record parsing,
@@ -4773,13 +4873,26 @@ static void RunStage13Tests(TestCounter& tc) {
     // the program moves on. Checked with programs every Windows has: one that succeeds, one that fails,
     // and one that takes half a minute and gets one second.
     {
+#ifndef _WIN32
+        const std::wstring cmdExe = (::access("/bin/sh", X_OK) == 0) ? L"/bin/sh" : L"/usr/bin/sh";
+        const std::wstring pingExe = (::access("/bin/sleep", X_OK) == 0) ? L"/bin/sleep" : L"/usr/bin/sleep";
+        const wchar_t* kSlowProcName = L"sleep";
+        const wchar_t* kOkArgs = L"-c \"exit 0\"";
+        const wchar_t* kFailArgs = L"-c \"exit 3\"";
+        const wchar_t* kSlowArgs = L"30";
+#else
         wchar_t sysDir[MAX_PATH] = {};
         GetSystemDirectoryW(sysDir, MAX_PATH);
         const std::wstring cmdExe = std::wstring(sysDir) + L"\\cmd.exe";
         const std::wstring pingExe = std::wstring(sysDir) + L"\\PING.EXE";
+        const wchar_t* kSlowProcName = L"PING.EXE";
+        const wchar_t* kOkArgs = L"/c exit 0";
+        const wchar_t* kFailArgs = L"/c exit 3";
+        const wchar_t* kSlowArgs = L"-n 30 127.0.0.1";
+#endif
 
-        // Number of ping.exe processes that this process started and that are still running
-        auto ourPingsRunning = []() {
+        // Number of slow child processes that this process started and that are still running
+        auto ourPingsRunning = [&]() {
             int count = 0;
             HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snap == INVALID_HANDLE_VALUE) return -1;
@@ -4787,20 +4900,20 @@ static void RunStage13Tests(TestCounter& tc) {
             pe.dwSize = sizeof(pe);
             if (Process32FirstW(snap, &pe)) {
                 do {
-                    if (pe.th32ParentProcessID == GetCurrentProcessId() && _wcsicmp(pe.szExeFile, L"PING.EXE") == 0) ++count;
+                    if (pe.th32ParentProcessID == GetCurrentProcessId() && _wcsicmp(pe.szExeFile, kSlowProcName) == 0) ++count;
                 } while (Process32NextW(snap, &pe));
             }
             CloseHandle(snap);
             return count;
         };
 
-        const bool succeeded = ArchiveExplorer::RunToolAndWait(cmdExe, L"/c exit 0", 15000) == ArchiveExplorer::ToolRun::Succeeded;
-        const bool failed = ArchiveExplorer::RunToolAndWait(cmdExe, L"/c exit 3", 15000) == ArchiveExplorer::ToolRun::Failed;
+        const bool succeeded = ArchiveExplorer::RunToolAndWait(cmdExe, kOkArgs, 15000) == ArchiveExplorer::ToolRun::Succeeded;
+        const bool failed = ArchiveExplorer::RunToolAndWait(cmdExe, kFailArgs, 15000) == ArchiveExplorer::ToolRun::Failed;
         const bool missing = ArchiveExplorer::RunToolAndWait(baseDir + L"\\no_such_tool.exe", L"", 15000) == ArchiveExplorer::ToolRun::Failed;
 
         const int pingsBefore = ourPingsRunning();
         const ULONGLONG started = GetTickCount64();
-        const bool timedOut = ArchiveExplorer::RunToolAndWait(pingExe, L"-n 30 127.0.0.1", 1000) == ArchiveExplorer::ToolRun::TimedOut;
+        const bool timedOut = ArchiveExplorer::RunToolAndWait(pingExe, kSlowArgs, 1000) == ArchiveExplorer::ToolRun::TimedOut;
         const ULONGLONG tookMs = GetTickCount64() - started;
         const int pingsAfter = ourPingsRunning();
 
@@ -6158,7 +6271,7 @@ static void RunStage14Tests(TestCounter& tc) {
         p32le(pck, 1); p32le(pck, 4); p32le(pck, 2); p32le(pck, 0);
         pck.insert(pck.end(), 64, 0); // 16 reserved u32s
         p32le(pck, 1); // 1 file
-        std::string gpath = "res://scenes/main.tscn\0\0"; // 24 bytes (4B aligned)
+        std::string gpath("res://scenes/main.tscn\0\0", 24); // 24 bytes (4B aligned)
         p32le(pck, 24);
         pck.insert(pck.end(), gpath.data(), gpath.data() + 24);
         uint64_t pckDataOff = pck.size() + 8 + 8 + 16;
@@ -6840,7 +6953,8 @@ static void RunStage14Tests(TestCounter& tc) {
         std::vector<uint8_t> sof = { 'S','O','F',0 };
         p32le(sof, 2); // 2 packets
         p16le(sof, 2); p32le(sof, 13);
-        sof.insert(sof.end(), "EP4CE22F17C6", "EP4CE22F17C6" + 13);
+        const char sofPart[] = "EP4CE22F17C6";
+        sof.insert(sof.end(), sofPart, sofPart + 13);
         p16le(sof, 6); p32le(sof, 64);
         for (int i = 0; i < 64; ++i) sof.push_back(static_cast<uint8_t>((i * 37 + 0x5A) & 0xFFu));
 
@@ -7197,7 +7311,7 @@ int RunStageTests(const std::wstring& stageName, const std::wstring& outReportPa
             std::string u8 = PathUtils::WideToUtf8(tc.log);
             PathUtils::WriteFileBytes(outReportPath, u8.data(), u8.size());
         }
-        return (tc.failed == 0 && passesCompleted == 100 && tc.passed == 5000) ? 0 : 1;
+        return (tc.failed == 0 && passesCompleted == 100 && tc.passed >= 5000) ? 0 : 1;
     }
 
     if (stageLower == L"1" || stageLower == L"stage1" || stageLower == L"all") {
@@ -7278,6 +7392,7 @@ void InspectWrite(const char* text, int len) {
     if (len <= 0) return;
     DWORD written = 0;
     WriteFile(g_inspectOut, text, static_cast<DWORD>(len), &written, nullptr);
+    FlushFileBuffers(g_inspectOut);
 }
 
 // Records where the process died and ends it at once, without Windows Error Reporting getting involved
@@ -7303,6 +7418,58 @@ LONG WINAPI InspectCrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+#ifndef _WIN32
+char g_posixInspectAltStack[64 * 1024];
+
+void InspectPosixCrashHandler(int sig, siginfo_t*, void* context) {
+    const int fd = Compat::FdOf(g_inspectOut);
+    uintptr_t pc = 0;
+#if defined(__x86_64__)
+    pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__i386__)
+    pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_EIP]);
+#elif defined(__aarch64__)
+    pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.pc);
+#else
+    (void)context;
+#endif
+    const char* sigName = (sig == SIGSEGV) ? "SIGSEGV" : (sig == SIGBUS) ? "SIGBUS" :
+                          (sig == SIGFPE) ? "SIGFPE" : (sig == SIGILL) ? "SIGILL" :
+                          (sig == SIGABRT) ? "SIGABRT" : "SIGNAL";
+    const char* modName = "?";
+    uintptr_t offset = pc;
+    Dl_info where{};
+    if (pc && ::dladdr(reinterpret_cast<void*>(pc), &where) && where.dli_fname && *where.dli_fname) {
+        const char* slash = std::strrchr(where.dli_fname, '/');
+        modName = slash ? (slash + 1) : where.dli_fname;
+        offset = pc - reinterpret_cast<uintptr_t>(where.dli_fbase);
+    }
+    char buf[384];
+    const int n = std::snprintf(buf, sizeof(buf), "X\t%ld\t%s\t%s\t%s\t%llX\n",
+                                static_cast<long>(g_inspectIndex), g_inspectReader ? g_inspectReader : "",
+                                sigName, modName, static_cast<unsigned long long>(offset));
+    if (fd >= 0 && n > 0) {
+        const ssize_t wr = ::write(fd, buf, static_cast<size_t>(n));
+        (void)wr;
+    }
+    ::_exit(3);
+}
+
+void InstallPosixInspectHandlers() {
+    stack_t alt{};
+    alt.ss_sp = g_posixInspectAltStack;
+    alt.ss_size = sizeof(g_posixInspectAltStack);
+    ::sigaltstack(&alt, nullptr);
+    struct sigaction sa{};
+    sa.sa_sigaction = InspectPosixCrashHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    for (int sig : { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT, SIGTRAP }) {
+        ::sigaction(sig, &sa, nullptr);
+    }
+}
+#endif
+
 } // namespace
 
 namespace {
@@ -7317,6 +7484,9 @@ int InspectFiles(const std::wstring& listFile, const std::wstring& resultFile) {
     if (g_inspectOut == INVALID_HANDLE_VALUE) return 2;
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     SetUnhandledExceptionFilter(InspectCrashFilter);
+#ifndef _WIN32
+    InstallPosixInspectHandlers();
+#endif
 
     // A reader that never returns is a fault too: note it and end the process so the driver can go on
     std::atomic<bool> finished{ false };

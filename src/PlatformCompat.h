@@ -20,6 +20,14 @@
 #include <windows.h>
 #else
 
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+#ifndef _LARGEFILE64_SOURCE
+#define _LARGEFILE64_SOURCE 1
+#endif
+
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdarg>
@@ -33,10 +41,15 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <vector>
 #include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <map>
 #include <mutex>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 #include <iconv.h>
 #include <strings.h>
@@ -650,15 +663,30 @@ inline unsigned int _rotr(unsigned int v, int s) { s &= 31; return s ? (v >> s) 
 #define TRUNCATE_EXISTING 5
 #define FILE_ATTRIBUTE_READONLY 0x00000001u
 #define FILE_ATTRIBUTE_HIDDEN 0x00000002u
+#define FILE_ATTRIBUTE_SYSTEM 0x00000004u
 #define FILE_ATTRIBUTE_DIRECTORY 0x00000010u
+#define FILE_ATTRIBUTE_ARCHIVE 0x00000020u
 #define FILE_ATTRIBUTE_NORMAL 0x00000080u
+#define FILE_ATTRIBUTE_TEMPORARY 0x00000100u
+#define FILE_ATTRIBUTE_SPARSE_FILE 0x00000200u
+#define FILE_ATTRIBUTE_REPARSE_POINT 0x00000400u
+#define FILE_FLAG_OPEN_REPARSE_POINT 0x00200000u
+#define FILE_FLAG_BACKUP_SEMANTICS 0x02000000u
+#define FILE_FLAG_DELETE_ON_CLOSE 0x04000000u
 #define FILE_FLAG_SEQUENTIAL_SCAN 0x08000000u
 #define FILE_FLAG_RANDOM_ACCESS 0x10000000u
+#define FILE_FLAG_NO_BUFFERING 0x20000000u
+#define FILE_FLAG_OVERLAPPED 0x40000000u
+#define FILE_FLAG_WRITE_THROUGH 0x80000000u
+#define IO_REPARSE_TAG_MOUNT_POINT 0xA0000003u
+#define IO_REPARSE_TAG_SYMLINK 0xA000000Cu
+#define IsReparseTagNameSurrogate(_tag) (((_tag) & 0x20000000u) != 0)
 #define FILE_BEGIN 0
 #define FILE_CURRENT 1
 #define FILE_END 2
 #define INVALID_HANDLE_VALUE (reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1)))
 #define INVALID_FILE_ATTRIBUTES (static_cast<DWORD>(0xFFFFFFFFu))
+#define INVALID_FILE_SIZE (static_cast<DWORD>(0xFFFFFFFFu))
 
 union LARGE_INTEGER {
     __extension__ struct {
@@ -672,11 +700,34 @@ union LARGE_INTEGER {
     LONGLONG QuadPart;
 };
 
+union ULARGE_INTEGER {
+    __extension__ struct {
+        DWORD LowPart;
+        DWORD HighPart;
+    };
+    struct {
+        DWORD LowPart;
+        DWORD HighPart;
+    } u;
+    ULONGLONG QuadPart;
+};
+
 namespace Explorer2::Compat {
+inline std::wstring StripExtendedPrefix(const wchar_t* path) {
+    if (!path) return {};
+    std::wstring p(path);
+    if (p.rfind(L"\\\\?\\UNC\\", 0) == 0 || p.rfind(L"//?/UNC/", 0) == 0) {
+        p = L"\\\\" + p.substr(8);
+    } else if (p.rfind(L"\\\\?\\", 0) == 0 || p.rfind(L"//?/", 0) == 0) {
+        p = p.substr(4);
+    }
+    return p;
+}
+
 inline std::string NativePath(const wchar_t* path) {
     std::string out;
     if (!path) return out;
-    std::wstring p(path);
+    std::wstring p = StripExtendedPrefix(path);
     for (wchar_t& ch : p) {
         if (ch == L'\\') ch = L'/';
     }
@@ -685,14 +736,22 @@ inline std::string NativePath(const wchar_t* path) {
 }
 
 // Handles are small objects that say what they are, so that CloseHandle can close each kind
-enum class HandleKind : uint32_t { File = 0x454C4946u, Mapping = 0x5050414Du, Find = 0x444E4946u };
+enum class HandleKind : uint32_t { File = 0x454C4946u, Mapping = 0x5050414Du, Find = 0x444E4946u, Custom = 0x43555354u };
 struct HandleBase {
     explicit HandleBase(HandleKind k) : kind(k) {}
+    virtual ~HandleBase() = default;
+    virtual bool CloseCustom() { return true; }
     HandleKind kind;
 };
 struct FileHandle : HandleBase {
     FileHandle() : HandleBase(HandleKind::File) {}
     FILE* f = nullptr;
+    int dirFd = -1;
+    uint64_t dev = 0;
+    uint64_t ino = 0;
+    DWORD shareMode = 0;
+    bool deleteOnClose = false;
+    std::string nativePath;
 };
 struct MappingHandle : HandleBase {
     MappingHandle() : HandleBase(HandleKind::Mapping) {}
@@ -705,6 +764,46 @@ inline HandleBase* BaseOf(HANDLE h) {
 inline FILE* FileOf(HANDLE h) {
     HandleBase* b = BaseOf(h);
     return (b && b->kind == HandleKind::File) ? static_cast<FileHandle*>(b)->f : nullptr;
+}
+inline int FdOf(HANDLE h) {
+    HandleBase* b = BaseOf(h);
+    if (!b || b->kind != HandleKind::File) return -1;
+    auto* fh = static_cast<FileHandle*>(b);
+    if (fh->dirFd >= 0) return fh->dirFd;
+    return fh->f ? fileno(fh->f) : -1;
+}
+
+inline std::mutex& OpenFileMutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::map<std::pair<uint64_t, uint64_t>, std::vector<FileHandle*>>& OpenFileMap() {
+    static std::map<std::pair<uint64_t, uint64_t>, std::vector<FileHandle*>> m;
+    return m;
+}
+inline void RegisterOpenFile(FileHandle* fh) {
+    if (!fh || (fh->dev == 0 && fh->ino == 0)) return;
+    std::lock_guard<std::mutex> lk(OpenFileMutex());
+    OpenFileMap()[{ fh->dev, fh->ino }].push_back(fh);
+}
+inline void UnregisterOpenFile(FileHandle* fh) {
+    if (!fh || (fh->dev == 0 && fh->ino == 0)) return;
+    std::lock_guard<std::mutex> lk(OpenFileMutex());
+    auto it = OpenFileMap().find({ fh->dev, fh->ino });
+    if (it != OpenFileMap().end()) {
+        auto& vec = it->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), fh), vec.end());
+        if (vec.empty()) OpenFileMap().erase(it);
+    }
+}
+inline bool IsDeleteBlockedByOpenHandle(uint64_t dev, uint64_t ino) {
+    std::lock_guard<std::mutex> lk(OpenFileMutex());
+    auto it = OpenFileMap().find({ dev, ino });
+    if (it == OpenFileMap().end()) return false;
+    for (const FileHandle* fh : it->second) {
+        if ((fh->shareMode & FILE_SHARE_DELETE) == 0) return true;
+    }
+    return false;
 }
 
 // GetLastError: thread-local, set from errno by the functions below
@@ -737,6 +836,48 @@ inline FILETIME FileTimeFromUnix(time_t secs) {
     ft.dwHighDateTime = static_cast<DWORD>(ticks >> 32);
     return ft;
 }
+inline FILETIME FileTimeFromTimespec(const struct timespec& ts) {
+    const uint64_t ticks = static_cast<uint64_t>(static_cast<int64_t>(ts.tv_sec) + 11644473600LL) * 10000000ULL +
+                           static_cast<uint64_t>(ts.tv_nsec / 100);
+    FILETIME ft;
+    ft.dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFu);
+    ft.dwHighDateTime = static_cast<DWORD>(ticks >> 32);
+    return ft;
+}
+
+inline std::mutex& CreationTimeMutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::map<std::pair<uint64_t, uint64_t>, FILETIME>& CreationTimeMap() {
+    static std::map<std::pair<uint64_t, uint64_t>, FILETIME> m;
+    return m;
+}
+inline void SetInodeCreationTime(int fd, uint64_t dev, uint64_t ino, const FILETIME& ft) {
+    if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0) return;
+    {
+        std::lock_guard<std::mutex> lk(CreationTimeMutex());
+        if (CreationTimeMap().size() > 8192) CreationTimeMap().clear();
+        CreationTimeMap()[{ dev, ino }] = ft;
+    }
+    if (fd >= 0) {
+        (void)::fsetxattr(fd, "user.e2_btime", &ft, sizeof(FILETIME), 0);
+    }
+}
+inline FILETIME GetInodeCreationTime(const char* nativePath, const struct stat& st) {
+    {
+        std::lock_guard<std::mutex> lk(CreationTimeMutex());
+        auto it = CreationTimeMap().find({ static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino) });
+        if (it != CreationTimeMap().end()) return it->second;
+    }
+    if (nativePath) {
+        FILETIME xft = {};
+        if (::lgetxattr(nativePath, "user.e2_btime", &xft, sizeof(FILETIME)) == static_cast<ssize_t>(sizeof(FILETIME))) {
+            return xft;
+        }
+    }
+    return FileTimeFromTimespec(st.st_mtim);
+}
 } // namespace Explorer2::Compat
 
 #define ERROR_SUCCESS 0L
@@ -761,17 +902,30 @@ inline DWORD GetLastError() { return Explorer2::Compat::LastError(); }
 inline void SetLastError(DWORD e) { Explorer2::Compat::LastError() = e; }
 inline DWORD GetCurrentProcessId() { return static_cast<DWORD>(::getpid()); }
 
-inline HANDLE CreateFileW(const wchar_t* path, DWORD access, DWORD /*share*/, void* /*security*/, DWORD disposition,
-                          DWORD /*flags*/, HANDLE /*templateFile*/) {
+inline HANDLE CreateFileW(const wchar_t* path, DWORD access, DWORD share, void* /*security*/, DWORD disposition,
+                          DWORD flags, HANDLE /*templateFile*/) {
     const std::string native = Explorer2::Compat::NativePath(path);
     struct stat st = {};
     const bool exists = (::stat(native.c_str(), &st) == 0);
-    if (exists && S_ISDIR(st.st_mode)) {   // like CreateFileW without backup semantics
+    if (exists && S_ISDIR(st.st_mode)) {
+        if ((flags & FILE_FLAG_BACKUP_SEMANTICS) && disposition == OPEN_EXISTING) {
+            const int dfd = ::open(native.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (dfd < 0) { Explorer2::Compat::SetErrorFromErrno(); return INVALID_HANDLE_VALUE; }
+            auto* h = new Explorer2::Compat::FileHandle();
+            h->dirFd = dfd;
+            h->dev = static_cast<uint64_t>(st.st_dev);
+            h->ino = static_cast<uint64_t>(st.st_ino);
+            h->shareMode = share;
+            h->nativePath = native;
+            Explorer2::Compat::RegisterOpenFile(h);
+            SetLastError(ERROR_SUCCESS);
+            return static_cast<HANDLE>(static_cast<Explorer2::Compat::HandleBase*>(h));
+        }
         SetLastError(ERROR_ACCESS_DENIED);
         return INVALID_HANDLE_VALUE;
     }
     const char* mode = nullptr;
-    const bool wantWrite = (access & GENERIC_WRITE) != 0;
+    const bool wantWrite = (access & (GENERIC_WRITE | 0x0100u /*FILE_WRITE_ATTRIBUTES*/ | 0x0002u /*FILE_WRITE_DATA*/)) != 0;
     const bool wantRead = (access & GENERIC_READ) != 0 || !wantWrite;
     switch (disposition) {
     case OPEN_EXISTING:
@@ -797,12 +951,24 @@ inline HANDLE CreateFileW(const wchar_t* path, DWORD access, DWORD /*share*/, vo
         return INVALID_HANDLE_VALUE;
     }
     FILE* f = std::fopen(native.c_str(), mode);
+    if (!f && wantWrite && disposition == OPEN_EXISTING && (access & GENERIC_WRITE) == 0) {
+        // Read-only file opened for FILE_WRITE_ATTRIBUTES only: O_RDONLY fd still allows futimens!
+        f = std::fopen(native.c_str(), "rb");
+    }
     if (!f) {
         Explorer2::Compat::SetErrorFromErrno();
         return INVALID_HANDLE_VALUE;
     }
+    struct stat fst = {};
+    ::fstat(fileno(f), &fst);
     auto* h = new Explorer2::Compat::FileHandle();
     h->f = f;
+    h->dev = static_cast<uint64_t>(fst.st_dev);
+    h->ino = static_cast<uint64_t>(fst.st_ino);
+    h->shareMode = share;
+    h->deleteOnClose = (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0;
+    h->nativePath = native;
+    Explorer2::Compat::RegisterOpenFile(h);
     SetLastError((exists && (disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS)) ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
     return static_cast<HANDLE>(static_cast<Explorer2::Compat::HandleBase*>(h));
 }
@@ -852,22 +1018,108 @@ inline BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER distance, LARGE_INTEGER* ne
 }
 
 inline BOOL GetFileTime(HANDLE h, FILETIME* creation, FILETIME* access, FILETIME* write) {
-    FILE* f = Explorer2::Compat::FileOf(h);
+    const int fd = Explorer2::Compat::FdOf(h);
     struct stat st = {};
-    if (!f || ::fstat(fileno(f), &st) != 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    if (creation) *creation = Explorer2::Compat::FileTimeFromUnix(st.st_mtime);
-    if (access) *access = Explorer2::Compat::FileTimeFromUnix(st.st_atime);
-    if (write) *write = Explorer2::Compat::FileTimeFromUnix(st.st_mtime);
+    if (fd < 0 || ::fstat(fd, &st) != 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    auto* fh = static_cast<Explorer2::Compat::FileHandle*>(Explorer2::Compat::BaseOf(h));
+    if (creation) *creation = Explorer2::Compat::GetInodeCreationTime(fh ? fh->nativePath.c_str() : nullptr, st);
+    if (access) *access = Explorer2::Compat::FileTimeFromTimespec(st.st_atim);
+    if (write) *write = Explorer2::Compat::FileTimeFromTimespec(st.st_mtim);
     return TRUE;
 }
 
+inline BOOL SetFileTime(HANDLE h, const FILETIME* creation, const FILETIME* access, const FILETIME* write) {
+    const int fd = Explorer2::Compat::FdOf(h);
+    if (fd < 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (FILE* f = Explorer2::Compat::FileOf(h)) std::fflush(f);
+    if (creation && (creation->dwLowDateTime != 0 || creation->dwHighDateTime != 0)) {
+        struct stat st = {};
+        if (::fstat(fd, &st) == 0) {
+            Explorer2::Compat::SetInodeCreationTime(fd, static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino), *creation);
+        }
+    }
+    if (!access && !write) return TRUE;
+    struct timespec ts[2] = {};
+    auto toSpec = [](const FILETIME* ft, timespec& out) {
+        if (!ft || (ft->dwLowDateTime == 0 && ft->dwHighDateTime == 0)) {
+            out.tv_nsec = UTIME_OMIT;
+            return;
+        }
+        const uint64_t ticks = (static_cast<uint64_t>(ft->dwHighDateTime) << 32) | ft->dwLowDateTime;
+        out.tv_sec = static_cast<time_t>(static_cast<int64_t>(ticks / 10000000ULL) - 11644473600LL);
+        out.tv_nsec = static_cast<long>((ticks % 10000000ULL) * 100ULL);
+    };
+    toSpec(access, ts[0]);
+    toSpec(write, ts[1]);
+    if (::futimens(fd, ts) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    return TRUE;
+}
+
+inline BOOL SetEndOfFile(HANDLE h) {
+    FILE* f = Explorer2::Compat::FileOf(h);
+    if (!f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    std::fflush(f);
+    const off_t pos = ::ftello(f);
+    if (pos < 0 || ::ftruncate(fileno(f), pos) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    return TRUE;
+}
+
+inline BOOL FlushFileBuffers(HANDLE h) {
+    FILE* f = Explorer2::Compat::FileOf(h);
+    if (!f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (std::fflush(f) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    return TRUE;
+}
+
+namespace Explorer2::Compat {
+inline bool IsSparseStat(const struct stat& st) {
+    if (!S_ISREG(st.st_mode) || st.st_size < 65536) return false;
+    const uint64_t logical = static_cast<uint64_t>(st.st_size);
+    const uint64_t allocated = static_cast<uint64_t>(st.st_blocks) * 512ULL;
+    return allocated + 65536ULL < logical;
+}
+} // namespace Explorer2::Compat
+
 inline DWORD GetFileAttributesW(const wchar_t* path) {
-    struct stat st = {};
-    if (::stat(Explorer2::Compat::NativePath(path).c_str(), &st) != 0) {
+    const std::string native = Explorer2::Compat::NativePath(path);
+    struct stat lst = {};
+    if (::lstat(native.c_str(), &lst) != 0) {
         Explorer2::Compat::SetErrorFromErrno();
         return INVALID_FILE_ATTRIBUTES;
     }
-    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    DWORD attrs = 0;
+    if (S_ISLNK(lst.st_mode)) {
+        attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
+        struct stat tst = {};
+        if (::stat(native.c_str(), &tst) == 0 && S_ISDIR(tst.st_mode)) attrs |= FILE_ATTRIBUTE_DIRECTORY;
+    } else if (S_ISDIR(lst.st_mode)) {
+        attrs |= FILE_ATTRIBUTE_DIRECTORY;
+        if ((lst.st_mode & 0200) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+    } else {
+        if ((lst.st_mode & 0222) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+        if (Explorer2::Compat::IsSparseStat(lst)) attrs |= FILE_ATTRIBUTE_SPARSE_FILE;
+    }
+    return attrs ? attrs : FILE_ATTRIBUTE_NORMAL;
+}
+
+inline BOOL SetFileAttributesW(const wchar_t* path, DWORD attrs) {
+    const std::string native = Explorer2::Compat::NativePath(path);
+    struct stat st = {};
+    if (::lstat(native.c_str(), &st) != 0) {
+        Explorer2::Compat::SetErrorFromErrno();
+        return FALSE;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        if ((attrs & FILE_ATTRIBUTE_READONLY) == 0 && (st.st_mode & 0700) != 0700) {
+            ::chmod(native.c_str(), st.st_mode | 0700);
+        }
+    } else if (!S_ISLNK(st.st_mode)) {
+        mode_t mode = st.st_mode;
+        if (attrs & FILE_ATTRIBUTE_READONLY) mode &= ~static_cast<mode_t>(0222);
+        else mode |= static_cast<mode_t>(0200);
+        if (mode != st.st_mode) ::chmod(native.c_str(), mode);
+    }
+    return TRUE;
 }
 
 inline BOOL CreateDirectoryW(const wchar_t* path, void* /*security*/) {
@@ -875,11 +1127,24 @@ inline BOOL CreateDirectoryW(const wchar_t* path, void* /*security*/) {
     return TRUE;
 }
 inline BOOL RemoveDirectoryW(const wchar_t* path) {
-    if (::rmdir(Explorer2::Compat::NativePath(path).c_str()) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    const std::string native = Explorer2::Compat::NativePath(path);
+    struct stat lst = {};
+    if (::lstat(native.c_str(), &lst) == 0 && S_ISLNK(lst.st_mode)) {
+        if (::unlink(native.c_str()) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+        return TRUE;
+    }
+    if (::rmdir(native.c_str()) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
     return TRUE;
 }
 inline BOOL DeleteFileW(const wchar_t* path) {
-    if (::unlink(Explorer2::Compat::NativePath(path).c_str()) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    const std::string native = Explorer2::Compat::NativePath(path);
+    struct stat lst = {};
+    if (::lstat(native.c_str(), &lst) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    if (!S_ISLNK(lst.st_mode) && Explorer2::Compat::IsDeleteBlockedByOpenHandle(static_cast<uint64_t>(lst.st_dev), static_cast<uint64_t>(lst.st_ino))) {
+        SetLastError(ERROR_SHARING_VIOLATION);
+        return FALSE;
+    }
+    if (::unlink(native.c_str()) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
     return TRUE;
 }
 
@@ -888,8 +1153,14 @@ inline BOOL DeleteFileW(const wchar_t* path) {
 inline BOOL MoveFileExW(const wchar_t* from, const wchar_t* to, DWORD flags) {
     const std::string a = Explorer2::Compat::NativePath(from);
     const std::string b = Explorer2::Compat::NativePath(to);
+    struct stat stSrc = {};
+    if (::lstat(a.c_str(), &stSrc) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    if (!S_ISLNK(stSrc.st_mode) && Explorer2::Compat::IsDeleteBlockedByOpenHandle(static_cast<uint64_t>(stSrc.st_dev), static_cast<uint64_t>(stSrc.st_ino))) {
+        SetLastError(ERROR_SHARING_VIOLATION);
+        return FALSE;
+    }
     struct stat st = {};
-    if (!(flags & MOVEFILE_REPLACE_EXISTING) && ::stat(b.c_str(), &st) == 0) { SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }
+    if (!(flags & MOVEFILE_REPLACE_EXISTING) && ::lstat(b.c_str(), &st) == 0) { SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }
     if (::rename(a.c_str(), b.c_str()) == 0) return TRUE;
     if (errno != EXDEV || !(flags & MOVEFILE_COPY_ALLOWED)) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
     // another file system: copy, then delete the original
@@ -974,7 +1245,9 @@ inline void* MapViewOfFile(HANDLE mapping, DWORD /*access*/, DWORD offsetHigh, D
     auto* m = static_cast<Explorer2::Compat::MappingHandle*>(b);
     const uint64_t offset = (static_cast<uint64_t>(offsetHigh) << 32) | offsetLow;
     if (offset >= m->size) { SetLastError(ERROR_INVALID_PARAMETER); return nullptr; }
-    const size_t len = bytes ? bytes : static_cast<size_t>(m->size - offset);
+    const uint64_t rem = m->size - offset;
+    if (!bytes && rem > static_cast<uint64_t>(~size_t(0))) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
+    const size_t len = bytes ? bytes : static_cast<size_t>(rem);
     void* p = ::mmap(nullptr, len, PROT_READ, MAP_PRIVATE, m->fd, static_cast<off_t>(offset));
     if (p == MAP_FAILED) { Explorer2::Compat::SetErrorFromErrno(); return nullptr; }
     std::lock_guard<std::mutex> lock(Explorer2::Compat::MapRegistryMutex());
@@ -1039,14 +1312,34 @@ inline bool NextMatch(FindState& st, WIN32_FIND_DATAW* data) {
         if (!WildcardMatch(st.mask.c_str(), name.c_str())) continue;
         std::memset(data, 0, sizeof(*data));
         const std::string full = st.dirNative + "/" + e->d_name;
-        struct stat s = {};
-        if (::stat(full.c_str(), &s) == 0) {
-            data->dwFileAttributes = S_ISDIR(s.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
-            data->nFileSizeHigh = static_cast<DWORD>(static_cast<uint64_t>(s.st_size) >> 32);
-            data->nFileSizeLow = static_cast<DWORD>(static_cast<uint64_t>(s.st_size) & 0xFFFFFFFFu);
-            data->ftLastWriteTime = FileTimeFromUnix(s.st_mtime);
-            data->ftCreationTime = data->ftLastWriteTime;
-            data->ftLastAccessTime = FileTimeFromUnix(s.st_atime);
+        struct stat lst = {};
+        if (::lstat(full.c_str(), &lst) == 0) {
+            DWORD attrs = 0;
+            uint64_t sz = static_cast<uint64_t>(lst.st_size);
+            if (S_ISLNK(lst.st_mode)) {
+                attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
+                data->dwReserved0 = IO_REPARSE_TAG_SYMLINK;
+                struct stat tst = {};
+                if (::stat(full.c_str(), &tst) == 0) {
+                    if (S_ISDIR(tst.st_mode)) attrs |= FILE_ATTRIBUTE_DIRECTORY;
+                    else sz = static_cast<uint64_t>(tst.st_size);
+                }
+            } else if (S_ISDIR(lst.st_mode)) {
+                attrs |= FILE_ATTRIBUTE_DIRECTORY;
+                if ((lst.st_mode & 0200) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+            } else {
+                if ((lst.st_mode & 0222) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+                if (IsSparseStat(lst)) attrs |= FILE_ATTRIBUTE_SPARSE_FILE;
+            }
+            if (e->d_name[0] == '.' && std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) {
+                attrs |= FILE_ATTRIBUTE_HIDDEN;
+            }
+            data->dwFileAttributes = attrs ? attrs : FILE_ATTRIBUTE_NORMAL;
+            data->nFileSizeHigh = static_cast<DWORD>(sz >> 32);
+            data->nFileSizeLow = static_cast<DWORD>(sz & 0xFFFFFFFFu);
+            data->ftLastWriteTime = FileTimeFromTimespec(lst.st_mtim);
+            data->ftCreationTime = GetInodeCreationTime(full.c_str(), lst);
+            data->ftLastAccessTime = FileTimeFromTimespec(lst.st_atim);
         } else {
             data->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
         }
@@ -1061,7 +1354,7 @@ inline bool NextMatch(FindState& st, WIN32_FIND_DATAW* data) {
 
 inline HANDLE FindFirstFileW(const wchar_t* pattern, WIN32_FIND_DATAW* data) {
     if (!pattern || !data) { SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
-    std::wstring p(pattern);
+    std::wstring p = Explorer2::Compat::StripExtendedPrefix(pattern);
     const size_t sep = p.find_last_of(L"\\/");
     std::wstring dir = (sep == std::wstring::npos) ? std::wstring(L".") : p.substr(0, sep);
     if (dir.empty()) dir = L"/";
@@ -1106,7 +1399,13 @@ inline BOOL CloseHandle(HANDLE h) {
     switch (b->kind) {
     case Explorer2::Compat::HandleKind::File: {
         auto* fh = static_cast<Explorer2::Compat::FileHandle*>(b);
-        const bool ok = !fh->f || std::fclose(fh->f) == 0;
+        Explorer2::Compat::UnregisterOpenFile(fh);
+        bool ok = true;
+        if (fh->f) ok = (std::fclose(fh->f) == 0);
+        if (fh->dirFd >= 0) ok = (::close(fh->dirFd) == 0) && ok;
+        if (fh->deleteOnClose && !fh->nativePath.empty()) {
+            (void)::unlink(fh->nativePath.c_str());
+        }
         delete fh;
         return ok ? TRUE : FALSE;
     }
@@ -1118,6 +1417,11 @@ inline BOOL CloseHandle(HANDLE h) {
     }
     case Explorer2::Compat::HandleKind::Find:
         return FindClose(h);
+    case Explorer2::Compat::HandleKind::Custom: {
+        const bool ok = b->CloseCustom();
+        delete b;
+        return ok ? TRUE : FALSE;
+    }
     }
     return FALSE;
 }
@@ -1248,18 +1552,33 @@ struct WIN32_FILE_ATTRIBUTE_DATA {
 enum GET_FILEEX_INFO_LEVELS { GetFileExInfoStandard = 0 };
 
 inline BOOL GetFileAttributesExW(const wchar_t* path, GET_FILEEX_INFO_LEVELS, void* info) {
-    struct stat st = {};
-    if (!info || ::stat(Explorer2::Compat::NativePath(path).c_str(), &st) != 0) return FALSE;
+    const std::string native = Explorer2::Compat::NativePath(path);
+    struct stat lst = {};
+    if (!info || ::lstat(native.c_str(), &lst) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
     auto* d = static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(info);
     std::memset(d, 0, sizeof(*d));
-    d->dwFileAttributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
-    d->nFileSizeHigh = static_cast<DWORD>(static_cast<uint64_t>(st.st_size) >> 32);
-    d->nFileSizeLow = static_cast<DWORD>(static_cast<uint64_t>(st.st_size) & 0xFFFFFFFFu);
-    const uint64_t ticks = static_cast<uint64_t>(static_cast<int64_t>(st.st_mtime) + 11644473600LL) * 10000000ULL;
-    d->ftLastWriteTime.dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFu);
-    d->ftLastWriteTime.dwHighDateTime = static_cast<DWORD>(ticks >> 32);
-    d->ftCreationTime = d->ftLastWriteTime;
-    d->ftLastAccessTime = d->ftLastWriteTime;
+    DWORD attrs = 0;
+    uint64_t sz = static_cast<uint64_t>(lst.st_size);
+    if (S_ISLNK(lst.st_mode)) {
+        attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
+        struct stat tst = {};
+        if (::stat(native.c_str(), &tst) == 0) {
+            if (S_ISDIR(tst.st_mode)) attrs |= FILE_ATTRIBUTE_DIRECTORY;
+            else sz = static_cast<uint64_t>(tst.st_size);
+        }
+    } else if (S_ISDIR(lst.st_mode)) {
+        attrs |= FILE_ATTRIBUTE_DIRECTORY;
+        if ((lst.st_mode & 0200) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+    } else {
+        if ((lst.st_mode & 0222) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+        if (Explorer2::Compat::IsSparseStat(lst)) attrs |= FILE_ATTRIBUTE_SPARSE_FILE;
+    }
+    d->dwFileAttributes = attrs ? attrs : FILE_ATTRIBUTE_NORMAL;
+    d->nFileSizeHigh = static_cast<DWORD>(sz >> 32);
+    d->nFileSizeLow = static_cast<DWORD>(sz & 0xFFFFFFFFu);
+    d->ftLastWriteTime = Explorer2::Compat::FileTimeFromTimespec(lst.st_mtim);
+    d->ftCreationTime = Explorer2::Compat::GetInodeCreationTime(native.c_str(), lst);
+    d->ftLastAccessTime = Explorer2::Compat::FileTimeFromTimespec(lst.st_atim);
     return TRUE;
 }
 
@@ -1308,6 +1627,144 @@ inline BOOL LocalFileTimeToFileTime(const FILETIME* local, FILETIME* utc) {
     utc->dwLowDateTime = static_cast<DWORD>(out & 0xFFFFFFFFu);
     utc->dwHighDateTime = static_cast<DWORD>(out >> 32);
     return TRUE;
+}
+
+inline int localtime_s(struct tm* out, const time_t* t) {
+    if (!out || !t) return EINVAL;
+    return localtime_r(t, out) ? 0 : EINVAL;
+}
+
+inline void GetSystemTimeAsFileTime(FILETIME* ft) {
+    if (!ft) return;
+    struct timespec ts = {};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    const uint64_t ticks = static_cast<uint64_t>(static_cast<int64_t>(ts.tv_sec) + 11644473600LL) * 10000000ULL +
+                           static_cast<uint64_t>(ts.tv_nsec / 100);
+    ft->dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFu);
+    ft->dwHighDateTime = static_cast<DWORD>(ticks >> 32);
+}
+
+inline void GetLocalTime(SYSTEMTIME* st) {
+    if (!st) return;
+    struct timespec ts = {};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm t = {};
+    localtime_r(&ts.tv_sec, &t);
+    st->wYear = static_cast<WORD>(t.tm_year + 1900);
+    st->wMonth = static_cast<WORD>(t.tm_mon + 1);
+    st->wDayOfWeek = static_cast<WORD>(t.tm_wday);
+    st->wDay = static_cast<WORD>(t.tm_mday);
+    st->wHour = static_cast<WORD>(t.tm_hour);
+    st->wMinute = static_cast<WORD>(t.tm_min);
+    st->wSecond = static_cast<WORD>(t.tm_sec);
+    st->wMilliseconds = static_cast<WORD>(ts.tv_nsec / 1000000L);
+}
+
+inline void GetSystemTime(SYSTEMTIME* st) {
+    if (!st) return;
+    struct timespec ts = {};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm t = {};
+    gmtime_r(&ts.tv_sec, &t);
+    st->wYear = static_cast<WORD>(t.tm_year + 1900);
+    st->wMonth = static_cast<WORD>(t.tm_mon + 1);
+    st->wDayOfWeek = static_cast<WORD>(t.tm_wday);
+    st->wDay = static_cast<WORD>(t.tm_mday);
+    st->wHour = static_cast<WORD>(t.tm_hour);
+    st->wMinute = static_cast<WORD>(t.tm_min);
+    st->wSecond = static_cast<WORD>(t.tm_sec);
+    st->wMilliseconds = static_cast<WORD>(ts.tv_nsec / 1000000L);
+}
+
+inline BOOL SystemTimeToFileTime(const SYSTEMTIME* st, FILETIME* ft) {
+    if (!st || !ft) return FALSE;
+    struct tm t = {};
+    t.tm_year = static_cast<int>(st->wYear) - 1900;
+    t.tm_mon = static_cast<int>(st->wMonth) - 1;
+    t.tm_mday = static_cast<int>(st->wDay);
+    t.tm_hour = static_cast<int>(st->wHour);
+    t.tm_min = static_cast<int>(st->wMinute);
+    t.tm_sec = static_cast<int>(st->wSecond);
+    const time_t secs = timegm(&t);
+    const uint64_t ticks = static_cast<uint64_t>(static_cast<int64_t>(secs) + 11644473600LL) * 10000000ULL +
+                           static_cast<uint64_t>(st->wMilliseconds) * 10000ULL;
+    ft->dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFu);
+    ft->dwHighDateTime = static_cast<DWORD>(ticks >> 32);
+    return TRUE;
+}
+
+inline BOOL SystemTimeToTzSpecificLocalTime(const void* /*tz*/, const SYSTEMTIME* utc, SYSTEMTIME* local) {
+    if (!utc || !local) return FALSE;
+    struct tm t = {};
+    t.tm_year = static_cast<int>(utc->wYear) - 1900;
+    t.tm_mon = static_cast<int>(utc->wMonth) - 1;
+    t.tm_mday = static_cast<int>(utc->wDay);
+    t.tm_hour = static_cast<int>(utc->wHour);
+    t.tm_min = static_cast<int>(utc->wMinute);
+    t.tm_sec = static_cast<int>(utc->wSecond);
+    const time_t secs = timegm(&t);
+    struct tm lt = {};
+    if (!localtime_r(&secs, &lt)) return FALSE;
+    local->wYear = static_cast<WORD>(lt.tm_year + 1900);
+    local->wMonth = static_cast<WORD>(lt.tm_mon + 1);
+    local->wDayOfWeek = static_cast<WORD>(lt.tm_wday);
+    local->wDay = static_cast<WORD>(lt.tm_mday);
+    local->wHour = static_cast<WORD>(lt.tm_hour);
+    local->wMinute = static_cast<WORD>(lt.tm_min);
+    local->wSecond = static_cast<WORD>(lt.tm_sec);
+    local->wMilliseconds = utc->wMilliseconds;
+    return TRUE;
+}
+
+inline DWORD GetCurrentThreadId() {
+#ifdef SYS_gettid
+    return static_cast<DWORD>(::syscall(SYS_gettid));
+#else
+    return static_cast<DWORD>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+
+inline DWORD GetCurrentDirectoryW(DWORD bufferLength, wchar_t* buffer) {
+    char cwd[PATH_MAX] = {};
+    if (!::getcwd(cwd, sizeof(cwd))) { Explorer2::Compat::SetErrorFromErrno(); return 0; }
+    std::wstring w;
+    Explorer2::Compat::DecodeUtf8(cwd, std::strlen(cwd), w, false);
+    if (!buffer || bufferLength <= w.size()) return static_cast<DWORD>(w.size() + 1);
+    std::wmemcpy(buffer, w.c_str(), w.size() + 1);
+    return static_cast<DWORD>(w.size());
+}
+
+inline BOOL SetCurrentDirectoryW(const wchar_t* path) {
+    if (!path || ::chdir(Explorer2::Compat::NativePath(path).c_str()) != 0) {
+        Explorer2::Compat::SetErrorFromErrno();
+        return FALSE;
+    }
+    return TRUE;
+}
+
+inline DWORD GetFullPathNameW(const wchar_t* fileName, DWORD bufferLength, wchar_t* buffer, wchar_t** filePart) {
+    if (!fileName || !*fileName) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    std::string native = Explorer2::Compat::NativePath(fileName);
+    char resolved[PATH_MAX] = {};
+    std::string full;
+    if (::realpath(native.c_str(), resolved)) {
+        full = resolved;
+    } else if (!native.empty() && native[0] == '/') {
+        full = native;
+    } else {
+        char cwd[PATH_MAX] = {};
+        if (::getcwd(cwd, sizeof(cwd))) full = std::string(cwd) + "/" + native;
+        else full = native;
+    }
+    std::wstring w;
+    Explorer2::Compat::DecodeUtf8(full.data(), full.size(), w, false);
+    if (!buffer || bufferLength <= w.size()) return static_cast<DWORD>(w.size() + 1);
+    std::wmemcpy(buffer, w.c_str(), w.size() + 1);
+    if (filePart) {
+        wchar_t* slash = std::wcsrchr(buffer, L'/');
+        *filePart = slash ? (slash + 1) : buffer;
+    }
+    return static_cast<DWORD>(w.size());
 }
 
 #endif // _WIN32

@@ -306,7 +306,7 @@ std::wstring NetbiosName(uint32_t ipHost) {
 
         fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
         timeval tv{0, kNbstatTimeoutMs * 1000};
-        if (select(0, &rd, nullptr, nullptr, &tv) <= 0) break;
+        if (select(static_cast<int>(s + 1), &rd, nullptr, nullptr, &tv) <= 0) break;
         uint8_t buf[1024];
         int n = recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
         if (n < 12 + 2 + 10 + 1) break;
@@ -355,7 +355,7 @@ SOCKET ConnectWithDeadline(uint32_t ipHost, uint16_t port, Clock::time_point dea
     if (left < 0) left = 0;
     fd_set wr, ex; FD_ZERO(&wr); FD_ZERO(&ex); FD_SET(s, &wr); FD_SET(s, &ex);
     timeval tv{(long)(left / 1000000), (long)(left % 1000000)};
-    int r = select(0, nullptr, &wr, &ex, &tv);
+    int r = select(static_cast<int>(s + 1), nullptr, &wr, &ex, &tv);
     int err = 1; int el = sizeof(err);
     if (r > 0 && FD_ISSET(s, &wr)) getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &el);
     if (err != 0) { closesocket(s); return INVALID_SOCKET; }
@@ -419,7 +419,7 @@ bool HttpGetBody(const std::string& url, std::string& body) {
             if (left <= 0) break;
             fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
             timeval tv{(long)(left / 1000000), (long)(left % 1000000)};
-            if (select(0, &rd, nullptr, nullptr, &tv) <= 0) break;
+            if (select(static_cast<int>(s + 1), &rd, nullptr, nullptr, &tv) <= 0) break;
             int n = recv(s, buf, sizeof(buf), 0);
             if (n <= 0) break;                               // closed (or error): we got what there is
             raw.append(buf, (size_t)n);
@@ -722,10 +722,14 @@ void LanScanner::PortScanThreadMain(uint32_t gen, std::wstring ip) {
             auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - Clock::now()).count();
             if (left <= 0) break;
             fd_set wr, ex; FD_ZERO(&wr); FD_ZERO(&ex);
-            for (auto& p : pending) { FD_SET(p.s, &wr); FD_SET(p.s, &ex); }
+            int maxSock = 0;
+            for (auto& p : pending) {
+                FD_SET(p.s, &wr); FD_SET(p.s, &ex);
+                if (static_cast<int>(p.s) > maxSock) maxSock = static_cast<int>(p.s);
+            }
             left = std::min<long long>(left, 50000);   // slices keep cancellation responsive
             timeval tv{0, (long)left};
-            if (select(0, nullptr, &wr, &ex, &tv) <= 0) continue;
+            if (select(maxSock + 1, nullptr, &wr, &ex, &tv) <= 0) continue;
             for (size_t i = 0; i < pending.size();) {
                 bool w = FD_ISSET(pending[i].s, &wr) != 0, x = FD_ISSET(pending[i].s, &ex) != 0;
                 if (!w && !x) { ++i; continue; }
@@ -994,7 +998,7 @@ void LanScanner::SsdpThreadMain(uint32_t gen, int listenMs) {
         }
         fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
         timeval tv{0, 50 * 1000};
-        if (select(0, &rd, nullptr, nullptr, &tv) <= 0) continue;
+        if (select(static_cast<int>(s + 1), &rd, nullptr, nullptr, &tv) <= 0) continue;
         sockaddr_in from{};
         int fl = sizeof(from);
         int n = recvfrom(s, rx.data(), (int)rx.size(), 0, reinterpret_cast<sockaddr*>(&from), &fl);

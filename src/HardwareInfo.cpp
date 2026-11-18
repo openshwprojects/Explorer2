@@ -25,6 +25,17 @@
 
 #include "HardwareInfo.h"
 #include "FileEngine.h"
+#ifndef _WIN32
+#include "PathUtils.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <fstream>
+#include <set>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -122,6 +133,7 @@ using PFN_nvmlDeviceGetPowerManagementLimit = int(*)(nvmlDevice_t, unsigned int*
 using PFN_nvmlDeviceGetMemoryInfo = int(*)(nvmlDevice_t, nvmlMemory_t*);
 using PFN_nvmlSystemGetDriverVersion = int(*)(char*, unsigned int);
 
+#ifdef _WIN32
 // Extract string by 1-based index from an SMBIOS structure's unformatted string table
 std::wstring GetSmbiosString(const uint8_t* structStart, uint8_t formattedLen, const uint8_t* tableEnd, uint8_t strIndex) {
     if (strIndex == 0 || structStart + formattedLen >= tableEnd) return L"";
@@ -138,6 +150,7 @@ std::wstring GetSmbiosString(const uint8_t* structStart, uint8_t formattedLen, c
     }
     return L"";
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Disk temperature / SMART helpers
@@ -357,6 +370,181 @@ uint64_t ReadLe64(const uint8_t* p) {
     std::memcpy(&v, p, 8);
     return v;
 }
+
+#ifndef _WIN32
+std::string ReadSysfsLine(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return {};
+    char buf[1024];
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    ::close(fd);
+    if (n <= 0) return {};
+    std::string s(buf, static_cast<size_t>(n));
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t' || s.back() == '\0')) {
+        s.pop_back();
+    }
+    size_t a = 0;
+    while (a < s.size() && (s[a] == ' ' || s[a] == '\t')) ++a;
+    if (a > 0) s.erase(0, a);
+    return s;
+}
+
+int ReadBlockDevHwmonTempC(const std::string& sysBlockDir) {
+    for (const char* sub : { "/device/hwmon", "/hwmon" }) {
+        std::string hmBase = sysBlockDir + sub;
+        DIR* d = ::opendir(hmBase.c_str());
+        if (!d) continue;
+        while (struct dirent* e = ::readdir(d)) {
+            if (std::strncmp(e->d_name, "hwmon", 5) != 0) continue;
+            std::string tStr = ReadSysfsLine(hmBase + "/" + e->d_name + "/temp1_input");
+            if (!tStr.empty()) {
+                int milliC = std::atoi(tStr.c_str());
+                int c = (milliC > 500) ? ((milliC + 500) / 1000) : milliC;
+                if (c > -40 && c < 140) {
+                    ::closedir(d);
+                    return c;
+                }
+            }
+        }
+        ::closedir(d);
+    }
+    return -1;
+}
+
+std::vector<HwPhysicalDisk> DiscoverLinuxPhysicalDisks() {
+    std::vector<HwPhysicalDisk> out;
+    DIR* d = ::opendir("/sys/block");
+    if (!d) return out;
+    std::vector<std::string> names;
+    while (struct dirent* e = ::readdir(d)) {
+        std::string nm = e->d_name;
+        if (nm.empty() || nm[0] == '.') continue;
+        if (nm.rfind("loop", 0) == 0 || nm.rfind("ram", 0) == 0 || nm.rfind("zram", 0) == 0 ||
+            nm.rfind("dm-", 0) == 0 || nm.rfind("sr", 0) == 0 || nm.rfind("fd", 0) == 0) {
+            continue;
+        }
+        names.push_back(std::move(nm));
+    }
+    ::closedir(d);
+    std::sort(names.begin(), names.end());
+
+    int idx = 0;
+    for (const auto& nm : names) {
+        std::string bdir = "/sys/block/" + nm;
+        uint64_t sectors = std::strtoull(ReadSysfsLine(bdir + "/size").c_str(), nullptr, 10);
+        if (sectors == 0) continue;
+
+        HwPhysicalDisk pd;
+        pd.index = idx++;
+        pd.capacityBytes = sectors * 512ULL;
+        uint32_t lb = static_cast<uint32_t>(std::strtoul(ReadSysfsLine(bdir + "/queue/logical_block_size").c_str(), nullptr, 10));
+        pd.bytesPerSector = (lb >= 512) ? lb : 512;
+        pd.isRotational = (ReadSysfsLine(bdir + "/queue/rotational") == "1");
+        pd.supportsTrim = (std::strtoull(ReadSysfsLine(bdir + "/queue/discard_max_bytes").c_str(), nullptr, 10) > 0);
+        pd.supportsCommandQueueing = true;
+        pd.tempHistory.assign(60, 0.0f);
+
+        pd.vendor = PathUtils::Utf8ToWide(ReadSysfsLine(bdir + "/device/vendor"));
+        pd.model  = PathUtils::Utf8ToWide(ReadSysfsLine(bdir + "/device/model"));
+        std::string fw = ReadSysfsLine(bdir + "/device/firmware_rev");
+        if (fw.empty()) fw = ReadSysfsLine(bdir + "/device/rev");
+        pd.firmwareRev = PathUtils::Utf8ToWide(fw);
+        pd.serialNumber = PathUtils::Utf8ToWide(ReadSysfsLine(bdir + "/device/serial"));
+
+        char realBuf[PATH_MAX] = {};
+        std::string linkTarget;
+        if (::realpath(bdir.c_str(), realBuf)) linkTarget = realBuf;
+
+        if (nm.rfind("nvme", 0) == 0 || linkTarget.find("/nvme/") != std::string::npos) {
+            pd.isNvme = true;
+            pd.busType = L"NVMe PCIe";
+            pd.mediaType = L"NVMe SSD";
+        } else if (linkTarget.find("/usb") != std::string::npos) {
+            pd.busType = L"USB";
+            pd.mediaType = L"USB Flash / External";
+        } else if (nm.rfind("vd", 0) == 0 || linkTarget.find("/virtio") != std::string::npos || linkTarget.find("vmbus") != std::string::npos) {
+            pd.busType = L"Virtual Block";
+            pd.mediaType = pd.isRotational ? L"Virtual Disk" : L"Virtual SSD";
+        } else if (nm.rfind("mmcblk", 0) == 0) {
+            pd.busType = L"MMC / SD";
+            pd.mediaType = L"eMMC / SD Flash";
+        } else {
+            pd.busType = L"SATA";
+            pd.mediaType = pd.isRotational ? L"SATA HDD" : L"SATA SSD";
+        }
+
+        if (pd.model.empty()) {
+            pd.model = PathUtils::Utf8ToWide("/dev/" + nm);
+        } else if (!pd.vendor.empty() && pd.vendor != L"ATA" && pd.model.find(pd.vendor) == std::wstring::npos) {
+            pd.model = pd.vendor + L" " + pd.model;
+        }
+
+        int t = ReadBlockDevHwmonTempC(bdir);
+        if (t > -40) {
+            pd.tempC = t;
+            pd.tempPeakC = t;
+        }
+        out.push_back(std::move(pd));
+    }
+    return out;
+}
+
+std::vector<HwLogicalVolume> DiscoverLinuxVolumes() {
+    std::vector<HwLogicalVolume> out;
+    std::ifstream mf("/proc/self/mounts");
+    std::string line;
+    std::set<std::string> seenMnts;
+    std::set<dev_t> seenDevs;
+    while (std::getline(mf, line)) {
+        std::istringstream iss(line);
+        std::string dev, mnt, fstype;
+        if (!(iss >> dev >> mnt >> fstype)) continue;
+        static const char* kPseudo[] = {
+            "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "pstore",
+            "securityfs", "debugfs", "tracefs", "configfs", "fusectl", "mqueue", "hugetlbfs",
+            "autofs", "binfmt_misc", "bpf", "nsfs", "squashfs", "overlay", "rpc_pipefs"
+        };
+        bool skip = false;
+        for (const char* ps : kPseudo) {
+            if (fstype == ps) { skip = true; break; }
+        }
+        if (skip) continue;
+        if (mnt.rfind("/proc/", 0) == 0 || mnt.rfind("/sys/", 0) == 0 || mnt.rfind("/dev/", 0) == 0 ||
+            mnt.rfind("/run/", 0) == 0 || mnt.rfind("/snap/", 0) == 0 || mnt == "/init") {
+            continue;
+        }
+        if (!seenMnts.insert(mnt).second) continue;
+
+        struct stat st = {};
+        if (::stat(mnt.c_str(), &st) == 0 && mnt != "/") {
+            if (!seenDevs.insert(st.st_dev).second) continue;
+        } else if (mnt == "/") {
+            seenDevs.insert(st.st_dev);
+        }
+
+        const bool isNet = (fstype == "cifs" || fstype == "smb3" || fstype == "smbfs" || fstype == "nfs" || fstype == "nfs4");
+        HwLogicalVolume v;
+        v.rootPath     = PathUtils::Utf8ToWide(mnt);
+        v.label        = PathUtils::Utf8ToWide(dev);
+        v.fileSystem   = PathUtils::Utf8ToWide(fstype);
+        v.driveTypeStr = isNet ? L"Sieciowy (NAS/SMB/NFS)" : L"Lokalny (Mount)";
+        if (isNet) {
+            v.isReady = false;
+        } else {
+            struct statvfs vfs = {};
+            if (::statvfs(mnt.c_str(), &vfs) != 0 || vfs.f_blocks == 0) continue;
+            const uint64_t bsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+            v.totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsize;
+            v.freeBytes  = static_cast<uint64_t>(vfs.f_bavail) * bsize;
+            v.usedBytes  = (v.totalBytes >= v.freeBytes) ? (v.totalBytes - v.freeBytes) : 0;
+            v.usedPct    = (v.totalBytes > 0) ? static_cast<float>(static_cast<double>(v.usedBytes) * 100.0 / static_cast<double>(v.totalBytes)) : 0.0f;
+            v.isReady    = true;
+        }
+        out.push_back(std::move(v));
+    }
+    return out;
+}
+#endif
 
 } // namespace
 
@@ -602,6 +790,10 @@ void HardwareInspector::InitializeStaticInventory(bool syncForCli) {
 
 void HardwareInspector::EnsureDiskModelsLoaded() {
     if (!m_physDisks.empty()) return;
+#ifndef _WIN32
+    m_physDisks = DiscoverLinuxPhysicalDisks();
+    return;
+#else
     for (int d = 0; d < 16; ++d) {
         std::wstring devPath = L"\\\\.\\PhysicalDrive" + std::to_wstring(d);
         HANDLE hDisk = CreateFileW(devPath.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -672,10 +864,15 @@ void HardwareInspector::EnsureDiskModelsLoaded() {
             m_physDisks.push_back(pd);
         }
     }
+#endif
 }
 
 void HardwareInspector::QueryFastVolumes() {
     m_volumes.clear();
+#ifndef _WIN32
+    m_volumes = DiscoverLinuxVolumes();
+    return;
+#else
     wchar_t driveStrings[512] = {};
     DWORD dLen = GetLogicalDriveStringsW(511, driveStrings);
     const wchar_t* p = driveStrings;
@@ -724,10 +921,30 @@ void HardwareInspector::QueryFastVolumes() {
         }
         m_volumes.push_back(std::move(vol));
     }
+#endif
 }
 
 void HardwareInspector::QueryFastSystemAndRam(bool includeStaticOs) {
     if (includeStaticOs) {
+#ifndef _WIN32
+        struct utsname un = {};
+        ::uname(&un);
+        std::string prettyOs;
+        {
+            std::ifstream osf("/etc/os-release");
+            std::string line;
+            while (std::getline(osf, line)) {
+                if (line.rfind("PRETTY_NAME=", 0) == 0) {
+                    prettyOs = line.substr(12);
+                    while (!prettyOs.empty() && (prettyOs.back() == '\r' || prettyOs.back() == '"' || prettyOs.back() == '\'')) prettyOs.pop_back();
+                    if (!prettyOs.empty() && (prettyOs.front() == '"' || prettyOs.front() == '\'')) prettyOs.erase(prettyOs.begin());
+                    break;
+                }
+            }
+        }
+        m_system.osName = prettyOs.empty() ? PathUtils::Utf8ToWide(un.sysname) : PathUtils::Utf8ToWide(prettyOs);
+        m_system.osBuildStr = PathUtils::Utf8ToWide(std::string(un.sysname) + " " + un.release + " (" + un.machine + ")");
+#else
         m_system.osName = ReadRegSz(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"ProductName");
         std::wstring dispVer = ReadRegSz(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"DisplayVersion");
 
@@ -748,6 +965,7 @@ void HardwareInspector::QueryFastSystemAndRam(bool includeStaticOs) {
                 }
             }
         }
+#endif
 
         wchar_t compBuf[MAX_COMPUTERNAME_LENGTH + 1] = {};
         DWORD cSz = MAX_COMPUTERNAME_LENGTH + 1;
@@ -789,7 +1007,15 @@ void HardwareInspector::QueryFastSystemAndRam(bool includeStaticOs) {
     }
 
     // Uptime (< 0.005 ms)
+#ifndef _WIN32
+    {
+        std::string upLine = ReadSysfsLine("/proc/uptime");
+        double upSec = !upLine.empty() ? std::atof(upLine.c_str()) : 0.0;
+        m_system.uptimeSeconds = (upSec > 0.0) ? static_cast<uint64_t>(upSec) : (GetTickCount64() / 1000ULL);
+    }
+#else
     m_system.uptimeSeconds = GetTickCount64() / 1000ULL;
+#endif
     uint64_t d = m_system.uptimeSeconds / 86400;
     uint64_t h = (m_system.uptimeSeconds % 86400) / 3600;
     uint64_t m = (m_system.uptimeSeconds % 3600) / 60;
@@ -799,6 +1025,33 @@ void HardwareInspector::QueryFastSystemAndRam(bool includeStaticOs) {
     m_system.uptimeStr = upBuf;
 
     // Power status (< 0.01 ms)
+#ifndef _WIN32
+    {
+        bool foundBat = false;
+        if (DIR* psDir = ::opendir("/sys/class/power_supply")) {
+            while (struct dirent* e = ::readdir(psDir)) {
+                std::string nm = e->d_name;
+                if (nm.rfind("BAT", 0) == 0) {
+                    std::string cap = ReadSysfsLine("/sys/class/power_supply/" + nm + "/capacity");
+                    std::string st  = ReadSysfsLine("/sys/class/power_supply/" + nm + "/status");
+                    if (!cap.empty()) {
+                        int pct = std::clamp(std::atoi(cap.c_str()), 0, 100);
+                        bool charging = (st == "Charging" || st == "Full");
+                        wchar_t pbuf[128] = {};
+                        swprintf_s(pbuf, L"Bateria: %d%% (%s)", pct, charging ? L"Ładowanie AC" : L"Na baterii");
+                        m_system.powerStatusStr = pbuf;
+                        foundBat = true;
+                        break;
+                    }
+                }
+            }
+            ::closedir(psDir);
+        }
+        if (!foundBat) {
+            m_system.powerStatusStr = L"Zasilanie sieciowe AC (Stacja robocza / Desktop)";
+        }
+    }
+#else
     SYSTEM_POWER_STATUS sps = {};
     if (GetSystemPowerStatus(&sps)) {
         if (sps.BatteryFlag == 128 || sps.BatteryFlag == 255) {
@@ -811,6 +1064,7 @@ void HardwareInspector::QueryFastSystemAndRam(bool includeStaticOs) {
             m_system.powerStatusStr = pbuf;
         }
     }
+#endif
 }
 
 void HardwareInspector::RefreshFullInventory(bool syncForCli) {
@@ -965,11 +1219,101 @@ void HardwareInspector::QueryCpuStatic() {
     if (m_cpu.physicalCores == 0) m_cpu.physicalCores = std::max(1u, m_cpu.logicalThreads / 2);
     if (m_cpu.packages == 0) m_cpu.packages = 1;
     if (m_cpu.numaNodes == 0) m_cpu.numaNodes = 1;
+
+#ifndef _WIN32
+    // Supplement CPU frequency, core topology, and L1/L2/L3 cache sizes from Linux /proc/cpuinfo & sysfs
+    {
+        std::ifstream cf("/proc/cpuinfo");
+        std::string line;
+        int curPkg = 0, curCore = -1;
+        std::set<int> pkgs;
+        std::set<std::pair<int, int>> cores;
+        uint32_t mhzSeen = 0;
+        while (std::getline(cf, line)) {
+            if (line.empty() || line == "\r") {
+                if (curCore >= 0) cores.emplace(curPkg, curCore);
+                curPkg = 0; curCore = -1;
+                continue;
+            }
+            const size_t col = line.find(':');
+            if (col == std::string::npos) continue;
+            std::string key = line.substr(0, col);
+            while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+            std::string val = line.substr(col + 1);
+            while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+            while (!val.empty() && (val.back() == '\r' || val.back() == ' ')) val.pop_back();
+
+            if (key == "model name" && m_cpu.brand.empty()) m_cpu.brand = PathUtils::Utf8ToWide(val);
+            else if (key == "cpu MHz" && mhzSeen == 0) mhzSeen = static_cast<uint32_t>(std::atof(val.c_str()) + 0.5);
+            else if (key == "physical id") { curPkg = std::atoi(val.c_str()); pkgs.insert(curPkg); }
+            else if (key == "core id") curCore = std::atoi(val.c_str());
+            else if (key == "microcode" && m_cpu.microcodeRev.empty()) m_cpu.microcodeRev = PathUtils::Utf8ToWide(val);
+        }
+        if (curCore >= 0) cores.emplace(curPkg, curCore);
+        if (!cores.empty()) m_cpu.physicalCores = static_cast<uint32_t>(cores.size());
+        if (!pkgs.empty()) m_cpu.packages = static_cast<uint32_t>(pkgs.size());
+        if (m_cpu.baseFreqMHz == 0 && mhzSeen > 0) m_cpu.baseFreqMHz = mhzSeen;
+
+        std::string maxKhz = ReadSysfsLine("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq");
+        if (!maxKhz.empty()) {
+            uint32_t mhz = static_cast<uint32_t>(std::strtoul(maxKhz.c_str(), nullptr, 10) / 1000UL);
+            if (mhz > 0) m_cpu.maxFreqMHz = mhz;
+        }
+        if (m_cpu.maxFreqMHz == 0) m_cpu.maxFreqMHz = m_cpu.baseFreqMHz;
+
+        // Deduplicate cache instances by (level, type, shared_cpu_list)
+        std::set<std::string> seenCaches;
+        for (uint32_t c = 0; c < m_cpu.logicalThreads; ++c) {
+            for (int idx = 0; idx < 6; ++idx) {
+                std::string cdir = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cache/index" + std::to_string(idx);
+                std::string lvlS = ReadSysfsLine(cdir + "/level");
+                if (lvlS.empty()) break;
+                std::string typS = ReadSysfsLine(cdir + "/type");
+                std::string szS  = ReadSysfsLine(cdir + "/size");
+                std::string shS  = ReadSysfsLine(cdir + "/shared_cpu_list");
+                std::string lnS  = ReadSysfsLine(cdir + "/coherency_line_size");
+                if (!lnS.empty()) m_cpu.cacheLineBytes = static_cast<uint32_t>(std::atoi(lnS.c_str()));
+                std::string key  = lvlS + "|" + typS + "|" + (shS.empty() ? std::to_string(c) : shS);
+                if (!seenCaches.insert(key).second) continue;
+
+                uint32_t kb = static_cast<uint32_t>(std::strtoul(szS.c_str(), nullptr, 10));
+                if (szS.find('M') != std::string::npos || szS.find('m') != std::string::npos) kb *= 1024u;
+                int lvl = std::atoi(lvlS.c_str());
+                if (lvl == 1) {
+                    if (typS == "Instruction") { m_cpu.l1InstKB += kb; ++m_cpu.l1InstCount; }
+                    else { m_cpu.l1DataKB += kb; ++m_cpu.l1DataCount; }
+                } else if (lvl == 2) {
+                    m_cpu.l2KB += kb; ++m_cpu.l2Count;
+                } else if (lvl == 3) {
+                    m_cpu.l3KB += kb; ++m_cpu.l3Count;
+                }
+            }
+        }
+    }
+#endif
 }
 
 void HardwareInspector::QueryMotherboardAndSmbios() {
     m_ram.dimms.clear();
 
+#ifndef _WIN32
+    auto readDmi = [](const char* file) -> std::wstring {
+        return PathUtils::Utf8ToWide(ReadSysfsLine(std::string("/sys/class/dmi/id/") + file));
+    };
+    m_mobo.boardManufacturer  = readDmi("board_vendor");
+    m_mobo.boardProduct       = readDmi("board_name");
+    m_mobo.boardVersion       = readDmi("board_version");
+    m_mobo.boardSerial        = readDmi("board_serial");
+    m_mobo.biosVendor         = readDmi("bios_vendor");
+    m_mobo.biosVersion        = readDmi("bios_version");
+    m_mobo.biosReleaseDate    = readDmi("bios_date");
+    m_mobo.systemManufacturer = readDmi("sys_vendor");
+    m_mobo.systemProductName  = readDmi("product_name");
+    m_mobo.systemSku          = readDmi("product_sku");
+    struct stat efiSt = {};
+    m_mobo.isUefiBoot         = (::stat("/sys/firmware/efi", &efiSt) == 0);
+    return;
+#else
     // Registry fallbacks first
     const wchar_t* biosKey = L"HARDWARE\\DESCRIPTION\\System\\BIOS";
     m_mobo.boardManufacturer = ReadRegSz(HKEY_LOCAL_MACHINE, biosKey, L"BaseBoardManufacturer");
@@ -1095,6 +1439,7 @@ void HardwareInspector::QueryMotherboardAndSmbios() {
             }
         }
     }
+#endif
 }
 
 void HardwareInspector::QueryGpusAndDisplays() {
@@ -1172,6 +1517,20 @@ void HardwareInspector::QueryPhysicalDisksAndVolumes() {
     m_wState.physDisks.clear();
     m_wState.volumes.clear();
 
+#ifndef _WIN32
+    m_wState.physDisks = DiscoverLinuxPhysicalDisks();
+    for (auto& pd : m_wState.physDisks) {
+        for (const auto& old : previousDisks) {
+            if (old.index == pd.index && old.model == pd.model) {
+                pd.tempHistory = old.tempHistory;
+                pd.tempPeakC = std::max(pd.tempPeakC, old.tempPeakC);
+                break;
+            }
+        }
+    }
+    m_wState.volumes = DiscoverLinuxVolumes();
+    return;
+#else
     // 1. Query Physical Drives (\\.\PhysicalDrive0..15) via zero-access handle + IOCTL_STORAGE_QUERY_PROPERTY
     for (int d = 0; d < 16; ++d) {
         HANDLE hDisk = OpenPhysicalDrive(d, 0);
@@ -1324,6 +1683,7 @@ void HardwareInspector::QueryPhysicalDisksAndVolumes() {
         }
         m_wState.volumes.push_back(vol);
     }
+#endif
 }
 
 bool HardwareInspector::IsProcessElevated() {
@@ -1526,6 +1886,23 @@ void HardwareInspector::RefreshDiskSmartOnVector(std::vector<HwPhysicalDisk>& di
 }
 
 void HardwareInspector::UpdateDiskTemperatures() {
+#ifndef _WIN32
+    auto fresh = DiscoverLinuxPhysicalDisks();
+    for (auto& pd : m_wState.physDisks) {
+        for (const auto& f : fresh) {
+            if (f.index == pd.index && f.tempC > -40) {
+                pd.tempC = f.tempC;
+                pd.tempPeakC = std::max(pd.tempPeakC, f.tempC);
+                if (!pd.tempHistory.empty()) {
+                    pd.tempHistory.erase(pd.tempHistory.begin());
+                    pd.tempHistory.push_back(static_cast<float>(f.tempC));
+                }
+                break;
+            }
+        }
+    }
+    return;
+#else
     for (auto& pd : m_wState.physDisks) {
         HANDLE h = OpenPhysicalDrive(pd.index, 0);
         int t = -1, w = -1, c = -1;
@@ -1563,6 +1940,7 @@ void HardwareInspector::UpdateDiskTemperatures() {
             pd.tempHistory.push_back(static_cast<float>(t));
         }
     }
+#endif
 }
 
 void HardwareInspector::UpdateAcpiThermalZones() {
@@ -1861,16 +2239,17 @@ void HardwareInspector::QuerySystemAndAudio(bool fullRefresh) {
 
 namespace {
 
-static const DEVPROPKEY kDevPkeyBusReportedDeviceDesc = {
-    { 0x540b947e, 0x8b40, 0x45bc, { 0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2 } }, 4
-};
-
 std::wstring ToUpperAscii(std::wstring s) {
     for (wchar_t& c : s) {
         if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
     }
     return s;
 }
+
+#ifdef _WIN32
+static const DEVPROPKEY kDevPkeyBusReportedDeviceDesc = {
+    { 0x540b947e, 0x8b40, 0x45bc, { 0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2 } }, 4
+};
 
 std::wstring GetDevInstId(DEVINST dn) {
     wchar_t buf[512] = {};
@@ -2041,6 +2420,7 @@ void ParseHubAndPortFromLocation(const std::wstring& loc, int& outPort, int& out
         outHub = _wtoi(up.c_str() + pHub + 5);
     }
 }
+#endif
 
 std::wstring LookupUsbVendorName(const std::wstring& vid) {
     if (vid.empty()) return L"";
@@ -2169,6 +2549,7 @@ std::wstring IdentifyUsbChipModel(const std::wstring& vid, const std::wstring& p
     return L"";
 }
 
+#ifdef _WIN32
 std::wstring FormatDevNodeStatus(ULONG status, ULONG problem) {
     if (problem != 0) {
         switch (problem) {
@@ -2207,6 +2588,7 @@ bool IsGenericUsbDescription(const std::wstring& s) {
            up.find(L"ZGODNE Z HID") != std::wstring::npos ||
            up.find(L"HID-COMPLIANT") != std::wstring::npos;
 }
+#endif
 
 } // namespace
 
@@ -2214,6 +2596,213 @@ void HardwareInspector::QueryUsbAndComPorts() {
     m_wState.comPorts.clear();
     m_wState.usbTree.clear();
 
+#ifndef _WIN32
+    // 1. Enumerate Linux TTY / USB-Serial ports (/sys/class/tty/ttyUSB*, ttyACM*, ttyAMA*, active ttyS*)
+    std::unordered_map<std::string, std::wstring> usbPathToTty;
+    if (DIR* td = ::opendir("/sys/class/tty")) {
+        int portIdx = 1;
+        while (struct dirent* e = ::readdir(td)) {
+            std::string nm = e->d_name;
+            const bool isUsbTty = (nm.rfind("ttyUSB", 0) == 0 || nm.rfind("ttyACM", 0) == 0);
+            const bool isHwTty  = (nm.rfind("ttyAMA", 0) == 0 || nm.rfind("ttyS", 0) == 0);
+            if (!isUsbTty && !isHwTty) continue;
+            std::string tdir = "/sys/class/tty/" + nm;
+            if (nm.rfind("ttyS", 0) == 0) {
+                std::string typ = ReadSysfsLine(tdir + "/type");
+                if (typ.empty() || typ == "0") continue; // Skip phantom unconfigured 8250 ports
+            }
+            char realBuf[PATH_MAX] = {};
+            std::string realTarget;
+            if (::realpath((tdir + "/device").c_str(), realBuf)) realTarget = realBuf;
+
+            HwComPortInfo cp;
+            cp.portName     = PathUtils::Utf8ToWide("/dev/" + nm);
+            cp.portNumber   = portIdx++;
+            cp.ntDevicePath = cp.portName;
+            cp.isUsbBacked  = isUsbTty || (realTarget.find("/usb") != std::string::npos);
+            cp.defaultBaud  = cp.isUsbBacked ? 115200 : 9600;
+            cp.statusStr    = L"OK (Linux TTY)";
+
+            if (cp.isUsbBacked && !realTarget.empty()) {
+                // Walk up sysfs path to USB device directory containing idVendor/idProduct
+                std::string walk = realTarget;
+                for (int up = 0; up < 4; ++up) {
+                    std::string vidS = ReadSysfsLine(walk + "/idVendor");
+                    std::string pidS = ReadSysfsLine(walk + "/idProduct");
+                    if (!vidS.empty() && !pidS.empty()) {
+                        std::wstring vid = ToUpperAscii(PathUtils::Utf8ToWide(vidS));
+                        std::wstring pid = ToUpperAscii(PathUtils::Utf8ToWide(pidS));
+                        cp.vidPid          = vid + L":" + pid;
+                        cp.manufacturer    = PathUtils::Utf8ToWide(ReadSysfsLine(walk + "/manufacturer"));
+                        cp.busReportedDesc = PathUtils::Utf8ToWide(ReadSysfsLine(walk + "/product"));
+                        cp.serialNumber    = PathUtils::Utf8ToWide(ReadSysfsLine(walk + "/serial"));
+                        cp.vendorName      = LookupUsbVendorName(vid);
+                        if (cp.vendorName.empty()) cp.vendorName = cp.manufacturer;
+                        cp.chipModel       = IdentifyUsbChipModel(vid, pid, cp.busReportedDesc, cp.busReportedDesc);
+                        const size_t sl = walk.find_last_of('/');
+                        if (sl != std::string::npos) usbPathToTty[walk.substr(sl + 1)] = cp.portName;
+                        break;
+                    }
+                    const size_t sl = walk.find_last_of('/');
+                    if (sl == std::string::npos || sl == 0) break;
+                    walk.resize(sl);
+                }
+            }
+            if (cp.chipModel.empty()) {
+                cp.chipModel = cp.isUsbBacked ? L"Linux USB CDC / UART Bridge" : L"Hardware UART 16550A (Linux ttyS)";
+            }
+            cp.description  = !cp.busReportedDesc.empty() ? cp.busReportedDesc : cp.chipModel;
+            cp.friendlyName = cp.description + L" (" + cp.portName + L")";
+            m_wState.comPorts.push_back(std::move(cp));
+        }
+        ::closedir(td);
+    }
+
+    // 2. Enumerate Linux USB Buses & Device Tree (/sys/bus/usb/devices)
+    struct LinuxUsbEntry {
+        std::string name; // e.g. "usb1", "1-1", "1-1.2"
+        std::string dir;
+        int busNum = 0;
+    };
+    std::vector<LinuxUsbEntry> buses;
+    std::map<std::string, std::vector<LinuxUsbEntry>> childrenByParent;
+    if (DIR* ud = ::opendir("/sys/bus/usb/devices")) {
+        std::vector<std::string> allNames;
+        while (struct dirent* e = ::readdir(ud)) {
+            std::string nm = e->d_name;
+            if (nm.empty() || nm[0] == '.' || nm.find(':') != std::string::npos) continue; // skip interface subdirs 1-1:1.0
+            allNames.push_back(std::move(nm));
+        }
+        ::closedir(ud);
+        std::sort(allNames.begin(), allNames.end());
+
+        for (const auto& nm : allNames) {
+            std::string udir = "/sys/bus/usb/devices/" + nm;
+            if (nm.rfind("usb", 0) == 0) {
+                int b = std::atoi(nm.c_str() + 3);
+                if (b > 0) buses.push_back({ nm, udir, b });
+            } else {
+                const size_t dot = nm.rfind('.');
+                const size_t dash = nm.find('-');
+                std::string parentKey;
+                if (dot != std::string::npos) parentKey = nm.substr(0, dot);
+                else if (dash != std::string::npos) parentKey = "usb" + nm.substr(0, dash);
+                if (!parentKey.empty()) {
+                    childrenByParent[parentKey].push_back({ nm, udir, std::atoi(nm.c_str()) });
+                }
+            }
+        }
+    }
+
+    auto appendUsbChildren = [&](auto& self, const std::string& parentKey, int parentIdx, int depth, uint32_t ancMask) -> void {
+        auto it = childrenByParent.find(parentKey);
+        if (it == childrenByParent.end() || depth > 10) return;
+        const auto& kids = it->second;
+        for (size_t i = 0; i < kids.size(); ++i) {
+            const auto& k = kids[i];
+            const bool isLast = (i + 1 == kids.size());
+            HwUsbNodeInfo n;
+            n.nodeIndex            = static_cast<int>(m_wState.usbTree.size());
+            n.parentIndex          = parentIdx;
+            n.depth                = depth;
+            n.isLastSibling        = isLast;
+            n.ancestorContinueMask = ancMask;
+            n.deviceInstanceId     = PathUtils::Utf8ToWide("USB/" + k.name);
+            n.locationInfo         = PathUtils::Utf8ToWide(k.name);
+
+            std::wstring vid = ToUpperAscii(PathUtils::Utf8ToWide(ReadSysfsLine(k.dir + "/idVendor")));
+            std::wstring pid = ToUpperAscii(PathUtils::Utf8ToWide(ReadSysfsLine(k.dir + "/idProduct")));
+            if (!vid.empty() && !pid.empty()) n.vidPid = vid + L":" + pid;
+            n.revStr          = PathUtils::Utf8ToWide(ReadSysfsLine(k.dir + "/bcdDevice"));
+            n.manufacturer    = PathUtils::Utf8ToWide(ReadSysfsLine(k.dir + "/manufacturer"));
+            n.busReportedDesc = PathUtils::Utf8ToWide(ReadSysfsLine(k.dir + "/product"));
+            n.serialNumber    = PathUtils::Utf8ToWide(ReadSysfsLine(k.dir + "/serial"));
+            n.vendorName      = LookupUsbVendorName(vid);
+            if (n.vendorName.empty()) n.vendorName = n.manufacturer;
+            n.chipModel       = IdentifyUsbChipModel(vid, pid, n.busReportedDesc, n.busReportedDesc);
+            n.statusStr       = L"OK";
+
+            std::string devCls = ReadSysfsLine(k.dir + "/bDeviceClass");
+            std::string spd    = ReadSysfsLine(k.dir + "/speed");
+            n.speedHint        = spd.empty() ? L"USB Device" : PathUtils::Utf8ToWide(spd + " Mbps");
+
+            auto ttyIt = usbPathToTty.find(k.name);
+            if (ttyIt != usbPathToTty.end()) n.comPortName = ttyIt->second;
+
+            auto subIt = childrenByParent.find(k.name);
+            n.childCount = (subIt != childrenByParent.end()) ? static_cast<int>(subIt->second.size()) : 0;
+
+            if (devCls == "09") {
+                n.isHub = true;
+                n.categoryBadge = L"HUB";
+                n.badgeColor = 0x0D9488;
+            } else if (!n.comPortName.empty()) {
+                n.categoryBadge = L"TTY";
+                n.badgeColor = 0xD97706;
+            } else {
+                n.categoryBadge = L"USB";
+                n.badgeColor = 0x2563EB;
+            }
+            n.displayName = !n.busReportedDesc.empty() ? n.busReportedDesc
+                          : (!n.vendorName.empty() ? (n.vendorName + L" USB Device") : n.deviceInstanceId);
+
+            const int myIdx = static_cast<int>(m_wState.usbTree.size());
+            m_wState.usbTree.push_back(std::move(n));
+            uint32_t nextMask = ancMask;
+            if (!isLast && depth < 31) nextMask |= (1u << depth);
+            self(self, k.name, myIdx, depth + 1, nextMask);
+        }
+    };
+
+    for (size_t b = 0; b < buses.size(); ++b) {
+        const auto& bus = buses[b];
+        const bool lastBus = (b + 1 == buses.size());
+        std::string spd = ReadSysfsLine(bus.dir + "/speed");
+        const int mbps = std::atoi(spd.c_str());
+        const bool isUsb3 = (mbps >= 5000);
+
+        HwUsbNodeInfo ctrl;
+        ctrl.nodeIndex        = static_cast<int>(m_wState.usbTree.size());
+        ctrl.parentIndex      = -1;
+        ctrl.depth            = 0;
+        ctrl.isLastSibling    = lastBus;
+        ctrl.childCount       = 1;
+        ctrl.isController     = true;
+        ctrl.categoryBadge    = isUsb3 ? L"xHCI" : L"EHCI";
+        ctrl.badgeColor       = isUsb3 ? 0x7C3AED : 0x6366F1;
+        ctrl.deviceInstanceId = PathUtils::Utf8ToWide("USB_HOST/" + bus.name);
+        ctrl.displayName      = PathUtils::Utf8ToWide(
+            std::string("Linux USB Host Controller Bus #") + std::to_string(bus.busNum) +
+            (isUsb3 ? " (SuperSpeed xHCI)" : " (High-Speed)"));
+        ctrl.speedHint        = spd.empty() ? L"USB Host" : PathUtils::Utf8ToWide(spd + " Mbps");
+        ctrl.statusStr        = L"OK";
+        const int ctrlIdx     = static_cast<int>(m_wState.usbTree.size());
+        m_wState.usbTree.push_back(std::move(ctrl));
+
+        auto rootKidsIt = childrenByParent.find(bus.name);
+        HwUsbNodeInfo rh;
+        rh.nodeIndex        = static_cast<int>(m_wState.usbTree.size());
+        rh.parentIndex      = ctrlIdx;
+        rh.depth            = 1;
+        rh.isLastSibling    = true;
+        rh.childCount       = (rootKidsIt != childrenByParent.end()) ? static_cast<int>(rootKidsIt->second.size()) : 0;
+        rh.isRootHub        = true;
+        rh.isHub            = true;
+        rh.categoryBadge    = L"ROOT";
+        rh.badgeColor       = 0x0284C7;
+        rh.deviceInstanceId = PathUtils::Utf8ToWide("USB/ROOT_HUB_" + bus.name);
+        std::wstring prod   = PathUtils::Utf8ToWide(ReadSysfsLine(bus.dir + "/product"));
+        rh.displayName      = !prod.empty() ? prod : (isUsb3 ? L"Linux USB 3.x Root Hub" : L"Linux USB 2.0 Root Hub");
+        rh.vidPid           = L"1D6B:" + std::wstring(isUsb3 ? L"0003" : L"0002");
+        rh.vendorName       = L"Linux Foundation";
+        rh.statusStr        = L"OK";
+        const int rhIdx     = static_cast<int>(m_wState.usbTree.size());
+        m_wState.usbTree.push_back(std::move(rh));
+
+        appendUsbChildren(appendUsbChildren, bus.name, rhIdx, 2, 0);
+    }
+    return;
+#else
     // 1. Read active kernel serial map from HKLM\HARDWARE\DEVICEMAP\SERIALCOMM
     // Maps COM port name (e.g. "COM3") -> NT device path (e.g. "\Device\Serial0" or "\Device\USBSER000")
     std::unordered_map<std::wstring, std::wstring> comToNtDevice;
@@ -2674,9 +3263,68 @@ void HardwareInspector::QueryUsbAndComPorts() {
         bool lastRoot = (i + 1 == usbControllerRoots.size());
         buildUsbSubtree(buildUsbSubtree, usbControllerRoots[i], -1, 0, lastRoot, 0);
     }
+#endif
 }
 
 void HardwareInspector::UpdateCpuLivePerCoreLoad() {
+#ifndef _WIN32
+    std::ifstream sf("/proc/stat");
+    if (!sf) return;
+    struct LinuxCpuRow { int64_t idle = 0, kernel = 0, user = 0; };
+    std::vector<LinuxCpuRow> rows;
+    std::string line;
+    while (std::getline(sf, line)) {
+        if (line.rfind("cpu", 0) != 0 || line.size() < 4 || line[3] < '0' || line[3] > '9') continue;
+        std::istringstream iss(line);
+        std::string label;
+        uint64_t u = 0, n = 0, sys = 0, idle = 0, iow = 0, irq = 0, sirq = 0, steal = 0;
+        if (!(iss >> label >> u >> n >> sys >> idle)) continue;
+        iss >> iow >> irq >> sirq >> steal;
+        LinuxCpuRow r;
+        r.idle   = static_cast<int64_t>(idle + iow);
+        r.kernel = static_cast<int64_t>(sys + irq + sirq + steal) + r.idle; // matches Windows NT convention (kernel includes idle)
+        r.user   = static_cast<int64_t>(u + n);
+        rows.push_back(r);
+    }
+    if (rows.empty()) return;
+    const uint32_t count = static_cast<uint32_t>(rows.size());
+    if (m_prevCoreTimes.size() != count) {
+        m_prevCoreTimes.resize(count);
+        m_cpu.coreLoadPct.assign(count, 0.0f);
+        for (uint32_t i = 0; i < count; ++i) {
+            m_prevCoreTimes[i].idle   = rows[i].idle;
+            m_prevCoreTimes[i].kernel = rows[i].kernel;
+            m_prevCoreTimes[i].user   = rows[i].user;
+        }
+        return;
+    }
+    double sumLoad = 0.0, sumKernel = 0.0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const int64_t dIdle   = rows[i].idle   - m_prevCoreTimes[i].idle;
+        const int64_t dKernel = rows[i].kernel - m_prevCoreTimes[i].kernel;
+        const int64_t dUser   = rows[i].user   - m_prevCoreTimes[i].user;
+        m_prevCoreTimes[i].idle   = rows[i].idle;
+        m_prevCoreTimes[i].kernel = rows[i].kernel;
+        m_prevCoreTimes[i].user   = rows[i].user;
+        const int64_t dTotal = dKernel + dUser;
+        if (dTotal > 0) {
+            const int64_t dBusy     = std::max<int64_t>(0, dTotal - dIdle);
+            const int64_t dKernBusy = std::max<int64_t>(0, dKernel - dIdle);
+            const float pct  = std::clamp(static_cast<float>(static_cast<double>(dBusy) * 100.0 / static_cast<double>(dTotal)), 0.0f, 100.0f);
+            const float kpct = std::clamp(static_cast<float>(static_cast<double>(dKernBusy) * 100.0 / static_cast<double>(dTotal)), 0.0f, 100.0f);
+            m_cpu.coreLoadPct[i] = pct;
+            sumLoad += pct;
+            sumKernel += kpct;
+        }
+    }
+    m_cpu.totalLoadPct  = static_cast<float>(sumLoad / count);
+    m_cpu.kernelLoadPct = static_cast<float>(sumKernel / count);
+    if (!m_cpu.loadHistory.empty()) {
+        m_cpu.loadHistory.erase(m_cpu.loadHistory.begin());
+        m_cpu.loadHistory.push_back(m_cpu.totalLoadPct);
+    }
+    return;
+#else
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     if (!hNtdll) return;
     auto fnQuery = reinterpret_cast<PFN_NtQuerySystemInformation>(GetProcAddress(hNtdll, "NtQuerySystemInformation"));
@@ -2730,6 +3378,7 @@ void HardwareInspector::UpdateCpuLivePerCoreLoad() {
         m_cpu.loadHistory.erase(m_cpu.loadHistory.begin());
         m_cpu.loadHistory.push_back(m_cpu.totalLoadPct);
     }
+#endif
 }
 
 void HardwareInspector::UpdateGpuLiveTelemetry() {

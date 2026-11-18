@@ -137,7 +137,7 @@ inline void ExtractGeoTrackFromSheets(ParsedOfficeDocument& doc) {
     doc.hasGeoTrack = (doc.geoPoints.size() >= 2);
 }
 
-#ifdef _WIN32   // drawing (Direct2D): not part of the Linux build of the readers
+#if defined(_WIN32) || defined(E2_WIN32_HAL)   // drawing (Direct2D): not part of the Linux build of the readers
 inline void DrawGpsMapAndElevationView(
     ID2D1RenderTarget* rt,
     ID2D1SolidColorBrush* brush,

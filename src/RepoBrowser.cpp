@@ -211,12 +211,13 @@ std::wstring Hash16(const std::wstring& s) {
 
 void RemoveTree(const std::wstring& dir) {
     WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    const std::wstring prefix = PathUtils::EnsureTrailingSlash(dir);
+    HANDLE h = FindFirstFileW((prefix + L"*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             const std::wstring name = fd.cFileName;
             if (name == L"." || name == L"..") continue;
-            const std::wstring p = dir + L"\\" + name;
+            const std::wstring p = prefix + name;
             SetFileAttributesW(p.c_str(), FILE_ATTRIBUTE_NORMAL);       // git keeps its pack files read-only
             if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) RemoveTree(p);
             else DeleteFileW(p.c_str());
@@ -405,10 +406,11 @@ bool EnsureGitRepo(const GitUrlParts& parts, GitRepo& out, std::wstring& message
         auto it = g_git.find(key);
         if (it != g_git.end() && it->second.ready) { out = it->second; return true; }
     }
-    const std::wstring dir = TempRoot() + L"Explorer2_Repos\\" + Hash16(key);
-    SHCreateDirectoryExW(nullptr, (TempRoot() + L"Explorer2_Repos").c_str(), nullptr);   // with the folders above it
+    const std::wstring reposRoot = PathUtils::EnsureTrailingSlash(TempRoot()) + L"Explorer2_Repos";
+    const std::wstring dir = PathUtils::EnsureTrailingSlash(reposRoot) + Hash16(key);
+    SHCreateDirectoryExW(nullptr, reposRoot.c_str(), nullptr);          // with the folders above it
     std::wstring commit;
-    const DWORD gitAttr = GetFileAttributesW((dir + L"\\.git").c_str());
+    const DWORD gitAttr = GetFileAttributesW((PathUtils::EnsureTrailingSlash(dir) + L".git").c_str());
     if (gitAttr != INVALID_FILE_ATTRIBUTES && (gitAttr & FILE_ATTRIBUTE_DIRECTORY)) {
         // A clone from an earlier visit: fetch what is new; offline, show what it has
         std::lock_guard<std::mutex> fetchLock(g_gitFetchMutex);       // not while a file is being fetched into it
@@ -796,8 +798,7 @@ void SetNotifyWindow(HWND hwnd) {
 
 void SetCacheRoot(const std::wstring& folder) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    g_cacheRoot = folder;
-    if (!g_cacheRoot.empty() && g_cacheRoot.back() != L'\\') g_cacheRoot += L'\\';
+    g_cacheRoot = folder.empty() ? std::wstring() : PathUtils::EnsureTrailingSlash(folder);
     g_git.clear();                                   // clones made under another root are not looked for there
 }
 
@@ -895,8 +896,9 @@ bool FetchFileToTemp(const std::wstring& url, std::wstring& outLocalPath, std::w
     }
 
     const std::wstring version = (kind == Kind::Git) ? (repo.commit + L":" + parts.innerPath) : (key + L"@" + std::to_wstring(svnRev));
-    const std::wstring dir = TempRoot() + L"Explorer2_RepoFiles\\" + Hash16(version);
-    const std::wstring dest = dir + L"\\" + SafeFileName(LeafName(key));
+    const std::wstring filesRoot = PathUtils::EnsureTrailingSlash(TempRoot()) + L"Explorer2_RepoFiles";
+    const std::wstring dir = PathUtils::EnsureTrailingSlash(filesRoot) + Hash16(version);
+    const std::wstring dest = PathUtils::EnsureTrailingSlash(dir) + SafeFileName(LeafName(key));
     const DWORD attr = GetFileAttributesW(dest.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) { outLocalPath = dest; return true; }
     SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);              // with the folders above it

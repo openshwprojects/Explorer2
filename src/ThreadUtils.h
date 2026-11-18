@@ -15,10 +15,12 @@ namespace Explorer2 {
 // Called by the main thread when the program closes.
 inline void JoinServingCom(std::thread& worker) {
     if (!worker.joinable()) return;
+#ifdef _WIN32
     HANDLE handle = static_cast<HANDLE>(worker.native_handle());
     DWORD index = 0;
     // Fails at once on a thread without COM; join() then waits the plain way
     CoWaitForMultipleHandles(COWAIT_DISPATCH_CALLS, INFINITE, 1, &handle, &index);
+#endif
     worker.join();
 }
 

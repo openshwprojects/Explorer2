@@ -1800,11 +1800,21 @@ inline void WalkAsn1Der(const uint8_t* p, size_t len, int depth, std::wstring& l
             std::wstring mapped = MapKnownOid(oid);
             lastOidLabel = mapped;
             rows.push_back({ L"ASN.1 OID", mapped + L" (" + PathUtils::Utf8ToWide(oid) + L")" });
-        } else if (tag == 0x0C || tag == 0x13 || tag == 0x16 || tag == 0x14 || tag == 0x17 || tag == 0x18) {
-            std::wstring s = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(val), valLen));
-            std::wstring key = lastOidLabel.empty() ? L"ASN.1 String" : lastOidLabel;
-            lastOidLabel.clear();
-            rows.push_back({ key, s });
+        } else if (tag == 0x0C || tag == 0x13 || tag == 0x16 || tag == 0x14 || tag == 0x17 || tag == 0x18 ||
+                   tag == 0x81 || tag == 0x82 || tag == 0x86) {
+            bool printableOk = true;
+            if ((tag & 0x80u) != 0) {
+                if (valLen == 0 || valLen > 512) printableOk = false;
+                for (size_t k = 0; k < valLen && printableOk; ++k) {
+                    if (val[k] < 0x20u || val[k] > 0x7Eu) printableOk = false;
+                }
+            }
+            if (printableOk) {
+                std::wstring s = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(val), valLen));
+                std::wstring key = lastOidLabel.empty() ? L"ASN.1 String" : lastOidLabel;
+                if ((tag & 0x80u) == 0) lastOidLabel.clear();
+                rows.push_back({ key, s });
+            }
         } else if (tag == 0x1E && (valLen % 2 == 0)) { // BMPString (UTF-16BE)
             std::wstring s;
             for (size_t i = 0; i + 2 <= valLen; i += 2) {

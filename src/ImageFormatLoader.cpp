@@ -3,10 +3,9 @@
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
-#ifdef _WIN32
+#if defined(_WIN32) || defined(E2_WIN32_HAL)
 // Windows codecs: WIC (JPEG / PNG inside other formats, HEIF), DirectWrite and GDI (fonts, metafiles), Media
-// Foundation (HEVC, H.264). The Linux build of the readers has none of them: the few decoders that need them
-// return false there (#ifndef _WIN32 at the top of each).
+// Foundation (HEVC, H.264). On Linux with E2_WIN32_HAL, WIC is supplied by linux/win32_hal/src/WicHal.cpp.
 #include "OsCompat.h"
 #include <wrl/client.h>
 #include <wincodec.h>

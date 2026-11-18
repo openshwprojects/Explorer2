@@ -194,7 +194,7 @@ inline bool SkipUndefinedLengthElement(const uint8_t* data, size_t size, size_t&
 }
 
 inline bool DecodeWicFragment(const uint8_t* fragData, size_t fragSize, ExtendedImageInfo& outInfo) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(E2_WIN32_HAL)
     return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
 #else
     if (!fragData || fragSize < 8 || fragSize > 0x7FFFFFFFu) return false;

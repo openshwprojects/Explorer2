@@ -849,7 +849,10 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     if (ext == L".mid" || ext == L".midi") return Formats::ParseMidiFileDoc(raw, outDoc);
     if (ext == L".wav" || ext == L".flac" || ext == L".aiff") return Formats::ParseAudioContainerDoc(raw, outDoc);
     if (ext == L".edf")     return Formats::ParseBioMedicalEdfDoc(raw, outDoc);
-    if (ext == L".elf")     return Formats::ParseElfBinaryDoc(raw, outDoc);
+    if (ext == L".elf" || ext == L".so" ||
+        (ext.empty() && raw.size() >= 16 && raw[0] == 0x7Fu && raw[1] == 'E' && raw[2] == 'L' && raw[3] == 'F')) {
+        return Formats::ParseElfBinaryDoc(raw, outDoc);
+    }
     if (ext == L".wasm")    return Formats::ParseWebAssemblyWasmDoc(raw, outDoc);
     if (ext == L".nmea")    return Formats::ParseNmeaGpsLogDoc(raw, outDoc);
     if (ext == L".igc")     return Formats::ParseIgcFlightLogDoc(raw, outDoc);

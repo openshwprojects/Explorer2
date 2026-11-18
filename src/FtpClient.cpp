@@ -7,6 +7,9 @@
 #include "PathUtils.h"
 #include "FileEngine.h"
 #include "AppLog.h"
+#ifndef _WIN32
+#include "ToolProcess.h"
+#endif
 #include <wininet.h>
 #include <algorithm>
 #include <atomic>
@@ -203,7 +206,11 @@ bool ProbeTcpEndpointReachable(const std::wstring& rawHost, uint16_t port, std::
             timeval tv = {};
             tv.tv_sec = timeoutMs / 1000;
             tv.tv_usec = (timeoutMs % 1000) * 1000;
+#ifndef _WIN32
+            int sel = E2SelectWinsock(static_cast<int>(sock + 1), nullptr, &wfds, &efds, &tv);
+#else
             int sel = select(0, nullptr, &wfds, &efds, &tv);
+#endif
             if (sel > 0 && FD_ISSET(sock, &wfds) && !FD_ISSET(sock, &efds)) {
                 int soErr = 0;
                 int optLen = sizeof(soErr);
@@ -360,6 +367,18 @@ std::string ExtractXmlTagValue(const std::string& block, const char* tagName, st
     return "";
 }
 
+std::wstring ResolveCurlExePath() {
+#ifndef _WIN32
+    return ToolProcess::FindExecutable(L"curl", { L"/usr/bin/curl", L"/bin/curl", L"/usr/local/bin/curl" });
+#else
+    wchar_t sysDir[MAX_PATH] = {};
+    GetSystemDirectoryW(sysDir, MAX_PATH);
+    std::wstring curlExe = std::wstring(sysDir) + L"\\curl.exe";
+    if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) return {};
+    return curlExe;
+#endif
+}
+
 bool RunCurlProcessCapture(
     const std::wstring& args,
     std::string* outStdout,
@@ -374,10 +393,8 @@ bool RunCurlProcessCapture(
         return false;
     }
 
-    wchar_t sysDir[MAX_PATH] = {};
-    GetSystemDirectoryW(sysDir, MAX_PATH);
-    std::wstring curlExe = std::wstring(sysDir) + L"\\curl.exe";
-    if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::wstring curlExe = ResolveCurlExePath();
+    if (curlExe.empty()) {
         return false;
     }
 
@@ -481,10 +498,8 @@ bool RunCurlStreamDownload(
         return false;
     }
 
-    wchar_t sysDir[MAX_PATH] = {};
-    GetSystemDirectoryW(sysDir, MAX_PATH);
-    std::wstring curlExe = std::wstring(sysDir) + L"\\curl.exe";
-    if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::wstring curlExe = ResolveCurlExePath();
+    if (curlExe.empty()) {
         return false;
     }
 
@@ -593,10 +608,8 @@ bool RunCurlStreamUpload(
         return false;
     }
 
-    wchar_t sysDir[MAX_PATH] = {};
-    GetSystemDirectoryW(sysDir, MAX_PATH);
-    std::wstring curlExe = std::wstring(sysDir) + L"\\curl.exe";
-    if (GetFileAttributesW(curlExe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::wstring curlExe = ResolveCurlExePath();
+    if (curlExe.empty()) {
         return false;
     }
 
@@ -2155,6 +2168,15 @@ bool FtpClient::DownloadFtpTreeToLocal(
 }
 
 std::wstring FtpClient::DefaultBookmarksPath() {
+#ifndef _WIN32
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const char* home = std::getenv("HOME");
+    std::string base = (xdg && *xdg) ? (std::string(xdg) + "/Explorer2")
+                     : ((home && *home) ? (std::string(home) + "/.config/Explorer2") : "/tmp/Explorer2");
+    std::wstring dir = PathUtils::Utf8ToWide(base);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"/ftp_bookmarks.ini";
+#else
     wchar_t localAppData[MAX_PATH] = {};
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
     std::wstring dir = (n > 0 && n < MAX_PATH)
@@ -2162,6 +2184,7 @@ std::wstring FtpClient::DefaultBookmarksPath() {
         : L".";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\ftp_bookmarks.ini";
+#endif
 }
 
 std::vector<FtpBookmark> FtpClient::ImportFileZillaSites(const std::wstring& customFileZillaDir) {
@@ -2176,10 +2199,21 @@ std::vector<FtpBookmark> FtpClient::ImportFileZillaSites(const std::wstring& cus
     std::vector<FtpBookmark> results;
     std::wstring fzDir = customFileZillaDir;
     if (fzDir.empty()) {
+#ifndef _WIN32
+        const char* xdg = std::getenv("XDG_CONFIG_HOME");
+        const char* home = std::getenv("HOME");
+        std::wstring cand1 = (xdg && *xdg) ? PathUtils::Utf8ToWide(std::string(xdg) + "/filezilla")
+                           : ((home && *home) ? PathUtils::Utf8ToWide(std::string(home) + "/.config/filezilla") : std::wstring());
+        std::wstring cand2 = (home && *home) ? PathUtils::Utf8ToWide(std::string(home) + "/.filezilla") : std::wstring();
+        if (!cand1.empty() && GetFileAttributesW(cand1.c_str()) != INVALID_FILE_ATTRIBUTES) fzDir = cand1;
+        else if (!cand2.empty() && GetFileAttributesW(cand2.c_str()) != INVALID_FILE_ATTRIBUTES) fzDir = cand2;
+        else return results;
+#else
         wchar_t appData[MAX_PATH] = {};
         DWORD n = GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
         if (n == 0 || n >= MAX_PATH) return results;
         fzDir = std::wstring(appData) + L"\\FileZilla";
+#endif
     }
 
     const wchar_t* kFiles[] = { L"sitemanager.xml", L"recentservers.xml", L"filezilla.xml" };

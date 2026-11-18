@@ -112,6 +112,14 @@ std::wstring FindSvnExe() {
     std::lock_guard<std::mutex> lk(g_svnMutex);
     const ULONGLONG now = GetTickCount64();
     if (!g_svnProbed || (g_svnPath.empty() && now - g_svnProbeTick > 5000)) {
+#ifndef _WIN32
+        std::vector<std::wstring> candidates = {
+            L"/usr/bin/svn",
+            L"/usr/local/bin/svn",
+            L"/bin/svn"
+        };
+        g_svnPath = ToolProcess::FindExecutable(L"svn", candidates);
+#else
         std::vector<std::wstring> candidates;
         for (const std::wstring& base : { ToolProcess::GetEnv(L"ProgramFiles"), ToolProcess::GetEnv(L"ProgramW6432"),
                                           ToolProcess::GetEnv(L"ProgramFiles(x86)") }) {
@@ -123,6 +131,7 @@ std::wstring FindSvnExe() {
             }
         }
         g_svnPath = ToolProcess::FindExecutable(L"svn.exe", candidates);
+#endif
         g_svnProbed = true;
         g_svnProbeTick = now;
     }
@@ -230,7 +239,9 @@ bool ParseInfoXml(std::string_view xml, SvnInfo& out) {
     }
     if (X::FindChild(entry.body, "wc-info", part)) {
         out.wcRoot = W(X::ChildText(part.body, "wcroot-abspath"));
-        std::replace(out.wcRoot.begin(), out.wcRoot.end(), L'/', L'\\');
+        if (out.wcRoot.empty() || out.wcRoot[0] != L'/') {
+            std::replace(out.wcRoot.begin(), out.wcRoot.end(), L'/', L'\\');
+        }
     }
     if (X::FindChild(entry.body, "commit", part)) {
         out.lastChangedRevision = ToInt64(X::AttrText(part.attrs, "revision"));

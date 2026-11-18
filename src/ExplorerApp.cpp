@@ -5871,7 +5871,11 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         if (utf8Len > 0) {
             std::string utf8(utf8Len, '\0');
             WideCharToMultiByte(CP_UTF8, 0, finalDoc.c_str(), static_cast<int>(finalDoc.size()), utf8.data(), utf8Len, nullptr, nullptr);
+#ifdef _WIN32
             std::ofstream ofs(outPath, std::ios::binary);
+#else
+            std::ofstream ofs(PathUtils::WideToUtf8(outPath), std::ios::binary);
+#endif
             if (ofs) {
                 ofs.write(utf8.data(), utf8.size());
                 ofs.close();

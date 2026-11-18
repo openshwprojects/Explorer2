@@ -156,7 +156,7 @@ struct DecodedRgbaTile {
 // Backend 1: WIC Stream Decoder (handles JPEG items & OS-supported HEIF/AVIF)
 // ============================================================================
 inline bool TryDecodeViaWicMemory(const uint8_t* bytes, size_t len, DecodedRgbaTile& out) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(E2_WIN32_HAL)
     return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
 #else
     if (!bytes || len < 16) return false;
@@ -269,9 +269,6 @@ inline bool DecodeAvc1StillItem(
     bool fullRange, uint16_t matrixCoeffs,
     DecodedRgbaTile& out)
 {
-#ifndef _WIN32
-    return false;   // the Linux build of the readers has no Media Foundation H.264 decoder
-#else
     if (!itemData || itemLen < 5 || avcC.size() < 7 || avcC[0] != 1) return false;
     uint8_t lenSize = static_cast<uint8_t>((avcC[4] & 0x03u) + 1u);
 
@@ -456,6 +453,7 @@ inline bool DecodeAvc1StillItem(
         }
     }
 
+#ifdef _WIN32
     // Fallback to Windows inbox Media Foundation H.264 MFT (CLSID_CMSH264DecoderMFT via MFTEnumEx)
     if (!::Explorer2::IsMediaFoundationAvailable() || FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) return false;
     bool mfDecoded = false;
@@ -591,6 +589,8 @@ inline bool DecodeAvc1StillItem(
     }
     MFShutdown();
     return mfDecoded;
+#else
+    return false;
 #endif
 }
 

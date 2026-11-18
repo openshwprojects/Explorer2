@@ -512,7 +512,11 @@ std::vector<MonitorSmartPoint> MonitorStore::LoadSmartRange(int64_t fromTs, int6
         time_t dayStart = mktime(&cur);
         if (dayStart == static_cast<time_t>(-1) || static_cast<int64_t>(dayStart) > toTs) break;
 
+#ifndef _WIN32
+        std::ifstream in(Compat::NativePath(DayFilePath(L"smart", cur).c_str()), std::ios::binary);
+#else
         std::ifstream in(DayFilePath(L"smart", cur), std::ios::binary);
+#endif
         if (in) {
             std::string line;
             while (std::getline(in, line)) {

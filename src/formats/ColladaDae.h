@@ -569,7 +569,9 @@ inline void ParseDaeMeshBody(std::string_view meshBody, DaeGeometry& geomOut) {
             posSourceId = sources.begin()->first;
             posInputOffset = 0;
         }
-        auto [baseVert, vertCount] = ensurePositionSourceLoaded(posSourceId);
+        auto [bVert, vCnt] = ensurePositionSourceLoaded(posSourceId);
+        const auto baseVert = bVert;
+        const auto vertCount = vCnt;
         if (vertCount < 3 || pBlocks.empty()) continue;
 
         const size_t stride = hasAnyInput ? static_cast<size_t>(maxOffset + 1u) : 1u;

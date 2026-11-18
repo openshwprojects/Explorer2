@@ -168,6 +168,16 @@ void ShellMenuEmulator::ScanStartupData() {
         sevenZGui = L"C:\\Program Files\\7-Zip\\7zG.exe";
         sevenZFm = L"C:\\Program Files\\7-Zip\\7zFM.exe";
     }
+#ifndef _WIN32
+    if (sevenZGui.empty()) {
+        for (const wchar_t* cand : { L"/usr/bin/7z", L"/usr/bin/7zz", L"/usr/bin/7za", L"/bin/7z" }) {
+            if (GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
+                sevenZGui = cand;
+                break;
+            }
+        }
+    }
+#endif
 
     if (GetFileAttributesW(L"C:\\Program Files\\WinRAR\\WinRAR.exe") != INVALID_FILE_ATTRIBUTES) {
         winRar = L"C:\\Program Files\\WinRAR\\WinRAR.exe";
@@ -226,6 +236,16 @@ void ShellMenuEmulator::ScanStartupData() {
     tryAddApp(L"Notepad++ (x86)", L"C:\\Program Files (x86)\\Notepad++\\notepad++.exe", false);
     tryAddApp(L"IrfanView", L"C:\\Program Files\\IrfanView\\i_view64.exe", true);
     tryAddApp(L"Honeyview", L"C:\\Program Files\\Honeyview\\Honeyview.exe", true);
+#ifndef _WIN32
+    tryAddApp(L"Visual Studio Code", L"/usr/bin/code", false);
+    tryAddApp(L"GNOME Text Editor (gedit)", L"/usr/bin/gedit", false);
+    tryAddApp(L"KDE Kate", L"/usr/bin/kate", false);
+    tryAddApp(L"Mousepad", L"/usr/bin/mousepad", false);
+    tryAddApp(L"GIMP", L"/usr/bin/gimp", true);
+    tryAddApp(L"Inkscape", L"/usr/bin/inkscape", true);
+    tryAddApp(L"Eye of GNOME (eog)", L"/usr/bin/eog", true);
+    tryAddApp(L"feh", L"/usr/bin/feh", true);
+#endif
 
     std::vector<SendToTarget> sendTo;
     PWSTR pszSendTo = nullptr;
@@ -455,20 +475,42 @@ void ShellMenuEmulator::Execute7ZipAction(int actionId, const std::vector<std::w
 
     switch (actionId) {
     case SZ_OPEN_ARCHIVE:
+#ifndef _WIN32
+        if (fmExe.empty()) {
+            ShellExecuteW(nullptr, L"open", firstPath.c_str(), nullptr, currentDir.c_str(), SW_SHOWNORMAL);
+            return;
+        }
+#endif
         exeToRun = fmExe.empty() ? guiExe : fmExe;
         args = L"\"" + firstPath + L"\"";
         break;
     case SZ_EXTRACT_FILES:
+#ifndef _WIN32
+        args = L"x \"" + firstPath + L"\" -o\"" + currentDir + L"\" -y";
+#else
         args = L"x \"" + firstPath + L"\" -o\"" + currentDir + L"\" -ad";
+#endif
         break;
     case SZ_EXTRACT_HERE:
+#ifndef _WIN32
+        args = L"x \"" + firstPath + L"\" -o\"" + currentDir + L"\" -y";
+#else
         args = L"x \"" + firstPath + L"\" -o\"" + currentDir + L"\"";
+#endif
         break;
     case SZ_EXTRACT_SUBFOLDER:
+#ifndef _WIN32
+        args = L"x \"" + firstPath + L"\" -o\"" + PathUtils::EnsureTrailingSlash(currentDir) + stem + L"\" -y";
+#else
         args = L"x \"" + firstPath + L"\" -o\"" + PathUtils::EnsureTrailingSlash(currentDir) + stem + L"\"";
+#endif
         break;
     case SZ_ADD_DIALOG:
+#ifndef _WIN32
+        args = L"a -t7z \"" + PathUtils::EnsureTrailingSlash(currentDir) + stem + L".7z\" " + quotedFiles;
+#else
         args = L"a -ad \"" + PathUtils::EnsureTrailingSlash(currentDir) + stem + L"\" " + quotedFiles;
+#endif
         break;
     case SZ_ADD_7Z:
         args = L"a -t7z \"" + PathUtils::EnsureTrailingSlash(currentDir) + stem + L".7z\" " + quotedFiles;

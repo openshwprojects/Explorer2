@@ -6,10 +6,12 @@
 #include <wincodec.h>
 #include <shcore.h>
 #include <shellapi.h>
+#ifdef _WIN32
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Data.Pdf.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -27,8 +29,23 @@
 
 namespace Explorer2 {
 
+#ifndef _WIN32
+namespace Hal {
+bool RenderPdfPageLinux(
+    const std::wstring& fullPath,
+    uint32_t pageIndex,
+    uint32_t targetWidth,
+    std::vector<uint8_t>& outBgraPixels,
+    uint32_t& outWidth,
+    uint32_t& outHeight,
+    uint32_t* outTotalPages);
+void ReleasePdfRendererLinux();
+} // namespace Hal
+#endif
+
 namespace {
 
+#ifdef _WIN32
 // shcore!CreateStreamOverRandomAccessStream (Windows 8+), resolved on first use; null on Windows 7
 using CreateStreamOverRasFn = HRESULT (WINAPI*)(IUnknown*, REFIID, void**);
 CreateStreamOverRasFn GetCreateStreamOverRandomAccessStream() {
@@ -39,6 +56,7 @@ CreateStreamOverRasFn GetCreateStreamOverRandomAccessStream() {
     }();
     return fn;
 }
+#endif
 
 static D2D1_COLOR_F PdfColor(uint32_t rgb, float a = 1.0f) {
     return PathUtils::ColorFromRgb(rgb, a);
@@ -280,6 +298,7 @@ std::wstring ExtractTextFromPdfContentStream(const uint8_t* streamData, size_t s
     return out;
 }
 
+#ifdef _WIN32
 // Renders one page with Windows.Data.Pdf. Runs on the worker thread of RenderPdfPageToBgra; every WinRT and
 // COM object it creates is released again before it returns. Throws when Windows turns the document down.
 bool RenderPageInThisApartment(
@@ -482,6 +501,7 @@ RenderThread& Renderer() {
     static RenderThread* renderer = new RenderThread();
     return *renderer;
 }
+#endif // _WIN32
 
 } // namespace
 
@@ -654,6 +674,9 @@ bool PdfViewer::RenderPdfPageToBgra(
     outHeight = 0;
     if (fullPath.empty()) return false;
 
+#ifndef _WIN32
+    return Hal::RenderPdfPageLinux(fullPath, pageIndex, targetWidth, outBgraPixels, outWidth, outHeight, outTotalPages);
+#else
     bool ok = false;
     const bool ran = Renderer().Run([&]() {
         try {
@@ -669,10 +692,15 @@ bool PdfViewer::RenderPdfPageToBgra(
         return false;
     }
     return true;
+#endif
 }
 
 void PdfViewer::ReleaseRenderer() {
+#ifdef _WIN32
     Renderer().Stop();
+#else
+    Hal::ReleasePdfRendererLinux();
+#endif
 }
 
 void PdfViewer::RenderPagePicture(const std::wstring& fullPath, uint32_t page, PagePicture& out) {

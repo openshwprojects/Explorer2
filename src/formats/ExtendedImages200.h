@@ -3349,8 +3349,8 @@ inline bool DecodeCorelOrAffinity(const uint8_t* data, size_t size, const std::w
 // #14. Windows Enhanced Metafile (.emf) & Windows / Aldus Placeable Metafile (.wmf)
 // ============================================================================
 inline bool DecodeEmfOrWmf(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
-#ifndef _WIN32
-    return false;   // the Linux build of the readers has no GDI metafile playback
+#if !defined(_WIN32) && !defined(E2_WIN32_HAL)
+    return false;   // the standalone headless build without E2_WIN32_HAL has no GDI metafile playback
 #else
     if (size < 22) return false;
     HENHMETAFILE hEmf = nullptr;

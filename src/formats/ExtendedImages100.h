@@ -103,7 +103,7 @@ inline void DrawBitmapText5x7(
 
 // Decode an embedded PNG, JPEG, JP2, or JXL buffer via Windows WIC into ExtendedImageInfo
 inline bool DecodeEmbeddedWicBuffer(const uint8_t* bytes, size_t len, const std::wstring& fmtLabel, ExtendedImageInfo& outInfo) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(E2_WIN32_HAL)
     return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
 #else
     if (!bytes || len < 16) return false;
@@ -8118,9 +8118,6 @@ inline bool ReconstructWoff2TransformedGlyfLoca(
 }
 
 inline bool ReconstructSfntFromWoff2(const uint8_t* data, size_t size, std::vector<uint8_t>& outSfnt) {
-#ifndef _WIN32
-    return false;   // the Linux build of the readers has no DirectWrite (WOFF2 fonts)
-#else
     outSfnt.clear();
     if (!data || size < 48u || std::memcmp(data, "wOF2", 4) != 0) return false;
 
@@ -8229,6 +8226,7 @@ inline bool ReconstructSfntFromWoff2(const uint8_t* data, size_t size, std::vect
     if (totalCompSize > size - pos) return false;
     const uint8_t* compStream = data + pos;
 
+#ifdef _WIN32
     // 1. Primary Unpacker: DirectWrite IDWriteFactory5::UnpackFontFile(DWRITE_CONTAINER_TYPE_WOFF2, ...)
     {
         IDWriteFactory5* dwrite5 = nullptr;
@@ -8262,6 +8260,7 @@ inline bool ReconstructSfntFromWoff2(const uint8_t* data, size_t size, std::vect
             return true;
         }
     }
+#endif
 
     // 2. Pure-C++ Fallback Unpacker: RFC 7932 Brotli + SFNT / glyf / loca reconstruction
     if (flavor == MakeSfntTag("ttcf")) return false;
@@ -8368,7 +8367,6 @@ inline bool ReconstructSfntFromWoff2(const uint8_t* data, size_t size, std::vect
         WrU32BE(outSfnt.data() + headTableOff + 8u, 0xB1B0AFBAu - fontCsum);
     }
     return true;
-#endif
 }
 
 } // namespace DetailFont
@@ -8470,9 +8468,6 @@ inline bool DecodeAseprite(const uint8_t* data, size_t size, ExtendedImageInfo& 
 }
 
 inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
-#ifndef _WIN32
-    return false;   // the Linux build of the readers has no GDI font rendering
-#else
     if (!data || size < 28) return false;
     (void)extLower;
 
@@ -8559,6 +8554,7 @@ inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstr
 
     // Attempt Win32 GDI rendering via AddFontMemResourceEx + DIBSection
     bool gdiRenderedRealFont = false;
+#ifdef _WIN32
     if (!sfnt.familyName.empty()) {
         DWORD numAdded = 0;
         HANDLE hFontRes = AddFontMemResourceEx(
@@ -8649,6 +8645,7 @@ inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstr
             RemoveFontMemResourceEx(hFontRes);
         }
     }
+#endif
 
     // Pure-C++ TrueType 'glyf' / OpenType 'CFF ' / 'CFF2' / Color font rasterizer fallback
     if (!gdiRenderedRealFont) {
@@ -8704,7 +8701,6 @@ inline bool DecodeFontSpecimen(const uint8_t* data, size_t size, const std::wstr
 
     outInfo.valid = true;
     return true;
-#endif
 }
 
 } // namespace Formats

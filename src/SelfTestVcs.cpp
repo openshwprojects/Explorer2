@@ -256,12 +256,13 @@ bool Has(const std::wstring& text, const std::wstring& part) { return text.find(
 
 void DeleteTreeForTest(const std::wstring& dir) {
     WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    const std::wstring prefix = PathUtils::EnsureTrailingSlash(dir);
+    HANDLE h = FindFirstFileW((prefix + L"*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             const std::wstring name = fd.cFileName;
             if (name == L"." || name == L"..") continue;
-            const std::wstring p = dir + L"\\" + name;
+            const std::wstring p = prefix + name;
             SetFileAttributesW(p.c_str(), FILE_ATTRIBUTE_NORMAL);       // svn keeps its pristine copies read-only
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) DeleteTreeForTest(p);
             else DeleteFileW(p.c_str());
@@ -272,9 +273,9 @@ void DeleteTreeForTest(const std::wstring& dir) {
 }
 
 bool MakeDirs(const std::wstring& path) {
-    size_t pos = 3;
+    size_t pos = (path.size() >= 3 && path[1] == L':') ? 3 : 1;
     while (pos < path.size()) {
-        size_t slash = path.find(L'\\', pos);
+        size_t slash = path.find_first_of(L"\\/", pos);
         if (slash == std::wstring::npos) slash = path.size();
         CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
         pos = slash + 1;
@@ -546,28 +547,38 @@ void RunVcsTests(TestCounter& tc) {
     }
 
     // ---- finding the working copy: .svn (a folder) or .git, the nearest one wins
-    const std::wstring base = ScratchTestDir() + L"\\vcs";
+#ifndef _WIN32
+    constexpr const wchar_t* kSep = L"/";
+#else
+    constexpr const wchar_t* kSep = L"\\";
+#endif
+    const std::wstring base = PathUtils::EnsureTrailingSlash(ScratchTestDir()) + L"vcs";
     DeleteTreeForTest(base);
     {
-        const bool made = MakeDirs(base + L"\\wc\\.svn") && MakeDirs(base + L"\\wc\\sub\\deeper") &&
-                          MakeDirs(base + L"\\wc\\sub\\inner\\.git") && MakeDirs(base + L"\\wc\\sub\\inner\\x") &&
-                          MakeDirs(base + L"\\both\\.git") && MakeDirs(base + L"\\both\\.svn") && MakeDirs(base + L"\\fake");
-        const std::wstring fakeSvnFile = base + L"\\fake\\.svn";       // a file, not a working copy
+        const bool made = MakeDirs(base + kSep + L"wc" + kSep + L".svn") &&
+                          MakeDirs(base + kSep + L"wc" + kSep + L"sub" + kSep + L"deeper") &&
+                          MakeDirs(base + kSep + L"wc" + kSep + L"sub" + kSep + L"inner" + kSep + L".git") &&
+                          MakeDirs(base + kSep + L"wc" + kSep + L"sub" + kSep + L"inner" + kSep + L"x") &&
+                          MakeDirs(base + kSep + L"both" + kSep + L".git") &&
+                          MakeDirs(base + kSep + L"both" + kSep + L".svn") &&
+                          MakeDirs(base + kSep + L"fake");
+        const std::wstring fakeSvnFile = base + kSep + L"fake" + kSep + L".svn";       // a file, not a working copy
         PathUtils::WriteFileBytes(fakeSvnFile, reinterpret_cast<const uint8_t*>("x"), 1);
         VcsKind k1 = VcsKind::Git, k2 = VcsKind::Svn, k3 = VcsKind::Svn, k4 = VcsKind::Svn;
-        const std::wstring r1 = GitIntegration::FindRepoRoot(base + L"\\wc\\sub\\deeper", &k1);
-        const std::wstring r2 = GitIntegration::FindRepoRoot(base + L"\\wc\\sub\\inner\\x", &k2);
-        const std::wstring r3 = GitIntegration::FindRepoRoot(base + L"\\both", &k3);
-        const std::wstring r4 = GitIntegration::FindRepoRoot(base + L"\\fake", &k4);
-        const bool good = made && r1 == base + L"\\wc" && k1 == VcsKind::Svn && r2 == base + L"\\wc\\sub\\inner" && k2 == VcsKind::Git &&
-                          r3 == base + L"\\both" && k3 == VcsKind::Git && r4 != base + L"\\fake" && k4 != VcsKind::Svn;
+        const std::wstring r1 = GitIntegration::FindRepoRoot(base + kSep + L"wc" + kSep + L"sub" + kSep + L"deeper", &k1);
+        const std::wstring r2 = GitIntegration::FindRepoRoot(base + kSep + L"wc" + kSep + L"sub" + kSep + L"inner" + kSep + L"x", &k2);
+        const std::wstring r3 = GitIntegration::FindRepoRoot(base + kSep + L"both", &k3);
+        const std::wstring r4 = GitIntegration::FindRepoRoot(base + kSep + L"fake", &k4);
+        const bool good = made && r1 == base + kSep + L"wc" && k1 == VcsKind::Svn &&
+                          r2 == base + kSep + L"wc" + kSep + L"sub" + kSep + L"inner" && k2 == VcsKind::Git &&
+                          r3 == base + kSep + L"both" && k3 == VcsKind::Git && r4 != base + kSep + L"fake" && k4 != VcsKind::Svn;
         tc.Record(good, L"Stage12.Vcs.FindWorkingCopyRoot", L"svn=" + r1 + L" git=" + r2 + L" both=" + r3);
     }
 
     // ---- the worker on a folder that only looks like a working copy: it must report, not hang
     {
         GitIntegration g;
-        const std::wstring root = base + L"\\wc";
+        const std::wstring root = base + kSep + L"wc";
         g.RequestRefresh(root, VcsKind::Svn);
         const bool idle = WaitIdle(g, 60000);
         const GitRepoState s = g.SnapshotState();
@@ -581,27 +592,32 @@ void RunVcsTests(TestCounter& tc) {
     // ---- a real repository, when a Subversion client with svnadmin is installed
     {
         const std::wstring svnExe = Svn::FindSvnExe();
+#ifndef _WIN32
+        const std::wstring svnadmin = svnExe.empty() ? std::wstring()
+                                                     : PathUtils::EnsureTrailingSlash(PathUtils::GetParentPath(svnExe)) + L"svnadmin";
+#else
         const std::wstring svnadmin = svnExe.empty() ? std::wstring()
                                                      : PathUtils::GetParentPath(svnExe) + L"\\svnadmin.exe";
+#endif
         if (svnExe.empty() || GetFileAttributesW(svnadmin.c_str()) == INVALID_FILE_ATTRIBUTES) {
             tc.Record(true, L"Stage12.Vcs.SvnRealWorkingCopy", L"skipped: no svn.exe with svnadmin.exe installed");
         } else {
             std::atomic<bool> stop{ false };
             ToolProcess::Options o;
             o.timeoutMs = 30000;
-            const std::wstring repo = base + L"\\repo", wc = base + L"\\live";
-            std::wstring url = L"file:///" + repo;
+            const std::wstring repo = base + kSep + L"repo", wc = base + kSep + L"live";
+            std::wstring url = ((!repo.empty() && repo.front() == L'/') ? L"file://" : L"file:///") + repo;
             for (wchar_t& c : url) if (c == L'\\') c = L'/';
             bool setup = ToolProcess::Run(svnadmin, { L"create", repo }, o, stop).ok() &&
                          Svn::Run(base, { L"checkout", url, wc }, 30000, stop).ok();
             const std::string text = "hello\n";
-            setup = setup && PathUtils::WriteFileBytes(wc + L"\\a.txt", reinterpret_cast<const uint8_t*>(text.data()), text.size()) &&
+            setup = setup && PathUtils::WriteFileBytes(wc + kSep + L"a.txt", reinterpret_cast<const uint8_t*>(text.data()), text.size()) &&
                     Svn::Run(wc, { L"add", L"a.txt" }, 30000, stop).ok() &&
                     Svn::Run(wc, { L"commit", L"-m", L"First revision" }, 30000, stop).ok() &&
                     Svn::Run(wc, { L"update" }, 30000, stop).ok();
             const std::string changed = "hello\nworld\n";
-            setup = setup && PathUtils::WriteFileBytes(wc + L"\\a.txt", reinterpret_cast<const uint8_t*>(changed.data()), changed.size()) &&
-                    PathUtils::WriteFileBytes(wc + L"\\new.txt", reinterpret_cast<const uint8_t*>(text.data()), text.size());
+            setup = setup && PathUtils::WriteFileBytes(wc + kSep + L"a.txt", reinterpret_cast<const uint8_t*>(changed.data()), changed.size()) &&
+                    PathUtils::WriteFileBytes(wc + kSep + L"new.txt", reinterpret_cast<const uint8_t*>(text.data()), text.size());
             GitRepoState s;
             std::wstring diff;
             if (setup) {
@@ -625,7 +641,7 @@ void RunVcsTests(TestCounter& tc) {
                             : std::wstring(L"could not create the test repository"));
 
             // The same repository browsed by its URL, as a folder of the main view would be
-            RepoBrowser::SetCacheRoot(base + L"\\cache");
+            RepoBrowser::SetCacheRoot(base + kSep + L"cache");
             std::vector<FileEntry> items;
             std::wstring message, local;
             const bool listed = setup && WaitListing(url, items, &message) == RepoBrowser::ListState::Ready;
@@ -654,19 +670,19 @@ void RunVcsTests(TestCounter& tc) {
                 all.insert(all.end(), args.begin(), args.end());
                 return ToolProcess::Run(gitExe, all, o, stop).ok();
             };
-            const std::wstring work = base + L"\\gitwork", bare = base + L"\\origin.git";
+            const std::wstring work = base + kSep + L"gitwork", bare = base + kSep + L"origin.git";
             const std::string readme = "hello git\n", mainC = "int main() { return 0; }\n";
-            bool setup = MakeDirs(work + L"\\src") &&
-                         PathUtils::WriteFileBytes(work + L"\\README.md", readme.data(), readme.size()) &&
-                         PathUtils::WriteFileBytes(work + L"\\src\\main.c", mainC.data(), mainC.size()) &&
+            bool setup = MakeDirs(work + kSep + L"src") &&
+                         PathUtils::WriteFileBytes(work + kSep + L"README.md", readme.data(), readme.size()) &&
+                         PathUtils::WriteFileBytes(work + kSep + L"src" + kSep + L"main.c", mainC.data(), mainC.size()) &&
                          git(work, { L"init", L"-q" }) && git(work, { L"add", L"." }) && git(work, { L"commit", L"-q", L"-m", L"first" }) &&
                          git(base, { L"clone", L"-q", L"--bare", work, bare }) &&
                          git(bare, { L"config", L"uploadpack.allowFilter", L"true" }) &&
                          git(bare, { L"config", L"uploadpack.allowAnySHA1InWant", L"true" });
-            std::wstring url = L"file:///" + bare;
+            std::wstring url = ((!bare.empty() && bare.front() == L'/') ? L"file://" : L"file:///") + bare;
             for (wchar_t& c : url) if (c == L'\\') c = L'/';
 
-            RepoBrowser::SetCacheRoot(base + L"\\cache");
+            RepoBrowser::SetCacheRoot(base + kSep + L"cache");
             std::vector<FileEntry> rootItems, srcItems;
             std::wstring message, local;
             const bool rootListed = setup && WaitListing(url, rootItems, &message) == RepoBrowser::ListState::Ready;

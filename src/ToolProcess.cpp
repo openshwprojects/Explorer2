@@ -1,12 +1,69 @@
 #include "ToolProcess.h"
+#include "PathUtils.h"
 
 #include <algorithm>
 #include <cwchar>
+#ifndef _WIN32
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 namespace Explorer2::ToolProcess {
 
 namespace {
 
+#ifndef _WIN32
+bool ExecutableExists(const std::wstring& p) {
+    const std::string u = Compat::NativePath(p.c_str());
+    struct stat st = {};
+    if (::stat(u.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) return false;
+    return ::access(u.c_str(), X_OK) == 0;
+}
+
+bool DrainFd(int fd, std::string& dst, size_t maxBytes) {
+    if (fd < 0) return false;
+    bool any = false;
+    char buf[65536];
+    for (;;) {
+        const ssize_t got = ::read(fd, buf, sizeof(buf));
+        if (got <= 0) return any;
+        any = true;
+        if (dst.size() < maxBytes) {
+            dst.append(buf, std::min<size_t>(static_cast<size_t>(got), maxBytes - dst.size()));
+        }
+        // else: keep draining so the child never blocks on a full pipe, but drop the data
+    }
+}
+
+std::string NormalizeLinuxToolArg(const std::wstring& a) {
+    std::string u = PathUtils::WideToUtf8(a);
+    // When internal paths were joined with '\\' on top of a POSIX absolute prefix (e.g. "/tmp/x\\y" or "-o/tmp/x\\y"),
+    // normalize '\\' -> '/' if the parent directory exists on disk.
+    auto tryFix = [](std::string& s, size_t prefixLen) {
+        if (s.size() <= prefixLen + 1 || s[prefixLen] != '/' || s.find('\\', prefixLen) == std::string::npos) return;
+        std::string cand = s.substr(prefixLen);
+        std::replace(cand.begin(), cand.end(), '\\', '/');
+        const size_t slash = cand.find_last_of('/');
+        const std::string parent = (slash == std::string::npos || slash == 0) ? "/" : cand.substr(0, slash);
+        struct stat st = {};
+        if (::stat(cand.c_str(), &st) == 0 || ::stat(parent.c_str(), &st) == 0) {
+            s = s.substr(0, prefixLen) + cand;
+        }
+    };
+    tryFix(u, 0);
+    if (u.rfind("-o/", 0) == 0) tryFix(u, 2);
+    return u;
+}
+#else
 bool FileExists(const std::wstring& p) {
     DWORD a = GetFileAttributesW(p.c_str());
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
@@ -71,6 +128,7 @@ bool Drain(HANDLE h, std::string& dst, size_t maxBytes) {
         // else: keep draining so the child never blocks on a full pipe, but drop the data
     }
 }
+#endif
 
 void TrimInPlace(std::wstring& s) {
     size_t b = 0;
@@ -92,6 +150,33 @@ std::wstring GetEnv(const wchar_t* name) {
 }
 
 std::wstring FindExecutable(const wchar_t* exeName, const std::vector<std::wstring>& candidates) {
+#ifndef _WIN32
+    if (!exeName || !*exeName) return {};
+    std::wstring primary(exeName);
+    std::wstring stripped;
+    if (primary.size() > 4 && _wcsicmp(primary.c_str() + primary.size() - 4, L".exe") == 0) {
+        stripped = primary.substr(0, primary.size() - 4);
+    }
+    // PATH walk done by hand: never search relative or empty entries (anti-binary-planting).
+    std::wstring path = GetEnv(L"PATH");
+    size_t pos = 0;
+    while (pos <= path.size()) {
+        size_t sep = path.find(L':', pos);
+        if (sep == std::wstring::npos) sep = path.size();
+        std::wstring dir = path.substr(pos, sep - pos);
+        pos = sep + 1;
+        dir.erase(std::remove(dir.begin(), dir.end(), L'"'), dir.end());
+        while (dir.size() > 1 && (dir.back() == L'/' || dir.back() == L'\\')) dir.pop_back();
+        if (dir.empty() || dir[0] != L'/') continue;
+        const std::wstring prefix = (dir == L"/") ? std::wstring(L"/") : (dir + L"/");
+        if (ExecutableExists(prefix + primary)) return prefix + primary;
+        if (!stripped.empty() && ExecutableExists(prefix + stripped)) return prefix + stripped;
+    }
+    for (const auto& cand : candidates) {
+        if (!cand.empty() && ExecutableExists(cand)) return cand;
+    }
+    return {};
+#else
     // PATH walk done by hand: SearchPathW would also look in the current directory (binary planting).
     std::wstring path = GetEnv(L"PATH");
     size_t pos = 0;
@@ -110,6 +195,7 @@ std::wstring FindExecutable(const wchar_t* exeName, const std::vector<std::wstri
         if (!cand.empty() && FileExists(cand)) return cand;
     }
     return {};
+#endif
 }
 
 std::wstring DecodeOutput(const std::string& bytes) {
@@ -138,6 +224,223 @@ Result Run(const std::wstring& exePath, const std::vector<std::wstring>& args, c
     Result res;
     if (exePath.empty()) { res.notFound = true; return res; }
 
+#ifndef _WIN32
+    const std::string exeUtf8 = Compat::NativePath(exePath.c_str());
+    struct stat st = {};
+    if (::stat(exeUtf8.c_str(), &st) != 0 || S_ISDIR(st.st_mode)) {
+        res.notFound = true;
+        return res;
+    }
+
+    int outPipe[2] = { -1, -1 };
+    int errPipe[2] = { -1, -1 };
+    int execPipe[2] = { -1, -1 };
+    int outFileFd = -1;
+    int nulFd = -1;
+
+    auto closeFd = [](int& fd) {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    };
+    auto closeAll = [&]() {
+        closeFd(outPipe[0]); closeFd(outPipe[1]);
+        closeFd(errPipe[0]); closeFd(errPipe[1]);
+        closeFd(execPipe[0]); closeFd(execPipe[1]);
+        closeFd(outFileFd);
+        closeFd(nulFd);
+    };
+
+    const bool toFile = !opt.stdoutFile.empty();
+    const bool merge = opt.mergeStderr && !toFile;
+    if (toFile) {
+        const std::string outPathUtf8 = Compat::NativePath(opt.stdoutFile.c_str());
+        outFileFd = ::open(outPathUtf8.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+        if (outFileFd < 0) { closeAll(); return res; }
+    } else {
+        if (::pipe2(outPipe, O_CLOEXEC) != 0) { closeAll(); return res; }
+    }
+    if (!merge) {
+        if (::pipe2(errPipe, O_CLOEXEC) != 0) { closeAll(); return res; }
+    }
+    if (::pipe2(execPipe, O_CLOEXEC) != 0) { closeAll(); return res; }
+    nulFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (nulFd < 0) { closeAll(); return res; }
+
+    // Build argv & envp in parent before fork() so the child performs only async-signal-safe calls
+    std::vector<std::string> argvStorage;
+    argvStorage.reserve(1 + args.size());
+    argvStorage.push_back(exeUtf8);
+    for (const auto& a : args) argvStorage.push_back(NormalizeLinuxToolArg(a));
+    std::vector<char*> argvPtrs;
+    argvPtrs.reserve(argvStorage.size() + 1);
+    for (auto& s : argvStorage) argvPtrs.push_back(s.data());
+    argvPtrs.push_back(nullptr);
+
+    auto envNameOf = [](const std::string& kv) -> std::string {
+        const size_t eq = kv.find('=');
+        return (eq == std::string::npos) ? kv : kv.substr(0, eq);
+    };
+    std::vector<std::string> overUtf8, defUtf8;
+    for (const auto& kv : opt.envOverride) overUtf8.push_back(PathUtils::WideToUtf8(kv));
+    for (const auto& kv : opt.envDefault) defUtf8.push_back(PathUtils::WideToUtf8(kv));
+
+    std::vector<std::string> envStorage;
+    std::vector<bool> defPresent(defUtf8.size(), false);
+    if (environ) {
+        for (char** ep = environ; *ep; ++ep) {
+            std::string entry(*ep);
+            const std::string ename = envNameOf(entry);
+            bool overridden = false;
+            for (const auto& ov : overUtf8) {
+                if (ename == envNameOf(ov)) { overridden = true; break; }
+            }
+            for (size_t k = 0; k < defUtf8.size(); ++k) {
+                if (ename == envNameOf(defUtf8[k])) defPresent[k] = true;
+            }
+            if (!overridden) envStorage.push_back(std::move(entry));
+        }
+    }
+    for (const auto& ov : overUtf8) envStorage.push_back(ov);
+    for (size_t k = 0; k < defUtf8.size(); ++k) {
+        if (!defPresent[k]) envStorage.push_back(defUtf8[k]);
+    }
+    std::vector<char*> envPtrs;
+    envPtrs.reserve(envStorage.size() + 1);
+    for (auto& s : envStorage) envPtrs.push_back(s.data());
+    envPtrs.push_back(nullptr);
+
+    const std::string workDirUtf8 = opt.workDir.empty() ? std::string() : Compat::NativePath(opt.workDir.c_str());
+    const int childOutFd = toFile ? outFileFd : outPipe[1];
+    const int childErrFd = merge ? childOutFd : errPipe[1];
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        closeAll();
+        return res;
+    }
+    if (pid == 0) {
+        ::setpgid(0, 0);
+        auto writeErrAndExit = [&](int err) -> void {
+            ssize_t wr = ::write(execPipe[1], &err, sizeof(err));
+            (void)wr;
+            ::_exit(127);
+        };
+        if (!workDirUtf8.empty() && ::chdir(workDirUtf8.c_str()) != 0) {
+            writeErrAndExit(errno);
+        }
+        if (::dup2(nulFd, STDIN_FILENO) < 0 ||
+            ::dup2(childOutFd, STDOUT_FILENO) < 0 ||
+            ::dup2(childErrFd, STDERR_FILENO) < 0)
+        {
+            writeErrAndExit(errno);
+        }
+        // Close any extra descriptors inherited from other threads (except execPipe[1], which has FD_CLOEXEC)
+        if (DIR* d = ::opendir("/proc/self/fd")) {
+            const int dirFd = ::dirfd(d);
+            while (dirent* e = ::readdir(d)) {
+                if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+                const int fd = std::atoi(e->d_name);
+                if (fd >= 3 && fd != execPipe[1] && fd != dirFd) ::close(fd);
+            }
+            ::closedir(d);
+        } else {
+            for (int fd = 3; fd < 1024; ++fd) {
+                if (fd != execPipe[1]) ::close(fd);
+            }
+        }
+        ::execve(exeUtf8.c_str(), argvPtrs.data(), envPtrs.data());
+        writeErrAndExit(errno);
+    }
+
+    // Parent: ensure child process group is established and close child-side descriptors
+    (void)::setpgid(pid, pid);
+    closeFd(execPipe[1]);
+    closeFd(outPipe[1]);
+    closeFd(errPipe[1]);
+    closeFd(outFileFd);
+    closeFd(nulFd);
+
+    int childExecErr = 0;
+    ssize_t errRead = 0;
+    do {
+        errRead = ::read(execPipe[0], &childExecErr, sizeof(childExecErr));
+    } while (errRead < 0 && errno == EINTR);
+    closeFd(execPipe[0]);
+
+    if (errRead > 0) {
+        int wstatus = 0;
+        (void)::waitpid(pid, &wstatus, 0);
+        res.notFound = (childExecErr == ENOENT || childExecErr == ENOTDIR);
+        closeAll();
+        return res;
+    }
+
+    res.started = true;
+    if (outPipe[0] >= 0) {
+        const int fl = ::fcntl(outPipe[0], F_GETFL, 0);
+        if (fl >= 0) (void)::fcntl(outPipe[0], F_SETFL, fl | O_NONBLOCK);
+    }
+    if (errPipe[0] >= 0) {
+        const int fl = ::fcntl(errPipe[0], F_GETFL, 0);
+        if (fl >= 0) (void)::fcntl(errPipe[0], F_SETFL, fl | O_NONBLOCK);
+    }
+
+    int wstatus = 0;
+    bool reaped = false;
+    auto killChildGroup = [&]() {
+        (void)::kill(-pid, SIGKILL);
+        (void)::kill(pid, SIGKILL);
+        if (!reaped) {
+            while (::waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) {}
+            reaped = true;
+        }
+    };
+
+    const ULONGLONG startTick = GetTickCount64();
+    bool exited = false;
+    for (;;) {
+        bool got = DrainFd(outPipe[0], res.out, opt.maxBytes);
+        got |= DrainFd(errPipe[0], res.err, opt.maxBytes);
+        if (exited) {
+            if (!got) break;
+            continue;
+        }
+        if (stop.load()) {
+            killChildGroup();
+            res.cancelled = true;
+            break;
+        }
+        if (GetTickCount64() - startTick > opt.timeoutMs) {
+            killChildGroup();
+            res.timedOut = true;
+            break;
+        }
+        const pid_t w = ::waitpid(pid, &wstatus, WNOHANG);
+        if (w == pid) {
+            reaped = true;
+            exited = true;
+            continue;
+        }
+        if (!got) {
+            struct pollfd pfds[2] = {};
+            nfds_t nfds = 0;
+            if (outPipe[0] >= 0) { pfds[nfds].fd = outPipe[0]; pfds[nfds].events = POLLIN; ++nfds; }
+            if (errPipe[0] >= 0) { pfds[nfds].fd = errPipe[0]; pfds[nfds].events = POLLIN; ++nfds; }
+            if (nfds > 0) (void)::poll(pfds, nfds, 4);
+            else ::usleep(4000);
+        }
+    }
+
+    if (!reaped) {
+        while (::waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) {}
+        reaped = true;
+    }
+    if (!res.timedOut && !res.cancelled) {
+        if (WIFEXITED(wstatus)) res.exitCode = static_cast<DWORD>(WEXITSTATUS(wstatus));
+        else if (WIFSIGNALED(wstatus)) res.exitCode = static_cast<DWORD>(128 + WTERMSIG(wstatus));
+    }
+    closeAll();
+    return res;
+#else
     std::wstring cl = L"\"" + exePath + L"\"";
     for (const auto& a : args) AppendQuotedArg(cl, a);
 
@@ -237,6 +540,7 @@ Result Run(const std::wstring& exePath, const std::vector<std::wstring>& args, c
     if (job) CloseHandle(job);
     closeAll();
     return res;
+#endif
 }
 
 } // namespace Explorer2::ToolProcess

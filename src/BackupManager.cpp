@@ -2,6 +2,9 @@
 #include "PathUtils.h"
 #include "FileEngine.h"
 #include "AppLog.h"
+#ifndef _WIN32
+#include "ToolProcess.h"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -95,11 +98,31 @@ uint64_t BackupManager::CurrentEpochSeconds() {
 std::wstring BackupManager::DefaultConfigPath() {
     wchar_t localAppData[MAX_PATH] = {};
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+#ifdef _WIN32
     std::wstring dir = (n > 0 && n < MAX_PATH)
         ? (std::wstring(localAppData) + L"\\Explorer2")
         : L".";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\backups.ini";
+#else
+    std::wstring dir;
+    if (n > 0 && n < MAX_PATH) {
+        dir = PathUtils::EnsureTrailingSlash(localAppData) + L"Explorer2";
+    } else {
+        wchar_t xdgCfg[MAX_PATH] = {};
+        wchar_t homeBuf[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"XDG_CONFIG_HOME", xdgCfg, MAX_PATH) > 0) {
+            dir = PathUtils::EnsureTrailingSlash(xdgCfg) + L"Explorer2";
+        } else if (GetEnvironmentVariableW(L"HOME", homeBuf, MAX_PATH) > 0) {
+            CreateDirectoryW((PathUtils::EnsureTrailingSlash(homeBuf) + L".config").c_str(), nullptr);
+            dir = PathUtils::EnsureTrailingSlash(homeBuf) + L".config/Explorer2";
+        } else {
+            dir = L"/tmp/Explorer2";
+        }
+    }
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return PathUtils::EnsureTrailingSlash(dir) + L"backups.ini";
+#endif
 }
 
 bool BackupManager::LoadJobs(const std::wstring& iniPathIn) {
@@ -395,6 +418,7 @@ bool BackupManager::IsRcloneInstalled(std::wstring* outVersion) {
         if (outVersion) *outVersion = s_cachedVer;
         return s_cachedState == 1;
     }
+#ifdef _WIN32
     wchar_t foundPath[MAX_PATH] = {};
     DWORD n = SearchPathW(nullptr, L"rclone.exe", nullptr, MAX_PATH, foundPath, nullptr);
     if (n > 0 && n < MAX_PATH) {
@@ -403,6 +427,15 @@ bool BackupManager::IsRcloneInstalled(std::wstring* outVersion) {
     } else {
         s_cachedState = 0;
     }
+#else
+    std::wstring exe = ToolProcess::FindExecutable(L"rclone", { L"/usr/bin/rclone", L"/usr/local/bin/rclone", L"/snap/bin/rclone" });
+    if (!exe.empty()) {
+        s_cachedState = 1;
+        s_cachedVer = std::move(exe);
+    } else {
+        s_cachedState = 0;
+    }
+#endif
     if (outVersion) *outVersion = s_cachedVer;
     return s_cachedState == 1;
 }
@@ -439,6 +472,20 @@ bool BackupManager::IsTargetAvailable(const std::wstring& targetPath) {
         std::wstring driveRoot = clean.substr(0, 2) + L"\\";
         DWORD rootAttrs = GetFileAttributesW(driveRoot.c_str());
         online = (rootAttrs != INVALID_FILE_ATTRIBUTES && (rootAttrs & FILE_ATTRIBUTE_DIRECTORY));
+#ifndef _WIN32
+    } else if (!clean.empty() && clean[0] == L'/') {
+        std::wstring par = PathUtils::GetParentPath(clean);
+        while (!par.empty()) {
+            DWORD pAttrs = GetFileAttributesW(par.c_str());
+            if (pAttrs != INVALID_FILE_ATTRIBUTES && (pAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                online = true;
+                break;
+            }
+            std::wstring next = PathUtils::GetParentPath(par);
+            if (next == par) break;
+            par = std::move(next);
+        }
+#endif
     }
 
     {
@@ -512,8 +559,10 @@ BackupSyncResult BackupManager::ExecuteJobSync(const BackupJob& job, bool dryRun
     }
 
     // Check if rclone CLI should and can be used
-    if ((job.useRclone || IsRcloneRemoteSyntax(dstRoot)) && IsRcloneInstalled()) {
+    std::wstring rcloneExe;
+    if ((job.useRclone || IsRcloneRemoteSyntax(dstRoot)) && IsRcloneInstalled(&rcloneExe)) {
         res.usedRclone = true;
+#ifdef _WIN32
         std::wstring cmdLine = BuildRcloneCommandLine(job, dryRun);
         STARTUPINFOW si = { sizeof(si) };
         si.dwFlags = STARTF_USESHOWWINDOW;
@@ -533,6 +582,32 @@ BackupSyncResult BackupManager::ExecuteJobSync(const BackupJob& job, bool dryRun
                 : (L"Rclone zwrócił kod błędu " + std::to_wstring(exitCode));
             return res;
         }
+#else
+        std::vector<std::wstring> args = { L"copy", job.sourcePath, job.targetPath };
+        if (dryRun) args.push_back(L"--dry-run");
+        for (const auto& ex : SplitFilterPatterns(job.excludeFilter)) {
+            args.push_back(L"--exclude");
+            args.push_back(ex);
+        }
+        for (const auto& inc : SplitFilterPatterns(job.includeFilter)) {
+            if (inc != L"*" && inc != L"*.*") {
+                args.push_back(L"--include");
+                args.push_back(inc);
+            }
+        }
+        args.push_back(L"--stats-one-line");
+        ToolProcess::Options opt;
+        opt.timeoutMs = 120000;
+        std::atomic<bool> stop{ false };
+        ToolProcess::Result rr = ToolProcess::Run(rcloneExe, args, opt, stop);
+        if (rr.started) {
+            res.ok = rr.ok();
+            res.summaryText = res.ok
+                ? (dryRun ? L"Rclone Dry-Run zakończony pomyślnie" : L"Synchronizacja rclone zakończona pomyślnie")
+                : (L"Rclone zwrócił kod błędu " + std::to_wstring(rr.exitCode));
+            return res;
+        }
+#endif
     }
 
     // Native high-speed C++ incremental directory sync

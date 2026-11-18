@@ -33,6 +33,14 @@ ULONGLONG g_gitLastProbeTick = 0;
 bool g_gitProbed = false;
 
 std::wstring ProbeGit() {
+#ifndef _WIN32
+    std::vector<std::wstring> candidates = {
+        L"/usr/bin/git",
+        L"/usr/local/bin/git",
+        L"/bin/git"
+    };
+    return ToolProcess::FindExecutable(L"git", candidates);
+#else
     using ToolProcess::GetEnv;
     std::vector<std::wstring> candidates;
     for (const std::wstring& r : { GetEnv(L"ProgramFiles"), GetEnv(L"ProgramFiles(x86)"), std::wstring(L"C:\\Program Files"),
@@ -41,6 +49,7 @@ std::wstring ProbeGit() {
         candidates.push_back(r + L"\\Git\\cmd\\git.exe");
     }
     return ToolProcess::FindExecutable(L"git.exe", candidates);
+#endif
 }
 
 // Returns the path of git.exe or empty.
@@ -284,7 +293,12 @@ std::wstring GitIntegration::FindRepoRoot(const std::wstring& folder, VcsKind* k
     DWORD n = GetFullPathNameW(folder.c_str(), (DWORD)(sizeof(full) / sizeof(full[0])), full, nullptr);
     if (n == 0 || n >= sizeof(full) / sizeof(full[0])) return {};
     std::wstring cur(full, n);
+#ifndef _WIN32
+    const bool isPosixAbs = (!cur.empty() && cur[0] == L'/');
+    if (!isPosixAbs && (cur.size() < 3 || !(cur[1] == L':' || (cur[0] == L'\\' && cur[1] == L'\\')))) return {};
+#else
     if (cur.size() < 3 || !(cur[1] == L':' || (cur[0] == L'\\' && cur[1] == L'\\'))) return {};   // virtual folders
+#endif
     if (cur.rfind(L"\\\\?\\", 0) == 0 || cur.rfind(L"\\\\.\\", 0) == 0) return {};
 
     // A file path starts at its parent directory.
@@ -292,10 +306,17 @@ std::wstring GitIntegration::FindRepoRoot(const std::wstring& folder, VcsKind* k
     bool startIsFile = (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 
     for (;;) {
-        while (cur.size() > 3 && (cur.back() == L'\\' || cur.back() == L'/')) cur.pop_back();
+#ifndef _WIN32
+        const size_t minRootLen = isPosixAbs ? 1 : 3;
+        const wchar_t sep = isPosixAbs ? L'/' : L'\\';
+#else
+        constexpr size_t minRootLen = 3;
+        constexpr wchar_t sep = L'\\';
+#endif
+        while (cur.size() > minRootLen && (cur.back() == L'\\' || cur.back() == L'/')) cur.pop_back();
         if (!startIsFile) {
             std::wstring base = cur;
-            if (base.back() != L'\\') base += L'\\';
+            if (base.back() != L'\\' && base.back() != L'/') base += sep;
             if (GetFileAttributesW((base + L".git").c_str()) != INVALID_FILE_ATTRIBUTES) return cur;   // dir or file
             // Subversion 1.7 and later keep a single .svn folder, at the root of the working copy
             const DWORD svnAttr = GetFileAttributesW((base + L".svn").c_str());
@@ -305,6 +326,15 @@ std::wstring GitIntegration::FindRepoRoot(const std::wstring& folder, VcsKind* k
             }
         }
         startIsFile = false;
+#ifndef _WIN32
+        if (isPosixAbs) {
+            if (cur == L"/") return {};
+            size_t pslash = cur.find_last_of(L"/\\");
+            if (pslash == std::wstring::npos) return {};
+            cur.resize(pslash == 0 ? 1 : pslash);
+            continue;
+        }
+#endif
         size_t slash = cur.find_last_of(L'\\');
         if (slash == std::wstring::npos) return {};
         if (slash <= 2 && cur[1] == L':') {             // "C:\dir" -> "C:\" ; "C:\" is the top

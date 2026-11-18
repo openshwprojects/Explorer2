@@ -192,13 +192,12 @@ inline uint32_t ReadLE32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE
 
 } // namespace
 
-bool InflateRaw(
+bool InflateRawAppend(
     const uint8_t* src,
     size_t srcLen,
     std::vector<uint8_t>& outData,
     size_t maxOutputBytes)
 {
-    outData.clear();
     if (!src || srcLen == 0) return false;
 
     BitStream bs{ src, srcLen, 0, 0, 0 };
@@ -315,6 +314,16 @@ bool InflateRaw(
         }
     }
     return true;
+}
+
+bool InflateRaw(
+    const uint8_t* src,
+    size_t srcLen,
+    std::vector<uint8_t>& outData,
+    size_t maxOutputBytes)
+{
+    outData.clear();
+    return InflateRawAppend(src, srcLen, outData, maxOutputBytes);
 }
 
 bool InflateZlib(

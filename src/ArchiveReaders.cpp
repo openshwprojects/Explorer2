@@ -6,10 +6,16 @@
 #include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "ZipDeflate.h"
+#include "LzxDecoder.h"
 #include "Ole2Compound.h"
 #include "PathUtils.h"
 #ifdef _WIN32
 #include <setupapi.h>   // CAB (SetupIterateCabinetW)
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 #include <map>
 #include <set>
@@ -2013,7 +2019,172 @@ bool ExtractCabEntryFromFile(
     std::vector<uint8_t>& outBytes)
 {
 #ifndef _WIN32
-    return false;   // the Linux build of the readers has no CAB extraction (SetupAPI)
+    outBytes.clear();
+    if (cabFilePath.empty() || targetNorm.empty()) return false;
+    std::vector<uint8_t> cab;
+    if (!PathUtils::ReadFileBytes(cabFilePath, 256 * 1024 * 1024, cab) || cab.size() < 36) return false;
+    if (std::memcmp(cab.data(), "MSCF\0\0\0\0", 8) != 0) return false;
+
+    auto rd16 = [](const uint8_t* p) -> uint16_t { return static_cast<uint16_t>(p[0] | (p[1] << 8)); };
+    auto rd32 = [](const uint8_t* p) -> uint32_t {
+        return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    };
+    auto cabCsum = [](const uint8_t* pv, size_t cb, uint32_t seed) -> uint32_t {
+        uint32_t csum = seed;
+        size_t words = cb / 4;
+        for (size_t i = 0; i < words; ++i) {
+            csum ^= static_cast<uint32_t>(pv[0]) | (static_cast<uint32_t>(pv[1]) << 8) |
+                    (static_cast<uint32_t>(pv[2]) << 16) | (static_cast<uint32_t>(pv[3]) << 24);
+            pv += 4;
+        }
+        uint32_t rem = 0;
+        switch (cb & 3u) {
+        case 3: rem |= (static_cast<uint32_t>(*pv++) << 16); [[fallthrough]];
+        case 2: rem |= (static_cast<uint32_t>(*pv++) << 8);  [[fallthrough]];
+        case 1: rem |= static_cast<uint32_t>(*pv++); break;
+        default: break;
+        }
+        return csum ^ rem;
+    };
+
+    const size_t sz = cab.size();
+    const uint32_t coffFiles = rd32(cab.data() + 16);
+    const uint16_t cFolders  = rd16(cab.data() + 26);
+    const uint16_t cFiles    = rd16(cab.data() + 28);
+    const uint16_t flags     = rd16(cab.data() + 30);
+    if (cFolders == 0 || cFiles == 0 || coffFiles >= sz) return false;
+    if ((flags & 0x0003u) != 0) return false; // Multi-volume spanning cabinets unsupported
+
+    size_t hdrPos = 36;
+    uint16_t cbCFHeader = 0;
+    uint8_t cbCFFolder = 0, cbCFData = 0;
+    if (flags & 0x0004u) {
+        if (hdrPos + 4 > sz) return false;
+        cbCFHeader = rd16(cab.data() + hdrPos);
+        cbCFFolder = cab[hdrPos + 2];
+        cbCFData   = cab[hdrPos + 3];
+        hdrPos += 4 + cbCFHeader;
+    }
+    if (hdrPos > sz) return false;
+
+    struct CabFolderRec { uint32_t coffCabStart; uint16_t cCFData; uint16_t typeCompress; };
+    std::vector<CabFolderRec> folders;
+    folders.reserve(cFolders);
+    for (uint16_t i = 0; i < cFolders; ++i) {
+        if (hdrPos + 8 + cbCFFolder > sz) return false;
+        folders.push_back({ rd32(cab.data() + hdrPos), rd16(cab.data() + hdrPos + 4), rd16(cab.data() + hdrPos + 6) });
+        hdrPos += 8 + cbCFFolder;
+    }
+
+    const std::wstring wantedNorm = ArchivePath::Normalize(targetNorm);
+    bool found = false;
+    uint32_t targetSize = 0, targetOffset = 0;
+    uint16_t targetFolder = 0;
+
+    size_t fpos = coffFiles;
+    for (uint16_t i = 0; i < cFiles && fpos + 16 < sz; ++i) {
+        const uint32_t cbFile = rd32(cab.data() + fpos);
+        const uint32_t uoff   = rd32(cab.data() + fpos + 4);
+        const uint16_t iFold  = rd16(cab.data() + fpos + 8);
+        const uint16_t attr   = rd16(cab.data() + fpos + 14);
+        fpos += 16;
+        size_t nameStart = fpos;
+        while (fpos < sz && cab[fpos] != 0) ++fpos;
+        if (fpos >= sz) return false;
+        std::string rawName(reinterpret_cast<const char*>(cab.data() + nameStart), fpos - nameStart);
+        ++fpos;
+
+        std::wstring wName;
+        if (attr & 0x0080u) {
+            wName = PathUtils::Utf8ToWide(rawName);
+        } else {
+            int wl = MultiByteToWideChar(CP_ACP, 0, rawName.data(), static_cast<int>(rawName.size()), nullptr, 0);
+            if (wl > 0) {
+                wName.resize(static_cast<size_t>(wl));
+                MultiByteToWideChar(CP_ACP, 0, rawName.data(), static_cast<int>(rawName.size()), wName.data(), wl);
+            } else {
+                wName = PathUtils::Utf8ToWide(rawName);
+            }
+        }
+        std::wstring entryNorm = ArchivePath::Normalize(wName);
+        if (_wcsicmp(entryNorm.c_str(), wantedNorm.c_str()) == 0) {
+            if (iFold >= folders.size()) return false;
+            found = true;
+            targetSize = cbFile;
+            targetOffset = uoff;
+            targetFolder = iFold;
+            break;
+        }
+    }
+    if (!found) return false;
+    if (targetSize == 0) return true;
+    const uint64_t needEnd = static_cast<uint64_t>(targetOffset) + targetSize;
+    if (needEnd > 256ULL * 1024 * 1024) return false;
+
+    const auto& fld = folders[targetFolder];
+    if (fld.coffCabStart >= sz || fld.cCFData == 0) return false;
+    const uint16_t compKind = fld.typeCompress & 0x000Fu;
+
+    std::vector<uint8_t> folderUncomp;
+    size_t dpos = fld.coffCabStart;
+
+    if (compKind == 0u || compKind == 1u) {
+        folderUncomp.reserve(static_cast<size_t>(needEnd) + 32768u);
+        for (uint16_t b = 0; b < fld.cCFData && folderUncomp.size() < needEnd; ++b) {
+            if (dpos + 8 + cbCFData > sz) return false;
+            const uint32_t csum     = rd32(cab.data() + dpos);
+            const uint16_t cbData   = rd16(cab.data() + dpos + 4);
+            const uint16_t cbUncomp = rd16(cab.data() + dpos + 6);
+            if (cbData == 0 || cbUncomp == 0 || cbUncomp > 32768u) return false;
+            if (dpos + 8 + cbCFData + cbData > sz) return false;
+            if (csum != 0) {
+                uint32_t calc = cabCsum(cab.data() + dpos + 4, 4, cabCsum(cab.data() + dpos + 8, cbCFData + cbData, 0));
+                if (calc != csum) return false;
+            }
+            const uint8_t* payload = cab.data() + dpos + 8 + cbCFData;
+            dpos += 8 + cbCFData + cbData;
+
+            if (compKind == 0u) {
+                if (cbData != cbUncomp) return false;
+                folderUncomp.insert(folderUncomp.end(), payload, payload + cbData);
+            } else {
+                if (cbData < 2 || payload[0] != 'C' || payload[1] != 'K') return false;
+                const size_t before = folderUncomp.size();
+                if (!ZipDeflate::InflateRawAppend(payload + 2, cbData - 2, folderUncomp, static_cast<size_t>(needEnd) + 65536u)) {
+                    return false;
+                }
+                if (folderUncomp.size() - before != cbUncomp) return false;
+            }
+        }
+    } else if (compKind == 3u) {
+        const int winBits = static_cast<int>((fld.typeCompress >> 8) & 0x1Fu);
+        std::vector<uint8_t> lzxStream;
+        size_t totalBlockUncomp = 0;
+        for (uint16_t b = 0; b < fld.cCFData && totalBlockUncomp < needEnd; ++b) {
+            if (dpos + 8 + cbCFData > sz) return false;
+            const uint32_t csum     = rd32(cab.data() + dpos);
+            const uint16_t cbData   = rd16(cab.data() + dpos + 4);
+            const uint16_t cbUncomp = rd16(cab.data() + dpos + 6);
+            if (cbData == 0 || dpos + 8 + cbCFData + cbData > sz) return false;
+            if (csum != 0) {
+                uint32_t calc = cabCsum(cab.data() + dpos + 4, 4, cabCsum(cab.data() + dpos + 8, cbCFData + cbData, 0));
+                if (calc != csum) return false;
+            }
+            const uint8_t* payload = cab.data() + dpos + 8 + cbCFData;
+            lzxStream.insert(lzxStream.end(), payload, payload + cbData);
+            totalBlockUncomp += cbUncomp;
+            dpos += 8 + cbCFData + cbData;
+        }
+        Lzx::Decoder dec(lzxStream.data(), lzxStream.size(), winBits, 0, {});
+        if (!dec.Decode(totalBlockUncomp, folderUncomp)) return false;
+    } else {
+        return false;
+    }
+
+    if (folderUncomp.size() < needEnd) return false;
+    outBytes.assign(folderUncomp.data() + targetOffset, folderUncomp.data() + needEnd);
+    return true;
 #else
     outBytes.clear();
     if (cabFilePath.empty() || targetNorm.empty()) return false;
@@ -3526,8 +3697,72 @@ using ToolRun = ArchiveReaders::ToolRun;
 
 ToolRun RunSilentProcessWait(const std::wstring& exePath, const std::wstring& args, DWORD timeoutMs) {
 #ifndef _WIN32
-    (void)exePath; (void)args; (void)timeoutMs;
-    return ToolRun::Failed;   // the Linux build of the readers has no Windows archive tools (7z.exe, UnRAR.exe, tar.exe)
+    if (exePath.empty()) return ToolRun::Failed;
+    const std::string exeUtf8 = Compat::NativePath(exePath.c_str());
+    if (::access(exeUtf8.c_str(), X_OK) != 0) return ToolRun::Failed;
+
+    std::vector<std::string> argvStorage;
+    argvStorage.push_back(exeUtf8);
+    // Split `args` with standard double-quote handling and normalize mixed "/tmp/a\\b" local paths
+    const wchar_t* p = args.c_str();
+    while (*p) {
+        while (*p == L' ' || *p == L'\t') ++p;
+        if (!*p) break;
+        std::wstring cur;
+        bool inQ = false;
+        while (*p) {
+            if (*p == L'"') { inQ = !inQ; ++p; }
+            else if (*p == L'\\' && p[1] == L'"') { cur.push_back(L'"'); p += 2; }
+            else if (!inQ && (*p == L' ' || *p == L'\t')) break;
+            else cur.push_back(*p++);
+        }
+        std::string a = PathUtils::WideToUtf8(cur);
+        auto fixLocal = [](std::string& s, size_t pfx) {
+            if (s.size() > pfx + 1 && s[pfx] == '/' && s.find('\\', pfx) != std::string::npos) {
+                std::replace(s.begin() + static_cast<std::ptrdiff_t>(pfx), s.end(), '\\', '/');
+            }
+        };
+        fixLocal(a, 0);
+        if (a.rfind("-o/", 0) == 0) fixLocal(a, 2);
+        argvStorage.push_back(std::move(a));
+    }
+    std::vector<char*> argvPtrs;
+    for (auto& s : argvStorage) argvPtrs.push_back(s.data());
+    argvPtrs.push_back(nullptr);
+
+    const pid_t pid = ::fork();
+    if (pid < 0) return ToolRun::Failed;
+    if (pid == 0) {
+        ::setpgid(0, 0);
+        const int nul = ::open("/dev/null", O_RDWR);
+        if (nul >= 0) {
+            ::dup2(nul, STDIN_FILENO);
+            ::dup2(nul, STDOUT_FILENO);
+            ::dup2(nul, STDERR_FILENO);
+            if (nul > 2) ::close(nul);
+        }
+        ::execvp(exeUtf8.c_str(), argvPtrs.data());
+        ::_exit(127);
+    }
+    (void)::setpgid(pid, pid);
+    const ULONGLONG start = GetTickCount64();
+    int wstatus = 0;
+    for (;;) {
+        const pid_t w = ::waitpid(pid, &wstatus, WNOHANG);
+        if (w == pid) {
+            return (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0) ? ToolRun::Succeeded : ToolRun::Failed;
+        }
+        if (w < 0 && errno != EINTR) return ToolRun::Failed;
+        if (timeoutMs != INFINITE && GetTickCount64() - start > timeoutMs) {
+            (void)::kill(-pid, SIGKILL);
+            (void)::kill(pid, SIGKILL);
+            while (::waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) {}
+            AppLog::Warn(L"Archive", L"Stopped " + PathUtils::GetFileName(exePath) + L" after " +
+                                     std::to_wstring(timeoutMs / 1000) + L" s without a result");
+            return ToolRun::TimedOut;
+        }
+        ::usleep(5000);
+    }
 #else
     std::wstring cmdLine = L"\"" + exePath + L"\" " + args;
     std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
@@ -3571,6 +3806,18 @@ ToolRun RunSilentProcessWait(const std::wstring& exePath, const std::wstring& ar
 }
 
 std::wstring Find7ZipExePath() {
+#ifndef _WIN32
+    static const wchar_t* kLinuxCandidates[] = {
+        L"/usr/bin/7z",
+        L"/usr/bin/7zz",
+        L"/usr/bin/7za",
+        L"/usr/local/bin/7z"
+    };
+    for (const wchar_t* c : kLinuxCandidates) {
+        if (::access(Compat::NativePath(c).c_str(), X_OK) == 0) return c;
+    }
+    return L"";
+#else
     static const wchar_t* kCandidates[] = {
         L"C:\\Program Files\\7-Zip\\7z.exe",
         L"C:\\Program Files (x86)\\7-Zip\\7z.exe"
@@ -3579,9 +3826,21 @@ std::wstring Find7ZipExePath() {
         if (GetFileAttributesW(c) != INVALID_FILE_ATTRIBUTES) return c;
     }
     return L"";
+#endif
 }
 
 std::wstring FindUnRarExePath() {
+#ifndef _WIN32
+    static const wchar_t* kLinuxCandidates[] = {
+        L"/usr/bin/unrar",
+        L"/usr/bin/unrar-nonfree",
+        L"/usr/local/bin/unrar"
+    };
+    for (const wchar_t* c : kLinuxCandidates) {
+        if (::access(Compat::NativePath(c).c_str(), X_OK) == 0) return c;
+    }
+    return L"";
+#else
     static const wchar_t* kCandidates[] = {
         L"C:\\Program Files\\WinRAR\\UnRAR.exe",
         L"C:\\Program Files\\WinRAR\\Rar.exe",
@@ -3591,6 +3850,7 @@ std::wstring FindUnRarExePath() {
         if (GetFileAttributesW(c) != INVALID_FILE_ATTRIBUTES) return c;
     }
     return L"";
+#endif
 }
 
 // An archive decides the names of its entries, so they are never trusted. This turns an entry's path into
@@ -4101,7 +4361,12 @@ bool ArchiveReaders::ExtractSingleEntryToTempFile(
 
     std::wstring sevenZ = Find7ZipExePath();
     if (!sevenZ.empty()) {
-        std::wstring args = L"e -y -bd -o\"" + previewDir + L"\" -- \"" + archivePath + L"\" \"" + winInner + L"\"";
+#ifndef _WIN32
+        const std::wstring innerArg = normInner;
+#else
+        const std::wstring& innerArg = winInner;
+#endif
+        std::wstring args = L"e -y -bd -o\"" + previewDir + L"\" -- \"" + archivePath + L"\" \"" + innerArg + L"\"";
         if (producedFile(RunSilentProcessWait(sevenZ, args, kPreviewToolLimitMs), targetTemp)) {
             outTempFilePath = targetTemp;
             return true;
@@ -4110,19 +4375,28 @@ bool ArchiveReaders::ExtractSingleEntryToTempFile(
 
     std::wstring unrar = FindUnRarExePath();
     if (!unrar.empty()) {
-        std::wstring args = L"e -y -inul -- \"" + archivePath + L"\" \"" + winInner + L"\" \"" + previewDir + L"\\\"";
+#ifndef _WIN32
+        const std::wstring innerArg = normInner;
+#else
+        const std::wstring& innerArg = winInner;
+#endif
+        std::wstring args = L"e -y -inul -- \"" + archivePath + L"\" \"" + innerArg + L"\" \"" + PathUtils::EnsureTrailingSlash(previewDir) + L"\"";
         if (producedFile(RunSilentProcessWait(unrar, args, kPreviewToolLimitMs), targetTemp)) {
             outTempFilePath = targetTemp;
             return true;
         }
     }
 
+#ifndef _WIN32
+    std::wstring tarExe = (::access("/bin/tar", X_OK) == 0) ? L"/bin/tar" : L"/usr/bin/tar";
+#else
     wchar_t sysDir[MAX_PATH] = {};
     GetSystemDirectoryW(sysDir, MAX_PATH);
     std::wstring tarExe = std::wstring(sysDir) + L"\\tar.exe";
+#endif
     if (GetFileAttributesW(tarExe.c_str()) != INVALID_FILE_ATTRIBUTES) {
         std::wstring args = L"-xf \"" + archivePath + L"\" -C \"" + previewDir + L"\" -- \"" + normInner + L"\"";
-        std::wstring fullNested = previewDir + L"\\" + safeRelative;
+        std::wstring fullNested = PathUtils::EnsureTrailingSlash(previewDir) + safeRelative;
         if (producedFile(RunSilentProcessWait(tarExe, args, kPreviewToolLimitMs), fullNested)) {
             if (_wcsicmp(fullNested.c_str(), targetTemp.c_str()) != 0) {
                 MoveFileExW(fullNested.c_str(), targetTemp.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
@@ -4219,9 +4493,13 @@ bool ArchiveReaders::ExtractEntireArchiveToFolder(
             std::wstring args = L"x -o- -inul -- \"" + archivePath + L"\" \"" + PathUtils::EnsureTrailingSlash(destFolderPath) + L"\"";
             if (RunSilentProcessWait(unrar, args, INFINITE) == ToolRun::Succeeded) return true;
         }
+#ifndef _WIN32
+        std::wstring tarExe = (::access("/bin/tar", X_OK) == 0) ? L"/bin/tar" : L"/usr/bin/tar";
+#else
         wchar_t sysDir[MAX_PATH] = {};
         GetSystemDirectoryW(sysDir, MAX_PATH);
         std::wstring tarExe = std::wstring(sysDir) + L"\\tar.exe";
+#endif
         if (GetFileAttributesW(tarExe.c_str()) != INVALID_FILE_ATTRIBUTES) {
             std::wstring args = L"-xkf \"" + archivePath + L"\" -C \"" + destFolderPath + L"\"";
             if (RunSilentProcessWait(tarExe, args, INFINITE) == ToolRun::Succeeded) return true;

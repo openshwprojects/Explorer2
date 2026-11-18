@@ -3540,6 +3540,15 @@ DWORD DeleteFileOnce(const std::wstring& extPath, DWORD attrs) {
     if (DeleteFileW(extPath.c_str())) return 0;
     const DWORD err = GetLastError();
     if (IsGoneError(err)) return 0;
+#ifndef _WIN32
+    if (err == ERROR_ACCESS_DENIED) {
+        // On POSIX, unlink() checks u+w on the parent directory: lift read-only parent folder mode if needed
+        const std::wstring parentExt = PathUtils::GetParentPath(extPath);
+        if (!parentExt.empty() && SetFileAttributesW(parentExt.c_str(), FILE_ATTRIBUTE_NORMAL)) {
+            if (DeleteFileW(extPath.c_str()) || IsGoneError(GetLastError())) return 0;
+        }
+    }
+#endif
     if (clearedReadOnly) SetFileAttributesW(extPath.c_str(), attrs);
     return err;
 }
@@ -3880,6 +3889,11 @@ bool TransferManager::IsDeleteRefused(const std::wstring& rawPath) {
         const size_t shareEnd = p.find(L'\\', serverEnd + 1);
         if (shareEnd == std::wstring::npos || shareEnd == serverEnd + 1 || shareEnd + 1 >= p.size()) return true;
         firstComponent = shareEnd + 1;
+#ifndef _WIN32
+    } else if (p.size() >= 2 && p[0] == L'\\' && p[1] != L'\\') {
+        // POSIX absolute path "/first/..." (after '/' -> '\\' normalization); "/" alone has size 1 and is refused
+        firstComponent = 1;
+#endif
     } else {
         return true;   // relative, or a form this engine does not know
     }
@@ -3906,6 +3920,13 @@ bool TransferManager::PathHasNoRecycleBin(const std::wstring& rawPath) {
     if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) return true;   // extended UNC network share
     if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
     if (p.rfind(L"\\\\", 0) == 0) return true;          // standard UNC network share (\\server\share\...)
+#ifndef _WIN32
+    if (p == L"\\proc" || p.rfind(L"\\proc\\", 0) == 0 ||
+        p == L"\\sys"  || p.rfind(L"\\sys\\", 0) == 0 ||
+        p == L"\\dev"  || p.rfind(L"\\dev\\", 0) == 0) {
+        return true;
+    }
+#endif
 
     if (p.size() >= 2 && p[1] == L':') {
         const wchar_t root[4] = { p[0], L':', L'\\', L'\0' };

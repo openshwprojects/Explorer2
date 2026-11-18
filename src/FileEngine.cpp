@@ -14,6 +14,14 @@
 #include <sddl.h>
 #include <algorithm>
 #include <cwctype>
+#ifndef _WIN32
+#include "ToolProcess.h"
+#include <fstream>
+#include <poll.h>
+#include <sstream>
+#include <sys/inotify.h>
+#include <sys/statvfs.h>
+#endif
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -42,6 +50,183 @@ static std::wstring GetCurrentUserSidString() {
     });
     return s_cachedSid;
 }
+
+#ifndef _WIN32
+namespace {
+
+struct LinuxMountInfo {
+    std::wstring mountPoint;
+    std::wstring fsType;
+    std::wstring device;
+    std::wstring label;
+    uint64_t totalBytes = 0;
+    uint64_t freeBytes = 0;
+    bool isNetwork = false;
+    bool isOptical = false;
+};
+
+std::string UnescapeProcMountField(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() &&
+            s[i + 1] >= '0' && s[i + 1] <= '7' &&
+            s[i + 2] >= '0' && s[i + 2] <= '7' &&
+            s[i + 3] >= '0' && s[i + 3] <= '7') {
+            char ch = static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0'));
+            out.push_back(ch);
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+std::vector<LinuxMountInfo> EnumerateLinuxMounts(Lang lang) {
+    std::vector<LinuxMountInfo> out;
+    std::unordered_set<std::string> seenMounts;
+    std::ifstream f("/proc/self/mounts");
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        std::string devRaw, mntRaw, fsType;
+        if (!(iss >> devRaw >> mntRaw >> fsType)) continue;
+        std::string mnt = UnescapeProcMountField(mntRaw);
+        std::string dev = UnescapeProcMountField(devRaw);
+        if (mnt.empty() || mnt[0] != '/') continue;
+        if (mnt != "/") {
+            if (mnt.rfind("/proc", 0) == 0 || mnt.rfind("/sys", 0) == 0 || mnt.rfind("/dev", 0) == 0) continue;
+            if (mnt.rfind("/run", 0) == 0 && mnt.rfind("/run/media/", 0) != 0 && mnt.rfind("/run/user/", 0) == 0) continue;
+            if (mnt.rfind("/snap/", 0) == 0 || mnt.rfind("/var/snap/", 0) == 0) continue;
+            if (fsType == "proc" || fsType == "sysfs" || fsType == "devtmpfs" || fsType == "devpts" ||
+                fsType == "tmpfs" || fsType == "cgroup" || fsType == "cgroup2" || fsType == "pstore" ||
+                fsType == "efivarfs" || fsType == "bpf" || fsType == "autofs" || fsType == "mqueue" ||
+                fsType == "hugetlbfs" || fsType == "debugfs" || fsType == "tracefs" || fsType == "securityfs" ||
+                fsType == "configfs" || fsType == "fusectl" || fsType == "binfmt_misc" || fsType == "nsfs" ||
+                fsType == "ramfs" || fsType == "rpc_pipefs" || fsType == "overlay" || fsType == "squashfs" ||
+                fsType == "fuse.portal" || fsType == "fuse.gvfsd-fuse") {
+                continue;
+            }
+            if (mnt.rfind("/run/", 0) == 0 && mnt.rfind("/run/media/", 0) != 0) continue;
+        }
+        if (!seenMounts.insert(mnt).second) continue;
+
+        LinuxMountInfo mi;
+        mi.mountPoint = PathUtils::Utf8ToWide(mnt);
+        mi.fsType = PathUtils::Utf8ToWide(fsType);
+        mi.device = PathUtils::Utf8ToWide(dev);
+        mi.isNetwork = (fsType == "cifs" || fsType == "smb3" || fsType == "nfs" || fsType == "nfs4" ||
+                        fsType == "sshfs" || fsType == "fuse.sshfs");
+        mi.isOptical = (fsType == "iso9660" || fsType == "udf");
+
+        struct statvfs vfs = {};
+        if (::statvfs(mnt.c_str(), &vfs) == 0) {
+            const uint64_t bsz = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+            mi.totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsz;
+            mi.freeBytes  = static_cast<uint64_t>(vfs.f_bavail) * bsz;
+        }
+
+        if (mnt == "/") {
+            mi.label = std::wstring(lang == Lang::PL ? L"System Linux (/)" : L"Linux Root (/)") + L" [" + mi.fsType + L"]";
+        } else {
+            std::wstring leaf = PathUtils::GetFileName(mi.mountPoint);
+            if (leaf.empty()) leaf = mi.mountPoint;
+            mi.label = leaf + L" (" + mi.mountPoint + L")";
+        }
+        out.push_back(std::move(mi));
+    }
+
+    if (out.empty()) {
+        LinuxMountInfo root;
+        root.mountPoint = L"/";
+        root.fsType = L"ext4";
+        root.label = (lang == Lang::PL) ? L"System Linux (/)" : L"Linux Root (/)";
+        struct statvfs vfs = {};
+        if (::statvfs("/", &vfs) == 0) {
+            const uint64_t bsz = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+            root.totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsz;
+            root.freeBytes  = static_cast<uint64_t>(vfs.f_bavail) * bsz;
+        }
+        out.push_back(std::move(root));
+    }
+    return out;
+}
+
+std::string GetLinuxTrashBaseDir() {
+    const char* xdg = std::getenv("XDG_DATA_HOME");
+    if (xdg && *xdg) return std::string(xdg) + "/Trash";
+    const char* home = std::getenv("HOME");
+    if (home && *home) return std::string(home) + "/.local/share/Trash";
+    return "/tmp/Trash-" + std::to_string(::geteuid());
+}
+
+std::string UrlDecodeTrashPath(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            const int hi = hexVal(s[i + 1]);
+            const int lo = hexVal(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
+bool ParseFreeDesktopTrashInfo(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord) {
+    std::string txt(reinterpret_cast<const char*>(raw.data()), raw.size());
+    if (txt.find("[Trash Info]") == std::string::npos) return false;
+    std::istringstream iss(txt);
+    std::string line, origUtf8, delDate;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.rfind("Path=", 0) == 0) origUtf8 = UrlDecodeTrashPath(std::string_view(line).substr(5));
+        else if (line.rfind("DeletionDate=", 0) == 0) delDate = line.substr(13);
+    }
+    if (origUtf8.empty()) return false;
+    if (origUtf8[0] != '/') {
+        origUtf8 = GetLinuxTrashBaseDir() + "/" + origUtf8;
+    }
+
+    FILETIME ft = {};
+    int Y = 0, M = 0, D = 0, h = 0, m = 0, sec = 0;
+    if (std::sscanf(delDate.c_str(), "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) == 6) {
+        struct tm lt = {};
+        lt.tm_year = Y - 1900;
+        lt.tm_mon = M - 1;
+        lt.tm_mday = D;
+        lt.tm_hour = h;
+        lt.tm_min = m;
+        lt.tm_sec = sec;
+        lt.tm_isdst = -1;
+        time_t t = ::mktime(&lt);
+        if (t > 0) ft = Explorer2::Compat::FileTimeFromUnix(t);
+    }
+    if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0) {
+        GetSystemTimeAsFileTime(&ft);
+    }
+
+    outRecord.version = 3; // FreeDesktop .trashinfo
+    outRecord.fileSize = 0;
+    outRecord.deletedTime = ft;
+    outRecord.originalPath = PathUtils::TrimTrailingSlashes(PathUtils::Utf8ToWide(origUtf8));
+    return !outRecord.originalPath.empty();
+}
+
+} // namespace
+#endif
 
 // Reads HKCU\Network\<Letter>\RemotePath in <0.005ms without touching the network!
 // Formats "\\NAS191725\Backup" on 'X' as "Backup (\\NAS191725) (X:)" matching Windows 10 Explorer.
@@ -413,6 +598,66 @@ void FileEngine::WatchDirectory(const std::wstring& dirPath) {
 }
 
 void FileEngine::DirWatcherWorkerLoop() {
+#ifndef _WIN32
+    uint64_t seenGen = 0;
+    while (m_running) {
+        std::wstring watchDir;
+        {
+            std::unique_lock<std::mutex> lk(m_watcherMutex);
+            m_watcherCv.wait(lk, [&]() {
+                return !m_running || m_watcherGeneration.load() != seenGen;
+            });
+            if (!m_running) break;
+            seenGen = m_watcherGeneration.load();
+            watchDir = m_watchedDir;
+            if (m_watcherWakeEvent) ResetEvent(m_watcherWakeEvent);
+        }
+        if (watchDir.empty()) continue;
+
+        const std::string nativeDir = Explorer2::Compat::NativePath(watchDir.c_str());
+        const int ifd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (ifd < 0) continue;
+
+        const int wd = ::inotify_add_watch(
+            ifd, nativeDir.c_str(),
+            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
+        if (wd < 0) {
+            ::close(ifd);
+            continue;
+        }
+
+        alignas(inotify_event) char buf[8192];
+        while (m_running && m_watcherGeneration.load() == seenGen) {
+            struct pollfd pfd = { ifd, POLLIN, 0 };
+            const int pr = ::poll(&pfd, 1, 100);
+            if (!m_running || m_watcherGeneration.load() != seenGen) break;
+            if (pr <= 0 || !(pfd.revents & POLLIN)) continue;
+
+            bool relevantChange = false;
+            for (;;) {
+                const ssize_t n = ::read(ifd, buf, sizeof(buf));
+                if (n <= 0) break;
+                ssize_t off = 0;
+                while (off + static_cast<ssize_t>(sizeof(inotify_event)) <= n) {
+                    const auto* ev = reinterpret_cast<const inotify_event*>(buf + off);
+                    const char* nm = (ev->len > 0) ? ev->name : "";
+                    if (std::strncmp(nm, ".explorer2_undo", 15) != 0) {
+                        relevantChange = true;
+                    }
+                    off += static_cast<ssize_t>(sizeof(inotify_event)) + ev->len;
+                }
+            }
+            if (relevantChange) {
+                if (WaitForSingleObject(m_watcherWakeEvent, 250) == WAIT_TIMEOUT &&
+                    m_running && m_watcherGeneration.load() == seenGen && m_notifyHwnd) {
+                    PostMessageW(m_notifyHwnd, WM_APP_DIR_CHANGED, 0, 0);
+                }
+            }
+        }
+        ::inotify_rm_watch(ifd, wd);
+        ::close(ifd);
+    }
+#else
     alignas(DWORD) BYTE notifyBuf[16384] = {};
     uint64_t seenGen = 0;
 
@@ -509,6 +754,7 @@ void FileEngine::DirWatcherWorkerLoop() {
         CloseHandle(hIoEvent);
         CloseHandle(hDir);
     }
+#endif
 }
 
 FileEngine::ExtTypeInfo FileEngine::GetExtensionInfo(const std::wstring& extLower, bool isDir, Lang lang) {
@@ -607,6 +853,28 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
     std::vector<FileEntry> results;
 
     if (dirPath == L"THIS_PC" || dirPath.empty()) {
+#ifndef _WIN32
+        for (const auto& mi : EnumerateLinuxMounts(lang)) {
+            FileEntry entry;
+            entry.fullPath = mi.mountPoint;
+            entry.normKey = PathUtils::NormalizePathKey(mi.mountPoint);
+            entry.isDirectory = true;
+            entry.isDrive = true;
+            entry.isNetworkDrive = mi.isNetwork;
+            entry.isOpticalDrive = mi.isOptical;
+            entry.sysIconIndex = m_folderIconIndex;
+            entry.name = mi.label;
+            entry.displayName = mi.label;
+            entry.size = mi.totalBytes;
+            if (mi.totalBytes > 0) entry.sizeStr = FormatSizeDetailed(mi.totalBytes);
+            entry.typeName = mi.isNetwork
+                ? ((lang == Lang::PL ? L"Udział sieciowy (" : L"Network Mount (") + mi.fsType + L")")
+                : (mi.isOptical
+                    ? (lang == Lang::PL ? L"Stacja dysków optycznych" : L"Optical Drive")
+                    : ((lang == Lang::PL ? L"Wolumin Linux (" : L"Linux Volume (") + mi.fsType + L")"));
+            results.push_back(std::move(entry));
+        }
+#else
         DWORD drivesMask = GetLogicalDrives();
         wchar_t rootPath[] = L"A:\\";
         for (int i = 0; i < 26; ++i) {
@@ -690,6 +958,7 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
                 results.push_back(std::move(entry));
             }
         }
+#endif
 
         // Append FileZilla / saved FTP & FTPS servers under Ten komputer
         auto ftpSites = FtpClient::LoadBookmarks();
@@ -815,6 +1084,75 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
                 FindClose(hFind);
             }
         }
+
+#ifndef _WIN32
+        // FreeDesktop.org Trash (~/.local/share/Trash/{files,info})
+        {
+            const std::string trashBase = GetLinuxTrashBaseDir();
+            const std::wstring trashInfoDir = PathUtils::Utf8ToWide(trashBase + "/info");
+            const std::wstring trashFilesDir = PathUtils::Utf8ToWide(trashBase + "/files");
+            WIN32_FIND_DATAW ffd = {};
+            HANDLE hFind = FindFirstFileExW(
+                (trashInfoDir + L"/*.trashinfo").c_str(),
+                FindExInfoBasic, &ffd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    std::wstring fn(ffd.cFileName);
+                    if (fn.size() <= 10) continue;
+                    std::wstring baseName = fn.substr(0, fn.size() - 10); // strip ".trashinfo"
+                    std::wstring infoPath = trashInfoDir + L"/" + fn;
+                    std::wstring dataPath = trashFilesDir + L"/" + baseName;
+
+                    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+                    if (!GetFileAttributesExW(dataPath.c_str(), GetFileExInfoStandard, &fad)) continue;
+
+                    std::vector<uint8_t> raw;
+                    RecycleBinRecord rec;
+                    if (!PathUtils::ReadFileBytes(infoPath, 65536, raw) || !ParseFreeDesktopTrashInfo(raw, rec)) continue;
+
+                    FileEntry entry;
+                    entry.name = PathUtils::GetFileName(rec.originalPath);
+                    if (entry.name.empty()) entry.name = baseName;
+                    entry.originalPath = rec.originalPath;
+                    entry.fullPath = dataPath;
+                    entry.normKey = PathUtils::NormalizePathKey(dataPath);
+                    entry.attributes = fad.dwFileAttributes;
+                    entry.isDirectory = (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    entry.isHidden = false;
+                    entry.writeTime = rec.deletedTime;
+                    entry.dateStr = FormatFileTime(rec.deletedTime);
+
+                    uint64_t diskSize = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+                    entry.size = entry.isDirectory ? 0ULL : diskSize;
+                    entry.sizeStr = (entry.isDirectory && entry.size == 0) ? L"" : FormatSizeKB(entry.size);
+
+                    if (!entry.isDirectory) {
+                        entry.ext = PathUtils::GetExtension(entry.name);
+                        entry.displayName = showExtensions ? entry.name : PathUtils::GetStem(entry.name, false);
+                        entry.isImage = IsImageExtension(entry.ext);
+                        entry.isVideo = IsVideoExtension(entry.ext);
+                        entry.isAudio = IsAudioExtension(entry.ext);
+                        if (entry.ext != lastExt) {
+                            lastExt = entry.ext;
+                            lastExtInfo = GetExtensionInfo(entry.ext, false, lang);
+                        }
+                        entry.sysIconIndex = lastExtInfo.sysIconIndex;
+                    } else {
+                        entry.displayName = entry.name;
+                        entry.sysIconIndex = dirExtInfo.sysIconIndex;
+                    }
+
+                    std::wstring origDir = PathUtils::GetParentPath(rec.originalPath);
+                    entry.typeName = !origDir.empty()
+                        ? origDir
+                        : (entry.isDirectory ? dirExtInfo.typeName : lastExtInfo.typeName);
+                    results.push_back(std::move(entry));
+                } while (FindNextFileW(hFind, &ffd));
+                FindClose(hFind);
+            }
+        }
+#endif
 
         {
             std::lock_guard<std::mutex> lock(m_deleteStateMutex);
@@ -1140,6 +1478,45 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
     pcHeader.isExpanded = true;
     nodes.push_back(pcHeader);
 
+#ifndef _WIN32
+    for (const auto& mi : EnumerateLinuxMounts(lang)) {
+        TreeNode driveNode;
+        driveNode.path = mi.mountPoint;
+        driveNode.normKey = PathUtils::NormalizePathKey(mi.mountPoint);
+        driveNode.label = mi.label;
+        driveNode.indent = 1;
+        driveNode.isDrive = true;
+        driveNode.isNetworkDrive = mi.isNetwork;
+        driveNode.isOpticalDrive = mi.isOptical;
+        driveNode.hasChildren = true;
+        driveNode.isExpanded = false;
+        driveNode.totalBytes = mi.totalBytes;
+        driveNode.freeBytes = mi.freeBytes;
+        driveNode.size = (mi.totalBytes >= mi.freeBytes) ? (mi.totalBytes - mi.freeBytes) : 0;
+        if (mi.totalBytes > 0) {
+            wchar_t buf[64] = {};
+            if (mi.totalBytes >= (1ULL << 40)) {
+                swprintf_s(buf, L"%.1f / %.1f TB",
+                    static_cast<double>(driveNode.size) / static_cast<double>(1ULL << 40),
+                    static_cast<double>(mi.totalBytes) / static_cast<double>(1ULL << 40));
+            } else if (mi.totalBytes >= (10ULL << 30)) {
+                swprintf_s(buf, L"%llu / %llu GB",
+                    static_cast<unsigned long long>((driveNode.size + (1ULL << 29)) >> 30),
+                    static_cast<unsigned long long>((mi.totalBytes + (1ULL << 29)) >> 30));
+            } else if (mi.totalBytes >= (1ULL << 30)) {
+                swprintf_s(buf, L"%.1f / %.1f GB",
+                    static_cast<double>(driveNode.size) / static_cast<double>(1ULL << 30),
+                    static_cast<double>(mi.totalBytes) / static_cast<double>(1ULL << 30));
+            } else {
+                swprintf_s(buf, L"%llu / %llu MB",
+                    static_cast<unsigned long long>((driveNode.size + (1ULL << 19)) >> 20),
+                    static_cast<unsigned long long>((mi.totalBytes + (1ULL << 19)) >> 20));
+            }
+            driveNode.sizeStr = buf;
+        }
+        nodes.push_back(std::move(driveNode));
+    }
+#else
     DWORD drivesMask = GetLogicalDrives();
     wchar_t rootPath[] = L"A:\\";
     for (int i = 0; i < 26; ++i) {
@@ -1241,6 +1618,7 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
             nodes.push_back(std::move(driveNode));
         }
     }
+#endif
 
     // FTP / FileZilla (FTPS) section under Ten komputer
     {
@@ -1373,6 +1751,39 @@ std::wstring FileEngine::GetUndoStagingDirForPath(const std::wstring& path) {
         std::wstring root = path.substr(0, 2) + L"\\";
         return root + L".explorer2_undo";
     }
+#ifndef _WIN32
+    if (!path.empty() && (path[0] == L'/' || path.rfind(L"\\\\?\\/", 0) == 0)) {
+        std::string native = Explorer2::Compat::NativePath(path.c_str());
+        struct stat stPath = {};
+        std::string probe = native;
+        while (probe.size() > 1 && ::lstat(probe.c_str(), &stPath) != 0) {
+            size_t sl = probe.find_last_of('/');
+            probe = (sl == 0 || sl == std::string::npos) ? "/" : probe.substr(0, sl);
+        }
+        if (::lstat(probe.c_str(), &stPath) == 0) {
+            const dev_t wantDev = stPath.st_dev;
+            const std::string uidTag = std::to_string(::geteuid());
+            const char* home = std::getenv("HOME");
+            if (home && *home) {
+                struct stat stHome = {};
+                if (::stat(home, &stHome) == 0 && stHome.st_dev == wantDev && ::access(home, W_OK) == 0) {
+                    std::string cacheBase = std::string(home) + "/.cache";
+                    ::mkdir(cacheBase.c_str(), 0700);
+                    return PathUtils::Utf8ToWide(cacheBase + "/.explorer2_undo");
+                }
+            }
+            struct stat stTmp = {};
+            if (::stat("/tmp", &stTmp) == 0 && stTmp.st_dev == wantDev && ::access("/tmp", W_OK) == 0) {
+                return PathUtils::Utf8ToWide("/tmp/.explorer2_undo_" + uidTag);
+            }
+            size_t sl = native.find_last_of('/');
+            std::string parent = (sl == 0 || sl == std::string::npos) ? "/" : native.substr(0, sl);
+            if (::access(parent.c_str(), W_OK) == 0) {
+                return PathUtils::Utf8ToWide((parent == "/" ? "" : parent) + "/.explorer2_undo");
+            }
+        }
+    }
+#endif
     return L"";
 }
 
@@ -1851,6 +2262,15 @@ std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const s
     }
 
     std::wstring clean = PathUtils::TrimTrailingSlashes(s);
+#ifndef _WIN32
+    if (clean == L"~" || clean.rfind(L"~/", 0) == 0 || clean.rfind(L"~\\", 0) == 0) {
+        const char* home = std::getenv("HOME");
+        if (home && *home) {
+            std::wstring homeW = PathUtils::TrimTrailingSlashes(PathUtils::Utf8ToWide(home));
+            clean = (clean.size() == 1) ? homeW : (homeW + L"/" + clean.substr(2));
+        }
+    }
+#endif
     std::wstring low = PathUtils::ToLower(clean);
 
     // 1. Recycle Bin ("Kosz") aliases — matches Windows Explorer address bar behavior
@@ -1920,6 +2340,9 @@ std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const s
     // 5. Relative child path inside current local folder (e.g. ".\Kosz" or typing a subfolder name)
     if (!FtpClient::IsFtpPath(clean) && !RepoBrowser::IsRepoUrl(clean) &&
         !(clean.size() >= 2 && clean[1] == L':') &&
+#ifndef _WIN32
+        (clean.empty() || clean[0] != L'/') &&
+#endif
         clean.rfind(L"\\\\", 0) != 0 &&
         !currentDir.empty() && !IsVirtualFolder(currentDir) && !FtpClient::IsFtpPath(currentDir) && !RepoBrowser::IsRepoUrl(currentDir))
     {
@@ -1947,6 +2370,11 @@ std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const s
 
 bool FileEngine::ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord) {
     outRecord = {};
+#ifndef _WIN32
+    if (raw.size() >= 12 && std::memcmp(raw.data(), "[Trash Info]", 12) == 0) {
+        return ParseFreeDesktopTrashInfo(raw, outRecord);
+    }
+#endif
     if (raw.size() < 26) return false;
 
     uint64_t version = 0;
@@ -1959,18 +2387,49 @@ bool FileEngine::ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, Recyc
     std::wstring orig;
     if (version == 1) {
         // Windows Vista / Windows 7 SP1 fixed 544-byte layout: 24-byte header + wchar_t[260]
-        size_t maxChars = std::min<size_t>((raw.size() - 24) / sizeof(wchar_t), 260);
-        if (maxChars == 0) return false;
-        std::vector<wchar_t> wbuf(maxChars, L'\0');
-        std::memcpy(wbuf.data(), raw.data() + 24, maxChars * sizeof(wchar_t));
-        size_t len = 0;
-        while (len < maxChars && wbuf[len] != L'\0') ++len;
-        orig.assign(wbuf.data(), len);
+#ifndef _WIN32
+        const bool looksUtf32 = (raw.size() >= 28 && raw[26] == 0 && raw[27] == 0);
+        if (!looksUtf32) {
+            size_t maxU16 = std::min<size_t>((raw.size() - 24) / 2, 260);
+            for (size_t i = 0; i < maxU16; ++i) {
+                uint16_t u = static_cast<uint16_t>(raw[24 + i * 2] | (raw[24 + i * 2 + 1] << 8));
+                if (u == 0) break;
+                orig.push_back(static_cast<wchar_t>(u));
+            }
+        } else
+#endif
+        {
+            size_t maxChars = std::min<size_t>((raw.size() - 24) / sizeof(wchar_t), 260);
+            if (maxChars == 0) return false;
+            std::vector<wchar_t> wbuf(maxChars, L'\0');
+            std::memcpy(wbuf.data(), raw.data() + 24, maxChars * sizeof(wchar_t));
+            size_t len = 0;
+            while (len < maxChars && wbuf[len] != L'\0') ++len;
+            orig.assign(wbuf.data(), len);
+        }
     } else if (version == 2) {
         // Windows 10 / Windows 11 variable-length layout: 24-byte header + uint32_t charCount + wchar_t[charCount]
         if (raw.size() < 28) return false;
         uint32_t chars = 0;
         std::memcpy(&chars, raw.data() + 24, sizeof(chars));
+#ifndef _WIN32
+        if (chars > 0 && chars <= 32768 && 28 + static_cast<size_t>(chars) * sizeof(wchar_t) <= raw.size() &&
+            (chars < 2 || (raw[30] == 0 && raw[31] == 0))) {
+            std::vector<wchar_t> wbuf(chars, L'\0');
+            std::memcpy(wbuf.data(), raw.data() + 28, static_cast<size_t>(chars) * sizeof(wchar_t));
+            size_t len = 0;
+            while (len < chars && wbuf[len] != L'\0') ++len;
+            orig.assign(wbuf.data(), len);
+        } else if (chars > 0 && chars <= 32768 && 28 + static_cast<size_t>(chars) * 2 <= raw.size()) {
+            for (uint32_t i = 0; i < chars; ++i) {
+                uint16_t u = static_cast<uint16_t>(raw[28 + i * 2] | (raw[28 + i * 2 + 1] << 8));
+                if (u == 0) break;
+                orig.push_back(static_cast<wchar_t>(u));
+            }
+        } else {
+            return false;
+        }
+#else
         if (chars == 0 || chars > 32768 || 28 + static_cast<size_t>(chars) * sizeof(wchar_t) > raw.size()) {
             return false;
         }
@@ -1979,6 +2438,7 @@ bool FileEngine::ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, Recyc
         size_t len = 0;
         while (len < chars && wbuf[len] != L'\0') ++len;
         orig.assign(wbuf.data(), len);
+#endif
     } else {
         return false;
     }
@@ -2005,6 +2465,15 @@ bool FileEngine::GetRecycleBinCompanionInfoPath(const std::wstring& dataPath, st
 
     std::wstring parentDir = PathUtils::GetParentPath(clean);
     std::wstring leaf = PathUtils::GetFileName(clean);
+#ifndef _WIN32
+    {
+        std::wstring trashFilesW = PathUtils::Utf8ToWide(GetLinuxTrashBaseDir() + "/files");
+        if (!leaf.empty() && PathUtils::NormalizePathKey(parentDir) == PathUtils::NormalizePathKey(trashFilesW)) {
+            outInfoPath = PathUtils::Utf8ToWide(GetLinuxTrashBaseDir() + "/info/") + leaf + L".trashinfo";
+            return true;
+        }
+    }
+#endif
     if (parentDir.empty() || leaf.size() < 3 || leaf[0] != L'$' || (leaf[1] != L'R' && leaf[1] != L'r')) {
         return false;
     }
@@ -2391,6 +2860,16 @@ void FileEngine::OpenFileOrProperties(HWND hwnd, const std::wstring& path, bool 
 }
 
 void FileEngine::OpenInClassicExplorer(const std::wstring& path, bool selectItem) {
+#ifndef _WIN32
+    std::wstring target = path;
+    if (path == L"RECYCLE_BIN") target = PathUtils::Utf8ToWide(GetLinuxTrashBaseDir() + "/files");
+    else if (path == L"THIS_PC") target = L"/";
+    else if (selectItem) {
+        std::wstring par = PathUtils::GetParentPath(path);
+        if (!par.empty()) target = par;
+    }
+    ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
     if (path == L"RECYCLE_BIN") {
         ShellExecuteW(nullptr, L"open", L"explorer.exe", L"shell:RecycleBinFolder", nullptr, SW_SHOWNORMAL);
         return;
@@ -2401,11 +2880,25 @@ void FileEngine::OpenInClassicExplorer(const std::wstring& path, bool selectItem
     }
     std::wstring params = selectItem ? (L"/select,\"" + path + L"\"") : (L"\"" + path + L"\"");
     ShellExecuteW(nullptr, L"open", L"explorer.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
+#endif
 }
 
 void FileEngine::OpenTerminalInFolder(const std::wstring& dirPath) {
     if (dirPath.empty() || IsVirtualFolder(dirPath)) return;
+#ifndef _WIN32
+    std::string dirUtf8 = Explorer2::Compat::NativePath(dirPath.c_str());
+    for (const wchar_t* term : { L"x-terminal-emulator", L"gnome-terminal", L"konsole", L"xfce4-terminal", L"xterm" }) {
+        std::wstring exe = ToolProcess::FindExecutable(term, {});
+        if (!exe.empty()) {
+            std::string cmd = "cd \"" + dirUtf8 + "\" && \"" + PathUtils::WideToUtf8(exe) + "\" >/dev/null 2>&1 &";
+            const int rc = std::system(cmd.c_str());
+            (void)rc;
+            return;
+        }
+    }
+#else
     ShellExecuteW(nullptr, L"open", L"powershell.exe", nullptr, dirPath.c_str(), SW_SHOWNORMAL);
+#endif
 }
 
 std::wstring FileEngine::FormatSizeKB(uint64_t bytes) {
@@ -2942,6 +3435,27 @@ bool FileContentContainsText(const std::wstring& filePath, const std::wstring& n
         }
 
         // 2. Check UTF-16LE match
+#ifndef _WIN32
+        size_t u16Count = windowBuf.size() / sizeof(uint16_t);
+        if (u16Count >= needleLower.size()) {
+            const auto* rawBytes = reinterpret_cast<const uint8_t*>(windowBuf.data());
+            for (size_t pos = 0; pos + needleLower.size() <= u16Count; ++pos) {
+                bool match = true;
+                for (size_t k = 0; k < needleLower.size(); ++k) {
+                    uint16_t cu = static_cast<uint16_t>(rawBytes[(pos + k) * 2] | (rawBytes[(pos + k) * 2 + 1] << 8));
+                    if (static_cast<wchar_t>(towlower(static_cast<wint_t>(cu))) != needleLower[k]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        }
+#endif
         size_t wCount = windowBuf.size() / sizeof(wchar_t);
         if (wCount >= needleLower.size()) {
             const wchar_t* wPtr = reinterpret_cast<const wchar_t*>(windowBuf.data());

@@ -9,7 +9,7 @@
 #define NOMINMAX
 #endif
 #include "PlatformCompat.h"   // <windows.h> on Windows
-#ifdef _WIN32
+#if defined(_WIN32) || defined(E2_WIN32_HAL)
 #include <d2d1.h>
 #include <dwrite.h>
 #include <shlwapi.h>
@@ -81,6 +81,7 @@ inline std::wstring TrimTrailingSlashes(std::wstring_view sv) {
     std::wstring out(sv);
     while (!out.empty() && (out.back() == L'\\' || out.back() == L'/')) {
         if (out.size() == 3 && out[1] == L':') break; // Preserve "C:\"
+        if (out.size() == 1 && out[0] == L'/') break; // Preserve "/" on POSIX
         out.pop_back();
     }
     if (out.size() == 2 && out[1] == L':') {
@@ -92,7 +93,7 @@ inline std::wstring TrimTrailingSlashes(std::wstring_view sv) {
 inline std::wstring EnsureTrailingSlash(std::wstring_view sv) {
     std::wstring out(sv);
     if (!out.empty() && out.back() != L'\\' && out.back() != L'/') {
-        out.push_back(L'\\');
+        out.push_back((out[0] == L'/') ? L'/' : L'\\');
     }
     return out;
 }
@@ -108,8 +109,10 @@ inline std::wstring NormalizePathKey(std::wstring_view sv) {
 
 inline std::wstring GetParentPath(std::wstring_view sv) {
     std::wstring clean = TrimTrailingSlashes(sv);
+    if (clean == L"/") return L"";
     size_t slash = clean.find_last_of(L"\\/");
     if (slash == std::wstring::npos) return L"";
+    if (slash == 0 && clean[0] == L'/') return L"/";
     std::wstring parent = clean.substr(0, slash);
     if (parent.size() == 2 && parent[1] == L':') {
         parent.push_back(L'\\');
@@ -277,7 +280,7 @@ inline bool WriteFileBytes(const std::wstring& fullPath, const void* data, size_
     return ok != FALSE && written == static_cast<DWORD>(byteCount);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(E2_WIN32_HAL)
 inline bool CopyWideToClipboard(HWND ownerHwnd, const std::wstring& text) {
     if (!OpenClipboard(ownerHwnd)) return false;
     EmptyClipboard();
@@ -314,7 +317,7 @@ inline std::wstring FormatByteSize(uint64_t bytes) {
     return buf;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(E2_WIN32_HAL)
 // Shared Direct2D color & UI helpers
 inline D2D1_COLOR_F ColorFromRgb(uint32_t rgb, float a = 1.0f) {
     return D2D1::ColorF(

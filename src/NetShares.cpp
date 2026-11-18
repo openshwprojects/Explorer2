@@ -4,6 +4,16 @@
 #include "VirtualFolders.h"
 
 #include <winnetwk.h>
+#ifndef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <errno.h>
+#include <fstream>
+#include <poll.h>
+#include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <chrono>
 #include <condition_variable>
@@ -105,6 +115,120 @@ std::wstring ProbeTarget(const std::wstring& path) {
 
 bool IsDriveTarget(const std::wstring& target) { return target.size() == 3 && target[1] == L':'; }
 
+#ifndef _WIN32
+struct LinuxMountShare {
+    std::wstring server;
+    std::wstring share;
+    std::string mountPoint;
+    std::string fsType;
+};
+
+std::vector<LinuxMountShare> EnumerateLinuxNetworkMounts() {
+    std::vector<LinuxMountShare> out;
+    std::ifstream mf("/proc/self/mounts");
+    std::string line;
+    while (std::getline(mf, line)) {
+        std::istringstream iss(line);
+        std::string dev, mnt, fstype;
+        if (!(iss >> dev >> mnt >> fstype)) continue;
+        if (fstype != "cifs" && fstype != "smb3" && fstype != "smbfs" && fstype != "nfs" && fstype != "nfs4") continue;
+        LinuxMountShare ms;
+        ms.mountPoint = mnt;
+        ms.fsType = fstype;
+        if (dev.size() > 2 && dev[0] == '/' && dev[1] == '/') {
+            const size_t sl = dev.find('/', 2);
+            ms.server = PathUtils::Utf8ToWide(dev.substr(2, sl == std::string::npos ? std::string::npos : sl - 2));
+            if (sl != std::string::npos && sl + 1 < dev.size()) {
+                const size_t sl2 = dev.find('/', sl + 1);
+                ms.share = PathUtils::Utf8ToWide(dev.substr(sl + 1, sl2 == std::string::npos ? std::string::npos : sl2 - sl - 1));
+            }
+        } else {
+            const size_t col = dev.find(':');
+            if (col != std::string::npos && col > 0) {
+                ms.server = PathUtils::Utf8ToWide(dev.substr(0, col));
+                std::string exp = dev.substr(col + 1);
+                while (!exp.empty() && exp.front() == '/') exp.erase(exp.begin());
+                const size_t sl = exp.find('/');
+                ms.share = PathUtils::Utf8ToWide(exp.substr(0, sl));
+            }
+        }
+        if (!ms.server.empty() && !ms.share.empty()) out.push_back(std::move(ms));
+    }
+    return out;
+}
+
+bool IsLocalHostNameLinux(const std::wstring& server) {
+    const std::wstring low = PathUtils::ToLower(server);
+    if (low == L"localhost" || low == L"127.0.0.1" || low == L"::1" || low == L"[::1]") return true;
+    char hn[256] = {};
+    if (::gethostname(hn, sizeof(hn) - 1) == 0 && hn[0]) {
+        if (_wcsicmp(server.c_str(), PathUtils::Utf8ToWide(hn).c_str()) == 0) return true;
+    }
+    return false;
+}
+
+DWORD ProbeUncServerTcpLinux(const std::wstring& server, int timeoutMs) {
+    if (IsLocalHostNameLinux(server)) {
+        // Localhost always answers immediately (either SMB port 445 is open -> NO_ERROR, or not shared -> ERROR_BAD_NET_NAME)
+        int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+        if (fd >= 0) {
+            sockaddr_in sin = {};
+            sin.sin_family = AF_INET;
+            sin.sin_port = htons(445);
+            sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            int rc = ::connect(fd, reinterpret_cast<const sockaddr*>(&sin), sizeof(sin));
+            bool open = (rc == 0);
+            if (!open && errno == EINPROGRESS) {
+                struct pollfd pfd = { fd, POLLOUT, 0 };
+                if (::poll(&pfd, 1, 50) > 0) {
+                    int soErr = 0;
+                    socklen_t sl = sizeof(soErr);
+                    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &sl) == 0 && soErr == 0) open = true;
+                }
+            }
+            ::close(fd);
+            if (open) return NO_ERROR;
+        }
+        return ERROR_BAD_NET_NAME; // Server answered; requested share does not exist
+    }
+
+    ADDRINFOW hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    ADDRINFOW* res = nullptr;
+    if (GetAddrInfoW(server.c_str(), L"445", &hints, &res) != 0 || !res) {
+        return ERROR_BAD_NETPATH;
+    }
+    int fd = ::socket(res->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (fd < 0) {
+        FreeAddrInfoW(res);
+        return ERROR_BAD_NETPATH;
+    }
+    int rc = ::connect(fd, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
+    FreeAddrInfoW(res);
+    if (rc == 0) {
+        ::close(fd);
+        return NO_ERROR;
+    }
+    if (errno == EINPROGRESS) {
+        struct pollfd pfd = { fd, POLLOUT, 0 };
+        const int pr = ::poll(&pfd, 1, timeoutMs);
+        int soErr = ETIMEDOUT;
+        if (pr > 0) {
+            socklen_t sl = sizeof(soErr);
+            ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &sl);
+        }
+        ::close(fd);
+        if (pr > 0 && soErr == 0) return NO_ERROR;
+        if (pr > 0 && soErr == ECONNREFUSED) return ERROR_REM_NOT_LIST;
+        return ERROR_BAD_NETPATH;
+    }
+    ::close(fd);
+    return ERROR_BAD_NETPATH;
+}
+#endif
+
 void StartProbe(const std::shared_ptr<State>& st, const std::wstring& key, const std::wstring& target) {
     std::thread([st, key, target]() {
         std::wstring remote;
@@ -114,8 +238,31 @@ void StartProbe(const std::shared_ptr<State>& st, const std::wstring& key, const
             DWORD len = MAX_PATH;
             if (WNetGetConnectionW(local, buf, &len) == NO_ERROR) remote = buf;
         }
+#ifndef _WIN32
+        DWORD err = NO_ERROR;
+        std::wstring server, share;
+        if (SplitUnc(target, server, share)) {
+            bool foundMount = false;
+            for (const auto& m : EnumerateLinuxNetworkMounts()) {
+                if (_wcsicmp(m.server.c_str(), server.c_str()) == 0 &&
+                    (share.empty() || _wcsicmp(m.share.c_str(), share.c_str()) == 0)) {
+                    struct stat mst = {};
+                    err = (::stat(m.mountPoint.c_str(), &mst) == 0) ? NO_ERROR : ERROR_BAD_NETPATH;
+                    foundMount = true;
+                    break;
+                }
+            }
+            if (!foundMount) {
+                err = ProbeUncServerTcpLinux(server, 1200);
+            }
+        } else {
+            const DWORD attrs = GetFileAttributesW(target.c_str());
+            err = (attrs == INVALID_FILE_ATTRIBUTES) ? GetLastError() : NO_ERROR;
+        }
+#else
         const DWORD attrs = GetFileAttributesW(target.c_str());
         const DWORD err = (attrs == INVALID_FILE_ATTRIBUTES) ? GetLastError() : NO_ERROR;
+#endif
         HWND notify = nullptr;
         {
             std::lock_guard<std::mutex> lk(st->mutex);
@@ -142,6 +289,27 @@ std::wstring NoAnswerMessage(const std::wstring& target, const Probe& p, Lang la
 }
 
 DWORD ReadShares(const std::wstring& server, std::vector<ShareItem>& out, std::wstring& errorText) {
+#ifndef _WIN32
+    for (const auto& m : EnumerateLinuxNetworkMounts()) {
+        if (_wcsicmp(m.server.c_str(), server.c_str()) == 0) {
+            bool dup = false;
+            for (const auto& ex : out) {
+                if (_wcsicmp(ex.name.c_str(), m.share.c_str()) == 0) { dup = true; break; }
+            }
+            if (!dup) {
+                ShareItem s;
+                s.name = m.share;
+                s.comment = PathUtils::Utf8ToWide(m.fsType + " @ " + m.mountPoint);
+                out.push_back(std::move(s));
+            }
+        }
+    }
+    if (!out.empty() || IsLocalHostNameLinux(server)) return NO_ERROR;
+    const DWORD probe = ProbeUncServerTcpLinux(server, 1200);
+    if (probe == NO_ERROR) return NO_ERROR;
+    errorText = L"SMB/NFS shares not mounted or server unreachable";
+    return probe;
+#else
     std::wstring remote = L"\\\\" + server;
     NETRESOURCEW nr = {};
     nr.dwScope = RESOURCE_GLOBALNET;
@@ -183,6 +351,7 @@ DWORD ReadShares(const std::wstring& server, std::vector<ShareItem>& out, std::w
         if (WNetGetLastErrorW(&code, text, 511, provider, 127) == NO_ERROR && text[0]) errorText = text;
     }
     return r;
+#endif
 }
 
 std::wstring ListMessage(const std::wstring& server, const ServerShares& s, Lang lang) {

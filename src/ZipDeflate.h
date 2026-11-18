@@ -37,6 +37,13 @@ bool InflateRaw(
     std::vector<uint8_t>& outData,
     size_t maxOutputBytes = 128 * 1024 * 1024);
 
+// Appends raw RFC 1951 DEFLATE stream onto ioData, preserving prior bytes in ioData as LZ77 sliding-window history (for MSZIP multi-block CAB folders)
+bool InflateRawAppend(
+    const uint8_t* src,
+    size_t srcLen,
+    std::vector<uint8_t>& ioData,
+    size_t maxOutputBytes = 128 * 1024 * 1024);
+
 // Decompresses RFC 1950 Zlib stream (2-byte header + raw deflate)
 bool InflateZlib(
     const uint8_t* src,

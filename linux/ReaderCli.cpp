@@ -89,6 +89,8 @@ void OnCrash(int sig, siginfo_t*, void* context) {
     uintptr_t pc = 0;
 #if defined(__x86_64__)
     pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__i386__)
+    pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_EIP]);
 #elif defined(__aarch64__)
     pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.pc);
 #else

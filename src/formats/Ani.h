@@ -38,7 +38,7 @@ inline uint8_t ExtractBitfield8(uint32_t px, uint32_t mask) {
 }
 
 inline bool DecodePngViaWic(const uint8_t* pngData, size_t pngSize, ExtendedImageInfo& outInfo) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(E2_WIN32_HAL)
     return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
 #else
     if (!pngData || pngSize < 8 || pngSize > 0x7FFFFFFFu) return false;
