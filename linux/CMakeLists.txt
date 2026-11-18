@@ -33,6 +33,11 @@ endif()
 
 add_compile_definitions(_FILE_OFFSET_BITS=64 _LARGEFILE64_SOURCE=1)
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../build/version_gen.h")
+    add_compile_definitions(E2_HAS_GENERATED_VERSION=1)
+    include_directories("${CMAKE_CURRENT_SOURCE_DIR}/../build")
+endif()
+
 set(E2_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 set(E2_HAL_INC ${CMAKE_CURRENT_SOURCE_DIR}/win32_hal/include)
 set(E2_HAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/win32_hal/src)

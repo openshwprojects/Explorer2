@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
 if ([string]::IsNullOrWhiteSpace($OutHeader)) {
-    $OutHeader = Join-Path $RepoRoot "build\version_gen.h"
+    $OutHeader = Join-Path (Join-Path $RepoRoot "build") "version_gen.h"
 }
 
 $versionFile = Join-Path $RepoRoot "VERSION"

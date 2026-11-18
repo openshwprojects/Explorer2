@@ -38,6 +38,12 @@ jobs:
     name: Build Windows x64 EXE & Installer
     runs-on: windows-latest
     timeout-minutes: 30
+    outputs:
+      semver: ${{ steps.version.outputs.semver }}
+      file_version: ${{ steps.version.outputs.file_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+      full_version: ${{ steps.version.outputs.full_version }}
 
     steps:
       - name: Checkout repository
@@ -212,55 +218,89 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Publish GitHub Release
-        if: >-
-          github.event_name != 'pull_request' &&
-          !contains(github.event.head_commit.message, '[skip release]') &&
-          (github.event_name != 'workflow_dispatch' || inputs.publish_release == true || inputs.publish_release == 'true')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: Explorer2 ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          body: |
-            ### Downloads (Windows 10 / 11 x64)
-            - **Installer (Recommended):** `Explorer2-Setup-${{ steps.version.outputs.semver }}-x64.exe` — Installs Explorer2 with Start Menu shortcut, optional Desktop icon, and optional *"Open in Explorer2"* folder context menu (per-user or system-wide).
-            - **Standalone Executable:** `Explorer2-${{ steps.version.outputs.semver }}-x64.exe` — Single-file native portable executable (no installation or third-party runtime needed).
-            - **Portable Archive:** `Explorer2-${{ steps.version.outputs.semver }}-portable-x64.zip` — Portable ZIP with `Explorer2.exe`, `LICENSE`, and `README.md`.
-            - **Checksums:** `SHA256SUMS.txt`
-
-            **PE FileVersion:** `${{ steps.version.outputs.file_version }}` (`${{ steps.version.outputs.sha }}`)
-          files: |
-            dist/Explorer2-Setup-${{ steps.version.outputs.semver }}-x64.exe
-            dist/Explorer2-${{ steps.version.outputs.semver }}-x64.exe
-            dist/Explorer2-${{ steps.version.outputs.semver }}-portable-x64.zip
-            dist/SHA256SUMS.txt
-
-  # The file readers alone, built for Linux by a second compiler (linux/CMakeLists.txt). Nothing here is released;
-  # the job shows that the readers still build without Windows and still read every sample without a fault.
-  build-linux-readers:
-    name: File readers on Linux (headless)
+  build-linux-x64:
+    name: Build Linux x64 (App, X11 GUI & Readers)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Build explorer2-readers
+      - name: Generate version metadata
+        id: version
+        shell: pwsh
+        env:
+          E2_VERSION_OVERRIDE: ${{ inputs.version_override }}
         run: |
-          cmake -S linux -B build-linux -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-linux -j "$(nproc)"
+          & ./tools/gen_version.ps1
+          $global:LASTEXITCODE = 0
 
-      - name: Self-check of the harness (a crash, an exception and a hang are each caught)
-        run: python3 tools/fuzz_samples.py --exe build-linux/explorer2-readers --only '__no_sample__'
-
-      - name: Read every sample in testdata/
+      - name: Install Linux x64 build & test dependencies
         run: |
-          find "$PWD/testdata" -type f ! -name README.md ! -path '*/LICENSES/*' | sort > build-linux/samples.txt
-          build-linux/explorer2-readers --inspect-files build-linux/samples.txt build-linux/samples_result.txt
-          result=build-linux/samples_result.txt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache libx11-dev poppler-utils fonts-dejavu-core subversion p7zip-full xvfb
+
+      - name: Cache ccache (Linux x64)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-x64-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-x64-
+
+      - name: Compile Explorer2 Linux x64 targets
+        run: ./linux/build_linux.sh --build-dir build-linux-x64
+
+      - name: Verify Linux x64 executable & version info
+        run: |
+          test -x build-linux-x64/explorer2
+          file build-linux-x64/explorer2 | grep -q "ELF 64-bit"
+          ./build-linux-x64/explorer2 --version build-linux-x64/cli_version.txt
+          cat build-linux-x64/cli_version.txt
+
+      - name: Run built-in Linux x64 self-test suite
+        id: selftest
+        run: |
+          report="build-linux-x64/selftest_report.txt"
+          crash="${report}.crash.txt"
+          set +e
+          timeout 300s ./build-linux-x64/explorer2 --self-test all "$report"
+          rc=$?
+          set -e
+          if [ -f "$crash" ]; then
+              echo "=== CRASH RECORD ==="
+              cat "$crash"
+              echo "::error title=Linux x64 Self-Test Crash::$(tr '\r\n' ' ' < "$crash")"
+          fi
+          if [ -f "$report" ]; then
+              if grep -q '^\[FAIL\]' "$report"; then
+                  echo "=== FAILED TESTS ==="
+                  grep '^\[FAIL\]' "$report"
+              fi
+              summary=$(tail -n 1 "$report" | tr -d '\r')
+              echo "$summary"
+              echo "::notice title=Linux x64 Self-Tests::$summary"
+              echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$rc" -ne 0 ]; then
+              echo "::error title=Linux x64 Self-Test Failure::Exited with code $rc"
+              exit "$rc"
+          fi
+
+      - name: Smoke-test native X11 GUI under Xvfb
+        run: |
+          EXPLORER2_AUTO_CLOSE_MS=1500 xvfb-run -a -s "-screen 0 1280x800x24" ./build-linux-x64/explorer2 "$PWD"
+
+      - name: Self-check of the reader harness & read every sample in testdata/
+        run: |
+          python3 tools/fuzz_samples.py --exe build-linux-x64/explorer2-readers --only '__no_sample__'
+          find "$PWD/testdata" -type f ! -name README.md ! -path '*/LICENSES/*' | sort > build-linux-x64/samples.txt
+          build-linux-x64/explorer2-readers --inspect-files build-linux-x64/samples.txt build-linux-x64/samples_result.txt
+          result=build-linux-x64/samples_result.txt
           faults=$(awk -F'\t' '$1 == "T" || $1 == "X" || $1 == "H"' "$result")
           if [ "$(tail -n 1 "$result")" != "D" ] || [ -n "$faults" ]; then
               echo "::error title=Reader fault::a reader crashed, hung or let an exception escape"
@@ -268,4 +308,233 @@ jobs:
               tail -n 5 "$result"
               exit 1
           fi
-          echo "files: $(wc -l < build-linux/samples.txt)   reader runs: $(grep -c '^E' "$result")   read: $(awk -F'\t' '$1 == "E" && $4 == "1"' "$result" | wc -l)   no reader: $(grep -c '^N' "$result")"
+          echo "files: $(wc -l < build-linux-x64/samples.txt)   reader runs: $(grep -c '^E' "$result")   read: $(awk -F'\t' '$1 == "E" && $4 == "1"' "$result" | wc -l)   no reader: $(grep -c '^N' "$result")"
+
+      - name: Package Linux x64 portable tarball & checksums
+        env:
+          E2_SEMVER: ${{ steps.version.outputs.semver }}
+        run: |
+          rm -rf build-linux-x64/stage dist-linux-x64
+          mkdir -p "build-linux-x64/stage/Explorer2-${E2_SEMVER}-linux-x64" dist-linux-x64
+          cp build-linux-x64/explorer2 "build-linux-x64/stage/Explorer2-${E2_SEMVER}-linux-x64/explorer2"
+          strip --strip-unneeded "build-linux-x64/stage/Explorer2-${E2_SEMVER}-linux-x64/explorer2"
+          chmod 0755 "build-linux-x64/stage/Explorer2-${E2_SEMVER}-linux-x64/explorer2"
+          cp LICENSE README.md "build-linux-x64/stage/Explorer2-${E2_SEMVER}-linux-x64/"
+          tar -C build-linux-x64/stage -czf "dist-linux-x64/Explorer2-${E2_SEMVER}-linux-x64.tar.gz" "Explorer2-${E2_SEMVER}-linux-x64"
+          (cd dist-linux-x64 && sha256sum "Explorer2-${E2_SEMVER}-linux-x64.tar.gz" > SHA256SUMS.txt)
+
+      - name: Write GitHub Job Summary (Linux x64)
+        if: always()
+        env:
+          E2_SEMVER: ${{ steps.version.outputs.semver }}
+          E2_FULLVER: ${{ steps.version.outputs.full_version }}
+          E2_TESTSUM: ${{ steps.selftest.outputs.summary }}
+        run: |
+          {
+            echo "## Explorer2 Linux x64 Build \`v${E2_SEMVER}\`"
+            echo ""
+            echo "- **Version:** \`${E2_FULLVER}\`"
+            [ -n "${E2_TESTSUM}" ] && echo "- **Self-Tests:** \`${E2_TESTSUM}\`"
+            echo ""
+            if [ -d dist-linux-x64 ]; then
+              echo "### Generated Linux x64 Files"
+              echo "| File | Size | SHA-256 |"
+              echo "| --- | ---: | --- |"
+              for f in dist-linux-x64/*; do
+                [ -f "$f" ] || continue
+                bn=$(basename "$f")
+                sz=$(awk "BEGIN { printf \"%.1f KB\", $(stat -c%s "$f") / 1024.0 }")
+                h=$(sha256sum "$f" | awk '{print $1}')
+                echo "| \`${bn}\` | ${sz} | \`${h}\` |"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Linux x64 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Explorer2-${{ steps.version.outputs.semver }}-linux-x64
+          path: |
+            dist-linux-x64/*
+            build-linux-x64/selftest_report.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  build-linux-x86:
+    name: Build Linux x86 32-bit (-m32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version metadata
+        id: version
+        shell: pwsh
+        env:
+          E2_VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          & ./tools/gen_version.ps1
+          $global:LASTEXITCODE = 0
+
+      - name: Install Linux 32-bit multilib & test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache g++-multilib libx11-dev poppler-utils fonts-dejavu-core subversion p7zip-full
+
+      - name: Cache ccache (Linux x86 32-bit)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-x86-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-x86-
+
+      - name: Compile Explorer2 Linux x86 (32-bit) targets
+        run: |
+          ./linux/build_linux.sh --32 --build-dir build-linux-x86
+          file build-linux-x86/explorer2 | grep -q "ELF 32-bit"
+
+      - name: Run built-in Linux x86 (32-bit) self-test suite
+        id: selftest
+        run: |
+          report="build-linux-x86/selftest_report.txt"
+          crash="${report}.crash.txt"
+          set +e
+          timeout 300s ./build-linux-x86/explorer2 --self-test all "$report"
+          rc=$?
+          set -e
+          if [ -f "$crash" ]; then
+              echo "=== CRASH RECORD ==="
+              cat "$crash"
+              echo "::error title=Linux x86 Self-Test Crash::$(tr '\r\n' ' ' < "$crash")"
+          fi
+          if [ -f "$report" ]; then
+              if grep -q '^\[FAIL\]' "$report"; then
+                  echo "=== FAILED TESTS ==="
+                  grep '^\[FAIL\]' "$report"
+              fi
+              summary=$(tail -n 1 "$report" | tr -d '\r')
+              echo "$summary"
+              echo "::notice title=Linux x86 (32-bit) Self-Tests::$summary"
+              echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$rc" -ne 0 ]; then
+              echo "::error title=Linux x86 Self-Test Failure::Exited with code $rc"
+              exit "$rc"
+          fi
+
+      - name: Package Linux x86 (32-bit) portable tarball & checksums
+        env:
+          E2_SEMVER: ${{ steps.version.outputs.semver }}
+        run: |
+          rm -rf build-linux-x86/stage dist-linux-x86
+          mkdir -p "build-linux-x86/stage/Explorer2-${E2_SEMVER}-linux-x86" dist-linux-x86
+          cp build-linux-x86/explorer2 "build-linux-x86/stage/Explorer2-${E2_SEMVER}-linux-x86/explorer2"
+          strip --strip-unneeded "build-linux-x86/stage/Explorer2-${E2_SEMVER}-linux-x86/explorer2"
+          chmod 0755 "build-linux-x86/stage/Explorer2-${E2_SEMVER}-linux-x86/explorer2"
+          cp LICENSE README.md "build-linux-x86/stage/Explorer2-${E2_SEMVER}-linux-x86/"
+          tar -C build-linux-x86/stage -czf "dist-linux-x86/Explorer2-${E2_SEMVER}-linux-x86.tar.gz" "Explorer2-${E2_SEMVER}-linux-x86"
+          (cd dist-linux-x86 && sha256sum "Explorer2-${E2_SEMVER}-linux-x86.tar.gz" > SHA256SUMS.txt)
+
+      - name: Write GitHub Job Summary (Linux x86 32-bit)
+        if: always()
+        env:
+          E2_SEMVER: ${{ steps.version.outputs.semver }}
+          E2_FULLVER: ${{ steps.version.outputs.full_version }}
+          E2_TESTSUM: ${{ steps.selftest.outputs.summary }}
+        run: |
+          {
+            echo "## Explorer2 Linux x86 (32-bit) Build \`v${E2_SEMVER}\`"
+            echo ""
+            echo "- **Version:** \`${E2_FULLVER}\`"
+            [ -n "${E2_TESTSUM}" ] && echo "- **Self-Tests:** \`${E2_TESTSUM}\`"
+            echo ""
+            if [ -d dist-linux-x86 ]; then
+              echo "### Generated Linux x86 (32-bit) Files"
+              echo "| File | Size | SHA-256 |"
+              echo "| --- | ---: | --- |"
+              for f in dist-linux-x86/*; do
+                [ -f "$f" ] || continue
+                bn=$(basename "$f")
+                sz=$(awk "BEGIN { printf \"%.1f KB\", $(stat -c%s "$f") / 1024.0 }")
+                h=$(sha256sum "$f" | awk '{print $1}')
+                echo "| \`${bn}\` | ${sz} | \`${h}\` |"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Linux x86 (32-bit) Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Explorer2-${{ steps.version.outputs.semver }}-linux-x86
+          path: |
+            dist-linux-x86/*
+            build-linux-x86/selftest_report.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows-x64
+      - build-linux-x64
+      - build-linux-x86
+    if: >-
+      github.event_name != 'pull_request' &&
+      !contains(github.event.head_commit.message, '[skip release]') &&
+      (github.event_name != 'workflow_dispatch' || inputs.publish_release == true || inputs.publish_release == 'true')
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release files & unified SHA256SUMS.txt
+        env:
+          E2_SEMVER: ${{ needs.build-windows-x64.outputs.semver }}
+        run: |
+          mkdir -p release
+          find artifacts -type f \( \
+            -name "Explorer2-Setup-${E2_SEMVER}-x64.exe" -o \
+            -name "Explorer2-${E2_SEMVER}-x64.exe" -o \
+            -name "Explorer2-${E2_SEMVER}-portable-x64.zip" -o \
+            -name "Explorer2-${E2_SEMVER}-linux-x64.tar.gz" -o \
+            -name "Explorer2-${E2_SEMVER}-linux-x86.tar.gz" \
+          \) -exec cp -v {} release/ \;
+          (cd release && sha256sum Explorer2-* | sort -k2 > SHA256SUMS.txt)
+          cat release/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-windows-x64.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Explorer2 ${{ needs.build-windows-x64.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ### Downloads — Windows x64 (Windows 7 SP1 / 8.1 / 10 / 11)
+            - **Installer (Recommended):** `Explorer2-Setup-${{ needs.build-windows-x64.outputs.semver }}-x64.exe` — Installs Explorer2 with Start Menu shortcut, optional Desktop icon, and optional *"Open in Explorer2"* folder context menu (per-user or system-wide).
+            - **Standalone Executable:** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-x64.exe` — Single-file native portable executable (no installation or third-party runtime needed).
+            - **Portable Archive:** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-portable-x64.zip` — Portable ZIP with `Explorer2.exe`, `LICENSE`, and `README.md`.
+
+            ### Downloads — Linux (Ubuntu / Debian / Desktop X11 & XWayland)
+            - **Linux x86_64 (64-bit):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x64.tar.gz` — Portable 64-bit `explorer2` binary (`dlopen("libX11.so.6")` GUI + CLI modes).
+            - **Linux x86 (32-bit i686):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x86.tar.gz` — Portable 32-bit `explorer2` binary (with 64-bit large-file support).
+
+            - **Checksums:** `SHA256SUMS.txt`
+
+            **Version:** `${{ needs.build-windows-x64.outputs.file_version }}` (`${{ needs.build-windows-x64.outputs.sha }}`)
+          files: |
+            release/Explorer2-Setup-${{ needs.build-windows-x64.outputs.semver }}-x64.exe
+            release/Explorer2-${{ needs.build-windows-x64.outputs.semver }}-x64.exe
+            release/Explorer2-${{ needs.build-windows-x64.outputs.semver }}-portable-x64.zip
+            release/Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x64.tar.gz
+            release/Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x86.tar.gz
+            release/SHA256SUMS.txt
