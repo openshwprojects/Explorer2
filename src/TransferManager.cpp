@@ -11,6 +11,15 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#ifndef _WIN32
+#include <cerrno>
+#include <cstdlib>
+#include <fcntl.h>
+#include <fstream>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+#endif
 
 #ifndef COPY_FILE_REQUEST_COMPRESSED_TRAFFIC
 #define COPY_FILE_REQUEST_COMPRESSED_TRAFFIC 0x10000000
@@ -362,6 +371,47 @@ bool ProbeDriveHasSeekPenalty(const std::wstring& driveColon) {
     return seekPenalty;
 }
 
+#ifndef _WIN32
+// Linux: the queue/rotational flag sysfs keeps for the block device `dev`, or for the disk that holds it
+// when it is a partition ("/sys/dev/block/8:1/.." is the directory of sda). False when there is none.
+bool ReadSysfsRotational(uint64_t dev, bool& outRotational) {
+    const std::string base = "/sys/dev/block/" + std::to_string(major(static_cast<dev_t>(dev))) + ":" +
+                             std::to_string(minor(static_cast<dev_t>(dev)));
+    for (const char* rel : { "/queue/rotational", "/../queue/rotational" }) {
+        std::ifstream f(base + rel);
+        char flag = 0;
+        if (f.get(flag)) {
+            outRotational = (flag == '1');
+            return true;
+        }
+    }
+    return false;
+}
+
+// Linux: whether the disk under a mount point spins (a hard disk; most USB sticks say so too). A file
+// system without a block device of its own in st_dev (btrfs, for one) is looked up through the device the
+// mount table names for it. Anything that cannot be told counts as not rotational.
+bool LinuxVolumeIsRotational(const std::wstring& volMount) {
+    const std::string native = Explorer2::Compat::NativePath(volMount.c_str());
+    struct stat st = {};
+    if (::stat(native.c_str(), &st) != 0) return false;
+    bool rotational = false;
+    if (major(st.st_dev) != 0 && ReadSysfsRotational(static_cast<uint64_t>(st.st_dev), rotational)) {
+        return rotational;
+    }
+    const auto mounts = LinuxMounts::Current();
+    const LinuxMounts::Mount* mount = nullptr;
+    for (const auto& m : *mounts) {
+        if (m.mountPoint == native) mount = &m;
+    }
+    if (!mount) mount = LinuxMounts::FindByDevice(*mounts, static_cast<uint64_t>(st.st_dev));
+    if (!mount || mount->source.rfind("/dev/", 0) != 0) return false;
+    struct stat devSt = {};
+    if (::stat(mount->source.c_str(), &devSt) != 0 || !S_ISBLK(devSt.st_mode)) return false;
+    return ReadSysfsRotational(static_cast<uint64_t>(devSt.st_rdev), rotational) && rotational;
+}
+#endif
+
 VolumeIdentity QueryVolumeIdentity(const std::wstring& path) {
     VolumeIdentity vi;
     if (path.empty()) return vi;
@@ -417,6 +467,13 @@ VolumeIdentity QueryVolumeIdentity(const std::wstring& path) {
         if (dtype == DRIVE_FIXED && vi.label.size() == 2 && vi.label[1] == L':') {
             vi.isRotationalHdd = ProbeDriveHasSeekPenalty(vi.label);
         }
+#ifndef _WIN32
+        // Linux: a mount point, not a drive letter. A hard disk or a USB stick gets the cautious one-stream
+        // copy below, as on Windows; remote and removable come from GetDriveTypeW above.
+        if (dtype == DRIVE_FIXED || dtype == DRIVE_REMOVABLE) {
+            vi.isRotationalHdd = LinuxVolumeIsRotational(volMount);
+        }
+#endif
         DWORD serial = 0, flags = 0;
         if (GetVolumeInformationW(volMount, nullptr, 0, &serial, nullptr, &flags, nullptr, 0)) {
             vi.serial = serial;
@@ -634,6 +691,132 @@ bool ComputeXxHash64FileBuffered(
     outHash = hasher.Digest();
     return true;
 }
+
+#ifndef _WIN32
+// ============================================================================
+// Linux: permission bits, symbolic links and late write errors of copied files
+// ============================================================================
+struct timespec TimespecFromFileTime(const FILETIME& ft) {
+    struct timespec ts = {};
+    const uint64_t ticks = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    if (ticks == 0) {
+        ts.tv_nsec = UTIME_OMIT;
+        return ts;
+    }
+    ts.tv_sec = static_cast<time_t>(static_cast<int64_t>(ticks / 10000000ULL) - 11644473600LL);
+    ts.tv_nsec = static_cast<long>((ticks % 10000000ULL) * 100ULL);
+    return ts;
+}
+
+// The permission bits a copy of `src` gets: the source's, with the set-user-ID and set-group-ID bits only
+// when the copy has the source's owner and group, as "cp -p" does
+mode_t ModeForCopy(const struct stat& src, const struct stat* dst) {
+    mode_t mode = src.st_mode & 07777;
+    if ((mode & (S_ISUID | S_ISGID)) != 0 && (!dst || dst->st_uid != src.st_uid || dst->st_gid != src.st_gid)) {
+        mode &= ~static_cast<mode_t>(S_ISUID | S_ISGID);
+    }
+    return mode;
+}
+
+// Gives a copied file the permission bits of its source (following a link, as the copy did). The C library
+// creates files with 0666 minus the umask, which drops the execute bits and would make a private file
+// readable by others; a copy is made owner-only while it is written (CreateOwnerOnlyFile). A failure (a file
+// system without Unix permissions, a file owned by someone else) leaves the mode as it is.
+void ApplySourceModeToFd(int dstFd, const std::wstring& srcPath) {
+    if (dstFd < 0) return;
+    struct stat src = {};
+    if (::stat(Explorer2::Compat::NativePath(srcPath.c_str()).c_str(), &src) != 0) return;
+    struct stat dst = {};
+    const bool haveDst = (::fstat(dstFd, &dst) == 0);
+    (void)::fchmod(dstFd, ModeForCopy(src, haveDst ? &dst : nullptr));
+}
+
+// The same for a copy named by its path: a file that had to be read back for verification first, or a
+// folder. Only a plain file or folder is changed, never what a link points to.
+void ApplySourceModeToPath(const std::wstring& srcPath, const std::wstring& dstPath) {
+    struct stat src = {};
+    if (::stat(Explorer2::Compat::NativePath(srcPath.c_str()).c_str(), &src) != 0) return;
+    const std::string dst = Explorer2::Compat::NativePath(dstPath.c_str());
+    struct stat dstSt = {};
+    if (::lstat(dst.c_str(), &dstSt) != 0 || S_ISLNK(dstSt.st_mode)) return;
+    (void)::chmod(dst.c_str(), ModeForCopy(src, &dstSt));
+}
+
+// Creates `path` as an empty file that only its owner can open (0600), when nothing has that name yet, and
+// says whether it did. The copy then opens it to write the data: nobody else can open it in the meantime and
+// go on reading what is written. It gets the source's permission bits once the data is in.
+bool CreateOwnerOnlyFile(const std::wstring& path) {
+    const int fd = ::open(Explorer2::Compat::NativePath(path.c_str()).c_str(),
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+    ::close(fd);
+    return true;
+}
+
+// How much of what WriteFile accepted is really in the file. WriteFile hands data to the C library, which
+// writes it out later, and when that fails part of it never arrives. The file position the kernel keeps
+// moves only with what was written; a file cut at the accepted length instead would get zeros in the gap,
+// which a later resume would take for copied data.
+uint64_t WrittenPrefixLength(HANDLE h, uint64_t accepted) {
+    FlushFileBuffers(h);    // whatever can still be written now is
+    const int fd = Explorer2::Compat::FdOf(h);
+    const off_t pos = (fd >= 0) ? ::lseek(fd, 0, SEEK_CUR) : static_cast<off_t>(-1);
+    if (pos < 0) return 0;  // not known: keep nothing
+    return std::min<uint64_t>(accepted, static_cast<uint64_t>(pos));
+}
+
+// Makes `dstPath` a symbolic link with the target text of the link `srcPath`, never a copy of what it points
+// to. The new link is made under a name of its own and renamed into place, so that a file of that name is
+// replaced in one step and a folder of that name is never touched. Returns 0 or the Win32 error.
+DWORD RecreateSymlink(const std::wstring& srcPath, const std::wstring& dstPath, const FILETIME& linkWriteTime) {
+    const std::string src = Explorer2::Compat::NativePath(srcPath.c_str());
+    const std::string dst = Explorer2::Compat::NativePath(dstPath.c_str());
+    std::vector<char> target(1024);
+    for (;;) {
+        const ssize_t n = ::readlink(src.c_str(), target.data(), target.size());
+        if (n < 0) return Explorer2::Compat::Win32ErrorFromErrno(errno);
+        if (static_cast<size_t>(n) < target.size()) {
+            target.resize(static_cast<size_t>(n));
+            break;
+        }
+        if (target.size() >= 1024 * 1024) return ERROR_INVALID_DATA;
+        target.resize(target.size() * 2);
+    }
+    target.push_back('\0');
+
+    std::string tmp;
+    for (int i = 0; i < 10 && tmp.empty(); ++i) {
+        const std::string candidate = dst + ".e2link" + (i == 0 ? std::string() : std::to_string(i));
+        if (::symlink(target.data(), candidate.c_str()) == 0) {
+            tmp = candidate;
+        } else if (errno != EEXIST) {
+            return Explorer2::Compat::Win32ErrorFromErrno(errno);
+        }
+    }
+    if (tmp.empty()) return ERROR_FILE_EXISTS;
+
+    struct timespec times[2] = {};
+    times[0].tv_nsec = UTIME_OMIT;                       // access time: left as it is
+    times[1] = TimespecFromFileTime(linkWriteTime);      // the link's own modification time
+    (void)::utimensat(AT_FDCWD, tmp.c_str(), times, AT_SYMLINK_NOFOLLOW);
+    if (::rename(tmp.c_str(), dst.c_str()) != 0) {
+        const int err = errno;
+        ::unlink(tmp.c_str());
+        return Explorer2::Compat::Win32ErrorFromErrno(err);
+    }
+    return 0;
+}
+
+// Removes the link `srcPath` at the end of a move, but only while it still is a link
+DWORD RemoveSourceLink(const std::wstring& srcPath) {
+    const std::string src = Explorer2::Compat::NativePath(srcPath.c_str());
+    struct stat st = {};
+    if (::lstat(src.c_str(), &st) != 0) return (errno == ENOENT) ? 0 : Explorer2::Compat::Win32ErrorFromErrno(errno);
+    if (!S_ISLNK(st.st_mode)) return 0;     // replaced by something else meanwhile: that stays
+    if (::unlink(src.c_str()) != 0 && errno != ENOENT) return Explorer2::Compat::Win32ErrorFromErrno(errno);
+    return 0;
+}
+#endif
 
 } // namespace
 
@@ -2439,6 +2622,10 @@ void TransferManager::ExecuteFtpJobWorker(std::shared_ptr<InternalJob> job) {
             }
         };
 
+#ifndef _WIN32
+        // The local tree being scanned (set for each top-level folder below): the scan stays on its file system
+        const MountFence* localScanFence = nullptr;
+#endif
         auto scanLocalDirRec = [&](auto& self, const std::wstring& curSrcDir, const std::wstring& curDstUrl) -> void {
             if (!WaitIfPausedOrCancelled(*job)) return;
             scannedDirs.push_back(InternalDirItem{ curSrcDir, curDstUrl, {}, {}, {}, FILE_ATTRIBUTE_DIRECTORY });
@@ -2479,6 +2666,18 @@ void TransferManager::ExecuteFtpJobWorker(std::shared_ptr<InternalJob> job) {
 
             for (const auto& sdName : subDirs) {
                 if (!WaitIfPausedOrCancelled(*job)) return;
+#ifndef _WIN32
+                // Another file system mounted inside the tree (a USB disk, a network share) is not part of it
+                bool cannotTell = false;
+                if (localScanFence && localScanFence->IsMountRoot(srcPrefix + sdName, &cannotTell) && !cannotTell) {
+                    std::lock_guard<std::mutex> jlk(job->jobMutex);
+                    job->errors.push_back({ srcPrefix + sdName, makeChildDst(curDstUrl, sdName), ERROR_NOT_SUPPORTED,
+                        L"Pominięto: tu jest zamontowany inny system plików (dysk, udział sieciowy) - jego zawartość "
+                        L"nie jest kopiowana / Skipped: another file system is mounted here (a disk, a network "
+                        L"share); its content is not copied", 0 });
+                    continue;
+                }
+#endif
                 self(self, srcPrefix + sdName, makeChildDst(curDstUrl, sdName));
             }
         };
@@ -2516,7 +2715,14 @@ void TransferManager::ExecuteFtpJobWorker(std::shared_ptr<InternalJob> job) {
                     continue;
                 }
                 if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+#ifndef _WIN32
+                    const MountFence fence(topSrc);
+                    localScanFence = &fence;
+#endif
                     scanLocalDirRec(scanLocalDirRec, topSrc, topDst);
+#ifndef _WIN32
+                    localScanFence = nullptr;
+#endif
                 } else {
                     uint64_t fsz = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
                     InternalFileItem fi;
@@ -2923,6 +3129,10 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
         std::vector<InternalDirItem>  scannedDirs;
         scannedFiles.reserve(512);
         scannedDirs.reserve(64);
+#ifndef _WIN32
+        // The tree being scanned (set for each top-level folder below): the scan stays on its file system
+        const MountFence* scanFence = nullptr;
+#endif
 
         auto scanDirRecursive = [&](auto& self,
                                     const std::wstring& curSrcDir,
@@ -2966,12 +3176,30 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
                 bool isReparse = (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
                 if (isDir) {
                     if (isReparse) {
+#ifndef _WIN32
+                        // A symbolic link to a folder is copied as a link (CopyOrMoveSingleItem), never
+                        // followed: an empty folder in its place would be reported as a successful copy
+                        InternalFileItem li;
+                        li.srcPath = srcPrefix + ffd.cFileName;
+                        li.dstPath = dstPrefix + ffd.cFileName;
+                        li.creationTime = ffd.ftCreationTime;
+                        li.lastAccessTime = ffd.ftLastAccessTime;
+                        li.lastWriteTime = ffd.ftLastWriteTime;
+                        li.attributes = ffd.dwFileAttributes;
+                        li.isReparse = true;
+                        scannedFiles.push_back(std::move(li));
+                        ++dirFiles;
+#else
                         EnsureDirHierarchyTrackFresh(dstPrefix + ffd.cFileName, knownExistingNormDirs, newlyCreatedNormDirs);
+#endif
                     } else {
                         subDirs.push_back(ffd);
                     }
                 } else {
                     uint64_t fsz = (static_cast<uint64_t>(ffd.nFileSizeHigh) << 32) | ffd.nFileSizeLow;
+#ifndef _WIN32
+                    if (isReparse) fsz = 0;     // a link to a file is copied as a link, not as the file it names
+#endif
                     InternalFileItem fi;
                     fi.srcPath = srcPrefix + ffd.cFileName;
                     fi.dstPath = dstPrefix + ffd.cFileName;
@@ -2995,6 +3223,20 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
 
             for (const auto& sd : subDirs) {
                 if (!WaitIfPausedOrCancelled(*job)) return;
+#ifndef _WIN32
+                // Another file system mounted inside the tree (a USB disk, a network share, a bind mount) is
+                // not part of it: not entered, not copied (and for a move, not emptied), and reported. A folder
+                // that could not be checked is listed as usual, which reports why it cannot be read.
+                bool cannotTell = false;
+                if (scanFence && scanFence->IsMountRoot(srcPrefix + sd.cFileName, &cannotTell) && !cannotTell) {
+                    std::lock_guard<std::mutex> jlk(job->jobMutex);
+                    job->errors.push_back({ srcPrefix + sd.cFileName, dstPrefix + sd.cFileName, ERROR_NOT_SUPPORTED,
+                        L"Pominięto: tu jest zamontowany inny system plików (dysk, udział sieciowy) - jego zawartość "
+                        L"nie jest kopiowana / Skipped: another file system is mounted here (a disk, a network "
+                        L"share); its content is not copied", 0 });
+                    continue;
+                }
+#endif
                 self(self, srcPrefix + sd.cFileName, dstPrefix + sd.cFileName,
                      sd.ftCreationTime, sd.ftLastAccessTime, sd.ftLastWriteTime, sd.dwFileAttributes);
             }
@@ -3055,13 +3297,38 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
 
             if (isDir) {
                 if (isReparse) {
+#ifndef _WIN32
+                    // A selected link to a folder is copied (or moved) as a link, like one found in a tree
+                    InternalFileItem li;
+                    li.srcPath = topSrc;
+                    li.dstPath = topDst;
+                    li.creationTime = fad.ftCreationTime;
+                    li.lastAccessTime = fad.ftLastAccessTime;
+                    li.lastWriteTime = fad.ftLastWriteTime;
+                    li.attributes = fad.dwFileAttributes;
+                    li.isReparse = true;
+                    scannedFiles.push_back(std::move(li));
+                    job->totalFiles.fetch_add(1, std::memory_order_relaxed);
+#else
                     EnsureDirHierarchyTrackFresh(topDst, knownExistingNormDirs, newlyCreatedNormDirs);
+#endif
                 } else {
+#ifndef _WIN32
+                    // A selected folder may itself be a mount point; what is mounted further down is not entered
+                    const MountFence fence(topSrc);
+                    scanFence = &fence;
+#endif
                     scanDirRecursive(scanDirRecursive, topSrc, topDst,
                                      fad.ftCreationTime, fad.ftLastAccessTime, fad.ftLastWriteTime, fad.dwFileAttributes);
+#ifndef _WIN32
+                    scanFence = nullptr;
+#endif
                 }
             } else {
                 uint64_t fsz = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+#ifndef _WIN32
+                if (isReparse) fsz = 0;     // a link to a file is copied as a link, not as the file it names
+#endif
                 InternalFileItem fi;
                 fi.srcPath = topSrc;
                 fi.dstPath = topDst;
@@ -3093,6 +3360,22 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
                 if (!WaitIfPausedOrCancelled(*job)) break;
                 EnsureDirHierarchyTrackFresh(d.dstPath, knownExistingNormDirs, newlyCreatedNormDirs);
             }
+#ifndef _WIN32
+            // The folders this job makes get their source folder's mode at the end (PHASE 3); until then they
+            // keep the default one, so the files can be written into them. In a retry, a folder that got a
+            // read-only mode at the end of the first run is opened up for its owner again until then.
+            for (auto& d : job->dirItems) {
+                if (newlyCreatedNormDirs.count(PathUtils::NormalizePathKey(d.dstPath)) != 0) {
+                    d.dstCreated = true;
+                } else if (isRetryRun && d.dstCreated) {
+                    const std::string native = Explorer2::Compat::NativePath(d.dstPath.c_str());
+                    struct stat st = {};
+                    if (::lstat(native.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & S_IRWXU) != S_IRWXU) {
+                        (void)::chmod(native.c_str(), (st.st_mode & 07777) | S_IRWXU);
+                    }
+                }
+            }
+#endif
 
             if (!isRetryRun && !job->fileItems.empty() && !job->cancelled.load() && m_running.load()) {
                 std::unordered_set<std::wstring> seenDstNorm;
@@ -3348,6 +3631,11 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
                 ApplyHandleTimestampsAndAttrs(hDir, it->creationTime, it->lastAccessTime, it->lastWriteTime, it->attributes);
                 CloseHandle(hDir);
             }
+#ifndef _WIN32
+            // A folder this job made was created with 0777 minus the umask; now that its files are in, it gets
+            // its source folder's mode (a private 0700 folder stays private). Bottom-up, after its contents.
+            if (it->dstCreated) ApplySourceModeToPath(it->srcPath, it->dstPath);
+#endif
         }
 
         // For Move: remove empty source directories bottom-up (never deletes non-empty folders if any file was skipped or failed!)
@@ -3504,6 +3792,47 @@ bool PathRunsThroughAFile(const std::wstring& path) {
     return false;
 }
 
+#ifndef _WIN32
+// Linux: unlink() and rmdir() need write and search permission on the folder that holds the name, not on the
+// item itself. When the first attempt is refused and the folder lacks them, they are given to its owner for
+// one more attempt and the folder's mode is put back right after, whatever that attempt gives.
+template <typename RemoveOnce>
+DWORD RemoveWithParentOpened(const std::wstring& extPath, RemoveOnce&& removeOnce) {
+    if (removeOnce()) return 0;
+    const DWORD err = GetLastError();
+    if (IsGoneError(err)) return 0;
+    if (err != ERROR_ACCESS_DENIED) return err;
+
+    const std::string native = Explorer2::Compat::NativePath(extPath.c_str());
+    const size_t slash = native.find_last_of('/');
+    if (slash == std::string::npos) return err;
+    const std::string parent = (slash == 0) ? std::string("/") : native.substr(0, slash);
+    struct stat pst = {};
+    if (::lstat(parent.c_str(), &pst) != 0 || !S_ISDIR(pst.st_mode)) return err;
+    const mode_t oldMode = pst.st_mode & 07777;
+    if ((oldMode & (S_IWUSR | S_IXUSR)) == (S_IWUSR | S_IXUSR)) return err;   // the folder's mode is not the reason
+    if (::chmod(parent.c_str(), oldMode | S_IWUSR | S_IXUSR) != 0) return err;
+    const bool removed = removeOnce();
+    const DWORD retryErr = removed ? 0 : GetLastError();
+    (void)::chmod(parent.c_str(), oldMode);
+    if (removed || IsGoneError(retryErr)) return 0;
+    return retryErr;
+}
+
+// Removes one file or symbolic link by its name (lstat + unlink in DeleteFileW). The handle-based way of the
+// Windows build is not used: opening a path follows a link, so a dangling link looked "already gone" and was
+// never removed, and the folder that held it could then not be deleted either.
+DWORD DeleteFileOnce(const std::wstring& extPath, DWORD /*attrs*/) {
+    return RemoveWithParentOpened(extPath, [&]() { return DeleteFileW(extPath.c_str()) != FALSE; });
+}
+
+// Removes an empty folder, or a link to a folder (the link only, never what it points to). The folder's own
+// mode is never changed: it does not decide whether it can be removed, and a mount point that refuses to go
+// (EBUSY) is the root of another file system, which is left exactly as it is.
+DWORD RemoveDirOnce(const std::wstring& extPath, DWORD /*attrs*/) {
+    return RemoveWithParentOpened(extPath, [&]() { return RemoveDirectoryW(extPath.c_str()) != FALSE; });
+}
+#else
 // Removes one file or file symlink. Returns 0 when it is gone, else the Win32 error.
 DWORD DeleteFileOnce(const std::wstring& extPath, DWORD attrs) {
     HANDLE h = CreateFileW(extPath.c_str(), DELETE,
@@ -3540,15 +3869,6 @@ DWORD DeleteFileOnce(const std::wstring& extPath, DWORD attrs) {
     if (DeleteFileW(extPath.c_str())) return 0;
     const DWORD err = GetLastError();
     if (IsGoneError(err)) return 0;
-#ifndef _WIN32
-    if (err == ERROR_ACCESS_DENIED) {
-        // On POSIX, unlink() checks u+w on the parent directory: lift read-only parent folder mode if needed
-        const std::wstring parentExt = PathUtils::GetParentPath(extPath);
-        if (!parentExt.empty() && SetFileAttributesW(parentExt.c_str(), FILE_ATTRIBUTE_NORMAL)) {
-            if (DeleteFileW(extPath.c_str()) || IsGoneError(GetLastError())) return 0;
-        }
-    }
-#endif
     if (clearedReadOnly) SetFileAttributesW(extPath.c_str(), attrs);
     return err;
 }
@@ -3577,6 +3897,7 @@ DWORD RemoveDirOnce(const std::wstring& extPath, DWORD attrs) {
     }
     return err;
 }
+#endif
 
 // Runs one delete step, waiting and trying again while the failure looks temporary.
 // Returns the final Win32 error (0 = gone).
@@ -3601,6 +3922,18 @@ DWORD DeleteWithRetry(Once&& once, uint32_t maxRetries, const std::atomic<bool>&
 template <typename OnDir, typename OnLeaf, typename OnError, typename KeepGoing>
 void WalkTreeForDelete(const std::wstring& rootDir, DWORD rootAttrs,
                        OnDir&& onDir, OnLeaf&& onLeaf, OnError&& onError, KeepGoing&& keepGoing) {
+#ifndef _WIN32
+    // Linux: a folder on which another file system is mounted (a USB disk, a network share, a bind mount of
+    // another folder) looks like any other folder here. It is handed on as a leaf and never entered: its
+    // removal then fails (the kernel answers EBUSY) and nothing on the mounted file system is touched.
+    const MountFence fence(rootDir);
+    if (!fence.RootIsRealFolder()) {
+        // Never walked through a link, whatever the caller was told about rootDir (a name that differs from
+        // another one only in case can come back with the other one's attributes)
+        onError(rootDir, ERROR_DIRECTORY);
+        return;
+    }
+#endif
     std::vector<std::pair<std::wstring, DWORD>> pending;
     pending.emplace_back(rootDir, rootAttrs);
     WIN32_FIND_DATAW ffd = {};
@@ -3631,7 +3964,11 @@ void WalkTreeForDelete(const std::wstring& rootDir, DWORD rootAttrs,
             if (!isDots) {
                 const DWORD attrs = ffd.dwFileAttributes;
                 const bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                if (isDir && !IsLinkReparseTag(attrs, ffd.dwReserved0)) {
+                bool enter = isDir && !IsLinkReparseTag(attrs, ffd.dwReserved0);
+#ifndef _WIN32
+                if (enter && fence.IsMountRoot(prefix + name)) enter = false;    // the root of another mount: a leaf
+#endif
+                if (enter) {
                     pending.emplace_back(prefix + name, attrs);
                 } else {
                     const uint64_t size = isDir ? 0ULL : ((static_cast<uint64_t>(ffd.nFileSizeHigh) << 32) | ffd.nFileSizeLow);
@@ -3861,6 +4198,38 @@ std::wstring DescribeShellError(HRESULT hr, DWORD& outWin32) {
     return buf;
 }
 
+#ifndef _WIN32
+// Linux: true when an item cannot go to the user's trash. The trash ($XDG_DATA_HOME/Trash, usually
+// ~/.local/share/Trash, the folder the HAL moves items into) takes an item by rename() only, so only from its
+// own file system. An item on a network or FUSE file system is not given to it at all, as Windows has no
+// Recycle Bin on a network share.
+bool LinuxPathHasNoTrash(const std::wstring& path) {
+    const std::string native = Explorer2::Compat::NativePath(path.c_str());
+    struct stat st = {};
+    if (::lstat(native.c_str(), &st) != 0) return false;   // gone or unreadable: the delete itself reports that
+    const auto mounts = LinuxMounts::Current();
+    if (const LinuxMounts::Mount* m = LinuxMounts::FindByDevice(*mounts, static_cast<uint64_t>(st.st_dev))) {
+        if (LinuxMounts::IsNetworkFsType(m->fsType)) return true;
+    }
+    // The same trash folder as the HAL's delete uses
+    std::string trash;
+    const char* xdg = std::getenv("XDG_DATA_HOME");
+    const char* home = std::getenv("HOME");
+    if (xdg && *xdg) trash = std::string(xdg) + "/Trash/files";
+    else if (home && *home) trash = std::string(home) + "/.local/share/Trash/files";
+    else trash = "/tmp/Trash-" + std::to_string(::geteuid()) + "/files";
+    // It may not exist yet: it is then made inside the nearest folder above it that does
+    for (int depth = 0; depth < 64; ++depth) {
+        struct stat tst = {};
+        if (::stat(trash.c_str(), &tst) == 0) return tst.st_dev != st.st_dev;
+        const size_t slash = trash.find_last_of('/');
+        if (slash == std::string::npos || trash == "/") break;
+        trash = (slash == 0) ? std::string("/") : trash.substr(0, slash);
+    }
+    return true;    // no part of the trash path exists: there is no trash to move the item to
+}
+#endif
+
 } // namespace
 
 bool TransferManager::IsDeleteRefused(const std::wstring& rawPath) {
@@ -3907,6 +4276,11 @@ bool TransferManager::IsDeleteRefused(const std::wstring& rawPath) {
         if (part.empty() || part == L"." || part == L"..") return true;
         pos = end + 1;
     }
+#ifndef _WIN32
+    // A mount point is a whole drive as well: deleting it would empty the file system mounted there (a USB
+    // disk, a network share, another partition, a bind mount of another folder)
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] != L'\\' && MountFence::IsMountPoint(p)) return true;
+#endif
     return false;
 }
 
@@ -3924,6 +4298,11 @@ bool TransferManager::PathHasNoRecycleBin(const std::wstring& rawPath) {
     if (p == L"\\proc" || p.rfind(L"\\proc\\", 0) == 0 ||
         p == L"\\sys"  || p.rfind(L"\\sys\\", 0) == 0 ||
         p == L"\\dev"  || p.rfind(L"\\dev\\", 0) == 0) {
+        return true;
+    }
+    // A USB disk, another partition, a network share: the trash cannot take the item, and the usual "no
+    // Recycle Bin here, delete permanently?" question is asked instead of failing in the delete job
+    if (p.size() >= 2 && p[0] == L'\\' && p[1] != L'\\' && LinuxPathHasNoTrash(p)) {
         return true;
     }
 #endif
@@ -4298,6 +4677,15 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
                         job->doneFiles.fetch_add(1, std::memory_order_relaxed);
                         job->doneBytes.fetch_add(item.size, std::memory_order_relaxed);
                     } else if (!job->cancelled.load(std::memory_order_relaxed)) {
+#ifndef _WIN32
+                        // A folder the walk did not enter because another file system is mounted on it
+                        if (message.empty() && (item.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                            MountFence::IsMountPoint(item.srcPath)) {
+                            message = L"Nie usunięto: tu jest zamontowany inny system plików (dysk, udział sieciowy) - "
+                                      L"jego zawartość pozostaje nietknięta / Not deleted: another file system is mounted "
+                                      L"here (a disk, a network share); its content is left untouched";
+                        }
+#endif
                         item.failed = true;
                         addError(item.srcPath, err, message);
                         std::lock_guard<std::mutex> blk(blockedMtx);
@@ -4656,6 +5044,28 @@ bool TransferManager::CopyOrMoveSingleItem(
         }
     }
 
+#ifndef _WIN32
+    // 2.5. Linux: a symbolic link (to a file or to a folder) is recreated at the destination with the same
+    //      target text, never followed: a link to a folder would otherwise become an empty folder and a link
+    //      to a file a second copy of that file. A move removes the source link once the new one is in place
+    //      (a move on one volume has already renamed it above).
+    if (item.isReparse) {
+        const DWORD linkErr = RecreateSymlink(item.srcPath, finalDst, item.lastWriteTime);
+        if (linkErr != 0) {
+            outErr = { item.srcPath, finalDst, linkErr, FormatWin32Err(linkErr), 0 };
+            return false;
+        }
+        if (job.op == TransferOp::Move) {
+            const DWORD delErr = RemoveSourceLink(item.srcPath);
+            if (delErr != 0) {
+                outErr = { item.srcPath, finalDst, delErr, L"Copied OK, but could not remove source: " + FormatWin32Err(delErr), 0 };
+                return false;
+            }
+        }
+        return true;
+    }
+#endif
+
     const bool computeHash = (job.cfg.verifyMode == TransferVerifyMode::XxHash64);
 
     // 3. Fast-path B: ReFS / Dev Drive Copy-on-Write Block Cloning (chunked in 1 GB extents for >4 GB support!)
@@ -4665,8 +5075,14 @@ bool TransferManager::CopyOrMoveSingleItem(
         HANDLE hSrc = CreateFileW(ToExtPath(item.srcPath).c_str(), GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hSrc != INVALID_HANDLE_VALUE) {
+#ifndef _WIN32
+            const bool cloneDstMadeHere = CreateOwnerOnlyFile(extFinalDst);     // owner-only until it is complete
+#endif
             HANDLE hDst = CreateFileW(extFinalDst.c_str(), GENERIC_READ | GENERIC_WRITE,
                 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+#ifndef _WIN32
+            if (hDst == INVALID_HANDLE_VALUE && cloneDstMadeHere) DeleteFileW(extFinalDst.c_str());
+#endif
             if (hDst != INVALID_HANDLE_VALUE) {
                 FILE_END_OF_FILE_INFO eof = {};
                 eof.EndOfFile.QuadPart = static_cast<LONGLONG>(item.size);
@@ -4697,9 +5113,16 @@ bool TransferManager::CopyOrMoveSingleItem(
                     if (cloned) {
                         SetFileInformationByHandle(hDst, FileEndOfFileInfo, &eof, sizeof(eof));
                         ApplyHandleTimestampsAndAttrs(hDst, item.creationTime, item.lastAccessTime, item.lastWriteTime, item.attributes);
+#ifndef _WIN32
+                        ApplySourceModeToFd(Explorer2::Compat::FdOf(hDst), item.srcPath);
+#endif
                     }
                 }
+#ifndef _WIN32
+                if (!CloseHandle(hDst)) cloned = false;     // a write error reported only now: copied the normal way below
+#else
                 CloseHandle(hDst);
+#endif
                 CloseHandle(hSrc);
                 if (cloned) {
                     RecordProgressBytes(job, item.size);
@@ -4853,6 +5276,12 @@ bool TransferManager::CopyOrMoveSingleItem(
 
     HANDLE hDst = INVALID_HANDLE_VALUE;
     DWORD disp = (resumeOffset > 0) ? OPEN_EXISTING : CREATE_ALWAYS;
+#ifndef _WIN32
+    // A new file is made owner-only first: CREATE_ALWAYS would make it with 0666 minus the umask, readable by
+    // others for as long as the data is written, even when the source is private. It gets the source's
+    // permission bits when the data is in (8. and 10. below).
+    const bool dstMadeHere = (resumeOffset == 0) && CreateOwnerOnlyFile(extWritePath);
+#endif
     if (wantUnbuffered && resumeOffset == 0) {
         hDst = CreateFileW(extWritePath.c_str(), GENERIC_WRITE,
             FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
@@ -4867,6 +5296,9 @@ bool TransferManager::CopyOrMoveSingleItem(
     if (hDst == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         CloseHandle(hSrc);
+#ifndef _WIN32
+        if (dstMadeHere) DeleteFileW(extWritePath.c_str());    // the empty file made above, nothing else
+#endif
         outErr = { item.srcPath, finalDst, err, FormatWin32Err(err), 0 };
         return false;
     }
@@ -5136,13 +5568,31 @@ bool TransferManager::CopyOrMoveSingleItem(
         }
     }
 
+#ifndef _WIN32
+    // Data the C library still holds is written out now, so that a full disk or a lost network share shows
+    // up here, where the failed-write handling below deals with it, and never after the file has been
+    // renamed into place or the source of a move deleted
+    if (ioOk && !FlushFileBuffers(hDst)) {
+        ioErr = GetLastError();
+        if (ioErr == 0) ioErr = ERROR_GEN_FAILURE;
+        ioOk = false;
+    }
+#endif
     CloseHandle(hSrc);
 
     if (!ioOk) {
+#ifndef _WIN32
+        // What really reached the file (WrittenPrefixLength); the file is cut there, never extended
+        const uint64_t keptBytes = WrittenPrefixLength(hDst, bytesAddedThisAttempt);
+#endif
         if (!usingUnbufferedDst) {
             if (!job.cancelled.load()) {
                 FILE_END_OF_FILE_INFO truncEof = {};
+#ifndef _WIN32
+                truncEof.EndOfFile.QuadPart = static_cast<LONGLONG>(keptBytes);
+#else
                 truncEof.EndOfFile.QuadPart = static_cast<LONGLONG>(bytesAddedThisAttempt);
+#endif
                 SetFileInformationByHandle(hDst, FileEndOfFileInfo, &truncEof, sizeof(truncEof));
             }
             FlushFileBuffers(hDst);
@@ -5163,7 +5613,11 @@ bool TransferManager::CopyOrMoveSingleItem(
                 FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (hFix != INVALID_HANDLE_VALUE) {
                 FILE_END_OF_FILE_INFO truncEof = {};
+#ifndef _WIN32
+                truncEof.EndOfFile.QuadPart = static_cast<LONGLONG>(keptBytes);
+#else
                 truncEof.EndOfFile.QuadPart = static_cast<LONGLONG>(bytesAddedThisAttempt);
+#endif
                 SetFileInformationByHandle(hFix, FileEndOfFileInfo, &truncEof, sizeof(truncEof));
                 FILE_BASIC_INFO tagInfo = {};
                 tagInfo.CreationTime.LowPart  = item.lastWriteTime.dwLowDateTime;
@@ -5172,13 +5626,35 @@ bool TransferManager::CopyOrMoveSingleItem(
                 CloseHandle(hFix);
             }
         }
+#ifndef _WIN32
+        outErr = { item.srcPath, finalDst, ioErr, FormatWin32Err(ioErr), job.cancelled.load() ? 0ULL : keptBytes };
+#else
         outErr = { item.srcPath, finalDst, ioErr, FormatWin32Err(ioErr), job.cancelled.load() ? 0ULL : bytesAddedThisAttempt };
+#endif
         return false;
     }
 
     // 8. Finalize EOF (only needed if NO_BUFFERING padded last sector or size mismatch) & apply original timestamps + attributes!
+#ifndef _WIN32
+    // Closing the destination can still report a write error (a network file system writes back on close).
+    // The file is then treated like one whose write failed: it is not committed, the source of a move stays,
+    // and the error is reported. A kept .e2part has the full length and is never resumed from.
+    auto destinationCloseFailed = [&](HANDLE h) -> bool {
+        SetLastError(ERROR_SUCCESS);
+        if (CloseHandle(h)) return false;
+        DWORD closeErr = GetLastError();
+        if (closeErr == 0) closeErr = ERROR_GEN_FAILURE;
+        job.doneBytes.fetch_sub(bytesAddedThisAttempt, std::memory_order_relaxed);
+        outErr = { item.srcPath, finalDst, closeErr, FormatWin32Err(closeErr), 0 };
+        return true;
+    };
+#endif
     if (usingUnbufferedDst) {
+#ifndef _WIN32
+        if (destinationCloseFailed(hDst)) return false;
+#else
         CloseHandle(hDst);
+#endif
         HANDLE hFix = CreateFileW(extWritePath.c_str(), FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES,
             FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFix != INVALID_HANDLE_VALUE) {
@@ -5186,6 +5662,10 @@ bool TransferManager::CopyOrMoveSingleItem(
             eof.EndOfFile.QuadPart = static_cast<LONGLONG>(item.size);
             SetFileInformationByHandle(hFix, FileEndOfFileInfo, &eof, sizeof(eof));
             ApplyHandleTimestampsAndAttrs(hFix, item.creationTime, item.lastAccessTime, item.lastWriteTime, item.attributes);
+#ifndef _WIN32
+            // The source's permission bits, now that the data is in (after the checksum, when it is read back)
+            if (!computeHash) ApplySourceModeToFd(Explorer2::Compat::FdOf(hFix), item.srcPath);
+#endif
             CloseHandle(hFix);
         }
     } else {
@@ -5195,7 +5675,13 @@ bool TransferManager::CopyOrMoveSingleItem(
             SetFileInformationByHandle(hDst, FileEndOfFileInfo, &eof, sizeof(eof));
         }
         ApplyHandleTimestampsAndAttrs(hDst, item.creationTime, item.lastAccessTime, item.lastWriteTime, item.attributes);
+#ifndef _WIN32
+        // The source's permission bits, now that the data is in (after the checksum, when it is read back)
+        if (!computeHash) ApplySourceModeToFd(Explorer2::Compat::FdOf(hDst), item.srcPath);
+        if (destinationCloseFailed(hDst)) return false;
+#else
         CloseHandle(hDst);
+#endif
     }
 
     // 9. Optional Post-Copy Integrity Verification (Size+Time or full XXH64 disk re-read reusing workerBuf!)
@@ -5227,6 +5713,10 @@ bool TransferManager::CopyOrMoveSingleItem(
                 outErr = { item.srcPath, finalDst, ERROR_CRC, L"XXH64 checksum mismatch on destination!", 0 };
                 return false;
             }
+#ifndef _WIN32
+            // Read back and found good: now it gets the source's permission bits (before the commit below)
+            ApplySourceModeToPath(item.srcPath, writePath);
+#endif
         }
         job.verifiedFiles.fetch_add(1, std::memory_order_relaxed);
     }

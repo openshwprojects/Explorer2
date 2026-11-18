@@ -49,6 +49,7 @@
 #include <mutex>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 #include <iconv.h>
@@ -847,11 +848,15 @@ struct HandleBase {
 struct FileHandle : HandleBase {
     FileHandle() : HandleBase(HandleKind::File) {}
     FILE* f = nullptr;
-    int dirFd = -1;
+    int dirFd = -1;               // a descriptor without a stdio stream: a folder, or a symbolic link opened as itself
     uint64_t dev = 0;
     uint64_t ino = 0;
     DWORD shareMode = 0;
     bool deleteOnClose = false;
+    bool canWrite = false;        // opened with a right to write, so the stdio buffer may hold data still to be written
+    bool isStream = false;        // a pipe or a socket: ReadFile returns what has arrived instead of filling the buffer
+    bool writeFailed = false;     // a write, or a later flush of buffered data, failed (FlushFileBuffers and CloseHandle say so)
+    DWORD writeError = 0;         // the Win32 error of that first failure
     std::string nativePath;
 };
 struct MappingHandle : HandleBase {
@@ -872,6 +877,10 @@ inline int FdOf(HANDLE h) {
     auto* fh = static_cast<FileHandle*>(b);
     if (fh->dirFd >= 0) return fh->dirFd;
     return fh->f ? fileno(fh->f) : -1;
+}
+inline FileHandle* FileHandleOf(HANDLE h) {
+    HandleBase* b = BaseOf(h);
+    return (b && b->kind == HandleKind::File) ? static_cast<FileHandle*>(b) : nullptr;
 }
 
 inline std::mutex& OpenFileMutex() {
@@ -918,17 +927,71 @@ inline DWORD Win32ErrorFromErrno(int e) {
     case ENOENT: return 2;          // ERROR_FILE_NOT_FOUND
     case ENOTDIR: return 3;         // ERROR_PATH_NOT_FOUND
     case EACCES: case EPERM: case EROFS: return 5;   // ERROR_ACCESS_DENIED
+    case EISDIR: return 5;          // ERROR_ACCESS_DENIED, which Windows gives for a folder opened as a file
     case EBADF: return 6;           // ERROR_INVALID_HANDLE
     case ENOMEM: return 8;          // ERROR_NOT_ENOUGH_MEMORY
+    case EXDEV: return 17;          // ERROR_NOT_SAME_DEVICE
     case EEXIST: return 183;        // ERROR_ALREADY_EXISTS
     case ENOTEMPTY: return 145;     // ERROR_DIR_NOT_EMPTY
-    case ENOSPC: return 112;        // ERROR_DISK_FULL
+    case ENOSPC: case EDQUOT: return 112;   // ERROR_DISK_FULL (a used-up quota is a full disk to the user)
     case EINVAL: return 87;         // ERROR_INVALID_PARAMETER
     case EBUSY: return 32;          // ERROR_SHARING_VIOLATION
+    case EPIPE: return 109;         // ERROR_BROKEN_PIPE
+    case ENAMETOOLONG: return 206;  // ERROR_FILENAME_EXCED_RANGE
+    case ELOOP: return 1921;        // ERROR_CANT_RESOLVE_FILENAME (too many levels of symbolic links)
+    case ENOTSUP: return 50;        // ERROR_NOT_SUPPORTED
+#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
+    case EOPNOTSUPP: return 50;     // ERROR_NOT_SUPPORTED (on Linux the same number as ENOTSUP, so no case of its own)
+#endif
     default: return 31;             // ERROR_GEN_FAILURE
     }
 }
 inline void SetErrorFromErrno() { LastError() = Win32ErrorFromErrno(errno); }
+
+// A failed write is remembered by its handle. stdio keeps data in a buffer, so a WriteFile call can report
+// success for data that a later flush fails to write: that failure must still reach the caller, through
+// FlushFileBuffers or CloseHandle. Sets the last error to this failure and returns it.
+inline DWORD NoteWriteFailure(FileHandle* fh, int err) {
+    DWORD code = Win32ErrorFromErrno(err);
+    if (code == 0) code = 29;       // ERROR_WRITE_FAULT: the C library said nothing more precise
+    if (fh && !fh->writeFailed) {
+        fh->writeFailed = true;
+        fh->writeError = code;
+    }
+    LastError() = code;
+    return code;
+}
+
+// Writes out what the stdio buffer of a writable handle holds. A failure is recorded in the handle.
+inline bool FlushHandleStream(FileHandle* fh) {
+    if (!fh || !fh->f || !fh->canWrite) return true;
+    if (std::fflush(fh->f) == 0) return true;
+    NoteWriteFailure(fh, errno);
+    return false;
+}
+
+// Network and FUSE file systems, where every extended attribute read is a round trip to a server or to a
+// user-space daemon
+inline bool IsRemoteFileSystem(int fd) {
+    struct statfs sfs = {};
+    if (fd < 0 || ::fstatfs(fd, &sfs) != 0) return false;
+    switch (static_cast<uint32_t>(static_cast<unsigned long>(sfs.f_type))) {
+    case 0x00006969u:   // NFS
+    case 0x0000517Bu:   // SMB
+    case 0xFF534D42u:   // CIFS
+    case 0xFE534D42u:   // SMB2
+    case 0x65735546u:   // FUSE (sshfs, rclone, gvfs and others)
+    case 0x01021997u:   // 9p
+    case 0x00C36400u:   // Ceph
+    case 0x5346414Fu:   // AFS
+    case 0x6B414653u:   // kAFS
+    case 0x73757245u:   // Coda
+    case 0x0000564Cu:   // NCP
+        return true;
+    default:
+        return false;
+    }
+}
 
 inline FILETIME FileTimeFromUnix(time_t secs) {
     const uint64_t ticks = static_cast<uint64_t>(static_cast<int64_t>(secs) + 11644473600LL) * 10000000ULL;
@@ -987,16 +1050,22 @@ inline FILETIME GetInodeCreationTime(const char* nativePath, const struct stat& 
 #define ERROR_ACCESS_DENIED 5L
 #define ERROR_INVALID_HANDLE 6L
 #define ERROR_NOT_ENOUGH_MEMORY 8L
+#define ERROR_NOT_SAME_DEVICE 17L
 #define ERROR_NO_MORE_FILES 18L
+#define ERROR_WRITE_FAULT 29L
 #define ERROR_GEN_FAILURE 31L
 #define ERROR_SHARING_VIOLATION 32L
 #define ERROR_HANDLE_EOF 38L
 #define ERROR_NOT_SUPPORTED 50L
 #define ERROR_FILE_EXISTS 80L
 #define ERROR_INVALID_PARAMETER 87L
+#define ERROR_BROKEN_PIPE 109L
 #define ERROR_DISK_FULL 112L
 #define ERROR_DIR_NOT_EMPTY 145L
 #define ERROR_ALREADY_EXISTS 183L
+#define ERROR_FILENAME_EXCED_RANGE 206L
+#define ERROR_NO_DATA 232L
+#define ERROR_CANT_RESOLVE_FILENAME 1921L
 #define INFINITE 0xFFFFFFFFu
 
 inline DWORD GetLastError() { return Explorer2::Compat::LastError(); }
@@ -1006,8 +1075,36 @@ inline DWORD GetCurrentProcessId() { return static_cast<DWORD>(::getpid()); }
 inline HANDLE CreateFileW(const wchar_t* path, DWORD access, DWORD share, void* /*security*/, DWORD disposition,
                           DWORD flags, HANDLE /*templateFile*/) {
     const std::string native = Explorer2::Compat::NativePath(path);
+    // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link itself, as Windows opens the reparse point: a link whose
+    // target is gone is still there to be deleted, and must not be reported as missing.
+    const bool openLink = (flags & FILE_FLAG_OPEN_REPARSE_POINT) != 0;
     struct stat st = {};
-    const bool exists = (::stat(native.c_str(), &st) == 0);
+    bool exists = ((openLink ? ::lstat(native.c_str(), &st) : ::stat(native.c_str(), &st)) == 0);
+    if (exists && S_ISLNK(st.st_mode)) {
+        if (disposition == CREATE_NEW) { SetLastError(ERROR_FILE_EXISTS); return INVALID_HANDLE_VALUE; }
+        if (disposition == OPEN_EXISTING || disposition == OPEN_ALWAYS) {
+#ifdef O_PATH
+            // A descriptor of the link, not of what it points to: enough for its times and to delete it by name
+            const int lfd = ::open(native.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            if (lfd < 0) { Explorer2::Compat::SetErrorFromErrno(); return INVALID_HANDLE_VALUE; }
+            auto* h = new Explorer2::Compat::FileHandle();
+            h->dirFd = lfd;
+            h->dev = static_cast<uint64_t>(st.st_dev);
+            h->ino = static_cast<uint64_t>(st.st_ino);
+            h->shareMode = share;
+            h->deleteOnClose = (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0;
+            h->nativePath = native;
+            Explorer2::Compat::RegisterOpenFile(h);
+            SetLastError(disposition == OPEN_ALWAYS ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
+            return static_cast<HANDLE>(static_cast<Explorer2::Compat::HandleBase*>(h));
+#else
+            SetLastError(ERROR_ACCESS_DENIED);
+            return INVALID_HANDLE_VALUE;
+#endif
+        }
+        // CREATE_ALWAYS and TRUNCATE_EXISTING write through the link, as they always did
+        exists = (::stat(native.c_str(), &st) == 0);
+    }
     if (exists && S_ISDIR(st.st_mode)) {
         if ((flags & FILE_FLAG_BACKUP_SEMANTICS) && disposition == OPEN_EXISTING) {
             const int dfd = ::open(native.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1025,49 +1122,104 @@ inline HANDLE CreateFileW(const wchar_t* path, DWORD access, DWORD share, void* 
         SetLastError(ERROR_ACCESS_DENIED);
         return INVALID_HANDLE_VALUE;
     }
-    const char* mode = nullptr;
-    const bool wantWrite = (access & (GENERIC_WRITE | 0x0100u /*FILE_WRITE_ATTRIBUTES*/ | 0x0002u /*FILE_WRITE_DATA*/)) != 0;
+    if (exists && !S_ISREG(st.st_mode)) {
+        // A named pipe, a socket or a device. Opening one can wait for ever (a FIFO nobody writes to) or act on
+        // hardware (a serial port, a watchdog), and reading one may never end: none of them is a file to open here.
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    constexpr DWORD kFileWriteData = 0x0002u, kFileAppendData = 0x0004u, kFileWriteAttributes = 0x0100u;
+    // FILE_APPEND_DATA without a right to write anywhere else: every write goes to the end of the file (the log,
+    // the monitoring recorder's CSV files)
+    const bool appendOnly = (access & kFileAppendData) != 0 && (access & (GENERIC_WRITE | kFileWriteData)) == 0;
+    const bool wantWrite = appendOnly || (access & (GENERIC_WRITE | kFileWriteAttributes | kFileWriteData)) != 0;
     const bool wantRead = (access & GENERIC_READ) != 0 || !wantWrite;
+    int accMode = O_RDONLY;
+    int createFlags = 0;
     switch (disposition) {
     case OPEN_EXISTING:
         if (!exists) { SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
-        mode = wantWrite ? "r+b" : "rb";
+        accMode = wantWrite ? O_RDWR : O_RDONLY;
         break;
     case CREATE_ALWAYS:
-        mode = wantRead && wantWrite ? "w+b" : "wb";
+        accMode = (wantRead && wantWrite) ? O_RDWR : O_WRONLY;
+        createFlags = O_CREAT | O_TRUNC;
         break;
     case CREATE_NEW:
         if (exists) { SetLastError(ERROR_FILE_EXISTS); return INVALID_HANDLE_VALUE; }
-        mode = wantRead && wantWrite ? "w+b" : "wb";
+        accMode = (wantRead && wantWrite) ? O_RDWR : O_WRONLY;
+        createFlags = O_CREAT | O_EXCL;
         break;
     case OPEN_ALWAYS:
-        mode = exists ? (wantWrite ? "r+b" : "rb") : (wantRead && wantWrite ? "w+b" : "wb");
+        accMode = exists ? (wantWrite ? O_RDWR : O_RDONLY) : ((wantRead && wantWrite) ? O_RDWR : O_WRONLY);
+        createFlags = O_CREAT;
         break;
     case TRUNCATE_EXISTING:
         if (!exists) { SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
-        mode = wantRead ? "w+b" : "wb";
+        accMode = wantRead ? O_RDWR : O_WRONLY;
+        createFlags = O_TRUNC;
         break;
     default:
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    FILE* f = std::fopen(native.c_str(), mode);
-    if (!f && wantWrite && disposition == OPEN_EXISTING && (access & GENERIC_WRITE) == 0) {
-        // Read-only file opened for FILE_WRITE_ATTRIBUTES only: O_RDONLY fd still allows futimens!
-        f = std::fopen(native.c_str(), "rb");
+    if (appendOnly) {
+        // CREATE_ALWAYS and TRUNCATE_EXISTING still empty the file first; reading needs GENERIC_READ as well
+        accMode = wantRead ? O_RDWR : O_WRONLY;
+        createFlags |= O_APPEND;
     }
-    if (!f) {
-        Explorer2::Compat::SetErrorFromErrno();
+    // O_NONBLOCK in case the name has turned into a FIFO since the stat above: the open must not wait for a
+    // writer. It is cleared again below, once the descriptor is known to be a regular file.
+    auto openAs = [&](int accessMode) {
+        int r = ::open(native.c_str(), accessMode | createFlags | O_CLOEXEC | O_NOCTTY | O_NONBLOCK, 0666);
+        if (r < 0 && errno == EAGAIN && exists) {
+            // A lease on the file (Samba, the NFS server): only a blocking open waits for its holder to let go.
+            // The stat above found a regular file, and opening one does not hang.
+            r = ::open(native.c_str(), accessMode | createFlags | O_CLOEXEC | O_NOCTTY, 0666);
+        }
+        return r;
+    };
+    int fd = openAs(accMode);
+    if (fd < 0 && wantWrite && !appendOnly && disposition == OPEN_EXISTING && (access & GENERIC_WRITE) == 0) {
+        // Read-only file opened for FILE_WRITE_ATTRIBUTES only: an O_RDONLY descriptor still allows futimens
+        accMode = O_RDONLY;
+        fd = openAs(O_RDONLY);
+    }
+    if (fd < 0) {
+        if (disposition == CREATE_NEW && errno == EEXIST) SetLastError(ERROR_FILE_EXISTS);
+        else Explorer2::Compat::SetErrorFromErrno();
         return INVALID_HANDLE_VALUE;
     }
     struct stat fst = {};
-    ::fstat(fileno(f), &fst);
+    if (::fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
+        ::close(fd);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    const int fdFlags = ::fcntl(fd, F_GETFL);
+    if (fdFlags >= 0) (void)::fcntl(fd, F_SETFL, fdFlags & ~O_NONBLOCK);
+    // fdopen neither creates nor truncates: the mode only has to match the descriptor's access
+    const char* mode = (accMode == O_RDONLY) ? "rb"
+                     : (accMode == O_WRONLY) ? (appendOnly ? "ab" : "wb")
+                     : (appendOnly ? "a+b" : "r+b");
+    FILE* f = ::fdopen(fd, mode);
+    if (!f) {
+        ::close(fd);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (appendOnly) {
+        // Unbuffered, so that every WriteFile is one write(2): a log line is in the file the moment it is written,
+        // and survives the program being killed
+        std::setvbuf(f, nullptr, _IONBF, 0);
+    }
     auto* h = new Explorer2::Compat::FileHandle();
     h->f = f;
     h->dev = static_cast<uint64_t>(fst.st_dev);
     h->ino = static_cast<uint64_t>(fst.st_ino);
     h->shareMode = share;
     h->deleteOnClose = (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0;
+    h->canWrite = (accMode != O_RDONLY);
     h->nativePath = native;
     Explorer2::Compat::RegisterOpenFile(h);
     SetLastError((exists && (disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS)) ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
@@ -1076,8 +1228,26 @@ inline HANDLE CreateFileW(const wchar_t* path, DWORD access, DWORD share, void* 
 
 inline BOOL ReadFile(HANDLE h, void* buffer, DWORD toRead, DWORD* read, void* /*overlapped*/) {
     if (read) *read = 0;
-    FILE* f = Explorer2::Compat::FileOf(h);
+    Explorer2::Compat::FileHandle* fh = Explorer2::Compat::FileHandleOf(h);
+    FILE* f = fh ? fh->f : nullptr;
     if (!f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (fh->isStream) {
+        // A pipe or a socket returns what has arrived, as on Windows. fread would wait until the whole buffer is
+        // full, which never happens while the program at the other end waits for an answer.
+        if (toRead == 0) return TRUE;
+        ssize_t got = 0;
+        do {
+            got = ::read(fileno(f), buffer, toRead);
+        } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            if (errno == EAGAIN) SetLastError(ERROR_NO_DATA);
+            else Explorer2::Compat::SetErrorFromErrno();
+            return FALSE;
+        }
+        if (got == 0) { SetLastError(ERROR_BROKEN_PIPE); return FALSE; }   // the writing end is closed
+        if (read) *read = static_cast<DWORD>(got);
+        return TRUE;
+    }
     const size_t got = toRead ? std::fread(buffer, 1, toRead, f) : 0;
     if (read) *read = static_cast<DWORD>(got);
     if (got != toRead && std::ferror(f)) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
@@ -1086,18 +1256,29 @@ inline BOOL ReadFile(HANDLE h, void* buffer, DWORD toRead, DWORD* read, void* /*
 
 inline BOOL WriteFile(HANDLE h, const void* buffer, DWORD toWrite, DWORD* written, void* /*overlapped*/) {
     if (written) *written = 0;
-    FILE* f = Explorer2::Compat::FileOf(h);
+    Explorer2::Compat::FileHandle* fh = Explorer2::Compat::FileHandleOf(h);
+    FILE* f = fh ? fh->f : nullptr;
     if (!f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    errno = 0;
     const size_t put = toWrite ? std::fwrite(buffer, 1, toWrite, f) : 0;
     if (written) *written = static_cast<DWORD>(put);
-    if (put != toWrite) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    if (put != toWrite) {
+        const int e = errno;
+        if (!fh->canWrite) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }   // a handle opened for reading
+        Explorer2::Compat::NoteWriteFailure(fh, e);
+        return FALSE;
+    }
     return TRUE;
 }
 
 inline BOOL GetFileSizeEx(HANDLE h, LARGE_INTEGER* size) {
-    FILE* f = Explorer2::Compat::FileOf(h);
+    Explorer2::Compat::FileHandle* fh = Explorer2::Compat::FileHandleOf(h);
+    FILE* f = fh ? fh->f : nullptr;
     struct stat st = {};
-    if (!f || !size || ::fstat(fileno(f), &st) != 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (!f || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    // Data still in the stdio buffer is part of the file, as everything WriteFile accepted is on Windows
+    Explorer2::Compat::FlushHandleStream(fh);
+    if (::fstat(fileno(f), &st) != 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
     size->QuadPart = static_cast<LONGLONG>(st.st_size);
     return TRUE;
 }
@@ -1110,8 +1291,11 @@ inline DWORD GetFileSize(HANDLE h, DWORD* high) {
 }
 
 inline BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER distance, LARGE_INTEGER* newPos, DWORD method) {
-    FILE* f = Explorer2::Compat::FileOf(h);
+    Explorer2::Compat::FileHandle* fh = Explorer2::Compat::FileHandleOf(h);
+    FILE* f = fh ? fh->f : nullptr;
     if (!f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    // A seek writes out the stdio buffer first; done here, so that a failure is known to be a failed write
+    if (!Explorer2::Compat::FlushHandleStream(fh)) return FALSE;
     const int whence = (method == FILE_CURRENT) ? SEEK_CUR : (method == FILE_END) ? SEEK_END : SEEK_SET;
     if (::fseeko(f, static_cast<off_t>(distance.QuadPart), whence) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
     if (newPos) newPos->QuadPart = static_cast<LONGLONG>(::ftello(f));
@@ -1132,7 +1316,9 @@ inline BOOL GetFileTime(HANDLE h, FILETIME* creation, FILETIME* access, FILETIME
 inline BOOL SetFileTime(HANDLE h, const FILETIME* creation, const FILETIME* access, const FILETIME* write) {
     const int fd = Explorer2::Compat::FdOf(h);
     if (fd < 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    if (FILE* f = Explorer2::Compat::FileOf(h)) std::fflush(f);
+    // Buffered data written after futimens would move the modification time again. A flush that fails is a
+    // failed write, which the handle keeps for FlushFileBuffers and CloseHandle; the times are set all the same.
+    Explorer2::Compat::FlushHandleStream(Explorer2::Compat::FileHandleOf(h));
     if (creation && (creation->dwLowDateTime != 0 || creation->dwHighDateTime != 0)) {
         struct stat st = {};
         if (::fstat(fd, &st) == 0) {
@@ -1157,18 +1343,23 @@ inline BOOL SetFileTime(HANDLE h, const FILETIME* creation, const FILETIME* acce
 }
 
 inline BOOL SetEndOfFile(HANDLE h) {
-    FILE* f = Explorer2::Compat::FileOf(h);
+    Explorer2::Compat::FileHandle* fh = Explorer2::Compat::FileHandleOf(h);
+    FILE* f = fh ? fh->f : nullptr;
     if (!f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    std::fflush(f);
+    // The end is where the data written so far ends, so that data has to be in the file first
+    if (!Explorer2::Compat::FlushHandleStream(fh)) return FALSE;
     const off_t pos = ::ftello(f);
     if (pos < 0 || ::ftruncate(fileno(f), pos) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
     return TRUE;
 }
 
+// Hands the stdio buffer to the kernel, without an fsync: the copy engine calls this after every file, and
+// waiting for the disk there would make copies much slower. Fails when this or any earlier write failed.
 inline BOOL FlushFileBuffers(HANDLE h) {
-    FILE* f = Explorer2::Compat::FileOf(h);
-    if (!f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    if (std::fflush(f) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    Explorer2::Compat::FileHandle* fh = Explorer2::Compat::FileHandleOf(h);
+    if (!fh || !fh->f) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    Explorer2::Compat::FlushHandleStream(fh);
+    if (fh->writeFailed) { SetLastError(fh->writeError); return FALSE; }
     return TRUE;
 }
 
@@ -1251,6 +1442,94 @@ inline BOOL DeleteFileW(const wchar_t* path) {
 
 #define MOVEFILE_REPLACE_EXISTING 0x00000001u
 #define MOVEFILE_COPY_ALLOWED 0x00000002u
+namespace Explorer2::Compat {
+// Gives one directory entry a new spelling of its name ("IMG_0001.JPG" -> "img_0001.jpg" on FAT, exFAT or SMB,
+// where both spellings name the same entry). rename() between two names of one file does nothing on Linux, so
+// the entry goes through a free temporary name in its folder. Returns 0 on success, else the Win32 error.
+inline DWORD RespellEntry(const std::string& from, const std::string& to) {
+    std::string clean = from;
+    while (clean.size() > 1 && clean.back() == '/') clean.pop_back();
+    const size_t sl = clean.find_last_of('/');
+    const std::string dir = (sl == std::string::npos) ? std::string(".") : (sl == 0 ? std::string("/") : clean.substr(0, sl));
+    for (int n = 0; n < 100; ++n) {
+        const std::string tmp = dir + (dir == "/" ? "" : "/") + ".e2-rename-" + std::to_string(::getpid()) + "-" + std::to_string(n);
+        struct stat stTmp = {};
+        if (::lstat(tmp.c_str(), &stTmp) == 0 || errno != ENOENT) continue;
+        if (::rename(clean.c_str(), tmp.c_str()) != 0) return Win32ErrorFromErrno(errno);
+        if (::rename(tmp.c_str(), to.c_str()) == 0) return 0;
+        const DWORD err = Win32ErrorFromErrno(errno);
+        (void)::rename(tmp.c_str(), clean.c_str());     // the old name back
+        return err;
+    }
+    return 183;     // ERROR_ALREADY_EXISTS: no free temporary name
+}
+
+// MoveFileExW's copy to another file system. The content, the permission bits, the access and modification times
+// and the creation time Explorer2 keeps go with the file; a symbolic link is moved as a link. A folder or a
+// special file is not copied: Windows moves folders only within a volume. Returns 0 on success, else the error.
+inline DWORD CopyForMove(const std::string& from, const std::string& to, const struct stat& stFrom, bool replace) {
+    if (S_ISLNK(stFrom.st_mode)) {
+        char target[PATH_MAX] = {};
+        const ssize_t n = ::readlink(from.c_str(), target, sizeof(target) - 1);
+        if (n < 0) return Win32ErrorFromErrno(errno);
+        target[n] = '\0';
+        struct stat stTo = {};
+        if (replace && ::lstat(to.c_str(), &stTo) == 0 && !S_ISDIR(stTo.st_mode)) (void)::unlink(to.c_str());
+        if (::symlink(target, to.c_str()) != 0) return Win32ErrorFromErrno(errno);
+        return 0;
+    }
+    if (!S_ISREG(stFrom.st_mode)) return 17;            // ERROR_NOT_SAME_DEVICE
+    const int in = ::open(from.c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NOFOLLOW | O_NONBLOCK);
+    if (in < 0) return Win32ErrorFromErrno(errno);
+    struct stat stIn = {};
+    if (::fstat(in, &stIn) != 0 || !S_ISREG(stIn.st_mode)) { ::close(in); return 5; }   // ERROR_ACCESS_DENIED
+    const int inFlags = ::fcntl(in, F_GETFL);
+    if (inFlags >= 0) (void)::fcntl(in, F_SETFL, inFlags & ~O_NONBLOCK);
+    // A link in the way is replaced, as rename() would replace it, instead of being written through
+    struct stat stTo = {};
+    if (replace && ::lstat(to.c_str(), &stTo) == 0 && S_ISLNK(stTo.st_mode)) (void)::unlink(to.c_str());
+    const int out = ::open(to.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC | (replace ? O_TRUNC : O_EXCL), stIn.st_mode & 0777);
+    if (out < 0) { const DWORD e = Win32ErrorFromErrno(errno); ::close(in); return e; }
+    DWORD err = 0;
+    std::vector<char> buf(256 * 1024);
+    for (;;) {
+        const ssize_t got = ::read(in, buf.data(), buf.size());
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            err = Win32ErrorFromErrno(errno);
+            break;
+        }
+        if (got == 0) break;
+        ssize_t off = 0;
+        while (off < got) {
+            const ssize_t put = ::write(out, buf.data() + off, static_cast<size_t>(got - off));
+            if (put < 0) {
+                if (errno == EINTR) continue;
+                err = Win32ErrorFromErrno(errno);
+                break;
+            }
+            off += put;
+        }
+        if (err != 0) break;
+    }
+    if (err == 0) {
+        // The mode after the data (the umask narrowed it at the create, and a write clears set-id bits); FAT and
+        // exFAT refuse some modes, which is no reason to fail the move
+        (void)::fchmod(out, stIn.st_mode & 07777);
+        const struct timespec times[2] = { stIn.st_atim, stIn.st_mtim };
+        (void)::futimens(out, times);
+        FILETIME created = {};
+        if (::lgetxattr(from.c_str(), "user.e2_btime", &created, sizeof(created)) == static_cast<ssize_t>(sizeof(created))) {
+            (void)::fsetxattr(out, "user.e2_btime", &created, sizeof(created), 0);
+        }
+    }
+    ::close(in);
+    if (::close(out) != 0 && err == 0) err = Win32ErrorFromErrno(errno);
+    if (err != 0) (void)::unlink(to.c_str());
+    return err;
+}
+} // namespace Explorer2::Compat
+
 inline BOOL MoveFileExW(const wchar_t* from, const wchar_t* to, DWORD flags) {
     const std::string a = Explorer2::Compat::NativePath(from);
     const std::string b = Explorer2::Compat::NativePath(to);
@@ -1260,26 +1539,26 @@ inline BOOL MoveFileExW(const wchar_t* from, const wchar_t* to, DWORD flags) {
         SetLastError(ERROR_SHARING_VIOLATION);
         return FALSE;
     }
-    struct stat st = {};
-    if (!(flags & MOVEFILE_REPLACE_EXISTING) && ::lstat(b.c_str(), &st) == 0) { SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }
+    struct stat stDst = {};
+    const bool dstExists = (::lstat(b.c_str(), &stDst) == 0);
+    // On a file system that ignores letter case (FAT, exFAT, SMB) the new spelling of a name finds the item being
+    // renamed. With one link to the inode (or a folder, which has no hard links) the same inode can only be the
+    // same entry: a rename, not a clash with another file.
+    if (dstExists && stDst.st_dev == stSrc.st_dev && stDst.st_ino == stSrc.st_ino &&
+        (S_ISDIR(stSrc.st_mode) || stSrc.st_nlink <= 1)) {
+        if (a == b) return TRUE;
+        const DWORD err = Explorer2::Compat::RespellEntry(a, b);
+        if (err != 0) { SetLastError(err); return FALSE; }
+        return TRUE;
+    }
+    if (dstExists && !(flags & MOVEFILE_REPLACE_EXISTING)) { SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }
     if (::rename(a.c_str(), b.c_str()) == 0) return TRUE;
     if (errno != EXDEV || !(flags & MOVEFILE_COPY_ALLOWED)) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
-    // another file system: copy, then delete the original
-    FILE* in = std::fopen(a.c_str(), "rb");
-    if (!in) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
-    FILE* out = std::fopen(b.c_str(), "wb");
-    if (!out) { Explorer2::Compat::SetErrorFromErrno(); std::fclose(in); return FALSE; }
-    char buf[65536];
-    bool ok = true;
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (std::fwrite(buf, 1, n, out) != n) { ok = false; break; }
-    }
-    if (std::ferror(in)) ok = false;
-    std::fclose(in);
-    if (std::fclose(out) != 0) ok = false;
-    if (!ok) { Explorer2::Compat::SetErrorFromErrno(); ::unlink(b.c_str()); return FALSE; }
-    ::unlink(a.c_str());
+    // Another file system: copy, then delete the original. As on Windows, a copy whose original cannot be deleted
+    // still counts as done.
+    const DWORD err = Explorer2::Compat::CopyForMove(a, b, stSrc, (flags & MOVEFILE_REPLACE_EXISTING) != 0);
+    if (err != 0) { SetLastError(err); return FALSE; }
+    (void)::unlink(a.c_str());
     return TRUE;
 }
 
@@ -1384,11 +1663,89 @@ struct WIN32_FIND_DATAW {
 };
 
 namespace Explorer2::Compat {
+// ---- Network and FUSE mount points -----------------------------------------------------------------------------
+// A folder listing must not stat the mount point of a network or FUSE file system, nor follow a link into one: when
+// its server stops answering (a NAS switched off), that stat waits for minutes, and so does the window that lists
+// /mnt, /media/<user> or a home folder with a link to the NAS.
+inline bool IsRemoteMountType(const char* type) {
+    static const char* const kTypes[] = { "nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "ceph", "glusterfs", "afs",
+                                          "coda", "ncpfs", "lustre", "gpfs", "beegfs", "davfs", "sshfs", "fuse" };
+    for (const char* t : kTypes) {
+        if (std::strcmp(type, t) == 0) return true;
+    }
+    return std::strncmp(type, "fuse.", 5) == 0;      // sshfs, rclone, gvfsd-fuse, s3fs... ("fuseblk" is a local disk)
+}
+
+// A /proc/self/mounts field: a space, tab, newline or backslash in it is written as an octal escape ("\040")
+inline std::string DecodeMountsField(const char* s) {
+    std::string out;
+    for (size_t i = 0; s[i] != '\0'; ++i) {
+        if (s[i] == '\\' && s[i + 1] >= '0' && s[i + 1] <= '3' && s[i + 2] >= '0' && s[i + 2] <= '7' &&
+            s[i + 3] >= '0' && s[i + 3] <= '7') {
+            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+// The mount points of network and FUSE file systems, read from /proc/self/mounts at most every 2 seconds (reading
+// that file never waits for a server)
+inline std::vector<std::string> RemoteMountPoints() {
+    static std::mutex s_mutex;
+    static std::vector<std::string> s_points;
+    static bool s_loaded = false;
+    static std::chrono::steady_clock::time_point s_readAt;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(s_mutex);
+    if (!s_loaded || now - s_readAt > std::chrono::seconds(2)) {
+        s_points.clear();
+        if (FILE* f = std::fopen("/proc/self/mounts", "re")) {
+            char line[4096];
+            while (std::fgets(line, sizeof(line), f)) {
+                char* save = nullptr;
+                const char* device = ::strtok_r(line, " \t\n", &save);
+                const char* where = device ? ::strtok_r(nullptr, " \t\n", &save) : nullptr;
+                const char* type = where ? ::strtok_r(nullptr, " \t\n", &save) : nullptr;
+                if (type && IsRemoteMountType(type)) s_points.push_back(DecodeMountsField(where));
+            }
+            std::fclose(f);
+        }
+        s_loaded = true;
+        s_readAt = now;
+    }
+    return s_points;
+}
+
+// Whether a path is one of those mount points (*isMountPoint) or lies inside one. Only the text is compared:
+// nothing is looked up on disk.
+inline bool IsUnderRemoteMount(const std::string& nativePath, const std::vector<std::string>& points, bool* isMountPoint) {
+    if (isMountPoint) *isMountPoint = false;
+    for (const auto& p : points) {
+        if (p.size() < 2 || nativePath.size() < p.size() || nativePath.compare(0, p.size(), p) != 0) continue;
+        if (nativePath.size() == p.size()) {
+            if (isMountPoint) *isMountPoint = true;
+            return true;
+        }
+        if (nativePath[p.size()] == '/') return true;
+    }
+    return false;
+}
+
 struct FindState : HandleBase {
     FindState() : HandleBase(HandleKind::Find) {}
     DIR* dir = nullptr;
     std::string dirNative;
     std::wstring mask;
+    bool remoteFs = false;    // the folder is on a network or FUSE file system
+    std::vector<std::string> remoteMounts;    // network / FUSE mount points when the listing started
+    mutable std::string dirResolved;          // the folder as a canonical path, compared with those mount points
+    mutable bool dirResolvedKnown = false;    // worked out only when an entry has a mount point's name
+    bool exact = false;       // the mask names one item (no '*' or '?'): it is looked up by exactly that name
+    bool exactDone = false;
+    int exactErrno = 0;       // why that lookup failed, when it was not simply "no such item"
 };
 
 inline bool WildcardMatch(const wchar_t* mask, const wchar_t* name) {
@@ -1406,47 +1763,144 @@ inline bool WildcardMatch(const wchar_t* mask, const wchar_t* name) {
     return false;
 }
 
+// Whether the folder entry nativeName is a network share's mount point (looked at without a stat). The folder's
+// canonical path is worked out only for an entry whose name is the last part of such a mount point.
+inline bool IsRemoteMountEntry(const FindState& st, const char* nativeName) {
+    if (st.remoteMounts.empty()) return false;
+    bool leafMatches = false;
+    for (const auto& p : st.remoteMounts) {
+        const size_t slash = p.find_last_of('/');
+        if (slash != std::string::npos && p.compare(slash + 1, std::string::npos, nativeName) == 0) {
+            leafMatches = true;
+            break;
+        }
+    }
+    if (!leafMatches) return false;
+    if (!st.dirResolvedKnown) {
+        char resolved[PATH_MAX];
+        st.dirResolved = ::realpath(st.dirNative.c_str(), resolved) ? std::string(resolved) : st.dirNative;
+        while (st.dirResolved.size() > 1 && st.dirResolved.back() == '/') st.dirResolved.pop_back();
+        st.dirResolvedKnown = true;
+    }
+    bool isMountPoint = false;
+    const std::string entry = (st.dirResolved == "/" ? std::string() : st.dirResolved) + "/" + nativeName;
+    return IsUnderRemoteMount(entry, st.remoteMounts, &isMountPoint) && isMountPoint;
+}
+
+// Fills *data for the entry nativeName of the listed folder. lst: its lstat, or null when that failed.
+inline void FillFindEntry(const FindState& st, int dfd, const char* nativeName, const std::wstring& name,
+                          const struct stat* lst, WIN32_FIND_DATAW* data) {
+    std::memset(data, 0, sizeof(*data));
+    const std::string full = st.dirNative + "/" + nativeName;
+    if (IsRemoteMountEntry(st, nativeName)) {
+        // The mount point of a network share: shown as a folder without asking its server anything
+        data->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+    } else if (lst) {
+        DWORD attrs = 0;
+        uint64_t sz = static_cast<uint64_t>(lst->st_size);
+        if (S_ISLNK(lst->st_mode)) {
+            attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
+            data->dwReserved0 = IO_REPARSE_TAG_SYMLINK;
+            // A link into a network share is not followed (its target is only known as text then)
+            bool intoShare = false, toMountPoint = false;
+            if (!st.remoteMounts.empty()) {
+                char target[PATH_MAX];
+                const ssize_t len = (dfd >= 0) ? ::readlinkat(dfd, nativeName, target, sizeof(target) - 1)
+                                               : ::readlink(full.c_str(), target, sizeof(target) - 1);
+                if (len > 0 && target[0] == '/') {
+                    std::string t(target, static_cast<size_t>(len));
+                    while (t.size() > 1 && t.back() == '/') t.pop_back();
+                    intoShare = IsUnderRemoteMount(t, st.remoteMounts, &toMountPoint);
+                }
+            }
+            if (intoShare) {
+                if (toMountPoint) attrs |= FILE_ATTRIBUTE_DIRECTORY;
+            } else {
+                struct stat tst = {};
+                if (((dfd >= 0) ? ::fstatat(dfd, nativeName, &tst, 0) : ::stat(full.c_str(), &tst)) == 0) {
+                    if (S_ISDIR(tst.st_mode)) attrs |= FILE_ATTRIBUTE_DIRECTORY;
+                    else sz = static_cast<uint64_t>(tst.st_size);
+                }
+            }
+        } else if (S_ISDIR(lst->st_mode)) {
+            attrs |= FILE_ATTRIBUTE_DIRECTORY;
+            if ((lst->st_mode & 0200) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+        } else {
+            if ((lst->st_mode & 0222) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
+            if (IsSparseStat(*lst)) attrs |= FILE_ATTRIBUTE_SPARSE_FILE;
+        }
+        data->dwFileAttributes = attrs ? attrs : FILE_ATTRIBUTE_NORMAL;
+        data->nFileSizeHigh = static_cast<DWORD>(sz >> 32);
+        data->nFileSizeLow = static_cast<DWORD>(sz & 0xFFFFFFFFu);
+        data->ftLastWriteTime = FileTimeFromTimespec(lst->st_mtim);
+        // On a network or FUSE file system each extended attribute read is one more round trip per entry, so
+        // the listing takes the creation time from memory or the modification time there. On a local disk the
+        // attribute is read, because the copy engine takes creation times from these listings and would lose
+        // the ones kept in it.
+        data->ftCreationTime = GetInodeCreationTime(st.remoteFs ? nullptr : full.c_str(), *lst);
+        data->ftLastAccessTime = FileTimeFromTimespec(lst->st_atim);
+    } else {
+        data->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    }
+    if (nativeName[0] == '.' && std::strcmp(nativeName, ".") != 0 && std::strcmp(nativeName, "..") != 0) {
+        data->dwFileAttributes = (data->dwFileAttributes & ~static_cast<DWORD>(FILE_ATTRIBUTE_NORMAL)) | FILE_ATTRIBUTE_HIDDEN;
+    }
+    const size_t n = (name.size() < MAX_PATH - 1) ? name.size() : MAX_PATH - 1;
+    std::wmemcpy(data->cFileName, name.data(), n);
+    data->cFileName[n] = L'\0';
+}
+
 inline bool NextMatch(FindState& st, WIN32_FIND_DATAW* data) {
+    const int dfd = ::dirfd(st.dir);
+    if (st.exact) {
+        // A name without wildcards is looked up as it is written. On Linux "file.txt" and "File.txt" are two
+        // different items, and whichever one readdir returned first must not stand in for the one asked for.
+        if (st.exactDone) return false;
+        st.exactDone = true;
+        std::string nativeName;
+        EncodeUtf8(st.mask.data(), st.mask.size(), nativeName);
+        if (!nativeName.empty() && nativeName.find('/') == std::string::npos) {
+            if (IsRemoteMountEntry(st, nativeName.c_str())) {
+                FillFindEntry(st, dfd, nativeName.c_str(), st.mask, nullptr, data);
+                return true;
+            }
+            struct stat lst = {};
+            if (((dfd >= 0) ? ::fstatat(dfd, nativeName.c_str(), &lst, AT_SYMLINK_NOFOLLOW)
+                            : ::lstat((st.dirNative + "/" + nativeName).c_str(), &lst)) == 0) {
+                FillFindEntry(st, dfd, nativeName.c_str(), st.mask, &lst, data);
+                return true;
+            }
+            if (errno != ENOENT && errno != EILSEQ) {
+                st.exactErrno = errno;
+                return false;
+            }
+        }
+        // A name stored in another encoding than UTF-8 is found by its decoded form, still case by case
+        while (dirent* e = ::readdir(st.dir)) {
+            std::wstring name;
+            DecodeUtf8(e->d_name, std::strlen(e->d_name), name, false);
+            if (name != st.mask) continue;
+            struct stat lst = {};
+            const bool ok = ((dfd >= 0) ? ::fstatat(dfd, e->d_name, &lst, AT_SYMLINK_NOFOLLOW)
+                                        : ::lstat((st.dirNative + "/" + e->d_name).c_str(), &lst)) == 0;
+            FillFindEntry(st, dfd, e->d_name, name, ok ? &lst : nullptr, data);
+            return true;
+        }
+        return false;
+    }
     while (dirent* e = ::readdir(st.dir)) {
         std::wstring name;
         DecodeUtf8(e->d_name, std::strlen(e->d_name), name, false);
         if (!WildcardMatch(st.mask.c_str(), name.c_str())) continue;
-        std::memset(data, 0, sizeof(*data));
-        const std::string full = st.dirNative + "/" + e->d_name;
-        struct stat lst = {};
-        if (::lstat(full.c_str(), &lst) == 0) {
-            DWORD attrs = 0;
-            uint64_t sz = static_cast<uint64_t>(lst.st_size);
-            if (S_ISLNK(lst.st_mode)) {
-                attrs |= FILE_ATTRIBUTE_REPARSE_POINT;
-                data->dwReserved0 = IO_REPARSE_TAG_SYMLINK;
-                struct stat tst = {};
-                if (::stat(full.c_str(), &tst) == 0) {
-                    if (S_ISDIR(tst.st_mode)) attrs |= FILE_ATTRIBUTE_DIRECTORY;
-                    else sz = static_cast<uint64_t>(tst.st_size);
-                }
-            } else if (S_ISDIR(lst.st_mode)) {
-                attrs |= FILE_ATTRIBUTE_DIRECTORY;
-                if ((lst.st_mode & 0200) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
-            } else {
-                if ((lst.st_mode & 0222) == 0) attrs |= FILE_ATTRIBUTE_READONLY;
-                if (IsSparseStat(lst)) attrs |= FILE_ATTRIBUTE_SPARSE_FILE;
-            }
-            if (e->d_name[0] == '.' && std::strcmp(e->d_name, ".") != 0 && std::strcmp(e->d_name, "..") != 0) {
-                attrs |= FILE_ATTRIBUTE_HIDDEN;
-            }
-            data->dwFileAttributes = attrs ? attrs : FILE_ATTRIBUTE_NORMAL;
-            data->nFileSizeHigh = static_cast<DWORD>(sz >> 32);
-            data->nFileSizeLow = static_cast<DWORD>(sz & 0xFFFFFFFFu);
-            data->ftLastWriteTime = FileTimeFromTimespec(lst.st_mtim);
-            data->ftCreationTime = GetInodeCreationTime(full.c_str(), lst);
-            data->ftLastAccessTime = FileTimeFromTimespec(lst.st_atim);
-        } else {
-            data->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        if (IsRemoteMountEntry(st, e->d_name)) {
+            FillFindEntry(st, dfd, e->d_name, name, nullptr, data);
+            return true;
         }
-        const size_t n = (name.size() < MAX_PATH - 1) ? name.size() : MAX_PATH - 1;
-        std::wmemcpy(data->cFileName, name.data(), n);
-        data->cFileName[n] = L'\0';
+        // Looked up relative to the open folder, so the whole path is not walked again for every entry
+        struct stat lst = {};
+        const bool ok = ((dfd >= 0) ? ::fstatat(dfd, e->d_name, &lst, AT_SYMLINK_NOFOLLOW)
+                                    : ::lstat((st.dirNative + "/" + e->d_name).c_str(), &lst)) == 0;
+        FillFindEntry(st, dfd, e->d_name, name, ok ? &lst : nullptr, data);
         return true;
     }
     return false;
@@ -1462,12 +1916,17 @@ inline HANDLE FindFirstFileW(const wchar_t* pattern, WIN32_FIND_DATAW* data) {
     auto* st = new Explorer2::Compat::FindState();
     st->mask = (sep == std::wstring::npos) ? p : p.substr(sep + 1);
     if (st->mask == L"*.*") st->mask = L"*";
+    st->exact = !st->mask.empty() && st->mask.find_first_of(L"*?") == std::wstring::npos;
     st->dirNative = Explorer2::Compat::NativePath(dir.c_str());
     st->dir = ::opendir(st->dirNative.c_str());
+    if (st->dir) {
+        st->remoteFs = Explorer2::Compat::IsRemoteFileSystem(::dirfd(st->dir));
+        st->remoteMounts = Explorer2::Compat::RemoteMountPoints();
+    }
     if (!st->dir || !Explorer2::Compat::NextMatch(*st, data)) {
         if (st->dir) {
             ::closedir(st->dir);
-            SetLastError(ERROR_FILE_NOT_FOUND);
+            SetLastError(st->exactErrno ? Explorer2::Compat::Win32ErrorFromErrno(st->exactErrno) : ERROR_FILE_NOT_FOUND);
         } else {
             Explorer2::Compat::SetErrorFromErrno();
         }
@@ -1501,14 +1960,27 @@ inline BOOL CloseHandle(HANDLE h) {
     case Explorer2::Compat::HandleKind::File: {
         auto* fh = static_cast<Explorer2::Compat::FileHandle*>(b);
         Explorer2::Compat::UnregisterOpenFile(fh);
-        bool ok = true;
-        if (fh->f) ok = (std::fclose(fh->f) == 0);
-        if (fh->dirFd >= 0) ok = (::close(fh->dirFd) == 0) && ok;
+        DWORD err = 0;
+        if (fh->f) {
+            // The last buffered data is written here. If that, or any write before it, failed, the file is not
+            // what the caller wrote, and CloseHandle says so.
+            Explorer2::Compat::FlushHandleStream(fh);
+            if (std::fclose(fh->f) != 0) {
+                const DWORD e = Explorer2::Compat::Win32ErrorFromErrno(errno);
+                err = e ? e : ERROR_GEN_FAILURE;
+            }
+        }
+        if (fh->dirFd >= 0 && ::close(fh->dirFd) != 0 && err == 0) {
+            const DWORD e = Explorer2::Compat::Win32ErrorFromErrno(errno);
+            err = e ? e : ERROR_GEN_FAILURE;
+        }
+        if (fh->writeFailed) err = fh->writeError;      // the first failure is the one to report
         if (fh->deleteOnClose && !fh->nativePath.empty()) {
             (void)::unlink(fh->nativePath.c_str());
         }
         delete fh;
-        return ok ? TRUE : FALSE;
+        if (err != 0) { SetLastError(err); return FALSE; }
+        return TRUE;
     }
     case Explorer2::Compat::HandleKind::Mapping: {
         auto* m = static_cast<Explorer2::Compat::MappingHandle*>(b);

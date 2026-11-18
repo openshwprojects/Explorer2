@@ -8,10 +8,12 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <errno.h>
+#include <cstring>
 #include <fstream>
 #include <poll.h>
 #include <sstream>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #endif
 
@@ -51,6 +53,9 @@ struct Probe {
     ULONGLONG tick = 0;              // when the answer came
     DWORD error = NO_ERROR;
     std::wstring remote;             // what a mapped drive points at ("\\server\share"), for the message
+#ifndef _WIN32
+    std::wstring detail;             // the C library's words for a failed probe of a mount (the Win32 layer has none)
+#endif
 };
 
 struct State {
@@ -106,9 +111,127 @@ bool SplitUnc(const std::wstring& path, std::wstring& server, std::wstring& shar
     return !server.empty();
 }
 
-// What is asked: the share's top folder, or the top of a mapped drive
+#ifndef _WIN32
+// One line of /proc/self/mounts
+struct MountEntry {
+    std::string device;
+    std::string mountPoint;
+    std::string fsType;
+};
+
+// /proc/self/mounts writes a space, tab, newline or backslash inside a field as a backslash and three octal digits
+// ("/mnt/Moje\040Dokumenty"); this turns such a field back into the real text
+std::string DecodeMountField(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() &&
+            s[i + 1] >= '0' && s[i + 1] <= '3' &&
+            s[i + 2] >= '0' && s[i + 2] <= '7' &&
+            s[i + 3] >= '0' && s[i + 3] <= '7') {
+            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+std::vector<MountEntry> ReadMounts() {
+    std::vector<MountEntry> out;
+    std::ifstream mf("/proc/self/mounts");
+    std::string line;
+    while (std::getline(mf, line)) {
+        std::istringstream iss(line);
+        std::string dev, mnt, fstype;
+        if (!(iss >> dev >> mnt >> fstype)) continue;
+        out.push_back(MountEntry{ DecodeMountField(dev), DecodeMountField(mnt), fstype });
+    }
+    return out;
+}
+
+// The mount table for IsNetworkPath, which runs on the window's thread at every navigation: read again at most every
+// 2 s. Reading it never waits for a server, unlike stat() on a path below a mount whose server is gone.
+std::shared_ptr<const std::vector<MountEntry>> CachedMounts() {
+    static std::mutex mutex;
+    static std::shared_ptr<const std::vector<MountEntry>> mounts;
+    static ULONGLONG readTick = 0;
+    std::lock_guard<std::mutex> lk(mutex);
+    const ULONGLONG now = GetTickCount64();
+    if (!mounts || now - readTick >= 2000) {
+        mounts = std::make_shared<std::vector<MountEntry>>(ReadMounts());
+        readTick = now;
+    }
+    return mounts;
+}
+
+// File systems on another machine: a folder on one is asked in the background before the window opens it, like a UNC
+// path, because stat() or a listing there waits for the server (forever for a hard NFS mount whose server is gone)
+bool IsNetworkFsType(const std::string& fsType) {
+    static const char* const kTypes[] = {
+        "cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs", "davfs", "sshfs",
+        "afs", "coda", "ncpfs", "lustre", "gpfs", "beegfs",
+        "fuse.sshfs", "fuse.rclone", "fuse.gvfsd-fuse", "fuse.s3fs", "fuse.curlftpfs", "fuse.smbnetfs",
+        "fuse.glusterfs", "fuse.ceph-fuse"
+    };
+    for (const char* t : kTypes) {
+        if (fsType == t) return true;
+    }
+    return false;
+}
+
+// Length of "/run/user/<uid>/gvfs" at the start of the path (followed by '/' or by nothing), or 0. gvfs, GNOME's
+// network places, shows every share it has opened as one folder in there.
+size_t GvfsRootLength(const std::string& path) {
+    static const std::string kRunUser = "/run/user/";
+    if (path.compare(0, kRunUser.size(), kRunUser) != 0) return 0;
+    size_t i = kRunUser.size();
+    while (i < path.size() && path[i] >= '0' && path[i] <= '9') ++i;
+    if (i == kRunUser.size()) return 0;
+    static const std::string kGvfs = "/gvfs";
+    if (path.compare(i, kGvfs.size(), kGvfs) != 0) return 0;
+    i += kGvfs.size();
+    return (i == path.size() || path[i] == '/') ? i : 0;
+}
+
+// For a path on a network mount: the folder whose answer says whether the server answers, which is the mount point
+// (for gvfs, the folder of that one share). Empty for any other path. Only the cached mount table is read, never the
+// path itself, so this does not wait for a server.
+std::string NetworkMountTarget(const std::wstring& path) {
+    const std::string native = Compat::NativePath(path.c_str());
+    if (native.empty() || native[0] != '/') return {};
+    std::string p;                                      // "/mnt//nas/" as "/mnt/nas", to compare with mount points
+    p.reserve(native.size());
+    for (const char c : native) {
+        if (c == '/' && !p.empty() && p.back() == '/') continue;
+        p.push_back(c);
+    }
+    if (p.size() > 1 && p.back() == '/') p.pop_back();
+    if (const size_t gvfsEnd = GvfsRootLength(p)) {
+        return p.substr(0, p.find('/', gvfsEnd + 1));   // "/run/user/1000/gvfs/smb-share:server=nas,share=x"
+    }
+    const std::shared_ptr<const std::vector<MountEntry>> mounts = CachedMounts();
+    const MountEntry* best = nullptr;
+    for (const MountEntry& m : *mounts) {
+        const std::string& mp = m.mountPoint;
+        const bool covers = mp == "/" || p == mp ||
+                            (p.size() > mp.size() && p.compare(0, mp.size(), mp) == 0 && p[mp.size()] == '/');
+        // ">=": of two file systems mounted on the same folder, the later line is the one in use
+        if (covers && (!best || mp.size() >= best->mountPoint.size())) best = &m;
+    }
+    if (!best || !IsNetworkFsType(best->fsType)) return {};
+    return best->mountPoint;
+}
+#endif
+
+// What is asked: the share's top folder, or the top of a mapped drive (on Linux: the network mount the path is on)
 std::wstring ProbeTarget(const std::wstring& path) {
     if (IsUncPath(path)) return ShareRoot(path);
+#ifndef _WIN32
+    const std::string mount = NetworkMountTarget(path);
+    if (!mount.empty()) return PathUtils::Utf8ToWide(mount);
+#endif
     if (path.size() >= 2 && path[1] == L':') return std::wstring{ static_cast<wchar_t>(std::towupper(path[0])), L':', L'\\' };
     return {};
 }
@@ -125,15 +248,13 @@ struct LinuxMountShare {
 
 std::vector<LinuxMountShare> EnumerateLinuxNetworkMounts() {
     std::vector<LinuxMountShare> out;
-    std::ifstream mf("/proc/self/mounts");
-    std::string line;
-    while (std::getline(mf, line)) {
-        std::istringstream iss(line);
-        std::string dev, mnt, fstype;
-        if (!(iss >> dev >> mnt >> fstype)) continue;
+    // Escapes decoded: "//nas/Moje Dokumenty" on "/mnt/Moje Dokumenty", not "/mnt/Moje\040Dokumenty"
+    for (const MountEntry& m : ReadMounts()) {
+        const std::string& dev = m.device;
+        const std::string& fstype = m.fsType;
         if (fstype != "cifs" && fstype != "smb3" && fstype != "smbfs" && fstype != "nfs" && fstype != "nfs4") continue;
         LinuxMountShare ms;
-        ms.mountPoint = mnt;
+        ms.mountPoint = m.mountPoint;
         ms.fsType = fstype;
         if (dev.size() > 2 && dev[0] == '/' && dev[1] == '/') {
             const size_t sl = dev.find('/', 2);
@@ -227,6 +348,29 @@ DWORD ProbeUncServerTcpLinux(const std::wstring& server, int timeoutMs) {
     ::close(fd);
     return ERROR_BAD_NETPATH;
 }
+
+// Asks a network mount whether its server answers. statvfs() goes to the server (NFS FSSTAT, SMB QUERY_FS_INFO, the
+// FUSE daemon), while stat() may be answered from the attribute cache for a minute after the server went away. It runs
+// on StartProbe's own thread, so a hard NFS mount whose server is gone only leaves that thread waiting. Errors that
+// mean "no answer" become codes IsNoAnswer knows; detail gets the C library's words for the error.
+DWORD ProbeMountPoint(const std::string& nativePath, std::wstring& detail) {
+    struct statvfs vfs = {};
+    if (::statvfs(nativePath.c_str(), &vfs) == 0) return NO_ERROR;
+    const int e = errno;
+    detail = PathUtils::Utf8ToWide(std::strerror(e));
+    switch (e) {
+    case ETIMEDOUT: return ERROR_SEM_TIMEOUT;
+    case EHOSTUNREACH: return ERROR_HOST_UNREACHABLE;
+    case EHOSTDOWN: return ERROR_HOST_DOWN;
+    case ENETUNREACH: return ERROR_NETWORK_UNREACHABLE;
+    case ENETDOWN: return ERROR_NO_NETWORK;
+    case ECONNREFUSED: return ERROR_CONNECTION_REFUSED;
+    case ECONNABORTED: case ECONNRESET: return ERROR_CONNECTION_ABORTED;
+    case ENOTCONN: case ESTALE: return ERROR_NETNAME_DELETED;   // a FUSE daemon that died, a share that went away
+    case EIO: return ERROR_UNEXP_NET_ERR;                        // e.g. a soft NFS mount whose server did not answer
+    default: return Compat::Win32ErrorFromErrno(e);
+    }
+}
 #endif
 
 void StartProbe(const std::shared_ptr<State>& st, const std::wstring& key, const std::wstring& target) {
@@ -240,6 +384,7 @@ void StartProbe(const std::shared_ptr<State>& st, const std::wstring& key, const
         }
 #ifndef _WIN32
         DWORD err = NO_ERROR;
+        std::wstring detail;
         std::wstring server, share;
         if (SplitUnc(target, server, share)) {
             bool foundMount = false;
@@ -255,6 +400,8 @@ void StartProbe(const std::shared_ptr<State>& st, const std::wstring& key, const
             if (!foundMount) {
                 err = ProbeUncServerTcpLinux(server, 1200);
             }
+        } else if (!target.empty() && target[0] == L'/') {
+            err = ProbeMountPoint(Compat::NativePath(target.c_str()), detail);   // a network mount (ProbeTarget)
         } else {
             const DWORD attrs = GetFileAttributesW(target.c_str());
             err = (attrs == INVALID_FILE_ATTRIBUTES) ? GetLastError() : NO_ERROR;
@@ -271,6 +418,9 @@ void StartProbe(const std::shared_ptr<State>& st, const std::wstring& key, const
             p.error = err;
             p.tick = GetTickCount64();
             p.remote = remote;
+#ifndef _WIN32
+            p.detail = detail;
+#endif
             notify = st->notify;
         }
         st->cv.notify_all();
@@ -285,6 +435,10 @@ std::wstring NoAnswerMessage(const std::wstring& target, const Probe& p, Lang la
         what = std::wstring(pl ? L"dyskiem sieciowym " : L"the network drive ") + target.substr(0, 2);
         if (!p.remote.empty()) what += L" (" + p.remote + L")";
     }
+#ifndef _WIN32
+    // The Win32 layer has no text for network error codes ("System error"); the C library's words say what happened
+    if (!p.detail.empty()) return std::wstring(pl ? L"Brak połączenia z " : L"No connection to ") + what + L": " + p.detail;
+#endif
     return std::wstring(pl ? L"Brak połączenia z " : L"No connection to ") + what + L": " + ErrorText(p.error);
 }
 
@@ -373,6 +527,11 @@ bool IsServerRoot(const std::wstring& path) { return IsUncServerRoot(path); }
 
 bool IsNetworkPath(const std::wstring& path) {
     if (IsUncPath(path)) return true;
+#ifndef _WIN32
+    // A folder on an NFS / SMB / sshfs / gvfs ... mount: the window asks its server in the background first, as for a
+    // UNC path, instead of calling stat() on it and freezing when the server is gone
+    if (!NetworkMountTarget(path).empty()) return true;
+#endif
     if (path.size() < 2 || path[1] != L':') return false;
     const wchar_t root[4] = { path[0], L':', L'\\', 0 };
     return GetDriveTypeW(root) == DRIVE_REMOTE;           // the drive's type is known locally: no network wait

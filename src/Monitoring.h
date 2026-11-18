@@ -116,9 +116,9 @@ public:
     // Entry point of the hidden recorder process (`Explorer2.exe --monitor-daemon`). Returns when stopped.
     static int Run();
 
-    static bool IsRunning();                              // named mutex probe, works across processes / integrity levels
+    static bool IsRunning();                              // named mutex probe (a lock file on Linux), works across processes / integrity levels
     static bool Start(bool elevated);                     // spawns the recorder unless one is already running
-    static void RequestStop();                            // signals the running recorder to exit
+    static void RequestStop();                            // signals the running recorder to exit (SIGTERM on Linux)
 
     // 0 = off, 1 = HKCU Run key, 2 = scheduled task with highest privileges (recorder runs as administrator)
     static int AutostartMode();

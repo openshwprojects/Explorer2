@@ -4,6 +4,9 @@
 #include "AppLog.h"
 #ifndef _WIN32
 #include "ToolProcess.h"
+#include <set>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 #include <algorithm>
 #include <chrono>
@@ -76,6 +79,95 @@ bool AreFileTimesClose(const FILETIME& a, const FILETIME& b) {
     // 2 seconds in 100-ns intervals (20,000,000) to tolerate FAT32/exFAT/SMB timestamp granularity
     return diff <= 20000000ULL;
 }
+
+#ifndef _WIN32
+// Linux: whether a local backup target can be reached, asked the slow way. Runs on a probe thread only
+// (CachedTargetState): on an NFS or SMB mount whose server does not answer it waits for minutes.
+bool ProbeTargetBlocking(const std::wstring& clean) {
+    DWORD attrs = GetFileAttributesW(clean.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return true;
+    // A target folder that does not exist yet is made by the backup: the folder above it that exists counts
+    std::wstring par = PathUtils::GetParentPath(clean);
+    while (!par.empty()) {
+        const DWORD pAttrs = GetFileAttributesW(par.c_str());
+        if (pAttrs != INVALID_FILE_ATTRIBUTES && (pAttrs & FILE_ATTRIBUTE_DIRECTORY)) return true;
+        std::wstring next = PathUtils::GetParentPath(par);
+        if (next == par) break;
+        par = std::move(next);
+    }
+    return false;
+}
+
+struct TargetProbeCache {
+    struct Entry {
+        bool known = false;     // a probe has answered
+        bool online = false;
+        bool running = false;   // a probe thread is asking now
+        ULONGLONG tick = 0;     // when the last answer came
+    };
+    std::mutex mutex;
+    std::map<std::wstring, Entry> entries;
+};
+
+TargetProbeCache& GetTargetProbeCache() {
+    // Never destroyed: a probe thread that waits for a dead server may outlive everything else
+    static TargetProbeCache* const s_cache = new TargetProbeCache();
+    return *s_cache;
+}
+
+// Linux: the target's state as the last probe found it, without waiting. Returns whether any probe has
+// answered yet (outOnline is false until then). A probe thread is started when there is no answer or the
+// answer is five seconds old, one at a time per target.
+bool CachedTargetState(const std::wstring& targetPath, bool& outOnline) {
+    outOnline = false;
+    const std::wstring clean = TrimWs(targetPath);
+    if (clean.empty() || clean.find(L"://") != std::wstring::npos) return true;    // known: never available
+    if (BackupManager::IsRcloneRemoteSyntax(clean)) {
+        outOnline = BackupManager::IsRcloneInstalled();
+        return true;
+    }
+    if (clean[0] != L'/') return true;     // not a path on this machine (a "C:\..." left from Windows)
+
+    TargetProbeCache& cache = GetTargetProbeCache();
+    bool known = false;
+    bool startProbe = false;
+    {
+        std::lock_guard<std::mutex> lk(cache.mutex);
+        if (cache.entries.size() > 512) {
+            for (auto it = cache.entries.begin(); it != cache.entries.end(); ) {
+                if (it->second.running) ++it;
+                else it = cache.entries.erase(it);
+            }
+        }
+        TargetProbeCache::Entry& e = cache.entries[clean];
+        known = e.known;
+        outOnline = e.online;
+        if (!e.running && (!e.known || GetTickCount64() - e.tick >= 5000ULL)) {
+            e.running = true;
+            startProbe = true;
+        }
+    }
+    if (startProbe) {
+        try {
+            std::thread([clean]() {
+                const bool online = ProbeTargetBlocking(clean);
+                TargetProbeCache& c = GetTargetProbeCache();
+                std::lock_guard<std::mutex> lk(c.mutex);
+                TargetProbeCache::Entry& e = c.entries[clean];
+                e.known = true;
+                e.online = online;
+                e.running = false;
+                e.tick = GetTickCount64();
+            }).detach();
+        } catch (...) {
+            // No thread could be started: the next call tries again
+            std::lock_guard<std::mutex> lk(cache.mutex);
+            cache.entries[clean].running = false;
+        }
+    }
+    return known;
+}
+#endif
 
 } // namespace
 
@@ -196,7 +288,13 @@ bool BackupManager::LoadJobs(const std::wstring& iniPathIn) {
         j.lastStatus = buf;
         j.lastRunOk = GetPrivateProfileIntW(sec, L"LastRunOk", 1, path.c_str()) != 0;
         j.lastFilesCopied = static_cast<uint32_t>(GetPrivateProfileIntW(sec, L"LastFilesCopied", 0, path.c_str()));
+#ifndef _WIN32
+        // Only what a probe has found so far (this runs on the window's thread); TickScheduler takes the
+        // first answer as the starting state
+        j.targetStateKnown = CachedTargetState(j.targetPath, j.targetCurrentlyOnline);
+#else
         j.targetCurrentlyOnline = IsTargetAvailable(j.targetPath);
+#endif
         j.targetWasOnline = j.targetCurrentlyOnline;
         m_jobs.push_back(std::move(j));
     }
@@ -262,7 +360,11 @@ int BackupManager::AddJob(const BackupJob& jobIn) {
         j.id = assignedId;
         if (j.lastRunTimeStr.empty()) j.lastRunTimeStr = L"Nigdy";
         if (j.lastStatus.empty()) j.lastStatus = L"Gotowe";
+#ifndef _WIN32
+        j.targetStateKnown = CachedTargetState(j.targetPath, j.targetCurrentlyOnline);   // never waits
+#else
         j.targetCurrentlyOnline = IsTargetAvailable(j.targetPath);
+#endif
         j.targetWasOnline = j.targetCurrentlyOnline;
         m_jobs.push_back(std::move(j));
     }
@@ -441,6 +543,11 @@ bool BackupManager::IsRcloneInstalled(std::wstring* outVersion) {
 }
 
 bool BackupManager::IsTargetAvailable(const std::wstring& targetPath) {
+#ifndef _WIN32
+    bool online = false;
+    (void)CachedTargetState(targetPath, online);     // never waits (see the declaration)
+    return online;
+#else
     std::wstring clean = TrimWs(targetPath);
     if (clean.empty() || clean.find(L"://") != std::wstring::npos) return false;
     if (IsRcloneRemoteSyntax(clean)) {
@@ -472,20 +579,6 @@ bool BackupManager::IsTargetAvailable(const std::wstring& targetPath) {
         std::wstring driveRoot = clean.substr(0, 2) + L"\\";
         DWORD rootAttrs = GetFileAttributesW(driveRoot.c_str());
         online = (rootAttrs != INVALID_FILE_ATTRIBUTES && (rootAttrs & FILE_ATTRIBUTE_DIRECTORY));
-#ifndef _WIN32
-    } else if (!clean.empty() && clean[0] == L'/') {
-        std::wstring par = PathUtils::GetParentPath(clean);
-        while (!par.empty()) {
-            DWORD pAttrs = GetFileAttributesW(par.c_str());
-            if (pAttrs != INVALID_FILE_ATTRIBUTES && (pAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
-                online = true;
-                break;
-            }
-            std::wstring next = PathUtils::GetParentPath(par);
-            if (next == par) break;
-            par = std::move(next);
-        }
-#endif
     }
 
     {
@@ -494,6 +587,7 @@ bool BackupManager::IsTargetAvailable(const std::wstring& targetPath) {
         s_availCache[key] = { GetTickCount64(), online };
     }
     return online;
+#endif
 }
 
 std::wstring BackupManager::BuildRcloneCommandLine(const BackupJob& job, bool dryRun) {
@@ -624,17 +718,87 @@ BackupSyncResult BackupManager::ExecuteJobSync(const BackupJob& job, bool dryRun
         return res;
     }
 
-    auto syncRecursive = [&](auto& self, const std::wstring& curSrc, const std::wstring& curDst, const std::wstring& relPrefix) -> void {
-        std::wstring searchPattern = curSrc + L"\\*";
+    // The tree is walked with a stack of open listings kept on the heap, in the same order as a recursive
+    // walk (a folder is gone through completely where it is met), so that its depth never depends on the
+    // size of the worker thread's stack.
+    struct SyncFolder {
+        HANDLE hFind = INVALID_HANDLE_VALUE;
         WIN32_FIND_DATAW fd = {};
-        HANDLE hFind = FindFirstFileExW(searchPattern.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-        if (hFind == INVALID_HANDLE_VALUE) return;
+        bool fdUnread = true;           // fd holds the entry FindFirstFileExW gave, not handled yet
+        std::wstring src;
+        std::wstring dst;
+        std::wstring rel;
+    };
+    std::vector<SyncFolder> stack;
+    auto openFolder = [&](const std::wstring& curSrc, const std::wstring& curDst, const std::wstring& relPrefix) {
+        SyncFolder folder;
+        std::wstring searchPattern = curSrc + L"\\*";
+        folder.hFind = FindFirstFileExW(searchPattern.c_str(), FindExInfoBasic, &folder.fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (folder.hFind == INVALID_HANDLE_VALUE) return;
+        folder.src = curSrc;
+        folder.dst = curDst;
+        folder.rel = relPrefix;
+        stack.push_back(std::move(folder));
+    };
 
-        do {
+#ifndef _WIN32
+    // Linux: the walk never leaves the source's file system (a USB disk or a network share mounted inside
+    // is not part of it), never follows a link (a link back up the tree, such as ~/.wine/dosdevices/z: -> /,
+    // would copy the whole disk again and again) and enters each folder once, however it is reached
+    const MountFence fence(srcRoot);
+    std::set<std::pair<uint64_t, uint64_t>> visitedFolders;
+    {
+        struct stat rootSt = {};
+        if (::stat(Explorer2::Compat::NativePath(srcRoot.c_str()).c_str(), &rootSt) == 0) {
+            visitedFolders.insert({ static_cast<uint64_t>(rootSt.st_dev), static_cast<uint64_t>(rootSt.st_ino) });
+        }
+    }
+    // A link (to a file or to a folder) is backed up as a link with the same target text
+    auto backUpLink = [&](const std::wstring& fullSrc, const std::wstring& fullDst, const std::wstring& curDst,
+                          const std::wstring& relPath) {
+        const std::string srcNative = Explorer2::Compat::NativePath(fullSrc.c_str());
+        const std::string dstNative = Explorer2::Compat::NativePath(fullDst.c_str());
+        auto linkText = [](const std::string& path, std::string& out) -> bool {
+            char buf[4096];
+            const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf));
+            if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) return false;
+            out.assign(buf, static_cast<size_t>(n));
+            return true;
+        };
+        std::string srcText, dstText;
+        if (!linkText(srcNative, srcText)) return;      // gone, or a target text too long to compare: not copied
+        if (linkText(dstNative, dstText) && dstText == srcText) {
+            ++res.filesSkipped;
+        } else if (dryRun) {
+            ++res.filesCopied;
+            if (res.transferredFiles.size() < 64) res.transferredFiles.push_back(relPath);
+        } else {
+            EnsureDirectoryHierarchy(curDst);
+            if (CopyFileExW(fullSrc.c_str(), fullDst.c_str(), nullptr, nullptr, nullptr, COPY_FILE_COPY_SYMLINK)) {
+                ++res.filesCopied;
+                if (res.transferredFiles.size() < 64) res.transferredFiles.push_back(relPath);
+            }
+        }
+    };
+#endif
+
+    openFolder(srcRoot, dstRoot, L"");
+    while (!stack.empty()) {
+        SyncFolder& top = stack.back();
+        if (!top.fdUnread && !FindNextFileW(top.hFind, &top.fd)) {
+            FindClose(top.hFind);
+            stack.pop_back();
+            continue;
+        }
+        top.fdUnread = false;
+        // `top` and `fd` stay valid up to openFolder below, which may move the folders on the stack
+        const WIN32_FIND_DATAW& fd = top.fd;
+        {
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-            std::wstring relPath = relPrefix.empty() ? fd.cFileName : (relPrefix + L"/" + fd.cFileName);
-            std::wstring fullSrc = curSrc + L"\\" + fd.cFileName;
-            std::wstring fullDst = curDst + L"\\" + fd.cFileName;
+            std::wstring relPath = top.rel.empty() ? std::wstring(fd.cFileName) : (top.rel + L"/" + fd.cFileName);
+            std::wstring fullSrc = top.src + L"\\" + fd.cFileName;
+            std::wstring fullDst = top.dst + L"\\" + fd.cFileName;
+            const std::wstring& curDst = top.dst;
 
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 // Skip whole directory if excluded by pattern (e.g. ".git/*" or "node_modules/*")
@@ -642,12 +806,45 @@ BackupSyncResult BackupManager::ExecuteJobSync(const BackupJob& job, bool dryRun
                     ++res.filesFilteredOut;
                     continue;
                 }
-                self(self, fullSrc, fullDst, relPath);
+#ifndef _WIN32
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                    backUpLink(fullSrc, fullDst, curDst, relPath);
+                    continue;
+                }
+                bool cannotTell = false;
+                if (fence.IsMountRoot(fullSrc, &cannotTell)) {
+                    if (!cannotTell) {
+                        ++res.filesFilteredOut;
+                        AppLog::Info(L"Backup", L"Not entered, another file system is mounted there: " + fullSrc);
+                    }
+                    continue;   // a folder that cannot even be checked (gone, no access) is not entered either
+                }
+                struct stat dirSt = {};
+                if (::lstat(Explorer2::Compat::NativePath(fullSrc.c_str()).c_str(), &dirSt) != 0 ||
+                    !visitedFolders.insert({ static_cast<uint64_t>(dirSt.st_dev), static_cast<uint64_t>(dirSt.st_ino) }).second) {
+                    continue;   // gone, or already backed up under another name
+                }
+#endif
+                openFolder(fullSrc, fullDst, relPath);   // the last use of `top` and `fd` in this round
+                continue;
             } else {
                 if (!MatchesFilterRules(relPath, job.includeFilter, job.excludeFilter)) {
                     ++res.filesFilteredOut;
                     continue;
                 }
+#ifndef _WIN32
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                    backUpLink(fullSrc, fullDst, curDst, relPath);
+                    continue;
+                }
+                struct stat fileSt = {};
+                if (::lstat(Explorer2::Compat::NativePath(fullSrc.c_str()).c_str(), &fileSt) != 0 || !S_ISREG(fileSt.st_mode)) {
+                    // A FIFO would block the copy forever (nothing writes to it), and a socket or a device node
+                    // holds no data to back up
+                    ++res.filesFilteredOut;
+                    continue;
+                }
+#endif
 
                 uint64_t srcSize = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
                 bool needsCopy = true;
@@ -675,12 +872,8 @@ BackupSyncResult BackupManager::ExecuteJobSync(const BackupJob& job, bool dryRun
                     }
                 }
             }
-        } while (FindNextFileW(hFind, &fd));
-
-        FindClose(hFind);
-    };
-
-    syncRecursive(syncRecursive, srcRoot, dstRoot, L"");
+        }
+    }
     res.ok = true;
 
     wchar_t summary[256] = {};
@@ -750,7 +943,20 @@ void BackupManager::TickScheduler(uint64_t nowEpochSec) {
     {
         std::lock_guard<std::mutex> lk(m_mutex);
         for (auto& j : m_jobs) {
+#ifndef _WIN32
+            // Only the cached answer of the probe thread is read here (CachedTargetState): the target is never
+            // asked on this thread. Until a probe has answered, the job waits. The first answer is the state
+            // the job starts from, so a target that is simply there when the program starts does not count as
+            // one that has just become available.
+            bool online = false;
+            if (!CachedTargetState(j.targetPath, online)) continue;
+            if (!j.targetStateKnown) {
+                j.targetStateKnown = true;
+                j.targetWasOnline = online;
+            }
+#else
             bool online = IsTargetAvailable(j.targetPath);
+#endif
             std::wstring reason;
             if (ShouldAutoRunJob(j, nowEpochSec, online, &reason) && triggerJobId == 0) {
                 triggerJobId = j.id;

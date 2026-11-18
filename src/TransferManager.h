@@ -206,11 +206,13 @@ public:
     static bool DeleteTreeNow(const std::wstring& path, std::vector<TransferFileError>* outErrors = nullptr);
 
     // Paths the delete engine refuses outright: empty or relative paths, anything with "." or ".." in it,
-    // whole drives ("C:\") and network share roots ("\\server\share").
+    // whole drives ("C:\") and network share roots ("\\server\share"); on Linux also "/" and every mount
+    // point (deleting one would empty the file system mounted there).
     static bool IsDeleteRefused(const std::wstring& path);
 
     // True when Windows has no Recycle Bin for this path's volume (network shares "\\server\share\...",
-    // mapped network drives like "Z:\" with DRIVE_REMOTE, RAM disks, optical media).
+    // mapped network drives like "Z:\" with DRIVE_REMOTE, RAM disks, optical media). On Linux: the path is
+    // on a network or FUSE file system, or on another file system than the user's trash folder.
     static bool PathHasNoRecycleBin(const std::wstring& path);
 
     // Self-test hook: wait this long before each deleted item, so pause and cancel can be tested mid-run
@@ -285,6 +287,9 @@ private:
         FILETIME     lastWriteTime = {};
         DWORD        attributes = 0;
         bool         done = false;   // Delete jobs: the folder has been removed
+#ifndef _WIN32
+        bool         dstCreated = false;   // Copy and move jobs: this job made dstPath (it gets the source's mode)
+#endif
     };
 
     struct InternalJob;

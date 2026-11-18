@@ -98,6 +98,7 @@ private:
 
     // Rendering sections
     void DrawRibbon(const D2D1_RECT_F& rect);
+    void FinishRibbonBody(size_t firstHit, const D2D1_RECT_F& body);
     void DrawNavBar(const D2D1_RECT_F& rect);
     void DrawTreePane(const D2D1_RECT_F& rect);
     void DrawMainContent(const D2D1_RECT_F& rect);
@@ -350,6 +351,10 @@ private:
     Lang m_lang = Lang::PL;
     RibbonTab m_activeRibbonTab = RibbonTab::Home;
     bool m_ribbonCollapsed = false;
+    // A window narrower than the active tab's buttons (e.g. on a 1024 x 768 screen) scrolls the ribbon body sideways
+    float m_ribbonScrollX = 0.0f;
+    float m_ribbonContentW = 0.0f;          // width of the active tab's buttons, measured at the last paint
+    RibbonTab m_ribbonScrollTab = RibbonTab::Home;
     ViewMode m_viewMode = ViewMode::Details;
     ViewMode m_lastNonViewerMode = ViewMode::Details;
     bool m_showPreviewPane = false;

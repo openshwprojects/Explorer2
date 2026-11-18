@@ -16,11 +16,17 @@
 #include <cwctype>
 #ifndef _WIN32
 #include "ToolProcess.h"
+#include <cstdlib>
+#include <fcntl.h>
 #include <fstream>
 #include <poll.h>
 #include <sstream>
+#include <sys/file.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
 #endif
 
 #pragma comment(lib, "shell32.lib")
@@ -63,6 +69,7 @@ struct LinuxMountInfo {
     uint64_t freeBytes = 0;
     bool isNetwork = false;
     bool isOptical = false;
+    bool probeAsync = false;    // the size comes from FileEngine::ProbeLinuxMountAsync, not from here
 };
 
 std::string UnescapeProcMountField(const std::string& s) {
@@ -116,15 +123,20 @@ std::vector<LinuxMountInfo> EnumerateLinuxMounts(Lang lang) {
         mi.mountPoint = PathUtils::Utf8ToWide(mnt);
         mi.fsType = PathUtils::Utf8ToWide(fsType);
         mi.device = PathUtils::Utf8ToWide(dev);
-        mi.isNetwork = (fsType == "cifs" || fsType == "smb3" || fsType == "nfs" || fsType == "nfs4" ||
-                        fsType == "sshfs" || fsType == "fuse.sshfs");
+        mi.isNetwork = LinuxMounts::IsNetworkFsType(fsType);
         mi.isOptical = (fsType == "iso9660" || fsType == "udf");
 
-        struct statvfs vfs = {};
-        if (::statvfs(mnt.c_str(), &vfs) == 0) {
-            const uint64_t bsz = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
-            mi.totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsz;
-            mi.freeBytes  = static_cast<uint64_t>(vfs.f_bavail) * bsz;
+        // statvfs() waits for the server of a network mount, and for the program behind a FUSE mount, for
+        // as long as they take, up to forever. This runs on the window's thread (Ten komputer, the folder
+        // tree), so such mounts are asked on a probe thread instead and show no size until it answers.
+        mi.probeAsync = mi.isNetwork || fsType == "fuse" || fsType == "fuseblk" || fsType.rfind("fuse.", 0) == 0;
+        if (!mi.probeAsync) {
+            struct statvfs vfs = {};
+            if (::statvfs(mnt.c_str(), &vfs) == 0) {
+                const uint64_t bsz = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+                mi.totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsz;
+                mi.freeBytes  = static_cast<uint64_t>(vfs.f_bavail) * bsz;
+            }
         }
 
         if (mnt == "/") {
@@ -225,7 +237,186 @@ bool ParseFreeDesktopTrashInfo(const std::vector<uint8_t>& raw, RecycleBinRecord
     return !outRecord.originalPath.empty();
 }
 
+// "used / total" as the folder tree shows it next to a mount
+std::wstring LinuxDriveBadge(uint64_t usedBytes, uint64_t totalBytes) {
+    if (totalBytes == 0) return L"";
+    wchar_t buf[64] = {};
+    if (totalBytes >= (1ULL << 40)) {
+        swprintf_s(buf, L"%.1f / %.1f TB",
+            static_cast<double>(usedBytes) / static_cast<double>(1ULL << 40),
+            static_cast<double>(totalBytes) / static_cast<double>(1ULL << 40));
+    } else if (totalBytes >= (10ULL << 30)) {
+        swprintf_s(buf, L"%llu / %llu GB",
+            static_cast<unsigned long long>((usedBytes + (1ULL << 29)) >> 30),
+            static_cast<unsigned long long>((totalBytes + (1ULL << 29)) >> 30));
+    } else if (totalBytes >= (1ULL << 30)) {
+        swprintf_s(buf, L"%.1f / %.1f GB",
+            static_cast<double>(usedBytes) / static_cast<double>(1ULL << 30),
+            static_cast<double>(totalBytes) / static_cast<double>(1ULL << 30));
+    } else {
+        swprintf_s(buf, L"%llu / %llu MB",
+            static_cast<unsigned long long>((usedBytes + (1ULL << 19)) >> 20),
+            static_cast<unsigned long long>((totalBytes + (1ULL << 19)) >> 20));
+    }
+    return buf;
+}
+
+// "/a//b/" -> "/a/b", as the mount table spells paths ("/" stays "/")
+std::string CollapseSlashes(const std::string& path) {
+    std::string out;
+    out.reserve(path.size());
+    for (const char ch : path) {
+        if (ch == '/' && !out.empty() && out.back() == '/') continue;
+        out.push_back(ch);
+    }
+    while (out.size() > 1 && out.back() == '/') out.pop_back();
+    return out;
+}
+
+std::string RealPathOr(const std::string& path) {
+    char* real = ::realpath(path.c_str(), nullptr);
+    if (!real) return path;
+    std::string out = CollapseSlashes(real);
+    std::free(real);
+    return out;
+}
+
+// One line of /proc/self/mountinfo per mount:
+// "36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue"
+std::vector<LinuxMounts::Mount> ReadMountInfo() {
+    std::vector<LinuxMounts::Mount> out;
+    std::ifstream f("/proc/self/mountinfo");
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        std::string mountId, parentId, devNumbers, root, mountPoint;
+        if (!(iss >> mountId >> parentId >> devNumbers >> root >> mountPoint)) continue;
+        std::string token, fsType, source;
+        while (iss >> token) {
+            if (token == "-") {
+                iss >> fsType >> source;
+                break;
+            }
+        }
+        unsigned devMajor = 0, devMinor = 0;
+        if (std::sscanf(devNumbers.c_str(), "%u:%u", &devMajor, &devMinor) != 2) continue;
+        LinuxMounts::Mount m;
+        m.mountPoint = UnescapeProcMountField(mountPoint);
+        m.fsType = fsType;
+        m.source = UnescapeProcMountField(source);
+        m.device = static_cast<uint64_t>(makedev(devMajor, devMinor));
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
 } // namespace
+
+namespace LinuxMounts {
+
+std::shared_ptr<const std::vector<Mount>> Current() {
+    struct Cache {
+        std::mutex mutex;
+        std::shared_ptr<const std::vector<Mount>> table;
+        ULONGLONG tick = 0;
+    };
+    // Never destroyed: walker and probe threads may still ask while the process ends
+    static Cache* const s_cache = new Cache();
+    const ULONGLONG now = GetTickCount64();
+    std::lock_guard<std::mutex> lk(s_cache->mutex);
+    if (!s_cache->table || now - s_cache->tick >= 1000) {
+        s_cache->table = std::make_shared<std::vector<Mount>>(ReadMountInfo());
+        s_cache->tick = now;
+    }
+    return s_cache->table;
+}
+
+bool IsNetworkFsType(const std::string& fsType) {
+    static const char* const kNetworkTypes[] = {
+        "nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "9p", "ceph", "glusterfs", "lustre",
+        "davfs", "sshfs", "vboxsf", "vmhgfs", "virtiofs", "fuse"
+    };
+    for (const char* t : kNetworkTypes) {
+        if (fsType == t) return true;
+    }
+    return fsType.rfind("fuse.", 0) == 0;   // sshfs, rclone, gvfs, s3fs, ... (but not "fuseblk": a local disk)
+}
+
+const Mount* FindByDevice(const std::vector<Mount>& mounts, uint64_t device) {
+    const Mount* found = nullptr;
+    for (const auto& m : mounts) {
+        if (m.device == device) found = &m;
+    }
+    return found;
+}
+
+} // namespace LinuxMounts
+
+MountFence::MountFence(const std::wstring& rootDir) {
+    m_rootNative = CollapseSlashes(Explorer2::Compat::NativePath(rootDir.c_str()));
+    if (m_rootNative.empty()) return;
+    struct stat lst = {};
+    m_rootIsFolder = ::lstat(m_rootNative.c_str(), &lst) == 0 && S_ISDIR(lst.st_mode);
+    // The walk lists what the root names (a link to a folder is followed there), so its device is the target's
+    struct stat st = {};
+    if (::stat(m_rootNative.c_str(), &st) == 0) {
+        m_rootDevice = static_cast<uint64_t>(st.st_dev);
+        m_rootKnown = true;
+    }
+    m_rootReal = RealPathOr(m_rootNative);
+    const std::string prefix = (m_rootReal == "/") ? std::string("/") : (m_rootReal + "/");
+    const auto mounts = LinuxMounts::Current();
+    for (const auto& m : *mounts) {
+        if (m.mountPoint.size() > prefix.size() && m.mountPoint.compare(0, prefix.size(), prefix) == 0) {
+            m_mountsBelow.insert(m.mountPoint);
+        }
+    }
+}
+
+bool MountFence::IsMountRoot(const std::wstring& childPath, bool* outCannotTell) const {
+    if (outCannotTell) *outCannotTell = false;
+    const std::string native = CollapseSlashes(Explorer2::Compat::NativePath(childPath.c_str()));
+    struct stat st = {};
+    if (!m_rootKnown || ::lstat(native.c_str(), &st) != 0) {
+        if (outCannotTell) *outCannotTell = true;
+        return true;
+    }
+    if (static_cast<uint64_t>(st.st_dev) != m_rootDevice) return true;   // another file system
+    if (m_mountsBelow.empty()) return false;
+    // A bind mount of a folder of the same file system has the same device: the mount table tells. The walk
+    // never follows a link, so the real path of a folder in it is the root's real path plus the rest.
+    std::string canonical = native;
+    const size_t n = m_rootNative.size();
+    if (m_rootNative != "/" && native.size() > n && native.compare(0, n, m_rootNative) == 0 && native[n] == '/') {
+        canonical = m_rootReal + native.substr(n);
+    }
+    return m_mountsBelow.count(canonical) != 0;
+}
+
+bool MountFence::IsMountPoint(const std::wstring& path) {
+    const std::string native = CollapseSlashes(Explorer2::Compat::NativePath(path.c_str()));
+    if (native.empty() || native[0] != '/') return false;
+    if (native == "/") return true;
+    const size_t slash = native.find_last_of('/');
+    const std::string parent = (slash == 0) ? std::string("/") : native.substr(0, slash);
+    // The mount table first: it answers without touching the mounted file system, whose server may not answer
+    // (a stat of a switched-off NAS's mount point waits for minutes, and the window with it). The folder that
+    // holds the mount point is resolved, not the mount point itself.
+    const std::string realParent = RealPathOr(parent);
+    const std::string leaf = native.substr(slash + 1);
+    const std::string canonical = (realParent == "/") ? ("/" + leaf) : (realParent + "/" + leaf);
+    {
+        const auto mounts = LinuxMounts::Current();
+        for (const auto& m : *mounts) {
+            if (m.mountPoint == canonical || m.mountPoint == native) return true;
+        }
+    }
+    struct stat st = {};
+    if (::lstat(native.c_str(), &st) != 0 || S_ISLNK(st.st_mode)) return false;
+    struct stat pst = {};
+    if (::lstat(parent.c_str(), &pst) == 0 && pst.st_dev != st.st_dev) return true;   // another file system
+    return false;
+}
 #endif
 
 // Reads HKCU\Network\<Letter>\RemotePath in <0.005ms without touching the network!
@@ -293,6 +484,66 @@ void FileEngine::ProbeNetworkDriveAsync(wchar_t driveLetter) {
         }
     }).detach();
 }
+
+#ifndef _WIN32
+void FileEngine::ProbeLinuxMountAsync(const std::wstring& mountPoint) {
+    {
+        std::lock_guard<std::mutex> lk(m_net->mutex);
+        NetDriveInfo& info = m_net->mounts[mountPoint];
+        // One probe at a time per mount, so a server that never answers holds one thread and not one per
+        // visit; asked again after a while, so a share that comes back (or goes away) is shown as it is now
+        if (info.running || (info.probed && GetTickCount64() - info.tick < 30000)) {
+            return;
+        }
+        info.running = true;
+    }
+
+    // The thread works on the shared block only, never on the engine itself (see NetDriveState)
+    HWND notifyHwnd = m_notifyHwnd;
+    const std::string native = Explorer2::Compat::NativePath(mountPoint.c_str());
+    try {
+        std::thread([state = m_net, mountPoint, native, notifyHwnd]() {
+            struct statvfs vfs = {};
+            const bool ok = (::statvfs(native.c_str(), &vfs) == 0);
+            uint64_t totalBytes = 0, freeBytes = 0;
+            if (ok) {
+                const uint64_t bsz = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+                totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsz;
+                freeBytes = static_cast<uint64_t>(vfs.f_bavail) * bsz;
+            }
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lk(state->mutex);
+                NetDriveInfo& info = state->mounts[mountPoint];
+                changed = !info.probed || info.online != ok || info.totalBytes != totalBytes || info.freeBytes != freeBytes;
+                info.probed = true;
+                info.online = ok;
+                info.totalBytes = totalBytes;
+                info.freeBytes = freeBytes;
+                info.running = false;
+                info.tick = GetTickCount64();
+            }
+            if (changed && notifyHwnd && state->wanted) {
+                PostMessageW(notifyHwnd, WM_APP_FOLDER_SIZE_UPDATED, 0, 0);
+            }
+        }).detach();
+    } catch (...) {
+        // No thread could be started: the next visit tries again
+        std::lock_guard<std::mutex> lk(m_net->mutex);
+        m_net->mounts[mountPoint].running = false;
+    }
+}
+
+bool FileEngine::GetProbedMountSize(const std::wstring& mountPoint, uint64_t& outTotal, uint64_t& outFree, bool& outOnline) const {
+    std::lock_guard<std::mutex> lk(m_net->mutex);
+    auto it = m_net->mounts.find(mountPoint);
+    if (it == m_net->mounts.end() || !it->second.probed) return false;
+    outOnline = it->second.online;
+    outTotal = it->second.online ? it->second.totalBytes : 0;
+    outFree = it->second.online ? it->second.freeBytes : 0;
+    return true;
+}
+#endif
 
 std::wstring FileEngine::MappedNetworkDriveLabel(wchar_t driveLetter, Lang lang) {
     return GetMappedNetworkDriveLabel(driveLetter, lang);
@@ -526,11 +777,23 @@ void FileEngine::Shutdown() {
         }
         m_extIconCv.notify_all();
         JoinServingCom(m_extIconThread);        // it may be inside a shell call (see ThreadUtils.h)
-        m_sizeGeneration.fetch_add(1);
-        m_searchGeneration.fetch_add(1);
-        m_watcherGeneration.fetch_add(1);
-        if (m_watcherWakeEvent) {
-            SetEvent(m_watcherWakeEvent);
+        // Each worker checks m_running and its generation under its own mutex before it waits. The changes
+        // are made under that mutex too, so a worker that has just found nothing to do either sees them or
+        // is already waiting and gets the wake-up: no wake-up is lost and no join below waits forever.
+        {
+            std::lock_guard<std::mutex> lock(m_sizeMutex);
+            m_sizeGeneration.fetch_add(1);
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_searchMutex);
+            m_searchGeneration.fetch_add(1);
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_watcherMutex);
+            m_watcherGeneration.fetch_add(1);
+            if (m_watcherWakeEvent) {
+                SetEvent(m_watcherWakeEvent);
+            }
         }
         m_sizeCv.notify_all();
         m_searchCv.notify_all();
@@ -585,21 +848,38 @@ void FileEngine::WatchDirectory(const std::wstring& dirPath) {
     }
     {
         std::lock_guard<std::mutex> lk(m_watcherMutex);
+#ifndef _WIN32
+        if (m_watchedDir == clean) {    // names that differ only in case are different folders here
+            return;
+        }
+#else
         if (_wcsicmp(m_watchedDir.c_str(), clean.c_str()) == 0) {
             return;
         }
+#endif
         m_watchedDir = clean;
         m_watcherGeneration.fetch_add(1);
-    }
-    if (m_watcherWakeEvent) {
-        SetEvent(m_watcherWakeEvent);
+        // Set while the mutex is held: the watcher resets the event under this mutex when it takes up the new
+        // generation, so it can never reset this wake-up first and then miss it (which stopped auto-refresh)
+        if (m_watcherWakeEvent) {
+            SetEvent(m_watcherWakeEvent);
+        }
     }
     m_watcherCv.notify_all();
 }
 
 void FileEngine::DirWatcherWorkerLoop() {
 #ifndef _WIN32
+    // Every message makes the window list the folder again and repaint, which is slow on a slow machine.
+    // So a change is reported once the folder has settled: after an event the loop waits until there has
+    // been kQuietMs without one (but no longer than kMaxDelayMs after the first), posts one message, and
+    // never posts more often than once per kMinGapMs. IN_MODIFY is not watched: a file being written (a
+    // download) changes nothing that the listing shows until it is closed (IN_CLOSE_WRITE) or renamed.
+    constexpr ULONGLONG kQuietMs = 300;
+    constexpr ULONGLONG kMaxDelayMs = 1500;
+    constexpr ULONGLONG kMinGapMs = 1000;
     uint64_t seenGen = 0;
+    ULONGLONG lastPostTick = 0;
     while (m_running) {
         std::wstring watchDir;
         {
@@ -620,16 +900,36 @@ void FileEngine::DirWatcherWorkerLoop() {
 
         const int wd = ::inotify_add_watch(
             ifd, nativeDir.c_str(),
-            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
+            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE | IN_ATTRIB |
+            IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR);
         if (wd < 0) {
             ::close(ifd);
             continue;
         }
 
         alignas(inotify_event) char buf[8192];
+        ULONGLONG firstEventTick = 0;   // 0: no change waits to be reported
+        ULONGLONG lastEventTick = 0;
+        bool watchEnded = false;        // the folder itself was deleted or moved away
         while (m_running && m_watcherGeneration.load() == seenGen) {
+            int timeoutMs = 100;        // the generation and m_running are looked at this often
+            if (firstEventTick != 0) {
+                const ULONGLONG now = GetTickCount64();
+                ULONGLONG due = std::min(lastEventTick + kQuietMs, firstEventTick + kMaxDelayMs);
+                if (lastPostTick != 0) due = std::max(due, lastPostTick + kMinGapMs);
+                if (now >= due) {
+                    if (m_notifyHwnd) PostMessageW(m_notifyHwnd, WM_APP_DIR_CHANGED, 0, 0);
+                    lastPostTick = now;
+                    firstEventTick = 0;
+                    continue;
+                }
+                timeoutMs = static_cast<int>(std::min<ULONGLONG>(due - now, 100));
+            } else if (watchEnded) {
+                break;                  // reported; nothing is left to watch until the next folder
+            }
+
             struct pollfd pfd = { ifd, POLLIN, 0 };
-            const int pr = ::poll(&pfd, 1, 100);
+            const int pr = ::poll(&pfd, 1, timeoutMs);
             if (!m_running || m_watcherGeneration.load() != seenGen) break;
             if (pr <= 0 || !(pfd.revents & POLLIN)) continue;
 
@@ -640,18 +940,24 @@ void FileEngine::DirWatcherWorkerLoop() {
                 ssize_t off = 0;
                 while (off + static_cast<ssize_t>(sizeof(inotify_event)) <= n) {
                     const auto* ev = reinterpret_cast<const inotify_event*>(buf + off);
-                    const char* nm = (ev->len > 0) ? ev->name : "";
-                    if (std::strncmp(nm, ".explorer2_undo", 15) != 0) {
+                    if (ev->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
+                        watchEnded = true;
                         relevantChange = true;
+                    } else if (ev->mask & IN_Q_OVERFLOW) {
+                        relevantChange = true;      // events were lost: assume something changed
+                    } else {
+                        const char* nm = (ev->len > 0) ? ev->name : "";
+                        if (std::strncmp(nm, ".explorer2_undo", 15) != 0) {
+                            relevantChange = true;
+                        }
                     }
                     off += static_cast<ssize_t>(sizeof(inotify_event)) + ev->len;
                 }
             }
             if (relevantChange) {
-                if (WaitForSingleObject(m_watcherWakeEvent, 250) == WAIT_TIMEOUT &&
-                    m_running && m_watcherGeneration.load() == seenGen && m_notifyHwnd) {
-                    PostMessageW(m_notifyHwnd, WM_APP_DIR_CHANGED, 0, 0);
-                }
+                const ULONGLONG now = GetTickCount64();
+                if (firstEventTick == 0) firstEventTick = now;
+                lastEventTick = now;
             }
         }
         ::inotify_rm_watch(ifd, wd);
@@ -851,6 +1157,7 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
     Lang lang)
 {
     std::vector<FileEntry> results;
+    m_lastEnumerateError.store(0);
 
     if (dirPath == L"THIS_PC" || dirPath.empty()) {
 #ifndef _WIN32
@@ -865,8 +1172,16 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
             entry.sysIconIndex = m_folderIconIndex;
             entry.name = mi.label;
             entry.displayName = mi.label;
-            entry.size = mi.totalBytes;
-            if (mi.totalBytes > 0) entry.sizeStr = FormatSizeDetailed(mi.totalBytes);
+            uint64_t totalBytes = mi.totalBytes;
+            if (mi.probeAsync) {
+                // Network and FUSE mounts: the size the probe thread found, none until it has answered
+                ProbeLinuxMountAsync(mi.mountPoint);
+                uint64_t freeBytes = 0;
+                bool online = false;
+                if (GetProbedMountSize(mi.mountPoint, totalBytes, freeBytes, online)) entry.isOffline = !online;
+            }
+            entry.size = totalBytes;
+            if (totalBytes > 0) entry.sizeStr = FormatSizeDetailed(totalBytes);
             entry.typeName = mi.isNetwork
                 ? ((lang == Lang::PL ? L"Udział sieciowy (" : L"Network Mount (") + mi.fsType + L")")
                 : (mi.isOptical
@@ -1212,6 +1527,7 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
 
     WIN32_FIND_DATAW ffd;
     HANDLE hFind = INVALID_HANDLE_VALUE;
+    DWORD findError = 0;
     // Fast-path: if cleanDir is a virtual archive path, skip the failed kernel FindFirstFileExW
     if (!ArchiveExplorer::IsVirtualArchivePath(cleanDir)) {
         hFind = FindFirstFileExW(
@@ -1221,11 +1537,15 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
             FindExSearchNameMatch,
             nullptr,
             FIND_FIRST_EX_LARGE_FETCH);
+        if (hFind == INVALID_HANDLE_VALUE) findError = GetLastError();
     }
 
     if (hFind == INVALID_HANDLE_VALUE) {
         std::wstring arcFile, innerDir;
-        if (ArchiveExplorer::SplitVirtualArchivePath(cleanDir, arcFile, innerDir)) {
+        if (!ArchiveExplorer::SplitVirtualArchivePath(cleanDir, arcFile, innerDir)) {
+            // Not inside an archive: the folder itself could not be listed (see LastEnumerateError)
+            m_lastEnumerateError.store(findError);
+        } else {
             std::vector<ArchiveItemEntry> arcChildren;
             if (ArchiveExplorer::EnumerateArchiveFolder(arcFile, innerDir, arcChildren)) {
                 results.reserve(arcChildren.size());
@@ -1490,30 +1810,18 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
         driveNode.isOpticalDrive = mi.isOptical;
         driveNode.hasChildren = true;
         driveNode.isExpanded = false;
-        driveNode.totalBytes = mi.totalBytes;
-        driveNode.freeBytes = mi.freeBytes;
-        driveNode.size = (mi.totalBytes >= mi.freeBytes) ? (mi.totalBytes - mi.freeBytes) : 0;
-        if (mi.totalBytes > 0) {
-            wchar_t buf[64] = {};
-            if (mi.totalBytes >= (1ULL << 40)) {
-                swprintf_s(buf, L"%.1f / %.1f TB",
-                    static_cast<double>(driveNode.size) / static_cast<double>(1ULL << 40),
-                    static_cast<double>(mi.totalBytes) / static_cast<double>(1ULL << 40));
-            } else if (mi.totalBytes >= (10ULL << 30)) {
-                swprintf_s(buf, L"%llu / %llu GB",
-                    static_cast<unsigned long long>((driveNode.size + (1ULL << 29)) >> 30),
-                    static_cast<unsigned long long>((mi.totalBytes + (1ULL << 29)) >> 30));
-            } else if (mi.totalBytes >= (1ULL << 30)) {
-                swprintf_s(buf, L"%.1f / %.1f GB",
-                    static_cast<double>(driveNode.size) / static_cast<double>(1ULL << 30),
-                    static_cast<double>(mi.totalBytes) / static_cast<double>(1ULL << 30));
-            } else {
-                swprintf_s(buf, L"%llu / %llu MB",
-                    static_cast<unsigned long long>((driveNode.size + (1ULL << 19)) >> 20),
-                    static_cast<unsigned long long>((mi.totalBytes + (1ULL << 19)) >> 20));
-            }
-            driveNode.sizeStr = buf;
+        uint64_t totalBytes = mi.totalBytes;
+        uint64_t freeBytes = mi.freeBytes;
+        if (mi.probeAsync) {
+            // Network and FUSE mounts: the size the probe thread found, none until it has answered
+            ProbeLinuxMountAsync(mi.mountPoint);
+            bool online = false;
+            if (GetProbedMountSize(mi.mountPoint, totalBytes, freeBytes, online)) driveNode.isOffline = !online;
         }
+        driveNode.totalBytes = totalBytes;
+        driveNode.freeBytes = freeBytes;
+        driveNode.size = (totalBytes >= freeBytes) ? (totalBytes - freeBytes) : 0;
+        driveNode.sizeStr = LinuxDriveBadge(driveNode.size, totalBytes);
         nodes.push_back(std::move(driveNode));
     }
 #else
@@ -1827,6 +2135,20 @@ std::wstring FileEngine::EnsureUndoSessionDir(const std::wstring& stagingRoot) {
             RemoveDirectoryW(session.dir.c_str());
             return L"";
         }
+#ifndef _WIN32
+        // Linux has no share modes: any process may delete an open file, and nothing removes the lock file
+        // of a process that crashed. The lock file is held with flock() for the whole session instead. The
+        // kernel drops that lock when the process ends, however it ends, and a sweep that cannot take it
+        // knows the session is alive (SweepStaleUndoStaging).
+        const int lockFd = Explorer2::Compat::FdOf(session.lock);
+        if (lockFd < 0 || ::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+            CloseHandle(session.lock);              // removes the lock file (FILE_FLAG_DELETE_ON_CLOSE)
+            RemoveDirectoryW(session.dir.c_str());
+            return L"";
+        }
+        // A program started from here must not inherit the descriptor and keep the session "alive"
+        (void)::fcntl(lockFd, F_SETFD, ::fcntl(lockFd, F_GETFD) | FD_CLOEXEC);
+#endif
         sessionDir = session.dir;
         m_undoSessions.emplace(stagingRoot, std::move(session));
     }
@@ -1849,6 +2171,16 @@ void FileEngine::QueueUndoSweep(const std::wstring& stagingRoot) {
 }
 
 void FileEngine::StartUndoStagingSweep() {
+#ifndef _WIN32
+    // Linux has one "drive", "/", but GetUndoStagingDirForPath picks the staging folder by the file system
+    // a path is on: ~/.cache for the one that holds the home folder, /tmp for the one that holds /tmp. Asking
+    // for "/" would give the /tmp folder whenever /home is a separate file system, and the folder that holds
+    // the copies of everything deleted in the home folder would never be swept. So both are queued here; a
+    // staging folder on any other file system is swept the first time it is used, like a removable drive.
+    const char* home = std::getenv("HOME");
+    if (home && *home) QueueUndoSweep(GetUndoStagingDirForPath(PathUtils::Utf8ToWide(home)));
+    QueueUndoSweep(GetUndoStagingDirForPath(L"/tmp"));
+#else
     wchar_t drives[512] = {};
     const DWORD len = GetLogicalDriveStringsW(static_cast<DWORD>(std::size(drives) - 1), drives);
     if (len == 0 || len >= std::size(drives)) return;
@@ -1857,6 +2189,7 @@ void FileEngine::StartUndoStagingSweep() {
         // so that starting the app never waits for a drive that is asleep or missing.
         if (GetDriveTypeW(d) == DRIVE_FIXED) QueueUndoSweep(GetUndoStagingDirForPath(d));
     }
+#endif
 }
 
 void FileEngine::UndoSweepWorkerLoop() {
@@ -1922,6 +2255,31 @@ size_t FileEngine::SweepStaleUndoStaging(const std::wstring& stagingRoot, const 
     for (const auto& c : candidates) {
         if (keepRunning && !keepRunning->load()) break;
         if (c.isSession) {
+#ifndef _WIN32
+            // A running session holds an flock() on its lock file (EnsureUndoSessionDir). Taking that lock
+            // here proves its owner has ended; it is kept while the folder is removed. A lock that cannot be
+            // taken (EWOULDBLOCK: a running Explorer2), or any other failure, means the session stays, as does
+            // a lock file this process holds open without delete sharing (opened the Windows way). No lock
+            // file at all means the owner ended before it could make one.
+            const std::string lockNative = Explorer2::Compat::NativePath((c.path + L"\\" + kUndoLockName).c_str());
+            const int lockFd = ::open(lockNative.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (lockFd < 0) {
+                if (errno != ENOENT) continue;
+            } else {
+                struct stat lockSt = {};
+                const bool heldHere = ::fstat(lockFd, &lockSt) == 0 &&
+                    Explorer2::Compat::IsDeleteBlockedByOpenHandle(static_cast<uint64_t>(lockSt.st_dev),
+                                                                   static_cast<uint64_t>(lockSt.st_ino));
+                if (heldHere || ::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+                    ::close(lockFd);
+                    continue;
+                }
+                const bool sessionRemoved = DeletePathPermanently(c.path);
+                ::close(lockFd);
+                if (sessionRemoved) ++removed;
+                continue;
+            }
+#else
             // Abandoned means: the lock file is gone (its owner ended) or can be deleted (nobody holds it).
             // Any other answer, such as "in use" or "access denied", is treated as a live session.
             const std::wstring lockPath = c.path + L"\\" + kUndoLockName;
@@ -1931,6 +2289,7 @@ size_t FileEngine::SweepStaleUndoStaging(const std::wstring& stagingRoot, const 
                 const DWORD err = GetLastError();
                 if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) continue;
             }
+#endif
         }
         if (DeletePathPermanently(c.path)) ++removed;
     }
@@ -2040,7 +2399,7 @@ bool FileEngine::UndoLastDelete(std::wstring& outRestoredDir) {
                 if (isSameFile(backupPath, origPath)) {
                     restored = DeleteFileW(backupPath.c_str()) != FALSE;
                 } else {
-                    const size_t slash = origPath.find_last_of(L'\\');
+                    const size_t slash = origPath.find_last_of(L"\\/");   // Linux paths use '/'
                     size_t dot = origPath.find_last_of(L'.');
                     if (dot == std::wstring::npos || (slash != std::wstring::npos && dot <= slash + 1)) dot = origPath.size();
                     for (int n = 1; n < 100 && !restored; ++n) {
@@ -2695,12 +3054,26 @@ bool MergeDirectoriesRecursive(const std::wstring& srcDir, const std::wstring& d
     }
 
     bool allChildrenOk = true;
+#ifndef _WIN32
+    const MountFence fence(srcDir);
+#endif
     for (const auto& ffd : entries) {
         const std::wstring childName = ffd.cFileName;
         const std::wstring srcChild = PathUtils::EnsureTrailingSlash(srcDir) + childName;
         const std::wstring dstChild = PathUtils::EnsureTrailingSlash(dstDir) + childName;
         const bool isSrcDir = (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const bool isSrcReparse = (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+#ifndef _WIN32
+        // Another file system mounted in the folder (a USB disk, a network share, a bind mount) is not part
+        // of it: it is neither moved nor entered (the fallback below would move its files one by one) and
+        // stays where it is, reported as not merged
+        if (isSrcDir && !isSrcReparse && fence.IsMountRoot(srcChild)) {
+            outResult.failures.push_back({ srcChild, ERROR_NOT_SUPPORTED });
+            allChildrenOk = false;
+            continue;
+        }
+#endif
 
         const std::wstring extDstChild = ToExtendedPath(dstChild);
         const DWORD dstAttrs = GetFileAttributesW(extDstChild.c_str());
@@ -2886,13 +3259,21 @@ void FileEngine::OpenInClassicExplorer(const std::wstring& path, bool selectItem
 void FileEngine::OpenTerminalInFolder(const std::wstring& dirPath) {
     if (dirPath.empty() || IsVirtualFolder(dirPath)) return;
 #ifndef _WIN32
-    std::string dirUtf8 = Explorer2::Compat::NativePath(dirPath.c_str());
+    const DWORD dirAttrs = GetFileAttributesW(dirPath.c_str());
+    if (dirAttrs == INVALID_FILE_ATTRIBUTES || !(dirAttrs & FILE_ATTRIBUTE_DIRECTORY)) return;
+    // The terminal is started directly, with the folder as its working directory (CreateProcessW changes
+    // into lpCurrentDirectory before it starts the program). No shell is involved, so the folder's name is
+    // never read as a command, whatever quotes, "$(...)" or ";" it contains.
     for (const wchar_t* term : { L"x-terminal-emulator", L"gnome-terminal", L"konsole", L"xfce4-terminal", L"xterm" }) {
-        std::wstring exe = ToolProcess::FindExecutable(term, {});
-        if (!exe.empty()) {
-            std::string cmd = "cd \"" + dirUtf8 + "\" && \"" + PathUtils::WideToUtf8(exe) + "\" >/dev/null 2>&1 &";
-            const int rc = std::system(cmd.c_str());
-            (void)rc;
+        const std::wstring exe = ToolProcess::FindExecutable(term, {});
+        if (exe.empty()) continue;
+        std::wstring cmdLine = L"\"" + exe + L"\"";
+        STARTUPINFOW si = {};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(exe.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, 0, nullptr, dirPath.c_str(), &si, &pi)) {
+            if (pi.hThread) CloseHandle(pi.hThread);
+            if (pi.hProcess) CloseHandle(pi.hProcess);
             return;
         }
     }
@@ -2966,8 +3347,29 @@ bool FileEngine::HasAnyCachedFolderSizes(const std::vector<FileEntry>& entries) 
     return false;
 }
 
+#ifndef _WIN32
+void FileEngine::SyncProbedMountSizes(std::vector<FileEntry>& entries) {
+    // Linux network and FUSE mounts listed in Ten komputer: their size arrives from the probe thread
+    std::lock_guard<std::mutex> lk(m_net->mutex);
+    if (m_net->mounts.empty()) return;
+    for (auto& item : entries) {
+        if (!item.isDrive || item.fullPath.empty()) continue;
+        auto it = m_net->mounts.find(item.fullPath);
+        if (it == m_net->mounts.end() || !it->second.probed) continue;
+        item.isOffline = !it->second.online;
+        if (it->second.online && it->second.totalBytes > 0) {
+            item.size = it->second.totalBytes;
+            item.sizeStr = FormatSizeDetailed(it->second.totalBytes);
+        }
+    }
+}
+#endif
+
 void FileEngine::SyncDirectorySizes(std::vector<FileEntry>& entries) {
     m_sizeNotifyPending.store(false, std::memory_order_relaxed);
+#ifndef _WIN32
+    SyncProbedMountSizes(entries);
+#endif
     std::lock_guard<std::mutex> lock(m_sizeMutex);
     for (auto& item : entries) {
         if (!item.isDirectory || item.normKey.empty()) continue;
@@ -3009,6 +3411,23 @@ void FileEngine::SyncTreeNodeSizes(std::vector<TreeNode>& treeNodes) {
                 }
             }
         }
+#ifndef _WIN32
+        // 1b. Linux network and FUSE mounts: their size arrives from the probe thread (ProbeLinuxMountAsync)
+        if (!m_net->mounts.empty()) {
+            for (auto& node : treeNodes) {
+                if (!node.isDrive || node.path.empty()) continue;
+                auto it = m_net->mounts.find(node.path);
+                if (it == m_net->mounts.end() || !it->second.probed) continue;
+                node.isOffline = !it->second.online;
+                if (it->second.online && it->second.totalBytes > 0) {
+                    node.totalBytes = it->second.totalBytes;
+                    node.freeBytes = it->second.freeBytes;
+                    node.size = (node.totalBytes >= node.freeBytes) ? (node.totalBytes - node.freeBytes) : 0;
+                    node.sizeStr = LinuxDriveBadge(node.size, node.totalBytes);
+                }
+            }
+        }
+#endif
     }
 
     // 2. Sync folder sizes from m_folderSizeCache onto folder tree nodes
@@ -3109,6 +3528,14 @@ void FileEngine::RequestFolderSizes(const std::vector<FileEntry>& entries, bool 
     m_sizeCv.notify_all();
 }
 
+#ifndef _WIN32
+namespace {
+// The fence of the folder a size worker is measuring (each worker measures one folder at a time); set by
+// FolderSizeWorkerLoop around ComputeFolderSizeRecursive
+thread_local const MountFence* t_sizeWalkFence = nullptr;
+} // namespace
+#endif
+
 uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int depth, uint64_t generation, bool& outAborted) {
     if (!m_running || generation != m_sizeGeneration.load(std::memory_order_relaxed)) {
         outAborted = true;
@@ -3161,6 +3588,11 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
 
         if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             std::wstring childDir = prefix + name;
+#ifndef _WIN32
+            // Another file system mounted inside (a USB disk, a network share, a bind mount) is not part of
+            // this folder's size, and a share that does not answer would hold the measurement up forever
+            if (t_sizeWalkFence && t_sizeWalkFence->IsMountRoot(childDir)) continue;
+#endif
             uint64_t subBytes = ComputeFolderSizeRecursive(childDir, depth + 1, generation, outAborted);
             if (outAborted) break;
             totalBytes += subBytes;
@@ -3266,7 +3698,14 @@ void FileEngine::FolderSizeWorkerLoop() {
         }
 
         bool aborted = false;
+#ifndef _WIN32
+        const MountFence fence(task.path);
+        t_sizeWalkFence = &fence;
+#endif
         uint64_t totalBytes = ComputeFolderSizeRecursive(task.path, 0, task.generation, aborted);
+#ifndef _WIN32
+        t_sizeWalkFence = nullptr;
+#endif
 
         if (m_running && !aborted && task.generation == m_sizeGeneration.load(std::memory_order_relaxed)) {
             {

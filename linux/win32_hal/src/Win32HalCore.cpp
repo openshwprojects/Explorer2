@@ -38,6 +38,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <limits.h>
 #include <map>
 #include <memory>
@@ -459,6 +460,16 @@ DWORD FormatMessageW(DWORD, LPCVOID, DWORD dwMessageId, DWORD, LPWSTR lpBuffer, 
     case ERROR_FILE_EXISTS: case ERROR_ALREADY_EXISTS: msg = "File already exists"; break;
     case ERROR_DISK_FULL: msg = "No space left on device"; break;
     case ERROR_DIR_NOT_EMPTY: msg = "Directory not empty"; break;
+    case ERROR_INVALID_HANDLE: msg = "Invalid handle"; break;
+    case ERROR_NOT_SAME_DEVICE: msg = "Cannot move the item to a different file system"; break;
+    case ERROR_WRITE_FAULT: msg = "Write error"; break;
+    case ERROR_SHARING_VIOLATION: msg = "The file is in use"; break;
+    case ERROR_NOT_SUPPORTED: msg = "Operation not supported"; break;
+    case ERROR_INVALID_PARAMETER: msg = "Invalid argument"; break;
+    case ERROR_BROKEN_PIPE: msg = "Broken pipe"; break;
+    case ERROR_FILENAME_EXCED_RANGE: msg = "File name too long"; break;
+    case ERROR_CANCELLED: msg = "Operation cancelled"; break;
+    case ERROR_CANT_RESOLVE_FILENAME: msg = "Too many levels of symbolic links"; break;
     default: break;
     }
     std::wstring w = Explorer2::PathUtils::Utf8ToWide(msg);
@@ -473,13 +484,61 @@ BOOL SetThreadErrorMode(DWORD, LPDWORD lpOldMode) { if (lpOldMode) *lpOldMode = 
 LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER) { return nullptr; }
 BOOL IsBadReadPtr(const void* lp, UINT_PTR ucb) { return (lp == nullptr && ucb > 0) ? TRUE : FALSE; }
 
+namespace {
+// Reads a file of /proc or /sys whole (these never wait for a disk; the size limit is only a safety net)
+std::string ReadKernelTextFile(const std::string& path, size_t maxBytes = 65536) {
+    std::string out;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return out;
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        out.append(buf, static_cast<size_t>(n));
+        if (out.size() > maxBytes) break;
+    }
+    ::close(fd);
+    return out;
+}
+
+// The number after "Key:" on the line of /proc/meminfo that starts with it (the key given with its colon, so
+// that "Cached:" does not find "SwapCached:")
+bool MeminfoValueKb(const std::string& text, const char* key, uint64_t& outKb) {
+    const size_t keyLen = std::strlen(key);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        if (text.compare(pos, keyLen, key) == 0) {
+            outKb = std::strtoull(text.c_str() + pos + keyLen, nullptr, 10);
+            return true;
+        }
+        const size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    return false;
+}
+} // namespace
+
 BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX* lpBuffer) {
     if (!lpBuffer) return FALSE;
     struct sysinfo si = {};
     if (::sysinfo(&si) != 0) return FALSE;
     const uint64_t unit = si.mem_unit ? si.mem_unit : 1;
     lpBuffer->ullTotalPhys = static_cast<ULONGLONG>(si.totalram) * unit;
-    lpBuffer->ullAvailPhys = static_cast<ULONGLONG>(si.freeram + si.bufferram) * unit;
+    // MemAvailable is the kernel's estimate of what programs can still get without swapping: free memory plus the
+    // page cache and the kernel caches it can drop. Free plus buffers alone leaves the page cache out, and on a
+    // machine that has been up for a while that makes nearly all memory look used.
+    const std::string meminfo = ReadKernelTextFile("/proc/meminfo");
+    uint64_t availKb = 0, cachedKb = 0;
+    if (MeminfoValueKb(meminfo, "MemAvailable:", availKb)) {
+        lpBuffer->ullAvailPhys = static_cast<ULONGLONG>(availKb) * 1024ULL;
+    } else {
+        (void)MeminfoValueKb(meminfo, "Cached:", cachedKb);     // kernels before 3.14 have no MemAvailable
+        lpBuffer->ullAvailPhys = (static_cast<ULONGLONG>(si.freeram) + static_cast<ULONGLONG>(si.bufferram)) * unit +
+                                 static_cast<ULONGLONG>(cachedKb) * 1024ULL;
+    }
+    lpBuffer->ullAvailPhys = std::min(lpBuffer->ullAvailPhys, lpBuffer->ullTotalPhys);
     lpBuffer->ullTotalPageFile = lpBuffer->ullTotalPhys + static_cast<ULONGLONG>(si.totalswap) * unit;
     lpBuffer->ullAvailPageFile = lpBuffer->ullAvailPhys + static_cast<ULONGLONG>(si.freeswap) * unit;
     lpBuffer->ullTotalVirtual = lpBuffer->ullTotalPageFile;
@@ -574,13 +633,13 @@ BOOL CopyFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, LPPROGRESS_R
     if (!lpExistingFileName || !lpNewFileName) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     const std::string src = Explorer2::Compat::NativePath(lpExistingFileName);
     const std::string dst = Explorer2::Compat::NativePath(lpNewFileName);
-    struct stat stSrc = {}, stDst = {};
-    if (::lstat(src.c_str(), &stSrc) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    struct stat stLink = {}, stDst = {};
+    if (::lstat(src.c_str(), &stLink) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
     if ((dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) && ::lstat(dst.c_str(), &stDst) == 0) {
         SetLastError(ERROR_FILE_EXISTS);
         return FALSE;
     }
-    if ((dwCopyFlags & COPY_FILE_COPY_SYMLINK) && S_ISLNK(stSrc.st_mode)) {
+    if ((dwCopyFlags & COPY_FILE_COPY_SYMLINK) && S_ISLNK(stLink.st_mode)) {
         char linkTarget[PATH_MAX] = {};
         const ssize_t ln = ::readlink(src.c_str(), linkTarget, sizeof(linkTarget) - 1);
         if (ln < 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
@@ -588,10 +647,36 @@ BOOL CopyFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, LPPROGRESS_R
         if (::symlink(linkTarget, dst.c_str()) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
         return TRUE;
     }
-    const int fdIn = ::open(src.c_str(), O_RDONLY | O_CLOEXEC);
+    // Only regular files are copied: opening a FIFO waits for a writer, and a device or a socket has no content to
+    // copy. Checked by name first, so that a device is never even opened, then again on the open descriptor.
+    struct stat stTarget = {};
+    if (::stat(src.c_str(), &stTarget) != 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    if (!S_ISREG(stTarget.st_mode)) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
+    const int fdIn = ::open(src.c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
     if (fdIn < 0) { Explorer2::Compat::SetErrorFromErrno(); return FALSE; }
+    // Size, mode and times come from the file that was opened (through a link, the file it points to: the link's
+    // own size and mode 0777 made truncated copies)
+    struct stat stSrc = {};
+    if (::fstat(fdIn, &stSrc) != 0 || !S_ISREG(stSrc.st_mode)) {
+        ::close(fdIn);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+    const int inFlags = ::fcntl(fdIn, F_GETFL);
+    if (inFlags >= 0) (void)::fcntl(fdIn, F_SETFL, inFlags & ~O_NONBLOCK);
+    // A copy onto the file itself (the same name, another spelling of it, or a hard link) would empty the source
+    // before a byte of it was read
+    if (::stat(dst.c_str(), &stDst) == 0 && stDst.st_dev == stSrc.st_dev && stDst.st_ino == stSrc.st_ino) {
+        ::close(fdIn);
+        SetLastError(ERROR_SHARING_VIOLATION);
+        return FALSE;
+    }
     const int fdOut = ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, stSrc.st_mode & 0777);
     if (fdOut < 0) { Explorer2::Compat::SetErrorFromErrno(); ::close(fdIn); return FALSE; }
+    // The source's permission bits right away (the umask narrowed them at the create, and a file that existed
+    // keeps its old mode until now), so the copy is never more open than its source while the data goes in.
+    // FAT, exFAT and some network file systems refuse or ignore modes, which is no reason to fail the copy.
+    (void)::fchmod(fdOut, stSrc.st_mode & 0777);
 
     LARGE_INTEGER totalSz{}, transferred{};
     totalSz.QuadPart = static_cast<LONGLONG>(stSrc.st_size);
@@ -625,7 +710,13 @@ BOOL CopyFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, LPPROGRESS_R
                 Explorer2::Compat::SetErrorFromErrno();
                 break;
             }
-            if (copied == 0) break;
+            if (copied == 0) {
+                // Nothing copied although the file is not finished: some file systems (FUSE and network mounts,
+                // files whose size the kernel only estimates) answer copy_file_range this way. Plain reads and
+                // writes, from the start, copy what is really there.
+                cfrSupported = false;
+                break;
+            }
             transferred.QuadPart += copied;
             if (lpProgressRoutine) {
                 DWORD act = lpProgressRoutine(totalSz, transferred, totalSz, transferred, 1, 0, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, lpData);
@@ -639,9 +730,12 @@ BOOL CopyFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, LPPROGRESS_R
     if (!done && ok) {
         ::lseek(fdIn, 0, SEEK_SET);
         ::lseek(fdOut, 0, SEEK_SET);
+        // What copy_file_range wrote before it gave up is written again; should the source now be shorter, no
+        // stale tail may stay behind
+        if (::ftruncate(fdOut, 0) != 0) { ok = false; Explorer2::Compat::SetErrorFromErrno(); }
         transferred.QuadPart = 0;
         std::vector<uint8_t> buf(256 * 1024);
-        while (true) {
+        while (ok) {
             if (pbCancel && *pbCancel) { ok = false; SetLastError(ERROR_CANCELLED); break; }
             const ssize_t got = ::read(fdIn, buf.data(), buf.size());
             if (got < 0) {
@@ -670,7 +764,8 @@ BOOL CopyFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, LPPROGRESS_R
     struct timespec ts[2] = { stSrc.st_atim, stSrc.st_mtim };
     if (ok) {
         ::futimens(fdOut, ts);
-        ::fchmod(fdOut, stSrc.st_mode & 0777);
+        // Set-user-ID, set-group-ID and sticky bits after the data: a write by an ordinary user clears them
+        if (stSrc.st_mode & 07000) (void)::fchmod(fdOut, stSrc.st_mode & 07777);
     }
     ::close(fdIn);
     if (::close(fdOut) != 0 && ok) { ok = false; Explorer2::Compat::SetErrorFromErrno(); }
@@ -692,6 +787,13 @@ BOOL GetFileInformationByHandle(HANDLE hFile, BY_HANDLE_FILE_INFORMATION* lpFile
     auto* fh = static_cast<Explorer2::Compat::FileHandle*>(Explorer2::Compat::BaseOf(hFile));
     std::memset(lpFileInformation, 0, sizeof(*lpFileInformation));
     lpFileInformation->dwFileAttributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    if (S_ISLNK(st.st_mode)) {
+        // A link opened with FILE_FLAG_OPEN_REPARSE_POINT: a reparse point, and a folder one when it points to a
+        // folder, as GetFileAttributesW describes it
+        struct stat tst = {};
+        const bool toDir = fh && !fh->nativePath.empty() && ::stat(fh->nativePath.c_str(), &tst) == 0 && S_ISDIR(tst.st_mode);
+        lpFileInformation->dwFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT | (toDir ? FILE_ATTRIBUTE_DIRECTORY : 0u);
+    }
     lpFileInformation->ftCreationTime = Explorer2::Compat::GetInodeCreationTime(fh ? fh->nativePath.c_str() : nullptr, st);
     lpFileInformation->ftLastAccessTime = Explorer2::Compat::FileTimeFromTimespec(st.st_atim);
     lpFileInformation->ftLastWriteTime = Explorer2::Compat::FileTimeFromTimespec(st.st_mtim);
@@ -707,7 +809,9 @@ BOOL GetFileInformationByHandle(HANDLE hFile, BY_HANDLE_FILE_INFORMATION* lpFile
 BOOL SetFileInformationByHandle(HANDLE hFile, int FileInformationClass, LPVOID lpFileInformation, DWORD dwBufferSize) {
     const int fd = Explorer2::Compat::FdOf(hFile);
     if (fd < 0 || !lpFileInformation) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    if (FILE* f = Explorer2::Compat::FileOf(hFile)) std::fflush(f);
+    // Buffered data has to be in the file before its size or times change. A flush that fails is a failed write:
+    // the handle keeps it for FlushFileBuffers and CloseHandle, and this call fails with it.
+    if (!Explorer2::Compat::FlushHandleStream(Explorer2::Compat::FileHandleOf(hFile))) return FALSE;
     if (FileInformationClass == FileEndOfFileInfo && dwBufferSize >= sizeof(FILE_END_OF_FILE_INFO)) {
         const auto* info = static_cast<const FILE_END_OF_FILE_INFO*>(lpFileInformation);
         if (::ftruncate(fd, static_cast<off_t>(info->EndOfFile.QuadPart)) != 0) {
@@ -719,7 +823,12 @@ BOOL SetFileInformationByHandle(HANDLE hFile, int FileInformationClass, LPVOID l
     if (FileInformationClass == FileAllocationInfo && dwBufferSize >= sizeof(FILE_ALLOCATION_INFO)) {
         const auto* info = static_cast<const FILE_ALLOCATION_INFO*>(lpFileInformation);
         if (info->AllocationSize.QuadPart > 0) {
-            (void)::posix_fallocate(fd, 0, static_cast<off_t>(info->AllocationSize.QuadPart));
+            // Space is reserved without changing the file's size, as on Windows: a copy that stops early must not
+            // leave a file of full length padded with zeros (posix_fallocate grows the file, and glibc's version
+            // writes those zeros itself where the file system cannot reserve). Where it cannot, nothing happens.
+#ifdef FALLOC_FL_KEEP_SIZE
+            (void)::fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(info->AllocationSize.QuadPart));
+#endif
         }
         return TRUE;
     }
@@ -752,7 +861,7 @@ BOOL DeviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, D
         return (Explorer2::Compat::FdOf(hDevice) >= 0) ? TRUE : FALSE;
     }
     if (dwIoControlCode == FSCTL_QUERY_ALLOCATED_RANGES) {
-        if (FILE* f = Explorer2::Compat::FileOf(hDevice)) std::fflush(f);
+        Explorer2::Compat::FlushHandleStream(Explorer2::Compat::FileHandleOf(hDevice));   // a failure stays in the handle
         const int fd = Explorer2::Compat::FdOf(hDevice);
         struct stat st = {};
         if (fd < 0 || !lpInBuffer || nInBufferSize < sizeof(FILE_ALLOCATED_RANGE_BUFFER) ||
@@ -857,10 +966,144 @@ DWORD GetLogicalDriveStringsW(DWORD nBufferLength, LPWSTR lpBuffer) {
     return 2;
 }
 
+namespace {
+struct HalMount {
+    std::string point;      // the mount point, with the octal escapes of /proc/self/mounts decoded
+    std::string device;
+    std::string fsType;
+    UINT driveType = 0;     // DRIVE_*, worked out when first asked for (0: not yet)
+};
+std::mutex g_mountTableMutex;
+std::vector<HalMount> g_mountTable;
+ULONGLONG g_mountTableTick = 0;
+
+// /proc/self/mounts writes a space as \040, a tab as \011, a newline as \012 and a backslash as \134
+std::string DecodeMountField(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() &&
+            s[i + 1] >= '0' && s[i + 1] <= '7' && s[i + 2] >= '0' && s[i + 2] <= '7' && s[i + 3] >= '0' && s[i + 3] <= '7') {
+            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+// "/a/./b//c/../d" -> "/a/b/d", without asking the file system: a symbolic link on the way is not resolved,
+// because resolving one can wait for ever on a network mount that stopped answering
+std::string NormalizeAbsolutePath(const std::string& p) {
+    std::vector<std::string> parts;
+    size_t i = 0;
+    while (i <= p.size()) {
+        size_t j = p.find('/', i);
+        if (j == std::string::npos) j = p.size();
+        const std::string part = p.substr(i, j - i);
+        if (part == "..") {
+            if (!parts.empty()) parts.pop_back();
+        } else if (!part.empty() && part != ".") {
+            parts.push_back(part);
+        }
+        i = j + 1;
+    }
+    std::string out;
+    for (const auto& part : parts) {
+        out.push_back('/');
+        out += part;
+    }
+    return out.empty() ? std::string("/") : out;
+}
+
+UINT ClassifyMount(const HalMount& m) {
+    static const char* const kRemoteTypes[] = {
+        "cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs", "fuse.glusterfs", "davfs", "afs",
+        "ncpfs", "sshfs", "fuse.sshfs", "fuse.rclone", "fuse.gvfsd-fuse" };
+    for (const char* t : kRemoteTypes) {
+        if (m.fsType == t) return DRIVE_REMOTE;
+    }
+    if (m.fsType == "iso9660" || m.fsType == "udf") return DRIVE_CDROM;
+    if (m.device.rfind("/dev/", 0) != 0) return DRIVE_FIXED;     // tmpfs, overlay, proc and other virtual file systems
+    // /dev/mapper/... and /dev/disk/by-.../... are links to the device node (all of it lives in devtmpfs)
+    std::string dev = m.device;
+    char resolved[PATH_MAX] = {};
+    if (::realpath(dev.c_str(), resolved)) dev = resolved;
+    const std::string name = dev.substr(dev.find_last_of('/') + 1);
+    if (name.empty()) return DRIVE_FIXED;
+    if (name.rfind("sr", 0) == 0) return DRIVE_CDROM;
+    char link[PATH_MAX] = {};
+    const ssize_t n = ::readlink(("/sys/class/block/" + name).c_str(), link, sizeof(link) - 1);
+    const std::string sysPath = (n > 0) ? std::string(link, static_cast<size_t>(n)) : std::string();
+    // A disk behind USB (a stick, a card reader, a USB hard disk): its sysfs path runs through the USB device
+    if (sysPath.find("/usb") != std::string::npos) return DRIVE_REMOVABLE;
+    // A partition's disk is the folder above the partition's own one in sysfs (.../block/sdb/sdb1)
+    std::string disk = name;
+    struct stat pst = {};
+    if (!sysPath.empty() && ::stat(("/sys/class/block/" + name + "/partition").c_str(), &pst) == 0) {
+        const size_t last = sysPath.find_last_of('/');
+        if (last != std::string::npos && last > 0) {
+            const size_t prev = sysPath.find_last_of('/', last - 1);
+            const size_t start = (prev == std::string::npos) ? 0 : prev + 1;
+            if (last > start) disk = sysPath.substr(start, last - start);
+        }
+    }
+    const std::string removable = ReadKernelTextFile("/sys/block/" + disk + "/removable");
+    if (!removable.empty() && removable[0] == '1') return DRIVE_REMOVABLE;
+    return DRIVE_FIXED;
+}
+
+// The type of the mount that holds `path` (absolute and normalized): the longest mount point that is a prefix of
+// it at a '/'. The mount table is read again at most every two seconds; only /proc and /sys are read, which
+// never wait for a disk or a server.
+UINT DriveTypeOfPath(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_mountTableMutex);
+    const ULONGLONG now = GetTickCount64();
+    if (g_mountTableTick == 0 || now - g_mountTableTick > 2000) {
+        std::vector<HalMount> fresh;
+        const std::string text = ReadKernelTextFile("/proc/self/mounts", 8u << 20);   // hosts with containers have thousands of mounts
+        std::istringstream lines(text);
+        std::string line;
+        while (std::getline(lines, line)) {
+            std::istringstream iss(line);
+            std::string dev, mnt, fs;
+            if (!(iss >> dev >> mnt >> fs)) continue;
+            HalMount m;
+            m.device = DecodeMountField(dev);
+            m.point = DecodeMountField(mnt);
+            m.fsType = fs;
+            if (m.point.empty() || m.point[0] != '/') continue;
+            fresh.push_back(std::move(m));
+        }
+        if (!fresh.empty()) g_mountTable = std::move(fresh);
+        g_mountTableTick = now ? now : 1;
+    }
+    HalMount* best = nullptr;
+    for (auto& m : g_mountTable) {
+        const std::string& mp = m.point;
+        const bool inside = (mp == "/") ||
+            (path.compare(0, mp.size(), mp) == 0 && (path.size() == mp.size() || path[mp.size()] == '/'));
+        // ">=": of two mounts on the same point the later one, which hides the earlier, wins
+        if (inside && (!best || mp.size() >= best->point.size())) best = &m;
+    }
+    if (!best) return DRIVE_FIXED;
+    if (best->driveType == 0) best->driveType = ClassifyMount(*best);
+    return best->driveType;
+}
+} // namespace
+
 UINT GetDriveTypeW(LPCWSTR lpRootPathName) {
     if (!lpRootPathName || !*lpRootPathName) return DRIVE_UNKNOWN;
-    if (lpRootPathName[0] == L'\\' && lpRootPathName[1] == L'\\') return DRIVE_REMOTE;
-    return DRIVE_FIXED;
+    std::string native = Explorer2::Compat::NativePath(lpRootPathName);
+    if (native.rfind("//", 0) == 0) return DRIVE_REMOTE;                    // \\server\share
+    if (native.empty()) return DRIVE_UNKNOWN;
+    if (native.size() >= 2 && native[1] == ':') native = "/";                // this port's "C:" is the root
+    if (native[0] != '/') {
+        char cwd[PATH_MAX] = {};
+        native = (::getcwd(cwd, sizeof(cwd)) ? std::string(cwd) : std::string("/")) + "/" + native;
+    }
+    return DriveTypeOfPath(NormalizeAbsolutePath(native));
 }
 
 BOOL GetDiskFreeSpaceExW(LPCWSTR lpDirectoryName, ULARGE_INTEGER* lpFreeBytesAvailableToCaller, ULARGE_INTEGER* lpTotalNumberOfBytes, ULARGE_INTEGER* lpTotalNumberOfFreeBytes) {
@@ -1153,6 +1396,7 @@ struct SyncHandle : Explorer2::Compat::HandleBase {
 };
 
 SyncState* SyncOf(HANDLE h) {
+    if (h == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-2))) return nullptr;     // GetCurrentProcess(): no object behind it
     auto* b = Explorer2::Compat::BaseOf(h);
     if (!b || b->kind != Explorer2::Compat::HandleKind::Custom) return nullptr;
     auto* sh = dynamic_cast<SyncHandle*>(b);
@@ -1293,16 +1537,48 @@ DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) {
 }
 
 DWORD WaitForMultipleObjects(DWORD nCount, const HANDLE* lpHandles, BOOL bWaitAll, DWORD dwMilliseconds) {
-    if (nCount == 0 || !lpHandles) return WAIT_FAILED;
+    if (nCount == 0 || !lpHandles || nCount > 64 /* MAXIMUM_WAIT_OBJECTS */) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    // Only events, mutexes and processes become signaled here: a wait on anything else would poll for ever
+    std::vector<SyncState*> states(nCount, nullptr);
+    for (DWORD i = 0; i < nCount; ++i) {
+        states[i] = SyncOf(lpHandles[i]);
+        if (!states[i]) { SetLastError(ERROR_INVALID_HANDLE); return WAIT_FAILED; }
+    }
     if (nCount == 1) return WaitForSingleObject(lpHandles[0], dwMilliseconds);
+    // Wait-all locks every object at once, each once and always in the same (address) order, so that two waits on
+    // overlapping sets cannot deadlock each other
+    std::vector<SyncState*> distinct(states);
+    std::sort(distinct.begin(), distinct.end(), std::less<SyncState*>());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    const std::thread::id self = std::this_thread::get_id();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(dwMilliseconds);
     while (true) {
         if (bWaitAll) {
+            // All or nothing: the objects are checked and taken while all of them are locked, so an auto-reset
+            // event or a mutex is never used up by a wait that does not end with all of them
+            std::vector<std::unique_lock<std::mutex>> locks;
+            locks.reserve(distinct.size());
+            for (SyncState* st : distinct) locks.emplace_back(st->mtx);
             bool allReady = true;
-            for (DWORD i = 0; i < nCount; ++i) {
-                if (WaitForSingleObject(lpHandles[i], 0) != WAIT_OBJECT_0) { allReady = false; break; }
+            for (const SyncState* st : distinct) {
+                const bool ready = st->isMutex ? (st->signaled || st->owner == self) : st->signaled;
+                if (!ready) { allReady = false; break; }
             }
-            if (allReady) return WAIT_OBJECT_0;
+            if (allReady) {
+                for (SyncState* st : distinct) {
+                    if (st->isMutex) {
+                        st->signaled = false;
+                        st->owner = self;
+                        ++st->recursion;
+                    } else if (!st->manualReset) {
+                        st->signaled = false;
+                    }
+                }
+                return WAIT_OBJECT_0;
+            }
         } else {
             for (DWORD i = 0; i < nCount; ++i) {
                 if (WaitForSingleObject(lpHandles[i], 0) == WAIT_OBJECT_0) return WAIT_OBJECT_0 + i;
@@ -1383,12 +1659,17 @@ BOOL CreatePipe(HANDLE* hReadPipe, HANDLE* hWritePipe, LPSECURITY_ATTRIBUTES, DW
     }
     std::setvbuf(fr, nullptr, _IONBF, 0);
     std::setvbuf(fw, nullptr, _IONBF, 0);
+    // Pipe ends: ReadFile returns what has arrived (see isStream), and a failed write to the other end (EPIPE once
+    // the reader is gone) is reported like any other failed write
     auto* hr = new Explorer2::Compat::FileHandle();
     hr->f = fr;
     hr->shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    hr->isStream = true;
     auto* hw = new Explorer2::Compat::FileHandle();
     hw->f = fw;
     hw->shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    hw->isStream = true;
+    hw->canWrite = true;
     *hReadPipe  = static_cast<HANDLE>(static_cast<Explorer2::Compat::HandleBase*>(hr));
     *hWritePipe = static_cast<HANDLE>(static_cast<Explorer2::Compat::HandleBase*>(hw));
     return TRUE;
@@ -1477,6 +1758,9 @@ BOOL CreateProcessW(
         return FALSE;
     }
     if (pid == 0) {
+        // main() ignores SIGPIPE, and an ignored signal stays ignored across exec: the program started here gets
+        // the default action back, as every program expects
+        ::signal(SIGPIPE, SIG_DFL);
         ::close(errPipe[0]);
         (void)::setpgid(0, 0);
         if (!cwdNative.empty()) {
@@ -1570,7 +1854,9 @@ extern "C" BOOL ConvertStringSecurityDescriptorToSecurityDescriptorW(
     LPCWSTR, DWORD, PSECURITY_DESCRIPTOR* sd, PULONG sz)
 {
     if (!sd) return FALSE;
-    *sd = GlobalAlloc(GMEM_ZEROINIT, 16);
+    // The caller frees the descriptor with LocalFree, which is std::free here: a GlobalAlloc block (a pointer
+    // into the middle of a malloc block) corrupted the heap when the monitoring daemon exited
+    *sd = std::calloc(1, 16);
     if (sz) *sz = 16;
     return *sd ? TRUE : FALSE;
 }
@@ -1638,40 +1924,94 @@ __attribute__((weak)) BOOL Process32NextW(HANDLE, PROCESSENTRY32W*) { return FAL
 // ==============================================================================================================
 // 5. Shlwapi & Shell Helpers (StrCmpLogicalW, PathMatchSpecW, SHCreateDirectoryExW, SHGetKnownFolderPath, Streams)
 // ==============================================================================================================
-int StrCmpLogicalW(LPCWSTR psz1, LPCWSTR psz2) {
-    if (!psz1 && !psz2) return 0;
-    if (!psz1) return -1;
-    if (!psz2) return 1;
-    const wchar_t* a = psz1;
-    const wchar_t* b = psz2;
+namespace {
+// Lower case for comparing. Latin-1 and Latin Extended-A are mapped here: the C library's towlower knows them
+// only in a UTF-8 locale, and this program never calls setlocale.
+wchar_t LowerForCompare(wchar_t c) {
+    if (c < 0x80) return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + 32) : c;
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return static_cast<wchar_t>(c + 32);
+    if (c >= 0x100 && c <= 0x17F) {
+        if (c == 0x130) return L'i';                // capital I with dot
+        if (c == 0x178) return 0xFF;                // capital Y with diaeresis
+        if ((c <= 0x137) || (c >= 0x14A && c <= 0x177)) return static_cast<wchar_t>(c | 1);   // pairs: even upper, odd lower
+        if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) {                        // pairs: odd upper, even lower
+            return (c & 1) ? static_cast<wchar_t>(c + 1) : c;
+        }
+        return c;                                   // kra, n preceded by apostrophe, long s
+    }
+    return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
+}
+
+// Lower case without diacritics: a letter of Latin-1 or Latin Extended-A becomes its base letter ("ą" -> "a",
+// "Ł" -> "l", "ż" -> "z"), so that names starting with Polish (or French, German, Czech...) letters sort among
+// the others instead of after "z"
+wchar_t FoldToBaseLetter(wchar_t c) {
+    // U+00C0..U+00FF; '.' keeps the character (the multiplication and division signs)
+    static const char kLatin1[] = "aaaaaaaceeeeiiiidnooooo.ouuuuytsaaaaaaaceeeeiiiidnooooo.ouuuuyty";
+    // U+0100..U+017F
+    static const char kLatinExtA[] =
+        "aaaaaaccccccccdd" "ddeeeeeeeeeegggg" "gggghhhhiiiiiiii" "iiiijjkkklllllll"
+        "lllnnnnnnnnnoooo" "oooorrrrrrssssss" "ssttttttuuuuuuuu" "uuuuwwyyyzzzzzzs";
+    if (c >= 0xC0 && c <= 0xFF) {
+        const char base = kLatin1[c - 0xC0];
+        return (base == '.') ? c : static_cast<wchar_t>(base);
+    }
+    if (c >= 0x100 && c <= 0x17F) return static_cast<wchar_t>(kLatinExtA[c - 0x100]);
+    return LowerForCompare(c);
+}
+
+bool IsAsciiDigit(wchar_t c) { return c >= L'0' && c <= L'9'; }
+
+// Explorer's "logical" order: runs of digits compare by their value, other characters one by one after `fold`.
+// With zerosCount, of two equal numbers the one with more leading zeros comes first.
+template <typename Fold>
+int CompareNatural(const wchar_t* a, const wchar_t* b, Fold fold, bool zerosCount) {
     while (*a && *b) {
-        if (std::iswdigit(*a) && std::iswdigit(*b)) {
+        if (IsAsciiDigit(*a) && IsAsciiDigit(*b)) {
             const wchar_t* az = a;
             const wchar_t* bz = b;
             while (*a == L'0') ++a;
             while (*b == L'0') ++b;
             const wchar_t* an = a;
             const wchar_t* bn = b;
-            while (std::iswdigit(*a)) ++a;
-            while (std::iswdigit(*b)) ++b;
+            while (IsAsciiDigit(*a)) ++a;
+            while (IsAsciiDigit(*b)) ++b;
             const size_t alen = static_cast<size_t>(a - an);
             const size_t blen = static_cast<size_t>(b - bn);
             if (alen != blen) return (alen < blen) ? -1 : 1;
             for (size_t i = 0; i < alen; ++i) {
                 if (an[i] != bn[i]) return (an[i] < bn[i]) ? -1 : 1;
             }
-            const size_t azLen = static_cast<size_t>(an - az);
-            const size_t bzLen = static_cast<size_t>(bn - bz);
-            if (azLen != bzLen) return (azLen > bzLen) ? -1 : 1;
+            if (zerosCount) {
+                const size_t azLen = static_cast<size_t>(an - az);
+                const size_t bzLen = static_cast<size_t>(bn - bz);
+                if (azLen != bzLen) return (azLen > bzLen) ? -1 : 1;
+            }
             continue;
         }
-        const wint_t ca = std::towlower(*a);
-        const wint_t cb = std::towlower(*b);
+        const wchar_t ca = fold(*a);
+        const wchar_t cb = fold(*b);
         if (ca != cb) return (ca < cb) ? -1 : 1;
         ++a;
         ++b;
     }
     return (*a == *b) ? 0 : (*a ? 1 : -1);
+}
+} // namespace
+
+// Three keys, each deciding only where the ones before it tie: letters without diacritics and case, then with
+// diacritics (an unaccented letter first), then the exact characters, so that the order is total and stable
+int StrCmpLogicalW(LPCWSTR psz1, LPCWSTR psz2) {
+    if (!psz1 && !psz2) return 0;
+    if (!psz1) return -1;
+    if (!psz2) return 1;
+    int r = CompareNatural(psz1, psz2, FoldToBaseLetter, false);
+    if (r == 0) r = CompareNatural(psz1, psz2, LowerForCompare, true);
+    if (r == 0) {
+        const int c = std::wcscmp(psz1, psz2);
+        r = (c < 0) ? -1 : (c > 0 ? 1 : 0);
+    }
+    return r;
 }
 
 BOOL PathMatchSpecW(LPCWSTR pszFile, LPCWSTR pszSpec) {
@@ -1781,6 +2121,22 @@ HRESULT SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD, HANDLE, PWSTR* ppszPa
 
 // ---- Memory IStream (CreateStreamOnHGlobal / GetHGlobalFromStream / SHCreateMemStream) -----------------------
 namespace {
+// Opens a regular file as a stdio stream. A FIFO, a socket or a device is refused without waiting: an image
+// preview of a FIFO named "x.png" must not hang the program.
+FILE* OpenRegularFileStream(const std::string& native, bool forWrite) {
+    struct stat st = {};
+    if (::stat(native.c_str(), &st) == 0 && !S_ISREG(st.st_mode)) return nullptr;
+    const int accessFlags = forWrite ? (O_RDWR | O_CREAT | O_TRUNC) : O_RDONLY;
+    const int fd = ::open(native.c_str(), accessFlags | O_CLOEXEC | O_NOCTTY | O_NONBLOCK, 0666);
+    if (fd < 0) return nullptr;
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { ::close(fd); return nullptr; }
+    const int fl = ::fcntl(fd, F_GETFL);
+    if (fl >= 0) (void)::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    FILE* f = ::fdopen(fd, forWrite ? "w+b" : "rb");
+    if (!f) ::close(fd);
+    return f;
+}
+
 class MemStreamImpl final : public IWICStream {
 public:
     MemStreamImpl() = default;
@@ -1921,7 +2277,7 @@ public:
         if (m_file) { std::fclose(m_file); m_file = nullptr; }
         const std::string native = Explorer2::Compat::NativePath(wzFilename);
         const bool wantWrite = (dwDesiredAccess & GENERIC_WRITE) != 0;
-        m_file = std::fopen(native.c_str(), wantWrite ? "w+b" : "rb");
+        m_file = OpenRegularFileStream(native, wantWrite);
         return m_file ? S_OK : E_FAIL;
     }
 
@@ -2047,6 +2403,108 @@ std::string UrlEncodeTrashPath(const std::string& raw) {
     return out;
 }
 
+// Creates a folder and any missing folders above it with mode 0700, the mode the trash specification asks for
+// (the names in the trash say what the user deleted). True when the folder exists afterwards.
+bool MakePrivateDirs(const std::string& path) {
+    for (size_t i = 1; i <= path.size(); ++i) {
+        if (i < path.size() && path[i] != '/') continue;
+        const std::string sub = path.substr(0, i);
+        if (sub.back() == '/') continue;
+        if (::mkdir(sub.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    }
+    struct stat st = {};
+    return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// Moves one item into the freedesktop.org trash: its .trashinfo first (created exclusively, so that the name is
+// ours), then the item itself by rename(), never by a copy. Returns S_OK or the failure; on a failure the item
+// stays where it was and no .trashinfo is left behind.
+HRESULT MoveItemToTrash(const std::string& srcNative, const std::string& trashFiles, const std::string& trashInfo) {
+    // Path= names the item itself: its folder resolved, its own name as it is, so that a symbolic link is
+    // restored as that link and not as the file it points to
+    std::string clean = srcNative;
+    while (clean.size() > 1 && clean.back() == '/') clean.pop_back();
+    const size_t sl = clean.find_last_of('/');
+    const std::string parentDir = (sl == std::string::npos || sl == 0) ? std::string("/") : clean.substr(0, sl);
+    const std::string leafName = (sl == std::string::npos) ? clean : clean.substr(sl + 1);
+    char realBuf[PATH_MAX] = {};
+    const std::string parentAbs = ::realpath(parentDir.c_str(), realBuf) ? std::string(realBuf) : parentDir;
+    const std::string origAbs = (!parentAbs.empty() && parentAbs.back() == '/') ? parentAbs + leafName : parentAbs + "/" + leafName;
+
+    const std::string leaf = leafName.empty() ? std::string("trashed_item") : leafName;
+    std::string stem = leaf, ext;
+    const size_t dot = leaf.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) {
+        stem = leaf.substr(0, dot);
+        ext = leaf.substr(dot);
+    }
+    std::string chosenName;
+    int infoFd = -1;
+    int lastErr = EEXIST;
+    for (int attempt = 1; attempt < 10000; ++attempt) {
+        const std::string cand = (attempt == 1) ? leaf : (stem + "." + std::to_string(attempt) + ext);
+        struct stat stExist = {};
+        if (::lstat((trashFiles + "/" + cand).c_str(), &stExist) == 0) continue;
+        infoFd = ::open((trashInfo + "/" + cand + ".trashinfo").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (infoFd >= 0) {
+            chosenName = cand;
+            break;
+        }
+        lastErr = errno;
+        if (lastErr != EEXIST) break;           // the info folder itself is the problem: another name does not help
+    }
+    if (infoFd < 0) {
+        const DWORD e = (lastErr == EEXIST) ? static_cast<DWORD>(ERROR_FILE_EXISTS) : Explorer2::Compat::Win32ErrorFromErrno(lastErr);
+        return HRESULT_FROM_WIN32(e);
+    }
+    const std::string infoPath = trashInfo + "/" + chosenName + ".trashinfo";
+
+    time_t now = ::time(nullptr);
+    struct tm lt = {};
+    localtime_r(&now, &lt);
+    char dtBuf[64] = {};
+    std::snprintf(dtBuf, sizeof(dtBuf), "%04d-%02d-%02dT%02d:%02d:%02d",
+                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
+    const std::string infoBody = "[Trash Info]\nPath=" + UrlEncodeTrashPath(origAbs) + "\nDeletionDate=" + dtBuf + "\n";
+    // An item in the trash without its complete .trashinfo could not be restored, so it is only moved once the
+    // .trashinfo is written (a full disk shows up here)
+    int infoErr = 0;
+    size_t off = 0;
+    while (off < infoBody.size()) {
+        const ssize_t wr = ::write(infoFd, infoBody.data() + off, infoBody.size() - off);
+        if (wr < 0) {
+            if (errno == EINTR) continue;
+            infoErr = errno;
+            break;
+        }
+        off += static_cast<size_t>(wr);
+    }
+    if (::close(infoFd) != 0 && infoErr == 0) infoErr = errno;
+    if (infoErr != 0) {
+        ::unlink(infoPath.c_str());
+        const DWORD e = Explorer2::Compat::Win32ErrorFromErrno(infoErr);
+        return HRESULT_FROM_WIN32(e ? e : static_cast<DWORD>(ERROR_WRITE_FAULT));
+    }
+
+    // rename() only. Should the item be on another file system after all (a bind mount of the same disk, which
+    // rename refuses with EXDEV), it stays where it is instead of being copied into the home trash.
+    DWORD mvErr = 0;
+    struct stat stNow = {};
+    if (::lstat(clean.c_str(), &stNow) != 0) {
+        mvErr = Explorer2::Compat::Win32ErrorFromErrno(errno);
+    } else if (!S_ISLNK(stNow.st_mode) &&
+               Explorer2::Compat::IsDeleteBlockedByOpenHandle(static_cast<uint64_t>(stNow.st_dev), static_cast<uint64_t>(stNow.st_ino))) {
+        mvErr = ERROR_SHARING_VIOLATION;
+    } else if (::rename(clean.c_str(), (trashFiles + "/" + chosenName).c_str()) != 0) {
+        mvErr = Explorer2::Compat::Win32ErrorFromErrno(errno);
+    }
+    if (mvErr != 0) {
+        ::unlink(infoPath.c_str());
+        return HRESULT_FROM_WIN32(mvErr);
+    }
+    return S_OK;
+}
+
 class LinuxShellItem final : public IShellItem {
 public:
     explicit LinuxShellItem(std::wstring p) : m_path(std::move(p)) {}
@@ -2141,12 +2599,14 @@ public:
     }
     HRESULT STDMETHODCALLTYPE PerformOperations() override {
         const bool recycle = (m_flags & (FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE)) != 0;
-        std::string trashBase = GetFreeDesktopTrashBase();
-        std::string trashFiles = trashBase + "/files";
-        std::string trashInfo  = trashBase + "/info";
+        const std::string trashBase = GetFreeDesktopTrashBase();
+        const std::string trashFiles = trashBase + "/files";
+        const std::string trashInfo  = trashBase + "/info";
+        // The file system of the trash: items reach it by rename() only, so only from that file system
+        struct stat stTrash = {};
+        bool haveTrash = false;
         if (recycle) {
-            SHCreateDirectoryExW(nullptr, Explorer2::PathUtils::Utf8ToWide(trashFiles).c_str(), nullptr);
-            SHCreateDirectoryExW(nullptr, Explorer2::PathUtils::Utf8ToWide(trashInfo).c_str(), nullptr);
+            haveTrash = MakePrivateDirs(trashFiles) && MakePrivateDirs(trashInfo) && ::stat(trashFiles.c_str(), &stTrash) == 0;
         }
 
         for (auto& [item, sink] : m_items) {
@@ -2156,8 +2616,16 @@ public:
             CoTaskMemFree(rawW);
 
             std::string srcNative = Explorer2::Compat::NativePath(srcW.c_str());
-            const bool canRecycle = recycle && !srcNative.empty() && srcNative[0] == '/' &&
-                                    srcNative.rfind("/proc/", 0) != 0 && srcNative.rfind("/sys/", 0) != 0 && srcNative.rfind("/dev/", 0) != 0;
+            const bool wantRecycle = recycle && !srcNative.empty() && srcNative[0] == '/' &&
+                                     srcNative.rfind("/proc/", 0) != 0 && srcNative.rfind("/sys/", 0) != 0 && srcNative.rfind("/dev/", 0) != 0;
+            // The home trash takes only items of its own file system. One on a USB stick, another partition or a
+            // network share would have to be copied into it (filling the home disk, and slow): for such an item
+            // there is no recycle bin, as for a Windows drive without one. The sink hears TSF_NORMAL (the shell
+            // would delete the item for good), which Explorer2 refuses and then offers a permanent delete.
+            struct stat stSrc = {};
+            const bool srcKnown = wantRecycle && ::lstat(srcNative.c_str(), &stSrc) == 0;
+            const bool noBinForItem = srcKnown && (!haveTrash || stSrc.st_dev != stTrash.st_dev);
+            const bool canRecycle = wantRecycle && !noBinForItem;
 
             const DWORD tsf = canRecycle ? TSF_DELETE_RECYCLE_IF_POSSIBLE : TSF_NORMAL;
             if (sink) {
@@ -2170,53 +2638,10 @@ public:
 
             HRESULT opHr = S_OK;
             if (canRecycle) {
-                char realBuf[PATH_MAX] = {};
-                std::string origAbs = (::realpath(srcNative.c_str(), realBuf) != nullptr) ? realBuf : srcNative;
-                std::string leaf = Explorer2::PathUtils::WideToUtf8(Explorer2::PathUtils::GetFileName(srcW));
-                if (leaf.empty()) leaf = "trashed_item";
-
-                std::string stem = leaf, ext;
-                const size_t dot = leaf.find_last_of('.');
-                if (dot != std::string::npos && dot > 0) {
-                    stem = leaf.substr(0, dot);
-                    ext = leaf.substr(dot);
-                }
-
-                std::string chosenName;
-                int infoFd = -1;
-                for (int attempt = 1; attempt < 10000; ++attempt) {
-                    std::string cand = (attempt == 1) ? leaf : (stem + "." + std::to_string(attempt) + ext);
-                    std::string candInfo = trashInfo + "/" + cand + ".trashinfo";
-                    std::string candData = trashFiles + "/" + cand;
-                    struct stat stExist = {};
-                    if (::lstat(candData.c_str(), &stExist) == 0) continue;
-                    infoFd = ::open(candInfo.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-                    if (infoFd >= 0) {
-                        chosenName = std::move(cand);
-                        break;
-                    }
-                }
-                if (infoFd < 0) {
-                    opHr = HRESULT_FROM_WIN32(ERROR_FILE_EXISTS);
-                } else {
-                    time_t now = ::time(nullptr);
-                    struct tm lt = {};
-                    localtime_r(&now, &lt);
-                    char dtBuf[64] = {};
-                    std::snprintf(dtBuf, sizeof(dtBuf), "%04d-%02d-%02dT%02d:%02d:%02d",
-                                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
-                    std::string infoBody = "[Trash Info]\nPath=" + UrlEncodeTrashPath(origAbs) + "\nDeletionDate=" + dtBuf + "\n";
-                    const ssize_t wr = ::write(infoFd, infoBody.data(), infoBody.size());
-                    (void)wr;
-                    ::close(infoFd);
-
-                    std::wstring dstDataW = Explorer2::PathUtils::Utf8ToWide(trashFiles + "/" + chosenName);
-                    if (!MoveFileExW(srcW.c_str(), dstDataW.c_str(), MOVEFILE_COPY_ALLOWED)) {
-                        DWORD mvErr = GetLastError();
-                        ::unlink((trashInfo + "/" + chosenName + ".trashinfo").c_str());
-                        opHr = HRESULT_FROM_WIN32(mvErr ? mvErr : ERROR_ACCESS_DENIED);
-                    }
-                }
+                opHr = MoveItemToTrash(srcNative, trashFiles, trashInfo);
+            } else if (wantRecycle) {
+                // The trash was asked for and cannot take this item: nothing is deleted
+                opHr = HRESULT_FROM_WIN32(ERROR_NOT_SAME_DEVICE);
             } else {
                 if (!DeleteFileW(srcW.c_str()) && !RemoveDirectoryW(srcW.c_str())) {
                     DWORD delErr = GetLastError();
@@ -3620,9 +4045,47 @@ __attribute__((weak)) HRESULT SHGetStockIconInfo(SHSTOCKICONID siid, UINT, SHSTO
     psii->iIcon = psii->iSysImageIndex;
     return S_OK;
 }
+namespace {
+// True for a file that is a program to run: an ELF binary or a script with a "#!" line. The execute bit alone
+// says little, as every file on an NTFS, exFAT or SMB mount has it.
+bool LooksLikeProgram(const std::string& native) {
+    const int fd = ::open(native.c_str(), O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) return false;
+    unsigned char head[4] = {};
+    ssize_t got = 0;
+    do {
+        got = ::read(fd, head, sizeof(head));
+    } while (got < 0 && errno == EINTR);
+    ::close(fd);
+    if (got >= 4 && head[0] == 0x7F && head[1] == 'E' && head[2] == 'L' && head[3] == 'F') return true;
+    return got >= 2 && head[0] == '#' && head[1] == '!';
+}
+
+// A double-quoted argument for the command line CreateProcessW splits (the HAL's CommandLineToArgvW reads \" as a
+// quote inside the argument)
+std::wstring QuoteForCommandLine(const std::wstring& arg) {
+    std::wstring out = L"\"";
+    for (wchar_t c : arg) {
+        if (c == L'"') out += L"\\\"";
+        else out.push_back(c);
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+constexpr DWORD kErrorNoAssociation = 1155;     // ERROR_NO_ASSOCIATION
+} // namespace
+
 __attribute__((weak)) BOOL ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
     if (!pExecInfo) return FALSE;
     pExecInfo->hProcess = nullptr;
+
+    // There is no properties sheet here. Opening the item instead would run a program or open a document the
+    // user only wanted to look at, so the verb fails as Windows fails a verb that nothing handles.
+    if (pExecInfo->lpVerb && _wcsicmp(pExecInfo->lpVerb, L"properties") == 0) {
+        SetLastError(kErrorNoAssociation);
+        return FALSE;
+    }
 
     std::wstring fileW;
     if (pExecInfo->lpFile && *pExecInfo->lpFile) {
@@ -3639,7 +4102,7 @@ __attribute__((weak)) BOOL ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
     const LPCWSTR cwdW = (pExecInfo->lpDirectory && *pExecInfo->lpDirectory) ? pExecInfo->lpDirectory : nullptr;
 
     auto spawnDirect = [&](const std::wstring& exePath, const std::wstring& rawArgs) -> BOOL {
-        std::wstring cmdLine = L"\"" + exePath + L"\"";
+        std::wstring cmdLine = QuoteForCommandLine(exePath);
         if (!rawArgs.empty()) cmdLine += L" " + rawArgs;
         std::vector<wchar_t> mutCmd(cmdLine.begin(), cmdLine.end());
         mutCmd.push_back(L'\0');
@@ -3686,23 +4149,21 @@ __attribute__((weak)) BOOL ShellExecuteExW(SHELLEXECUTEINFOW* pExecInfo) {
         fileW = doc;
     }
 
-    // Direct execution if fileW resolves to a regular executable file on Linux
+    // Run the file itself only when it is a program (an ELF binary or a "#!" script) with the execute bit; a
+    // document, even one with that bit, goes to xdg-open like everything else
     const std::string nativeFile = Explorer2::Compat::NativePath(fileW.c_str());
     struct stat st = {};
-    if (!nativeFile.empty() && ::stat(nativeFile.c_str(), &st) == 0 && S_ISREG(st.st_mode) && ::access(nativeFile.c_str(), X_OK) == 0) {
-        const bool isProps = (pExecInfo->lpVerb && _wcsicmp(pExecInfo->lpVerb, L"properties") == 0);
-        if (!isProps) {
-            return spawnDirect(Explorer2::PathUtils::Utf8ToWide(nativeFile), paramsW);
-        }
+    const bool exists = !nativeFile.empty() && ::stat(nativeFile.c_str(), &st) == 0;
+    if (exists && S_ISREG(st.st_mode) && ::access(nativeFile.c_str(), X_OK) == 0 && LooksLikeProgram(nativeFile)) {
+        if (spawnDirect(Explorer2::PathUtils::Utf8ToWide(nativeFile), paramsW)) return TRUE;
+        // A program that cannot start here (another architecture, a missing interpreter) still gets xdg-open
     }
 
-    // Fallback for folders, documents, URLs (http/https/mailto) -> xdg-open (without shell evaluation!)
+    // Folders, documents, URLs (http/https/mailto) -> xdg-open (without shell evaluation!)
     const std::wstring xdgOpen = findFirstExec({ "/usr/bin/xdg-open", "/bin/xdg-open" });
     if (xdgOpen.empty()) return FALSE;
-    const std::wstring argTarget = (!nativeFile.empty() && ::stat(nativeFile.c_str(), &st) == 0)
-        ? Explorer2::PathUtils::Utf8ToWide(nativeFile)
-        : fileW;
-    return spawnDirect(xdgOpen, L"\"" + argTarget + L"\"");
+    const std::wstring argTarget = exists ? Explorer2::PathUtils::Utf8ToWide(nativeFile) : fileW;
+    return spawnDirect(xdgOpen, QuoteForCommandLine(argTarget));
 }
 __attribute__((weak)) HINSTANCE ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile, LPCWSTR lpParameters, LPCWSTR lpDirectory, int nShowCmd) {
     SHELLEXECUTEINFOW sei = {};
@@ -3747,10 +4208,7 @@ __attribute__((weak)) HRESULT SHQueryRecycleBinW(LPCWSTR, SHQUERYRBINFO* pSHQuer
     if (!pSHQueryRBInfo) return E_POINTER;
     pSHQueryRBInfo->i64Size = 0;
     pSHQueryRBInfo->i64NumItems = 0;
-    const char* xdg = std::getenv("XDG_DATA_HOME");
-    const char* home = std::getenv("HOME");
-    std::string trashFiles = (xdg && *xdg) ? (std::string(xdg) + "/Trash/files")
-                           : ((home && *home) ? (std::string(home) + "/.local/share/Trash/files") : "/tmp/Trash/files");
+    const std::string trashFiles = GetFreeDesktopTrashBase() + "/files";      // the trash the delete code fills
     if (DIR* d = ::opendir(trashFiles.c_str())) {
         while (struct dirent* de = ::readdir(d)) {
             if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
@@ -3766,40 +4224,119 @@ __attribute__((weak)) HRESULT SHQueryRecycleBinW(LPCWSTR, SHQUERYRBINFO* pSHQuer
 }
 
 namespace {
-void RemovePosixTree(const std::string& p) {
-    struct stat st = {};
-    if (::lstat(p.c_str(), &st) != 0) return;
-    if (S_ISDIR(st.st_mode)) {
-        if (DIR* d = ::opendir(p.c_str())) {
-            while (struct dirent* de = ::readdir(d)) {
-                if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
-                RemovePosixTree(p + "/" + de->d_name);
-            }
-            ::closedir(d);
-        }
-        ::rmdir(p.c_str());
-    } else {
-        ::unlink(p.c_str());
+// The names in an open folder, without "." and "..". Takes over the descriptor and closes it. The names are read
+// before anything in the folder is removed, so no descriptor per level stays open while a deep tree is walked.
+std::vector<std::string> ListFolderNamesAt(int dfd) {
+    std::vector<std::string> names;
+    DIR* d = ::fdopendir(dfd);
+    if (!d) {
+        ::close(dfd);
+        return names;
     }
+    while (struct dirent* de = ::readdir(d)) {
+        if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
+        names.emplace_back(de->d_name);
+    }
+    ::closedir(d);
+    return names;
+}
+
+std::vector<std::string> ListFolderNames(const std::string& dir) {
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return {};
+    return ListFolderNamesAt(dfd);
+}
+
+// Removes `p` and everything below it without ever leaving the file system `dev` (the trash's). A folder that
+// belongs to another file system, something mounted inside the trash, is never entered: it is only rmdir()-ed,
+// which fails while it is mounted, so nothing on that file system is deleted. Symbolic links are removed, never
+// followed. Returns 0 when `p` is gone, else the errno of the first failure.
+int RemovePosixTree(const std::string& p, dev_t dev) {
+    struct stat st = {};
+    if (::lstat(p.c_str(), &st) != 0) return (errno == ENOENT) ? 0 : errno;
+    if (!S_ISDIR(st.st_mode)) return (::unlink(p.c_str()) == 0 || errno == ENOENT) ? 0 : errno;
+    int firstErr = 0;
+    if (st.st_dev == dev) {
+        // Opened without following a link and checked to be the folder lstat saw, so that a folder swapped for a
+        // link in the meantime cannot lead the walk somewhere else
+        const int dfd = ::open(p.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        struct stat dst = {};
+        if (dfd >= 0 && ::fstat(dfd, &dst) == 0 && dst.st_dev == st.st_dev && dst.st_ino == st.st_ino) {
+            for (const std::string& name : ListFolderNamesAt(dfd)) {
+                const int e = RemovePosixTree(p + "/" + name, dev);
+                if (e != 0 && firstErr == 0) firstErr = e;
+            }
+        } else if (dfd >= 0) {
+            ::close(dfd);
+        }
+    }
+    if (::rmdir(p.c_str()) == 0 || errno == ENOENT) return 0;
+    return firstErr ? firstErr : errno;
+}
+
+// True when the system's language is Polish (LC_ALL, then LC_MESSAGES, then LANG, as the C library picks them)
+bool SystemLocaleIsPolish() {
+    for (const char* var : { "LC_ALL", "LC_MESSAGES", "LANG" }) {
+        const char* v = std::getenv(var);
+        if (v && *v) return (v[0] == 'p' || v[0] == 'P') && (v[1] == 'l' || v[1] == 'L');
+    }
+    return false;
 }
 } // namespace
 
-__attribute__((weak)) HRESULT SHEmptyRecycleBinW(HWND, LPCWSTR, DWORD) {
-    const char* xdg = std::getenv("XDG_DATA_HOME");
-    const char* home = std::getenv("HOME");
-    std::string base = (xdg && *xdg) ? (std::string(xdg) + "/Trash")
-                     : ((home && *home) ? (std::string(home) + "/.local/share/Trash") : "/tmp/Trash");
-    for (const char* sub : { "/files", "/info" }) {
-        std::string dir = base + sub;
-        if (DIR* d = ::opendir(dir.c_str())) {
-            while (struct dirent* de = ::readdir(d)) {
-                if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
-                RemovePosixTree(dir + "/" + de->d_name);
-            }
-            ::closedir(d);
+__attribute__((weak)) HRESULT SHEmptyRecycleBinW(HWND hwnd, LPCWSTR, DWORD dwFlags) {
+    const std::string base = GetFreeDesktopTrashBase();
+    const std::string filesDir = base + "/files";
+    const std::string infoDir = base + "/info";
+
+    // Emptying deletes everything in the trash for good. Windows asks first unless told not to, and so does this.
+    if (!(dwFlags & SHERB_NOCONFIRMATION)) {
+        SHQUERYRBINFO info = {};
+        info.cbSize = sizeof(info);
+        SHQueryRecycleBinW(nullptr, &info);
+        if (info.i64NumItems <= 0) return S_OK;
+        const long long n = info.i64NumItems;
+        std::wstring text, caption;
+        if (SystemLocaleIsPolish()) {
+            const long long ones = n % 10, tens = n % 100;
+            const wchar_t* noun = (n == 1) ? L"element"
+                                : (ones >= 2 && ones <= 4 && (tens < 12 || tens > 14)) ? L"elementy" : L"element\x00F3w";
+            text = L"Czy na pewno trwale usun\x0105\x0107 " + std::to_wstring(n) + L" " + noun + L" z Kosza?";
+            caption = L"Opr\x00F3\x017Cnij Kosz";
+        } else {
+            text = L"Are you sure you want to permanently delete " + std::to_wstring(n) + (n == 1 ? L" item" : L" items") +
+                   L" from the Recycle Bin?";
+            caption = L"Empty Recycle Bin";
+        }
+        if (MessageBoxW(hwnd, text.c_str(), caption.c_str(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
         }
     }
-    return S_OK;
+
+    DWORD firstErr = 0;
+    struct stat stFiles = {};
+    if (::lstat(filesDir.c_str(), &stFiles) == 0 && S_ISDIR(stFiles.st_mode)) {
+        for (const std::string& name : ListFolderNames(filesDir)) {
+            const int e = RemovePosixTree(filesDir + "/" + name, stFiles.st_dev);
+            if (e == 0) {
+                // The .trashinfo goes only after its item: an item that stays keeps what it needs to be restored
+                ::unlink((infoDir + "/" + name + ".trashinfo").c_str());
+            } else if (firstErr == 0) {
+                const DWORD w = Explorer2::Compat::Win32ErrorFromErrno(e);
+                firstErr = w ? w : static_cast<DWORD>(ERROR_ACCESS_DENIED);
+            }
+        }
+    }
+    // A .trashinfo whose item is gone already describes nothing. Anything else in info/ is not ours to delete.
+    static const char kInfoSuffix[] = ".trashinfo";
+    const size_t suffixLen = sizeof(kInfoSuffix) - 1;
+    for (const std::string& name : ListFolderNames(infoDir)) {
+        if (name.size() <= suffixLen || name.compare(name.size() - suffixLen, suffixLen, kInfoSuffix) != 0) continue;
+        struct stat st = {};
+        const std::string item = filesDir + "/" + name.substr(0, name.size() - suffixLen);
+        if (::lstat(item.c_str(), &st) != 0 && errno == ENOENT) ::unlink((infoDir + "/" + name).c_str());
+    }
+    return firstErr ? HRESULT_FROM_WIN32(firstErr) : S_OK;
 }
 
 __attribute__((weak)) HRESULT SHGetSpecialFolderLocation(HWND, int, PIDLIST_ABSOLUTE* ppidl) { if (ppidl) *ppidl = nullptr; return E_NOTIMPL; }

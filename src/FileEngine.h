@@ -64,6 +64,10 @@ public:
         bool showHidden,
         bool showExtensions,
         Lang lang);
+    // Why the last EnumerateDirectory call could not list its folder (a Win32 code such as
+    // ERROR_ACCESS_DENIED), or 0 when it could. A folder that cannot be read is returned as an empty list,
+    // and this tells it apart from a folder that is really empty.
+    DWORD LastEnumerateError() const { return m_lastEnumerateError.load(); }
 
     // Fast in-memory sorting (folders first, natural sort for names)
     static void SortEntries(
@@ -122,6 +126,11 @@ public:
     // Single-lock batch sync of folder sizes from hash table into FileEntry / TreeNode vectors
     void SyncDirectorySizes(std::vector<FileEntry>& entries);
     void SyncTreeNodeSizes(std::vector<TreeNode>& treeNodes);
+#ifndef _WIN32
+    // Linux: only the sizes and the offline state of network / FUSE mounts the probe threads have answered for
+    // (the Ten komputer list, whose drives get no folder sizes)
+    void SyncProbedMountSizes(std::vector<FileEntry>& entries);
+#endif
     void RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, bool forceRefresh = false);
 
     // Retrieve cached nested child blocks for WinDirStat/WizTree-style Proporcje treemap
@@ -195,6 +204,7 @@ private:
     int m_folderIconIndex = -1;
 
     std::atomic<bool> m_running{ false };
+    std::atomic<DWORD> m_lastEnumerateError{ 0 };   // see LastEnumerateError
 
     // Items a delete job is working on (hidden from listings until the job reports back)
     mutable std::mutex m_deleteStateMutex;
@@ -261,9 +271,19 @@ private:
     struct NetDriveState {
         std::mutex mutex;
         std::unordered_map<wchar_t, NetDriveInfo> drives;
+#ifndef _WIN32
+        std::unordered_map<std::wstring, NetDriveInfo> mounts;   // Linux network and FUSE mounts, by mount point
+#endif
         std::atomic<bool> wanted{ true };       // false once the engine has no use for the answers any more
     };
     void ProbeNetworkDriveAsync(wchar_t driveLetter);
+#ifndef _WIN32
+    // Linux: the size of a network or FUSE mount is asked on a probe thread of its own (statvfs waits as long
+    // as the server does not answer) and kept in m_net->mounts; the view is told with
+    // WM_APP_FOLDER_SIZE_UPDATED. GetProbedMountSize gives the last answer, false while there is none yet.
+    void ProbeLinuxMountAsync(const std::wstring& mountPoint);
+    bool GetProbedMountSize(const std::wstring& mountPoint, uint64_t& outTotal, uint64_t& outFree, bool& outOnline) const;
+#endif
     std::shared_ptr<NetDriveState> m_net = std::make_shared<NetDriveState>();
 
     // Async Recursive Search Worker
@@ -292,5 +312,56 @@ private:
     std::atomic<uint64_t> m_watcherGeneration{ 0 };
     HANDLE m_watcherWakeEvent = nullptr;
 };
+
+#ifndef _WIN32
+// Linux: the mount table, for the drive list and for the folder walkers below (FileEngine.cpp)
+namespace LinuxMounts {
+
+struct Mount {
+    std::string mountPoint;     // as /proc/self/mountinfo spells it, its "\040"-style escapes decoded
+    std::string fsType;
+    std::string source;         // the device or share, such as "/dev/sda1" or "server:/export"
+    uint64_t device = 0;        // the st_dev of what is mounted there
+};
+
+// The current mount table, read again when the copy at hand is more than a second old. Reading it never
+// waits for a mounted file system.
+std::shared_ptr<const std::vector<Mount>> Current();
+
+// Network file systems, and FUSE file systems ("fuse.*"), whose server may take long to answer or never do
+bool IsNetworkFsType(const std::string& fsType);
+
+// The mount whose device is `device` (the one mounted last when there are several), or nullptr
+const Mount* FindByDevice(const std::vector<Mount>& mounts, uint64_t device);
+
+} // namespace LinuxMounts
+
+// Linux: tells, while a folder tree is walked without following links, which of its folders is the root of
+// another mount: another file system (its device differs from the tree's) or a bind mount of a folder of the
+// same one (listed in the mount table). The walkers that delete, move, copy, measure or back up a tree treat
+// such a folder as a leaf and never enter it, so nothing on a USB disk or a network share mounted inside the
+// tree is touched.
+class MountFence {
+public:
+    explicit MountFence(const std::wstring& rootDir);
+
+    // Whether the folder `childPath`, found in the tree, is the root of another mount. A folder that cannot
+    // be checked counts as one, so that it is not entered; outCannotTell says when that was the reason.
+    bool IsMountRoot(const std::wstring& childPath, bool* outCannotTell = nullptr) const;
+    // Whether the tree's root itself is a folder and not a link to one
+    bool RootIsRealFolder() const { return m_rootIsFolder; }
+
+    // Whether `path` itself is a mount point (a link never is: removing it removes only the link)
+    static bool IsMountPoint(const std::wstring& path);
+
+private:
+    std::string m_rootNative;   // the root as the walk spells it
+    std::string m_rootReal;     // the same with every link resolved, as the mount table spells paths
+    uint64_t m_rootDevice = 0;
+    bool m_rootKnown = false;
+    bool m_rootIsFolder = false;
+    std::unordered_set<std::string> m_mountsBelow;   // mount points inside the tree, by their real path
+};
+#endif
 
 } // namespace Explorer2

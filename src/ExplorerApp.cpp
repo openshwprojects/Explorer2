@@ -20,6 +20,14 @@
 #include <system_error>
 #include <algorithm>
 #include <cmath>
+#ifndef _WIN32
+#include <cerrno>
+#include <ctime>
+#include <grp.h>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -90,6 +98,82 @@ static std::wstring DescribePaths(const std::vector<std::wstring>& paths) {
     std::wstring s = L"\"" + PathUtils::GetFileName(paths[0]) + L"\"";
     if (paths.size() > 1) s += L" (+" + std::to_wstring(paths.size() - 1) + L" more)";
     return s + L"  in  " + PathUtils::GetParentPath(paths[0]);
+}
+
+// Properties of a file or folder. Windows opens its own Properties sheet; Linux has none to open, so the item's
+// facts from stat() are listed in a message box: type, size, permissions, owner and times.
+static void ShowItemProperties(HWND hwnd, const std::wstring& path, Lang lang) {
+#ifdef _WIN32
+    (void)lang;
+    FileEngine::OpenFileOrProperties(hwnd, path, true);
+#else
+    const bool pl = (lang == Lang::PL);
+    const wchar_t* title = pl ? L"Właściwości" : L"Properties";
+    const std::string native = Explorer2::Compat::NativePath(path.c_str());
+    struct stat lst = {};
+    if (::lstat(native.c_str(), &lst) != 0) {
+        const DWORD err = Explorer2::Compat::Win32ErrorFromErrno(errno);
+        MessageBoxW(hwnd, (path + L"\n\n" + SystemErrorText(err)).c_str(), title, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    struct stat st = lst;
+    std::wstring linkTarget;
+    if (S_ISLNK(lst.st_mode)) {
+        char buf[4096] = {};
+        const ssize_t n = ::readlink(native.c_str(), buf, sizeof(buf) - 1);
+        if (n > 0) linkTarget = PathUtils::Utf8ToWide(std::string(buf, static_cast<size_t>(n)));
+        if (::stat(native.c_str(), &st) != 0) st = lst;      // a link whose target is gone: the link's own facts
+    }
+    std::wstring type;
+    if (S_ISDIR(st.st_mode)) type = pl ? L"Folder" : L"Folder";
+    else if (S_ISREG(st.st_mode)) type = pl ? L"Plik" : L"File";
+    else if (S_ISFIFO(st.st_mode)) type = pl ? L"Potok nazwany (FIFO)" : L"Named pipe (FIFO)";
+    else if (S_ISSOCK(st.st_mode)) type = pl ? L"Gniazdo" : L"Socket";
+    else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode)) type = pl ? L"Urządzenie" : L"Device";
+    else type = pl ? L"Inny" : L"Other";
+    if (!linkTarget.empty()) type += pl ? (L" (dowiązanie do: " + linkTarget + L")") : (L" (link to: " + linkTarget + L")");
+
+    // rwxr-xr-x and the octal mode, as ls and chmod show them
+    wchar_t perms[11] = L"----------";
+    const mode_t m = st.st_mode;
+    perms[0] = S_ISDIR(m) ? L'd' : (S_ISLNK(lst.st_mode) ? L'l' : L'-');
+    const mode_t bits[9] = { S_IRUSR, S_IWUSR, S_IXUSR, S_IRGRP, S_IWGRP, S_IXGRP, S_IROTH, S_IWOTH, S_IXOTH };
+    const wchar_t chars[9] = { L'r', L'w', L'x', L'r', L'w', L'x', L'r', L'w', L'x' };
+    for (int i = 0; i < 9; ++i) if (m & bits[i]) perms[1 + i] = chars[i];
+    wchar_t octal[8] = {};
+    swprintf_s(octal, L"%04o", static_cast<unsigned>(m & 07777));
+
+    std::wstring owner = std::to_wstring(st.st_uid), group = std::to_wstring(st.st_gid);
+    {
+        struct passwd pw = {}, *pwr = nullptr;
+        struct group gr = {}, *grr = nullptr;
+        char buf[4096] = {};
+        if (::getpwuid_r(st.st_uid, &pw, buf, sizeof(buf), &pwr) == 0 && pwr && pwr->pw_name) owner = PathUtils::Utf8ToWide(pwr->pw_name);
+        if (::getgrgid_r(st.st_gid, &gr, buf, sizeof(buf), &grr) == 0 && grr && grr->gr_name) group = PathUtils::Utf8ToWide(grr->gr_name);
+    }
+    auto formatTime = [](time_t t) {
+        struct tm lt = {};
+        localtime_r(&t, &lt);
+        wchar_t b[32] = {};
+        swprintf_s(b, L"%02d.%02d.%04d %02d:%02d:%02d", lt.tm_mday, lt.tm_mon + 1, lt.tm_year + 1900, lt.tm_hour, lt.tm_min, lt.tm_sec);
+        return std::wstring(b);
+    };
+
+    std::wstring text;
+    text += (pl ? L"Nazwa:  " : L"Name:  ") + PathUtils::GetFileName(path) + L"\n";
+    text += (pl ? L"Położenie:  " : L"Location:  ") + PathUtils::GetParentPath(path) + L"\n";
+    text += (pl ? L"Typ:  " : L"Type:  ") + type + L"\n";
+    if (!S_ISDIR(st.st_mode)) {
+        text += (pl ? L"Rozmiar:  " : L"Size:  ") + PathUtils::FormatByteSize(static_cast<uint64_t>(st.st_size)) +
+                L" (" + std::to_wstring(static_cast<long long>(st.st_size)) + (pl ? L" B)\n" : L" bytes)\n");
+    }
+    text += (pl ? L"Uprawnienia:  " : L"Permissions:  ") + std::wstring(perms) + L"  (" + octal + L")\n";
+    text += (pl ? L"Właściciel:  " : L"Owner:  ") + owner + L" : " + group + L"\n";
+    text += (pl ? L"Zmodyfikowano:  " : L"Modified:  ") + formatTime(st.st_mtime) + L"\n";
+    text += (pl ? L"Ostatni dostęp:  " : L"Accessed:  ") + formatTime(st.st_atime) + L"\n";
+    text += (pl ? L"Zmiana atrybutów:  " : L"Status changed:  ") + formatTime(st.st_ctime);
+    MessageBoxW(hwnd, text.c_str(), title, MB_OK | MB_ICONINFORMATION);
+#endif
 }
 
 // ---- Drag out of the window (OLE drag and drop to other programs) ----
@@ -245,8 +329,10 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
             if (v >= 72 && v <= 480) m_dpi = static_cast<UINT>(v);
         }
     }
-    if (m_dpi != 96) {
-        // CreateWindowExW took 1240 x 760 as pixels: give the window that size in DIPs instead, kept on its screen
+    {
+        // CreateWindowExW took 1240 x 760 as pixels: give the window that size in DIPs instead, and never more than
+        // its screen's work area (a 1024 x 768 screen would otherwise get a window wider than the screen, whose
+        // right part, with ribbon buttons, cannot be reached)
         RECT wr = {};
         GetWindowRect(m_hwnd, &wr);
         int w = DipToPx(1240.0f);
@@ -261,7 +347,9 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
             x = std::clamp<int>(x, wa.left, wa.right - w);
             y = std::clamp<int>(y, wa.top, wa.bottom - h);
         }
-        SetWindowPos(m_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (x != wr.left || y != wr.top || w != wr.right - wr.left || h != wr.bottom - wr.top) {
+            SetWindowPos(m_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
     AppLog::Info(L"App", L"Display scaling: " + std::to_wstring(m_dpi) + L" DPI (" + std::to_wstring(m_dpi * 100 / 96) + L"%)");
 
@@ -1340,6 +1428,21 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
                 return;
             }
         }
+#ifndef _WIN32
+        // A folder that exists but may not be listed (another user's home, /root, a 0700 folder): say so and stay
+        // where we were, as Windows Explorer does, instead of showing it as an empty folder
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) &&
+            ::access(Explorer2::Compat::NativePath(cleanPath.c_str()).c_str(), R_OK | X_OK) != 0 &&
+            (errno == EACCES || errno == EPERM)) {
+            AppLog::Warn(L"Navigate", L"Access denied: " + cleanPath);
+            m_statusToast = L"\x26A0 " + std::wstring(m_lang == Lang::PL ? L"Brak dost\x0119pu: " : L"Access denied: ") + cleanPath;
+            m_statusToastExpireTick = GetTickCount64() + 5000;
+            EnsureWorkAnimTimerState();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            if (m_currentPath.empty()) NavigateTo(L"THIS_PC", false);   // at start-up: not an empty window
+            return;
+        }
+#endif
     }
 
     m_mediaPlayer.CloseMedia();
@@ -2510,7 +2613,12 @@ void ExplorerApp::LoadUiSettings() {
     m_treePaneWidth = std::clamp(static_cast<float>(GetPrivateProfileIntW(L"UI", L"TreePaneWidth", 265, ini.c_str())), 140.0f, 500.0f);
     m_gitDockWidth = std::clamp(static_cast<float>(GetPrivateProfileIntW(L"UI", L"GitDockWidth", 340, ini.c_str())), 260.0f, 900.0f);
     m_ribbonCollapsed = GetPrivateProfileIntW(L"UI", L"RibbonCollapsed", 0, ini.c_str()) != 0;
+#ifdef _WIN32
     m_showHidden = GetPrivateProfileIntW(L"UI", L"ShowHidden", 1, ini.c_str()) != 0;
+#else
+    // Linux keeps its settings and caches in dot folders (.cache, .config, .local...): hidden unless asked for
+    m_showHidden = GetPrivateProfileIntW(L"UI", L"ShowHidden", 0, ini.c_str()) != 0;
+#endif
     m_showExtensions = GetPrivateProfileIntW(L"UI", L"ShowExtensions", 1, ini.c_str()) != 0;
     m_confirmDelete = GetPrivateProfileIntW(L"UI", L"ConfirmDelete", 0, ini.c_str()) != 0;
     m_darkMode = GetPrivateProfileIntW(L"UI", L"DarkMode", 0, ini.c_str()) != 0;
@@ -3725,7 +3833,14 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         // The cursor left the window (the capture still reports it): continue as a Windows drag and drop.
         // FTP items are not files Windows can take, so a drag of only those stays inside the window.
         const D2D1_SIZE_F client = ClientSizeDip();
+#ifdef E2_WIN32_HAL
+        // The Linux build has no drag and drop with other programs yet (no XDND): a drag that overshoots the window's
+        // edge stays a drag inside the window instead of being cancelled
+        (void)client;
+        const bool outside = false;
+#else
         const bool outside = (x < 0.0f || y < 0.0f || x >= client.width || y >= client.height);
+#endif
         if (outside && std::any_of(m_dragPaths.begin(), m_dragPaths.end(),
                                    [](const std::wstring& p) { return !p.empty() && !FtpClient::IsFtpPath(p) && !RepoBrowser::IsRepoUrl(p) && !IsVirtualFolder(p); })) {
             const std::vector<std::wstring> paths = m_dragPaths;
@@ -4084,6 +4199,16 @@ void ExplorerApp::OnMouseWheel(short delta, float x, float y, WPARAM keyFlags) {
     int steps = delta / WHEEL_DELTA;
     if (steps == 0) steps = (delta > 0) ? 1 : -1;
 
+    // Over a ribbon that is wider than the window, the wheel scrolls it sideways
+    if (!m_isFullScreen && !m_ribbonCollapsed && y >= kRibbonTabsHeight && y < kRibbonTabsHeight + kRibbonBodyHeight) {
+        const float maxScroll = std::max(0.0f, m_ribbonContentW - ClientSizeDip().width);
+        if (maxScroll > 0.0f) {
+            m_ribbonScrollX = std::clamp(m_ribbonScrollX - steps * 80.0f, 0.0f, maxScroll);
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            return;
+        }
+    }
+
     // If cursor is over the Right-Side File Content Pane (Hex / 3D), scroll or zoom it!
     if (PreviewPaneVisible() && m_contentPane.OnMouseWheel(delta, x, y)) {
         EnsureWorkAnimTimerState();     // a PDF page turned by the wheel is drawn in the background
@@ -4237,7 +4362,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
         if (vk == VK_UP) { NavigateUp(); return; }
         if (vk == VK_RETURN) {
             auto paths = GetSelectedPaths();
-            if (!paths.empty()) FileEngine::OpenFileOrProperties(m_hwnd, paths[0], true);
+            if (!paths.empty()) ShowItemProperties(m_hwnd, paths[0], m_lang);
             return;
         }
         if (vk == 'D') {
@@ -4427,6 +4552,15 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         SaveUiSettings();
         ClampScrollOffset();
         break;
+    case CMD_RIBBON_SCROLL_LEFT:
+    case CMD_RIBBON_SCROLL_RIGHT: {
+        // The arrows at the ends of a ribbon wider than the window move it by most of the window's width
+        const float bodyW = ClientSizeDip().width;
+        const float step = std::max(120.0f, bodyW * 0.6f);
+        const float maxScroll = std::max(0.0f, m_ribbonContentW - bodyW);
+        m_ribbonScrollX = std::clamp(m_ribbonScrollX + (cmdId == CMD_RIBBON_SCROLL_LEFT ? -step : step), 0.0f, maxScroll);
+        break;
+    }
     case CMD_TAB_NEW:
         CreateNewTab(L"", true);
         break;
@@ -4541,8 +4675,8 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     }
     case CMD_PROPERTIES: {
         auto paths = GetSelectedPaths();
-        if (!paths.empty()) FileEngine::OpenFileOrProperties(m_hwnd, paths[0], true);
-        else if (!m_currentPath.empty()) FileEngine::OpenFileOrProperties(m_hwnd, m_currentPath, true);
+        if (!paths.empty()) ShowItemProperties(m_hwnd, paths[0], m_lang);
+        else if (!m_currentPath.empty()) ShowItemProperties(m_hwnd, m_currentPath, m_lang);
         break;
     }
     case CMD_OPEN:          ActivateFocusedOrSelectedItem(); break;
@@ -6274,7 +6408,9 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
             auto entries = m_fileEngine.EnumerateDirectory(curDir, m_showHidden, m_showExtensions, m_lang);
             for (auto& e : entries) {
                 if (e.isDirectory) {
-                    if (m_searchOpts.recursive) {
+                    // A linked folder (symlink, junction) is not entered: through it the same files would be listed
+                    // twice, each the "duplicate" of itself, and deleting the "extra copy" would delete the only one
+                    if (m_searchOpts.recursive && !(e.attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
                         dirQueue.push_back(e.fullPath);
                     }
                 } else if (e.size > 0) {
@@ -6600,9 +6736,23 @@ void ExplorerApp::DeleteSelectedItems(bool permanent) {
 
     std::vector<std::wstring> toDelete = GetSelectedPaths();
     // Whole drives and share roots are never deleted; the delete engine refuses them too
+#ifndef _WIN32
+    const size_t selectedCount = toDelete.size();
+#endif
     toDelete.erase(std::remove_if(toDelete.begin(), toDelete.end(),
                                   [](const std::wstring& p) { return TransferManager::IsDeleteRefused(p); }),
                    toDelete.end());
+#ifndef _WIN32
+    if (toDelete.size() != selectedCount) {
+        // On Linux a mount point inside a folder (a USB disk under /media, a share under /mnt) is refused as
+        // well: say why nothing happened to it
+        m_statusToast = (m_lang == Lang::PL) ? L"\x26A0 Punktu montowania (dysku, udzia\x0142u) nie usuwa si\x0119 w ca\x0142o\x015B" L"ci"
+                                             : L"\x26A0 A mount point (a drive or a share) is never deleted as a whole";
+        m_statusToastExpireTick = GetTickCount64() + 5000;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    }
+#endif
     if (toDelete.empty()) return;
 
     // Network shares (\\server\share\...), mapped network drives (Z:\ with DRIVE_REMOTE), RAM disks and
@@ -7778,7 +7928,7 @@ void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeInde
         return;
     }
     if (cmd == CMD_CTX_PROPERTIES) {
-        FileEngine::OpenFileOrProperties(m_hwnd, nodeCopy.path, true);
+        ShowItemProperties(m_hwnd, nodeCopy.path, m_lang);
         return;
     }
     if (cmd == CMD_CTX_EXPLORER) {
@@ -7798,7 +7948,13 @@ void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeInde
 void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
     const Strings& s = GetStrings(m_lang);
 
-    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+#ifdef E2_WIN32_HAL
+    // Linux has no Windows shell menu to show: Shift+right-click gets the app's own menu
+    const bool nativeShellMenu = false;
+#else
+    const bool nativeShellMenu = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+#endif
+    if (nativeShellMenu) {
         auto selPaths = GetSelectedPaths();
         if (!selPaths.empty()) {
             ShellMenuEmulator::ShowNativeShellContextMenu(m_hwnd, selPaths, screenX, screenY);
@@ -8027,7 +8183,9 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         if (HBITMAP hExpBmp = m_shellEmulator.GetExplorerMenuBitmap()) {
             ShellMenuEmulator::AttachMenuBitmap(hMenu, CMD_CTX_EXPLORER, false, hExpBmp);
         }
+#ifndef E2_WIN32_HAL
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_NATIVE_SHELL_MENU, s.ctxNativeShellMenu);
+#endif
     } else {
         HMENU hViewMenu = CreatePopupMenu();
         auto addViewOption = [&](int cmdId, const wchar_t* label, bool isCurrent) {
@@ -8413,8 +8571,8 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
     }
     case CMD_CTX_PROPERTIES: {
         auto paths = GetSelectedPaths();
-        if (!paths.empty() && hitIndex >= 0) FileEngine::OpenFileOrProperties(m_hwnd, paths[0], true);
-        else FileEngine::OpenFileOrProperties(m_hwnd, m_currentPath, true);
+        if (!paths.empty() && hitIndex >= 0) ShowItemProperties(m_hwnd, paths[0], m_lang);
+        else ShowItemProperties(m_hwnd, m_currentPath, m_lang);
         break;
     }
     case CMD_CTX_REFRESH:        RefreshFromUser(); break;
@@ -8532,7 +8690,14 @@ void ExplorerApp::TriggerFolderSizeCalculation() {
 
 void ExplorerApp::SyncFolderSizesFromCache() {
     m_fileEngine.SyncTreeNodeSizes(m_treeNodes);
-    if (m_currentPath == L"THIS_PC") return;
+    if (m_currentPath == L"THIS_PC") {
+#ifndef _WIN32
+        // A network share's size (or "offline") arrives from its probe thread after the list was made
+        m_fileEngine.SyncProbedMountSizes(m_allItems);
+        m_fileEngine.SyncProbedMountSizes(m_items);
+#endif
+        return;
+    }
 
     // Single-lock batch sync for m_allItems and m_items!
     m_fileEngine.SyncDirectorySizes(m_allItems);
@@ -8877,7 +9042,14 @@ static bool PromptCustomImageInput(
     SendMessageW(st.hEdit, EM_SETSEL, 0, -1);
 
     MSG msg = {};
-    while (!st.closed && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    while (!st.closed) {
+        const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+        if (got <= 0) {
+            // The app is quitting: the dialog ends, and the main loop must still see the WM_QUIT
+            if (got == 0) PostQuitMessage(static_cast<int>(msg.wParam));
+            if (IsWindow(hDlg)) DestroyWindow(hDlg);
+            break;
+        }
         if (!IsDialogMessageW(hDlg, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);

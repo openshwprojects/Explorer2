@@ -158,8 +158,10 @@ elseif(E2_STATIC_LINUX)
     # runs on any Linux distribution / glibc or musl version / 64-bit host without 32-bit multilib installed.
     target_compile_definitions(explorer2 PRIVATE E2_STATIC_X11=1)
     target_link_libraries(explorer2 PRIVATE X11 xcb Xau Xdmcp)
+    # musl gives a new thread 128 KiB of stack, where the readers' and workers' deep recursion overflows; it takes
+    # the default for its threads from the PT_GNU_STACK size this option sets (glibc uses the 8 MiB stack limit)
     foreach(exe explorer2-readers explorer2-stage15 explorer2)
-        target_link_options(${exe} PRIVATE -static)
+        target_link_options(${exe} PRIVATE -static -Wl,-z,stack-size=2097152)
     endforeach()
 else()
     # Statically link libstdc++ and libgcc so portable binaries do not need libstdc++.so.6 / libgcc_s.so.1 at runtime

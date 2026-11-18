@@ -3734,6 +3734,8 @@ ToolRun RunSilentProcessWait(const std::wstring& exePath, const std::wstring& ar
     if (pid < 0) return ToolRun::Failed;
     if (pid == 0) {
         ::setpgid(0, 0);
+        // The app ignores SIGPIPE; an ignored signal stays ignored across exec, and the archiver expects the default
+        ::signal(SIGPIPE, SIG_DFL);
         const int nul = ::open("/dev/null", O_RDWR);
         if (nul >= 0) {
             ::dup2(nul, STDIN_FILENO);

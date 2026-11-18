@@ -29,6 +29,9 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#ifndef _WIN32
+#include <system_error>
+#endif
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -280,6 +283,39 @@ std::wstring ReverseDns(uint32_t ipHost) {
     return s;
 }
 
+#ifndef _WIN32
+// ReverseDns with a way out. getnameinfo() cannot be cancelled and may wait out the resolver's whole timeout (5 s or
+// more per name server). ~LanScanner joins the scan thread, which joins its name workers, so closing the window used
+// to wait for that too. The lookup runs on a detached helper thread that owns everything it touches; the caller stops
+// waiting as soon as giveUp() says so, and an answer that comes later is dropped.
+std::wstring ReverseDnsUntil(uint32_t ipHost, const std::function<bool()>& giveUp) {
+    struct Lookup {
+        std::mutex m;
+        std::condition_variable cv;
+        bool done = false;
+        std::wstring name;
+    };
+    auto lookup = std::make_shared<Lookup>();
+    try {
+        std::thread([lookup, ipHost] {
+            std::wstring name = ReverseDns(ipHost);
+            std::lock_guard<std::mutex> lk(lookup->m);
+            lookup->name = std::move(name);
+            lookup->done = true;
+            lookup->cv.notify_all();
+        }).detach();
+    } catch (const std::system_error&) {
+        return ReverseDns(ipHost);   // no thread to spare: wait for the answer here, as before
+    }
+    std::unique_lock<std::mutex> lk(lookup->m);
+    while (!lookup->done) {
+        if (giveUp()) return L"";
+        lookup->cv.wait_for(lk, std::chrono::milliseconds(50));
+    }
+    return lookup->name;
+}
+#endif
+
 // NetBIOS node status (UDP 137). Returns the machine's unique workstation name or empty.
 std::wstring NetbiosName(uint32_t ipHost) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -347,9 +383,13 @@ SOCKET ConnectWithDeadline(uint32_t ipHost, uint16_t port, Clock::time_point dea
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
     sa.sin_addr.s_addr = htonl(ipHost);
-    if (connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(s);
-        return INVALID_SOCKET;
+    if (connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+        // A connect that is still under way says WSAEWOULDBLOCK on Windows and EINPROGRESS on Linux
+        const int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
     }
     auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - Clock::now()).count();
     if (left < 0) left = 0;
@@ -712,10 +752,14 @@ void LanScanner::PortScanThreadMain(uint32_t gen, std::wstring ip) {
             if (connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0) {
                 open.push_back(ports[i]);
                 closesocket(s);
-            } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
-                pending.push_back({s, ports[i]});
             } else {
-                closesocket(s);
+                // A connect that is still under way says WSAEWOULDBLOCK on Windows and EINPROGRESS on Linux
+                const int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
+                    pending.push_back({s, ports[i]});
+                } else {
+                    closesocket(s);
+                }
             }
         }
         while (!pending.empty() && !stale()) {
@@ -818,7 +862,13 @@ void LanScanner::ScanThreadMain(uint32_t gen, LanAdapterInfo adapter, int maxHos
             }
             if (!stale() && Clock::now() < deadline) {
                 std::wstring nb = NetbiosName(ip);
+#ifndef _WIN32
+                // Bounded by the scan: cancelled (the window closes) or out of budget ends the wait at once
+                std::wstring dns = (stale() || Clock::now() >= deadline) ? L""
+                    : ReverseDnsUntil(ip, [&] { return stale() || Clock::now() >= deadline; });
+#else
                 std::wstring dns = (stale() || Clock::now() >= deadline) ? L"" : ReverseDns(ip);
+#endif
                 if (!stale() && (!nb.empty() || !dns.empty())) {
                     std::lock_guard<std::mutex> lk(mutex_);
                     if (!stale()) WithHostLocked(ip, [&](LanHost& h) { h.netbiosName = nb; h.hostName = dns; });

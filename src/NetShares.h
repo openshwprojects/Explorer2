@@ -20,7 +20,7 @@ enum class Reach { Ok, Pending, Failed };
 
 bool IsUncPath(const std::wstring& path);            // \\server or \\server\share\... (not \\?\ or \\.\ device paths)
 bool IsServerRoot(const std::wstring& path);         // \\server alone: the list of its shares
-bool IsNetworkPath(const std::wstring& path);        // a UNC path, or a path on a drive mapped to a share
+bool IsNetworkPath(const std::wstring& path);        // a UNC path, or a path on a drive mapped to a share (Linux: on a network mount)
 std::wstring ServerName(const std::wstring& path);   // "server" of \\server\share\x ("" when the path is not UNC)
 std::wstring ShareRoot(const std::wstring& path);    // "\\server\share" ("" for \\server alone or a non-UNC path)
 

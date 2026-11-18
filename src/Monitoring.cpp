@@ -19,6 +19,18 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#ifndef _WIN32
+#include <cerrno>
+#include <chrono>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 #pragma comment(lib, "pdh.lib")
 
@@ -208,7 +220,14 @@ bool AppendText(const std::wstring& path, const char* header, const std::string&
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size = {};
+#ifndef _WIN32
+    // The header goes only into a file whose size was read as 0: a size that cannot be read must not put a header
+    // line between two rows. (The Win32 layer opens a FILE_APPEND_DATA handle with O_APPEND and without a stdio
+    // buffer, so the single WriteFile below is a single write(2) at the end of the file.)
+    if (!GetFileSizeEx(h, &size)) size.QuadPart = 1;
+#else
     GetFileSizeEx(h, &size);
+#endif
     std::string payload;
     if (size.QuadPart == 0) payload = header;
     payload += line;
@@ -404,6 +423,7 @@ std::wstring SelfExePath() {
     return exe;
 }
 
+#ifdef _WIN32
 // Runs a program elevated (UAC prompt) and waits for it
 bool RunElevatedAndWait(const std::wstring& file, const std::wstring& params, DWORD& exitCode) {
     SHELLEXECUTEINFOW sei = {};
@@ -430,6 +450,193 @@ bool TaskExists() {
     DWORD attr = GetFileAttributesW(taskFile.c_str());
     return attr != INVALID_FILE_ATTRIBUTES;
 }
+#endif
+
+#ifndef _WIN32
+// ---- autostart (Linux) ------------------------------------------------------------------------------
+// The desktop starts at login what ~/.config/autostart lists (the XDG autostart rule that GNOME, KDE, Xfce and the
+// others follow): the counterpart of the Run key used on Windows
+std::string XdgAutostartEntryPath() {
+    std::string base;
+    const char* config = std::getenv("XDG_CONFIG_HOME");
+    if (config && config[0] == '/') {
+        base = config;
+    } else {
+        const char* home = std::getenv("HOME");
+        if (!home || home[0] != '/') return std::string();
+        base = std::string(home) + "/.config";
+    }
+    return base + "/autostart/explorer2-monitor.desktop";
+}
+
+// One argument of a desktop entry's Exec line, quoted, with the escapes the Desktop Entry Specification asks for:
+// '"', '`' and '$' get a backslash inside the quotes, and every backslash is doubled once more for the file
+std::string DesktopExecArgument(const std::string& arg) {
+    std::string out = "\"";
+    for (char c : arg) {
+        if (c == '"' || c == '`' || c == '$') {
+            out += "\\\\";
+            out.push_back(c);
+        } else if (c == '\\') {
+            out += "\\\\\\\\";
+        } else if (c == '%') {
+            out += "%%";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+// ---- recorder lock and stop request (Linux) --------------------------------------------------------
+// The Win32 layer keeps named mutexes and events inside one process, so a window could neither see a running recorder
+// nor stop it, and every start of a window added one more recorder. Instead the recorder holds an exclusive flock() on
+// a lock file for its whole life and keeps its process id in that file. The kernel drops the lock when the recorder
+// exits or crashes, so a file left behind never makes a dead recorder look alive.
+
+const std::string& DaemonLockPath() {
+    static const std::string path = []() {
+        const char* runtimeDir = std::getenv("XDG_RUNTIME_DIR");
+        struct stat st = {};
+        if (runtimeDir && runtimeDir[0] == '/' && ::stat(runtimeDir, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return std::string(runtimeDir) + "/explorer2-monitor.lock";
+        }
+        return Compat::NativePath((MonitorStore::DataDir() + L"\\explorer2-monitor.lock").c_str());
+    }();
+    return path;
+}
+
+constexpr int kLockHeldByOther = -2;
+
+// Takes the recorder lock for this process. Returns the descriptor that holds it (kept open while the recorder runs),
+// kLockHeldByOther when another recorder runs, or -1 when the lock file cannot be used.
+int AcquireDaemonLock() {
+    const int fd = ::open(DaemonLockPath().c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    // A window that checks whether a recorder runs holds a shared lock for a few microseconds, and that refuses an
+    // exclusive one too. Only a recorder keeps the lock, so a refusal that lasts half a second means one runs.
+    int lastError = 0;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+            char text[32] = {};
+            const int len = std::snprintf(text, sizeof(text), "%ld\n", static_cast<long>(::getpid()));
+            if (len > 0 && ::pwrite(fd, text, static_cast<size_t>(len), 0) == len) {
+                const int truncated = ::ftruncate(fd, len);   // drops the end of a longer process id written before
+                (void)truncated;
+            }
+            return fd;
+        }
+        lastError = errno;
+        if (lastError != EWOULDBLOCK) break;
+        Sleep(10);
+    }
+    ::close(fd);
+    return (lastError == EWOULDBLOCK) ? kLockHeldByOther : -1;
+}
+
+// True while some process holds the recorder lock
+bool DaemonLockHeld() {
+    const int fd = ::open(DaemonLockPath().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;   // no file: no recorder has run yet
+    const bool held = ::flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    ::close(fd);                // also gives the shared lock back when it was granted
+    return held;
+}
+
+// Whether /proc says that process was started as a recorder (its arguments are separated by NUL characters)
+bool IsRecorderProcess(pid_t pid) {
+    char path[64] = {};
+    std::snprintf(path, sizeof(path), "/proc/%ld/cmdline", static_cast<long>(pid));
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[4096];
+    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    ::close(fd);
+    if (n <= 0) return false;
+    const std::string args(buf, static_cast<size_t>(n));
+    size_t start = 0;
+    while (start < args.size()) {
+        size_t end = args.find('\0', start);
+        if (end == std::string::npos) end = args.size();
+        if (args.compare(start, end - start, "--monitor-daemon") == 0) return true;
+        start = end + 1;
+    }
+    return false;
+}
+
+// The process id kept in the lock file, or 0. It is read only while the lock is held and trusted only when that
+// process is a recorder, so an id the system has given to another program since is never signalled.
+pid_t RunningDaemonPid() {
+    const int fd = ::open(DaemonLockPath().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    pid_t pid = 0;
+    if (::flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK) {
+        char text[32] = {};
+        const ssize_t n = ::pread(fd, text, sizeof(text) - 1, 0);
+        const long value = (n > 0) ? std::strtol(text, nullptr, 10) : 0;
+        if (value > 1 && IsRecorderProcess(static_cast<pid_t>(value))) pid = static_cast<pid_t>(value);
+    }
+    ::close(fd);
+    return pid;
+}
+
+// RequestStop() sends SIGTERM. The handler only sets a flag and writes one byte into a pipe, which is all a signal
+// handler may safely do; the recorder sleeps in poll() on that pipe, so it wakes at once and leaves its loop between
+// two rows instead of being killed in the middle of one.
+volatile sig_atomic_t g_stopRequested = 0;
+int g_stopPipe[2] = { -1, -1 };
+
+void OnStopSignal(int) {
+    const int savedErrno = errno;
+    g_stopRequested = 1;
+    if (g_stopPipe[1] >= 0) {
+        const char wake = 1;
+        const ssize_t written = ::write(g_stopPipe[1], &wake, 1);
+        (void)written;
+    }
+    errno = savedErrno;
+}
+
+void InstallStopHandler() {
+    if (::pipe2(g_stopPipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+        g_stopPipe[0] = -1;
+        g_stopPipe[1] = -1;
+    }
+    struct sigaction action = {};
+    action.sa_handler = OnStopSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    ::sigaction(SIGTERM, &action, nullptr);
+    ::sigaction(SIGINT, &action, nullptr);
+    // The signal mask is inherited through fork() and exec(): the window's thread that started this process may
+    // have had these two blocked
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    ::pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+}
+
+// Sleeps up to ms milliseconds; returns true as soon as the recorder was asked to stop
+bool WaitForStopRequest(DWORD ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!g_stopRequested) {
+        const long long left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) return false;
+        if (g_stopPipe[0] < 0) {
+            Sleep(static_cast<DWORD>(std::min<long long>(left, 250)));   // no pipe: look at the flag 4 times a second
+            continue;
+        }
+        pollfd pfd = {};
+        pfd.fd = g_stopPipe[0];
+        pfd.events = POLLIN;
+        ::poll(&pfd, 1, static_cast<int>(left));   // the byte, a signal or the time: the flag decides
+    }
+    return true;
+}
+#endif
 
 } // namespace
 
@@ -632,10 +839,14 @@ void MonitorHistory::Update(int64_t fromTs, int64_t toTs) {
 // =============================================================================================
 
 bool MonitorDaemon::IsRunning() {
+#ifndef _WIN32
+    return DaemonLockHeld();
+#else
     HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, kDaemonMutexName);
     if (!m) return false;
     CloseHandle(m);
     return true;
+#endif
 }
 
 bool MonitorDaemon::Start(bool elevated) {
@@ -662,13 +873,23 @@ bool MonitorDaemon::Start(bool elevated) {
 }
 
 void MonitorDaemon::RequestStop() {
+#ifndef _WIN32
+    const pid_t pid = RunningDaemonPid();
+    if (pid > 0) ::kill(pid, SIGTERM);
+#else
     HANDLE e = OpenEventW(EVENT_MODIFY_STATE, FALSE, kDaemonStopEventName);
     if (!e) return;
     SetEvent(e);
     CloseHandle(e);
+#endif
 }
 
 int MonitorDaemon::AutostartMode() {
+#ifndef _WIN32
+    const std::string entry = XdgAutostartEntryPath();
+    struct stat st = {};
+    return (!entry.empty() && ::stat(entry.c_str(), &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
+#else
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_READ, &key) == ERROR_SUCCESS) {
         bool present = RegQueryValueExW(key, kRunValueName, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
@@ -676,9 +897,41 @@ int MonitorDaemon::AutostartMode() {
         if (present) return 1;
     }
     return TaskExists() ? 2 : 0;
+#endif
 }
 
 void MonitorDaemon::SetAutostart(bool enable, bool elevated) {
+#ifndef _WIN32
+    // Linux has neither the HKCU Run key nor the Task Scheduler used below (running that code would hand
+    // "schtasks.exe" to xdg-open): an XDG autostart entry starts the recorder at login instead. It runs as the user;
+    // there is no elevated flavour.
+    (void)elevated;
+    const std::string entry = XdgAutostartEntryPath();
+    if (entry.empty()) return;
+    if (!enable) {
+        (void)::unlink(entry.c_str());
+        return;
+    }
+    const std::string folder = entry.substr(0, entry.find_last_of('/'));
+    (void)::mkdir(folder.substr(0, folder.find_last_of('/')).c_str(), 0700);    // ~/.config
+    (void)::mkdir(folder.c_str(), 0755);                                         // ~/.config/autostart
+    const std::string exe = Compat::NativePath(SelfExePath().c_str());
+    if (exe.empty()) return;
+    const std::string text =
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Explorer2 monitoring recorder\n"
+        "Comment=Records the history shown on the Explorer2 Monitoring tab\n"
+        "Exec=" + DesktopExecArgument(exe) + " --monitor-daemon\n"
+        "Terminal=false\n"
+        "NoDisplay=true\n"
+        "X-GNOME-Autostart-enabled=true\n";
+    const std::string temp = entry + ".tmp";
+    FILE* f = std::fopen(temp.c_str(), "w");
+    if (!f) return;
+    const bool written = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    if (std::fclose(f) != 0 || !written || ::rename(temp.c_str(), entry.c_str()) != 0) (void)::unlink(temp.c_str());
+#else
     // Always clear the Run-key flavour first; the scheduled-task flavour is removed/created through UAC
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
@@ -723,9 +976,21 @@ void MonitorDaemon::SetAutostart(bool enable, bool elevated) {
     } else if (taskPresent) {
         RunElevatedAndWait(L"schtasks.exe", L"/Delete /F /TN " + std::wstring(kTaskName), code);
     }
+#endif
 }
 
 int MonitorDaemon::Run() {
+#ifndef _WIN32
+    // Single recorder per user session, however many windows are (or are not) open: see DaemonLockPath
+    const int lockFd = AcquireDaemonLock();
+    if (lockFd == kLockHeldByOther) return 0;
+    if (lockFd < 0) return 1;
+    InstallStopHandler();
+    // Below normal priority, like BELOW_NORMAL_PRIORITY_CLASS on Windows. Linux keeps the nice value per thread;
+    // the hardware worker threads started below inherit it from this one.
+    const int niceResult = ::setpriority(PRIO_PROCESS, 0, 10);
+    (void)niceResult;
+#else
     // Single recorder per user session, however many windows are (or are not) open
     SharedSecurity security;
     HANDLE mutex = CreateMutexW(security.get(), TRUE, kDaemonMutexName);
@@ -738,6 +1003,7 @@ int MonitorDaemon::Run() {
     if (stopEvent) ResetEvent(stopEvent);
 
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+#endif
 
     {
         HardwareInspector hw;
@@ -758,7 +1024,11 @@ int MonitorDaemon::Run() {
 
         io.Collect();   // PDH rate counters need two collections
         // Warm-up so the first CPU / network / disk deltas cover a real interval
+#ifndef _WIN32
+        if (!WaitForStopRequest(2000)) {
+#else
         if (!stopEvent || WaitForSingleObject(stopEvent, 2000) == WAIT_TIMEOUT) {
+#endif
             while (true) {
                 hw.UpdateLiveTelemetry(true);
                 io.Collect();
@@ -769,6 +1039,12 @@ int MonitorDaemon::Run() {
                 }
 
                 MonitorSettings settings = MonitorStore::LoadSettings();
+#ifndef _WIN32
+                // Safety net for a stop request that did not arrive: the window that switched recording off saved
+                // Enabled=0 before it signalled, so the recorder ends itself before its next row. A missing key (the
+                // file being rewritten at this moment) is not a reason to stop.
+                if (GetPrivateProfileIntW(L"Monitor", L"Enabled", 1, SettingsPath().c_str()) == 0) break;
+#endif
                 MonitorStore::AppendSample(SampleNow(hw, io.Read()));
 
                 tm today = LocalTime(static_cast<int64_t>(time(nullptr)));
@@ -778,15 +1054,23 @@ int MonitorDaemon::Run() {
                 }
 
                 DWORD waitMs = static_cast<DWORD>(settings.intervalSec) * 1000u;
+#ifndef _WIN32
+                if (WaitForStopRequest(waitMs)) break;
+#else
                 if (!stopEvent) { Sleep(waitMs); continue; }
                 if (WaitForSingleObject(stopEvent, waitMs) != WAIT_TIMEOUT) break;
+#endif
             }
         }
     }
 
+#ifndef _WIN32
+    ::close(lockFd);   // gives the lock back: a new recorder may start now
+#else
     if (stopEvent) CloseHandle(stopEvent);
     ReleaseMutex(mutex);
     CloseHandle(mutex);
+#endif
     return 0;
 }
 

@@ -318,6 +318,9 @@ Result Run(const std::wstring& exePath, const std::vector<std::wstring>& args, c
         return res;
     }
     if (pid == 0) {
+        // The Linux main() ignores SIGPIPE, and an ignored signal stays ignored across exec: the tool gets the
+        // default action back (signal() is async-signal-safe)
+        ::signal(SIGPIPE, SIG_DFL);
         ::setpgid(0, 0);
         auto writeErrAndExit = [&](int err) -> void {
             ssize_t wr = ::write(execPipe[1], &err, sizeof(err));

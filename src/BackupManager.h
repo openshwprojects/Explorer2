@@ -24,6 +24,11 @@ struct BackupJob {
     // Runtime & telemetry state
     bool targetCurrentlyOnline = false;
     bool targetWasOnline = false;
+#ifndef _WIN32
+    // Linux: whether a probe of the target has answered yet (the target is asked on a probe thread, see
+    // BackupManager::IsTargetAvailable). The first answer is the starting state, not a "became available".
+    bool targetStateKnown = false;
+#endif
     uint64_t lastRunEpochSec = 0;
     std::wstring lastRunTimeStr;
     std::wstring lastStatus;
@@ -76,6 +81,10 @@ public:
     // Target availability & auto-run evaluation
     static bool IsRcloneRemoteSyntax(const std::wstring& path);
     static bool IsRcloneInstalled(std::wstring* outVersion = nullptr);
+    // On Linux this never waits for the target: it gives the last answer of a probe thread (false until the
+    // first one has come) and starts a new probe when that answer is a few seconds old. An NFS or SMB mount
+    // whose server does not answer would otherwise stop the window, which asks for every job every few
+    // seconds and while it paints the backup page.
     static bool IsTargetAvailable(const std::wstring& targetPath);
     static std::wstring BuildRcloneCommandLine(const BackupJob& job, bool dryRun);
 

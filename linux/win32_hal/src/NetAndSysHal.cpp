@@ -548,12 +548,22 @@ DWORD IcmpSendEcho(HANDLE IcmpHandle, IPAddr DestinationAddress, LPVOID RequestD
     const auto t0 = std::chrono::steady_clock::now();
 
     if (fd >= 0) {
+        // A raw socket receives every ICMP packet of the host, IP header first; an unprivileged ping socket
+        // (SOCK_DGRAM) only the replies to its own echo id, without the IP header
+        int sockType = SOCK_DGRAM;
+        socklen_t typeLen = sizeof(sockType);
+        if (::getsockopt(fd, SOL_SOCKET, SO_TYPE, &sockType, &typeLen) != 0) sockType = SOCK_DGRAM;
+        const bool rawSocket = (sockType == SOCK_RAW);
+
         std::vector<uint8_t> pkt(sizeof(icmphdr) + RequestSize, 0);
         auto* hdr = reinterpret_cast<icmphdr*>(pkt.data());
         hdr->type = ICMP_ECHO;
         hdr->code = 0;
         static std::atomic<uint16_t> s_seq{ 1 };
-        hdr->un.echo.sequence = htons(s_seq.fetch_add(1));
+        const uint16_t seq = s_seq.fetch_add(1);
+        const uint16_t ident = static_cast<uint16_t>(::getpid() & 0xFFFF);   // a ping socket puts its own id here
+        hdr->un.echo.id = htons(ident);
+        hdr->un.echo.sequence = htons(seq);
         if (RequestData && RequestSize > 0) std::memcpy(pkt.data() + sizeof(icmphdr), RequestData, RequestSize);
 
         // Compute RFC 1071 checksum (needed for SOCK_RAW; ignored by SOCK_DGRAM)
@@ -567,21 +577,43 @@ DWORD IcmpSendEcho(HANDLE IcmpHandle, IPAddr DestinationAddress, LPVOID RequestD
         dst.sin_family = AF_INET;
         dst.sin_addr.s_addr = DestinationAddress;
         if (::sendto(fd, pkt.data(), pkt.size(), 0, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) > 0) {
-            struct pollfd pfd = { fd, POLLIN, 0 };
-            if (::poll(&pfd, 1, static_cast<int>(Timeout)) > 0) {
-                uint8_t rbuf[512] = {};
+            // Read until the reply to this very request arrives or the time is up. A late reply to an earlier
+            // request (another host of a LAN scan), or on a raw socket any other ICMP packet, is skipped: taken
+            // as this host's answer, it made the host look dead.
+            const auto deadline = t0 + std::chrono::milliseconds(Timeout);
+            for (;;) {
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+                if (left <= 0) break;
+                struct pollfd pfd = { fd, POLLIN, 0 };
+                const int pr = ::poll(&pfd, 1, static_cast<int>(std::min<long long>(left, 60000)));
+                if (pr < 0 && errno == EINTR) continue;
+                if (pr <= 0) break;
+                uint8_t rbuf[1500] = {};
                 sockaddr_in from = {};
                 socklen_t flen = sizeof(from);
-                const ssize_t got = ::recvfrom(fd, rbuf, sizeof(rbuf), 0, reinterpret_cast<sockaddr*>(&from), &flen);
-                if (got > 0 && from.sin_addr.s_addr == DestinationAddress) {
-                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-                    auto* rep = reinterpret_cast<ICMP_ECHO_REPLY*>(ReplyBuffer);
-                    std::memset(rep, 0, sizeof(*rep));
-                    rep->Address = DestinationAddress;
-                    rep->Status = IP_SUCCESS;
-                    rep->RoundTripTime = static_cast<ULONG>(std::max<long long>(0, ms));
-                    return 1;
+                const ssize_t got = ::recvfrom(fd, rbuf, sizeof(rbuf), MSG_DONTWAIT, reinterpret_cast<sockaddr*>(&from), &flen);
+                if (got < 0) {
+                    if (errno == EINTR || errno == EAGAIN) continue;
+                    break;                                  // a socket error: no answer will come through it
                 }
+                if (got == 0 || from.sin_addr.s_addr != DestinationAddress) continue;
+                size_t off = 0;
+                if (rawSocket) {
+                    if (got < 20) continue;
+                    off = static_cast<size_t>(rbuf[0] & 0x0Fu) * 4u;     // the IP header's own length
+                }
+                if (static_cast<size_t>(got) < off + sizeof(icmphdr)) continue;
+                icmphdr reply = {};
+                std::memcpy(&reply, rbuf + off, sizeof(reply));
+                if (reply.type != ICMP_ECHOREPLY || ntohs(reply.un.echo.sequence) != seq) continue;
+                if (rawSocket && ntohs(reply.un.echo.id) != ident) continue;    // another program's ping
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                auto* rep = reinterpret_cast<ICMP_ECHO_REPLY*>(ReplyBuffer);
+                std::memset(rep, 0, sizeof(*rep));
+                rep->Address = DestinationAddress;
+                rep->Status = IP_SUCCESS;
+                rep->RoundTripTime = static_cast<ULONG>(std::max<long long>(0, ms));
+                return 1;
             }
             return 0;
         }
@@ -753,29 +785,34 @@ BOOL GetPerformanceInfo(PERFORMANCE_INFORMATION* pInfo, DWORD cb) {
     pInfo->CommitLimit = static_cast<SIZE_T>(((memTotalKB + swapTotalKB) * 1024ULL) / pg);
     pInfo->CommitPeak  = pInfo->CommitTotal;
 
-    DWORD procs = 0, threads = 0;
+    // Processes: the numeric entries of /proc, counted without opening any of them (this runs on the UI thread
+    // about twice a second, and opening /proc/<pid>/stat for every process cost milliseconds each time)
+    DWORD procs = 0;
     if (DIR* d = ::opendir("/proc")) {
         while (dirent* e = ::readdir(d)) {
-            if (e->d_name[0] >= '1' && e->d_name[0] <= '9') {
-                ++procs;
-                std::ifstream sf(std::string("/proc/") + e->d_name + "/stat");
-                std::string line;
-                if (std::getline(sf, line)) {
-                    const size_t rp = line.rfind(')');
-                    if (rp != std::string::npos) {
-                        std::istringstream iss(line.substr(rp + 2));
-                        char state = 0;
-                        long long dummy = 0, numThreads = 1;
-                        // state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads
-                        if (iss >> state) {
-                            for (int f = 0; f < 16; ++f) iss >> dummy;
-                            if (iss >> numThreads && numThreads > 0) threads += static_cast<DWORD>(numThreads);
-                        }
-                    }
-                }
+            const char* n = e->d_name;
+            if (*n < '1' || *n > '9') continue;
+            bool numeric = true;
+            for (const char* c = n; *c; ++c) {
+                if (*c < '0' || *c > '9') { numeric = false; break; }
             }
+            if (numeric) ++procs;
         }
         ::closedir(d);
+    }
+    // Threads: the fourth field of /proc/loadavg is "running/total" scheduling entities, and those are threads
+    DWORD threads = 0;
+    {
+        std::istringstream la(ReadSmallTextFile("/proc/loadavg"));
+        std::string load1, load5, load15, entities;
+        if (la >> load1 >> load5 >> load15 >> entities) {
+            const size_t slash = entities.find('/');
+            if (slash != std::string::npos) threads = static_cast<DWORD>(std::strtoul(entities.c_str() + slash + 1, nullptr, 10));
+        }
+    }
+    if (threads == 0) {
+        struct sysinfo si = {};
+        if (::sysinfo(&si) == 0) threads = static_cast<DWORD>(si.procs);     // the kernel's thread count too
     }
     pInfo->ProcessCount = procs;
     pInfo->ThreadCount = threads ? threads : procs;

@@ -30,7 +30,9 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
+#include <memory>
 #include <set>
+#include <system_error>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/utsname.h>
@@ -489,7 +491,99 @@ std::vector<HwPhysicalDisk> DiscoverLinuxPhysicalDisks() {
     return out;
 }
 
-std::vector<HwLogicalVolume> DiscoverLinuxVolumes() {
+// /proc/self/mounts writes a space, tab, newline or backslash inside a field as a backslash and three octal digits
+// ("/mnt/Moje\040Dokumenty"); this turns such a field back into the real text.
+std::string DecodeMountField(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() &&
+            s[i + 1] >= '0' && s[i + 1] <= '3' &&
+            s[i + 2] >= '0' && s[i + 2] <= '7' &&
+            s[i + 3] >= '0' && s[i + 3] <= '7') {
+            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+bool IsNetworkFsType(const std::string& fsType) {
+    static const char* const kNetwork[] = {
+        "cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "davfs", "ceph", "glusterfs",
+        "afs", "coda", "ncpfs", "lustre", "gpfs", "beegfs"
+    };
+    for (const char* t : kNetwork) {
+        if (fsType == t) return true;
+    }
+    return false;
+}
+
+// FUSE file systems answer through a user-space daemon (sshfs, rclone, gvfs, ...), which may itself wait for a server.
+// "fuseblk" is left out: it is a local disk (NTFS through ntfs-3g, exFAT).
+bool IsFuseFsType(const std::string& fsType) {
+    return fsType == "fuse" || fsType == "sshfs" || fsType.rfind("fuse.", 0) == 0;
+}
+
+// statvfs() of a network or FUSE mount waits for the server or the FUSE daemon, and a hard NFS mount whose server is
+// gone never returns. The call runs on a detached helper thread that owns everything it touches, and the caller waits
+// for it at most timeoutMs. A mount whose previous helper is still waiting is not asked again, so a dead server costs
+// one parked thread, not one more per refresh.
+bool StatvfsWithTimeout(const std::string& path, struct statvfs& out, int timeoutMs) {
+    struct InFlight {
+        std::mutex mutex;
+        std::set<std::string> paths;
+    };
+    // Never destroyed: a helper may still be waiting for its server while the process exits
+    static InFlight* const inFlight = new InFlight();
+    {
+        std::lock_guard<std::mutex> lk(inFlight->mutex);
+        if (!inFlight->paths.insert(path).second) return false;
+    }
+
+    struct Request {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        bool ok = false;
+        struct statvfs vfs = {};
+    };
+    auto request = std::make_shared<Request>();
+    try {
+        std::thread([request, path]() {
+            struct statvfs vfs = {};
+            const bool ok = (::statvfs(path.c_str(), &vfs) == 0);
+            {
+                std::lock_guard<std::mutex> lk(inFlight->mutex);
+                inFlight->paths.erase(path);
+            }
+            std::lock_guard<std::mutex> lk(request->mutex);
+            request->vfs = vfs;
+            request->ok = ok;
+            request->done = true;
+            request->cv.notify_all();
+        }).detach();
+    } catch (const std::system_error&) {
+        std::lock_guard<std::mutex> lk(inFlight->mutex);
+        inFlight->paths.erase(path);
+        return false;
+    }
+    std::unique_lock<std::mutex> lk(request->mutex);
+    if (!request->cv.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&request] { return request->done; })) return false;
+    if (!request->ok) return false;
+    out = request->vfs;
+    return true;
+}
+
+constexpr int kRemoteStatvfsTimeoutMs = 1000;
+
+// The mounted file systems for the Hardware tab. stat() and statvfs() of a network or FUSE mount can wait for a server
+// (forever for a hard NFS mount whose server is gone), so on the window's thread (askRemote = false) such mounts are
+// listed without their sizes and are never touched; the background worker (askRemote = true) asks for their sizes
+// with a time limit.
+std::vector<HwLogicalVolume> DiscoverLinuxVolumes(bool askRemote) {
     std::vector<HwLogicalVolume> out;
     std::ifstream mf("/proc/self/mounts");
     std::string line;
@@ -497,8 +591,8 @@ std::vector<HwLogicalVolume> DiscoverLinuxVolumes() {
     std::set<dev_t> seenDevs;
     while (std::getline(mf, line)) {
         std::istringstream iss(line);
-        std::string dev, mnt, fstype;
-        if (!(iss >> dev >> mnt >> fstype)) continue;
+        std::string devField, mntField, fstype;
+        if (!(iss >> devField >> mntField >> fstype)) continue;
         static const char* kPseudo[] = {
             "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "pstore",
             "securityfs", "debugfs", "tracefs", "configfs", "fusectl", "mqueue", "hugetlbfs",
@@ -509,37 +603,49 @@ std::vector<HwLogicalVolume> DiscoverLinuxVolumes() {
             if (fstype == ps) { skip = true; break; }
         }
         if (skip) continue;
+        const std::string dev = DecodeMountField(devField);
+        const std::string mnt = DecodeMountField(mntField);
+        // The rest of /run is runtime state, but udisks mounts removable drives in /run/media/<user>
         if (mnt.rfind("/proc/", 0) == 0 || mnt.rfind("/sys/", 0) == 0 || mnt.rfind("/dev/", 0) == 0 ||
-            mnt.rfind("/run/", 0) == 0 || mnt.rfind("/snap/", 0) == 0 || mnt == "/init") {
+            (mnt.rfind("/run/", 0) == 0 && mnt.rfind("/run/media/", 0) != 0) || mnt.rfind("/snap/", 0) == 0 ||
+            mnt == "/init") {
             continue;
         }
         if (!seenMnts.insert(mnt).second) continue;
 
-        struct stat st = {};
-        if (::stat(mnt.c_str(), &st) == 0 && mnt != "/") {
-            if (!seenDevs.insert(st.st_dev).second) continue;
-        } else if (mnt == "/") {
-            seenDevs.insert(st.st_dev);
-        }
-
-        const bool isNet = (fstype == "cifs" || fstype == "smb3" || fstype == "smbfs" || fstype == "nfs" || fstype == "nfs4");
+        // Decided before anything touches the mount: a remote one is not even stat()ed for the duplicate check
+        const bool isNet = IsNetworkFsType(fstype);
+        const bool isFuse = !isNet && IsFuseFsType(fstype);
         HwLogicalVolume v;
         v.rootPath     = PathUtils::Utf8ToWide(mnt);
         v.label        = PathUtils::Utf8ToWide(dev);
         v.fileSystem   = PathUtils::Utf8ToWide(fstype);
-        v.driveTypeStr = isNet ? L"Sieciowy (NAS/SMB/NFS)" : L"Lokalny (Mount)";
-        if (isNet) {
+        v.driveTypeStr = isNet ? L"Sieciowy (NAS/SMB/NFS)" : (isFuse ? L"FUSE (Mount)" : L"Lokalny (Mount)");
+
+        struct statvfs vfs = {};
+        if (isNet || isFuse) {
             v.isReady = false;
+            const bool answered = askRemote && StatvfsWithTimeout(mnt, vfs, kRemoteStatvfsTimeoutMs);
+            if (answered && vfs.f_blocks == 0 && isFuse) continue;   // a FUSE pseudo file system, like local ones below
+            if (!answered || vfs.f_blocks == 0) {
+                out.push_back(std::move(v));                         // listed, without sizes
+                continue;
+            }
         } else {
-            struct statvfs vfs = {};
+            struct stat st = {};
+            if (::stat(mnt.c_str(), &st) == 0 && mnt != "/") {
+                if (!seenDevs.insert(st.st_dev).second) continue;
+            } else if (mnt == "/") {
+                seenDevs.insert(st.st_dev);
+            }
             if (::statvfs(mnt.c_str(), &vfs) != 0 || vfs.f_blocks == 0) continue;
-            const uint64_t bsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
-            v.totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsize;
-            v.freeBytes  = static_cast<uint64_t>(vfs.f_bavail) * bsize;
-            v.usedBytes  = (v.totalBytes >= v.freeBytes) ? (v.totalBytes - v.freeBytes) : 0;
-            v.usedPct    = (v.totalBytes > 0) ? static_cast<float>(static_cast<double>(v.usedBytes) * 100.0 / static_cast<double>(v.totalBytes)) : 0.0f;
-            v.isReady    = true;
         }
+        const uint64_t bsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+        v.totalBytes = static_cast<uint64_t>(vfs.f_blocks) * bsize;
+        v.freeBytes  = static_cast<uint64_t>(vfs.f_bavail) * bsize;
+        v.usedBytes  = (v.totalBytes >= v.freeBytes) ? (v.totalBytes - v.freeBytes) : 0;
+        v.usedPct    = (v.totalBytes > 0) ? static_cast<float>(static_cast<double>(v.usedBytes) * 100.0 / static_cast<double>(v.totalBytes)) : 0.0f;
+        v.isReady    = true;
         out.push_back(std::move(v));
     }
     return out;
@@ -565,7 +671,12 @@ HardwareInspector::HardwareInspector() {
 }
 
 HardwareInspector::~HardwareInspector() {
-    m_stopWorker.store(true, std::memory_order_release);
+    {
+        // Under the worker mutex, like every request below: otherwise the flag can be set between the worker's
+        // check of its wait condition and its wait, the notify is lost and join() waits forever
+        std::lock_guard<std::mutex> lk(m_workerMutex);
+        m_stopWorker.store(true, std::memory_order_release);
+    }
     m_workerCv.notify_all();
     if (m_workerThread.joinable()) {
         m_workerThread.join();
@@ -619,18 +730,27 @@ bool HardwareInspector::ApplyStagedData() {
 
 void HardwareInspector::RequestAsyncRefresh(bool fullInventory, bool allSmart, int singleSmartDisk) {
     StartWorkerThreadIfNeeded();
-    if (fullInventory) m_reqFullRefresh.store(true, std::memory_order_release);
-    if (allSmart) m_reqAllSmart.store(true, std::memory_order_release);
-    if (singleSmartDisk >= 0) m_reqSingleSmartDisk.store(singleSmartDisk, std::memory_order_release);
-    m_reqLiveUpdate.store(true, std::memory_order_release);
-    m_workerBusy.store(true, std::memory_order_release);
+    {
+        // The worker checks these flags under m_workerMutex and then waits. Set without the mutex, a request could
+        // land between that check and the wait: the notify below would wake nobody, the worker would sleep on with
+        // m_workerBusy set, and UpdateLiveTelemetry (which asks only when the worker is idle) would never ask again.
+        std::lock_guard<std::mutex> lk(m_workerMutex);
+        if (fullInventory) m_reqFullRefresh.store(true, std::memory_order_release);
+        if (allSmart) m_reqAllSmart.store(true, std::memory_order_release);
+        if (singleSmartDisk >= 0) m_reqSingleSmartDisk.store(singleSmartDisk, std::memory_order_release);
+        m_reqLiveUpdate.store(true, std::memory_order_release);
+        m_workerBusy.store(true, std::memory_order_release);
+    }
     m_workerCv.notify_one();
 }
 
 void HardwareInspector::RequestUsbComRefresh(bool syncForCli) {
     StartWorkerThreadIfNeeded();
-    m_reqUsbComRefresh.store(true, std::memory_order_release);
-    m_workerBusy.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(m_workerMutex);   // see RequestAsyncRefresh
+        m_reqUsbComRefresh.store(true, std::memory_order_release);
+        m_workerBusy.store(true, std::memory_order_release);
+    }
     m_workerCv.notify_one();
     if (syncForCli) {
         WaitForAsync();
@@ -870,7 +990,7 @@ void HardwareInspector::EnsureDiskModelsLoaded() {
 void HardwareInspector::QueryFastVolumes() {
     m_volumes.clear();
 #ifndef _WIN32
-    m_volumes = DiscoverLinuxVolumes();
+    m_volumes = DiscoverLinuxVolumes(false);   // the window's thread: network and FUSE mounts are not touched
     return;
 #else
     wchar_t driveStrings[512] = {};
@@ -1528,7 +1648,7 @@ void HardwareInspector::QueryPhysicalDisksAndVolumes() {
             }
         }
     }
-    m_wState.volumes = DiscoverLinuxVolumes();
+    m_wState.volumes = DiscoverLinuxVolumes(true);   // the worker: network and FUSE sizes, each with a time limit
     return;
 #else
     // 1. Query Physical Drives (\\.\PhysicalDrive0..15) via zero-access handle + IOCTL_STORAGE_QUERY_PROPERTY
@@ -3489,8 +3609,11 @@ void HardwareInspector::UpdateLiveTelemetry(bool syncForCli) {
     // Offload heavier live sensors (GPU DXGI/NVML, NIC GetIfTable2, TopProcesses, Disk & ACPI Temperatures) to background worker
     if (!m_workerBusy.load(std::memory_order_relaxed) || syncForCli) {
         StartWorkerThreadIfNeeded();
-        m_reqLiveUpdate.store(true, std::memory_order_release);
-        m_workerBusy.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(m_workerMutex);   // see RequestAsyncRefresh
+            m_reqLiveUpdate.store(true, std::memory_order_release);
+            m_workerBusy.store(true, std::memory_order_release);
+        }
         m_workerCv.notify_one();
     }
     if (syncForCli) {

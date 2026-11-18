@@ -773,20 +773,27 @@ bool NotepadViewer::SaveFile(std::wstring* outStatusToast, Lang lang) {
     }
 
     std::vector<uint8_t> outBytes;
-    if (m_encoding == TextFileEncoding::UTF16_LE) {
-        outBytes.push_back(0xFF);
-        outBytes.push_back(0xFE);
-        size_t byteCount = outW.size() * sizeof(wchar_t);
-        outBytes.resize(2 + byteCount);
-        if (byteCount > 0) std::memcpy(outBytes.data() + 2, outW.data(), byteCount);
-    } else if (m_encoding == TextFileEncoding::UTF16_BE) {
-        outBytes.push_back(0xFE);
-        outBytes.push_back(0xFF);
-        outBytes.resize(2 + outW.size() * 2);
-        for (size_t i = 0; i < outW.size(); ++i) {
-            uint16_t v = static_cast<uint16_t>(outW[i]);
-            outBytes[2 + i * 2]     = static_cast<uint8_t>((v >> 8) & 0xFF);
-            outBytes[2 + i * 2 + 1] = static_cast<uint8_t>(v & 0xFF);
+    if (m_encoding == TextFileEncoding::UTF16_LE || m_encoding == TextFileEncoding::UTF16_BE) {
+        // UTF-16 code units: wchar_t is UTF-16 on Windows but a whole code point (UTF-32) on Linux, where one above
+        // U+FFFF becomes a surrogate pair
+        const bool bigEndian = (m_encoding == TextFileEncoding::UTF16_BE);
+        outBytes.push_back(bigEndian ? 0xFE : 0xFF);
+        outBytes.push_back(bigEndian ? 0xFF : 0xFE);
+        outBytes.reserve(2 + outW.size() * 2);
+        auto putUnit = [&](uint16_t v) {
+            const uint8_t hi = static_cast<uint8_t>((v >> 8) & 0xFF);
+            const uint8_t lo = static_cast<uint8_t>(v & 0xFF);
+            outBytes.push_back(bigEndian ? hi : lo);
+            outBytes.push_back(bigEndian ? lo : hi);
+        };
+        for (wchar_t wc : outW) {
+            const uint32_t c = static_cast<uint32_t>(wc);
+            if (c > 0xFFFFu && c <= 0x10FFFFu) {
+                putUnit(static_cast<uint16_t>(0xD800u + ((c - 0x10000u) >> 10)));
+                putUnit(static_cast<uint16_t>(0xDC00u + ((c - 0x10000u) & 0x3FFu)));
+            } else {
+                putUnit(static_cast<uint16_t>(c));
+            }
         }
     } else {
         UINT cp = (m_encoding == TextFileEncoding::ANSI) ? CP_ACP : CP_UTF8;
@@ -836,6 +843,10 @@ void NotepadViewer::ToggleSyntaxMode() {
         HideWindow();
         m_syntaxMode = true;
     } else {
+#ifdef E2_WIN32_HAL
+        // The Linux build has no multi-line EDIT control yet (its EDIT is one line): the file stays in the syntax view
+        return;
+#endif
         m_syntaxMode = false;
         if (m_editHwnd) {
             ShowWindow(m_editHwnd, SW_SHOWNOACTIVATE);

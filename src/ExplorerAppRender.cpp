@@ -133,18 +133,24 @@ void ExplorerApp::OnPaint() {
             int otherIdx = 1 - m_activePane;
 
             // 1. Draw the inactive pane first (no extra sub-header bar underneath — main NavBar is split above!)
+            //    Each pane is clipped to itself: in a narrow window its columns are wider than the pane, and the
+            //    column titles would run on into the other pane
             D2D1_RECT_F otherMain = GetSplitPaneContentMainRect(otherIdx);
             SwapWithOtherPane();
             m_overrideMainRect = true;
             m_customMainRect = otherMain;
+            m_rt->PushAxisAlignedClip(otherMain, D2D1_ANTIALIAS_MODE_ALIASED);
             DrawMainContent(otherMain);
+            m_rt->PopAxisAlignedClip();
             m_overrideMainRect = false;
             SwapWithOtherPane();
 
             // 2. Draw the active pane
             D2D1_RECT_F activeOuter = GetSplitPaneOuterRect(m_activePane);
             D2D1_RECT_F activeMain  = GetSplitPaneContentMainRect(m_activePane);
+            m_rt->PushAxisAlignedClip(activeMain, D2D1_ANTIALIAS_MODE_ALIASED);
             DrawMainContent(activeMain);
+            m_rt->PopAxisAlignedClip();
 
             // 3. Draw the draggable center splitter bar between Pane 0 and Pane 1
             D2D1_RECT_F p0Outer = GetSplitPaneOuterRect(0);
@@ -933,9 +939,16 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         { CMD_TAB_LOG,        RibbonTab::Log,        L"Log",        48.0f, false }
     };
 
+    // A narrow window (1024 px and less) squeezes the tabs so that the last ones stay clear of the buttons on the right
+    float tabsTotalW = 0.0f;
+    for (const auto& t : tabs) tabsTotalW += t.width;
+    const float tabsAvailW = std::max(200.0f, (rect.right - 146.0f) - rect.left);
+    const float tabScale = (tabsTotalW > tabsAvailW) ? (tabsAvailW / tabsTotalW) : 1.0f;
+
     float tx = rect.left;
     for (const auto& t : tabs) {
-        D2D1_RECT_F tr = D2D1::RectF(tx, rect.top + 3.0f, tx + t.width, rect.top + kRibbonTabsHeight);
+        const float tabW = t.width * tabScale;
+        D2D1_RECT_F tr = D2D1::RectF(tx, rect.top + 3.0f, tx + tabW, rect.top + kRibbonTabsHeight);
         m_ribbonHits.push_back({ t.cmdId, tr });
 
         if (t.isBlueFileTab) {
@@ -967,7 +980,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         DrawTextCached(t.label, static_cast<UINT32>(wcslen(t.label)), m_fmtSmall, tr, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        tx += t.width;
+        tx += tabW;
     }
 
     // Right-side controls on Tab Strip: [🌙/☀ Theme] + [PL / EN] language button + Collapse Ribbon '^' + Blue Help '?'
@@ -1017,6 +1030,24 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
     m_rt->FillRectangle(body, m_solidBrush);
     m_solidBrush->SetColor(HexColor(0xDADADA));
     m_rt->DrawLine(D2D1::Point2F(body.left, body.bottom - 1.0f), D2D1::Point2F(body.right, body.bottom - 1.0f), m_solidBrush, 1.0f);
+
+    // A window narrower than the tab's buttons (e.g. on a 1024 x 768 screen) scrolls the body sideways, with the wheel
+    // over it or the arrows at its ends. The buttons are drawn shifted left and clipped to the body; FinishRibbonBody()
+    // (run however the tab's code below returns) moves their click targets the same way and draws the arrows.
+    if (m_ribbonScrollTab != m_activeRibbonTab) {
+        m_ribbonScrollTab = m_activeRibbonTab;
+        m_ribbonScrollX = 0.0f;
+        m_ribbonContentW = 0.0f;
+    }
+    m_ribbonScrollX = std::clamp(m_ribbonScrollX, 0.0f, std::max(0.0f, m_ribbonContentW - (body.right - body.left)));
+    struct RibbonBodyScope {
+        ExplorerApp* app;
+        size_t firstHit;
+        D2D1_RECT_F bodyRect;
+        ~RibbonBodyScope() { app->FinishRibbonBody(firstHit, bodyRect); }
+    } bodyScope{ this, m_ribbonHits.size(), body };
+    m_rt->PushAxisAlignedClip(body, D2D1_ANTIALIAS_MODE_ALIASED);
+    m_rt->SetTransform(D2D1::Matrix3x2F::Translation(-m_ribbonScrollX, 0.0f));
 
     auto drawLargeButton = [&](int cmdId, float x, float w, const wchar_t* label, bool activeHighlight = false) {
         D2D1_RECT_F br = D2D1::RectF(x, body.top + 4.0f, x + w, body.bottom - 17.0f);
@@ -1504,7 +1535,12 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         if (m_monAutostartMode < 0) m_monAutostartMode = MonitorDaemon::AutostartMode();   // may spawn schtasks.exe: cached, refreshed on demand
         const int autoMode = m_monAutostartMode;
         wchar_t autoLbl[96] = {};
+#ifdef _WIN32
         swprintf_s(autoLbl, pl ? L"Autostart z Windows: %s" : L"Start with Windows: %s", autoMode == 2 ? (pl ? L"WŁ. (admin)" : L"ON (admin)") : (autoMode == 1 ? (pl ? L"WŁ." : L"ON") : (pl ? L"wył." : L"off")));
+#else
+        // Linux: an XDG autostart entry, started when the user logs in
+        swprintf_s(autoLbl, pl ? L"Autostart po zalogowaniu: %s" : L"Start at login: %s", autoMode != 0 ? (pl ? L"WŁ." : L"ON") : (pl ? L"wył." : L"off"));
+#endif
         wchar_t intLbl[96] = {};
         swprintf_s(intLbl, pl ? L"Próbkowanie co: %d s" : L"Sample every: %d s", ms.intervalSec);
         wchar_t retLbl[96] = {};
@@ -1720,6 +1756,62 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
     drawSmallRowButton(CMD_CTX_ROTATE_CW,     x, body.top + 52.0f, 132.0f, pl ? L"Obróć o 90°" : L"Rotate 90°");
     x += 136.0f;
     drawGroupSeparatorAndTitle(g6Start, x, pl ? L"Obrazy" : L"Images");
+}
+
+// After the ribbon body is drawn (shifted left by m_ribbonScrollX and clipped to the body): back to the window's
+// coordinates, the width of the tab's buttons measured, their click targets moved by the scroll and cut to what is
+// visible, and arrow buttons at the ends that do not show everything
+void ExplorerApp::FinishRibbonBody(size_t firstHit, const D2D1_RECT_F& body) {
+    m_rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    m_rt->PopAxisAlignedClip();
+
+    float contentRight = body.left;
+    for (size_t i = firstHit; i < m_ribbonHits.size(); ++i) contentRight = std::max(contentRight, m_ribbonHits[i].rect.right);
+    const float bodyW = body.right - body.left;
+    const float contentW = (contentRight - body.left) + 10.0f;     // the last group's separator and title
+    m_ribbonContentW = contentW;
+    const float maxScroll = std::max(0.0f, contentW - bodyW);
+    const float scroll = m_ribbonScrollX;                          // what this frame was drawn with
+
+    constexpr float kArrowW = 16.0f;
+    const bool canLeft = scroll > 0.5f;
+    const bool canRight = scroll < maxScroll - 0.5f;
+    const float visLeft = body.left + (canLeft ? kArrowW : 0.0f);
+    const float visRight = body.right - (canRight ? kArrowW : 0.0f);
+
+    size_t kept = firstHit;
+    for (size_t i = firstHit; i < m_ribbonHits.size(); ++i) {
+        RibbonButtonHit hit = m_ribbonHits[i];
+        hit.rect.left = std::max(hit.rect.left - scroll, visLeft);
+        hit.rect.right = std::min(hit.rect.right - scroll, visRight);
+        if (hit.rect.right - hit.rect.left < 2.0f) continue;      // scrolled out of sight
+        m_ribbonHits[kept++] = hit;
+    }
+    m_ribbonHits.resize(kept);
+
+    auto drawArrow = [&](bool left) {
+        const int cmd = left ? CMD_RIBBON_SCROLL_LEFT : CMD_RIBBON_SCROLL_RIGHT;
+        const D2D1_RECT_F r = left ? D2D1::RectF(body.left, body.top + 1.0f, body.left + kArrowW, body.bottom - 2.0f)
+                                   : D2D1::RectF(body.right - kArrowW, body.top + 1.0f, body.right, body.bottom - 2.0f);
+        m_ribbonHits.push_back({ cmd, r });
+        m_solidBrush->SetColor(m_hoverRibbonBtn == cmd ? HexColor(0xDCEBFC) : HexColor(0xE8ECF0));
+        m_rt->FillRectangle(r, m_solidBrush);
+        m_solidBrush->SetColor(HexColor(0xC7CFD8));
+        const float edgeX = left ? r.right : r.left;
+        m_rt->DrawLine(D2D1::Point2F(edgeX, r.top), D2D1::Point2F(edgeX, r.bottom), m_solidBrush, 1.0f);
+        m_solidBrush->SetColor(HexColor(0x334155));
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawTextCached(left ? L"\x2039" : L"\x203A", 1, m_fmtSmall, r, m_solidBrush);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    };
+    if (canLeft) drawArrow(true);
+    if (canRight) drawArrow(false);
+
+    // The window got wider than the scroll needs: draw again without the part of the scroll it no longer needs
+    if (m_ribbonScrollX > maxScroll + 0.5f) {
+        m_ribbonScrollX = maxScroll;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    }
 }
 
 void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {

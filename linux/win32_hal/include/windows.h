@@ -341,6 +341,7 @@ struct MSG {
     LPARAM lParam;
     DWORD time;
     POINT pt;
+    DWORD lPrivate;     // HAL only: Shift/Ctrl/Alt as they were when the input happened, and keyboard routing
 };
 using LPMSG = MSG*;
 
