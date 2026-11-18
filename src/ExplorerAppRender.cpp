@@ -1836,8 +1836,25 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
             const float availW     = std::max(0.0f, availEnd - availStart);
             const int nSeg = static_cast<int>(m_breadcrumbs.size());
 
+            std::vector<float> segTextWidths(nSeg, 0.0f);
+            for (int k = 0; k < nSeg; ++k) {
+                const auto& lbl = m_breadcrumbs[k].label;
+                float tw = static_cast<float>(lbl.size()) * 7.1f;
+                if (m_dwriteFactory && m_fmtRegular && !lbl.empty()) {
+                    IDWriteTextLayout* tl = nullptr;
+                    if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(lbl.c_str(), static_cast<UINT32>(lbl.size()), m_fmtRegular, 2000.0f, 32.0f, &tl)) && tl) {
+                        DWRITE_TEXT_METRICS tm = {};
+                        if (SUCCEEDED(tl->GetMetrics(&tm))) {
+                            tw = std::ceil(tm.widthIncludingTrailingWhitespace);
+                        }
+                        tl->Release();
+                    }
+                }
+                segTextWidths[k] = std::max(18.0f, tw + 12.0f);
+            }
+
             auto calcSegFullW = [&](int idx) -> float {
-                return static_cast<float>(m_breadcrumbs[idx].label.size()) * 7.1f + 13.0f + 15.0f;
+                return segTextWidths[idx] + 15.0f;
             };
 
             float totalW = 0.0f;
@@ -1866,8 +1883,8 @@ void ExplorerApp::DrawNavBar(const D2D1_RECT_F& rect) {
             float bx = availStart;
             auto renderOneSeg = [&](int segIdx) {
                 auto& seg = m_breadcrumbs[segIdx];
-                float rawTextW = static_cast<float>(seg.label.size()) * 7.1f + 13.0f;
-                float maxAllowedTextW = std::max(28.0f, (availEnd - bx) - 15.0f);
+                float rawTextW = segTextWidths[segIdx];
+                float maxAllowedTextW = std::max(24.0f, (availEnd - bx) - 15.0f);
                 float segW = std::min(rawTextW, maxAllowedTextW);
                 if (bx + 24.0f > availEnd) return;
 
@@ -2153,7 +2170,8 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
                 }
             } else if (m_currentNormKey.size() > nk.size() &&
                        m_currentNormKey.compare(0, nk.size(), nk) == 0 &&
-                       (m_currentNormKey[nk.size()] == L'\\' || m_currentNormKey[nk.size()] == L'/')) {
+                       (nk.back() == L'\\' || nk.back() == L'/' ||
+                        m_currentNormKey[nk.size()] == L'\\' || m_currentNormKey[nk.size()] == L'/')) {
                 size_t score = nk.size();
                 if (score > bestScore) {
                     bestScore = score;
@@ -2401,6 +2419,17 @@ void ExplorerApp::DrawDragOverlay() {
         std::wstring srcDrive = (m_dragPaths[0].size() >= 2 && m_dragPaths[0][1] == L':') ? m_dragPaths[0].substr(0, 2) : L"";
         std::wstring dstDrive = (m_dragTargetDir.size() >= 2 && m_dragTargetDir[1] == L':') ? m_dragTargetDir.substr(0, 2) : L"";
         bool sameVol = (!srcDrive.empty() && !dstDrive.empty() && _wcsicmp(srcDrive.c_str(), dstDrive.c_str()) == 0);
+#ifndef _WIN32
+        if (!sameVol && !m_dragPaths[0].empty() && !m_dragTargetDir.empty() && m_dragPaths[0][0] == L'/' && m_dragTargetDir[0] == L'/') {
+            struct stat stSrc = {}, stDst = {};
+            std::wstring srcParent = PathUtils::GetParentPath(m_dragPaths[0]);
+            if (srcParent.empty()) srcParent = L"/";
+            if (::stat(Explorer2::Compat::NativePath(srcParent.c_str()).c_str(), &stSrc) == 0 &&
+                ::stat(Explorer2::Compat::NativePath(m_dragTargetDir.c_str()).c_str(), &stDst) == 0) {
+                sameVol = (stSrc.st_dev == stDst.st_dev);
+            }
+        }
+#endif
         bool isMove = shift ? true : (ctrl ? false : sameVol);
         std::wstring verb = isMove ? (pl ? L"\x2192 Przenieś " : L"\x2192 Move ") : (pl ? L"+ Kopiuj " : L"+ Copy ");
         badgeText = verb + countStr + (pl ? L" do: " : L" to: ") + m_dragTargetLabel;

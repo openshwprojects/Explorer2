@@ -1359,8 +1359,8 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
     // If leaving a subfolder back to its parent/ancestor (via Back, Up, or Breadcrumb), remember the subfolder we came from
     std::wstring effectiveSelectName = selectFileName;
     if (effectiveSelectName.empty() && !prevPath.empty() && !IsVirtualFolder(prevPath)) {
-        if (cleanPath == L"THIS_PC" && prevPath.size() >= 2 && prevPath[1] == L':') {
-            effectiveSelectName = prevPath.substr(0, 2) + L"\\";
+        if (cleanPath == L"THIS_PC" && ((prevPath.size() >= 2 && prevPath[1] == L':') || prevPath[0] == L'/')) {
+            effectiveSelectName = (prevPath[0] == L'/') ? L"/" : (prevPath.substr(0, 2) + L"\\");
         } else if (!IsVirtualFolder(cleanPath)) {
             std::wstring cleanPrefix = PathUtils::EnsureTrailingSlash(cleanPath);
             if (prevPath.size() > cleanPrefix.size() &&
@@ -1515,7 +1515,7 @@ void ExplorerApp::NavigateUp() {
         if (!parentUrl.empty()) NavigateTo(parentUrl, true, RepoBrowser::LeafName(m_currentPath));
         return;
     }
-    if (m_currentPath.size() <= 3 && m_currentPath[1] == L':') {
+    if ((m_currentPath.size() <= 3 && m_currentPath[1] == L':') || m_currentPath == L"/") {
         NavigateTo(L"THIS_PC", true, m_currentPath);
         return;
     }
@@ -1747,6 +1747,24 @@ void ExplorerApp::RebuildBreadcrumbs() {
         m_breadcrumbs.push_back(driveSeg);
 
         size_t pos = 3;
+        while (pos < m_currentPath.size()) {
+            size_t nextSlash = m_currentPath.find_first_of(L"\\/", pos);
+            if (nextSlash == std::wstring::npos) nextSlash = m_currentPath.size();
+            if (nextSlash > pos) {
+                BreadcrumbSegment seg;
+                seg.label = m_currentPath.substr(pos, nextSlash - pos);
+                seg.path = m_currentPath.substr(0, nextSlash);
+                m_breadcrumbs.push_back(seg);
+            }
+            pos = nextSlash + 1;
+        }
+    } else if (!m_currentPath.empty() && m_currentPath[0] == L'/') {
+        BreadcrumbSegment rootFsSeg;
+        rootFsSeg.label = (m_lang == Lang::PL) ? L"System Linux (/)" : L"Linux Root (/)";
+        rootFsSeg.path = L"/";
+        m_breadcrumbs.push_back(rootFsSeg);
+
+        size_t pos = 1;
         while (pos < m_currentPath.size()) {
             size_t nextSlash = m_currentPath.find_first_of(L"\\/", pos);
             if (nextSlash == std::wstring::npos) nextSlash = m_currentPath.size();
@@ -2266,6 +2284,17 @@ void ExplorerApp::ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, co
     bool sameDrive = (validSrc[0].size() >= 2 && targetDir.size() >= 2 &&
                       towupper(validSrc[0][0]) == towupper(targetDir[0]) &&
                       validSrc[0][1] == L':' && targetDir[1] == L':');
+#ifndef _WIN32
+    if (!sameDrive && !validSrc[0].empty() && !targetDir.empty() && validSrc[0][0] == L'/' && targetDir[0] == L'/') {
+        struct stat stSrc = {}, stDst = {};
+        std::wstring srcParent = PathUtils::GetParentPath(validSrc[0]);
+        if (srcParent.empty()) srcParent = L"/";
+        if (::stat(Explorer2::Compat::NativePath(srcParent.c_str()).c_str(), &stSrc) == 0 &&
+            ::stat(Explorer2::Compat::NativePath(targetDir.c_str()).c_str(), &stDst) == 0) {
+            sameDrive = (stSrc.st_dev == stDst.st_dev);
+        }
+    }
+#endif
     bool doMove = forceMove ? true : (forceCopy ? false : sameDrive);
     StartManagedTransfer(validSrc, targetDir, doMove, false);
 }

@@ -221,7 +221,7 @@ jobs:
   build-linux-x64:
     name: Build Linux x64 (100% Static — Any Distro)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -383,7 +383,7 @@ jobs:
   build-linux-x86:
     name: Build Linux x86 32-bit (100% Static — Any Distro)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
