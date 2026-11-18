@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -520,22 +521,67 @@ struct SystemFontBank {
     SystemFontBank() {
         static const char* kSansReg[] = {
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/ttf-bitstream-vera/Vera.ttf"
         };
         static const char* kSansBold[] = {
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
             "/usr/share/fonts/truetype/ttf-bitstream-vera/VeraBd.ttf"
         };
         static const char* kMonoReg[] = {
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
             "/usr/share/fonts/truetype/ttf-bitstream-vera/VeraMono.ttf"
         };
         for (const char* p : kSansReg)  if (sansReg.LoadFromFile(p)) break;
         for (const char* p : kSansBold) if (sansBold.LoadFromFile(p)) break;
         for (const char* p : kMonoReg)  if (monoReg.LoadFromFile(p)) break;
+
+        // Cross-distro fallback: scan /usr/share/fonts (up to depth 3) for any usable .ttf if none of the standard paths matched
+        if (!sansReg.IsLoaded()) {
+            auto scanFonts = [&](auto& self, const std::string& dir, int depth) -> bool {
+                if (depth > 3) return false;
+                DIR* d = ::opendir(dir.c_str());
+                if (!d) return false;
+                bool ok = false;
+                while (struct dirent* e = ::readdir(d)) {
+                    if (e->d_name[0] == '.') continue;
+                    std::string sub = dir + "/" + e->d_name;
+                    if (sub.size() > 4 && sub.compare(sub.size() - 4, 4, ".ttf") == 0) {
+                        if (sansReg.LoadFromFile(sub.c_str())) { ok = true; break; }
+                    } else if (self(self, sub, depth + 1)) {
+                        ok = true;
+                        break;
+                    }
+                }
+                ::closedir(d);
+                return ok;
+            };
+            scanFonts(scanFonts, "/usr/share/fonts", 0);
+        }
     }
 
     TrueTypeFace& Select(const std::wstring& family, DWRITE_FONT_WEIGHT weight) {

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Build & verify Explorer2 on Linux (64-bit x86_64, 32-bit i686 -m32, Clang, or ASan+UBSan).
 # Usage:
-#   ./linux/build_linux.sh [--32] [--clang] [--asan] [--build-dir DIR] [--test]
+#   ./linux/build_linux.sh [--32] [--static] [--clang] [--asan] [--build-dir DIR] [--test]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 BUILD_32="OFF"
+STATIC_LINUX="OFF"
 SANITIZE="OFF"
 CXX_ARG=()
 SUFFIX="gcc64"
@@ -19,6 +20,11 @@ while [[ $# -gt 0 ]]; do
         --32|-m32)
             BUILD_32="ON"
             SUFFIX="gcc32"
+            shift
+            ;;
+        --static)
+            STATIC_LINUX="ON"
+            SUFFIX="${SUFFIX}-static"
             shift
             ;;
         --clang)
@@ -41,7 +47,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 [--32] [--clang] [--asan] [--build-dir DIR] [--test]" >&2
+            echo "Usage: $0 [--32] [--static] [--clang] [--asan] [--build-dir DIR] [--test]" >&2
             exit 2
             ;;
     esac
@@ -60,6 +66,7 @@ cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
     "${GEN_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DE2_BUILD_32BIT="${BUILD_32}" \
+    -DE2_STATIC_LINUX="${STATIC_LINUX}" \
     -DEXPLORER2_SANITIZE="${SANITIZE}" \
     "${CXX_ARG[@]}"
 

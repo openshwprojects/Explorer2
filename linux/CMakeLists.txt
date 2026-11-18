@@ -13,6 +13,7 @@ project(Explorer2Linux LANGUAGES CXX)
 
 option(EXPLORER2_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer (for fuzzing)" OFF)
 option(E2_BUILD_32BIT "Build 32-bit x86 (-m32) Linux binaries" OFF)
+option(E2_STATIC_LINUX "Build 100% statically linked Linux binaries (zero .so dependencies)" OFF)
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -31,7 +32,7 @@ if(E2_BUILD_32BIT)
     add_link_options(-m32)
 endif()
 
-add_compile_definitions(_FILE_OFFSET_BITS=64 _LARGEFILE64_SOURCE=1)
+add_compile_definitions(_GNU_SOURCE=1 _FILE_OFFSET_BITS=64 _LARGEFILE64_SOURCE=1)
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../build/version_gen.h")
     add_compile_definitions(E2_HAS_GENERATED_VERSION=1)
@@ -151,5 +152,18 @@ if(EXPLORER2_SANITIZE)
     endforeach()
     foreach(exe explorer2-readers explorer2-stage15 explorer2)
         target_link_options(${exe} PRIVATE -fsanitize=address,undefined)
+    endforeach()
+elseif(E2_STATIC_LINUX)
+    # 100% static ELF binaries (musl + static libX11/libxcb/libXau/libXdmcp): zero shared library dependencies,
+    # runs on any Linux distribution / glibc or musl version / 64-bit host without 32-bit multilib installed.
+    target_compile_definitions(explorer2 PRIVATE E2_STATIC_X11=1)
+    target_link_libraries(explorer2 PRIVATE X11 xcb Xau Xdmcp)
+    foreach(exe explorer2-readers explorer2-stage15 explorer2)
+        target_link_options(${exe} PRIVATE -static)
+    endforeach()
+else()
+    # Statically link libstdc++ and libgcc so portable binaries do not need libstdc++.so.6 / libgcc_s.so.1 at runtime
+    foreach(exe explorer2-readers explorer2-stage15 explorer2)
+        target_link_options(${exe} PRIVATE -static-libstdc++ -static-libgcc)
     endforeach()
 endif()

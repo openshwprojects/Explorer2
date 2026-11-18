@@ -220,7 +220,7 @@ jobs:
 
   build-linux-x64:
     name: Build Linux x64 (App, X11 GUI & Readers)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
 
     steps:
@@ -362,7 +362,7 @@ jobs:
 
   build-linux-x86:
     name: Build Linux x86 32-bit (-m32)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
 
     steps:
@@ -524,9 +524,9 @@ jobs:
             - **Standalone Executable:** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-x64.exe` — Single-file native portable executable (no installation or third-party runtime needed).
             - **Portable Archive:** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-portable-x64.zip` — Portable ZIP with `Explorer2.exe`, `LICENSE`, and `README.md`.
 
-            ### Downloads — Linux (Ubuntu / Debian / Desktop X11 & XWayland)
-            - **Linux x86_64 (64-bit):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x64.tar.gz` — Portable 64-bit `explorer2` binary (`dlopen("libX11.so.6")` GUI + CLI modes).
-            - **Linux x86 (32-bit i686):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x86.tar.gz` — Portable 32-bit `explorer2` binary (with 64-bit large-file support).
+            ### Downloads — Linux (Ubuntu 22.04+ / Debian 12+ / Desktop X11 & XWayland)
+            - **Linux x86_64 (64-bit — Recommended for all 64-bit PCs & VMs):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x64.tar.gz` — Portable 64-bit `explorer2` binary (`-static-libstdc++ -static-libgcc`, `dlopen("libX11.so.6")` GUI + CLI modes).
+            - **Linux x86 (Legacy 32-bit i686 OS):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x86.tar.gz` — Portable 32-bit `explorer2` binary (`-static-libstdc++ -static-libgcc`, 64-bit large-file support).
 
             - **Checksums:** `SHA256SUMS.txt`
 

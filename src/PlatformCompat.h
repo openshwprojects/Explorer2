@@ -342,12 +342,29 @@ inline void EncodeUtf8(const wchar_t* src, size_t n, std::string& out) {
     }
 }
 
+inline const char* IconvFallbackAlias(const char* code) {
+    if (!code) return nullptr;
+    if (std::strcmp(code, "CP932") == 0) return "SHIFT_JIS";
+    if (std::strcmp(code, "CP936") == 0) return "GBK";
+    if (std::strcmp(code, "CP949") == 0) return "EUC-KR";
+    if (std::strcmp(code, "CP950") == 0) return "BIG5";
+    if (std::strcmp(code, "EUC-CN") == 0) return "GB2312";
+    return nullptr;
+}
+
 // Converts with iconv. Bytes the code page has no character for become U+FFFD (or '?' when encoding), or stop
 // the conversion (returns false) when strict.
 inline bool IconvConvert(const char* fromCode, const char* toCode, const char* src, size_t n,
                          std::string& outBytes, bool strict, const char* replacement, size_t replacementLen,
                          size_t skipUnit) {
     iconv_t cd = iconv_open(toCode, fromCode);
+    if (cd == reinterpret_cast<iconv_t>(-1)) {
+        const char* altFrom = IconvFallbackAlias(fromCode);
+        const char* altTo   = IconvFallbackAlias(toCode);
+        if (altFrom || altTo) {
+            cd = iconv_open(altTo ? altTo : toCode, altFrom ? altFrom : fromCode);
+        }
+    }
     if (cd == reinterpret_cast<iconv_t>(-1)) return false;
     char* in = const_cast<char*>(src);
     size_t inLeft = n;

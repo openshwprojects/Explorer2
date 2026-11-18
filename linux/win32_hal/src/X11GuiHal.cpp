@@ -177,6 +177,33 @@ struct X11Lib {
         const char* dispEnv = std::getenv("DISPLAY");
         if (!IsX11DisplayReachableFast(dispEnv)) return false;
 
+#ifdef E2_STATIC_X11
+        OpenDisplay            = &::XOpenDisplay;
+        CloseDisplay           = &::XCloseDisplay;
+        CreateSimpleWindow     = &::XCreateSimpleWindow;
+        DestroyWindow          = &::XDestroyWindow;
+        MapWindow              = &::XMapWindow;
+        UnmapWindow            = &::XUnmapWindow;
+        MoveResizeWindow       = &::XMoveResizeWindow;
+        StoreName              = &::XStoreName;
+        ChangeProperty         = &::XChangeProperty;
+        InternAtom             = &::XInternAtom;
+        SetWMProtocols         = &::XSetWMProtocols;
+        SelectInput            = &::XSelectInput;
+        Pending                = &::XPending;
+        NextEvent              = &::XNextEvent;
+        CreateGC               = &::XCreateGC;
+        FreeGC                 = &::XFreeGC;
+        CreateImage            = &::XCreateImage;
+        PutImage               = &::XPutImage;
+        Flush                  = &::XFlush;
+        LookupString           = &::XLookupString;
+        TranslateCoordinates   = &::XTranslateCoordinates;
+        ChangeWindowAttributes = &::XChangeWindowAttributes;
+        MapRaised              = &::XMapRaised;
+        GrabPointer            = &::XGrabPointer;
+        UngrabPointer          = &::XUngrabPointer;
+#else
         handle = ::dlopen("libX11.so.6", RTLD_LAZY);
         if (!handle) handle = ::dlopen("libX11.so", RTLD_LAZY);
         if (!handle) return false;
@@ -207,6 +234,7 @@ struct X11Lib {
         MapRaised            = reinterpret_cast<decltype(MapRaised)>(sym("XMapRaised"));
         GrabPointer          = reinterpret_cast<decltype(GrabPointer)>(sym("XGrabPointer"));
         UngrabPointer        = reinterpret_cast<decltype(UngrabPointer)>(sym("XUngrabPointer"));
+#endif
 
         if (!OpenDisplay || !CreateSimpleWindow || !MapWindow || !Pending || !NextEvent || !CreateGC || !CreateImage || !PutImage || !Flush) {
             return false;

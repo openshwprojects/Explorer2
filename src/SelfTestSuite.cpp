@@ -2647,6 +2647,8 @@ static void RunStage12Tests(TestCounter& tc) {
             if (ttfBytes.empty()) {
                 static const wchar_t* kLinuxTestFonts[] = {
                     L"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    L"/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                    L"/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
                     L"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
                     L"/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
                     L"/usr/share/fonts/TTF/DejaVuSans.ttf"
@@ -7424,9 +7426,9 @@ char g_posixInspectAltStack[64 * 1024];
 void InspectPosixCrashHandler(int sig, siginfo_t*, void* context) {
     const int fd = Compat::FdOf(g_inspectOut);
     uintptr_t pc = 0;
-#if defined(__x86_64__)
+#if defined(__x86_64__) && defined(REG_RIP)
     pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
-#elif defined(__i386__)
+#elif defined(__i386__) && defined(REG_EIP)
     pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_EIP]);
 #elif defined(__aarch64__)
     pc = static_cast<uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.pc);
