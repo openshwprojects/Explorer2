@@ -253,7 +253,7 @@ jobs:
             ccache-linux-x64-
 
       - name: Compile Explorer2 Linux x64 targets
-        run: ./linux/build_linux.sh --build-dir build-linux-x64
+        run: bash ./linux/build_linux.sh --build-dir build-linux-x64
 
       - name: Verify Linux x64 executable & version info
         run: |
@@ -396,7 +396,7 @@ jobs:
 
       - name: Compile Explorer2 Linux x86 (32-bit) targets
         run: |
-          ./linux/build_linux.sh --32 --build-dir build-linux-x86
+          bash ./linux/build_linux.sh --32 --build-dir build-linux-x86
           file build-linux-x86/explorer2 | grep -q "ELF 32-bit"
 
       - name: Run built-in Linux x86 (32-bit) self-test suite
