@@ -153,6 +153,9 @@ struct X11Lib {
     int      (*FreeGC)(Display*, GC) = nullptr;
     XImage*  (*CreateImage)(Display*, Visual*, unsigned int, int, int, char*, unsigned int, unsigned int, int, int) = nullptr;
     int      (*PutImage)(Display*, Drawable, GC, XImage*, int, int, int, int, unsigned int, unsigned int) = nullptr;
+    Pixmap   (*CreatePixmap)(Display*, Drawable, unsigned int, unsigned int, unsigned int) = nullptr;
+    int      (*FreePixmap)(Display*, Pixmap) = nullptr;
+    int      (*CopyArea)(Display*, Drawable, Drawable, GC, int, int, unsigned int, unsigned int, int, int) = nullptr;
     int      (*Flush)(Display*) = nullptr;
     int      (*LookupString)(XKeyEvent*, char*, int, KeySym*, XComposeStatus*) = nullptr;
     Bool     (*TranslateCoordinates)(Display*, Window, Window, int, int, int*, int*, Window*) = nullptr;
@@ -196,6 +199,9 @@ struct X11Lib {
         FreeGC                 = &::XFreeGC;
         CreateImage            = &::XCreateImage;
         PutImage               = &::XPutImage;
+        CreatePixmap           = &::XCreatePixmap;
+        FreePixmap             = &::XFreePixmap;
+        CopyArea               = &::XCopyArea;
         Flush                  = &::XFlush;
         LookupString           = &::XLookupString;
         TranslateCoordinates   = &::XTranslateCoordinates;
@@ -227,6 +233,9 @@ struct X11Lib {
         FreeGC               = reinterpret_cast<decltype(FreeGC)>(sym("XFreeGC"));
         CreateImage          = reinterpret_cast<decltype(CreateImage)>(sym("XCreateImage"));
         PutImage             = reinterpret_cast<decltype(PutImage)>(sym("XPutImage"));
+        CreatePixmap         = reinterpret_cast<decltype(CreatePixmap)>(sym("XCreatePixmap"));
+        FreePixmap           = reinterpret_cast<decltype(FreePixmap)>(sym("XFreePixmap"));
+        CopyArea             = reinterpret_cast<decltype(CopyArea)>(sym("XCopyArea"));
         Flush                = reinterpret_cast<decltype(Flush)>(sym("XFlush"));
         LookupString         = reinterpret_cast<decltype(LookupString)>(sym("XLookupString"));
         TranslateCoordinates = reinterpret_cast<decltype(TranslateCoordinates)>(sym("XTranslateCoordinates"));
@@ -284,9 +293,13 @@ struct WndRecord {
     size_t selStart = 0;
     Window xwin = 0;
     GC xgc = nullptr;
+    Pixmap xpixmap = 0;
+    uint32_t pixW = 0;
+    uint32_t pixH = 0;
     ULONGLONG shownAtTick = 0;
     uint32_t paintedFrames = 0;
     std::vector<uint8_t> lastFrame;
+    std::vector<uint8_t> prevSentFrame;
 };
 
 struct TimerKey {
@@ -436,6 +449,31 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (rec->parent) InvalidateRect(rec->parent, nullptr, FALSE);
             return 0;
         }
+        if (ch == 3 || ch == 24) { // Ctrl+C / Ctrl+X
+            if (rec->selStart != rec->caretPos && OpenClipboard(hwnd)) {
+                EmptyClipboard();
+                const size_t a = std::min(rec->selStart, rec->caretPos);
+                const size_t b = std::max(rec->selStart, rec->caretPos);
+                const std::wstring sel = rec->text.substr(a, b - a);
+                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (sel.size() + 1) * sizeof(wchar_t));
+                if (hMem) {
+                    if (auto* dst = static_cast<wchar_t*>(GlobalLock(hMem))) {
+                        std::wmemcpy(dst, sel.c_str(), sel.size() + 1);
+                        GlobalUnlock(hMem);
+                        SetClipboardData(CF_UNICODETEXT, hMem);
+                    } else {
+                        GlobalFree(hMem);
+                    }
+                }
+                CloseClipboard();
+                if (ch == 24) {
+                    rec->text.erase(a, b - a);
+                    rec->caretPos = rec->selStart = a;
+                    notifyParent(EN_CHANGE);
+                }
+            }
+            return 0;
+        }
         if (ch == 22) { // Ctrl+V
             if (OpenClipboard(hwnd)) {
                 HANDLE hData = GetClipboardData(CF_UNICODETEXT);
@@ -547,7 +585,7 @@ void WriteBmp24Or32(const char* path, const uint8_t* bgra, uint32_t w, uint32_t 
     std::fclose(f);
 }
 
-// Overlay visible child EDIT boxes (address/search/rename) onto top-level window BGRA buffer
+// Overlay visible child EDIT boxes (address/search/rename) onto top-level window BGRA buffer using TrueType DirectWrite
 void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint32_t w, uint32_t h) {
     std::vector<std::shared_ptr<WndRecord>> edits;
     {
@@ -558,48 +596,104 @@ void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint
             }
         }
     }
+    if (edits.empty()) return;
+
+    static Microsoft::WRL::ComPtr<IWICImagingFactory> s_wic;
+    static Microsoft::WRL::ComPtr<ID2D1Factory> s_d2d;
+    static Microsoft::WRL::ComPtr<IDWriteFactory> s_dw;
+    static Microsoft::WRL::ComPtr<IDWriteTextFormat> s_tf;
+    if (!s_tf) {
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&s_wic));
+        D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), nullptr, reinterpret_cast<void**>(s_d2d.GetAddressOf()));
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(s_dw.GetAddressOf()));
+        if (s_dw) {
+            s_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                   DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &s_tf);
+            if (s_tf) {
+                s_tf->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                s_tf->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
+        }
+    }
+
+    auto measurePrefixW = [&](const std::wstring& txt, size_t len) -> float {
+        len = std::min(len, txt.size());
+        if (len == 0 || !s_dw || !s_tf) return 0.0f;
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> tl;
+        if (FAILED(s_dw->CreateTextLayout(txt.c_str(), static_cast<UINT32>(len), s_tf.Get(), 8192.0f, 64.0f, &tl)) || !tl) {
+            return static_cast<float>(len) * 7.0f;
+        }
+        DWRITE_TEXT_METRICS tm = {};
+        if (FAILED(tl->GetMetrics(&tm))) return static_cast<float>(len) * 7.0f;
+        return tm.widthIncludingTrailingWhitespace;
+    };
+
+    std::vector<uint8_t> editBuf;
     for (const auto& ed : edits) {
         const int x0 = std::clamp(ed->x, 0, static_cast<int>(w));
         const int y0 = std::clamp(ed->y, 0, static_cast<int>(h));
         const int x1 = std::clamp(ed->x + ed->width, x0, static_cast<int>(w));
         const int y1 = std::clamp(ed->y + ed->height, y0, static_cast<int>(h));
+        const int ew = x1 - x0;
+        const int eh = y1 - y0;
+        if (ew <= 2 || eh <= 2) continue;
+
         const bool focused = (g_focusedHwnd == ed->hwnd);
-        for (int y = y0; y < y1; ++y) {
-            uint8_t* row = fb.data() + static_cast<size_t>(y) * w * 4u;
-            for (int x = x0; x < x1; ++x) {
-                const bool border = (x == x0 || x == x1 - 1 || y == y0 || y == y1 - 1);
-                uint8_t* p = row + x * 4;
-                if (border) {
-                    p[0] = focused ? 215 : 203;
-                    p[1] = focused ? 120 : 185;
-                    p[2] = focused ? 29  : 172;
-                    p[3] = 255;
-                } else {
-                    p[0] = 255; p[1] = 255; p[2] = 255; p[3] = 255;
+        if (s_wic && s_d2d && s_tf) {
+            Microsoft::WRL::ComPtr<IWICBitmap> bmp;
+            Microsoft::WRL::ComPtr<ID2D1RenderTarget> rt;
+            D2D1_RENDER_TARGET_PROPERTIES rtp = D2D1::RenderTargetProperties();
+            if (SUCCEEDED(s_wic->CreateBitmap(static_cast<UINT>(ew), static_cast<UINT>(eh),
+                                              GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bmp)) &&
+                bmp && SUCCEEDED(s_d2d->CreateWicBitmapRenderTarget(bmp.Get(), &rtp, &rt)) && rt)
+            {
+                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brBorder, brSel, brText, brCaret;
+                rt->CreateSolidColorBrush(D2D1::ColorF(focused ? 0x0078D7 : 0xCBD5E1), &brBorder);
+                rt->CreateSolidColorBrush(D2D1::ColorF(0xCCE8FF), &brSel);
+                rt->CreateSolidColorBrush(D2D1::ColorF(0x1E1E1E), &brText);
+                rt->CreateSolidColorBrush(D2D1::ColorF(0x005A9E), &brCaret);
+
+                const size_t caretIdx = std::min(ed->caretPos, ed->text.size());
+                const size_t selIdx   = std::min(ed->selStart, ed->text.size());
+                const float caretPx   = measurePrefixW(ed->text, caretIdx);
+                const float selPx     = (selIdx == caretIdx) ? caretPx : measurePrefixW(ed->text, selIdx);
+                const float padX      = 6.0f;
+                const float innerW    = std::max(8.0f, static_cast<float>(ew) - padX * 2.0f);
+                const float scrollX   = (caretPx > innerW - 4.0f) ? (caretPx - (innerW - 4.0f)) : 0.0f;
+
+                rt->BeginDraw();
+                rt->Clear(D2D1::ColorF(0xFFFFFF));
+                rt->DrawRectangle(D2D1::RectF(0.5f, 0.5f, ew - 0.5f, eh - 0.5f), brBorder.Get(), 1.0f);
+                rt->PushAxisAlignedClip(D2D1::RectF(2.0f, 1.0f, ew - 2.0f, eh - 1.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+                if (focused && selIdx != caretIdx) {
+                    const float sx0 = padX - scrollX + std::min(selPx, caretPx);
+                    const float sx1 = padX - scrollX + std::max(selPx, caretPx);
+                    rt->FillRectangle(D2D1::RectF(sx0, 3.0f, sx1, eh - 3.0f), brSel.Get());
                 }
-            }
-        }
-        // Simple 6x10 crisp glyph draw for child EDIT text + caret
-        int cx = x0 + 5;
-        const int cy = y0 + std::max(2, (y1 - y0 - 10) / 2);
-        for (size_t i = 0; i < ed->text.size() && cx + 6 < x1 - 2; ++i) {
-            const uint32_t cp = static_cast<uint32_t>(ed->text[i]);
-            if (cp > 32) {
-                for (int gy = 1; gy < 9 && cy + gy < y1 - 1; ++gy) {
-                    for (int gx = 0; gx < 5 && cx + gx < x1 - 2; ++gx) {
-                        if (((cp * 2654435761u) >> ((gy * 3 + gx) & 15)) & 1u) {
-                            uint8_t* p = fb.data() + (static_cast<size_t>(cy + gy) * w + (cx + gx)) * 4u;
-                            p[0] = 30; p[1] = 30; p[2] = 30; p[3] = 255;
-                        }
+                if (!ed->text.empty()) {
+                    rt->DrawText(ed->text.c_str(), static_cast<UINT32>(ed->text.size()), s_tf.Get(),
+                                 D2D1::RectF(padX - scrollX, 0.0f, padX - scrollX + 8192.0f, static_cast<float>(eh)),
+                                 brText.Get());
+                }
+                if (focused) {
+                    const float cx = std::clamp(padX - scrollX + caretPx, 2.0f, static_cast<float>(ew - 3));
+                    rt->DrawLine(D2D1::Point2F(cx, 4.0f), D2D1::Point2F(cx, static_cast<float>(eh - 4)), brCaret.Get(), 1.4f);
+                }
+
+                rt->PopAxisAlignedClip();
+                rt->EndDraw();
+
+                editBuf.resize(static_cast<size_t>(ew) * eh * 4u);
+                WICRect wrc = { 0, 0, ew, eh };
+                if (SUCCEEDED(bmp->CopyPixels(&wrc, static_cast<UINT>(ew * 4), static_cast<UINT>(editBuf.size()), editBuf.data()))) {
+                    for (int ry = 0; ry < eh; ++ry) {
+                        std::memcpy(fb.data() + (static_cast<size_t>(y0 + ry) * w + x0) * 4u,
+                                    editBuf.data() + static_cast<size_t>(ry) * ew * 4u,
+                                    static_cast<size_t>(ew) * 4u);
                     }
+                    continue;
                 }
-            }
-            cx += 6;
-        }
-        if (focused && cx < x1 - 2) {
-            for (int gy = 0; gy < 11 && cy + gy < y1 - 1; ++gy) {
-                uint8_t* p = fb.data() + (static_cast<size_t>(cy + gy) * w + cx) * 4u;
-                p[0] = 215; p[1] = 90; p[2] = 15; p[3] = 255;
             }
         }
     }
@@ -630,7 +724,14 @@ void PumpX11AndTimers(ULONGLONG* outNextTimerWaitMs = nullptr) {
             switch (ev.type) {
             case Expose:
                 if (ev.xexpose.count == 0) {
-                    rec->needsPaint = true;
+                    if (rec->xpixmap != 0 && rec->xgc && x.CopyArea &&
+                        rec->pixW == static_cast<uint32_t>(rec->width) &&
+                        rec->pixH == static_cast<uint32_t>(rec->height)) {
+                        x.CopyArea(x.dpy, rec->xpixmap, rec->xwin, rec->xgc, 0, 0, rec->pixW, rec->pixH, 0, 0);
+                        x.Flush(x.dpy);
+                    } else {
+                        rec->needsPaint = true;
+                    }
                 }
                 break;
 
@@ -687,6 +788,10 @@ void PumpX11AndTimers(ULONGLONG* outNextTimerWaitMs = nullptr) {
                     }
                     if (hitEdit) {
                         g_focusedHwnd = hitEdit->hwnd;
+                        const int relX = std::max(0, mx - hitEdit->x - 6);
+                        const size_t pos = std::min(hitEdit->text.size(), static_cast<size_t>((relX + 3) / 7));
+                        hitEdit->caretPos = pos;
+                        if (!(mk & MK_SHIFT)) hitEdit->selStart = pos;
                         rec->needsPaint = true;
                         break;
                     }
@@ -826,12 +931,53 @@ void PresentHwndFramebuffer(HWND hwnd, const uint8_t* bgra, uint32_t w, uint32_t
         if (rec->xgc) {
             Visual* vis = DefaultVisual(x.dpy, x.screen);
             const unsigned int depth = static_cast<unsigned int>(DefaultDepth(x.dpy, x.screen));
+            const size_t rowBytes = static_cast<size_t>(w) * 4u;
+
+            // Maintain server-side offscreen Pixmap backbuffer so X11/XWayland composites completed frames atomically
+            if (x.CreatePixmap && x.CopyArea) {
+                if (rec->xpixmap == 0 || rec->pixW != w || rec->pixH != h) {
+                    if (rec->xpixmap != 0 && x.FreePixmap) {
+                        x.FreePixmap(x.dpy, rec->xpixmap);
+                    }
+                    rec->xpixmap = x.CreatePixmap(x.dpy, rec->xwin, w, h, depth);
+                    rec->pixW = w;
+                    rec->pixH = h;
+                    rec->prevSentFrame.clear();
+                }
+            }
+
+            uint32_t dirtyY0 = 0;
+            uint32_t dirtyY1 = h;
+            if (rec->prevSentFrame.size() == rec->lastFrame.size() && rec->xpixmap != 0) {
+                dirtyY0 = h;
+                dirtyY1 = 0;
+                for (uint32_t y = 0; y < h; ++y) {
+                    const size_t off = static_cast<size_t>(y) * rowBytes;
+                    if (std::memcmp(rec->lastFrame.data() + off, rec->prevSentFrame.data() + off, rowBytes) != 0) {
+                        if (dirtyY0 == h) dirtyY0 = y;
+                        dirtyY1 = y + 1;
+                    }
+                }
+                if (dirtyY0 >= dirtyY1) {
+                    return; // Frame pixels unchanged — zero X11 upload needed
+                }
+            }
+            rec->prevSentFrame = rec->lastFrame;
+
+            const uint32_t dirtyH = dirtyY1 - dirtyY0;
+            char* stripPtr = reinterpret_cast<char*>(rec->lastFrame.data() + static_cast<size_t>(dirtyY0) * rowBytes);
             XImage* img = x.CreateImage(
                 x.dpy, vis, depth, ZPixmap, 0,
-                reinterpret_cast<char*>(rec->lastFrame.data()),
-                w, h, 32, static_cast<int>(w * 4u));
+                stripPtr, w, dirtyH, 32, static_cast<int>(rowBytes));
             if (img) {
-                x.PutImage(x.dpy, rec->xwin, rec->xgc, img, 0, 0, 0, 0, w, h);
+                if (rec->xpixmap != 0 && x.CopyArea) {
+                    x.PutImage(x.dpy, rec->xpixmap, rec->xgc, img, 0, 0, 0, static_cast<int>(dirtyY0), w, dirtyH);
+                    x.CopyArea(x.dpy, rec->xpixmap, rec->xwin, rec->xgc,
+                               0, static_cast<int>(dirtyY0), w, dirtyH,
+                               0, static_cast<int>(dirtyY0));
+                } else {
+                    x.PutImage(x.dpy, rec->xwin, rec->xgc, img, 0, 0, 0, static_cast<int>(dirtyY0), w, dirtyH);
+                }
                 img->data = nullptr; // Owned by rec->lastFrame
                 XDestroyImage(img);
                 x.Flush(x.dpy);
@@ -895,6 +1041,12 @@ HWND CreateWindowExW(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName,
                 0, BlackPixel(x.dpy, x.screen), WhitePixel(x.dpy, x.screen));
             if (rec->xwin != 0) {
                 g_xwinToHwnd[rec->xwin] = hwnd;
+                if (x.ChangeWindowAttributes) {
+                    XSetWindowAttributes swa = {};
+                    swa.background_pixmap = None;
+                    swa.bit_gravity = NorthWestGravity;
+                    x.ChangeWindowAttributes(x.dpy, rec->xwin, CWBackPixmap | CWBitGravity, &swa);
+                }
                 x.SelectInput(x.dpy, rec->xwin,
                               ExposureMask | StructureNotifyMask | KeyPressMask | KeyReleaseMask |
                               ButtonPressMask | ButtonReleaseMask | PointerMotionMask | FocusChangeMask);
@@ -955,6 +1107,10 @@ BOOL DestroyWindow(HWND hWnd) {
 
     auto& x = X11();
     if (x.ready && x.dpy && rec->xwin != 0) {
+        if (rec->xpixmap != 0 && x.FreePixmap) {
+            x.FreePixmap(x.dpy, rec->xpixmap);
+            rec->xpixmap = 0;
+        }
         if (rec->xgc && x.FreeGC) x.FreeGC(x.dpy, rec->xgc);
         g_xwinToHwnd.erase(rec->xwin);
         if (x.DestroyWindow) x.DestroyWindow(x.dpy, rec->xwin);
@@ -1227,6 +1383,28 @@ BOOL EndPaint(HWND, const PAINTSTRUCT*) { return TRUE; }
 BOOL PostMessageW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
     {
         std::lock_guard<std::mutex> lk(g_msgMutex);
+        if (Msg == WM_MOUSEMOVE) {
+            for (auto it = g_msgQueue.rbegin(); it != g_msgQueue.rend(); ++it) {
+                if (it->hwnd == hWnd && it->message == WM_MOUSEMOVE) {
+                    it->wParam = wParam;
+                    it->lParam = lParam;
+                    it->time   = GetTickCount();
+                    it->pt     = g_cursorScreen;
+                    return TRUE;
+                }
+                if (it->message != WM_MOUSEMOVE && it->message != WM_TIMER && it->message != WM_PAINT) {
+                    break; // Preserve ordering across clicks, keys, wheel, or commands
+                }
+            }
+        } else if (Msg == WM_PAINT) {
+            for (const auto& qm : g_msgQueue) {
+                if (qm.hwnd == hWnd && qm.message == WM_PAINT) return TRUE;
+            }
+        } else if (Msg == WM_TIMER) {
+            for (const auto& qm : g_msgQueue) {
+                if (qm.hwnd == hWnd && qm.message == WM_TIMER && qm.wParam == wParam) return TRUE;
+            }
+        }
         if (g_msgQueue.size() > 32768) g_msgQueue.pop_front();
         MSG m = {};
         m.hwnd = hWnd;
@@ -1519,7 +1697,8 @@ BOOL TrackPopupMenu(HMENU hMenu, UINT uFlags, int xPos, int yPos, int, HWND hWnd
     if (x.ChangeWindowAttributes) {
         XSetWindowAttributes swa = {};
         swa.override_redirect = True;
-        x.ChangeWindowAttributes(x.dpy, popWin, CWOverrideRedirect, &swa);
+        swa.background_pixmap = None;
+        x.ChangeWindowAttributes(x.dpy, popWin, CWOverrideRedirect | CWBackPixmap, &swa);
     }
     x.SelectInput(x.dpy, popWin, ExposureMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | KeyPressMask);
     if (x.MapRaised) x.MapRaised(x.dpy, popWin);

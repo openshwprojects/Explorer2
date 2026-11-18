@@ -68,6 +68,7 @@ public:
     }
 
     bool IsLoaded() const { return m_valid; }
+    void SetHorizCondense(float c) { m_horizCondense = c; }
 
     const RasterGlyph& GetGlyph(uint32_t cp, int pxHeight) {
         pxHeight = std::clamp(pxHeight, 6, 128);
@@ -380,28 +381,30 @@ private:
     RasterGlyph RasterizeCodepoint(uint32_t cp, int pxHeight) const {
         RasterGlyph out;
         if (cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n') {
-            const float scale = m_valid ? (static_cast<float>(pxHeight) / static_cast<float>(m_unitsPerEm)) : 0.5f;
+            const float scaleY = m_valid ? (static_cast<float>(pxHeight) / static_cast<float>(m_unitsPerEm)) : 0.5f;
+            const float scaleX = scaleY * m_horizCondense;
             uint16_t spGid = MapCodepointToGlyph(' ');
             if (m_valid && spGid > 0 && m_numHMetrics > 0) {
                 const uint16_t mIdx = std::min<uint16_t>(spGid, m_numHMetrics - 1);
                 if (static_cast<size_t>(mIdx) * 4u + 2u <= m_hmtxLen) {
-                    out.advancePx = RdBE16(m_data.data() + m_hmtxOff + mIdx * 4) * scale;
+                    out.advancePx = RdBE16(m_data.data() + m_hmtxOff + mIdx * 4) * scaleX;
                 }
             }
-            if (out.advancePx <= 0.5f) out.advancePx = pxHeight * 0.32f;
+            if (out.advancePx <= 0.5f) out.advancePx = pxHeight * 0.30f;
             if (cp == '\t') out.advancePx *= 4.0f;
             return out;
         }
 
         const uint16_t gid = MapCodepointToGlyph(cp);
         if (m_valid && gid != 0) {
-            const float scale = static_cast<float>(pxHeight) / static_cast<float>(m_unitsPerEm);
+            const float scaleY = static_cast<float>(pxHeight) / static_cast<float>(m_unitsPerEm);
+            const float scaleX = scaleY * m_horizCondense;
             const uint16_t mIdx = std::min<uint16_t>(gid, static_cast<uint16_t>(std::max<int>(0, m_numHMetrics - 1)));
             if (static_cast<size_t>(mIdx) * 4u + 2u <= m_hmtxLen) {
-                out.advancePx = RdBE16(m_data.data() + m_hmtxOff + mIdx * 4) * scale;
+                out.advancePx = RdBE16(m_data.data() + m_hmtxOff + mIdx * 4) * scaleX;
             }
             std::vector<Seg2D> segs;
-            AppendGlyphSegments(gid, scale, 0.0f, 0.0f, scale, 0.0f, 0.0f, segs);
+            AppendGlyphSegments(gid, scaleX, 0.0f, 0.0f, scaleY, 0.0f, 0.0f, segs);
             if (!segs.empty()) {
                 float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
                 for (const auto& s : segs) {
@@ -508,6 +511,7 @@ private:
     uint32_t m_cmapOff = 0, m_cmapLen = 0;
     uint32_t m_cmapSubOff = 0;
     int      m_cmapFmt = 0;
+    float    m_horizCondense = 1.0f;
 
     mutable std::mutex m_cacheMutex;
     mutable std::unordered_map<uint64_t, RasterGlyph> m_cache;
@@ -556,6 +560,8 @@ struct SystemFontBank {
             "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
             "/usr/share/fonts/truetype/ttf-bitstream-vera/VeraMono.ttf"
         };
+        sansReg.SetHorizCondense(0.91f);
+        sansBold.SetHorizCondense(0.91f);
         for (const char* p : kSansReg)  if (sansReg.LoadFromFile(p)) break;
         for (const char* p : kSansBold) if (sansBold.LoadFromFile(p)) break;
         for (const char* p : kMonoReg)  if (monoReg.LoadFromFile(p)) break;
