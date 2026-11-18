@@ -1,6 +1,5 @@
 #pragma once
 #include "../JsonDom.h"
-#include <memory>
 // Avro.h — Apache Avro Object Container File (.avro, Obj\x01) Schema & Binary Data Block Decoder
 
 namespace Formats {

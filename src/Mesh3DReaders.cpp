@@ -23,6 +23,7 @@
 #include <functional>
 #include <numeric>
 #include <limits>
+#include <memory>
 #include <thread>
 
 namespace Explorer2 {
