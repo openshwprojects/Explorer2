@@ -1,5 +1,6 @@
 #pragma once
 #include "MeshBuild3D.h"
+#include <memory>
 // Scad.h — OpenSCAD Parametric CSG Script (.scad) Recursive-Descent Parser & 4x4 CSG Mesh Evaluator
 
 namespace Formats {

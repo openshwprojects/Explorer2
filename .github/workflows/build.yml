@@ -219,8 +219,8 @@ jobs:
           retention-days: 90
 
   build-linux-x64:
-    name: Build Linux x64 (App, X11 GUI & Readers)
-    runs-on: ubuntu-22.04
+    name: Build Linux x64 (100% Static — Any Distro)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
@@ -238,31 +238,50 @@ jobs:
           & ./tools/gen_version.ps1
           $global:LASTEXITCODE = 0
 
-      - name: Install Linux x64 build & test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache libx11-dev poppler-utils fonts-dejavu-core subversion p7zip-full xvfb
-
-      - name: Cache ccache (Linux x64)
+      - name: Cache ccache (Linux x64 static)
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-x64-${{ github.sha }}
+          key: ccache-static-x64-${{ github.sha }}
           restore-keys: |
-            ccache-linux-x64-
+            ccache-static-x64-
 
-      - name: Compile Explorer2 Linux x64 targets
-        run: bash ./linux/build_linux.sh --build-dir build-linux-x64
+      - name: Compile 100% static Explorer2 Linux x64 targets (Alpine musl + static X11)
+        run: |
+          mkdir -p "$HOME/.cache/ccache"
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$HOME/.cache/ccache:/ccache" \
+            -e CCACHE_DIR=/ccache \
+            -w /work \
+            alpine:3.20 /bin/sh -euxc '
+              apk add --no-cache build-base cmake samurai ccache bash file \
+                libx11-dev libx11-static libxcb-static libxau-dev libxdmcp-dev
+              bash ./linux/build_linux.sh --static --build-dir build-linux-x64
+              chown -R '"$(id -u):$(id -g)"' build-linux-x64 /ccache
+            '
 
-      - name: Verify Linux x64 executable & version info
+      - name: Verify zero shared-library dependencies (statically linked ELF)
         run: |
           test -x build-linux-x64/explorer2
+          file build-linux-x64/explorer2
           file build-linux-x64/explorer2 | grep -q "ELF 64-bit"
+          file build-linux-x64/explorer2 | grep -q "statically linked"
+          if ldd build-linux-x64/explorer2 2>&1 | grep -q "=>"; then
+              echo "::error title=Dynamic Dependency Leaked::explorer2 must have zero .so dependencies"
+              ldd build-linux-x64/explorer2 || true
+              exit 1
+          fi
           ./build-linux-x64/explorer2 --version build-linux-x64/cli_version.txt
           cat build-linux-x64/cli_version.txt
 
-      - name: Run built-in Linux x64 self-test suite
+      - name: Install Ubuntu host runtime test tools (PDF, VCS, Xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            poppler-utils fonts-dejavu-core subversion p7zip-full xvfb
+
+      - name: Run built-in Linux x64 self-test suite on Ubuntu host
         id: selftest
         run: |
           report="build-linux-x64/selftest_report.txt"
@@ -291,7 +310,7 @@ jobs:
               exit "$rc"
           fi
 
-      - name: Smoke-test native X11 GUI under Xvfb
+      - name: Smoke-test native X11 GUI under Xvfb on Ubuntu host
         run: |
           EXPLORER2_AUTO_CLOSE_MS=1500 xvfb-run -a -s "-screen 0 1280x800x24" ./build-linux-x64/explorer2 "$PWD"
 
@@ -331,9 +350,10 @@ jobs:
           E2_TESTSUM: ${{ steps.selftest.outputs.summary }}
         run: |
           {
-            echo "## Explorer2 Linux x64 Build \`v${E2_SEMVER}\`"
+            echo "## Explorer2 Linux x64 Static Build \`v${E2_SEMVER}\`"
             echo ""
             echo "- **Version:** \`${E2_FULLVER}\`"
+            echo "- **Linkage:** \`100% Statically Linked ELF (zero .so / GLIBC dependencies)\`"
             [ -n "${E2_TESTSUM}" ] && echo "- **Self-Tests:** \`${E2_TESTSUM}\`"
             echo ""
             if [ -d dist-linux-x64 ]; then
@@ -361,8 +381,8 @@ jobs:
           retention-days: 90
 
   build-linux-x86:
-    name: Build Linux x86 32-bit (-m32)
-    runs-on: ubuntu-22.04
+    name: Build Linux x86 32-bit (100% Static — Any Distro)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
@@ -380,26 +400,48 @@ jobs:
           & ./tools/gen_version.ps1
           $global:LASTEXITCODE = 0
 
-      - name: Install Linux 32-bit multilib & test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache g++-multilib libx11-dev poppler-utils fonts-dejavu-core subversion p7zip-full
-
-      - name: Cache ccache (Linux x86 32-bit)
+      - name: Cache ccache (Linux x86 32-bit static)
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-x86-${{ github.sha }}
+          key: ccache-static-x86-${{ github.sha }}
           restore-keys: |
-            ccache-linux-x86-
+            ccache-static-x86-
 
-      - name: Compile Explorer2 Linux x86 (32-bit) targets
+      - name: Compile 100% static Explorer2 Linux x86 (32-bit) targets (i386/alpine)
         run: |
-          bash ./linux/build_linux.sh --32 --build-dir build-linux-x86
-          file build-linux-x86/explorer2 | grep -q "ELF 32-bit"
+          mkdir -p "$HOME/.cache/ccache"
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$HOME/.cache/ccache:/ccache" \
+            -e CCACHE_DIR=/ccache \
+            -w /work \
+            i386/alpine:3.20 /bin/sh -euxc '
+              apk add --no-cache build-base cmake samurai ccache bash file \
+                libx11-dev libx11-static libxcb-static libxau-dev libxdmcp-dev
+              bash ./linux/build_linux.sh --32 --static --build-dir build-linux-x86
+              chown -R '"$(id -u):$(id -g)"' build-linux-x86 /ccache
+            '
 
-      - name: Run built-in Linux x86 (32-bit) self-test suite
+      - name: Verify zero shared-library dependencies (32-bit static ELF)
+        run: |
+          test -x build-linux-x86/explorer2
+          file build-linux-x86/explorer2
+          file build-linux-x86/explorer2 | grep -q "ELF 32-bit"
+          file build-linux-x86/explorer2 | grep -q "statically linked"
+          if ldd build-linux-x86/explorer2 2>&1 | grep -q "=>"; then
+              echo "::error title=Dynamic Dependency Leaked::32-bit explorer2 must have zero .so dependencies"
+              ldd build-linux-x86/explorer2 || true
+              exit 1
+          fi
+
+      - name: Install Ubuntu host runtime test tools (no 32-bit libs installed!)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            poppler-utils fonts-dejavu-core subversion p7zip-full xvfb
+
+      - name: Run built-in Linux x86 (32-bit) self-test suite & Xvfb GUI on 64-bit Ubuntu host
         id: selftest
         run: |
           report="build-linux-x86/selftest_report.txt"
@@ -427,6 +469,7 @@ jobs:
               echo "::error title=Linux x86 Self-Test Failure::Exited with code $rc"
               exit "$rc"
           fi
+          EXPLORER2_AUTO_CLOSE_MS=1500 xvfb-run -a -s "-screen 0 1280x800x24" ./build-linux-x86/explorer2 "$PWD"
 
       - name: Package Linux x86 (32-bit) portable tarball & checksums
         env:
@@ -524,9 +567,9 @@ jobs:
             - **Standalone Executable:** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-x64.exe` — Single-file native portable executable (no installation or third-party runtime needed).
             - **Portable Archive:** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-portable-x64.zip` — Portable ZIP with `Explorer2.exe`, `LICENSE`, and `README.md`.
 
-            ### Downloads — Linux (Ubuntu 22.04+ / Debian 12+ / Desktop X11 & XWayland)
-            - **Linux x86_64 (64-bit — Recommended for all 64-bit PCs & VMs):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x64.tar.gz` — Portable 64-bit `explorer2` binary (`-static-libstdc++ -static-libgcc`, `dlopen("libX11.so.6")` GUI + CLI modes).
-            - **Linux x86 (Legacy 32-bit i686 OS):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x86.tar.gz` — Portable 32-bit `explorer2` binary (`-static-libstdc++ -static-libgcc`, 64-bit large-file support).
+            ### Downloads — Linux (Any Linux Distro — 100% Static Single Binary)
+            - **Linux x86_64 (64-bit — Recommended for all 64-bit PCs & VMs):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x64.tar.gz` — **100% statically linked** 64-bit `explorer2` binary (`zero .so / GLIBC / libstdc++ / libX11 runtime dependencies` — runs out-of-the-box on any Linux distribution).
+            - **Linux x86 (32-bit i686):** `Explorer2-${{ needs.build-windows-x64.outputs.semver }}-linux-x86.tar.gz` — **100% statically linked** 32-bit `explorer2` binary (also runs directly on 64-bit Linux without installing 32-bit multilib packages).
 
             - **Checksums:** `SHA256SUMS.txt`
 

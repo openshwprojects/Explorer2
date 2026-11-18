@@ -1,5 +1,6 @@
 #pragma once
 #include "../ByteIO.h"
+#include <memory>
 // ExtendedAiData100.h — Binary Decoders for AI/ML Models, Tensors, Columnar IPC & Statistical Datasets
 // Covers: .npy, .npz, .ipynb, .cbor, .msgpack/.mpk, .onnx, .pt/.pth/.ckpt, .tflite,
 //         .feather/.arrow/.ipc, .orc, .h5/.hdf5, .mat, .sav, .dta, .sas7bdat, .rds, .duckdb
