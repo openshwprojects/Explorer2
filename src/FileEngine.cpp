@@ -16,7 +16,10 @@
 #include <cwctype>
 #ifndef _WIN32
 #include "ToolProcess.h"
+#include "LinuxStorage.h"
+#include <climits>
 #include <cstdlib>
+#include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
 #include <poll.h>
@@ -308,6 +311,128 @@ std::vector<LinuxMounts::Mount> ReadMountInfo() {
         out.push_back(std::move(m));
     }
     return out;
+}
+
+// A small file of /sys or /run/udev as text (empty when it cannot be read)
+std::string ReadSmallTextFile(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return {};
+    std::string out;
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        out.append(buf, static_cast<size_t>(n));
+        if (out.size() > 256 * 1024) break;
+    }
+    ::close(fd);
+    return out;
+}
+
+// A file system on a pluggable device that is not mounted (LinuxStorage::IsMountableUnmountedVolume says which count)
+struct LinuxUnmountedVolume {
+    std::wstring devNode;       // "/dev/sdb1"
+    std::wstring label;         // the file system's label, or the device's model, or the device name
+    std::wstring fsType;
+    uint64_t sizeBytes = 0;
+};
+
+// Looks at the disks in /sys/block that can be plugged in (removable, on USB, or an SD card), at their partitions,
+// and at what udev found on each (/run/udev/data, readable by everyone). No device is opened and nothing is run,
+// so this is cheap enough for the drive list and for the periodic look at the drives.
+std::vector<LinuxUnmountedVolume> EnumerateLinuxUnmountedVolumes() {
+    std::vector<LinuxUnmountedVolume> out;
+    std::vector<std::string> disks;
+    if (DIR* d = ::opendir("/sys/block")) {
+        while (struct dirent* e = ::readdir(d)) {
+            const std::string nm = e->d_name;
+            if (nm.empty() || nm[0] == '.') continue;
+            if (nm.rfind("loop", 0) == 0 || nm.rfind("ram", 0) == 0 || nm.rfind("zram", 0) == 0 || nm.rfind("dm-", 0) == 0 ||
+                nm.rfind("sr", 0) == 0 || nm.rfind("fd", 0) == 0 || nm.rfind("nbd", 0) == 0 || nm.rfind("md", 0) == 0) {
+                continue;
+            }
+            disks.push_back(nm);
+        }
+        ::closedir(d);
+    }
+    if (disks.empty()) return out;
+    std::sort(disks.begin(), disks.end());
+
+    const std::vector<LinuxMounts::Mount> mounts = ReadMountInfo();    // as it is now, not the copy kept for a second
+    for (const std::string& disk : disks) {
+        const std::string base = "/sys/block/" + disk;
+        LinuxStorage::BlockVolumeFacts diskFacts;
+        diskFacts.diskRemovable = (LinuxStorage::Trim(ReadSmallTextFile(base + "/removable")) == "1");
+        char realBuf[PATH_MAX] = {};
+        const std::string realPath = ::realpath(base.c_str(), realBuf) ? std::string(realBuf) : std::string();
+        diskFacts.diskOnUsb = (realPath.find("/usb") != std::string::npos);
+        diskFacts.diskIsSdCard = (disk.rfind("mmcblk", 0) == 0 && LinuxStorage::Trim(ReadSmallTextFile(base + "/device/type")) == "SD");
+        if (!(diskFacts.diskRemovable || diskFacts.diskOnUsb || diskFacts.diskIsSdCard)) continue;
+
+        // The disk's partitions are folders inside its own, each with a file "partition"; a disk without a
+        // partition table (many small sticks) carries its file system itself
+        std::vector<std::string> volumes;
+        if (DIR* pd = ::opendir(base.c_str())) {
+            while (struct dirent* e = ::readdir(pd)) {
+                const std::string nm = e->d_name;
+                if (nm.size() <= disk.size() || nm.compare(0, disk.size(), disk) != 0) continue;
+                if (::access((base + "/" + nm + "/partition").c_str(), F_OK) == 0) volumes.push_back(nm);
+            }
+            ::closedir(pd);
+        }
+        std::sort(volumes.begin(), volumes.end());
+        const bool wholeDisk = volumes.empty();
+        if (wholeDisk) volumes.push_back(disk);
+
+        for (const std::string& vol : volumes) {
+            const std::string vdir = wholeDisk ? base : (base + "/" + vol);
+            LinuxStorage::BlockVolumeFacts v = diskFacts;
+            v.name = vol;
+            v.sizeBytes = std::strtoull(LinuxStorage::Trim(ReadSmallTextFile(vdir + "/size")).c_str(), nullptr, 10) * 512ULL;
+            const std::string devNumbers = LinuxStorage::Trim(ReadSmallTextFile(vdir + "/dev"));      // "8:17"
+            unsigned devMajor = 0, devMinor = 0;
+            if (std::sscanf(devNumbers.c_str(), "%u:%u", &devMajor, &devMinor) != 2) continue;
+            const std::string udevText = ReadSmallTextFile("/run/udev/data/b" + devNumbers);
+            if (!udevText.empty()) {
+                v.udevKnown = true;
+                v.udev = LinuxStorage::ParseUdevDb(udevText);
+            }
+            const uint64_t devNo = static_cast<uint64_t>(makedev(devMajor, devMinor));
+            const std::string devNode = "/dev/" + vol;
+            for (const auto& m : mounts) {
+                if (m.device == devNo || m.source == devNode) {
+                    v.mounted = true;
+                    break;
+                }
+            }
+            if (!LinuxStorage::IsMountableUnmountedVolume(v)) continue;
+
+            LinuxUnmountedVolume u;
+            u.devNode = PathUtils::Utf8ToWide(devNode);
+            u.fsType = PathUtils::Utf8ToWide(v.Udev("ID_FS_TYPE"));
+            u.sizeBytes = v.sizeBytes;
+            std::string label = LinuxStorage::VolumeLabelOf(v);
+            if (label.empty()) {
+                label = v.Udev("ID_MODEL");
+                std::replace(label.begin(), label.end(), '_', ' ');
+                label = LinuxStorage::Trim(label);
+            }
+            if (label.empty()) label = vol;
+            u.label = PathUtils::Utf8ToWide(label);
+            out.push_back(std::move(u));
+        }
+    }
+    return out;
+}
+
+// "KINGSTON (sdb1, 14.9 GB) - niezamontowany": the name under which the drive list shows such a volume
+std::wstring UnmountedVolumeTitle(const LinuxUnmountedVolume& uv, Lang lang) {
+    std::wstring shortDev = uv.devNode;
+    if (shortDev.rfind(L"/dev/", 0) == 0) shortDev.erase(0, 5);
+    std::wstring title = uv.label;
+    if (uv.label != shortDev) title += L" (" + shortDev + (uv.sizeBytes > 0 ? L", " + FileEngine::FormatSizeDetailed(uv.sizeBytes) : L"") + L")";
+    else if (uv.sizeBytes > 0) title += L" (" + FileEngine::FormatSizeDetailed(uv.sizeBytes) + L")";
+    return title + (lang == Lang::PL ? L" - niezamontowany" : L" - not mounted");
 }
 
 } // namespace
@@ -1189,6 +1314,22 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
                     : ((lang == Lang::PL ? L"Wolumin Linux (" : L"Linux Volume (") + mi.fsType + L")"));
             results.push_back(std::move(entry));
         }
+        // Sticks and cards that are plugged in but not mounted: opening one mounts it (ExplorerApp::NavigateTo)
+        for (const auto& uv : EnumerateLinuxUnmountedVolumes()) {
+            FileEntry entry;
+            entry.fullPath = std::wstring(kUnmountedVolumePrefix) + uv.devNode;
+            entry.normKey = PathUtils::NormalizePathKey(entry.fullPath);
+            entry.isDirectory = true;
+            entry.isDrive = true;
+            entry.sysIconIndex = m_folderIconIndex;
+            entry.name = UnmountedVolumeTitle(uv, lang);
+            entry.displayName = entry.name;
+            entry.size = uv.sizeBytes;
+            if (uv.sizeBytes > 0) entry.sizeStr = FormatSizeDetailed(uv.sizeBytes);
+            entry.typeName = (lang == Lang::PL ? L"Nośnik niezamontowany (" : L"Volume not mounted (") + uv.fsType +
+                             (lang == Lang::PL ? L") - otwórz, aby zamontować" : L") - open it to mount it");
+            results.push_back(std::move(entry));
+        }
 #else
         DWORD drivesMask = GetLogicalDrives();
         wchar_t rootPath[] = L"A:\\";
@@ -1701,6 +1842,86 @@ void FileEngine::SortEntries(std::vector<FileEntry>& entries, SortColumn column,
     });
 }
 
+bool FileEngine::MountVolume(const std::wstring& devNode, std::wstring& outMountPoint, std::wstring& outError) {
+    outMountPoint.clear();
+    outError.clear();
+#ifdef _WIN32
+    (void)devNode;
+    outError = L"NO_TOOL";
+    return false;
+#else
+    // Only a device node may become an argument of a command: "/dev/" and a plain name
+    const std::string dev = PathUtils::WideToUtf8(devNode);
+    bool plain = (dev.size() > 5 && dev.compare(0, 5, "/dev/") == 0);
+    for (size_t i = 5; plain && i < dev.size(); ++i) {
+        const char c = dev[i];
+        plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+    }
+    if (!plain) {
+        outError = L"bad device name";
+        return false;
+    }
+
+    // Where the device is mounted, by what the mount table says (not by what a tool printed)
+    auto mountPointNow = [&dev]() -> std::string {
+        struct stat st = {};
+        const bool isBlock = (::stat(dev.c_str(), &st) == 0) && S_ISBLK(st.st_mode);
+        for (const auto& m : ReadMountInfo()) {
+            if ((isBlock && m.device == static_cast<uint64_t>(st.st_rdev)) || m.source == dev) return m.mountPoint;
+        }
+        return {};
+    };
+
+    std::string mountPoint = mountPointNow();       // someone else may have mounted it meanwhile
+    if (mountPoint.empty()) {
+        ToolProcess::Options opt;
+        opt.timeoutMs = 45000;
+        opt.mergeStderr = true;
+        opt.envOverride = { L"LC_ALL=C", L"LANG=C" };
+        static const std::atomic<bool> s_never{ false };
+        std::string said;
+        bool anyTool = false;
+
+        const std::wstring udisksctl = ToolProcess::FindExecutable(L"udisksctl", { L"/usr/bin/udisksctl", L"/bin/udisksctl" });
+        if (!udisksctl.empty()) {
+            anyTool = true;
+            const ToolProcess::Result res = ToolProcess::Run(udisksctl, { L"mount", L"--block-device", devNode, L"--no-user-interaction" }, opt, s_never);
+            said = res.out;
+            mountPoint = mountPointNow();
+            if (mountPoint.empty() && res.ok()) mountPoint = LinuxStorage::ParseMountedAt(res.out);
+        }
+        if (mountPoint.empty()) {
+            const std::wstring gio = ToolProcess::FindExecutable(L"gio", { L"/usr/bin/gio", L"/bin/gio" });
+            if (!gio.empty()) {
+                anyTool = true;
+                const ToolProcess::Result res = ToolProcess::Run(gio, { L"mount", L"-d", devNode }, opt, s_never);
+                if (said.empty()) said = res.out;
+                mountPoint = mountPointNow();
+                if (mountPoint.empty() && res.ok()) mountPoint = LinuxStorage::ParseMountedAt(res.out);
+            }
+        }
+        if (mountPoint.empty()) {
+            outError = anyTool ? ToolProcess::FirstLine(ToolProcess::DecodeOutput(said)) : std::wstring(L"NO_TOOL");
+            return false;
+        }
+    }
+    outMountPoint = PathUtils::Utf8ToWide(mountPoint);
+    return true;
+#endif
+}
+
+std::wstring FileEngine::UnmountedVolumesSignature() {
+#ifdef _WIN32
+    return L"";
+#else
+    std::wstring sig;
+    for (const auto& uv : EnumerateLinuxUnmountedVolumes()) {
+        sig += uv.devNode + L"|" + uv.label + L"|" + std::to_wstring(uv.sizeBytes) + L";";
+    }
+    return sig;
+#endif
+}
+
 std::vector<std::pair<std::wstring, std::wstring>> FileEngine::GetDefaultQuickAccessFolders(Lang lang) {
     const Strings& s = GetStrings(lang);
     std::vector<std::pair<std::wstring, std::wstring>> list;
@@ -1843,6 +2064,18 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
         driveNode.size = (totalBytes >= freeBytes) ? (totalBytes - freeBytes) : 0;
         driveNode.sizeStr = LinuxDriveBadge(driveNode.size, totalBytes);
         nodes.push_back(std::move(driveNode));
+    }
+    // Sticks and cards that are plugged in but not mounted: a click mounts one and opens it
+    for (const auto& uv : EnumerateLinuxUnmountedVolumes()) {
+        TreeNode volNode;
+        volNode.path = std::wstring(kUnmountedVolumePrefix) + uv.devNode;
+        volNode.normKey = PathUtils::NormalizePathKey(volNode.path);
+        volNode.label = UnmountedVolumeTitle(uv, lang);
+        volNode.indent = 1;
+        volNode.isDrive = true;
+        volNode.hasChildren = false;
+        volNode.isExpanded = false;
+        nodes.push_back(std::move(volNode));
     }
 #else
     DWORD drivesMask = GetLogicalDrives();

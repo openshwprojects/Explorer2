@@ -191,6 +191,14 @@ public:
     // Format helpers
     static std::wstring FormatSizeKB(uint64_t bytes);
     static std::wstring FormatSizeDetailed(uint64_t bytes);
+
+    // Linux: mounts the file system on a device such as "/dev/sdb1" the way the desktop does it, through udisks2
+    // (udisksctl; it lets a logged-in user mount pluggable media without a password) or GVfs (gio). Waits for
+    // the tool, so it is for a worker thread. outError is the tool's message, or "NO_TOOL" when neither exists.
+    static bool MountVolume(const std::wstring& devNode, std::wstring& outMountPoint, std::wstring& outError);
+    // Linux: the volumes that are listed as "not mounted" right now, as one text, for noticing a stick that was
+    // plugged in or pulled out (the mount table does not change then). Empty on Windows.
+    static std::wstring UnmountedVolumesSignature();
     static std::wstring FormatFileTime(const FILETIME& ft);
 
 private:

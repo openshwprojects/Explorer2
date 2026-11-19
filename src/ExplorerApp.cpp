@@ -1049,6 +1049,13 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_APP_VOLUME_MOUNTED: {
+        // The worker of BeginMountVolume is done
+        std::unique_ptr<VolumeMountResult> result(reinterpret_cast<VolumeMountResult*>(lParam));
+        if (result) OnVolumeMounted(*result);
+        return 0;
+    }
+
     case WM_APP_PREVIEW_READY:
         // The preview pane's worker has read the selected file (a result for a file no longer selected is dropped)
         if (m_contentPane.OnPreviewLoaded()) InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -1439,6 +1446,14 @@ void ExplorerApp::SyncMediaPlayerToSelection() {
 }
 
 void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const std::wstring& selectFileName) {
+#ifndef _WIN32
+    if (IsUnmountedVolumePath(path)) {
+        // A stick or card that is plugged in but not mounted: it is mounted first, and its folder is opened when
+        // that has worked (OnVolumeMounted)
+        BeginMountVolume(UnmountedVolumeDevice(path));
+        return;
+    }
+#endif
     std::wstring resolvedInput = FileEngine::ResolveAddressInput(path, m_currentPath);
     std::wstring cleanPath = resolvedInput.empty() ? PathUtils::TrimTrailingSlashes(path) : resolvedInput;
     // A newer navigation replaces one that waits for a network server, and its "connecting" note
@@ -9301,8 +9316,57 @@ std::wstring ExplorerApp::DriveListSignature() const {
 #else
     std::ifstream mounts("/proc/self/mounts");
     const std::string text((std::istreambuf_iterator<char>(mounts)), std::istreambuf_iterator<char>());
-    return std::to_wstring(text.size()) + L":" + std::to_wstring(std::hash<std::string>{}(text));
+    // ... and the sticks and cards that are plugged in without being mounted: they are in the list too, and
+    // plugging one in does not change the mount table
+    return std::to_wstring(text.size()) + L":" + std::to_wstring(std::hash<std::string>{}(text)) + L":" +
+           FileEngine::UnmountedVolumesSignature();
 #endif
+}
+
+// ---- Mounting a volume from the drive list (Linux) -----------------------------------------------------------
+
+void ExplorerApp::BeginMountVolume(const std::wstring& devNode) {
+    if (devNode.empty() || !m_hwnd) return;
+    if (m_mountingDevice == devNode) return;            // already on its way
+    m_mountingDevice = devNode;
+    m_statusToast = (m_lang == Lang::PL ? L"\x23F3 Montowanie " : L"\x23F3 Mounting ") + devNode + L"...";
+    m_statusToastExpireTick = GetTickCount64() + 60000;
+    AppLog::Info(L"Mount", L"Mounting " + devNode);
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+
+    // The tool may take seconds (a disk that spins up, a slow card): the window stays usable meanwhile
+    const HWND hwnd = m_hwnd;
+    std::thread([hwnd, devNode]() {
+        auto* result = new VolumeMountResult();
+        result->devNode = devNode;
+        result->ok = FileEngine::MountVolume(devNode, result->mountPoint, result->error);
+        if (!PostMessageW(hwnd, WM_APP_VOLUME_MOUNTED, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    }).detach();
+}
+
+void ExplorerApp::OnVolumeMounted(const VolumeMountResult& result) {
+    const bool pl = (m_lang == Lang::PL);
+    m_mountingDevice.clear();
+    if (result.ok && !result.mountPoint.empty()) {
+        m_statusToast = (pl ? L"\x2713 Zamontowano " : L"\x2713 Mounted ") + result.devNode + L": " + result.mountPoint;
+        m_statusToastExpireTick = GetTickCount64() + 4000;
+        AppLog::Ok(L"Mount", result.devNode + L" mounted at " + result.mountPoint);
+        OnDrivesChanged();                              // it is a drive of the list now
+        NavigateTo(result.mountPoint, true);
+    } else {
+        std::wstring why = result.error;
+        if (why == L"NO_TOOL") {
+            why = pl ? L"nie ma programu udisksctl (pakiet udisks2) ani gio - zamontuj nośnik w systemie, pojawi się na liście"
+                     : L"neither udisksctl (the udisks2 package) nor gio is installed - mount the volume in the system and it will show up in the list";
+        }
+        if (why.size() > 220) why.resize(220);
+        m_statusToast = (pl ? L"\x26A0 Nie udało się zamontować " : L"\x26A0 Could not mount ") + result.devNode + (why.empty() ? L"" : L": " + why);
+        m_statusToastExpireTick = GetTickCount64() + 9000;
+        AppLog::Warn(L"Mount", result.devNode + L": " + (result.error.empty() ? L"not mounted" : result.error));
+    }
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
 void ExplorerApp::OnDrivesChanged() {

@@ -8475,6 +8475,7 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
         if (!sd) return 0.0f;
 
         std::wstring title = (pl ? L"SMART  \x2022  Dysk #" : L"SMART  \x2022  Drive #") + std::to_wstring(sd->index) + L":  " + sd->model;
+        if (!sd->smartSource.empty()) title += L"  \x2022  " + sd->smartSource;     // Linux: UDisks2 or smartctl
         const bool ok = (sd->smartState == HwSmartState::Ok);
         const float topBlockH = 98.0f, tblHdrH = 22.0f, tblRowH = 19.0f;
         float h = ok ? (34.0f + topBlockH + 10.0f + tblHdrH + static_cast<float>(sd->smartAttrs.size()) * tblRowH + 10.0f) : (34.0f + 76.0f);
@@ -8493,17 +8494,42 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
             if (sd->smartState == HwSmartState::NotQueried) {
                 msg = pl ? L"Trwa odczyt danych SMART w tle..."
                          : L"Reading SMART data in the background...";
-            } else if (sd->smartState == HwSmartState::NeedsAdmin) {
-                msg = pl ? L"Odczyt SMART tego dysku wymaga uprawnień administratora (Windows blokuje surowy dostęp do dysku zwykłym procesom).\nTemperatura jest odczytywana nadal, jeśli dysk ją udostępnia."
-                         : L"Reading SMART for this drive requires administrator rights (Windows blocks raw disk access for normal processes).\nTemperature is still shown when the drive exposes it.";
             } else {
 #ifdef _WIN32
-                msg = pl ? L"Ten dysk (USB / RAID / wirtualny) nie udostępnia danych SMART przez sterownik Windows."
-                         : L"This drive (USB / RAID / virtual) does not expose SMART data through the Windows driver.";
+                if (sd->smartState == HwSmartState::NeedsAdmin) {
+                    msg = pl ? L"Odczyt SMART tego dysku wymaga uprawnień administratora (Windows blokuje surowy dostęp do dysku zwykłym procesom).\nTemperatura jest odczytywana nadal, jeśli dysk ją udostępnia."
+                             : L"Reading SMART for this drive requires administrator rights (Windows blocks raw disk access for normal processes).\nTemperature is still shown when the drive exposes it.";
+                } else {
+                    msg = pl ? L"Ten dysk (USB / RAID / wirtualny) nie udostępnia danych SMART przez sterownik Windows."
+                             : L"This drive (USB / RAID / virtual) does not expose SMART data through the Windows driver.";
+                }
 #else
-                // The Linux build has no SMART reader yet: the note must not blame the drive or a Windows driver
-                msg = pl ? L"Wersja dla Linuksa nie odczytuje jeszcze atrybutów SMART (surowy dostęp do dysku wymaga tam uprawnień administratora).\nTemperatura jest pokazywana, gdy system ją udostępnia (dyski NVMe; dyski SATA po załadowaniu modułu drivetemp)."
-                         : L"The Linux build does not read SMART attributes yet (raw disk access needs root rights there).\nThe temperature is shown where the system exposes it (NVMe drives; SATA drives once the drivetemp module is loaded).";
+                // Linux: the values come from udisks2 (the system's disk service, no root needed) or from smartctl;
+                // the reader says which of them was missing (HardwareInfo.cpp, RefreshLinuxDiskSmart)
+                switch (sd->smartNote) {
+                case HwSmartNote::NoTool:
+                    msg = pl ? L"Do odczytu SMART potrzebny jest UDisks2 (pakiet udisks2; do tabeli atrybutów także gdbus albo busctl) lub smartmontools (smartctl). Żadnego z nich nie znaleziono w systemie."
+                             : L"Reading SMART needs UDisks2 (the udisks2 package; gdbus or busctl as well for the attribute table) or smartmontools (smartctl). Neither was found on this system.";
+                    break;
+                case HwSmartNote::NeedsRoot:
+                    msg = pl ? L"UDisks2 nie ma danych SMART tego dysku, a smartctl nie może otworzyć urządzenia jako zwykły użytkownik. Zainstaluj lub uruchom usługę udisks2 albo uruchom Explorer2 jako root."
+                             : L"UDisks2 has no SMART data for this drive, and smartctl may not open the device as an ordinary user. Install or start the udisks2 service, or run Explorer2 as root.";
+                    break;
+                case HwSmartNote::NvmeNeedsNewUdisks:
+                    msg = pl ? L"UDisks2 w tym systemie nie podaje danych SMART dysków NVMe (robi to od wersji 2.10). Pozostaje smartctl, który wymaga uprawnień administratora (root)."
+                             : L"The UDisks2 of this system does not report SMART data of NVMe drives (it does from version 2.10). That leaves smartctl, which needs root rights.";
+                    break;
+                case HwSmartNote::SmartSwitchedOff:
+                    msg = pl ? L"Dysk obsługuje SMART, ale funkcja jest na nim wyłączona. Można ją włączyć poleceniem: smartctl -s on (jako root)."
+                             : L"The drive supports SMART, but it is switched off on it. It can be switched on with: smartctl -s on (as root).";
+                    break;
+                default:
+                    msg = pl ? L"Ten dysk nie udostępnia danych SMART przez UDisks2 ani smartctl (pendrive, mostek USB, czytnik kart albo dysk wirtualny)."
+                             : L"This drive exposes no SMART data through UDisks2 or smartctl (a USB stick, a USB bridge, a card reader or a virtual disk).";
+                    break;
+                }
+                msg += pl ? L"\nTemperatura jest pokazywana, gdy system ją udostępnia (dyski NVMe; dyski SATA po załadowaniu modułu drivetemp)."
+                          : L"\nThe temperature is shown where the system exposes it (NVMe drives; SATA drives once the drivetemp module is loaded).";
 #endif
             }
             D2D1_RECT_F box = D2D1::RectF(x + 10.0f, y + 36.0f, x + w - 10.0f, y + h - 8.0f);
@@ -8511,7 +8537,11 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
             m_rt->FillRoundedRectangle(D2D1::RoundedRect(box, 4.0f, 4.0f), m_solidBrush);
             m_solidBrush->SetColor(HexColor(0xF59E0B));
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(box, 4.0f, 4.0f), m_solidBrush, 1.0f);
+#ifdef _WIN32
             bool showAdminBtn = (sd->smartState == HwSmartState::NeedsAdmin) && !HardwareInspector::IsProcessElevated();
+#else
+            const bool showAdminBtn = false;        // restarting elevated is a Windows mechanism
+#endif
             float msgRight = box.right - 10.0f - (showAdminBtn ? 262.0f : 0.0f);
             m_rt->PushAxisAlignedClip(box, D2D1_ANTIALIAS_MODE_ALIASED);
             m_solidBrush->SetColor(HexColor(0x92400E));

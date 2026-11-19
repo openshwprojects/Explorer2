@@ -171,6 +171,10 @@ Explorer2 uses these when they are installed, and works without them:
   run without prompts, so a server that needs a password the client has not stored is reported as an error.
 - **rclone**: cloud backup targets
 - **7-Zip or WinRAR** (default install location): extracting compressed entries from RAR and 7z archives
+- **UDisks2** (Linux; `udisksctl`, part of every desktop, with `gdbus` or `busctl` for the attribute table): SMART
+  data of SATA and NVMe drives without root rights, and mounting a USB stick or card from the drive list.
+  NVMe health data needs UDisks2 2.10 or newer. **smartmontools** (`smartctl`) is used as well when Explorer2
+  may open the disk itself (run as root); `gio` can do the mounting when `udisksctl` is missing.
 
 ### Things to know
 
@@ -189,8 +193,10 @@ Explorer2 uses these when they are installed, and works without them:
   is newer than the running version. Nothing else is sent, nothing is downloaded or installed, and the check can
   be switched off on the File tab. The version number in the status bar opens the releases page.
 - A USB stick or card that is plugged in or removed shows up in the drive list by itself; a drive letter made in
-  another way (`subst`, `net use`) appears when you come back to the window or press F5. On Linux a drive
-  appears once it is mounted (the desktop usually does that when it is plugged in).
+  another way (`subst`, `net use`) appears when you come back to the window or press F5. On Linux a mounted
+  drive appears by itself, and a stick or card that is plugged in but not mounted is listed as "not mounted":
+  opening it mounts it (through UDisks2, as the desktop's own file manager does) and shows its folder. Fixed
+  disks that are not mounted are not listed.
 - Files dragged out of the window can be dropped on other programs (a browser upload, a chat window,
   Windows Explorer, the desktop). The program you drop them on decides whether they are copied or moved.
 - Delete moves items to the Recycle Bin and Shift+Delete removes them for good. Neither asks for

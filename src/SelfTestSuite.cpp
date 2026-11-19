@@ -30,6 +30,7 @@
 #include "Version.h"
 #include "DetailsColumns.h"
 #include "RibbonTabLayout.h"
+#include "LinuxStorage.h"
 #include "UpdateCheck.h"
 #include "WinEOverride.h"
 #include <winver.h>
@@ -7443,6 +7444,266 @@ static void RunStage16Tests(TestCounter& tc) {
             ok = ok && tree[own.size() + 1].label == L"zwykly_folder";     // any other pin keeps its own label
         }
         tc.Record(ok, L"Stage16.Test12_NavTree_PinnedOwnFoldersKeepLocalizedNames", L"folders checked: " + std::to_wstring(checked));
+    }
+
+    // ---- Linux storage readers: text of udisks2, smartctl and the udev database (LinuxStorage.h) --------------
+    const std::string udisksDump =
+        "/org/freedesktop/UDisks2/Manager:\n"
+        "  org.freedesktop.UDisks2.Manager:\n"
+        "    Version:                    2.10.1\n"
+        "/org/freedesktop/UDisks2/block_devices/sda:\n"
+        "  org.freedesktop.UDisks2.Block:\n"
+        "    Device:                     /dev/sda\n"
+        "    Drive:                      '/org/freedesktop/UDisks2/drives/Samsung_SSD_860_EVO_500GB_S3Z2NB0K123456'\n"
+        "    Symlinks:                   /dev/disk/by-id/ata-Samsung_SSD_860_EVO_500GB_S3Z2NB0K123456\n"
+        "                                /dev/disk/by-path/pci-0000:00:17.0-ata-1\n"
+        "    Size:                       500107862016\n"
+        "/org/freedesktop/UDisks2/block_devices/sdb:\n"
+        "  org.freedesktop.UDisks2.Block:\n"
+        "    Device:                     /dev/sdb\n"
+        "    Drive:                      '/org/freedesktop/UDisks2/drives/Kingston_DataTraveler_3_2e0_408D5C1654F8E3C0'\n"
+        "/org/freedesktop/UDisks2/block_devices/nvme0n1:\n"
+        "  org.freedesktop.UDisks2.Block:\n"
+        "    Device:                     /dev/nvme0n1\n"
+        "    Drive:                      '/org/freedesktop/UDisks2/drives/Samsung_SSD_960_PRO_2TB_S3EXNX0J900123'\n"
+        "/org/freedesktop/UDisks2/drives/Samsung_SSD_860_EVO_500GB_S3Z2NB0K123456:\n"
+        "  org.freedesktop.UDisks2.Drive:\n"
+        "    Model:                      Samsung SSD 860 EVO 500GB\n"
+        "    Serial:                     S3Z2NB0K123456\n"
+        "  org.freedesktop.UDisks2.Drive.Ata:\n"
+        "    SmartEnabled:               true\n"
+        "    SmartFailing:               false\n"
+        "    SmartNumAttributesFailing:  0\n"
+        "    SmartNumBadSectors:         0\n"
+        "    SmartPowerOnSeconds:        44388000\n"
+        "    SmartSupported:             true\n"
+        "    SmartTemperature:           306.15\n"
+        "    SmartUpdated:               1795000000\n"
+        "/org/freedesktop/UDisks2/drives/Kingston_DataTraveler_3_2e0_408D5C1654F8E3C0:\n"
+        "  org.freedesktop.UDisks2.Drive:\n"
+        "    ConnectionBus:              usb\n"
+        "    Model:                      DataTraveler 3.0\n"
+        "/org/freedesktop/UDisks2/drives/Samsung_SSD_960_PRO_2TB_S3EXNX0J900123:\n"
+        "  org.freedesktop.UDisks2.Drive:\n"
+        "    Model:                      Samsung SSD 960 PRO 2TB\n"
+        "  org.freedesktop.UDisks2.NVMe.Controller:\n"
+        "    SmartCriticalWarning:\n"
+        "    SmartPowerOnHours:          8123\n"
+        "    SmartTemperature:           310\n"
+        "    SmartUpdated:               1795000100\n"
+        "    State:                      live\n";
+    const std::vector<LinuxStorage::UdisksObject> udisksObjects = LinuxStorage::ParseUdisksDump(udisksDump);
+    const LinuxStorage::UdisksDriveSmart sataDrive = LinuxStorage::FindUdisksDriveSmart(udisksObjects, "/dev/sda");
+    const LinuxStorage::UdisksDriveSmart nvmeDrive = LinuxStorage::FindUdisksDriveSmart(udisksObjects, "/dev/nvme0n1");
+    {
+        const LinuxStorage::UdisksDriveSmart usb = LinuxStorage::FindUdisksDriveSmart(udisksObjects, "/dev/sdb");
+        const LinuxStorage::UdisksDriveSmart none = LinuxStorage::FindUdisksDriveSmart(udisksObjects, "/dev/sdz");
+        bool symlinksJoined = false;
+        for (const auto& o : udisksObjects) {
+            if (o.path == "/org/freedesktop/UDisks2/block_devices/sda") {
+                symlinksJoined = o.Get("org.freedesktop.UDisks2.Block", "Symlinks") ==
+                    "/dev/disk/by-id/ata-Samsung_SSD_860_EVO_500GB_S3Z2NB0K123456 /dev/disk/by-path/pci-0000:00:17.0-ata-1" &&
+                    o.Get("org.freedesktop.UDisks2.Block", "Size") == "500107862016";
+            }
+        }
+        const bool ok = udisksObjects.size() == 7 && symlinksJoined &&
+            sataDrive.driveFound && sataDrive.isAta && !sataDrive.isNvme && sataDrive.smartSupported && sataDrive.smartEnabled &&
+            !sataDrive.failing && sataDrive.updated == 1795000000ull && sataDrive.powerOnSeconds == 44388000ull &&
+            std::fabs(sataDrive.temperatureK - 306.15) < 0.001 && sataDrive.badSectors == 0 && sataDrive.attrsFailing == 0 &&
+            sataDrive.drivePath == "/org/freedesktop/UDisks2/drives/Samsung_SSD_860_EVO_500GB_S3Z2NB0K123456" &&
+            usb.driveFound && !usb.isAta && !usb.isNvme && !usb.smartSupported &&
+            nvmeDrive.driveFound && nvmeDrive.isNvme && !nvmeDrive.isAta && nvmeDrive.powerOnHours == 8123 &&
+            nvmeDrive.updated == 1795000100ull && std::fabs(nvmeDrive.temperatureK - 310.0) < 0.001 && nvmeDrive.criticalWarning.empty() &&
+            !none.driveFound;
+        tc.Record(ok, L"Stage16.Test13_LinuxStorage_UdisksDump_DrivesAndSmartProperties", L"objects: " + std::to_wstring(udisksObjects.size()));
+    }
+    {
+        // The same three attributes as gdbus prints them, as busctl prints them, and as busctl --json prints them
+        const std::string gdbusText =
+            "([(byte 0x05, 'reallocated-sector-count', uint16 51, 100, 100, 10, int64 0, 3, @a{sv} {}), "
+            "(0x09, 'power-on-hours', 50, 99, 99, 0, 44388000000, 2, {}), "
+            "(0xc2, 'temperature-celsius-2', 34, 67, 55, 0, 306150, 4, {})],)\n";
+        const std::string busctlText =
+            "a(ysqiiixia{sv}) 3 5 \"reallocated-sector-count\" 51 100 100 10 0 3 0 9 \"power-on-hours\" 50 99 99 0 44388000000 2 0 "
+            "194 \"temperature-celsius-2\" 34 67 55 0 306150 4 0\n";
+        const std::string jsonText =
+            "{\"type\":\"a(ysqiiixia{sv})\",\"data\":[[[5,\"reallocated-sector-count\",51,100,100,10,0,3,{}],"
+            "[9,\"power-on-hours\",50,99,99,0,44388000000,2,{}],[194,\"temperature-celsius-2\",34,67,55,0,306150,4,{}]]]}";
+        bool ok = true;
+        for (const std::string* text : { &gdbusText, &busctlText, &jsonText }) {
+            const std::vector<LinuxStorage::UdisksAtaAttr> a = LinuxStorage::ParseUdisksAtaAttributes(*text);
+            ok = ok && a.size() == 3 &&
+                 a[0].id == 5 && a[0].name == "reallocated-sector-count" && a[0].flags == 51 && a[0].value == 100 && a[0].worst == 100 &&
+                 a[0].threshold == 10 && a[0].pretty == 0 && a[0].prettyUnit == 3 &&
+                 a[1].id == 9 && a[1].pretty == 44388000000ll && a[1].prettyUnit == 2 && a[1].value == 99 &&
+                 a[2].id == 194 && a[2].name == "temperature-celsius-2" && a[2].pretty == 306150 && a[2].prettyUnit == 4 && a[2].worst == 55;
+        }
+        // ... and what the disk panel makes of them
+        HwPhysicalDisk pd;
+        LinuxSmart::ApplyUdisksAta(pd, sataDrive, LinuxStorage::ParseUdisksAtaAttributes(gdbusText));
+        ok = ok && pd.smartState == HwSmartState::Ok && pd.smartAttrs.size() == 3 && pd.healthLevel == 0 &&
+             pd.powerOnHours == 12330 && pd.tempC == 33 &&
+             pd.smartAttrs[0].name == L"Reallocated Sectors Count" && pd.smartAttrs[0].hasNormalized && pd.smartAttrs[0].prefail &&
+             pd.smartAttrs[0].current == 100 && pd.smartAttrs[0].threshold == 10 && pd.smartAttrs[0].rawText == L"0" &&
+             pd.smartAttrs[1].rawText == L"12330 h" && pd.smartAttrs[1].raw == 12330 &&
+             pd.smartAttrs[2].rawText == L"33\x00B0" L"C";
+
+        // A disk with reallocated sectors is a warning; a value at its threshold on a pre-failure attribute is a failure
+        HwPhysicalDisk worn, failing;
+        LinuxSmart::ApplyUdisksAta(worn, sataDrive, LinuxStorage::ParseUdisksAtaAttributes(
+            "([(byte 0x05, 'reallocated-sector-count', uint16 51, 100, 100, 10, int64 8, 3, @a{sv} {})],)"));
+        LinuxSmart::ApplyUdisksAta(failing, sataDrive, LinuxStorage::ParseUdisksAtaAttributes(
+            "([(byte 0x01, 'raw-read-error-rate', uint16 47, 40, 40, 51, int64 0, 1, @a{sv} {}), (0xaa, 'attribute-170', 50, -1, -1, -1, 0, 0, {})],)"));
+        ok = ok && worn.healthLevel == 1 && worn.smartAttrs.size() == 1 && worn.smartAttrs[0].status == 1 && worn.smartAttrs[0].rawText == L"8" &&
+             failing.healthLevel == 2 && failing.smartAttrs.size() == 2 && failing.smartAttrs[0].status == 2 &&
+             failing.smartAttrs[1].current == 0 && failing.smartAttrs[1].rawText == L"\x2014" && failing.smartAttrs[1].status == 0;
+        tc.Record(ok, L"Stage16.Test14_LinuxStorage_AtaAttributes_GdbusBusctlJson_ToDiskPanel");
+    }
+    {
+        const std::string gdbusText =
+            "({'avail_spare': <byte 0x64>, 'spare_thresh': <byte 0x0a>, 'percent_used': <byte 0x03>, 'future_metric': <uint64 99>, "
+            "'total_data_read': <uint64 21474836480000>, 'total_data_written': <uint64 10737418240000>, 'ctrl_busy_time': <uint64 1234>, "
+            "'power_cycles': <uint64 456>, 'unsafe_shutdowns': <uint64 12>, 'media_errors': <uint64 0>, 'num_err_log_entries': <uint64 7>, "
+            "'temp_sensors': <[uint16 310, 318]>, 'wctemp': <uint16 358>, 'cctemp': <uint16 363>, 'warning_temp_time': <uint32 0>, "
+            "'critical_temp_time': <uint32 0>},)\n";
+        const std::string busctlText =
+            "a{sv} 15 \"avail_spare\" y 100 \"spare_thresh\" y 10 \"percent_used\" y 3 \"total_data_read\" t 21474836480000 "
+            "\"total_data_written\" t 10737418240000 \"ctrl_busy_time\" t 1234 \"power_cycles\" t 456 \"unsafe_shutdowns\" t 12 "
+            "\"media_errors\" t 0 \"num_err_log_entries\" t 7 \"temp_sensors\" aq 2 310 318 \"wctemp\" q 358 \"cctemp\" q 363 "
+            "\"warning_temp_time\" u 0 \"critical_temp_time\" u 0\n";
+        const std::string jsonText =
+            "{\"type\":\"a{sv}\",\"data\":[{\"avail_spare\":{\"type\":\"y\",\"data\":100},\"spare_thresh\":{\"type\":\"y\",\"data\":10},"
+            "\"percent_used\":{\"type\":\"y\",\"data\":3},\"total_data_read\":{\"type\":\"t\",\"data\":21474836480000},"
+            "\"total_data_written\":{\"type\":\"t\",\"data\":10737418240000},\"ctrl_busy_time\":{\"type\":\"t\",\"data\":1234},"
+            "\"power_cycles\":{\"type\":\"t\",\"data\":456},\"unsafe_shutdowns\":{\"type\":\"t\",\"data\":12},"
+            "\"media_errors\":{\"type\":\"t\",\"data\":0},\"num_err_log_entries\":{\"type\":\"t\",\"data\":7},"
+            "\"temp_sensors\":{\"type\":\"aq\",\"data\":[310,318]},\"wctemp\":{\"type\":\"q\",\"data\":358},\"cctemp\":{\"type\":\"q\",\"data\":363},"
+            "\"warning_temp_time\":{\"type\":\"u\",\"data\":0},\"critical_temp_time\":{\"type\":\"u\",\"data\":0}}]}";
+        bool ok = true;
+        for (const std::string* text : { &gdbusText, &busctlText, &jsonText }) {
+            const LinuxStorage::NvmeHealth h = LinuxStorage::NvmeHealthFromUdisks(nvmeDrive, LinuxStorage::ParseUdisksNvmeAttributes(*text));
+            ok = ok && h.availSpare == 100 && h.spareThresh == 10 && h.percentUsed == 3 && h.bytesRead == 21474836480000ll &&
+                 h.bytesWritten == 10737418240000ll && h.ctrlBusyMinutes == 1234 && h.powerCycles == 456 && h.unsafeShutdowns == 12 &&
+                 h.mediaErrors == 0 && h.errLogEntries == 7 && h.warnTempMinutes == 0 && h.critTempMinutes == 0 &&
+                 h.powerOnHours == 8123 && h.temperatureC == 37 && h.sensorsC.size() == 2 && h.sensorsC[0] == 37 && h.sensorsC[1] == 45 &&
+                 h.criticalWarning == -1 && h.criticalWarningText.empty();
+        }
+        HwPhysicalDisk pd;
+        LinuxSmart::ApplyNvmeHealth(pd, LinuxStorage::NvmeHealthFromUdisks(nvmeDrive, LinuxStorage::ParseUdisksNvmeAttributes(gdbusText)));
+        ok = ok && pd.smartState == HwSmartState::Ok && pd.healthLevel == 0 && pd.lifeRemainingPct == 97 && pd.powerOnHours == 8123 &&
+             pd.powerCycles == 456 && pd.bytesWritten == 10737418240000ll && pd.bytesRead == 21474836480000ll && pd.tempC == 37 &&
+             pd.smartAttrs.size() == 17 && pd.smartAttrs[0].name == L"Critical Warning" && pd.smartAttrs[0].status == 0 &&
+             !pd.smartAttrs[0].hasNormalized;
+
+        // A controller that warns, and a worn-out drive
+        LinuxStorage::UdisksDriveSmart warning = nvmeDrive;
+        warning.criticalWarning = "spare temperature";
+        LinuxStorage::NvmeHealth worn = LinuxStorage::NvmeHealthFromUdisks(warning, LinuxStorage::ParseUdisksNvmeAttributes(gdbusText));
+        worn.percentUsed = 104;
+        HwPhysicalDisk bad;
+        LinuxSmart::ApplyNvmeHealth(bad, worn);
+        ok = ok && bad.healthLevel == 2 && bad.lifeRemainingPct == 0 && bad.smartAttrs[0].status == 2 && bad.smartAttrs[0].rawText == L"spare temperature";
+        tc.Record(ok, L"Stage16.Test15_LinuxStorage_NvmeHealth_GdbusBusctlJson_ToDiskPanel", L"rows: " + std::to_wstring(pd.smartAttrs.size()));
+    }
+    {
+        const std::string ataJson =
+            "{\"json_format_version\":[1,0],\"smartctl\":{\"version\":[7,3],\"exit_status\":0},"
+            "\"device\":{\"name\":\"/dev/sda\",\"type\":\"sat\",\"protocol\":\"ATA\"},\"smart_status\":{\"passed\":true},"
+            "\"ata_smart_attributes\":{\"revision\":1,\"table\":["
+            "{\"id\":5,\"name\":\"Reallocated_Sector_Ct\",\"value\":100,\"worst\":100,\"thresh\":10,\"when_failed\":\"\","
+            "\"flags\":{\"value\":51,\"string\":\"PO--CK \",\"prefailure\":true},\"raw\":{\"value\":0,\"string\":\"0\"}},"
+            "{\"id\":9,\"name\":\"Power_On_Hours\",\"value\":97,\"worst\":97,\"thresh\":0,\"when_failed\":\"\","
+            "\"flags\":{\"value\":50,\"prefailure\":false},\"raw\":{\"value\":12330,\"string\":\"12330\"}},"
+            "{\"id\":194,\"name\":\"Temperature_Celsius\",\"value\":67,\"worst\":55,\"thresh\":0,\"when_failed\":\"\","
+            "\"flags\":{\"value\":34,\"prefailure\":false},\"raw\":{\"value\":184684970017,\"string\":\"33 (Min/Max 21/43)\"}},"
+            "{\"id\":225,\"name\":\"Host_Writes_32MiB\",\"value\":100,\"worst\":100,\"thresh\":10,\"when_failed\":\"\","
+            "\"flags\":{\"value\":51,\"prefailure\":true},\"raw\":{\"value\":0,\"string\":\"0\"}},"
+            "{\"id\":241,\"name\":\"Total_LBAs_Written\",\"value\":99,\"worst\":99,\"thresh\":0,\"when_failed\":\"\","
+            "\"flags\":{\"value\":50,\"prefailure\":false},\"raw\":{\"value\":20971520000,\"string\":\"20971520000\"}}]},"
+            "\"power_on_time\":{\"hours\":12330},\"power_cycle_count\":842,\"temperature\":{\"current\":33}}";
+        const std::string nvmeJson =
+            "{\"smartctl\":{\"exit_status\":0},\"smart_status\":{\"passed\":true},\"nvme_smart_health_information_log\":{"
+            "\"critical_warning\":0,\"temperature\":37,\"available_spare\":100,\"available_spare_threshold\":10,\"percentage_used\":3,"
+            "\"data_units_read\":41943040,\"data_units_written\":20971520,\"host_reads\":1000,\"host_writes\":2000,"
+            "\"controller_busy_time\":1234,\"power_cycles\":456,\"power_on_hours\":8123,\"unsafe_shutdowns\":12,\"media_errors\":0,"
+            "\"num_err_log_entries\":7,\"warning_temp_time\":0,\"critical_comp_time\":0,\"temperature_sensors\":[37,45]},"
+            "\"temperature\":{\"current\":37},\"power_cycle_count\":456,\"power_on_time\":{\"hours\":8123}}";
+        const std::string deniedJson =
+            "{\"json_format_version\":[1,0],\"smartctl\":{\"version\":[7,3],\"messages\":[{\"string\":"
+            "\"Smartctl open device: /dev/sda failed: Permission denied\",\"severity\":\"error\"}],\"exit_status\":2}}";
+
+        const LinuxStorage::SmartctlReport ata = LinuxStorage::ParseSmartctlJson(ataJson);
+        HwPhysicalDisk pdAta;
+        LinuxSmart::ApplySmartctl(pdAta, ata);
+        bool ok = ata.parsed && ata.hasData && !ata.hasNvme && !ata.permissionDenied && ata.hasPassed && ata.passed && ata.ata.size() == 5 &&
+            ata.ata[0].prefail && !ata.ata[1].prefail && ata.ata[2].raw == 184684970017ull &&
+            pdAta.smartState == HwSmartState::Ok && pdAta.healthLevel == 0 && pdAta.smartAttrs.size() == 5 &&
+            pdAta.powerOnHours == 12330 && pdAta.powerCycles == 842 && pdAta.tempC == 33 && pdAta.bytesWritten == 10737418240000ll &&
+            pdAta.smartAttrs[1].rawText == L"12330 h" && pdAta.smartAttrs[2].rawText == L"33\x00B0" L"C" &&
+            pdAta.smartAttrs[3].name == L"Host Writes 32MiB";      // a number the built-in table lacks: smartctl's own name
+
+        const LinuxStorage::SmartctlReport nv = LinuxStorage::ParseSmartctlJson(nvmeJson);
+        HwPhysicalDisk pdNv;
+        LinuxSmart::ApplySmartctl(pdNv, nv);
+        ok = ok && nv.parsed && nv.hasData && nv.hasNvme && nv.nvme.criticalWarning == 0 && nv.nvme.bytesRead == 21474836480000ll &&
+             nv.nvme.bytesWritten == 10737418240000ll && nv.nvme.hostWrites == 2000 && nv.nvme.sensorsC.size() == 2 &&
+             pdNv.smartState == HwSmartState::Ok && pdNv.healthLevel == 0 && pdNv.lifeRemainingPct == 97 && pdNv.powerOnHours == 8123 &&
+             pdNv.powerCycles == 456 && pdNv.tempC == 37 && pdNv.smartAttrs.size() == 19 && pdNv.smartAttrs[0].rawText == L"0x00  (OK)";
+
+        const LinuxStorage::SmartctlReport denied = LinuxStorage::ParseSmartctlJson(deniedJson);
+        const LinuxStorage::SmartctlReport garbage = LinuxStorage::ParseSmartctlJson("smartctl: command not found");
+        ok = ok && denied.parsed && !denied.hasData && denied.permissionDenied && !denied.message.empty() &&
+             !garbage.parsed && !garbage.hasData && !LinuxStorage::ParseSmartctlJson("").parsed;
+        tc.Record(ok, L"Stage16.Test16_LinuxStorage_SmartctlJson_AtaNvmeDenied");
+    }
+    {
+        // A FAT partition of a USB stick as the udev database describes it: listed when it is not mounted
+        const std::string udevText =
+            "S:disk/by-id/usb-Kingston_DataTraveler_3.0-0:0-part1\n"
+            "W:12\n"
+            "I:1234567\n"
+            "E:ID_BUS=usb\n"
+            "E:ID_MODEL=DataTraveler_3.0\n"
+            "E:ID_FS_TYPE=vfat\n"
+            "E:ID_FS_USAGE=filesystem\n"
+            "E:ID_FS_LABEL=MOJE_DANE\n"
+            "E:ID_FS_LABEL_ENC=MOJE\\x20DANE\n"
+            "E:ID_PART_ENTRY_TYPE=0xc\n"
+            "G:systemd\n";
+        LinuxStorage::BlockVolumeFacts stick;
+        stick.name = "sdb1";
+        stick.sizeBytes = 16000000000ull;
+        stick.diskOnUsb = true;
+        stick.udevKnown = true;
+        stick.udev = LinuxStorage::ParseUdevDb(udevText);
+        auto with = [&](const char* key, const char* value) { LinuxStorage::BlockVolumeFacts v = stick; v.udev[key] = value; return v; };
+        LinuxStorage::BlockVolumeFacts mounted = stick, fixedDisk = stick, noCard = stick, unknown = stick, sdCard = stick, removable = stick;
+        mounted.mounted = true;
+        fixedDisk.diskOnUsb = false;
+        noCard.sizeBytes = 0;
+        unknown.udevKnown = false;
+        unknown.udev.clear();
+        sdCard.diskOnUsb = false;
+        sdCard.diskIsSdCard = true;
+        removable.diskOnUsb = false;
+        removable.diskRemovable = true;
+        const bool ok = stick.udev.size() == 7 && stick.Udev("ID_BUS") == "usb" && stick.Udev("ID_FS_LABEL_ENC") == "MOJE\\x20DANE" &&
+            LinuxStorage::VolumeLabelOf(stick) == "MOJE DANE" && LinuxStorage::VolumeLabelOf(unknown).empty() &&
+            LinuxStorage::IsMountableUnmountedVolume(stick) && LinuxStorage::IsMountableUnmountedVolume(sdCard) &&
+            LinuxStorage::IsMountableUnmountedVolume(removable) &&
+            !LinuxStorage::IsMountableUnmountedVolume(mounted) && !LinuxStorage::IsMountableUnmountedVolume(fixedDisk) &&
+            !LinuxStorage::IsMountableUnmountedVolume(noCard) && !LinuxStorage::IsMountableUnmountedVolume(unknown) &&
+            !LinuxStorage::IsMountableUnmountedVolume(with("ID_FS_USAGE", "crypto")) &&
+            !LinuxStorage::IsMountableUnmountedVolume(with("ID_FS_USAGE", "other")) &&
+            !LinuxStorage::IsMountableUnmountedVolume(with("ID_FS_TYPE", "swap")) &&
+            !LinuxStorage::IsMountableUnmountedVolume(with("UDISKS_IGNORE", "1")) &&
+            !LinuxStorage::IsMountableUnmountedVolume(with("ID_PART_ENTRY_TYPE", "c12a7328-f81f-11d2-ba4b-00a0c93ec93b")) &&
+            LinuxStorage::ParseMountedAt("Mounted /dev/sdb1 at /run/media/janusz/MOJE DANE\n") == "/run/media/janusz/MOJE DANE" &&
+            LinuxStorage::ParseMountedAt("Mounted /dev/sdb1 at /media/janusz/KINGSTON.\n") == "/media/janusz/KINGSTON" &&
+            LinuxStorage::ParseMountedAt("Error mounting /dev/sdb1: GDBus.Error:org.freedesktop.UDisks2.Error.NotAuthorized: Not authorized").empty() &&
+            IsUnmountedVolumePath(L"MOUNT_VOLUME:/dev/sdb1") && UnmountedVolumeDevice(L"MOUNT_VOLUME:/dev/sdb1") == L"/dev/sdb1" &&
+            IsVirtualFolder(L"MOUNT_VOLUME:/dev/sdb1") && !IsUnmountedVolumePath(L"/dev/sdb1") && UnmountedVolumeDevice(L"/dev/sdb1").empty();
+        tc.Record(ok, L"Stage16.Test17_LinuxStorage_UnmountedVolumes_UdevFacts", L"udev keys: " + std::to_wstring(stick.udev.size()));
     }
 #ifdef _WIN32
     {

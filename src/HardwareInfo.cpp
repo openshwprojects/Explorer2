@@ -25,8 +25,11 @@
 
 #include "HardwareInfo.h"
 #include "FileEngine.h"
-#ifndef _WIN32
+#include "LinuxStorage.h"
 #include "PathUtils.h"
+#ifndef _WIN32
+#include "ToolProcess.h"
+#include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
@@ -373,7 +376,407 @@ uint64_t ReadLe64(const uint8_t* p) {
     return v;
 }
 
+std::wstring SmartTempText(int celsius) {
+    wchar_t b[32] = {};
+    swprintf_s(b, L"%d\x00B0" L"C", celsius);
+    return b;
+}
+
+// "reallocated-sector-count" (libatasmart) or "Reallocated_Sector_Ct" (smartctl) as words, for an attribute the
+// table of names above does not know
+std::wstring SmartNameFromToolName(const std::string& toolName) {
+    std::wstring out = PathUtils::Utf8ToWide(toolName);
+    bool startOfWord = true;
+    for (wchar_t& c : out) {
+        if (c == L'-' || c == L'_') {
+            c = L' ';
+            startOfWord = true;
+        } else if (startOfWord) {
+            if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - 32);
+            startOfWord = false;
+        }
+    }
+    return out;
+}
+
+// The worst row decides the health of the whole disk (never better than what is set already)
+void SmartHealthFromRows(HwPhysicalDisk& pd) {
+    int level = std::max(0, pd.healthLevel);
+    for (const auto& a : pd.smartAttrs) level = std::max(level, a.status);
+    pd.healthLevel = level;
+}
+
+void SmartSetTemperature(HwPhysicalDisk& pd, int celsius) {
+    if (celsius <= -40 || celsius >= 150) return;
+    pd.tempC = celsius;
+    pd.tempPeakC = std::max(pd.tempPeakC, celsius);
+}
+
+} // namespace
+
+namespace LinuxSmart {
+
+void ApplyUdisksAta(HwPhysicalDisk& pd, const LinuxStorage::UdisksDriveSmart& drive, const std::vector<LinuxStorage::UdisksAtaAttr>& attrs) {
+    pd.smartAttrs.clear();
+    pd.smartState = HwSmartState::Ok;
+    pd.healthLevel = 0;
+    int attrTempC = -1000;
+    for (const auto& a : attrs) {
+        HwSmartAttr row;
+        row.id = a.id;
+        row.name = AtaAttrName(a.id);
+        if (row.name == L"Vendor Specific" && !a.name.empty() && a.name.rfind("attribute-", 0) != 0) row.name = SmartNameFromToolName(a.name);
+        row.hasNormalized = true;
+        row.current = std::max(0, a.value);
+        row.worst = std::max(0, a.worst);
+        row.threshold = std::max(0, a.threshold);
+        row.prefail = (a.flags & 1u) != 0;
+
+        // udisks gives the raw value already interpreted, with its unit; one it cannot interpret has no raw value
+        const uint64_t pretty = (a.pretty > 0) ? static_cast<uint64_t>(a.pretty) : 0;
+        switch (a.prettyUnit) {
+        case 1:     // a plain number
+        case 3:     // sectors
+            row.raw = pretty;
+            row.rawText = std::to_wstring(pretty);
+            break;
+        case 2:     // milliseconds
+            if (pretty >= 3600000ull) {
+                row.raw = pretty / 3600000ull;
+                row.rawText = std::to_wstring(row.raw) + L" h";
+            } else {
+                row.raw = pretty;
+                row.rawText = std::to_wstring(pretty) + L" ms";
+            }
+            break;
+        case 4: {   // millikelvin
+            const int c = static_cast<int>((a.pretty - 273150) / 1000);
+            row.raw = static_cast<uint64_t>(std::max(0, c));
+            row.rawText = SmartTempText(c);
+            if (a.id == 194 || (a.id == 190 && attrTempC == -1000)) attrTempC = c;
+            break;
+        }
+        case 5:
+        case 6:     // percent
+            row.raw = pretty;
+            row.rawText = std::to_wstring(pretty) + L"%";
+            break;
+        case 7:     // megabytes
+            row.raw = pretty;
+            row.rawText = FileEngine::FormatSizeDetailed(pretty * 1000000ull);
+            break;
+        default:
+            row.rawText = L"\x2014";
+            break;
+        }
+
+        row.status = 0;
+        if (a.value >= 0 && row.threshold > 0 && row.current <= row.threshold && row.prefail) {
+            row.status = 2;
+        } else if ((a.id == 5 || a.id == 187 || a.id == 196 || a.id == 197 || a.id == 198) &&
+                   (a.prettyUnit == 1 || a.prettyUnit == 3) && pretty > 0) {
+            row.status = 1;
+        }
+
+        if (a.id == 9 && a.prettyUnit == 2 && pd.powerOnHours < 0) pd.powerOnHours = static_cast<int64_t>(pretty / 3600000ull);
+        if (a.id == 12 && a.prettyUnit == 1) pd.powerCycles = static_cast<int64_t>(pretty);
+        if (a.id == 241 && a.prettyUnit == 7) pd.bytesWritten = static_cast<int64_t>(pretty * 1000000ull);
+        if (a.id == 242 && a.prettyUnit == 7) pd.bytesRead = static_cast<int64_t>(pretty * 1000000ull);
+        if ((a.id == 177 || a.id == 231 || a.id == 233) && a.value >= 0 && pd.lifeRemainingPct < 0) pd.lifeRemainingPct = std::clamp(a.value, 0, 100);
+        pd.smartAttrs.push_back(std::move(row));
+    }
+    if (drive.powerOnSeconds > 0) pd.powerOnHours = static_cast<int64_t>(drive.powerOnSeconds / 3600);
+    if (drive.temperatureK > 200.0 && drive.temperatureK < 500.0) {
+        SmartSetTemperature(pd, static_cast<int>(drive.temperatureK - 273.15 + 0.5));
+    } else if (attrTempC != -1000) {
+        SmartSetTemperature(pd, attrTempC);
+    }
+    if (drive.failing || drive.attrsFailing > 0) pd.healthLevel = 2;
+    else if (drive.badSectors > 0) pd.healthLevel = 1;
+    SmartHealthFromRows(pd);
+}
+
+void ApplyNvmeHealth(HwPhysicalDisk& pd, const LinuxStorage::NvmeHealth& h) {
+    pd.smartAttrs.clear();
+    pd.smartState = HwSmartState::Ok;
+    pd.healthLevel = 0;
+    auto add = [&](const wchar_t* name, const std::wstring& text, int status, uint64_t raw = 0) {
+        HwSmartAttr a;
+        a.name = name;
+        a.rawText = text;
+        a.raw = raw;
+        a.status = status;
+        pd.smartAttrs.push_back(std::move(a));
+    };
+    auto number = [](int64_t v) { return std::to_wstring(v); };
+    auto percent = [](int v) { return std::to_wstring(v) + L"%"; };
+
+    if (h.criticalWarning >= 0) {
+        wchar_t buf[48] = {};
+        swprintf_s(buf, L"0x%02X%s", static_cast<unsigned>(h.criticalWarning & 0xFF), h.criticalWarning == 0 ? L"  (OK)" : L"");
+        add(L"Critical Warning", buf, h.criticalWarning ? 2 : 0, static_cast<uint64_t>(h.criticalWarning));
+    } else {
+        // udisks names what the controller warns about; nothing named = no warning
+        const bool warns = !h.criticalWarningText.empty();
+        add(L"Critical Warning", warns ? PathUtils::Utf8ToWide(h.criticalWarningText) : std::wstring(L"0x00  (OK)"), warns ? 2 : 0);
+    }
+    if (h.temperatureC > -100) {
+        add(L"Composite Temperature", SmartTempText(h.temperatureC), -1, static_cast<uint64_t>(std::max(0, h.temperatureC)));
+        SmartSetTemperature(pd, h.temperatureC);
+    }
+    if (h.availSpare >= 0) {
+        add(L"Available Spare", percent(h.availSpare), (h.spareThresh >= 0 && h.availSpare <= h.spareThresh) ? 2 : 0, static_cast<uint64_t>(h.availSpare));
+    }
+    if (h.spareThresh >= 0) add(L"Available Spare Threshold", percent(h.spareThresh), -1, static_cast<uint64_t>(h.spareThresh));
+    if (h.percentUsed >= 0) {
+        add(L"Percentage Used", percent(h.percentUsed), h.percentUsed >= 100 ? 2 : (h.percentUsed >= 90 ? 1 : 0), static_cast<uint64_t>(h.percentUsed));
+        pd.lifeRemainingPct = std::clamp(100 - h.percentUsed, 0, 100);
+    }
+    if (h.bytesRead >= 0) {
+        add(L"Data Read", FileEngine::FormatSizeDetailed(static_cast<uint64_t>(h.bytesRead)), -1, static_cast<uint64_t>(h.bytesRead));
+        pd.bytesRead = h.bytesRead;
+    }
+    if (h.bytesWritten >= 0) {
+        add(L"Data Written", FileEngine::FormatSizeDetailed(static_cast<uint64_t>(h.bytesWritten)), -1, static_cast<uint64_t>(h.bytesWritten));
+        pd.bytesWritten = h.bytesWritten;
+    }
+    if (h.hostReads >= 0) add(L"Host Read Commands", number(h.hostReads), -1, static_cast<uint64_t>(h.hostReads));
+    if (h.hostWrites >= 0) add(L"Host Write Commands", number(h.hostWrites), -1, static_cast<uint64_t>(h.hostWrites));
+    if (h.ctrlBusyMinutes >= 0) add(L"Controller Busy Time", number(h.ctrlBusyMinutes) + L" min", -1, static_cast<uint64_t>(h.ctrlBusyMinutes));
+    if (h.powerCycles >= 0) {
+        add(L"Power Cycles", number(h.powerCycles), -1, static_cast<uint64_t>(h.powerCycles));
+        pd.powerCycles = h.powerCycles;
+    }
+    if (h.powerOnHours >= 0) {
+        add(L"Power On Hours", number(h.powerOnHours) + L" h", -1, static_cast<uint64_t>(h.powerOnHours));
+        pd.powerOnHours = h.powerOnHours;
+    }
+    if (h.unsafeShutdowns >= 0) add(L"Unsafe Shutdowns", number(h.unsafeShutdowns), -1, static_cast<uint64_t>(h.unsafeShutdowns));
+    if (h.mediaErrors >= 0) add(L"Media and Data Integrity Errors", number(h.mediaErrors), h.mediaErrors > 0 ? 1 : 0, static_cast<uint64_t>(h.mediaErrors));
+    if (h.errLogEntries >= 0) add(L"Error Information Log Entries", number(h.errLogEntries), -1, static_cast<uint64_t>(h.errLogEntries));
+    if (h.warnTempMinutes >= 0) add(L"Warning Composite Temp Time", number(h.warnTempMinutes) + L" min", -1, static_cast<uint64_t>(h.warnTempMinutes));
+    if (h.critTempMinutes >= 0) add(L"Critical Composite Temp Time", number(h.critTempMinutes) + L" min", h.critTempMinutes > 0 ? 1 : 0, static_cast<uint64_t>(h.critTempMinutes));
+    for (size_t s = 0; s < h.sensorsC.size() && s < 8; ++s) {
+        const std::wstring name = L"Temperature Sensor " + std::to_wstring(s + 1);
+        add(name.c_str(), SmartTempText(h.sensorsC[s]), -1, static_cast<uint64_t>(std::max(0, h.sensorsC[s])));
+    }
+    SmartHealthFromRows(pd);
+}
+
+void ApplySmartctl(HwPhysicalDisk& pd, const LinuxStorage::SmartctlReport& r) {
+    if (r.hasNvme) {
+        ApplyNvmeHealth(pd, r.nvme);
+    } else {
+        pd.smartAttrs.clear();
+        pd.smartState = HwSmartState::Ok;
+        pd.healthLevel = 0;
+        for (const auto& a : r.ata) {
+            HwSmartAttr row;
+            row.id = a.id;
+            row.name = AtaAttrName(a.id);
+            if (row.name == L"Vendor Specific" && !a.name.empty() && a.name.rfind("Unknown", 0) != 0) row.name = SmartNameFromToolName(a.name);
+            row.hasNormalized = true;
+            row.current = a.value;
+            row.worst = a.worst;
+            row.threshold = a.thresh;
+            row.prefail = a.prefail;
+            row.raw = a.raw;
+            // The same readings of the raw value as the Windows reader gives
+            switch (a.id) {
+            case 9: case 222: case 240:
+                row.rawText = std::to_wstring(a.raw & 0xFFFFFFFFull) + L" h";
+                break;
+            case 190: case 194:
+                row.rawText = SmartTempText(static_cast<int>(a.raw & 0xFF));
+                break;
+            case 241: case 242: {
+                const uint64_t lbas = a.raw & 0xFFFFFFFFFFFFull;
+                row.rawText = std::to_wstring(lbas) + L"  (\x2248 " + FileEngine::FormatSizeDetailed(lbas * 512ull) + L")";
+                break;
+            }
+            default:
+                row.rawText = a.rawString.empty() ? std::to_wstring(a.raw & 0xFFFFFFFFFFFFull) : PathUtils::Utf8ToWide(a.rawString);
+                break;
+            }
+            row.status = 0;
+            if ((row.threshold > 0 && row.current <= row.threshold && row.prefail) || a.whenFailed == "now") {
+                row.status = 2;
+            } else if ((a.id == 5 || a.id == 187 || a.id == 196 || a.id == 197 || a.id == 198) && (a.raw & 0xFFFFFFFFull) > 0) {
+                row.status = 1;
+            }
+            pd.smartAttrs.push_back(std::move(row));
+        }
+        if (auto a = FindAttr(pd.smartAttrs, 9))   pd.powerOnHours = static_cast<int64_t>(a->raw & 0xFFFFFFFFull);
+        if (auto a = FindAttr(pd.smartAttrs, 12))  pd.powerCycles  = static_cast<int64_t>(a->raw & 0xFFFFFFFFull);
+        if (auto a = FindAttr(pd.smartAttrs, 241)) pd.bytesWritten = static_cast<int64_t>((a->raw & 0xFFFFFFFFFFFFull) * 512ull);
+        if (auto a = FindAttr(pd.smartAttrs, 242)) pd.bytesRead    = static_cast<int64_t>((a->raw & 0xFFFFFFFFFFFFull) * 512ull);
+        for (int id : { 177, 231, 233 }) {
+            if (auto a = FindAttr(pd.smartAttrs, id)) {
+                pd.lifeRemainingPct = std::clamp(a->current, 0, 100);
+                break;
+            }
+        }
+        if (r.temperatureC == -1000) {
+            const HwSmartAttr* ta = FindAttr(pd.smartAttrs, 194);
+            if (!ta) ta = FindAttr(pd.smartAttrs, 190);
+            if (ta) SmartSetTemperature(pd, static_cast<int>(ta->raw & 0xFF));
+        }
+    }
+    if (r.temperatureC != -1000) SmartSetTemperature(pd, r.temperatureC);
+    if (r.powerOnHours >= 0) pd.powerOnHours = r.powerOnHours;
+    if (r.powerCycles >= 0) pd.powerCycles = r.powerCycles;
+    if (r.hasPassed && !r.passed) pd.healthLevel = 2;
+    SmartHealthFromRows(pd);
+}
+
+} // namespace LinuxSmart
+
+namespace {
+
 #ifndef _WIN32
+struct ToolRun {
+    bool found = false;     // the program is installed
+    bool ok = false;        // it ran and ended with status 0
+    std::string out, err;
+};
+
+// Runs a system tool with English messages and collects what it prints
+ToolRun RunStorageTool(const wchar_t* name, const std::vector<std::wstring>& candidates, const std::vector<std::wstring>& args, DWORD timeoutMs) {
+    ToolRun r;
+    const std::wstring exe = ToolProcess::FindExecutable(name, candidates);
+    if (exe.empty()) return r;
+    r.found = true;
+    ToolProcess::Options opt;
+    opt.timeoutMs = timeoutMs;
+    opt.maxBytes = 8u << 20;
+    opt.envOverride = { L"LC_ALL=C", L"LANG=C" };
+    static const std::atomic<bool> s_never{ false };
+    ToolProcess::Result res = ToolProcess::Run(exe, args, opt, s_never);
+    r.ok = res.ok();
+    r.out = std::move(res.out);
+    r.err = std::move(res.err);
+    return r;
+}
+
+ToolRun RunUdisksDump() {
+    return RunStorageTool(L"udisksctl", { L"/usr/bin/udisksctl", L"/bin/udisksctl" }, { L"dump" }, 15000);
+}
+
+// What a method of a udisks2 object answers, as text; asked through gdbus (GLib) or busctl (systemd), whichever is
+// installed. Empty when neither is, or when the call failed or was refused.
+std::string CallUdisksMethod(const std::string& objectPath, const char* iface, const char* method, bool noWakeup) {
+    // Only an object path that udisks printed itself, made of the characters such a path may have, becomes an argument
+    if (objectPath.rfind("/org/freedesktop/UDisks2/", 0) != 0) return {};
+    for (char c : objectPath) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '/';
+        if (!ok) return {};
+    }
+    const std::wstring path = PathUtils::Utf8ToWide(objectPath);
+    const std::wstring ifaceW = PathUtils::Utf8ToWide(iface);
+    const std::wstring methodW = PathUtils::Utf8ToWide(method);
+
+    // "auth.no_user_interaction": a call that is not allowed fails at once and never opens a password prompt
+    ToolRun g = RunStorageTool(L"gdbus", { L"/usr/bin/gdbus", L"/bin/gdbus" },
+        { L"call", L"--system", L"--dest", L"org.freedesktop.UDisks2", L"--object-path", path,
+          L"--method", ifaceW + L"." + methodW, L"--timeout", L"20",
+          noWakeup ? L"{'nowakeup': <true>, 'auth.no_user_interaction': <true>}" : L"{'auth.no_user_interaction': <true>}" }, 25000);
+    if (g.found) return g.ok ? (g.out.empty() ? std::string("()") : g.out) : std::string();
+
+    std::vector<std::wstring> args = { L"--system", L"call", L"org.freedesktop.UDisks2", path, ifaceW, methodW, L"a{sv}" };
+    if (noWakeup) {
+        args.insert(args.end(), { L"2", L"nowakeup", L"b", L"true", L"auth.no_user_interaction", L"b", L"true" });
+    } else {
+        args.insert(args.end(), { L"1", L"auth.no_user_interaction", L"b", L"true" });
+    }
+    ToolRun b = RunStorageTool(L"busctl", { L"/usr/bin/busctl", L"/bin/busctl" }, args, 25000);
+    return (b.found && b.ok) ? (b.out.empty() ? std::string("()") : b.out) : std::string();
+}
+
+// SMART of one disk. An ordinary user may not open the device, so the values come from udisks2, the system service
+// the desktops use for it (it answers every logged-in user), and from smartctl when that is installed and allowed.
+void RefreshLinuxDiskSmart(HwPhysicalDisk& pd) {
+    pd.smartState = HwSmartState::Unsupported;
+    pd.smartNote = HwSmartNote::NoTool;
+    const std::string dev = PathUtils::WideToUtf8(pd.devNode);
+    if (dev.empty()) return;
+
+    static const char kAta[] = "org.freedesktop.UDisks2.Drive.Ata";
+    static const char kNvme[] = "org.freedesktop.UDisks2.NVMe.Controller";
+    bool udisksPresent = false, nvmeUnknownToUdisks = false, smartOff = false;
+
+    ToolRun dump = RunUdisksDump();
+    if (dump.found && dump.ok) {
+        udisksPresent = true;
+        LinuxStorage::UdisksDriveSmart drive = LinuxStorage::FindUdisksDriveSmart(LinuxStorage::ParseUdisksDump(dump.out), dev);
+        const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+        const bool stale = (drive.updated == 0 || now > drive.updated + 60);
+        if (drive.driveFound && drive.isAta && drive.smartSupported) {
+            if (!drive.smartEnabled) {
+                smartOff = true;
+            } else {
+                if (stale) {
+                    // Fresh values; a disk that sleeps is left asleep (udisks then keeps what it read before)
+                    CallUdisksMethod(drive.drivePath, kAta, "SmartUpdate", true);
+                    ToolRun again = RunUdisksDump();
+                    if (again.found && again.ok) {
+                        const LinuxStorage::UdisksDriveSmart fresh = LinuxStorage::FindUdisksDriveSmart(LinuxStorage::ParseUdisksDump(again.out), dev);
+                        if (fresh.driveFound && fresh.isAta) drive = fresh;
+                    }
+                }
+                if (drive.updated != 0) {
+                    const std::string answer = CallUdisksMethod(drive.drivePath, kAta, "SmartGetAttributes", true);
+                    LinuxSmart::ApplyUdisksAta(pd, drive, LinuxStorage::ParseUdisksAtaAttributes(answer));
+                    pd.smartNote = HwSmartNote::None;
+                    pd.smartSource = L"UDisks2";
+                    return;
+                }
+            }
+        } else if (drive.driveFound && drive.isNvme) {
+            if (stale) {
+                CallUdisksMethod(drive.drivePath, kNvme, "SmartUpdate", false);
+                ToolRun again = RunUdisksDump();
+                if (again.found && again.ok) {
+                    const LinuxStorage::UdisksDriveSmart fresh = LinuxStorage::FindUdisksDriveSmart(LinuxStorage::ParseUdisksDump(again.out), dev);
+                    if (fresh.driveFound && fresh.isNvme) drive = fresh;
+                }
+            }
+            const auto attrs = LinuxStorage::ParseUdisksNvmeAttributes(CallUdisksMethod(drive.drivePath, kNvme, "SmartGetAttributes", false));
+            if (drive.updated != 0 || !attrs.empty()) {
+                LinuxSmart::ApplyNvmeHealth(pd, LinuxStorage::NvmeHealthFromUdisks(drive, attrs));
+                pd.smartNote = HwSmartNote::None;
+                pd.smartSource = L"UDisks2";
+                return;
+            }
+        } else if (pd.isNvme) {
+            nvmeUnknownToUdisks = true;
+        }
+    }
+
+    // smartctl gives every value, but it opens the device itself. Its exit status is a set of flags and is not zero
+    // for a disk that ever logged an error, so the report counts, not the status.
+    ToolRun sc = RunStorageTool(L"smartctl", { L"/usr/sbin/smartctl", L"/sbin/smartctl", L"/usr/bin/smartctl", L"/usr/local/sbin/smartctl" },
+                                { L"--json=c", L"-a", pd.devNode }, 25000);
+    if (sc.found) {
+        const LinuxStorage::SmartctlReport report = LinuxStorage::ParseSmartctlJson(sc.out);
+        if (report.parsed && report.hasData) {
+            LinuxSmart::ApplySmartctl(pd, report);
+            pd.smartNote = HwSmartNote::None;
+            pd.smartSource = L"smartctl";
+            return;
+        }
+        if (report.permissionDenied || sc.err.find("Permission denied") != std::string::npos) {
+            pd.smartState = HwSmartState::NeedsAdmin;
+            pd.smartNote = nvmeUnknownToUdisks ? HwSmartNote::NvmeNeedsNewUdisks : HwSmartNote::NeedsRoot;
+            return;
+        }
+    }
+    pd.smartState = HwSmartState::Unsupported;
+    if (smartOff) pd.smartNote = HwSmartNote::SmartSwitchedOff;
+    else if (!udisksPresent && !sc.found) pd.smartNote = HwSmartNote::NoTool;
+    else if (nvmeUnknownToUdisks) pd.smartNote = HwSmartNote::NvmeNeedsNewUdisks;
+    else pd.smartNote = HwSmartNote::DriveHasNone;
+}
+
 std::string ReadSysfsLine(const std::string& path) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return {};
@@ -441,6 +844,7 @@ std::vector<HwPhysicalDisk> DiscoverLinuxPhysicalDisks() {
 
         HwPhysicalDisk pd;
         pd.index = idx++;
+        pd.devNode = PathUtils::Utf8ToWide("/dev/" + nm);
         pd.capacityBytes = sectors * 512ULL;
         uint32_t lb = static_cast<uint32_t>(std::strtoul(ReadSysfsLine(bdir + "/queue/logical_block_size").c_str(), nullptr, 10));
         pd.bytesPerSector = (lb >= 512) ? lb : 512;
@@ -1647,6 +2051,19 @@ void HardwareInspector::QueryPhysicalDisksAndVolumes() {
             if (old.index == pd.index && old.model == pd.model) {
                 pd.tempHistory = old.tempHistory;
                 pd.tempPeakC = std::max(pd.tempPeakC, old.tempPeakC);
+                if (old.smartState != HwSmartState::NotQueried) {
+                    // What was read before stays until SMART is read again (as on Windows)
+                    pd.smartState = old.smartState;
+                    pd.healthLevel = old.healthLevel;
+                    pd.lifeRemainingPct = old.lifeRemainingPct;
+                    pd.powerOnHours = old.powerOnHours;
+                    pd.powerCycles = old.powerCycles;
+                    pd.bytesWritten = old.bytesWritten;
+                    pd.bytesRead = old.bytesRead;
+                    pd.smartAttrs = old.smartAttrs;
+                    pd.smartNote = old.smartNote;
+                    pd.smartSource = old.smartSource;
+                }
                 break;
             }
         }
@@ -1834,6 +2251,14 @@ void HardwareInspector::RefreshDiskSmartOnVector(std::vector<HwPhysicalDisk>& di
     pd->powerCycles = -1;
     pd->bytesWritten = -1;
     pd->bytesRead = -1;
+    pd->smartNote = HwSmartNote::None;
+    pd->smartSource.clear();
+
+#ifndef _WIN32
+    // Linux: udisks2 or smartctl (below); the device itself can only be opened by root
+    RefreshLinuxDiskSmart(*pd);
+    return;
+#endif
 
     // Temperature straight from the storage stack (no elevation required where supported)
     {

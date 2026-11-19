@@ -165,8 +165,19 @@ enum class HwSmartState : int {
     Unsupported                 // controller/bus does not expose SMART (USB bridge, RAID, virtual...)
 };
 
+// Why a disk shows no SMART data (the Linux reader says which of its sources was missing)
+enum class HwSmartNote : int {
+    None = 0,
+    NoTool,             // neither udisks2 nor smartctl is installed
+    DriveHasNone,       // udisks2 has no SMART interface for the drive (USB stick, USB bridge, virtual disk)
+    NeedsRoot,          // only smartctl could read it, and it may not open the device as this user
+    NvmeNeedsNewUdisks, // udisks2 older than 2.10 does not read NVMe health data
+    SmartSwitchedOff    // the drive supports SMART but it is disabled on it
+};
+
 struct HwPhysicalDisk {
     int index = 0;
+    std::wstring devNode;       // Linux: the device, such as "/dev/sda"; empty on Windows
     std::wstring model;
     std::wstring vendor;
     std::wstring serialNumber;
@@ -196,7 +207,23 @@ struct HwPhysicalDisk {
     int64_t bytesWritten = -1;  // host writes (approx. for ATA)
     int64_t bytesRead = -1;
     std::vector<HwSmartAttr> smartAttrs;
+    HwSmartNote smartNote = HwSmartNote::None;
+    std::wstring smartSource;   // Linux: where the values came from ("UDisks2", "smartctl")
 };
+
+// Linux: SMART data that arrived as text from udisks2 or smartctl (LinuxStorage.h), put into a disk's fields.
+// Built on every platform, so that the self-tests can check it on the machine the program is written on.
+namespace LinuxStorage {
+struct UdisksDriveSmart;
+struct UdisksAtaAttr;
+struct NvmeHealth;
+struct SmartctlReport;
+}
+namespace LinuxSmart {
+void ApplyUdisksAta(HwPhysicalDisk& pd, const LinuxStorage::UdisksDriveSmart& drive, const std::vector<LinuxStorage::UdisksAtaAttr>& attrs);
+void ApplyNvmeHealth(HwPhysicalDisk& pd, const LinuxStorage::NvmeHealth& health);
+void ApplySmartctl(HwPhysicalDisk& pd, const LinuxStorage::SmartctlReport& report);
+}
 
 struct HwThermalSensor {
     std::wstring name;

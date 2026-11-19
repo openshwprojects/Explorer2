@@ -227,6 +227,17 @@ private:
 
     // Drives plugged in or removed while the window is open (WM_DEVICECHANGE; a look at the mount table on Linux)
     void OnDrivesChanged();
+    // Linux: a volume that is listed as "not mounted" (MOUNT_VOLUME:/dev/...) is mounted on a worker thread, and
+    // the window goes to its folder when the answer arrives (WM_APP_VOLUME_MOUNTED)
+    struct VolumeMountResult {
+        std::wstring devNode;
+        std::wstring mountPoint;
+        std::wstring error;
+        bool ok = false;
+    };
+    void BeginMountVolume(const std::wstring& devNode);
+    void OnVolumeMounted(const VolumeMountResult& result);
+    std::wstring m_mountingDevice;            // the device being mounted now; empty = none
     std::wstring DriveListSignature() const;
     std::wstring m_driveListSignature;
 
