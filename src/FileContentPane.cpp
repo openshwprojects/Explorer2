@@ -7,7 +7,7 @@
 #include "RepoBrowser.h"
 #include "ReaderGuard.h"
 #include "ThreadUtils.h"
-#include "formats/AiModelFormats.h"
+#include "formats/common/AiModelDispatch.h"
 #include <shellapi.h>
 #include <bcrypt.h>
 #include <wincodec.h>
@@ -23,7 +23,7 @@
 #pragma comment(lib, "bcrypt.lib")
 
 namespace Explorer2 {
-#include "formats/UnrealAsset3DTex.h"
+#include "formats/common/UnrealPackageCommon.h"
 
 static D2D1_COLOR_F FcpColor(uint32_t rgb, float a = 1.0f) {
     return PathUtils::ColorFromRgb(rgb, a);
@@ -1282,6 +1282,12 @@ ResolvedContentKind FileContentPane::ResolveKindForCurrentEntry() const {
             }
         }
         return ResolvedContentKind::Model3DViewport;
+    }
+    if (ext == L".map" && !Model3DViewer::IsLikelyQuakeMapFile(m_currentEntry.fullPath)) {
+        if (NotepadViewer::IsLikelyTextFile(m_currentEntry.fullPath, ext, m_currentEntry.size)) {
+            return ResolvedContentKind::NotepadEditor;
+        }
+        return ResolvedContentKind::HexInspector;
     }
     if (Model3DViewer::Is3DModelExtension(ext)) {
         return ResolvedContentKind::Model3DViewport;

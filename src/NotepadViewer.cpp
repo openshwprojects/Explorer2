@@ -563,8 +563,11 @@ bool NotepadViewer::IsLikelyTextFile(const std::wstring& fullPath, const std::ws
         extLower == L".gz"  || extLower == L".safetensors" || extLower == L".gguf" || extLower == L".pt" ||
         extLower == L".pth" || extLower == L".onnx" || extLower == L".stl" || extLower == L".ply" ||
         extLower == L".glb" || extLower == L".fbx" || extLower == L".pdf" || extLower == L".xlsx" ||
-        extLower == L".xls" || extLower == L".docx" || extLower == L".tga" || extLower == L".psd" ||
-        extLower == L".xcf")
+        extLower == L".xls" || extLower == L".xlsb" || extLower == L".docx" || extLower == L".pst" ||
+        extLower == L".ost" || extLower == L".tga" || extLower == L".psd" || extLower == L".xcf" ||
+        extLower == L".pdn" || extLower == L".jls" || extLower == L".sketch" || extLower == L".svgz" ||
+        extLower == L".c3d" || extLower == L".dtb" || extLower == L".trc" || extLower == L".br" ||
+        extLower == L".tbr" || extLower == L".udf" || extLower == L".nrg" || extLower == L".simg")
     {
         return false;
     }

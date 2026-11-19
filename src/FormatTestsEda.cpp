@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -3539,6 +3540,640 @@ void RunFormatTestsEda(TestCounter& tc) {
         tc.Record(passItem21, L"Stage15.Eda.FpgaRpdSync_RealOrCadBin_And_Hpgl2Full",
             L"orcPads=" + std::to_wstring(bRealOrc.pads.size()) +
             L" hpglTr=" + std::to_wstring(bHpgl.traces.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 22. Eagle v4/v5 Binary Schematic (.sch) 0x18 Symbol + 0x17/0x37 Gate + Rotated Placements
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        std::vector<uint8_t> buf(24, 0);
+        { uint8_t r[24] = { 0x14 }; AppendEagleRec(buf, r); } // Schematic header
+
+        // 0x15 Library containing:
+        //   0x1D Symbol section (1) + 0x18 Symbol "BUF_TRI" (1) + 3x 0x22 triangle wires + 2x 0x2C pins = 7 blocks
+        //   0x17 DeviceSet "SN741G" (1) + 0x37 Gate "G$1" (1) = 2 blocks
+        //   Total library child blocks = 9
+        {
+            uint8_t lib[24] = { 0x15 };
+            PutU32LE(lib + 4, 2); // devSet subblocks
+            PutU32LE(lib + 8, 7); // symbol subblocks
+            std::memcpy(lib + 16, "LOGIC", 5);
+            AppendEagleRec(buf, lib);
+
+            uint8_t symSec[24] = { 0x1D };
+            PutU32LE(symSec + 4, 6);
+            AppendEagleRec(buf, symSec);
+
+            uint8_t sym[24] = { 0x18 };
+            PutU16LE(sym + 2, 5); // 3x 0x22 wires + 2x 0x2C pins
+            std::memcpy(sym + 16, "BUF_TRI", 7);
+            AppendEagleRec(buf, sym);
+
+            auto pushSymWire = [&](int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+                uint8_t w[24] = { 0x22, 0, 0, 94 };
+                PutI32LE(w + 4,  x1); PutI32LE(w + 8,  y1);
+                PutI32LE(w + 12, x2); PutI32LE(w + 16, y2);
+                PutU16LE(w + 20, 1270); // 0.254 mm
+                AppendEagleRec(buf, w);
+            };
+            // Custom 8.0 x 10.0 mm triangle (non-6x4!)
+            pushSymWire(-40000, -50000, -40000,  50000);
+            pushSymWire(-40000,  50000,  40000,      0);
+            pushSymWire( 40000,      0, -40000, -50000);
+
+            // Pin 1: "IN_A" at (-9.08, 0), length=middle (2 -> 5.08mm), rot=R0 (0) => rec[12] = (0<<6)|(2<<4)|1 = 0x21
+            {
+                uint8_t p1[24] = { 0x2C };
+                PutI32LE(p1 + 4, -90800); PutI32LE(p1 + 8, 0);
+                p1[12] = 0x21u;
+                std::memcpy(p1 + 14, "IN_A", 4);
+                AppendEagleRec(buf, p1);
+            }
+            // Pin 2: "OUT_Y" at (+9.08, 0), length=middle (2 -> 5.08mm), rot=R180 (2) => rec[12] = (2<<6)|(2<<4)|2 = 0xA2
+            {
+                uint8_t p2[24] = { 0x2C };
+                PutI32LE(p2 + 4, 90800); PutI32LE(p2 + 8, 0);
+                p2[12] = 0xA2u;
+                std::memcpy(p2 + 14, "OUT_Y", 5);
+                AppendEagleRec(buf, p2);
+            }
+
+            // 0x17 DeviceSet + 0x37 Gate referencing symIdx = 1
+            uint8_t ds[24] = { 0x17 };
+            PutU16LE(ds + 2, 1);
+            std::memcpy(ds + 8,  "U", 1);
+            std::memcpy(ds + 16, "SN741G", 6);
+            AppendEagleRec(buf, ds);
+
+            uint8_t gt[24] = { 0x37 };
+            PutI32LE(gt + 4, 0); PutI32LE(gt + 8, 0);
+            PutU16LE(gt + 12, 1); // symIdx = 1
+            std::memcpy(gt + 14, "G$1", 3);
+            AppendEagleRec(buf, gt);
+        }
+
+        // Two 0x38 Parts ("U1", "U2") + two 0x3C Gate Instances at (20, 30) @ R0 and (60, 45) @ R90
+        for (int idx = 0; idx < 2; ++idx) {
+            uint8_t pt[24] = { 0x38 };
+            PutU16LE(pt + 2, 0);
+            PutU16LE(pt + 4, 1); // libIdx = 1
+            PutU16LE(pt + 6, 1); // devSetIdx = 1
+            std::string nm = (idx == 0) ? "U1" : "U2";
+            std::memcpy(pt + 18, nm.data(), nm.size());
+            AppendEagleRec(buf, pt);
+        }
+        {
+            uint8_t gi1[24] = { 0x3C };
+            PutU16LE(gi1 + 4, 1); // partIdx = 1 (U1)
+            PutU16LE(gi1 + 6, 1); // gateIdx = 1
+            PutI32LE(gi1 + 8, 200000); PutI32LE(gi1 + 12, 300000); // (20.0, 30.0)
+            PutU16LE(gi1 + 16, 0); // R0
+            AppendEagleRec(buf, gi1);
+
+            uint8_t gi2[24] = { 0x3C };
+            PutU16LE(gi2 + 4, 2); // partIdx = 2 (U2)
+            PutU16LE(gi2 + 6, 1); // gateIdx = 1
+            PutI32LE(gi2 + 8, 600000); PutI32LE(gi2 + 12, 450000); // (60.0, 45.0)
+            PutU16LE(gi2 + 16, 1024); // R90 (1024 / 4096 * 360 = 90 deg)
+            AppendEagleRec(buf, gi2);
+        }
+
+        buf[0] = 0x10;
+        PutU32LE(buf.data() + 4, static_cast<uint32_t>(buf.size() / 24));
+        buf[8] = 5;
+        buf[9] = 12;
+
+        ParsedEdaBoard bSchSym;
+        bool okSchSym = WriteAndInspect(dir + L"\\eagle_real_sym.sch", buf.data(), buf.size(), bSchSym);
+
+        auto hasPadNear = [&](float tx, float ty, std::wstring_view pnm) -> bool {
+            for (const auto& p : bSchSym.pads) {
+                if (std::fabs(p.x - tx) < 0.08f && std::fabs(p.y - ty) < 0.08f && p.pinName == pnm) return true;
+            }
+            return false;
+        };
+        bool hasDiagonalTriEdge = false;
+        for (const auto& t : bSchSym.traces) {
+            if (std::fabs(t.x2 - t.x1) > 2.0f && std::fabs(t.y2 - t.y1) > 2.0f) hasDiagonalTriEdge = true;
+        }
+        bool noOriginPads = true;
+        for (const auto& p : bSchSym.pads) {
+            if (std::fabs(p.y) < 1.0f) noOriginPads = false;
+        }
+
+        // Exact 2 parts, 4 transformed pads, 10 traces (2 * [3 triangle wires + 2 pin stems], ZERO 6x4 boxes!)
+        bool passEagleSym = okSchSym &&
+                            bSchSym.components.size() == 2u &&
+                            bSchSym.pads.size() == 4u &&
+                            bSchSym.traces.size() == 10u &&
+                            noOriginPads && hasDiagonalTriEdge &&
+                            bSchSym.components[0].widthMm > 17.0f &&
+                            hasPadNear(20.0f - 9.08f, 30.0f, L"IN_A") &&
+                            hasPadNear(20.0f + 9.08f, 30.0f, L"OUT_Y") &&
+                            hasPadNear(60.0f, 45.0f - 9.08f, L"IN_A") &&
+                            hasPadNear(60.0f, 45.0f + 9.08f, L"OUT_Y") &&
+                            hasLabelSubstr(bSchSym, L"IN_A") &&
+                            hasLabelSubstr(bSchSym, L"OUT_Y");
+
+        tc.Record(passEagleSym, L"Stage15.Eda.EagleBinaryV5Sch_Real0x18SymbolAndRotatedPins",
+            L"traces=" + std::to_wstring(bSchSym.traces.size()) +
+            L" pads=" + std::to_wstring(bSchSym.pads.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 23. Altium .SchLib Binary Pins (flags=1, 0x02) + Polyline-Only Symbol Body
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+        auto appendAltiumBinPin = [](std::vector<uint8_t>& stream,
+                                     int16_t locXDxp, int16_t locYDxp, int16_t pinLenDxp,
+                                     uint8_t pinCong, const std::string& name, const std::string& desig,
+                                     const std::string& desc = "") {
+            std::vector<uint8_t> pay;
+            pay.push_back(0x02u); // Binary Pin record type
+            pay.insert(pay.end(), { 0u, 1u, 0u, 0u }); // ownerPartId = 1
+            pay.insert(pay.end(), { 0u, 0u, 0u, 0u }); // inner/outer edge symbols
+            pay.push_back(static_cast<uint8_t>(desc.size()));
+            pay.insert(pay.end(), desc.begin(), desc.end());
+            pay.push_back(0u); // formalType
+            pay.push_back(4u); // electrical = passive
+            pay.push_back(pinCong);
+            AppendU16LE(pay, static_cast<uint16_t>(pinLenDxp));
+            AppendU16LE(pay, static_cast<uint16_t>(locXDxp));
+            AppendU16LE(pay, static_cast<uint16_t>(locYDxp));
+            AppendU32LE(pay, 0x00000080u); // color
+            pay.push_back(static_cast<uint8_t>(name.size()));
+            pay.insert(pay.end(), name.begin(), name.end());
+            pay.push_back(static_cast<uint8_t>(desig.size()));
+            pay.insert(pay.end(), desig.begin(), desig.end());
+
+            uint8_t hdr[4] = {};
+            PutU32LE(hdr, (static_cast<uint32_t>(pay.size()) & 0x00FFFFFFu) | (1u << 24)); // flags == 1!
+            stream.insert(stream.end(), hdr, hdr + 4);
+            stream.insert(stream.end(), pay.begin(), pay.end());
+        };
+
+        std::vector<uint8_t> symData;
+        AppendAltiumLenBlock(symData, "|RECORD=1|LIBREFERENCE=BAT54S|DESIGNITEMID=BAT54S|CURRENTPARTID=1|");
+        // Polyline diode triangle (3 edges) + cathode bar line (1 edge) — NO RECORD=14 rectangle!
+        AppendAltiumLenBlock(symData, "|RECORD=6|OWNERINDEX=0|OWNERPARTID=1|LOCATIONCOUNT=4|X1=-10|Y1=-10|X2=-10|Y2=10|X3=10|Y3=0|X4=-10|Y4=-10|");
+        AppendAltiumLenBlock(symData, "|RECORD=13|OWNERINDEX=0|OWNERPARTID=1|LOCATION.X=10|LOCATION.Y=-10|CORNER.X=10|CORNER.Y=10|");
+        // Two binary pins (flags == 1, record == 0x02): ANODE (180 deg left, showName|showDesig=0x0E) & CATHODE (0 deg right, 0x0C)
+        appendAltiumBinPin(symData, -10, 0, 20, 0x0Eu, "ANODE",   "1", "Schottky Anode");
+        appendAltiumBinPin(symData,  10, 0, 20, 0x0Cu, "CATHODE", "2", "Schottky Cathode");
+
+        std::vector<uint8_t> fh;
+        AppendAltiumLenBlock(fh, "|HEADER=Protel for Windows - Schematic Library Editor Binary File Version 5.0|COMPCOUNT=1|LIBREF0=BAT54S|");
+
+        auto schLibBytes = BuildOle2CompoundFile({
+            { L"FileHeader",  fh },
+            { L"BAT54S/Data", symData }
+        });
+
+        ParsedEdaBoard bBinLib;
+        bool okBinLib = WriteAndInspect(dir + L"\\diode_binpins.schlib", schLibBytes.data(), schLibBytes.size(), bBinLib);
+
+        // 3 polyline segments + 1 line + 2 binary pin stems = EXACT 6 traces (proving ZERO fake 4-edge body box!)
+        bool passBinLib = okBinLib &&
+                          bBinLib.components.size() == 1u &&
+                          bBinLib.pads.size() == 2u &&
+                          bBinLib.traces.size() == 6u &&
+                          std::fabs(bBinLib.pads[0].x - (-7.62f)) < 0.08f &&
+                          std::fabs(bBinLib.pads[1].x -   7.62f)  < 0.08f &&
+                          hasLabelSubstr(bBinLib, L"ANODE") &&
+                          hasLabelSubstr(bBinLib, L"CATHODE") &&
+                          hasLabelSubstr(bBinLib, L"1") &&
+                          hasLabelSubstr(bBinLib, L"2");
+
+        tc.Record(passBinLib, L"Stage15.Eda.AltiumSchLib_BinaryPinsFlags1_NoFakeBodyBox",
+            L"traces=" + std::to_wstring(bBinLib.traces.size()) +
+            L" pads=" + std::to_wstring(bBinLib.pads.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 24. Rigol DS1000Z (0xA5 0xA5 0x38 0x00) 2-Channel .wfm + Fallback Compatibility
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        const uint32_t nPts = 128u;
+        const uint32_t dataOff = 256u;
+        std::vector<uint8_t> ds1000z(dataOff + nPts * 2u, 0);
+        ds1000z[0] = 0xA5u; ds1000z[1] = 0xA5u;
+        ds1000z[2] = 0x38u; ds1000z[3] = 0x00u;
+        std::memcpy(ds1000z.data() + 4,  "DS1054Z", 7);
+        std::memcpy(ds1000z.data() + 24, "00.04.04.SP4", 12);
+        PutU16LE(ds1000z.data() + 44, 1u);
+        ds1000z[48] = 0x03u; // CH1 | CH2 active mask
+        PutU32LE(ds1000z.data() + 52, dataOff);
+        PutU32LE(ds1000z.data() + 56, nPts);
+        PutF32LE(ds1000z.data() + 60, 1.0e9f); // 1.00 GSa/s
+        PutU64LE(ds1000z.data() + 64, 1000000ULL); // 1 us/div
+
+        // Channel descriptors at offset 120 (4 x 32B): CH1 = 1.0V/div DC, CH2 = 0.5V/div AC
+        uint8_t* ch1 = ds1000z.data() + 120u;
+        ch1[0] = 1u; ch1[1] = 0u; // enabled, DC
+        PutF32LE(ch1 + 4,  1.0f); // 1X probe
+        PutF32LE(ch1 + 8,  1.0f); // 1.0 V/div
+        PutF32LE(ch1 + 12, 0.0f); // 0.0 V offset
+
+        uint8_t* ch2 = ds1000z.data() + 152u;
+        ch2[0] = 1u; ch2[1] = 1u; // enabled, AC
+        PutF32LE(ch2 + 4,  10.0f); // 10X probe
+        PutF32LE(ch2 + 8,  0.05f); // 0.05 * 10 = 0.50 V/div
+        PutF32LE(ch2 + 12, -0.25f);
+
+        for (uint32_t i = 0; i < nPts; ++i) {
+            int s1 = 128 + static_cast<int>(std::lround(60.0 * std::sin(static_cast<double>(i) * 0.12)));
+            int s2 = (i % 32u < 16u) ? 170 : 86;
+            ds1000z[dataOff + i * 2u + 0u] = static_cast<uint8_t>(std::clamp(s1, 0, 255));
+            ds1000z[dataOff + i * 2u + 1u] = static_cast<uint8_t>(std::clamp(s2, 0, 255));
+        }
+
+        // Legacy minimal 260+ byte synthetic Rigol .wfm fallback (zero structured channel flags)
+        std::vector<uint8_t> legacyWfm(256u + 64u, 0);
+        legacyWfm[0] = 0xA5u; legacyWfm[1] = 0xA5u;
+        PutU32LE(legacyWfm.data() + 28, 64u);
+        PutU32LE(legacyWfm.data() + 36, 1000000u); // 1V/div in uV
+        for (size_t i = 0; i < 64u; ++i) legacyWfm[256u + i] = static_cast<uint8_t>(90u + (i % 40u) * 2u);
+
+        ParsedEdaBoard bRigZ, bRigLegacy;
+        bool okRigZ   = WriteAndInspect(dir + L"\\rigol_ds1054z_2ch.wfm", ds1000z.data(), ds1000z.size(), bRigZ);
+        bool okLegacy = WriteAndInspect(dir + L"\\rigol_legacy_1ch.wfm", legacyWfm.data(), legacyWfm.size(), bRigLegacy);
+
+        bool sawTopCh1 = false, sawBotCh2 = false;
+        for (const auto& t : bRigZ.traces) {
+            if (t.layer == EdaLayerId::TopCopper) sawTopCh1 = true;
+            if (t.layer == EdaLayerId::BottomCopper) sawBotCh2 = true;
+        }
+
+        bool passRigol = okRigZ && okLegacy &&
+                         bRigZ.netCount == 2u &&
+                         sawTopCh1 && sawBotCh2 &&
+                         bRigZ.formatTitle.find(L"DS1054Z") != std::wstring::npos &&
+                         bRigZ.formatTitle.find(L"2 chs") != std::wstring::npos &&
+                         hasLabelSubstr(bRigZ, L"CH1") &&
+                         hasLabelSubstr(bRigZ, L"CH2") &&
+                         hasLabelSubstr(bRigZ, L"GSa/s") &&
+                         HashEdaGeometry(bRigZ) != HashEdaGeometry(bRigLegacy);
+
+        tc.Record(passRigol, L"Stage15.Eda.RigolDs1000zMultiChannel_And_LegacyFallback",
+            L"rigZTraces=" + std::to_wstring(bRigZ.traces.size()) +
+            L" nets=" + std::to_wstring(bRigZ.netCount));
+    }
+
+    // ------------------------------------------------------------------------
+    // 25. Flattened Device Tree Blob (.dtb — 0xD00DFEED v17 SoC Topology)
+    // ------------------------------------------------------------------------
+    {
+        auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
+            for (const auto& l : b.labels) {
+                if (l.text.find(sub) != std::wstring::npos) return true;
+            }
+            return false;
+        };
+
+        std::string strBlock;
+        std::unordered_map<std::string, uint32_t> strOffMap;
+        auto internPropName = [&](const std::string& nm) -> uint32_t {
+            auto it = strOffMap.find(nm);
+            if (it != strOffMap.end()) return it->second;
+            uint32_t off = static_cast<uint32_t>(strBlock.size());
+            strBlock.append(nm);
+            strBlock.push_back('\0');
+            strOffMap[nm] = off;
+            return off;
+        };
+
+        std::vector<uint8_t> dtStruct;
+        auto pad4 = [](std::vector<uint8_t>& v) {
+            while ((v.size() & 3u) != 0u) v.push_back(0u);
+        };
+        auto beginNode = [&](const char* name) {
+            AppendU32BE(dtStruct, 1u); // FDT_BEGIN_NODE
+            dtStruct.insert(dtStruct.end(), name, name + std::strlen(name) + 1u);
+            pad4(dtStruct);
+        };
+        auto endNode = [&]() {
+            AppendU32BE(dtStruct, 2u); // FDT_END_NODE
+        };
+        auto propU32 = [&](const char* nm, const std::vector<uint32_t>& cells) {
+            AppendU32BE(dtStruct, 3u); // FDT_PROP
+            AppendU32BE(dtStruct, static_cast<uint32_t>(cells.size() * 4u));
+            AppendU32BE(dtStruct, internPropName(nm));
+            for (uint32_t c : cells) AppendU32BE(dtStruct, c);
+        };
+        auto propStr = [&](const char* nm, const char* val) {
+            uint32_t len = static_cast<uint32_t>(std::strlen(val) + 1u);
+            AppendU32BE(dtStruct, 3u);
+            AppendU32BE(dtStruct, len);
+            AppendU32BE(dtStruct, internPropName(nm));
+            dtStruct.insert(dtStruct.end(), val, val + len);
+            pad4(dtStruct);
+        };
+
+        // Root node: #address-cells=2, #size-cells=2
+        beginNode("");
+        propU32("#address-cells", { 2u });
+        propU32("#size-cells", { 2u });
+        propStr("model", "SiFive HiFive Unmatched");
+        propStr("compatible", "sifive,hifive-unmatched-a00");
+
+        // /cpus
+        beginNode("cpus");
+        propU32("#address-cells", { 1u });
+        propU32("#size-cells", { 0u });
+        beginNode("cpu@0");
+        propStr("device_type", "cpu");
+        propStr("compatible", "sifive,u74-mc");
+        propStr("riscv,isa", "rv64imafdc");
+        propU32("reg", { 0u });
+        propU32("clock-frequency", { 1200000000u });
+        endNode();
+        endNode();
+
+        // /memory@80000000 (1 GB at 0x80000000 using root 2+2 cells)
+        beginNode("memory@80000000");
+        propStr("device_type", "memory");
+        propU32("reg", { 0x00000000u, 0x80000000u, 0x00000000u, 0x40000000u });
+        endNode();
+
+        // /soc (#address-cells=1, #size-cells=1)
+        beginNode("soc");
+        propU32("#address-cells", { 1u });
+        propU32("#size-cells", { 1u });
+        propStr("compatible", "simple-bus");
+
+        beginNode("serial@10000000");
+        propStr("compatible", "sifive,uart0");
+        propU32("reg", { 0x10000000u, 0x00001000u });
+        propU32("interrupts", { 4u });
+        propStr("status", "okay");
+        endNode();
+
+        beginNode("spi@10001000");
+        propStr("compatible", "sifive,spi0");
+        propU32("reg", { 0x10001000u, 0x00001000u });
+        propU32("interrupts", { 6u });
+        propStr("status", "disabled");
+        endNode();
+
+        endNode(); // /soc
+        endNode(); // /
+        AppendU32BE(dtStruct, 9u); // FDT_END
+
+        // Assemble 40B header + 32B /memreserve/ (1 entry + terminator) + struct + strings
+        const uint32_t offMemRsv  = 40u;
+        const uint32_t offStruct  = 40u + 32u;
+        const uint32_t offStrings = offStruct + static_cast<uint32_t>(dtStruct.size());
+        const uint32_t totalSz    = offStrings + static_cast<uint32_t>(strBlock.size());
+
+        std::vector<uint8_t> dtb;
+        AppendU32BE(dtb, 0xD00DFEEDu);
+        AppendU32BE(dtb, totalSz);
+        AppendU32BE(dtb, offStruct);
+        AppendU32BE(dtb, offStrings);
+        AppendU32BE(dtb, offMemRsv);
+        AppendU32BE(dtb, 17u); // version 17
+        AppendU32BE(dtb, 16u); // last_comp_version 16
+        AppendU32BE(dtb, 0u);  // boot_cpuid_phys
+        AppendU32BE(dtb, static_cast<uint32_t>(strBlock.size()));
+        AppendU32BE(dtb, static_cast<uint32_t>(dtStruct.size()));
+
+        // /memreserve/ 0x80000000 size 0x10000 + (0, 0) terminator
+        AppendU64BE(dtb, 0x80000000ULL);
+        AppendU64BE(dtb, 0x00010000ULL);
+        AppendU64BE(dtb, 0ULL);
+        AppendU64BE(dtb, 0ULL);
+
+        dtb.insert(dtb.end(), dtStruct.begin(), dtStruct.end());
+        dtb.insert(dtb.end(), strBlock.begin(), strBlock.end());
+
+        std::vector<uint8_t> truncDtb(dtb.begin(), dtb.begin() + 60);
+        const char* badDtbTxt = "/dts-v1/;\n/ { model = \"ASCII DTS not binary DTB\"; };\n";
+
+        ParsedEdaBoard bDtb, badDtb1, badDtb2;
+        bool okDtb  = WriteAndInspect(dir + L"\\hifive.dtb", dtb.data(), dtb.size(), bDtb);
+        bool rejDtb = !WriteAndInspect(dir + L"\\trunc.dtb", truncDtb.data(), truncDtb.size(), badDtb1) &&
+                      !WriteAndInspect(dir + L"\\source.dtb", badDtbTxt, std::strlen(badDtbTxt), badDtb2);
+
+        bool sawDisabledSpi = false;
+        for (const auto& c : bDtb.components) {
+            if (c.refDes == L"spi@10001000" && c.bottomSide) sawDisabledSpi = true;
+        }
+
+        bool passDtb = EdaViewer::IsEdaExtension(L".dtb") && okDtb && rejDtb &&
+                       bDtb.components.size() >= 4u && sawDisabledSpi &&
+                       hasLabelSubstr(bDtb, L"SiFive HiFive Unmatched") &&
+                       hasLabelSubstr(bDtb, L"0x80000000") &&
+                       hasLabelSubstr(bDtb, L"1 GB") &&
+                       hasLabelSubstr(bDtb, L"serial@10000000") &&
+                       hasLabelSubstr(bDtb, L"0x10000000") &&
+                       hasLabelSubstr(bDtb, L"sifive,uart0") &&
+                       hasLabelSubstr(bDtb, L"IRQ4") &&
+                       hasLabelSubstr(bDtb, L"spi@10001000 [DISABLED]");
+
+        tc.Record(passDtb, L"Stage15.Eda.FlattenedDeviceTree_DtbSocTopologyAndCells",
+            L"dtbComps=" + std::to_wstring(bDtb.components.size()) +
+            L" dtbPads=" + std::to_wstring(bDtb.pads.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 26. Siemens / Mentor HyperLynx Multi-Layer PCB Layout (.hyp)
+    // ------------------------------------------------------------------------
+    {
+        const std::string validHyp =
+            "* HyperLynx High-Speed Board Export\n"
+            "{VERSION=2.10}\n"
+            "{BOARD\n"
+            "  {UNITS=ENGLISH WEIGHT}\n"
+            "  {BOARD_OUTLINE\n"
+            "    (X=0.0 Y=0.0)\n"
+            "    (X=2.5 Y=0.0)\n"
+            "    (X=2.5 Y=1.8)\n"
+            "    (X=0.0 Y=1.8)\n"
+            "  }\n"
+            "  {STACKUP\n"
+            "    (SIGNAL T=0.0014 L=TOP)\n"
+            "    (DIELECTRIC T=0.008)\n"
+            "    (PLANE T=0.0014 L=GND_INT1)\n"
+            "    (DIELECTRIC T=0.040)\n"
+            "    (SIGNAL T=0.0014 L=INT2_SIG)\n"
+            "    (DIELECTRIC T=0.008)\n"
+            "    (SIGNAL T=0.0014 L=BOTTOM)\n"
+            "  }\n"
+            "  {DEVICES\n"
+            "    (IC REF=U1 NAME=DDR4_CTRL PKG=BGA256 L=TOP X=0.8 Y=0.9 R=0)\n"
+            "    (R  REF=R1 VAL=49.9 PKG=0402 L=TOP X=1.5 Y=0.9 R=90)\n"
+            "    (C  REF=C1 VAL=100nF PKG=0603 L=BOTTOM X=1.9 Y=1.2 R=180)\n"
+            "  }\n"
+            "  {PADSTACK=SMD_RECT, 0.0\n"
+            "    (TOP, 1, 0.050, 0.025, 0)\n"
+            "  }\n"
+            "  {PADSTACK=VIA_STD, 0.012\n"
+            "    (TOP, 2, 0.024, 0.024, 0)\n"
+            "    (BOTTOM, 2, 0.024, 0.024, 0)\n"
+            "  }\n"
+            "  {PADSTACK=THT_OVAL, 0.032\n"
+            "    (TOP, 0, 0.065, 0.045, 0)\n"
+            "    (BOTTOM, 0, 0.065, 0.045, 0)\n"
+            "  }\n"
+            "  {NET=DDR_CLK_P\n"
+            "    {PIN X=0.85 Y=0.90 ID=U1.A1 P=SMD_RECT L=TOP}\n"
+            "    {PIN X=1.50 Y=0.87 ID=R1.1  P=SMD_RECT L=TOP R=90}\n"
+            "    {SEG X1=0.85 Y1=0.90 X2=1.20 Y2=0.90 W=0.006 L=TOP}\n"
+            "    {VIA X=1.20 Y=0.90 P=VIA_STD}\n"
+            "    {SEG X1=1.20 Y1=0.90 X2=1.50 Y2=0.87 W=0.006 L=INT2_SIG}\n"
+            "  }\n"
+            "  {NET=GND\n"
+            "    {PIN X=1.50 Y=0.93 ID=R1.2 P=SMD_RECT L=TOP R=90}\n"
+            "    {PIN X=1.90 Y=1.16 ID=C1.1 P=SMD_RECT L=BOTTOM}\n"
+            "    {PIN X=1.90 Y=1.24 ID=C1.2 P=THT_OVAL}\n"
+            "    {VIA X=1.90 Y=1.05 P=VIA_STD}\n"
+            "    {SEG X1=1.90 Y1=1.05 X2=1.90 Y2=1.16 W=0.012 L=BOTTOM}\n"
+            "    {POLYGON L=GND_INT1 W=0.008\n"
+            "      (X=0.2 Y=0.2)\n"
+            "      (X=2.3 Y=0.2)\n"
+            "      (X=2.3 Y=1.6)\n"
+            "      (X=0.2 Y=1.6)\n"
+            "    }\n"
+            "  }\n"
+            "}\n";
+
+        const char* badHyp1 = "Plain English prose mentioning BOARD and NET without HyperLynx syntax.\n";
+        const char* badHyp2 = "{BOARD {UNITS=METRIC} {NET=BROKEN {SEG X1=0 Y1=0 X2=10 Y2=10";
+
+        ParsedEdaBoard bHyp, badH1, badH2;
+        bool okHyp  = WriteAndInspect(dir + L"\\ddr4_si.hyp", validHyp.data(), validHyp.size(), bHyp);
+        bool rejHyp = !WriteAndInspect(dir + L"\\prose.hyp",   badHyp1, std::strlen(badHyp1), badH1) &&
+                      !WriteAndInspect(dir + L"\\unclosed.hyp", badHyp2, std::strlen(badHyp2), badH2);
+
+        bool hasEdge = false, hasTop = false, hasInner = false, hasBot = false;
+        for (const auto& t : bHyp.traces) {
+            if (t.layer == EdaLayerId::EdgeCuts)     hasEdge = true;
+            if (t.layer == EdaLayerId::TopCopper)    hasTop = true;
+            if (t.layer == EdaLayerId::InnerCopper)  hasInner = true;
+            if (t.layer == EdaLayerId::BottomCopper) hasBot = true;
+        }
+
+        // 2.5 in = 63.5 mm wide, 1.8 in = 45.72 mm tall
+        bool passHyp = EdaViewer::IsEdaExtension(L".hyp") && okHyp && rejHyp &&
+                       bHyp.kind == EdaDocKind::KiCadPcb &&
+                       bHyp.components.size() == 3u &&
+                       bHyp.vias.size() == 2u &&
+                       bHyp.pads.size() == 5u &&
+                       bHyp.netCount == 2u &&
+                       hasEdge && hasTop && hasInner && hasBot &&
+                       std::fabs((bHyp.maxX - bHyp.minX) - 63.5f) < 1.0f;
+
+        tc.Record(passHyp, L"Stage15.Eda.HyperLynxPcb_MultiLayerStackupPadstacksAndNets",
+            L"hypComps=" + std::to_wstring(bHyp.components.size()) +
+            L" hypPads=" + std::to_wstring(bHyp.pads.size()) +
+            L" hypTr=" + std::to_wstring(bHyp.traces.size()));
+    }
+
+    // ------------------------------------------------------------------------
+    // 27. Teledyne LeCroy Oscilloscope Waveform (.trc — 16-bit LOFIRST & 8-bit HIFIRST)
+    // ------------------------------------------------------------------------
+    {
+        auto buildLeCroyTrc = [](bool bigEndian, bool word16, const std::string& scpiPrefix,
+                                 const char* inst, uint16_t waveSrc, uint32_t userTxtLen, size_t nSamples) {
+            const uint32_t wdLen = 346u;
+            const uint32_t bps   = word16 ? 2u : 1u;
+            const uint32_t arrBytes = static_cast<uint32_t>(nSamples * bps);
+            std::vector<uint8_t> wd(wdLen, 0u);
+            std::memcpy(wd.data() + 0,  "WAVEDESC", 8);
+            std::memcpy(wd.data() + 16, "LECROY_2_3", 10);
+
+            auto wr16 = [&](size_t o, uint16_t v) { if (bigEndian) PutU16BE(wd.data() + o, v); else PutU16LE(wd.data() + o, v); };
+            auto wr32 = [&](size_t o, uint32_t v) { if (bigEndian) PutU32BE(wd.data() + o, v); else PutU32LE(wd.data() + o, v); };
+            auto wrF32 = [&](size_t o, float f) {
+                uint32_t u = 0; std::memcpy(&u, &f, 4); wr32(o, u);
+            };
+            auto wrF64 = [&](size_t o, double d) {
+                uint64_t u = 0;
+                std::memcpy(&u, &d, 8);
+                if (bigEndian) PutU64BE(wd.data() + o, u);
+                else PutU64LE(wd.data() + o, u);
+            };
+
+            wr16(32, word16 ? 1u : 0u);     // COMM_TYPE
+            wr16(34, bigEndian ? 0u : 1u);  // COMM_ORDER: 0=HIFIRST, 1=LOFIRST
+            wr32(36, wdLen);                // WAVE_DESCRIPTOR
+            wr32(40, userTxtLen);           // USER_TEXT
+            wr32(60, arrBytes);             // WAVE_ARRAY_1 byte length
+            std::memcpy(wd.data() + 76, inst, std::min<size_t>(std::strlen(inst), 16u));
+            wr32(116, static_cast<uint32_t>(nSamples)); // WAVE_ARRAY_COUNT
+            wrF32(156, word16 ? 0.001f : 0.02f);        // VERTICAL_GAIN
+            wrF32(160, 0.25f);                          // VERTICAL_OFFSET
+            wrF32(176, 1.0e-9f);                        // HORIZ_INTERVAL (1 GSa/s)
+            wrF64(180, -2.5e-6);                        // HORIZ_OFFSET
+            wd[196] = 'V';
+            wd[244] = 's';
+            wr16(344, waveSrc);                         // WAVE_SOURCE (0=CH1, 1=CH2)
+
+            std::vector<uint8_t> out(scpiPrefix.begin(), scpiPrefix.end());
+            out.insert(out.end(), wd.begin(), wd.end());
+            out.insert(out.end(), userTxtLen, ' ');
+            for (size_t i = 0; i < nSamples; ++i) {
+                if (word16) {
+                    int16_t sv = static_cast<int16_t>(std::lround(1800.0 * std::sin(static_cast<double>(i) * 0.02)));
+                    if (i == 2500u) sv = 8000; // Sharp transient spike to test min/max envelope preservation
+                    uint8_t b2[2] = {};
+                    if (bigEndian) PutU16BE(b2, static_cast<uint16_t>(sv));
+                    else PutU16LE(b2, static_cast<uint16_t>(sv));
+                    out.push_back(b2[0]); out.push_back(b2[1]);
+                } else {
+                    int8_t sb = static_cast<int8_t>((i % 32u < 16u) ? 75 : -75);
+                    out.push_back(static_cast<uint8_t>(sb));
+                }
+            }
+            return out;
+        };
+
+        auto trcLe16 = buildLeCroyTrc(false, true,  "",                    "WAVERUNNER9254M", 0u, 0u,  5000u);
+        auto trcBe8  = buildLeCroyTrc(true,  false, "#9000000490",         "HDO6104A",        1u, 16u, 128u);
+
+        std::vector<uint8_t> truncTrc(trcLe16.begin(), trcLe16.begin() + 400); // Claims 10000B array, truncated at 400B
+        const char* badTrcTxt = "NOT A LECROY WAVEDESC OSCILLOSCOPE TRACE FILE\n";
+
+        ParsedEdaBoard bTrcLe, bTrcBe, badT1, badT2;
+        bool okTrcLe = WriteAndInspect(dir + L"\\c1_lofirst16.trc", trcLe16.data(), trcLe16.size(), bTrcLe);
+        bool okTrcBe = WriteAndInspect(dir + L"\\c2_hifirst8.trc",  trcBe8.data(),  trcBe8.size(),  bTrcBe);
+        bool rejTrc  = !WriteAndInspect(dir + L"\\trunc.trc",       truncTrc.data(), truncTrc.size(), badT1) &&
+                       !WriteAndInspect(dir + L"\\garbage.trc",     badTrcTxt, std::strlen(badTrcTxt), badT2);
+
+        bool passTrc = EdaViewer::IsEdaExtension(L".trc") && okTrcLe && okTrcBe && rejTrc &&
+                       bTrcLe.formatTitle.find(L"WAVERUNNER9254M") != std::wstring::npos &&
+                       bTrcLe.formatTitle.find(L"CH1") != std::wstring::npos &&
+                       bTrcLe.formatTitle.find(L"16-bit LOFIRST") != std::wstring::npos &&
+                       bTrcBe.formatTitle.find(L"HDO6104A") != std::wstring::npos &&
+                       bTrcBe.formatTitle.find(L"CH2") != std::wstring::npos &&
+                       bTrcBe.formatTitle.find(L"8-bit HIFIRST") != std::wstring::npos &&
+                       bTrcLe.traces.size() > 100u && bTrcLe.traces.size() <= 4200u &&
+                       bTrcBe.traces.size() > 100u &&
+                       HashEdaGeometry(bTrcLe) != HashEdaGeometry(bTrcBe);
+
+        tc.Record(passTrc, L"Stage15.Eda.LeCroyOscilloscopeTrc_16BitLoFirst_And_8BitHiFirst",
+            L"trcLeTr=" + std::to_wstring(bTrcLe.traces.size()) +
+            L" trcBeTr=" + std::to_wstring(bTrcBe.traces.size()));
     }
 
     RemoveDirectoryW(dir.c_str());

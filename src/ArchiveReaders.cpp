@@ -19,8 +19,49 @@
 #endif
 #include <map>
 #include <set>
-#include "formats/ExtendedArchives100.h"
-#include "formats/ExtendedArchives200.h"
+#include "formats/common/ArchiveFormatCommon.h"
+#include "formats/archives/Iso9660.h"
+#include "formats/archives/CabinetMscf.h"
+#include "formats/archives/WindowsInstallerMsi.h"
+#include "formats/archives/DebianDeb.h"
+#include "formats/archives/RedHatRpm.h"
+#include "formats/archives/Qcow2Disk.h"
+#include "formats/archives/VhdxDisk.h"
+#include "formats/archives/VhdDisk.h"
+#include "formats/archives/VmdkDisk.h"
+#include "formats/archives/VdiDisk.h"
+#include "formats/archives/AppleDmgDisk.h"
+#include "formats/archives/RawFilesystemDisk.h"
+#include "formats/archives/WindowsWim.h"
+#include "formats/archives/QuakePak.h"
+#include "formats/archives/DoomWad.h"
+#include "formats/archives/ValveVpk.h"
+#include "formats/archives/BethesdaBsa.h"
+#include "formats/archives/BethesdaBa2.h"
+#include "formats/archives/ElectronAsar.h"
+#include "formats/archives/UnityPackage.h"
+#include "formats/archives/UnityFsBundle.h"
+#include "formats/archives/GodotPck.h"
+#include "formats/archives/RpgMakerRgss.h"
+#include "formats/archives/KiriKiriXp3.h"
+#include "formats/archives/BlizzardMpq.h"
+#include "formats/archives/EaBigArchive.h"
+#include "formats/archives/BuildEngineGrp.h"
+#include "formats/archives/BohemiaPbo.h"
+#include "formats/archives/ScsPrismArchive.h"
+#include "formats/archives/LinuxSquashFs.h"
+#include "formats/archives/LinuxErofs.h"
+#include "formats/archives/PosixCpio.h"
+#include "formats/archives/UnixCoffAr.h"
+#include "formats/archives/AppleXarPkg.h"
+#include "formats/archives/LhaArchive.h"
+#include "formats/archives/ArjArchive.h"
+#include "formats/archives/WinAceArchive.h"
+#include "formats/archives/UdfImage.h"
+#include "formats/archives/NeroNrg.h"
+#include "formats/archives/BrotliArchive.h"
+#include "formats/archives/WebArchiveWarc.h"
+#include "formats/archives/AndroidSparseImg.h"
 #ifdef _WIN32
 #include <shellapi.h>
 #endif
@@ -32,12 +73,10 @@
 #include <cstdio>
 
 namespace Explorer2 {
-#define E2_AURORA_ENABLE_ARCHIVE 1
-#include "formats/BioWareAurora.h"
-#undef E2_AURORA_ENABLE_ARCHIVE
-#define E2_RETROTEX_ENABLE_ARCHIVE 1
-#include "formats/RetroGameTex.h"
-#undef E2_RETROTEX_ENABLE_ARCHIVE
+#include "formats/archives/BioWareErfArchive.h"
+#include "formats/archives/BioWareRimArchive.h"
+#include "formats/archives/BioWareBifArchive.h"
+#include "formats/archives/QuakeHlWadArchive.h"
 
 namespace {
 
@@ -3494,9 +3533,11 @@ bool ArchiveReaders::IsArchiveExtension(const std::wstring& extLower) {
            extLower == L".pk3"   || extLower == L".iso" || extLower == L".zst" ||
            extLower == L".tzst"  || extLower == L".xz"  || extLower == L".txz" ||
            extLower == L".bz2"   || extLower == L".tbz2"|| extLower == L".tbz" ||
-           extLower == L".lz4"   || extLower == L".tlz4"||
+           extLower == L".lz4"   || extLower == L".tlz4"|| extLower == L".br"  ||
+           extLower == L".tbr"   || extLower == L".udf" || extLower == L".nrg" ||
+           extLower == L".warc"  || extLower == L".simg"||
            extLower == L".cab"   || extLower == L".msi" || extLower == L".msp" ||
-           extLower == L".deb"   || extLower == L".rpm" || extLower == L".dmg" ||
+           extLower == L".deb"   || extLower == L".udeb"|| extLower == L".rpm" || extLower == L".dmg" ||
            extLower == L".hfs"   || extLower == L".ext2"|| extLower == L".ext3"|| extLower == L".ext4" ||
            extLower == L".vhd"   || extLower == L".vhdx"|| extLower == L".vmdk"||
            extLower == L".vdi"   || extLower == L".qcow2"|| extLower == L".wim"||
@@ -4034,7 +4075,7 @@ bool ArchiveReaders::InspectArchiveFile(const std::wstring& archivePath, Archive
     StreamKind streamKind = DetectStreamKind(data, size);
 
     bool parsed = false;
-    if (extLower == L".unitypackage" && Formats::DetailArc200::ParseUnityPackageFromMemory(data, size, outInfo)) {
+    if (Formats::InspectUnityPackage(data, size, extLower, outInfo)) {
         parsed = true;
     } else if (size >= 8 && std::memcmp(data, "Rar!\x1A\x07\x01\x00", 8) == 0) {
         parsed = ParseRar5Headers(data, size, outInfo);
@@ -4095,6 +4136,15 @@ bool ArchiveReaders::InspectArchiveFile(const std::wstring& archivePath, Archive
             outInfo.valid = true;
             parsed = true;
         }
+    } else if ((extLower == L".br" || extLower == L".tbr") &&
+               Formats::ParseOrExtractBrotli(archivePath, data, size, extLower, &outInfo, nullptr, nullptr)) {
+        parsed = true;
+    } else if ((extLower == L".warc" ||
+                (nameLower.size() > 8 && nameLower.substr(nameLower.size() - 8) == L".warc.gz")) &&
+               Formats::ParseOrExtractWarc(archivePath, data, size, extLower, &outInfo, nullptr, nullptr)) {
+        parsed = true;
+    } else if (extLower == L".br" || extLower == L".tbr" || extLower == L".warc") {
+        parsed = false;
     } else if (size >= 18 && data[0] == 0x1F && data[1] == 0x8B && data[2] == 8) {
         std::vector<ZipDeflate::ArchiveItemMeta> tarEntries;
         if (ZipDeflate::ListTarEntriesFromFile(archivePath, tarEntries) && !tarEntries.empty()) {
@@ -4117,10 +4167,62 @@ bool ArchiveReaders::InspectArchiveFile(const std::wstring& archivePath, Archive
             parsed = ParseSingleGzip(archivePath, data, size, outInfo);
         }
     } else {
+        auto inspectUdfOrNrg = [&]() -> bool {
+            Formats::DetailArc100::VirtualDiskReader probeNrg;
+            if (Formats::DetailUdfNrg::BuildNeroNrgReader(data, size, probeNrg)) {
+                return Formats::ParseOrExtractNeroNrg(data, size, &outInfo, nullptr, nullptr);
+            }
+            return Formats::ParseOrExtractUdfImage(data, size, extLower, &outInfo, nullptr, nullptr);
+        };
+        auto inspectVirtualDisk = [&]() -> bool {
+            if (size >= 72 && std::memcmp(data, "QFI\xFB", 4) == 0) return Formats::InspectQcow2Disk(data, size, outInfo);
+            if (size >= 65536 && std::memcmp(data, "vhdxfile", 8) == 0) return Formats::InspectVhdxDisk(data, size, outInfo);
+            if (size >= 1024 && (std::memcmp(data + size - 512, "conectix", 8) == 0 || std::memcmp(data, "conectix", 8) == 0)) return Formats::InspectVhdDisk(data, size, outInfo);
+            if (size >= 512 && std::memcmp(data, "KDMV", 4) == 0) return Formats::InspectVmdkDisk(data, size, outInfo);
+            if (size >= 512 && ByteIO::RdU32LE(data + 64) == 0xBEDA107Fu) return Formats::InspectVdiDisk(data, size, outInfo);
+            if (size >= 512 && std::memcmp(data + size - 512, "koly", 4) == 0) return Formats::InspectAppleDmgDisk(data, size, outInfo);
+            return Formats::InspectRawFilesystemDisk(data, size, extLower, outInfo);
+        };
+
         parsed = Formats::ParseOrExtractWad2Wad3Archive(data, size, &outInfo, nullptr, nullptr) ||
-                 Formats::InspectBioWareArchive(archivePath, data, size, extLower, outInfo) ||
-                 Formats::InspectExtendedArchive200(data, size, extLower, outInfo) ||
-                 Formats::InspectExtendedArchive100(archivePath, data, size, extLower, outInfo);
+                 Formats::InspectBioWareErfArchive(data, size, extLower, outInfo) ||
+                 Formats::InspectBioWareRimArchive(data, size, outInfo) ||
+                 Formats::InspectBioWareBifArchive(archivePath, data, size, outInfo) ||
+                 (size >= 40u && ByteIO::RdU32LE(data) == 0xED26FF3Au &&
+                  Formats::ParseOrExtractAndroidSimg(archivePath, data, size, &outInfo, nullptr, nullptr)) ||
+                 Formats::ParseOrExtractWarc(archivePath, data, size, extLower, &outInfo, nullptr, nullptr) ||
+                 inspectUdfOrNrg() ||
+                 Formats::InspectUnityPackage(data, size, extLower, outInfo) ||
+                 Formats::InspectUnityFsBundle(data, size, outInfo) ||
+                 Formats::InspectGodotPck(data, size, outInfo) ||
+                 Formats::InspectRpgMakerRgss(data, size, outInfo) ||
+                 Formats::InspectKiriKiriXp3(data, size, outInfo) ||
+                 Formats::InspectBlizzardMpq(data, size, outInfo) ||
+                 Formats::InspectEaBigArchive(data, size, outInfo) ||
+                 Formats::InspectBuildEngineGrp(data, size, outInfo) ||
+                 Formats::InspectBohemiaPbo(data, size, extLower, outInfo) ||
+                 Formats::InspectScsPrismArchive(data, size, outInfo) ||
+                 Formats::InspectLinuxSquashFs(data, size, extLower, outInfo) ||
+                 Formats::InspectLinuxErofs(data, size, outInfo) ||
+                 Formats::InspectPosixCpio(data, size, outInfo) ||
+                 Formats::InspectUnixCoffAr(data, size, extLower, outInfo) ||
+                 Formats::InspectAppleXarPkg(data, size, extLower, outInfo) ||
+                 Formats::InspectLhaArchive(data, size, outInfo) ||
+                 Formats::InspectArjArchive(data, size, outInfo) ||
+                 Formats::InspectWinAceArchive(data, size, outInfo) ||
+                 Formats::InspectIso9660(data, size, outInfo) ||
+                 Formats::InspectCabinetMscf(data, size, outInfo) ||
+                 Formats::InspectDebianDeb(data, size, extLower, outInfo) ||
+                 Formats::InspectRedHatRpm(data, size, outInfo) ||
+                 Formats::InspectWindowsWim(data, size, outInfo) ||
+                 Formats::InspectQuakePak(data, size, outInfo) ||
+                 Formats::InspectDoomWad(data, size, outInfo) ||
+                 Formats::InspectValveVpk(data, size, outInfo, &archivePath) ||
+                 Formats::InspectBethesdaBsa(data, size, outInfo) ||
+                 Formats::InspectBethesdaBa2(data, size, outInfo) ||
+                 Formats::InspectElectronAsar(data, size, outInfo, &archivePath) ||
+                 Formats::InspectWindowsInstallerMsi(data, size, extLower, outInfo) ||
+                 inspectVirtualDisk();
     }
 
     if (!parsed || !outInfo.valid) return false;
@@ -4220,18 +4322,127 @@ try {
     }
 
     // 5. UnityPackage (.unitypackage -> <GUID>/pathname + <GUID>/asset)
-    if (extLower == L".unitypackage") {
-        ArchiveSummaryInfo dummy;
-        if (Formats::DetailArc200::ParseUnityPackageFromMemory(data, size, dummy, &normTarget, &outBytes)) {
+    if (Formats::ExtractUnityPackageEntry(data, size, extLower, normTarget, outBytes)) {
+        return true;
+    }
+
+    // 5b. Brotli (.br/.tbr/.tar.br), Android Sparse (.simg), WARC (.warc), and UDF / Nero (.udf/.nrg)
+    if (extLower == L".br" || extLower == L".tbr") {
+        return Formats::ParseOrExtractBrotli(archivePath, data, size, extLower, nullptr, &normTarget, &outBytes);
+    }
+    if (size >= 40u && ByteIO::RdU32LE(data) == 0xED26FF3Au) {
+        if (Formats::ParseOrExtractAndroidSimg(archivePath, data, size, nullptr, &normTarget, &outBytes)) return true;
+    }
+    if (Formats::ParseOrExtractWarc(archivePath, data, size, extLower, nullptr, &normTarget, &outBytes)) {
+        return true;
+    }
+    if (extLower == L".warc") {
+        return false;
+    }
+    {
+        Formats::DetailArc100::VirtualDiskReader probeNrg;
+        if (Formats::DetailUdfNrg::BuildNeroNrgReader(data, size, probeNrg)) {
+            if (Formats::ParseOrExtractNeroNrg(data, size, nullptr, &normTarget, &outBytes)) return true;
+        } else if (Formats::ParseOrExtractUdfImage(data, size, extLower, nullptr, &normTarget, &outBytes)) {
             return true;
         }
     }
 
-    // 6. ExtendedArchives100 specialized extractors (.cab SetupIterateCabinetW, .bsa/.ba2, .rpm, .msi/.msp, .iso, .vhd/.vhdx/.vmdk/.vdi/.qcow2/.dmg)
-    if (Formats::ExtractExtendedArchive100Entry(archivePath, data, size, extLower, normTarget, outBytes)) {
+    // 6. Specialized single-format extractors (.cab, .wim/.esd, .vpk, .asar, .bsa/.ba2, .deb, .rpm, .msi/.msp, .iso, virtual disks, game & FS archives)
+    auto tryExtract100 = [&]() -> bool {
+        if (size >= 36 && std::memcmp(data, "MSCF\0\0\0\0", 8) == 0) {
+            return Formats::ExtractCabinetMscfEntry(archivePath, data, size, normTarget, outBytes);
+        }
+        if (size >= 208 && std::memcmp(data, "MSWIM\0\0\0", 8) == 0) {
+            return Formats::ExtractWindowsWimEntry(data, size, normTarget, outBytes);
+        }
+        if (size >= 12 && ByteIO::RdU32LE(data) == 0x55AA1234u) {
+            return Formats::ExtractValveVpkEntry(archivePath, data, size, normTarget, outBytes);
+        }
+        if (extLower == L".asar" || (size >= 20 && ByteIO::RdU32LE(data) == 4u && data[16] == '{')) {
+            if (Formats::ExtractElectronAsarEntry(archivePath, data, size, normTarget, outBytes)) return true;
+            if (extLower == L".asar") return false;
+        }
+        if (size >= 36 && std::memcmp(data, "BSA\0", 4) == 0) {
+            return Formats::ExtractBethesdaBsaEntry(data, size, normTarget, outBytes);
+        }
+        if (size >= 24 && std::memcmp(data, "BTDX", 4) == 0) {
+            return Formats::ExtractBethesdaBa2Entry(data, size, normTarget, outBytes);
+        }
+        if (Formats::DetailArc100::IsDebianDebArchive(data, size, extLower)) {
+            return Formats::ExtractDebianDebEntry(data, size, extLower, normTarget, outBytes);
+        }
+        if (size >= 112 && data[0] == 0xED && data[1] == 0xAB && data[2] == 0xEE && data[3] == 0xDB) {
+            return Formats::ExtractRedHatRpmEntry(data, size, normTarget, outBytes);
+        }
+        if (extLower == L".msi" || extLower == L".msp") {
+            if (Formats::ExtractWindowsInstallerMsiEntry(data, size, extLower, normTarget, outBytes)) return true;
+        }
+        if (Formats::ExtractIso9660Entry(data, size, normTarget, outBytes)) {
+            return true;
+        }
+        if (size >= 72 && std::memcmp(data, "QFI\xFB", 4) == 0) return Formats::ExtractQcow2DiskEntry(data, size, normTarget, outBytes);
+        if (size >= 65536 && std::memcmp(data, "vhdxfile", 8) == 0) return Formats::ExtractVhdxDiskEntry(data, size, normTarget, outBytes);
+        if (size >= 1024 && (std::memcmp(data + size - 512, "conectix", 8) == 0 || std::memcmp(data, "conectix", 8) == 0)) return Formats::ExtractVhdDiskEntry(data, size, normTarget, outBytes);
+        if (size >= 512 && std::memcmp(data, "KDMV", 4) == 0) return Formats::ExtractVmdkDiskEntry(data, size, normTarget, outBytes);
+        if (size >= 512 && ByteIO::RdU32LE(data + 64) == 0xBEDA107Fu) return Formats::ExtractVdiDiskEntry(data, size, normTarget, outBytes);
+        if (size >= 512 && std::memcmp(data + size - 512, "koly", 4) == 0) return Formats::ExtractAppleDmgDiskEntry(data, size, normTarget, outBytes);
+        return Formats::ExtractRawFilesystemDiskEntry(data, size, extLower, normTarget, outBytes);
+    };
+    if (tryExtract100()) {
         return true;
     }
-    if (Formats::ExtractExtendedArchive200Entry(archivePath, data, size, extLower, normTarget, outBytes)) {
+
+    auto tryExtract200 = [&]() -> bool {
+        if (normTarget.empty()) return false;
+        if (Formats::ExtractUnityPackageEntry(data, size, extLower, normTarget, outBytes)) {
+            return true;
+        }
+        if (size >= 32 && std::memcmp(data, "UnityFS\0", 8) == 0) {
+            return Formats::ExtractUnityFsBundleEntry(data, size, normTarget, outBytes);
+        }
+        if (size >= 12 && std::memcmp(data, "RGSSAD\0", 7) == 0) {
+            return Formats::ExtractRpgMakerRgssEntry(data, size, normTarget, outBytes);
+        }
+        static const uint8_t kXp3Sig[11] = { 'X','P','3','\r','\n',' ','\n',0x1A,0x8B,0x67,0x01 };
+        if (size >= 28 && std::memcmp(data, kXp3Sig, 11) == 0) {
+            return Formats::ExtractKiriKiriXp3Entry(data, size, normTarget, outBytes);
+        }
+        if (size >= 32 && (std::memcmp(data, "MPQ\x1A", 4) == 0 || std::memcmp(data, "MPQ\x1B", 4) == 0)) {
+            return Formats::ExtractBlizzardMpqEntry(data, size, normTarget, outBytes);
+        }
+        if (size >= 20 && std::memcmp(data, "SCS#", 4) == 0) {
+            return Formats::ExtractScsPrismArchiveEntry(data, size, normTarget, outBytes);
+        }
+        if ((size >= 96 && std::memcmp(data, "hsqs", 4) == 0) ||
+            extLower == L".squashfs" || extLower == L".snap" || extLower == L".appimage")
+        {
+            if (Formats::ExtractLinuxSquashFsEntry(data, size, extLower, normTarget, outBytes)) return true;
+        }
+        if ((size >= 1152 && ByteIO::RdU32LE(data + 1024) == 0xE0F5E1E2u) || extLower == L".erofs") {
+            if (Formats::ExtractLinuxErofsEntry(data, size, normTarget, outBytes)) return true;
+        }
+        if (size >= 28 && std::memcmp(data, "xar!", 4) == 0) {
+            return Formats::ExtractAppleXarPkgEntry(data, size, extLower, normTarget, outBytes);
+        }
+        if (size >= 16 && (std::memcmp(data, "BIGF", 4) == 0 || std::memcmp(data, "BIG4", 4) == 0)) {
+            return Formats::ExtractEaBigArchiveEntry(data, size, normTarget, outBytes);
+        }
+        if (extLower == L".pbo") {
+            return Formats::ExtractBohemiaPboEntry(data, size, extLower, normTarget, outBytes);
+        }
+        if (Formats::DetailArc200::IsUnixArButNotDeb(data, size, extLower)) {
+            return Formats::ExtractUnixCoffArEntry(data, size, extLower, normTarget, outBytes);
+        }
+        if (size >= 24 && data[2] == '-' && (data[3] == 'l' || data[3] == 'p') && data[6] == '-') {
+            return Formats::ExtractLhaArchiveEntry(data, size, normTarget, outBytes);
+        }
+        if (size >= 34 && data[0] == 0x60 && data[1] == 0xEA) {
+            return Formats::ExtractArjArchiveEntry(data, size, normTarget, outBytes);
+        }
+        return false;
+    };
+    if (tryExtract200()) {
         return true;
     }
 

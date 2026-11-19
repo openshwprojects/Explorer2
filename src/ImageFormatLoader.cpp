@@ -3,6 +3,8 @@
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
+#include "JsonDom.h"
+#include "ByteIO.h"
 #if defined(_WIN32) || defined(E2_WIN32_HAL)
 // Windows codecs: WIC (JPEG / PNG inside other formats, HEIF), DirectWrite and GDI (fonts, metafiles), Media
 // Foundation (HEVC, H.264). On Linux with E2_WIN32_HAL, WIC is supplied by linux/win32_hal/src/WicHal.cpp.
@@ -14,6 +16,13 @@
 #include <mfidl.h>
 #include <mftransform.h>
 #include <mferror.h>
+#if defined(_WIN32)
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#endif
 #endif
 #include <algorithm>
 #include <array>
@@ -1127,55 +1136,109 @@ inline void BlitBlock4x4RgbaToPremulBgra(
 
 } // namespace GpuTex
 
-#include "formats/Tga.h"
-#include "formats/Psd.h"
-#include "formats/Xcf.h"
-#include "formats/Hdr.h"
-#include "formats/Netpbm.h"
-#include "formats/Pcx.h"
-#include "formats/Qoi.h"
-#include "formats/Dds.h"
-#include "formats/Xbm.h"
-#include "formats/Xpm.h"
-#include "formats/Svg.h"
+#include "formats/images/Tga.h"
+#include "formats/images/Psd.h"
+#include "formats/images/Xcf.h"
+#include "formats/images/Hdr.h"
+#include "formats/images/Netpbm.h"
+#include "formats/images/Pcx.h"
+#include "formats/images/Qoi.h"
+#include "formats/images/Dds.h"
+#include "formats/images/Xbm.h"
+#include "formats/images/Xpm.h"
+#include "formats/images/Svg.h"
 
 } // namespace
 
-#include "formats/Pam.h"
-#include "formats/Pfm.h"
-#include "formats/Sgi.h"
-#include "formats/Ras.h"
-#include "formats/Ktx.h"
-#include "formats/Vtf.h"
-#include "formats/Farbfeld.h"
-#include "formats/Fits.h"
-#include "formats/Pkm.h"
-#include "formats/Astc.h"
-#include "formats/Pvr.h"
-#include "formats/Ilbm.h"
-#include "formats/Tim.h"
-#include "formats/Wbmp.h"
-#include "formats/Bdf.h"
-#include "formats/Psf.h"
-#include "formats/Y4m.h"
-#include "formats/Ani.h"
-#include "formats/PaletteImg.h"
-#include "formats/Dicom.h"
-#include "formats/ExtendedImages100.h"
-#include "formats/ExtendedImages200.h"
-#define E2_RW_ENABLE_TXD 1
-#include "formats/RenderWare3D.h"
-#undef E2_RW_ENABLE_TXD
-#define E2_UE_ENABLE_TEX 1
-#include "formats/UnrealAsset3DTex.h"
-#undef E2_UE_ENABLE_TEX
-#include "formats/AvifHeifImage.h"
-#include "formats/Jpeg2000.h"
-#include "formats/TiffWebpNative.h"
-#define E2_RETROTEX_ENABLE_IMAGE 1
-#include "formats/RetroGameTex.h"
-#undef E2_RETROTEX_ENABLE_IMAGE
-#include "formats/ConsoleGameTex.h"
+#include "formats/images/Pam.h"
+#include "formats/images/Pfm.h"
+#include "formats/images/Sgi.h"
+#include "formats/images/Ras.h"
+#include "formats/images/Ktx.h"
+#include "formats/images/Vtf.h"
+#include "formats/images/Farbfeld.h"
+#include "formats/images/Fits.h"
+#include "formats/images/Pkm.h"
+#include "formats/images/Astc.h"
+#include "formats/images/Pvr.h"
+#include "formats/images/Ilbm.h"
+#include "formats/images/Tim.h"
+#include "formats/images/Wbmp.h"
+#include "formats/images/Bdf.h"
+#include "formats/images/Psf.h"
+#include "formats/images/Y4m.h"
+#include "formats/images/Ani.h"
+#include "formats/common/ImageFormatCommon.h"
+#include "formats/images/GimpPaletteGpl.h"
+#include "formats/images/JascPalettePal.h"
+#include "formats/images/AdobeColorAct.h"
+#include "formats/images/AdobeSwatchAco.h"
+#include "formats/images/OpenExr.h"
+#include "formats/images/Ktx2Image.h"
+#include "formats/images/BasisUniversal.h"
+#include "formats/images/AppleIcns.h"
+#include "formats/images/JpegXl.h"
+#include "formats/images/BetterPortableGraphicsBpg.h"
+#include "formats/images/BlizzardBlp.h"
+#include "formats/images/UnrealUtx.h"
+#include "formats/images/SmpteDpx.h"
+#include "formats/images/KodakCineon.h"
+#include "formats/images/ColorLutCube.h"
+#include "formats/images/ColorLut3dl.h"
+#include "formats/images/PhotometricIes.h"
+#include "formats/images/OpenRasterOra.h"
+#include "formats/images/KritaKra.h"
+#include "formats/images/ProcreateImage.h"
+#include "formats/images/ClipStudioClip.h"
+#include "formats/images/AsepriteImage.h"
+#include "formats/images/FontSpecimen.h"
+#include "formats/images/WindowsCursorCur.h"
+#include "formats/raw/CanonCr2.h"
+#include "formats/raw/CanonCr3.h"
+#include "formats/raw/NikonNef.h"
+#include "formats/raw/SonyArw.h"
+#include "formats/raw/AdobeDng.h"
+#include "formats/raw/FujifilmRaf.h"
+#include "formats/raw/OlympusOrf.h"
+#include "formats/raw/PanasonicRw2.h"
+#include "formats/raw/PentaxPef.h"
+#include "formats/images/WindowsEmf.h"
+#include "formats/images/WindowsWmf.h"
+#include "formats/images/PostScriptEps.h"
+#include "formats/images/AdobeIllustratorAi.h"
+#include "formats/images/CorelDrawCdr.h"
+#include "formats/images/AffinityImage.h"
+#include "formats/images/CgmVector.h"
+#include "formats/images/PhotoshopBrushAbr.h"
+#include "formats/images/GimpPat.h"
+#include "formats/images/PhotoshopPat.h"
+#include "formats/images/EmbroideryDst.h"
+#include "formats/images/EmbroideryPes.h"
+#include "formats/images/SixelGraphics.h"
+#include "formats/images/AnsiArt.h"
+#include "formats/images/RenderWareTxd.h"
+#include "formats/images/UnrealTexture2D.h"
+#include "formats/images/AvifImage.h"
+#include "formats/images/HeifImage.h"
+#include "formats/images/Jpeg2000.h"
+#include "formats/images/TiffImage.h"
+#include "formats/images/WebpImage.h"
+#include "formats/images/Quake2Wal.h"
+#include "formats/images/QuakeHlWadImage.h"
+#include "formats/images/QuakeHlSprite.h"
+#include "formats/images/QuakeLmp.h"
+#include "formats/images/BuildEngineArt.h"
+#include "formats/images/SwitchBntx.h"
+#include "formats/images/VitaGxt.h"
+#include "formats/images/Ps3Gtf.h"
+#include "formats/images/NamcoNut.h"
+#include "formats/images/CapcomTex.h"
+#include "formats/images/Source2VtexC.h"
+#include "formats/images/PaintDotNetPdn.h"
+#include "formats/images/JpegLs.h"
+#include "formats/images/SketchDesign.h"
+#include "formats/images/Svgz.h"
+#include "formats/images/Dicom.h"
 
 bool ImageFormatLoader::IsExtendedImageExtension(const std::wstring& extLower) {
     return extLower == L".tga" || extLower == L".icb" || extLower == L".vda" || extLower == L".vst" ||
@@ -1226,7 +1289,8 @@ bool ImageFormatLoader::IsExtendedImageExtension(const std::wstring& extLower) {
            extLower == L".jp2"  || extLower == L".j2k"  || extLower == L".jpf"  || extLower == L".jpx"  || extLower == L".j2c" ||
            extLower == L".tif"  || extLower == L".tiff" || extLower == L".btf"  || extLower == L".tf8"  || extLower == L".webp" ||
            extLower == L".cur"  || extLower == L".wal"  || extLower == L".wad"  || extLower == L".spr"  || extLower == L".lmp"  || extLower == L".art" ||
-           extLower == L".bntx" || extLower == L".gxt"  || extLower == L".gtf"  || extLower == L".nut"  || extLower == L".tex"  || extLower == L".vtex_c";
+           extLower == L".bntx" || extLower == L".gxt"  || extLower == L".gtf"  || extLower == L".nut"  || extLower == L".tex"  || extLower == L".vtex_c" ||
+           extLower == L".pdn"  || extLower == L".jls"  || extLower == L".sketch" || extLower == L".svgz";
 }
 
 bool ImageFormatLoader::DecodeImageMemory(
@@ -1243,9 +1307,15 @@ try {
     // Check magic signatures first so even misnamed files decode reliably
     if (size >= 4 && std::memcmp(data, "8BPS", 4) == 0) {
         ok = DecodePSD(data, size, outInfo);
-    } else if (extLower == L".avif" || extLower == L".heic" || extLower == L".heif" || extLower == L".avci" ||
+    } else if ((size >= 16 && std::memcmp(data, "PDN3", 4) == 0) || extLower == L".pdn") {
+        ok = Formats::DecodePaintDotNet(data, size, outInfo);
+    } else if (extLower == L".jls" || Formats::IsLikelyJpegLsSignature(data, size)) {
+        ok = Formats::DecodeJpegLs(data, size, outInfo);
+    } else if (extLower == L".avif" || (extLower != L".cr3" && Formats::IsLikelyAvifSignature(data, size))) {
+        ok = Formats::DecodeAvifImage(data, size, extLower, outInfo);
+    } else if (extLower == L".heic" || extLower == L".heif" || extLower == L".avci" ||
                (extLower != L".cr3" && Formats::IsLikelyAvifOrHeifSignature(data, size))) {
-        ok = Formats::DecodeAvifOrHeifImage(data, size, extLower, outInfo);
+        ok = Formats::DecodeHeifImage(data, size, extLower, outInfo);
     } else if (extLower == L".jp2" || extLower == L".j2k" || extLower == L".jpf" || extLower == L".jpx" || extLower == L".j2c" ||
                Formats::IsLikelyJpeg2000Signature(data, size)) {
         ok = Formats::DecodeJpeg2000(data, size, extLower, outInfo);
@@ -1271,9 +1341,9 @@ try {
     } else if (size >= 12 && data[0] == 0xAB && std::memcmp(data + 1, "KTX 11", 6) == 0) {
         ok = Formats::DecodeKTX(data, size, outInfo);
     } else if (size >= 12 && data[0] == 0xAB && std::memcmp(data + 1, "KTX 20", 6) == 0) {
-        ok = Formats::DecodeKTX2OrBasis(data, size, extLower, outInfo);
+        ok = Formats::DecodeKtx2Image(data, size, outInfo);
     } else if (size >= 77 && data[0] == 's' && data[1] == 'B' && ReadU16LE(data + 4) >= 77) {
-        ok = Formats::DecodeKTX2OrBasis(data, size, L".basis", outInfo);
+        ok = Formats::DecodeBasisUniversal(data, size, outInfo);
     } else if (size >= 32 && data[0] == 0x76 && data[1] == 0x2F && data[2] == 0x31 && data[3] == 0x01) {
         ok = Formats::DecodeOpenEXR(data, size, outInfo);
     } else if (size >= 24 && std::memcmp(data, "CSFCHUNK", 8) == 0) {
@@ -1283,7 +1353,7 @@ try {
     } else if (size >= 16 && std::memcmp(data, "icns", 4) == 0) {
         ok = Formats::DecodeAppleICNS(data, size, outInfo);
     } else if (size >= 12 && std::memcmp(data, "ASEF", 4) == 0) {
-        ok = Formats::DecodePaletteSwatch(data, size, extLower, outInfo);
+        ok = Formats::DecodeAdobeSwatchAco(data, size, outInfo);
     } else if (size >= 32 && data[0] == 0x59 && data[1] == 0xA6 && data[2] == 0x6A && data[3] == 0x95) {
         ok = Formats::DecodeSunRaster(data, size, outInfo);
     } else if (size >= 512 && data[0] == 0x01 && data[1] == 0xDA) {
@@ -1306,6 +1376,8 @@ try {
         ok = Formats::DecodeFarbfeld(data, size, outInfo);
     } else if (extLower == L".fits" || (extLower == L".fit" && size >= 80 && std::memcmp(data, "SIMPLE", 6) == 0) || extLower == L".fts") {
         ok = Formats::DecodeFITS(data, size, outInfo);
+    } else if (extLower == L".svgz") {
+        ok = Formats::DecodeSVGZ(data, size, maxDimension, outInfo);
     } else if (extLower == L".svg") {
         ok = DecodeSVG(data, size, maxDimension, outInfo);
     } else if (extLower == L".dds") {
@@ -1372,45 +1444,116 @@ try {
         ok = Formats::DecodeSource2VtexC(data, size, outInfo);
     } else if (extLower == L".ani" || (size >= 12 && std::memcmp(data, "RIFF", 4) == 0 && std::memcmp(data + 8, "ACON", 4) == 0)) {
         ok = Formats::DecodeANI(data, size, outInfo);
-    } else if (extLower == L".gpl" || extLower == L".pal" || extLower == L".act" || extLower == L".aco") {
-        ok = Formats::DecodePaletteSwatch(data, size, extLower, outInfo);
+    } else if (extLower == L".gpl") {
+        ok = Formats::DecodeGimpPaletteGpl(data, size, outInfo);
+    } else if (extLower == L".pal") {
+        ok = Formats::DecodeJascPalettePal(data, size, outInfo);
+    } else if (extLower == L".act") {
+        ok = Formats::DecodeAdobeColorAct(data, size, outInfo);
+    } else if (extLower == L".aco") {
+        ok = Formats::DecodeAdobeSwatchAco(data, size, outInfo);
     } else if (extLower == L".dcm" || extLower == L".dicom" || (size >= 132 && std::memcmp(data + 128, "DICM", 4) == 0)) {
         ok = Formats::DecodeDICOM(data, size, outInfo);
     } else if (extLower == L".exr") {
         ok = Formats::DecodeOpenEXR(data, size, outInfo);
-    } else if (extLower == L".ktx2" || extLower == L".basis") {
-        ok = Formats::DecodeKTX2OrBasis(data, size, extLower, outInfo);
-    } else if (extLower == L".kra" || extLower == L".ora" || extLower == L".procreate") {
-        ok = Formats::DecodeZipArtworkContainer(data, size, extLower, outInfo);
+    } else if (extLower == L".ktx2") {
+        ok = Formats::DecodeKtx2Image(data, size, outInfo);
+    } else if (extLower == L".basis") {
+        ok = Formats::DecodeBasisUniversal(data, size, outInfo);
+    } else if (extLower == L".sketch") {
+        ok = Formats::DecodeSketchDocument(data, size, maxDimension, outInfo);
+    } else if (extLower == L".ora") {
+        ok = Formats::DecodeOpenRasterOra(data, size, outInfo);
+    } else if (extLower == L".kra") {
+        ok = Formats::DecodeKritaKra(data, size, outInfo);
+    } else if (extLower == L".procreate") {
+        ok = Formats::DecodeProcreateImage(data, size, outInfo);
     } else if (extLower == L".clip") {
         ok = Formats::DecodeClipStudio(data, size, outInfo);
-    } else if (extLower == L".aseprite") {
+    } else if (extLower == L".aseprite" || extLower == L".ase") {
         ok = Formats::DecodeAseprite(data, size, outInfo);
     } else if (extLower == L".icns") {
         ok = Formats::DecodeAppleICNS(data, size, outInfo);
-    } else if (extLower == L".jxl" || extLower == L".bpg" || (size >= 8 && std::memcmp(data, "BPG\xFB", 4) == 0) ||
+    } else if (extLower == L".bpg" || (size >= 8 && std::memcmp(data, "BPG\xFB", 4) == 0)) {
+        ok = Formats::DecodeBetterPortableGraphicsBpg(data, size, outInfo);
+    } else if (extLower == L".jxl" ||
                (size >= 12 && std::memcmp(data, "\x00\x00\x00\x0CJXL \x0D\x0A\x87\x0A", 12) == 0)) {
-        ok = Formats::DecodeJxlOrBpg(data, size, extLower, outInfo);
+        ok = Formats::DecodeJpegXl(data, size, outInfo);
     } else if (extLower == L".uasset" ||
                (size >= 64 && ReadU32LE(data) == 0x9E2A83C1u && static_cast<int32_t>(ReadU32LE(data + 4)) < 0)) {
         ok = Formats::DecodeUnrealTexture2D(data, size, L"", outInfo);
-    } else if (extLower == L".blp" || extLower == L".utx" || (size >= 36 && ReadU32LE(data) == 0x9E2A83C1u)) {
-        ok = Formats::DecodeBlpOrUtx(data, size, extLower, outInfo);
+    } else if (size >= 148 && (std::memcmp(data, "BLP2", 4) == 0 || std::memcmp(data, "BLP1", 4) == 0)) {
+        ok = Formats::DecodeBlizzardBlp(data, size, outInfo);
+    } else if (extLower == L".blp") {
+        ok = Formats::DecodeBlizzardBlp(data, size, outInfo);
+    } else if (extLower == L".utx" || (size >= 36 && ReadU32LE(data) == 0x9E2A83C1u)) {
+        ok = Formats::DecodeUnrealUtx(data, size, outInfo);
     } else if (extLower == L".txd" || (size >= 36 && ReadU32LE(data) == 0x16u && Formats::RwStreamDetail::IsPlausibleRwVersion(ReadU32LE(data + 8)))) {
         ok = Formats::DecodeRenderWareTxd(data, size, outInfo);
-    } else if (extLower == L".dpx" || extLower == L".cin") {
-        ok = Formats::DecodeDpxOrCineon(data, size, extLower, outInfo);
-    } else if (extLower == L".cube" || extLower == L".3dl") {
-        ok = Formats::DecodeColorLutCube(data, size, extLower, outInfo);
+    } else if (extLower == L".dpx") {
+        ok = Formats::DecodeSmpteDpx(data, size, outInfo);
+    } else if (extLower == L".cin") {
+        ok = Formats::DecodeKodakCineon(data, size, outInfo);
+    } else if (extLower == L".cube") {
+        ok = Formats::DecodeColorLutCube(data, size, outInfo);
+    } else if (extLower == L".3dl") {
+        ok = Formats::DecodeColorLut3dl(data, size, outInfo);
     } else if (extLower == L".ies") {
         ok = Formats::DecodePhotometricIES(data, size, extLower, outInfo);
     } else if (extLower == L".ttf" || extLower == L".otf" || extLower == L".woff" || extLower == L".woff2" ||
                (size >= 44 && std::memcmp(data, "wOFF", 4) == 0) || (size >= 48 && std::memcmp(data, "wOF2", 4) == 0)) {
         ok = Formats::DecodeFontSpecimen(data, size, extLower, outInfo);
-    } else if (size >= 12 && std::memcmp(data, "8BPT", 4) == 0) {
-        ok = Formats::DecodeAbrOrPat(data, size, L".pat", outInfo);
-    } else {
-        ok = Formats::DecodeExtendedImages200(data, size, extLower, outInfo);
+    } else if (size >= 24 && std::memcmp(data + 20, "GPAT", 4) == 0) {
+        ok = Formats::DecodeGimpPat(data, size, outInfo);
+    } else if ((size >= 12 && std::memcmp(data, "8BPT", 4) == 0) || extLower == L".pat") {
+        ok = Formats::DecodePhotoshopPat(data, size, outInfo) || Formats::DecodeGimpPat(data, size, outInfo);
+    } else if (extLower == L".abr") {
+        ok = Formats::DecodePhotoshopBrushAbr(data, size, outInfo);
+    } else if (extLower == L".cr2") {
+        ok = Formats::DecodeCanonCr2(data, size, outInfo);
+    } else if (extLower == L".cr3") {
+        ok = Formats::DecodeCanonCr3(data, size, outInfo);
+    } else if (extLower == L".nef") {
+        ok = Formats::DecodeNikonNef(data, size, outInfo);
+    } else if (extLower == L".arw") {
+        ok = Formats::DecodeSonyArw(data, size, outInfo);
+    } else if (extLower == L".dng") {
+        ok = Formats::DecodeAdobeDng(data, size, outInfo);
+    } else if (extLower == L".raf") {
+        ok = Formats::DecodeFujifilmRaf(data, size, outInfo);
+    } else if (extLower == L".orf") {
+        ok = Formats::DecodeOlympusOrf(data, size, outInfo);
+    } else if (extLower == L".rw2") {
+        ok = Formats::DecodePanasonicRw2(data, size, outInfo);
+    } else if (extLower == L".pef") {
+        ok = Formats::DecodePentaxPef(data, size, outInfo);
+    } else if (extLower == L".eps") {
+        ok = Formats::DecodePostScriptEps(data, size, outInfo);
+    } else if (extLower == L".ai") {
+        ok = Formats::DecodeAdobeIllustratorAi(data, size, outInfo);
+    } else if (extLower == L".cdr") {
+        ok = Formats::DecodeCorelDrawCdr(data, size, outInfo);
+    } else if (extLower == L".afphoto" || extLower == L".afdesign" || extLower == L".afpub") {
+        ok = Formats::DecodeAffinityImage(data, size, extLower, outInfo);
+    } else if (extLower == L".emf" || extLower == L".wmf") {
+        if (size >= 88 && ReadU32LE(data) == 1u && ReadU32LE(data + 40) == 0x464D4520u) {
+            ok = Formats::DecodeWindowsEmf(data, size, outInfo);
+        } else if (extLower == L".wmf" || (size >= 18 && (ReadU32LE(data) == 0x9AC6CDD7u ||
+                   ((ReadU16LE(data) == 1u || ReadU16LE(data) == 2u) && ReadU16LE(data + 2) == 9u)))) {
+            ok = Formats::DecodeWindowsWmf(data, size, outInfo);
+        } else {
+            ok = Formats::DecodeWindowsEmf(data, size, outInfo);
+        }
+    } else if (extLower == L".cgm") {
+        ok = Formats::DecodeCgmVector(data, size, outInfo);
+    } else if (extLower == L".dst") {
+        ok = Formats::DecodeEmbroideryDst(data, size, outInfo);
+    } else if (extLower == L".pes") {
+        ok = Formats::DecodeEmbroideryPes(data, size, outInfo);
+    } else if (extLower == L".sixel") {
+        ok = Formats::DecodeSixelGraphics(data, size, extLower, outInfo);
+    } else if (extLower == L".ans") {
+        ok = Formats::DecodeAnsiArt(data, size, outInfo);
     }
 
     if (ok && outInfo.valid) {

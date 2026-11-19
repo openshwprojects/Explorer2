@@ -35,6 +35,9 @@ public:
     static bool IsLikely3DGeoOrDemFile(const std::wstring& fullPath, const std::wstring& extLower) {
         return MeshReaders::IsLikely3DGeoOrDemFile(fullPath, extLower);
     }
+    static bool IsLikelyQuakeMapFile(const std::wstring& fullPath) {
+        return MeshReaders::IsLikelyQuakeMapFile(fullPath);
+    }
     static bool InspectMeshFile(const std::wstring& fullPath, LoadedMesh3D& outMesh) {
         return MeshReaders::InspectMeshFile(fullPath, outMesh);
     }

@@ -308,7 +308,8 @@ static inline bool IsImageExtension(const std::wstring& extLower) {
            extLower == L".jp2"  || extLower == L".j2k"  || extLower == L".jpf"  || extLower == L".jpx"  || extLower == L".j2c" ||
            extLower == L".btf"  || extLower == L".tf8"  || extLower == L".cur"  ||
            extLower == L".wal"  || extLower == L".wad"  || extLower == L".spr"  || extLower == L".lmp"  || extLower == L".art" ||
-           extLower == L".bntx" || extLower == L".gxt"  || extLower == L".gtf"  || extLower == L".nut"  || extLower == L".vtex_c";
+           extLower == L".bntx" || extLower == L".gxt"  || extLower == L".gtf"  || extLower == L".nut"  || extLower == L".vtex_c" ||
+           extLower == L".pdn"  || extLower == L".jls"  || extLower == L".sketch" || extLower == L".svgz";
 }
 
 inline bool IsVideoExtension(const std::wstring& extLower) {

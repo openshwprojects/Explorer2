@@ -7102,9 +7102,9 @@ static void RunStage14Tests(TestCounter& tc) {
         p16be(jks, 5); jks.insert(jks.end(), {'X','.','5','0','9'});
         p32be(jks, 4); jks.insert(jks.end(), {0x30, 0x02, 0x05, 0x00});
 
-        // #91 .cat (ASN.1 DER PKCS#7 + SPC_CATALOG_LIST OID + SHA-256 OCTET STRING)
+        // #91 .cat (ASN.1 DER SPC_CATALOG_LIST OID + ReferenceTag + SHA-1 OCTET STRING)
         std::vector<uint8_t> cat = {
-            0x30, 0x34,
+            0x30, 0x30,
             0x06, 0x0A, 0x2B,0x06,0x01,0x04,0x01,0x82,0x37,0x0C,0x01,0x01,
             0x13, 0x0C, 'M','S','_','W','i','n','_','D','r','v','6','4',
             0x04, 0x14, 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20

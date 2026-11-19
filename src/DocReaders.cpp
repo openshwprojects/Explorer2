@@ -6,9 +6,9 @@
 #include "PathUtils.h"
 #include "ZipDeflate.h"
 #include "Ole2Compound.h"
-#include "formats/AiModelFormats.h"
+#include "formats/common/AiModelDispatch.h"
 #ifdef _WIN32
-#include <wincrypt.h>   // certificates (ExtendedSysSec100.h)
+#include <wincrypt.h>   // certificates (X509Cert.h, Pkcs7Bundle.h, AuthenticodeCat.h)
 #include <bcrypt.h>     // SHA-1 of torrent info (BitTorrent.h)
 #endif
 #include <cstdio>
@@ -44,70 +44,179 @@ static int ExcelCellRefToColIndex(std::string_view cellRef, int* outRowIdx = nul
     return std::max(0, col - 1);
 }
 
-#include "formats/CsvTsv.h"
-#include "formats/ExcelXlsxOds.h"
-#include "formats/WordDocxOdt.h"
-#include "formats/Rtf.h"
-#include "formats/PowerPointPptxOdp.h"
-#include "formats/Epub.h"
-#include "formats/Fb2.h"
-#include "formats/Sqlite.h"
-#include "formats/Dbf.h"
-#include "formats/Dif.h"
-#include "formats/Sylk.h"
+
+#include "formats/docs/Rtf.h"
+#include "formats/docs/Epub.h"
+#include "formats/docs/Fb2.h"
+#include "formats/data/Sqlite.h"
+#include "formats/data/Dbf.h"
+#include "formats/data/Dif.h"
+#include "formats/data/Sylk.h"
 
 } // namespace
 
-#include "formats/Parquet.h"
-#include "formats/Avro.h"
-#include "formats/Bson.h"
-#include "formats/Ics.h"
-#include "formats/Vcf.h"
-#include "formats/Srt.h"
-#include "formats/Vtt.h"
-#include "formats/Ass.h"
-#include "formats/Gpx.h"
-#include "formats/Kml.h"
-#include "formats/GeoJson.h"
-#include "formats/OpenStreetMap.h"
-#include "formats/GarminTcx.h"
-#include "formats/BibTex.h"
-#include "formats/RisCitation.h"
-#include "formats/WekaArff.h"
-#include "formats/MatrixMarket.h"
-#include "formats/NdJson.h"
-#include "formats/HttpArchiveHar.h"
-#include "formats/LibPcap.h"
-#include "formats/BitTorrent.h"
-#include "formats/CueSheet.h"
-#include "formats/PlaylistM3u.h"
-#include "formats/MidiFile.h"
-#include "formats/AudioContainer.h"
-#include "formats/BioMedicalEdf.h"
-#include "formats/ElfBinary.h"
-#include "formats/WebAssemblyWasm.h"
-#include "formats/NmeaGpsLog.h"
-#include "formats/IgcFlightLog.h"
-#include "formats/GpsTrackMap.h"
-#include "formats/ExtendedSysSec100.h"
-#include "formats/ExtendedAiData100.h"
-#include "formats/ExtendedGeoSci100.h"
-#include "formats/ExtendedMediaDoc100.h"
-#include "formats/ExtendedDocs200.h"
-#include "formats/LegacyOfficeOle.h"
-#include "formats/ValveMaterialVmt.h"
+#include "formats/data/Parquet.h"
+#include "formats/data/Avro.h"
+#include "formats/data/Bson.h"
+#include "formats/docs/Ics.h"
+#include "formats/docs/Vcf.h"
+#include "formats/docs/Srt.h"
+#include "formats/docs/Vtt.h"
+#include "formats/docs/Ass.h"
+#include "formats/gis/Gpx.h"
+#include "formats/gis/Kml.h"
+#include "formats/gis/GeoJson.h"
+#include "formats/gis/OpenStreetMap.h"
+#include "formats/gis/GarminTcx.h"
+#include "formats/docs/BibTex.h"
+#include "formats/docs/RisCitation.h"
+#include "formats/data/WekaArff.h"
+#include "formats/data/MatrixMarket.h"
+#include "formats/data/NdJson.h"
+#include "formats/data/HttpArchiveHar.h"
+#include "formats/data/BitTorrent.h"
+#include "formats/audio/CueSheet.h"
+#include "formats/audio/PlaylistM3u.h"
+#include "formats/audio/MidiFile.h"
+#include "formats/data/BioMedicalEdf.h"
+#include "formats/security/ElfBinary.h"
+#include "formats/security/WebAssemblyWasm.h"
+#include "formats/gis/NmeaGpsLog.h"
+#include "formats/gis/IgcFlightLog.h"
+#include "formats/common/GpsTrackMap.h"
+#include "formats/common/DocFormatCommon.h"
+#include "formats/data/CsvDoc.h"
+#include "formats/data/TsvDoc.h"
+#include "formats/docs/ExcelXlsx.h"
+#include "formats/docs/OpenDocumentOds.h"
+#include "formats/docs/WordDocx.h"
+#include "formats/docs/OpenDocumentOdt.h"
+#include "formats/docs/PowerPointPptx.h"
+#include "formats/docs/OpenDocumentOdp.h"
+#include "formats/docs/WordLegacyDoc.h"
+#include "formats/docs/ExcelLegacyXls.h"
+#include "formats/docs/PowerPointLegacyPpt.h"
+#include "formats/audio/WavAudio.h"
+#include "formats/audio/FlacAudio.h"
+#include "formats/audio/AiffAudio.h"
+#include "formats/security/WindowsPeBinary.h"
+#include "formats/security/WindowsShortcutLnk.h"
+#include "formats/security/WindowsPrefetchPf.h"
+#include "formats/security/WindowsEvtxLog.h"
+#include "formats/security/WindowsMinidumpDmp.h"
+#include "formats/security/MsfPdbSymbols.h"
+#include "formats/security/JavaClassFile.h"
+#include "formats/security/AndroidDexFile.h"
+#include "formats/security/AppleMachOBinary.h"
+#include "formats/security/X509Cert.h"
+#include "formats/security/Pkcs10Csr.h"
+#include "formats/security/Pkcs7Bundle.h"
+#include "formats/security/Pkcs12Keystore.h"
+#include "formats/security/KeePassKdbx.h"
+#include "formats/security/LibPcap.h"
+#include "formats/security/PcapNgCapture.h"
+#include "formats/security/Uf2Firmware.h"
+#include "formats/ai/NumPyNpy.h"
+#include "formats/ai/NumPyNpz.h"
+#include "formats/ai/JupyterIpynb.h"
+#include "formats/data/CborDoc.h"
+#include "formats/data/MessagePackDoc.h"
+#include "formats/ai/PyTorchCheckpoint.h"
+#include "formats/ai/TfLiteModel.h"
+#include "formats/data/ApacheArrowIpc.h"
+#include "formats/data/FeatherTable.h"
+#include "formats/data/ApacheOrc.h"
+#include "formats/data/Hdf5Data.h"
+#include "formats/data/MatlabMat.h"
+#include "formats/data/SpssSav.h"
+#include "formats/data/StataDta.h"
+#include "formats/data/Sas7bdat.h"
+#include "formats/data/RSerializedRds.h"
+#include "formats/data/DuckDbDatabase.h"
+#include "formats/gis/EsriShapefileDoc.h"
+#include "formats/gis/GeoPackageGpkg.h"
+#include "formats/gis/GarminFit.h"
+#include "formats/gis/KmzArchiveDoc.h"
+#include "formats/data/NetCdfData.h"
+#include "formats/gis/WmoGrib.h"
+#include "formats/data/NiftiVolume.h"
+#include "formats/docs/EmailEml.h"
+#include "formats/docs/UnixMbox.h"
+#include "formats/audio/Mp3Audio.h"
+#include "formats/audio/OggVorbisAudio.h"
+#include "formats/audio/OpusAudio.h"
+#include "formats/audio/SpeexAudio.h"
+#include "formats/audio/TrackerMod.h"
+#include "formats/audio/TrackerXm.h"
+#include "formats/audio/TrackerS3m.h"
+#include "formats/audio/TrackerIt.h"
+#include "formats/audio/SoundFontSf2.h"
+#include "formats/audio/SoundFontSfz.h"
+#include "formats/audio/MuseScoreMscz.h"
+#include "formats/audio/AbletonAls.h"
+#include "formats/audio/FlStudioFlp.h"
+#include "formats/audio/GuitarProTab.h"
+#include "formats/audio/ReaperRpp.h"
+#include "formats/docs/CmxEdl.h"
+#include "formats/docs/FinalCutFcpxml.h"
+#include "formats/docs/OpenTimelineOtio.h"
+#include "formats/docs/VobSubIdx.h"
+#include "formats/docs/VobSubMpegSub.h"
+#include "formats/docs/BluraySup.h"
+#include "formats/docs/MicroDvdSub.h"
+#include "formats/docs/SubViewerSub.h"
+#include "formats/docs/OutlookMsg.h"
+#include "formats/docs/KindleMobi.h"
+#include "formats/docs/DjVuDoc.h"
+#include "formats/docs/ChmHelp.h"
+#include "formats/data/AccessDatabaseMdb.h"
+#include "formats/data/RedisRdb.h"
+#include "formats/data/RocksLevelDbSst.h"
+#include "formats/gis/PmTilesMap.h"
+#include "formats/gis/MbTilesMap.h"
+#include "formats/gis/OsmPbfMap.h"
+#include "formats/data/ProtobufWire.h"
+#include "formats/data/TerraformState.h"
+#include "formats/security/SarifLog.h"
+#include "formats/security/SpdxSbom.h"
+#include "formats/security/CycloneDxSbom.h"
+#include "formats/security/OpenPgpPacket.h"
+#include "formats/security/JavaKeyStoreJks.h"
+#include "formats/security/AuthenticodeCat.h"
+#include "formats/security/WindowsRegistryHive.h"
+#include "formats/security/WindowsEtlTrace.h"
+#include "formats/security/GroupPolicyPol.h"
+#include "formats/audio/ChiptuneSid.h"
+#include "formats/audio/ChiptuneNsf.h"
+#include "formats/audio/ChiptuneSpc.h"
+#include "formats/audio/ChiptuneVgm.h"
+#include "formats/audio/MusicXmlScore.h"
+#include "formats/docs/AdobeXmp.h"
+#include "formats/docs/UnrealAssetDoc.h"
+#include "formats/docs/UnityYamlScene.h"
+#include "formats/docs/VisioVsdx.h"
+#include "formats/docs/AppleIwa.h"
+#include "formats/docs/ApplePages.h"
+#include "formats/docs/AppleNumbers.h"
+#include "formats/docs/AppleKeynote.h"
+#include "formats/docs/ExcelXlsb.h"
+#include "formats/docs/OutlookPst.h"
+#include "formats/docs/AdobeIdml.h"
+#include "formats/docs/MimeHtmlMht.h"
+#include "formats/docs/ApplePlist.h"
+#include "formats/docs/ValveMaterialVmt.h"
 
 namespace DocReaders {
 
 bool IsSpreadsheetOrDocExtension(const std::wstring& extLower) {
     return extLower == L".csv"     || extLower == L".tsv"     || extLower == L".psv"  ||
-           extLower == L".xlsx"    || extLower == L".xlsm"    || extLower == L".xls"  ||
+           extLower == L".xlsx"    || extLower == L".xlsm"    || extLower == L".xlsb" || extLower == L".xls"  ||
            extLower == L".ods"     || extLower == L".docx"    || extLower == L".docm" ||
            extLower == L".doc"     || extLower == L".dot"     || extLower == L".ppt"  || extLower == L".pps" ||
            extLower == L".odt"     || extLower == L".rtf"     || extLower == L".pptx" ||
            extLower == L".ppsx"    || extLower == L".pptm"    || extLower == L".ppsm" ||
            extLower == L".potx"    || extLower == L".potm"    || extLower == L".odp"  ||
-           extLower == L".otp"     || extLower == L".epub" ||
+           extLower == L".otp"     || extLower == L".epub"    || extLower == L".idml" ||
            extLower == L".fb2"     || extLower == L".sqlite"  || extLower == L".sqlite3" ||
            extLower == L".db"      || extLower == L".dbf"     || extLower == L".dif"  ||
            extLower == L".slk"     || extLower == L".sylk"    || extLower == L".parquet" ||
@@ -128,7 +237,8 @@ bool IsSpreadsheetOrDocExtension(const std::wstring& extLower) {
            extLower == L".lnk"     || extLower == L".pf"      || extLower == L".evtx" || extLower == L".dmp"  ||
            extLower == L".mdmp"    || extLower == L".class"   || extLower == L".dex"  || extLower == L".macho"||
            extLower == L".dylib"   || extLower == L".crt"     || extLower == L".cer"  || extLower == L".pem"  ||
-           extLower == L".der"     || extLower == L".csr"     || extLower == L".p12"  || extLower == L".pfx"  ||
+           extLower == L".der"     || extLower == L".csr"     || extLower == L".p7b"  || extLower == L".p7c"  ||
+           extLower == L".p12"     || extLower == L".pfx"     ||
            extLower == L".kdbx"    || extLower == L".pcapng"  || extLower == L".uf2"  ||
            extLower == L".onnx"    || extLower == L".gguf"    || extLower == L".safetensors" ||
            extLower == L".tflite"  || extLower == L".pt"      || extLower == L".pth"  ||
@@ -141,12 +251,14 @@ bool IsSpreadsheetOrDocExtension(const std::wstring& extLower) {
            extLower == L".nc"      || extLower == L".cdf"     || extLower == L".grib" || extLower == L".grib2"|| extLower == L".grb"  || extLower == L".nii"  ||
            extLower == L".ogg"     || extLower == L".opus"    || extLower == L".spx"  || extLower == L".mp3"  ||
            extLower == L".mod"     || extLower == L".xm"      || extLower == L".it"   || extLower == L".s3m"  ||
-           extLower == L".sf2"     || extLower == L".sfz"     || extLower == L".gp"   || extLower == L".gp5"  ||
+           extLower == L".sf2"     || extLower == L".sfz"     || extLower == L".gp"   || extLower == L".gp3"  || extLower == L".gp4" || extLower == L".gp5"  ||
            extLower == L".mscz"    || extLower == L".als"     || extLower == L".flp"  || extLower == L".rpp"  ||
            extLower == L".edl"     || extLower == L".fcpxml"  || extLower == L".otio" || extLower == L".sub"  ||
            extLower == L".idx"     || extLower == L".sup"     || extLower == L".eml"  || extLower == L".mbox" ||
-           extLower == L".msg"     || extLower == L".mobi"    || extLower == L".azw3" || extLower == L".djvu" ||
-           extLower == L".chm"     ||
+           extLower == L".msg"     || extLower == L".pst"     || extLower == L".ost"  || extLower == L".mht"  || extLower == L".mhtml" ||
+           extLower == L".mobi"    || extLower == L".azw"     || extLower == L".azw3" || extLower == L".prc"  ||
+           extLower == L".djvu"    || extLower == L".djv"     ||
+           extLower == L".chm"     || extLower == L".plist"   ||
            extLower == L".accdb"   || extLower == L".mdb"     || extLower == L".rdb"  || extLower == L".sst"  ||
            extLower == L".ldb"     || extLower == L".mbtiles" || extLower == L".pmtiles" || extLower == L".pb" ||
            extLower == L".pbf"     || extLower == L".tfstate" || extLower == L".sarif"|| extLower == L".spdx" ||
@@ -155,7 +267,7 @@ bool IsSpreadsheetOrDocExtension(const std::wstring& extLower) {
            extLower == L".pol"     || extLower == L".sid"     || extLower == L".nsf"  || extLower == L".spc"  ||
            extLower == L".vgm"     || extLower == L".musicxml"|| extLower == L".mxl"  || extLower == L".xmp"  ||
            extLower == L".uasset"  || extLower == L".umap"    || extLower == L".prefab"|| extLower == L".unity"||
-           extLower == L".pages"   || extLower == L".numbers" || extLower == L".key"  || extLower == L".vsdx" ||
+           extLower == L".pages"   || extLower == L".numbers" || extLower == L".key"  || extLower == L".iwa"  || extLower == L".vsdx" ||
            extLower == L".vmt";
 }
 
@@ -181,552 +293,6 @@ static std::vector<uint8_t> ReadFileTail(const std::wstring& path, uint64_t file
     return tail;
 }
 static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc, uint64_t& bytesNotRead);
-
-namespace BiffXlsDetail {
-
-// little-endian loads (ByteIO.h)
-inline uint16_t Rd16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
-inline uint32_t Rd32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
-inline double RdF64(const uint8_t* p) { return ::Explorer2::ByteIO::RdF64LE(p); }
-
-inline double DecodeBiffRk(uint32_t rk) {
-    double v = 0.0;
-    if ((rk & 0x02u) != 0) {
-        int32_t iv = static_cast<int32_t>(rk) >> 2;
-        v = static_cast<double>(iv);
-    } else {
-        uint64_t bits = static_cast<uint64_t>(rk & ~3u) << 34;
-        std::memcpy(&v, &bits, 8);
-    }
-    if ((rk & 0x01u) != 0) {
-        v /= 100.0;
-    }
-    return v;
-}
-
-inline std::wstring FormatXlsNumber(double v) {
-    if (std::isnan(v)) return L"#NUM!";
-    if (std::isinf(v)) return v < 0 ? L"-Inf" : L"Inf";
-    if (v == 0.0) return L"0";
-    wchar_t buf[64] = {};
-    double av = std::fabs(v);
-    if (av >= 1e-4 && av < 1e12 && std::floor(v) == v) {
-        swprintf_s(buf, L"%.0f", v);
-    } else {
-        swprintf_s(buf, L"%.12g", v);
-    }
-    return buf;
-}
-
-inline std::wstring BiffErrCodeToStr(uint8_t err) {
-    switch (err) {
-        case 0x00: return L"#NULL!";
-        case 0x07: return L"#DIV/0!";
-        case 0x0F: return L"#VALUE!";
-        case 0x17: return L"#REF!";
-        case 0x1D: return L"#NAME?";
-        case 0x24: return L"#NUM!";
-        case 0x2A: return L"#N/A";
-        default:   return L"#ERR!";
-    }
-}
-
-struct BiffChunk {
-    const uint8_t* ptr = nullptr;
-    size_t len = 0;
-};
-
-// MS-XLS 2.5.293 XLUnicodeRichExtendedString cursor spanning SST + CONTINUE record boundaries
-struct SstStreamCursor {
-    const std::vector<BiffChunk>& chunks;
-    size_t cIdx = 0;
-    size_t off  = 0;
-
-    explicit SstStreamCursor(const std::vector<BiffChunk>& c) : chunks(c) {}
-
-    bool EnsureAvail() {
-        while (cIdx < chunks.size() && off >= chunks[cIdx].len) {
-            ++cIdx;
-            off = 0;
-        }
-        return cIdx < chunks.size();
-    }
-
-    bool ReadRawBytes(uint8_t* dst, size_t count) {
-        size_t got = 0;
-        while (got < count) {
-            if (!EnsureAvail()) return false;
-            size_t avail = chunks[cIdx].len - off;
-            size_t take = std::min(count - got, avail);
-            std::memcpy(dst + got, chunks[cIdx].ptr + off, take);
-            off += take;
-            got += take;
-        }
-        return true;
-    }
-
-    bool SkipRawBytes(size_t count) {
-        size_t rem = count;
-        while (rem > 0) {
-            if (!EnsureAvail()) return false;
-            size_t avail = chunks[cIdx].len - off;
-            size_t take = std::min(rem, avail);
-            off += take;
-            rem -= take;
-        }
-        return true;
-    }
-
-    bool ReadRichExtendedString(std::wstring& out) {
-        out.clear();
-        uint8_t hdr[3] = {};
-        if (!ReadRawBytes(hdr, 3)) return false;
-        uint16_t cch = Rd16(hdr);
-        uint8_t flags = hdr[2];
-        bool fHighByte = (flags & 0x01u) != 0;
-        bool fExtSt    = (flags & 0x04u) != 0;
-        bool fRichSt   = (flags & 0x08u) != 0;
-
-        uint16_t cRun = 0;
-        if (fRichSt) {
-            uint8_t rb[2] = {};
-            if (!ReadRawBytes(rb, 2)) return false;
-            cRun = Rd16(rb);
-        }
-        uint32_t cbExtRst = 0;
-        if (fExtSt) {
-            uint8_t eb[4] = {};
-            if (!ReadRawBytes(eb, 4)) return false;
-            cbExtRst = Rd32(eb);
-        }
-
-        out.reserve(cch);
-        size_t remChars = cch;
-        while (remChars > 0) {
-            if (cIdx >= chunks.size()) return false;
-            if (off >= chunks[cIdx].len) {
-                // Crossing into a CONTINUE record mid-string: first byte of CONTINUE gives new fHighByte!
-                ++cIdx;
-                off = 0;
-                while (cIdx < chunks.size() && chunks[cIdx].len == 0) ++cIdx;
-                if (cIdx >= chunks.size()) return false;
-                uint8_t contFlags = chunks[cIdx].ptr[off++];
-                fHighByte = (contFlags & 0x01u) != 0;
-            }
-            size_t availBytes = chunks[cIdx].len - off;
-            if (fHighByte) {
-                if (availBytes < 2) {
-                    uint8_t b2[2] = {};
-                    if (!ReadRawBytes(b2, 2)) return false;
-                    out.push_back(static_cast<wchar_t>(Rd16(b2)));
-                    --remChars;
-                    continue;
-                }
-                size_t takeChars = std::min(remChars, availBytes / 2);
-                const uint8_t* p = chunks[cIdx].ptr + off;
-                for (size_t i = 0; i < takeChars; ++i) {
-                    out.push_back(static_cast<wchar_t>(Rd16(p + i * 2)));
-                }
-                off += takeChars * 2;
-                remChars -= takeChars;
-            } else {
-                size_t takeChars = std::min(remChars, availBytes);
-                const uint8_t* p = chunks[cIdx].ptr + off;
-                for (size_t i = 0; i < takeChars; ++i) {
-                    out.push_back(static_cast<wchar_t>(p[i]));
-                }
-                off += takeChars;
-                remChars -= takeChars;
-            }
-        }
-
-        if (cRun > 0 && !SkipRawBytes(static_cast<size_t>(cRun) * 4)) return false;
-        if (cbExtRst > 0 && !SkipRawBytes(cbExtRst)) return false;
-        return true;
-    }
-};
-
-inline std::wstring ReadInlineBiffString(const uint8_t* p, size_t avail, bool isBiff8, bool lenIs16Bit) {
-    if (avail == 0) return {};
-    size_t pos = 0;
-    uint16_t cch = 0;
-    if (lenIs16Bit) {
-        if (avail < 2) return {};
-        cch = Rd16(p);
-        pos = 2;
-    } else {
-        cch = p[0];
-        pos = 1;
-    }
-    if (cch == 0) return {};
-
-    if (!isBiff8) {
-        size_t take = std::min<size_t>(cch, avail - pos);
-        std::wstring out;
-        out.reserve(take);
-        for (size_t i = 0; i < take; ++i) out.push_back(static_cast<wchar_t>(p[pos + i]));
-        return out;
-    }
-
-    if (pos >= avail) return {};
-    uint8_t flags = p[pos++];
-    bool fHighByte = (flags & 0x01u) != 0;
-    bool fExtSt    = (flags & 0x04u) != 0;
-    bool fRichSt   = (flags & 0x08u) != 0;
-    if (fRichSt) { if (pos + 2 > avail) return {}; pos += 2; }
-    if (fExtSt)  { if (pos + 4 > avail) return {}; pos += 4; }
-
-    std::wstring out;
-    if (fHighByte) {
-        size_t take = std::min<size_t>(cch, (avail - pos) / 2);
-        out.reserve(take);
-        for (size_t i = 0; i < take; ++i) out.push_back(static_cast<wchar_t>(Rd16(p + pos + i * 2)));
-    } else {
-        size_t take = std::min<size_t>(cch, avail - pos);
-        out.reserve(take);
-        for (size_t i = 0; i < take; ++i) out.push_back(static_cast<wchar_t>(p[pos + i]));
-    }
-    return out;
-}
-
-inline bool ParseBiffWorkbook(const std::vector<uint8_t>& raw, ParsedOfficeDocument& outDoc) {
-    std::vector<uint8_t> streamBuf;
-    const uint8_t* biff = nullptr;
-    size_t biffSize = 0;
-
-    Ole2::CompoundFile cf;
-    if (Ole2::ParseCompoundFile(raw.data(), raw.size(), cf)) {
-        const Ole2::DirEntry* wb = Ole2::FindStreamCaseInsensitive(cf, L"Workbook");
-        if (!wb) wb = Ole2::FindStreamCaseInsensitive(cf, L"Book");
-        if (!wb || !Ole2::ExtractStream(cf, *wb, streamBuf) || streamBuf.size() < 8) {
-            return false;
-        }
-        biff = streamBuf.data();
-        biffSize = streamBuf.size();
-    } else {
-        if (raw.size() < 8) return false;
-        uint16_t rec0 = Rd16(raw.data());
-        uint16_t len0 = Rd16(raw.data() + 2);
-        if ((rec0 != 0x0809 && rec0 != 0x0409 && rec0 != 0x0209 && rec0 != 0x0009) || len0 < 4 || len0 > 64 || 4u + len0 > raw.size()) {
-            return false;
-        }
-        biff = raw.data();
-        biffSize = raw.size();
-    }
-
-    uint16_t firstRec = Rd16(biff);
-    uint16_t firstLen = Rd16(biff + 2);
-    if ((firstRec != 0x0809 && firstRec != 0x0409 && firstRec != 0x0209 && firstRec != 0x0009) || firstLen < 4 || 4u + firstLen > biffSize) {
-        return false;
-    }
-
-    uint16_t biffVer = Rd16(biff + 4);
-    uint16_t firstSubType = Rd16(biff + 6);
-    bool isBiff8 = (firstRec == 0x0809 && biffVer >= 0x0600);
-
-    struct BoundSheetMeta {
-        uint32_t bofOffset = 0;
-        uint8_t visibility = 0;
-        uint8_t sheetType  = 0;
-        std::wstring name;
-    };
-    std::vector<BoundSheetMeta> boundSheets;
-    std::vector<std::wstring> sst;
-
-    size_t pos = 0;
-    if (firstSubType == 0x0005) {
-        while (pos + 4 <= biffSize) {
-            uint16_t recId  = Rd16(biff + pos);
-            uint16_t recLen = Rd16(biff + pos + 2);
-            pos += 4;
-            if (recLen > biffSize - pos) break;
-            const uint8_t* p = biff + pos;
-            size_t nextPos = pos + recLen;
-
-            if (recId == 0x000A) {
-                pos = nextPos;
-                break;
-            }
-            if (recId == 0x0085 && recLen >= 7) {
-                BoundSheetMeta bs;
-                bs.bofOffset  = Rd32(p);
-                bs.visibility = p[4];
-                bs.sheetType  = p[5];
-                bs.name       = ReadInlineBiffString(p + 6, recLen - 6, isBiff8, false);
-                if (bs.name.empty()) bs.name = L"Sheet" + std::to_wstring(boundSheets.size() + 1);
-                boundSheets.push_back(std::move(bs));
-            } else if (recId == 0x00FC && recLen >= 8) {
-                uint32_t cstUnique = Rd32(p + 4);
-                std::vector<BiffChunk> chunks;
-                chunks.push_back({ p + 8, static_cast<size_t>(recLen - 8) });
-
-                while (nextPos + 4 <= biffSize && Rd16(biff + nextPos) == 0x003C) {
-                    uint16_t contLen = Rd16(biff + nextPos + 2);
-                    if (contLen > biffSize - (nextPos + 4)) break;
-                    chunks.push_back({ biff + nextPos + 4, contLen });
-                    nextPos += 4 + contLen;
-                }
-
-                uint32_t capUnique = std::min<uint32_t>(cstUnique, 500000u);
-                sst.reserve(std::min<uint32_t>(capUnique, 4096u));
-                SstStreamCursor cur(chunks);
-                for (uint32_t i = 0; i < capUnique; ++i) {
-                    std::wstring s;
-                    if (!cur.ReadRichExtendedString(s)) break;
-                    sst.push_back(std::move(s));
-                }
-            }
-            pos = nextPos;
-        }
-    }
-
-    auto parseWorksheetAt = [&](size_t startOff, const std::wstring& sheetName, size_t& outEndOff) -> bool {
-        outEndOff = startOff;
-        if (startOff + 8 > biffSize) return false;
-        uint16_t bofId  = Rd16(biff + startOff);
-        uint16_t bofLen = Rd16(biff + startOff + 2);
-        if ((bofId != 0x0809 && bofId != 0x0409 && bofId != 0x0209 && bofId != 0x0009) ||
-            bofLen < 4 || startOff + 4 + bofLen > biffSize) {
-            return false;
-        }
-        uint16_t subVer  = Rd16(biff + startOff + 4);
-        uint16_t subType = Rd16(biff + startOff + 6);
-        bool subBiff8 = (bofId == 0x0809 && subVer >= 0x0600) || isBiff8;
-        if (subType != 0x0010 && subType != 0x0040 && bofId == 0x0809) {
-            size_t cur = startOff + 4 + bofLen;
-            int bofDepth = 1;
-            while (cur + 4 <= biffSize && bofDepth > 0) {
-                uint16_t rid = Rd16(biff + cur);
-                uint16_t rln = Rd16(biff + cur + 2);
-                cur += 4;
-                if (rln > biffSize - cur) break;
-                if (rid == 0x0809 || rid == 0x0409 || rid == 0x0209 || rid == 0x0009) ++bofDepth;
-                else if (rid == 0x000A) --bofDepth;
-                cur += rln;
-            }
-            outEndOff = cur;
-            return false;
-        }
-
-        SpreadsheetSheet sheet;
-        sheet.name = sheetName;
-
-        auto setCell = [&](uint16_t r, uint16_t c, std::wstring val) {
-            if (r >= 16384 || c >= 512) return;
-            if (sheet.rows.size() <= r) sheet.rows.resize(static_cast<size_t>(r) + 1);
-            if (sheet.rows[r].size() <= c) sheet.rows[r].resize(static_cast<size_t>(c) + 1);
-            sheet.rows[r][c] = std::move(val);
-            sheet.maxCols = std::max(sheet.maxCols, static_cast<size_t>(c) + 1);
-        };
-
-        bool hasPendingFormulaStr = false;
-        uint16_t pendingFormulaRow = 0;
-        uint16_t pendingFormulaCol = 0;
-
-        size_t cur = startOff + 4 + bofLen;
-        int nestedBof = 0;
-        while (cur + 4 <= biffSize) {
-            uint16_t rid = Rd16(biff + cur);
-            uint16_t rln = Rd16(biff + cur + 2);
-            cur += 4;
-            if (rln > biffSize - cur) break;
-            const uint8_t* rp = biff + cur;
-            size_t nextCur = cur + rln;
-
-            if (rid == 0x0809 || rid == 0x0409 || rid == 0x0209 || rid == 0x0009) {
-                ++nestedBof;
-                cur = nextCur;
-                continue;
-            }
-            if (rid == 0x000A) {
-                if (nestedBof > 0) {
-                    --nestedBof;
-                    cur = nextCur;
-                    continue;
-                }
-                outEndOff = nextCur;
-                break;
-            }
-            if (nestedBof > 0) {
-                cur = nextCur;
-                continue;
-            }
-
-            switch (rid) {
-                case 0x00FD: // LABELSST
-                    if (rln >= 10) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t col = Rd16(rp + 2);
-                        uint32_t idx = Rd32(rp + 6);
-                        if (idx < sst.size()) setCell(row, col, sst[idx]);
-                    }
-                    hasPendingFormulaStr = false;
-                    break;
-
-                case 0x0204: // LABEL
-                case 0x00D6: // RSTRING
-                    if (rln >= 8) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t col = Rd16(rp + 2);
-                        setCell(row, col, ReadInlineBiffString(rp + 6, rln - 6, subBiff8, true));
-                    }
-                    hasPendingFormulaStr = false;
-                    break;
-
-                case 0x0004: // BIFF2 LABEL
-                    if (rln >= 8) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t col = Rd16(rp + 2);
-                        setCell(row, col, ReadInlineBiffString(rp + 7, rln - 7, false, false));
-                    }
-                    hasPendingFormulaStr = false;
-                    break;
-
-                case 0x0203: // NUMBER
-                    if (rln >= 14) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t col = Rd16(rp + 2);
-                        setCell(row, col, FormatXlsNumber(RdF64(rp + 6)));
-                    }
-                    hasPendingFormulaStr = false;
-                    break;
-
-                case 0x027E: // RK
-                case 0x007E:
-                    if (rln >= 10) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t col = Rd16(rp + 2);
-                        setCell(row, col, FormatXlsNumber(DecodeBiffRk(Rd32(rp + 6))));
-                    }
-                    hasPendingFormulaStr = false;
-                    break;
-
-                case 0x00BD: // MULRK
-                    if (rln >= 6) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t colFirst = Rd16(rp + 2);
-                        uint16_t colLast  = Rd16(rp + rln - 2);
-                        size_t count = (colLast >= colFirst) ? static_cast<size_t>(colLast - colFirst + 1) : 0;
-                        for (size_t i = 0; i < count && 4 + (i + 1) * 6 + 2 <= rln; ++i) {
-                            uint32_t rk = Rd32(rp + 4 + i * 6 + 2);
-                            setCell(row, static_cast<uint16_t>(colFirst + i), FormatXlsNumber(DecodeBiffRk(rk)));
-                        }
-                    }
-                    hasPendingFormulaStr = false;
-                    break;
-
-                case 0x0205: // BOOLERR
-                    if (rln >= 8) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t col = Rd16(rp + 2);
-                        if (rp[7] == 0) setCell(row, col, rp[6] != 0 ? L"TRUE" : L"FALSE");
-                        else setCell(row, col, BiffErrCodeToStr(rp[6]));
-                    }
-                    hasPendingFormulaStr = false;
-                    break;
-
-                case 0x0006: // FORMULA
-                case 0x0406:
-                case 0x0206:
-                    hasPendingFormulaStr = false;
-                    if (rln >= 14) {
-                        uint16_t row = Rd16(rp);
-                        uint16_t col = Rd16(rp + 2);
-                        if (Rd16(rp + 12) != 0xFFFFu) {
-                            setCell(row, col, FormatXlsNumber(RdF64(rp + 6)));
-                        } else {
-                            uint8_t resType = rp[6];
-                            if (resType == 0x00) {
-                                hasPendingFormulaStr = true;
-                                pendingFormulaRow = row;
-                                pendingFormulaCol = col;
-                            } else if (resType == 0x01) {
-                                setCell(row, col, rp[8] != 0 ? L"TRUE" : L"FALSE");
-                            } else if (resType == 0x02) {
-                                setCell(row, col, BiffErrCodeToStr(rp[8]));
-                            } else if (resType == 0x03) {
-                                setCell(row, col, L"");
-                            }
-                        }
-                    }
-                    break;
-
-                case 0x0207: // STRING
-                    if (hasPendingFormulaStr && rln >= 2) {
-                        std::vector<BiffChunk> schunks;
-                        schunks.push_back({ rp, rln });
-                        while (nextCur + 4 <= biffSize && Rd16(biff + nextCur) == 0x003C) {
-                            uint16_t cl = Rd16(biff + nextCur + 2);
-                            if (cl > biffSize - (nextCur + 4)) break;
-                            schunks.push_back({ biff + nextCur + 4, cl });
-                            nextCur += 4 + cl;
-                        }
-                        if (subBiff8) {
-                            SstStreamCursor scur(schunks);
-                            std::wstring s;
-                            if (scur.ReadRichExtendedString(s)) setCell(pendingFormulaRow, pendingFormulaCol, std::move(s));
-                        } else {
-                            setCell(pendingFormulaRow, pendingFormulaCol, ReadInlineBiffString(rp, rln, false, true));
-                        }
-                        hasPendingFormulaStr = false;
-                    }
-                    break;
-
-                case 0x04BC: // SHRFMLA
-                case 0x0221: // ARRAY
-                case 0x0236: // TABLE
-                    break;
-
-                default:
-                    hasPendingFormulaStr = false;
-                    break;
-            }
-            cur = nextCur;
-        }
-
-        if (sheet.rows.empty()) {
-            sheet.rows.push_back({ L"" });
-            sheet.maxCols = 1;
-        }
-        outDoc.sheets.push_back(std::move(sheet));
-        outEndOff = cur;
-        return true;
-    };
-
-    if (!boundSheets.empty()) {
-        for (const auto& bs : boundSheets) {
-            if (bs.sheetType == 0x00 || bs.sheetType == 0x01) {
-                size_t endOff = 0;
-                parseWorksheetAt(bs.bofOffset, bs.name, endOff);
-            }
-        }
-    } else {
-        size_t scan = (firstSubType == 0x0005) ? pos : 0;
-        size_t idx = 1;
-        while (scan + 8 <= biffSize && outDoc.sheets.size() < 32) {
-            uint16_t rid = Rd16(biff + scan);
-            uint16_t rln = Rd16(biff + scan + 2);
-            if (rid == 0x0809 || rid == 0x0409 || rid == 0x0209 || rid == 0x0009) {
-                size_t endOff = scan;
-                parseWorksheetAt(scan, L"Sheet" + std::to_wstring(idx++), endOff);
-                if (endOff <= scan) break;
-                scan = endOff;
-            } else {
-                if (4u + rln > biffSize - scan) break;
-                scan += 4 + rln;
-            }
-        }
-    }
-
-    if (outDoc.sheets.empty()) return false;
-    outDoc.kind = OfficeFileKind::ExcelXls;
-    outDoc.isSpreadsheet = true;
-    outDoc.formatTitle = isBiff8 ? L"Microsoft Excel 97-2003 BIFF8 (.xls)" : L"Microsoft Excel BIFF5 Workbook (.xls)";
-    outDoc.valid = true;
-    return true;
-}
-
-} // namespace BiffXlsDetail
 
 bool InspectOfficeFile(const std::wstring& fullPath, ParsedOfficeDocument& outDoc) try {
     uint64_t bytesNotRead = 0;
@@ -762,6 +328,203 @@ bool InspectOfficeFile(const std::wstring& fullPath, ParsedOfficeDocument& outDo
     return ok;
 } E2_READER_CATCH(L"Document reader", fullPath, { outDoc = ParsedOfficeDocument(); return false; })
 
+
+static bool DispatchSysSecFormats(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
+    if (extLower == L".exe" || extLower == L".dll" || extLower == L".sys" || extLower == L".ocx" ||
+        extLower == L".scr" || extLower == L".efi" || extLower == L".drv" || extLower == L".cpl" ||
+        (raw.size() >= 64 && raw[0] == 'M' && raw[1] == 'Z' &&
+         Formats::DetailSys100::RdU32LE(raw.data() + 60) + 24 <= raw.size() &&
+         std::memcmp(raw.data() + Formats::DetailSys100::RdU32LE(raw.data() + 60), "PE\0\0", 4) == 0))
+    {
+        return Formats::ParseWindowsPeBinary(raw, out);
+    }
+    if ((extLower == L".so" || extLower == L".o") && raw.size() >= 52 &&
+        raw[0] == 0x7F && raw[1] == 'E' && raw[2] == 'L' && raw[3] == 'F')
+    {
+        return Formats::ParseElfBinaryDoc(raw, out);
+    }
+    if (extLower == L".lnk" || (raw.size() >= 76 && Formats::DetailSys100::RdU32LE(raw.data()) == 0x0000004Cu && raw[4] == 0x01 && raw[5] == 0x14)) {
+        return Formats::ParseWindowsLnkShortcut(raw, out);
+    }
+    if (extLower == L".pf" || (raw.size() >= 84 && std::memcmp(raw.data() + 4, "SCCA", 4) == 0) ||
+        (raw.size() >= 12 && raw[0] == 'M' && raw[1] == 'A' && raw[2] == 'M' && (raw[3] & 0x0Fu) == 0x04u))
+    {
+        return Formats::ParseWindowsPrefetch(raw, out);
+    }
+    if (extLower == L".evtx" || (raw.size() >= 128 && std::memcmp(raw.data(), "ElfFile\0", 8) == 0)) {
+        return Formats::ParseWindowsEvtxLog(raw, out);
+    }
+    if (extLower == L".dmp" || extLower == L".mdmp" || (raw.size() >= 32 && std::memcmp(raw.data(), "MDMP", 4) == 0)) {
+        return Formats::ParseWindowsMinidump(raw, out);
+    }
+    if (extLower == L".pdb" || (raw.size() >= 56 && std::memcmp(raw.data(), "Microsoft C/C++ MSF 7.00", 24) == 0)) {
+        return Formats::ParseMsfPdbSymbols(raw, out);
+    }
+    if (extLower == L".macho" || extLower == L".dylib" || extLower == L".so") {
+        return Formats::ParseAppleMachOBinary(raw, out);
+    }
+    if (extLower == L".class") {
+        return Formats::ParseJavaClassFile(raw, out);
+    }
+    if (raw.size() >= 28 && Formats::IsValidMachOFatArchive(raw, out.sourceFileSize)) {
+        return Formats::ParseAppleMachOBinary(raw, out);
+    }
+    if (raw.size() >= 24 && Formats::DetailSys100::RdU32BE(raw.data()) == 0xCAFEBABEu) {
+        return Formats::ParseJavaClassFile(raw, out);
+    }
+    if (raw.size() >= 28 && Formats::IsValidMachOMagic(Formats::DetailSys100::RdU32LE(raw.data()))) {
+        return Formats::ParseAppleMachOBinary(raw, out);
+    }
+    if (extLower == L".dex" || (raw.size() >= 112 && std::memcmp(raw.data(), "dex\n", 4) == 0)) {
+        return Formats::ParseAndroidDexFile(raw, out);
+    }
+    if (extLower == L".crt" || extLower == L".cer" || extLower == L".pem" || extLower == L".der") {
+        return Formats::ParseX509CertDoc(raw, extLower, out);
+    }
+    if (extLower == L".csr") return Formats::ParsePkcs10CsrDoc(raw, extLower, out);
+    if (extLower == L".p7b" || extLower == L".p7c") return Formats::ParsePkcs7BundleDoc(raw, extLower, out);
+    if (extLower == L".p12" || extLower == L".pfx") return Formats::ParsePkcs12KeystoreDoc(raw, extLower, out);
+    if (extLower == L".kdbx" || (raw.size() >= 16 && Formats::DetailSys100::RdU32LE(raw.data()) == 0x9AA2D903u && Formats::DetailSys100::RdU32LE(raw.data() + 4) == 0xB54BFB67u)) {
+        return Formats::ParseKeePassKdbx(raw, out);
+    }
+    if (extLower == L".pcapng" || (raw.size() >= 28 && Formats::DetailSys100::RdU32LE(raw.data()) == 0x0A0D0D0Au)) {
+        return Formats::ParsePcapNgCapture(raw, out) || Formats::ParseLibPcapDoc(raw, out);
+    }
+    if (extLower == L".pcap") {
+        return Formats::ParseLibPcapDoc(raw, out) || Formats::ParsePcapNgCapture(raw, out);
+    }
+    if (extLower == L".uf2" || (raw.size() >= 512 && std::memcmp(raw.data(), "UF2\n", 4) == 0)) {
+        return Formats::ParseUf2Firmware(raw, out);
+    }
+    return false;
+}
+
+static bool DispatchAiDataFormats(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
+    if (extLower == L".npy" || (raw.size() >= 10 && std::memcmp(raw.data(), "\x93NUMPY", 6) == 0)) {
+        return Formats::ParseNumPyNpy(raw, out);
+    }
+    if (extLower == L".npz") return Formats::ParseNumPyNpz(raw, out);
+    if (extLower == L".ipynb") return Formats::ParseJupyterIpynb(raw, out);
+    if (extLower == L".cbor") return Formats::ParseCborDoc(raw, out);
+    if (extLower == L".msgpack" || extLower == L".mpk") return Formats::ParseMessagePackDoc(raw, extLower, out);
+    if (extLower == L".onnx" || extLower == L".gguf" || extLower == L".safetensors") {
+        return ::Explorer2::AiModels::ParseAiModelMemoryToDocument(raw.data(), raw.size(), extLower, out);
+    }
+    if (extLower == L".pt" || extLower == L".pth" || extLower == L".ckpt") return Formats::ParsePyTorchCheckpoint(raw, extLower, out);
+    if (extLower == L".tflite") return Formats::ParseTfLiteModel(raw, out);
+    if (extLower == L".feather") return Formats::ParseFeatherTable(raw, extLower, out);
+    if (extLower == L".arrow" || extLower == L".ipc") return Formats::ParseApacheArrowIpc(raw, extLower, out);
+    if (extLower == L".orc") return Formats::ParseApacheOrc(raw, out);
+    if (extLower == L".h5" || extLower == L".hdf5") return Formats::ParseHdf5Doc(raw, extLower, out);
+    if (extLower == L".mat") return Formats::ParseMatlabMat(raw, out);
+    if (extLower == L".sav") return Formats::ParseSpssSav(raw, out);
+    if (extLower == L".dta") return Formats::ParseStataDta(raw, out);
+    if (extLower == L".sas7bdat") return Formats::ParseSas7bdat(raw, out);
+    if (extLower == L".rds") return Formats::ParseRSerializedRds(raw, out);
+    if (extLower == L".duckdb") return Formats::ParseDuckDbDatabase(raw, out);
+    return false;
+}
+
+static bool DispatchGeoSciFormats(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
+    if (extLower == L".shp" || extLower == L".shx" ||
+        (raw.size() >= 100 && Formats::GeoSciDetail::RdU32BE(raw.data()) == 9994u))
+    {
+        return Formats::ParseEsriShapefileDoc(raw, extLower, out);
+    }
+    if (extLower == L".gpkg") {
+        return Formats::ParseGeoPackageGpkg(raw, out);
+    }
+    if (extLower == L".fit" || (raw.size() >= 14 && (raw[0] == 12 || raw[0] == 14) && std::memcmp(raw.data() + 8, ".FIT", 4) == 0)) {
+        return Formats::ParseGarminFitDoc(raw, out);
+    }
+    if (extLower == L".kmz") {
+        return Formats::ParseKmzArchiveDoc(raw, out);
+    }
+    if (extLower == L".nc" || extLower == L".cdf" ||
+        (raw.size() >= 16 && (std::memcmp(raw.data(), "CDF\x01", 4) == 0 ||
+                              std::memcmp(raw.data(), "CDF\x02", 4) == 0 ||
+                              std::memcmp(raw.data(), "CDF\x05", 4) == 0)))
+    {
+        return Formats::ParseNetCdfData(raw, extLower, out);
+    }
+    if (extLower == L".grib" || extLower == L".grib2" || extLower == L".grb" ||
+        (raw.size() >= 16 && std::memcmp(raw.data(), "GRIB", 4) == 0 && (raw[7] == 1 || raw[7] == 2)))
+    {
+        return Formats::ParseWmoGribDoc(raw, out);
+    }
+    if (extLower == L".nii" || extLower == L".nii.gz") {
+        return Formats::ParseNiftiVolumeDoc(raw, out);
+    }
+    return false;
+}
+
+static bool DispatchMediaDocFormats(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
+    if (extLower == L".eml")   return Formats::ParseEmailEmlDoc(raw, out);
+    if (extLower == L".mbox")  return Formats::ParseUnixMboxDoc(raw, out);
+    if (extLower == L".mp3")   return Formats::ParseMp3AudioDoc(raw, out);
+    if (extLower == L".opus")  return Formats::ParseOpusAudioDoc(raw, extLower, out) || Formats::ParseOggVorbisAudioDoc(raw, extLower, out);
+    if (extLower == L".spx")   return Formats::ParseSpeexAudioDoc(raw, extLower, out) || Formats::ParseOggVorbisAudioDoc(raw, extLower, out);
+    if (extLower == L".ogg")   return Formats::ParseOggVorbisAudioDoc(raw, extLower, out) || Formats::ParseOpusAudioDoc(raw, extLower, out) || Formats::ParseSpeexAudioDoc(raw, extLower, out);
+    if (extLower == L".mod")   return Formats::ParseTrackerModDoc(raw, out);
+    if (extLower == L".xm")    return Formats::ParseTrackerXmDoc(raw, out);
+    if (extLower == L".s3m")   return Formats::ParseTrackerS3mDoc(raw, out);
+    if (extLower == L".it")    return Formats::ParseTrackerItDoc(raw, out);
+    if (extLower == L".sf2")   return Formats::ParseSoundFontSf2Doc(raw, out);
+    if (extLower == L".sfz")   return Formats::ParseSoundFontSfzDoc(raw, out);
+    if (extLower == L".mscz")  return Formats::ParseMuseScoreMsczDoc(raw, out);
+    if (extLower == L".als")   return Formats::ParseAbletonAlsDoc(raw, out);
+    if (extLower == L".flp")   return Formats::ParseFlStudioFlpDoc(raw, out);
+    if (extLower == L".gp" || extLower == L".gp3" || extLower == L".gp4" || extLower == L".gp5") return Formats::ParseGuitarProTabDoc(raw, extLower, out);
+    if (extLower == L".rpp")   return Formats::ParseReaperRppDoc(raw, out);
+    if (extLower == L".edl")   return Formats::ParseCmxEdlDoc(raw, out);
+    if (extLower == L".fcpxml") return Formats::ParseFinalCutFcpxmlDoc(raw, out);
+    if (extLower == L".otio")  return Formats::ParseOpenTimelineOtioDoc(raw, out);
+    if (extLower == L".idx")   return Formats::ParseVobSubIdxDoc(raw, out);
+    if (extLower == L".sup")   return Formats::ParseBluraySupDoc(raw, out);
+    if (extLower == L".sub")   return Formats::ParseVobSubSpuDoc(raw, out) || Formats::ParseMicroDvdSubDoc(raw, out) || Formats::ParseSubViewerSubDoc(raw, out);
+    if (extLower == L".msg")   return Formats::ParseOutlookMsgDoc(raw, out);
+    if (extLower == L".mobi" || extLower == L".azw" || extLower == L".azw3" || extLower == L".prc") return Formats::ParseKindleMobiDoc(raw, extLower, out);
+    if (extLower == L".djvu" || extLower == L".djv") return Formats::ParseDjVuDoc(raw, out);
+    if (extLower == L".chm")   return Formats::ParseChmHelpDoc(raw, out);
+    return false;
+}
+
+static bool DispatchExtended200Formats(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
+    if (extLower == L".accdb" || extLower == L".mdb") return Formats::ParseAccessDatabase200(raw, extLower, out);
+    if (extLower == L".rdb") return Formats::ParseRedisRdb200(raw, out);
+    if (extLower == L".sst" || extLower == L".ldb") return Formats::ParseRocksLevelDbSst200(raw, extLower, out);
+    if (extLower == L".pmtiles") return Formats::ParsePmTilesMapDoc(raw, extLower, out);
+    if (extLower == L".mbtiles") return Formats::ParseMbTilesMapDoc(raw, extLower, out);
+    if (extLower == L".pbf") return Formats::ParseOsmPbfMapDoc(raw, extLower, out) || Formats::ParseProtobufWireDoc(raw, extLower, out);
+    if (extLower == L".pb") return Formats::ParseProtobufWireDoc(raw, extLower, out);
+    if (extLower == L".tfstate") return Formats::ParseTerraformStateDoc(raw, out);
+    if (extLower == L".sarif") return Formats::ParseSarifLogDoc(raw, out);
+    if (extLower == L".spdx") return Formats::ParseSpdxSbomDoc(raw, out);
+    if (extLower == L".cdx") return Formats::ParseCycloneDxSbomDoc(raw, out);
+    if (extLower == L".gpg" || extLower == L".pgp" || extLower == L".sig") return Formats::ParseOpenPgpPacketDoc(raw, extLower, out);
+    if (extLower == L".jks") return Formats::ParseJavaKeyStoreJksDoc(raw, extLower, out);
+    if (extLower == L".cat") return Formats::ParseAuthenticodeCatDoc(raw, extLower, out);
+    if (extLower == L".hiv" || extLower == L".dat") {
+        return Formats::ParseWindowsRegistryHiveDoc(raw, extLower, out) || Formats::ParseGroupPolicyPolDoc(raw, extLower, out);
+    }
+    if (extLower == L".etl") return Formats::ParseWindowsEtlTraceDoc(raw, extLower, out);
+    if (extLower == L".pol") return Formats::ParseGroupPolicyPolDoc(raw, extLower, out);
+    if (extLower == L".sid") return Formats::ParseChiptuneSidDoc(raw, out);
+    if (extLower == L".nsf") return Formats::ParseChiptuneNsfDoc(raw, out);
+    if (extLower == L".spc") return Formats::ParseChiptuneSpcDoc(raw, out);
+    if (extLower == L".vgm") return Formats::ParseChiptuneVgmDoc(raw, out);
+    if (extLower == L".musicxml" || extLower == L".mxl") return Formats::ParseMusicXmlScoreDoc(raw, extLower, out);
+    if (extLower == L".xmp") return Formats::ParseAdobeXmpDoc(raw, extLower, out);
+    if (extLower == L".uasset" || extLower == L".umap") return Formats::ParseUnrealAssetDoc(raw, extLower, out);
+    if (extLower == L".prefab" || extLower == L".unity") return Formats::ParseUnityYamlSceneDoc(raw, extLower, out);
+    if (extLower == L".vsdx") return Formats::ParseVisioVsdxDoc(raw, extLower, out);
+    if (extLower == L".pages")   return Formats::ParseApplePagesDoc(raw, out);
+    if (extLower == L".numbers") return Formats::ParseAppleNumbersDoc(raw, out);
+    if (extLower == L".key")     return Formats::ParseAppleKeynoteDoc(raw, out);
+    if (extLower == L".iwa")     return Formats::ParseAppleIwaDoc(raw, out);
+    return false;
+}
+
 static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocument& outDoc, uint64_t& bytesNotRead) {
     bytesNotRead = 0;
     outDoc = ParsedOfficeDocument{};
@@ -773,25 +536,43 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
         }
     }
 
-    if (ext == L".xlsx" || ext == L".xlsm" || ext == L".ods") {
-        return ParseExcelXlsx(fullPath, outDoc);
+    if (ext == L".ods") {
+        return Formats::ParseOpenDocumentOds(fullPath, outDoc);
     }
-    if (ext == L".docx" || ext == L".docm" || ext == L".odt") {
-        return ParseWordDocx(fullPath, outDoc);
+    if (ext == L".xlsx" || ext == L".xlsm" || ext == L".xltx") {
+        return Formats::ParseExcelXlsx(fullPath, outDoc) || Formats::ParseOpenDocumentOds(fullPath, outDoc);
+    }
+    if (ext == L".odt" || ext == L".ott") {
+        return Formats::ParseOpenDocumentOdt(fullPath, outDoc);
+    }
+    if (ext == L".docx" || ext == L".docm" || ext == L".dotx" || ext == L".dotm") {
+        return Formats::ParseWordDocx(fullPath, outDoc);
+    }
+    if (ext == L".odp" || ext == L".otp") {
+        return Formats::ParseOpenDocumentOdp(fullPath, outDoc);
     }
     if (ext == L".pptx" || ext == L".ppsx" || ext == L".pptm" || ext == L".ppsm" ||
-        ext == L".potx" || ext == L".potm" || ext == L".odp"  || ext == L".otp")
+        ext == L".potx" || ext == L".potm")
     {
-        return ParsePowerPointPptx(fullPath, ext, outDoc);
+        return Formats::ParsePowerPointPptx(fullPath, ext, outDoc);
     }
     if (ext == L".epub") {
         return ParseEpubDocument(fullPath, outDoc);
     }
+    if (ext == L".xlsb") {
+        return Formats::ParseExcelXlsbFile(fullPath, {}, outDoc);
+    }
+    if (ext == L".idml") {
+        return Formats::ParseAdobeIdml(fullPath, {}, outDoc);
+    }
     if (ext == L".parquet") {
         return Formats::ParseApacheParquetFile(fullPath, outDoc);
     }
-    if (ext == L".feather" || ext == L".arrow" || ext == L".ipc") {
-        return Formats::ParseArrowOrFeatherFile(fullPath, ext, outDoc);
+    if (ext == L".feather") {
+        return Formats::ParseFeatherTableFile(fullPath, ext, outDoc);
+    }
+    if (ext == L".arrow" || ext == L".ipc") {
+        return Formats::ParseApacheArrowIpcFile(fullPath, ext, outDoc);
     }
     if (AiModels::IsSupportedAiModelExt(ext)) {
         return AiModels::ParseAiModelFileToDocument(fullPath, ext, outDoc);
@@ -823,6 +604,9 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
         }
     }
 
+    if (ext == L".pst" || ext == L".ost")   return Formats::ParseOutlookPstOst(raw, ext, outDoc);
+    if (ext == L".mht" || ext == L".mhtml") return Formats::ParseMimeHtmlMht(raw, ext, outDoc);
+    if (ext == L".plist")                   return Formats::ParseApplePlist(raw, outDoc);
     if (ext == L".vmt")     return Formats::ParseValveMaterialVmt(raw, outDoc);
     if (ext == L".avro")    return Formats::ParseApacheAvro(raw, outDoc);
     if (ext == L".bson")    return Formats::ParseBsonDocument(raw, outDoc);
@@ -842,12 +626,14 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     if (ext == L".mtx")     return Formats::ParseMatrixMarketDoc(raw, outDoc);
     if (ext == L".ndjson" || ext == L".jsonl") return Formats::ParseNdJsonDoc(raw, outDoc);
     if (ext == L".har")     return Formats::ParseHttpArchiveHarDoc(raw, outDoc);
-    if (ext == L".pcap")    return Formats::ParseLibPcapDoc(raw, outDoc);
+    if (ext == L".pcap")    return Formats::ParseLibPcapDoc(raw, outDoc) || Formats::ParsePcapNgCapture(raw, outDoc);
     if (ext == L".torrent") return Formats::ParseBitTorrentDoc(raw, outDoc);
     if (ext == L".cue")     return Formats::ParseCueSheetDoc(raw, outDoc);
     if (ext == L".m3u" || ext == L".m3u8" || ext == L".pls") return Formats::ParsePlaylistM3uDoc(raw, outDoc);
     if (ext == L".mid" || ext == L".midi") return Formats::ParseMidiFileDoc(raw, outDoc);
-    if (ext == L".wav" || ext == L".flac" || ext == L".aiff") return Formats::ParseAudioContainerDoc(raw, outDoc);
+    if (ext == L".wav")     return Formats::ParseWavAudioDoc(raw, outDoc);
+    if (ext == L".flac")    return Formats::ParseFlacAudioDoc(raw, outDoc);
+    if (ext == L".aiff" || ext == L".aif" || ext == L".aifc") return Formats::ParseAiffAudioDoc(raw, outDoc);
     if (ext == L".edf")     return Formats::ParseBioMedicalEdfDoc(raw, outDoc);
     if (ext == L".elf" || ext == L".so" ||
         (ext.empty() && raw.size() >= 16 && raw[0] == 0x7Fu && raw[1] == 'E' && raw[2] == 'L' && raw[3] == 'F')) {
@@ -856,11 +642,11 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     if (ext == L".wasm")    return Formats::ParseWebAssemblyWasmDoc(raw, outDoc);
     if (ext == L".nmea")    return Formats::ParseNmeaGpsLogDoc(raw, outDoc);
     if (ext == L".igc")     return Formats::ParseIgcFlightLogDoc(raw, outDoc);
-    if (Formats::ParseExtendedSysSecDoc(raw, ext, outDoc))  return true;
-    if (Formats::ParseExtendedAiDataDoc(raw, ext, outDoc))  return true;
-    if (Formats::ParseExtendedGeoSciDoc(raw, ext, outDoc))  return true;
-    if (Formats::ParseExtendedMediaDoc(raw, ext, outDoc))   return true;
-    if (Formats::ParseExtendedDocs200(raw, ext, outDoc))    return true;
+    if (DispatchSysSecFormats(raw, ext, outDoc))      return true;
+    if (DispatchAiDataFormats(raw, ext, outDoc))      return true;
+    if (DispatchGeoSciFormats(raw, ext, outDoc))      return true;
+    if (DispatchMediaDocFormats(raw, ext, outDoc))    return true;
+    if (DispatchExtended200Formats(raw, ext, outDoc)) return true;
 
     if (ext == L".fb2") {
         return ParseFb2Document(raw, outDoc);
@@ -885,18 +671,25 @@ static bool InspectOfficeFileRaw(const std::wstring& fullPath, ParsedOfficeDocum
     if (ext == L".rtf" || (raw.size() >= 5 && std::memcmp(raw.data(), "{\\rtf", 5) == 0)) {
         return ParseRtfDocument(raw, outDoc);
     }
-    if (ext == L".csv" || ext == L".tsv" || ext == L".psv") {
-        return ParseCsvOrTsv(raw, ext, outDoc);
+    if (ext == L".tsv") {
+        return Formats::ParseTsvDoc(raw, outDoc);
+    }
+    if (ext == L".csv" || ext == L".psv") {
+        return Formats::ParseCsvDoc(raw, outDoc);
     }
 
     // Legacy .xls (OLE2 BIFF8 / BIFF5 Workbook & Shared String Table parser)
     if (ext == L".xls") {
-        return BiffXlsDetail::ParseBiffWorkbook(raw, outDoc);
+        return Formats::ParseExcelLegacyXls(raw, outDoc);
     }
 
+
     // Legacy .doc/.dot ([MS-DOC] Piece Table) & .ppt/.pps ([MS-PPT] Record Tree + Escher Shapes)
-    if (ext == L".doc" || ext == L".dot" || ext == L".ppt" || ext == L".pps") {
-        return Formats::ParseLegacyOfficeOleDoc(raw, ext, outDoc);
+    if (ext == L".doc" || ext == L".dot") {
+        return Formats::ParseWordLegacyDoc(raw, ext, outDoc);
+    }
+    if (ext == L".ppt" || ext == L".pps") {
+        return Formats::ParsePowerPointLegacyPpt(raw, ext, outDoc);
     }
 
     return false;

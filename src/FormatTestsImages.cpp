@@ -2225,6 +2225,1116 @@ std::vector<uint8_t> BuildAni24BppFixture() {
     return riff;
 }
 
+// ============================================================================
+// Part C Upgrade Test Builders (WebP VP8 Seg/MultiPart/B_PRED, BLP1, RAW, PDN, JLS, Sketch, SVGZ)
+// ============================================================================
+uint32_t ComputeCrc32Ieee(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int k = 0; k < 8; ++k) {
+            crc = (crc & 1u) ? ((crc >> 1u) ^ 0xEDB88320u) : (crc >> 1u);
+        }
+    }
+    return ~crc;
+}
+
+std::vector<uint8_t> CompressRawDeflateFixed(const std::vector<uint8_t>& raw) {
+    std::vector<uint8_t> out;
+    uint32_t bitBuf = 0;
+    int bitCnt = 0;
+    auto putBitsLSB = [&](uint32_t val, int n) {
+        for (int i = 0; i < n; ++i) {
+            bitBuf |= (((val >> i) & 1u) << bitCnt);
+            if (++bitCnt == 8) {
+                out.push_back(static_cast<uint8_t>(bitBuf));
+                bitBuf = 0;
+                bitCnt = 0;
+            }
+        }
+    };
+    auto putHuffMSB = [&](uint32_t code, int n) {
+        for (int i = n - 1; i >= 0; --i) putBitsLSB((code >> i) & 1u, 1);
+    };
+
+    putBitsLSB(1, 1); // BFINAL = 1
+    putBitsLSB(1, 2); // BTYPE  = 01 (Fixed Huffman)
+    size_t i = 0;
+    while (i < raw.size()) {
+        if (i > 0) {
+            size_t run = 0;
+            while (i + run < raw.size() && run < 10 && raw[i + run] == raw[i - 1]) ++run;
+            if (run >= 3) {
+                uint32_t sym = static_cast<uint32_t>(254 + run);
+                putHuffMSB(sym - 256u, 7);
+                putHuffMSB(0u, 5);
+                i += run;
+                continue;
+            }
+        }
+        uint8_t lit = raw[i++];
+        if (lit <= 143) putHuffMSB(0x30u + lit, 8);
+        else putHuffMSB(0x190u + (lit - 144u), 9);
+    }
+    putHuffMSB(0u, 7); // EOB 256
+    if (bitCnt > 0) out.push_back(static_cast<uint8_t>(bitBuf));
+    return out;
+}
+
+std::vector<uint8_t> CompressGzipTest(const std::vector<uint8_t>& raw) {
+    std::vector<uint8_t> gz = { 0x1Fu, 0x8Bu, 0x08u, 0x00u, 0u, 0u, 0u, 0u, 0x00u, 0x03u };
+    std::vector<uint8_t> def = CompressRawDeflateFixed(raw);
+    gz.insert(gz.end(), def.begin(), def.end());
+    PushU32LE(gz, ComputeCrc32Ieee(raw.data(), raw.size()));
+    PushU32LE(gz, static_cast<uint32_t>(raw.size()));
+    return gz;
+}
+
+std::vector<uint8_t> BuildMultiFileDeflateZip(const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files) {
+    struct CdItem {
+        std::string name;
+        uint32_t crc = 0;
+        uint32_t compSz = 0;
+        uint32_t uncompSz = 0;
+        uint32_t localOff = 0;
+    };
+    std::vector<uint8_t> z;
+    std::vector<CdItem> cd;
+    for (const auto& kv : files) {
+        std::vector<uint8_t> comp = CompressRawDeflateFixed(kv.second);
+        CdItem c;
+        c.name = kv.first;
+        c.crc = ComputeCrc32Ieee(kv.second.data(), kv.second.size());
+        c.compSz = static_cast<uint32_t>(comp.size());
+        c.uncompSz = static_cast<uint32_t>(kv.second.size());
+        c.localOff = static_cast<uint32_t>(z.size());
+
+        PushU32LE(z, 0x04034B50u);
+        PushU16LE(z, 20u);
+        PushU16LE(z, 0u);
+        PushU16LE(z, 8u); // Method 8 = Deflate
+        PushU16LE(z, 0u);
+        PushU16LE(z, 0u);
+        PushU32LE(z, c.crc);
+        PushU32LE(z, c.compSz);
+        PushU32LE(z, c.uncompSz);
+        PushU16LE(z, static_cast<uint16_t>(c.name.size()));
+        PushU16LE(z, 0u);
+        z.insert(z.end(), c.name.begin(), c.name.end());
+        z.insert(z.end(), comp.begin(), comp.end());
+        cd.push_back(std::move(c));
+    }
+    uint32_t cdStart = static_cast<uint32_t>(z.size());
+    for (const auto& c : cd) {
+        PushU32LE(z, 0x02014B50u);
+        PushU16LE(z, 20u);
+        PushU16LE(z, 20u);
+        PushU16LE(z, 0u);
+        PushU16LE(z, 8u);
+        PushU16LE(z, 0u);
+        PushU16LE(z, 0u);
+        PushU32LE(z, c.crc);
+        PushU32LE(z, c.compSz);
+        PushU32LE(z, c.uncompSz);
+        PushU16LE(z, static_cast<uint16_t>(c.name.size()));
+        PushU16LE(z, 0u);
+        PushU16LE(z, 0u);
+        PushU16LE(z, 0u);
+        PushU16LE(z, 0u);
+        PushU32LE(z, 0u);
+        PushU32LE(z, c.localOff);
+        z.insert(z.end(), c.name.begin(), c.name.end());
+    }
+    uint32_t cdSize = static_cast<uint32_t>(z.size()) - cdStart;
+    PushU32LE(z, 0x06054B50u);
+    PushU16LE(z, 0u);
+    PushU16LE(z, 0u);
+    PushU16LE(z, static_cast<uint16_t>(cd.size()));
+    PushU16LE(z, static_cast<uint16_t>(cd.size()));
+    PushU32LE(z, cdSize);
+    PushU32LE(z, cdStart);
+    PushU16LE(z, 0u);
+    return z;
+}
+
+// RFC 6386 Section 7.3 VP8 Boolean Arithmetic Encoder
+struct TestVp8BoolEncoder {
+    std::vector<uint8_t> buf;
+    uint32_t range = 255u;
+    uint32_t bottom = 0u;
+    int bitCount = 24;
+
+    void AddOneToOutput() {
+        size_t q = buf.size();
+        while (q > 0 && buf[q - 1] == 255u) {
+            buf[--q] = 0u;
+        }
+        if (q > 0) ++buf[q - 1];
+    }
+
+    void WriteBool(uint8_t prob, int bit) {
+        uint32_t split = 1u + (((range - 1u) * prob) >> 8u);
+        if (bit) {
+            bottom += split;
+            range -= split;
+        } else {
+            range = split;
+        }
+        while (range < 128u) {
+            range <<= 1u;
+            if (bottom & (1u << 31)) AddOneToOutput();
+            bottom <<= 1u;
+            if (--bitCount == 0) {
+                buf.push_back(static_cast<uint8_t>(bottom >> 24));
+                bottom &= (1u << 24) - 1u;
+                bitCount = 8;
+            }
+        }
+    }
+
+    void WriteLit(uint32_t v, int n) {
+        for (int i = n - 1; i >= 0; --i) WriteBool(128u, static_cast<int>((v >> i) & 1u));
+    }
+
+    void WriteSignedLit(int v, int n) {
+        WriteLit(static_cast<uint32_t>(std::abs(v)), n);
+        WriteBool(128u, v < 0 ? 1 : 0);
+    }
+
+    void Flush() {
+        int c = bitCount;
+        uint32_t v = bottom;
+        if (c <= 31 && (v & (1u << (32 - c)))) AddOneToOutput();
+        v <<= (c & 7);
+        c >>= 3;
+        while (--c >= 0) v <<= 8u;
+        for (int i = 0; i < 4; ++i) {
+            buf.push_back(static_cast<uint8_t>(v >> 24));
+            v <<= 8u;
+        }
+    }
+};
+
+// Builds a genuine 32x32 (2x2 MBs) Lossy WebP VP8 keyframe exercising:
+//   - segEnabled = 1 (absolute per-segment quantizers + segment_id tree probs)
+//   - log2NbrPartitions = 1 (2 token partitions: row 0 in part0, row 1 in part1)
+//   - yMode = 4 (B_PRED) with directional 4x4 subblock modes (B_DC_PRED, B_VE_PRED, B_HE_PRED, B_LD_PRED, B_RD_PRED)
+//   - Optional VP8X + ALPH semi-transparent alpha plane
+std::vector<uint8_t> BuildSegmentedMultiPartBPredWebP(bool withAlpha, int colorVariant) {
+    // Default keyframe band-0 coeff probs for type=3 (B_PRED Y) and type=2 (UV)
+    static constexpr uint8_t kType3Band0[3][11] = {
+        {202,24,213,235,186,191,220,160,240,175,255},
+        {126,38,182,232,169,184,228,174,255,187,128},
+        {61,46,138,219,151,178,240,170,255,216,128}
+    };
+    static constexpr uint8_t kType3Band1Ctx1Eob = 166;
+    static constexpr uint8_t kType3Band1Ctx2Eob = 39;
+    static constexpr uint8_t kType2Band0[3][11] = {
+        {253,9,248,251,207,208,255,192,128,128,128},
+        {175,13,224,243,193,185,249,198,255,255,128},
+        {73,17,171,221,161,179,236,167,255,234,128}
+    };
+    static constexpr uint8_t kType2Band1Ctx1Eob = 239;
+    static constexpr uint8_t kType2Band1Ctx2Eob = 155;
+
+    // Encode a 4x4 block with only DC token `dcQuantSteps` (0, or Cat4 magnitude 19..34) followed by EOB
+    auto encodeDcOnlyBlock = [&](TestVp8BoolEncoder& enc, bool isUv, int initCtx, int dcSteps) -> uint8_t {
+        const uint8_t* p = isUv ? kType2Band0[initCtx] : kType3Band0[initCtx];
+        if (dcSteps == 0) {
+            enc.WriteBool(p[0], 0); // DCT_EOB at coeff 0
+            return 0u;
+        }
+        int mag = std::clamp(std::abs(dcSteps), 19, 34); // DCT_VAL_CATEGORY4 (19..34)
+        enc.WriteBool(p[0], 1); // Not EOB
+        enc.WriteBool(p[1], 1); // Not DCT_0
+        enc.WriteBool(p[2], 1); // > 1
+        enc.WriteBool(p[3], 1); // > 4
+        enc.WriteBool(p[6], 1); // > 10 (Cat3..6)
+        enc.WriteBool(p[8], 0); // b1 = 0 (Cat3 or Cat4)
+        enc.WriteBool(p[9], 1); // b0 = 1 -> Cat4 (base 19, 4 extra bits with probs {176,155,140,135})
+        int extra = mag - 19;
+        static constexpr uint8_t kCat4Probs[4] = { 176, 155, 140, 135 };
+        for (int k = 0; k < 4; ++k) {
+            enc.WriteBool(kCat4Probs[k], (extra >> (3 - k)) & 1);
+        }
+        enc.WriteBool(128u, dcSteps < 0 ? 1 : 0); // Sign bit
+        // Band 1 EOB (ctx = 2 since mag > 1)
+        uint8_t eobProb1 = isUv ? kType2Band1Ctx2Eob : kType3Band1Ctx2Eob;
+        (void)kType3Band1Ctx1Eob; (void)kType2Band1Ctx1Eob;
+        enc.WriteBool(eobProb1, 0); // DCT_EOB at coeff 1
+        return 1u;
+    };
+
+    // RFC 6386 Section 11.3 B_PRED tree paths for modes 0..5:
+    //   0 (B_DC_PRED): [0]
+    //   1 (B_TM_PRED): [1, 0]
+    //   2 (B_VE_PRED): [1, 1, 0]
+    //   3 (B_HE_PRED): [1, 1, 1, 0, 0]
+    //   4 (B_LD_PRED): [1, 1, 1, 0, 1, 0]
+    //   5 (B_RD_PRED): [1, 1, 1, 0, 1, 1]
+    // We check kVp8KfBmodeProbs via exact subset for (above,left) in {0,1,2,3,4,5}
+    // Note: if all 16 subblocks of MB(0,0) use B_DC_PRED(0), B_TM_PRED(1), B_VE_PRED(2),
+    // we only need probs[a][l][0..2] for a,l in {0,1,2}!
+    static constexpr uint8_t kKfBProbs012[3][3][3] = {
+        { { 231, 120,  48 }, { 152, 179,  64 }, { 175,  69, 143 } },
+        { { 134, 183,  89 }, {  72, 187, 100 }, {  66, 102, 167 } },
+        { {  88,  88, 147 }, {  43,  97, 183 }, {  39,  53, 200 } }
+    };
+    auto encodeBMode012 = [&](TestVp8BoolEncoder& bd0, uint8_t a, uint8_t l, uint8_t m) {
+        const uint8_t* pr = kKfBProbs012[a][l];
+        if (m == 0) {
+            bd0.WriteBool(pr[0], 0);
+        } else if (m == 1) {
+            bd0.WriteBool(pr[0], 1);
+            bd0.WriteBool(pr[1], 0);
+        } else { // m == 2 (B_VE_PRED)
+            bd0.WriteBool(pr[0], 1);
+            bd0.WriteBool(pr[1], 1);
+            bd0.WriteBool(pr[2], 0);
+        }
+    };
+
+    TestVp8BoolEncoder bd0;
+    bd0.WriteBool(128u, 0); // color_space = 0
+    bd0.WriteBool(128u, 0); // clamping_type = 0
+    bd0.WriteBool(128u, 1); // segmentation_enabled = 1!
+    bd0.WriteBool(128u, 1); // update_mb_segmentation_map = 1
+    bd0.WriteBool(128u, 1); // update_segment_feature_data = 1
+    bd0.WriteBool(128u, 1); // segment_feature_mode = 1 (absolute mode!)
+    // 4 segment quantizer indices: seg0=12 (dcQ=15, uvDcQ=15), seg1=20 (dcQ=21, uvDcQ=21), seg2=16, seg3=24
+    const int segQi[4] = { 12, 20, 16, 24 };
+    for (int s = 0; s < 4; ++s) {
+        bd0.WriteBool(128u, 1);
+        bd0.WriteSignedLit(segQi[s], 7);
+    }
+    // 4 segment loop-filter levels (not present = 0)
+    for (int s = 0; s < 4; ++s) bd0.WriteBool(128u, 0);
+    // 3 mb_segment_tree_probs (explicit 128)
+    for (int s = 0; s < 3; ++s) {
+        bd0.WriteBool(128u, 1);
+        bd0.WriteLit(128u, 8);
+    }
+
+    bd0.WriteBool(128u, 0); // filter_type = 0
+    bd0.WriteLit(0u, 6);    // loop_filter_level = 0
+    bd0.WriteLit(0u, 3);    // sharpness_level = 0
+    bd0.WriteBool(128u, 0); // loop_filter_adj_enable = 0
+    bd0.WriteLit(1u, 2);    // log2_nbr_of_dct_partitions = 1 -> 2 partitions!
+
+    bd0.WriteLit(12u, 7);   // base y_ac_qi = 12
+    for (int d = 0; d < 5; ++d) bd0.WriteBool(128u, 0); // zero deltas
+    bd0.WriteBool(128u, 0); // refresh_entropy_probs = 0
+
+    // Coeff prob updates: all 4*8*3*11 = 1056 flags = 0 (prob 252)
+    for (int i = 0; i < 4 * 8 * 3 * 11; ++i) bd0.WriteBool(252u, 0);
+    bd0.WriteBool(128u, 0); // mb_no_skip_coeff = 0
+
+    // Encode 2x2 macroblocks (32x32 image):
+    //   MB(0,0): seg=0, B_PRED (modes cycling 0, 1, 2), UV DC_PRED -> Saturated Red (V=+28, U=-20)
+    //   MB(1,0): seg=1, B_PRED (modes cycling 2, 0, 1), UV DC_PRED -> Saturated Green (V=-24, U=-24)
+    //   MB(0,1): seg=2, B_PRED (modes cycling 1, 2, 0), UV DC_PRED -> Saturated Blue (U=+28, V=-20)
+    //   MB(1,1): seg=3, B_PRED (modes cycling 0, 2, 1), UV DC_PRED -> Bright Gold (Y=+22, U=-26, V=+19)
+    uint8_t aboveBM[8] = {};
+    uint8_t aboveNzY[8] = {}, aboveNzU[4] = {}, aboveNzV[4] = {};
+    TestVp8BoolEncoder partEnc[2];
+
+    for (uint32_t mby = 0; mby < 2; ++mby) {
+        uint8_t leftBM[4] = {};
+        uint8_t leftNzY[4] = {}, leftNzU[2] = {}, leftNzV[2] = {};
+        TestVp8BoolEncoder& pe = partEnc[mby & 1u];
+
+        for (uint32_t mbx = 0; mbx < 2; ++mbx) {
+            uint32_t segId = mby * 2u + mbx;
+            // Segment tree: 0=[0,0], 1=[0,1], 2=[1,0], 3=[1,1]
+            bd0.WriteBool(128u, (segId >> 1u) & 1u);
+            bd0.WriteBool(128u, segId & 1u);
+
+            // yMode = B_PRED (bit 0 with prob 145!)
+            bd0.WriteBool(145u, 0);
+
+            for (int sby = 0; sby < 4; ++sby) {
+                for (int sbx = 0; sbx < 4; ++sbx) {
+                    uint8_t m = static_cast<uint8_t>((segId + sby + sbx) % 3u); // 0=DC, 1=TM, 2=VE
+                    encodeBMode012(bd0, aboveBM[mbx * 4u + sbx], leftBM[sby], m);
+                    aboveBM[mbx * 4u + sbx] = m;
+                    leftBM[sby] = m;
+                }
+            }
+            // uvMode = DC_PRED (bit 0 with prob 142)
+            bd0.WriteBool(142u, 0);
+
+            int yStep = 0, uStep = 0, vStep = 0;
+            uint32_t slot = (segId + static_cast<uint32_t>(colorVariant)) & 3u;
+            if (slot == 0u)      { yStep =  0; uStep = -22; vStep = +30; } // Red
+            else if (slot == 1u) { yStep =  0; uStep = -24; vStep = -34; } // Green
+            else if (slot == 2u) { yStep =  0; uStep = +34; vStep = -34; } // Blue
+            else                 { yStep = +20; uStep = -24; vStep = +24; } // Gold
+
+            // First 4x4 luma subblock gets yStep if non-zero (propagates across neighbor predictions!), rest 0
+            for (int sby = 0; sby < 4; ++sby) {
+                for (int sbx = 0; sbx < 4; ++sbx) {
+                    int step = (sby == 0 && sbx == 0) ? yStep : 0;
+                    uint8_t nz = encodeDcOnlyBlock(pe, false, aboveNzY[mbx * 4u + sbx] + leftNzY[sby], step);
+                    aboveNzY[mbx * 4u + sbx] = leftNzY[sby] = nz;
+                }
+            }
+            for (int by = 0; by < 2; ++by) {
+                for (int bx = 0; bx < 2; ++bx) {
+                    int step = (mby == 0 && mbx == 0) ? uStep : (uStep - ((mbx > 0 || mby > 0) ? 0 : 0));
+                    uint8_t nz = encodeDcOnlyBlock(pe, true, aboveNzU[mbx * 2u + bx] + leftNzU[by], step);
+                    aboveNzU[mbx * 2u + bx] = leftNzU[by] = nz;
+                }
+            }
+            for (int by = 0; by < 2; ++by) {
+                for (int bx = 0; bx < 2; ++bx) {
+                    uint8_t nz = encodeDcOnlyBlock(pe, true, aboveNzV[mbx * 2u + bx] + leftNzV[by], vStep);
+                    aboveNzV[mbx * 2u + bx] = leftNzV[by] = nz;
+                }
+            }
+        }
+    }
+
+    bd0.Flush();
+    partEnc[0].Flush();
+    partEnc[1].Flush();
+
+    std::vector<uint8_t> vp8;
+    uint32_t firstPartSize = static_cast<uint32_t>(bd0.buf.size());
+    uint32_t tag = (firstPartSize << 5u) | (1u << 4u) | 0u; // keyframe=0, show_frame=1
+    PushU24LE(vp8, tag);
+    vp8.insert(vp8.end(), { 0x9Du, 0x01u, 0x2Au });
+    PushU16LE(vp8, 32u); // width = 32
+    PushU16LE(vp8, 32u); // height = 32
+    vp8.insert(vp8.end(), bd0.buf.begin(), bd0.buf.end());
+    // 2 partitions -> (numParts - 1) = 1 24-bit LE size of partition 0!
+    PushU24LE(vp8, static_cast<uint32_t>(partEnc[0].buf.size()));
+    vp8.insert(vp8.end(), partEnc[0].buf.begin(), partEnc[0].buf.end());
+    vp8.insert(vp8.end(), partEnc[1].buf.begin(), partEnc[1].buf.end());
+
+    std::vector<uint8_t> body = { 'W', 'E', 'B', 'P' };
+    auto addRiffChunk = [&](const char fourcc[4], const std::vector<uint8_t>& pay) {
+        body.insert(body.end(), fourcc, fourcc + 4);
+        PushU32LE(body, static_cast<uint32_t>(pay.size()));
+        body.insert(body.end(), pay.begin(), pay.end());
+        if (pay.size() & 1u) body.push_back(0u);
+    };
+
+    if (withAlpha) {
+        std::vector<uint8_t> vp8x(10, 0u);
+        vp8x[0] = 0x10u; // Alpha flag
+        PushU24LE(vp8x, 0u); // redo properly below:
+        vp8x.assign(10, 0u);
+        vp8x[0] = 0x10u;
+        vp8x[4] = 31u; // canvasW - 1 = 31
+        vp8x[7] = 31u; // canvasH - 1 = 31
+        addRiffChunk("VP8X", vp8x);
+
+        // Raw ALPH chunk (header byte 0x00 = uncompressed, no filter; top half 255, bottom half 128)
+        std::vector<uint8_t> alph(1u + 32u * 32u, 255u);
+        alph[0] = 0x00u;
+        for (size_t i = 32u * 16u; i < 32u * 32u; ++i) alph[1u + i] = 128u;
+        addRiffChunk("ALPH", alph);
+    }
+    addRiffChunk("VP8 ", vp8);
+
+    std::vector<uint8_t> riff = { 'R', 'I', 'F', 'F' };
+    PushU32LE(riff, static_cast<uint32_t>(body.size()));
+    riff.insert(riff.end(), body.begin(), body.end());
+    return riff;
+}
+
+// Build a 16x8 1/3/4-channel Baseline DCT JPEG (SOF0, DQT all 8s so quantized DC = val - 128 exact!)
+std::vector<uint8_t> BuildExactFlatBlocksJpeg(
+    uint32_t width, uint32_t height, uint8_t numComps,
+    const uint8_t block0Vals[4], const uint8_t block1Vals[4])
+{
+    static constexpr uint8_t kDcBits[16] = { 0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0 };
+    static constexpr uint8_t kDcVal[12]  = { 0,1,2,3,4,5,6,7,8,9,10,11 };
+    static constexpr uint8_t kAcBits[16] = { 1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };
+    static constexpr uint8_t kAcVal[1]   = { 0x00 }; // '0' -> EOB
+
+    // Canonical Huffman codes for kDcBits / kDcVal:
+    // len 2: sym 0 -> 00
+    // len 3: sym 1..5 -> 010, 011, 100, 101, 110
+    // len 4..9: sym 6..11 -> 1110, 11110, 111110, 1111110, 11111110, 111111110
+    static constexpr uint16_t kDcCode[12] = { 0, 2, 3, 4, 5, 6, 14, 30, 62, 126, 254, 510 };
+    static constexpr uint8_t  kDcLen[12]  = { 2, 3, 3, 3, 3, 3,  4,  5,  6,   7,   8,   9 };
+
+    std::vector<uint8_t> j = { 0xFFu, 0xD8u };
+    // DQT (Tq=0, Pq=0, all 64 entries = 8)
+    j.insert(j.end(), { 0xFFu, 0xDBu, 0x00u, 67u, 0x00u });
+    j.insert(j.end(), 64u, 8u);
+
+    // DHT: DC table 0 + AC table 0
+    j.insert(j.end(), { 0xFFu, 0xC4u });
+    PushU16BE(j, static_cast<uint16_t>(2u + 1u + 16u + 12u + 1u + 16u + 1u));
+    j.push_back(0x00u); j.insert(j.end(), kDcBits, kDcBits + 16); j.insert(j.end(), kDcVal, kDcVal + 12);
+    j.push_back(0x10u); j.insert(j.end(), kAcBits, kAcBits + 16); j.insert(j.end(), kAcVal, kAcVal + 1);
+
+    // SOF0
+    j.insert(j.end(), { 0xFFu, 0xC0u });
+    PushU16BE(j, static_cast<uint16_t>(8u + numComps * 3u));
+    j.push_back(8u);
+    PushU16BE(j, static_cast<uint16_t>(height));
+    PushU16BE(j, static_cast<uint16_t>(width));
+    j.push_back(numComps);
+    for (uint8_t c = 0; c < numComps; ++c) {
+        j.push_back(static_cast<uint8_t>(c + 1u));
+        j.push_back(0x11u);
+        j.push_back(0x00u);
+    }
+
+    // SOS
+    j.insert(j.end(), { 0xFFu, 0xDAu });
+    PushU16BE(j, static_cast<uint16_t>(6u + numComps * 2u));
+    j.push_back(numComps);
+    for (uint8_t c = 0; c < numComps; ++c) {
+        j.push_back(static_cast<uint8_t>(c + 1u));
+        j.push_back(0x00u);
+    }
+    j.insert(j.end(), { 0x00u, 63u, 0x00u });
+
+    uint32_t bitBuf = 0;
+    int bitCnt = 0;
+    auto putBits = [&](uint32_t v, int n) {
+        for (int i = n - 1; i >= 0; --i) {
+            bitBuf = (bitBuf << 1u) | ((v >> i) & 1u);
+            if (++bitCnt == 8) {
+                uint8_t b = static_cast<uint8_t>(bitBuf & 0xFFu);
+                j.push_back(b);
+                if (b == 0xFFu) j.push_back(0x00u);
+                bitBuf = 0; bitCnt = 0;
+            }
+        }
+    };
+    auto encodeDcDiff = [&](int diff) {
+        if (diff == 0) {
+            putBits(kDcCode[0], kDcLen[0]);
+            return;
+        }
+        int a = std::abs(diff);
+        int ssss = 0;
+        while ((1 << ssss) <= a) ++ssss;
+        putBits(kDcCode[ssss], kDcLen[ssss]);
+        uint32_t magBits = (diff > 0) ? static_cast<uint32_t>(diff) : static_cast<uint32_t>(diff + (1 << ssss) - 1);
+        putBits(magBits, ssss);
+    };
+
+    int lastDc[4] = {};
+    uint32_t mcuCols = (width + 7u) / 8u;
+    uint32_t mcuRows = (height + 7u) / 8u;
+    for (uint32_t my = 0; my < mcuRows; ++my) {
+        for (uint32_t mx = 0; mx < mcuCols; ++mx) {
+            const uint8_t* tv = ((mx & 1u) == 0u) ? block0Vals : block1Vals;
+            for (uint8_t c = 0; c < numComps; ++c) {
+                int dc = static_cast<int>(tv[c]) - 128;
+                encodeDcDiff(dc - lastDc[c]);
+                lastDc[c] = dc;
+                putBits(0u, 1); // AC EOB ('0')
+            }
+        }
+    }
+    if (bitCnt > 0) putBits((1u << (8 - bitCnt)) - 1u, 8 - bitCnt);
+    j.insert(j.end(), { 0xFFu, 0xD9u });
+    return j;
+}
+
+// Pentax PEF Lossless Huffman (Compression = 65535) Stream Encoder
+std::vector<uint8_t> EncodePentaxPefStream(const std::vector<uint16_t>& samples, uint32_t width, uint32_t height) {
+    // Default Pentax 13-entry Huffman code table (CameraRawUpgrade.h lines 467-468):
+    // counts = {0, 2, 3, 1, 1, 1, 1, 1, 1, 2}, syms = {3, 4, 2, 5, 1, 6, 0, 7, 8, 9, 10, 11, 12}
+    static constexpr uint8_t kCounts[16] = { 0, 2, 3, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0 };
+    static constexpr uint8_t kSyms[13]   = { 3, 4, 2, 5, 1, 6, 0, 7, 8, 9, 10, 11, 12 };
+    uint32_t huffCode[13] = {};
+    uint8_t  huffLen[13]  = {};
+    uint32_t code = 0, idx = 0;
+    for (int len = 1; len <= 16; ++len) {
+        for (int k = 0; k < kCounts[len - 1]; ++k) {
+            uint8_t s = kSyms[idx++];
+            huffCode[s] = code++;
+            huffLen[s]  = static_cast<uint8_t>(len);
+        }
+        code <<= 1u;
+    }
+
+    std::vector<uint8_t> out;
+    uint32_t bitBuf = 0; int bitCnt = 0;
+    auto putBits = [&](uint32_t v, int n) {
+        for (int i = n - 1; i >= 0; --i) {
+            bitBuf = (bitBuf << 1u) | ((v >> i) & 1u);
+            if (++bitCnt == 8) {
+                out.push_back(static_cast<uint8_t>(bitBuf));
+                bitBuf = 0; bitCnt = 0;
+            }
+        }
+    };
+
+    for (uint32_t row = 0; row < height; ++row) {
+        int32_t pred[2] = { 0, 0 };
+        if (row >= 2u) {
+            pred[0] = samples[(row - 2u) * width + 0u];
+            pred[1] = samples[(row - 2u) * width + 1u];
+        }
+        for (uint32_t col = 0; col < width; ++col) {
+            int32_t cur = samples[row * width + col];
+            int32_t diff = cur - pred[col & 1u];
+            pred[col & 1u] = cur;
+            if (diff == 0) {
+                putBits(huffCode[0], huffLen[0]);
+            } else {
+                int a = std::abs(diff);
+                int ssss = 0;
+                while ((1 << ssss) <= a) ++ssss;
+                putBits(huffCode[ssss], huffLen[ssss]);
+                uint32_t v = (diff > 0) ? static_cast<uint32_t>(diff) : static_cast<uint32_t>(diff + (1 << ssss) - 1);
+                putBits(v, ssss);
+            }
+        }
+    }
+    if (bitCnt > 0) putBits(0u, 8 - bitCnt);
+    out.insert(out.end(), 4u, 0u);
+    return out;
+}
+
+// Olympus ORF 12-bit Adaptive Golomb-Rice Lossless Stream Encoder
+std::vector<uint8_t> EncodeOlympusOrfStream(const std::vector<uint16_t>& samples, uint32_t width, uint32_t height) {
+    std::vector<uint8_t> out(7, 0u); // 7-byte Olympus 12-bit stream header
+    uint32_t bitBuf = 0; int bitCnt = 0;
+    auto putBits = [&](uint32_t v, int n) {
+        for (int i = n - 1; i >= 0; --i) {
+            bitBuf = (bitBuf << 1u) | ((v >> i) & 1u);
+            if (++bitCnt == 8) {
+                out.push_back(static_cast<uint8_t>(bitBuf));
+                bitBuf = 0; bitCnt = 0;
+            }
+        }
+    };
+    auto activeBits16 = [](uint16_t v) -> int {
+        int n = 0;
+        while (v > 0u) { ++n; v >>= 1u; }
+        return n;
+    };
+
+    for (uint32_t row = 0; row < height; ++row) {
+        int acarry[2][3] = { { 0, 0, 0 }, { 0, 0, 0 } };
+        for (uint32_t col = 0; col < width; ++col) {
+            int pred = 0;
+            if (row < 2u && col < 2u) pred = 0;
+            else if (row < 2u) pred = samples[row * width + (col - 2u)];
+            else if (col < 2u) pred = samples[(row - 2u) * width + col];
+            else {
+                int left = samples[row * width + (col - 2u)];
+                int up   = samples[(row - 2u) * width + col];
+                int nw   = samples[(row - 2u) * width + (col - 2u)];
+                int lnw  = left - nw, unw = up - nw;
+                if (((lnw < 0) != (unw < 0)) && lnw != 0 && unw != 0) {
+                    pred = (std::abs(lnw) > 32 || std::abs(unw) > 32) ? (left + unw) : ((left + up) >> 1);
+                } else {
+                    pred = (std::abs(lnw) > std::abs(unw)) ? left : up;
+                }
+            }
+
+            int fullDiff = static_cast<int>(samples[row * width + col]) - pred;
+            int low = fullDiff & 3;
+            int diff = (fullDiff - low) / 4;
+
+            int* carry = acarry[col & 1u];
+            int bias = (carry[2] < 3) ? 2 : 0;
+            int nb = std::max(activeBits16(static_cast<uint16_t>(carry[0])) - bias, 2 + bias);
+
+            int delta = diff - carry[1];
+            uint32_t signBit = (delta < 0) ? 1u : 0u;
+            int carry0 = (delta >= 0) ? delta : ((-delta) - 1);
+
+            int highBits = carry0 >> nb;
+            uint32_t remBits = static_cast<uint32_t>(carry0 & ((1 << nb) - 1));
+
+            putBits(signBit, 1);
+            putBits(static_cast<uint32_t>(low), 2);
+            if (highBits < 12) {
+                for (int z = 0; z < highBits; ++z) putBits(0u, 1);
+                putBits(1u, 1);
+            } else {
+                for (int z = 0; z < 12; ++z) putBits(0u, 1);
+                int nh = 15 - nb;
+                putBits(static_cast<uint32_t>(highBits), nh);
+                putBits(0u, 1);
+            }
+            putBits(remBits, nb);
+
+            carry[0] = carry0;
+            carry[1] = (diff * 3 + carry[1]) >> 5;
+            carry[2] = (carry0 > 16) ? 0 : (carry[2] + 1);
+        }
+    }
+    if (bitCnt > 0) putBits(0u, 8 - bitCnt);
+    out.insert(out.end(), 8u, 0u);
+    return out;
+}
+
+// Pure-C++ ITU-T T.87 / ISO/IEC 14495-1 Lossless JPEG-LS (LOCO-I) Encoder for Self-Tests
+std::vector<uint8_t> EncodeTestJpegLs(
+    uint32_t width, uint32_t height, uint8_t numComps, uint8_t precision, uint8_t ilv,
+    const std::vector<uint16_t>& interleavedSamples, bool* outSawStuffedFF = nullptr)
+{
+    static constexpr int kLog2Run[32] = {
+        0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3, 4,4, 5,5, 6,6, 7,7, 8,9,10,11,12,13,14,15
+    };
+    const int maxVal = (1 << precision) - 1;
+    const int range = maxVal + 1;
+    int qbpp = 1;
+    while ((1 << qbpp) < range) ++qbpp;
+    int bpp = std::max<int>(2, precision);
+    const int limit = 2 * (bpp + std::max(8, bpp)) - qbpp;
+
+    int factor = (maxVal >= 128) ? ((std::min(maxVal, 4095) + 128) >> 8) : (256 / (maxVal + 1));
+    int T1 = (maxVal >= 128) ? (factor * (3 - 2) + 2) : std::max(2, 3 / factor);
+    int T2 = (maxVal >= 128) ? (factor * (7 - 3) + 3) : std::max(3, 7 / factor);
+    int T3 = (maxVal >= 128) ? (factor * (21 - 4) + 4) : std::max(4, 21 / factor);
+    const int reset = 64;
+
+    int A[367] = {}, B[367] = {}, C[365] = {}, N[367] = {}, runIndex[4] = {};
+    int initA = std::max((range + 32) >> 6, 2);
+    for (int i = 0; i < 367; ++i) { A[i] = initA; B[i] = 0; N[i] = 1; }
+
+    auto quantize = [&](int d) -> int {
+        if (d <= -T3) return -4;
+        if (d <= -T2) return -3;
+        if (d <= -T1) return -2;
+        if (d < 0)    return -1;
+        if (d == 0)   return 0;
+        if (d < T1)   return 1;
+        if (d < T2)   return 2;
+        if (d < T3)   return 3;
+        return 4;
+    };
+    auto medPred = [](int ra, int rb, int rc) -> int {
+        if (rc >= std::max(ra, rb)) return std::min(ra, rb);
+        if (rc <= std::min(ra, rb)) return std::max(ra, rb);
+        return ra + rb - rc;
+    };
+    auto modRange = [&](int e) -> int {
+        if (e < -(range / 2)) e += range;
+        else if (e > ((range - 1) / 2)) e -= range;
+        return e;
+    };
+    auto downscale = [&](int Q) {
+        if (N[Q] == reset) { A[Q] >>= 1; B[Q] >>= 1; N[Q] >>= 1; }
+        ++N[Q];
+    };
+
+    std::vector<uint8_t> jls = { 0xFFu, 0xD8u, 0xFFu, 0xF7u }; // SOI + SOF55
+    PushU16BE(jls, static_cast<uint16_t>(8u + numComps * 3u));
+    jls.push_back(precision);
+    PushU16BE(jls, static_cast<uint16_t>(height));
+    PushU16BE(jls, static_cast<uint16_t>(width));
+    jls.push_back(numComps);
+    for (uint8_t c = 0; c < numComps; ++c) {
+        jls.push_back(static_cast<uint8_t>(c + 1u));
+        jls.push_back(0x11u);
+        jls.push_back(0x00u);
+    }
+
+    // SOS (0xFFDA)
+    jls.insert(jls.end(), { 0xFFu, 0xDAu });
+    PushU16BE(jls, static_cast<uint16_t>(6u + numComps * 2u));
+    jls.push_back(numComps);
+    for (uint8_t c = 0; c < numComps; ++c) {
+        jls.push_back(static_cast<uint8_t>(c + 1u));
+        jls.push_back(0x00u);
+    }
+    jls.push_back(0u);   // NEAR = 0
+    jls.push_back(ilv);  // ILV = 0 / 1 / 2
+    jls.push_back(0u);   // Pt = 0
+
+    uint8_t curByte = 0;
+    int bitUsed = 0;
+    int targetBits = 8; // After 0xFF byte, next byte holds only 7 data bits (MSB = 0)!
+    bool sawStuff = false;
+
+    auto putBit = [&](uint32_t b) {
+        curByte = static_cast<uint8_t>((curByte << 1u) | (b & 1u));
+        if (++bitUsed == targetBits) {
+            jls.push_back(curByte);
+            if (targetBits == 8 && curByte == 0xFFu) {
+                targetBits = 7;
+                sawStuff = true;
+            } else {
+                targetBits = 8;
+            }
+            curByte = 0;
+            bitUsed = 0;
+        }
+    };
+    auto putBits = [&](uint32_t v, int n) {
+        for (int i = n - 1; i >= 0; --i) putBit((v >> i) & 1u);
+    };
+    auto writeGolomb = [&](int me, int k, int lim) {
+        int q = me >> k;
+        if (q < lim - 1) {
+            for (int z = 0; z < q; ++z) putBit(0u);
+            putBit(1u);
+            if (k > 0) putBits(static_cast<uint32_t>(me & ((1 << k) - 1)), k);
+        } else {
+            for (int z = 0; z < lim - 1; ++z) putBit(0u);
+            putBit(1u);
+            putBits(static_cast<uint32_t>(me - 1), qbpp);
+        }
+    };
+    auto encodeRegularSample = [&](int ix, int ra, int rb, int rc, int rd) {
+        int q = quantize(rd - rb) * 81 + quantize(rb - rc) * 9 + quantize(rc - ra);
+        int sign = 1;
+        if (q < 0) { q = -q; sign = -1; }
+        int px = std::clamp(medPred(ra, rb, rc) + sign * C[q], 0, maxVal);
+        int err = modRange(sign * (ix - px));
+        int k = 0;
+        while ((static_cast<uint32_t>(N[q]) << k) < static_cast<uint32_t>(A[q]) && k < 24) ++k;
+        int mappedErr = (k == 0 && 2 * B[q] <= -N[q]) ? -(err + 1) : err;
+        int me = (mappedErr >= 0) ? (2 * mappedErr) : (-2 * mappedErr - 1);
+        writeGolomb(me, k, limit);
+
+        A[q] += std::abs(err);
+        B[q] += err;
+        downscale(q);
+        if (B[q] <= -N[q]) {
+            B[q] = std::max(B[q] + N[q], 1 - N[q]);
+            if (C[q] > -128) --C[q];
+        } else if (B[q] > 0) {
+            B[q] = std::min(B[q] - N[q], 0);
+            if (C[q] < 127) ++C[q];
+        }
+    };
+    auto encodeRunTerm = [&](int ix, int ra, int rb, int riType, int rk) {
+        int Q = 365 + riType;
+        int temp = A[Q] + (riType ? (N[Q] >> 1) : 0);
+        int k = 0;
+        while ((static_cast<uint32_t>(N[Q]) << k) < static_cast<uint32_t>(temp) && k < 24) ++k;
+        int px = riType ? ra : rb;
+        int err = ix - px;
+        if (!riType && rb < ra) err = -err;
+        err = modRange(err);
+
+        bool cond = (k == 0 && (2 * B[Q] < N[Q]));
+        int me = 0;
+        if (err == 0)      me = 0;
+        else if (err > 0)  me = 2 * err - riType - (cond ? 1 : 0);
+        else               me = -2 * err - 1 - riType + (cond ? 1 : 0);
+        writeGolomb(me, k, limit - rk - 1);
+
+        if (err < 0) ++B[Q];
+        A[Q] += std::abs(err) - riType;
+        downscale(Q);
+    };
+
+    auto encodeLineSingle = [&](const std::vector<int>& prev, const std::vector<int>& cur, int prevFirst, int slot) {
+        uint32_t x = 0;
+        while (x < width) {
+            int ra = (x > 0) ? cur[x - 1u] : prev[0];
+            int rb = prev[x];
+            int rc = (x > 0) ? prev[x - 1u] : prevFirst;
+            int rd = (x + 1u < width) ? prev[x + 1u] : rb;
+            if (rd == rb && rb == rc && rc == ra) {
+                uint32_t runLen = 0;
+                while (x + runLen < width && cur[x + runLen] == ra) ++runLen;
+                while (runLen >= (1u << kLog2Run[runIndex[slot]])) {
+                    putBit(1u);
+                    uint32_t rg = 1u << kLog2Run[runIndex[slot]];
+                    x += rg;
+                    runLen -= rg;
+                    if (runIndex[slot] < 31) ++runIndex[slot];
+                    if (x >= width) return;
+                }
+                if (x + runLen == width && runLen > 0) {
+                    putBit(1u); // Truncated run to EOL
+                    return;
+                }
+                putBit(0u);
+                int rk = kLog2Run[runIndex[slot]];
+                if (rk > 0) putBits(runLen, rk);
+                x += runLen;
+                rb = prev[x];
+                int riType = (ra == rb) ? 1 : 0;
+                encodeRunTerm(cur[x], ra, rb, riType, rk);
+                if (runIndex[slot] > 0) --runIndex[slot];
+                ++x;
+            } else {
+                encodeRegularSample(cur[x], ra, rb, rc, rd);
+                ++x;
+            }
+        }
+    };
+
+    if (ilv == 0 || ilv == 1) {
+        std::vector<int> prev[4], cur[4];
+        int prevFirst[4] = {};
+        for (uint8_t c = 0; c < numComps; ++c) { prev[c].assign(width, 0); cur[c].assign(width, 0); }
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint8_t c = 0; c < numComps; ++c) {
+                for (uint32_t x = 0; x < width; ++x) {
+                    cur[c][x] = interleavedSamples[(static_cast<size_t>(y) * width + x) * numComps + c];
+                }
+                encodeLineSingle(prev[c], cur[c], prevFirst[c], c);
+                prevFirst[c] = prev[c][0];
+                prev[c].swap(cur[c]);
+            }
+        }
+    } else { // ilv == 2 (Sample-Interleaved)
+        std::vector<int> prev(static_cast<size_t>(width) * numComps, 0);
+        std::vector<int> cur(static_cast<size_t>(width) * numComps, 0);
+        int prevFirst[4] = {};
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
+                for (uint8_t c = 0; c < numComps; ++c) {
+                    cur[x * numComps + c] = interleavedSamples[(static_cast<size_t>(y) * width + x) * numComps + c];
+                }
+            }
+            uint32_t x = 0;
+            while (x < width) {
+                int ra[4], rb[4], rc[4], rd[4];
+                bool allFlat = true;
+                for (uint8_t c = 0; c < numComps; ++c) {
+                    ra[c] = (x > 0) ? cur[(x - 1u) * numComps + c] : prev[c];
+                    rb[c] = prev[x * numComps + c];
+                    rc[c] = (x > 0) ? prev[(x - 1u) * numComps + c] : prevFirst[c];
+                    rd[c] = (x + 1u < width) ? prev[(x + 1u) * numComps + c] : rb[c];
+                    if (rd[c] != rb[c] || rb[c] != rc[c] || rc[c] != ra[c]) allFlat = false;
+                }
+                if (allFlat) {
+                    uint32_t runLen = 0;
+                    while (x + runLen < width) {
+                        bool match = true;
+                        for (uint8_t c = 0; c < numComps; ++c) {
+                            if (cur[(x + runLen) * numComps + c] != ra[c]) { match = false; break; }
+                        }
+                        if (!match) break;
+                        ++runLen;
+                    }
+                    while (runLen >= (1u << kLog2Run[runIndex[0]])) {
+                        putBit(1u);
+                        uint32_t rg = 1u << kLog2Run[runIndex[0]];
+                        x += rg; runLen -= rg;
+                        if (runIndex[0] < 31) ++runIndex[0];
+                        if (x >= width) break;
+                    }
+                    if (x >= width) break;
+                    if (x + runLen == width && runLen > 0) {
+                        putBit(1u);
+                        break;
+                    }
+                    putBit(0u);
+                    int rk = kLog2Run[runIndex[0]];
+                    if (rk > 0) putBits(runLen, rk);
+                    x += runLen;
+                    for (uint8_t c = 0; c < numComps; ++c) {
+                        encodeRunTerm(cur[x * numComps + c], ra[c], prev[x * numComps + c], 0, rk);
+                    }
+                    if (runIndex[0] > 0) --runIndex[0];
+                    ++x;
+                } else {
+                    for (uint8_t c = 0; c < numComps; ++c) {
+                        encodeRegularSample(cur[x * numComps + c], ra[c], rb[c], rc[c], rd[c]);
+                    }
+                    ++x;
+                }
+            }
+            for (uint8_t c = 0; c < numComps; ++c) prevFirst[c] = prev[c];
+            prev.swap(cur);
+        }
+    }
+
+    if (bitUsed > 0) {
+        while (bitUsed != 0) putBit(0u);
+    }
+    if (targetBits == 7) {
+        jls.push_back(0x00u); // Trailing 0xFF must be followed by 7-bit stuffed byte < 0x80 before EOI!
+    }
+    jls.insert(jls.end(), { 0xFFu, 0xD9u });
+    if (outSawStuffedFF) *outSawStuffedFF = sawStuff;
+    return jls;
+}
+
+// Build a genuine paint.net (.pdn) multi-layer NRBF + chunked GZip MemoryBlock document
+struct TestPdnLayerInput {
+    std::string name;
+    bool visible = true;
+    uint8_t opacity = 255;
+    int32_t blendMode = 0; // 0=Normal, 1=Multiply, 12=Screen, etc.
+    std::vector<uint8_t> straightBgra; // width * height * 4
+};
+
+std::vector<uint8_t> BuildPaintDotNetFixture(uint32_t w, uint32_t h, const std::vector<TestPdnLayerInput>& layers) {
+    auto pushLPStr = [](std::vector<uint8_t>& d, const std::string& s) {
+        size_t n = s.size();
+        do {
+            uint8_t b = static_cast<uint8_t>(n & 0x7Fu);
+            n >>= 7u;
+            if (n > 0) b |= 0x80u;
+            d.push_back(b);
+        } while (n > 0);
+        d.insert(d.end(), s.begin(), s.end());
+    };
+
+    std::string xml = "<pdnImage width=\"" + std::to_string(w) + "\" height=\"" + std::to_string(h) +
+                      "\" layers=\"" + std::to_string(layers.size()) + "\" />";
+    std::vector<uint8_t> pdn = { 'P', 'D', 'N', '3' };
+    PushU24LE(pdn, static_cast<uint32_t>(xml.size()));
+    pdn.insert(pdn.end(), xml.begin(), xml.end());
+    pdn.insert(pdn.end(), { 0x00u, 0x01u }); // Uncompressed NRBF+MemoryBlock stream indicator
+
+    // [MS-NRBF] stream:
+    //   obj 1 = PaintDotNet.Document (width, height, layers -> ref 2)
+    //   obj 2 = PaintDotNet.LayerList (ArrayList+_items -> ref 3, ArrayList+_size)
+    //   obj 3 = ArraySingleObject of layer refs (10, 20, 30, ...)
+    //   For layer i (baseId = (i+1)*10):
+    //     baseId+0 = PaintDotNet.BitmapLayer (Layer+width, Layer+height, Layer+properties -> ref baseId+1, surface -> ref baseId+3)
+    //     baseId+1 = PaintDotNet.Layer+LayerProperties (name, visible, isBackground, opacity, blendMode -> ref baseId+2)
+    //     baseId+2 = PaintDotNet.LayerBlendMode (value__)
+    //     baseId+3 = PaintDotNet.Surface (width, height, stride, scan0 -> ref baseId+4)
+    //     baseId+4 = PaintDotNet.MemoryBlock (length64, hasParent)
+    pdn.push_back(0u); // SerializedStreamHeader
+    PushU32LE(pdn, 1u); // rootId = 1
+    PushU32LE(pdn, 0xFFFFFFFFu);
+    PushU32LE(pdn, 1u); // major = 1
+    PushU32LE(pdn, 0u); // minor = 0
+
+    // BinaryLibrary (id = 2, "PaintDotNet.Data")
+    pdn.push_back(12u);
+    PushU32LE(pdn, 2u);
+    pushLPStr(pdn, "PaintDotNet.Data");
+
+    // ClassWithMembersAndTypes (5): obj 1 = PaintDotNet.Document
+    pdn.push_back(5u);
+    PushU32LE(pdn, 1u);
+    pushLPStr(pdn, "PaintDotNet.Document");
+    PushU32LE(pdn, 3u);
+    pushLPStr(pdn, "width"); pushLPStr(pdn, "height"); pushLPStr(pdn, "layers");
+    pdn.insert(pdn.end(), { 0u, 0u, 4u }); // Primitive, Primitive, Class
+    pdn.push_back(8u); pdn.push_back(8u);  // Int32, Int32
+    pushLPStr(pdn, "PaintDotNet.LayerList"); PushU32LE(pdn, 2u);
+    PushU32LE(pdn, 2u); // libraryId = 2
+    PushU32LE(pdn, w);
+    PushU32LE(pdn, h);
+    pdn.push_back(9u); PushU32LE(pdn, 2u); // MemberReference -> 2
+
+    // ClassWithMembersAndTypes (5): obj 2 = PaintDotNet.LayerList
+    pdn.push_back(5u);
+    PushU32LE(pdn, 2u);
+    pushLPStr(pdn, "PaintDotNet.LayerList");
+    PushU32LE(pdn, 2u);
+    pushLPStr(pdn, "ArrayList+_items"); pushLPStr(pdn, "ArrayList+_size");
+    pdn.insert(pdn.end(), { 5u, 0u }); // ObjectArray, Primitive
+    pdn.push_back(8u);                 // Int32
+    PushU32LE(pdn, 2u);                // libraryId = 2
+    pdn.push_back(9u); PushU32LE(pdn, 3u); // MemberReference -> 3
+    PushU32LE(pdn, static_cast<uint32_t>(layers.size()));
+
+    // ArraySingleObject (16): obj 3 (padded with 2 trailing nulls to test _size slicing + ObjectNullMultiple256!)
+    pdn.push_back(16u);
+    PushU32LE(pdn, 3u);
+    PushU32LE(pdn, static_cast<uint32_t>(layers.size() + 2u));
+    for (size_t i = 0; i < layers.size(); ++i) {
+        pdn.push_back(9u);
+        PushU32LE(pdn, static_cast<uint32_t>((i + 1u) * 10u));
+    }
+    pdn.push_back(13u); pdn.push_back(2u); // ObjectNullMultiple256(2)
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        uint32_t bid = static_cast<uint32_t>((i + 1u) * 10u);
+        const auto& L = layers[i];
+
+        // BitmapLayer (bid+0)
+        pdn.push_back(5u);
+        PushU32LE(pdn, bid + 0u);
+        pushLPStr(pdn, "PaintDotNet.BitmapLayer");
+        PushU32LE(pdn, 4u);
+        pushLPStr(pdn, "Layer+width"); pushLPStr(pdn, "Layer+height");
+        pushLPStr(pdn, "Layer+properties"); pushLPStr(pdn, "surface");
+        pdn.insert(pdn.end(), { 0u, 0u, 4u, 4u });
+        pdn.push_back(8u); pdn.push_back(8u);
+        pushLPStr(pdn, "PaintDotNet.Layer+LayerProperties"); PushU32LE(pdn, 2u);
+        pushLPStr(pdn, "PaintDotNet.Surface"); PushU32LE(pdn, 2u);
+        PushU32LE(pdn, 2u);
+        PushU32LE(pdn, w);
+        PushU32LE(pdn, h);
+        pdn.push_back(9u); PushU32LE(pdn, bid + 1u);
+        pdn.push_back(9u); PushU32LE(pdn, bid + 3u);
+
+        // LayerProperties (bid+1)
+        pdn.push_back(5u);
+        PushU32LE(pdn, bid + 1u);
+        pushLPStr(pdn, "PaintDotNet.Layer+LayerProperties");
+        PushU32LE(pdn, 5u);
+        pushLPStr(pdn, "name"); pushLPStr(pdn, "visible"); pushLPStr(pdn, "isBackground");
+        pushLPStr(pdn, "opacity"); pushLPStr(pdn, "blendMode");
+        pdn.insert(pdn.end(), { 1u, 0u, 0u, 0u, 4u }); // String, Bool, Bool, Byte, Class
+        pdn.push_back(1u); pdn.push_back(1u); pdn.push_back(2u);
+        pushLPStr(pdn, "PaintDotNet.LayerBlendMode"); PushU32LE(pdn, 2u);
+        PushU32LE(pdn, 2u);
+        // BinaryObjectString (6) for name
+        pdn.push_back(6u); PushU32LE(pdn, bid + 5u); pushLPStr(pdn, L.name);
+        pdn.push_back(L.visible ? 1u : 0u);
+        pdn.push_back(i == 0 ? 1u : 0u);
+        pdn.push_back(L.opacity);
+        pdn.push_back(9u); PushU32LE(pdn, bid + 2u);
+
+        // LayerBlendMode enum (bid+2)
+        pdn.push_back(5u);
+        PushU32LE(pdn, bid + 2u);
+        pushLPStr(pdn, "PaintDotNet.LayerBlendMode");
+        PushU32LE(pdn, 1u);
+        pushLPStr(pdn, "value__");
+        pdn.push_back(0u); pdn.push_back(8u); // Int32
+        PushU32LE(pdn, 2u);
+        PushU32LE(pdn, static_cast<uint32_t>(L.blendMode));
+
+        // Surface (bid+3)
+        pdn.push_back(5u);
+        PushU32LE(pdn, bid + 3u);
+        pushLPStr(pdn, "PaintDotNet.Surface");
+        PushU32LE(pdn, 4u);
+        pushLPStr(pdn, "width"); pushLPStr(pdn, "height"); pushLPStr(pdn, "stride"); pushLPStr(pdn, "scan0");
+        pdn.insert(pdn.end(), { 0u, 0u, 0u, 4u });
+        pdn.push_back(8u); pdn.push_back(8u); pdn.push_back(8u);
+        pushLPStr(pdn, "PaintDotNet.MemoryBlock"); PushU32LE(pdn, 2u);
+        PushU32LE(pdn, 2u);
+        PushU32LE(pdn, w);
+        PushU32LE(pdn, h);
+        PushU32LE(pdn, w * 4u);
+        pdn.push_back(9u); PushU32LE(pdn, bid + 4u);
+
+        // MemoryBlock (bid+4)
+        pdn.push_back(5u);
+        PushU32LE(pdn, bid + 4u);
+        pushLPStr(pdn, "PaintDotNet.MemoryBlock");
+        PushU32LE(pdn, 2u);
+        pushLPStr(pdn, "length64"); pushLPStr(pdn, "hasParent");
+        pdn.insert(pdn.end(), { 0u, 0u });
+        pdn.push_back(9u); pdn.push_back(1u); // Int64, Boolean
+        PushU32LE(pdn, 2u);
+        PushU64LE(pdn, static_cast<uint64_t>(w) * h * 4ull);
+        pdn.push_back(0u);
+    }
+
+    pdn.push_back(11u); // MessageEnd (0x0B)
+
+    // Sequential chunked GZip MemoryBlock payloads (split into 2 out-of-order chunks [chunk 1, chunk 0]!)
+    const uint32_t totalBytes = w * h * 4u;
+    const uint32_t chunkSz = totalBytes / 2u;
+    for (const auto& L : layers) {
+        pdn.push_back(0u); // formatVersion = 0 (GZip)
+        PushU32BE(pdn, chunkSz);
+        for (int ci : { 1, 0 }) {
+            size_t off = static_cast<size_t>(ci) * chunkSz;
+            std::vector<uint8_t> slice(L.straightBgra.begin() + off, L.straightBgra.begin() + off + chunkSz);
+            std::vector<uint8_t> gz = CompressGzipTest(slice);
+            PushU32BE(pdn, static_cast<uint32_t>(ci));
+            PushU32BE(pdn, static_cast<uint32_t>(gz.size()));
+            pdn.insert(pdn.end(), gz.begin(), gz.end());
+        }
+    }
+    return pdn;
+}
+
 } // namespace
 
 void RunFormatTestsImages(TestCounter& tc) {
@@ -3855,6 +4965,858 @@ void RunFormatTestsImages(TestCounter& tc) {
                    (bgPx[3] == 0);
         }
         tc.Record(ggOk, L"Stage15.Images.Svg_GroupTransformStackDefsSkipAndGradients");
+    }
+
+    // 25. Lossy WebP VP8 (.webp): Segmentation + Multi-Token Partitions + B_PRED 4x4 Intra + VP8X/ALPH (Pure-C++ non-WIC)
+    {
+        auto webpSegA = BuildSegmentedMultiPartBPredWebP(false, 0);
+        auto webpAlph = BuildSegmentedMultiPartBPredWebP(true,  1);
+        verifyPair(L"Stage15.Images.WebP_Vp8SegMultiPartBPredPair",
+                   L"vp8_seg_bpred.webp", webpSegA, L"vp8_alph.webp", webpAlph, L".webp", 24);
+
+        ExtendedImageInfo iSeg, iAlph;
+        bool segOk = ImageFormatLoader::DecodeImageMemory(webpSegA.data(), webpSegA.size(), L".webp", 0, iSeg) &&
+                     iSeg.valid && iSeg.width == 32 && iSeg.height == 32 &&
+                     iSeg.formatName == L"WebP Lossy VP8 (.webp)"; // Proves pure-C++ VP8 ran (NOT WIC "WebP Raster (.webp)")!
+        bool alphOk = ImageFormatLoader::DecodeImageMemory(webpAlph.data(), webpAlph.size(), L".webp", 0, iAlph) &&
+                      iAlph.valid && iAlph.width == 32 && iAlph.height == 32 &&
+                      iAlph.formatName == L"WebP Lossy + ALPH (.webp)";
+        bool vp8ColorsOk = false;
+        if (segOk && alphOk) {
+            auto pxAt = [](const ExtendedImageInfo& im, uint32_t x, uint32_t y) {
+                return &im.bgraPixels[(static_cast<size_t>(y) * im.width + x) * 4u];
+            };
+            const uint8_t* q00 = pxAt(iSeg, 4,  4);  // MB(0,0) Part0 Seg0 -> Red dominant
+            const uint8_t* q10 = pxAt(iSeg, 20, 4);  // MB(1,0) Part0 Seg1 -> Green dominant
+            const uint8_t* q01 = pxAt(iSeg, 4,  20); // MB(0,1) Part1 Seg2 -> Blue dominant
+            const uint8_t* q11 = pxAt(iSeg, 20, 20); // MB(1,1) Part1 Seg3 -> Gold (R & G > B)
+            const uint8_t* aTop = pxAt(iAlph, 4, 4);   // ALPH top half = 255
+            const uint8_t* aBot = pxAt(iAlph, 4, 24);  // ALPH bottom half = 128 premultiplied
+            vp8ColorsOk =
+                (q00[2] > q00[0] + 60 && q00[3] == 255) &&
+                (q10[1] > q10[2] + 60 && q10[1] > q10[0] + 60) &&
+                (q01[0] > q01[2] + 60) &&
+                (q11[2] > q11[0] + 50 && q11[1] > q11[0] + 40) &&
+                (aTop[3] == 255 && aBot[3] == 128 && aBot[0] <= 128 && aBot[1] <= 128 && aBot[2] <= 128);
+        }
+        tc.Record(segOk && alphOk && vp8ColorsOk,
+                  L"Stage15.Images.WebP_PureCppSegMultiPartBPredAndAlphaExact",
+                  segOk ? (iSeg.formatName + L" + " + iAlph.formatName) : L"pure-C++ VP8 decode failed");
+    }
+
+    // 26. Pure-C++ Windows Metafile (.wmf Aldus Placeable) & Enhanced Metafile (.emf Paths/Transforms/4x4 AA)
+    {
+        auto buildEmf = [](uint8_t polyR, uint8_t polyG, uint8_t polyB) {
+            std::vector<uint8_t> emf;
+            auto emitEmr = [&](uint32_t type, const std::vector<uint8_t>& body) {
+                std::vector<uint8_t> padded = body;
+                while (padded.size() & 3u) padded.push_back(0u);
+                PushU32LE(emf, type);
+                PushU32LE(emf, static_cast<uint32_t>(8u + padded.size()));
+                emf.insert(emf.end(), padded.begin(), padded.end());
+            };
+
+            // EMR_HEADER (108 bytes)
+            std::vector<uint8_t> hdr(100, 0u); // + 8B type/size = 108B
+            auto wrI32 = [](std::vector<uint8_t>& v, size_t off, int32_t val) {
+                uint32_t u = static_cast<uint32_t>(val);
+                v[off+0] = static_cast<uint8_t>(u); v[off+1] = static_cast<uint8_t>(u >> 8);
+                v[off+2] = static_cast<uint8_t>(u >> 16); v[off+3] = static_cast<uint8_t>(u >> 24);
+            };
+            wrI32(hdr, 0,  0); wrI32(hdr, 4,  0); wrI32(hdr, 8,  255); wrI32(hdr, 12, 255); // rclBounds [0,0,255,255]
+            wrI32(hdr, 16, 0); wrI32(hdr, 20, 0); wrI32(hdr, 24, 9000); wrI32(hdr, 28, 9000); // rclFrame
+            wrI32(hdr, 32, 0x464D4520); // dSignature = " EMF"
+            wrI32(hdr, 36, 0x00010000); // nVersion
+            wrI32(hdr, 44, 14);         // nRecords placeholder
+            hdr[48] = 4; hdr[49] = 0;   // nHandles = 4
+            wrI32(hdr, 64, 256); wrI32(hdr, 68, 256); // szlDevice
+            wrI32(hdr, 72, 90);  wrI32(hdr, 76, 90);  // szlMillimeters
+            emitEmr(1u, hdr);
+
+            // Select NULL_PEN (0x80000008)
+            { std::vector<uint8_t> b; PushU32LE(b, 0x80000008u); emitEmr(37u, b); }
+
+            // CreateBrushIndirect(ihBrush=1, BS_SOLID=0, RGB(polyR,polyG,polyB)) + SelectObject(1)
+            {
+                std::vector<uint8_t> b;
+                PushU32LE(b, 1u); PushU32LE(b, 0u);
+                b.insert(b.end(), { polyR, polyG, polyB, 0u });
+                PushU32LE(b, 0u);
+                emitEmr(39u, b);
+            }
+            { std::vector<uint8_t> b; PushU32LE(b, 1u); emitEmr(37u, b); }
+
+            // EMR_POLYGON16 (type 86): diagonal triangle (16,16)-(120,16)-(16,120) in top-left quadrant (tests 4x4 AA hypotenuse!)
+            {
+                std::vector<uint8_t> b;
+                PushU32LE(b, 16u); PushU32LE(b, 16u); PushU32LE(b, 120u); PushU32LE(b, 120u);
+                PushU32LE(b, 3u);
+                PushU16LE(b, 16u);  PushU16LE(b, 16u);
+                PushU16LE(b, 120u); PushU16LE(b, 16u);
+                PushU16LE(b, 16u);  PushU16LE(b, 120u);
+                emitEmr(86u, b);
+            }
+
+            // CreateBrushIndirect(ihBrush=2, RGB(20, 195, 75)) + SelectObject(2) + EMR_ELLIPSE(42) in top-right (140,20)-(236,116)
+            {
+                std::vector<uint8_t> b;
+                PushU32LE(b, 2u); PushU32LE(b, 0u);
+                b.insert(b.end(), { 20u, 195u, 75u, 0u });
+                PushU32LE(b, 0u);
+                emitEmr(39u, b);
+            }
+            { std::vector<uint8_t> b; PushU32LE(b, 2u); emitEmr(37u, b); }
+            {
+                std::vector<uint8_t> b;
+                PushU32LE(b, 140u); PushU32LE(b, 20u); PushU32LE(b, 236u); PushU32LE(b, 116u);
+                emitEmr(42u, b);
+            }
+
+            // EMR_SAVEDC(33) + EMR_SETWORLDTRANSFORM(35) translate(+16, +140) + Path Bracket Bezier Fill in bottom-left + EMR_RESTOREDC(34)
+            emitEmr(33u, {});
+            {
+                std::vector<uint8_t> b;
+                PushF32LE(b, 1.0f); PushF32LE(b, 0.0f); PushF32LE(b, 0.0f); PushF32LE(b, 1.0f);
+                PushF32LE(b, 16.0f); PushF32LE(b, 140.0f);
+                emitEmr(35u, b);
+            }
+            {
+                std::vector<uint8_t> b;
+                PushU32LE(b, 3u); PushU32LE(b, 0u);
+                b.insert(b.end(), { 35u, 95u, 235u, 0u }); // Royal Blue
+                PushU32LE(b, 0u);
+                emitEmr(39u, b);
+            }
+            { std::vector<uint8_t> b; PushU32LE(b, 3u); emitEmr(37u, b); }
+            emitEmr(59u, {}); // EMR_BEGINPATH
+            { std::vector<uint8_t> b; PushU32LE(b, 0u); PushU32LE(b, 0u); emitEmr(27u, b); } // EMR_MOVETOEX(0,0)
+            { // EMR_POLYBEZIERTO16(88): (45,-10), (95,20), (90,90)
+                std::vector<uint8_t> b;
+                PushU32LE(b, 0u); PushU32LE(b, 0u); PushU32LE(b, 95u); PushU32LE(b, 95u);
+                PushU32LE(b, 3u);
+                PushU16LE(b, 45u); PushU16LE(b, 0u);
+                PushU16LE(b, 95u); PushU16LE(b, 20u);
+                PushU16LE(b, 90u); PushU16LE(b, 90u);
+                emitEmr(88u, b);
+            }
+            { std::vector<uint8_t> b; PushU32LE(b, 0u); PushU32LE(b, 90u); emitEmr(54u, b); } // EMR_LINETO(0,90)
+            emitEmr(61u, {}); // EMR_CLOSEFIGURE
+            emitEmr(60u, {}); // EMR_ENDPATH
+            { std::vector<uint8_t> b(16, 0u); emitEmr(62u, b); } // EMR_FILLPATH
+            { std::vector<uint8_t> b; PushU32LE(b, 0xFFFFFFFFu); emitEmr(34u, b); } // EMR_RESTOREDC(-1)
+
+            // EMR_EOF (type 14)
+            { std::vector<uint8_t> b = { 0,0,0,0, 0,0,0,0, 20,0,0,0 }; emitEmr(14u, b); }
+
+            uint32_t totalBytes = static_cast<uint32_t>(emf.size());
+            std::memcpy(emf.data() + 48, &totalBytes, 4);
+            return emf;
+        };
+
+        // Aldus Placeable WMF (0x9AC6CDD7) with Rectangle + Ellipse + DeleteObject/CreateBrushIndirect slot reuse
+        auto buildPlaceableWmf = [](uint8_t rectR, uint8_t rectG, uint8_t rectB) {
+            std::vector<uint8_t> wmf(22, 0u);
+            uint32_t key = 0x9AC6CDD7u;
+            std::memcpy(wmf.data(), &key, 4);
+            int16_t right = 200, bottom = 200;
+            std::memcpy(wmf.data() + 10, &right, 2);
+            std::memcpy(wmf.data() + 12, &bottom, 2);
+            uint16_t inch = 96u;
+            std::memcpy(wmf.data() + 14, &inch, 2);
+            uint16_t csum = 0u;
+            for (int i = 0; i < 10; ++i) {
+                uint16_t w16 = 0;
+                std::memcpy(&w16, wmf.data() + i * 2, 2);
+                csum ^= w16;
+            }
+            std::memcpy(wmf.data() + 20, &csum, 2);
+
+            size_t mhPos = wmf.size();
+            PushU16LE(wmf, 1u);       // mtType = 1
+            PushU16LE(wmf, 9u);       // mtHeaderSize = 9 words (18B)
+            PushU16LE(wmf, 0x0300u);  // mtVersion
+            PushU32LE(wmf, 0u);       // mtSizeWords placeholder
+            PushU16LE(wmf, 4u);       // mtNoObjects
+            PushU32LE(wmf, 32u);      // mtMaxRecord
+            PushU16LE(wmf, 0u);
+
+            uint32_t maxWords = 9u;
+            auto emitWmf = [&](uint16_t fn, const std::vector<uint16_t>& args) {
+                uint32_t words = static_cast<uint32_t>(3u + args.size());
+                maxWords = std::max(maxWords, words);
+                PushU32LE(wmf, words);
+                PushU16LE(wmf, fn);
+                for (uint16_t a : args) PushU16LE(wmf, a);
+            };
+            emitWmf(0x020Bu, { 0u, 0u });     // META_SETWINDOWORG(0, 0)
+            emitWmf(0x020Cu, { 200u, 200u }); // META_SETWINDOWEXT(200, 200)
+            // Slot 0: Brush RGB(rectR, rectG, rectB)
+            emitWmf(0x02FCu, { 0u, static_cast<uint16_t>(rectR | (uint16_t(rectG) << 8)), rectB, 0u });
+            // Slot 1: Pen PS_NULL (5)
+            emitWmf(0x02FAu, { 5u, 0u, 0u, 0u, 0u });
+            emitWmf(0x012Du, { 0u }); // SelectObject(0)
+            emitWmf(0x012Du, { 1u }); // SelectObject(1)
+            // META_RECTANGLE(bottom=90, right=90, top=10, left=10)
+            emitWmf(0x041Bu, { 90u, 90u, 10u, 10u });
+            // DeleteObject(0) then CreateBrushIndirect -> reuses slot 0 with Purple RGB(160, 40, 210)!
+            emitWmf(0x01F0u, { 0u });
+            emitWmf(0x02FCu, { 0u, static_cast<uint16_t>(160u | (40u << 8)), 210u, 0u });
+            emitWmf(0x012Du, { 0u });
+            // META_ELLIPSE(bottom=190, right=190, top=110, left=110)
+            emitWmf(0x0418u, { 190u, 190u, 110u, 110u });
+            emitWmf(0x0000u, {}); // META_EOF
+
+            uint32_t totalWords = static_cast<uint32_t>((wmf.size() - mhPos) / 2u);
+            std::memcpy(wmf.data() + mhPos + 6, &totalWords, 4);
+            std::memcpy(wmf.data() + mhPos + 12, &maxWords, 4);
+            return wmf;
+        };
+
+        auto emfA = buildEmf(230, 35, 45);
+        auto emfB = buildEmf(245, 175, 20);
+        verifyPair(L"Stage15.Images.Emf_PureCppPathsAndShapesPair",
+                   L"a.emf", emfA, L"b.emf", emfB, L".emf", 60);
+
+        auto wmfA = buildPlaceableWmf(25, 165, 235);
+        auto wmfB = buildPlaceableWmf(235, 90, 30);
+        verifyPair(L"Stage15.Images.Wmf_PureCppPlaceablePair",
+                   L"a.wmf", wmfA, L"b.wmf", wmfB, L".wmf", 28);
+
+        ExtendedImageInfo iEmf, iWmf;
+        bool emfOk = ImageFormatLoader::DecodeImageMemory(emfA.data(), emfA.size(), L".emf", 0, iEmf) &&
+                     iEmf.valid && iEmf.width >= 128 && iEmf.height >= 128;
+        bool wmfOk = ImageFormatLoader::DecodeImageMemory(wmfA.data(), wmfA.size(), L".wmf", 0, iWmf) &&
+                     iWmf.valid && iWmf.width == 512 && iWmf.height == 512; // 512x512 proves pure-C++ WMF (GDI fallback used 512x384)!
+        bool metaPxOk = false;
+        if (emfOk && wmfOk) {
+            auto emfSample = [&](float nx, float ny) {
+                uint32_t x = static_cast<uint32_t>(nx * iEmf.width);
+                uint32_t y = static_cast<uint32_t>(ny * iEmf.height);
+                return &iEmf.bgraPixels[(static_cast<size_t>(y) * iEmf.width + x) * 4u];
+            };
+            const uint8_t* eTri  = emfSample(0.16f, 0.16f); // Top-left Red triangle
+            const uint8_t* eEll  = emfSample(0.73f, 0.26f); // Top-right Green ellipse
+            const uint8_t* eBez  = emfSample(0.20f, 0.72f); // Bottom-left XFORM+Bezier Blue path
+            const uint8_t* wRect = &iWmf.bgraPixels[(128u * 512u + 128u) * 4u]; // Top-left Cyan-Blue rect
+            const uint8_t* wEll  = &iWmf.bgraPixels[(384u * 512u + 384u) * 4u]; // Bottom-right Purple ellipse (reused slot 0!)
+            metaPxOk =
+                (eTri[2] == 230 && eTri[1] == 35 && eTri[0] == 45) &&
+                (eEll[2] == 20  && eEll[1] == 195 && eEll[0] == 75) &&
+                (eBez[2] == 35  && eBez[1] == 95  && eBez[0] == 235) &&
+                (wRect[2] == 25 && wRect[1] == 165 && wRect[0] == 235) &&
+                (wEll[2] == 160 && wEll[1] == 40  && wEll[0] == 210);
+        }
+        tc.Record(emfOk && wmfOk && metaPxOk, L"Stage15.Images.EmfAndWmf_PureCppExactColorsAndObjectReuse");
+    }
+
+    // 27. Blizzard Warcraft III BLP1 (.blp): Paletted + 8-bit Alpha (Offsets 28 & 92) AND 4-Channel Split-JPEG BGRA
+    {
+        // A. Paletted BLP1 (compression=1, flags=0x8, pictureType=4, w=16, h=16, mip0Off@28 = 1180, mip0Len@92 = 512)
+        std::vector<uint8_t> blpPal(156u + 1024u + 512u, 0u);
+        std::memcpy(blpPal.data(), "BLP1", 4);
+        auto wr32 = [](std::vector<uint8_t>& v, size_t off, uint32_t val) { std::memcpy(v.data() + off, &val, 4); };
+        wr32(blpPal, 4,  1u);    // compression = 1 (Paletted)
+        wr32(blpPal, 8,  0x08u); // flags = has alpha
+        wr32(blpPal, 12, 16u);   // width = 16
+        wr32(blpPal, 16, 16u);   // height = 16
+        wr32(blpPal, 20, 4u);    // pictureType = 4 (8-bit alpha)
+        wr32(blpPal, 24, 1u);    // pictureSubType = 1 (nonzero to prove offset 24 is NOT treated as mip0Off!)
+        wr32(blpPal, 28, 1180u); // mipOffsets[0] at exact offset 28!
+        wr32(blpPal, 92, 512u);  // mipSizes[0]   at exact offset 92!
+        // Palette at 156 (BGRA): idx 1 = {B=40, G=100, R=240, 0}, idx 2 = {B=220, G=180, R=20, 0}
+        blpPal[156 + 1 * 4 + 0] = 40u;  blpPal[156 + 1 * 4 + 1] = 100u; blpPal[156 + 1 * 4 + 2] = 240u;
+        blpPal[156 + 2 * 4 + 0] = 220u; blpPal[156 + 2 * 4 + 1] = 180u; blpPal[156 + 2 * 4 + 2] = 20u;
+        for (uint32_t y = 0; y < 16; ++y) {
+            for (uint32_t x = 0; x < 16; ++x) {
+                blpPal[1180u + y * 16u + x] = (x < 8u) ? 1u : 2u;
+                blpPal[1180u + 256u + y * 16u + x] = (y < 8u) ? 255u : 128u;
+            }
+        }
+
+        // B. Split-JPEG BLP1 (compression=0, 16x8 4-channel raw BGRA JPEG split into shared header @160 + mip0 @mip0Off)
+        const uint8_t b0Bgra[4] = { 30u, 190u, 250u, 255u }; // Left 8x8 block: R=250, G=190, B=30, A=255
+        const uint8_t b1Bgra[4] = { 240u, 80u, 40u,  128u }; // Right 8x8 block: R=40, G=80, B=240, A=128 -> premul (20,40,120,128)
+        std::vector<uint8_t> fullJpg4 = BuildExactFlatBlocksJpeg(16, 8, 4, b0Bgra, b1Bgra);
+        size_t splitAt = 96u; // Split right across tables/SOS header just like real Warcraft III BLP1!
+        uint32_t jpgHdrSz = static_cast<uint32_t>(splitAt);
+        uint32_t mip0Pos  = static_cast<uint32_t>(160u + jpgHdrSz + 16u);
+        uint32_t mip0Sz   = static_cast<uint32_t>(fullJpg4.size() - splitAt);
+        std::vector<uint8_t> blpJpg(mip0Pos + mip0Sz, 0u);
+        std::memcpy(blpJpg.data(), "BLP1", 4);
+        wr32(blpJpg, 4,   0u);      // compression = 0 (JPEG)
+        wr32(blpJpg, 8,   0x08u);   // has alpha
+        wr32(blpJpg, 12,  16u);
+        wr32(blpJpg, 16,  8u);
+        wr32(blpJpg, 20,  0u);
+        wr32(blpJpg, 24,  1u);      // pictureSubType = 1
+        wr32(blpJpg, 28,  mip0Pos); // mipOffsets[0] @ 28
+        wr32(blpJpg, 92,  mip0Sz);  // mipSizes[0]   @ 92
+        wr32(blpJpg, 156, jpgHdrSz);// jpegHeaderSize @ 156
+        std::memcpy(blpJpg.data() + 160u, fullJpg4.data(), jpgHdrSz);
+        std::memcpy(blpJpg.data() + mip0Pos, fullJpg4.data() + splitAt, mip0Sz);
+
+        verifyPair(L"Stage15.Images.WarcraftBlp1_PalettedAndSplitJpegPair",
+                   L"pal.blp", blpPal, L"jpg.blp", blpJpg, L".blp", 120);
+
+        ExtendedImageInfo iPal, iJpg;
+        bool blpOk = ImageFormatLoader::DecodeImageMemory(blpPal.data(), blpPal.size(), L".blp", 0, iPal) &&
+                     ImageFormatLoader::DecodeImageMemory(blpJpg.data(), blpJpg.size(), L".blp", 0, iJpg) &&
+                     iPal.width == 16 && iPal.height == 16 && iJpg.width == 16 && iJpg.height == 8;
+        if (blpOk) {
+            const uint8_t* pTopL = &iPal.bgraPixels[(2u * 16u + 2u) * 4u];   // (B=40, G=100, R=240, A=255)
+            const uint8_t* pBotL = &iPal.bgraPixels[(12u * 16u + 2u) * 4u];  // Premul alpha=128 -> (B=20, G=50, R=120, A=128)
+            const uint8_t* jL    = &iJpg.bgraPixels[(4u * 16u + 2u) * 4u];   // (B=30, G=190, R=250, A=255)
+            const uint8_t* jR    = &iJpg.bgraPixels[(4u * 16u + 12u) * 4u];  // Premul alpha=128 -> (B=120, G=40, R=20, A=128)
+            blpOk =
+                (pTopL[0] == 40 && pTopL[1] == 100 && pTopL[2] == 240 && pTopL[3] == 255) &&
+                (std::abs(int(pBotL[0]) - 20) <= 1 && std::abs(int(pBotL[1]) - 50) <= 1 &&
+                 std::abs(int(pBotL[2]) - 120) <= 1 && pBotL[3] == 128) &&
+                (std::abs(int(jL[0]) - 30) <= 2 && std::abs(int(jL[1]) - 190) <= 2 &&
+                 std::abs(int(jL[2]) - 250) <= 2 && jL[3] == 255) &&
+                (std::abs(int(jR[0]) - 120) <= 2 && std::abs(int(jR[1]) - 40) <= 2 &&
+                 std::abs(int(jR[2]) - 20) <= 2 && std::abs(int(jR[3]) - 128) <= 1);
+        }
+        tc.Record(blpOk, L"Stage15.Images.WarcraftBlp1_Offsets28And92AlphaAnd4ChSplitJpegExact");
+    }
+
+    // 28. Sony PlayStation 1 TIM (.tim): 24-bit Direct RGB (pmode=3) + 16-bit STP Bit + pmode>=4 Rejection
+    {
+        // A. 24-bit Direct RGB TIM (pmode = 3, w = 8 -> wWords = (8*3)/2 = 12, h = 8)
+        std::vector<uint8_t> tim24 = { 0x10u, 0u, 0u, 0u };
+        PushU32LE(tim24, 3u); // flags = 3 (24-bit RGB, no CLUT)
+        PushU32LE(tim24, 12u + 24u * 8u); // bnum = 204
+        PushU16LE(tim24, 0u); PushU16LE(tim24, 0u); // dx, dy
+        PushU16LE(tim24, 12u); // wWords = 12 -> w = 8 pixels
+        PushU16LE(tim24, 8u);  // h = 8
+        for (uint32_t y = 0; y < 8; ++y) {
+            for (uint32_t x = 0; x < 8; ++x) {
+                if (x < 4u && y < 4u)       tim24.insert(tim24.end(), { 230u, 45u,  25u  }); // R, G, B
+                else if (x >= 4u && y < 4u) tim24.insert(tim24.end(), { 20u,  210u, 70u  });
+                else if (x < 4u && y >= 4u) tim24.insert(tim24.end(), { 35u,  90u,  240u });
+                else                        tim24.insert(tim24.end(), { 245u, 200u, 15u  });
+            }
+        }
+
+        // B. 16-bit BGR555 TIM (pmode = 2, 4x4): 0x0000 = transparent, 0x8000 = STP opaque black, 0x001F = pure Red
+        std::vector<uint8_t> tim16 = { 0x10u, 0u, 0u, 0u };
+        PushU32LE(tim16, 2u);
+        PushU32LE(tim16, 12u + 4u * 4u * 2u);
+        PushU16LE(tim16, 0u); PushU16LE(tim16, 0u);
+        PushU16LE(tim16, 4u); PushU16LE(tim16, 4u);
+        for (uint32_t i = 0; i < 16; ++i) {
+            uint16_t px = (i == 0) ? 0x0000u : (i == 1) ? 0x8000u : 0x001Fu;
+            PushU16LE(tim16, px);
+        }
+
+        verifyPair(L"Stage15.Images.Ps1Tim_24BitRgbAnd16BitStpPair",
+                   L"rgb24.tim", tim24, L"stp16.tim", tim16, L".tim", 18);
+
+        ExtendedImageInfo i24, i16, badTim;
+        bool timOk = ImageFormatLoader::DecodeImageMemory(tim24.data(), tim24.size(), L".tim", 0, i24) &&
+                     ImageFormatLoader::DecodeImageMemory(tim16.data(), tim16.size(), L".tim", 0, i16) &&
+                     i24.width == 8 && i24.height == 8 && i16.width == 4 && i16.height == 4;
+        if (timOk) {
+            // Confirm 24-bit TIM unpacked real RGB triplets (NOT solid 255 white!) and 16-bit STP bit works
+            const uint8_t* p00 = &i24.bgraPixels[(1u * 8u + 1u) * 4u];
+            const uint8_t* p10 = &i24.bgraPixels[(1u * 8u + 5u) * 4u];
+            const uint8_t* p01 = &i24.bgraPixels[(5u * 8u + 1u) * 4u];
+            timOk = (p00[2] == 230 && p00[1] == 45  && p00[0] == 25  && p00[3] == 255) &&
+                    (p10[2] == 20  && p10[1] == 210 && p10[0] == 70  && p10[3] == 255) &&
+                    (p01[2] == 35  && p01[1] == 90  && p01[0] == 240 && p01[3] == 255) &&
+                    (i16.bgraPixels[0 * 4 + 3] == 0) && // 0x0000 -> transparent
+                    (i16.bgraPixels[1 * 4 + 0] == 0 && i16.bgraPixels[1 * 4 + 1] == 0 &&
+                     i16.bgraPixels[1 * 4 + 2] == 0 && i16.bgraPixels[1 * 4 + 3] == 255); // 0x8000 -> opaque black!
+        }
+        auto invalidPmodeTim = tim16;
+        invalidPmodeTim[4] = 4u; // pmode = 4 (invalid)
+        auto invalidVerTim = tim16;
+        invalidVerTim[4] = 0x22u; // non-zero reserved bits
+        bool timRej = !ImageFormatLoader::DecodeImageMemory(invalidPmodeTim.data(), invalidPmodeTim.size(), L".tim", 0, badTim) &&
+                      !ImageFormatLoader::DecodeImageMemory(invalidVerTim.data(), invalidVerTim.size(), L".tim", 0, badTim);
+        tc.Record(timOk && timRej, L"Stage15.Images.Ps1Tim_24BitRgbStpAndRejectInvalidPmode");
+    }
+
+    // 29. Camera RAW Upgrades: Fujifilm .raf CFA Winning Over Preview JPEG, Pentax .pef (65535), Olympus .orf (12-bit Golomb-Rice)
+    {
+        auto appendIfdLE = [](std::vector<uint8_t>& buf, uint16_t tag, uint16_t type, uint32_t count, uint32_t valOrOff) {
+            PushU16LE(buf, tag); PushU16LE(buf, type); PushU32LE(buf, count); PushU32LE(buf, valOrOff);
+        };
+
+        // A. Fujifilm .raf containing BOTH a valid 8x8 Blue JPEG at offset 84 AND a 16x16 Red 6x6 X-Trans CFA sensor table!
+        //    Must decode the 16x16 Red CFA sensor data FIRST (not the 8x8 Blue preview JPEG!)
+        const uint8_t blueYcbcr[4] = { 55u, 225u, 100u, 255u }; // Saturated Blue YCbCr
+        std::vector<uint8_t> dummyBlueJpg = BuildExactFlatBlocksJpeg(8, 8, 3, blueYcbcr, blueYcbcr);
+        // 6x6 Fujifilm X-Trans pattern (0=R, 1=G, 2=B)
+        static constexpr uint8_t kXTrans6x6[36] = {
+            1, 0, 1, 1, 2, 1,
+            2, 1, 2, 0, 1, 0,
+            1, 0, 1, 1, 2, 1,
+            1, 2, 1, 1, 0, 1,
+            0, 1, 0, 2, 1, 2,
+            1, 2, 1, 1, 0, 1
+        };
+        std::vector<uint8_t> rafXTrans(148, 0u);
+        std::memcpy(rafXTrans.data(), "FUJIFILMCCD-RAW 0201", 20);
+        uint32_t jpgOff = 148u;
+        uint32_t jpgLen = static_cast<uint32_t>(dummyBlueJpg.size());
+        uint32_t cfaHdrOff = jpgOff + jpgLen;
+        // CFA header: 4B count(2) + rec0(0x0100, len=4, 18x18) + rec1(0x0131, len=36, X-Trans) = 4 + 8 + 40 = 52 bytes
+        uint32_t cfaDataOff = cfaHdrOff + 52u;
+        uint32_t cfaDataLen = 18u * 18u * 2u;
+        auto wr32BE = [](std::vector<uint8_t>& v, size_t o, uint32_t x) {
+            v[o+0] = static_cast<uint8_t>(x >> 24); v[o+1] = static_cast<uint8_t>(x >> 16);
+            v[o+2] = static_cast<uint8_t>(x >> 8);  v[o+3] = static_cast<uint8_t>(x);
+        };
+        wr32BE(rafXTrans, 84,  jpgOff);
+        wr32BE(rafXTrans, 88,  jpgLen);
+        wr32BE(rafXTrans, 92,  cfaHdrOff);
+        wr32BE(rafXTrans, 96,  52u);
+        wr32BE(rafXTrans, 100, cfaDataOff);
+        wr32BE(rafXTrans, 104, cfaDataLen);
+        rafXTrans.insert(rafXTrans.end(), dummyBlueJpg.begin(), dummyBlueJpg.end());
+        PushU32BE(rafXTrans, 2u);
+        PushU16BE(rafXTrans, 0x0100u); PushU16BE(rafXTrans, 4u); PushU16BE(rafXTrans, 18u); PushU16BE(rafXTrans, 18u);
+        PushU16BE(rafXTrans, 0x0131u); PushU16BE(rafXTrans, 36u);
+        rafXTrans.insert(rafXTrans.end(), kXTrans6x6, kXTrans6x6 + 36);
+        for (uint32_t y = 0; y < 18; ++y) {
+            for (uint32_t x = 0; x < 18; ++x) {
+                uint8_t c = kXTrans6x6[(y % 6u) * 6u + (x % 6u)];
+                PushU16BE(rafXTrans, (c == 0u) ? 0x0EA5u : 0x00A5u); // Red photosites high, G/B low
+            }
+        }
+
+        // B. Pentax .pef (Compression = 65535 lossless Huffman, 16x16 12-bit RGGB CFA, Emerald Green dominant)
+        std::vector<uint16_t> pefSamples(16u * 16u);
+        for (uint32_t y = 0; y < 16; ++y) {
+            for (uint32_t x = 0; x < 16; ++x) {
+                bool isG = ((x ^ y) & 1u) != 0u;
+                pefSamples[y * 16u + x] = isG ? 3800u : static_cast<uint16_t>(160u + ((x + y) & 7u) * 4u);
+            }
+        }
+        std::vector<uint8_t> pefComp = EncodePentaxPefStream(pefSamples, 16, 16);
+        std::vector<uint8_t> pefFile = { 'I', 'I', 42, 0, 8, 0, 0, 0 };
+        uint32_t pefStripOff = 8u + 2u + 11u * 12u + 4u;
+        PushU16LE(pefFile, 11u);
+        appendIfdLE(pefFile, 0x00FE, 4, 1, 0u);
+        appendIfdLE(pefFile, 0x0100, 4, 1, 16u);
+        appendIfdLE(pefFile, 0x0101, 4, 1, 16u);
+        appendIfdLE(pefFile, 0x0102, 3, 1, 12u);
+        appendIfdLE(pefFile, 0x0103, 3, 1, 65535u);     // Compression = 65535 (Pentax Lossless Huffman!)
+        appendIfdLE(pefFile, 0x0106, 3, 1, 32803u);     // CFA
+        appendIfdLE(pefFile, 0x0111, 4, 1, pefStripOff);
+        appendIfdLE(pefFile, 0x0115, 3, 1, 1u);
+        appendIfdLE(pefFile, 0x0117, 4, 1, static_cast<uint32_t>(pefComp.size()));
+        appendIfdLE(pefFile, 0x828D, 3, 2, 0x00020002u);
+        appendIfdLE(pefFile, 0x828E, 1, 4, 0x02010100u); // RGGB
+        PushU32LE(pefFile, 0u);
+        pefFile.insert(pefFile.end(), pefComp.begin(), pefComp.end());
+
+        // C. Olympus .orf (Magic 'I','I', 0x4F, 0x52, 12-bit Adaptive Golomb-Rice, 16x16 RGGB CFA, Royal Blue dominant)
+        std::vector<uint16_t> orfSamples(16u * 16u);
+        for (uint32_t y = 0; y < 16; ++y) {
+            for (uint32_t x = 0; x < 16; ++x) {
+                bool isB = ((y & 1u) == 1u) && ((x & 1u) == 1u);
+                orfSamples[y * 16u + x] = isB ? 3850u : static_cast<uint16_t>(140u + ((x * 3u + y) & 15u) * 4u);
+            }
+        }
+        std::vector<uint8_t> orfComp = EncodeOlympusOrfStream(orfSamples, 16, 16);
+        std::vector<uint8_t> orfFile = { 'I', 'I', 0x52u, 0x4Fu, 8, 0, 0, 0 }; // LE magic 0x4F52 ('RO')
+        uint32_t orfStripOff = 8u + 2u + 11u * 12u + 4u;
+        PushU16LE(orfFile, 11u);
+        appendIfdLE(orfFile, 0x00FE, 4, 1, 0u);
+        appendIfdLE(orfFile, 0x0100, 4, 1, 16u);
+        appendIfdLE(orfFile, 0x0101, 4, 1, 16u);
+        appendIfdLE(orfFile, 0x0102, 3, 1, 12u);
+        appendIfdLE(orfFile, 0x0103, 3, 1, 1u); // Olympus stores Golomb-Rice with Compression=1 and byteCount < packed12
+        appendIfdLE(orfFile, 0x0106, 3, 1, 32803u);
+        appendIfdLE(orfFile, 0x0111, 4, 1, orfStripOff);
+        appendIfdLE(orfFile, 0x0115, 3, 1, 1u);
+        appendIfdLE(orfFile, 0x0117, 4, 1, static_cast<uint32_t>(orfComp.size()));
+        appendIfdLE(orfFile, 0x828D, 3, 2, 0x00020002u);
+        appendIfdLE(orfFile, 0x828E, 1, 4, 0x02010100u);
+        PushU32LE(orfFile, 0u);
+        orfFile.insert(orfFile.end(), orfComp.begin(), orfComp.end());
+
+        ExtendedImageInfo iRafX, iPef, iOrf;
+        bool rawUpOk =
+            ImageFormatLoader::DecodeImageMemory(rafXTrans.data(), rafXTrans.size(), L".raf", 0, iRafX) &&
+            ImageFormatLoader::DecodeImageMemory(pefFile.data(), pefFile.size(), L".pef", 0, iPef) &&
+            ImageFormatLoader::DecodeImageMemory(orfFile.data(), orfFile.size(), L".orf", 0, iOrf) &&
+            iRafX.width == 18 && iRafX.height == 18 && // 18x18 proves CFA decoded (preview JPEG was 8x8)!
+            iPef.width == 16 && iPef.height == 16 &&
+            iOrf.width == 16 && iOrf.height == 16;
+        if (rawUpOk) {
+            const uint8_t* pRaf = &iRafX.bgraPixels[(9u * 18u + 9u) * 4u];
+            const uint8_t* pPef = &iPef.bgraPixels[(8u * 16u + 8u) * 4u];
+            const uint8_t* pOrf = &iOrf.bgraPixels[(8u * 16u + 8u) * 4u];
+            rawUpOk =
+                (pRaf[2] > pRaf[0] + 80 && pRaf[2] > pRaf[1] + 80) && // RAF X-Trans CFA is Red (NOT dummy Blue preview!)
+                (pPef[1] > pPef[2] + 80 && pPef[1] > pPef[0] + 80) && // Pentax 65535 Huffman is Green!
+                (pOrf[0] > pOrf[2] + 80 && pOrf[0] > pOrf[1] + 80);   // Olympus Golomb-Rice is Blue!
+        }
+        tc.Record(rawUpOk, L"Stage15.Images.CameraRAW_RafXTransOverPreviewPentax65535AndOlympusOrf");
+    }
+
+    // 30. paint.net Multi-Layer Image (.pdn): NRBF + Chunked GZip MemoryBlock + Multiply/Screen/Normal + Hidden Skip
+    {
+        const uint32_t w = 16, h = 16;
+        auto makeSolidLayer = [&](const char* nm, bool vis, uint8_t op, int32_t bm,
+                                  auto pxFn) -> TestPdnLayerInput {
+            TestPdnLayerInput L;
+            L.name = nm; L.visible = vis; L.opacity = op; L.blendMode = bm;
+            L.straightBgra.resize(w * h * 4u);
+            for (uint32_t y = 0; y < h; ++y) {
+                for (uint32_t x = 0; x < w; ++x) {
+                    uint8_t r = 0, g = 0, b = 0, a = 0;
+                    pxFn(x, y, r, g, b, a);
+                    size_t o = (y * w + x) * 4u;
+                    L.straightBgra[o + 0] = b; L.straightBgra[o + 1] = g;
+                    L.straightBgra[o + 2] = r; L.straightBgra[o + 3] = a;
+                }
+            }
+            return L;
+        };
+
+        std::vector<TestPdnLayerInput> layersA = {
+            // Layer 0: Normal base — left half (200, 100, 60, 255), right half (100, 150, 200, 255)
+            makeSolidLayer("Background", true, 255, 0, [](uint32_t x, uint32_t, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) {
+                if (x < 8u) { r = 200; g = 100; b = 60;  a = 255; }
+                else        { r = 100; g = 150; b = 200; a = 255; }
+            }),
+            // Layer 1: Multiply (1) on top half (y < 8) with (128, 255, 128, 255) -> halves R & B, preserves G!
+            makeSolidLayer("Multiply Tint", true, 255, 1, [](uint32_t, uint32_t y, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) {
+                if (y < 8u) { r = 128; g = 255; b = 128; a = 255; }
+            }),
+            // Layer 2: Screen (12) on bottom-right quadrant (x >= 8 && y >= 8) with (128, 128, 55, 255)
+            makeSolidLayer("Screen Glow", true, 255, 12, [](uint32_t x, uint32_t y, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) {
+                if (x >= 8u && y >= 8u) { r = 128; g = 128; b = 55; a = 255; }
+            }),
+            // Layer 3: Hidden poison layer (visible = false) — pure Magenta (255, 0, 255, 255) MUST NOT composite!
+            makeSolidLayer("Hidden Poison", false, 255, 0, [](uint32_t, uint32_t, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) {
+                r = 255; g = 0; b = 255; a = 255;
+            })
+        };
+        std::vector<TestPdnLayerInput> layersB = {
+            makeSolidLayer("BaseB", true, 128, 0, [](uint32_t, uint32_t, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) {
+                r = 40; g = 200; b = 180; a = 255;
+            })
+        };
+
+        auto pdnA = BuildPaintDotNetFixture(w, h, layersA);
+        auto pdnB = BuildPaintDotNetFixture(w, h, layersB);
+        verifyPair(L"Stage15.Images.PaintDotNet_MultiLayerNrbfPair",
+                   L"multi.pdn", pdnA, L"alpha.pdn", pdnB, L".pdn", 64);
+
+        ExtendedImageInfo pdnInfo;
+        bool pdnOk = ImageFormatLoader::DecodeImageMemory(pdnA.data(), pdnA.size(), L".pdn", 0, pdnInfo) &&
+                     pdnInfo.valid && pdnInfo.width == 16 && pdnInfo.height == 16 &&
+                     pdnInfo.layerNames.size() == 4 &&
+                     pdnInfo.layerNames[0] == L"Background" &&
+                     pdnInfo.layerNames[1] == L"Multiply Tint" &&
+                     pdnInfo.layerNames[2] == L"Screen Glow" &&
+                     pdnInfo.layerNames[3] == L"Hidden Poison";
+        if (pdnOk) {
+            auto chkPdn = [&](uint32_t x, uint32_t y, int er, int eg, int eb) {
+                const uint8_t* p = &pdnInfo.bgraPixels[(static_cast<size_t>(y) * 16u + x) * 4u];
+                return std::abs(int(p[2]) - er) <= 2 && std::abs(int(p[1]) - eg) <= 2 &&
+                       std::abs(int(p[0]) - eb) <= 2 && p[3] == 255;
+            };
+            // Top-left (2,2): Multiply((200,100,60), (128,255,128)) -> (~100, 100, ~30)
+            // Bottom-left (2,12): untouched Normal -> (200, 100, 60) (proving Hidden Magenta was skipped!)
+            // Bottom-right (12,12): Screen((100,150,200), (128,128,55)) -> 1 - (1-A)*(1-B):
+            //   R: 100 + 128 - (100*128)/255 = 178, G: 150 + 128 - (150*128)/255 = 203, B: 200 + 55 - (200*55)/255 = 212
+            pdnOk = chkPdn(2,  2,  100, 100, 30) &&
+                    chkPdn(2,  12, 200, 100, 60) &&
+                    chkPdn(12, 12, 178, 203, 212) &&
+                    ImageFormatLoader::IsExtendedImageExtension(L".pdn") &&
+                    IsImageExtension(L".pdn");
+        }
+        tc.Record(pdnOk, L"Stage15.Images.PaintDotNet_BlendModesMultiplyScreenAndHiddenLayerSkip");
+    }
+
+    // 31. ISO/IEC 14495-1 JPEG-LS (.jls Grayscale + RGB ILV=1/2 + 0xFF 7-bit Stuffing) & Encapsulated DICOM (.dcm .4.80)
+    {
+        const uint32_t w = 24, h = 16;
+        // Grayscale pattern combining long flat runs (Run Mode + EOL + Run Interruption) AND high-frequency alternating
+        // spikes that emit >= 8 consecutive '1' bits in unary Golomb codes, guaranteeing 0xFF -> 7-bit bit-stuffing!
+        std::vector<uint16_t> graySamps(w * h);
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                if (y < 6u) {
+                    graySamps[y * w + x] = (x < 14u) ? 42u : ((x == 14u) ? 210u : 42u); // Flat run + interruption + EOL run!
+                } else {
+                    // Alternating sharp jumps force large unary Golomb zero/one runs & 0xFF bytes
+                    graySamps[y * w + x] = static_cast<uint16_t>(((x + y) & 1u) ? (250u - (x * 7u) % 60u) : ((x * 13u + y * 5u) % 40u));
+                }
+            }
+        }
+        // Inject a row of 1-step unary values (me=1 -> '01', or me=0 -> '1' eight times in a row = 0xFF!)
+        // When Ra=Rb=Rc=0 but Rd!=0 (regular mode, C=0, px=0), ix=0 -> err=0 -> me=0 -> Golomb(0, k=2) = '100',
+        // and as N grows (N >= A -> k=0!), me=0 emits single '1' bit -> 8 consecutive ix==px pixels emit 0xFF!
+        for (uint32_t y = 6; y < 12; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                graySamps[y * w + x] = static_cast<uint16_t>((x * 17u + y * 3u) & 7u);
+            }
+        }
+        for (uint32_t x = 0; x < w; ++x) {
+            // Row 12: previous row has non-equal neighbors so Regular Mode runs with k=0, and cur == MedPred -> err=0 -> '1' bits -> 0xFF!
+            int ra = (x > 0) ? graySamps[12u * w + x - 1u] : graySamps[11u * w + 0u];
+            int rb = graySamps[11u * w + x];
+            int rc = (x > 0) ? graySamps[11u * w + x - 1u] : graySamps[10u * w + 0u];
+            int med = (rc >= std::max(ra, rb)) ? std::min(ra, rb) : (rc <= std::min(ra, rb)) ? std::max(ra, rb) : (ra + rb - rc);
+            graySamps[12u * w + x] = static_cast<uint16_t>(std::clamp(med, 0, 255));
+        }
+
+        bool sawStuffGray = false;
+        std::vector<uint8_t> jlsGray = EncodeTestJpegLs(w, h, 1, 8, 0, graySamps, &sawStuffGray);
+
+        // 3-channel RGB JPEG-LS (ILV=1 line-interleaved AND ILV=2 sample-interleaved)
+        std::vector<uint16_t> rgbSamps(w * h * 3u);
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                size_t o = (y * w + x) * 3u;
+                if (y < 4u && x < 12u) {
+                    rgbSamps[o + 0] = 220; rgbSamps[o + 1] = 40; rgbSamps[o + 2] = 65; // Flat RGB run
+                } else {
+                    rgbSamps[o + 0] = static_cast<uint16_t>((x * 9u + y * 7u) & 255u);
+                    rgbSamps[o + 1] = static_cast<uint16_t>((230u - x * 5u + y * 11u) & 255u);
+                    rgbSamps[o + 2] = static_cast<uint16_t>(((x ^ y) * 13u + 50u) & 255u);
+                }
+            }
+        }
+        std::vector<uint8_t> jlsRgbLine   = EncodeTestJpegLs(w, h, 3, 8, 1, rgbSamps);
+        std::vector<uint8_t> jlsRgbSample = EncodeTestJpegLs(w, h, 3, 8, 2, rgbSamps);
+
+        verifyPair(L"Stage15.Images.JpegLs_GrayscaleAndRgbPair",
+                   L"gray.jls", jlsGray, L"rgb.jls", jlsRgbSample, L".jls", 20);
+
+        ExtendedImageInfo iGray, iRgb1, iRgb2;
+        bool jlsExact =
+            sawStuffGray &&
+            ImageFormatLoader::DecodeImageMemory(jlsGray.data(), jlsGray.size(), L".jls", 0, iGray) &&
+            ImageFormatLoader::DecodeImageMemory(jlsRgbLine.data(), jlsRgbLine.size(), L".jls", 0, iRgb1) &&
+            ImageFormatLoader::DecodeImageMemory(jlsRgbSample.data(), jlsRgbSample.size(), L".jls", 0, iRgb2) &&
+            iGray.width == w && iGray.height == h && iRgb1.width == w && iRgb2.width == w &&
+            iRgb1.bgraPixels == iRgb2.bgraPixels &&
+            ImageFormatLoader::IsExtendedImageExtension(L".jls") &&
+            IsImageExtension(L".jls");
+        if (jlsExact) {
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                uint8_t expG = static_cast<uint8_t>(graySamps[i]);
+                if (iGray.bgraPixels[i * 4u + 0] != expG || iGray.bgraPixels[i * 4u + 2] != expG) { jlsExact = false; break; }
+                if (iRgb2.bgraPixels[i * 4u + 2] != rgbSamps[i * 3u + 0] ||
+                    iRgb2.bgraPixels[i * 4u + 1] != rgbSamps[i * 3u + 1] ||
+                    iRgb2.bgraPixels[i * 4u + 0] != rgbSamps[i * 3u + 2]) { jlsExact = false; break; }
+            }
+        }
+
+        // Encapsulated 12-bit DICOM (.dcm) with Transfer Syntax 1.2.840.10008.1.2.4.80 (JPEG-LS Lossless)
+        std::vector<uint16_t> ct12(8u * 8u, 1024u);
+        ct12[0] = 24u;              // 24 - 1024 = -1000 HU (air -> 0)
+        ct12[4 * 8 + 4] = 1064u;    // 1064 - 1024 = +40 HU (WindowCenter=40 -> ~128)
+        ct12[7 * 8 + 7] = 1524u;    // 1524 - 1024 = +500 HU (bone -> 255)
+        std::vector<uint8_t> ctJlsFrag = EncodeTestJpegLs(8, 8, 1, 12, 0, ct12);
+        if (ctJlsFrag.size() & 1u) ctJlsFrag.push_back(0u);
+
+        std::vector<uint8_t> dcmJls(128, 0u);
+        dcmJls.insert(dcmJls.end(), { 'D', 'I', 'C', 'M' });
+        AppendDcmStr(dcmJls, 0x0002, 0x0010, "UI", "1.2.840.10008.1.2.4.80"); // JPEG-LS Lossless!
+        AppendDcmUS(dcmJls, 0x0028, 0x0002, 1);
+        AppendDcmStr(dcmJls, 0x0028, 0x0004, "CS", "MONOCHROME2");
+        AppendDcmUS(dcmJls, 0x0028, 0x0010, 8);
+        AppendDcmUS(dcmJls, 0x0028, 0x0011, 8);
+        AppendDcmUS(dcmJls, 0x0028, 0x0100, 16);
+        AppendDcmUS(dcmJls, 0x0028, 0x0101, 12);
+        AppendDcmUS(dcmJls, 0x0028, 0x0102, 11);
+        AppendDcmUS(dcmJls, 0x0028, 0x0103, 0);
+        AppendDcmStr(dcmJls, 0x0028, 0x1050, "DS", "40");
+        AppendDcmStr(dcmJls, 0x0028, 0x1051, "DS", "400");
+        AppendDcmStr(dcmJls, 0x0028, 0x1052, "DS", "-1024");
+        AppendDcmStr(dcmJls, 0x0028, 0x1053, "DS", "1");
+        AppendDcmLongTag(dcmJls, 0x7FE0, 0x0010, "OB", 0xFFFFFFFFu);
+        PushU16LE(dcmJls, 0xFFFEu); PushU16LE(dcmJls, 0xE000u); PushU32LE(dcmJls, 0u);
+        PushU16LE(dcmJls, 0xFFFEu); PushU16LE(dcmJls, 0xE000u); PushU32LE(dcmJls, static_cast<uint32_t>(ctJlsFrag.size()));
+        dcmJls.insert(dcmJls.end(), ctJlsFrag.begin(), ctJlsFrag.end());
+        PushU16LE(dcmJls, 0xFFFEu); PushU16LE(dcmJls, 0xE0DDu); PushU32LE(dcmJls, 0u);
+
+        ExtendedImageInfo iDcmJls;
+        bool dcmJlsOk = ImageFormatLoader::DecodeImageMemory(dcmJls.data(), dcmJls.size(), L".dcm", 0, iDcmJls) &&
+                        iDcmJls.valid && iDcmJls.width == 8 && iDcmJls.height == 8;
+        if (dcmJlsOk) {
+            uint8_t pAir  = iDcmJls.bgraPixels[0 * 4];
+            uint8_t pMid  = iDcmJls.bgraPixels[(4 * 8 + 4) * 4];
+            uint8_t pBone = iDcmJls.bgraPixels[(7 * 8 + 7) * 4];
+            dcmJlsOk = (pAir == 0u) && (pMid >= 120u && pMid <= 136u) && (pBone == 255u);
+        }
+        tc.Record(jlsExact && dcmJlsOk, L"Stage15.Images.JpegLs_BitExactStuffingRunModeAndDicomEncapsulated");
+    }
+
+    // 32. Sketch Vector Design Document (.sketch) & Compressed SVG (.svgz)
+    {
+        std::string docJson = R"({"_class":"document","pages":[{"_class":"MSJSONFileReference","_ref_class":"MSImmutablePage","_ref":"pages/main-page"}]})";
+        std::string metaJson = R"({"commit":"sketch-test","version":136})";
+        std::string pageAJson = R"({
+            "_class": "page",
+            "name": "Page 1",
+            "layers": [{
+                "_class": "artboard",
+                "name": "Hero Artboard",
+                "isVisible": true,
+                "hasBackgroundColor": true,
+                "backgroundColor": { "red": 0.0627, "green": 0.0941, "blue": 0.1569, "alpha": 1.0 },
+                "frame": { "_class": "rect", "x": 100, "y": 200, "width": 128, "height": 128 },
+                "layers": [
+                    {
+                        "_class": "rectangle",
+                        "name": "Top Gradient Bar",
+                        "isVisible": true,
+                        "fixedRadius": 0,
+                        "frame": { "x": 0, "y": 0, "width": 128, "height": 32 },
+                        "style": {
+                            "fills": [{
+                                "isEnabled": true,
+                                "fillType": 1,
+                                "gradient": {
+                                    "gradientType": 0,
+                                    "from": "{0, 0.5}",
+                                    "to": "{1, 0.5}",
+                                    "stops": [
+                                        { "position": 0.0, "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 } },
+                                        { "position": 1.0, "color": { "red": 0.0, "green": 0.0, "blue": 1.0, "alpha": 1.0 } }
+                                    ]
+                                }
+                            }]
+                        }
+                    },
+                    {
+                        "_class": "oval",
+                        "name": "Radial Badge",
+                        "isVisible": true,
+                        "frame": { "x": 8, "y": 44, "width": 48, "height": 48 },
+                        "style": {
+                            "fills": [{
+                                "isEnabled": true,
+                                "fillType": 1,
+                                "gradient": {
+                                    "gradientType": 1,
+                                    "from": "{0.5, 0.5}",
+                                    "to": "{1.0, 0.5}",
+                                    "stops": [
+                                        { "position": 0.0, "color": { "red": 0.0, "green": 1.0, "blue": 0.0, "alpha": 1.0 } },
+                                        { "position": 1.0, "color": { "red": 0.0, "green": 0.2, "blue": 0.0, "alpha": 1.0 } }
+                                    ]
+                                }
+                            }]
+                        }
+                    },
+                    {
+                        "_class": "shapePath",
+                        "name": "Bezier Wave Blob",
+                        "isVisible": true,
+                        "isClosed": true,
+                        "frame": { "x": 68, "y": 44, "width": 52, "height": 52 },
+                        "points": [
+                            { "point": "{0.5, 0.0}", "curveFrom": "{0.95, 0.0}", "curveTo": "{0.05, 0.0}", "curveMode": 2, "hasCurveFrom": true, "hasCurveTo": true },
+                            { "point": "{1.0, 0.5}", "curveFrom": "{1.0, 0.95}", "curveTo": "{1.0, 0.05}", "curveMode": 2, "hasCurveFrom": true, "hasCurveTo": true },
+                            { "point": "{0.5, 1.0}", "curveFrom": "{0.05, 1.0}", "curveTo": "{0.95, 1.0}", "curveMode": 4, "hasCurveFrom": true, "hasCurveTo": true },
+                            { "point": "{0.0, 0.5}", "curveFrom": "{0.0, 0.05}", "curveTo": "{0.0, 0.95}", "curveMode": 4, "hasCurveFrom": true, "hasCurveTo": true }
+                        ],
+                        "style": {
+                            "fills": [{ "isEnabled": true, "fillType": 0, "color": { "red": 0.98, "green": 0.80, "blue": 0.08, "alpha": 1.0 } }],
+                            "borders": [{ "isEnabled": true, "fillType": 0, "position": 0, "thickness": 3, "color": { "red": 1.0, "green": 1.0, "blue": 1.0, "alpha": 1.0 } }]
+                        }
+                    },
+                    {
+                        "_class": "rectangle",
+                        "name": "Hidden Magenta",
+                        "isVisible": false,
+                        "frame": { "x": 0, "y": 0, "width": 128, "height": 128 },
+                        "style": {
+                            "fills": [{ "isEnabled": true, "fillType": 0, "color": { "red": 1.0, "green": 0.0, "blue": 1.0, "alpha": 1.0 } }]
+                        }
+                    }
+                ]
+            }]
+        })";
+
+        std::string pageBJson = R"({
+            "_class": "page",
+            "name": "Page B",
+            "layers": [{
+                "_class": "star",
+                "name": "Standalone Star",
+                "numberOfPoints": 5,
+                "radius": 0.5,
+                "frame": { "x": 0, "y": 0, "width": 96, "height": 96 },
+                "style": { "fills": [{ "isEnabled": true, "fillType": 0, "color": { "red": 0.2, "green": 0.7, "blue": 0.95, "alpha": 1.0 } }] }
+            }]
+        })";
+
+        auto toVec = [](const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); };
+        auto sketchA = BuildMultiFileDeflateZip({
+            { "meta.json", toVec(metaJson) },
+            { "document.json", toVec(docJson) },
+            { "pages/main-page.json", toVec(pageAJson) }
+        });
+        auto sketchB = BuildMultiFileDeflateZip({
+            { "meta.json", toVec(metaJson) },
+            { "pages/other.json", toVec(pageBJson) }
+        });
+
+        verifyPair(L"Stage15.Images.SketchDocument_ArtboardAndShapesPair",
+                   L"a.sketch", sketchA, L"b.sketch", sketchB, L".sketch", 32);
+
+        ExtendedImageInfo skInfo, badSketch;
+        bool skOk = ImageFormatLoader::DecodeImageMemory(sketchA.data(), sketchA.size(), L".sketch", 128, skInfo) &&
+                    skInfo.valid && skInfo.width == 128 && skInfo.height == 128 &&
+                    skInfo.layerNames.size() >= 4 &&
+                    ImageFormatLoader::IsExtendedImageExtension(L".sketch") &&
+                    IsImageExtension(L".sketch");
+        if (skOk) {
+            auto skPx = [&](uint32_t x, uint32_t y) { return &skInfo.bgraPixels[(static_cast<size_t>(y) * 128u + x) * 4u]; };
+            const uint8_t* gLeft  = skPx(2, 16);   // Linear gradient start -> Red
+            const uint8_t* gRight = skPx(125, 16); // Linear gradient end -> Blue
+            const uint8_t* radCtr = skPx(32, 68);  // Radial oval center -> Green
+            const uint8_t* bezCtr = skPx(94, 70);  // Cubic Bezier shapePath center -> Gold (#FACC15)
+            const uint8_t* bgBot  = skPx(16, 118); // Artboard background (#101828) — NOT hidden magenta!
+            skOk = (gLeft[2] > 235 && gLeft[0] < 25) &&
+                   (gRight[0] > 235 && gRight[2] < 25) &&
+                   (radCtr[1] > 230 && radCtr[2] < 25) &&
+                   (bezCtr[2] > 230 && bezCtr[1] > 185 && bezCtr[0] < 45) &&
+                   (bgBot[2] < 35 && bgBot[1] < 40 && bgBot[0] >= 30 && bgBot[0] <= 55);
+        }
+        // Non-Sketch ZIP (e.g. random foo.txt) must be strictly rejected
+        auto nonSketchZip = BuildMultiFileDeflateZip({ { "hello.txt", toVec("not a sketch file") } });
+        bool skRej = !ImageFormatLoader::DecodeImageMemory(nonSketchZip.data(), nonSketchZip.size(), L".sketch", 0, badSketch);
+        tc.Record(skOk && skRej, L"Stage15.Images.SketchDocument_ArtboardBezierGradientsAndRejectNonSketchZip");
+
+        // Compressed SVG (.svgz): GZip-compressed SVG vector graphics
+        std::string svgXmlA =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">"
+            "<rect x=\"0\" y=\"0\" width=\"64\" height=\"64\" fill=\"#0f172a\"/>"
+            "<circle cx=\"32\" cy=\"32\" r=\"20\" fill=\"#22c55e\"/></svg>";
+        std::string svgXmlB =
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\">"
+            "<path d=\"M8,8 L56,8 L32,56 Z\" fill=\"#ef4444\"/></svg>";
+        std::vector<uint8_t> rawSvgA(svgXmlA.begin(), svgXmlA.end());
+        std::vector<uint8_t> svgzA = CompressGzipTest(rawSvgA);
+        std::vector<uint8_t> svgzB = CompressGzipTest(std::vector<uint8_t>(svgXmlB.begin(), svgXmlB.end()));
+
+        verifyPair(L"Stage15.Images.CompressedSvgz_GzipVectorPair",
+                   L"a.svgz", svgzA, L"b.svgz", svgzB, L".svgz", 14);
+
+        ExtendedImageInfo iSvgRef, iSvgz, badSvgz;
+        bool svgzOk =
+            ImageFormatLoader::DecodeImageMemory(rawSvgA.data(), rawSvgA.size(), L".svg", 64, iSvgRef) &&
+            ImageFormatLoader::DecodeImageMemory(svgzA.data(), svgzA.size(), L".svgz", 64, iSvgz) &&
+            iSvgz.valid && iSvgz.width == 64 && iSvgz.height == 64 &&
+            iSvgz.formatName == L"Compressed SVG Vector (.svgz)" &&
+            iSvgz.bgraPixels == iSvgRef.bgraPixels &&
+            ImageFormatLoader::IsExtendedImageExtension(L".svgz") &&
+            IsImageExtension(L".svgz");
+        std::vector<uint8_t> nonSvgGzip = CompressGzipTest(toVec("not an xml svg document"));
+        bool svgzRej = !ImageFormatLoader::DecodeImageMemory(nonSvgGzip.data(), nonSvgGzip.size(), L".svgz", 64, badSvgz);
+        tc.Record(svgzOk && svgzRej, L"Stage15.Images.CompressedSvgz_ExactMatchWithSvgAndRejectNonSvgGzip");
     }
 
     RunFormatTestsImagesBatch70(tc);

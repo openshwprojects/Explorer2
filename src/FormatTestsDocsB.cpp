@@ -2641,6 +2641,1095 @@ void RunFormatTestsDocsB(TestCounter& tc) {
                       DocContainsToken(etlDoc, L"3180"),
                 L"DocsB .etl (WMI_BUFFER_HEADER, TRACE_LOGFILE_HEADER, 64-bit EVENT_HEADER & Cheat Reject)");
         }
+
+        // =====================================================================
+        // 9. Upgraded GIS / Security / Database / E-Book & 5 New Office/Data Readers
+        // =====================================================================
+        {
+            // Verify extension registration for newly wired & previously missing formats
+            bool extsOk =
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".azw") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".prc") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".djv") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".gp3") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".gp4") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".xlsb") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".pst") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".ost") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".idml") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".mht") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".mhtml") &&
+                SpreadsheetDocViewer::IsSpreadsheetOrDocExtension(L".plist");
+            tc.Record(extsOk, L"DocsB Extension Registration (.azw/.prc/.djv/.gp3/.gp4/.xlsb/.pst/.ost/.idml/.mht/.mhtml/.plist)");
+
+            auto buildStoredZlib = [](const std::vector<uint8_t>& payload) -> std::vector<uint8_t> {
+                uint32_t s1 = 1u, s2 = 0u;
+                for (uint8_t byte : payload) {
+                    s1 = (s1 + byte) % 65521u;
+                    s2 = (s2 + s1) % 65521u;
+                }
+                uint16_t len = static_cast<uint16_t>(payload.size());
+                ByteBuf z;
+                z.U8(0x78u); z.U8(0x01u); // RFC 1950 zlib header (30721 % 31 == 0)
+                z.U8(0x01u);              // RFC 1951 final stored block
+                z.U16LE(len);
+                z.U16LE(static_cast<uint16_t>(~len));
+                if (!payload.empty()) z.Bytes(payload.data(), payload.size());
+                z.U32BE((s2 << 16) | s1); // Adler-32 BE
+                return z.b;
+            };
+
+            auto buildStoredZipMulti = [](const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries) -> std::vector<uint8_t> {
+                struct CdItem { std::string path; uint32_t crc; uint32_t sz; uint32_t lhoff; };
+                std::vector<CdItem> cd;
+                ByteBuf z;
+                for (const auto& [path, data] : entries) {
+                    uint32_t crc = data.empty() ? 0u : Checksum::Crc32(data.data(), data.size());
+                    uint32_t sz  = static_cast<uint32_t>(data.size());
+                    uint32_t off = static_cast<uint32_t>(z.b.size());
+                    z.U32LE(0x04034B50u);
+                    z.U16LE(20); z.U16LE(0); z.U16LE(0); z.U16LE(0); z.U16LE(0);
+                    z.U32LE(crc); z.U32LE(sz); z.U32LE(sz);
+                    z.U16LE(static_cast<uint16_t>(path.size())); z.U16LE(0);
+                    z.Str(path);
+                    if (!data.empty()) z.Bytes(data.data(), data.size());
+                    cd.push_back({ path, crc, sz, off });
+                }
+                uint32_t cdOff = static_cast<uint32_t>(z.b.size());
+                for (const auto& c : cd) {
+                    z.U32LE(0x02014B50u);
+                    z.U16LE(20); z.U16LE(20); z.U16LE(0); z.U16LE(0); z.U16LE(0); z.U16LE(0);
+                    z.U32LE(c.crc); z.U32LE(c.sz); z.U32LE(c.sz);
+                    z.U16LE(static_cast<uint16_t>(c.path.size()));
+                    z.U16LE(0); z.U16LE(0); z.U16LE(0); z.U16LE(0);
+                    z.U32LE(0); z.U32LE(c.lhoff);
+                    z.Str(c.path);
+                }
+                uint32_t cdSize = static_cast<uint32_t>(z.b.size()) - cdOff;
+                z.U32LE(0x06054B50u);
+                z.U16LE(0); z.U16LE(0);
+                z.U16LE(static_cast<uint16_t>(cd.size()));
+                z.U16LE(static_cast<uint16_t>(cd.size()));
+                z.U32LE(cdSize);
+                z.U32LE(cdOff);
+                z.U16LE(0);
+                return z.b;
+            };
+
+            auto zigZag64 = [](int64_t v) -> uint64_t {
+                return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63);
+            };
+            auto pbBytes = [](ByteBuf& dst, uint32_t fn, const void* p, size_t n) {
+                dst.Uleb((static_cast<uint64_t>(fn) << 3) | 2u);
+                dst.Uleb(n);
+                if (n > 0) dst.Bytes(p, n);
+            };
+            auto pbStr = [&](ByteBuf& dst, uint32_t fn, std::string_view s) {
+                pbBytes(dst, fn, s.data(), s.size());
+            };
+            auto pbVar = [](ByteBuf& dst, uint32_t fn, uint64_t v) {
+                dst.Uleb((static_cast<uint64_t>(fn) << 3) | 0u);
+                dst.Uleb(v);
+            };
+
+            // 9A. OpenStreetMap Binary PBF (.pbf): OSMHeader + Zlib-compressed OSMData (DenseNodes + Way + geoPoints)
+            {
+                auto appendOsmBlock = [](ByteBuf& file, std::string_view btype, const ByteBuf& blob) {
+                    ByteBuf bh;
+                    bh.Uleb((1u << 3) | 2u); bh.Uleb(btype.size()); bh.Str(btype);
+                    bh.Uleb((3u << 3) | 0u); bh.Uleb(blob.b.size());
+                    file.U32BE(static_cast<uint32_t>(bh.b.size()));
+                    file.Bytes(bh.b.data(), bh.b.size());
+                    file.Bytes(blob.b.data(), blob.b.size());
+                };
+
+                ByteBuf bbox;
+                pbVar(bbox, 1, zigZag64(11570000000LL)); // left  = 11.57
+                pbVar(bbox, 2, zigZag64(11590000000LL)); // right = 11.59
+                pbVar(bbox, 3, zigZag64(48150000000LL)); // top   = 48.15
+                pbVar(bbox, 4, zigZag64(48130000000LL)); // bot   = 48.13
+                ByteBuf hdrBlk;
+                pbBytes(hdrBlk, 1, bbox.b.data(), bbox.b.size());
+                pbStr(hdrBlk, 4, "OsmSchema-V0.6");
+                pbStr(hdrBlk, 4, "DenseNodes");
+                pbStr(hdrBlk, 16, "Osmium/1.16.0");
+                ByteBuf hdrBlob;
+                pbBytes(hdrBlob, 1, hdrBlk.b.data(), hdrBlk.b.size()); // raw
+
+                // StringTable: 0="", 1="name", 2="Marienplatz", 3="amenity", 4="townhall", 5="highway", 6="pedestrian", 7="Kaufingerstrasse"
+                ByteBuf st;
+                static const char* const kOsmStrs[] = { "", "name", "Marienplatz", "amenity", "townhall", "highway", "pedestrian", "Kaufingerstrasse" };
+                for (const char* s : kOsmStrs) {
+                    pbStr(st, 1, s);
+                }
+                // DenseNodes: 2 nodes (1001 @ 48.1371540, 11.5754980 with name=Marienplatz, amenity=townhall; 1005 @ +0.0005, -0.0012)
+                ByteBuf dnIds, dnLats, dnLons, dnKv;
+                dnIds.Uleb(zigZag64(1001));      dnIds.Uleb(zigZag64(4));
+                dnLats.Uleb(zigZag64(481371540)); dnLats.Uleb(zigZag64(500));
+                dnLons.Uleb(zigZag64(115754980)); dnLons.Uleb(zigZag64(-1200));
+                for (uint32_t kv : { 1u, 2u, 3u, 4u, 0u, 0u }) dnKv.Uleb(kv);
+                ByteBuf dense;
+                pbBytes(dense, 1, dnIds.b.data(), dnIds.b.size());
+                pbBytes(dense, 8, dnLats.b.data(), dnLats.b.size());
+                pbBytes(dense, 9, dnLons.b.data(), dnLons.b.size());
+                pbBytes(dense, 10, dnKv.b.data(), dnKv.b.size());
+
+                // Way 5001: name=Kaufingerstrasse, highway=pedestrian, refs=[1001, 1005]
+                ByteBuf wKeys, wVals, wRefs;
+                wKeys.Uleb(1); wKeys.Uleb(5);
+                wVals.Uleb(7); wVals.Uleb(6);
+                wRefs.Uleb(zigZag64(1001)); wRefs.Uleb(zigZag64(4));
+                ByteBuf way;
+                pbVar(way, 1, 5001);
+                pbBytes(way, 2, wKeys.b.data(), wKeys.b.size());
+                pbBytes(way, 3, wVals.b.data(), wVals.b.size());
+                pbBytes(way, 8, wRefs.b.data(), wRefs.b.size());
+
+                ByteBuf pg;
+                pbBytes(pg, 2, dense.b.data(), dense.b.size());
+                pbBytes(pg, 3, way.b.data(), way.b.size());
+
+                ByteBuf primBlk;
+                pbBytes(primBlk, 1, st.b.data(), st.b.size());
+                pbBytes(primBlk, 2, pg.b.data(), pg.b.size());
+
+                auto zPrim = buildStoredZlib(primBlk.b);
+                ByteBuf dataBlob;
+                pbVar(dataBlob, 2, primBlk.b.size());
+                pbBytes(dataBlob, 3, zPrim.data(), zPrim.size()); // zlib_data!
+
+                ByteBuf pbfFile;
+                appendOsmBlock(pbfFile, "OSMHeader", hdrBlob);
+                appendOsmBlock(pbfFile, "OSMData", dataBlob);
+
+                // Corrupt OSM PBF: valid BlobHeader("OSMData") but broken zlib stream
+                ByteBuf badZBlob;
+                pbVar(badZBlob, 2, 64);
+                pbStr(badZBlob, 3, "\x78\x01\xFF\xFF\x00\x00");
+                ByteBuf badPbf;
+                appendOsmBlock(badPbf, "OSMData", badZBlob);
+
+                ParsedOfficeDocument pbfDoc, pbfBadDoc;
+                bool okPbf = writeTempAndInspect(L"munich_center.pbf", pbfFile.b, pbfDoc);
+                bool badPbfRej = !writeTempAndInspect(L"corrupt_zlib.pbf", badPbf.b, pbfBadDoc);
+                tc.Record(okPbf && badPbfRej &&
+                          DocContainsToken(pbfDoc, L"Osmium/1.16.0") &&
+                          DocContainsToken(pbfDoc, L"Marienplatz") &&
+                          DocContainsToken(pbfDoc, L"amenity=townhall") &&
+                          DocContainsToken(pbfDoc, L"Kaufingerstrasse") &&
+                          DocContainsToken(pbfDoc, L"highway=pedestrian") &&
+                          DocContainsToken(pbfDoc, L"1001 -> 1005") &&
+                          pbfDoc.geoPoints.size() >= 2 && pbfDoc.hasGeoTrack,
+                    L"DocsB .pbf (OSMHeader + Zlib OSMData DenseNodes/Ways + Map GeoPoints)");
+            }
+
+            // 9B. Protomaps PMTiles v3 (.pmtiles): Gzip JSON Metadata + Gzip Hilbert Root Directory (TileIdToZXY)
+            {
+                // Root directory with 3 entries: tileId 0 (0/0/0), tileId 4 (1/1/0), tileId 19 (2/2/0)
+                ByteBuf rootRaw;
+                rootRaw.Uleb(3);  // nEntries = 3
+                rootRaw.Uleb(0);  rootRaw.Uleb(4);  rootRaw.Uleb(15);  // deltas -> 0, 4, 19
+                rootRaw.Uleb(1);  rootRaw.Uleb(2);  rootRaw.Uleb(1);   // run_length
+                rootRaw.Uleb(64); rootRaw.Uleb(96); rootRaw.Uleb(80);  // length
+                rootRaw.Uleb(1);  rootRaw.Uleb(0);  rootRaw.Uleb(0);   // offset: 0, contiguous(64), contiguous(160)
+                auto rootGz = BuildStoredGzip(std::string_view(reinterpret_cast<const char*>(rootRaw.b.data()), rootRaw.b.size()));
+
+                std::string metaJson =
+                    "{\"name\":\"Alps Vector Basemap\",\"format\":\"pbf\",\"attribution\":\"OSM Contributors\","
+                    "\"vector_layers\":[{\"id\":\"transportation\",\"minzoom\":0,\"maxzoom\":14,"
+                    "\"description\":\"Alpine highway network\",\"fields\":{\"class\":\"String\"}}]}";
+                auto metaGz = BuildStoredGzip(metaJson);
+
+                ByteBuf pm;
+                pm.Bytes("PMTiles\x03", 8);
+                uint64_t rOff = 127;
+                uint64_t jOff = rOff + rootGz.size();
+                uint64_t tOff = jOff + metaGz.size();
+                pm.U64LE(rOff); pm.U64LE(rootGz.size()); // root dir
+                pm.U64LE(jOff); pm.U64LE(metaGz.size()); // json metadata
+                pm.U64LE(0);    pm.U64LE(0);             // leaf dirs
+                pm.U64LE(tOff); pm.U64LE(240);           // tile data
+                pm.U64LE(4);    pm.U64LE(3); pm.U64LE(3);
+                pm.U8(1); // clustered
+                pm.U8(2); // internal_compression = Gzip (2)
+                pm.U8(2); // tile_compression = Gzip (2)
+                pm.U8(1); // MVT
+                pm.U8(0); // minZoom = 0
+                pm.U8(14);// maxZoom = 14
+                pm.U32LE(static_cast<uint32_t>(100000000)); // minLon = 10.0
+                pm.U32LE(static_cast<uint32_t>(460000000)); // minLat = 46.0
+                pm.U32LE(static_cast<uint32_t>(130000000)); // maxLon = 13.0
+                pm.U32LE(static_cast<uint32_t>(480000000)); // maxLat = 48.0
+                pm.U8(8);                                   // centerZoom = 8
+                pm.U32LE(static_cast<uint32_t>(115000000)); // centerLon = 11.5
+                pm.U32LE(static_cast<uint32_t>(470000000)); // centerLat = 47.0
+                pm.Bytes(rootGz.data(), rootGz.size());
+                pm.Bytes(metaGz.data(), metaGz.size());
+                pm.Zeros(240);
+
+                // Corrupt PMTiles: 127B header claiming Gzip root dir, but invalid non-Gzip root dir payload
+                std::vector<uint8_t> badPm = pm.b;
+                badPm[127] = 0xDE; badPm[128] = 0xAD;
+
+                ParsedOfficeDocument pmDoc, pmBadDoc;
+                bool okPm = writeTempAndInspect(L"alps_v3.pmtiles", pm.b, pmDoc);
+                bool badPmRej = !writeTempAndInspect(L"corrupt_v3.pmtiles", badPm, pmBadDoc);
+                tc.Record(okPm && badPmRej &&
+                          DocContainsToken(pmDoc, L"Alps Vector Basemap") &&
+                          DocContainsToken(pmDoc, L"transportation") &&
+                          DocContainsToken(pmDoc, L"Alpine highway network") &&
+                          DocContainsToken(pmDoc, L"0/0/0") &&
+                          DocContainsToken(pmDoc, L"1/1/0") &&
+                          DocContainsToken(pmDoc, L"2/2/0") &&
+                          pmDoc.geoPoints.size() >= 5,
+                    L"DocsB .pmtiles (PMTiles v3 Gzip Metadata + Inverse Hilbert TileIdToZXY)");
+            }
+
+            // 9C. Windows Authenticode Security Catalog (.cat): PKCS#7 SignedData + SPC_CATALOG_LIST + X.509 Signer & Anti-Cheat
+            {
+                auto makeBmpStr = [](std::string_view s) {
+                    std::vector<uint8_t> body;
+                    for (char c : s) { body.push_back(0); body.push_back(static_cast<uint8_t>(c)); }
+                    return Asn1Wrap(0x1E, body);
+                };
+
+                // CAT_NAMEVALUE (1.3.6.1.4.1.311.12.2.1): name="File" (BMPString), flags=1, value=UTF-16LE "nvme_storport.sys\0"
+                ByteBuf utf16Val;
+                utf16Val.Utf16LE(L"nvme_storport.sys", true);
+                std::vector<uint8_t> nvSeqBody;
+                Asn1Append(nvSeqBody, makeBmpStr("File"));
+                Asn1Append(nvSeqBody, { 0x02, 0x01, 0x01 });
+                Asn1Append(nvSeqBody, Asn1Wrap(0x04, utf16Val.b));
+                std::vector<uint8_t> attrNvBody = { 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0C, 0x02, 0x01 };
+                Asn1Append(attrNvBody, Asn1Wrap(0x31, Asn1Wrap(0x30, nvSeqBody)));
+
+                // SPC_INDIRECT_DATA_CONTENT (1.3.6.1.4.1.311.2.1.4): DigestInfo with SHA-256 (2.16.840.1.101.3.4.2.1)
+                std::vector<uint8_t> realSha256(32);
+                for (size_t i = 0; i < 32; ++i) realSha256[i] = static_cast<uint8_t>(0xA0u + (i & 0x0Fu));
+                std::vector<uint8_t> sha256Alg = Asn1Wrap(0x30, { 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00 });
+                std::vector<uint8_t> digestInfoBody;
+                Asn1Append(digestInfoBody, sha256Alg);
+                Asn1Append(digestInfoBody, Asn1Wrap(0x04, realSha256));
+                std::vector<uint8_t> spcIdcBody;
+                Asn1Append(spcIdcBody, Asn1Wrap(0x30, { 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x0F }));
+                Asn1Append(spcIdcBody, Asn1Wrap(0x30, digestInfoBody));
+                std::vector<uint8_t> attrIdcBody = { 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04 };
+                Asn1Append(attrIdcBody, Asn1Wrap(0x31, Asn1Wrap(0x30, spcIdcBody)));
+
+                std::vector<uint8_t> memAttrsBody;
+                Asn1Append(memAttrsBody, Asn1Wrap(0x30, attrNvBody));
+                Asn1Append(memAttrsBody, Asn1Wrap(0x30, attrIdcBody));
+                std::vector<uint8_t> memberBody;
+                Asn1Append(memberBody, makeBmpStr("E2DRV001"));
+                Asn1Append(memberBody, Asn1Wrap(0x31, memAttrsBody));
+
+                // CTL / SPC_CATALOG_LIST (SubjectUsage = 1.3.6.1.4.1.311.12.1.1)
+                std::vector<uint8_t> ctlBody;
+                Asn1Append(ctlBody, Asn1Wrap(0x30, { 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0C, 0x01, 0x01 }));
+                Asn1Append(ctlBody, Asn1Wrap(0x04, { 0x11, 0x22, 0x33, 0x44 }));
+                std::string ctlTime = "250315120000Z";
+                Asn1Append(ctlBody, Asn1Wrap(0x17, std::vector<uint8_t>(ctlTime.begin(), ctlTime.end())));
+                Asn1Append(ctlBody, Asn1Wrap(0x30, { 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0C, 0x01, 0x02 }));
+                Asn1Append(ctlBody, Asn1Wrap(0x30, Asn1Wrap(0x30, memberBody)));
+
+                // EncapsulatedContentInfo: szOID_CTL (1.3.6.1.4.1.311.10.1) + [0] EXPLICIT CTL SEQUENCE
+                std::vector<uint8_t> encapBody = { 0x06, 0x09, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x01 };
+                Asn1Append(encapBody, Asn1Wrap(0xA0, Asn1Wrap(0x30, ctlBody)));
+
+                auto signerCert = MakeX509Der(0x42, "Explorer2 WHQL Catalog Signer", "whql.explorer2.local");
+
+                // Deliberate anti-cheat trap inside SignerInfo RSA encryptedDigest: 0x04 0x20 + 32 bytes of 0xDE,0xAD,0xBE,0xEF!
+                std::vector<uint8_t> fakeSigBytes = { 0x99, 0x88, 0x04, 0x20 };
+                for (int k = 0; k < 8; ++k) {
+                    fakeSigBytes.push_back(0xDE); fakeSigBytes.push_back(0xAD);
+                    fakeSigBytes.push_back(0xBE); fakeSigBytes.push_back(0xEF);
+                }
+                std::vector<uint8_t> signerInfoBody = { 0x02, 0x01, 0x01 };
+                Asn1Append(signerInfoBody, Asn1Wrap(0x04, fakeSigBytes));
+
+                std::vector<uint8_t> signedDataBody;
+                Asn1Append(signedDataBody, { 0x02, 0x01, 0x01 }); // version = 1
+                Asn1Append(signedDataBody, Asn1Wrap(0x31, sha256Alg));
+                Asn1Append(signedDataBody, Asn1Wrap(0x30, encapBody));
+                Asn1Append(signedDataBody, Asn1Wrap(0xA0, signerCert)); // [0] IMPLICIT certificates
+                Asn1Append(signedDataBody, Asn1Wrap(0x31, Asn1Wrap(0x30, signerInfoBody)));
+
+                std::vector<uint8_t> contentInfoBody = { 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02 }; // SignedData
+                Asn1Append(contentInfoBody, Asn1Wrap(0xA0, Asn1Wrap(0x30, signedDataBody)));
+                std::vector<uint8_t> catDer = Asn1Wrap(0x30, contentInfoBody);
+
+                // Anti-cheat negative test: non-catalog DER sequence containing raw 0x04 0x20 bytes
+                std::vector<uint8_t> fakeCat = Asn1Wrap(0x30, fakeSigBytes);
+
+                ParsedOfficeDocument catDoc, catBadDoc;
+                bool okCat = writeTempAndInspect(L"driver_whql.cat", catDer, catDoc);
+                bool badCatRej = !writeTempAndInspect(L"fake_thumbprint_cheat.cat", fakeCat, catBadDoc);
+                tc.Record(okCat && badCatRej &&
+                          DocContainsToken(catDoc, L"E2DRV001") &&
+                          DocContainsToken(catDoc, L"nvme_storport.sys") &&
+                          DocContainsToken(catDoc, L"SHA-256") &&
+                          DocContainsToken(catDoc, L"A0A1A2A3A4A5A6A7A8A9AAABACADAEAF") &&
+                          DocContainsToken(catDoc, L"Explorer2 WHQL Catalog Signer") &&
+                          !DocContainsToken(catDoc, L"DEADBEEFDEADBEEF"),
+                    L"DocsB .cat (Authenticode ASN.1 SPC_CATALOG_LIST, SHA-256 Member, X.509 Signer & RSA Trap Reject)");
+            }
+
+            // 9D. Apache ORC (.orc): LZ4 & ZSTD Compression + RLEv2 DELTA & DICTIONARY_V2 Row Decoding + Corrupt Footer Reject
+            {
+                auto makeOrcChunk = [](const std::vector<uint8_t>& plain, uint64_t codec) -> std::vector<uint8_t> {
+                    ByteBuf chunk;
+                    if (codec == 4) { // LZ4 raw block (token + literals)
+                        ByteBuf lz4;
+                        if (plain.size() < 15) {
+                            lz4.U8(static_cast<uint8_t>(plain.size() << 4));
+                        } else {
+                            lz4.U8(0xF0u);
+                            size_t rem = plain.size() - 15u;
+                            while (rem >= 255u) { lz4.U8(255u); rem -= 255u; }
+                            lz4.U8(static_cast<uint8_t>(rem));
+                        }
+                        lz4.Bytes(plain.data(), plain.size());
+                        uint32_t hdr = static_cast<uint32_t>(lz4.b.size() << 1); // isOriginal = 0
+                        chunk.U8(static_cast<uint8_t>(hdr & 0xFFu));
+                        chunk.U8(static_cast<uint8_t>((hdr >> 8) & 0xFFu));
+                        chunk.U8(static_cast<uint8_t>((hdr >> 16) & 0xFFu));
+                        chunk.Bytes(lz4.b.data(), lz4.b.size());
+                    } else if (codec == 5) { // ZSTD single-segment raw-block frame
+                        ByteBuf zst;
+                        zst.U32LE(0xFD2FB528u); // ZSTD frame magic
+                        zst.U8(0x20u);          // FHD: Single_Segment_Flag=1 (1-byte FCS)
+                        zst.U8(static_cast<uint8_t>(plain.size()));
+                        uint32_t blkHdr = (static_cast<uint32_t>(plain.size()) << 3) | 1u; // Last_Block=1, Block_Type=0 (Raw_Block)
+                        zst.U8(static_cast<uint8_t>(blkHdr & 0xFFu));
+                        zst.U8(static_cast<uint8_t>((blkHdr >> 8) & 0xFFu));
+                        zst.U8(static_cast<uint8_t>((blkHdr >> 16) & 0xFFu));
+                        zst.Bytes(plain.data(), plain.size());
+                        uint32_t hdr = static_cast<uint32_t>(zst.b.size() << 1); // isOriginal = 0
+                        chunk.U8(static_cast<uint8_t>(hdr & 0xFFu));
+                        chunk.U8(static_cast<uint8_t>((hdr >> 8) & 0xFFu));
+                        chunk.U8(static_cast<uint8_t>((hdr >> 16) & 0xFFu));
+                        chunk.Bytes(zst.b.data(), zst.b.size());
+                    }
+                    return chunk.b;
+                };
+
+                auto buildOrcWithRows = [&](uint64_t codec, int64_t baseSensorId, std::string_view st0, std::string_view st1) {
+                    // Col 1 (LONG, DIRECT_V2): RLEv2 DELTA (subEnc=3, bw=0, runLen=3, base=baseSensorId, delta=+50)
+                    ByteBuf col1Raw;
+                    col1Raw.U8(0xC0u); col1Raw.U8(0x02u);
+                    col1Raw.Uleb(zigZag64(baseSensorId));
+                    col1Raw.Uleb(zigZag64(50));
+                    auto col1Comp = makeOrcChunk(col1Raw.b, codec);
+
+                    // Col 2 (STRING, DICTIONARY_V2, dictSize=2):
+                    //   DATA (indices for 3 rows: [0, 1, 0] via RLEv2 DIRECT 8-bit)
+                    //   LENGTH (lengths [st0.size, st1.size] via RLEv2 DIRECT 8-bit)
+                    //   DICTIONARY_DATA (st0 + st1)
+                    ByteBuf c2DataRaw, c2LenRaw, c2DictRaw;
+                    c2DataRaw.U8(0x4Eu); c2DataRaw.U8(0x02u); c2DataRaw.U8(0); c2DataRaw.U8(1); c2DataRaw.U8(0);
+                    c2LenRaw.U8(0x4Eu);  c2LenRaw.U8(0x01u);
+                    c2LenRaw.U8(static_cast<uint8_t>(st0.size()));
+                    c2LenRaw.U8(static_cast<uint8_t>(st1.size()));
+                    c2DictRaw.Str(st0); c2DictRaw.Str(st1);
+
+                    auto c2DataComp = makeOrcChunk(c2DataRaw.b, codec);
+                    auto c2LenComp  = makeOrcChunk(c2LenRaw.b, codec);
+                    auto c2DictComp = makeOrcChunk(c2DictRaw.b, codec);
+
+                    auto makeStreamMsg = [&](uint64_t kind, uint32_t col, uint64_t len) {
+                        ByteBuf sm;
+                        pbVar(sm, 1, kind); pbVar(sm, 2, col); pbVar(sm, 3, len);
+                        return sm.b;
+                    };
+                    auto makeColEncMsg = [&](uint64_t kind, uint64_t dictSz) {
+                        ByteBuf ce;
+                        pbVar(ce, 1, kind);
+                        if (dictSz > 0) pbVar(ce, 2, dictSz);
+                        return ce.b;
+                    };
+
+                    ByteBuf sfRaw;
+                    auto s1 = makeStreamMsg(1, 1, col1Comp.size());   pbBytes(sfRaw, 1, s1.data(), s1.size());
+                    auto s2 = makeStreamMsg(1, 2, c2DataComp.size()); pbBytes(sfRaw, 1, s2.data(), s2.size());
+                    auto s3 = makeStreamMsg(2, 2, c2LenComp.size());  pbBytes(sfRaw, 1, s3.data(), s3.size());
+                    auto s4 = makeStreamMsg(3, 2, c2DictComp.size()); pbBytes(sfRaw, 1, s4.data(), s4.size());
+                    auto e0 = makeColEncMsg(0, 0); pbBytes(sfRaw, 2, e0.data(), e0.size()); // col 0 (root struct)
+                    auto e1 = makeColEncMsg(2, 0); pbBytes(sfRaw, 2, e1.data(), e1.size()); // col 1: DIRECT_V2
+                    auto e2 = makeColEncMsg(3, 2); pbBytes(sfRaw, 2, e2.data(), e2.size()); // col 2: DICTIONARY_V2 (size=2)
+                    auto sfComp = makeOrcChunk(sfRaw.b, codec);
+
+                    ByteBuf orc;
+                    orc.Str("ORC"); // offset 3
+                    uint64_t stripeOff = orc.b.size();
+                    orc.Bytes(col1Comp.data(), col1Comp.size());
+                    orc.Bytes(c2DataComp.data(), c2DataComp.size());
+                    orc.Bytes(c2LenComp.data(), c2LenComp.size());
+                    orc.Bytes(c2DictComp.data(), c2DictComp.size());
+                    uint64_t dataLen = orc.b.size() - stripeOff;
+                    orc.Bytes(sfComp.data(), sfComp.size());
+
+                    // FileFooter
+                    ByteBuf stInfo;
+                    pbVar(stInfo, 1, stripeOff);
+                    pbVar(stInfo, 2, 0); // indexLength = 0
+                    pbVar(stInfo, 3, dataLen);
+                    pbVar(stInfo, 4, sfComp.size());
+                    pbVar(stInfo, 5, 3); // numRows = 3
+
+                    ByteBuf t0, t1, t2;
+                    pbVar(t0, 1, 12); pbVar(t0, 2, 1); pbVar(t0, 2, 2);
+                    pbStr(t0, 3, "sensor_id"); pbStr(t0, 3, "station_name");
+                    pbVar(t1, 1, 4); // LONG
+                    pbVar(t2, 1, 7); // STRING
+
+                    ByteBuf ffRaw;
+                    pbVar(ffRaw, 1, 3);
+                    pbVar(ffRaw, 2, dataLen + sfComp.size());
+                    pbBytes(ffRaw, 3, stInfo.b.data(), stInfo.b.size());
+                    pbBytes(ffRaw, 4, t0.b.data(), t0.b.size());
+                    pbBytes(ffRaw, 4, t1.b.data(), t1.b.size());
+                    pbBytes(ffRaw, 4, t2.b.data(), t2.b.size());
+                    pbVar(ffRaw, 6, 3); // numberOfRows = 3
+                    auto ffComp = makeOrcChunk(ffRaw.b, codec);
+                    orc.Bytes(ffComp.data(), ffComp.size());
+
+                    ByteBuf ps;
+                    pbVar(ps, 1, ffComp.size());
+                    pbVar(ps, 2, codec);
+                    pbStr(ps, 8000, "ORC");
+                    orc.Bytes(ps.b.data(), ps.b.size());
+                    orc.U8(static_cast<uint8_t>(ps.b.size()));
+                    return orc.b;
+                };
+
+                // Anti-cheat negative test: "ORC" + undecodable Zlib footer MUST return false (NOT fake Total Rows = 0!)
+                ByteBuf undecodableOrc;
+                undecodableOrc.Str("ORC");
+                undecodableOrc.Bytes("\x08\x00\x00\xDE\xAD\xBE\xEF", 7); // 4-byte fake compressed chunk
+                ByteBuf badPs;
+                pbVar(badPs, 1, 7);
+                pbVar(badPs, 2, 1); // codec = ZLIB, but chunk is invalid deflate!
+                pbStr(badPs, 8000, "ORC");
+                undecodableOrc.Bytes(badPs.b.data(), badPs.b.size());
+                undecodableOrc.U8(static_cast<uint8_t>(badPs.b.size()));
+
+                ParsedOfficeDocument orcLz4Doc, orcZstdDoc, orcBadDoc;
+                bool okLz4  = writeTempAndInspect(L"telemetry_lz4.orc", buildOrcWithRows(4, 9100, "Zugspitze_Lab", "Jungfraujoch_Obs"), orcLz4Doc);
+                bool okZstd = writeTempAndInspect(L"telemetry_zstd.orc", buildOrcWithRows(5, 4200, "MaunaLoa_Station", "Svalbard_Vault"), orcZstdDoc);
+                bool badOrcRej = !writeTempAndInspect(L"corrupt_footer_cheat.orc", undecodableOrc.b, orcBadDoc);
+                tc.Record(okLz4 && okZstd && badOrcRej &&
+                          DocContainsToken(orcLz4Doc, L"LZ4") &&
+                          DocContainsToken(orcLz4Doc, L"9150") &&
+                          DocContainsToken(orcLz4Doc, L"Jungfraujoch_Obs") &&
+                          DocContainsToken(orcZstdDoc, L"ZSTD") &&
+                          DocContainsToken(orcZstdDoc, L"4250") &&
+                          DocContainsToken(orcZstdDoc, L"Svalbard_Vault"),
+                    L"DocsB .orc (LZ4 & ZSTD Streams, RLEv2 DELTA + DICTIONARY_V2 Rows & Corrupt Footer Reject)");
+            }
+
+            // 9E. Redis RDB Snapshot (.rdb v11): Real LZF Backref String + SET_INTSET + HASH_ZIPLIST + ZSET_LISTPACK
+            {
+                ByteBuf rdb;
+                rdb.Str("REDIS0011");
+                // AUX (0xFA): redis-ver = "7.2.4"
+                rdb.U8(0xFAu); rdb.U8(9); rdb.Str("redis-ver"); rdb.U8(5); rdb.Str("7.2.4");
+                // SELECTDB (0xFE) db=0, RESIZEDB (0xFB) dbSize=4, expSize=0
+                rdb.U8(0xFEu); rdb.U8(0);
+                rdb.U8(0xFBu); rdb.U8(4); rdb.U8(0);
+
+                // Key 1 (0x00 String, LZF enc=3): "ClusterNodeAlpha_2026_ClusterNodeAlpha" (38B)
+                // Compressed with genuine LZF backreference (ctrl=21 -> 22 literals "ClusterNodeAlpha_2026_",
+                // then match len=16 -> ctrl=((7<<5)|0)=0xE0, extraLen=7 (9+7=16), off-1=21 -> copies "ClusterNodeAlpha"!)
+                rdb.U8(0x00u);
+                rdb.U8(7); rdb.Str("lzf_key");
+                ByteBuf lzfComp;
+                lzfComp.U8(21u); lzfComp.Str("ClusterNodeAlpha_2026_");
+                lzfComp.U8(0xE0u); lzfComp.U8(7u); lzfComp.U8(21u);
+                rdb.U8(0xC3u); // enc = 3 (RDB_ENC_LZF)
+                rdb.U8(static_cast<uint8_t>(lzfComp.b.size()));
+                rdb.U8(38u);   // uncompressed len = 38
+                rdb.Bytes(lzfComp.b.data(), lzfComp.b.size());
+
+                // Key 2 (0x0B RDB_TYPE_SET_INTSET): 32-bit intset { 1024, 2048 }
+                ByteBuf intset;
+                intset.U32LE(4); // 32-bit ints
+                intset.U32LE(2); // 2 elements
+                intset.U32LE(1024); intset.U32LE(2048);
+                rdb.U8(0x0Bu);
+                rdb.U8(6); rdb.Str("ids_32");
+                rdb.U8(static_cast<uint8_t>(intset.b.size()));
+                rdb.Bytes(intset.b.data(), intset.b.size());
+
+                // Key 3 (0x0D RDB_TYPE_HASH_ZIPLIST): { "role": "primary_replica" }
+                ByteBuf zl;
+                zl.U32LE(0); // zlbytes patched below
+                zl.U32LE(10);// zltail
+                zl.U16LE(2); // 2 entries
+                zl.U8(0);    zl.U8(4);  zl.Str("role");                       // entry 0 (len=6)
+                zl.U8(6);    zl.U8(15); zl.Str("primary_replica");            // entry 1
+                zl.U8(0xFFu);
+                PutU32LE(zl.b.data(), static_cast<uint32_t>(zl.b.size()));
+                rdb.U8(0x0Du);
+                rdb.U8(8); rdb.Str("cfg_hash");
+                rdb.U8(static_cast<uint8_t>(zl.b.size()));
+                rdb.Bytes(zl.b.data(), zl.b.size());
+
+                // Key 4 (0x11 RDB_TYPE_ZSET_LISTPACK): { "hyperion_node": "99.5" }
+                ByteBuf lp;
+                lp.U32LE(0); // tot-bytes patched below
+                lp.U16LE(2); // 2 elements
+                // Element 0: 6-bit string (0x80 | 13) + "hyperion_node" + backlen(14)
+                lp.U8(static_cast<uint8_t>(0x80u | 13u)); lp.Str("hyperion_node"); lp.U8(14u);
+                // Element 1: 6-bit string (0x80 | 4) + "99.5" + backlen(5)
+                lp.U8(static_cast<uint8_t>(0x80u | 4u));  lp.Str("99.5");          lp.U8(5u);
+                lp.U8(0xFFu);
+                PutU32LE(lp.b.data(), static_cast<uint32_t>(lp.b.size()));
+                rdb.U8(0x11u);
+                rdb.U8(9); rdb.Str("rank_zset");
+                rdb.U8(static_cast<uint8_t>(lp.b.size()));
+                rdb.Bytes(lp.b.data(), lp.b.size());
+
+                rdb.U8(0xFFu); // EOF
+                rdb.U64LE(0);  // CRC64
+
+                std::vector<uint8_t> badRdb = { 'R','E','D','I','S','0','0','9','9', 0xFF }; // invalid version 99
+                ParsedOfficeDocument rdbDoc, rdbBadDoc;
+                bool okRdb = writeTempAndInspect(L"dump_v11.rdb", rdb.b, rdbDoc);
+                bool badRdbRej = !writeTempAndInspect(L"bad_ver.rdb", badRdb, rdbBadDoc);
+                tc.Record(okRdb && badRdbRej &&
+                          DocContainsToken(rdbDoc, L"ClusterNodeAlpha_2026_ClusterNodeAlpha") &&
+                          DocContainsToken(rdbDoc, L"2048") &&
+                          DocContainsToken(rdbDoc, L"primary_replica") &&
+                          DocContainsToken(rdbDoc, L"hyperion_node") &&
+                          DocContainsToken(rdbDoc, L"99.5"),
+                    L"DocsB .rdb (Redis v11 LZF Backref Decompression + INTSET + ZIPLIST + LISTPACK)");
+            }
+
+            // 9F. Kindle / Mobipocket HUFF/CDIC (.mobi / .azw3): compression==17480 + Recursive CDIC + extraDataFlags Tail Trim
+            {
+                // 4-symbol canonical 2-bit HUFF codebook:
+                //   code 11 (3) -> r=0 (leaf "<html><body><h1>")
+                //   code 10 (2) -> r=1 (NON-LEAF recursive phrase: codes [2(r=1? no: 01->r=2), 00->r=3]!)
+                //   code 01 (1) -> r=2 (leaf "Quantum Cryptography ")
+                //   code 00 (0) -> r=3 (leaf "Handbook</h1></body></html>")
+                ByteBuf huff;
+                huff.Bytes("HUFF\x00\x00\x00\x18", 8);
+                huff.U32BE(24);          // off1 = 24
+                huff.U32BE(24 + 1024);   // off2 = 1048
+                huff.U32BE(0);           // BE dict1/dict2
+                huff.U32BE(0);
+                // dict1: 256 BE uint32 entries; for all 8-bit prefixes, cl=2, term=1 (0x80), maxcode_raw=3 -> (3<<8)|0x82 = 0x00000382
+                for (int i = 0; i < 256; ++i) huff.U32BE(0x00000382u);
+                // dict2: 32 pairs of (mincode, maxcode) BE uint32
+                for (int cl = 1; cl <= 32; ++cl) {
+                    huff.U32BE(0);
+                    huff.U32BE(cl == 2 ? 3u : 0u);
+                }
+
+                // CDIC record: numPhrases=4, bits=2
+                std::string p0 = "<html><body><h1>";
+                // p1 is recursive non-leaf (flag 0x0000): 4 bits: '01' (r=2) + '00' (r=3) -> 0b0100_0000 = 0x40 (1 byte — wait:
+                // UnpackSlice consumes 2+2=4 bits; with 1 byte (8 bits), remaining 4 bits '0000' would decode 2 more symbols!
+                // So make r=1 encode EXACTLY 4 symbols in 1 byte (8 bits): '01' (r=2) + '01' (r=2) + '01' (r=2) + '00' (r=3) = 0b01010100 = 0x54!
+                uint8_t p1RecByte = 0x54u; // 4 x 2-bit codes: r=2, r=2, r=2, r=3 -> "Quantum Cryptography " x3 + "Handbook</h1></body></html>"!
+                std::string p2 = "Quantum Cryptography ";
+                std::string p3 = "Handbook</h1><p>HuffCdic Verified.</p></body></html>";
+
+                ByteBuf cdicData;
+                uint16_t offP0 = 8;
+                cdicData.U16BE(static_cast<uint16_t>(0x8000u | p0.size())); cdicData.Str(p0);
+                uint16_t offP1 = static_cast<uint16_t>(8 + cdicData.b.size());
+                cdicData.U16BE(0x0001u); cdicData.U8(p1RecByte); // flag 0x8000 CLEAR -> recursive UnpackSlice!
+                uint16_t offP2 = static_cast<uint16_t>(8 + cdicData.b.size());
+                cdicData.U16BE(static_cast<uint16_t>(0x8000u | p2.size())); cdicData.Str(p2);
+                uint16_t offP3 = static_cast<uint16_t>(8 + cdicData.b.size());
+                cdicData.U16BE(static_cast<uint16_t>(0x8000u | p3.size())); cdicData.Str(p3);
+
+                ByteBuf cdic;
+                cdic.Bytes("CDIC\x00\x00\x00\x10", 8);
+                cdic.U32BE(4); // numPhrases = 4
+                cdic.U32BE(2); // bits = 2
+                cdic.U16BE(offP0); cdic.U16BE(offP1); cdic.U16BE(offP2); cdic.U16BE(offP3);
+                cdic.Bytes(cdicData.b.data(), cdicData.b.size());
+
+                // Text record 1: 1 compressed byte: '11' (r=0) + '10' (r=1) + '10' (r=1) + '10' (r=1) = 0b11101010 = 0xEA
+                // PLUS 2 trailing multibyte overlap bytes (extraDataFlags = 1, last byte (overlapCount & 3) = 1 -> trims 2 bytes!)
+                ByteBuf txtRec;
+                txtRec.U8(0xEAu);
+                txtRec.U8(0xFFu); txtRec.U8(0x01u); // trailing overlap bytes trimmed before HUFF/CDIC!
+
+                // Record 0: 16B PalmDOC (compression=17480) + 248B MOBI header (huffRecIdx=2, huffRecCnt=2, extraDataFlags=1 at +0xF2)
+                std::string bookTitle = "Post-Quantum Cipher Compendium";
+                ByteBuf rec0;
+                rec0.U16BE(17480); // HUFF/CDIC!
+                rec0.U16BE(0);
+                rec0.U32BE(512);
+                rec0.U16BE(1);     // 1 text record (record 1)
+                rec0.U16BE(4096);
+                rec0.U16BE(0);
+                rec0.U16BE(0);
+
+                uint32_t mobiHdrLen = 248;
+                uint32_t fnOff = 16 + mobiHdrLen;
+                rec0.Str("MOBI");
+                rec0.U32BE(mobiHdrLen);
+                rec0.U32BE(2);
+                rec0.U32BE(65001);
+                rec0.U32BE(77777);
+                rec0.U32BE(8); // KF8 v8
+                rec0.PadTo(84);
+                rec0.U32BE(fnOff);
+                rec0.U32BE(static_cast<uint32_t>(bookTitle.size()));
+                rec0.PadTo(16 + 96);
+                rec0.U32BE(2); // huffRecIdx = 2
+                rec0.U32BE(2); // huffRecCnt = 2 (rec 2 = HUFF, rec 3 = CDIC)
+                rec0.PadTo(0xF2);
+                rec0.U16BE(1); // extraDataFlags = 1 (multibyte overlap enabled)
+                rec0.PadTo(16 + mobiHdrLen);
+                rec0.Str(bookTitle);
+
+                ByteBuf pdb;
+                pdb.FixedStr("PQ_Cipher_KF8", 32);
+                pdb.Zeros(28);
+                pdb.Str("BOOKMOBI");
+                pdb.Zeros(8);
+                pdb.U16BE(4); // 4 records: 0=MOBI, 1=Text, 2=HUFF, 3=CDIC
+                uint32_t o0 = 78 + 4 * 8;
+                uint32_t o1 = o0 + static_cast<uint32_t>(rec0.b.size());
+                uint32_t o2 = o1 + static_cast<uint32_t>(txtRec.b.size());
+                uint32_t o3 = o2 + static_cast<uint32_t>(huff.b.size());
+                pdb.U32BE(o0); pdb.U32BE(0);
+                pdb.U32BE(o1); pdb.U32BE(1);
+                pdb.U32BE(o2); pdb.U32BE(2);
+                pdb.U32BE(o3); pdb.U32BE(3);
+                pdb.Bytes(rec0.b.data(), rec0.b.size());
+                pdb.Bytes(txtRec.b.data(), txtRec.b.size());
+                pdb.Bytes(huff.b.data(), huff.b.size());
+                pdb.Bytes(cdic.b.data(), cdic.b.size());
+
+                ParsedOfficeDocument azw3Doc, azwDoc;
+                bool okAzw3 = writeTempAndInspect(L"pq_cipher.azw3", pdb.b, azw3Doc);
+                bool okAzw  = writeTempAndInspect(L"pq_cipher.azw", pdb.b, azwDoc);
+                tc.Record(okAzw3 && okAzw &&
+                          DocContainsToken(azw3Doc, L"Post-Quantum Cipher Compendium") &&
+                          DocContainsToken(azw3Doc, L"Quantum Cryptography Quantum Cryptography Quantum Cryptography Handbook") &&
+                          DocContainsToken(azw3Doc, L"HuffCdic Verified.") &&
+                          DocContainsToken(azwDoc, L"HuffCdic Verified."),
+                    L"DocsB .azw3/.azw (Mobipocket HUFF/CDIC Recursive Dictionary & extraDataFlags Trim)");
+            }
+
+            // 9G. Microsoft Excel Binary Workbook (.xlsb, [MS-XLSB]): BIFF12 Workbook + SST + Styles + Sheet Cells
+            {
+                auto biff12Rec = [](ByteBuf& dst, uint32_t recId, const void* pay, size_t len) {
+                    uint32_t id = recId;
+                    do {
+                        uint8_t b = static_cast<uint8_t>(id & 0x7Fu);
+                        id >>= 7;
+                        if (id != 0) b |= 0x80u;
+                        dst.U8(b);
+                    } while (id != 0);
+                    uint32_t ln = static_cast<uint32_t>(len);
+                    do {
+                        uint8_t b = static_cast<uint8_t>(ln & 0x7Fu);
+                        ln >>= 7;
+                        if (ln != 0) b |= 0x80u;
+                        dst.U8(b);
+                    } while (ln != 0);
+                    if (len > 0) dst.Bytes(pay, len);
+                };
+                auto xlWide = [](ByteBuf& dst, std::wstring_view w) {
+                    dst.U32LE(static_cast<uint32_t>(w.size()));
+                    dst.Utf16LE(w, false);
+                };
+
+                // xl/workbook.bin: BrtBeginBook(0x0083) + BrtBundleSh(0x009C: hsState=0, iTabID=1, rId="rId1", name="Revenue_Q4") + BrtEndBook(0x0084)
+                ByteBuf wb, bsh;
+                biff12Rec(wb, 0x0083u, nullptr, 0);
+                bsh.U32LE(0); bsh.U32LE(1); xlWide(bsh, L"rId1"); xlWide(bsh, L"Revenue_Q4");
+                biff12Rec(wb, 0x009Cu, bsh.b.data(), bsh.b.size());
+                biff12Rec(wb, 0x0084u, nullptr, 0);
+
+                std::string wbRels =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+                    "<Relationship Id=\"rId1\" Target=\"worksheets/sheet1.bin\"/>"
+                    "</Relationships>";
+
+                // xl/sharedStrings.bin: BrtBeginSst(0x009F) + BrtSSTItem(0x0013: flags=0, "Enterprise SaaS") + BrtEndSst(0x00A0)
+                ByteBuf sst, ssti;
+                uint64_t sstHdr = 1;
+                biff12Rec(sst, 0x009Fu, &sstHdr, 8);
+                ssti.U8(0); xlWide(ssti, L"Enterprise SaaS");
+                biff12Rec(sst, 0x0013u, ssti.b.data(), ssti.b.size());
+                biff12Rec(sst, 0x00A0u, nullptr, 0);
+
+                // xl/styles.bin: BrtBeginCellXFs(0x0269) + xf0 (general ifmt=0) + xf1 (date ifmt=14 -> YYYY-MM-DD) + BrtEndCellXFs(0x026A)
+                ByteBuf sty, xf0, xf1;
+                uint32_t cxfCnt = 2;
+                biff12Rec(sty, 0x0269u, &cxfCnt, 4);
+                xf0.U16LE(0); xf0.U16LE(0);  xf0.Zeros(12);
+                xf1.U16LE(0); xf1.U16LE(14); xf1.Zeros(12); // ifmt=14 built-in date!
+                biff12Rec(sty, 0x002Fu, xf0.b.data(), xf0.b.size());
+                biff12Rec(sty, 0x002Fu, xf1.b.data(), xf1.b.size());
+                biff12Rec(sty, 0x026Au, nullptr, 0);
+
+                // xl/worksheets/sheet1.bin: BrtBeginSheetData(0x0091) + Row 0:
+                //   col 0: BrtCellIsst(0x0007) -> sst[0] ("Enterprise SaaS")
+                //   col 1: BrtCellRk(0x0002)   -> integer 125075 / 100 = 1250.75 (rk = (125075 << 2) | 0x03)
+                //   col 2: BrtCellReal(0x0005) -> style=1 (date), serial 45658.0 -> 2025-01-01
+                //   col 3: BrtCellBool(0x0004) -> TRUE
+                ByteBuf sh1, r0, c0, c1, c2, c3;
+                biff12Rec(sh1, 0x0091u, nullptr, 0);
+                r0.U32LE(0); r0.Zeros(12);
+                biff12Rec(sh1, 0x0000u, r0.b.data(), r0.b.size());
+                c0.U32LE(0); c0.U32LE(0); c0.U32LE(0);
+                biff12Rec(sh1, 0x0007u, c0.b.data(), c0.b.size());
+                c1.U32LE(1); c1.U32LE(0); c1.U32LE((125075u << 2) | 0x03u);
+                biff12Rec(sh1, 0x0002u, c1.b.data(), c1.b.size());
+                double serialDate = 45658.0; // 2025-01-01
+                uint64_t dateBits = 0; std::memcpy(&dateBits, &serialDate, 8);
+                c2.U32LE(2); c2.U32LE(1); c2.U64LE(dateBits); // stBits = 1 -> xf1 (ifmt=14)
+                biff12Rec(sh1, 0x0005u, c2.b.data(), c2.b.size());
+                c3.U32LE(3); c3.U32LE(0); c3.U8(1);
+                biff12Rec(sh1, 0x0004u, c3.b.data(), c3.b.size());
+                biff12Rec(sh1, 0x0092u, nullptr, 0);
+
+                auto xlsbZip = buildStoredZipMulti({
+                    { "xl/workbook.bin", wb.b },
+                    { "xl/_rels/workbook.bin.rels", std::vector<uint8_t>(wbRels.begin(), wbRels.end()) },
+                    { "xl/sharedStrings.bin", sst.b },
+                    { "xl/styles.bin", sty.b },
+                    { "xl/worksheets/sheet1.bin", sh1.b }
+                });
+                auto nonXlsbZip = BuildStoredZipSingle("readme.txt", "Plain archive renamed to .xlsb");
+
+                ParsedOfficeDocument xlsbDoc, xlsbBadDoc;
+                bool okXlsb = writeTempAndInspect(L"financials.xlsb", xlsbZip, xlsbDoc);
+                bool badXlsbRej = !writeTempAndInspect(L"not_workbook.xlsb", nonXlsbZip, xlsbBadDoc);
+                tc.Record(okXlsb && badXlsbRej &&
+                          !xlsbDoc.sheets.empty() && xlsbDoc.sheets[0].name == L"Revenue_Q4" &&
+                          DocContainsToken(xlsbDoc, L"Enterprise SaaS") &&
+                          DocContainsToken(xlsbDoc, L"1250.75") &&
+                          DocContainsToken(xlsbDoc, L"2025-01-01") &&
+                          DocContainsToken(xlsbDoc, L"TRUE"),
+                    L"DocsB .xlsb ([MS-XLSB] BIFF12 Workbook, SST, Date Styles, RK/Real/Bool Cells & ZIP Reject)");
+            }
+
+            // 9H. Microsoft Outlook Personal Folders (.pst, [MS-PST]): Unicode v23 + Permutative Encryption (bCryptMethod=1) + BBT/NBT/HN/PC
+            {
+                // Exact [MS-PST] §5.1 mpbbR encryption table so data blocks on disk are genuinely encrypted
+                static const uint8_t kMpbbR[256] = {
+                    0x47,0xF1,0xB4,0xE6,0x0B,0x6A,0x72,0x48,0x85,0x4E,0x9E,0xEB,0xE2,0xF8,0x94,0x53,
+                    0xE0,0xBB,0xA0,0x02,0xE8,0x5A,0x09,0xAB,0xDB,0xE3,0xBA,0xC6,0x7C,0xC3,0x10,0xDD,
+                    0x39,0x05,0x96,0x30,0xF5,0x37,0x60,0x82,0x8C,0xC9,0x13,0x4A,0x6B,0x1D,0xF3,0xFB,
+                    0x8F,0x26,0x97,0xCA,0x91,0x17,0x01,0xC4,0x32,0x2D,0x6E,0x31,0x95,0xFF,0xD9,0x23,
+                    0xD1,0x00,0x5E,0x79,0xDC,0x44,0x3B,0x1A,0x28,0xC5,0x61,0x57,0x20,0x90,0x3D,0x83,
+                    0xB9,0x43,0xBE,0x67,0xD2,0x46,0x42,0x76,0xC0,0x6D,0x5B,0x7E,0xB2,0x0F,0x16,0x29,
+                    0x3C,0xA9,0x03,0x54,0x0D,0xDA,0x5D,0xDF,0xF6,0xB7,0xC7,0x62,0xCD,0x8D,0x06,0xD3,
+                    0x69,0x5C,0x86,0xD6,0x14,0xF7,0xA5,0x66,0x75,0xAC,0xB1,0xE9,0x45,0x21,0x70,0x0C,
+                    0x87,0x9F,0x74,0xA4,0x22,0x4C,0x6F,0xBF,0x1F,0x56,0xAA,0x2E,0xB3,0x78,0x33,0x50,
+                    0xB0,0xA3,0x92,0xBC,0xCF,0x19,0x1C,0xA7,0x63,0xCB,0x1E,0x4D,0x3E,0x4B,0x1B,0x9B,
+                    0x4F,0xE7,0xF0,0xEE,0xAD,0x3A,0xB5,0x59,0x04,0xEA,0x40,0x55,0x25,0x51,0xE5,0x7A,
+                    0x89,0x38,0x68,0x52,0x7B,0xFC,0x27,0xAE,0xD7,0xBD,0xFA,0x07,0xF4,0xCC,0x8E,0x5F,
+                    0xEF,0x35,0x9C,0x84,0x2B,0x15,0xD5,0x77,0x34,0x49,0xB6,0x12,0x0A,0x7F,0x71,0x88,
+                    0xFD,0x9D,0x18,0x41,0x7D,0x93,0xD8,0x58,0x2C,0xCE,0xFE,0x24,0xAF,0xDE,0xB8,0x36,
+                    0xC8,0xA1,0x80,0xA6,0x99,0x98,0xA8,0x2F,0x0E,0x81,0x65,0x73,0xE4,0xC2,0xA2,0x8A,
+                    0xD4,0xE1,0x11,0xD0,0x08,0x8B,0x2A,0xF2,0xED,0x9A,0x64,0x3F,0xC1,0x6C,0xF9,0xEC
+                };
+
+                // Build a Heap-on-Node (HN, bSig=0xEC, bClientSig=0xBC Property Context) block encrypted via mpbbR
+                auto makeEncryptedPcBlock = [&](const std::vector<std::pair<uint16_t, std::wstring>>& strProps) {
+                    // HID index 1 (0x20): BTHHEADER (8B: bType=0xB5, cbKey=2, cbEnt=6, bIdxLevels=0, hidRoot=0x40)
+                    // HID index 2 (0x40): Leaf PC records (8B each: wPropId, wPropType=0x001F, dwValueHnid)
+                    // HID index 3+ (0x60+): UTF-16LE string slices
+                    std::vector<std::vector<uint8_t>> allocs(2 + strProps.size());
+                    ByteBuf bthHdr;
+                    bthHdr.U8(0xB5u); bthHdr.U8(2); bthHdr.U8(6); bthHdr.U8(0); bthHdr.U32LE(0x40u);
+                    allocs[0] = bthHdr.b;
+
+                    ByteBuf leafRecs;
+                    for (size_t i = 0; i < strProps.size(); ++i) {
+                        uint32_t valHid = static_cast<uint32_t>((i + 3u) << 5);
+                        leafRecs.U16LE(strProps[i].first);
+                        leafRecs.U16LE(0x001Fu); // PtypString (UTF-16LE)
+                        leafRecs.U32LE(valHid);
+                        ByteBuf sb;
+                        sb.Utf16LE(strProps[i].second, false);
+                        allocs[2 + i] = sb.b;
+                    }
+                    allocs[1] = leafRecs.b;
+
+                    ByteBuf blk;
+                    blk.U16LE(0);    // ibHnpm patched below
+                    blk.U8(0xECu);   // bSig = HN
+                    blk.U8(0xBCu);   // bClientSig = PC
+                    blk.U32LE(0x20u);// hidUserRoot = HID #1 (0x20)
+                    blk.U32LE(0);    // rgbFillLevel
+
+                    std::vector<uint16_t> offsets;
+                    offsets.push_back(static_cast<uint16_t>(blk.b.size()));
+                    for (const auto& a : allocs) {
+                        blk.Bytes(a.data(), a.size());
+                        offsets.push_back(static_cast<uint16_t>(blk.b.size()));
+                    }
+                    if (blk.b.size() & 1u) blk.U8(0);
+                    uint16_t ibHnpm = static_cast<uint16_t>(blk.b.size());
+                    PutU16LE(blk.b.data(), ibHnpm);
+                    blk.U16LE(static_cast<uint16_t>(allocs.size()));
+                    blk.U16LE(static_cast<uint16_t>(allocs.size()));
+                    for (uint16_t o : offsets) blk.U16LE(o);
+
+                    for (uint8_t& byte : blk.b) byte = kMpbbR[byte]; // Permutative encryption!
+                    return blk.b;
+                };
+
+                auto folderBlk = makeEncryptedPcBlock({
+                    { 0x3001u, L"Incident_Response" } // PidTagDisplayName
+                });
+                auto msgBlk = makeEncryptedPcBlock({
+                    { 0x0037u, L"Zero-Day Patch Deployment" },        // PidTagSubject
+                    { 0x0C1Au, L"SecOps Lead" },                      // PidTagSenderName
+                    { 0x0E04u, L"Platform Engineering" },             // PidTagDisplayTo
+                    { 0x1000u, L"All production nodes patched cleanly." } // PidTagBody
+                });
+
+                // Layout:
+                //   0..1023    : Unicode PST header (wVer=23, bCryptMethod=1 @ 513, NBT @ 1024, BBT @ 1536)
+                //   1024..1535 : NBT root leaf page (512B, ptype=0x81)
+                //   1536..2047 : BBT root leaf page (512B, ptype=0x80)
+                //   2048..     : Encrypted data blocks (bid=0x04 folderBlk, bid=0x08 msgBlk)
+                ByteBuf pst;
+                pst.Zeros(2048);
+                PutU32LE(pst.b.data() + 0,  0x4E444221u); // "!BDN"
+                PutU16LE(pst.b.data() + 10, 23u);         // Unicode PST v23
+                pst.b[512] = 0x80u;                       // bSentinel
+                pst.b[513] = 0x01u;                       // bCryptMethod = 1 (NDB_CRYPT_PERMUTE)
+
+                uint64_t offFolder = pst.b.size();
+                pst.Bytes(folderBlk.data(), folderBlk.size());
+                pst.PadTo((pst.b.size() + 63u) & ~size_t(63u));
+                uint64_t offMsg = pst.b.size();
+                pst.Bytes(msgBlk.data(), msgBlk.size());
+                pst.PadTo((pst.b.size() + 63u) & ~size_t(63u));
+
+                // Patch NDB header root pointers: ibRootNBT @ 224 = 1024, ibRootBBT @ 240 = 1536
+                PutU32LE(pst.b.data() + 224, 1024u);
+                PutU32LE(pst.b.data() + 240, 1536u);
+
+                // Populate NBT leaf page @ 1024 (2 entries, cbEnt=32):
+                //   Entry 0: Folder NID = 0x8022 (type 0x02 NORMAL_FOLDER), bidData=0x04, bidSub=0, nidParent=0x8022
+                //   Entry 1: Message NID = 0x200024 (type 0x04 NORMAL_MESSAGE), bidData=0x08, bidSub=0, nidParent=0x8022
+                uint8_t* nbt = pst.b.data() + 1024;
+                PutU32LE(nbt + 0,  0x00008022u); PutU32LE(nbt + 8,  0x04u); PutU32LE(nbt + 24, 0x00008022u);
+                PutU32LE(nbt + 32, 0x00200024u); PutU32LE(nbt + 40, 0x08u); PutU32LE(nbt + 56, 0x00008022u);
+                nbt[488] = 2u;    // cEnt = 2
+                nbt[490] = 32u;   // cbEnt = 32
+                nbt[491] = 0u;    // cLevel = 0
+                nbt[496] = 0x81u; // ptype = ptypeNBT
+
+                // Populate BBT leaf page @ 1536 (2 entries, cbEnt=24):
+                //   Entry 0: bid=0x04, ib=offFolder, cb=folderBlk.size()
+                //   Entry 1: bid=0x08, ib=offMsg,    cb=msgBlk.size()
+                uint8_t* bbt = pst.b.data() + 1536;
+                PutU32LE(bbt + 0,  0x04u); PutU32LE(bbt + 8,  static_cast<uint32_t>(offFolder)); PutU16LE(bbt + 16, static_cast<uint16_t>(folderBlk.size()));
+                PutU32LE(bbt + 24, 0x08u); PutU32LE(bbt + 32, static_cast<uint32_t>(offMsg));    PutU16LE(bbt + 40, static_cast<uint16_t>(msgBlk.size()));
+                bbt[488] = 2u;    // cEnt = 2
+                bbt[490] = 24u;   // cbEnt = 24
+                bbt[491] = 0u;    // cLevel = 0
+                bbt[496] = 0x80u; // ptype = ptypeBBT
+
+                std::vector<uint8_t> badPst(600, 0);
+                PutU32LE(badPst.data(), 0x4E444221u); // "!BDN" with wVer=0 and zeroed BBT/NBT
+
+                ParsedOfficeDocument pstDoc, pstBadDoc;
+                bool okPst = writeTempAndInspect(L"secops_archive.pst", pst.b, pstDoc);
+                bool badPstRej = !writeTempAndInspect(L"empty_bad.pst", badPst, pstBadDoc);
+                tc.Record(okPst && badPstRej &&
+                          DocContainsToken(pstDoc, L"Incident_Response") &&
+                          DocContainsToken(pstDoc, L"Zero-Day Patch Deployment") &&
+                          DocContainsToken(pstDoc, L"SecOps Lead") &&
+                          DocContainsToken(pstDoc, L"Platform Engineering") &&
+                          DocContainsToken(pstDoc, L"All production nodes patched cleanly."),
+                    L"DocsB .pst ([MS-PST] Unicode v23 Permutative Decryption, NBT/BBT, Folder & Message PC)");
+            }
+
+            // 9I. Adobe InDesign Markup Language Package (.idml): designmap.xml + Story Paragraphs & Table Grid
+            {
+                std::string designMap =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                    "<Document DOMVersion=\"19.0\" Name=\"Annual_Report_2025\" StoryList=\"u101\">"
+                    "<idPkg:Spread src=\"Spreads/Spread_u201.xml\"/>"
+                    "<idPkg:Story src=\"Stories/Story_u101.xml\"/>"
+                    "</Document>";
+                std::string spreadXml =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                    "<idPkg:Spread DOMVersion=\"19.0\"><Spread Self=\"u201\">"
+                    "<Page Self=\"p1\" Name=\"1\"/><Page Self=\"p2\" Name=\"2\"/>"
+                    "<TextFrame Self=\"tf1\" ParentStory=\"u101\"/>"
+                    "</Spread></idPkg:Spread>";
+                std::string storyXml =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                    "<idPkg:Story DOMVersion=\"19.0\"><Story Self=\"u101\">"
+                    "<ParagraphStyleRange AppliedParagraphStyle=\"ParagraphStyle/Heading 1\">"
+                    "<CharacterStyleRange><Content>Executive Overview</Content></CharacterStyleRange><Br/>"
+                    "</ParagraphStyleRange>"
+                    "<ParagraphStyleRange AppliedParagraphStyle=\"ParagraphStyle/Body\">"
+                    "<CharacterStyleRange><Content>Global revenue expanded by 28 percent year over year.</Content></CharacterStyleRange>"
+                    "<Table HeaderRowCount=\"1\" BodyRowCount=\"1\" ColumnCount=\"2\">"
+                    "<Cell Name=\"0:0\"><ParagraphStyleRange><CharacterStyleRange><Content>Region</Content></CharacterStyleRange></ParagraphStyleRange></Cell>"
+                    "<Cell Name=\"1:0\"><ParagraphStyleRange><CharacterStyleRange><Content>Growth</Content></CharacterStyleRange></ParagraphStyleRange></Cell>"
+                    "<Cell Name=\"0:1\"><ParagraphStyleRange><CharacterStyleRange><Content>EMEA</Content></CharacterStyleRange></ParagraphStyleRange></Cell>"
+                    "<Cell Name=\"1:1\"><ParagraphStyleRange><CharacterStyleRange><Content>+31.4%</Content></CharacterStyleRange></ParagraphStyleRange></Cell>"
+                    "</Table>"
+                    "</ParagraphStyleRange>"
+                    "</Story></idPkg:Story>";
+
+                auto idmlZip = buildStoredZipMulti({
+                    { "designmap.xml", std::vector<uint8_t>(designMap.begin(), designMap.end()) },
+                    { "Spreads/Spread_u201.xml", std::vector<uint8_t>(spreadXml.begin(), spreadXml.end()) },
+                    { "Stories/Story_u101.xml", std::vector<uint8_t>(storyXml.begin(), storyXml.end()) }
+                });
+                auto nonIdmlZip = BuildStoredZipSingle("notes.xml", "<note>Not an IDML package</note>");
+
+                ParsedOfficeDocument idmlDoc, idmlBadDoc;
+                bool okIdml = writeTempAndInspect(L"annual_report.idml", idmlZip, idmlDoc);
+                bool badIdmlRej = !writeTempAndInspect(L"fake.idml", nonIdmlZip, idmlBadDoc);
+                tc.Record(okIdml && badIdmlRej &&
+                          !idmlDoc.paragraphs.empty() &&
+                          DocContainsToken(idmlDoc, L"Annual_Report_2025") &&
+                          DocContainsToken(idmlDoc, L"Executive Overview") &&
+                          DocContainsToken(idmlDoc, L"Global revenue expanded by 28 percent") &&
+                          DocContainsToken(idmlDoc, L"EMEA") &&
+                          DocContainsToken(idmlDoc, L"+31.4%"),
+                    L"DocsB .idml (Adobe InDesign UCF Package, StoryList Headings/Paragraphs, Spreads & Table Grid)");
+            }
+
+            // 9J. RFC 2557 MIME HTML Web Archive (.mht / .mhtml): multipart/related Quoted-Printable HTML + Base64 Sub-Resource
+            {
+                std::string mht =
+                    "From: <saved@explorer2.local>\r\n"
+                    "Subject: Architecture Specification Snapshot\r\n"
+                    "Date: Wed, 15 Jan 2025 10:30:00 +0000\r\n"
+                    "Snapshot-Content-Location: https://docs.explorer2.dev/spec/v3\r\n"
+                    "MIME-Version: 1.0\r\n"
+                    "Content-Type: multipart/related; boundary=\"----=_NextPart_E2_001\"; type=\"text/html\"\r\n"
+                    "\r\n"
+                    "------=_NextPart_E2_001\r\n"
+                    "Content-Type: text/html; charset=\"utf-8\"\r\n"
+                    "Content-Transfer-Encoding: quoted-printable\r\n"
+                    "Content-Location: https://docs.explorer2.dev/spec/v3\r\n"
+                    "\r\n"
+                    "<html><head><title>Zero-Copy Storage Engine</title></head><body>\r\n"
+                    "<h1>Memory-Mapped B+Tree</h1>\r\n"
+                    "<p>Latency=3D0.42ms at 99.9th percentile.</p>\r\n"
+                    "<table><tr><th>Metric</th><th>Value</th></tr><tr><td>Throughput</td><td>1.8M ops/s</td></tr></table>\r\n"
+                    "</body></html>\r\n"
+                    "------=_NextPart_E2_001\r\n"
+                    "Content-Type: image/png\r\n"
+                    "Content-Transfer-Encoding: base64\r\n"
+                    "Content-Location: https://docs.explorer2.dev/assets/diagram.png\r\n"
+                    "\r\n"
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\r\n"
+                    "------=_NextPart_E2_001--\r\n";
+
+                std::string badMht = "Random binary noise without MIME headers or HTML";
+                ParsedOfficeDocument mhtDoc, mhtBadDoc;
+                bool okMht = writeTempAndInspect(L"snapshot.mhtml", std::vector<uint8_t>(mht.begin(), mht.end()), mhtDoc);
+                bool badMhtRej = !writeTempAndInspect(L"invalid.mht", std::vector<uint8_t>(badMht.begin(), badMht.end()), mhtBadDoc);
+                tc.Record(okMht && badMhtRej &&
+                          DocContainsToken(mhtDoc, L"Zero-Copy Storage Engine") &&
+                          DocContainsToken(mhtDoc, L"Memory-Mapped B+Tree") &&
+                          DocContainsToken(mhtDoc, L"Latency=0.42ms") && // =3D decoded via Quoted-Printable!
+                          DocContainsToken(mhtDoc, L"1.8M ops/s") &&
+                          DocContainsToken(mhtDoc, L"diagram.png") &&
+                          DocContainsToken(mhtDoc, L"image/png"),
+                    L"DocsB .mht/.mhtml (RFC 2557 multipart/related QP HTML + Table + Base64 Embedded_Resources)");
+            }
+
+            // 9K. Apple Property List (.plist): BOTH Binary "bplist00" (Dict, Array, UTF-16BE, NSDate) AND XML <plist>
+            {
+                // Build a genuine bplist00 with 7 objects:
+                //   0: NSDictionary { keys=[1,2,3], vals=[4,5,6] }
+                //   1: ASCII "BundleName"
+                //   2: ASCII "BuildTimestamp"
+                //   3: ASCII "Capabilities"
+                //   4: UTF-16BE (0x60) L"Explorer2 Pro \x03A9" (tests 0x60 UTF-16BE decoding!)
+                //   5: NSDate (0x33) 757382400.0 seconds since 2001-01-01 -> 2025-01-01 00:00:00 UTC!
+                //   6: NSArray [1] -> ["BundleName"] (or add object 7 ASCII "MetalGPU")
+                ByteBuf bp;
+                bp.Bytes("bplist00", 8);
+                std::vector<uint8_t> offs;
+                auto markObj = [&]() { offs.push_back(static_cast<uint8_t>(bp.b.size())); };
+
+                markObj(); // #0: NSDictionary of 3 pairs: keys [1,2,3], vals [4,5,6]
+                bp.U8(0xD3u); bp.U8(1); bp.U8(2); bp.U8(3); bp.U8(4); bp.U8(5); bp.U8(6);
+
+                markObj(); // #1: ASCII "BundleName" (10 chars)
+                bp.U8(0x5Au); bp.Str("BundleName");
+
+                markObj(); // #2: ASCII "BuildTimestamp" (14 chars)
+                bp.U8(0x5Eu); bp.Str("BuildTimestamp");
+
+                markObj(); // #3: ASCII "Capabilities" (12 chars)
+                bp.U8(0x5Cu); bp.Str("Capabilities");
+
+                markObj(); // #4: UTF-16BE (0x60 | 0x0F + int 0x10 len=15): "Explorer2_Omega" in UTF-16BE
+                std::wstring u16Val = L"Explorer2_\x03A9"; // 11 UTF-16 code units -> 0x6B!
+                bp.U8(static_cast<uint8_t>(0x60u | u16Val.size()));
+                for (wchar_t ch : u16Val) bp.U16BE(static_cast<uint16_t>(ch));
+
+                markObj(); // #5: NSDate (0x33 + float64 BE = 757382400.0 -> 2025-01-01 00:00:00 UTC)
+                bp.U8(0x33u);
+                double nsDateSec = 757382400.0; // (2025-01-01 - 2001-01-01) = 8766 days * 86400 = 757,382,400 s
+                uint64_t dateBits = 0; std::memcpy(&dateBits, &nsDateSec, 8);
+                bp.U32BE(static_cast<uint32_t>(dateBits >> 32));
+                bp.U32BE(static_cast<uint32_t>(dateBits & 0xFFFFFFFFULL));
+
+                markObj(); // #6: NSArray of 1 element -> #7
+                bp.U8(0xA1u); bp.U8(7);
+
+                markObj(); // #7: ASCII "MetalCompute" (12 chars)
+                bp.U8(0x5Cu); bp.Str("MetalCompute");
+
+                uint64_t offTblOff = bp.b.size();
+                for (uint8_t o : offs) bp.U8(o);
+                // 32-byte bplist00 trailer: 6 unused + offsetIntSize(1) + objectRefSize(1) + numObjects(8B BE) + topObject(8B BE) + offsetTableOffset(8B BE)
+                bp.Zeros(6);
+                bp.U8(1); // offsetIntSize = 1
+                bp.U8(1); // objectRefSize = 1
+                bp.U32BE(0); bp.U32BE(static_cast<uint32_t>(offs.size()));
+                bp.U32BE(0); bp.U32BE(0); // topObject = 0
+                bp.U32BE(0); bp.U32BE(static_cast<uint32_t>(offTblOff));
+
+                std::string xmlPlist =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                    "<plist version=\"1.0\"><dict>"
+                    "<key>CFBundleIdentifier</key><string>com.deepmind.explorer2</string>"
+                    "<key>MinimumSystemVersion</key><integer>14</integer>"
+                    "<key>SupportsHiDPI</key><true/>"
+                    "<key>SupportedArchitectures</key><array><string>arm64</string><string>x86_64</string></array>"
+                    "</dict></plist>";
+
+                // Corrupt bplist00: valid magic, zeroed invalid trailer (offsetIntSize=0)
+                ByteBuf badBp;
+                badBp.Bytes("bplist00", 8);
+                badBp.Zeros(32);
+
+                ParsedOfficeDocument bpDoc, xpDoc, badBpDoc;
+                bool okBp = writeTempAndInspect(L"Info_bin.plist", bp.b, bpDoc);
+                bool okXp = writeTempAndInspect(L"Info_xml.plist", std::vector<uint8_t>(xmlPlist.begin(), xmlPlist.end()), xpDoc);
+                bool badBpRej = !writeTempAndInspect(L"corrupt_trailer.plist", badBp.b, badBpDoc);
+                tc.Record(okBp && okXp && badBpRej &&
+                          DocContainsToken(bpDoc, L"Explorer2_\x03A9") &&
+                          DocContainsToken(bpDoc, L"2025-01-01 00:00:00 UTC") &&
+                          DocContainsToken(bpDoc, L"MetalCompute") &&
+                          DocContainsToken(xpDoc, L"com.deepmind.explorer2") &&
+                          DocContainsToken(xpDoc, L"arm64") &&
+                          DocContainsToken(xpDoc, L"true"),
+                    L"DocsB .plist (Apple bplist00 UTF-16BE/NSDate/Dict/Array + XML Plist & Corrupt Trailer Reject)");
+            }
+        }
     }
 
     RemoveDirectoryW(dir.c_str());

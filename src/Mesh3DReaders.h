@@ -14,6 +14,7 @@ bool Is3DModelExtension(const std::wstring& extLower);
 // views otherwise)
 bool IsLikely3DDxfFile(const std::wstring& fullPath);
 bool IsLikely3DGeoOrDemFile(const std::wstring& fullPath, const std::wstring& extLower);
+bool IsLikelyQuakeMapFile(const std::wstring& fullPath);
 
 // Reads a model. A load that is not the newest (activeGen != generation; activeGen may be null) stops early.
 LoadedMesh3D ParseMeshFromDisk(const std::wstring& fullPath, uint64_t generation, const std::atomic<uint64_t>* activeGen);

@@ -3145,6 +3145,1115 @@ std::vector<uint8_t> BuildEaBigTestArchive(
     return big;
 }
 
+// ============================================================================
+// 11. Encoders & Builders for Tests 15.20 – 15.27:
+//     LHA -lh5- (Level 1) & ARJ (method 1 & method 4), Debian .deb + Unix/BSD .ar,
+//     Linux z_erofs (LZ4 Legacy/Full & Compact), Bohemia .pbo ("srpC" LZSS),
+//     RFC 7932 Brotli (.br / .tbr / .tar.br), ECMA-167 UDF (.udf) & Nero (.nrg),
+//     ISO 28500 WARC (.warc + multi-member gzip), Android Sparse (.simg + ext4)
+// ============================================================================
+
+void BuildKraftCompleteLengths(const std::vector<uint16_t>& activeSyms, size_t alphaSz,
+                               std::vector<uint8_t>& outLens, std::vector<uint32_t>& outMsbCodes)
+{
+    outLens.assign(alphaSz, 0u);
+    outMsbCodes.assign(alphaSz, 0u);
+    const size_t k = activeSyms.size();
+    if (k < 2u) return;
+
+    uint32_t bits = 1u;
+    while ((size_t(1) << bits) < k) ++bits;
+    const size_t shortCnt = (size_t(1) << bits) - k;
+    for (size_t i = 0; i < k; ++i) {
+        outLens[activeSyms[i]] = static_cast<uint8_t>((i < shortCnt) ? (bits - 1u) : bits);
+    }
+
+    uint32_t cnt[17] = {};
+    for (uint8_t l : outLens) if (l > 0u) ++cnt[l];
+    uint32_t firstCode[17] = {};
+    uint32_t code = 0u;
+    for (uint32_t l = 1u; l <= bits; ++l) {
+        code = (code + cnt[l - 1u]) << 1u;
+        firstCode[l] = code;
+    }
+    for (size_t s = 0; s < alphaSz; ++s) {
+        if (outLens[s] > 0u) outMsbCodes[s] = firstCode[outLens[s]]++;
+    }
+}
+
+std::vector<uint8_t> EncodeLhaArjBlockHuffForTest(
+    const uint8_t* raw, size_t len, uint32_t np, uint32_t pbit, size_t maxWindow)
+{
+    struct LzTok { uint16_t cSym; uint16_t pSym; uint32_t distExtra; uint32_t distExtraBits; };
+    std::vector<LzTok> toks;
+    bool cUsed[510] = {};
+    bool pUsed[32]  = {};
+
+    size_t pos = 0;
+    while (pos < len) {
+        size_t bestLen = 0, bestDist = 0;
+        size_t maxBack = std::min<size_t>(pos, maxWindow);
+        for (size_t d = 1; d <= maxBack; ++d) {
+            size_t m = 0;
+            size_t maxM = std::min<size_t>(256u, len - pos);
+            while (m < maxM && raw[pos + m] == raw[pos - d + m]) ++m;
+            if (m >= 4u && m > bestLen) {
+                bestLen = m;
+                bestDist = d;
+                if (bestLen >= 64u) break;
+            }
+        }
+        if (bestLen >= 4u) {
+            uint16_t cSym = static_cast<uint16_t>(256u + bestLen - 3u);
+            uint32_t dist0 = static_cast<uint32_t>(bestDist - 1u);
+            uint16_t pSym = 0u;
+            uint32_t eb = 0u, ev = 0u;
+            if (dist0 > 0u) {
+                uint32_t tmp = dist0;
+                while (tmp > 0u) { ++pSym; tmp >>= 1u; }
+                eb = pSym - 1u;
+                ev = dist0 & ((1u << eb) - 1u);
+            }
+            toks.push_back({ cSym, pSym, ev, eb });
+            cUsed[cSym] = true;
+            pUsed[pSym] = true;
+            pos += bestLen;
+        } else {
+            uint16_t cSym = raw[pos++];
+            toks.push_back({ cSym, 0u, 0u, 0u });
+            cUsed[cSym] = true;
+        }
+    }
+    if (!pUsed[0]) pUsed[0] = true;
+
+    std::vector<uint16_t> cAct, pAct;
+    for (uint16_t s = 0; s < 510u; ++s) if (cUsed[s]) cAct.push_back(s);
+    for (uint16_t s = 0; s < np; ++s)   if (pUsed[s]) pAct.push_back(s);
+
+    std::vector<uint8_t> cLens, pLens;
+    std::vector<uint32_t> cCodes, pCodes;
+    BuildKraftCompleteLengths(cAct, 510u, cLens, cCodes);
+    BuildKraftCompleteLengths(pAct, np,   pLens, pCodes);
+
+    MsbBitWriter bw;
+    bw.Write(static_cast<uint32_t>(toks.size()), 16); // 16-bit block size
+
+    auto writePtTree = [&](const std::vector<uint8_t>& lens, const std::vector<uint16_t>& act,
+                           uint32_t nn, uint32_t nbit, int iSpecial)
+    {
+        if (act.size() == 1u) {
+            bw.Write(0u, static_cast<int>(nbit));
+            bw.Write(act[0], static_cast<int>(nbit));
+            return;
+        }
+        uint32_t n = nn;
+        while (n > 0u && lens[n - 1u] == 0u) --n;
+        bw.Write(n, static_cast<int>(nbit));
+        uint32_t i = 0u;
+        while (i < n) {
+            uint8_t c = lens[i++];
+            if (c < 7u) {
+                bw.Write(c, 3);
+            } else {
+                bw.Write(7u, 3);
+                for (uint8_t k = 0; k < c - 7u; ++k) bw.Write(1u, 1);
+                bw.Write(0u, 1);
+            }
+            if (static_cast<int>(i) == iSpecial) {
+                uint32_t z = 0u;
+                while (z < 3u && i < n && lens[i] == 0u) { ++z; ++i; }
+                bw.Write(z, 2);
+            }
+        }
+    };
+
+    if (cAct.size() == 1u) {
+        // Dummy 1-symbol pt_tree + 1-symbol c_tree
+        bw.Write(0u, 5);
+        bw.Write(0u, 5);
+        bw.Write(0u, 9);
+        bw.Write(cAct[0], 9);
+    } else {
+        uint32_t nc = 510u;
+        while (nc > 0u && cLens[nc - 1u] == 0u) --nc;
+        // RLE-encode cLens[0..nc-1] into pt symbols (0=1 zero, 1=3..18 zeroes, 2=20..531 zeroes, c+2=length c)
+        struct ClItem { uint16_t ptSym; int extraBits; uint32_t extraVal; };
+        std::vector<ClItem> clSeq;
+        bool ptUsed[19] = {};
+        uint32_t idx = 0u;
+        while (idx < nc) {
+            if (cLens[idx] == 0u) {
+                uint32_t run = 0u;
+                while (idx + run < nc && cLens[idx + run] == 0u) ++run;
+                idx += run;
+                while (run > 0u) {
+                    if (run >= 20u) {
+                        uint32_t take = std::min<uint32_t>(run, 531u);
+                        clSeq.push_back({ 2u, 9, take - 20u });
+                        ptUsed[2] = true;
+                        run -= take;
+                    } else if (run >= 3u) {
+                        uint32_t take = std::min<uint32_t>(run, 18u);
+                        clSeq.push_back({ 1u, 4, take - 3u });
+                        ptUsed[1] = true;
+                        run -= take;
+                    } else {
+                        clSeq.push_back({ 0u, 0, 0u });
+                        ptUsed[0] = true;
+                        --run;
+                    }
+                }
+            } else {
+                uint16_t ps = static_cast<uint16_t>(cLens[idx++] + 2u);
+                clSeq.push_back({ ps, 0, 0u });
+                ptUsed[ps] = true;
+            }
+        }
+
+        std::vector<uint16_t> ptAct;
+        for (uint16_t s = 0; s < 19u; ++s) if (ptUsed[s]) ptAct.push_back(s);
+        std::vector<uint8_t> ptLens;
+        std::vector<uint32_t> ptCodes;
+        BuildKraftCompleteLengths(ptAct, 19u, ptLens, ptCodes);
+        writePtTree(ptLens, ptAct, 19u, 5u, 3);
+
+        bw.Write(nc, 9);
+        for (const auto& it : clSeq) {
+            if (ptAct.size() > 1u) {
+                bw.Write(ptCodes[it.ptSym], ptLens[it.ptSym]);
+            }
+            if (it.extraBits > 0) bw.Write(it.extraVal, it.extraBits);
+        }
+    }
+
+    writePtTree(pLens, pAct, np, pbit, -1);
+
+    for (const auto& t : toks) {
+        if (cAct.size() > 1u) bw.Write(cCodes[t.cSym], cLens[t.cSym]);
+        if (t.cSym >= 256u) {
+            if (pAct.size() > 1u) bw.Write(pCodes[t.pSym], pLens[t.pSym]);
+            if (t.distExtraBits > 0u) bw.Write(t.distExtra, static_cast<int>(t.distExtraBits));
+        }
+    }
+    bw.Flush();
+    return bw.out;
+}
+
+std::vector<uint8_t> EncodeArjMethod4ForTest(const uint8_t* raw, size_t len) {
+    MsbBitWriter bw;
+    size_t pos = 0;
+    while (pos < len) {
+        size_t bestLen = 0, bestDist = 0;
+        size_t maxBack = std::min<size_t>(pos, 15872u);
+        for (size_t d = 1; d <= maxBack; ++d) {
+            size_t m = 0;
+            size_t maxM = std::min<size_t>(256u, len - pos);
+            while (m < maxM && raw[pos + m] == raw[pos - d + m]) ++m;
+            if (m >= 4u && m > bestLen) {
+                bestLen = m;
+                bestDist = d;
+                if (bestLen >= 64u) break;
+            }
+        }
+        if (bestLen >= 4u) {
+            uint32_t lenVal = static_cast<uint32_t>(bestLen - 2u);
+            uint32_t w = 1u;
+            while (w < 7u && lenVal >= ((1u << (w + 1u)) - 1u)) ++w;
+            for (uint32_t k = 0; k < w; ++k) bw.Write(1u, 1);
+            if (w < 7u) bw.Write(0u, 1);
+            bw.Write(lenVal - ((1u << w) - 1u), static_cast<int>(w));
+
+            uint32_t dist0 = static_cast<uint32_t>(bestDist - 1u);
+            uint32_t pw = 0u;
+            while (pw < 4u && dist0 >= (((1u << (pw + 1u)) - 1u) << 9u)) ++pw;
+            for (uint32_t k = 0; k < pw; ++k) bw.Write(1u, 1);
+            if (pw < 4u) bw.Write(0u, 1);
+            bw.Write(dist0 - (((1u << pw) - 1u) << 9u), static_cast<int>(9u + pw));
+            pos += bestLen;
+        } else {
+            bw.Write(0u, 1); // lenVal == 0 -> literal
+            bw.Write(raw[pos++], 8);
+        }
+    }
+    bw.Flush();
+    return bw.out;
+}
+
+std::vector<uint8_t> BuildLzhLevel1Archive(
+    const std::string& dirPart,
+    const std::string& filePart,
+    const std::string& plainBody,
+    const std::string& storedFile,
+    const std::string& storedBody)
+{
+    auto compLh5 = EncodeLhaArjBlockHuffForTest(
+        reinterpret_cast<const uint8_t*>(plainBody.data()), plainBody.size(), 14u, 4u, 8192u);
+
+    // Extended header 0x02 (directory name with 0xFF separator): [0x02][dir + 0xFF][u16 nextExt = 0]
+    std::vector<uint8_t> extDir = { 0x02u };
+    extDir.insert(extDir.end(), dirPart.begin(), dirPart.end());
+    extDir.push_back(0xFFu);
+    AppendU16LE(extDir, 0u); // end of extended headers
+
+    // Level-1 basic header: [0]=hdrSz, [1]=sum, [2..6]="-lh5-", [7..10]=skipSz(ext+comp), [11..14]=origSz,
+    // [15..18]=dosTime, [19]=0x20, [20]=1, [21]=fnLen, [22..]=fn, [crc16], [os='M'], [u16 firstExtSz]
+    const uint8_t fnLen = static_cast<uint8_t>(filePart.size());
+    const uint8_t hdrSz = static_cast<uint8_t>(25u + fnLen); // 2 + hdrSz == 27 + fnLen
+    std::vector<uint8_t> h1(2u + hdrSz, 0u);
+    h1[0] = hdrSz;
+    std::memcpy(h1.data() + 2, "-lh5-", 5);
+    PutU32LE(h1.data() + 7,  static_cast<uint32_t>(extDir.size() + compLh5.size())); // Level-1 skip_size!
+    PutU32LE(h1.data() + 11, static_cast<uint32_t>(plainBody.size()));
+    h1[19] = 0x20u;
+    h1[20] = 1u; // Level 1
+    h1[21] = fnLen;
+    std::memcpy(h1.data() + 22, filePart.data(), fnLen);
+    h1[24 + fnLen] = 'M';
+    PutU16LE(h1.data() + 25 + fnLen, static_cast<uint16_t>(extDir.size()));
+    uint8_t csum = 0u;
+    for (size_t i = 2; i < h1.size(); ++i) csum = static_cast<uint8_t>(csum + h1[i]);
+    h1[1] = csum;
+
+    // Second entry: Level-0 "-lh0-" stored file
+    const uint8_t fn2Len = static_cast<uint8_t>(storedFile.size());
+    const uint8_t hdr2Sz = static_cast<uint8_t>(22u + fn2Len);
+    std::vector<uint8_t> h2(2u + hdr2Sz, 0u);
+    h2[0] = hdr2Sz;
+    std::memcpy(h2.data() + 2, "-lh0-", 5);
+    PutU32LE(h2.data() + 7,  static_cast<uint32_t>(storedBody.size()));
+    PutU32LE(h2.data() + 11, static_cast<uint32_t>(storedBody.size()));
+    h2[19] = 0x20u;
+    h2[20] = 0u; // Level 0
+    h2[21] = fn2Len;
+    std::memcpy(h2.data() + 22, storedFile.data(), fn2Len);
+    uint8_t csum2 = 0u;
+    for (size_t i = 2; i < h2.size(); ++i) csum2 = static_cast<uint8_t>(csum2 + h2[i]);
+    h2[1] = csum2;
+
+    std::vector<uint8_t> arc;
+    arc.insert(arc.end(), h1.begin(), h1.end());
+    arc.insert(arc.end(), extDir.begin(), extDir.end());
+    arc.insert(arc.end(), compLh5.begin(), compLh5.end());
+    arc.insert(arc.end(), h2.begin(), h2.end());
+    arc.insert(arc.end(), storedBody.begin(), storedBody.end());
+    arc.push_back(0u); // End-of-archive sentinel
+    return arc;
+}
+
+std::vector<uint8_t> BuildArjTestArchive(
+    const std::string& nameM1, const std::string& plainM1,
+    const std::string& nameM4, const std::string& plainM4)
+{
+    auto compM1 = EncodeLhaArjBlockHuffForTest(
+        reinterpret_cast<const uint8_t*>(plainM1.data()), plainM1.size(), 17u, 5u, 26624u);
+    auto compM4 = EncodeArjMethod4ForTest(
+        reinterpret_cast<const uint8_t*>(plainM4.data()), plainM4.size());
+
+    std::vector<uint8_t> arc;
+    auto pushArjHeader = [&](uint8_t method, uint8_t fileType, const std::string& fn,
+                             const uint8_t* compPtr, size_t compSz, size_t origSz, uint32_t fileCrc)
+    {
+        std::vector<uint8_t> basic(30u, 0u);
+        basic[0] = 30u; // first_hdr_size
+        basic[1] = 6u;  // archiver version
+        basic[2] = 1u;  // min version
+        basic[3] = method;
+        basic[4] = fileType;
+        PutU32LE(basic.data() + 12, static_cast<uint32_t>(compSz));
+        PutU32LE(basic.data() + 16, static_cast<uint32_t>(origSz));
+        PutU32LE(basic.data() + 20, fileCrc);
+        basic.insert(basic.end(), fn.begin(), fn.end());
+        basic.push_back(0u); // filename NUL
+        basic.push_back(0u); // comment NUL
+
+        arc.push_back(0x60u);
+        arc.push_back(0xEAu);
+        AppendU16LE(arc, static_cast<uint16_t>(basic.size()));
+        arc.insert(arc.end(), basic.begin(), basic.end());
+        AppendU32LE(arc, Checksum::Crc32(basic.data(), basic.size()));
+        AppendU16LE(arc, 0u); // no extended headers
+        if (compPtr && compSz > 0u) {
+            arc.insert(arc.end(), compPtr, compPtr + compSz);
+        }
+    };
+
+    pushArjHeader(0u, 2u, "TEST.ARJ", nullptr, 0u, 0u, 0u); // Main archive header
+    pushArjHeader(1u, 0u, nameM1, compM1.data(), compM1.size(), plainM1.size(),
+                  Checksum::Crc32(reinterpret_cast<const uint8_t*>(plainM1.data()), plainM1.size()));
+    pushArjHeader(4u, 0u, nameM4, compM4.data(), compM4.size(), plainM4.size(),
+                  Checksum::Crc32(reinterpret_cast<const uint8_t*>(plainM4.data()), plainM4.size()));
+
+    // End-of-archive marker: 0x60 0xEA + basicSz = 0
+    arc.push_back(0x60u);
+    arc.push_back(0xEAu);
+    AppendU16LE(arc, 0u);
+    return arc;
+}
+
+void AppendArMemberForTest(std::vector<uint8_t>& ar, const std::string& rawNameField, const uint8_t* body, size_t bodyLen) {
+    uint8_t hdr[60];
+    std::memset(hdr, ' ', sizeof(hdr));
+    std::memcpy(hdr, rawNameField.data(), std::min<size_t>(rawNameField.size(), 16u));
+    std::memcpy(hdr + 16, "1700000000", 10);
+    std::memcpy(hdr + 40, "100644", 6);
+    char szBuf[16] = {};
+    snprintf(szBuf, sizeof(szBuf), "%llu", static_cast<unsigned long long>(bodyLen));
+    std::memcpy(hdr + 48, szBuf, std::strlen(szBuf));
+    hdr[58] = 0x60u;
+    hdr[59] = 0x0Au;
+    ar.insert(ar.end(), hdr, hdr + 60);
+    if (body && bodyLen > 0u) ar.insert(ar.end(), body, body + bodyLen);
+    if ((bodyLen & 1u) != 0u) ar.push_back('\n');
+}
+
+std::vector<uint8_t> BuildDebianDebArchive(const std::vector<std::pair<std::string, std::string>>& dataFiles) {
+    std::vector<uint8_t> deb = { '!','<','a','r','c','h','>','\n' };
+    const std::string debVer = "2.0\n";
+    AppendArMemberForTest(deb, "debian-binary/", reinterpret_cast<const uint8_t*>(debVer.data()), debVer.size());
+
+    auto ctrlTar = BuildPosixTar({ { "control", "Package: explorer2-test\nVersion: 1.0\nArchitecture: amd64\n" } });
+    auto ctrlGz  = CompressGzip(ctrlTar.data(), ctrlTar.size());
+    AppendArMemberForTest(deb, "control.tar.gz/", ctrlGz.data(), ctrlGz.size());
+
+    auto dataTar = BuildPosixTar(dataFiles);
+    auto dataGz  = CompressGzip(dataTar.data(), dataTar.size());
+    AppendArMemberForTest(deb, "data.tar.gz/", dataGz.data(), dataGz.size());
+    return deb;
+}
+
+std::vector<uint8_t> CompressRawLz4BlockForTest(const uint8_t* raw, size_t len) {
+    std::vector<uint8_t> blk;
+    size_t pos = 0, anchor = 0;
+    while (pos + 5 <= len) {
+        size_t bestLen = 0, bestDist = 0;
+        size_t maxBack = std::min<size_t>(pos, 8192u);
+        for (size_t d = 1; d <= maxBack; ++d) {
+            size_t m = 0;
+            size_t maxM = (len - pos > 5) ? (len - pos - 5) : 0;
+            while (m < maxM && raw[pos + m] == raw[pos - d + m]) ++m;
+            if (m >= 4 && m > bestLen) { bestLen = m; bestDist = d; if (bestLen >= 64) break; }
+        }
+        if (bestLen >= 4) {
+            size_t litLen = pos - anchor;
+            size_t mCode  = bestLen - 4;
+            blk.push_back(static_cast<uint8_t>((std::min<size_t>(litLen, 15) << 4) | std::min<size_t>(mCode, 15)));
+            if (litLen >= 15) {
+                size_t rem = litLen - 15;
+                while (rem >= 255) { blk.push_back(255); rem -= 255; }
+                blk.push_back(static_cast<uint8_t>(rem));
+            }
+            blk.insert(blk.end(), raw + anchor, raw + pos);
+            AppendU16LE(blk, static_cast<uint16_t>(bestDist));
+            if (mCode >= 15) {
+                size_t rem = mCode - 15;
+                while (rem >= 255) { blk.push_back(255); rem -= 255; }
+                blk.push_back(static_cast<uint8_t>(rem));
+            }
+            pos += bestLen;
+            anchor = pos;
+        } else {
+            ++pos;
+        }
+    }
+    size_t tailLit = len - anchor;
+    blk.push_back(static_cast<uint8_t>(std::min<size_t>(tailLit, 15) << 4));
+    if (tailLit >= 15) {
+        size_t rem = tailLit - 15;
+        while (rem >= 255) { blk.push_back(255); rem -= 255; }
+        blk.push_back(static_cast<uint8_t>(rem));
+    }
+    blk.insert(blk.end(), raw + anchor, raw + len);
+    return blk;
+}
+
+std::vector<uint8_t> BuildCompressedErofsTestImage(
+    const std::string& legacyFullBody,
+    const std::string& compactBody)
+{
+    // 8 x 4096B blocks:
+    //   Block 0: Superblock @ 1024 (LZ4_0PADDING = 0x01)
+    //   Block 1: Metadata inodes (NID 0 root dir, NID 4 legacy/full compressed file, NID 12 compact compressed file)
+    //   Block 2: Root directory dirents
+    //   Blocks 3..4: Two LZ4-compressed physical clusters for NID 4 (legacyFullBody > 4096B)
+    //   Block 5: LZ4-compressed physical cluster for NID 12 (compactBody <= 4096B)
+    const size_t blkSz = 4096u;
+    std::vector<uint8_t> img(6u * blkSz, 0u);
+
+    uint8_t* sb = img.data() + 1024u;
+    PutU32LE(sb + 0,  0xE0F5E1E2u);
+    sb[12] = 12u;          // blkszbits = 12 (4096B)
+    PutU16LE(sb + 14, 0u); // root_nid = 0
+    PutU32LE(sb + 20, 0x01u); // EROFS_FEATURE_INCOMPAT_LZ4_0PADDING
+    PutU32LE(sb + 36, 6u); // blocks = 6
+    PutU32LE(sb + 40, 1u); // meta_blkaddr = 1
+    std::memcpy(sb + 64, "EROFS_ZL4", 9);
+
+    // NID 0 @ 4096 + 0: root dir -> "legacy_lz4.bin" (NID 4), "compact_lz4.bin" (NID 12)
+    uint8_t* n0 = img.data() + 4096u;
+    PutU16LE(n0 + 0, 0u);
+    PutU16LE(n0 + 4, 0040755u);
+    PutU32LE(n0 + 8, 53u);
+    PutU32LE(n0 + 16, 2u);
+    uint8_t* rd = img.data() + 2u * blkSz;
+    PutU64LE(rd + 0,  4ULL);  PutU16LE(rd + 8,  24u); rd[10] = 1u;
+    PutU64LE(rd + 12, 12ULL); PutU16LE(rd + 20, 38u); rd[22] = 1u;
+    std::memcpy(rd + 24, "legacy_lz4.bin", 14);
+    std::memcpy(rd + 38, "compact_lz4.bin", 15);
+
+    auto writeZeroPaddedLz4Block = [&](size_t physBlk, const uint8_t* src, size_t len) {
+        auto lz = CompressRawLz4BlockForTest(src, len);
+        // Right-align LZ4 payload with leading 0x00 padding per EROFS_FEATURE_INCOMPAT_LZ4_0PADDING!
+        size_t pad = blkSz - lz.size();
+        std::memcpy(img.data() + physBlk * blkSz + pad, lz.data(), lz.size());
+    };
+
+    // NID 4 @ 4096 + 128: dataLayout = 1 (FLAT_COMPRESSION_LEGACY / COMPRESSED_FULL, 2 lclusters -> blocks 3 & 4)
+    {
+        size_t c0Len = blkSz;
+        size_t c1Len = legacyFullBody.size() - blkSz;
+        writeZeroPaddedLz4Block(3u, reinterpret_cast<const uint8_t*>(legacyFullBody.data()), c0Len);
+        writeZeroPaddedLz4Block(4u, reinterpret_cast<const uint8_t*>(legacyFullBody.data()) + c0Len, c1Len);
+
+        uint8_t* n4 = img.data() + 4096u + 4u * 32u;
+        PutU16LE(n4 + 0, (1u << 1) | 0u); // COMPACT | dataLayout=1
+        PutU16LE(n4 + 4, 0100644u);
+        PutU32LE(n4 + 8, static_cast<uint32_t>(legacyFullBody.size()));
+        // 8B z_erofs_map_header @ n4 + 32: h_advise=0, h_algorithmtype=0 (LZ4), h_clusterbits=0 (4096B)
+        uint8_t* mh = n4 + 32u;
+        PutU16LE(mh + 4, 0u);
+        mh[6] = 0u;
+        mh[7] = 0u;
+        // Two 8B z_erofs_lcluster_index entries @ n4 + 40:
+        uint8_t* idx0 = n4 + 40u;
+        PutU16LE(idx0 + 0, 1u); // Z_EROFS_LCLUSTER_TYPE_HEAD1
+        PutU16LE(idx0 + 2, 0u); // clusterofs = 0
+        PutU32LE(idx0 + 4, 3u); // blkaddr = 3
+        uint8_t* idx1 = n4 + 48u;
+        PutU16LE(idx1 + 0, 1u); // HEAD1
+        PutU16LE(idx1 + 2, 0u); // clusterofs = 0
+        PutU32LE(idx1 + 4, 4u); // blkaddr = 4
+    }
+
+    // NID 12 @ 4096 + 384: dataLayout = 4 (COMPRESSED_COMPACT 4B pack -> block 5)
+    {
+        writeZeroPaddedLz4Block(5u, reinterpret_cast<const uint8_t*>(compactBody.data()), compactBody.size());
+        uint8_t* n12 = img.data() + 4096u + 12u * 32u;
+        PutU16LE(n12 + 0, (4u << 1) | 0u); // COMPACT | dataLayout=4 (COMPRESSED_COMPACT)
+        PutU16LE(n12 + 4, 0100644u);
+        PutU32LE(n12 + 8, static_cast<uint32_t>(compactBody.size()));
+        uint8_t* mh = n12 + 32u;
+        PutU16LE(mh + 4, 0u); // 4B compact pack (amortizedshift=2, vcnt=2)
+        mh[6] = 0u;           // LZ4
+        mh[7] = 0u;           // lclusterbits = 12
+        // 8B 4B-pack @ n12 + 40: slot0 = (HEAD1 << 12) | 0, slot1 = 0, baseBlkAddr = 5
+        uint8_t* pk = n12 + 40u;
+        PutU16LE(pk + 0, static_cast<uint16_t>((1u << 12u) | 0u));
+        PutU16LE(pk + 2, 0u);
+        PutU32LE(pk + 4, 5u);
+    }
+
+    return img;
+}
+
+std::vector<uint8_t> EncodeBohemiaPboLzssForTest(const uint8_t* raw, size_t len) {
+    std::vector<uint8_t> out;
+    size_t pos = 0;
+    while (pos < len) {
+        size_t flagPos = out.size();
+        out.push_back(0u);
+        uint8_t flags = 0u;
+        for (int bit = 0; bit < 8 && pos < len; ++bit) {
+            size_t bestLen = 0, bestDist = 0;
+            size_t maxBack = std::min<size_t>(pos, 4095u);
+            for (size_t d = 1; d <= maxBack; ++d) {
+                size_t m = 0;
+                size_t maxM = std::min<size_t>(18u, len - pos);
+                while (m < maxM && raw[pos + m] == raw[pos - d + m]) ++m;
+                if (m >= 3u && m > bestLen) {
+                    bestLen = m;
+                    bestDist = d;
+                    if (bestLen == 18u) break;
+                }
+            }
+            if (bestLen >= 3u) {
+                out.push_back(static_cast<uint8_t>(bestDist & 0xFFu));
+                out.push_back(static_cast<uint8_t>(((bestDist >> 4u) & 0xF0u) | ((bestLen - 3u) & 0x0Fu)));
+                pos += bestLen;
+            } else {
+                flags = static_cast<uint8_t>(flags | (1u << bit));
+                out.push_back(raw[pos++]);
+            }
+        }
+        out[flagPos] = flags;
+    }
+    uint32_t sum = 0u;
+    for (size_t i = 0; i < len; ++i) sum += raw[i];
+    AppendU32LE(out, sum);
+    return out;
+}
+
+std::vector<uint8_t> BuildBohemiaPboTestArchive(
+    const std::string& prefix,
+    const std::string& compFileName, const std::string& compPlain,
+    const std::string& rawFileName,  const std::string& rawPlain)
+{
+    auto lzss = EncodeBohemiaPboLzssForTest(reinterpret_cast<const uint8_t*>(compPlain.data()), compPlain.size());
+    std::vector<uint8_t> pbo;
+    auto pushHdr = [&](const std::string& fn, uint32_t mime, uint32_t origSz, uint32_t dataSz) {
+        pbo.insert(pbo.end(), fn.begin(), fn.end());
+        pbo.push_back(0u);
+        AppendU32LE(pbo, mime);
+        AppendU32LE(pbo, origSz);
+        AppendU32LE(pbo, 0u);
+        AppendU32LE(pbo, 0u);
+        AppendU32LE(pbo, dataSz);
+    };
+
+    // "sreV" version properties block
+    pushHdr("", 0x56657273u, 0u, 0u);
+    const std::string k = "prefix";
+    pbo.insert(pbo.end(), k.begin(), k.end()); pbo.push_back(0u);
+    pbo.insert(pbo.end(), prefix.begin(), prefix.end()); pbo.push_back(0u);
+    pbo.push_back(0u); // end properties
+
+    pushHdr(compFileName, 0x43707273u, static_cast<uint32_t>(compPlain.size()), static_cast<uint32_t>(lzss.size()));
+    pushHdr(rawFileName,  0u,          static_cast<uint32_t>(rawPlain.size()),  static_cast<uint32_t>(rawPlain.size()));
+    pushHdr("", 0u, 0u, 0u); // End of header table
+
+    pbo.insert(pbo.end(), lzss.begin(), lzss.end());
+    pbo.insert(pbo.end(), rawPlain.begin(), rawPlain.end());
+    return pbo;
+}
+
+// Genuine RFC 7932 Brotli Compressor (LZ77 + Canonical Prefix Trees for Literals, IAC 128..383, and Distances 0..63)
+std::vector<uint8_t> CompressBrotliRfc7932ForTest(const uint8_t* raw, size_t len) {
+    auto revBits = [](uint32_t v, int n) -> uint32_t {
+        uint32_t r = 0u;
+        for (int i = 0; i < n; ++i) r = (r << 1u) | ((v >> i) & 1u);
+        return r;
+    };
+
+    static constexpr uint32_t kInsBase[16]  = { 0,1,2,3,4,5,6,8,10,14,18,26,34,50,66,98 };
+    static constexpr uint8_t  kInsExtra[16] = { 0,0,0,0,0,0,1,1,2,2,3,3,4,4,5,5 };
+    static constexpr uint32_t kCopyBase[16] = { 2,3,4,5,6,7,8,9,10,12,14,18,22,30,38,54 };
+    static constexpr uint8_t  kCopyExtra[16]= { 0,0,0,0,0,0,0,0,1,1,2,2,3,3,4,4 };
+
+    auto mapIns = [&](size_t insLen, uint32_t& code, uint32_t& eb, uint32_t& ev) {
+        code = 15u;
+        for (uint32_t c = 0; c < 15u; ++c) {
+            if (insLen >= kInsBase[c] && insLen < kInsBase[c + 1u]) { code = c; break; }
+        }
+        eb = kInsExtra[code];
+        ev = static_cast<uint32_t>(insLen - kInsBase[code]);
+    };
+    auto mapCopy = [&](size_t copyLen, uint32_t& code, uint32_t& eb, uint32_t& ev) {
+        code = 15u;
+        for (uint32_t c = 0; c < 15u; ++c) {
+            if (copyLen >= kCopyBase[c] && copyLen < kCopyBase[c + 1u]) { code = c; break; }
+        }
+        eb = kCopyExtra[code];
+        ev = static_cast<uint32_t>(copyLen - kCopyBase[code]);
+    };
+    auto mapIacSym = [](uint32_t insCode, uint32_t copyCode) -> uint32_t {
+        // Maps (insCode 0..15, copyCode 0..15) into rangeIdx 2..5 => iacSym 128..383!
+        uint32_t rangeIdx = 2u + ((insCode >= 8u) ? 2u : 0u) + ((copyCode >= 8u) ? 1u : 0u);
+        return (rangeIdx << 6u) | ((insCode & 7u) << 3u) | (copyCode & 7u);
+    };
+    auto mapDist = [](size_t dist, uint32_t& dSym, uint32_t& eb, uint32_t& ev) {
+        // Direct RFC 7932 distance code (npostfix=0, ndirect=0 => dSym = 16 + hcode)
+        for (uint32_t hcode = 0; hcode < 48u; ++hcode) {
+            uint32_t ndb = 1u + (hcode >> 1u);
+            size_t lo = (((size_t(2u) + (hcode & 1u)) << ndb) - 4u) + 1u;
+            size_t hi = lo + (size_t(1u) << ndb) - 1u;
+            if (dist >= lo && dist <= hi) {
+                dSym = 16u + hcode;
+                eb = ndb;
+                ev = static_cast<uint32_t>(dist - lo);
+                return;
+            }
+        }
+        dSym = 16u; eb = 1u; ev = 0u;
+    };
+
+    LsbBitWriter bw;
+    bw.WriteBits(0u, 1); // WBITS = 16
+
+    size_t chunkOff = 0;
+    while (chunkOff < len) {
+        // Slice into chunks where every literal run <= 129 bytes; if an uncompressible run > 129 exists,
+        // emit a small uncompressed non-last meta-block for it, else emit a compressed meta-block!
+        size_t chunkLen = std::min<size_t>(len - chunkOff, 32768u);
+        const uint8_t* src = raw + chunkOff;
+        const bool isLastChunk = (chunkOff + chunkLen == len);
+
+        struct BrCmd { size_t litStart; size_t insLen; size_t copyLen; size_t dist; };
+        std::vector<BrCmd> cmds;
+        bool fitsCompressed = true;
+        size_t pos = 0, anchor = 0;
+        while (pos < chunkLen) {
+            size_t bestLen = 0, bestDist = 0;
+            size_t maxBack = std::min<size_t>(chunkOff + pos, 32768u);
+            for (size_t d = 1; d <= maxBack; ++d) {
+                size_t m = 0;
+                size_t maxM = std::min<size_t>(69u, chunkLen - pos);
+                while (m < maxM && raw[chunkOff + pos + m] == raw[chunkOff + pos - d + m]) ++m;
+                if (m >= 4u && m > bestLen) {
+                    bestLen = m;
+                    bestDist = d;
+                    if (bestLen >= 54u) break;
+                }
+            }
+            if (bestLen >= 4u) {
+                if (pos - anchor > 129u) { fitsCompressed = false; break; }
+                cmds.push_back({ anchor, pos - anchor, bestLen, bestDist });
+                pos += bestLen;
+                anchor = pos;
+            } else {
+                if (pos - anchor >= 129u) {
+                    if (cmds.empty()) {
+                        fitsCompressed = false;
+                        break;
+                    }
+                    // Truncate this meta-block right at `anchor` (which ended cleanly on a match!)
+                    chunkLen = anchor;
+                    break;
+                }
+                ++pos;
+            }
+        }
+        if (fitsCompressed && chunkLen - anchor > 129u) {
+            if (!cmds.empty()) chunkLen = anchor;
+            else fitsCompressed = false;
+        }
+
+        const bool finalMeta = (chunkOff + chunkLen == len) && fitsCompressed;
+        if (!fitsCompressed) {
+            size_t rawSlice = std::min<size_t>(len - chunkOff, 4096u);
+            bw.WriteBits(0u, 1); // ISLAST = 0
+            bw.WriteBits(0u, 2); // MNIBBLES = 4
+            bw.WriteBits(static_cast<uint32_t>(rawSlice - 1u), 16);
+            bw.WriteBits(1u, 1); // ISUNCOMPRESSED = 1
+            bw.Flush();          // AlignToByteZero!
+            bw.out.insert(bw.out.end(), raw + chunkOff, raw + chunkOff + rawSlice);
+            chunkOff += rawSlice;
+            continue;
+        }
+
+        if (anchor < chunkLen) {
+            cmds.push_back({ anchor, chunkLen - anchor, 2u, 1u }); // trailing literals; copy skipped at produced==mlen
+        }
+
+        bw.WriteBits(finalMeta ? 1u : 0u, 1); // ISLAST
+        if (finalMeta) bw.WriteBits(0u, 1);   // ISLASTEMPTY = 0
+        bw.WriteBits(0u, 2);                  // MNIBBLES = 4
+        bw.WriteBits(static_cast<uint32_t>(chunkLen - 1u), 16);
+        if (!finalMeta) bw.WriteBits(0u, 1);  // ISUNCOMPRESSED = 0
+
+        // NBLTYPES[0..2] = 1 (three 0 bits), NPOSTFIX=0 (2b), NDIRECT=0 (4b), ctxMode[0]=0 (2b), 2x ContextMap=1 (2b)
+        bw.WriteBits(0u, 3);
+        bw.WriteBits(0u, 2);
+        bw.WriteBits(0u, 4);
+        bw.WriteBits(0u, 2);
+        bw.WriteBits(0u, 2);
+
+        auto writeSingleClTree = [&](uint32_t targetClSym) {
+            // Complex prefix code (hskip=0) with single active code-length symbol => 0 run bits!
+            static constexpr uint8_t kClOrd[18] = { 1,2,3,4,0,5,17,6,16,7,8,9,10,11,12,13,14,15 };
+            bw.WriteBits(0u, 2); // hskip = 0
+            for (int i = 0; i < 18; ++i) {
+                if (kClOrd[i] == targetClSym) bw.WriteBits(7u, 4); // v = 1 (4 bits: 0111)
+                else bw.WriteBits(0u, 2);                          // v = 0 (2 bits: 00)
+            }
+        };
+
+        // 1. Literal tree: all 256 bytes have code length 8
+        writeSingleClTree(8u);
+
+        // 2. IAC tree (704): 0..127 have length 0, 128..383 have length 8 (Kraft sum = 256 * 128 = 32768!)
+        //    Encode clTree with sym 0 (len=1 => code 0) and sym 8 (len=1 => code 1)
+        bw.WriteBits(0u, 2); // hskip = 0
+        {
+            static constexpr uint8_t kClOrd[18] = { 1,2,3,4,0,5,17,6,16,7,8,9,10,11,12,13,14,15 };
+            uint32_t sp = 32u;
+            for (int i = 0; i < 18 && sp > 0u; ++i) {
+                if (kClOrd[i] == 0u || kClOrd[i] == 8u) {
+                    bw.WriteBits(7u, 4); // v = 1 => cost 16
+                    sp -= 16u;
+                } else {
+                    bw.WriteBits(0u, 2); // v = 0
+                }
+            }
+            for (int s = 0; s < 128; ++s) bw.WriteBits(0u, 1); // sym 0 (length 0)
+            for (int s = 0; s < 256; ++s) bw.WriteBits(1u, 1); // sym 8 (length 8)
+        }
+
+        // 3. Distance tree (64): all 64 symbols have code length 6 (Kraft sum = 64 * 512 = 32768!)
+        writeSingleClTree(6u);
+
+        size_t produced = 0u;
+        for (const auto& cmd : cmds) {
+            uint32_t ic = 0, ieb = 0, iev = 0;
+            uint32_t cc = 0, ceb = 0, cev = 0;
+            mapIns(cmd.insLen, ic, ieb, iev);
+            mapCopy(cmd.copyLen, cc, ceb, cev);
+            uint32_t iacSym = mapIacSym(ic, cc);
+            bw.WriteBits(revBits(iacSym - 128u, 8), 8);
+            if (ieb > 0u) bw.WriteBits(iev, static_cast<int>(ieb));
+            if (ceb > 0u) bw.WriteBits(cev, static_cast<int>(ceb));
+
+            for (size_t k = 0; k < cmd.insLen; ++k) {
+                bw.WriteBits(revBits(src[cmd.litStart + k], 8), 8);
+            }
+            produced += cmd.insLen;
+            if (produced == chunkLen) break;
+
+            uint32_t dSym = 0, deb = 0, dev = 0;
+            mapDist(cmd.dist, dSym, deb, dev);
+            bw.WriteBits(revBits(dSym, 6), 6);
+            if (deb > 0u) bw.WriteBits(dev, static_cast<int>(deb));
+            produced += cmd.copyLen;
+        }
+
+        chunkOff += chunkLen;
+        if (finalMeta) {
+            bw.Flush();
+            return bw.out;
+        }
+    }
+
+    // Emit empty ISLAST meta-block if previous meta-block was non-last
+    bw.WriteBits(1u, 1); // ISLAST = 1
+    bw.WriteBits(1u, 1); // ISLASTEMPTY = 1
+    bw.Flush();
+    return bw.out;
+}
+
+void FinalizeUdfTagForTest(uint8_t* buf, uint16_t tagId, uint32_t tagLocation) {
+    PutU16LE(buf + 0, tagId);
+    PutU16LE(buf + 2, 3u); // UDF 2.xx descriptor version 3
+    PutU32LE(buf + 12, tagLocation);
+    uint8_t sum = 0u;
+    for (int i = 0; i < 16; ++i) {
+        if (i != 4) sum = static_cast<uint8_t>(sum + buf[i]);
+    }
+    buf[4] = sum;
+}
+
+std::vector<uint8_t> EncodeOstaCs0Utf16BEForTest(const std::wstring& s) {
+    std::vector<uint8_t> out = { 16u }; // compId = 16 (UTF-16BE)
+    for (wchar_t wc : s) {
+        out.push_back(static_cast<uint8_t>((static_cast<uint16_t>(wc) >> 8u) & 0xFFu));
+        out.push_back(static_cast<uint8_t>(static_cast<uint16_t>(wc) & 0xFFu));
+    }
+    return out;
+}
+
+std::vector<uint8_t> BuildUdfTestImage(
+    const std::wstring& unicodeDirName,
+    const std::wstring& inlineFileName, const std::string& inlinePayload,
+    const std::wstring& shortAdFileName, const std::string& shortAdPayload,
+    bool useUdf250MetadataPart = false)
+{
+    const size_t secSz = 2048u;
+    const uint32_t partStart = 64u;
+    const uint32_t metaBasePhysLba = useUdf250MetadataPart ? 30u : 0u;
+    const uint16_t metaPartRef     = useUdf250MetadataPart ? 1u  : 0u;
+    std::vector<uint8_t> img(280u * secSz, 0u);
+
+    std::memcpy(img.data() + 16u * secSz + 1u, "BEA01\x01", 6);
+    std::memcpy(img.data() + 17u * secSz + 1u, "NSR03\x01", 6);
+    std::memcpy(img.data() + 18u * secSz + 1u, "TEA01\x01", 6);
+
+    // AVDP [2] @ sector 256
+    {
+        uint8_t* avdp = img.data() + 256u * secSz;
+        PutU32LE(avdp + 16, 3u * static_cast<uint32_t>(secSz)); // MVDS byte len
+        PutU32LE(avdp + 20, 32u);                               // MVDS sector loc = 32
+        FinalizeUdfTagForTest(avdp, 2u, 256u);
+    }
+
+    // MVDS @ sectors 32..34
+    {
+        uint8_t* pd = img.data() + 32u * secSz;
+        PutU16LE(pd + 22,  0u);        // PartitionNumber = 0
+        PutU32LE(pd + 188, partStart); // PartitionStartingLocation = 64
+        PutU32LE(pd + 192, 180u);      // PartitionLength = 180
+        FinalizeUdfTagForTest(pd, 5u, 32u);
+
+        uint8_t* lvd = img.data() + 33u * secSz;
+        lvd[84] = 8u;
+        std::memcpy(lvd + 85, "UDF_TEST", 8);
+        lvd[84 + 127] = 9u;
+        PutU32LE(lvd + 212, static_cast<uint32_t>(secSz)); // LogicalBlockSize = 2048
+        PutU16LE(lvd + 240, 0x0250u);                      // UDF 2.50 revision
+        PutU32LE(lvd + 248, static_cast<uint32_t>(secSz));
+        PutU32LE(lvd + 252, 0u);          // FSD @ LBA 0 in metaPartRef
+        PutU16LE(lvd + 256, metaPartRef); // partRef = 0 (Type 1) or 1 (Type 2 Metadata Partition!)
+        PutU32LE(lvd + 264, useUdf250MetadataPart ? 70u : 6u);
+        PutU32LE(lvd + 268, useUdf250MetadataPart ? 2u  : 1u);
+        lvd[440] = 1u; // Type 1 Physical Partition Map (partRef 0 -> phys part 0)
+        lvd[441] = 6u;
+        PutU16LE(lvd + 442, 1u);
+        PutU16LE(lvd + 444, 0u);
+        if (useUdf250MetadataPart) {
+            uint8_t* pm2 = lvd + 446u;
+            pm2[0] = 2u;  // Type 2 Partition Map
+            pm2[1] = 64u;
+            std::memcpy(pm2 + 5, "*UDF Metadata Partition", 23);
+            PutU16LE(pm2 + 36, 1u);
+            PutU16LE(pm2 + 38, 0u);          // Physical PartitionNumber = 0
+            PutU32LE(pm2 + 40, 20u);         // MetadataFileLocation = phys LBA 20!
+            PutU32LE(pm2 + 44, 0xFFFFFFFFu); // MetadataMirrorFileLocation
+            PutU32LE(pm2 + 52, 32u);         // AllocUnitSize
+        }
+        FinalizeUdfTagForTest(lvd, 6u, 33u);
+
+        uint8_t* td = img.data() + 34u * secSz;
+        FinalizeUdfTagForTest(td, 8u, 34u);
+    }
+
+    auto pBlk = [&](uint32_t physLba) -> uint8_t* {
+        return img.data() + (partStart + physLba) * secSz;
+    };
+    auto mBlk = [&](uint32_t metaLba) -> uint8_t* {
+        return pBlk(metaBasePhysLba + metaLba);
+    };
+
+    if (useUdf250MetadataPart) {
+        // Metadata File ICB [266] @ physical LBA 20 -> maps Metadata Partition LBA 0..15 to physical LBA 30..45!
+        uint8_t* mfe = pBlk(20u);
+        mfe[27] = 250u; // UDF 2.50 Metadata File
+        PutU16LE(mfe + 34, 0u); // Short AD on physical partition 0
+        PutU64LE(mfe + 56, 16u * secSz);
+        PutU32LE(mfe + 212, 8u);
+        PutU32LE(mfe + 216, static_cast<uint32_t>(16u * secSz));
+        PutU32LE(mfe + 220, metaBasePhysLba); // physical LBA 30!
+        FinalizeUdfTagForTest(mfe, 266u, 20u);
+    }
+
+    auto appendFid = [&](std::vector<uint8_t>& dirBuf, uint32_t dirLba, uint8_t fileChars,
+                         uint32_t childLba, const std::vector<uint8_t>& cs0Ident)
+    {
+        size_t off = dirBuf.size();
+        size_t rawLen = 38u + cs0Ident.size();
+        size_t padLen = (rawLen + 3u) & ~size_t(3u);
+        dirBuf.resize(off + padLen, 0u);
+        uint8_t* fid = dirBuf.data() + off;
+        PutU16LE(fid + 16, 1u);
+        fid[18] = fileChars;
+        fid[19] = static_cast<uint8_t>(cs0Ident.size());
+        PutU32LE(fid + 20, 2048u);
+        PutU32LE(fid + 24, childLba);
+        PutU16LE(fid + 28, metaPartRef);
+        PutU16LE(fid + 36, 0u);
+        if (!cs0Ident.empty()) std::memcpy(fid + 38u, cs0Ident.data(), cs0Ident.size());
+        FinalizeUdfTagForTest(fid, 257u, dirLba);
+    };
+
+    // Metadata LBA 0: FSD [256] -> Root ICB @ Metadata LBA 1
+    {
+        uint8_t* fsd = mBlk(0u);
+        PutU32LE(fsd + 400, static_cast<uint32_t>(secSz));
+        PutU32LE(fsd + 404, 1u);
+        PutU16LE(fsd + 408, metaPartRef);
+        FinalizeUdfTagForTest(fsd, 256u, 0u);
+    }
+
+    // Metadata LBA 2: Root Directory FIDs (parent + unicode subdir @ LBA 3 + shortAdFile @ LBA 5)
+    std::vector<uint8_t> rootDirBytes;
+    appendFid(rootDirBytes, 2u, 0x08u | 0x02u, 1u, {}); // Parent ".."
+    appendFid(rootDirBytes, 2u, 0x02u, 3u, EncodeOstaCs0Utf16BEForTest(unicodeDirName));
+    appendFid(rootDirBytes, 2u, 0x00u, 5u, EncodeOstaCs0Utf16BEForTest(shortAdFileName));
+    std::memcpy(mBlk(2u), rootDirBytes.data(), rootDirBytes.size());
+
+    // Metadata LBA 1: Root Directory Extended File Entry [266] (Short AD -> Metadata LBA 2)
+    {
+        uint8_t* efe = mBlk(1u);
+        efe[27] = 4u;             // Directory
+        PutU16LE(efe + 34, 0u);   // allocType = 0 (Short AD inside metaPartRef)
+        PutU64LE(efe + 56, rootDirBytes.size());
+        PutU32LE(efe + 212, 8u);  // lenAllocDescs = 8
+        PutU32LE(efe + 216, static_cast<uint32_t>(rootDirBytes.size()));
+        PutU32LE(efe + 220, 2u);  // Metadata LBA 2
+        FinalizeUdfTagForTest(efe, 266u, 1u);
+    }
+
+    // Metadata LBA 3: Subdirectory File Entry [261] using Inline ICB (allocType = 3) -> inlineFile @ LBA 4
+    {
+        std::vector<uint8_t> subDirBytes;
+        appendFid(subDirBytes, 3u, 0x08u | 0x02u, 1u, {});
+        appendFid(subDirBytes, 3u, 0x00u, 4u, EncodeOstaCs0Utf16BEForTest(inlineFileName));
+        uint8_t* fe = mBlk(3u);
+        fe[27] = 4u;            // Directory
+        PutU16LE(fe + 34, 3u);  // allocType = 3 (Inline ICB!)
+        PutU64LE(fe + 56, subDirBytes.size());
+        PutU32LE(fe + 172, static_cast<uint32_t>(subDirBytes.size()));
+        std::memcpy(fe + 176u, subDirBytes.data(), subDirBytes.size());
+        FinalizeUdfTagForTest(fe, 261u, 3u);
+    }
+
+    // Metadata LBA 4: Inline File Entry [261] (allocType = 3 Inline ICB!)
+    {
+        uint8_t* fe = mBlk(4u);
+        fe[27] = 5u;            // Regular file
+        PutU16LE(fe + 34, 3u);  // allocType = 3 (Inline ICB!)
+        PutU64LE(fe + 56, inlinePayload.size());
+        PutU32LE(fe + 172, static_cast<uint32_t>(inlinePayload.size()));
+        std::memcpy(fe + 176u, inlinePayload.data(), inlinePayload.size());
+        FinalizeUdfTagForTest(fe, 261u, 4u);
+    }
+
+    // Metadata LBA 5: Multi-Sector File Extended File Entry [266]
+    // Uses Short AD (allocType=0) in standard mode, and Long AD (allocType=1 -> phys partRef 0, LBA 6) in UDF 2.50 Metadata mode!
+    {
+        uint8_t* efe = mBlk(5u);
+        efe[27] = 5u; // Regular file
+        PutU64LE(efe + 56, shortAdPayload.size());
+        if (!useUdf250MetadataPart) {
+            PutU16LE(efe + 34, 0u);  // allocType = 0 (Short AD!)
+            PutU32LE(efe + 212, 8u); // 1 Short AD
+            PutU32LE(efe + 216, static_cast<uint32_t>(shortAdPayload.size()));
+            PutU32LE(efe + 220, 6u); // physical LBA 6
+        } else {
+            PutU16LE(efe + 34, 1u);   // allocType = 1 (Long AD -> partRef 0, LBA 6!)
+            PutU32LE(efe + 212, 16u); // 1 Long AD
+            PutU32LE(efe + 216, static_cast<uint32_t>(shortAdPayload.size()));
+            PutU32LE(efe + 220, 6u);
+            PutU16LE(efe + 224, 0u);  // partRef 0 (Physical Partition!)
+        }
+        FinalizeUdfTagForTest(efe, 266u, 5u);
+        std::memcpy(pBlk(6u), shortAdPayload.data(), shortAdPayload.size());
+    }
+
+    return img;
+}
+
+// Wraps a 2048B-sector optical image into a Nero .nrg ("NER5" + "DAOX" + 2352-byte Mode 1 raw sectors + pregap!)
+std::vector<uint8_t> WrapOpticalImageInNeroNer5Raw2352(const std::vector<uint8_t>& isoOrUdf2048) {
+    const size_t numSecs = isoOrUdf2048.size() / 2048u;
+    const size_t pregapBytes = 2u * 2352u; // 2-sector index0 pregap before Track 1 index1!
+    std::vector<uint8_t> nrg(pregapBytes, 0xAAu);
+    nrg.reserve(pregapBytes + numSecs * 2352u + 128u);
+
+    static const uint8_t kSync[12] = {
+        0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00
+    };
+    for (size_t s = 0; s < numSecs; ++s) {
+        size_t base = nrg.size();
+        nrg.resize(base + 2352u, 0u);
+        std::memcpy(nrg.data() + base, kSync, 12);
+        nrg[base + 15] = 1u; // Mode 1 (user data at +16..+2063)
+        std::memcpy(nrg.data() + base + 16u, isoOrUdf2048.data() + s * 2048u, 2048u);
+    }
+
+    const uint64_t trackEndOff = nrg.size();
+    const uint64_t trailerOff  = nrg.size();
+
+    // DAOX chunk: 4B "DAOX" + u32BE(64) + 22B header + 42B track 1 record
+    nrg.insert(nrg.end(), { 'D','A','O','X' });
+    AppendU32BE(nrg, 64u);
+    size_t db = nrg.size();
+    nrg.resize(db + 64u, 0u);
+    PutU32BE(nrg.data() + db + 0, 64u);
+    nrg[db + 20] = 1u; // first track
+    nrg[db + 21] = 1u; // last track
+    PutU16BE(nrg.data() + db + 22 + 12, 2352u); // raw sector size = 2352!
+    nrg[db + 22 + 14] = 0x07u;                  // Mode 1 raw
+    PutU64BE(nrg.data() + db + 22 + 18, 0ULL);          // index0 (pregap)
+    PutU64BE(nrg.data() + db + 22 + 26, pregapBytes);   // index1 (Track 1 data start!)
+    PutU64BE(nrg.data() + db + 22 + 34, trackEndOff);   // track end
+
+    // END! chunk + NER5 12-byte footer
+    nrg.insert(nrg.end(), { 'E','N','D','!', 0,0,0,0 });
+    nrg.insert(nrg.end(), { 'N','E','R','5' });
+    AppendU64BE(nrg, trailerOff);
+    return nrg;
+}
+
+std::string MakeWarc11Record(
+    const std::string& warcType,
+    const std::string& targetUri,
+    const std::string& contentType,
+    const std::string& payload)
+{
+    std::string r = "WARC/1.1\r\n";
+    r += "WARC-Type: " + warcType + "\r\n";
+    r += "WARC-Date: 2026-05-12T14:30:00Z\r\n";
+    if (!targetUri.empty()) r += "WARC-Target-URI: " + targetUri + "\r\n";
+    r += "Content-Type: " + contentType + "\r\n";
+    r += "Content-Length: " + std::to_string(payload.size()) + "\r\n\r\n";
+    r += payload;
+    r += "\r\n\r\n";
+    return r;
+}
+
+std::vector<uint8_t> EncodeRawImageAsAndroidSimg(const std::vector<uint8_t>& rawImg, uint32_t blkSz) {
+    const uint32_t totalBlks = static_cast<uint32_t>(rawImg.size() / blkSz);
+    struct SChunk { uint16_t type; uint32_t blks; uint32_t fillVal; size_t rawOff; };
+    std::vector<SChunk> chunks;
+
+    for (uint32_t b = 0; b < totalBlks; ++b) {
+        const uint8_t* p = rawImg.data() + static_cast<size_t>(b) * blkSz;
+        bool allZero = true;
+        uint32_t pat0 = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                        (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+        bool allFill = true;
+        for (size_t i = 0; i < blkSz; i += 4u) {
+            uint32_t w = static_cast<uint32_t>(p[i]) | (static_cast<uint32_t>(p[i + 1]) << 8) |
+                         (static_cast<uint32_t>(p[i + 2]) << 16) | (static_cast<uint32_t>(p[i + 3]) << 24);
+            if (w != 0u) allZero = false;
+            if (w != pat0) allFill = false;
+        }
+        uint16_t tp = allZero ? 0xCAC3u : (allFill ? 0xCAC2u : 0xCAC1u);
+        if (!chunks.empty() && chunks.back().type == tp &&
+            (tp != 0xCAC2u || chunks.back().fillVal == pat0) &&
+            (tp != 0xCAC1u))
+        {
+            ++chunks.back().blks;
+        } else if (!chunks.empty() && tp == 0xCAC1u && chunks.back().type == 0xCAC1u &&
+                   chunks.back().rawOff + static_cast<size_t>(chunks.back().blks) * blkSz == static_cast<size_t>(b) * blkSz)
+        {
+            ++chunks.back().blks;
+        } else {
+            chunks.push_back({ tp, 1u, pat0, static_cast<size_t>(b) * blkSz });
+        }
+    }
+
+    // Also append CHUNK_TYPE_CRC32 (0xCAC4) trailer chunk
+    const uint32_t totalChunkRecords = static_cast<uint32_t>(chunks.size() + 1u);
+    std::vector<uint8_t> simg(28u, 0u);
+    PutU32LE(simg.data() + 0,  0xED26FF3Au); // SPARSE_HEADER_MAGIC
+    PutU16LE(simg.data() + 4,  1u);          // major_version = 1
+    PutU16LE(simg.data() + 6,  0u);          // minor_version = 0
+    PutU16LE(simg.data() + 8,  28u);         // file_hdr_sz = 28
+    PutU16LE(simg.data() + 10, 12u);         // chunk_hdr_sz = 12
+    PutU32LE(simg.data() + 12, blkSz);
+    PutU32LE(simg.data() + 16, totalBlks);
+    PutU32LE(simg.data() + 20, totalChunkRecords);
+    PutU32LE(simg.data() + 24, Checksum::Crc32(rawImg.data(), rawImg.size()));
+
+    for (const auto& ch : chunks) {
+        uint32_t payloadBytes = (ch.type == 0xCAC1u) ? (ch.blks * blkSz) : ((ch.type == 0xCAC2u) ? 4u : 0u);
+        AppendU16LE(simg, ch.type);
+        AppendU16LE(simg, 0u);
+        AppendU32LE(simg, ch.blks);
+        AppendU32LE(simg, 12u + payloadBytes);
+        if (ch.type == 0xCAC1u) {
+            simg.insert(simg.end(), rawImg.data() + ch.rawOff, rawImg.data() + ch.rawOff + payloadBytes);
+        } else if (ch.type == 0xCAC2u) {
+            AppendU32LE(simg, ch.fillVal);
+        }
+    }
+
+    // CHUNK_TYPE_CRC32 (0xCAC4)
+    AppendU16LE(simg, 0xCAC4u);
+    AppendU16LE(simg, 0u);
+    AppendU32LE(simg, 0u);
+    AppendU32LE(simg, 16u);
+    AppendU32LE(simg, Checksum::Crc32(rawImg.data(), rawImg.size()));
+    return simg;
+}
+
 } // namespace
 
 // ============================================================================
@@ -3995,6 +5104,452 @@ void RunFormatTestsArchives(TestCounter& tc) {
     }
 
     // ------------------------------------------------------------------------
+    // Test 15.20: LHA / LZH (-lh5- Block Huffman + LZSS + Level-1 Extended Header)
+    //             & ARJ (method 1 Block Huffman + LZSS & method 4 Fast Unary LZ77 + CRC32)
+    // ------------------------------------------------------------------------
+    {
+        std::string lh5Plain;
+        while (lh5Plain.size() < 1200) {
+            lh5Plain += "LHA_LH5_CANONICAL_HUFFMAN_LZSS_LEVEL1_EXTENDED_DIR_HEADER_PAYLOAD_LINE_1234567890!\r\n";
+        }
+        std::string lh0Plain = "Companion stored -lh0- README inside LZH archive.\n";
+
+        auto lzhBytes = BuildLzhLevel1Archive("docs\\sub", "manual.txt", lh5Plain, "readme.txt", lh0Plain);
+        std::wstring lzhPath = baseDir + L"\\retro_lh5.lzh";
+        PathUtils::WriteFileBytes(lzhPath, lzhBytes.data(), lzhBytes.size());
+
+        ArchiveSummaryInfo lzhSum;
+        std::vector<uint8_t> outLh5, outLh0;
+        bool okLzh = lzhBytes.size() < lh5Plain.size() &&
+                     ArchiveExplorer::InspectArchiveFile(lzhPath, lzhSum) && lzhSum.valid && lzhSum.entries.size() == 2 &&
+                     FindEntryCI(lzhSum, L"docs/sub/manual.txt") != nullptr &&
+                     FindEntryCI(lzhSum, L"docs/sub/manual.txt")->uncompressedSize == lh5Plain.size() &&
+                     FindEntryCI(lzhSum, L"docs/sub/manual.txt")->compressedSize < lh5Plain.size() &&
+                     FindEntryCI(lzhSum, L"readme.txt") != nullptr &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(lzhPath, L"docs/sub/manual.txt", outLh5) &&
+                     BytesMatchStr(outLh5, lh5Plain) &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(lzhPath, L"readme.txt", outLh0) &&
+                     BytesMatchStr(outLh0, lh0Plain);
+
+        std::string arjM1Plain, arjM4Plain;
+        while (arjM1Plain.size() < 1100) {
+            arjM1Plain += "ARJ_METHOD_1_BLOCK_HUFFMAN_26624_WINDOW_TEST_DATA_ABCDEF_0123456789\n";
+        }
+        while (arjM4Plain.size() < 950) {
+            arjM4Plain += "ARJ_METHOD_4_FAST_UNARY_VARIABLE_WIDTH_LZ77_DECODER_PAYLOAD_XYZ_987654\n";
+        }
+        auto arjBytes = BuildArjTestArchive("src/engine.c", arjM1Plain, "docs/notes.txt", arjM4Plain);
+        std::wstring arjPath = baseDir + L"\\bundle_m1_m4.arj";
+        PathUtils::WriteFileBytes(arjPath, arjBytes.data(), arjBytes.size());
+
+        ArchiveSummaryInfo arjSum;
+        std::vector<uint8_t> outArjM1, outArjM4, outArjBad;
+        bool okArj = arjBytes.size() < (arjM1Plain.size() + arjM4Plain.size()) &&
+                     ArchiveExplorer::InspectArchiveFile(arjPath, arjSum) && arjSum.valid && arjSum.entries.size() == 2 &&
+                     FindEntryCI(arjSum, L"src/engine.c") != nullptr &&
+                     FindEntryCI(arjSum, L"src/engine.c")->uncompressedSize == arjM1Plain.size() &&
+                     FindEntryCI(arjSum, L"docs/notes.txt") != nullptr &&
+                     FindEntryCI(arjSum, L"docs/notes.txt")->uncompressedSize == arjM4Plain.size() &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(arjPath, L"src/engine.c", outArjM1) &&
+                     BytesMatchStr(outArjM1, arjM1Plain) &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(arjPath, L"docs/notes.txt", outArjM4) &&
+                     BytesMatchStr(outArjM4, arjM4Plain);
+
+        // Corrupt ARJ method 4 compressed stream -> CRC32 / decoder check must fail!
+        if (const auto* e4 = FindEntryCI(arjSum, L"docs/notes.txt")) {
+            auto badArj = arjBytes;
+            badArj[static_cast<size_t>(e4->rawDataOffset)] ^= 0xFFu;
+            std::wstring badArjPath = baseDir + L"\\corrupt_crc.arj";
+            PathUtils::WriteFileBytes(badArjPath, badArj.data(), badArj.size());
+            okArj = okArj && !ArchiveExplorer::ExtractSingleEntryToMemory(badArjPath, L"docs/notes.txt", outArjBad);
+        } else {
+            okArj = false;
+        }
+
+        tc.Record(okLzh && okArj,
+            L"Stage15.Archives.LhaLh5Level1_And_ArjMethod1And4_InProcessDecompression",
+            L"lzhLh5=" + std::to_wstring(okLzh) + L", arjM1M4=" + std::to_wstring(okArj));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.21: Debian .deb Inner data.tar.gz Unpacking &
+    //             Unix/BSD .ar ("//" GNU Long Names & "#1/N" BSD Inline Names, No DEB Hijack)
+    // ------------------------------------------------------------------------
+    {
+        std::string debBinScript = "#!/bin/sh\necho 'Explorer2 Debian Unpacked Binary OK'\n";
+        std::string debConfFile  = "listen_port = 8080\nlog_level = info\n";
+        auto debBytes = BuildDebianDebArchive({
+            { "./usr/", "" },
+            { "./usr/bin/", "" },
+            { "./usr/bin/explorer2-cli", debBinScript },
+            { "./etc/explorer2.conf", debConfFile }
+        });
+        std::wstring debPath = baseDir + L"\\explorer2_1.0_amd64.deb";
+        PathUtils::WriteFileBytes(debPath, debBytes.data(), debBytes.size());
+
+        ArchiveSummaryInfo debSum;
+        std::vector<uint8_t> outDebBin, outDebConf;
+        bool okDeb = ArchiveExplorer::InspectArchiveFile(debPath, debSum) && debSum.valid &&
+                     debSum.formatName == L"Debian Package (DEB)" &&
+                     FindEntryCI(debSum, L"data.tar.gz") == nullptr &&
+                     FindEntryCI(debSum, L"usr/bin/explorer2-cli") != nullptr &&
+                     FindEntryCI(debSum, L"usr/bin/explorer2-cli")->uncompressedSize == debBinScript.size() &&
+                     FindEntryCI(debSum, L"etc/explorer2.conf") != nullptr &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(debPath, L"usr/bin/explorer2-cli", outDebBin) &&
+                     BytesMatchStr(outDebBin, debBinScript) &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(debPath, L"etc/explorer2.conf", outDebConf) &&
+                     BytesMatchStr(outDebConf, debConfFile);
+
+        // Build Unix/BSD .a static library with GNU "//" long name + BSD "#1/28" inline name + "__.SYMDEF"
+        std::vector<uint8_t> arBytes = { '!','<','a','r','c','h','>','\n' };
+        const std::string symdefDummy = "SYMDEF_TABLE_SKIP";
+        AppendArMemberForTest(arBytes, "__.SYMDEF", reinterpret_cast<const uint8_t*>(symdefDummy.data()), symdefDummy.size());
+        const std::string gnuStrTbl = "very_long_gnu_archive_module.o/\n";
+        AppendArMemberForTest(arBytes, "//", reinterpret_cast<const uint8_t*>(gnuStrTbl.data()), gnuStrTbl.size());
+        const std::string gnuObjPayload = "ELF64_GNU_LONG_NAME_OBJECT_CODE_PAYLOAD_V1";
+        AppendArMemberForTest(arBytes, "/0", reinterpret_cast<const uint8_t*>(gnuObjPayload.data()), gnuObjPayload.size());
+
+        // BSD "#1/28": 28-byte NUL-padded inline filename + exact object payload immediately following
+        std::string bsdInlineName = "bsd_inline_extended_unit.o";
+        std::vector<uint8_t> bsdCombined(28u, 0u);
+        std::memcpy(bsdCombined.data(), bsdInlineName.data(), bsdInlineName.size());
+        const std::string bsdObjPayload = "MACHO64_BSD_EXTENDED_INLINE_OBJECT_EXACT_BYTES!";
+        bsdCombined.insert(bsdCombined.end(), bsdObjPayload.begin(), bsdObjPayload.end());
+        AppendArMemberForTest(arBytes, "#1/28", bsdCombined.data(), bsdCombined.size());
+
+        std::wstring arPath = baseDir + L"\\libbsd_gnu_test.a";
+        PathUtils::WriteFileBytes(arPath, arBytes.data(), arBytes.size());
+
+        ArchiveSummaryInfo arSum;
+        std::vector<uint8_t> outGnuObj, outBsdObj;
+        bool okAr = ArchiveExplorer::InspectArchiveFile(arPath, arSum) && arSum.valid &&
+                    arSum.formatName == L"Unix Static Archive (.ar/.a)" &&
+                    arSum.entries.size() == 2 &&
+                    FindEntryCI(arSum, L"very_long_gnu_archive_module.o") != nullptr &&
+                    FindEntryCI(arSum, L"bsd_inline_extended_unit.o") != nullptr &&
+                    FindEntryCI(arSum, L"bsd_inline_extended_unit.o")->uncompressedSize == bsdObjPayload.size() &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(arPath, L"very_long_gnu_archive_module.o", outGnuObj) &&
+                    BytesMatchStr(outGnuObj, gnuObjPayload) &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(arPath, L"bsd_inline_extended_unit.o", outBsdObj) &&
+                    BytesMatchStr(outBsdObj, bsdObjPayload);
+
+        tc.Record(okDeb && okAr,
+            L"Stage15.Archives.DebianDeb_InnerDataTarGz_And_UnixBsdAr_LongNamesNoHijack",
+            L"deb=" + std::to_wstring(okDeb) + L", ar=" + std::to_wstring(okAr));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.22: Linux EROFS (.erofs) z_erofs LZ4-Compressed Inodes
+    //             (FLAT_COMPRESSION_LEGACY / COMPRESSED_FULL & COMPRESSED_COMPACT)
+    // ------------------------------------------------------------------------
+    {
+        std::string erofsLegacyPlain, erofsCompactPlain;
+        while (erofsLegacyPlain.size() < 5400) { // Spans 2 x 4096B logical clusters!
+            erofsLegacyPlain += "Z_EROFS_LZ4_0PADDING_LEGACY_FULL_2_CLUSTER_FILE_LINE_0123456789ABCDEF!\n";
+        }
+        while (erofsCompactPlain.size() < 2600) {
+            erofsCompactPlain += "Z_EROFS_COMPRESSED_COMPACT_4B_PACK_LZ4_INODE_CONTENT_9876543210!\n";
+        }
+
+        auto erofsImg = BuildCompressedErofsTestImage(erofsLegacyPlain, erofsCompactPlain);
+        std::wstring zErofsPath = baseDir + L"\\system_lz4.erofs";
+        PathUtils::WriteFileBytes(zErofsPath, erofsImg.data(), erofsImg.size());
+
+        ArchiveSummaryInfo zeSum;
+        std::vector<uint8_t> outZeLeg, outZeComp;
+        bool okZErofs = ArchiveExplorer::InspectArchiveFile(zErofsPath, zeSum) && zeSum.valid && zeSum.entries.size() == 2 &&
+                        FindEntryCI(zeSum, L"legacy_lz4.bin") != nullptr &&
+                        FindEntryCI(zeSum, L"legacy_lz4.bin")->uncompressedSize == erofsLegacyPlain.size() &&
+                        FindEntryCI(zeSum, L"compact_lz4.bin") != nullptr &&
+                        FindEntryCI(zeSum, L"compact_lz4.bin")->uncompressedSize == erofsCompactPlain.size() &&
+                        ArchiveExplorer::ExtractSingleEntryToMemory(zErofsPath, L"legacy_lz4.bin", outZeLeg) &&
+                        BytesMatchStr(outZeLeg, erofsLegacyPlain) &&
+                        ArchiveExplorer::ExtractSingleEntryToMemory(zErofsPath, L"compact_lz4.bin", outZeComp) &&
+                        BytesMatchStr(outZeComp, erofsCompactPlain);
+
+        tc.Record(okZErofs,
+            L"Stage15.Archives.LinuxEROFS_ZeroPaddedLZ4_CompressedLegacyAndCompact",
+            L"zErofs=" + std::to_wstring(okZErofs));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.23: Bohemia Interactive PBO (.pbo) "srpC" LZSS Decompression +
+    //             Unsigned Byte-Sum Checksum Verification & Corrupt Checksum Rejection
+    // ------------------------------------------------------------------------
+    {
+        std::string sqfPlain = "    "; // Leading spaces + repeating Arma SQF script lines
+        while (sqfPlain.size() < 900) {
+            sqfPlain += "player addMagazine \"30Rnd_65x39_caseless_mag\"; hintSilent \"PBO_LZSS_OK\";\r\n";
+        }
+        std::string sqmPlain = "version=54;\nclass EditorData { moveGridStep=1.0; };\n";
+
+        auto pboBytes = BuildBohemiaPboTestArchive("addons\\mission_pack", "scripts\\init.sqf", sqfPlain, "mission.sqm", sqmPlain);
+        std::wstring pboPath = baseDir + L"\\mission_pack.pbo";
+        PathUtils::WriteFileBytes(pboPath, pboBytes.data(), pboBytes.size());
+
+        ArchiveSummaryInfo pboSum;
+        std::vector<uint8_t> outSqf, outSqm, outBadPbo;
+        bool okPbo = ArchiveExplorer::InspectArchiveFile(pboPath, pboSum) && pboSum.valid && pboSum.entries.size() == 2 &&
+                     FindEntryCI(pboSum, L"addons/mission_pack/scripts/init.sqf") != nullptr &&
+                     FindEntryCI(pboSum, L"addons/mission_pack/scripts/init.sqf")->uncompressedSize == sqfPlain.size() &&
+                     FindEntryCI(pboSum, L"addons/mission_pack/scripts/init.sqf")->compressedSize < sqfPlain.size() &&
+                     FindEntryCI(pboSum, L"addons/mission_pack/mission.sqm") != nullptr &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(pboPath, L"addons/mission_pack/scripts/init.sqf", outSqf) &&
+                     BytesMatchStr(outSqf, sqfPlain) &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(pboPath, L"addons/mission_pack/mission.sqm", outSqm) &&
+                     BytesMatchStr(outSqm, sqmPlain);
+
+        // Corrupt the 4-byte unsigned byte-sum checksum at the end of init.sqf's compressed stream -> MUST reject!
+        if (const auto* sqfEnt = FindEntryCI(pboSum, L"addons/mission_pack/scripts/init.sqf")) {
+            auto badPbo = pboBytes;
+            size_t csumOff = static_cast<size_t>(sqfEnt->rawDataOffset + sqfEnt->compressedSize - 4u);
+            badPbo[csumOff] ^= 0x01u;
+            std::wstring badPboPath = baseDir + L"\\bad_csum.pbo";
+            PathUtils::WriteFileBytes(badPboPath, badPbo.data(), badPbo.size());
+            okPbo = okPbo && !ArchiveExplorer::ExtractSingleEntryToMemory(
+                badPboPath, L"addons/mission_pack/scripts/init.sqf", outBadPbo);
+        } else {
+            okPbo = false;
+        }
+
+        tc.Record(okPbo,
+            L"Stage15.Archives.BohemiaPBO_SrpCLZSS_Decompression_And_ChecksumVerify",
+            L"pboLzss=" + std::to_wstring(okPbo));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.24: RFC 7932 Brotli Single Stream (.br) & Multi-File Tarballs (.tbr / .tar.br)
+    // ------------------------------------------------------------------------
+    {
+        std::string brSinglePlain;
+        while (brSinglePlain.size() < 1400) {
+            brSinglePlain += "{\"service\":\"explorer2\",\"codec\":\"RFC7932_BROTLI\",\"status\":\"VERIFIED\"}\n";
+        }
+        auto brSingle = CompressBrotliRfc7932ForTest(
+            reinterpret_cast<const uint8_t*>(brSinglePlain.data()), brSinglePlain.size());
+        std::wstring brPath = baseDir + L"\\telemetry.json.br";
+        PathUtils::WriteFileBytes(brPath, brSingle.data(), brSingle.size());
+
+        // Trailing garbage after valid Brotli stream MUST be rejected due to requireExactEnd=true!
+        auto brTrailingJunk = brSingle;
+        brTrailingJunk.push_back(0xDEu);
+        brTrailingJunk.push_back(0xADu);
+        std::wstring badBrPath = baseDir + L"\\trailing_junk.json.br";
+        PathUtils::WriteFileBytes(badBrPath, brTrailingJunk.data(), brTrailingJunk.size());
+
+        std::string tarFileA = "Brotli tarball first config payload inside subdir.\n";
+        std::string tarFileB;
+        while (tarFileB.size() < 900) {
+            tarFileB += "export const BROTLI_TAR_LINE = 'MULTI_FILE_TAR_BR_OK_12345';\n";
+        }
+        auto rawTar = BuildPosixTar({
+            { "pkg/", "" },
+            { "pkg/config.toml", tarFileA },
+            { "pkg/index.ts", tarFileB }
+        });
+        auto brTar = CompressBrotliRfc7932ForTest(rawTar.data(), rawTar.size());
+        std::wstring tbrPath   = baseDir + L"\\release_pkg.tbr";
+        std::wstring tarBrPath = baseDir + L"\\release_pkg.tar.br";
+        PathUtils::WriteFileBytes(tbrPath, brTar.data(), brTar.size());
+        PathUtils::WriteFileBytes(tarBrPath, brTar.data(), brTar.size());
+
+        ArchiveSummaryInfo brSum, tbrSum, tarBrSum, badBrSum;
+        std::vector<uint8_t> outBrSingle, outTbrA, outTarBrB;
+        bool okBr = brSingle.size() < brSinglePlain.size() &&
+                    brTar.size() < rawTar.size() &&
+                    ArchiveExplorer::IsArchiveExtension(L".br") &&
+                    ArchiveExplorer::IsArchiveExtension(L".tbr") &&
+                    ArchiveExplorer::InspectArchiveFile(brPath, brSum) && brSum.valid && brSum.entries.size() == 1 &&
+                    FindEntryCI(brSum, L"telemetry.json") != nullptr &&
+                    FindEntryCI(brSum, L"telemetry.json")->uncompressedSize == brSinglePlain.size() &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(brPath, L"telemetry.json", outBrSingle) &&
+                    BytesMatchStr(outBrSingle, brSinglePlain) &&
+                    !ArchiveExplorer::InspectArchiveFile(badBrPath, badBrSum) &&
+                    ArchiveExplorer::InspectArchiveFile(tbrPath, tbrSum) && tbrSum.valid && tbrSum.formatName == L"TAR.BR" &&
+                    FindEntryCI(tbrSum, L"pkg/config.toml") != nullptr &&
+                    FindEntryCI(tbrSum, L"pkg/index.ts") != nullptr &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(tbrPath, L"pkg/config.toml", outTbrA) &&
+                    BytesMatchStr(outTbrA, tarFileA) &&
+                    ArchiveExplorer::InspectArchiveFile(tarBrPath, tarBrSum) && tarBrSum.valid && tarBrSum.formatName == L"TAR.BR" &&
+                    ArchiveExplorer::ExtractSingleEntryToMemory(tarBrPath, L"pkg/index.ts", outTarBrB) &&
+                    BytesMatchStr(outTarBrB, tarFileB);
+
+        tc.Record(okBr,
+            L"Stage15.Archives.BrotliStream_And_TarBr_Tbr_Decompression",
+            L"brotli=" + std::to_wstring(okBr));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.25: Universal Disk Format (.udf — OSTA UTF-16BE, Subdir, Inline ICB + Short AD)
+    //             & Nero Optical Image (.nrg — NER5 + DAOX 2352-Byte Mode 1 Raw Sector Slicing)
+    // ------------------------------------------------------------------------
+    {
+        const std::wstring uDirName    = L"Docs_\u03A9";
+        const std::wstring uInlineName = L"note_\u00E9.txt";
+        const std::wstring uShortName  = L"video_stream.bin";
+        const std::string inlineTxt    = "UDF 2.50 Inline ICB (allocType == 3) payload stored directly inside File Entry!";
+        std::string shortAdData;
+        while (shortAdData.size() < 2900) { // Spans 2 x 2048B UDF logical blocks!
+            shortAdData += "UDF_SHORT_ALLOCATION_DESCRIPTOR_MULTI_SECTOR_PAYLOAD_LINE_0123456789!\r\n";
+        }
+
+        auto udfBytes = BuildUdfTestImage(uDirName, uInlineName, inlineTxt, uShortName, shortAdData, false);
+        std::wstring udfPath = baseDir + L"\\optical_disc.udf";
+        PathUtils::WriteFileBytes(udfPath, udfBytes.data(), udfBytes.size());
+
+        auto udf250MetaBytes = BuildUdfTestImage(uDirName, uInlineName, inlineTxt, uShortName, shortAdData, true);
+        auto nrgBytes = WrapOpticalImageInNeroNer5Raw2352(udf250MetaBytes);
+        std::wstring nrgPath = baseDir + L"\\nero_disc.nrg";
+        PathUtils::WriteFileBytes(nrgPath, nrgBytes.data(), nrgBytes.size());
+
+        const std::wstring wantInlinePath = uDirName + L"/" + uInlineName;
+        ArchiveSummaryInfo udfSum, nrgSum;
+        std::vector<uint8_t> outUdfInline, outUdfShort, outNrgInline, outNrgShort;
+        bool okUdf = ArchiveExplorer::IsArchiveExtension(L".udf") &&
+                     ArchiveExplorer::InspectArchiveFile(udfPath, udfSum) && udfSum.valid &&
+                     FindEntryCI(udfSum, uDirName) != nullptr && FindEntryCI(udfSum, uDirName)->isDirectory &&
+                     FindEntryCI(udfSum, wantInlinePath) != nullptr &&
+                     FindEntryCI(udfSum, wantInlinePath)->uncompressedSize == inlineTxt.size() &&
+                     FindEntryCI(udfSum, uShortName) != nullptr &&
+                     FindEntryCI(udfSum, uShortName)->uncompressedSize == shortAdData.size() &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(udfPath, wantInlinePath, outUdfInline) &&
+                     BytesMatchStr(outUdfInline, inlineTxt) &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(udfPath, uShortName, outUdfShort) &&
+                     BytesMatchStr(outUdfShort, shortAdData);
+
+        bool okNrg = ArchiveExplorer::IsArchiveExtension(L".nrg") &&
+                     ArchiveExplorer::InspectArchiveFile(nrgPath, nrgSum) && nrgSum.valid &&
+                     nrgSum.formatName.find(L"Nero") != std::wstring::npos &&
+                     FindEntryCI(nrgSum, wantInlinePath) != nullptr &&
+                     FindEntryCI(nrgSum, uShortName) != nullptr &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(nrgPath, wantInlinePath, outNrgInline) &&
+                     BytesMatchStr(outNrgInline, inlineTxt) &&
+                     ArchiveExplorer::ExtractSingleEntryToMemory(nrgPath, uShortName, outNrgShort) &&
+                     BytesMatchStr(outNrgShort, shortAdData);
+
+        tc.Record(okUdf && okNrg,
+            L"Stage15.Archives.UdfOptical_OstaUnicode_InlineAndShortAD_And_NeroNer5Raw2352",
+            L"udf=" + std::to_wstring(okUdf) + L", nrg=" + std::to_wstring(okNrg));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.26: ISO 28500 Web ARChive (.warc — Uncompressed WARC/1.1 + Multi-Member GZIP,
+    //             warcinfo + HTTP Response Header Stripping + Chunked Transfer Decoding)
+    // ------------------------------------------------------------------------
+    {
+        const std::string warcInfoBody = "software: Explorer2 Crawler/1.0\r\nformat: WARC File Format 1.1\r\n";
+        const std::string httpReqRaw   = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        const std::string htmlHomeBody = "<!doctype html><html><body><h1>Example Archived Home</h1></body></html>\n";
+        const std::string httpRespHome =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " +
+            std::to_string(htmlHomeBody.size()) + "\r\n\r\n" + htmlHomeBody;
+
+        const std::string jsonPart1 = "{\"archived\":true,";
+        const std::string jsonPart2 = "\"items\":[10,20,30]}";
+        const std::string jsonExpected = jsonPart1 + jsonPart2;
+        char hex1[16] = {}, hex2[16] = {};
+        snprintf(hex1, sizeof(hex1), "%zx", jsonPart1.size());
+        snprintf(hex2, sizeof(hex2), "%zx", jsonPart2.size());
+        const std::string httpRespChunked =
+            std::string("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n") +
+            hex1 + "\r\n" + jsonPart1 + "\r\n" +
+            hex2 + ";ext=ok\r\n" + jsonPart2 + "\r\n0\r\n\r\n";
+
+        const std::string rec1 = MakeWarc11Record("warcinfo", "", "application/warc-fields", warcInfoBody);
+        const std::string rec2 = MakeWarc11Record("request", "https://example.com/", "application/http; msgtype=request", httpReqRaw);
+        const std::string rec3 = MakeWarc11Record("response", "https://example.com/", "application/http; msgtype=response", httpRespHome);
+        const std::string rec4 = MakeWarc11Record("response", "https://example.com/api/items.json", "application/http; msgtype=response", httpRespChunked);
+        const std::string plainWarc = rec1 + rec2 + rec3 + rec4;
+
+        std::wstring warcPath = baseDir + L"\\archive_crawl.warc";
+        PathUtils::WriteFileBytes(warcPath, reinterpret_cast<const uint8_t*>(plainWarc.data()), plainWarc.size());
+
+        // Multi-member GZIP .warc: compress (rec1+rec2) as GZIP member 1 and (rec3+rec4) as GZIP member 2!
+        const std::string m1Plain = rec1 + rec2;
+        const std::string m2Plain = rec3 + rec4;
+        auto gz1 = CompressGzip(reinterpret_cast<const uint8_t*>(m1Plain.data()), m1Plain.size());
+        auto gz2 = CompressGzip(reinterpret_cast<const uint8_t*>(m2Plain.data()), m2Plain.size());
+        std::vector<uint8_t> gzWarc = std::move(gz1);
+        gzWarc.insert(gzWarc.end(), gz2.begin(), gz2.end());
+        std::wstring gzWarcPath = baseDir + L"\\archive_multimember.warc";
+        PathUtils::WriteFileBytes(gzWarcPath, gzWarc.data(), gzWarc.size());
+
+        ArchiveSummaryInfo wSum, gzwSum;
+        std::vector<uint8_t> outWi, outHome, outJson, outGzHome, outGzJson;
+        bool okWarc = ArchiveExplorer::IsArchiveExtension(L".warc") &&
+                      ArchiveExplorer::InspectArchiveFile(warcPath, wSum) && wSum.valid &&
+                      FindEntryCI(wSum, L"warcinfo.txt") != nullptr &&
+                      FindEntryCI(wSum, L"example.com/index.html") != nullptr &&
+                      FindEntryCI(wSum, L"example.com/index.html")->uncompressedSize == htmlHomeBody.size() &&
+                      FindEntryCI(wSum, L"example.com/api/items.json") != nullptr &&
+                      FindEntryCI(wSum, L"example.com/api/items.json")->uncompressedSize == jsonExpected.size() &&
+                      ArchiveExplorer::ExtractSingleEntryToMemory(warcPath, L"warcinfo.txt", outWi) &&
+                      BytesMatchStr(outWi, warcInfoBody) &&
+                      ArchiveExplorer::ExtractSingleEntryToMemory(warcPath, L"example.com/index.html", outHome) &&
+                      BytesMatchStr(outHome, htmlHomeBody) &&
+                      ArchiveExplorer::ExtractSingleEntryToMemory(warcPath, L"example.com/api/items.json", outJson) &&
+                      BytesMatchStr(outJson, jsonExpected);
+
+        bool okGzWarc = ArchiveExplorer::InspectArchiveFile(gzWarcPath, gzwSum) && gzwSum.valid &&
+                        FindEntryCI(gzwSum, L"warcinfo.txt") != nullptr &&
+                        FindEntryCI(gzwSum, L"example.com/index.html") != nullptr &&
+                        FindEntryCI(gzwSum, L"example.com/api/items.json") != nullptr &&
+                        ArchiveExplorer::ExtractSingleEntryToMemory(gzWarcPath, L"example.com/index.html", outGzHome) &&
+                        BytesMatchStr(outGzHome, htmlHomeBody) &&
+                        ArchiveExplorer::ExtractSingleEntryToMemory(gzWarcPath, L"example.com/api/items.json", outGzJson) &&
+                        BytesMatchStr(outGzJson, jsonExpected);
+
+        tc.Record(okWarc && okGzWarc,
+            L"Stage15.Archives.Iso28500Warc_HttpResponseBody_Chunked_And_MultiMemberGzip",
+            L"plainWarc=" + std::to_wstring(okWarc) + L", gzWarc=" + std::to_wstring(okGzWarc));
+    }
+
+    // ------------------------------------------------------------------------
+    // Test 15.27: Android Sparse Filesystem Image (.simg — RAW + FILL + DONT_CARE + CRC32)
+    //             Mounting Inner ext4 Filesystem with Byte-Exact Extraction
+    // ------------------------------------------------------------------------
+    {
+        std::string simgConf;
+        while (simgConf.size() < 2500) {
+            simgConf += "ro.product.system.brand=Explorer2\nro.build.type=user\n";
+        }
+        simgConf.resize(2500, '#');
+
+        // Include a 8192-byte constant 0x5A5A5A5A region inside the 13,500B file so 4096B blocks
+        // inside the ext4 image become real CHUNK_TYPE_FILL (0xCAC2) chunks in the .simg!
+        std::string simgLarge(13500, 'Z'); // 0x5A5A5A5A!
+        for (size_t i = 0; i < 1200; ++i) simgLarge[i] = static_cast<char>('A' + (i % 26));
+        for (size_t i = 12800; i < simgLarge.size(); ++i) simgLarge[i] = static_cast<char>('0' + (i % 10));
+
+        // Build 40KB ext4 image (pad to 64KB = 16 x 4096B sparse blocks so trailing zero blocks become DONT_CARE!)
+        auto rawExt4 = BuildExt4ExtentAndIndirectImage(simgConf, simgLarge);
+        rawExt4.resize(16u * 4096u, 0u);
+
+        auto simgBytes = EncodeRawImageAsAndroidSimg(rawExt4, 4096u);
+        std::wstring simgPath = baseDir + L"\\system_sparse.simg";
+        PathUtils::WriteFileBytes(simgPath, simgBytes.data(), simgBytes.size());
+
+        ArchiveSummaryInfo simgSum;
+        std::vector<uint8_t> outSimgConf, outSimgLarge;
+        bool okSimg = simgBytes.size() < rawExt4.size() &&
+                      ArchiveExplorer::IsArchiveExtension(L".simg") &&
+                      ArchiveExplorer::InspectArchiveFile(simgPath, simgSum) && simgSum.valid &&
+                      simgSum.formatName.find(L"ext4") != std::wstring::npos &&
+                      FindEntryCI(simgSum, L"etc/app.conf") != nullptr &&
+                      FindEntryCI(simgSum, L"etc/app.conf")->uncompressedSize == simgConf.size() &&
+                      FindEntryCI(simgSum, L"legacy_indirect.bin") != nullptr &&
+                      FindEntryCI(simgSum, L"legacy_indirect.bin")->uncompressedSize == simgLarge.size() &&
+                      ArchiveExplorer::ExtractSingleEntryToMemory(simgPath, L"etc/app.conf", outSimgConf) &&
+                      BytesMatchStr(outSimgConf, simgConf) &&
+                      ArchiveExplorer::ExtractSingleEntryToMemory(simgPath, L"legacy_indirect.bin", outSimgLarge) &&
+                      BytesMatchStr(outSimgLarge, simgLarge);
+
+        tc.Record(okSimg,
+            L"Stage15.Archives.AndroidSparseSimg_RawFillDontCareExtents_MountingExt4",
+            L"simgExt4=" + std::to_wstring(okSimg));
+    }
+
+    // ------------------------------------------------------------------------
     // Test 15.19: Corrupt / Truncated Archive & Stream Safety (Zero Crashes, Zero ReaderGuard Stops)
     // ------------------------------------------------------------------------
     {
@@ -4018,7 +5573,16 @@ void RunFormatTestsArchives(TestCounter& tc) {
             { L"bad.wim",      { 'M','S','W','I','M',0,0,0, 208,0,0,0, 0,13,1,0, 2,0,2,0, 0xFF,0xFF } },
             { L"bad.vpk",      { 0x34,0x12,0xAA,0x55, 2,0,0,0, 99,0,0,0, 't','x','t',0, 'a',0 } },
             { L"bad.asar",     { 4,0,0,0, 32,0,0,0, 28,0,0,0, 20,0,0,0, '{','"','f','i','l','e','s','"',':','{' } },
-            { L"bad.big",      { 'B','I','G','F', 64,0,0,0, 0,0,0,5, 0,0,0,32, 0xFF,0xFF,0xFF,0xFF, 0,0,1,0, 'a',0 } }
+            { L"bad.big",      { 'B','I','G','F', 64,0,0,0, 0,0,0,5, 0,0,0,32, 0xFF,0xFF,0xFF,0xFF, 0,0,1,0, 'a',0 } },
+            { L"bad.br",       { 0xFF, 0xFF, 0xFF, 0x7F, 0xAA, 0x55 } },
+            { L"bad.tbr",      { 0x01, 0xF0, 0xFF, 0x99, 0x12, 0x34 } },
+            { L"bad.udf",      { 2,0, 3,0, 5,0, 0,0, 0,0, 0,0, 0,1,0,0 } },
+            { L"bad.nrg",      { 0,0,0,0, 'D','A','O','X', 0,0,0,99, 'N','E','R','5', 0,0,0,0, 0xFF,0xFF,0xFF,0xFF } },
+            { L"bad.warc",     { 'W','A','R','C','/','1','.','1','\r','\n','C','o','n','t','e','n','t','-','L','e','n','g','t','h',':',' ','9','9','9','9','\r','\n','\r','\n','x' } },
+            { L"bad.simg",     { 0x3A,0xFF,0x26,0xED, 1,0, 0,0, 28,0, 12,0, 0,16,0,0, 99,0,0,0, 5,0,0,0, 0,0,0,0, 0xC1,0xCA,0,0, 9,0,0,0, 12,0,0,0 } },
+            { L"bad.lzh",      { 26,0,'-','l','h','5','-', 99,0,0,0, 99,0,0,0, 0,0,0,0, 0x20,1, 3,'a','.','c', 0,0,'M', 99,0 } },
+            { L"bad.arj",      { 0x60,0xEA, 34,0, 30,6,1,4,0,0,0,0, 0,0,0,0, 99,0,0,0, 99,0,0,0 } },
+            { L"bad.pbo",      { 'a','.','s','q','f',0, 's','r','p','C', 99,0,0,0, 0,0,0,0, 0,0,0,0, 99,0,0,0, 0 } }
         };
         for (const auto& b : bads) {
             std::wstring p = baseDir + L"\\" + b.name;

@@ -4658,6 +4658,949 @@ void RunFormatTests3D(TestCounter& tc) {
 
     RunFormatTests3DBatch70(tc);
 
+    // ========================================================================
+    // 25. AutoCAD R2018 (AC1032) Genuine UMC + BOT 2-Bit Object Header & AcDbSubDMesh (.dwg)
+    // ========================================================================
+    {
+        struct DwgTestBitWriter {
+            std::vector<uint8_t> buf;
+            size_t bitPos = 0;
+
+            void WriteB(uint8_t b) {
+                if ((bitPos >> 3u) >= buf.size()) buf.push_back(0u);
+                if (b & 1u) buf[bitPos >> 3u] |= static_cast<uint8_t>(1u << (7u - (bitPos & 7u)));
+                ++bitPos;
+            }
+            void WriteBB(uint8_t v) { WriteB((v >> 1u) & 1u); WriteB(v & 1u); }
+            void WriteRC(uint8_t v) { for (int i = 7; i >= 0; --i) WriteB(static_cast<uint8_t>((v >> i) & 1u)); }
+            void WriteRS(uint16_t v) { WriteRC(static_cast<uint8_t>(v & 0xFFu)); WriteRC(static_cast<uint8_t>((v >> 8u) & 0xFFu)); }
+            void WriteRL(uint32_t v) { for (int i = 0; i < 4; ++i) WriteRC(static_cast<uint8_t>((v >> (i * 8)) & 0xFFu)); }
+            void WriteRD(double d) {
+                uint8_t raw[8]; std::memcpy(raw, &d, 8);
+                for (int i = 0; i < 8; ++i) WriteRC(raw[i]);
+            }
+            void WriteBS(int16_t v) {
+                if (v == 0) WriteBB(2u);
+                else if (v == 256) WriteBB(3u);
+                else if (v > 0 && v < 256) { WriteBB(1u); WriteRC(static_cast<uint8_t>(v)); }
+                else { WriteBB(0u); WriteRS(static_cast<uint16_t>(v)); }
+            }
+            void WriteBL(int32_t v) {
+                if (v == 0) WriteBB(2u);
+                else if (v > 0 && v < 256) { WriteBB(1u); WriteRC(static_cast<uint8_t>(v)); }
+                else { WriteBB(0u); WriteRL(static_cast<uint32_t>(v)); }
+            }
+            void WriteBD(double d) {
+                if (d == 0.0) WriteBB(2u);
+                else if (d == 1.0) WriteBB(1u);
+                else { WriteBB(0u); WriteRD(d); }
+            }
+            void WriteDD(double d, double def) {
+                if (d == def) WriteBB(0u);
+                else { WriteBB(3u); WriteRD(d); }
+            }
+            void WriteUMC(uint64_t u) {
+                do {
+                    uint8_t b = static_cast<uint8_t>(u & 0x7Fu);
+                    u >>= 7u;
+                    if (u != 0u) b |= 0x80u;
+                    WriteRC(b);
+                } while (u != 0u);
+            }
+            void WriteBOT(int16_t t) {
+                if (t >= 0 && t <= 255) { WriteBB(0u); WriteRC(static_cast<uint8_t>(t)); }
+                else if (t >= 0x1F0 && t <= 0x1F0 + 255) { WriteBB(1u); WriteRC(static_cast<uint8_t>(t - 0x1F0)); }
+                else { WriteBB(2u); WriteRS(static_cast<uint16_t>(t)); }
+            }
+            void WriteHandle(uint8_t code, uint8_t val) {
+                WriteRC(static_cast<uint8_t>((code << 4u) | 1u));
+                WriteRC(val);
+            }
+            void WriteTU(const char* s) {
+                int16_t n = static_cast<int16_t>(std::strlen(s));
+                WriteBS(n);
+                for (int16_t i = 0; i < n; ++i) WriteRS(static_cast<uint8_t>(s[i]));
+            }
+        };
+
+        auto writeCommonEntityR2018 = [](DwgTestBitWriter& bw, uint8_t handleVal, bool trueColor) {
+            bw.WriteHandle(0u, handleVal); // self-handle (NO RL objBits before handle in R2010+!)
+            bw.WriteBS(0);                 // EED = 0
+            bw.WriteB(0);                  // graphicPresent = 0
+            bw.WriteBB(2u);                // entmode = model space
+            bw.WriteBL(0);                 // numReactors = 0
+            bw.WriteB(1u);                 // is_xdic_missing = 1
+            bw.WriteB(0u);                 // has_ds_data = 0 (R2013+)
+            if (trueColor) {
+                bw.WriteBS(static_cast<int16_t>(0x8007u)); // ENC with RGB flag!
+                bw.WriteBL(0x00FF8040);
+            } else {
+                bw.WriteBS(256);           // ByLayer ENC
+            }
+            bw.WriteBD(1.0);               // ltype_scale
+            bw.WriteBB(2u);                // ltype_flags
+            bw.WriteBB(0u);                // plotstyle_flags
+            bw.WriteBB(0u);                // material_flags
+            bw.WriteRC(0u);                // shadow_flags
+            bw.WriteB(0u); bw.WriteB(0u); bw.WriteB(0u); // visualstyles (R2010+)
+            bw.WriteBS(0);                 // invis
+            bw.WriteRC(0u);                // lineweight
+        };
+
+        // Build AcDb:Classes defining class 500 = AcDbSubDMesh ("MESH") using R2007+ String Stream TU
+        std::vector<uint8_t> classesSec;
+        {
+            DwgTestBitWriter strStream;
+            strStream.WriteTU("ObjectDBX Classes");
+            strStream.WriteTU("AcDbSubDMesh");
+            strStream.WriteTU("MESH");
+            size_t strBits = strStream.bitPos;
+
+            DwgTestBitWriter clsData;
+            clsData.WriteRL(0u); // placeholder for totalBits at bit 0..31
+            clsData.WriteBS(500); // maxClassNum
+            clsData.WriteRC(0u); clsData.WriteRC(0u); clsData.WriteB(1u);
+            // Class 500 body (strings live in strStream!)
+            clsData.WriteBS(500);
+            clsData.WriteBS(0);     // proxyFlags
+            clsData.WriteB(0u);     // wasZombie
+            clsData.WriteBS(0x1F2); // itemClassId = entity
+            clsData.WriteBL(1);     // numInstances
+            clsData.WriteBL(32);    // dwgVersion
+            clsData.WriteBL(0);     // maintVersion
+            clsData.WriteBL(0);
+            clsData.WriteBL(0);
+
+            // Append string stream + 16-bit strBits size + 1-bit hasStrings=1 flag
+            for (size_t b = 0; b < strBits; ++b) {
+                uint8_t bit = (strStream.buf[b >> 3u] >> (7u - (b & 7u))) & 1u;
+                clsData.WriteB(bit);
+            }
+            clsData.WriteRS(static_cast<uint16_t>(strBits));
+            clsData.WriteB(1u); // hasStrings = 1!
+
+            uint32_t totalBits = static_cast<uint32_t>(clsData.bitPos);
+            clsData.buf[0] = static_cast<uint8_t>(totalBits & 0xFFu);
+            clsData.buf[1] = static_cast<uint8_t>((totalBits >> 8u) & 0xFFu);
+            clsData.buf[2] = static_cast<uint8_t>((totalBits >> 16u) & 0xFFu);
+            clsData.buf[3] = static_cast<uint8_t>((totalBits >> 24u) & 0xFFu);
+
+            static const uint8_t kStartS[16] = {
+                0x8Du,0xA1u,0xC4u,0xB8u,0xC4u,0xA9u,0xF8u,0xC5u,0xC0u,0xDCu,0xF4u,0x5Fu,0xE7u,0xCFu,0xB6u,0x8Au
+            };
+            static const uint8_t kEndS[16] = {
+                0x72u,0x5Eu,0x3Bu,0x47u,0x3Bu,0x56u,0x07u,0x3Au,0x3Fu,0x23u,0x0Bu,0xA0u,0x18u,0x30u,0x49u,0x75u
+            };
+            ByteWriter cw;
+            cw.Bytes(kStartS, 16);
+            cw.U32LE(static_cast<uint32_t>(clsData.buf.size()));
+            cw.U32LE(0u); // R2013+ highZero RL
+            cw.Bytes(clsData.buf.data(), clsData.buf.size());
+            cw.U16LE(0u); // CRC16
+            cw.Bytes(kEndS, 16);
+            classesSec = std::move(cw.buf);
+        }
+
+        // Build Record 1: 3DFACE (BOT prefix 0 -> 28) at Z=18 (maps to Y=18 in viewer)
+        auto packR2018Record = [](const DwgTestBitWriter& payloadBits, uint32_t handleBitsCount) -> std::vector<uint8_t> {
+            DwgTestBitWriter rec;
+            rec.WriteUMC(handleBitsCount);
+            for (size_t b = 0; b < payloadBits.bitPos; ++b) {
+                uint8_t bit = (payloadBits.buf[b >> 3u] >> (7u - (b & 7u))) & 1u;
+                rec.WriteB(bit);
+            }
+            while ((rec.bitPos & 7u) != 0u) rec.WriteB(0u);
+            for (uint32_t hb = 0; hb < handleBitsCount; ++hb) rec.WriteB(0u);
+
+            ByteWriter out;
+            uint16_t ms = static_cast<uint16_t>(rec.buf.size());
+            out.U16LE(ms);
+            out.Bytes(rec.buf.data(), rec.buf.size());
+            out.U16BE(0u); // CRC
+            return out.buf;
+        };
+
+        DwgTestBitWriter ent1;
+        ent1.WriteBOT(28); // 3DFACE via BOT 2-bit prefix 00 + RC(28)
+        writeCommonEntityR2018(ent1, 10u, true);
+        ent1.WriteB(1u); // hasNoFlags = 1
+        ent1.WriteB(0u); // zIsZero = 0
+        ent1.WriteRD(-4.0); ent1.WriteRD(-4.0); ent1.WriteRD(18.0);
+        ent1.WriteDD( 4.0, -4.0); ent1.WriteDD(-4.0, -4.0); ent1.WriteDD(18.0, 18.0);
+        ent1.WriteDD( 4.0,  4.0); ent1.WriteDD( 4.0, -4.0); ent1.WriteDD(18.0, 18.0);
+        ent1.WriteDD(-4.0,  4.0); ent1.WriteDD( 4.0,  4.0); ent1.WriteDD(18.0, 18.0);
+        auto rec1Bytes = packR2018Record(ent1, 16u);
+
+        // Build Record 2: MESH / AcDbSubDMesh (BOT prefix 01 -> 0x1F0 + 4 = 500) 5-vertex pyramid
+        DwgTestBitWriter ent2;
+        ent2.WriteBOT(500); // Class 500 via BOT 2-bit prefix 01 + RC(4)
+        writeCommonEntityR2018(ent2, 11u, false);
+        ent2.WriteBS(2); // version = 2
+        ent2.WriteB(0u); // blendCrease = 0
+        ent2.WriteBL(0); // subdivLevels = 0
+        ent2.WriteBL(5); // 5 vertices
+        const double pyrV[5][3] = {
+            {-3.0, -3.0, 0.0}, {3.0, -3.0, 0.0}, {3.0, 3.0, 0.0}, {-3.0, 3.0, 0.0}, {0.0, 0.0, 10.0}
+        };
+        for (const auto& pv : pyrV) { ent2.WriteBD(pv[0]); ent2.WriteBD(pv[1]); ent2.WriteBD(pv[2]); }
+        const int32_t faceArr[21] = {
+            4, 0, 3, 2, 1,
+            3, 0, 1, 4,
+            3, 1, 2, 4,
+            3, 2, 3, 4,
+            3, 3, 0, 4
+        };
+        ent2.WriteBL(21);
+        for (int32_t fv : faceArr) ent2.WriteBL(fv);
+        auto rec2Bytes = packR2018Record(ent2, 16u);
+
+        std::vector<uint8_t> objectsSec = rec1Bytes;
+        size_t rec2Off = objectsSec.size();
+        objectsSec.insert(objectsSec.end(), rec2Bytes.begin(), rec2Bytes.end());
+
+        // Build AcDb:Handles map: (handle=10, off=0), (deltaH=1 -> 11, deltaOff=rec2Off)
+        std::vector<uint8_t> handlesSec;
+        {
+            ByteWriter blk;
+            blk.U8(10u); // UMC hd = 10
+            blk.U8(0u);  // MC ld = 0
+            blk.U8(1u);  // UMC hd = 1 (-> handle 11)
+            // Encode MC positive delta rec2Off
+            uint64_t v = rec2Off;
+            while (v >= 0x40u) {
+                blk.U8(static_cast<uint8_t>(0x80u | (v & 0x7Fu)));
+                v >>= 7u;
+            }
+            blk.U8(static_cast<uint8_t>(v & 0x3Fu));
+
+            ByteWriter hm;
+            hm.U16BE(static_cast<uint16_t>(2u + blk.buf.size()));
+            hm.Bytes(blk.buf.data(), blk.buf.size());
+            hm.U16BE(0u); // CRC16
+            hm.U16BE(2u); // End-of-map block
+            hm.U16BE(0u);
+            handlesSec = std::move(hm.buf);
+        }
+
+        // Assemble complete AC1032 paged .dwg file (uncompressed pages compCode=1)
+        ByteWriter dwg;
+        dwg.Bytes("AC1032", 6);
+        while (dwg.buf.size() < 0x100u) dwg.U8(0u);
+
+        // Page 1 (id=1): AcDb:Classes, Page 2 (id=2): AcDb:Handles, Page 3 (id=3): AcDb:AcDbObjects, Page 4 (id=4): SectionMap, Page 5: PageMap
+        auto writeDataPage = [&](const std::vector<uint8_t>& sec) -> uint32_t {
+            size_t start = dwg.buf.size();
+            for (int i = 0; i < 32; ++i) dwg.U8(0u); // 32B encrypted data page header
+            dwg.Bytes(sec.data(), sec.size());
+            while (((dwg.buf.size() - start) & 7u) != 0u) dwg.U8(0u);
+            return static_cast<uint32_t>(dwg.buf.size() - start);
+        };
+        uint32_t p1Sz = writeDataPage(classesSec);
+        uint32_t p2Sz = writeDataPage(handlesSec);
+        uint32_t p3Sz = writeDataPage(objectsSec);
+
+        // Build Section Map payload (3 sections)
+        ByteWriter secMapPay;
+        secMapPay.U32LE(3u); secMapPay.U32LE(2u); secMapPay.U32LE(0x7400u); secMapPay.U32LE(0u); secMapPay.U32LE(3u);
+        auto appendSecDesc = [&](const char* name, size_t dataLen, int32_t pgId, uint32_t pgTotalSz) {
+            secMapPay.U64LE(dataLen);
+            secMapPay.U32LE(1u); // pageCnt = 1
+            secMapPay.U32LE(0x7400u);
+            secMapPay.U32LE(1u);
+            secMapPay.U32LE(1u); // compCode = 1 (raw)
+            secMapPay.U32LE(0u); secMapPay.U32LE(0u);
+            char nm[64] = {};
+            std::memcpy(nm, name, std::strlen(name));
+            secMapPay.Bytes(nm, 64);
+            secMapPay.I32LE(pgId);
+            secMapPay.U32LE(pgTotalSz - 32u);
+            secMapPay.U64LE(0u);
+        };
+        appendSecDesc("AcDb:Classes",     classesSec.size(), 1, p1Sz);
+        appendSecDesc("AcDb:Handles",     handlesSec.size(), 2, p2Sz);
+        appendSecDesc("AcDb:AcDbObjects", objectsSec.size(), 3, p3Sz);
+
+        auto writeSysPage = [&](uint32_t pgType, const std::vector<uint8_t>& pay) -> uint32_t {
+            size_t start = dwg.buf.size();
+            dwg.U32LE(pgType);
+            dwg.U32LE(static_cast<uint32_t>(pay.size()));
+            dwg.U32LE(static_cast<uint32_t>(pay.size()));
+            dwg.U32LE(1u); // compType = 1 (uncompressed)
+            dwg.U32LE(0u); // checksum
+            dwg.Bytes(pay.data(), pay.size());
+            return static_cast<uint32_t>(dwg.buf.size() - start);
+        };
+        uint32_t p4Sz = writeSysPage(0x4163003Bu, secMapPay.buf);
+
+        uint64_t pageMapFileOff = dwg.buf.size();
+        ByteWriter pageMapPay;
+        pageMapPay.I32LE(1); pageMapPay.U32LE(p1Sz);
+        pageMapPay.I32LE(2); pageMapPay.U32LE(p2Sz);
+        pageMapPay.I32LE(3); pageMapPay.U32LE(p3Sz);
+        pageMapPay.I32LE(4); pageMapPay.U32LE(p4Sz);
+        writeSysPage(0x41630E3Bu, pageMapPay.buf);
+
+        // Encrypt 0x6C header at 0x80 with ODA LCG mask
+        uint8_t plainHdr[0x6C] = {};
+        std::memcpy(plainHdr, "AcFssFcAJMB", 11);
+        uint32_t secMapId = 4u;
+        uint64_t pmRel = pageMapFileOff - 0x100ULL;
+        std::memcpy(plainHdr + 0x28, &pmRel, 8);
+        std::memcpy(plainHdr + 0x30, &secMapId, 4);
+        uint32_t seed = 1u;
+        for (size_t i = 0; i < 0x6Cu; ++i) {
+            seed = seed * 0x343FDu + 0x269EC3u;
+            dwg.buf[0x80u + i] = plainHdr[i] ^ static_cast<uint8_t>(seed >> 16u);
+        }
+
+        LoadedMesh3D mDwgUmc;
+        bool okDwg = Model3DViewer::InspectMeshFile(writeBytes(L"r2018_genuine_umc_bot.dwg", dwg.buf), mDwgUmc);
+        tc.Record(okDwg && mDwgUmc.loadedOk && mDwgUmc.rawVertexCount == 9 && mDwgUmc.rawTriangleCount == 8 &&
+                  std::fabs(mDwgUmc.bboxMax.y - 18.0f) < 0.02f,
+                  L"Stage15.3D.DwgDxf3D.GenuineR2018UmcBotAndSubDMeshDWG",
+                  L"verts=" + std::to_wstring(mDwgUmc.rawVertexCount) +
+                  L" tris=" + std::to_wstring(mDwgUmc.rawTriangleCount) +
+                  L" maxY=" + std::to_wstring(mDwgUmc.bboxMax.y));
+    }
+
+    // ========================================================================
+    // 26. Siemens JT Open (.jt) ISO 14306 TriStripSetShapeLODElement + Int32CDP (Bitlength + Lag1 & Huffman)
+    // ========================================================================
+    {
+        auto tfZlibWrap = [](const uint8_t* ptr, size_t len) -> std::vector<uint8_t> {
+            ByteWriter zw;
+            zw.U8(0x78u); zw.U8(0x9Cu);
+            auto def = TfDeflateFixedHuffman(ptr, len);
+            zw.Bytes(def.data(), def.size());
+            uint32_t s1 = 1u, s2 = 0u;
+            for (size_t i = 0; i < len; ++i) {
+                s1 = (s1 + ptr[i]) % 65521u;
+                s2 = (s2 + s1) % 65521u;
+            }
+            zw.U32BE((s2 << 16u) | s1);
+            return zw.buf;
+        };
+
+        struct JtWordPacker {
+            std::vector<uint32_t> words;
+            size_t bitPos = 0;
+            void PutBit(uint32_t b) {
+                if ((bitPos >> 5u) >= words.size()) words.push_back(0u);
+                if (b & 1u) words[bitPos >> 5u] |= (1u << (31u - (bitPos & 31u)));
+                ++bitPos;
+            }
+            void PutU(uint32_t v, int n) {
+                for (int i = n - 1; i >= 0; --i) PutBit((v >> i) & 1u);
+            }
+            void PutS(int32_t v, int n) {
+                PutU(static_cast<uint32_t>(v), n);
+            }
+        };
+
+        auto writeInt32CdpBitlengthFixed = [](ByteWriter& bw, const std::vector<int32_t>& res) {
+            bw.U8(1u); // CodecType_Bitlength
+            int32_t mn = res[0], mx = res[0];
+            for (int32_t r : res) { mn = std::min(mn, r); mx = std::max(mx, r); }
+            auto reqSignedBits = [](int32_t v) -> int {
+                if (v == 0) return 0;
+                for (int b = 1; b < 32; ++b) {
+                    int32_t lo = -(1 << (b - 1));
+                    int32_t hi = (1 << (b - 1)) - 1;
+                    if (v >= lo && v <= hi) return b;
+                }
+                return 32;
+            };
+            int minB = reqSignedBits(mn);
+            int maxB = reqSignedBits(mx);
+            uint64_t span = static_cast<uint64_t>(static_cast<int64_t>(mx) - static_cast<int64_t>(mn));
+            int fw = 0;
+            while (fw < 32 && (1ULL << fw) <= span) ++fw;
+
+            JtWordPacker wp;
+            wp.PutU(0u, 1); // mode = 0 (fixed-width)
+            wp.PutU(static_cast<uint32_t>(minB), 6);
+            wp.PutU(static_cast<uint32_t>(maxB), 6);
+            if (minB > 0) wp.PutS(mn, minB);
+            if (maxB > 0) wp.PutS(mx, maxB);
+            for (int32_t r : res) {
+                if (fw > 0) wp.PutU(static_cast<uint32_t>(static_cast<int64_t>(r) - static_cast<int64_t>(mn)), fw);
+            }
+            bw.I32LE(static_cast<int32_t>(wp.bitPos));
+            bw.I32LE(static_cast<int32_t>(res.size()));
+            bw.I32LE(static_cast<int32_t>(wp.words.size()));
+            for (uint32_t w : wp.words) bw.U32LE(w);
+        };
+
+        auto writeInt32CdpBitlengthVar = [](ByteWriter& bw, const std::vector<int32_t>& res) {
+            bw.U8(1u); // CodecType_Bitlength
+            JtWordPacker wp;
+            wp.PutU(1u, 1);  // mode = 1 (variable-width adaptive step)
+            wp.PutS(0, 8);   // iMean = 0
+            wp.PutU(4u, 3);  // cBlkValBits = 4 (signed step -8..+7)
+            wp.PutU(4u, 3);  // cBlkLenBits = 4 (runLen up to 15)
+            // Adjust width from 0 -> +7 -> +7 -> +3 = 17 bits, then emit all residuals in one block
+            wp.PutU(1u, 1);
+            wp.PutS(7, 4);
+            wp.PutU(1u, 1);
+            wp.PutS(7, 4);
+            wp.PutU(1u, 1);
+            wp.PutS(3, 4);
+            wp.PutU(0u, 1); // done adjusting width (width = 17)
+            wp.PutU(static_cast<uint32_t>(res.size()), 4);
+            for (int32_t r : res) wp.PutS(r, 17);
+
+            bw.I32LE(static_cast<int32_t>(wp.bitPos));
+            bw.I32LE(static_cast<int32_t>(res.size()));
+            bw.I32LE(static_cast<int32_t>(wp.words.size()));
+            for (uint32_t w : wp.words) bw.U32LE(w);
+        };
+
+        auto lag1Residuals = [](const std::vector<int32_t>& vals) -> std::vector<int32_t> {
+            std::vector<int32_t> r(vals.size());
+            for (size_t i = 0; i < vals.size(); ++i) r[i] = (i == 0u) ? vals[0] : (vals[i] - vals[i - 1u]);
+            return r;
+        };
+
+        auto wrapJt95File = [&](const std::vector<uint8_t>& elemPayload) -> std::vector<uint8_t> {
+            ByteWriter segRaw;
+            segRaw.I32LE(static_cast<int32_t>(elemPayload.size()));
+            // TriStripSetShapeLODElement GUID: {0x10dd10ab, 0x2ac8, 0x11d1, {0x9b,0x6b,0x00,0x80,0xc7,0xbb,0x59,0x97}}
+            segRaw.U32LE(0x10dd10abu);
+            segRaw.U16LE(0x2ac8u);
+            segRaw.U16LE(0x11d1u);
+            const uint8_t gb[8] = { 0x9bu, 0x6bu, 0x00u, 0x80u, 0xc7u, 0xbbu, 0x59u, 0x97u };
+            segRaw.Bytes(gb, 8);
+            segRaw.U8(4u); // objBaseType = Shape LOD Data
+
+            ByteWriter fullElem;
+            fullElem.I32LE(static_cast<int32_t>(17u + elemPayload.size()));
+            fullElem.Bytes(segRaw.buf.data() + 4, 17);
+            fullElem.Bytes(elemPayload.data(), elemPayload.size());
+
+            auto zBytes = tfZlibWrap(fullElem.buf.data(), fullElem.buf.size());
+
+            const uint8_t segGuid[16] = { 1,2,3,4, 5,6, 7,8, 9,10,11,12,13,14,15,16 };
+            ByteWriter seg;
+            seg.Bytes(segGuid, 16);
+            seg.I32LE(7); // Shape LOD0
+            uint32_t totalSegLen = static_cast<uint32_t>(24u + 9u + zBytes.size());
+            seg.U32LE(totalSegLen);
+            seg.U32LE(2u); // compressionFlag = 2
+            seg.U32LE(static_cast<uint32_t>(zBytes.size() + 1u)); // compDataLen includes alg byte
+            seg.U8(2u);    // compressionAlgorithm = 2 (zlib)
+            seg.Bytes(zBytes.data(), zBytes.size());
+
+            ByteWriter jt;
+            std::string ver80(80, ' ');
+            std::memcpy(ver80.data(), "Version 9.5 JT", 14);
+            ver80[78] = '\r'; ver80[79] = '\n';
+            jt.Bytes(ver80.data(), 80);
+            jt.U8(0u); // little-endian
+            jt.I32LE(0);
+            uint32_t tocOff = 105u;
+            jt.U32LE(tocOff);
+            jt.Bytes(segGuid, 16); // LSG stub GUID -> byte 105
+
+            uint32_t segOffset = static_cast<uint32_t>(tocOff + 4u + 28u);
+            jt.U32LE(1u); // 1 TOC entry
+            jt.Bytes(segGuid, 16);
+            jt.U32LE(segOffset);
+            jt.U32LE(totalSegLen);
+            jt.U32LE(7u << 24u); // segType = 7 (Shape LOD0)
+            jt.Bytes(seg.buf.data(), seg.buf.size());
+            return jt.buf;
+        };
+
+        // JT File A: Quantized 16-bit VertexCoordArray + Bitlength (fixed & variable-width) + Lag1 predictor
+        ByteWriter bodyA;
+        bodyA.I32LE(42);   // Object ID (JT v9)
+        bodyA.U16LE(1u);   // VertexShapeLODData version
+        bodyA.U64LE(1ULL); // vertexBindings
+        bodyA.U16LE(1u);   // TriStripSet version
+        bodyA.U16LE(1u);   // VertexBasedShapeCompressedRepData version
+        bodyA.U8(0u); bodyA.U8(0u); bodyA.U8(0u); // bindings = 0
+        bodyA.U8(16u); bodyA.U8(0u); bodyA.U8(0u); bodyA.U8(0u); // 16 bitsPerVertex
+        // 2 strips of 4 vertices each: [0, 4, 8] encoded with Lag1 residuals [0, 4, 4]
+        writeInt32CdpBitlengthFixed(bodyA, { 0, 4, 4 });
+        // PointQuantizerData: X in [-10, 10], Y in [0, 24], Z in [-6, 6], 16 bits each
+        bodyA.F32LE(-10.0f); bodyA.F32LE(10.0f); bodyA.U8(16u);
+        bodyA.F32LE(0.0f);   bodyA.F32LE(24.0f); bodyA.U8(16u);
+        bodyA.F32LE(-6.0f);  bodyA.F32LE(6.0f);  bodyA.U8(16u);
+        bodyA.I32LE(8); // 8 vertices
+        const std::vector<int32_t> qX = { 0, 32768, 0, 32768, 32768, 65535, 32768, 65535 };
+        const std::vector<int32_t> qY = { 0, 0, 32768, 32768, 32768, 32768, 65535, 65535 };
+        const std::vector<int32_t> qZ = { 0, 0, 65535, 65535, 0, 0, 65535, 65535 };
+        writeInt32CdpBitlengthFixed(bodyA, lag1Residuals(qX));
+        writeInt32CdpBitlengthVar(bodyA,   lag1Residuals(qY)); // exercises adaptive-width mode=1!
+        writeInt32CdpBitlengthFixed(bodyA, lag1Residuals(qZ));
+        auto jtBytesA = wrapJt95File(bodyA.buf);
+
+        // JT File B: Lossless Zlib-compressed float32 vertices (bitsPerVertex = 0) + Huffman Int32CDP strip offsets
+        ByteWriter bodyB;
+        bodyB.I32LE(99);
+        bodyB.U16LE(1u);
+        bodyB.U64LE(1ULL);
+        bodyB.U16LE(1u);
+        bodyB.U16LE(1u);
+        bodyB.U8(0u); bodyB.U8(0u); bodyB.U8(0u);
+        bodyB.U8(0u); bodyB.U8(0u); bodyB.U8(0u); bodyB.U8(0u); // bitsPerVertex = 0 -> lossless raw float32!
+        // Huffman Int32CDP for stripOffsets [0, 5] (Stride1/Lag1 residuals = [0, 5])
+        {
+            bodyB.U8(2u); // CodecType_Huffman
+            bodyB.U8(1u); // 1 probability context table
+            // Pack byte bitstream: entryCount=2 (16b), symBits=4 (6b), occBits=4 (6b), valBits=4 (6b), nextBits=0 (6b), minVal=0 (32b)
+            struct ByteBitPacker {
+                std::vector<uint8_t> buf;
+                size_t bitPos = 0;
+                void PutU(uint32_t v, int n) {
+                    for (int i = n - 1; i >= 0; --i) {
+                        if ((bitPos >> 3u) >= buf.size()) buf.push_back(0u);
+                        if ((v >> i) & 1u) buf[bitPos >> 3u] |= static_cast<uint8_t>(1u << (7u - (bitPos & 7u)));
+                        ++bitPos;
+                    }
+                }
+            } pbp;
+            pbp.PutU(2u, 16); // 2 entries
+            pbp.PutU(4u, 6);  // symBits = 4
+            pbp.PutU(4u, 6);  // occBits = 4
+            pbp.PutU(4u, 6);  // valBits = 4
+            pbp.PutU(0u, 6);  // nextBits = 0
+            pbp.PutU(0u, 32); // minVal = 0
+            // Entry 0: sym=0, occ=1, valOff=0 (left / bit 1 because smaller occ=1 popped first!)
+            pbp.PutU(0u, 4); pbp.PutU(1u, 4); pbp.PutU(0u, 4);
+            // Entry 1: sym=1, occ=2, valOff=5 (right / bit 0)
+            pbp.PutU(1u, 4); pbp.PutU(2u, 4); pbp.PutU(5u, 4);
+            bodyB.Bytes(pbp.buf.data(), pbp.buf.size());
+            bodyB.I32LE(0); // oobCount = 0
+            // CodeText: bit 1 -> Entry 0 (0), bit 0 -> Entry 1 (5) => 2 bits: 0b10_000... = 0x80000000u
+            bodyB.I32LE(2); // codeTextBits = 2
+            bodyB.I32LE(2); // valueCount = 2
+            bodyB.I32LE(1); // 1 word
+            bodyB.U32LE(0x80000000u);
+        }
+        ByteWriter rawF32;
+        const float strip5[5][3] = {
+            {0.0f, 0.0f, 0.0f}, {6.0f, 0.0f, 0.0f}, {0.0f, 8.0f, 0.0f}, {6.0f, 8.0f, 3.0f}, {3.0f, 15.0f, 5.0f}
+        };
+        for (const auto& sv : strip5) { rawF32.F32LE(sv[0]); rawF32.F32LE(sv[1]); rawF32.F32LE(sv[2]); }
+        auto zVtx = tfZlibWrap(rawF32.buf.data(), rawF32.buf.size());
+        bodyB.I32LE(static_cast<int32_t>(rawF32.buf.size()));
+        bodyB.I32LE(static_cast<int32_t>(zVtx.size()));
+        bodyB.Bytes(zVtx.data(), zVtx.size());
+        auto jtBytesB = wrapJt95File(bodyB.buf);
+
+        LoadedMesh3D mJtA, mJtB;
+        bool okJtA = Model3DViewer::InspectMeshFile(writeBytes(L"iso14306_quant_bitlen.jt", jtBytesA), mJtA);
+        bool okJtB = Model3DViewer::InspectMeshFile(writeBytes(L"iso14306_lossless_huff.jt", jtBytesB), mJtB);
+        tc.Record(okJtA && okJtB &&
+                  mJtA.rawVertexCount == 8 && mJtA.rawTriangleCount == 4 &&
+                  std::fabs(mJtA.bboxSize.x - 20.0f) < 0.05f && std::fabs(mJtA.bboxMax.y - 24.0f) < 0.05f &&
+                  mJtB.rawVertexCount == 5 && mJtB.rawTriangleCount == 3 &&
+                  std::fabs(mJtB.bboxMax.y - 15.0f) < 0.02f &&
+                  HashMeshGeometry(mJtA) != HashMeshGeometry(mJtB),
+                  L"Stage15.3D.JT.Iso14306TriStripSetInt32CdpBitlengthLag1AndHuffman",
+                  L"vertsA=" + std::to_wstring(mJtA.rawVertexCount) + L" maxYA=" + std::to_wstring(mJtA.bboxMax.y) +
+                  L" vertsB=" + std::to_wstring(mJtB.rawVertexCount));
+    }
+
+    // ========================================================================
+    // 27. LDraw LEGO CAD Multi-Part Document (.mpd, .ldr): Matrix Instancing, Mirroring, Bowtie Quads & Primitives
+    // ========================================================================
+    {
+        tc.Record(Model3DViewer::Is3DModelExtension(L".ldr") &&
+                  Model3DViewer::Is3DModelExtension(L".mpd"),
+                  L"Stage15.3D.LDraw.ExtensionsRegistered");
+
+        const char* mpdAssembly =
+            "0 FILE space_shuttle.ldr\n"
+            "0 Name: Space Shuttle Test\n"
+            "0 !LDRAW_ORG Model\n"
+            "0 !COLOUR CustomGold CODE 88 VALUE #FFD700 EDGE #333333\n"
+            "0 BFC CERTIFY CCW\n"
+            // Right wing at X=+20 (identity 3x3)
+            "1 4 20 0 0 1 0 0 0 1 0 0 0 1 sub\\wing_pod.ldr\n"
+            // Left wing mirrored across X at X=-20 (det = -1 < 0 -> automatic BFC winding flip!)
+            "0 BFC INVERTNEXT\n"
+            "1 88 -20 0 0 -1 0 0 0 1 0 0 0 1 sub/wing_pod.ldr\n"
+            // Top LEGO stud primitive at Y=-12 (maps to viewer +Y = +12..+16!)
+            "1 14 0 -12 0 1 0 0 0 1 0 0 0 1 stud.dat\n"
+            "0 NOFILE\n"
+            "0 FILE sub/wing_pod.ldr\n"
+            "0 BFC CERTIFY CCW\n"
+            // Triangle rising to LDraw Y = -10 (viewer +Y = +10)
+            "3 16 0 0 0 10 0 0 5 -10 4\n"
+            // Intentionally bowtie-ordered quad (0,0,0 -> 10,0,8 -> 10,0,0 -> 0,0,8) that must untwist cleanly into 2 tris!
+            "4 16 0 0 0 10 0 8 10 0 0 0 0 8\n"
+            "0 NOFILE\n";
+
+        LoadedMesh3D mMpd;
+        bool okMpd = Model3DViewer::InspectMeshFile(writeText(L"shuttle_assy.mpd", mpdAssembly), mMpd);
+        // Each wing_pod = 1 tri + 2 quad tris = 3 tris (x2 wings = 6 tris) + stud.dat (16*3 = 48 tris) = 54 tris!
+        // X spans from (-20 - 10) = -30 to (+20 + 10) = +30; stud top at LDraw y = -12 - 4 = -16 -> viewer maxY = +16!
+        tc.Record(okMpd && mMpd.loadedOk && mMpd.rawTriangleCount == 54 &&
+                  std::fabs(mMpd.bboxMin.x - (-30.0f)) < 0.05f &&
+                  std::fabs(mMpd.bboxMax.x - 30.0f) < 0.05f &&
+                  std::fabs(mMpd.bboxMax.y - 16.0f) < 0.05f,
+                  L"Stage15.3D.LDraw.MpdSubmodelsMirrorBowtieAndPrimitives",
+                  L"tris=" + std::to_wstring(mMpd.rawTriangleCount) +
+                  L" minX=" + std::to_wstring(mMpd.bboxMin.x) + L" maxX=" + std::to_wstring(mMpd.bboxMax.x) +
+                  L" maxY=" + std::to_wstring(mMpd.bboxMax.y));
+
+        LoadedMesh3D mBadLdr;
+        bool okBadLdr = Model3DViewer::InspectMeshFile(writeText(L"not_ldraw.ldr", "Just a plain README note without LDraw geometry.\n"), mBadLdr);
+        tc.Record(!okBadLdr && !mBadLdr.loadedOk, L"Stage15.3D.LDraw.RejectNonLDrawText");
+    }
+
+    // ========================================================================
+    // 28. Valve Hammer (.vmf) & Quake CSG Brush Map (.map) + MSVC Linker .map Rejection
+    // ========================================================================
+    {
+        tc.Record(Model3DViewer::Is3DModelExtension(L".vmf") &&
+                  Model3DViewer::Is3DModelExtension(L".map"),
+                  L"Stage15.3D.CsgMapVmf.ExtensionsRegistered");
+
+        // Quake .map: Brush 1 = 6-plane box [0..64]x[0..64]x[0..32] (8v, 12t)
+        //             Brush 2 = 5-plane wedge ramp [64..128]x[0..64]x[0..48] (6v, 8t)
+        //             Brush 3 = TRIGGER volume [0..512]^3 (all TRIGGER faces -> culled!)
+        const char* quakeBrushMap =
+            "// Game: Quake / Valve 220 Map\n"
+            "{\n"
+            "\"classname\" \"worldspawn\"\n"
+            "\"wad\" \"quake.wad\"\n"
+            "{\n"
+            "( 0 64 32 ) ( 64 64 32 ) ( 64 0 32 ) BRICK1 0 0 0 1 1\n"
+            "( 0 0 0 ) ( 64 0 0 ) ( 64 64 0 ) BRICK1 0 0 0 1 1\n"
+            "( 64 64 32 ) ( 64 64 0 ) ( 64 0 0 ) BRICK1 0 0 0 1 1\n"
+            "( 0 0 32 ) ( 0 0 0 ) ( 0 64 0 ) BRICK1 0 0 0 1 1\n"
+            "( 64 64 0 ) ( 64 64 32 ) ( 0 64 32 ) BRICK1 0 0 0 1 1\n"
+            "( 0 0 0 ) ( 0 0 32 ) ( 64 0 32 ) BRICK1 0 0 0 1 1\n"
+            "}\n"
+            "{\n"
+            "( 64 0 0 ) ( 128 0 0 ) ( 128 64 0 ) METAL2 0 0 0 1 1\n"
+            "( 64 0 48 ) ( 64 0 0 ) ( 64 64 0 ) METAL2 0 0 0 1 1\n"
+            "( 128 64 0 ) ( 64 64 48 ) ( 64 64 0 ) METAL2 0 0 0 1 1\n"
+            "( 64 0 0 ) ( 64 0 48 ) ( 128 0 0 ) METAL2 0 0 0 1 1\n"
+            "( 64 64 48 ) ( 128 64 0 ) ( 128 0 0 ) METAL2 0 0 0 1 1\n"
+            "}\n"
+            "{\n"
+            "( 0 512 512 ) ( 512 512 512 ) ( 512 0 512 ) TRIGGER 0 0 0 1 1\n"
+            "( 0 0 0 ) ( 512 0 0 ) ( 512 512 0 ) TRIGGER 0 0 0 1 1\n"
+            "( 512 512 512 ) ( 512 512 0 ) ( 512 0 0 ) TRIGGER 0 0 0 1 1\n"
+            "( 0 0 512 ) ( 0 0 0 ) ( 0 512 0 ) TRIGGER 0 0 0 1 1\n"
+            "( 512 512 0 ) ( 512 512 512 ) ( 0 512 512 ) TRIGGER 0 0 0 1 1\n"
+            "( 0 0 0 ) ( 0 0 512 ) ( 512 0 512 ) TRIGGER 0 0 0 1 1\n"
+            "}\n"
+            "}\n";
+
+        std::wstring qMapPath = writeText(L"bunker_csg.map", quakeBrushMap);
+        LoadedMesh3D mQMap;
+        bool okQMap = Model3DViewer::InspectMeshFile(qMapPath, mQMap);
+        tc.Record(okQMap && mQMap.loadedOk && MeshReaders::IsLikelyQuakeMapFile(qMapPath) &&
+                  mQMap.rawVertexCount == 14 && mQMap.rawTriangleCount == 20 &&
+                  std::fabs(mQMap.bboxSize.x - 128.0f) < 0.05f &&
+                  std::fabs(mQMap.bboxMax.y - 48.0f) < 0.05f,
+                  L"Stage15.3D.CsgMapVmf.QuakeCsgBoxWedgeAndTriggerCull",
+                  L"verts=" + std::to_wstring(mQMap.rawVertexCount) +
+                  L" tris=" + std::to_wstring(mQMap.rawTriangleCount) +
+                  L" maxY=" + std::to_wstring(mQMap.bboxMax.y));
+
+        // MSVC Linker .map & JS Source .map MUST be cleanly rejected!
+        const char* msvcLinkerMap =
+            " Explorer2\n\n"
+            " Timestamp is 673b1234 (Mon Nov 18 22:00:00 2026)\n\n"
+            " Preferred load address is 0000000140000000\n\n"
+            " Start         Length     Name                   Class\n"
+            " 0001:00000000 0024a100H .text$mn                CODE\n"
+            "  Address         Publics by Value              Rva+Base               Lib:Object\n"
+            " 0001:00001000       wWinMain                   0000000140002000 f   main.obj\n";
+        std::wstring lnkMapPath = writeText(L"Explorer2_linker.map", msvcLinkerMap);
+        std::wstring jsMapPath  = writeText(L"bundle.js.map", "{\"version\":3,\"sources\":[\"app.ts\"],\"mappings\":\"AAAA\"}");
+        LoadedMesh3D mLnk, mJs;
+        bool okLnk = Model3DViewer::InspectMeshFile(lnkMapPath, mLnk);
+        bool okJs  = Model3DViewer::InspectMeshFile(jsMapPath, mJs);
+        tc.Record(!MeshReaders::IsLikelyQuakeMapFile(lnkMapPath) && !MeshReaders::IsLikelyQuakeMapFile(jsMapPath) &&
+                  !okLnk && !okJs && mLnk.tris.empty() && mJs.tris.empty(),
+                  L"Stage15.3D.CsgMapVmf.RejectMsvcLinkerAndJsSourceMap");
+
+        // Valve Hammer .vmf: Solid 1 has 1 visible top slab face + 5 TOOLS/TOOLSNODRAW clipping planes (2 tris);
+        //                    Solid 2 has power=2 dispinfo terrain quad-grid rising to Z=40 (32 tris) => 34 tris!
+        const char* hammerVmf =
+            "versioninfo { \"editorversion\" \"400\" \"mapversion\" \"1\" }\n"
+            "world\n"
+            "{\n"
+            "  \"id\" \"1\"\n"
+            "  \"classname\" \"worldspawn\"\n"
+            "  solid\n"
+            "  {\n"
+            "    \"id\" \"2\"\n"
+            "    side { \"id\" \"1\" \"plane\" \"(0 64 16) (64 64 16) (64 0 16)\" \"material\" \"CONCRETE/CONCRETEFLOOR001A\" }\n"
+            "    side { \"id\" \"2\" \"plane\" \"(0 0 0) (64 0 0) (64 64 0)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"3\" \"plane\" \"(64 64 16) (64 64 0) (64 0 0)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"4\" \"plane\" \"(0 0 16) (0 0 0) (0 64 0)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"5\" \"plane\" \"(64 64 0) (64 64 16) (0 64 16)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"6\" \"plane\" \"(0 0 0) (0 0 16) (64 0 16)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "  }\n"
+            "  solid\n"
+            "  {\n"
+            "    \"id\" \"3\"\n"
+            "    side\n"
+            "    {\n"
+            "      \"id\" \"10\"\n"
+            "      \"plane\" \"(100 64 0) (164 64 0) (164 0 0)\"\n"
+            "      \"material\" \"NATURE/DIRTFLOOR001A\"\n"
+            "      dispinfo\n"
+            "      {\n"
+            "        \"power\" \"2\"\n"
+            "        \"startposition\" \"[100 0 0]\"\n"
+            "        \"elevation\" \"0\"\n"
+            "        normals\n"
+            "        {\n"
+            "          \"row0\" \"0 0 1 0 0 1 0 0 1 0 0 1 0 0 1\"\n"
+            "          \"row1\" \"0 0 1 0 0 1 0 0 1 0 0 1 0 0 1\"\n"
+            "          \"row2\" \"0 0 1 0 0 1 0 0 1 0 0 1 0 0 1\"\n"
+            "          \"row3\" \"0 0 1 0 0 1 0 0 1 0 0 1 0 0 1\"\n"
+            "          \"row4\" \"0 0 1 0 0 1 0 0 1 0 0 1 0 0 1\"\n"
+            "        }\n"
+            "        distances\n"
+            "        {\n"
+            "          \"row0\" \"0 0 0 0 0\"\n"
+            "          \"row1\" \"0 12 18 12 0\"\n"
+            "          \"row2\" \"0 18 40 18 0\"\n"
+            "          \"row3\" \"0 12 18 12 0\"\n"
+            "          \"row4\" \"0 0 0 0 0\"\n"
+            "        }\n"
+            "        offsets { \"row0\" \"0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\" }\n"
+            "      }\n"
+            "    }\n"
+            "    side { \"id\" \"11\" \"plane\" \"(100 0 -16) (164 0 -16) (164 64 -16)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"12\" \"plane\" \"(164 64 0) (164 64 -16) (164 0 -16)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"13\" \"plane\" \"(100 0 0) (100 0 -16) (100 64 -16)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"14\" \"plane\" \"(164 64 -16) (164 64 0) (100 64 0)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "    side { \"id\" \"15\" \"plane\" \"(100 0 -16) (100 0 0) (164 0 0)\" \"material\" \"TOOLS/TOOLSNODRAW\" }\n"
+            "  }\n"
+            "}\n";
+
+        LoadedMesh3D mVmf;
+        bool okVmf = Model3DViewer::InspectMeshFile(writeText(L"outpost_disp.vmf", hammerVmf), mVmf);
+        tc.Record(okVmf && mVmf.loadedOk && mVmf.rawVertexCount == 29 && mVmf.rawTriangleCount == 34 &&
+                  std::fabs(mVmf.bboxSize.x - 164.0f) < 0.05f &&
+                  std::fabs(mVmf.bboxMax.y - 40.0f) < 0.05f,
+                  L"Stage15.3D.CsgMapVmf.ValveVmfNodrawClipAndDisplacement",
+                  L"verts=" + std::to_wstring(mVmf.rawVertexCount) +
+                  L" tris=" + std::to_wstring(mVmf.rawTriangleCount) +
+                  L" maxY=" + std::to_wstring(mVmf.bboxMax.y));
+    }
+
+    // ========================================================================
+    // 29. C3D Biomechanical 3D Motion Capture (.c3d): POINT:LABELS, POINT:SCALE, Multi-Frame & Occluded Residual
+    // ========================================================================
+    {
+        tc.Record(Model3DViewer::Is3DModelExtension(L".c3d"),
+                  L"Stage15.3D.C3D.ExtensionRegistered");
+
+        // Build genuine 3-sector C3D file (Intel LE procType=84, float32 scale=-0.05, 9 markers, 4 frames)
+        std::vector<uint8_t> c3d(512 * 3, 0);
+        c3d[0] = 2u;    // paramBlock = sector 2
+        c3d[1] = 0x50u; // C3D magic byte
+        uint16_t nPts = 9u, firstFr = 1u, lastFr = 4u, dataSec = 3u;
+        float hdrScale = -0.05f, hdrRate = 120.0f;
+        std::memcpy(c3d.data() + 2,  &nPts, 2);
+        std::memcpy(c3d.data() + 6,  &firstFr, 2);
+        std::memcpy(c3d.data() + 8,  &lastFr, 2);
+        std::memcpy(c3d.data() + 12, &hdrScale, 4);
+        std::memcpy(c3d.data() + 16, &dataSec, 2);
+        std::memcpy(c3d.data() + 20, &hdrRate, 4);
+
+        // Sector 2 (offset 512): Parameter Section
+        ByteWriter prm;
+        prm.U8(1u); prm.U8(0x50u); prm.U8(1u); prm.U8(84u); // 1 param block, procType=84 (Intel LE)
+        // Group -1 = "POINT"
+        prm.U8(5u); prm.U8(static_cast<uint8_t>(-1));
+        prm.Bytes("POINT", 5);
+        prm.U16LE(3u); // nextOffset = 2 + 1 (descLen=0)
+        prm.U8(0u);
+        // Parameter "LABELS" in group 1: 9 labels x 8 chars ("Actor:LFHD", etc., testing prefix stripping!)
+        const char* labels9[9] = {
+            "S1:LFHD ", "S1:RFHD ", "S1:C7   ", "S1:CLAV ",
+            "S1:LSHO ", "S1:LELB ", "S1:RSHO ", "S1:RELB ", "S1:OCCL "
+        };
+        prm.U8(6u); prm.U8(1u);
+        prm.Bytes("LABELS", 6);
+        uint16_t lblNext = static_cast<uint16_t>(2u + 1u + 1u + 2u + 9u * 8u + 1u);
+        prm.U16LE(lblNext);
+        prm.U8(static_cast<uint8_t>(-1)); // char type
+        prm.U8(2u);                       // 2D char array [8, 9]
+        prm.U8(8u); prm.U8(9u);
+        for (const char* lb : labels9) prm.Bytes(lb, 8);
+        prm.U8(0u); // descLen
+        // End-of-parameters sentinel
+        prm.U8(0u); prm.U8(0u);
+        std::memcpy(c3d.data() + 512, prm.buf.data(), prm.buf.size());
+
+        // Sector 3 (offset 1024): 4 frames of 9 float32 16-byte markers (marker 8 is occluded with residual = -1.0f at 9999!)
+        struct C3dPt4 { float x, y, z, res; };
+        const C3dPt4 frame0[9] = {
+            { -60.0f,  80.0f, 1700.0f,  0.5f }, // LFHD
+            {  60.0f,  80.0f, 1700.0f,  0.5f }, // RFHD
+            {   0.0f, -60.0f, 1500.0f,  0.5f }, // C7
+            {   0.0f,  60.0f, 1450.0f,  0.5f }, // CLAV
+            {-180.0f,   0.0f, 1460.0f,  0.5f }, // LSHO
+            {-320.0f,  20.0f, 1180.0f,  0.5f }, // LELB
+            { 180.0f,   0.0f, 1460.0f,  0.5f }, // RSHO
+            { 320.0f,  20.0f, 1180.0f,  0.5f }, // RELB
+            {9999.0f,9999.0f, 9999.0f, -1.0f }  // OCCL (occluded -> MUST be skipped!)
+        };
+        ByteWriter traj;
+        for (int fr = 0; fr < 4; ++fr) {
+            float dz = static_cast<float>(fr) * 15.0f;
+            for (int m = 0; m < 9; ++m) {
+                traj.F32LE(frame0[m].x);
+                traj.F32LE(frame0[m].y);
+                traj.F32LE(frame0[m].z + (frame0[m].res >= 0.0f ? dz : 0.0f));
+                traj.F32LE(frame0[m].res);
+            }
+        }
+        c3d.resize(1024);
+        c3d.insert(c3d.end(), traj.buf.begin(), traj.buf.end());
+
+        LoadedMesh3D mC3d;
+        bool okC3d = Model3DViewer::InspectMeshFile(writeBytes(L"vicon_upperbody.c3d", c3d), mC3d);
+        // 8 valid markers * 8 octahedron tris (64) + 10 anatomical bone struts * 4 tris (40) = 104 tris; maxY ~ 1712 (< 2000, proving 9999 outlier skipped!)
+        tc.Record(okC3d && mC3d.loadedOk && mC3d.animFrameCount == 4 &&
+                  mC3d.rawTriangleCount == 104 &&
+                  mC3d.bboxSize.x > 600.0f && mC3d.bboxSize.x < 800.0f &&
+                  mC3d.bboxMax.y > 1700.0f && mC3d.bboxMax.y < 1800.0f,
+                  L"Stage15.3D.C3D.BinaryMocapLabelsFramesAndOccludedFilter",
+                  L"frames=" + std::to_wstring(mC3d.animFrameCount) +
+                  L" tris=" + std::to_wstring(mC3d.rawTriangleCount) +
+                  L" maxY=" + std::to_wstring(mC3d.bboxMax.y));
+
+        std::vector<uint8_t> badC3d(1024, 0);
+        badC3d[0] = 2u; badC3d[1] = 0x00u; // missing 0x50 C3D key
+        LoadedMesh3D mBadC3d;
+        bool okBadC3d = Model3DViewer::InspectMeshFile(writeBytes(L"bad_magic.c3d", badC3d), mBadC3d);
+        tc.Record(!okBadC3d && !mBadC3d.loadedOk, L"Stage15.3D.C3D.RejectBadMagic");
+    }
+
+    // ========================================================================
+    // 30. NRRD 3D Volumetric Dataset (.nrrd): Raw & Gzip Marching Cubes Sphere vs Torus Watertight Isosurfaces
+    // ========================================================================
+    {
+        tc.Record(Model3DViewer::Is3DModelExtension(L".nrrd"),
+                  L"Stage15.3D.NRRD.ExtensionRegistered");
+
+        // Helper: count open boundary edges & compute Euler characteristic V - E + F to prove watertight manifold!
+        auto checkWatertightEuler = [](const LoadedMesh3D& m, int& outBoundaryEdges, int& outEuler) {
+            std::vector<uint64_t> edges;
+            edges.reserve(m.tris.size() * 3u);
+            for (const auto& t : m.tris) {
+                uint32_t v[3] = { t.i0, t.i1, t.i2 };
+                for (int k = 0; k < 3; ++k) {
+                    uint32_t a = std::min(v[k], v[(k + 1) % 3]);
+                    uint32_t b = std::max(v[k], v[(k + 1) % 3]);
+                    edges.push_back((static_cast<uint64_t>(a) << 32u) | static_cast<uint64_t>(b));
+                }
+            }
+            std::sort(edges.begin(), edges.end());
+            outBoundaryEdges = 0;
+            int uniqueEdges = 0;
+            size_t i = 0;
+            while (i < edges.size()) {
+                size_t j = i + 1u;
+                while (j < edges.size() && edges[j] == edges[i]) ++j;
+                if ((j - i) != 2u) ++outBoundaryEdges;
+                ++uniqueEdges;
+                i = j;
+            }
+            outEuler = static_cast<int>(m.vertices.size()) - uniqueEdges + static_cast<int>(m.tris.size());
+        };
+
+        // 1. Raw float32 20x20x20 Sphere with anisotropic spacings (1.0, 1.0, 2.0) -> Z span is 2x X/Y span, Euler V-E+F == 2!
+        const int sN = 20;
+        const char* nrrdSphereHdr =
+            "NRRD0004\n"
+            "# Smooth 3D Sphere Volume\n"
+            "type: float\n"
+            "dimension: 3\n"
+            "sizes: 20 20 20\n"
+            "spacings: 1.0 1.0 2.0\n"
+            "endian: little\n"
+            "encoding: raw\n\n";
+        ByteWriter rawNrrd;
+        rawNrrd.Bytes(nrrdSphereHdr, std::strlen(nrrdSphereHdr));
+        for (int z = 0; z < sN; ++z) {
+            for (int y = 0; y < sN; ++y) {
+                for (int x = 0; x < sN; ++x) {
+                    float dx = static_cast<float>(x) - 9.5f;
+                    float dy = static_cast<float>(y) - 9.5f;
+                    float dz = static_cast<float>(z) - 9.5f;
+                    float r = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    float density = std::clamp(6.2f - r, 0.0f, 6.2f);
+                    rawNrrd.F32LE(density);
+                }
+            }
+        }
+
+        // 2. Gzip uint8 26x26x18 3D Torus -> genus-1 watertight surface (Euler V-E+F == 0!)
+        const int tXY = 26, tZ = 18;
+        std::vector<uint8_t> torusVox(static_cast<size_t>(tXY * tXY * tZ), 0u);
+        for (int z = 0; z < tZ; ++z) {
+            for (int y = 0; y < tXY; ++y) {
+                for (int x = 0; x < tXY; ++x) {
+                    float dx = static_cast<float>(x) - 12.5f;
+                    float dy = static_cast<float>(y) - 12.5f;
+                    float dz = static_cast<float>(z) - 8.5f;
+                    float q = std::sqrt(dx * dx + dy * dy) - 7.0f;
+                    float dTube = std::sqrt(q * q + dz * dz);
+                    float val = std::clamp((3.2f - dTube) / 3.2f, 0.0f, 1.0f);
+                    torusVox[static_cast<size_t>((z * tXY + y) * tXY + x)] = static_cast<uint8_t>(std::lround(val * 250.0f));
+                }
+            }
+        }
+        auto torusGz = TfGzipCompress(torusVox.data(), torusVox.size());
+        const char* nrrdTorusHdr =
+            "NRRD0005\n"
+            "type: uint8\n"
+            "dimension: 3\n"
+            "sizes: 26 26 18\n"
+            "spacings: 1.0 1.0 1.0\n"
+            "encoding: gzip\n\n";
+        ByteWriter gzNrrd;
+        gzNrrd.Bytes(nrrdTorusHdr, std::strlen(nrrdTorusHdr));
+        gzNrrd.Bytes(torusGz.data(), torusGz.size());
+
+        LoadedMesh3D mSphere, mTorus;
+        bool okSph = Model3DViewer::InspectMeshFile(writeBytes(L"sphere_raw.nrrd", rawNrrd.buf), mSphere);
+        bool okTor = Model3DViewer::InspectMeshFile(writeBytes(L"torus_gzip.nrrd", gzNrrd.buf), mTorus);
+
+        int bndSph = -1, eulerSph = -999, bndTor = -1, eulerTor = -999;
+        if (okSph) checkWatertightEuler(mSphere, bndSph, eulerSph);
+        if (okTor) checkWatertightEuler(mTorus,  bndTor, eulerTor);
+
+        tc.Record(okSph && okTor &&
+                  mSphere.rawTriangleCount > 300 && mTorus.rawTriangleCount > 400 &&
+                  bndSph == 0 && eulerSph == 2 &&
+                  bndTor == 0 && eulerTor == 0 &&
+                  std::fabs((mSphere.bboxSize.z / std::max(mSphere.bboxSize.x, 1e-3f)) - 2.0f) < 0.08f &&
+                  HashMeshGeometry(mSphere) != HashMeshGeometry(mTorus),
+                  L"Stage15.3D.NRRD.MarchingCubesRawSphereAndGzipTorusWatertight",
+                  L"sphTris=" + std::to_wstring(mSphere.rawTriangleCount) +
+                  L" sphEuler=" + std::to_wstring(eulerSph) +
+                  L" torTris=" + std::to_wstring(mTorus.rawTriangleCount) +
+                  L" torEuler=" + std::to_wstring(eulerTor));
+
+        // Reject constant all-zero NRRD & truncated raw NRRD
+        std::string zeroNrrd = "NRRD0004\ntype: uint8\ndimension: 3\nsizes: 4 4 4\nencoding: raw\n\n";
+        zeroNrrd.append(64, '\0');
+        LoadedMesh3D mZeroNrrd, mTruncNrrd;
+        bool okZero  = Model3DViewer::InspectMeshFile(writeBytes(L"constant_zero.nrrd",
+                           std::vector<uint8_t>(zeroNrrd.begin(), zeroNrrd.end())), mZeroNrrd);
+        bool okTrunc = Model3DViewer::InspectMeshFile(writeText(L"truncated.nrrd",
+                           "NRRD0004\ntype: float\ndimension: 3\nsizes: 16 16 16\nencoding: raw\n\nabcd"), mTruncNrrd);
+        tc.Record(!okZero && !okTrunc && mZeroNrrd.tris.empty() && mTruncNrrd.tris.empty(),
+                  L"Stage15.3D.NRRD.RejectConstantAndTruncated");
+    }
+
     for (const auto& f : createdFiles) {
         DeleteFileW(f.c_str());
     }

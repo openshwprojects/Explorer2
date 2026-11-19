@@ -30,7 +30,7 @@ static D2D1_COLOR_F SdvColor(uint32_t rgb, float a = 1.0f) {
 
 } // namespace
 
-#include "formats/GpsTrackMap.h"   // DrawGpsMapAndElevationView
+#include "formats/common/GpsTrackMap.h"   // DrawGpsMapAndElevationView
 #include <shellapi.h>
 
 void SpreadsheetDocViewer::Initialize(HWND parentHwnd) {

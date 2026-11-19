@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "BrotliDecode.h"
 
 namespace Explorer2::StreamCodecs {
 
@@ -95,5 +96,10 @@ bool DecompressXzStream(const uint8_t* data, size_t size, std::vector<uint8_t>& 
 bool DecompressBzip2Stream(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
 bool DecompressLz4Frame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
 bool DecompressZstdFrame(const uint8_t* data, size_t size, std::vector<uint8_t>& out, size_t maxOut = 128 * 1024 * 1024);
+
+inline bool DecompressBrotliStream(const uint8_t* data, size_t size, std::vector<uint8_t>& out,
+                                   size_t maxOut = 128 * 1024 * 1024, bool requireExactEnd = false) {
+    return ::Explorer2::Brotli::Decompress(data, size, out, maxOut, requireExactEnd);
+}
 
 } // namespace Explorer2::StreamCodecs

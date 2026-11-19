@@ -4,7 +4,7 @@
 #include "FileEngine.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
-#include "formats/AiModelFormats.h"
+#include "formats/common/AiModelDispatch.h"
 
 #include <cstdio>
 #include <cstring>
