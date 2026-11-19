@@ -407,7 +407,9 @@ enum CommandId : int {
     CMD_OPEN_RELEASES_PAGE       = 1047,     // status bar: the version / "new version" note
     CMD_UI_SCALE_UP              = 1048,
     CMD_UI_SCALE_DOWN            = 1049,
-    CMD_BASE_UI_SCALE            = 1050      // 1050..1069: the entries of the UI scale menu
+    CMD_BASE_UI_SCALE            = 1050,     // 1050..1069: the entries of the UI scale menu
+    CMD_NAV_SECTIONS_MENU        = 1070,     // "sections of the navigation pane" drop-down
+    CMD_BASE_NAV_SECTION         = 1071      // 1071..1078: its entries, one per FileEngine::NavSection bit
 };
 
 // Layout constants (in DIPs / pixels)

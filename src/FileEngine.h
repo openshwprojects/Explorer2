@@ -77,9 +77,18 @@ public:
 
     // Navigation tree builder (Quick Access + Drives) & dynamic subfolder expansion
     static std::vector<std::pair<std::wstring, std::wstring>> GetDefaultQuickAccessFolders(Lang lang);
+    // Sections of the tree that the user can switch off (File tab, "Ustawienia"); the drives are always shown
+    enum NavSection : unsigned {
+        kNavQuickAccess  = 1u << 0,
+        kNavCloudFolders = 1u << 1,     // Dropbox, OneDrive
+        kNavRecycleBin   = 1u << 2,
+        kNavFtpServers   = 1u << 3,
+        kNavAllSections  = 15u
+    };
     std::vector<TreeNode> BuildNavigationTree(
         Lang lang,
-        const std::vector<std::pair<std::wstring, std::wstring>>& pinnedQuickAccess);
+        const std::vector<std::pair<std::wstring, std::wstring>>& pinnedQuickAccess,
+        unsigned sections = kNavAllSections);
     static std::vector<TreeNode> EnumerateSubfoldersForTree(
         const std::wstring& parentPath,
         int childIndent,

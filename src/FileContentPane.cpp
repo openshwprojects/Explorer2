@@ -2,6 +2,7 @@
 #include "FormatSupport.h"
 #include "CommandIds.h"
 #include "PathUtils.h"
+#include "ThemeColors.h"
 #include "FileEngine.h"
 #include "FtpClient.h"
 #include "RepoBrowser.h"
@@ -25,8 +26,9 @@
 namespace Explorer2 {
 #include "formats/common/UnrealPackageCommon.h"
 
+// A colour of the light design, or its counterpart in the dark theme (ThemeColors.h)
 static D2D1_COLOR_F FcpColor(uint32_t rgb, float a = 1.0f) {
-    return PathUtils::ColorFromRgb(rgb, a);
+    return PathUtils::ColorFromRgb(ThemedPaneRgb(rgb), a);
 }
 
 static bool IsAiModelExtension(const std::wstring& ext) {
@@ -1485,7 +1487,7 @@ void FileContentPane::Draw(
             rt->FillRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), brush);
             brush->SetColor(active ? FcpColor(0x005A9E) : FcpColor(0x93C5FD));
             rt->DrawRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), brush, 1.0f);
-            brush->SetColor(active ? FcpColor(0xFFFFFF) : FcpColor(0x1E3A8A));
+            brush->SetColor(active ? PathUtils::ColorFromRgb(0xFFFFFF) : FcpColor(0x1E3A8A));    // white on the blue fill in both themes
         }
         fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), fmtSmall, br, brush);
@@ -1546,7 +1548,10 @@ void FileContentPane::Draw(
     }
     D2D1_RECT_F titleR = D2D1::RectF(hdrR.left + 8.0f, hdrR.top + 2.0f, std::max(hdrR.left + 20.0f, rx - 4.0f), hdrR.bottom);
     brush->SetColor(FcpColor(0x0F172A));
+    // Cut at the first mode button: a long name used to be drawn over the buttons
+    rt->PushAxisAlignedClip(titleR, D2D1_ANTIALIAS_MODE_ALIASED);
     rt->DrawTextW(hdrTitle.c_str(), static_cast<UINT32>(hdrTitle.size()), fmtBold, titleR, brush);
+    rt->PopAxisAlignedClip();
 
     m_bodyRect = D2D1::RectF(innerR.left, hdrR.bottom, innerR.right, innerR.bottom);
 
@@ -2025,9 +2030,10 @@ void FileContentPane::Draw(
                     rt->DrawBitmap(vbmp, dr);
                 }
             } else {
-                brush->SetColor(FcpColor(0x1E293B));
+                // A dark plate with a light caption in both themes (not FcpColor: both would be swapped)
+                brush->SetColor(PathUtils::ColorFromRgb(0x1E293B));
                 rt->FillRoundedRectangle(D2D1::RoundedRect(imgArea, 6.0f, 6.0f), brush);
-                brush->SetColor(FcpColor(0xF8FAFC));
+                brush->SetColor(PathUtils::ColorFromRgb(0xF8FAFC));
                 std::wstring noteLbl = L"\x266B  " + m_currentEntry.name;
                 rt->DrawTextW(noteLbl.c_str(), static_cast<UINT32>(noteLbl.size()), fmtCenterSmall, imgArea, brush);
             }

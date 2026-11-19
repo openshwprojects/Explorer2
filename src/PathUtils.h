@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include "PlatformCompat.h"   // <windows.h> on Windows
+#include "ThemeColors.h"
 #if defined(_WIN32) || defined(E2_WIN32_HAL)
 #include <d2d1.h>
 #include <dwrite.h>
@@ -327,6 +328,8 @@ inline D2D1_COLOR_F ColorFromRgb(uint32_t rgb, float a = 1.0f) {
         a);
 }
 
+// A toolbar button of the preview pane's viewers. themed = false keeps the light look in the dark theme too, for a
+// toolbar whose own background is not themed (the PCB viewer).
 inline void DrawToolbarButton(
     ID2D1RenderTarget* rt,
     ID2D1SolidColorBrush* brush,
@@ -335,21 +338,23 @@ inline void DrawToolbarButton(
     const wchar_t* label,
     bool active,
     bool hovered,
-    bool danger = false)
+    bool danger = false,
+    bool themed = true)
 {
     if (!rt || !brush || !fmt || !label) return;
+    auto col = [themed](uint32_t rgb) { return ColorFromRgb(themed ? ThemedPaneRgb(rgb) : rgb); };
     if (danger) {
-        brush->SetColor(hovered ? ColorFromRgb(0xFEE2E2) : ColorFromRgb(0xFFF1F2));
+        brush->SetColor(hovered ? col(0xFEE2E2) : col(0xFFF1F2));
         rt->FillRoundedRectangle(D2D1::RoundedRect(r, 3.0f, 3.0f), brush);
-        brush->SetColor(hovered ? ColorFromRgb(0xEF4444) : ColorFromRgb(0xFECDD3));
+        brush->SetColor(hovered ? col(0xEF4444) : col(0xFECDD3));
         rt->DrawRoundedRectangle(D2D1::RoundedRect(r, 3.0f, 3.0f), brush, 1.0f);
-        brush->SetColor(ColorFromRgb(0xDC2626));
+        brush->SetColor(col(0xDC2626));
     } else {
-        brush->SetColor(active ? ColorFromRgb(0xDBEAFE) : (hovered ? ColorFromRgb(0xE2E8F0) : ColorFromRgb(0xFFFFFF)));
+        brush->SetColor(active ? col(0xDBEAFE) : (hovered ? col(0xE2E8F0) : col(0xFFFFFF)));
         rt->FillRoundedRectangle(D2D1::RoundedRect(r, 3.0f, 3.0f), brush);
-        brush->SetColor(active ? ColorFromRgb(0x0067B8) : ColorFromRgb(0xCBD5E1));
+        brush->SetColor(active ? col(0x0067B8) : col(0xCBD5E1));
         rt->DrawRoundedRectangle(D2D1::RoundedRect(r, 3.0f, 3.0f), brush, 1.0f);
-        brush->SetColor(active ? ColorFromRgb(0x005A9E) : ColorFromRgb(0x1E293B));
+        brush->SetColor(active ? col(0x005A9E) : col(0x1E293B));
     }
     DWRITE_TEXT_ALIGNMENT prevAlign = fmt->GetTextAlignment();
     fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);

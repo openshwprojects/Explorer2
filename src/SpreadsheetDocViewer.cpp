@@ -2,6 +2,7 @@
 #include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
+#include "ThemeColors.h"
 #include "ZipDeflate.h"
 #include "Ole2Compound.h"
 #pragma comment(lib, "bcrypt.lib")
@@ -23,8 +24,9 @@ namespace Explorer2 {
 
 namespace {
 
+// A colour of the light design, or its counterpart in the dark theme (ThemeColors.h)
 static D2D1_COLOR_F SdvColor(uint32_t rgb, float a = 1.0f) {
-    return PathUtils::ColorFromRgb(rgb, a);
+    return PathUtils::ColorFromRgb(ThemedPaneRgb(rgb), a);
 }
 
 

@@ -1721,27 +1721,47 @@ std::vector<std::pair<std::wstring, std::wstring>> FileEngine::GetDefaultQuickAc
 
 std::vector<TreeNode> FileEngine::BuildNavigationTree(
     Lang lang,
-    const std::vector<std::pair<std::wstring, std::wstring>>& pinnedQuickAccess)
+    const std::vector<std::pair<std::wstring, std::wstring>>& pinnedQuickAccess,
+    unsigned sections)
 {
     std::vector<TreeNode> nodes;
     const Strings& s = GetStrings(lang);
 
     // 1. Quick Access Header (expanded by default)
-    TreeNode qaHeader;
-    qaHeader.label = s.navQuickAccess;
-    qaHeader.normKey = L"__HEADER_QA__";
-    qaHeader.indent = 0;
-    qaHeader.isHeader = true;
-    qaHeader.isQuickAccess = true;
-    qaHeader.hasChildren = true;
-    qaHeader.isExpanded = true;
-    nodes.push_back(qaHeader);
+    const bool showQuickAccess = (sections & kNavQuickAccess) != 0;
+    if (showQuickAccess) {
+        TreeNode qaHeader;
+        qaHeader.label = s.navQuickAccess;
+        qaHeader.normKey = L"__HEADER_QA__";
+        qaHeader.indent = 0;
+        qaHeader.isHeader = true;
+        qaHeader.isQuickAccess = true;
+        qaHeader.hasChildren = true;
+        qaHeader.isExpanded = true;
+        nodes.push_back(qaHeader);
+    }
+
+    // A pin that is one of the user's own folders is shown under the name the program has for it in its language
+    // ("Pulpit"), as on the very first start. The settings file keeps only the path, and a label made from the path
+    // is the folder's name on disk ("Desktop"), which is what every later start used to show.
+    std::vector<std::pair<std::wstring, std::wstring>> ownFolders;
+    if (showQuickAccess) {
+        ownFolders = GetDefaultQuickAccessFolders(lang);
+        for (auto& own : ownFolders) own.second = PathUtils::NormalizePathKey(own.second);
+    }
 
     for (const auto& [label, path] : pinnedQuickAccess) {
+        if (!showQuickAccess) break;
         TreeNode n;
         n.label = label;
         n.path = path;
         n.normKey = PathUtils::NormalizePathKey(path);
+        for (const auto& [ownLabel, ownKey] : ownFolders) {
+            if (ownKey == n.normKey) {
+                n.label = ownLabel;
+                break;
+            }
+        }
         n.indent = 1;
         n.isQuickAccess = true;
         n.hasChildren = true;
@@ -1750,7 +1770,7 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
     }
 
     wchar_t userProfile[MAX_PATH] = {};
-    if (GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH)) {
+    if ((sections & kNavCloudFolders) && GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH)) {
         std::wstring dropboxPath = std::wstring(userProfile) + L"\\Dropbox";
         if (GetFileAttributesW(dropboxPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
             TreeNode n;
@@ -1776,7 +1796,7 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
     }
 
     // Recycle Bin ("Kosz") virtual folder at top level
-    {
+    if (sections & kNavRecycleBin) {
         TreeNode binNode;
         binNode.label = s.navRecycleBin;
         binNode.path = L"RECYCLE_BIN";
@@ -1929,7 +1949,7 @@ std::vector<TreeNode> FileEngine::BuildNavigationTree(
 #endif
 
     // FTP / FileZilla (FTPS) section under Ten komputer
-    {
+    if (sections & kNavFtpServers) {
         auto ftpSites = FtpClient::LoadBookmarks();
         TreeNode ftpGroup;
         ftpGroup.label = (lang == Lang::PL) ? L"FTP / FileZilla (FTPS)" : L"FTP / FileZilla (FTPS)";

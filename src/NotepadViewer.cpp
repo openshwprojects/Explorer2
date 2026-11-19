@@ -1,5 +1,6 @@
 #include "NotepadViewer.h"
 #include "PathUtils.h"
+#include "ThemeColors.h"
 #include "AppLog.h"
 #include <shellapi.h>
 #include <commdlg.h>
@@ -12,8 +13,9 @@ namespace Explorer2 {
 static constexpr int ID_NOTEPAD_PANE_EDIT = 1995;
 static constexpr size_t kMaxEditableFileBytes = 4 * 1024 * 1024; // 4 MB editable, above that 1 MB preview
 
+// A colour of the light design, or its counterpart in the dark theme (ThemeColors.h)
 static D2D1_COLOR_F NpColor(uint32_t rgb, float a = 1.0f) {
-    return PathUtils::ColorFromRgb(rgb, a);
+    return PathUtils::ColorFromRgb(ThemedPaneRgb(rgb), a);
 }
 
 static WNDPROC g_origNotepadEditProc = nullptr;
@@ -1000,9 +1002,10 @@ void NotepadViewer::Draw(
         m_toolbarHits.push_back({ id, br });
         bool hov = (m_hoverBtnId == id);
         if (primary) {
-            brush->SetColor(hov ? NpColor(0x005A9E) : NpColor(0x0078D7));
+            // Blue with a white caption in both themes (not NpColor: the dark theme would swap them)
+            brush->SetColor(hov ? PathUtils::ColorFromRgb(0x005A9E) : PathUtils::ColorFromRgb(0x0078D7));
             rt->FillRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), brush);
-            brush->SetColor(NpColor(0xFFFFFF));
+            brush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF));
         } else {
             brush->SetColor(highlighted ? NpColor(0xDBEAFE) : (hov ? NpColor(0xE2E8F0) : NpColor(0xFFFFFF)));
             rt->FillRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), brush);

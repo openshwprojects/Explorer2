@@ -278,6 +278,10 @@ ExplorerApp::~ExplorerApp() {
     m_textLayouts.Clear();
     if (m_fmtRegular) m_fmtRegular->Release();
     if (m_fmtSmall) m_fmtSmall->Release();
+    if (m_fmtSmallTrim) m_fmtSmallTrim->Release();
+#ifdef _WIN32
+    if (m_darkEditBrush) DeleteObject(m_darkEditBrush);
+#endif
     if (m_fmtBold) m_fmtBold->Release();
     if (m_fmtCenterSmall) m_fmtCenterSmall->Release();
     if (m_fmtViewerHud) m_fmtViewerHud->Release();
@@ -519,6 +523,21 @@ bool ExplorerApp::CreateDeviceIndependentResources() {
         m_fmtSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
 
+    // The same, for captions that must stay inside their box (ribbon tabs and group titles): cut with an ellipsis
+    m_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        11.0f, L"pl-PL", &m_fmtSmallTrim);
+    if (m_fmtSmallTrim) {
+        m_fmtSmallTrim->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        m_fmtSmallTrim->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        DWRITE_TRIMMING trim = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+        IDWriteInlineObject* ellipsis = nullptr;
+        m_dwriteFactory->CreateEllipsisTrimmingSign(m_fmtSmallTrim, &ellipsis);
+        m_fmtSmallTrim->SetTrimming(&trim, ellipsis);
+        if (ellipsis) ellipsis->Release();
+    }
+
     m_dwriteFactory->CreateTextFormat(
         L"Segoe UI", nullptr,
         DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
@@ -683,6 +702,19 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_ERASEBKGND:
         return 1;
+
+#ifdef _WIN32
+    case WM_CTLCOLOREDIT:
+        // The address, search and rename boxes are real EDIT controls: in the dark theme they are dark as well
+        // (they stayed white with black text, a bright box in a dark window)
+        if (m_darkMode) {
+            if (!m_darkEditBrush) m_darkEditBrush = CreateSolidBrush(RGB(0x18, 0x1B, 0x20));
+            SetTextColor(reinterpret_cast<HDC>(wParam), RGB(0xE2, 0xE8, 0xF0));
+            SetBkColor(reinterpret_cast<HDC>(wParam), RGB(0x18, 0x1B, 0x20));
+            return reinterpret_cast<LRESULT>(m_darkEditBrush);
+        }
+        break;
+#endif
 
     case WM_PAINT:
         OnPaint();
@@ -2701,6 +2733,8 @@ void ExplorerApp::LoadUiSettings() {
     m_uiScalePct = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"UiScalePct", 100, ini.c_str())), 75, 250);
 #endif
     m_openMediaExternally = GetPrivateProfileIntW(L"UI", L"MediaOpenExternal", 0, ini.c_str()) != 0;
+    m_navSections = static_cast<unsigned>(GetPrivateProfileIntW(L"UI", L"NavSections", static_cast<int>(FileEngine::kNavAllSections), ini.c_str())) &
+                    FileEngine::kNavAllSections;
     m_mediaPlayer.SetVolume(std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"MediaVolumePct", 100, ini.c_str())), 0, 100) / 100.0);
     m_mediaPlayer.SetMuted(GetPrivateProfileIntW(L"UI", L"MediaMuted", 0, ini.c_str()) != 0);
 
@@ -2899,6 +2933,7 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
     content += L"PreviewPaneWidth=" + std::to_wstring(prevW) + L"\r\n";
     content += L"UiScalePct=" + std::to_wstring(m_uiScalePct) + L"\r\n";
     content += L"MediaOpenExternal="; content += (m_openMediaExternally ? L"1\r\n" : L"0\r\n");
+    content += L"NavSections=" + std::to_wstring(m_navSections) + L"\r\n";
     content += L"MediaVolumePct=" + std::to_wstring(static_cast<int>(std::lround(m_mediaPlayer.GetVolume() * 100.0))) + L"\r\n";
     content += L"MediaMuted="; content += (m_mediaPlayer.IsMuted() ? L"1\r\n" : L"0\r\n");
     content += L"SortCol=" + std::to_wstring(static_cast<int>(m_sortCol)) + L"\r\n";
@@ -4701,6 +4736,9 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_TAB_FILE:
         m_activeRibbonTab = RibbonTab::File;
         m_ribbonCollapsed = false;
+        // As Home, Share, View and Search do: coming from a tool tab (Log, Monitoring, LAN...) the files are shown
+        // again. Without this the window fell back to the hardware view, which no click had asked for.
+        if (m_viewMode == ViewMode::Hardware) m_viewMode = m_lastNonViewerMode;
         break;
     case CMD_TAB_HOME:
         m_activeRibbonTab = RibbonTab::Home;
@@ -5212,6 +5250,9 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         break;
     case CMD_UI_SCALE_MENU:
         ShowUiScaleMenu();
+        return;
+    case CMD_NAV_SECTIONS_MENU:
+        ShowNavSectionsMenu();
         return;
     case CMD_UI_SCALE_UP:
     case CMD_UI_SCALE_DOWN: {
@@ -6495,10 +6536,11 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
               L"  \x2022 F11 / Spacja                       — Pełny ekran / Odtwarzaj-Pauza wideo\n"
               L"  \x2022 Kółko myszy (w Pełnym podglądzie)  - Obraz: powiększenie do 16\xD7. Wideo i audio: przewijanie co 5 s (Shift + kółko: powiększenie)\n"
               L"  \x2022 Ctrl + strzałki, M (wideo i audio) - W lewo / w prawo: 5 s wstecz / dalej. W górę / w dół: głośność. M: wycisz"
-#ifdef _WIN32
               L"\n\nWYGLĄD:\n"
-              L"  \x2022 Ctrl i +, Ctrl i -, Ctrl i 0       - Skala interfejsu: większa, mniejsza, 100% (także: karta Plik)"
+#ifdef _WIN32
+              L"  \x2022 Ctrl i +, Ctrl i -, Ctrl i 0       - Skala interfejsu: większa, mniejsza, 100% (także: karta Plik)\n"
 #endif
+              L"  \x2022 Karta Plik, \"Sekcje panelu nawigacji\" - Co widać w panelu po lewej: Szybki dostęp, Dropbox i OneDrive, Kosz, serwery FTP"
             : L"NAVIGATION & TABS:\n"
               L"  \x2022 Ctrl + T / Middle-Click            — Open folder in new tab\n"
               L"  \x2022 Ctrl + W / Ctrl + Tab              — Close tab / Switch to next tab\n"
@@ -6517,10 +6559,11 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
               L"  \x2022 F11 / Space                        — Fullscreen / Play-Pause media\n"
               L"  \x2022 Mouse Wheel (in FullViewer)        - Image: zoom up to 16\xD7. Video and audio: seek 5 s a notch (Shift + wheel: zoom)\n"
               L"  \x2022 Ctrl + arrows, M (video and audio) - Left / Right: 5 s back / forward. Up / Down: volume. M: mute"
-#ifdef _WIN32
               L"\n\nAPPEARANCE:\n"
-              L"  \x2022 Ctrl and +, Ctrl and -, Ctrl and 0 - UI scale: larger, smaller, 100% (also: File tab)"
+#ifdef _WIN32
+              L"  \x2022 Ctrl and +, Ctrl and -, Ctrl and 0 - UI scale: larger, smaller, 100% (also: File tab)\n"
 #endif
+              L"  \x2022 File tab, \"Navigation pane sections\" - What the pane on the left shows: Quick access, Dropbox and OneDrive, Recycle Bin, FTP servers"
               ;
         MessageBoxW(m_hwnd, body, title, MB_OK | MB_ICONINFORMATION);
         break;
@@ -7768,7 +7811,7 @@ void ExplorerApp::ShowDeleteDropdownMenu(int screenX, int screenY) {
 }
 
 void ExplorerApp::RebuildTreeNodes() {
-    m_treeNodes = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+    m_treeNodes = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders, m_navSections);
     m_fileEngine.RequestTreeFolderSizes(m_treeNodes, false);
     m_fileEngine.SyncTreeNodeSizes(m_treeNodes);
     EnsureWorkAnimTimerState();
@@ -7804,19 +7847,19 @@ void ExplorerApp::ToggleTreeNodeExpand(int nodeIndex) {
     // Case 2: Node is collapsed -> expand ("rozwiń") its immediate children!
     std::vector<TreeNode> children;
     if (node.isHeader && node.isQuickAccess) {
-        auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+        auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders, m_navSections);
         for (size_t i = 1; i < fullTree.size() && fullTree[i].isQuickAccess && !fullTree[i].isHeader; ++i) {
             children.push_back(fullTree[i]);
         }
     } else if (node.isHeader && node.path == L"THIS_PC") {
-        auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+        auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders, m_navSections);
         bool afterPc = false;
         for (const auto& tn : fullTree) {
             if (tn.path == L"THIS_PC" && tn.isHeader) { afterPc = true; continue; }
             if (afterPc) children.push_back(tn);
         }
     } else if (node.normKey == L"__HEADER_FTP__") {
-        auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+        auto fullTree = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders, m_navSections);
         bool afterFtp = false;
         for (const auto& tn : fullTree) {
             if (tn.normKey == L"__HEADER_FTP__") { afterFtp = true; continue; }
@@ -7878,6 +7921,11 @@ void ExplorerApp::PinFolderToQuickAccess(const std::wstring& folderPath) {
     std::wstring label = PathUtils::GetFileName(folderPath);
     if (label.empty()) label = folderPath;
     m_pinnedFolders.push_back({ label, folderPath });
+    if (!(m_navSections & FileEngine::kNavQuickAccess)) {
+        // Pinned into a hidden section: the section comes back, or the pin would seem to have done nothing
+        m_navSections |= FileEngine::kNavQuickAccess;
+        SaveUiSettings();
+    }
     RebuildTreeNodes();
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
@@ -9157,6 +9205,49 @@ void ExplorerApp::ShowUiScaleMenu() {
     }
 }
 
+// ---- Sections of the navigation pane -------------------------------------------------------------------------
+
+// Which parts of the tree on the left are shown: a menu of check marks. The drives are always there.
+void ExplorerApp::ShowNavSectionsMenu() {
+    const bool pl = (m_lang == Lang::PL);
+    const Strings& s = GetStrings(m_lang);
+    struct Entry { unsigned bit; std::wstring label; };
+    const Entry entries[] = {
+        { FileEngine::kNavQuickAccess,  s.navQuickAccess },
+        { FileEngine::kNavCloudFolders, pl ? L"Dropbox i OneDrive" : L"Dropbox and OneDrive" },
+        { FileEngine::kNavRecycleBin,   s.navRecycleBin },
+        { FileEngine::kNavFtpServers,   pl ? L"Serwery FTP" : L"FTP servers" },
+    };
+    HMENU hMenu = CreatePopupMenu();
+    for (size_t i = 0; i < std::size(entries); ++i) {
+        AppendMenuW(hMenu, MF_STRING | ((m_navSections & entries[i].bit) ? MF_CHECKED : MF_UNCHECKED),
+                    CMD_BASE_NAV_SECTION + static_cast<UINT>(i), entries[i].label.c_str());
+    }
+    POINT pt = {};
+    GetCursorPos(&pt);
+    for (const auto& hit : m_ribbonHits) {
+        if (hit.id == CMD_NAV_SECTIONS_MENU) {
+            pt = ClientDipToScreen(hit.rect.left, hit.rect.bottom);
+            break;
+        }
+    }
+    const int sel = static_cast<int>(TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr));
+    DestroyMenu(hMenu);
+    if (sel < CMD_BASE_NAV_SECTION || sel >= CMD_BASE_NAV_SECTION + static_cast<int>(std::size(entries))) return;
+    const Entry& e = entries[sel - CMD_BASE_NAV_SECTION];
+    m_navSections ^= e.bit;
+    const bool shown = (m_navSections & e.bit) != 0;
+    RebuildTreeNodes();
+    m_treeScrollY = 0.0f;
+    m_statusToast = e.label + (shown ? (pl ? L": widać w panelu nawigacji" : L": shown in the navigation pane")
+                                     : (pl ? L": ukryto w panelu nawigacji (karta Plik, \"Sekcje panelu nawigacji\")"
+                                           : L": hidden from the navigation pane (File tab, \"Navigation pane sections\")"));
+    m_statusToastExpireTick = GetTickCount64() + 4000;
+    SaveUiSettings();
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
 // ---- Player volume and seeking -------------------------------------------------------------------------------
 
 void ExplorerApp::SetMediaVolumeFromX(float x) {
@@ -9224,7 +9315,7 @@ void ExplorerApp::OnDrivesChanged() {
 
     // The drives under "Ten komputer" are replaced one by one, so that folders the user has opened in the tree
     // (on drives that are still there) stay open. A collapsed "Ten komputer" lists its drives when it is opened.
-    const std::vector<TreeNode> fresh = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+    const std::vector<TreeNode> fresh = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders, m_navSections);
     int header = -1;
     for (int i = 0; i < static_cast<int>(m_treeNodes.size()); ++i) {
         if (m_treeNodes[i].normKey == L"__HEADER_PC__") { header = i; break; }

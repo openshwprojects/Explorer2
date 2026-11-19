@@ -2,6 +2,7 @@
 #include "ReaderGuard.h"
 #include "ZipDeflate.h"
 #include "PathUtils.h"
+#include "ThemeColors.h"
 #include "FileEngine.h"
 #include <wincodec.h>
 #include <shcore.h>
@@ -58,8 +59,9 @@ CreateStreamOverRasFn GetCreateStreamOverRandomAccessStream() {
 }
 #endif
 
+// A colour of the light design, or its counterpart in the dark theme (ThemeColors.h)
 static D2D1_COLOR_F PdfColor(uint32_t rgb, float a = 1.0f) {
-    return PathUtils::ColorFromRgb(rgb, a);
+    return PathUtils::ColorFromRgb(ThemedPaneRgb(rgb), a);
 }
 
 // Decodes a PDF literal string (...) or hex string <...> into UTF-16
@@ -983,9 +985,10 @@ void PdfViewer::Draw(
         D2D1_RECT_F pageR = D2D1::RectF(cx - drawW * 0.5f, cy - drawH * 0.5f, cx + drawW * 0.5f, cy + drawH * 0.5f);
 
         // Drop shadow + white paper sheet
-        brush->SetColor(PdfColor(0x64748B, 0.45f));
+        // The sheet is paper in both themes (not PdfColor)
+        brush->SetColor(PathUtils::ColorFromRgb(0x64748B, 0.45f));
         rt->FillRectangle(D2D1::RectF(pageR.left + 4.0f, pageR.top + 5.0f, pageR.right + 4.0f, pageR.bottom + 5.0f), brush);
-        brush->SetColor(PdfColor(0xFFFFFF));
+        brush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF));
         rt->FillRectangle(pageR, brush);
 
         if (m_d2dPageBitmap) {
@@ -1014,9 +1017,10 @@ void PdfViewer::Draw(
             const float noteW = 150.0f;
             const float ncx = (m_viewportRect.left + m_viewportRect.right) * 0.5f;
             D2D1_RECT_F noteR = D2D1::RectF(ncx - noteW * 0.5f, m_viewportRect.top + 10.0f, ncx + noteW * 0.5f, m_viewportRect.top + 34.0f);
-            brush->SetColor(PdfColor(0x0F172A, 0.78f));
+            // A dark note with white text over the page, in both themes (not PdfColor)
+            brush->SetColor(PathUtils::ColorFromRgb(0x0F172A, 0.78f));
             rt->FillRoundedRectangle(D2D1::RoundedRect(noteR, 11.0f, 11.0f), brush);
-            brush->SetColor(PdfColor(0xFFFFFF));
+            brush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF));
             fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             rt->DrawText(note, static_cast<UINT32>(wcslen(note)), fmtSmall,
                 D2D1::RectF(noteR.left, noteR.top + 4.0f, noteR.right, noteR.bottom), brush);

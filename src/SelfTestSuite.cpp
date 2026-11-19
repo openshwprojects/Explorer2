@@ -29,6 +29,7 @@
 #include "SelfTestCommon.h"
 #include "Version.h"
 #include "DetailsColumns.h"
+#include "RibbonTabLayout.h"
 #include "UpdateCheck.h"
 #include "WinEOverride.h"
 #include <winver.h>
@@ -7349,6 +7350,99 @@ static void RunStage16Tests(TestCounter& tc) {
                         ExeOfCommand(L"  \"D:\\e2.exe\"") == L"D:\\e2.exe" &&
                         ExeOfCommand(L"").empty();
         tc.Record(ok, L"Stage16.Test8_WinEOverride_ExeOfCommand");
+    }
+    {
+        // The ribbon's twelve tabs: designed widths and (roughly) the widths of the Polish captions
+        const std::vector<float> natural = { 56, 112, 96, 66, 92, 74, 74, 80, 84, 52, 98, 48 };
+        const std::vector<float> textW   = { 22, 97, 80, 36, 76, 54, 38, 56, 62, 24, 84, 20 };
+        auto total = [](const std::vector<float>& v) { float t = 0.0f; for (float x : v) t += x; return t; };
+
+        // Room for all: the designed widths
+        const std::vector<float> roomy = FitRibbonTabWidths(natural, textW, 1100.0f);
+        bool ok1 = (roomy == natural);
+
+        // A little too narrow: every caption still whole, the strip filled exactly
+        const std::vector<float> snug = FitRibbonTabWidths(natural, textW, 860.0f);
+        bool ok2 = std::fabs(total(snug) - 860.0f) < 0.5f;
+        for (size_t i = 0; i < snug.size(); ++i) ok2 = ok2 && snug[i] >= textW[i] + kRibbonTabPadTight - 0.01f && snug[i] <= natural[i] + 0.01f;
+
+        // Much too narrow (150% UI scale in a 1224 px window leaves 670): short captions whole, the long ones cut
+        // to one common width, and nothing wider than the room
+        const std::vector<float> tight = FitRibbonTabWidths(natural, textW, 670.0f);
+        bool ok3 = total(tight) <= 670.5f;
+        float cutWidth = 0.0f;
+        int cutCount = 0;
+        for (size_t i = 0; i < tight.size(); ++i) {
+            const float need = textW[i] + kRibbonTabPadTight;
+            if (tight[i] < need - 0.01f) {
+                ++cutCount;
+                if (cutWidth == 0.0f) cutWidth = tight[i];
+                ok3 = ok3 && std::fabs(tight[i] - cutWidth) < 0.01f;
+            } else {
+                ok3 = ok3 && std::fabs(tight[i] - need) < 0.01f;
+            }
+        }
+        ok3 = ok3 && cutCount >= 2 && cutCount <= 5 && cutWidth >= 60.0f &&
+              std::fabs(tight[9] - (24.0f + kRibbonTabPadTight)) < 0.01f;       // "LAN" is never cut
+
+        // Absurdly narrow: no tab below the minimum (the strip is then wider than the room, which the caller clips)
+        const std::vector<float> tiny = FitRibbonTabWidths(natural, textW, 100.0f);
+        bool ok4 = true;
+        for (float w : tiny) ok4 = ok4 && w >= kRibbonTabMinWidth - 0.01f;
+
+        // A caption longer than its tab's design gets the room it needs while there is room
+        const std::vector<float> longCap = FitRibbonTabWidths({ 50.0f, 50.0f }, { 80.0f, 20.0f }, 400.0f);
+        const bool ok5 = longCap.size() == 2 && std::fabs(longCap[0] - (80.0f + kRibbonTabPadRoomy)) < 0.01f && longCap[1] == 50.0f;
+
+        tc.Record(ok1 && ok2 && ok3 && ok4 && ok5 && FitRibbonTabWidths({}, {}, 500.0f).empty(),
+                  L"Stage16.Test10_RibbonTabs_FitWithoutOverlap",
+                  std::wstring(L"roomy=") + (ok1 ? L"ok" : L"FAIL") + L" snug=" + (ok2 ? L"ok" : L"FAIL") +
+                  L" tight=" + (ok3 ? L"ok" : L"FAIL") + L" (cut " + std::to_wstring(cutCount) + L" to " + std::to_wstring(static_cast<int>(cutWidth)) +
+                  L") tiny=" + (ok4 ? L"ok" : L"FAIL") + L" longCaption=" + (ok5 ? L"ok" : L"FAIL"));
+    }
+    {
+        // Sections of the navigation tree can be switched off; the drives stay
+        FileEngine fe;
+        const std::vector<std::pair<std::wstring, std::wstring>> noPins;
+        auto has = [](const std::vector<TreeNode>& nodes, const wchar_t* normKey) {
+            for (const auto& n : nodes) { if (n.normKey == normKey) return true; }
+            return false;
+        };
+        const auto all = fe.BuildNavigationTree(Lang::PL, noPins);
+        const auto none = fe.BuildNavigationTree(Lang::PL, noPins, 0u);
+        const auto onlyBin = fe.BuildNavigationTree(Lang::PL, noPins, FileEngine::kNavRecycleBin);
+        const bool ok = !all.empty() && all[0].normKey == L"__HEADER_QA__" &&
+                        has(all, L"__RECYCLE_BIN__") && has(all, L"__HEADER_FTP__") && has(all, L"__HEADER_PC__") &&
+                        !none.empty() && none[0].normKey == L"__HEADER_PC__" &&
+                        !has(none, L"__HEADER_QA__") && !has(none, L"__RECYCLE_BIN__") && !has(none, L"__HEADER_FTP__") &&
+                        has(onlyBin, L"__RECYCLE_BIN__") && !has(onlyBin, L"__HEADER_QA__") && !has(onlyBin, L"__HEADER_FTP__") &&
+                        has(onlyBin, L"__HEADER_PC__");
+        tc.Record(ok, L"Stage16.Test11_NavTree_SectionsCanBeHidden",
+                  L"all=" + std::to_wstring(all.size()) + L" none=" + std::to_wstring(none.size()) + L" onlyBin=" + std::to_wstring(onlyBin.size()));
+    }
+    {
+        // A pin read back from the settings file has only its path: one of the user's own folders (Desktop,
+        // Downloads...) is still shown under the program's name for it, in the program's language
+        FileEngine fe;
+        bool ok = true;
+        size_t checked = 0;
+        for (Lang lang : { Lang::PL, Lang::EN }) {
+            const auto own = FileEngine::GetDefaultQuickAccessFolders(lang);
+            std::vector<std::pair<std::wstring, std::wstring>> pins;
+            for (const auto& [label, path] : own) {
+                std::wstring raw = PathUtils::GetFileName(path);
+                pins.push_back({ raw.empty() ? path : raw, path });         // as LoadUiSettings makes them
+            }
+            pins.push_back({ L"zwykly_folder", L"C:\\e2_selftest_no_such_folder\\zwykly_folder" });
+            const auto tree = fe.BuildNavigationTree(lang, pins, FileEngine::kNavQuickAccess);
+            ok = ok && tree.size() >= pins.size() + 1;
+            for (size_t i = 0; ok && i < own.size(); ++i) {
+                ok = tree[i + 1].isQuickAccess && tree[i + 1].label == own[i].first && tree[i + 1].path == own[i].second;
+                ++checked;
+            }
+            ok = ok && tree[own.size() + 1].label == L"zwykly_folder";     // any other pin keeps its own label
+        }
+        tc.Record(ok, L"Stage16.Test12_NavTree_PinnedOwnFoldersKeepLocalizedNames", L"folders checked: " + std::to_wstring(checked));
     }
 #ifdef _WIN32
     {

@@ -5,6 +5,8 @@
 #include "NetShares.h"
 #include "RepoBrowser.h"
 #include "SvnWorkingCopy.h"
+#include "RibbonTabLayout.h"
+#include "ThemeColors.h"
 #include "Version.h"
 #include <shlwapi.h>
 #include <wincodec.h>
@@ -19,56 +21,8 @@
 
 namespace Explorer2 {
 
-static bool g_renderDarkMode = false;
-
 static D2D1_COLOR_F HexColor(uint32_t rgb, float a = 1.0f) {
-    if (g_renderDarkMode) {
-        switch (rgb) {
-        case 0xFFFFFF: rgb = 0x181B20; break;
-        case 0xF8FAFC:
-        case 0xF5F6F7:
-        case 0xF3F3F3:
-        case 0xF1F5F9:
-        case 0xF0F3F6:
-        case 0xEEF2F6: rgb = 0x1E222A; break;
-        case 0xEFF6FF:
-        case 0xEBF5FF:
-        case 0xE8EEF4:
-        case 0xE8EEF5:
-        case 0xE2E8F0: rgb = 0x262C36; break;
-        case 0xE5F3FB:
-        case 0xE5F3FF:
-        case 0xE8F1FB:
-        case 0xE1ECF4:
-        case 0xDBEAFE:
-        case 0xDCEBFC:
-        case 0xE0F2FE: rgb = 0x243B55; break;
-        case 0xCBE8F6:
-        case 0xCCE8FF: rgb = 0x1E4976; break;
-        case 0xDADADA:
-        case 0xDFDFDF:
-        case 0xD9D9D9:
-        case 0xE5E5E5:
-        case 0xCBD5E1:
-        case 0xD1D5DB:
-        case 0xCCCCCC: rgb = 0x333B48; break;
-        case 0x0F172A:
-        case 0x111111:
-        case 0x1E1E1E:
-        case 0x1E293B:
-        case 0x2B2B2B:
-        case 0x333333: rgb = 0xE2E8F0; break;
-        case 0x334155:
-        case 0x454545:
-        case 0x475569:
-        case 0x4C566A: rgb = 0xCBD5E1; break;
-        case 0x555555:      // date, type and size of the details view
-        case 0x64748B:
-        case 0x666666:
-        case 0x6E6E6E:
-        case 0x767676: rgb = 0x94A3B8; break;
-        }
-    }
+    if (g_darkTheme) rgb = DarkThemeRgb(rgb);       // ThemeColors.h
     return D2D1::ColorF(
         ((rgb >> 16) & 0xFF) / 255.0f,
         ((rgb >> 8) & 0xFF) / 255.0f,
@@ -102,7 +56,7 @@ void ExplorerApp::OnPaint() {
 
     m_rt->BeginDraw();
     m_rt->SetTransform(D2D1::Matrix3x2F::Identity());
-    g_renderDarkMode = m_darkMode;
+    g_darkTheme = m_darkMode;
     // New icons and thumbnails get 8 ms of this paint; what is left waits for the next one (see ImageCache.h)
     m_imageCache.BeginPaintBudget(8.0);
     m_rt->Clear(HexColor(0xFFFFFF));
@@ -941,22 +895,29 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         { CMD_TAB_LOG,        RibbonTab::Log,        L"Log",        48.0f, false }
     };
 
-    // A narrow window (1024 px and less) squeezes the tabs so that the last ones stay clear of the buttons on the right
-    float tabsTotalW = 0.0f;
-    for (const auto& t : tabs) tabsTotalW += t.width;
+    // A window too narrow for all tabs at their designed widths (1024 px and less, or a large UI scale) gives up the
+    // padding first and then cuts the longest captions, so that the last tabs stay clear of the buttons on the right
+    // and no caption runs into the next one (RibbonTabLayout.h)
     const float tabsAvailW = std::max(200.0f, (rect.right - 146.0f) - rect.left);
-    const float tabScale = (tabsTotalW > tabsAvailW) ? (tabsAvailW / tabsTotalW) : 1.0f;
+    std::vector<float> tabNatural, tabTextW;
+    for (const auto& t : tabs) {
+        tabNatural.push_back(t.width);
+        tabTextW.push_back(MeasureTextWidth(t.label, m_fmtSmall));
+    }
+    const std::vector<float> tabWidths = FitRibbonTabWidths(tabNatural, tabTextW, tabsAvailW);
 
     float tx = rect.left;
-    for (const auto& t : tabs) {
-        const float tabW = t.width * tabScale;
+    for (size_t ti = 0; ti < std::size(tabs); ++ti) {
+        const auto& t = tabs[ti];
+        const float tabW = tabWidths[ti];
+        const bool cutCaption = tabW < tabTextW[ti] + kRibbonTabPadTight - 0.5f;
         D2D1_RECT_F tr = D2D1::RectF(tx, rect.top + 3.0f, tx + tabW, rect.top + kRibbonTabsHeight);
         m_ribbonHits.push_back({ t.cmdId, tr });
 
         if (t.isBlueFileTab) {
             m_solidBrush->SetColor(HexColor(0x0067B8));
             m_rt->FillRectangle(tr, m_solidBrush);
-            m_solidBrush->SetColor(HexColor(0xFFFFFF));
+            m_solidBrush->SetColor(HexColor(0xFEFEFE));     // white on the blue tab in the dark theme too
         } else if (m_activeRibbonTab == t.tab && !m_ribbonCollapsed) {
             m_solidBrush->SetColor(HexColor(0xF5F6F7));
             m_rt->FillRectangle(tr, m_solidBrush);
@@ -979,9 +940,11 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
                     : HexColor(0x2B2B2B));
         }
 
-        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        DrawTextCached(t.label, static_cast<UINT32>(wcslen(t.label)), m_fmtSmall, tr, m_solidBrush);
-        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        IDWriteTextFormat* capFmt = (cutCaption && m_fmtSmallTrim) ? m_fmtSmallTrim : m_fmtSmall;
+        const D2D1_RECT_F capR = cutCaption ? D2D1::RectF(tr.left + 3.0f, tr.top, tr.right - 3.0f, tr.bottom) : tr;
+        capFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawTextCached(t.label, static_cast<UINT32>(wcslen(t.label)), capFmt, capR, m_solidBrush);
+        capFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         tx += tabW;
     }
 
@@ -1091,9 +1054,11 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
 
         D2D1_RECT_F titleR = D2D1::RectF(groupStartX, body.bottom - 17.0f, groupEndX, body.bottom - 2.0f);
         m_solidBrush->SetColor(HexColor(0x6E6E6E));
-        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        DrawTextCached(groupTitle, static_cast<UINT32>(wcslen(groupTitle)), m_fmtSmall, titleR, m_solidBrush);
-        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        // A title wider than its group is cut with an ellipsis: centred and uncut it ran over the separators
+        IDWriteTextFormat* titleFmt = m_fmtSmallTrim ? m_fmtSmallTrim : m_fmtSmall;
+        titleFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawTextCached(groupTitle, static_cast<UINT32>(wcslen(groupTitle)), titleFmt, titleR, m_solidBrush);
+        titleFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
 
     if (m_activeRibbonTab == RibbonTab::View) {
@@ -1192,7 +1157,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
             m_rt->FillRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush);
             m_solidBrush->SetColor(active ? HexColor(0x005A9E) : HexColor(0xB8C4D0));
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(pr, 3.0f, 3.0f), m_solidBrush, 1.0f);
-            m_solidBrush->SetColor(active ? HexColor(0xFFFFFF) : HexColor(0x2B3846));
+            m_solidBrush->SetColor(active ? HexColor(0xFFFFFF) : HexColor(0x1E293B));
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, pr, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -1330,16 +1295,20 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         const float ux = fx + 8.0f;
         const wchar_t* mediaLbl = pl ? L"Wideo/audio w domyślnym programie" : L"Video/audio in the default program";
         const wchar_t* updateLbl = pl ? L"Sprawdzaj, czy jest nowa wersja" : L"Check for a newer version";
+        // What the navigation pane shows (Quick access, cloud folders, Recycle Bin, FTP servers): a menu of check marks
+        const wchar_t* navLbl = pl ? L"Sekcje panelu nawigacji \x25BE" : L"Navigation pane sections \x25BE";
 #ifdef _WIN32
         const std::wstring scaleLbl = (pl ? L"Skala interfejsu: " : L"UI scale: ") + std::to_wstring(m_uiScalePct) + L"% \x25BE";
         drawSmallRowButton(CMD_UI_SCALE_MENU,         ux,          body.top + 6.0f,  232.0f, scaleLbl.c_str());
         drawSmallRowButton(CMD_TOGGLE_MEDIA_EXTERNAL, ux,          body.top + 29.0f, 232.0f, mediaLbl, m_openMediaExternally);
         drawSmallRowButton(CMD_TOGGLE_UPDATE_CHECK,   ux,          body.top + 52.0f, 232.0f, updateLbl, m_updateCheckEnabled);
-        drawSmallRowButton(CMD_TOGGLE_WIN_E,          ux + 236.0f, body.top + 6.0f,  176.0f, pl ? L"Win+E otwiera Explorer2" : L"Win+E opens Explorer2", m_winEOverrideSet);
-        drawGroupSeparatorAndTitle(ux, ux + 418.0f, pl ? L"Ustawienia" : L"Settings");
+        drawSmallRowButton(CMD_TOGGLE_WIN_E,          ux + 236.0f, body.top + 6.0f,  192.0f, pl ? L"Win+E otwiera Explorer2" : L"Win+E opens Explorer2", m_winEOverrideSet);
+        drawSmallRowButton(CMD_NAV_SECTIONS_MENU,     ux + 236.0f, body.top + 29.0f, 192.0f, navLbl);
+        drawGroupSeparatorAndTitle(ux, ux + 434.0f, pl ? L"Ustawienia" : L"Settings");
 #else
         drawSmallRowButton(CMD_TOGGLE_MEDIA_EXTERNAL, ux, body.top + 6.0f,  232.0f, mediaLbl, m_openMediaExternally);
         drawSmallRowButton(CMD_TOGGLE_UPDATE_CHECK,   ux, body.top + 29.0f, 232.0f, updateLbl, m_updateCheckEnabled);
+        drawSmallRowButton(CMD_NAV_SECTIONS_MENU,     ux, body.top + 52.0f, 232.0f, navLbl);
         drawGroupSeparatorAndTitle(ux, ux + 238.0f, pl ? L"Ustawienia" : L"Settings");
 #endif
         return;
@@ -1530,7 +1499,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         lx += 90.0f;
         drawLargeButton(CMD_LOG_OPEN_FOLDER, lx, 76.0f, pl ? L"Folder\nlogów" : L"Logs\nfolder");
         lx += 78.0f;
-        drawGroupSeparatorAndTitle(lg2, lx, pl ? L"Pliki logów (nowy przy każdym starcie)" : L"Log files (new one per start)");
+        drawGroupSeparatorAndTitle(lg2, lx, pl ? L"Pliki logów" : L"Log files");
         lx += 6.0f;
 
         float lg3 = lx;
@@ -2343,6 +2312,9 @@ void ExplorerApp::DrawTreePane(const D2D1_RECT_F& rect) {
                 m_rt->DrawRectangle(D2D1::RectF(iconR.left + 1.0f, iconR.top + 2.0f, iconR.right - 1.0f, iconR.bottom - 4.0f), m_solidBrush, 1.5f);
             } else if (node.isDrive || (node.isFtpNode && node.indent == 2)) {
                 DrawDriveVectorIcon(iconR, true, node.isOpticalDrive, node.isOffline);
+            } else if (((node.isQuickAccess && node.indent == 1) || (node.indent == 0 && !node.isHeader && !node.isFtpNode)) &&
+                       DrawOwnShellFolderIcon(node.path, iconR)) {
+                // A pinned folder or a cloud folder that Windows shows with its own icon (Desktop, Downloads, OneDrive)
             } else {
                 DrawFolderVectorIcon(iconR, true);
             }
@@ -2658,7 +2630,7 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(advBtnR, 3.0f, 3.0f), m_solidBrush);
         m_solidBrush->SetColor(HexColor(0x0078D7));
         m_rt->DrawRoundedRectangle(D2D1::RoundedRect(advBtnR, 3.0f, 3.0f), m_solidBrush, 1.0f);
-        m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_SEARCH_ADVANCED_GEAR ? HexColor(0xFFFFFF) : HexColor(0x005A9E));
+        m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_SEARCH_ADVANCED_GEAR ? HexColor(0xFFFFFF) : HexColor(m_darkMode ? 0x9CCBFF : 0x005A9E));
         const wchar_t* advLbl = m_lang == Lang::PL ? L"\x2699 Filtry / Opcje" : L"\x2699 Filters / Gear";
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         DrawTextCached(advLbl, static_cast<UINT32>(wcslen(advLbl)), m_fmtSmall, advBtnR, m_solidBrush);
@@ -2670,7 +2642,7 @@ void ExplorerApp::DrawMainContent(const D2D1_RECT_F& rect) {
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(closeBtnR, 3.0f, 3.0f), m_solidBrush);
         m_solidBrush->SetColor(HexColor(0xC42B1C));
         m_rt->DrawRoundedRectangle(D2D1::RoundedRect(closeBtnR, 3.0f, 3.0f), m_solidBrush, 1.0f);
-        m_solidBrush->SetColor(m_hoverRibbonBtn == rightCmd ? HexColor(0xFFFFFF) : HexColor(0xA80000));
+        m_solidBrush->SetColor(m_hoverRibbonBtn == rightCmd ? HexColor(0xFFFFFF) : HexColor(m_darkMode ? 0xFFB4B4 : 0xA80000));
         const wchar_t* clsLbl = running
             ? (m_lang == Lang::PL ? L"\x23F9 Zatrzymaj" : L"\x23F9 Stop")
             : (m_lang == Lang::PL ? L"\x2715 Zamknij wyniki" : L"\x2715 Close search");
@@ -2983,34 +2955,37 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
             bool hovTrash = (m_hoverIndex == i && m_hoverRowActionKind == 1);
             bool hovPerm  = (m_hoverIndex == i && m_hoverRowActionKind == 2);
 
+            // In the dark theme the buttons are dark too, with light text (they used to stay light: bright boxes
+            // down the whole list)
+            const bool dk = m_darkMode;
             if (inRecycleBin) {
                 // [↩ Przywróć] restore button inside Kosz
-                m_solidBrush->SetColor(hovTrash ? HexColor(0xDCFCE7) : HexColor(0xF0FDF4));
+                m_solidBrush->SetColor(HexColor(hovTrash ? (dk ? 0x1C3A28 : 0xDCFCE7) : (dk ? 0x15281D : 0xF0FDF4)));
                 m_rt->FillRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush);
-                m_solidBrush->SetColor(hovTrash ? HexColor(0x16A34A) : HexColor(0x86EFAC));
+                m_solidBrush->SetColor(HexColor(hovTrash ? (dk ? 0x22C55E : 0x16A34A) : (dk ? 0x2F6B45 : 0x86EFAC)));
                 m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush, 1.0f);
-                m_solidBrush->SetColor(hovTrash ? HexColor(0x166534) : HexColor(0x15803D));
+                m_solidBrush->SetColor(HexColor(hovTrash ? (dk ? 0xBBF7D0 : 0x166534) : (dk ? 0x7EE2A8 : 0x15803D)));
                 std::wstring restTxt = std::wstring(L"\x21A9 ") + s.btnRowRestore;
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 DrawTextCached(restTxt.c_str(), static_cast<UINT32>(restTxt.size()), m_fmtSmall, rTrash, m_solidBrush);
             } else {
                 // [🗑 Kosz] button
-                m_solidBrush->SetColor(hovTrash ? HexColor(0xDCEBFC) : HexColor(0xF3F5F8));
+                m_solidBrush->SetColor(hovTrash ? HexColor(0xDCEBFC) : HexColor(0xF1F5F9));
                 m_rt->FillRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush);
-                m_solidBrush->SetColor(hovTrash ? HexColor(0x0078D7) : HexColor(0xC8D0DA));
+                m_solidBrush->SetColor(hovTrash ? HexColor(0x0078D7) : HexColor(0xCBD5E1));
                 m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rTrash, 2.5f, 2.5f), m_solidBrush, 1.0f);
-                m_solidBrush->SetColor(hovTrash ? HexColor(0x005A9E) : HexColor(0x3B4252));
+                m_solidBrush->SetColor(hovTrash ? HexColor(dk ? 0x9CCBFF : 0x005A9E) : HexColor(0x334155));
                 std::wstring trashTxt = std::wstring(L"\xD83D\xDDD1 ") + s.btnRowTrash;
                 m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 DrawTextCached(trashTxt.c_str(), static_cast<UINT32>(trashTxt.size()), m_fmtSmall, rTrash, m_solidBrush);
             }
 
             // [✕ Usuń] permanent delete button
-            m_solidBrush->SetColor(hovPerm ? HexColor(0xFDE7E9) : HexColor(0xFAF2F2));
+            m_solidBrush->SetColor(HexColor(hovPerm ? (dk ? 0x4A2227 : 0xFDE7E9) : (dk ? 0x2A1C1F : 0xFAF2F2)));
             m_rt->FillRoundedRectangle(D2D1::RoundedRect(rPerm, 2.5f, 2.5f), m_solidBrush);
-            m_solidBrush->SetColor(hovPerm ? HexColor(0xD13438) : HexColor(0xE2C2C4));
+            m_solidBrush->SetColor(HexColor(hovPerm ? (dk ? 0xE5484D : 0xD13438) : (dk ? 0x5C3338 : 0xE2C2C4)));
             m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rPerm, 2.5f, 2.5f), m_solidBrush, 1.0f);
-            m_solidBrush->SetColor(hovPerm ? HexColor(0xA80000) : HexColor(0x9E2A2B));
+            m_solidBrush->SetColor(HexColor(hovPerm ? (dk ? 0xFFC9CC : 0xA80000) : (dk ? 0xF0A0A4 : 0x9E2A2B)));
             std::wstring permTxt = std::wstring(L"\x2715 ") + s.btnRowPermDel;
             DrawTextCached(permTxt.c_str(), static_cast<UINT32>(permTxt.size()), m_fmtSmall, rPerm, m_solidBrush);
             m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -5509,6 +5484,50 @@ void ExplorerApp::DrawCardTinyButton(const D2D1_RECT_F& br, const std::wstring& 
     bh.actionIndex = actionIndex;
     bh.label = label;
     m_hwCardHits.push_back(bh);
+}
+
+float ExplorerApp::MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt) {
+    if (text.empty() || !fmt || !m_dwriteFactory) return 0.0f;
+    std::wstring key = std::to_wstring(reinterpret_cast<uintptr_t>(fmt));
+    key += L'|';
+    key += text;
+    auto it = m_textWidthCache.find(key);
+    if (it != m_textWidthCache.end()) return it->second;
+    float width = static_cast<float>(text.size()) * 6.5f;       // a guess, should the layout fail
+    IDWriteTextLayout* layout = nullptr;
+    if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt, 4000.0f, 64.0f, &layout)) && layout) {
+        DWRITE_TEXT_METRICS tm = {};
+        if (SUCCEEDED(layout->GetMetrics(&tm))) width = std::ceil(tm.widthIncludingTrailingWhitespace);
+        layout->Release();
+    }
+    if (m_textWidthCache.size() > 600) m_textWidthCache.clear();
+    m_textWidthCache.emplace(std::move(key), width);
+    return width;
+}
+
+bool ExplorerApp::DrawOwnShellFolderIcon(const std::wstring& folderPath, const D2D1_RECT_F& iconR) {
+#ifdef _WIN32
+    if (folderPath.size() < 3 || folderPath[1] != L':' || IsVirtualFolder(folderPath)) return false;
+    // Only a folder on a fixed disk is asked about: for a network drive that does not answer, the shell would keep
+    // the icon worker waiting
+    const wchar_t rootPath[] = { folderPath[0], L':', L'\\', 0 };
+    if (GetDriveTypeW(rootPath) != DRIVE_FIXED) return false;
+    static const int kPlainFolderIcon = [] {
+        SHFILEINFOW sfi = {};
+        return SHGetFileInfoW(L"folder", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES)
+                   ? sfi.iIcon : -1;
+    }();
+    const int iconIndex = m_imageCache.GetOrQueuePerFileIconIndex(folderPath, -1);     // -1 until the worker has looked
+    if (iconIndex < 0 || iconIndex == kPlainFolderIcon) return false;
+    const ImageCache::SystemIcon icon = m_imageCache.GetSystemIcon(m_rt, iconIndex, 0);
+    if (!icon) return false;
+    ImageCache::DrawSystemIcon(m_rt, icon, iconR, 1.0f);
+    return true;
+#else
+    (void)folderPath;
+    (void)iconR;
+    return false;
+#endif
 }
 
 void ExplorerApp::DrawClippedText(const std::wstring& text, const D2D1_RECT_F& r, IDWriteTextFormat* fmt, uint32_t colorHex) {

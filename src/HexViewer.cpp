@@ -1,5 +1,6 @@
 #include "HexViewer.h"
 #include "PathUtils.h"
+#include "ThemeColors.h"
 #include "FileEngine.h"
 #include <algorithm>
 #include <cstring>
@@ -7,8 +8,9 @@
 
 namespace Explorer2 {
 
+// A colour of the light design, or its counterpart in the dark theme (ThemeColors.h)
 static D2D1_COLOR_F HexVColor(uint32_t rgb, float a = 1.0f) {
-    return PathUtils::ColorFromRgb(rgb, a);
+    return PathUtils::ColorFromRgb(ThemedPaneRgb(rgb), a);
 }
 
 HexViewer::~HexViewer() {

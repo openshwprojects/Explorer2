@@ -577,7 +577,7 @@ void EdaViewer::Draw(
         if (bx + w > tbR.right - 4.0f) return;
         D2D1_RECT_F br = D2D1::RectF(bx, tbR.top + 4.0f, bx + w, tbR.bottom - 4.0f);
         m_toolbarHits.push_back({ id, br });
-        PathUtils::DrawToolbarButton(rt, brush, fmtSmall, br, label, active, m_hoverBtnId == id);
+        PathUtils::DrawToolbarButton(rt, brush, fmtSmall, br, label, active, m_hoverBtnId == id, false, false);
         bx += w + 4.0f;
     };
 

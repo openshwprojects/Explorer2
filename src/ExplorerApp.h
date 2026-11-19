@@ -375,12 +375,29 @@ private:
     void SetUiScale(int pct);
     void ShowUiScaleMenu();
 
+    // Which sections of the navigation tree are shown (FileEngine::NavSection bits; File tab, "Ustawienia")
+    unsigned m_navSections = FileEngine::kNavAllSections;
+    void ShowNavSectionsMenu();
+
+    // Width of one line of text in a format, in DIPs. Kept per text and format: the tab strip asks on every paint.
+    float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt);
+    std::unordered_map<std::wstring, float> m_textWidthCache;
+
+    // A pinned or cloud folder that Windows shows with an icon of its own (Desktop, Downloads, OneDrive, a folder
+    // with a desktop.ini icon) is drawn with that icon; false = an ordinary folder, drawn like every other one
+    bool DrawOwnShellFolderIcon(const std::wstring& folderPath, const D2D1_RECT_F& iconR);
+
+#ifdef _WIN32
+    HBRUSH m_darkEditBrush = nullptr;         // background of the edit boxes in the dark theme
+#endif
+
     ID2D1Factory* m_d2dFactory = nullptr;
     IDWriteFactory* m_dwriteFactory = nullptr;
     ID2D1HwndRenderTarget* m_rt = nullptr;
 
     IDWriteTextFormat* m_fmtRegular = nullptr;
     IDWriteTextFormat* m_fmtSmall = nullptr;
+    IDWriteTextFormat* m_fmtSmallTrim = nullptr;      // m_fmtSmall that cuts a text too long for its box with an ellipsis
     IDWriteTextFormat* m_fmtBold = nullptr;
     IDWriteTextFormat* m_fmtCenterSmall = nullptr;
     IDWriteTextFormat* m_fmtViewerHud = nullptr;

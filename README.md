@@ -20,6 +20,7 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
 - Details, list and five icon-size views, with sorting and grouping
 - Disk-usage views: a squarified treemap and a sunburst chart
 - Dual-pane split view, navigation tree with pinned Quick Access folders, breadcrumb bar
+- Light and dark theme (the moon button at the right end of the tab strip)
 - Search with filters for date, size, file type and file content
 - Network folders: mapped drives and `\\server\share` paths, and `\\server` alone lists its shared folders (also
   from the LAN scanner). A server that does not answer never freezes the window: it is asked in the background,
@@ -175,6 +176,9 @@ Explorer2 uses these when they are installed, and works without them:
 
 - The File tab has a "UI scale" setting (also Ctrl and +, Ctrl and -, Ctrl and 0) that makes the whole interface
   larger or smaller without changing the display scaling of Windows. It is not available in the Linux build yet.
+- "Navigation pane sections" on the File tab chooses what the tree on the left shows: Quick access, Dropbox and
+  OneDrive, the Recycle Bin and the FTP servers can each be switched off; the drives are always there. Pinning a
+  folder brings a hidden Quick access section back.
 - "Win+E opens Explorer2" on the File tab gives that shortcut to Explorer2 for the current user. It writes one key
   under `HKEY_CURRENT_USER\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}` and removes it when
   switched off; nothing else in the system is changed and no administrator rights are needed. Switch it off before
