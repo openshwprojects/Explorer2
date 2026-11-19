@@ -31,6 +31,7 @@
 #include "DetailsColumns.h"
 #include "RibbonTabLayout.h"
 #include "LinuxStorage.h"
+#include "WidePrintf.h"
 #include "UpdateCheck.h"
 #include "WinEOverride.h"
 #include <winver.h>
@@ -7704,6 +7705,36 @@ static void RunStage16Tests(TestCounter& tc) {
             IsUnmountedVolumePath(L"MOUNT_VOLUME:/dev/sdb1") && UnmountedVolumeDevice(L"MOUNT_VOLUME:/dev/sdb1") == L"/dev/sdb1" &&
             IsVirtualFolder(L"MOUNT_VOLUME:/dev/sdb1") && !IsUnmountedVolumePath(L"/dev/sdb1") && UnmountedVolumeDevice(L"/dev/sdb1").empty();
         tc.Record(ok, L"Stage16.Test17_LinuxStorage_UnmountedVolumes_UdevFacts", L"udev keys: " + std::to_wstring(stick.udev.size()));
+    }
+    {
+        // swprintf_s with text outside ASCII. On Linux swprintf_s is this program's own (PlatformCompat.h on top of
+        // WidePrintf.h): the C library of the static build (musl, no locale set) fails on such text, which left
+        // every formatted "33°C", Polish message and non-English file name empty there - and made Test14 and
+        // Test16 above fail on Linux only. On Windows the same calls go to Microsoft's swprintf_s, so the two agree.
+        wchar_t b[128] = {};
+        auto made = [&b](int n, const wchar_t* want) { return n == static_cast<int>(std::wcslen(want)) && std::wcscmp(b, want) == 0; };
+        bool ok = made(swprintf_s(b, L"%d\x00B0" L"C", 33), L"33\x00B0" L"C");
+        ok = ok && made(swprintf_s(b, L"OK: usuni\x0119to trwale %llu el. (%s) w %.2f s", 12ull, L"za\x017C\x00F3\x0142\x0107.txt", 1.5),
+                        L"OK: usuni\x0119to trwale 12 el. (za\x017C\x00F3\x0142\x0107.txt) w 1.50 s");
+        ok = ok && made(swprintf_s(b, L"\xD83D\xDDBC %s \x2022 %u \xD7 %u px", L"obraz", 640u, 480u), L"\xD83D\xDDBC obraz \x2022 640 \xD7 480 px");
+        ok = ok && made(swprintf_s(b, L"%5s|%-5s|%.2s|%c|%S|%C", L"\x0142\x00F3", L"\x0142\x00F3", L"\x017C\x00F3\x0142w", L'\x0119', "abc", 'x'),
+                        L"   \x0142\x00F3|\x0142\x00F3   |\x017C\x00F3|\x0119|abc|x");
+        ok = ok && made(swprintf_s(b, L"%I64d %05d %#x %*d|%-*d|%.1f%%", -5000000000ll, 42, 255u, 4, 7, 4, 7, 99.5),
+                        L"-5000000000 00042 0xff    7|7   |99.5%");
+
+        // A narrow argument is widened byte by byte: Microsoft's library does that as long as no locale is set, and
+        // the formatter does the same, so that a reader prints the same text on both systems
+        ok = ok && made(swprintf_s(b, L"%S|%4hs|%C", "a\xB0", "\xFFz", '\xE9'), L"a\x00B0|  \x00FFz|\x00E9");
+
+        // The formatter itself, in the C dialect it works in (%ls wide, %s narrow); a result that does not fit is
+        // refused as a whole
+        using Explorer2::Compat::FormatWideC;
+        ok = ok && made(FormatWideC(b, 128, L"%s|%4s|%ls|%lc", "a\xB0", "\xFFz", L"\x2022", L'\x0119'), L"a\x00B0|  \x00FFz|\x2022|\x0119");
+        wchar_t tiny[5] = L"####";
+        ok = ok && FormatWideC(tiny, 5, L"%ls", L"\x017C\x00F3\x0142w") == 4 && std::wcscmp(tiny, L"\x017C\x00F3\x0142w") == 0 &&
+             FormatWideC(tiny, 5, L"%ls", L"za\x017C\x00F3\x0142\x0107") == -1 && tiny[0] == L'\0' &&
+             FormatWideC(tiny, 5, L"%999999999d", 1) == -1 && tiny[0] == L'\0';
+        tc.Record(ok, L"Stage16.Test18_WidePrintf_TextOutsideAsciiIsKept");
     }
 #ifdef _WIN32
     {

@@ -9,7 +9,9 @@
 // Elsewhere it defines the Windows types, constants and functions those readers call, with the meaning they have
 // on Windows:
 //   - swprintf_s / sprintf_s follow Microsoft's format rules (in a wide format %s is a wide string and %S a narrow
-//     one; %I64d is a 64-bit number): the format is translated for the C library, which reads %s as narrow;
+//     one; %I64d is a 64-bit number): the format is translated to the C dialect, in which %s is narrow. Wide
+//     formats are then carried out by WidePrintf.h and not by the C library's vswprintf, which loses every text
+//     with a character outside ASCII where no locale is set (musl);
 //   - MultiByteToWideChar / WideCharToMultiByte convert with iconv. CP_ACP, the "ANSI code page" Windows uses for
 //     legacy 8-bit text, is Windows-1252 here; CP_OEMCP is code page 437;
 //   - wchar_t is 32 bits (UTF-32) instead of 16 (UTF-16).
@@ -56,6 +58,8 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+
+#include "WidePrintf.h"     // VFormatWideC: what swprintf_s formats with
 
 // ---- Types ----------------------------------------------------------------------------------------------------
 using BYTE = uint8_t;
@@ -199,12 +203,10 @@ std::basic_string<Ch> TranslateMsFormat(const Ch* fmt, bool wideFormat) {
 inline int VSwprintfMs(wchar_t* buffer, size_t count, const wchar_t* format, va_list args) {
     if (!buffer || count == 0) return -1;
     const std::wstring fmt = TranslateMsFormat(format, true);
-    const int n = vswprintf(buffer, count, fmt.c_str(), args);
-    if (n < 0) {
-        buffer[0] = L'\0';   // too long for the buffer (Microsoft's _s functions also leave an empty string)
-        return -1;
-    }
-    return n;
+    // Not the C library's vswprintf: musl's fails on any character outside ASCII unless a locale is set, and then
+    // the whole text was lost (WidePrintf.h). Too long for the buffer: -1 and an empty string, which is also what
+    // Microsoft's _s functions leave.
+    return VFormatWideC(buffer, count, fmt.c_str(), args);
 }
 
 inline int VSprintfMs(char* buffer, size_t count, const char* format, va_list args) {
