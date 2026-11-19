@@ -63,6 +63,8 @@ if ($env:GITHUB_RUN_NUMBER -match '^\d+$') {
 # 3. GitHub Actions CI run (MAJOR.MINOR.<GITHUB_RUN_NUMBER>)
 # 4. Local build from VERSION file (MAJOR.MINOR.PATCH.<gitCommits>)
 $override = $env:E2_VERSION_OVERRIDE
+# 1 for cases 1-3 (the version is a release's), 0 for a local build (the VERSION file's base version)
+$isRelease = 1
 if (-not [string]::IsNullOrWhiteSpace($override) -and $override.Trim() -match '^v?(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$') {
     $major = [int]$Matches[1]
     $minor = [int]$Matches[2]
@@ -83,6 +85,7 @@ if (-not [string]::IsNullOrWhiteSpace($override) -and $override.Trim() -match '^
     $build = $gitCommits
 } else {
     $build = $gitCommits
+    $isRelease = 0
 }
 
 # Clamp each 16-bit PE VERSIONINFO component to 0..65535
@@ -105,6 +108,7 @@ $headerContent = @"
 #define E2_VERSION_MINOR $minor
 #define E2_VERSION_PATCH $patch
 #define E2_VERSION_BUILD $build
+#define E2_VERSION_IS_RELEASE $isRelease
 
 #define E2_VERSION_SEMVER_STR "$semver"
 #define E2_VERSION_SEMVER_WSTR L"$semver"

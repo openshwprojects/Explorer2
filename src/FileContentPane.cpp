@@ -1430,6 +1430,7 @@ void FileContentPane::Draw(
 {
     m_paneRect = rect;
     m_headerHits.clear();
+    m_mediaVolumeArea = {};
     const bool pl = (lang == Lang::PL);
 
     if (rect.right <= rect.left + 40.0f || rect.bottom <= rect.top + 40.0f) {
@@ -2043,7 +2044,15 @@ void FileContentPane::Draw(
             double pos = mediaPlayer.GetCurrentTimeSec();
             double dur = mediaPlayer.GetDurationSec();
             float frac = (dur > 0.05) ? static_cast<float>(std::clamp(pos / dur, 0.0, 1.0)) : 0.0f;
-            outMediaSeekBarRect = D2D1::RectF(playBtn.right + 10.0f, playBtn.top + 4.0f, m_bodyRect.right - 14.0f, playBtn.bottom - 4.0f);
+            // The right end of the row is left to the volume control (speaker and slider; the speaker alone in a
+            // narrow pane), drawn by the owner of the player
+            const float bodyW = m_bodyRect.right - m_bodyRect.left;
+            const float volumeW = (bodyW >= 330.0f) ? 104.0f : ((bodyW >= 210.0f) ? 30.0f : 0.0f);
+            if (volumeW > 0.0f) {
+                m_mediaVolumeArea = D2D1::RectF(m_bodyRect.right - 12.0f - volumeW, playBtn.top, m_bodyRect.right - 12.0f, playBtn.bottom);
+            }
+            outMediaSeekBarRect = D2D1::RectF(playBtn.right + 10.0f, playBtn.top + 4.0f,
+                                              m_bodyRect.right - 14.0f - (volumeW > 0.0f ? volumeW + 8.0f : 0.0f), playBtn.bottom - 4.0f);
             float ty = (outMediaSeekBarRect.top + outMediaSeekBarRect.bottom) * 0.5f;
             brush->SetColor(FcpColor(0xCBD5E1));
             rt->FillRectangle(D2D1::RectF(outMediaSeekBarRect.left, ty - 2.0f, outMediaSeekBarRect.right, ty + 2.0f), brush);

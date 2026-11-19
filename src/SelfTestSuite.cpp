@@ -28,6 +28,9 @@
 #include "ReaderInspect.h"
 #include "SelfTestCommon.h"
 #include "Version.h"
+#include "DetailsColumns.h"
+#include "UpdateCheck.h"
+#include "WinEOverride.h"
 #include <winver.h>
 #include <winioctl.h>
 #include <wincodec.h>
@@ -7262,6 +7265,130 @@ static void RunStage14Tests(TestCounter& tc) {
     RemoveTestTreeRecursive(baseDir);
 }
 
+// Stage 16: the logic behind the forum reports of 2026-11-19 that needs no window: the details columns of a list
+// that is too narrow for them, the version comparison of the update note, and the Win+E registry override (on a
+// scratch key, never the real one).
+static void RunStage16Tests(TestCounter& tc) {
+    const float stored[5] = { 320.0f, 145.0f, 155.0f, 115.0f, 128.0f };     // the default widths: 863 in all
+    auto sum = [](const float w[5]) { return w[0] + w[1] + w[2] + w[3] + w[4]; };
+
+    {
+        float w[5] = {};
+        FitDetailsColumns(stored, true, 1200.0f, w);
+        bool same = true;
+        for (int c = 0; c < 5; ++c) same = same && (w[c] == stored[c]);
+        tc.Record(same, L"Stage16.Test1_DetailsColumns_WideListKeepsStoredWidths");
+    }
+    {
+        // A 1024 px wide window with the 265 px tree: the list has 737 for its columns. Only the name gives way.
+        float w[5] = {};
+        FitDetailsColumns(stored, true, 737.0f, w);
+        const bool ok = sum(w) <= 737.01f && w[0] >= 150.0f && w[0] < 320.0f &&
+                        w[1] == 145.0f && w[2] == 155.0f && w[3] == 115.0f && w[4] == 128.0f;
+        tc.Record(ok, L"Stage16.Test2_DetailsColumns_1024Screen_RowButtonsStayInView",
+                  L"name " + std::to_wstring(static_cast<int>(w[0])) + L", total " + std::to_wstring(static_cast<int>(sum(w))));
+    }
+    {
+        // A split pane on that screen (357 for the columns): type and date are left out, the row buttons stay
+        float w[5] = {};
+        FitDetailsColumns(stored, true, 357.0f, w);
+        const bool ok = sum(w) <= 357.01f && w[2] == 0.0f && w[1] == 0.0f && w[4] == 128.0f && w[3] >= 76.0f && w[0] >= 60.0f;
+        tc.Record(ok, L"Stage16.Test3_DetailsColumns_NarrowSplitPane_HidesTypeAndDateFirst",
+                  L"name " + std::to_wstring(static_cast<int>(w[0])) + L", size " + std::to_wstring(static_cast<int>(w[3])));
+    }
+    {
+        // No row buttons (Ten komputer, a repository): the last column is gone whatever the width; and however
+        // narrow the list, no width is negative and the name keeps a usable minimum
+        float wide[5] = {}, tiny[5] = {};
+        FitDetailsColumns(stored, false, 2000.0f, wide);
+        FitDetailsColumns(stored, true, 40.0f, tiny);
+        bool noneNegative = true;
+        for (int c = 0; c < 5; ++c) noneNegative = noneNegative && tiny[c] >= 0.0f;
+        const bool ok = wide[4] == 0.0f && wide[0] == 320.0f && noneNegative && tiny[0] >= 60.0f &&
+                        tiny[1] == 0.0f && tiny[2] == 0.0f && tiny[3] == 0.0f && tiny[4] == 0.0f;
+        tc.Record(ok, L"Stage16.Test4_DetailsColumns_NoRowButtons_And_VeryNarrowList");
+    }
+    {
+        // A hidden column's room goes back to the name, but never beyond the width the user gave it
+        const float narrowName[5] = { 100.0f, 145.0f, 155.0f, 115.0f, 128.0f };
+        float w[5] = {};
+        FitDetailsColumns(narrowName, true, 400.0f, w);
+        tc.Record(sum(w) <= 400.01f && w[0] <= 100.01f && w[4] == 128.0f, L"Stage16.Test5_DetailsColumns_NameNeverWiderThanStored",
+                  L"name " + std::to_wstring(static_cast<int>(w[0])));
+    }
+    {
+        using UpdateCheck::CompareVersions;
+        const bool ok = CompareVersions(L"v1.0.25", L"1.0.24") > 0 &&
+                        CompareVersions(L"1.0.9", L"1.0.10") < 0 &&            // numbers, not text
+                        CompareVersions(L"v1.0.24", L"1.0.24 (3f51126)") == 0 &&
+                        CompareVersions(L"2.0", L"1.9.99") > 0 &&
+                        CompareVersions(L"1.0.24", L"1.0.24.41") < 0 &&
+                        CompareVersions(L"latest", L"1.0.0") == 0 &&           // unreadable: never "newer"
+                        CompareVersions(L"", L"1.0.0") == 0;
+        tc.Record(ok, L"Stage16.Test6_UpdateCheck_CompareVersions");
+    }
+    {
+        using UpdateCheck::TagFromReleaseJson;
+        // The tag of the document itself, not the text "tag_name" quoted inside the release notes
+        const std::string good =
+            "{\"url\":\"https://api.github.com/x\",\"author\":{\"login\":\"someone\"},\"tag_name\":\"v1.0.25\","
+            "\"name\":\"Explorer2 v1.0.25\",\"body\":\"notes with \\\"tag_name\\\": \\\"v9.9.9\\\" inside\"}";
+        const bool ok = TagFromReleaseJson(good) == L"v1.0.25" &&
+                        TagFromReleaseJson("{\"tag_name\":\"<b>v2</b>\"}").empty() &&     // not a plain version name
+                        TagFromReleaseJson("{\"tag_name\":\"nightly\"}").empty() &&       // no number to compare
+                        TagFromReleaseJson("{\"tag_name\":125}").empty() &&
+                        TagFromReleaseJson("{\"message\":\"Not Found\"}").empty() &&
+                        TagFromReleaseJson("<html>proxy login</html>").empty() &&
+                        TagFromReleaseJson("").empty();
+        tc.Record(ok, L"Stage16.Test7_UpdateCheck_TagFromReleaseJson");
+    }
+    {
+        using WinEOverride::ExeOfCommand;
+        const bool ok = ExeOfCommand(L"\"C:\\Program Files\\Explorer2\\Explorer2.exe\" /x") == L"C:\\Program Files\\Explorer2\\Explorer2.exe" &&
+                        ExeOfCommand(L"C:\\Tools\\Explorer2.exe /x") == L"C:\\Tools\\Explorer2.exe" &&
+                        ExeOfCommand(L"  \"D:\\e2.exe\"") == L"D:\\e2.exe" &&
+                        ExeOfCommand(L"").empty();
+        tc.Record(ok, L"Stage16.Test8_WinEOverride_ExeOfCommand");
+    }
+#ifdef _WIN32
+    {
+        // The override is written, read back and removed under a scratch key of this process
+        const std::wstring parent = L"Software\\Explorer2SelfTest";
+        const std::wstring key = parent + L"\\WinE_" + std::to_wstring(GetCurrentProcessId());
+        const std::wstring exe = L"C:\\Program Files\\Explorer2\\Explorer2.exe";
+        WinEOverride::Remove(key);
+        const bool noneAtFirst = WinEOverride::ReadCommand(key).empty() && !WinEOverride::IsSetFor(key, exe);
+        const bool refusedQuote = !WinEOverride::Set(key, L"C:\\a\"b\\Explorer2.exe") && WinEOverride::ReadCommand(key).empty();
+        const bool set = WinEOverride::Set(key, exe);
+        const bool readBack = WinEOverride::ReadCommand(key) == L"\"" + exe + L"\"" &&
+                              WinEOverride::IsSetFor(key, exe) &&
+                              WinEOverride::IsSetFor(key, L"c:\\program files\\explorer2\\EXPLORER2.EXE") &&
+                              !WinEOverride::IsSetFor(key, L"C:\\Other\\Explorer2.exe");
+        // Windows starts the command only when DelegateExecute is there and empty
+        bool delegateEmpty = false;
+        HKEY cmdKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, (key + L"\\shell\\opennewwindow\\command").c_str(), 0, KEY_QUERY_VALUE, &cmdKey) == ERROR_SUCCESS) {
+            wchar_t value[8] = { L'x', 0 };
+            DWORD type = 0;
+            DWORD bytes = sizeof(value);
+            delegateEmpty = RegQueryValueExW(cmdKey, L"DelegateExecute", nullptr, &type, reinterpret_cast<BYTE*>(value), &bytes) == ERROR_SUCCESS &&
+                            type == REG_SZ && value[0] == 0;
+            RegCloseKey(cmdKey);
+        }
+        const bool removed = WinEOverride::Remove(key) && WinEOverride::ReadCommand(key).empty() && !WinEOverride::IsSetFor(key, exe);
+        HKEY left = nullptr;
+        const bool keyGone = RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_READ, &left) != ERROR_SUCCESS;
+        if (left) RegCloseKey(left);
+        RegDeleteKeyW(HKEY_CURRENT_USER, parent.c_str());       // goes only when no other run's key is under it
+        tc.Record(noneAtFirst && refusedQuote && set && readBack && delegateEmpty && removed && keyGone,
+                  L"Stage16.Test9_WinEOverride_SetReadRemove_OnScratchKey",
+                  std::wstring(noneAtFirst ? L"" : L"[not empty at first] ") + (refusedQuote ? L"" : L"[took a quoted path] ") +
+                  (set ? L"" : L"[set failed] ") + (readBack ? L"" : L"[read back differs] ") +
+                  (delegateEmpty ? L"" : L"[DelegateExecute] ") + (removed ? L"" : L"[not removed] ") + (keyGone ? L"" : L"[key left behind]"));
+    }
+#endif
+}
+
 } // namespace
 
 int RunStageTests(const std::wstring& stageName, const std::wstring& outReportPath) {
@@ -7357,6 +7484,9 @@ int RunStageTests(const std::wstring& stageName, const std::wstring& outReportPa
     }
     if (stageLower == L"14" || stageLower == L"stage14" || stageLower == L"formats200" || stageLower == L"all") {
         RunStage14Tests(tc);
+    }
+    if (stageLower == L"16" || stageLower == L"stage16" || stageLower == L"ui" || stageLower == L"all") {
+        RunStage16Tests(tc);
     }
     // Stage 15: the format readers, one file per family; "15.3d", "15.eda", "15.images", "15.docs" (both
     // document files, or "15.docsa" / "15.docsb" alone) and "15.archives" run one family alone

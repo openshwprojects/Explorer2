@@ -166,6 +166,7 @@ public:
     // An "Extract" button of the archive view was clicked (see ArchiveExplorer::ExtractRequest)
     bool TakePendingExtract(ArchiveExplorer::ExtractRequest& out) { return m_archive.TakePendingExtract(out); }
 
+    const D2D1_RECT_F& MediaVolumeArea() const { return m_mediaVolumeArea; }
     void Draw(
         ID2D1RenderTarget* rt,
         ID2D1SolidColorBrush* brush,
@@ -302,6 +303,9 @@ private:
 
     D2D1_RECT_F m_paneRect = {};
     D2D1_RECT_F m_bodyRect = {};
+    // The room the last Draw left at the right end of the media transport row for the volume control, which the
+    // owner draws (it has the player's volume and the click handling); empty when no media is shown
+    D2D1_RECT_F m_mediaVolumeArea = {};
     int m_hoverHeaderBtn = 0;
     std::vector<HeaderHit> m_headerHits;
 

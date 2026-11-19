@@ -85,6 +85,7 @@
 // that go to whichever window has the focus when they are taken (keys typed right after F2 belong in the rename box)
 constexpr DWORD kMsgHasKeyState = 0x80000000u;
 constexpr DWORD kMsgToFocus     = 0x40000000u;
+constexpr DWORD kMsgXFocus      = 0x20000000u;     // a WM_NULL that carries FocusIn (wParam 1) / FocusOut (0): ApplyXFocus
 constexpr DWORD kMsgShift       = 0x00000001u;
 constexpr DWORD kMsgControl     = 0x00000002u;
 constexpr DWORD kMsgAlt         = 0x00000004u;
@@ -507,6 +508,8 @@ intptr_t g_nextHwndId = 0x20000;
 
 HWND g_focusedHwnd = nullptr;
 HWND g_captureHwnd = nullptr;
+HWND g_zenityOwner = nullptr;               // the top-level window whose file / folder picker (zenity) is open
+std::atomic<bool>* g_zenityStop = nullptr;  // that picker's cancel flag while it is open (RunZenityDialog)
 POINT g_cursorScreen = { 100, 100 };
 SHORT g_keyStates[256] = {};        // GetKeyState: as of the input message being handled
 SHORT g_liveKeyStates[256] = {};    // GetAsyncKeyState: as of the last X event read
@@ -594,6 +597,40 @@ HWND KeyTargetFor(HWND top) {
         if (r && r->visible && TopLevelOf(f) == top) return f;
     }
     return top;
+}
+
+// Gives the keyboard focus back to a top-level window: to the control that had it when the window lost the focus
+// (WndRecord::focusChild), if that control is still there, otherwise to the window itself
+void RestoreFocusOf(HWND top) {
+    auto rec = FindWnd(top);
+    if (!rec) return;
+    HWND target = top;
+    if (rec->focusChild) {
+        auto ch = FindWnd(rec->focusChild);
+        if (ch && ch->visible && ch->enabled && TopLevelOf(rec->focusChild) == top) target = rec->focusChild;
+    }
+    rec->focusChild = nullptr;
+    ChangeFocus(target);
+}
+
+// The X server took the keyboard focus from a top-level window, or gave it back (FocusOut / FocusIn, applied when
+// their message reaches the front of the queue). Losing it ends the focus as Win32 does when another program is
+// activated: the focused control gets WM_KILLFOCUS, so an inline rename or the address bar is committed. Coming
+// back, the control that had the focus gets it again if it is still there, otherwise the window itself.
+void ApplyXFocus(HWND top, bool gained) {
+    auto rec = FindWnd(top);
+    if (!rec || !rec->topLevel) return;
+    const HWND cur = g_focusedHwnd;
+    const bool focusIsHere = cur && TopLevelOf(cur) == top;
+    if (!gained) {
+        if (!focusIsHere) return;               // it already moved to another of our windows (a dialog that opened)
+        rec->focusChild = (cur != top) ? cur : nullptr;
+        ChangeFocus(nullptr);
+        return;
+    }
+    if (focusIsHere) return;                    // set meanwhile by the app (SetFocus) or by the dialog itself
+    if (!rec->enabled) return;                  // the owner of an open dialog or picker: given back when that closes
+    RestoreFocusOf(top);
 }
 
 // Shift / Ctrl / Alt from an X event's state (the state before the event itself)
@@ -721,6 +758,65 @@ void RaiseModalDialogOf(HWND owner) {
         }
     }
     if (dlg) ActivateX11Window(*dlg);
+}
+
+// The same for an open file / folder picker. zenity is another program, so its window is looked up among the
+// windows the window manager lists (_NET_CLIENT_LIST) by its WM_CLASS, raised, and the window manager is asked to
+// give it the focus. Without such a list (no EWMH window manager) nothing happens: the picker stays where it is.
+void ActivateZenityPicker() {
+    auto& x = X11();
+    if (!x.ready || !x.dpy || !x.GetWindowProperty || !x.InternAtom) return;
+    const Atom clientList = x.InternAtom(x.dpy, "_NET_CLIENT_LIST", True);
+    if (!clientList) return;
+    std::vector<Window> clients;
+    {
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        if (x.GetWindowProperty(x.dpy, x.root, clientList, 0, 4096, False, XA_WINDOW, &type, &format, &count, &after, &data) == Success &&
+            data && type == XA_WINDOW && format == 32) {
+            const unsigned long* w = reinterpret_cast<const unsigned long*>(data);   // format 32: an array of long
+            for (unsigned long i = 0; i < count; ++i) clients.push_back(static_cast<Window>(w[i]));
+        }
+        if (data && x.Free) x.Free(data);
+    }
+    bool any = false;
+    for (Window w : clients) {
+        {
+            std::lock_guard<std::recursive_mutex> lk(g_guiMutex);
+            if (g_xwinToHwnd.count(w)) continue;        // one of our own windows
+        }
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        bool isPicker = false;
+        if (x.GetWindowProperty(x.dpy, w, XA_WM_CLASS, 0, 64, False, XA_STRING, &type, &format, &count, &after, &data) == Success &&
+            data && type == XA_STRING && format == 8) {
+            // WM_CLASS is two names, each ended by a zero byte: "zenity\0Zenity\0"
+            std::string names(reinterpret_cast<const char*>(data), static_cast<size_t>(count));
+            for (char& c : names) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            isPicker = names.find("zenity") != std::string::npos;
+        }
+        if (data && x.Free) x.Free(data);
+        if (!isPicker) continue;
+        any = true;
+        if (x.RaiseWindow) x.RaiseWindow(x.dpy, w);
+        if (x.SendEvent && x.netActiveWindow) {
+            XEvent e = {};
+            e.xclient.type = ClientMessage;
+            e.xclient.send_event = True;
+            e.xclient.display = x.dpy;
+            e.xclient.window = w;
+            e.xclient.message_type = x.netActiveWindow;
+            e.xclient.format = 32;
+            e.xclient.data.l[0] = 1;                    // from an application
+            e.xclient.data.l[1] = CurrentTime;
+            x.SendEvent(x.dpy, x.root, False, SubstructureRedirectMask | SubstructureNotifyMask, &e);
+        }
+    }
+    if (any && x.Flush) x.Flush(x.dpy);
 }
 
 int X11Lib::NonFatalXErrorHandler(Display*, XErrorEvent* e) {
@@ -1556,6 +1652,11 @@ std::deque<MSG>::iterator FindNextMessage(HWND hWnd, UINT fMin, UINT fMax) {
 // A message just taken from the queue: GetKeyState() shows the keys as they were when the input happened, and a
 // keyboard message goes to the window that has the focus now
 void PrepareTakenMessage(MSG& m) {
+    if (m.lPrivate & kMsgXFocus) {
+        // FocusIn / FocusOut of a top-level window, in queue order; the WM_NULL itself then does nothing
+        ApplyXFocus(m.hwnd, m.wParam != 0);
+        return;
+    }
     if (m.lPrivate & kMsgHasKeyState) {
         ApplyModifierSnapshot(g_keyStates, m.lPrivate);
         if ((m.message == WM_KEYDOWN || m.message == WM_KEYUP) && m.wParam < 256 &&
@@ -3838,10 +3939,22 @@ bool RunZenityDialog(const std::vector<std::wstring>& args, std::wstring& outTex
         auto topRec = FindWnd(top);
         const bool wasEnabled = topRec && topRec->enabled;
         if (wasEnabled) EnableWindow(top, FALSE);
+        // While the picker is open, a click on its (disabled) owner brings the picker to the front and the owner's
+        // close button cancels it (HandleX11Event)
+        const HWND prevOwner = g_zenityOwner;
+        std::atomic<bool>* const prevStop = g_zenityStop;
+        g_zenityOwner = top;
+        g_zenityStop = &stop;
         RunModalLoop(nullptr, [&]() { return finished.load(); });
         if (!finished.load()) stop = true;              // the app is quitting: the picker goes too
         worker.join();
-        if (wasEnabled && FindWnd(top)) EnableWindow(top, TRUE);
+        g_zenityOwner = prevOwner;
+        g_zenityStop = prevStop;
+        if (wasEnabled && FindWnd(top)) {
+            EnableWindow(top, TRUE);
+            // The X focus may have come back while the window was still disabled (ApplyXFocus left it alone then)
+            if (!g_focusedHwnd) RestoreFocusOf(top);
+        }
         if (!res.ok()) return false;
         outText = Explorer2::PathUtils::Utf8ToWide(res.out);
     }

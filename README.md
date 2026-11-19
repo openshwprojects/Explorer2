@@ -25,7 +25,10 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
   from the LAN scanner). A server that does not answer never freezes the window: it is asked in the background,
   and the folder opens by itself when it answers
 - Subversion and git repositories by their URL, read-only, like folders (see [Things to know](#things-to-know))
-- In-window image and media viewer with a filmstrip
+- In-window image and media viewer with a filmstrip. For video and audio the mouse wheel moves through the file
+  and the transport bar has a volume slider; they can also be set to open in the system's default player
+- A details view that stays usable in a narrow window or split pane: the columns give up width, the name first,
+  and the least needed ones are left out, so the row buttons on the right never end up out of reach
 
 **Preview pane**
 
@@ -143,6 +146,8 @@ Explorer2.exe [folder]
 
 To check the layout for high-DPI displays on a 100% one, set the environment variable
 `EXPLORER2_FORCE_DPI` (for example `144`, which is 150% scaling) before starting Explorer2.
+`EXPLORER2_UPDATE_TEST_VERSION` (for example `1.0.1`) makes a build pose as that version for the
+update check, which a build made from source otherwise skips.
 
 Settings, FTP bookmarks, backup jobs, monitoring data and logs are stored under
 `%LOCALAPPDATA%\Explorer2`.
@@ -168,6 +173,20 @@ Explorer2 uses these when they are installed, and works without them:
 
 ### Things to know
 
+- The File tab has a "UI scale" setting (also Ctrl and +, Ctrl and -, Ctrl and 0) that makes the whole interface
+  larger or smaller without changing the display scaling of Windows. It is not available in the Linux build yet.
+- "Win+E opens Explorer2" on the File tab gives that shortcut to Explorer2 for the current user. It writes one key
+  under `HKEY_CURRENT_USER\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}` and removes it when
+  switched off; nothing else in the system is changed and no administrator rights are needed. Switch it off before
+  deleting a portable copy (the uninstaller of the Setup version does that itself; a copy that was only moved is
+  found again the next time it starts).
+- Once a day Explorer2 asks GitHub for the tag of the newest release
+  (`api.github.com/repos/openshwprojects/Explorer2/releases/latest`) and shows a note in the status bar when it
+  is newer than the running version. Nothing else is sent, nothing is downloaded or installed, and the check can
+  be switched off on the File tab. The version number in the status bar opens the releases page.
+- A USB stick or card that is plugged in or removed shows up in the drive list by itself; a drive letter made in
+  another way (`subst`, `net use`) appears when you come back to the window or press F5. On Linux a drive
+  appears once it is mounted (the desktop usually does that when it is plugged in).
 - Files dragged out of the window can be dropped on other programs (a browser upload, a chat window,
   Windows Explorer, the desktop). The program you drop them on decides whether they are copied or moved.
 - Delete moves items to the Recycle Bin and Shift+Delete removes them for good. Neither asks for
@@ -211,14 +230,15 @@ $p = Start-Process .\Explorer2.exe -ArgumentList '--self-test','all','build\self
 $p.ExitCode
 ```
 
-`<stage>` is `all`, a stage number (`1` to `10`, `12`, `13`, `14` or `15`), `vcs` for the Git and
+`<stage>` is `all`, a stage number (`1` to `10`, `12`, `13`, `14`, `15` or `16`), `vcs` for the Git and
 Subversion panel's back end alone, or `100x`, which repeats stages 1 to 10 a hundred times.
 
 The tests read sample files from `testdata/`, which must sit next to the executable or in the
 current directory. Some of them exercise the real machine: they ping 127.0.0.1, ask `\\localhost` for
 its shared folders, try to reach `\\10.255.255.1` (a host that never answers) in the background, enumerate USB
 controllers, render a PDF through Windows, start a second copy of the executable to check that
-it ends cleanly, move one small file to the Recycle Bin and take it out again, and briefly use
+it ends cleanly, move one small file to the Recycle Bin and take it out again, write and remove a
+scratch key under `HKEY_CURRENT_USER\Software\Explorer2SelfTest`, and briefly use
 the hidden undo folder on the drive that holds `%TEMP%`. When git is installed, they create a small
 local git repository and browse it by its `file://` URL; when a Subversion client with `svnadmin.exe`
 is installed, they do the same with a Subversion repository and test the Subversion panel against a

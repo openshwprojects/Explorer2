@@ -39,6 +39,12 @@
 #define E2_VERSION_FULL_WSTR L"1.0.0"
 #endif
 
+// 1: a build with a release version (CI run, version tag or explicit override). 0: a build made from source,
+// which carries the base version of the VERSION file and is therefore not compared with the releases (UpdateCheck.h).
+#ifndef E2_VERSION_IS_RELEASE
+#define E2_VERSION_IS_RELEASE 0
+#endif
+
 #ifndef E2_GIT_SHA_STR
 #define E2_GIT_SHA_STR "dev"
 #endif

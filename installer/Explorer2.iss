@@ -85,3 +85,28 @@ Root: HKA; Subkey: "Software\Classes\Drive\shell\Explorer2\command"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// Win+E can be given to Explorer2 from inside the program (File tab). That is a per-user registry key which Setup
+// does not create, so Setup would not remove it either, and after an uninstall Win+E would start a program that is
+// gone. The key therefore goes with the program. A key that points somewhere else (another copy of Explorer2,
+// another file manager) is left alone.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Command: String;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    if RegQueryStringValue(HKEY_CURRENT_USER,
+         'Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command', '', Command) then
+    begin
+      if Pos(Lowercase(ExpandConstant('{app}') + '\'), Lowercase(Command)) > 0 then
+      begin
+        RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER,
+          'Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow');
+        RegDeleteKeyIfEmpty(HKEY_CURRENT_USER, 'Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell');
+        RegDeleteKeyIfEmpty(HKEY_CURRENT_USER, 'Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}');
+      end;
+    end;
+  end;
+end;

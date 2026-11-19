@@ -6,6 +6,9 @@
 #include "RepoBrowser.h"
 #include "OsCompat.h"
 #include "Version.h"
+#include "DetailsColumns.h"
+#include "UpdateCheck.h"
+#include "WinEOverride.h"
 #include <windowsx.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -13,7 +16,14 @@
 #include <commdlg.h>
 #include <commctrl.h>
 #include <winnetwk.h>
+#ifdef _WIN32
+#include <dbt.h>
+#endif
 #include <fstream>
+#include <ctime>
+#include <cwchar>
+#include <cwctype>
+#include <iterator>
 #include <unordered_set>
 #include <memory>
 #include <thread>
@@ -44,8 +54,11 @@ constexpr UINT_PTR ID_TIMER_WORK_ANIM = 2002;
 constexpr UINT_PTR ID_TIMER_MONITOR   = 2003;   // slow refresh of the Monitoring history view
 constexpr UINT_PTR ID_TIMER_GIT       = 2004;   // periodic git status refresh while a repository is shown
 constexpr UINT_PTR ID_TIMER_SLIDESHOW = 2005;   // FullViewer slideshow timer (3.5s interval)
+constexpr UINT_PTR ID_TIMER_DRIVES    = 2006;   // drives changed: one refresh shortly after the last notification (Linux: the periodic look)
+constexpr UINT_PTR ID_TIMER_UPDATE    = 2007;   // one shot after start-up: look for a newer release
 
 static WNDPROC g_origEditProc = nullptr;
+static std::wstring UiSettingsPath();
 
 // Result of a background rename (heap-allocated by the worker, owned by the WM_APP_RENAME_DONE handler)
 struct RenameJobResult {
@@ -319,16 +332,22 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     if (!m_hwnd) { AppLog::Error(L"App", L"Could not create the main window"); return false; }
     AppLog::SetNotify(m_hwnd, WM_APP_LOG_ADDED);
 
-    m_dpi = GetWindowDpiCompat(m_hwnd);
+    m_systemDpi = GetWindowDpiCompat(m_hwnd);
     {
         // Developer aid: EXPLORER2_FORCE_DPI=144 draws as on a 150% display, to check the DPI handling on a 100% one.
         // Moving the window to another monitor (WM_DPICHANGED) returns to the real DPI.
         wchar_t forced[16] = {};
         if (GetEnvironmentVariableW(L"EXPLORER2_FORCE_DPI", forced, 16) > 0) {
             const int v = _wtoi(forced);
-            if (v >= 72 && v <= 480) m_dpi = static_cast<UINT>(v);
+            if (v >= 72 && v <= 480) m_systemDpi = static_cast<UINT>(v);
         }
     }
+#ifdef _WIN32
+    // The user's own scale (File tab) is needed before the window gets its size, so it is read ahead of the other
+    // settings. (Not on Linux: its software renderer draws at 96 DPI only.)
+    m_uiScalePct = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"UiScalePct", 100, UiSettingsPath().c_str())), 75, 250);
+#endif
+    m_dpi = EffectiveDpi();
     {
         // CreateWindowExW took 1240 x 760 as pixels: give the window that size in DIPs instead, and never more than
         // its screen's work area (a 1024 x 768 screen would otherwise get a window wider than the screen, whose
@@ -351,7 +370,8 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
             SetWindowPos(m_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
-    AppLog::Info(L"App", L"Display scaling: " + std::to_wstring(m_dpi) + L" DPI (" + std::to_wstring(m_dpi * 100 / 96) + L"%)");
+    AppLog::Info(L"App", L"Display scaling: " + std::to_wstring(m_systemDpi) + L" DPI (" + std::to_wstring(m_systemDpi * 100 / 96) +
+                         L"%), UI scale " + std::to_wstring(m_uiScalePct) + L"%, drawing at " + std::to_wstring(m_dpi) + L" DPI");
 
     RecreateEditFont();
 
@@ -413,6 +433,14 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
         }
     }
     RebuildTreeNodes();
+    m_driveListSignature = DriveListSignature();
+#ifndef _WIN32
+    // Linux has no WM_DEVICECHANGE: the mount table is looked at every few seconds instead (a small /proc file)
+    SetTimer(m_hwnd, ID_TIMER_DRIVES, 3000, nullptr);
+#endif
+    RefreshWinEState(true);
+    // The look for a newer release waits until the window is up and idle
+    SetTimer(m_hwnd, ID_TIMER_UPDATE, 4000, nullptr);
     AppLog::Info(L"App", L"Init step 2: Settings loaded & Tree nodes built");
 
     std::wstring startDir = initialPath;
@@ -719,6 +747,14 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             EnsureWorkAnimTimerState();
             InvalidateRect(m_hwnd, nullptr, FALSE);
+        } else if (wParam == ID_TIMER_DRIVES) {
+#ifdef _WIN32
+            KillTimer(m_hwnd, ID_TIMER_DRIVES);     // one shot, armed by WM_DEVICECHANGE
+#endif
+            OnDrivesChanged();
+        } else if (wParam == ID_TIMER_UPDATE) {
+            KillTimer(m_hwnd, ID_TIMER_UPDATE);
+            StartUpdateCheckIfDue();
         } else if (wParam == ID_TIMER_GIT) {
             if (GitDockVisible() && !m_git.IsBusy()) SyncGitRepo(true);
         } else if (wParam == ID_TIMER_MONITOR) {
@@ -889,7 +925,8 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DPICHANGED: {
         // Moved to a monitor with another scale factor (or the scaling changed): draw at the new DPI and take the
         // window size Windows suggests, which keeps the layout the same size in DIPs
-        ApplyDpi(HIWORD(wParam));
+        m_systemDpi = (HIWORD(wParam) >= 48) ? HIWORD(wParam) : 96;
+        ApplyDpi(EffectiveDpi());
         const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
         if (suggested) {
             SetWindowPos(m_hwnd, nullptr, suggested->left, suggested->top,
@@ -920,6 +957,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         int id = LOWORD(wParam);
         int code = HIWORD(wParam);
         if (id == ID_EDIT_SEARCH && code == EN_CHANGE) {
+            if (m_settingSearchEditText) return 0;   // the text was set from code (SetSearchEditText), not typed
             wchar_t buf[256] = {};
             GetWindowTextW(m_searchEdit, buf, 256);
             if (IsProgramsView()) {
@@ -954,6 +992,30 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_APP_FULLIMG_READY:
         InvalidateRect(m_hwnd, nullptr, FALSE);
         return 0;
+
+#ifdef _WIN32
+    case WM_ACTIVATEAPP:
+        // A drive letter can come or go without any device notification (subst, net use in a console window, a
+        // mapped drive Windows reconnects): looked at when the user comes back to this window. One cheap call.
+        if (wParam && DriveListSignature() != m_driveListSignature) SetTimer(m_hwnd, ID_TIMER_DRIVES, 150, nullptr);
+        break;
+
+    case WM_DEVICECHANGE:
+        // A volume arrived or left (a USB stick, a card, a mounted image). Several notifications come for one
+        // device: the drive list is rebuilt once, shortly after the last of them.
+        if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) {
+            const auto* hdr = reinterpret_cast<const DEV_BROADCAST_HDR*>(lParam);
+            if (hdr && hdr->dbch_devicetype == DBT_DEVTYP_VOLUME) SetTimer(m_hwnd, ID_TIMER_DRIVES, 700, nullptr);
+        }
+        return TRUE;
+#endif
+
+    case WM_APP_UPDATE_INFO: {
+        // The worker of StartUpdateCheckIfDue has GitHub's answer (an empty tag: no answer)
+        std::unique_ptr<std::wstring> tag(reinterpret_cast<std::wstring*>(lParam));
+        if (tag) OnUpdateCheckResult(*tag);
+        return 0;
+    }
 
     case WM_APP_PREVIEW_READY:
         // The preview pane's worker has read the selected file (a result for a file no longer selected is dropped)
@@ -1509,7 +1571,7 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
     m_searchProgress = {};
     m_editingSearchFieldCmd = 0;
     if (m_searchEdit && IsWindowVisible(m_searchEdit)) {
-        SetWindowTextW(m_searchEdit, L"");
+        SetSearchEditText(L"");
         ShowWindow(m_searchEdit, SW_HIDE);
     }
 
@@ -1651,6 +1713,7 @@ bool ExplorerApp::RefuseReadOnlyFolder(const std::wstring& path) {
 }
 
 void ExplorerApp::RefreshFromUser() {
+    if (DriveListSignature() != m_driveListSignature) OnDrivesChanged();    // also the drive list, when it is out of date
     if (RepoBrowser::IsRepoUrl(m_currentPath)) RepoBrowser::Invalidate(m_currentPath);
     if (NetShares::IsNetworkPath(m_currentPath)) NetShares::Invalidate(m_currentPath);   // the server is asked again
     RefreshCurrentFolder();
@@ -2574,23 +2637,29 @@ int ExplorerApp::HitResizeHandle(float x, float y) const {
     }
     D2D1_RECT_F checkRect = GetMainViewRect();
     bool checkSearch = m_isSearchActive;
+    const std::wstring* checkPath = &m_currentPath;
     if (IsSplitViewActive()) {
         D2D1_RECT_F r0 = GetSplitPaneContentMainRect(0);
         D2D1_RECT_F r1 = GetSplitPaneContentMainRect(1);
         if (x >= r0.left && x <= r0.right) {
             checkRect = r0;
             checkSearch = (m_activePane == 0) ? m_isSearchActive : m_otherPane.isSearchActive;
+            checkPath = (m_activePane == 0) ? &m_currentPath : &m_otherPane.currentPath;
         } else if (x >= r1.left && x <= r1.right) {
             checkRect = r1;
             checkSearch = (m_activePane == 1) ? m_isSearchActive : m_otherPane.isSearchActive;
+            checkPath = (m_activePane == 1) ? &m_currentPath : &m_otherPane.currentPath;
         }
     }
     float hdrTop = checkRect.top + (IsTabBarVisible() ? 26.0f : 0.0f) + (checkSearch ? 28.0f : 0.0f);
     if (m_viewMode == ViewMode::Details && y >= hdrTop && y <= hdrTop + kDetailsHeaderHeight &&
         x >= checkRect.left && x <= checkRect.right) {
+        float colW[5];
+        GetDetailsColumnWidthsFor(checkRect, *checkPath, colW);
         float colX = checkRect.left + 6.0f;
         for (int c = 0; c < 5; ++c) {
-            colX += m_colWidths[c];
+            if (colW[c] <= 0.5f) continue;      // a column left out of a narrow list has no edge to drag
+            colX += colW[c];
             if (std::abs(x - colX) <= 5.0f) return 3;
         }
     }
@@ -2628,6 +2697,23 @@ void ExplorerApp::LoadUiSettings() {
     m_showPreviewPane = GetPrivateProfileIntW(L"UI", L"ShowPreviewPane", 0, ini.c_str()) != 0;
     int prevW = GetPrivateProfileIntW(L"UI", L"PreviewPaneWidth", 450, ini.c_str());
     m_previewPaneWidth = std::clamp(static_cast<float>(prevW), 260.0f, 1000.0f);
+#ifdef _WIN32
+    m_uiScalePct = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"UiScalePct", 100, ini.c_str())), 75, 250);
+#endif
+    m_openMediaExternally = GetPrivateProfileIntW(L"UI", L"MediaOpenExternal", 0, ini.c_str()) != 0;
+    m_mediaPlayer.SetVolume(std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"MediaVolumePct", 100, ini.c_str())), 0, 100) / 100.0);
+    m_mediaPlayer.SetMuted(GetPrivateProfileIntW(L"UI", L"MediaMuted", 0, ini.c_str()) != 0);
+
+    m_updateCheckEnabled = GetPrivateProfileIntW(L"Updates", L"Check", 1, ini.c_str()) != 0;
+    {
+        wchar_t tagBuf[64] = {};
+        GetPrivateProfileStringW(L"Updates", L"LatestTag", L"", tagBuf, static_cast<DWORD>(std::size(tagBuf)), ini.c_str());
+        int numbers[4];
+        m_updateLatestTag = UpdateCheck::ParseVersion(tagBuf, numbers) ? std::wstring(tagBuf) : std::wstring();
+        wchar_t lastBuf[32] = {};
+        GetPrivateProfileStringW(L"Updates", L"LastCheck", L"0", lastBuf, static_cast<DWORD>(std::size(lastBuf)), ini.c_str());
+        m_updateLastCheckUnix = std::max(0LL, std::wcstoll(lastBuf, nullptr, 10));
+    }
 
     int sortCol = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"SortCol", 0, ini.c_str())), 0, 3);
     m_sortCol = static_cast<SortColumn>(sortCol);
@@ -2811,6 +2897,10 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
     content += L"SplitRatioPct=" + std::to_wstring(splitPct) + L"\r\n";
     content += L"ShowPreviewPane="; content += (m_showPreviewPane ? L"1\r\n" : L"0\r\n");
     content += L"PreviewPaneWidth=" + std::to_wstring(prevW) + L"\r\n";
+    content += L"UiScalePct=" + std::to_wstring(m_uiScalePct) + L"\r\n";
+    content += L"MediaOpenExternal="; content += (m_openMediaExternally ? L"1\r\n" : L"0\r\n");
+    content += L"MediaVolumePct=" + std::to_wstring(static_cast<int>(std::lround(m_mediaPlayer.GetVolume() * 100.0))) + L"\r\n";
+    content += L"MediaMuted="; content += (m_mediaPlayer.IsMuted() ? L"1\r\n" : L"0\r\n");
     content += L"SortCol=" + std::to_wstring(static_cast<int>(m_sortCol)) + L"\r\n";
     content += L"SortAsc="; content += (m_sortAsc ? L"1\r\n" : L"0\r\n");
     content += L"GroupBy=" + std::to_wstring(static_cast<int>(m_groupBy)) + L"\r\n";
@@ -2831,6 +2921,11 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
     for (int i = 0; i < cnt; ++i) {
         content += L"Dir" + std::to_wstring(i) + L"=" + m_recentDirs[i] + L"\r\n";
     }
+
+    content += L"\r\n[Updates]\r\n";
+    content += L"Check="; content += (m_updateCheckEnabled ? L"1\r\n" : L"0\r\n");
+    content += L"LastCheck=" + std::to_wstring(m_updateLastCheckUnix) + L"\r\n";
+    content += L"LatestTag=" + m_updateLatestTag + L"\r\n";
 
     TransferConfig xcfg = m_transfers.GetConfig();
     content += L"\r\n[Transfers]\r\n";
@@ -3034,6 +3129,21 @@ void ExplorerApp::GetGridMetrics(const D2D1_RECT_F& contentRect, float& outCellW
     outCols = std::max(1, static_cast<int>(availW / outCellW));
 }
 
+bool ExplorerApp::DetailsRowButtonsShownFor(const std::wstring& path) {
+    return path != L"THIS_PC" && !RepoBrowser::IsRepoUrl(path) && !NetShares::IsServerRoot(path);
+}
+
+void ExplorerApp::GetDetailsColumnWidthsFor(const D2D1_RECT_F& mainViewRect, const std::wstring& path, float out[5]) const {
+    // The list is the view without its scrollbar (GetContentItemsRect), with 6 DIPs before the first column and 2
+    // after the last one
+    const float listW = std::max(0.0f, (mainViewRect.right - mainViewRect.left) - kScrollbarWidth);
+    FitDetailsColumns(m_colWidths, DetailsRowButtonsShownFor(path), listW - 8.0f, out);
+}
+
+void ExplorerApp::GetDetailsColumnWidths(float out[5]) const {
+    GetDetailsColumnWidthsFor(GetMainViewRect(), m_currentPath, out);
+}
+
 D2D1_RECT_F ExplorerApp::GetItemRect(int index, const D2D1_RECT_F& contentRect) const {
     if (index < 0 || index >= static_cast<int>(m_items.size())) {
         return D2D1::RectF(0, 0, 0, 0);
@@ -3041,7 +3151,9 @@ D2D1_RECT_F ExplorerApp::GetItemRect(int index, const D2D1_RECT_F& contentRect) 
 
     if (m_viewMode == ViewMode::Details) {
         float y = contentRect.top + index * kDetailsRowHeight - m_scrollY;
-        float totalColsW = m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3] + m_colWidths[4];
+        float colW[5];
+        GetDetailsColumnWidths(colW);
+        float totalColsW = colW[0] + colW[1] + colW[2] + colW[3] + colW[4];
         float rowW = std::max(totalColsW, contentRect.right - contentRect.left - 4.0f);
         return D2D1::RectF(contentRect.left + 2.0f, y, contentRect.left + rowW, y + kDetailsRowHeight);
     }
@@ -3116,7 +3228,9 @@ int ExplorerApp::HitTestItem(float x, float y, const D2D1_RECT_F& contentRect, b
         if (relY < 0.0f) return -1;
         int idx = static_cast<int>(relY / kDetailsRowHeight);
         if (idx >= 0 && idx < static_cast<int>(m_items.size())) {
-            float nameAndColsW = m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3] + m_colWidths[4];
+            float colW[5];
+            GetDetailsColumnWidths(colW);
+            float nameAndColsW = colW[0] + colW[1] + colW[2] + colW[3] + colW[4];
             if (x <= contentRect.left + nameAndColsW) {
                 if (outOnLabelOrIcon) *outOnLabelOrIcon = true;
                 return idx;
@@ -3391,7 +3505,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                 PlaceChildDip(m_searchEdit, m_searchBarRect.left, navY,
                               m_searchBarRect.right - m_searchBarRect.left - 44.0f,
                               m_searchBarRect.bottom - m_searchBarRect.top);
-                SetWindowTextW(m_searchEdit, IsProgramsView() ? m_progFilter.c_str() : m_filterText.c_str());
+                SetSearchEditText(IsProgramsView() ? m_progFilter.c_str() : m_filterText.c_str());
                 SetFocus(m_searchEdit);
                 SendMessageW(m_searchEdit, EM_SETSEL, 0, -1);
                 return;
@@ -3420,6 +3534,12 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
     if (PreviewPaneVisible()) {
         D2D1_RECT_F prevRect = GetPreviewPaneRect();
         if (PathUtils::PtInRectF(x, y, prevRect)) {
+            if (!rightButton && m_mediaPlayer.HasMedia() && PathUtils::PtInRectF(x, y, m_mediaVolumeBarRect)) {
+                m_draggingMediaVolume = true;
+                SetCapture(m_hwnd);
+                SetMediaVolumeFromX(x);
+                return;
+            }
             if (!rightButton && m_mediaPlayer.HasMedia() && PathUtils::PtInRectF(x, y, m_mediaSeekBarRect)) {
                 float pct = std::clamp((x - m_mediaSeekBarRect.left) / std::max(1.0f, m_mediaSeekBarRect.right - m_mediaSeekBarRect.left), 0.0f, 1.0f);
                 m_mediaPlayer.SeekToSeconds(pct * m_mediaPlayer.GetDurationSec());
@@ -3530,6 +3650,14 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                 }
             }
 
+            // Volume slider: a click sets the volume, holding the button drags it
+            if (m_mediaPlayer.HasMedia() && PathUtils::PtInRectF(x, y, m_mediaVolumeBarRect)) {
+                m_draggingMediaVolume = true;
+                SetCapture(m_hwnd);
+                SetMediaVolumeFromX(x);
+                return;
+            }
+
             // Check Media Player Seek Bar click
             if (m_mediaPlayer.HasMedia() && PathUtils::PtInRectF(x, y, m_mediaSeekBarRect)) {
                 float pct = std::clamp((x - m_mediaSeekBarRect.left) / std::max(1.0f, m_mediaSeekBarRect.right - m_mediaSeekBarRect.left), 0.0f, 1.0f);
@@ -3574,10 +3702,18 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
         y >= hdrTop && y <= hdrTop + kDetailsHeaderHeight &&
         x >= mainRect.left && x <= mainRect.right)
     {
+        float colW[5];
+        GetDetailsColumnWidths(colW);
         float colX = mainRect.left + 6.0f;
         for (int c = 0; c < 5; ++c) {
-            float colRight = colX + m_colWidths[c];
+            if (colW[c] <= 0.5f) continue;      // left out of a narrow list (FitDetailsColumns)
+            float colRight = colX + colW[c];
             if (std::abs(x - colRight) <= 5.0f) {
+                // In a list too narrow for the stored widths the columns are drawn narrower: the drag starts from
+                // what is on screen, so those widths become the stored ones (hidden columns keep theirs)
+                for (int k = 0; k < 5; ++k) {
+                    if (colW[k] > 0.5f) m_colWidths[k] = colW[k];
+                }
                 m_resizingCol = c;
                 m_resizeStartX = x;
                 m_resizeStartWidth = m_colWidths[c];
@@ -3666,9 +3802,11 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
         int hitIdx = HitTestItem(x, y, contentRect, &onItem);
 
         // Check "Operacje" column buttons ([Kosz] / [Przywróć] and [Usuń]) in Details view
-        if (!rightButton && m_viewMode == ViewMode::Details && hitIdx >= 0 && m_currentPath != L"THIS_PC") {
+        float colW[5] = {};
+        if (m_viewMode == ViewMode::Details) GetDetailsColumnWidths(colW);
+        if (!rightButton && m_viewMode == ViewMode::Details && hitIdx >= 0 && colW[4] > 0.5f) {
             D2D1_RECT_F rowR = GetItemRect(hitIdx, contentRect);
-            float opColX = contentRect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
+            float opColX = contentRect.left + 6.0f + colW[0] + colW[1] + colW[2] + colW[3];
             const bool inBin = (m_currentPath == L"RECYCLE_BIN");
             D2D1_RECT_F trashBtn = D2D1::RectF(opColX + (inBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
             D2D1_RECT_F permBtn  = D2D1::RectF(opColX + (inBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
@@ -3740,6 +3878,11 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
 
 void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
     m_mousePt = D2D1::Point2F(x, y);
+
+    if (m_draggingMediaVolume) {
+        SetMediaVolumeFromX(x);
+        return;
+    }
 
     if (m_draggingTreeSplitter) {
         m_treePaneWidth = std::clamp(x, 140.0f, 500.0f);
@@ -3910,10 +4053,11 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
 
     int prevRowAction = m_hoverRowActionKind;
     m_hoverRowActionKind = 0;
-    if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath) &&
-        !NetShares::IsServerRoot(m_currentPath)) {
+    float hoverColW[5] = {};
+    if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0) GetDetailsColumnWidths(hoverColW);
+    if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && hoverColW[4] > 0.5f) {
         D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, contentRect);
-        float opColX = contentRect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
+        float opColX = contentRect.left + 6.0f + hoverColW[0] + hoverColW[1] + hoverColW[2] + hoverColW[3];
         const bool inBin = (m_currentPath == L"RECYCLE_BIN");
         D2D1_RECT_F trashBtn = D2D1::RectF(opColX + (inBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
         D2D1_RECT_F permBtn  = D2D1::RectF(opColX + (inBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
@@ -3933,10 +4077,11 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
             D2D1_RECT_F otherContent = GetContentItemsRect();
             m_hoverIndex = (m_viewMode == ViewMode::FullViewer || m_viewMode == ViewMode::Hardware) ? -1 : HitTestItem(x, y, otherContent, nullptr);
             m_hoverRowActionKind = 0;
-            if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath) &&
-                !NetShares::IsServerRoot(m_currentPath)) {
+            float otherColW[5] = {};
+            if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0) GetDetailsColumnWidths(otherColW);
+            if (m_viewMode == ViewMode::Details && m_hoverIndex >= 0 && otherColW[4] > 0.5f) {
                 D2D1_RECT_F rowR = GetItemRect(m_hoverIndex, otherContent);
-                float opColX = otherContent.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
+                float opColX = otherContent.left + 6.0f + otherColW[0] + otherColW[1] + otherColW[2] + otherColW[3];
                 const bool inBin = (m_currentPath == L"RECYCLE_BIN");
                 D2D1_RECT_F trashBtn = D2D1::RectF(opColX + (inBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
                 D2D1_RECT_F permBtn  = D2D1::RectF(opColX + (inBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
@@ -4082,6 +4227,14 @@ void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags)
         return;
     }
 
+    if (m_draggingMediaVolume) {
+        m_draggingMediaVolume = false;
+        ReleaseCapture();
+        SaveUiSettings();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
     bool contentUp = m_contentPane.OnMouseUp();
     if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0 || m_draggingScrollbar || m_viewerDraggingPan || m_isBoxSelecting || contentUp) {
         if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0) SaveUiSettings();
@@ -4129,6 +4282,17 @@ void ExplorerApp::OnMouseDoubleClick(float x, float y, WPARAM keyFlags) {
     D2D1_RECT_F mainRect = GetMainViewRect();
 
     if (m_viewMode == ViewMode::FullViewer) {
+        // The second click on a transport control (volume, mute, seek bar, play) is a click like the first one
+        if (m_mediaPlayer.HasMedia()) {
+            bool onControl = PathUtils::PtInRectF(x, y, m_mediaVolumeBarRect) || PathUtils::PtInRectF(x, y, m_mediaSeekBarRect);
+            for (const auto& btn : m_ribbonHits) {
+                if ((btn.id == CMD_MEDIA_MUTE || btn.id == CMD_MEDIA_PLAY_PAUSE) && PathUtils::PtInRectF(x, y, btn.rect)) onControl = true;
+            }
+            if (onControl) {
+                OnMouseDown(x, y, false, keyFlags);
+                return;
+            }
+        }
         float canvasBottom = m_isFullScreen ? mainRect.bottom : (mainRect.bottom - kFilmstripHeight);
         if (x >= mainRect.left && x <= mainRect.right && y >= mainRect.top && y < canvasBottom) {
             ToggleFullScreen();
@@ -4209,10 +4373,25 @@ void ExplorerApp::OnMouseWheel(short delta, float x, float y, WPARAM keyFlags) {
         }
     }
 
+    // Over the volume control of a transport bar (full viewer or preview pane) the wheel changes the volume
+    if (m_mediaPlayer.HasMedia() && (m_viewMode == ViewMode::FullViewer || PreviewPaneVisible()) &&
+        m_mediaVolumeBarRect.right > m_mediaVolumeBarRect.left &&
+        x >= m_mediaVolumeBarRect.left - 30.0f && x <= m_mediaVolumeBarRect.right + 6.0f &&
+        y >= m_mediaVolumeBarRect.top - 8.0f && y <= m_mediaVolumeBarRect.bottom + 8.0f) {
+        NudgeMediaVolume(steps);
+        return;
+    }
+
     // If cursor is over the Right-Side File Content Pane (Hex / 3D), scroll or zoom it!
     if (PreviewPaneVisible() && m_contentPane.OnMouseWheel(delta, x, y)) {
         EnsureWorkAnimTimerState();     // a PDF page turned by the wheel is drawn in the background
         InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+    // Over a video or a sound file playing in the preview pane the wheel moves through it, as in the full viewer
+    // (it used to scroll the file list next to the pane)
+    if (PreviewPaneVisible() && m_mediaPlayer.HasMedia() && PathUtils::PtInRectF(x, y, GetPreviewPaneRect())) {
+        SeekMediaBy(steps * 5.0);
         return;
     }
 
@@ -4278,6 +4457,11 @@ void ExplorerApp::OnMouseWheel(short delta, float x, float y, WPARAM keyFlags) {
             m_filmstripScrollX -= steps * 140.0f;
             float maxScrollX = std::max(0.0f, static_cast<float>(m_items.size()) * 74.0f - (mainRect.right - mainRect.left) + 20.0f);
             m_filmstripScrollX = std::clamp(m_filmstripScrollX, 0.0f, maxScrollX);
+        } else if (m_mediaPlayer.HasMedia() && (keyFlags & MK_SHIFT) == 0) {
+            // A video or a sound file: the wheel moves through it, 5 seconds a notch (towards the end when the wheel
+            // is turned away from the user, as in most players). Shift + wheel still zooms the picture.
+            SeekMediaBy(steps * 5.0);
+            return;
         } else {
             m_viewerActualPixels = false;
             float factor = (steps > 0) ? 1.2f : (1.0f / 1.2f);
@@ -4394,6 +4578,17 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
         if (vk == 'T') { CreateNewTab(L"", true); return; }
         if (vk == 'W') { CloseTab(m_activeTab); return; }
         if (vk == 'M') { ExecuteRibbonCommand(CMD_BATCH_RENAME); return; }
+        // The player in the full viewer: Ctrl + Left / Right move 5 seconds, Ctrl + Up / Down change the volume
+        if (m_viewMode == ViewMode::FullViewer && m_mediaPlayer.HasMedia()) {
+            if (vk == VK_LEFT)  { SeekMediaBy(-5.0); return; }
+            if (vk == VK_RIGHT) { SeekMediaBy(5.0); return; }
+            if (vk == VK_UP)    { NudgeMediaVolume(1); return; }
+            if (vk == VK_DOWN)  { NudgeMediaVolume(-1); return; }
+        }
+        // UI scale: Ctrl + Plus / Minus one step, Ctrl + 0 back to 100%
+        if (vk == VK_OEM_PLUS || vk == VK_ADD)       { ExecuteRibbonCommand(CMD_UI_SCALE_UP); return; }
+        if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) { ExecuteRibbonCommand(CMD_UI_SCALE_DOWN); return; }
+        if (vk == '0' || vk == VK_NUMPAD0)           { SetUiScale(100); return; }
     }
 
     if (vk == VK_F2) { StartInlineRename(); return; }
@@ -4413,6 +4608,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
             }
             return;
         }
+        if (vk == 'M' && m_mediaPlayer.HasMedia()) { ExecuteRibbonCommand(CMD_MEDIA_MUTE); return; }
         if (vk == '0' || vk == VK_NUMPAD0) { ResetViewerZoom(); return; }
         if (vk == '1' || vk == VK_NUMPAD1) { SetViewerZoom100(); return; }
         if (vk == VK_LEFT || vk == VK_UP || vk == VK_PRIOR) { StepViewerImage(-1); return; }
@@ -4999,6 +5195,56 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         break;
     case CMD_MEDIA_PLAY_PAUSE:
         m_mediaPlayer.TogglePlayPause();
+        break;
+    case CMD_MEDIA_MUTE:
+        m_mediaPlayer.SetMuted(!m_mediaPlayer.IsMuted());
+        SaveUiSettings();
+        break;
+    case CMD_TOGGLE_MEDIA_EXTERNAL:
+        m_openMediaExternally = !m_openMediaExternally;
+        m_statusToast = m_openMediaExternally
+            ? (m_lang == Lang::PL ? L"\x2713 Wideo i audio otwierają się w domyślnym programie systemu (wbudowany podgląd: menu kontekstowe lub Spacja)"
+                                  : L"\x2713 Video and audio open in the system's default program (built-in viewer: context menu or Space)")
+            : (m_lang == Lang::PL ? L"\x2713 Wideo i audio otwierają się we wbudowanym podglądzie"
+                                  : L"\x2713 Video and audio open in the built-in viewer");
+        m_statusToastExpireTick = GetTickCount64() + 4500;
+        SaveUiSettings();
+        break;
+    case CMD_UI_SCALE_MENU:
+        ShowUiScaleMenu();
+        return;
+    case CMD_UI_SCALE_UP:
+    case CMD_UI_SCALE_DOWN: {
+        static const int kSteps[] = { 75, 90, 100, 110, 125, 150, 175, 200, 250 };
+        int next = m_uiScalePct;
+        if (cmdId == CMD_UI_SCALE_UP) {
+            for (int v : kSteps) { if (v > m_uiScalePct) { next = v; break; } }
+        } else {
+            for (int i = static_cast<int>(std::size(kSteps)) - 1; i >= 0; --i) { if (kSteps[i] < m_uiScalePct) { next = kSteps[i]; break; } }
+        }
+        SetUiScale(next);
+        return;
+    }
+    case CMD_TOGGLE_WIN_E:
+        ToggleWinEOverride();
+        break;
+    case CMD_TOGGLE_UPDATE_CHECK:
+        m_updateCheckEnabled = !m_updateCheckEnabled;
+        SaveUiSettings();
+        if (m_updateCheckEnabled) {
+            m_statusToast = m_lang == Lang::PL ? L"\x2713 Explorer2 raz dziennie sprawdzi, czy jest nowsza wersja (tylko pyta GitHub o numer wydania)"
+                                               : L"\x2713 Explorer2 will look for a newer version once a day (it only asks GitHub for the release number)";
+            m_statusToastExpireTick = GetTickCount64() + 4500;
+            StartUpdateCheckIfDue(true);
+        } else {
+            m_updateAvailable = false;
+            m_statusToast = m_lang == Lang::PL ? L"\x2713 Explorer2 nie będzie sprawdzać, czy jest nowsza wersja"
+                                               : L"\x2713 Explorer2 will not look for newer versions";
+            m_statusToastExpireTick = GetTickCount64() + 3500;
+        }
+        break;
+    case CMD_OPEN_RELEASES_PAGE:
+        ShellExecuteW(m_hwnd, L"open", UpdateCheck::kReleasesPageUrl, nullptr, nullptr, SW_SHOWNORMAL);
         break;
 
     // Share ("Udostępnianie") & File ("Plik") Ribbon Commands
@@ -6247,7 +6493,12 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
               L"PODGLĄD I MULTIMEDIA:\n"
               L"  \x2022 Alt + P                            — Przełącz prawy panel podglądu (Kod, Hex, 3D, PCB, PDF, AI/EXIF)\n"
               L"  \x2022 F11 / Spacja                       — Pełny ekran / Odtwarzaj-Pauza wideo\n"
-              L"  \x2022 Kółko myszy (w Pełnym podglądzie)  — Powiększenie do 16\xD7 + porównywanie obrazów i histogram RGB"
+              L"  \x2022 Kółko myszy (w Pełnym podglądzie)  - Obraz: powiększenie do 16\xD7. Wideo i audio: przewijanie co 5 s (Shift + kółko: powiększenie)\n"
+              L"  \x2022 Ctrl + strzałki, M (wideo i audio) - W lewo / w prawo: 5 s wstecz / dalej. W górę / w dół: głośność. M: wycisz"
+#ifdef _WIN32
+              L"\n\nWYGLĄD:\n"
+              L"  \x2022 Ctrl i +, Ctrl i -, Ctrl i 0       - Skala interfejsu: większa, mniejsza, 100% (także: karta Plik)"
+#endif
             : L"NAVIGATION & TABS:\n"
               L"  \x2022 Ctrl + T / Middle-Click            — Open folder in new tab\n"
               L"  \x2022 Ctrl + W / Ctrl + Tab              — Close tab / Switch to next tab\n"
@@ -6264,7 +6515,13 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
               L"PREVIEW & MEDIA:\n"
               L"  \x2022 Alt + P                            — Toggle right Preview Pane (Code, Hex, 3D, PCB, PDF, AI/EXIF)\n"
               L"  \x2022 F11 / Space                        — Fullscreen / Play-Pause media\n"
-              L"  \x2022 Mouse Wheel (in FullViewer)        — Smooth zoom up to 16\xD7 + Side-by-Side Compare & RGB Histogram";
+              L"  \x2022 Mouse Wheel (in FullViewer)        - Image: zoom up to 16\xD7. Video and audio: seek 5 s a notch (Shift + wheel: zoom)\n"
+              L"  \x2022 Ctrl + arrows, M (video and audio) - Left / Right: 5 s back / forward. Up / Down: volume. M: mute"
+#ifdef _WIN32
+              L"\n\nAPPEARANCE:\n"
+              L"  \x2022 Ctrl and +, Ctrl and -, Ctrl and 0 - UI scale: larger, smaller, 100% (also: File tab)"
+#endif
+              ;
         MessageBoxW(m_hwnd, body, title, MB_OK | MB_ICONINFORMATION);
         break;
     }
@@ -6526,7 +6783,7 @@ void ExplorerApp::ActivateFocusedOrSelectedItem() {
     }
     if (item.isDirectory || ArchiveExplorer::IsArchiveExtension(item.ext)) {
         NavigateTo(item.fullPath, true);
-    } else if (item.isImage || item.isVideo || item.isAudio) {
+    } else if (item.isImage || ((item.isVideo || item.isAudio) && !(m_openMediaExternally && m_viewMode != ViewMode::FullViewer))) {
         if (m_viewMode != ViewMode::FullViewer) {
             m_lastNonViewerMode = m_viewMode;
             m_viewMode = ViewMode::FullViewer;
@@ -7201,7 +7458,9 @@ void ExplorerApp::StartInlineRename() {
     m_renamingOldName = m_items[m_focusedIndex].name;
     float editLeft = itemR.left + (m_viewMode == ViewMode::Details ? 22.0f : 2.0f);
     float editTop  = (m_viewMode == ViewMode::Details) ? itemR.top : (itemR.bottom - 24.0f);
-    float editW    = std::max(120.0f, (m_viewMode == ViewMode::Details ? m_colWidths[0] - 24.0f : (itemR.right - itemR.left - 4.0f)));
+    float renameColW[5] = {};
+    if (m_viewMode == ViewMode::Details) GetDetailsColumnWidths(renameColW);
+    float editW    = std::max(120.0f, (m_viewMode == ViewMode::Details ? renameColW[0] - 24.0f : (itemR.right - itemR.left - 4.0f)));
 
     PlaceChildDip(m_renameEdit, editLeft, editTop, editW, 22.0f);
     SetWindowTextW(m_renameEdit, m_items[m_focusedIndex].name.c_str());
@@ -8407,7 +8666,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
             const FileEntry& targetItem = m_items[hitIndex];
             if (targetItem.isDirectory) {
                 NavigateTo(targetItem.fullPath, true);
-            } else if (targetItem.isImage || targetItem.isVideo || targetItem.isAudio) {
+            } else if (targetItem.isImage || ((targetItem.isVideo || targetItem.isAudio) && !m_openMediaExternally)) {
                 ToggleFullViewerMode();
             } else {
                 std::wstring arcFile, innerPath;
@@ -8832,10 +9091,323 @@ void ExplorerApp::ClearSearchAndRestoreFolder() {
     m_searchProgress = {};
     m_filterText.clear();
     if (m_searchEdit) {
-        SetWindowTextW(m_searchEdit, L"");
-        ShowWindow(m_searchEdit, SW_HIDE);
+        SetSearchEditText(L"");
+        // Emptied by typing (the last character deleted): the box stays open for the next query, otherwise the next
+        // key press would go to the file list. Cleared in any other way (the X button, a filter reset): it closes.
+        if (GetFocus() != m_searchEdit) ShowWindow(m_searchEdit, SW_HIDE);
     }
     ApplyFilterAndSort();
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::SetSearchEditText(const wchar_t* text) {
+    if (!m_searchEdit) return;
+    const bool wasSetting = m_settingSearchEditText;
+    m_settingSearchEditText = true;
+    SetWindowTextW(m_searchEdit, text ? text : L"");
+    m_settingSearchEditText = wasSetting;
+}
+
+// ---- UI scale ------------------------------------------------------------------------------------------------
+
+UINT ExplorerApp::EffectiveDpi() const {
+    const long scaled = std::lround(static_cast<double>(m_systemDpi) * static_cast<double>(m_uiScalePct) / 100.0);
+    return static_cast<UINT>(std::clamp<long>(scaled, 48, 960));
+}
+
+void ExplorerApp::SetUiScale(int pct) {
+#ifndef _WIN32
+    (void)pct;      // the Linux build's software renderer draws at 96 DPI only: the setting is not offered there
+#else
+    pct = std::clamp(pct, 75, 250);
+    if (pct == m_uiScalePct) return;
+    m_uiScalePct = pct;
+    ApplyDpi(EffectiveDpi());
+    ClampScrollOffset();
+    SaveUiSettings();
+    m_statusToast = (m_lang == Lang::PL ? L"Skala interfejsu: " : L"UI scale: ") + std::to_wstring(pct) +
+                    (m_lang == Lang::PL ? L"%   (Ctrl i +, Ctrl i -, Ctrl i 0 = 100%)" : L"%   (Ctrl and +, Ctrl and -, Ctrl and 0 = 100%)");
+    m_statusToastExpireTick = GetTickCount64() + 3500;
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+#endif
+}
+
+void ExplorerApp::ShowUiScaleMenu() {
+    static const int kChoices[] = { 90, 100, 110, 125, 150, 175, 200 };
+    HMENU hMenu = CreatePopupMenu();
+    for (size_t i = 0; i < std::size(kChoices); ++i) {
+        const std::wstring label = std::to_wstring(kChoices[i]) + L"%";
+        AppendMenuW(hMenu, MF_STRING | (kChoices[i] == m_uiScalePct ? MF_CHECKED : MF_UNCHECKED),
+                    CMD_BASE_UI_SCALE + static_cast<UINT>(i), label.c_str());
+    }
+    POINT pt = {};
+    GetCursorPos(&pt);
+    for (const auto& hit : m_ribbonHits) {
+        if (hit.id == CMD_UI_SCALE_MENU) {
+            pt = ClientDipToScreen(hit.rect.left, hit.rect.bottom);
+            break;
+        }
+    }
+    const int sel = static_cast<int>(TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr));
+    DestroyMenu(hMenu);
+    if (sel >= CMD_BASE_UI_SCALE && sel < CMD_BASE_UI_SCALE + static_cast<int>(std::size(kChoices))) {
+        SetUiScale(kChoices[sel - CMD_BASE_UI_SCALE]);
+    }
+}
+
+// ---- Player volume and seeking -------------------------------------------------------------------------------
+
+void ExplorerApp::SetMediaVolumeFromX(float x) {
+    const float w = m_mediaVolumeBarRect.right - m_mediaVolumeBarRect.left;
+    if (w <= 1.0f) return;
+    m_mediaPlayer.SetVolume(std::clamp((x - m_mediaVolumeBarRect.left) / w, 0.0f, 1.0f));
+    m_mediaPlayer.SetMuted(false);
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::NudgeMediaVolume(int steps) {
+    if (steps == 0) return;
+    if (m_mediaPlayer.IsMuted() && steps > 0) {
+        m_mediaPlayer.SetMuted(false);      // the first step up of a muted player only brings the sound back
+    } else {
+        m_mediaPlayer.SetVolume((std::round(m_mediaPlayer.GetVolume() * 20.0) + steps) / 20.0);
+    }
+    m_statusToast = (m_lang == Lang::PL ? L"Głośność: " : L"Volume: ") +
+                    std::to_wstring(static_cast<int>(std::lround(m_mediaPlayer.GetVolume() * 100.0))) + L"%";
+    m_statusToastExpireTick = GetTickCount64() + 1800;
+    SaveUiSettings();
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::SeekMediaBy(double seconds) {
+    if (!m_mediaPlayer.HasMedia()) return;
+    const double dur = m_mediaPlayer.GetDurationSec();
+    if (dur <= 0.0) return;
+    // Several notches in a row add up: until the player has reached the last place asked for, the next step
+    // starts from that place and not from where the picture still is
+    const ULONGLONG now = GetTickCount64();
+    double base = m_mediaPlayer.GetCurrentTimeSec();
+    if (m_mediaSeekTargetSec >= 0.0 && now - m_mediaSeekTick < 900 && m_mediaSeekPath == m_mediaPlayer.GetCurrentPath()) {
+        base = m_mediaSeekTargetSec;
+    }
+    const double target = std::clamp(base + seconds, 0.0, dur);
+    m_mediaSeekTargetSec = target;
+    m_mediaSeekTick = now;
+    m_mediaSeekPath = m_mediaPlayer.GetCurrentPath();
+    m_mediaPlayer.SeekToSeconds(target);
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+// ---- Drives plugged in or removed ----------------------------------------------------------------------------
+
+// What the drive list was made from: the set of drive letters on Windows, the mount table on Linux
+std::wstring ExplorerApp::DriveListSignature() const {
+#ifdef _WIN32
+    return std::to_wstring(GetLogicalDrives());
+#else
+    std::ifstream mounts("/proc/self/mounts");
+    const std::string text((std::istreambuf_iterator<char>(mounts)), std::istreambuf_iterator<char>());
+    return std::to_wstring(text.size()) + L":" + std::to_wstring(std::hash<std::string>{}(text));
+#endif
+}
+
+void ExplorerApp::OnDrivesChanged() {
+    const std::wstring signature = DriveListSignature();
+#ifndef _WIN32
+    if (signature == m_driveListSignature) return;      // the periodic look found the mount table as it was
+#endif
+    m_driveListSignature = signature;
+    AppLog::Info(L"App", L"Drives changed: updating the drive list");
+
+    // The drives under "Ten komputer" are replaced one by one, so that folders the user has opened in the tree
+    // (on drives that are still there) stay open. A collapsed "Ten komputer" lists its drives when it is opened.
+    const std::vector<TreeNode> fresh = m_fileEngine.BuildNavigationTree(m_lang, m_pinnedFolders);
+    int header = -1;
+    for (int i = 0; i < static_cast<int>(m_treeNodes.size()); ++i) {
+        if (m_treeNodes[i].normKey == L"__HEADER_PC__") { header = i; break; }
+    }
+    if (header >= 0 && m_treeNodes[header].isExpanded) {
+        size_t end = static_cast<size_t>(header) + 1;
+        while (end < m_treeNodes.size() && m_treeNodes[end].indent != 0) ++end;
+
+        // The header's nodes as they are now: each drive with what is open below it, and the rest (FTP sites)
+        std::vector<std::vector<TreeNode>> oldDrives;
+        std::vector<TreeNode> others;
+        for (size_t i = static_cast<size_t>(header) + 1; i < end;) {
+            const bool isDriveNode = m_treeNodes[i].isDrive && m_treeNodes[i].indent == 1;
+            size_t j = i + 1;
+            if (isDriveNode) {
+                while (j < end && m_treeNodes[j].indent > 1) ++j;
+                oldDrives.emplace_back(m_treeNodes.begin() + static_cast<std::ptrdiff_t>(i), m_treeNodes.begin() + static_cast<std::ptrdiff_t>(j));
+            } else {
+                others.push_back(m_treeNodes[i]);
+            }
+            i = isDriveNode ? j : i + 1;
+        }
+
+        std::vector<TreeNode> rebuilt;
+        for (const TreeNode& drive : fresh) {
+            if (!(drive.isDrive && drive.indent == 1)) continue;
+            auto old = std::find_if(oldDrives.begin(), oldDrives.end(),
+                                    [&](const std::vector<TreeNode>& d) { return d.front().normKey == drive.normKey; });
+            TreeNode node = drive;
+            if (old != oldDrives.end()) {
+                node.isExpanded = old->front().isExpanded;
+                rebuilt.push_back(std::move(node));
+                rebuilt.insert(rebuilt.end(), old->begin() + 1, old->end());
+            } else {
+                rebuilt.push_back(std::move(node));
+            }
+        }
+        rebuilt.insert(rebuilt.end(), others.begin(), others.end());
+
+        m_treeNodes.erase(m_treeNodes.begin() + header + 1, m_treeNodes.begin() + static_cast<std::ptrdiff_t>(end));
+        m_treeNodes.insert(m_treeNodes.begin() + header + 1, rebuilt.begin(), rebuilt.end());
+        m_hoverTreeIndex = -1;
+        m_fileEngine.RequestTreeFolderSizes(m_treeNodes, false);
+        m_fileEngine.SyncTreeNodeSizes(m_treeNodes);
+    }
+
+#ifdef _WIN32
+    // The folder on screen was on a drive that is gone: back to the list of drives
+    if (m_currentPath.size() >= 2 && m_currentPath[1] == L':') {
+        const wchar_t letter = static_cast<wchar_t>(towupper(m_currentPath[0]));
+        if (letter >= L'A' && letter <= L'Z' && !(GetLogicalDrives() & (1u << (letter - L'A')))) {
+            NavigateTo(L"THIS_PC", true);
+        }
+    }
+#endif
+    if (m_currentPath == L"THIS_PC" || (IsSplitViewActive() && m_otherPane.currentPath == L"THIS_PC")) {
+        RefreshCurrentFolder();
+    }
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+// ---- Win+E ---------------------------------------------------------------------------------------------------
+
+void ExplorerApp::RefreshWinEState(bool repairMovedExe) {
+#ifdef _WIN32
+    m_winEOverrideSet = false;
+    wchar_t exe[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    if (repairMovedExe && !WinEOverride::IsSetFor(WinEOverride::kShellObjectKey, exe)) {
+        // Win+E was given to an Explorer2.exe that is no longer where it was (a portable copy that was moved):
+        // the shortcut follows the program. A target on a network drive is left alone (asking about it could
+        // hold the start-up for a long time), and so is every other program's command.
+        const std::wstring target = WinEOverride::ExeOfCommand(WinEOverride::ReadCommand(WinEOverride::kShellObjectKey));
+        if (target.size() >= 3 && target[1] == L':' &&
+            _wcsicmp(PathUtils::GetFileName(target).c_str(), PathUtils::GetFileName(exe).c_str()) == 0) {
+            const std::wstring root = target.substr(0, 3);
+            const UINT driveType = GetDriveTypeW(root.c_str());
+            const bool gone = (driveType == DRIVE_NO_ROOT_DIR) ||
+                              ((driveType == DRIVE_FIXED || driveType == DRIVE_REMOVABLE) &&
+                               GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                               (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND));
+            if (gone && WinEOverride::Set(WinEOverride::kShellObjectKey, exe)) {
+                AppLog::Info(L"App", L"Win+E pointed at a copy of the program that is gone (" + target + L"): it now starts " + exe);
+            }
+        }
+    }
+    m_winEOverrideSet = WinEOverride::IsSetFor(WinEOverride::kShellObjectKey, exe);
+#else
+    (void)repairMovedExe;
+    m_winEOverrideSet = false;
+#endif
+}
+
+void ExplorerApp::ToggleWinEOverride() {
+#ifdef _WIN32
+    const bool pl = (m_lang == Lang::PL);
+    wchar_t exe[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    if (m_winEOverrideSet) {
+        const bool removed = WinEOverride::Remove(WinEOverride::kShellObjectKey);
+        m_statusToast = removed
+            ? (pl ? L"\x2713 Win+E znów otwiera Eksplorator Windows" : L"\x2713 Win+E opens Windows Explorer again")
+            : (pl ? L"\x26A0 Nie udało się usunąć ustawienia Win+E z rejestru" : L"\x26A0 The Win+E setting could not be removed from the registry");
+        AppLog::Info(L"App", removed ? L"Win+E given back to Windows Explorer" : L"Win+E override could not be removed");
+    } else {
+        const bool set = WinEOverride::Set(WinEOverride::kShellObjectKey, exe);
+        m_statusToast = set
+            ? (pl ? L"\x2713 Win+E otwiera teraz Explorer2 (tylko dla tego użytkownika). Wyłącz tutaj, zanim usuniesz program."
+                  : L"\x2713 Win+E now opens Explorer2 (for this user only). Switch it off here before you remove the program.")
+            : (pl ? L"\x26A0 Nie udało się zapisać ustawienia Win+E w rejestrze" : L"\x26A0 The Win+E setting could not be written to the registry");
+        AppLog::Info(L"App", set ? (L"Win+E now starts " + std::wstring(exe)) : L"Win+E override could not be written");
+    }
+    m_statusToastExpireTick = GetTickCount64() + 6500;
+    RefreshWinEState(false);
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+#endif
+}
+
+// ---- "A newer version is available" --------------------------------------------------------------------------
+
+// The version this build compares with the newest release. EXPLORER2_UPDATE_TEST_VERSION=1.0.1 is a developer aid:
+// the build then poses as that version, and a build made from source (which normally never asks) asks as well.
+std::wstring ExplorerApp::RunningVersionForUpdates() const {
+    wchar_t posed[32] = {};
+    if (GetEnvironmentVariableW(L"EXPLORER2_UPDATE_TEST_VERSION", posed, static_cast<DWORD>(std::size(posed))) > 0) return posed;
+    return E2_VERSION_SEMVER_WSTR;
+}
+
+void ExplorerApp::StartUpdateCheckIfDue(bool force) {
+    wchar_t posed[32] = {};
+    const bool posing = GetEnvironmentVariableW(L"EXPLORER2_UPDATE_TEST_VERSION", posed, static_cast<DWORD>(std::size(posed))) > 0;
+    // A build made from source carries the base version of the VERSION file, which every release is "newer" than:
+    // only released builds are compared
+    const bool comparable = (E2_VERSION_IS_RELEASE != 0) || posing;
+    const std::wstring running = RunningVersionForUpdates();
+    m_updateAvailable = m_updateCheckEnabled && comparable && UpdateCheck::CompareVersions(m_updateLatestTag, running) > 0;
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+    if (!m_updateCheckEnabled || !comparable) return;
+
+    // GitHub is asked at most once in 20 hours, whichever window of the program is started
+    const long long now = static_cast<long long>(std::time(nullptr));
+    if (!force && m_updateLastCheckUnix > 0 && now >= m_updateLastCheckUnix && now - m_updateLastCheckUnix < 20LL * 3600LL) return;
+
+    static std::atomic<bool> s_asking{ false };
+    if (s_asking.exchange(true)) return;
+    const HWND hwnd = m_hwnd;
+    const std::wstring agent = std::wstring(L"Explorer2/") + E2_VERSION_SEMVER_WSTR;
+    try {
+        std::thread([hwnd, agent]() {
+            auto* tag = new std::wstring(UpdateCheck::FetchLatestReleaseTag(agent));
+            s_asking.store(false);
+            if (!PostMessageW(hwnd, WM_APP_UPDATE_INFO, 0, reinterpret_cast<LPARAM>(tag))) delete tag;   // the window is gone
+        }).detach();
+    } catch (const std::system_error&) {
+        s_asking.store(false);
+    }
+}
+
+void ExplorerApp::OnUpdateCheckResult(const std::wstring& tag) {
+    if (tag.empty()) {
+        // Offline, a proxy in the way, GitHub busy: asked again the next time the program starts
+        AppLog::Info(L"Update", L"No answer about the newest release");
+        return;
+    }
+    const std::wstring running = RunningVersionForUpdates();
+    const bool newer = UpdateCheck::CompareVersions(tag, running) > 0;
+    m_updateLatestTag = tag;
+    m_updateLastCheckUnix = static_cast<long long>(std::time(nullptr));
+    m_updateAvailable = m_updateCheckEnabled && newer;
+    AppLog::Info(L"Update", L"Newest release: " + tag + L", this build: " + running);
+    if (m_updateAvailable) {
+        const bool pl = (m_lang == Lang::PL);
+        // Short enough for the floating banner of a narrow window
+        m_statusToast = (pl ? L"\x2B06 Nowsza wersja Explorer2: " : L"\x2B06 Newer Explorer2 version: ") + tag +
+                        (pl ? L" (masz " : L" (you have ") + running +
+                        (pl ? L") - kliknij \"Nowa wersja\" na pasku stanu" : L") - click \"New version\" in the status bar");
+        m_statusToastExpireTick = GetTickCount64() + 9000;
+    }
+    SaveUiSettings();
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }

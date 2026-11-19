@@ -201,6 +201,11 @@ private:
     // Advanced Search ("Wyszukiwanie") integration
     void TriggerAsyncSearch();
     void ClearSearchAndRestoreFolder();
+    // Puts text into the search box from code. A single-line EDIT answers that with EN_CHANGE, as it does for typing,
+    // and the EN_CHANGE handler starts or clears the search, which sets the text again: m_settingSearchEditText makes
+    // the handler leave such a change alone (without it one click on the box ended in a stack overflow).
+    void SetSearchEditText(const wchar_t* text);
+    bool m_settingSearchEditText = false;
     void RebuildParsedSearchOptions();
     void ShowSearchTypeListMenu(int screenX, int screenY);
     void BeginSearchFieldEdit(int fieldCmdId, const D2D1_RECT_F& fieldRect);
@@ -208,6 +213,36 @@ private:
 
     // Media Player integration
     void SyncMediaPlayerToSelection();
+    // Volume and seeking of the transport bars (full viewer and preview pane)
+    D2D1_RECT_F m_mediaVolumeBarRect = {};    // where the volume slider was drawn last; empty when there is none
+    bool m_draggingMediaVolume = false;
+    bool m_openMediaExternally = false;       // double-click / Enter / "Open" on video and audio start the system's player
+    void SetMediaVolumeFromX(float x);
+    void NudgeMediaVolume(int steps);         // 5% per step; a muted player is unmuted
+    void SeekMediaBy(double seconds);
+    double m_mediaSeekTargetSec = -1.0;       // where SeekMediaBy last sent the player, for steps that follow quickly
+    ULONGLONG m_mediaSeekTick = 0;
+    std::wstring m_mediaSeekPath;
+    void DrawMediaVolumeControl(const D2D1_RECT_F& area, bool darkBar);
+
+    // Drives plugged in or removed while the window is open (WM_DEVICECHANGE; a look at the mount table on Linux)
+    void OnDrivesChanged();
+    std::wstring DriveListSignature() const;
+    std::wstring m_driveListSignature;
+
+    // Win+E starts Explorer2 (WinEOverride.h)
+    bool m_winEOverrideSet = false;           // read from the registry at start-up and after a change
+    void RefreshWinEState(bool repairMovedExe);
+    void ToggleWinEOverride();
+
+    // "A newer version is available" (UpdateCheck.h)
+    bool m_updateCheckEnabled = true;
+    long long m_updateLastCheckUnix = 0;      // when GitHub was last asked (seconds since 1970, UTC)
+    std::wstring m_updateLatestTag;           // the newest release tag it reported, e.g. "v1.0.25"
+    bool m_updateAvailable = false;
+    std::wstring RunningVersionForUpdates() const;
+    void StartUpdateCheckIfDue(bool force = false);
+    void OnUpdateCheckResult(const std::wstring& tag);
 
     // Layout & Hit-testing
     bool IsSplitViewActive() const {
@@ -241,6 +276,11 @@ private:
 
     D2D1_RECT_F GetMainViewRect() const;
     D2D1_RECT_F GetContentItemsRect() const;
+    // The widths the details columns are drawn and hit-tested with: the stored ones (m_colWidths) while they fit the
+    // list, narrower ones (some columns left out, width 0) in a list too narrow for them. See DetailsColumns.h.
+    static bool DetailsRowButtonsShownFor(const std::wstring& path);   // the "Operacje" column (Kosz / Usuń)
+    void GetDetailsColumnWidthsFor(const D2D1_RECT_F& mainViewRect, const std::wstring& path, float out[5]) const;
+    void GetDetailsColumnWidths(float out[5]) const;                    // for the pane being drawn / hit-tested
     D2D1_RECT_F GetItemRect(int index, const D2D1_RECT_F& contentRect) const;
     int HitTestItem(float x, float y, const D2D1_RECT_F& contentRect, bool* outOnLabelOrIcon = nullptr) const;
     void GetGridMetrics(const D2D1_RECT_F& contentRect, float& outCellW, float& outCellH, float& outIconSize, int& outCols) const;
@@ -327,6 +367,13 @@ private:
     void PlaceChildDip(HWND child, float left, float top, float width, float height);
     void ApplyDpi(UINT dpi);
     void RecreateEditFont();
+    // The user's own scale on top of the display's (File tab, Ctrl+Plus / Ctrl+Minus / Ctrl+0): m_dpi is
+    // m_systemDpi * m_uiScalePct / 100, so everything that follows m_dpi follows the user's scale too
+    UINT m_systemDpi = 96;                    // what Windows reports for the window's monitor
+    int m_uiScalePct = 100;
+    UINT EffectiveDpi() const;
+    void SetUiScale(int pct);
+    void ShowUiScaleMenu();
 
     ID2D1Factory* m_d2dFactory = nullptr;
     IDWriteFactory* m_dwriteFactory = nullptr;

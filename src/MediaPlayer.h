@@ -33,12 +33,21 @@ public:
     double GetDurationSec() const;
     void SeekToSeconds(double sec);
 
+    // Playback volume (0.0 .. 1.0) and mute. Kept by the player, not by the file: the next file plays as loud.
+    void SetVolume(double volume);
+    double GetVolume() const { return m_volume; }
+    void SetMuted(bool muted);
+    bool IsMuted() const { return m_muted; }
+
     // Updates and returns the current video frame as a Direct2D bitmap
     ID2D1Bitmap* GetCurrentVideoFrame(ID2D1RenderTarget* rt, uint32_t& outW, uint32_t& outH);
 
 private:
     void RecreateEngine();
+    void ApplyVolume();
 
+    double m_volume = 1.0;
+    bool m_muted = false;
     HWND m_notifyHwnd = nullptr;
     bool m_mfInitialized = false;
     std::wstring m_currentPath;

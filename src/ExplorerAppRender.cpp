@@ -5,6 +5,7 @@
 #include "NetShares.h"
 #include "RepoBrowser.h"
 #include "SvnWorkingCopy.h"
+#include "Version.h"
 #include <shlwapi.h>
 #include <wincodec.h>
 #include <algorithm>
@@ -61,6 +62,7 @@ static D2D1_COLOR_F HexColor(uint32_t rgb, float a = 1.0f) {
         case 0x454545:
         case 0x475569:
         case 0x4C566A: rgb = 0xCBD5E1; break;
+        case 0x555555:      // date, type and size of the details view
         case 0x64748B:
         case 0x666666:
         case 0x6E6E6E:
@@ -1321,6 +1323,25 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawLargeButton(CMD_PROPERTIES,        fx, 72.0f, s.btnProperties); fx += 74.0f;
         drawLargeButton(CMD_FILE_EXIT,         fx, 72.0f, m_lang == Lang::PL ? L"Zamknij\nprogram" : L"Exit\nApp"); fx += 76.0f;
         drawGroupSeparatorAndTitle(g1Start, fx, m_lang == Lang::PL ? L"Plik i okno aplikacji" : L"Application & Shell");
+
+        // Program settings that have no tab of their own: how video opens, the update check and, on Windows, the UI
+        // scale and Win+E
+        const bool pl = (m_lang == Lang::PL);
+        const float ux = fx + 8.0f;
+        const wchar_t* mediaLbl = pl ? L"Wideo/audio w domyślnym programie" : L"Video/audio in the default program";
+        const wchar_t* updateLbl = pl ? L"Sprawdzaj, czy jest nowa wersja" : L"Check for a newer version";
+#ifdef _WIN32
+        const std::wstring scaleLbl = (pl ? L"Skala interfejsu: " : L"UI scale: ") + std::to_wstring(m_uiScalePct) + L"% \x25BE";
+        drawSmallRowButton(CMD_UI_SCALE_MENU,         ux,          body.top + 6.0f,  232.0f, scaleLbl.c_str());
+        drawSmallRowButton(CMD_TOGGLE_MEDIA_EXTERNAL, ux,          body.top + 29.0f, 232.0f, mediaLbl, m_openMediaExternally);
+        drawSmallRowButton(CMD_TOGGLE_UPDATE_CHECK,   ux,          body.top + 52.0f, 232.0f, updateLbl, m_updateCheckEnabled);
+        drawSmallRowButton(CMD_TOGGLE_WIN_E,          ux + 236.0f, body.top + 6.0f,  176.0f, pl ? L"Win+E otwiera Explorer2" : L"Win+E opens Explorer2", m_winEOverrideSet);
+        drawGroupSeparatorAndTitle(ux, ux + 418.0f, pl ? L"Ustawienia" : L"Settings");
+#else
+        drawSmallRowButton(CMD_TOGGLE_MEDIA_EXTERNAL, ux, body.top + 6.0f,  232.0f, mediaLbl, m_openMediaExternally);
+        drawSmallRowButton(CMD_TOGGLE_UPDATE_CHECK,   ux, body.top + 29.0f, 232.0f, updateLbl, m_updateCheckEnabled);
+        drawGroupSeparatorAndTitle(ux, ux + 238.0f, pl ? L"Ustawienia" : L"Settings");
+#endif
         return;
     }
 
@@ -2759,10 +2780,15 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
         s.colSize,
         s.colActions
     };
+    // The stored column widths, or narrower ones (some columns left out) when the list is too narrow for them
+    float colW[5];
+    GetDetailsColumnWidths(colW);
+    // The header is drawn inside its own pane only (a split pane's titles used to run into the pane next to it)
+    m_rt->PushAxisAlignedClip(hdrRect, D2D1_ANTIALIAS_MODE_ALIASED);
     float cx = rect.left + 6.0f;
     for (int c = 0; c < 5; ++c) {
-        if (c == 4 && m_currentPath == L"THIS_PC") break;
-        float cw = m_colWidths[c];
+        float cw = colW[c];
+        if (cw <= 0.5f) continue;
         D2D1_RECT_F cr = D2D1::RectF(cx + 6.0f, hdrRect.top, cx + cw - 6.0f, hdrRect.bottom);
         m_solidBrush->SetColor(HexColor(0x4C566A));
         DrawTextCached(colTitles[c], static_cast<UINT32>(wcslen(colTitles[c])), m_fmtRegular, cr, m_solidBrush);
@@ -2804,6 +2830,7 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
         m_rt->DrawLine(D2D1::Point2F(cx + cw, hdrRect.top + 4.0f), D2D1::Point2F(cx + cw, hdrRect.bottom - 4.0f), m_solidBrush, 1.0f);
         cx += cw;
     }
+    m_rt->PopAxisAlignedClip();
 
     // 2. Virtualized Rows (ONLY draw visible rows!)
     D2D1_RECT_F contentRect = GetContentItemsRect();
@@ -2851,7 +2878,7 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
 
         // Columns: Name | Date Modified | Type | Size | Operacje (Kosz / Usuń)
         float x0 = rowR.left + 4.0f;
-        D2D1_RECT_F nameR = D2D1::RectF(x0 + 24.0f, rowR.top, x0 + m_colWidths[0] - 4.0f, rowR.bottom);
+        D2D1_RECT_F nameR = D2D1::RectF(x0 + 24.0f, rowR.top, x0 + colW[0] - 4.0f, rowR.bottom);
         bool isRotating = m_imageCache.IsPathRotating(item.normKey);
         if (isRotating) {
             std::wstring rotTitle = item.displayName + (m_lang == Lang::PL ? L"   [\x23F3 Przetwarzanie...]" : L"   [\x23F3 Processing...]");
@@ -2912,7 +2939,7 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
                 m_solidBrush->SetColor(HexColor(0x0078D7, 0.55f));
                 m_rt->DrawLine(D2D1::Point2F(rowR.left + 4.0f, rowR.top + 0.5f), D2D1::Point2F(rowR.right - 4.0f, rowR.top + 0.5f), m_solidBrush, 1.2f);
                 float badgeW = std::min(145.0f, static_cast<float>(myGrp.size()) * 6.5f + 16.0f);
-                D2D1_RECT_F badgeR = D2D1::RectF(x0 + m_colWidths[0] - badgeW - 6.0f, rowR.top + 2.5f, x0 + m_colWidths[0] - 6.0f, rowR.bottom - 2.5f);
+                D2D1_RECT_F badgeR = D2D1::RectF(x0 + colW[0] - badgeW - 6.0f, rowR.top + 2.5f, x0 + colW[0] - 6.0f, rowR.bottom - 2.5f);
                 if (badgeR.left > x0 + 80.0f) {
                     m_solidBrush->SetColor(HexColor(0xE0F2FE));
                     m_rt->FillRoundedRectangle(D2D1::RoundedRect(badgeR, 3.0f, 3.0f), m_solidBrush);
@@ -2926,26 +2953,30 @@ void ExplorerApp::DrawDetailsView(const D2D1_RECT_F& rect) {
             }
         }
 
-        float x1 = x0 + m_colWidths[0];
-        D2D1_RECT_F dateR = D2D1::RectF(x1 + 6.0f, rowR.top, x1 + m_colWidths[1] - 4.0f, rowR.bottom);
+        float x1 = x0 + colW[0];
         m_solidBrush->SetColor(HexColor(0x555555, alpha));
-        DrawTextCached(item.dateStr.c_str(), static_cast<UINT32>(item.dateStr.size()), m_fmtRegular, dateR, m_solidBrush);
+        if (colW[1] > 0.5f) {
+            D2D1_RECT_F dateR = D2D1::RectF(x1 + 6.0f, rowR.top, x1 + colW[1] - 4.0f, rowR.bottom);
+            DrawTextCached(item.dateStr.c_str(), static_cast<UINT32>(item.dateStr.size()), m_fmtRegular, dateR, m_solidBrush);
+        }
 
-        float x2 = x1 + m_colWidths[1];
-        D2D1_RECT_F typeR = D2D1::RectF(x2 + 6.0f, rowR.top, x2 + m_colWidths[2] - 4.0f, rowR.bottom);
-        DrawTextCached(item.typeName.c_str(), static_cast<UINT32>(item.typeName.size()), m_fmtRegular, typeR, m_solidBrush);
+        float x2 = x1 + colW[1];
+        if (colW[2] > 0.5f) {
+            D2D1_RECT_F typeR = D2D1::RectF(x2 + 6.0f, rowR.top, x2 + colW[2] - 4.0f, rowR.bottom);
+            DrawTextCached(item.typeName.c_str(), static_cast<UINT32>(item.typeName.size()), m_fmtRegular, typeR, m_solidBrush);
+        }
 
-        float x3 = x2 + m_colWidths[2];
-        if (!item.sizeStr.empty()) {
-            D2D1_RECT_F sizeR = D2D1::RectF(x3 + 6.0f, rowR.top, x3 + m_colWidths[3] - 8.0f, rowR.bottom);
+        float x3 = x2 + colW[2];
+        if (!item.sizeStr.empty() && colW[3] > 0.5f) {
+            D2D1_RECT_F sizeR = D2D1::RectF(x3 + 6.0f, rowR.top, x3 + colW[3] - 8.0f, rowR.bottom);
             m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
             DrawTextCached(item.sizeStr.c_str(), static_cast<UINT32>(item.sizeStr.size()), m_fmtRegular, sizeR, m_solidBrush);
             m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
 
         // Column 4: Operacje (Kosz / Przywróć + Trwale usuń buttons with confirmation!); none in a read-only repository
-        if (m_currentPath != L"THIS_PC" && !RepoBrowser::IsRepoUrl(m_currentPath) && !NetShares::IsServerRoot(m_currentPath)) {
-            float opColX = rect.left + 6.0f + m_colWidths[0] + m_colWidths[1] + m_colWidths[2] + m_colWidths[3];
+        if (colW[4] > 0.5f) {
+            float opColX = rect.left + 6.0f + colW[0] + colW[1] + colW[2] + colW[3];
             D2D1_RECT_F rTrash = D2D1::RectF(opColX + (inRecycleBin ? 4.0f : 6.0f), rowR.top + 2.0f, opColX + (inRecycleBin ? 68.0f : 62.0f), rowR.bottom - 2.0f);
             D2D1_RECT_F rPerm  = D2D1::RectF(opColX + (inRecycleBin ? 71.0f : 66.0f), rowR.top + 2.0f, opColX + 124.0f, rowR.bottom - 2.0f);
 
@@ -3918,6 +3949,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
 
 void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilmstrip) {
     const Strings& s = GetStrings(m_lang);
+    m_mediaVolumeBarRect = {};      // set again below when a transport bar with a volume slider is drawn
 
     // Dark studio canvas background (#181A1F) so images & videos pop with maximum contrast
     m_solidBrush->SetColor(HexColor(0x181A1F));
@@ -4022,7 +4054,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         m_ribbonHits.push_back({ CMD_MEDIA_PLAY_PAUSE, playBtnR });
         m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_MEDIA_PLAY_PAUSE ? HexColor(0x0078D7) : HexColor(0x2B303C));
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(playBtnR, 4.0f, 4.0f), m_solidBrush);
-        m_solidBrush->SetColor(HexColor(0xFFFFFF));
+        m_solidBrush->SetColor(HexColor(0xFEFEFE));     // not 0xFFFFFF, which the dark theme turns dark (HexColor)
         const wchar_t* playGlyph = m_mediaPlayer.IsPlaying() ? L"\x23F8" : L"\x25B6";
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         DrawTextCached(playGlyph, 1, m_fmtSmall, playBtnR, m_solidBrush);
@@ -4033,7 +4065,10 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         double dur = m_mediaPlayer.GetDurationSec();
         float frac = (dur > 0.05) ? static_cast<float>(std::clamp(pos / dur, 0.0, 1.0)) : 0.0f;
 
-        m_mediaSeekBarRect = D2D1::RectF(playBtnR.right + 14.0f, barR.top + 8.0f, barR.right - 115.0f, barR.bottom - 8.0f);
+        // The right end holds the volume control: speaker button and slider, the button alone on a narrow bar
+        const float barW = barR.right - barR.left;
+        const float volAreaW = (barW >= 520.0f) ? 118.0f : ((barW >= 330.0f) ? 34.0f : 0.0f);
+        m_mediaSeekBarRect = D2D1::RectF(playBtnR.right + 14.0f, barR.top + 8.0f, barR.right - 115.0f - volAreaW, barR.bottom - 8.0f);
         float trackY = (m_mediaSeekBarRect.top + m_mediaSeekBarRect.bottom) * 0.5f;
         D2D1_RECT_F trackBg = D2D1::RectF(m_mediaSeekBarRect.left, trackY - 3.0f, m_mediaSeekBarRect.right, trackY + 3.0f);
         m_solidBrush->SetColor(HexColor(0x3B4252));
@@ -4043,16 +4078,20 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         D2D1_RECT_F trackFill = D2D1::RectF(m_mediaSeekBarRect.left, trackY - 3.0f, fillX, trackY + 3.0f);
         m_solidBrush->SetColor(HexColor(0x38A1F3));
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(trackFill, 3.0f, 3.0f), m_solidBrush);
-        m_solidBrush->SetColor(HexColor(0xFFFFFF));
+        m_solidBrush->SetColor(HexColor(0xFEFEFE));
         m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(fillX, trackY), 5.5f, 5.5f), m_solidBrush);
 
         // Timestamp text on right side of transport bar
         std::wstring tsStr = FormatMediaTime(pos) + L" / " + FormatMediaTime(dur);
-        D2D1_RECT_F tsR = D2D1::RectF(m_mediaSeekBarRect.right + 10.0f, barR.top, barR.right - 8.0f, barR.bottom);
+        D2D1_RECT_F tsR = D2D1::RectF(m_mediaSeekBarRect.right + 10.0f, barR.top, barR.right - 8.0f - volAreaW, barR.bottom);
         m_solidBrush->SetColor(HexColor(0xD8DEE9));
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         DrawTextCached(tsStr.c_str(), static_cast<UINT32>(tsStr.size()), m_fmtSmall, tsR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+        if (volAreaW > 0.0f) {
+            DrawMediaVolumeControl(D2D1::RectF(barR.right - volAreaW, barR.top, barR.right - 4.0f, barR.bottom), true);
+        }
     } else if (!curPath.empty() && !isMediaItem) {
         FullImageMeta fullMeta = m_imageCache.GetOrQueueFullImage(m_rt, curPath, prevPath, nextPath);
         ID2D1Bitmap* bmpToDraw = fullMeta.bitmap;
@@ -4376,6 +4415,60 @@ void ExplorerApp::DrawPreviewPane(const D2D1_RECT_F& rect) {
         m_lang,
         m_mousePt,
         m_mediaSeekBarRect);
+
+    m_mediaVolumeBarRect = {};
+    const D2D1_RECT_F& volumeArea = m_contentPane.MediaVolumeArea();
+    if (m_mediaPlayer.HasMedia() && volumeArea.right > volumeArea.left) {
+        DrawMediaVolumeControl(volumeArea, false);
+    }
+}
+
+// The volume control of a transport bar: a speaker button (click: mute) and, where `area` is wide enough for it, a
+// slider. darkBar: the full viewer's dark bar; otherwise the preview pane's light one. The speaker is drawn with
+// lines, not with a font glyph, so that it looks the same wherever the program runs.
+void ExplorerApp::DrawMediaVolumeControl(const D2D1_RECT_F& area, bool darkBar) {
+    const float cy = (area.top + area.bottom) * 0.5f;
+    const double volume = m_mediaPlayer.GetVolume();
+    const bool silent = m_mediaPlayer.IsMuted() || volume <= 0.001;
+
+    const D2D1_RECT_F btn = D2D1::RectF(area.left, cy - 11.0f, area.left + 24.0f, cy + 11.0f);
+    m_ribbonHits.push_back({ CMD_MEDIA_MUTE, btn });
+    const bool hover = (m_hoverRibbonBtn == CMD_MEDIA_MUTE);
+    m_solidBrush->SetColor(hover ? HexColor(0x0078D7) : HexColor(darkBar ? 0x2B303C : 0xE2E8F0));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(btn, 4.0f, 4.0f), m_solidBrush);
+
+    // 0xFEFEFE, not 0xFFFFFF: the dark theme turns pure white into its background colour (HexColor), and these
+    // marks sit on a bar that is dark in both themes
+    const float sx = btn.left + 5.0f;       // left edge of the speaker
+    m_solidBrush->SetColor(HexColor((darkBar || hover) ? 0xFEFEFE : 0x334155));
+    m_rt->FillRectangle(D2D1::RectF(sx, cy - 2.5f, sx + 3.0f, cy + 2.5f), m_solidBrush);
+    for (int i = 0; i < 5; ++i) {           // the cone, widening to the right
+        const float x = sx + 3.5f + static_cast<float>(i);
+        const float half = 2.5f + static_cast<float>(i) * 0.9f;
+        m_rt->DrawLine(D2D1::Point2F(x, cy - half), D2D1::Point2F(x, cy + half), m_solidBrush, 1.1f);
+    }
+    if (silent) {
+        m_solidBrush->SetColor(HexColor(0xF87171));
+        m_rt->DrawLine(D2D1::Point2F(sx + 10.5f, cy - 3.0f), D2D1::Point2F(sx + 15.5f, cy + 3.0f), m_solidBrush, 1.5f);
+        m_rt->DrawLine(D2D1::Point2F(sx + 10.5f, cy + 3.0f), D2D1::Point2F(sx + 15.5f, cy - 3.0f), m_solidBrush, 1.5f);
+    } else {
+        m_rt->DrawLine(D2D1::Point2F(sx + 11.0f, cy - 2.5f), D2D1::Point2F(sx + 11.0f, cy + 2.5f), m_solidBrush, 1.3f);
+        if (volume > 0.5) {
+            m_rt->DrawLine(D2D1::Point2F(sx + 14.0f, cy - 4.5f), D2D1::Point2F(sx + 14.0f, cy + 4.5f), m_solidBrush, 1.3f);
+        }
+    }
+
+    const float left = btn.right + 8.0f;
+    const float right = area.right - 6.0f;
+    if (right - left < 30.0f) return;       // no room for a slider: the button (mute) and the keys remain
+    m_mediaVolumeBarRect = D2D1::RectF(left, cy - 9.0f, right, cy + 9.0f);
+    m_solidBrush->SetColor(HexColor(darkBar ? 0x3B4252 : 0xCBD5E1));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(left, cy - 2.5f, right, cy + 2.5f), 2.5f, 2.5f), m_solidBrush);
+    const float fillX = left + static_cast<float>(std::clamp(volume, 0.0, 1.0)) * (right - left);
+    m_solidBrush->SetColor(HexColor(silent ? 0x64748B : (darkBar ? 0x38A1F3 : 0x0078D7)));
+    m_rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(left, cy - 2.5f, fillX, cy + 2.5f), 2.5f, 2.5f), m_solidBrush);
+    m_solidBrush->SetColor(HexColor(darkBar ? 0xFEFEFE : 0x0F172A));
+    m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(fillX, cy), 5.0f, 5.0f), m_solidBrush);
 }
 
 void ExplorerApp::DrawStatusBar(const D2D1_RECT_F& rect) {
@@ -4460,7 +4553,29 @@ void ExplorerApp::DrawStatusBar(const D2D1_RECT_F& rect) {
         statusText += L"     \x2022     " + m_statusToast;
     }
 
-    D2D1_RECT_F textR = D2D1::RectF(rect.left + 10.0f, rect.top, rect.right - 176.0f, rect.bottom);
+    // The running version, left of the view buttons; a click opens the releases page. When GitHub has a newer
+    // release (UpdateCheck.h) the note about it stands here instead.
+    std::wstring verText = std::wstring(L"v") + E2_VERSION_SEMVER_WSTR;
+    if (E2_VERSION_IS_RELEASE == 0) verText += L" dev";
+    if (m_updateAvailable) {
+        verText = (m_lang == Lang::PL ? L"\x2B06 Nowa wersja: " : L"\x2B06 New version: ") + m_updateLatestTag;
+    }
+    const float verW = std::min(240.0f, static_cast<float>(verText.size()) * 6.6f + 18.0f);
+    const D2D1_RECT_F verR = D2D1::RectF(rect.right - 180.0f - verW, rect.top + 2.0f, rect.right - 180.0f, rect.bottom - 2.0f);
+    if (verR.left > rect.left + 220.0f) {
+        m_ribbonHits.push_back({ CMD_OPEN_RELEASES_PAGE, verR });
+        const bool verHover = (m_hoverRibbonBtn == CMD_OPEN_RELEASES_PAGE);
+        if (m_updateAvailable || verHover) {
+            m_solidBrush->SetColor(HexColor(m_updateAvailable ? (verHover ? 0xA7F3D0 : 0xD1FAE5) : 0xE5F3FB));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(verR, 3.0f, 3.0f), m_solidBrush);
+        }
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        m_solidBrush->SetColor(HexColor(m_updateAvailable ? 0x065F46 : 0x64748B));
+        DrawTextCached(verText.c_str(), static_cast<UINT32>(verText.size()), m_fmtSmall, verR, m_solidBrush);
+        m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+
+    D2D1_RECT_F textR = D2D1::RectF(rect.left + 10.0f, rect.top, std::max(rect.left + 60.0f, verR.left - 10.0f), rect.bottom);
     uint32_t statusCol = 0x333333;
     if (hasSbXfer) {
         statusCol = (sbJob.state == TransferJobState::Paused) ? 0xB45309 : 0x0284C7;
@@ -8363,8 +8478,14 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
                 msg = pl ? L"Odczyt SMART tego dysku wymaga uprawnień administratora (Windows blokuje surowy dostęp do dysku zwykłym procesom).\nTemperatura jest odczytywana nadal, jeśli dysk ją udostępnia."
                          : L"Reading SMART for this drive requires administrator rights (Windows blocks raw disk access for normal processes).\nTemperature is still shown when the drive exposes it.";
             } else {
+#ifdef _WIN32
                 msg = pl ? L"Ten dysk (USB / RAID / wirtualny) nie udostępnia danych SMART przez sterownik Windows."
                          : L"This drive (USB / RAID / virtual) does not expose SMART data through the Windows driver.";
+#else
+                // The Linux build has no SMART reader yet: the note must not blame the drive or a Windows driver
+                msg = pl ? L"Wersja dla Linuksa nie odczytuje jeszcze atrybutów SMART (surowy dostęp do dysku wymaga tam uprawnień administratora).\nTemperatura jest pokazywana, gdy system ją udostępnia (dyski NVMe; dyski SATA po załadowaniu modułu drivetemp)."
+                         : L"The Linux build does not read SMART attributes yet (raw disk access needs root rights there).\nThe temperature is shown where the system exposes it (NVMe drives; SATA drives once the drivetemp module is loaded).";
+#endif
             }
             D2D1_RECT_F box = D2D1::RectF(x + 10.0f, y + 36.0f, x + w - 10.0f, y + h - 8.0f);
             m_solidBrush->SetColor(HexColor(0xFFFBEB));

@@ -392,7 +392,10 @@ std::string ReadSysfsLine(const std::string& path) {
 }
 
 int ReadBlockDevHwmonTempC(const std::string& sysBlockDir) {
-    for (const char* sub : { "/device/hwmon", "/hwmon" }) {
+    // A SATA disk's sensor (the drivetemp module) is <disk>/device/hwmon/hwmonN. An NVMe drive's sensor belongs to
+    // its controller, which <disk>/device points at, and sits there without a folder in between:
+    // <disk>/device/hwmonN. (In "/device" the entry "hwmon" itself has no temp1_input and is passed over.)
+    for (const char* sub : { "/device/hwmon", "/hwmon", "/device" }) {
         std::string hmBase = sysBlockDir + sub;
         DIR* d = ::opendir(hmBase.c_str());
         if (!d) continue;

@@ -396,7 +396,18 @@ enum CommandId : int {
     CMD_CTX_RESTORE_ALL_RECYCLE  = 1038,     // Recycle Bin ("Kosz"): restore all items
     CMD_CTX_EMPTY_RECYCLE_BIN    = 1039,     // Recycle Bin ("Kosz"): empty Recycle Bin across drives
     CMD_RIBBON_SCROLL_LEFT       = 1040,     // arrows at the ends of a ribbon that is wider than the window
-    CMD_RIBBON_SCROLL_RIGHT      = 1041
+    CMD_RIBBON_SCROLL_RIGHT      = 1041,
+
+    // Player volume, and the settings group of the File tab
+    CMD_MEDIA_MUTE               = 1042,     // speaker button of a media transport bar
+    CMD_TOGGLE_MEDIA_EXTERNAL    = 1043,     // video / audio open in the system's default player
+    CMD_UI_SCALE_MENU            = 1044,     // "UI scale" drop-down
+    CMD_TOGGLE_WIN_E             = 1045,     // Win+E starts Explorer2 (per-user registry override, WinEOverride.h)
+    CMD_TOGGLE_UPDATE_CHECK      = 1046,     // look for a newer release once a day (UpdateCheck.h)
+    CMD_OPEN_RELEASES_PAGE       = 1047,     // status bar: the version / "new version" note
+    CMD_UI_SCALE_UP              = 1048,
+    CMD_UI_SCALE_DOWN            = 1049,
+    CMD_BASE_UI_SCALE            = 1050      // 1050..1069: the entries of the UI scale menu
 };
 
 // Layout constants (in DIPs / pixels)

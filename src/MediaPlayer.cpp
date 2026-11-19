@@ -105,8 +105,29 @@ void MediaPlayer::RecreateEngine() {
         notify->SetEngine(m_engine.Get());
         m_engine.As(&m_engineEx);
         m_engine->SetLoop(TRUE);
+        ApplyVolume();
     }
     notify->Release();
+}
+
+void MediaPlayer::SetVolume(double volume) {
+    if (std::isnan(volume)) return;
+    m_volume = std::clamp(volume, 0.0, 1.0);
+    ApplyVolume();
+}
+
+void MediaPlayer::SetMuted(bool muted) {
+    m_muted = muted;
+    ApplyVolume();
+}
+
+void MediaPlayer::ApplyVolume() {
+#ifdef _WIN32
+    // (The Linux build has no media engine behind this class, and its IMFMediaEngine has no volume calls)
+    if (!m_engine) return;
+    m_engine->SetVolume(m_volume);
+    m_engine->SetMuted(m_muted ? TRUE : FALSE);
+#endif
 }
 
 void MediaPlayer::Shutdown() {
@@ -207,6 +228,7 @@ bool MediaPlayer::OpenAndPlay(const std::wstring& path) {
         SysFreeString(bstrUrl);
     }
 
+    ApplyVolume();
     m_engine->Load();
     m_engine->Play();
     return true;
