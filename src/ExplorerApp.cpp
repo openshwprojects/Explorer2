@@ -964,6 +964,11 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     return TRUE;
                 }
             }
+            // A side of the viewer's picture: a click there shows the previous / next file
+            if (!m_viewerDraggingPan && ViewerSideForClick(PxToDip(pt.x), PxToDip(pt.y)) != 0) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
         }
         break;
 
@@ -1235,6 +1240,13 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         OnClipboardChanged();
         return 0;
 
+#ifdef _WIN32
+    case WM_INITMENUPOPUP:
+        // The context menu's "Open with" submenu gets its programs the first time it opens
+        if (FillOpenWithPopup(reinterpret_cast<HMENU>(wParam))) return 0;
+        break;
+#endif
+
     case WM_APP_RENAME_DONE: {
         std::unique_ptr<RenameJobResult> r(reinterpret_cast<RenameJobResult*>(lParam));
         if (!r) return 0;
@@ -1438,6 +1450,8 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         RemoveClipboardFormatListener(m_hwnd);
         ReleaseClipThumbs();
+        m_openWithMenuApps.clear();
+        m_shellEmulator.ReleaseOpenWithCache();
         RepoBrowser::Shutdown();            // ends a repository read still running (and the svn / git it runs)
         NetShares::Shutdown();              // a server that answers later has no window to tell
         KillTimer(m_hwnd, ID_TIMER_MEDIA);
@@ -3808,6 +3822,10 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                     m_mediaPlayer.TogglePlayPause();
                     InvalidateRect(m_hwnd, nullptr, FALSE);
                 } else {
+                    // A click on the left or right part of a picture shown whole steps to the previous or next
+                    // file when the button comes up (OnMouseUp); held and moved, the press is a pan as before
+                    m_viewerSidePress = ViewerSideForClick(x, y);
+                    m_viewerSidePressAt = D2D1::Point2F(x, y);
                     m_viewerDraggingPan = true;
                     m_viewerDragStart = D2D1::Point2F(x - m_viewerPanX, y - m_viewerPanY);
                     SetCapture(m_hwnd);
@@ -4003,6 +4021,15 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
 void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
     m_mousePt = D2D1::Point2F(x, y);
 
+    // The viewer's side arrows follow the mouse (a click there steps to the previous / next file)
+    if (m_viewMode == ViewMode::FullViewer || m_viewerSideHover != 0) {
+        const int side = (keyFlags & MK_LBUTTON) ? 0 : ViewerSideForClick(x, y);
+        if (side != m_viewerSideHover) {
+            m_viewerSideHover = side;
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+        }
+    }
+
     if (m_draggingMediaVolume) {
         SetMediaVolumeFromX(x);
         return;
@@ -4074,6 +4101,8 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
     }
 
     if (m_viewerDraggingPan) {
+        // moved more than a twitch: a pan, not a click on a side
+        if (m_viewerSidePress != 0 && std::hypot(x - m_viewerSidePressAt.x, y - m_viewerSidePressAt.y) > 4.0f) m_viewerSidePress = 0;
         m_viewerPanX = x - m_viewerDragStart.x;
         m_viewerPanY = y - m_viewerDragStart.y;
         InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -4374,6 +4403,8 @@ void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags)
     bool contentUp = m_contentPane.OnMouseUp();
     if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0 || m_draggingScrollbar || m_viewerDraggingPan || m_isBoxSelecting || contentUp) {
         if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0) SaveUiSettings();
+        // A press on a side of the viewer's picture that did not move: the previous / next file
+        const int sideStep = (m_viewerDraggingPan && !rightButton) ? m_viewerSidePress : 0;
         m_draggingTreeSplitter = false;
         m_draggingGitSplitter = false;
         m_draggingSplitSplitter = false;
@@ -4381,9 +4412,11 @@ void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags)
         m_resizingCol = -1;
         m_draggingScrollbar = false;
         m_viewerDraggingPan = false;
+        m_viewerSidePress = 0;
         m_isBoxSelecting = false;
         ReleaseCapture();
         InvalidateRect(m_hwnd, nullptr, FALSE);
+        if (sideStep != 0) StepViewerImage(sideStep);
     } else if (GetCapture() == m_hwnd) {
         ReleaseCapture();
     }
@@ -4433,6 +4466,10 @@ void ExplorerApp::OnMouseDoubleClick(float x, float y, WPARAM keyFlags) {
         if (x >= mainRect.left && x <= mainRect.right && y >= mainRect.top && y < canvasBottom) {
             if (IsViewerCropping()) {
                 OnMouseDown(x, y, false, keyFlags);     // the second press of a double click is a press on the crop frame
+                return;
+            }
+            if (ViewerSideForClick(x, y) != 0) {
+                OnMouseDown(x, y, false, keyFlags);     // quick clicks on a side step once more each, no full screen
                 return;
             }
             ToggleFullScreen();
@@ -8615,18 +8652,26 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         }
 
         if (!isFolder) {
-            openWithApps = m_shellEmulator.GetOpenWithApps(isImg);
             HMENU hOpenWith = CreatePopupMenu();
-            for (size_t i = 0; i < openWithApps.size() && i < 25; ++i) {
-                UINT id = CMD_BASE_OPENWITH + static_cast<UINT>(i);
-                AppendMenuW(hOpenWith, MF_STRING, id, openWithApps[i].name.c_str());
-                if (openWithApps[i].hMenuBmp) {
-                    ShellMenuEmulator::AttachMenuBitmap(hOpenWith, id, false, openWithApps[i].hMenuBmp);
-                }
+            m_openWithMenuApps.clear();
+#ifdef _WIN32
+            // "Choose another app" now; the programs for this kind of file come in front of it when the submenu
+            // opens (Windows takes 0.2 to 0.7 s to say which ones it recommends; Explorer fills it late too)
+            m_openWithPopup = hOpenWith;
+            m_openWithExt = item.ext;
+            m_openWithIsImage = isImg;
+            m_openWithFilled = false;
+#else
+            // The X11 menus do not tell when a submenu opens: the list goes in now
+            m_openWithMenuApps = m_shellEmulator.OpenWithAppsFor(item.ext, isImg);
+            if (m_openWithMenuApps.size() > 25) m_openWithMenuApps.resize(25);
+            for (size_t i = 0; i < m_openWithMenuApps.size(); ++i) {
+                const UINT id = CMD_BASE_OPENWITH + static_cast<UINT>(i);
+                AppendMenuW(hOpenWith, MF_STRING, id, m_openWithMenuApps[i].name.c_str());
+                if (m_openWithMenuApps[i].hMenuBmp) ShellMenuEmulator::AttachMenuBitmap(hOpenWith, id, false, m_openWithMenuApps[i].hMenuBmp);
             }
-            if (!openWithApps.empty()) {
-                AppendMenuW(hOpenWith, MF_SEPARATOR, 0, nullptr);
-            }
+            if (!m_openWithMenuApps.empty()) AppendMenuW(hOpenWith, MF_SEPARATOR, 0, nullptr);
+#endif
             AppendMenuW(hOpenWith, MF_STRING, CMD_CTX_OPEN_WITH_DIALOG, s.ctxChooseAnotherApp);
             AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hOpenWith), s.ctxOpenWith);
         }
@@ -8830,6 +8875,9 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
 
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, screenX, screenY, 0, m_hwnd, nullptr);
     DestroyMenu(hMenu);
+    m_openWithPopup = nullptr;
+    openWithApps = std::move(m_openWithMenuApps);
+    m_openWithMenuApps.clear();
     if (cmd <= 0) return;
 
     if (cmd >= CMD_IMG_TOGGLE_OVERWRITE && cmd <= CMD_IMG_CONVERT_BMP) {
@@ -8897,10 +8945,19 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
 
     if (cmd >= CMD_BASE_OPENWITH && cmd < CMD_BASE_OPENWITH + static_cast<int>(openWithApps.size())) {
         const auto& app = openWithApps[cmd - CMD_BASE_OPENWITH];
-        auto paths = GetSelectedPaths();
-        if (!paths.empty()) {
-            std::wstring qArg = L"\"" + paths[0] + L"\"";
-            ShellExecuteW(m_hwnd, L"open", app.exePath.c_str(), qArg.c_str(), m_currentPath.c_str(), SW_SHOWNORMAL);
+        // The selected files of the clicked file's type (the list was made for that type), else the clicked file
+        std::vector<std::wstring> paths;
+        const std::wstring clickedPath = (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) ? m_items[hitIndex].fullPath : std::wstring();
+        const std::wstring clickedExt = PathUtils::GetExtension(clickedPath);       // lower case
+        for (const std::wstring& p : GetSelectedPaths()) {
+            if (PathUtils::GetExtension(p) == clickedExt) paths.push_back(p);
+        }
+        if (paths.empty() && !clickedPath.empty()) paths.push_back(clickedPath);
+        if (!ShellMenuEmulator::LaunchOpenWithApp(m_hwnd, app, paths, m_currentPath)) {
+            m_statusToast = (m_lang == Lang::PL ? L"\x26A0 Nie udało się otworzyć w: " : L"\x26A0 Could not open with: ") + app.name;
+            m_statusToastExpireTick = GetTickCount64() + 4000;
+            EnsureWorkAnimTimerState();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
         }
         return;
     }
@@ -9182,6 +9239,24 @@ void ExplorerApp::ToggleFullScreen() {
     }
     ResetViewerZoom();
     InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+// The side of the viewer a click at (x, y) steps to: -1 the previous file, +1 the next one, 0 none. Only for a
+// picture shown whole (zoomed in, a press is the start of a pan), not while cropping, comparing or playing a film,
+// and only towards a file the viewer can show.
+int ExplorerApp::ViewerSideForClick(float x, float y) const {
+    if (m_viewMode != ViewMode::FullViewer || m_items.empty() || IsViewerCropping() || m_viewerCompareMode || m_mediaPlayer.HasMedia()) return 0;
+    if (m_viewerZoom > 1.0f || m_viewerActualPixels) return 0;
+    const D2D1_RECT_F& area = m_viewerCanvasRect;
+    if (!(y >= area.top && y < area.bottom)) return 0;
+    const int side = ViewerSideZone(x, area.left, area.right);
+    const int count = static_cast<int>(m_items.size());
+    const int cur = (m_focusedIndex >= 0 && m_focusedIndex < count) ? m_focusedIndex : 0;
+    if (side == 0 || !m_items[cur].isImage) return 0;
+    for (int i = cur + side; i >= 0 && i < count; i += side) {
+        if (m_items[i].isImage || m_items[i].isVideo || m_items[i].isAudio) return side;
+    }
+    return 0;
 }
 
 void ExplorerApp::StepViewerImage(int delta) {
@@ -9649,6 +9724,29 @@ void ExplorerApp::ShowNavSectionsMenu() {
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
+
+// ---- The context menu's "Open with" submenu ---------------------------------------------------------------------
+
+#ifdef _WIN32
+// Puts the programs for the clicked file's type in front of "Choose another app", once per menu. False for any
+// other menu. (Windows only: the Linux menu gets its list when it is made.)
+bool ExplorerApp::FillOpenWithPopup(HMENU popup) {
+    if (!popup || popup != m_openWithPopup || m_openWithFilled) return false;
+    m_openWithFilled = true;
+    HCURSOR before = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    m_openWithMenuApps = m_shellEmulator.OpenWithAppsFor(m_openWithExt, m_openWithIsImage);
+    SetCursor(before);
+    if (m_openWithMenuApps.size() > 25) m_openWithMenuApps.resize(25);      // the command ids 320..344
+    UINT pos = 0;
+    for (size_t i = 0; i < m_openWithMenuApps.size(); ++i) {
+        const UINT id = CMD_BASE_OPENWITH + static_cast<UINT>(i);
+        InsertMenuW(popup, pos++, MF_BYPOSITION | MF_STRING, id, m_openWithMenuApps[i].name.c_str());
+        if (m_openWithMenuApps[i].hMenuBmp) ShellMenuEmulator::AttachMenuBitmap(popup, id, false, m_openWithMenuApps[i].hMenuBmp);
+    }
+    if (pos > 0) InsertMenuW(popup, pos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+    return true;
+}
+#endif
 
 // ---- The "Schowek" (Clipboard) tab ----------------------------------------------------------------------------
 

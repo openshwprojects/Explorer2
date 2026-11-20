@@ -8634,6 +8634,49 @@ static void RunStage16Tests(TestCounter& tc) {
         tc.Record(ok, L"Stage16.Test25_GtaCollision_ModelsDrawn", L"tris=" + std::to_wstring(mesh.rawTriangleCount) + L" verts=" +
                   std::to_wstring(mesh.rawVertexCount) + L" " + mesh.formatName);
     }
+    {
+        // Clicking the sides of the viewer (ViewerSideZone): a quarter of the picture area on each side, 60 to 320
+        // DIPs, never more than a third; the middle and anything outside are no side
+        const bool widths = ViewerSideZoneWidth(1800.0f) == 320.0f && ViewerSideZoneWidth(800.0f) == 200.0f &&
+                            ViewerSideZoneWidth(200.0f) == 60.0f && std::fabs(ViewerSideZoneWidth(150.0f) - 50.0f) < 0.01f &&
+                            ViewerSideZoneWidth(0.0f) == 0.0f && ViewerSideZoneWidth(-5.0f) == 0.0f;
+        const bool zones = ViewerSideZone(110.0f, 100.0f, 1900.0f) == -1 && ViewerSideZone(419.0f, 100.0f, 1900.0f) == -1 &&
+                           ViewerSideZone(421.0f, 100.0f, 1900.0f) == 0 && ViewerSideZone(1000.0f, 100.0f, 1900.0f) == 0 &&
+                           ViewerSideZone(1579.0f, 100.0f, 1900.0f) == 0 && ViewerSideZone(1581.0f, 100.0f, 1900.0f) == 1 &&
+                           ViewerSideZone(1900.0f, 100.0f, 1900.0f) == 1 && ViewerSideZone(99.0f, 100.0f, 1900.0f) == 0 &&
+                           ViewerSideZone(1901.0f, 100.0f, 1900.0f) == 0 && ViewerSideZone(5.0f, 10.0f, 10.0f) == 0;
+        tc.Record(widths && zones, L"Stage16.Test27_Viewer_SideClickZones",
+                  std::wstring(widths ? L"" : L"[widths] ") + (zones ? L"" : L"[zones]"));
+    }
+#ifdef _WIN32
+    {
+        // "Open with" (the context menu): the programs Windows recommends for a file type, as Explorer lists them -
+        // each named, each once, with the shell's handler kept to start it; the second ask comes from the cache; a
+        // type Windows knows nothing of gets the fixed list (empty here: this object never ran its start-up scan).
+        // Nothing is started: that would open programs on the desktop.
+        ShellMenuEmulator emu;
+        const ULONGLONG t0 = GetTickCount64();
+        const std::vector<OpenWithApp> txt = emu.OpenWithAppsFor(L".txt", false);
+        const ULONGLONG t1 = GetTickCount64();
+        const std::vector<OpenWithApp> again = emu.OpenWithAppsFor(L".txt", false);
+        const ULONGLONG t2 = GetTickCount64();
+        bool named = true, once = true, handlers = true, notepad = false;
+        for (size_t i = 0; i < txt.size(); ++i) {
+            named = named && !txt[i].name.empty();
+            handlers = handlers && txt[i].handler != nullptr;
+            for (size_t j = 0; j < i; ++j) once = once && _wcsicmp(txt[i].name.c_str(), txt[j].name.c_str()) != 0;
+            notepad = notepad || PathUtils::ToLower(PathUtils::GetFileName(txt[i].exePath)) == L"notepad.exe";
+        }
+        const bool cached = again.size() == txt.size() && (txt.empty() || again.front().handler == txt.front().handler);
+        const bool unknown = emu.OpenWithAppsFor(L".e2-no-such-type", false).empty() && emu.OpenWithAppsFor(L"", false).empty();
+        emu.ReleaseOpenWithCache();
+        tc.Record(named && once && handlers && cached && unknown, L"Stage16.Test26_OpenWith_RecommendedProgramsPerType",
+                  L".txt: " + std::to_wstring(txt.size()) + L" programs in " + std::to_wstring(t1 - t0) + L" ms, again in " +
+                  std::to_wstring(t2 - t1) + L" ms" + (notepad ? L", Notepad among them" : L"") +
+                  (named ? L"" : L" [unnamed]") + (once ? L"" : L" [twice]") + (handlers ? L"" : L" [no handler]") +
+                  (cached ? L"" : L" [not cached]") + (unknown ? L"" : L" [unknown type listed]"));
+    }
+#endif
 #ifdef _WIN32
     {
         // The override is written, read back and removed under a scratch key of this process

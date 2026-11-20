@@ -2,7 +2,9 @@
 #include "Types.h"
 #include "Localization.h"
 #include <windows.h>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -27,6 +29,9 @@ struct OpenWithApp {
     std::wstring exePath;
     HBITMAP hMenuBmp = nullptr;
     bool forImagesOnly = false;
+    // Windows: the shell's own handler for the program (an IAssocHandler), which also starts Store apps such as
+    // "Movies & TV" that have no .exe to run; empty for the fixed list
+    std::shared_ptr<void> handler;
 };
 
 struct SendToTarget {
@@ -101,6 +106,17 @@ public:
     std::vector<OpenWithApp> GetOpenWithApps(bool isImage) const;
     std::vector<SendToTarget> GetSendToTargets(Lang lang) const;
 
+    // "Open with" for a kind of file: on Windows the programs the system recommends for the extension - the list
+    // Windows Explorer shows - in the order the shell gives them. Asking takes 0.2 to 0.7 s, so the answer is kept
+    // for a few minutes per extension. An extension Windows recommends nothing for, and Linux, get the fixed list
+    // (GetOpenWithApps). UI thread only.
+    std::vector<OpenWithApp> OpenWithAppsFor(const std::wstring& extLower, bool isImage);
+    // The cached handlers go before COM does (the window's WM_DESTROY)
+    void ReleaseOpenWithCache();
+    // Opens the files with a program from that list: through its shell handler (all the files, as Explorer does),
+    // else its .exe with the first file as the argument
+    static bool LaunchOpenWithApp(HWND hwnd, const OpenWithApp& app, const std::vector<std::wstring>& paths, const std::wstring& workDir);
+
     HBITMAP Get7ZipMenuBitmap() const { std::lock_guard<std::mutex> lk(m_mutex); return m_7zMenuBmp; }
     HBITMAP GetTerminalMenuBitmap() const { std::lock_guard<std::mutex> lk(m_mutex); return m_terminalMenuBmp; }
     HBITMAP GetExplorerMenuBitmap() const { std::lock_guard<std::mutex> lk(m_mutex); return m_explorerMenuBmp; }
@@ -162,6 +178,15 @@ private:
     std::vector<EmulatedShellVerb> m_verbs;
     std::vector<OpenWithApp> m_openWithApps;
     std::vector<SendToTarget> m_sendToTargets;
+
+    // OpenWithAppsFor's answers (UI thread only): per extension, with the time they were asked for; the menu
+    // pictures of the programs by icon location, made once and kept
+    struct OpenWithCacheEntry {
+        ULONGLONG tick = 0;
+        std::vector<OpenWithApp> apps;
+    };
+    std::unordered_map<std::wstring, OpenWithCacheEntry> m_openWithCache;
+    std::unordered_map<std::wstring, HBITMAP> m_handlerIcons;
 };
 
 // 7-Zip Submenu Action IDs

@@ -164,6 +164,14 @@ private:
     bool m_clipHistoryEnabled = true;
     uint64_t m_clipSelectedId = 0;
     std::unordered_map<uint64_t, ID2D1Bitmap*> m_clipThumbs;    // previews of the pictures, made on first paint
+    // The context menu's "Open with" submenu: filled when it opens (WM_INITMENUPOPUP), since asking Windows which
+    // programs it recommends takes a moment; the programs it shows, for the command that comes back
+    HMENU m_openWithPopup = nullptr;
+    std::wstring m_openWithExt;
+    bool m_openWithIsImage = false;
+    bool m_openWithFilled = false;
+    std::vector<OpenWithApp> m_openWithMenuApps;
+    bool FillOpenWithPopup(HMENU popup);
     void OnClipboardChanged();
     void DrawClipboardView(const D2D1_RECT_F& rect);
     uint64_t ClipEntryForCommand() const;   // the entry a card button names, else the selected one, else the newest
@@ -589,6 +597,12 @@ private:
     bool OnViewerCropMouseDown(float x, float y);
     void OnViewerCropMouseMove(float x, float y);
     int ViewerCropGripAt(float x, float y) const;   // what a press there would take hold of (ViewerCrop.h)
+    // Clicking the sides of the picture: -1 previous file, +1 next, 0 none (see ViewerSideZone in ViewerCrop.h)
+    D2D1_RECT_F m_viewerCanvasRect = {};            // the picture area of the last paint (window DIPs)
+    int m_viewerSidePress = 0;                      // the side a press began on; 0 once it moved (a pan)
+    D2D1_POINT_2F m_viewerSidePressAt = {};
+    int m_viewerSideHover = 0;                      // the side the mouse is over: its arrow is drawn
+    int ViewerSideForClick(float x, float y) const;
 
     // Full Viewer Zoom / Pan state
     float m_viewerZoom = 1.0f;

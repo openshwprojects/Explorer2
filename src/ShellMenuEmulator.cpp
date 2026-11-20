@@ -14,6 +14,7 @@
 #include <wincodec.h>
 #ifdef _WIN32
 #include <wincodecsdk.h>    // IWICMetadataBlockReader / Writer: a photo's EXIF data goes along into the saved file
+#include <shobjidl.h>       // SHAssocEnumHandlers / IAssocHandler: the programs Windows recommends for a file type
 #endif
 #include <thread>
 #include <algorithm>
@@ -404,6 +405,149 @@ std::vector<OpenWithApp> ShellMenuEmulator::GetOpenWithApps(bool isImage) const 
         }
     }
     return result;
+}
+
+#ifdef _WIN32
+// A picture file (the PNG icon of a Store app) as a 16 x 16 menu picture, premultiplied like HIconToMenuBitmap16's
+static HBITMAP PictureFileToMenuBitmap16(const std::wstring& path) {
+    ComPtr<IWICImagingFactory> wic;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICBitmapScaler> scaler;
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic ||
+        FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) || !decoder ||
+        FAILED(decoder->GetFrame(0, &frame)) || !frame || FAILED(wic->CreateBitmapScaler(&scaler)) || !scaler ||
+        FAILED(scaler->Initialize(frame.Get(), 16, 16, WICBitmapInterpolationModeFant)) ||
+        FAILED(wic->CreateFormatConverter(&converter)) || !converter ||
+        FAILED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+        return nullptr;
+    }
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = 16;
+    bmi.bmiHeader.biHeight = -16;           // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screenDc = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screenDc);
+    if (!dib || !bits || FAILED(converter->CopyPixels(nullptr, 16 * 4, 16 * 16 * 4, static_cast<BYTE*>(bits)))) {
+        if (dib) DeleteObject(dib);
+        return nullptr;
+    }
+    return dib;
+}
+
+// The menu picture of a program as the shell names its icon: "@{...}" is a resource of a Store app (it resolves to
+// a PNG file), anything else a file with icons and an index
+static HBITMAP HandlerMenuBitmap(const wchar_t* location, int index) {
+    if (!location || !location[0]) return nullptr;
+    if (location[0] == L'@') {
+        wchar_t resolved[MAX_PATH] = {};
+        if (SUCCEEDED(SHLoadIndirectString(location, resolved, MAX_PATH, nullptr)) && resolved[0]) {
+            return PictureFileToMenuBitmap16(resolved);
+        }
+        return nullptr;
+    }
+    HICON hSmall = nullptr;
+    if (ExtractIconExW(location, index, nullptr, &hSmall, 1) > 0 && hSmall) {
+        HBITMAP bmp = HIconToMenuBitmap16(hSmall);
+        DestroyIcon(hSmall);
+        if (bmp) return bmp;
+    }
+    return ExtractSmallMenuBitmap(location);
+}
+#endif
+
+std::vector<OpenWithApp> ShellMenuEmulator::OpenWithAppsFor(const std::wstring& extLower, bool isImage) {
+#ifdef _WIN32
+    if (extLower.size() > 1 && extLower[0] == L'.') {
+        constexpr ULONGLONG kKeepMs = 3 * 60 * 1000;      // a program installed meanwhile shows up after this
+        const ULONGLONG now = GetTickCount64();
+        auto it = m_openWithCache.find(extLower);
+        if (it == m_openWithCache.end() || now - it->second.tick > kKeepMs) {
+            OpenWithCacheEntry entry;
+            entry.tick = now;
+            ComPtr<IEnumAssocHandlers> handlers;
+            if (SUCCEEDED(SHAssocEnumHandlers(extLower.c_str(), ASSOC_FILTER_RECOMMENDED, &handlers)) && handlers) {
+                IAssocHandler* raw = nullptr;
+                ULONG fetched = 0;
+                while (entry.apps.size() < 25 && handlers->Next(1, &raw, &fetched) == S_OK && fetched == 1 && raw) {
+                    std::shared_ptr<void> holder(raw, [](void* p) { static_cast<IAssocHandler*>(p)->Release(); });
+                    LPWSTR uiName = nullptr, name = nullptr, icon = nullptr;
+                    int iconIndex = 0;
+                    raw->GetUIName(&uiName);
+                    raw->GetName(&name);
+                    raw->GetIconLocation(&icon, &iconIndex);
+                    raw = nullptr;
+                    OpenWithApp app;
+                    app.name = uiName ? uiName : L"";
+                    app.exePath = name ? name : L"";
+                    // Unnamed entries (the shell lists a few) are left out, and a program listed twice is shown once
+                    const bool listed = std::any_of(entry.apps.begin(), entry.apps.end(),
+                                                    [&](const OpenWithApp& a) { return _wcsicmp(a.name.c_str(), app.name.c_str()) == 0; });
+                    if (!app.name.empty() && !listed) {
+                        const std::wstring iconKey = std::wstring(icon ? icon : L"") + L"," + std::to_wstring(iconIndex);
+                        auto ic = m_handlerIcons.find(iconKey);
+                        if (ic == m_handlerIcons.end()) ic = m_handlerIcons.emplace(iconKey, HandlerMenuBitmap(icon, iconIndex)).first;
+                        app.hMenuBmp = ic->second;
+                        app.handler = std::move(holder);
+                        entry.apps.push_back(std::move(app));
+                    }
+                    CoTaskMemFree(uiName);
+                    CoTaskMemFree(name);
+                    CoTaskMemFree(icon);
+                }
+            }
+            it = m_openWithCache.insert_or_assign(extLower, std::move(entry)).first;
+        }
+        if (!it->second.apps.empty()) return it->second.apps;
+    }
+#endif
+    return GetOpenWithApps(isImage);
+}
+
+void ShellMenuEmulator::ReleaseOpenWithCache() {
+    m_openWithCache.clear();
+    for (auto& [location, bmp] : m_handlerIcons) {
+        if (bmp) DeleteObject(bmp);
+    }
+    m_handlerIcons.clear();
+}
+
+bool ShellMenuEmulator::LaunchOpenWithApp(HWND hwnd, const OpenWithApp& app, const std::vector<std::wstring>& paths, const std::wstring& workDir) {
+    if (paths.empty()) return false;
+#ifdef _WIN32
+    if (app.handler) {
+        // The files as the shell hands them to a program: a data object of their items, given to the handler
+        std::vector<PIDLIST_ABSOLUTE> pidls;
+        for (const std::wstring& p : paths) {
+            PIDLIST_ABSOLUTE pidl = nullptr;
+            if (SUCCEEDED(SHParseDisplayName(p.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) pidls.push_back(pidl);
+        }
+        bool started = false;
+        {
+            std::vector<PCIDLIST_ABSOLUTE> items_(pidls.begin(), pidls.end());     // the type the call takes
+            ComPtr<IShellItemArray> items;
+            ComPtr<IDataObject> data;
+            if (!items_.empty() &&
+                SUCCEEDED(SHCreateShellItemArrayFromIDLists(static_cast<UINT>(items_.size()), items_.data(), &items)) &&
+                items && SUCCEEDED(items->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(&data))) && data) {
+                started = SUCCEEDED(static_cast<IAssocHandler*>(app.handler.get())->Invoke(data.Get()));
+            }
+        }
+        for (PIDLIST_ABSOLUTE pidl : pidls) CoTaskMemFree(pidl);
+        if (started) return true;
+    }
+#endif
+    // The fixed list, and a handler that did not start: the program itself, with the first file
+    if (app.exePath.empty() || GetFileAttributesW(app.exePath.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    const std::wstring arg = L"\"" + paths.front() + L"\"";
+    return reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", app.exePath.c_str(), arg.c_str(),
+                                                   workDir.empty() ? nullptr : workDir.c_str(), SW_SHOWNORMAL)) > 32;
 }
 
 std::vector<SendToTarget> ShellMenuEmulator::GetSendToTargets(Lang lang) const {
@@ -1565,7 +1709,10 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
             outRes.errorMsg = L"Cannot write output file";
             return false;
         }
-        if (_wcsicmp(destPath.c_str(), imagePath.c_str()) != 0) {
+        // The old file goes only when the picture got a new name (another format). Compared as path keys: the same
+        // file can be named with either separator ("/tmp/a\b.jpg" and "/tmp/a/b.jpg" on Linux, "C:/a/b.jpg" and
+        // "C:/a\b.jpg" on Windows), and deleting it as "the other name" deleted the picture just saved.
+        if (PathUtils::NormalizePathKey(destPath) != PathUtils::NormalizePathKey(imagePath)) {
             DeleteFileW(imagePath.c_str());
         }
     } else {

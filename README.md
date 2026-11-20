@@ -27,7 +27,8 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
   from the LAN scanner). A server that does not answer never freezes the window: it is asked in the background,
   and the folder opens by itself when it answers
 - Subversion and git repositories by their URL, read-only, like folders (see [Things to know](#things-to-know))
-- In-window image and media viewer with a filmstrip. For video and audio the mouse wheel moves through the file
+- In-window image and media viewer with a filmstrip. A click on the left or right part of a picture shows the
+  previous or next file (an arrow shows where; dragging still pans). For video and audio the mouse wheel moves through the file
   and the transport bar has a volume slider. Pictures, and video and audio, can each be set to open in the
   system's default program instead (Settings tab); Space still shows the built-in viewer
 - The viewer turns a picture by 90° and crops it, and saves the result into the file (or, for a crop, into a copy
@@ -214,6 +215,10 @@ Explorer2 uses these when they are installed, and works without them:
   clipboard history" on the tab switches the history off. "Paste as a file" saves a text as a UTF-8 `.txt` and a
   picture as a `.png` in the open folder. On Linux the clipboard is looked at once a second, so something copied
   and replaced again within that second can be missed.
+- "Open with" in the context menu lists the programs Windows recommends for the file's type - the list Windows
+  Explorer shows, Store apps such as "Movies & TV" included - and opens the selected files of that type with the
+  one you pick. Windows takes a moment to answer, so the list is asked for when the submenu opens and kept for a
+  few minutes per type. On Linux it is a fixed list of common editors and viewers.
 - An `.img` file opens like a folder when it is a GTA archive (San Andreas' `VER2`, or GTA III / Vice City's
   `.img` with its `.dir` next to it) or a disk image Explorer2 can read; any other `.img` opens as a file.
 - "Pictures in the default program" and "Video/audio in the default program" on the Settings tab decide what a
