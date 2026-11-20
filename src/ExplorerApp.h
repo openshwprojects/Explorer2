@@ -4,6 +4,8 @@
 #include "FileEngine.h"
 #include "ImageCache.h"
 #include "ShellMenuEmulator.h"
+#include "ViewerCrop.h"
+#include "ClipboardHistory.h"
 #include "MediaPlayer.h"
 #include "HardwareInfo.h"
 #include "ProgramsInfo.h"
@@ -155,6 +157,18 @@ private:
     void LoadUiSettings();
     bool IsLanView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Lan; }
     bool IsLogView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Log; }
+    bool IsClipboardView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Clipboard; }
+
+    // "Schowek" (Clipboard) tab: what was copied while the program runs, in memory only (ClipboardHistory.h)
+    ClipboardHistory m_clipHistory;
+    bool m_clipHistoryEnabled = true;
+    uint64_t m_clipSelectedId = 0;
+    std::unordered_map<uint64_t, ID2D1Bitmap*> m_clipThumbs;    // previews of the pictures, made on first paint
+    void OnClipboardChanged();
+    void DrawClipboardView(const D2D1_RECT_F& rect);
+    uint64_t ClipEntryForCommand() const;   // the entry a card button names, else the selected one, else the newest
+    ID2D1Bitmap* ClipThumbBitmap(const ClipboardEntry& e);
+    void ReleaseClipThumbs();
     bool IsBackupsView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Backups; }
     bool IsTransfersView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Transfers; }
     bool IsMonitoringView() const { return m_viewMode == ViewMode::Hardware && m_activeRibbonTab == RibbonTab::Monitoring; }
@@ -217,6 +231,7 @@ private:
     D2D1_RECT_F m_mediaVolumeBarRect = {};    // where the volume slider was drawn last; empty when there is none
     bool m_draggingMediaVolume = false;
     bool m_openMediaExternally = false;       // double-click / Enter / "Open" on video and audio start the system's player
+    bool m_openImagesExternally = false;      // the same for pictures: the system's program instead of the built-in viewer
     void SetMediaVolumeFromX(float x);
     void NudgeMediaVolume(int steps);         // 5% per step; a muted player is unmuted
     void SeekMediaBy(double seconds);
@@ -378,7 +393,7 @@ private:
     void PlaceChildDip(HWND child, float left, float top, float width, float height);
     void ApplyDpi(UINT dpi);
     void RecreateEditFont();
-    // The user's own scale on top of the display's (File tab, Ctrl+Plus / Ctrl+Minus / Ctrl+0): m_dpi is
+    // The user's own scale on top of the display's (Settings tab, Ctrl+Plus / Ctrl+Minus / Ctrl+0): m_dpi is
     // m_systemDpi * m_uiScalePct / 100, so everything that follows m_dpi follows the user's scale too
     UINT m_systemDpi = 96;                    // what Windows reports for the window's monitor
     int m_uiScalePct = 100;
@@ -386,9 +401,15 @@ private:
     void SetUiScale(int pct);
     void ShowUiScaleMenu();
 
-    // Which sections of the navigation tree are shown (FileEngine::NavSection bits; File tab, "Ustawienia")
+    // Which sections of the navigation tree are shown (FileEngine::NavSection bits; Settings tab)
     unsigned m_navSections = FileEngine::kNavAllSections;
     void ShowNavSectionsMenu();
+
+    // The "Ustawienia" (Settings) tab: the language, and which ribbon tabs the strip leaves out (bit t = the tab
+    // whose RibbonTab value is t; RibbonTabLayout.h, RibbonTabShown)
+    void SetLanguage(Lang lang);
+    unsigned m_hiddenRibbonTabs = 0;
+    void ShowRibbonTabsMenu();
 
     // Width of one line of text in a format, in DIPs. Kept per text and format: the tab strip asks on every paint.
     float MeasureTextWidth(const std::wstring& text, IDWriteTextFormat* fmt);
@@ -545,6 +566,29 @@ private:
     int m_hoverTabCloseIndex = -1;
     bool m_hoverNewTabBtn = false;
     bool m_darkMode = false;
+
+    // Full viewer: turning and cropping a picture, saved into its file (the work itself: TransformImageFile).
+    // The crop rectangle is in pixels of the picture as it is shown; while it is on screen the picture is kept
+    // fitted to the window, so that the whole of it can be reached.
+    bool m_viewerCropMode = false;
+    std::wstring m_viewerCropPath;                  // the file being cropped; showing another one ends the crop
+    D2D1_RECT_F m_viewerCropRect = {};
+    int m_viewerCropDrag = 0;                       // what the mouse holds: ViewerCropGrip (ViewerCrop.h), 0 = nothing
+    D2D1_POINT_2F m_viewerCropDragStart = {};       // where it was taken, in picture pixels
+    D2D1_POINT_2F m_viewerCropPressAt = {};         // the same in window DIPs, to tell a click from a drag
+    bool m_viewerCropDragMoved = false;
+    D2D1_RECT_F m_viewerCropDragRect = {};          // the rectangle at that moment
+    D2D1_RECT_F m_viewerImageRect = {};             // where the picture was drawn last (window DIPs); empty = none
+    uint32_t m_viewerImageW = 0;                    // its size in pixels
+    uint32_t m_viewerImageH = 0;
+    bool IsViewerCropping() const;                  // the crop rectangle is on, for the picture that is shown
+    bool ViewerPictureIsEditable(std::wstring* outPath = nullptr);   // a picture file on a disk, not busy
+    void RotateViewerPicture(bool clockwise);
+    void BeginViewerCrop();
+    void EndViewerCrop(bool save, bool asCopy);
+    bool OnViewerCropMouseDown(float x, float y);
+    void OnViewerCropMouseMove(float x, float y);
+    int ViewerCropGripAt(float x, float y) const;   // what a press there would take hold of (ViewerCrop.h)
 
     // Full Viewer Zoom / Pan state
     float m_viewerZoom = 1.0f;

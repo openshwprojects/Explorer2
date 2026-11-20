@@ -417,6 +417,7 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
     m_mediaPlayer.Initialize(m_hwnd);
     m_contentPane.Initialize(m_hwnd, hInstance, m_d2dFactory, m_dwriteFactory);
     DragAcceptFiles(m_hwnd, TRUE);
+    AddClipboardFormatListener(m_hwnd);     // WM_CLIPBOARDUPDATE: the "Schowek" tab's history
     AppLog::Info(L"App", L"Init step 1: Subsystems initialized");
 
     m_pinnedFolders = FileEngine::GetDefaultQuickAccessFolders(m_lang);
@@ -598,6 +599,7 @@ bool ExplorerApp::CreateDeviceResources() {
 void ExplorerApp::DiscardDeviceResources() {
     m_mediaPlayer.DiscardDeviceResources();
     m_imageCache.DiscardDeviceResources();
+    ReleaseClipThumbs();
     if (m_solidBrush) {
         m_solidBrush->Release();
         m_solidBrush = nullptr;
@@ -724,7 +726,8 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == ID_TIMER_MEDIA && m_mediaPlayer.HasMedia() && m_mediaPlayer.IsPlaying()) {
             InvalidateRect(m_hwnd, nullptr, FALSE);
         } else if (wParam == ID_TIMER_WORK_ANIM) {
-            if (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView() && !IsTransfersView()) {
+            if (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView() && !IsTransfersView() &&
+                !IsClipboardView()) {
                 m_hwInspector.ApplyStagedData();
                 if (m_hwLiveRefresh) {
                     ULONGLONG now = GetTickCount64();
@@ -927,6 +930,39 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 HitResizeHandle(PxToDip(pt.x), PxToDip(pt.y)) != 0) {
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return TRUE;
+            }
+            // The crop frame of the viewer: the cursor says which way a corner or an edge would go
+            if (IsViewerCropping()) {
+                const float cx = PxToDip(pt.x), cy = PxToDip(pt.y);
+                int grip = m_viewerCropDrag;
+                if (grip == kCropGripNone) {
+                    grip = ViewerCropGripAt(cx, cy);
+                    // off the picture the arrow stays: the bars and the filmstrip are clicked there
+                    const D2D1_RECT_F& pic = m_viewerImageRect;
+                    if (grip == kCropGripNew && !(cx >= pic.left && cx <= pic.right && cy >= pic.top && cy <= pic.bottom)) grip = kCropGripNone;
+                }
+                LPCWSTR shape = nullptr;
+                switch (grip) {
+                case kCropGripTopLeft:
+                case kCropGripBottomRight: shape = IDC_SIZENWSE; break;
+                case kCropGripTopRight:
+                case kCropGripBottomLeft:  shape = IDC_SIZENESW; break;
+                case kCropGripTop:
+                case kCropGripBottom:      shape = IDC_SIZENS; break;
+                case kCropGripLeft:
+                case kCropGripRight:       shape = IDC_SIZEWE; break;
+#ifdef IDC_SIZEALL
+                case kCropGripMove:        shape = IDC_SIZEALL; break;
+#else
+                case kCropGripMove:        shape = IDC_CROSS; break;     // the Linux build has no four-way arrow
+#endif
+                case kCropGripNew:         shape = IDC_CROSS; break;
+                default: break;
+                }
+                if (shape) {
+                    SetCursor(LoadCursorW(nullptr, shape));
+                    return TRUE;
+                }
             }
         }
         break;
@@ -1147,9 +1183,11 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::wstring newSz = FileEngine::FormatSizeDetailed(lastOk.newBytes);
                 if (okCount == 1 && !m_imageCache.IsAnyImageTransforming()) {
                     swprintf_s(msg, pl
-                        ? L"\x2713 Obraz gotowy: %s  (%u\xD7%u px \x2192 %u\xD7%u px,  %s \x2192 %s)"
-                        : L"\x2713 Image ready: %s  (%u\xD7%u px \x2192 %u\xD7%u px,  %s \x2192 %s)",
-                        outName.c_str(), lastOk.origW, lastOk.origH, lastOk.newW, lastOk.newH, oldSz.c_str(), newSz.c_str());
+                        ? L"\x2713 Obraz gotowy: %s  (%u\xD7%u px \x2192 %u\xD7%u px,  %s \x2192 %s)%s"
+                        : L"\x2713 Image ready: %s  (%u\xD7%u px \x2192 %u\xD7%u px,  %s \x2192 %s)%s",
+                        outName.c_str(), lastOk.origW, lastOk.origH, lastOk.newW, lastOk.newH, oldSz.c_str(), newSz.c_str(),
+                        // a JPEG that was only turned: its compressed data was moved, not made anew
+                        lastOk.lossless ? (pl ? L"  \x2022  bez utraty jakości" : L"  \x2022  no quality lost") : L"");
                 } else {
                     swprintf_s(msg, pl
                         ? L"\x2713 Przetworzono: %s  (%u\xD7%u px, %s)"
@@ -1191,6 +1229,10 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_APP_LOG_ADDED:
         if (IsLogView()) InvalidateRect(m_hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_CLIPBOARDUPDATE:
+        OnClipboardChanged();
         return 0;
 
     case WM_APP_RENAME_DONE: {
@@ -1394,6 +1436,8 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
+        RemoveClipboardFormatListener(m_hwnd);
+        ReleaseClipThumbs();
         RepoBrowser::Shutdown();            // ends a repository read still running (and the svn / git it runs)
         NetShares::Shutdown();              // a server that answers later has no window to tell
         KillTimer(m_hwnd, ID_TIMER_MEDIA);
@@ -1597,7 +1641,8 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
             m_activeRibbonTab == RibbonTab::Lan ||
             m_activeRibbonTab == RibbonTab::Log ||
             m_activeRibbonTab == RibbonTab::Backups ||
-            m_activeRibbonTab == RibbonTab::Transfers) {
+            m_activeRibbonTab == RibbonTab::Transfers ||
+            m_activeRibbonTab == RibbonTab::Clipboard) {
             m_activeRibbonTab = RibbonTab::Home;
         }
     }
@@ -1680,7 +1725,7 @@ void ExplorerApp::NavigateTo(const std::wstring& path, bool addToHistory, const 
         m_viewMode = m_lastNonViewerMode;
         if (m_activeRibbonTab == RibbonTab::Hardware || m_activeRibbonTab == RibbonTab::Programs ||
             m_activeRibbonTab == RibbonTab::Monitoring || m_activeRibbonTab == RibbonTab::Lan ||
-            m_activeRibbonTab == RibbonTab::Log) {
+            m_activeRibbonTab == RibbonTab::Log || m_activeRibbonTab == RibbonTab::Clipboard) {
             m_activeRibbonTab = RibbonTab::Home;
         }
     }
@@ -2717,9 +2762,27 @@ static std::wstring UiSettingsPath() {
     return PathUtils::GetParentPath(MonitorStore::DataDir()) + L"\\settings.ini";
 }
 
+namespace {
+// The language of a first start, before the user has chosen one: Polish where the system is set to Polish, English
+// everywhere else. The switch is in the "Ustawienia" tab, and nobody should have to look for it in a language
+// they do not read.
+Lang SystemLanguage() {
+#ifdef _WIN32
+    return (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_POLISH) ? Lang::PL : Lang::EN;
+#else
+    for (const char* variable : { "LC_ALL", "LC_MESSAGES", "LANG" }) {
+        const char* value = std::getenv(variable);
+        if (value && *value) return IsPolishLocaleName(value) ? Lang::PL : Lang::EN;
+    }
+    return Lang::EN;
+#endif
+}
+} // namespace
+
 void ExplorerApp::LoadUiSettings() {
     std::wstring ini = UiSettingsPath();
-    m_lang = (GetPrivateProfileIntW(L"UI", L"Lang", 0, ini.c_str()) == 1) ? Lang::EN : Lang::PL;
+    const int langSetting = static_cast<int>(GetPrivateProfileIntW(L"UI", L"Lang", -1, ini.c_str()));
+    m_lang = (langSetting == 1) ? Lang::EN : (langSetting == 0 ? Lang::PL : SystemLanguage());
     int vm = GetPrivateProfileIntW(L"UI", L"ViewMode", static_cast<int>(ViewMode::Details), ini.c_str());
     if (vm >= 0 && vm <= static_cast<int>(ViewMode::PieChart)) {
         m_viewMode = static_cast<ViewMode>(vm);
@@ -2748,6 +2811,10 @@ void ExplorerApp::LoadUiSettings() {
     m_uiScalePct = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"UiScalePct", 100, ini.c_str())), 75, 250);
 #endif
     m_openMediaExternally = GetPrivateProfileIntW(L"UI", L"MediaOpenExternal", 0, ini.c_str()) != 0;
+    m_openImagesExternally = GetPrivateProfileIntW(L"UI", L"ImagesOpenExternal", 0, ini.c_str()) != 0;
+    m_hiddenRibbonTabs = static_cast<unsigned>(GetPrivateProfileIntW(L"UI", L"HiddenTabs", 0, ini.c_str())) &
+                         ~kRibbonTabsAlwaysShown & ((1u << kRibbonTabCount) - 1u);
+    m_clipHistoryEnabled = GetPrivateProfileIntW(L"Clipboard", L"History", 1, ini.c_str()) != 0;
     m_navSections = static_cast<unsigned>(GetPrivateProfileIntW(L"UI", L"NavSections", static_cast<int>(FileEngine::kNavAllSections), ini.c_str())) &
                     FileEngine::kNavAllSections;
     m_mediaPlayer.SetVolume(std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"MediaVolumePct", 100, ini.c_str())), 0, 100) / 100.0);
@@ -2948,6 +3015,8 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
     content += L"PreviewPaneWidth=" + std::to_wstring(prevW) + L"\r\n";
     content += L"UiScalePct=" + std::to_wstring(m_uiScalePct) + L"\r\n";
     content += L"MediaOpenExternal="; content += (m_openMediaExternally ? L"1\r\n" : L"0\r\n");
+    content += L"ImagesOpenExternal="; content += (m_openImagesExternally ? L"1\r\n" : L"0\r\n");
+    content += L"HiddenTabs=" + std::to_wstring(m_hiddenRibbonTabs) + L"\r\n";
     content += L"NavSections=" + std::to_wstring(m_navSections) + L"\r\n";
     content += L"MediaVolumePct=" + std::to_wstring(static_cast<int>(std::lround(m_mediaPlayer.GetVolume() * 100.0))) + L"\r\n";
     content += L"MediaMuted="; content += (m_mediaPlayer.IsMuted() ? L"1\r\n" : L"0\r\n");
@@ -2971,6 +3040,9 @@ void ExplorerApp::SaveUiSettings(bool waitUntilWritten) const {
     for (int i = 0; i < cnt; ++i) {
         content += L"Dir" + std::to_wstring(i) + L"=" + m_recentDirs[i] + L"\r\n";
     }
+
+    content += L"\r\n[Clipboard]\r\n";
+    content += L"History="; content += (m_clipHistoryEnabled ? L"1\r\n" : L"0\r\n");
 
     content += L"\r\n[Updates]\r\n";
     content += L"Check="; content += (m_updateCheckEnabled ? L"1\r\n" : L"0\r\n");
@@ -3730,7 +3802,9 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
             }
 
             if (x >= mainRect.left && x <= mainRect.right && y >= mainRect.top && y < (m_isFullScreen ? mainRect.bottom : stripTop)) {
-                if (m_mediaPlayer.HasMedia()) {
+                if (IsViewerCropping()) {
+                    OnViewerCropMouseDown(x, y);        // the crop frame takes the mouse; the picture does not move under it
+                } else if (m_mediaPlayer.HasMedia()) {
                     m_mediaPlayer.TogglePlayPause();
                     InvalidateRect(m_hwnd, nullptr, FALSE);
                 } else {
@@ -3991,6 +4065,11 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         ClampScrollOffset();
         m_imageCache.BumpViewportGeneration();
         InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    if (m_viewerCropDrag != kCropGripNone) {
+        OnViewerCropMouseMove(x, y);
         return;
     }
 
@@ -4285,6 +4364,13 @@ void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags)
         return;
     }
 
+    if (m_viewerCropDrag != kCropGripNone) {
+        m_viewerCropDrag = kCropGripNone;
+        ReleaseCapture();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
     bool contentUp = m_contentPane.OnMouseUp();
     if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0 || m_draggingScrollbar || m_viewerDraggingPan || m_isBoxSelecting || contentUp) {
         if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0) SaveUiSettings();
@@ -4345,6 +4431,10 @@ void ExplorerApp::OnMouseDoubleClick(float x, float y, WPARAM keyFlags) {
         }
         float canvasBottom = m_isFullScreen ? mainRect.bottom : (mainRect.bottom - kFilmstripHeight);
         if (x >= mainRect.left && x <= mainRect.right && y >= mainRect.top && y < canvasBottom) {
+            if (IsViewerCropping()) {
+                OnMouseDown(x, y, false, keyFlags);     // the second press of a double click is a press on the crop frame
+                return;
+            }
             ToggleFullScreen();
             return;
         }
@@ -4512,6 +4602,8 @@ void ExplorerApp::OnMouseWheel(short delta, float x, float y, WPARAM keyFlags) {
             // is turned away from the user, as in most players). Shift + wheel still zooms the picture.
             SeekMediaBy(steps * 5.0);
             return;
+        } else if (IsViewerCropping()) {
+            return;     // the picture stays fitted to the window while the crop frame is on it
         } else {
             m_viewerActualPixels = false;
             float factor = (steps > 0) ? 1.2f : (1.0f / 1.2f);
@@ -4572,6 +4664,10 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
             m_dragTargetLabel.clear();
             ReleaseCapture();
             InvalidateRect(m_hwnd, nullptr, FALSE);
+            return;
+        }
+        if (IsViewerCropping()) {
+            EndViewerCrop(false, false);        // Esc gives up the crop frame first; the viewer stays
             return;
         }
         if (m_isFullScreen) {
@@ -4647,6 +4743,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
     if (vk == VK_F5) { RefreshFromUser(); return; }
     if (vk == VK_BACK) { NavigateBack(); return; }
     if (vk == VK_DELETE) { DeleteSelectedItems(shift); return; }
+    if (vk == VK_RETURN && IsViewerCropping()) { EndViewerCrop(true, false); return; }      // Enter saves the crop
     if (vk == VK_SPACE) { ToggleFullViewerMode(); return; }
     if (vk == VK_RETURN) { ActivateFocusedOrSelectedItem(); return; }
 
@@ -4782,20 +4879,43 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         m_viewMode = ViewMode::Hardware;
         EnsureWorkAnimTimerState();
         break;
-    case CMD_TOGGLE_LANG:
-        m_lang = (m_lang == Lang::PL) ? Lang::EN : Lang::PL;
-        SaveUiSettings();
-        RebuildTreeNodes();
-        RefreshCurrentFolder();
-        if (m_splitView && !m_otherPane.currentPath.empty()) {
-            int prevActive = m_activePane;
-            SwapWithOtherPane();
-            m_activePane = 1 - prevActive;
-            RefreshCurrentFolder();
-            SwapWithOtherPane();
-            m_activePane = prevActive;
-        }
+    case CMD_TAB_SETTINGS:
+        m_activeRibbonTab = RibbonTab::Settings;
+        m_ribbonCollapsed = false;
+        if (m_viewMode == ViewMode::Hardware) m_viewMode = m_lastNonViewerMode;
         break;
+    case CMD_TOGGLE_LANG:
+        SetLanguage(m_lang == Lang::PL ? Lang::EN : Lang::PL);
+        break;
+    case CMD_LANG_SET_PL:
+        SetLanguage(Lang::PL);
+        break;
+    case CMD_LANG_SET_EN:
+        SetLanguage(Lang::EN);
+        break;
+    case CMD_TOGGLE_IMAGES_EXTERNAL:
+        m_openImagesExternally = !m_openImagesExternally;
+        m_statusToast = m_openImagesExternally
+            ? (m_lang == Lang::PL ? L"\x2713 Obrazy otwierają się w domyślnym programie systemu (wbudowany podgląd: menu kontekstowe lub Spacja)"
+                                  : L"\x2713 Pictures open in the system's default program (built-in viewer: context menu or Space)")
+            : (m_lang == Lang::PL ? L"\x2713 Obrazy otwierają się we wbudowanym podglądzie"
+                                  : L"\x2713 Pictures open in the built-in viewer");
+        m_statusToastExpireTick = GetTickCount64() + 4500;
+        SaveUiSettings();
+        break;
+    case CMD_TOGGLE_CONFIRM_DELETE:
+        m_confirmDelete = !m_confirmDelete;
+        m_statusToast = m_confirmDelete
+            ? (m_lang == Lang::PL ? L"\x2713 Przed usunięciem Explorer2 zapyta o potwierdzenie"
+                                  : L"\x2713 Explorer2 will ask before it deletes")
+            : (m_lang == Lang::PL ? L"\x2713 Usuwanie bez pytania o potwierdzenie"
+                                  : L"\x2713 Deleting without asking for confirmation");
+        m_statusToastExpireTick = GetTickCount64() + 4000;
+        SaveUiSettings();
+        break;
+    case CMD_RIBBON_TABS_MENU:
+        ShowRibbonTabsMenu();
+        return;
     case CMD_TOGGLE_RIBBON:
         m_ribbonCollapsed = !m_ribbonCollapsed;
         SaveUiSettings();
@@ -5239,7 +5359,14 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
     case CMD_VIEWER_ZOOM_FIT:    ResetViewerZoom(); break;
     case CMD_VIEWER_ZOOM_100:    SetViewerZoom100(); break;
     case CMD_VIEWER_FULLSCREEN:  ToggleFullScreen(); break;
+    case CMD_VIEWER_ROTATE_LEFT:    RotateViewerPicture(false); break;
+    case CMD_VIEWER_ROTATE_RIGHT:   RotateViewerPicture(true); break;
+    case CMD_VIEWER_CROP:           BeginViewerCrop(); break;
+    case CMD_VIEWER_CROP_SAVE:      EndViewerCrop(true, false); break;
+    case CMD_VIEWER_CROP_SAVE_COPY: EndViewerCrop(true, true); break;
+    case CMD_VIEWER_CROP_CANCEL:    EndViewerCrop(false, false); break;
     case CMD_VIEWER_CLOSE:
+        m_viewerCropMode = false;
         if (m_isFullScreen) ToggleFullScreen();
         m_mediaPlayer.CloseMedia();
         KillTimer(m_hwnd, ID_TIMER_MEDIA);
@@ -5705,6 +5832,92 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         m_statusToastExpireTick = GetTickCount64() + 2600;
         break;
     }
+    // "Schowek" (Clipboard) tab: the history of what was copied
+    case CMD_TAB_CLIPBOARD:
+        m_activeRibbonTab = RibbonTab::Clipboard;
+        m_ribbonCollapsed = false;
+        m_viewMode = ViewMode::Hardware;   // hosted by the card-hit dashboard view
+        m_hwScrollY = 0.0f;
+        break;
+    case CMD_CLIP_SELECT:
+        m_clipSelectedId = ClipEntryForCommand();
+        m_hwActionArg.clear();
+        break;
+    case CMD_CLIP_COPY: {
+        const bool pl = (m_lang == Lang::PL);
+        const ClipboardEntry* e = m_clipHistory.Find(ClipEntryForCommand());
+        m_hwActionArg.clear();
+        if (!e) break;
+        m_clipSelectedId = e->id;
+        const bool ok = ClipboardIo::Restore(m_hwnd, *e);
+        m_statusToast = ok ? (pl ? L"\x2713 Wpis jest znowu w schowku (Ctrl + V wkleja go)" : L"\x2713 The entry is on the clipboard again (Ctrl + V pastes it)")
+                           : (pl ? L"\x26A0 Nie udało się umieścić wpisu w schowku" : L"\x26A0 Could not put the entry on the clipboard");
+        m_statusToastExpireTick = GetTickCount64() + 3500;
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_CLIP_SAVE_FILE: {
+        const bool pl = (m_lang == Lang::PL);
+        const ClipboardEntry* e = m_clipHistory.Find(ClipEntryForCommand());
+        m_hwActionArg.clear();
+        if (!e) break;
+        m_clipSelectedId = e->id;
+        if (e->kind == ClipboardEntry::Kind::Files) {
+            m_statusToast = pl ? L"To lista plików: wklej ją do folderu zwykłym Wklej (Ctrl + V)" : L"This is a list of files: paste it into a folder with Paste (Ctrl + V)";
+        } else {
+            // Into the folder that is open: a real one on a disk (not This PC, the Recycle Bin, an archive or a server)
+            const DWORD attrs = GetFileAttributesW(m_currentPath.c_str());
+            const bool folderOk = !m_currentPath.empty() && !IsVirtualFolder(m_currentPath) && !FtpClient::IsFtpPath(m_currentPath) &&
+                                  !RepoBrowser::IsRepoUrl(m_currentPath) && attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+            std::wstring saved;
+            if (!folderOk) {
+                m_statusToast = pl ? L"\x26A0 Otwórz najpierw folder na dysku, do którego ma trafić plik" : L"\x26A0 Open a folder on a disk first: the file is saved there";
+            } else if (ClipboardIo::SaveAsFile(*e, m_currentPath, m_lang, saved)) {
+                m_statusToast = (pl ? L"\x2713 Zapisano w bieżącym folderze: " : L"\x2713 Saved in the current folder: ") + PathUtils::GetFileName(saved);
+                RefreshCurrentFolder(saved);
+            } else {
+                m_statusToast = pl ? L"\x26A0 Nie udało się zapisać pliku w tym folderze" : L"\x26A0 Could not save the file in this folder";
+            }
+        }
+        m_statusToastExpireTick = GetTickCount64() + 4000;
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_CLIP_PIN:
+        if (const uint64_t id = ClipEntryForCommand()) {
+            m_clipHistory.TogglePin(id);
+            m_clipSelectedId = id;
+        }
+        m_hwActionArg.clear();
+        break;
+    case CMD_CLIP_DELETE:
+        if (const uint64_t id = ClipEntryForCommand()) {
+            m_clipHistory.Remove(id);
+            if (m_clipSelectedId == id) m_clipSelectedId = 0;
+            ReleaseClipThumbs();        // made again for the entries that are left
+        }
+        m_hwActionArg.clear();
+        break;
+    case CMD_CLIP_CLEAR: {
+        const size_t removed = m_clipHistory.ClearUnpinned();
+        if (!m_clipHistory.Find(m_clipSelectedId)) m_clipSelectedId = 0;
+        ReleaseClipThumbs();
+        m_statusToast = (m_lang == Lang::PL ? L"Usunięto wpisów: " : L"Entries removed: ") + std::to_wstring(removed) +
+                        (m_lang == Lang::PL ? L" (przypięte zostają)" : L" (pinned ones stay)");
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+        EnsureWorkAnimTimerState();
+        break;
+    }
+    case CMD_CLIP_TOGGLE_HISTORY:
+        m_clipHistoryEnabled = !m_clipHistoryEnabled;
+        SaveUiSettings();
+        m_statusToast = m_clipHistoryEnabled
+            ? (m_lang == Lang::PL ? L"\x2713 Historia schowka jest zapisywana (tylko w pamięci, do zamknięcia programu)"
+                                  : L"\x2713 The clipboard history is kept (in memory only, until the program closes)")
+            : (m_lang == Lang::PL ? L"\x2713 Historia schowka nie jest zapisywana" : L"\x2713 The clipboard history is not kept");
+        m_statusToastExpireTick = GetTickCount64() + 4000;
+        EnsureWorkAnimTimerState();
+        break;
     // "Kopie zapasowe" (Backups & Rclone Sync) tab
     case CMD_TAB_BACKUPS:
         m_activeRibbonTab = RibbonTab::Backups;
@@ -6551,11 +6764,12 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
               L"  \x2022 F11 / Spacja                       — Pełny ekran / Odtwarzaj-Pauza wideo\n"
               L"  \x2022 Kółko myszy (w Pełnym podglądzie)  - Obraz: powiększenie do 16\xD7. Wideo i audio: przewijanie co 5 s (Shift + kółko: powiększenie)\n"
               L"  \x2022 Ctrl + strzałki, M (wideo i audio) - W lewo / w prawo: 5 s wstecz / dalej. W górę / w dół: głośność. M: wycisz"
-              L"\n\nWYGLĄD:\n"
+              L"\n\nUSTAWIENIA (karta Ustawienia):\n"
 #ifdef _WIN32
-              L"  \x2022 Ctrl i +, Ctrl i -, Ctrl i 0       - Skala interfejsu: większa, mniejsza, 100% (także: karta Plik)\n"
+              L"  \x2022 Ctrl i +, Ctrl i -, Ctrl i 0       - Skala interfejsu (wielkość napisów): większa, mniejsza, 100%\n"
 #endif
-              L"  \x2022 Karta Plik, \"Sekcje panelu nawigacji\" - Co widać w panelu po lewej: Szybki dostęp, Dropbox i OneDrive, Kosz, serwery FTP"
+              L"  \x2022 Otwieranie plików                  - Obrazy, wideo i audio we wbudowanym podglądzie albo w domyślnych programach systemu\n"
+              L"  \x2022 Karty wstążki, Sekcje panelu nawigacji - Co widać na wstążce i w panelu po lewej; język: Polski / English"
             : L"NAVIGATION & TABS:\n"
               L"  \x2022 Ctrl + T / Middle-Click            — Open folder in new tab\n"
               L"  \x2022 Ctrl + W / Ctrl + Tab              — Close tab / Switch to next tab\n"
@@ -6574,11 +6788,12 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
               L"  \x2022 F11 / Space                        — Fullscreen / Play-Pause media\n"
               L"  \x2022 Mouse Wheel (in FullViewer)        - Image: zoom up to 16\xD7. Video and audio: seek 5 s a notch (Shift + wheel: zoom)\n"
               L"  \x2022 Ctrl + arrows, M (video and audio) - Left / Right: 5 s back / forward. Up / Down: volume. M: mute"
-              L"\n\nAPPEARANCE:\n"
+              L"\n\nSETTINGS (Settings tab):\n"
 #ifdef _WIN32
-              L"  \x2022 Ctrl and +, Ctrl and -, Ctrl and 0 - UI scale: larger, smaller, 100% (also: File tab)\n"
+              L"  \x2022 Ctrl and +, Ctrl and -, Ctrl and 0 - UI scale (text size): larger, smaller, 100%\n"
 #endif
-              L"  \x2022 File tab, \"Navigation pane sections\" - What the pane on the left shows: Quick access, Dropbox and OneDrive, Recycle Bin, FTP servers"
+              L"  \x2022 Opening files                      - Pictures, video and audio in the built-in viewer or in the system's default programs\n"
+              L"  \x2022 Ribbon tabs, Navigation pane sections - What the ribbon and the pane on the left show; language: Polski / English"
               ;
         MessageBoxW(m_hwnd, body, title, MB_OK | MB_ICONINFORMATION);
         break;
@@ -6839,9 +7054,18 @@ void ExplorerApp::ActivateFocusedOrSelectedItem() {
         }
         return;
     }
-    if (item.isDirectory || ArchiveExplorer::IsArchiveExtension(item.ext)) {
+    // ".img" is also what disk images are called, which Windows mounts: one that no reader here takes for an archive
+    // (a GTA IMG, a raw disk image of a file system Explorer2 reads) goes to its program as before
+    bool browseArchive = !item.isDirectory && ArchiveExplorer::IsArchiveExtension(item.ext);
+    if (browseArchive && item.ext == L".img") {
+        ArchiveSummaryInfo probe;
+        browseArchive = ArchiveExplorer::InspectArchiveFile(item.fullPath, probe);
+    }
+    if (item.isDirectory || browseArchive) {
         NavigateTo(item.fullPath, true);
-    } else if (item.isImage || ((item.isVideo || item.isAudio) && !(m_openMediaExternally && m_viewMode != ViewMode::FullViewer))) {
+    } else if ((m_viewMode == ViewMode::FullViewer) ? (item.isImage || item.isVideo || item.isAudio)
+                                                    : OpensInBuiltInViewer(item, m_openImagesExternally, m_openMediaExternally)) {
+        // (in the viewer itself Enter and a double-click go to full screen, whatever opens such files from the list)
         if (m_viewMode != ViewMode::FullViewer) {
             m_lastNonViewerMode = m_viewMode;
             m_viewMode = ViewMode::FullViewer;
@@ -8729,7 +8953,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
             const FileEntry& targetItem = m_items[hitIndex];
             if (targetItem.isDirectory) {
                 NavigateTo(targetItem.fullPath, true);
-            } else if (targetItem.isImage || ((targetItem.isVideo || targetItem.isAudio) && !m_openMediaExternally)) {
+            } else if (OpensInBuiltInViewer(targetItem, m_openImagesExternally, m_openMediaExternally)) {
                 ToggleFullViewerMode();
             } else {
                 std::wstring arcFile, innerPath;
@@ -8902,6 +9126,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
 }
 
 void ExplorerApp::ToggleFullViewerMode() {
+    m_viewerCropMode = false;       // a crop frame does not outlive the visit to the viewer
     if (m_viewMode == ViewMode::FullViewer) {
         if (m_isFullScreen) ToggleFullScreen();
         m_mediaPlayer.CloseMedia();
@@ -8999,6 +9224,167 @@ void ExplorerApp::SetViewerZoom100() {
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
+// ---- Full viewer: turning and cropping a picture, saved into the file ----------------------------------------
+
+bool ExplorerApp::IsViewerCropping() const {
+    return m_viewerCropMode && m_viewMode == ViewMode::FullViewer &&
+           m_focusedIndex >= 0 && m_focusedIndex < static_cast<int>(m_items.size()) &&
+           m_items[m_focusedIndex].fullPath == m_viewerCropPath;
+}
+
+// The picture the viewer shows, when it is a file that can be changed: on a disk (not inside an archive, on an
+// FTP server or in a repository) and not being saved at this very moment. Says why when it is not.
+bool ExplorerApp::ViewerPictureIsEditable(std::wstring* outPath) {
+    if (m_viewMode != ViewMode::FullViewer || m_focusedIndex < 0 || m_focusedIndex >= static_cast<int>(m_items.size())) return false;
+    const FileEntry& item = m_items[m_focusedIndex];
+    if (!item.isImage) return false;
+    const bool pl = (m_lang == Lang::PL);
+    std::wstring arcFile, innerPath;
+    const bool insideArchive = ArchiveExplorer::SplitVirtualArchivePath(item.fullPath, arcFile, innerPath) && !innerPath.empty();
+    if (insideArchive || FtpClient::IsFtpPath(item.fullPath) || RepoBrowser::IsRepoUrl(item.fullPath) ||
+        GetFileAttributesW(item.fullPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        m_statusToast = pl ? L"\x26A0 Ten obraz nie leży na dysku (archiwum, FTP lub repozytorium): skopiuj go najpierw do folderu"
+                           : L"\x26A0 This picture is not a file on a disk (archive, FTP or repository): copy it to a folder first";
+        m_statusToastExpireTick = GetTickCount64() + 5000;
+        EnsureWorkAnimTimerState();
+        return false;
+    }
+    if (m_imageCache.IsPathRotating(item.normKey)) return false;        // the last change is still being saved
+    if (outPath) *outPath = item.fullPath;
+    return true;
+}
+
+void ExplorerApp::RotateViewerPicture(bool clockwise) {
+    std::wstring path;
+    if (!ViewerPictureIsEditable(&path)) {
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+    m_viewerCropMode = false;
+    // Through the transform queue rather than QueueRotateImages: its result comes back, so a format that cannot be
+    // written is reported instead of nothing happening
+    ImageTransformParams params;
+    params.kind = clockwise ? ImageTransformKind::RotateCW : ImageTransformKind::RotateCCW;
+    params.overwriteOriginal = true;
+    params.sameFormatOnly = true;
+    m_imageCache.QueueTransformImages({ path }, params);
+    ResetViewerZoom();
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::BeginViewerCrop() {
+    std::wstring path;
+    if (!ViewerPictureIsEditable(&path)) {
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+    const bool pl = (m_lang == Lang::PL);
+    // The picture's size as it is shown: read from the file (the side-by-side comparison draws no single picture
+    // to take it from), or from what was drawn last for the formats only our own readers know
+    uint32_t picW = 0, picH = 0;
+    if (!ShellMenuEmulator::ProbeImageDimensions(path, picW, picH) || picW == 0 || picH == 0) {
+        picW = m_viewerImageW;
+        picH = m_viewerImageH;
+    }
+    if (picW < 2 || picH < 2) {
+        m_statusToast = pl ? L"Obraz jeszcze się wczytuje" : L"The picture is still loading";
+        m_statusToastExpireTick = GetTickCount64() + 2500;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+    // The whole picture has to be in reach: no comparison, no slide show, fitted to the window
+    m_viewerCompareMode = false;
+    m_viewerSlideshow = false;
+    ResetViewerZoom();
+    m_viewerCropMode = true;
+    m_viewerCropPath = path;
+    m_viewerCropDrag = kCropGripNone;
+    // It starts as the middle of the picture, a tenth off every side: every corner and edge can be taken at once
+    const float w = static_cast<float>(picW);
+    const float h = static_cast<float>(picH);
+    m_viewerCropRect = D2D1::RectF(std::round(w * 0.10f), std::round(h * 0.10f), std::round(w * 0.90f), std::round(h * 0.90f));
+    m_statusToast = pl ? L"Przycinanie: przeciągnij rogi lub krawędzie ramki, środek ją przesuwa. Enter zapisuje, Esc anuluje."
+                       : L"Crop: drag the corners or edges of the frame, its middle moves it. Enter saves, Esc cancels.";
+    m_statusToastExpireTick = GetTickCount64() + 6000;
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::EndViewerCrop(bool save, bool asCopy) {
+    const bool wasCropping = IsViewerCropping();
+    m_viewerCropMode = false;
+    if (m_viewerCropDrag != kCropGripNone) {
+        m_viewerCropDrag = kCropGripNone;
+        ReleaseCapture();
+    }
+    if (save && wasCropping && m_viewerImageW > 0 && m_viewerImageH > 0) {
+        const bool pl = (m_lang == Lang::PL);
+        const CropRectF rect{ m_viewerCropRect.left, m_viewerCropRect.top, m_viewerCropRect.right, m_viewerCropRect.bottom };
+        ImageTransformParams params;
+        params.kind = ImageTransformKind::Crop;
+        RoundCropRect(rect, m_viewerImageW, m_viewerImageH, params.cropX, params.cropY, params.cropW, params.cropH);
+        if (params.cropW == m_viewerImageW && params.cropH == m_viewerImageH) {
+            m_statusToast = pl ? L"Ramka obejmuje cały obraz: nie ma czego przycinać" : L"The frame holds the whole picture: nothing to crop";
+            m_statusToastExpireTick = GetTickCount64() + 3500;
+        } else {
+            params.overwriteOriginal = !asCopy;
+            // The file itself is replaced only by the same format: a WebP or a RAW photo is not quietly swapped for
+            // a PNG or a JPEG (the copy may be one)
+            params.sameFormatOnly = !asCopy;
+            params.suffix = L"_crop";
+            m_imageCache.QueueTransformImages({ m_viewerCropPath }, params);
+        }
+    }
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+// What a press at (x, y) would take hold of: a corner or an edge of the crop frame, its inside, or - anywhere
+// else - the start of a new frame. kCropGripNone while no picture is drawn.
+int ExplorerApp::ViewerCropGripAt(float x, float y) const {
+    const float drawnW = m_viewerImageRect.right - m_viewerImageRect.left;
+    if (m_viewerImageW == 0 || m_viewerImageH == 0 || drawnW <= 1.0f) return kCropGripNone;
+    const float scale = drawnW / static_cast<float>(m_viewerImageW);       // window DIPs per picture pixel
+    const CropRectF drawn{ m_viewerImageRect.left + m_viewerCropRect.left * scale, m_viewerImageRect.top + m_viewerCropRect.top * scale,
+                           m_viewerImageRect.left + m_viewerCropRect.right * scale, m_viewerImageRect.top + m_viewerCropRect.bottom * scale };
+    return HitCropGrip(x, y, drawn, 9.0f);
+}
+
+// A press on the picture while the crop rectangle is on: a corner or an edge of it is taken, its inside moves it,
+// and a press outside starts a new rectangle there
+bool ExplorerApp::OnViewerCropMouseDown(float x, float y) {
+    const float drawnW = m_viewerImageRect.right - m_viewerImageRect.left;
+    if (!IsViewerCropping() || m_viewerImageW == 0 || m_viewerImageH == 0 || drawnW <= 1.0f) return false;
+    const float scale = drawnW / static_cast<float>(m_viewerImageW);       // window DIPs per picture pixel
+    m_viewerCropDrag = ViewerCropGripAt(x, y);
+    m_viewerCropDragStart = D2D1::Point2F(std::clamp((x - m_viewerImageRect.left) / scale, 0.0f, static_cast<float>(m_viewerImageW)),
+                                          std::clamp((y - m_viewerImageRect.top) / scale, 0.0f, static_cast<float>(m_viewerImageH)));
+    m_viewerCropPressAt = D2D1::Point2F(x, y);
+    m_viewerCropDragMoved = false;
+    m_viewerCropDragRect = m_viewerCropRect;
+    SetCapture(m_hwnd);
+    return true;
+}
+
+void ExplorerApp::OnViewerCropMouseMove(float x, float y) {
+    const float drawnW = m_viewerImageRect.right - m_viewerImageRect.left;
+    if (m_viewerCropDrag == kCropGripNone || m_viewerImageW == 0 || m_viewerImageH == 0 || drawnW <= 1.0f) return;
+    // A press that has not moved yet changes nothing (a click outside the frame is not a new frame)
+    if (!m_viewerCropDragMoved && std::fabs(x - m_viewerCropPressAt.x) < 3.0f && std::fabs(y - m_viewerCropPressAt.y) < 3.0f) return;
+    m_viewerCropDragMoved = true;
+    const float scale = drawnW / static_cast<float>(m_viewerImageW);
+    const CropRectF start{ m_viewerCropDragRect.left, m_viewerCropDragRect.top, m_viewerCropDragRect.right, m_viewerCropDragRect.bottom };
+    // The frame never gets smaller than what can still be taken hold of on screen (about 24 DIPs), or 8 pixels
+    const float least = std::max(8.0f, 24.0f / scale);
+    const CropRectF r = DragCropRect(m_viewerCropDrag, start, m_viewerCropDragStart.x, m_viewerCropDragStart.y,
+                                     (x - m_viewerImageRect.left) / scale, (y - m_viewerImageRect.top) / scale,
+                                     static_cast<float>(m_viewerImageW), static_cast<float>(m_viewerImageH), least);
+    m_viewerCropRect = D2D1::RectF(r.left, r.top, r.right, r.bottom);
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
 void ExplorerApp::TriggerFolderSizeCalculation() {
     m_fileEngine.RequestTreeFolderSizes(m_treeNodes, false);
     if (!m_currentPath.empty() && m_currentPath != L"THIS_PC") {
@@ -9040,6 +9426,7 @@ void ExplorerApp::EnsureWorkAnimTimerState() {
     bool searchRunning = m_fileEngine.IsSearchRunning();
     bool recentlyFinishedScan = (m_folderScanFinishedTick > 0 && (GetTickCount64() - m_folderScanFinishedTick) < 3000);
     bool hwLiveActive = (m_viewMode == ViewMode::Hardware && !IsProgramsView() && !IsMonitoringView() && !IsLanView() && !IsLogView() && !IsBackupsView() && !IsTransfersView() &&
+                         !IsClipboardView() &&
                          (m_hwLiveRefresh || m_hwInspector.IsAsyncBusy() || m_hwInspector.HasStagedData()));
     bool programsPolling = IsProgramsView() && m_progRefreshAtTick != 0;
     bool lanBusy = IsLanView() && (m_lan.IsScanning() || m_lan.IsSsdpRunning() || m_lan.IsPortScanning() || m_lan.IsPingAutoRefreshEnabled());
@@ -9255,8 +9642,146 @@ void ExplorerApp::ShowNavSectionsMenu() {
     RebuildTreeNodes();
     m_treeScrollY = 0.0f;
     m_statusToast = e.label + (shown ? (pl ? L": widać w panelu nawigacji" : L": shown in the navigation pane")
-                                     : (pl ? L": ukryto w panelu nawigacji (karta Plik, \"Sekcje panelu nawigacji\")"
-                                           : L": hidden from the navigation pane (File tab, \"Navigation pane sections\")"));
+                                     : (pl ? L": ukryto w panelu nawigacji (karta Ustawienia, \"Sekcje panelu nawigacji\")"
+                                           : L": hidden from the navigation pane (Settings tab, \"Navigation pane sections\")"));
+    m_statusToastExpireTick = GetTickCount64() + 4000;
+    SaveUiSettings();
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+// ---- The "Schowek" (Clipboard) tab ----------------------------------------------------------------------------
+
+// Something was put on the clipboard (by another program or by this one): kept in the history
+void ExplorerApp::OnClipboardChanged() {
+    if (!m_clipHistoryEnabled) return;
+    ClipboardEntry e;
+    bool isPrivate = false;
+    if (!ClipboardIo::Capture(m_hwnd, e, &isPrivate)) return;
+    const uint64_t id = m_clipHistory.Add(std::move(e));
+    if (id == 0) return;
+    // The newest copy becomes the selected entry, the one the ribbon's buttons act on (it stayed on the first entry
+    // that ever came, so "Kopiuj ponownie" put an old entry back)
+    m_clipSelectedId = id;
+    // Previews of pictures that dropped out of the history are released (the others are made again when drawn)
+    for (auto it = m_clipThumbs.begin(); it != m_clipThumbs.end();) {
+        if (!m_clipHistory.Find(it->first)) {
+            if (it->second) it->second->Release();
+            it = m_clipThumbs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (IsClipboardView()) InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+// The entry a card button names ("clip:<id>"), else the selected one, else the newest
+uint64_t ExplorerApp::ClipEntryForCommand() const {
+    if (m_hwActionArg.rfind(L"clip:", 0) == 0) {
+        const uint64_t id = std::wcstoull(m_hwActionArg.c_str() + 5, nullptr, 10);
+        if (m_clipHistory.Find(id)) return id;
+    }
+    if (m_clipHistory.Find(m_clipSelectedId)) return m_clipSelectedId;
+    return m_clipHistory.Entries().empty() ? 0 : m_clipHistory.Entries().front().id;
+}
+
+ID2D1Bitmap* ExplorerApp::ClipThumbBitmap(const ClipboardEntry& e) {
+    if (e.kind != ClipboardEntry::Kind::Image || e.thumb.empty() || !m_rt) return nullptr;
+    if (auto it = m_clipThumbs.find(e.id); it != m_clipThumbs.end()) return it->second;
+    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    ID2D1Bitmap* bmp = nullptr;
+    if (FAILED(m_rt->CreateBitmap(D2D1::SizeU(e.thumbW, e.thumbH), e.thumb.data(), e.thumbW * 4, &props, &bmp))) bmp = nullptr;
+    m_clipThumbs[e.id] = bmp;
+    return bmp;
+}
+
+void ExplorerApp::ReleaseClipThumbs() {
+    for (auto& [id, bmp] : m_clipThumbs) {
+        if (bmp) bmp->Release();
+    }
+    m_clipThumbs.clear();
+}
+
+// ---- The "Ustawienia" (Settings) tab -------------------------------------------------------------------------
+
+void ExplorerApp::SetLanguage(Lang lang) {
+    if (lang == m_lang) return;
+    m_lang = lang;
+    SaveUiSettings();
+    // Names that come with the language: the tree's sections, the type and date columns of both panes
+    RebuildTreeNodes();
+    RefreshCurrentFolder();
+    if (m_splitView && !m_otherPane.currentPath.empty()) {
+        int prevActive = m_activePane;
+        SwapWithOtherPane();
+        m_activePane = 1 - prevActive;
+        RefreshCurrentFolder();
+        SwapWithOtherPane();
+        m_activePane = prevActive;
+    }
+}
+
+// Which tabs the strip shows: a menu of check marks, for those who find the program does too many things at once.
+// File, Home and Settings are always there. A hidden tab comes back by itself while it is in use (RibbonTabShown).
+void ExplorerApp::ShowRibbonTabsMenu() {
+    const bool pl = (m_lang == Lang::PL);
+    const Strings& s = GetStrings(m_lang);
+    struct Entry { RibbonTab tab; std::wstring label; bool tool; };
+    const Entry entries[] = {
+        { RibbonTab::Share,      s.tabShare,                           false },
+        { RibbonTab::View,       s.tabView,                            false },
+        { RibbonTab::Search,     s.tabSearch,                          false },
+        { RibbonTab::Clipboard,  pl ? L"Schowek" : L"Clipboard",       true },
+        { RibbonTab::Transfers,  pl ? L"Transfery" : L"Transfers",     true },
+        { RibbonTab::Hardware,   s.tabHardware,                        true },
+        { RibbonTab::Programs,   pl ? L"Programy" : L"Programs",       true },
+        { RibbonTab::Monitoring, L"Monitoring",                        true },
+        { RibbonTab::Lan,        L"LAN",                               true },
+        { RibbonTab::Backups,    pl ? L"Kopie zapasowe" : L"Backups",  true },
+        { RibbonTab::Log,        L"Log",                               true },
+    };
+    const UINT kOnlyFileTabs = CMD_BASE_RIBBON_TAB + 30;
+    const UINT kAllTabs = CMD_BASE_RIBBON_TAB + 31;
+    unsigned toolTabs = 0;
+    HMENU hMenu = CreatePopupMenu();
+    for (const Entry& e : entries) {
+        const unsigned bit = 1u << static_cast<int>(e.tab);
+        if (e.tool) toolTabs |= bit;
+        AppendMenuW(hMenu, MF_STRING | ((m_hiddenRibbonTabs & bit) ? MF_UNCHECKED : MF_CHECKED),
+                    CMD_BASE_RIBBON_TAB + static_cast<UINT>(e.tab), e.label.c_str());
+    }
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, kOnlyFileTabs, pl ? L"Tylko karty plików (ukryj karty narzędzi)" : L"File tabs only (hide the tool tabs)");
+    AppendMenuW(hMenu, MF_STRING, kAllTabs, pl ? L"Pokaż wszystkie karty" : L"Show all tabs");
+    POINT pt = {};
+    GetCursorPos(&pt);
+    for (const auto& hit : m_ribbonHits) {
+        if (hit.id == CMD_RIBBON_TABS_MENU) {
+            pt = ClientDipToScreen(hit.rect.left, hit.rect.bottom);
+            break;
+        }
+    }
+    const UINT sel = static_cast<UINT>(TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr));
+    DestroyMenu(hMenu);
+    if (sel == kOnlyFileTabs) {
+        m_hiddenRibbonTabs = toolTabs;
+        m_statusToast = pl ? L"Karty narzędzi ukryto (wracają tutaj: karta Ustawienia, \"Karty wstążki\")"
+                           : L"The tool tabs are hidden (they come back here: Settings tab, \"Ribbon tabs\")";
+    } else if (sel == kAllTabs) {
+        m_hiddenRibbonTabs = 0;
+        m_statusToast = pl ? L"Widać wszystkie karty wstążki" : L"All ribbon tabs are shown";
+    } else {
+        const Entry* chosen = nullptr;
+        for (const Entry& e : entries) {
+            if (sel == CMD_BASE_RIBBON_TAB + static_cast<UINT>(e.tab)) chosen = &e;
+        }
+        if (!chosen) return;
+        m_hiddenRibbonTabs ^= 1u << static_cast<int>(chosen->tab);
+        const bool shown = (m_hiddenRibbonTabs & (1u << static_cast<int>(chosen->tab))) == 0;
+        m_statusToast = chosen->label + (shown ? (pl ? L": karta jest znowu na wstążce" : L": the tab is on the ribbon again")
+                                               : (pl ? L": kartę ukryto (karta Ustawienia, \"Karty wstążki\")"
+                                                     : L": the tab is hidden (Settings tab, \"Ribbon tabs\")"));
+    }
     m_statusToastExpireTick = GetTickCount64() + 4000;
     SaveUiSettings();
     EnsureWorkAnimTimerState();

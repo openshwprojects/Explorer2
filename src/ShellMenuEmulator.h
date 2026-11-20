@@ -8,6 +8,8 @@
 #include <atomic>
 #include <thread>
 
+struct IWICBitmapFrameDecode;
+
 namespace Explorer2 {
 
 struct EmulatedShellVerb {
@@ -45,7 +47,8 @@ enum class ImageTransformKind {
     FitMaxDim,         // maxDim (e.g. 1920): downscales longest edge to maxDim preserving aspect ratio
     ExactWidthHeight,  // targetW x targetH
     TargetFileSize,    // targetBytes: iterative quality + resolution solver in RAM so output <= targetBytes
-    ConvertFormat      // forceExt = ".jpg", ".png", ".bmp" with jpegQuality
+    ConvertFormat,     // forceExt = ".jpg", ".png", ".bmp" with jpegQuality
+    Crop               // cropX / cropY / cropW / cropH: the rectangle of the picture that is kept
 };
 
 struct ImageTransformParams {
@@ -59,6 +62,14 @@ struct ImageTransformParams {
     float jpegQuality = 0.92f;
     bool overwriteOriginal = false;
     std::wstring suffix;   // e.g. L"_50pct", L"_1920px", L"_500KB"
+    // Crop: in pixels of the picture as the viewer shows it (a photo stored turned is upright there)
+    uint32_t cropX = 0;
+    uint32_t cropY = 0;
+    uint32_t cropW = 0;
+    uint32_t cropH = 0;
+    // Fail rather than write another format when this one cannot be written (an in-place rotate must not turn a
+    // .webp into a .jpg)
+    bool sameFormatOnly = false;
 };
 
 struct ImageTransformResult {
@@ -72,6 +83,7 @@ struct ImageTransformResult {
     uint64_t origBytes = 0;
     uint64_t newBytes = 0;
     float usedQuality = 0.0f;
+    bool lossless = false;      // a JPEG turned without being compressed again
     std::wstring errorMsg;
 };
 
@@ -113,6 +125,14 @@ public:
 
     // Rotate image 90 degrees CW or CCW losslessly/via WIC
     static bool RotateImageFile(const std::wstring& imagePath, bool clockwise);
+
+    // How a decoded frame's file says its pixels are stored: an ImageTurn code (ImageOrientation.h), 1 when the
+    // file says nothing. The viewer and everything that saves a picture make it upright with this.
+    static int ReadExifOrientation(IWICBitmapFrameDecode* frame);
+
+    // The quality (1 to 100) a JPEG was compressed at, read from its file bytes; 0 when they do not tell. A photo
+    // that has to be compressed again after a turn or a crop is written at about this quality.
+    static int EstimateJpegQuality(const uint8_t* data, size_t size);
 
     // Fast header-only dimension probe (< 0.2 ms, does not decode pixel data)
     static bool ProbeImageDimensions(const std::wstring& imagePath, uint32_t& outW, uint32_t& outH, uint64_t* outFileBytes = nullptr);

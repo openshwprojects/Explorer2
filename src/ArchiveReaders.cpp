@@ -34,6 +34,8 @@
 #include "formats/archives/RawFilesystemDisk.h"
 #include "formats/archives/WindowsWim.h"
 #include "formats/archives/QuakePak.h"
+#include "formats/archives/SilkroadPk2.h"
+#include "formats/archives/GtaImg.h"
 #include "formats/archives/DoomWad.h"
 #include "formats/archives/ValveVpk.h"
 #include "formats/archives/BethesdaBsa.h"
@@ -3531,6 +3533,8 @@ bool ArchiveReaders::IsArchiveExtension(const std::wstring& extLower) {
            extLower == L".jar"   || extLower == L".apk" || extLower == L".whl" ||
            extLower == L".nupkg" || extLower == L".cbz" || extLower == L".cbr" ||
            extLower == L".pk3"   || extLower == L".iso" || extLower == L".zst" ||
+           extLower == L".pk4"   || extLower == L".iwd" || extLower == L".ipk3" ||   // ZIP: Doom 3, Call of Duty, GZDoom
+           extLower == L".pk2"   || extLower == L".img" ||                           // Joymax PK2, GTA IMG (and raw disk images)
            extLower == L".tzst"  || extLower == L".xz"  || extLower == L".txz" ||
            extLower == L".bz2"   || extLower == L".tbz2"|| extLower == L".tbz" ||
            extLower == L".lz4"   || extLower == L".tlz4"|| extLower == L".br"  ||
@@ -4090,6 +4094,10 @@ bool ArchiveReaders::InspectArchiveFile(const std::wstring& archivePath, Archive
         std::vector<ZipDeflate::ArchiveItemMeta> zipEntries;
         if (ZipDeflate::ListZipEntriesFromMemory(data, size, zipEntries)) {
             outInfo.formatName = (extLower == L".jar")   ? L"JAR (ZIP)" :
+                                 (extLower == L".pk3")   ? L"PK3 (Quake III engine package, ZIP)" :
+                                 (extLower == L".pk4")   ? L"PK4 (Doom 3 engine package, ZIP)" :
+                                 (extLower == L".iwd")   ? L"IWD (Call of Duty package, ZIP)" :
+                                 (extLower == L".ipk3")  ? L"IPK3 (GZDoom package, ZIP)" :
                                  (extLower == L".apk")   ? L"APK (ZIP)" :
                                  (extLower == L".ipa")   ? L"iOS App Package (.ipa)" :
                                  (extLower == L".aab")   ? L"Android App Bundle (.aab)" :
@@ -4184,7 +4192,9 @@ bool ArchiveReaders::InspectArchiveFile(const std::wstring& archivePath, Archive
             return Formats::InspectRawFilesystemDisk(data, size, extLower, outInfo);
         };
 
-        parsed = Formats::ParseOrExtractWad2Wad3Archive(data, size, &outInfo, nullptr, nullptr) ||
+        parsed = Formats::InspectGtaImg(&archivePath, data, size, extLower, outInfo) ||
+                 Formats::InspectSilkroadPk2(data, size, outInfo) ||
+                 Formats::ParseOrExtractWad2Wad3Archive(data, size, &outInfo, nullptr, nullptr) ||
                  Formats::InspectBioWareErfArchive(data, size, extLower, outInfo) ||
                  Formats::InspectBioWareRimArchive(data, size, outInfo) ||
                  Formats::InspectBioWareBifArchive(archivePath, data, size, outInfo) ||

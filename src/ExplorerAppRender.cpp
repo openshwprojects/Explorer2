@@ -407,7 +407,8 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
     float sz = std::min(r.right - r.left, r.bottom - r.top) * 0.42f;
 
     switch (cmdId) {
-    case CMD_PIN_QUICK: {
+    case CMD_PIN_QUICK:
+    case CMD_CLIP_PIN: {
         // Grey/blue pushpin
         m_solidBrush->SetColor(HexColor(0x6D7885));
         m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.6f, cy + sz * 0.6f), D2D1::Point2F(cx + sz * 0.4f, cy - sz * 0.4f), m_solidBrush, 2.5f);
@@ -416,7 +417,8 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
         break;
     }
     case CMD_COPY:
-    case CMD_COPY_TO: {
+    case CMD_COPY_TO:
+    case CMD_CLIP_COPY: {
         // Two overlapping pages
         D2D1_RECT_F p1 = D2D1::RectF(cx - sz * 0.7f, cy - sz * 0.8f, cx + sz * 0.25f, cy + sz * 0.4f);
         D2D1_RECT_F p2 = D2D1::RectF(cx - sz * 0.25f, cy - sz * 0.4f, cx + sz * 0.7f, cy + sz * 0.8f);
@@ -430,7 +432,9 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
         m_rt->DrawRectangle(p2, m_solidBrush, 1.3f);
         break;
     }
-    case CMD_PASTE: {
+    case CMD_PASTE:
+    case CMD_CLIP_SAVE_FILE:
+    case CMD_TAB_CLIPBOARD: {
         // Clipboard + page
         D2D1_RECT_F board = D2D1::RectF(cx - sz * 0.75f, cy - sz * 0.75f, cx + sz * 0.4f, cy + sz * 0.75f);
         m_solidBrush->SetColor(HexColor(0xD4A359));
@@ -449,7 +453,9 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
         m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.6f, cy - sz * 0.6f), D2D1::Point2F(cx - sz * 0.6f, cy + sz * 0.6f), m_solidBrush, 1.8f);
         break;
     }
-    case CMD_DELETE_MAIN: {
+    case CMD_DELETE_MAIN:
+    case CMD_CLIP_DELETE:
+    case CMD_CLIP_CLEAR: {
         // "Kosz" - recycle bin: lid + handle + tapered body with slats
         D2D1_RECT_F lid = D2D1::RectF(cx - sz * 0.75f, cy - sz * 0.55f, cx + sz * 0.75f, cy - sz * 0.35f);
         D2D1_RECT_F handle = D2D1::RectF(cx - sz * 0.25f, cy - sz * 0.8f, cx + sz * 0.25f, cy - sz * 0.55f);
@@ -844,6 +850,45 @@ void ExplorerApp::DrawRibbonIcon(int cmdId, const D2D1_RECT_F& r) {
         m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.12f, cy + sz * 0.50f), D2D1::Point2F(cx + sz * 0.62f, cy - sz * 0.45f), m_solidBrush, 2.2f);
         break;
     }
+    case CMD_TAB_SETTINGS: {
+        // Gear: a ring with eight teeth
+        m_solidBrush->SetColor(HexColor(0x6D7885));
+        for (int i = 0; i < 8; ++i) {
+            const float a = static_cast<float>(i) * 0.7853982f;
+            const float ca = std::cos(a), sa = std::sin(a);
+            m_rt->DrawLine(D2D1::Point2F(cx + ca * sz * 0.60f, cy + sa * sz * 0.60f),
+                           D2D1::Point2F(cx + ca * sz * 0.98f, cy + sa * sz * 0.98f), m_solidBrush, sz * 0.34f);
+        }
+        m_rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.55f, sz * 0.55f), m_solidBrush, sz * 0.30f);
+        m_solidBrush->SetColor(HexColor(0x4B89DA));
+        m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), sz * 0.20f, sz * 0.20f), m_solidBrush);
+        break;
+    }
+    case CMD_UI_SCALE_UP:
+    case CMD_UI_SCALE_DOWN: {
+        // The letter A with a plus or a minus: larger / smaller text
+        m_solidBrush->SetColor(HexColor(0x2B6CB0));
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.85f, cy + sz * 0.75f), D2D1::Point2F(cx - sz * 0.25f, cy - sz * 0.75f), m_solidBrush, 1.5f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.25f, cy - sz * 0.75f), D2D1::Point2F(cx + sz * 0.35f, cy + sz * 0.75f), m_solidBrush, 1.5f);
+        m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.58f, cy + sz * 0.20f), D2D1::Point2F(cx + sz * 0.10f, cy + sz * 0.20f), m_solidBrush, 1.3f);
+        m_solidBrush->SetColor(HexColor(0x4B89DA));
+        m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.45f, cy - sz * 0.55f), D2D1::Point2F(cx + sz * 1.05f, cy - sz * 0.55f), m_solidBrush, 1.5f);
+        if (cmdId == CMD_UI_SCALE_UP) {
+            m_rt->DrawLine(D2D1::Point2F(cx + sz * 0.75f, cy - sz * 0.85f), D2D1::Point2F(cx + sz * 0.75f, cy - sz * 0.25f), m_solidBrush, 1.5f);
+        }
+        break;
+    }
+    case CMD_UI_SCALE_MENU:
+    case CMD_NAV_SECTIONS_MENU:
+    case CMD_RIBBON_TABS_MENU: {
+        // A list to choose from: three lines
+        m_solidBrush->SetColor(HexColor(0x4B89DA));
+        for (int i = -1; i <= 1; ++i) {
+            const float ly = cy + static_cast<float>(i) * sz * 0.5f;
+            m_rt->DrawLine(D2D1::Point2F(cx - sz * 0.6f, ly), D2D1::Point2F(cx + sz * 0.6f, ly), m_solidBrush, 1.4f);
+        }
+        break;
+    }
     default: {
         D2D1_RECT_F box = D2D1::RectF(cx - sz * 0.55f, cy - sz * 0.55f, cx + sz * 0.55f, cy + sz * 0.55f);
         m_solidBrush->SetColor(HexColor(0x4B89DA));
@@ -880,25 +925,36 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         float width;
         bool isBlueFileTab;
     };
-    TabDef tabs[] = {
+    const TabDef allTabs[] = {
         { CMD_TAB_FILE,       RibbonTab::File,       s.tabFile,     56.0f,  true  },
         { CMD_TAB_HOME,       RibbonTab::Home,       s.tabHome,     112.0f, false },
         { CMD_TAB_SHARE,      RibbonTab::Share,      s.tabShare,    96.0f,  false },
         { CMD_TAB_VIEW,       RibbonTab::View,       s.tabView,     66.0f,  false },
         { CMD_TAB_SEARCH,     RibbonTab::Search,     s.tabSearch,   92.0f,  false },
+        { CMD_TAB_CLIPBOARD,  RibbonTab::Clipboard,  m_lang == Lang::PL ? L"Schowek" : L"Clipboard", 76.0f, false },
         { CMD_TAB_TRANSFERS,  RibbonTab::Transfers,  xferTabLabel.c_str(), hasLiveXfers ? 90.0f : 74.0f, false },
         { CMD_TAB_HARDWARE,   RibbonTab::Hardware,   s.tabHardware, 74.0f,  false },
         { CMD_TAB_PROGRAMS,   RibbonTab::Programs,   m_lang == Lang::PL ? L"Programy" : L"Programs", 80.0f, false },
         { CMD_TAB_MONITORING, RibbonTab::Monitoring, L"Monitoring", 84.0f, false },
         { CMD_TAB_LAN,        RibbonTab::Lan,        L"LAN",        52.0f, false },
         { CMD_TAB_BACKUPS,    RibbonTab::Backups,    m_lang == Lang::PL ? L"Kopie zapasowe" : L"Backups", 98.0f, false },
-        { CMD_TAB_LOG,        RibbonTab::Log,        L"Log",        48.0f, false }
+        { CMD_TAB_LOG,        RibbonTab::Log,        L"Log",        48.0f, false },
+        { CMD_TAB_SETTINGS,   RibbonTab::Settings,   m_lang == Lang::PL ? L"Ustawienia" : L"Settings", 86.0f, false }
     };
+    // Tabs the user switched off in the Settings tab are left out; the one in use stays, and so does the transfers
+    // tab while something is being copied (RibbonTabLayout.h)
+    std::vector<TabDef> tabs;
+    for (const auto& t : allTabs) {
+        const bool busy = (t.tab == RibbonTab::Transfers && hasLiveXfers);
+        if (RibbonTabShown(m_hiddenRibbonTabs, kRibbonTabsAlwaysShown, static_cast<int>(t.tab), static_cast<int>(m_activeRibbonTab), busy)) {
+            tabs.push_back(t);
+        }
+    }
 
     // A window too narrow for all tabs at their designed widths (1024 px and less, or a large UI scale) gives up the
     // padding first and then cuts the longest captions, so that the last tabs stay clear of the buttons on the right
     // and no caption runs into the next one (RibbonTabLayout.h)
-    const float tabsAvailW = std::max(200.0f, (rect.right - 146.0f) - rect.left);
+    const float tabsAvailW = std::max(200.0f, (rect.right - 84.0f) - rect.left);
     std::vector<float> tabNatural, tabTextW;
     for (const auto& t : tabs) {
         tabNatural.push_back(t.width);
@@ -948,8 +1004,9 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         tx += tabW;
     }
 
-    // Right-side controls on Tab Strip: [🌙/☀ Theme] + [PL / EN] language button + Collapse Ribbon '^' + Blue Help '?'
-    D2D1_RECT_F themeBtn = D2D1::RectF(rect.right - 142.0f, rect.top + 4.0f, rect.right - 114.0f, rect.top + kRibbonTabsHeight - 3.0f);
+    // Right-side controls on Tab Strip: [🌙/☀ Theme] + Collapse Ribbon '^' + Blue Help '?'. (The language button
+    // that stood here is in the Settings tab now: its room went to that tab.)
+    D2D1_RECT_F themeBtn = D2D1::RectF(rect.right - 80.0f, rect.top + 4.0f, rect.right - 52.0f, rect.top + kRibbonTabsHeight - 3.0f);
     m_ribbonHits.push_back({ CMD_TOGGLE_THEME, themeBtn });
     m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_TOGGLE_THEME ? HexColor(0xDCEBFC) : HexColor(0xF0F3F6));
     m_rt->FillRoundedRectangle(D2D1::RoundedRect(themeBtn, 3.0f, 3.0f), m_solidBrush);
@@ -959,17 +1016,6 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
     const wchar_t* themeGlyph = m_darkMode ? L"\x2600" : L"\x263E";
     m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     DrawTextCached(themeGlyph, 1, m_fmtSmall, themeBtn, m_solidBrush);
-
-    D2D1_RECT_F langBtn = D2D1::RectF(rect.right - 110.0f, rect.top + 4.0f, rect.right - 52.0f, rect.top + kRibbonTabsHeight - 3.0f);
-    m_ribbonHits.push_back({ CMD_TOGGLE_LANG, langBtn });
-    m_solidBrush->SetColor(m_hoverRibbonBtn == CMD_TOGGLE_LANG ? HexColor(0xDCEBFC) : HexColor(0xF0F3F6));
-    m_rt->FillRoundedRectangle(D2D1::RoundedRect(langBtn, 3.0f, 3.0f), m_solidBrush);
-    m_solidBrush->SetColor(HexColor(0xB8C4D0));
-    m_rt->DrawRoundedRectangle(D2D1::RoundedRect(langBtn, 3.0f, 3.0f), m_solidBrush, 1.0f);
-    m_solidBrush->SetColor(HexColor(0x0067B8));
-    const wchar_t* langLabel = (m_lang == Lang::PL) ? L"PL \x21C4 EN" : L"EN \x21C4 PL";
-    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    DrawTextCached(langLabel, static_cast<UINT32>(wcslen(langLabel)), m_fmtSmall, langBtn, m_solidBrush);
 
     D2D1_RECT_F collapseBtn = D2D1::RectF(rect.right - 48.0f, rect.top + 4.0f, rect.right - 26.0f, rect.top + kRibbonTabsHeight - 3.0f);
     m_ribbonHits.push_back({ CMD_TOGGLE_RIBBON, collapseBtn });
@@ -1289,28 +1335,89 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawLargeButton(CMD_FILE_EXIT,         fx, 72.0f, m_lang == Lang::PL ? L"Zamknij\nprogram" : L"Exit\nApp"); fx += 76.0f;
         drawGroupSeparatorAndTitle(g1Start, fx, m_lang == Lang::PL ? L"Plik i okno aplikacji" : L"Application & Shell");
 
-        // Program settings that have no tab of their own: how video opens, the update check and, on Windows, the UI
-        // scale and Win+E
+        // The program's settings have a tab of their own; this button leads there for those who look under "File"
         const bool pl = (m_lang == Lang::PL);
         const float ux = fx + 8.0f;
-        const wchar_t* mediaLbl = pl ? L"Wideo/audio w domyślnym programie" : L"Video/audio in the default program";
-        const wchar_t* updateLbl = pl ? L"Sprawdzaj, czy jest nowa wersja" : L"Check for a newer version";
-        // What the navigation pane shows (Quick access, cloud folders, Recycle Bin, FTP servers): a menu of check marks
-        const wchar_t* navLbl = pl ? L"Sekcje panelu nawigacji \x25BE" : L"Navigation pane sections \x25BE";
+        drawLargeButton(CMD_TAB_SETTINGS, ux, 92.0f, pl ? L"Ustawienia\nprogramu" : L"Program\nSettings");
+        drawGroupSeparatorAndTitle(ux, ux + 96.0f, pl ? L"Ustawienia" : L"Settings");
+        return;
+    }
+
+    if (m_activeRibbonTab == RibbonTab::Settings) {
+        // USTAWIENIA (Settings) Ribbon Tab. What used to be scattered - the language button of the tab strip, the
+        // settings group of the File tab, a check mark in a context menu - together with what forum users asked for:
+        // the text size in plain sight, pictures and films in the user's own programs, fewer tabs.
+        const bool pl = (m_lang == Lang::PL);
+        const float r1 = body.top + 6.0f, r2 = body.top + 29.0f, r3 = body.top + 52.0f;
+        // A switch that is on has a tick in its box
+        auto drawCheckRow = [&](int cmdId, float x, float y, float w, const wchar_t* label, bool checked) {
+            drawSmallRowButton(cmdId, x, y, w, label, checked);
+            if (checked) {
+                const float bx = x + 11.0f, by = y + 11.0f;
+                m_solidBrush->SetColor(HexColor(0x0067B8));
+                m_rt->DrawLine(D2D1::Point2F(bx - 2.8f, by + 0.1f), D2D1::Point2F(bx - 0.9f, by + 2.1f), m_solidBrush, 1.6f);
+                m_rt->DrawLine(D2D1::Point2F(bx - 0.9f, by + 2.1f), D2D1::Point2F(bx + 2.9f, by - 2.3f), m_solidBrush, 1.6f);
+            }
+        };
+
+        // The widths below leave each caption (measured in both languages) at least 8 DIPs to spare and add up to
+        // 1012: the whole tab fits a window 1024 wide without having to scroll the ribbon sideways.
+
+        // Language. Each name is in its own language and the title is in both, so that the switch is found by
+        // someone who reads only one of them.
+        float x = rect.left + 8.0f;
+        float g = x;
+        drawCheckRow(CMD_LANG_SET_PL, x, r1, 92.0f, L"Polski", m_lang == Lang::PL);
+        drawCheckRow(CMD_LANG_SET_EN, x, r2, 92.0f, L"English", m_lang == Lang::EN);
+        x += 98.0f;
+        drawGroupSeparatorAndTitle(g, x, L"J\x0119zyk / Language");
+        x += 8.0f;
+
+        // Appearance: the size of everything (the Linux build draws at one size only) and the theme
+        g = x;
 #ifdef _WIN32
         const std::wstring scaleLbl = (pl ? L"Skala interfejsu: " : L"UI scale: ") + std::to_wstring(m_uiScalePct) + L"% \x25BE";
-        drawSmallRowButton(CMD_UI_SCALE_MENU,         ux,          body.top + 6.0f,  232.0f, scaleLbl.c_str());
-        drawSmallRowButton(CMD_TOGGLE_MEDIA_EXTERNAL, ux,          body.top + 29.0f, 232.0f, mediaLbl, m_openMediaExternally);
-        drawSmallRowButton(CMD_TOGGLE_UPDATE_CHECK,   ux,          body.top + 52.0f, 232.0f, updateLbl, m_updateCheckEnabled);
-        drawSmallRowButton(CMD_TOGGLE_WIN_E,          ux + 236.0f, body.top + 6.0f,  192.0f, pl ? L"Win+E otwiera Explorer2" : L"Win+E opens Explorer2", m_winEOverrideSet);
-        drawSmallRowButton(CMD_NAV_SECTIONS_MENU,     ux + 236.0f, body.top + 29.0f, 192.0f, navLbl);
-        drawGroupSeparatorAndTitle(ux, ux + 434.0f, pl ? L"Ustawienia" : L"Settings");
-#else
-        drawSmallRowButton(CMD_TOGGLE_MEDIA_EXTERNAL, ux, body.top + 6.0f,  232.0f, mediaLbl, m_openMediaExternally);
-        drawSmallRowButton(CMD_TOGGLE_UPDATE_CHECK,   ux, body.top + 29.0f, 232.0f, updateLbl, m_updateCheckEnabled);
-        drawSmallRowButton(CMD_NAV_SECTIONS_MENU,     ux, body.top + 52.0f, 232.0f, navLbl);
-        drawGroupSeparatorAndTitle(ux, ux + 238.0f, pl ? L"Ustawienia" : L"Settings");
+        drawSmallRowButton(CMD_UI_SCALE_MENU, x, r1, 156.0f, scaleLbl.c_str());
+        drawSmallRowButton(CMD_UI_SCALE_UP,   x, r2, 156.0f, pl ? L"Większe napisy (Ctrl i +)" : L"Larger text (Ctrl and +)");
+        drawSmallRowButton(CMD_UI_SCALE_DOWN, x, r3, 156.0f, pl ? L"Mniejsze napisy (Ctrl i -)" : L"Smaller text (Ctrl and -)");
+        x += 160.0f;
 #endif
+        drawCheckRow(CMD_TOGGLE_THEME, x, r1, 110.0f, pl ? L"Ciemny motyw" : L"Dark theme", m_darkMode);
+        x += 116.0f;
+        drawGroupSeparatorAndTitle(g, x, pl ? L"Wygląd" : L"Appearance");
+        x += 8.0f;
+
+        // What a double-click does with pictures and films: the built-in viewer (it takes the place of the file
+        // list) or the programs the system opens them with
+        g = x;
+        drawCheckRow(CMD_TOGGLE_IMAGES_EXTERNAL, x, r1, 222.0f, pl ? L"Obrazy w domyślnym programie" : L"Pictures in the default program", m_openImagesExternally);
+        drawCheckRow(CMD_TOGGLE_MEDIA_EXTERNAL,  x, r2, 222.0f, pl ? L"Wideo/audio w domyślnym programie" : L"Video/audio in the default program", m_openMediaExternally);
+        {
+            const wchar_t* hint = pl ? L"Wbudowany podgląd zawsze: Spacja" : L"The built-in viewer at any time: Space";
+            m_solidBrush->SetColor(HexColor(0x6E6E6E));
+            DrawTextCached(hint, static_cast<UINT32>(wcslen(hint)), m_fmtSmall, D2D1::RectF(x + 23.0f, r3, x + 222.0f, r3 + 22.0f), m_solidBrush);
+        }
+        x += 228.0f;
+        drawGroupSeparatorAndTitle(g, x, pl ? L"Otwieranie (dwuklik, Enter)" : L"Opening (double-click, Enter)");
+        x += 8.0f;
+
+        // What the window shows: two menus of check marks
+        g = x;
+        drawSmallRowButton(CMD_RIBBON_TABS_MENU,  x, r1, 168.0f, pl ? L"Karty wstążki \x25BE" : L"Ribbon tabs \x25BE");
+        drawSmallRowButton(CMD_NAV_SECTIONS_MENU, x, r2, 168.0f, pl ? L"Sekcje panelu nawigacji \x25BE" : L"Navigation pane sections \x25BE");
+        x += 174.0f;
+        drawGroupSeparatorAndTitle(g, x, pl ? L"Co widać w oknie" : L"What the window shows");
+        x += 8.0f;
+
+        // The program itself
+        g = x;
+        drawCheckRow(CMD_TOGGLE_CONFIRM_DELETE, x, r1, 190.0f, pl ? L"Pytaj przed usunięciem" : L"Ask before deleting", m_confirmDelete);
+        drawCheckRow(CMD_TOGGLE_UPDATE_CHECK,   x, r2, 190.0f, pl ? L"Sprawdzaj, czy jest nowa wersja" : L"Check for a newer version", m_updateCheckEnabled);
+#ifdef _WIN32
+        drawCheckRow(CMD_TOGGLE_WIN_E,          x, r3, 190.0f, pl ? L"Win+E otwiera Explorer2" : L"Win+E opens Explorer2", m_winEOverrideSet);
+#endif
+        x += 196.0f;
+        drawGroupSeparatorAndTitle(g, x, L"Program");
         return;
     }
 
@@ -1474,6 +1581,38 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawSmallRowButton(CMD_HW_BACK_TO_FILES, bx, body.top + 6.0f, 150.0f, pl ? L"Wróć do plików" : L"Back to Files");
         bx += 154.0f;
         drawGroupSeparatorAndTitle(bg4, bx, pl ? L"Okno" : L"Window");
+        return;
+    }
+
+    if (m_activeRibbonTab == RibbonTab::Clipboard) {
+        // SCHOWEK (Clipboard) Ribbon Tab: the history of what was copied; the buttons act on the selected entry
+        const bool pl = (m_lang == Lang::PL);
+        float cx = rect.left + 6.0f;
+        float cg1 = cx;
+        drawLargeButton(CMD_CLIP_COPY, cx, 84.0f, pl ? L"Kopiuj\nponownie" : L"Copy\nagain");
+        cx += 86.0f;
+        drawLargeButton(CMD_CLIP_SAVE_FILE, cx, 84.0f, pl ? L"Wklej\njako plik" : L"Paste\nas a file");
+        cx += 86.0f;
+        drawLargeButton(CMD_CLIP_PIN, cx, 76.0f, pl ? L"Przypnij /\nodepnij" : L"Pin /\nunpin");
+        cx += 78.0f;
+        drawLargeButton(CMD_CLIP_DELETE, cx, 70.0f, pl ? L"Usuń\nwpis" : L"Delete\nentry");
+        cx += 72.0f;
+        drawGroupSeparatorAndTitle(cg1, cx, pl ? L"Wybrany wpis" : L"Selected entry");
+        cx += 6.0f;
+
+        float cg2 = cx;
+        drawLargeButton(CMD_CLIP_CLEAR, cx, 84.0f, pl ? L"Wyczyść\nhistorię" : L"Clear\nhistory");
+        cx += 86.0f;
+        drawSmallRowButton(CMD_CLIP_TOGGLE_HISTORY, cx, body.top + 6.0f, 200.0f,
+                           pl ? L"Zapisuj historię schowka" : L"Keep a clipboard history", m_clipHistoryEnabled);
+        cx += 206.0f;
+        drawGroupSeparatorAndTitle(cg2, cx, pl ? L"Historia" : L"History");
+        cx += 6.0f;
+
+        float cg3 = cx;
+        drawSmallRowButton(CMD_HW_BACK_TO_FILES, cx, body.top + 6.0f, 150.0f, pl ? L"Wróć do plików" : L"Back to Files");
+        cx += 154.0f;
+        drawGroupSeparatorAndTitle(cg3, cx, pl ? L"Okno" : L"Window");
         return;
     }
 
@@ -3957,6 +4096,15 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         }
     }
 
+    // The crop frame belongs to one picture: showing another one, or a film, ends it
+    m_viewerImageRect = {};
+    m_viewerImageW = 0;
+    m_viewerImageH = 0;
+    if (m_viewerCropMode && (isMediaItem || curPath != m_viewerCropPath)) {
+        m_viewerCropMode = false;
+        m_viewerCropDrag = kCropGripNone;
+    }
+
     // 1. Render Full-Resolution Image OR Hardware-Accelerated Video/Audio Player
     m_rt->PushAxisAlignedClip(canvasR, D2D1_ANTIALIAS_MODE_ALIASED);
 
@@ -4161,6 +4309,68 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
                     destR,
                     1.0f,
                     (finalScale >= 2.0f) ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+
+                // Where the picture is and how many pixels it has: the crop frame is kept in picture pixels
+                if (imgOrigW > 0 && imgOrigH > 0) {
+                    m_viewerImageRect = destR;
+                    m_viewerImageW = imgOrigW;
+                    m_viewerImageH = imgOrigH;
+                }
+                if (m_viewerCropMode && m_viewerImageW > 0 && m_viewerImageH > 0) {
+                    // The colours here are meant as they are in both themes (HexColor would turn white into a panel grey)
+                    const float scale = drawW / static_cast<float>(m_viewerImageW);
+                    const D2D1_RECT_F fr = D2D1::RectF(destR.left + m_viewerCropRect.left * scale, destR.top + m_viewerCropRect.top * scale,
+                                                       destR.left + m_viewerCropRect.right * scale, destR.top + m_viewerCropRect.bottom * scale);
+                    // What will be cut off is dimmed
+                    m_solidBrush->SetColor(PathUtils::ColorFromRgb(0x000000, 0.62f));
+                    m_rt->FillRectangle(D2D1::RectF(destR.left, destR.top, destR.right, fr.top), m_solidBrush);
+                    m_rt->FillRectangle(D2D1::RectF(destR.left, fr.bottom, destR.right, destR.bottom), m_solidBrush);
+                    m_rt->FillRectangle(D2D1::RectF(destR.left, fr.top, fr.left, fr.bottom), m_solidBrush);
+                    m_rt->FillRectangle(D2D1::RectF(fr.right, fr.top, destR.right, fr.bottom), m_solidBrush);
+                    // Thirds, as a help for placing the subject
+                    m_solidBrush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF, 0.28f));
+                    for (int i = 1; i <= 2; ++i) {
+                        const float gx = fr.left + (fr.right - fr.left) * static_cast<float>(i) / 3.0f;
+                        const float gy = fr.top + (fr.bottom - fr.top) * static_cast<float>(i) / 3.0f;
+                        m_rt->DrawLine(D2D1::Point2F(gx, fr.top), D2D1::Point2F(gx, fr.bottom), m_solidBrush, 1.0f);
+                        m_rt->DrawLine(D2D1::Point2F(fr.left, gy), D2D1::Point2F(fr.right, gy), m_solidBrush, 1.0f);
+                    }
+                    // The frame: a white line on a dark one, so that it shows on a bright and on a dark picture
+                    m_solidBrush->SetColor(PathUtils::ColorFromRgb(0x000000, 0.75f));
+                    m_rt->DrawRectangle(fr, m_solidBrush, 3.0f);
+                    m_solidBrush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF));
+                    m_rt->DrawRectangle(fr, m_solidBrush, 1.4f);
+                    // Grips at the corners and in the middle of every edge
+                    const float gripX[3] = { fr.left, (fr.left + fr.right) * 0.5f, fr.right };
+                    const float gripY[3] = { fr.top, (fr.top + fr.bottom) * 0.5f, fr.bottom };
+                    for (int iy = 0; iy < 3; ++iy) {
+                        for (int ix = 0; ix < 3; ++ix) {
+                            if (ix == 1 && iy == 1) continue;
+                            const D2D1_RECT_F grip = D2D1::RectF(gripX[ix] - 5.0f, gripY[iy] - 5.0f, gripX[ix] + 5.0f, gripY[iy] + 5.0f);
+                            m_solidBrush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF));
+                            m_rt->FillRectangle(grip, m_solidBrush);
+                            m_solidBrush->SetColor(PathUtils::ColorFromRgb(0x0067B8));
+                            m_rt->DrawRectangle(grip, m_solidBrush, 1.5f);
+                        }
+                    }
+                    // What the saved picture will measure
+                    uint32_t cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+                    RoundCropRect(CropRectF{ m_viewerCropRect.left, m_viewerCropRect.top, m_viewerCropRect.right, m_viewerCropRect.bottom },
+                                  m_viewerImageW, m_viewerImageH, cropX, cropY, cropW, cropH);
+                    wchar_t sizeBuf[64] = {};
+                    swprintf_s(sizeBuf, L"%u \xD7 %u px", cropW, cropH);
+                    const float labelW = MeasureTextWidth(sizeBuf, m_fmtSmall) + 16.0f;
+                    // above the frame where there is room, else inside its top left corner
+                    const float labelTop = (fr.top - 24.0f >= canvasR.top + 2.0f) ? fr.top - 24.0f : fr.top + 8.0f;
+                    const float labelLeft = (labelTop < fr.top) ? fr.left : fr.left + 8.0f;
+                    const D2D1_RECT_F labelR = D2D1::RectF(labelLeft, labelTop, labelLeft + labelW, labelTop + 20.0f);
+                    m_solidBrush->SetColor(PathUtils::ColorFromRgb(0x0067B8, 0.94f));
+                    m_rt->FillRoundedRectangle(D2D1::RoundedRect(labelR, 3.0f, 3.0f), m_solidBrush);
+                    m_solidBrush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF));
+                    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    DrawTextCached(sizeBuf, static_cast<UINT32>(wcslen(sizeBuf)), m_fmtSmall, labelR, m_solidBrush);
+                    m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                }
             }
 
             // Live 64-bin RGB Histogram Overlay in Top-Right of Canvas
@@ -4255,7 +4465,8 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
                 m_solidBrush->SetColor(HexColor(0x0067B8, 0.94f));
                 m_rt->FillRoundedRectangle(D2D1::RoundedRect(pillR, 6.0f, 6.0f), m_solidBrush);
                 m_solidBrush->SetColor(HexColor(0xFFFFFF));
-                const wchar_t* rotTxt = (m_lang == Lang::PL) ? L"\x21BB Obracanie..." : L"\x21BB Rotating...";
+                // (a turn, a crop or a resize: the file is being written)
+                const wchar_t* rotTxt = (m_lang == Lang::PL) ? L"\x21BB Zapisywanie obrazu..." : L"\x21BB Saving the picture...";
                 m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 DrawTextCached(rotTxt, static_cast<UINT32>(wcslen(rotTxt)), m_fmtRegular, pillR, m_solidBrush);
                 m_fmtRegular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -4283,25 +4494,20 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
     m_solidBrush->SetColor(HexColor(0x111317));
     m_rt->FillRectangle(hudBar, m_solidBrush);
 
-    if (activeIdx >= 0 && activeIdx < static_cast<int>(m_items.size())) {
-        const FileEntry& cur = m_items[activeIdx];
-        wchar_t infoBuf[512] = {};
-        if (imgOrigW > 0 && imgOrigH > 0) {
-            swprintf_s(infoBuf, L"[%d / %d]   %s   \x2022   %u \xD7 %u px   \x2022   %s   \x2022   %.0f%%",
-                activeIdx + 1, static_cast<int>(m_items.size()),
-                cur.name.c_str(), imgOrigW, imgOrigH, cur.sizeStr.c_str(), effectiveZoomPct);
-        } else {
-            swprintf_s(infoBuf, L"[%d / %d]   %s   \x2022   %s",
-                activeIdx + 1, static_cast<int>(m_items.size()),
-                cur.name.c_str(), cur.sizeStr.c_str());
+    // The buttons are laid out from the right edge, the most needed first. One that would leave the file's name
+    // less than 150 DIPs is left out together with all that follow it, so a narrow window keeps closing,
+    // zooming, deleting and stepping, and never draws buttons over each other or past the left edge.
+    const bool hudPl = (m_lang == Lang::PL);
+    const float hudBarW = hudBar.right - hudBar.left;
+    float hudNextRight = 8.0f;          // how far the next button's right edge is from the bar's right edge
+    bool hudFull = false;
+    auto drawHudBtn = [&](int cmdId, float w, const wchar_t* label, uint32_t bgRgb = 0x262B33) {
+        if (hudFull || hudNextRight + w > hudBarW - 150.0f) {
+            hudFull = true;
+            return;
         }
-        D2D1_RECT_F infoR = D2D1::RectF(hudBar.left + 14.0f, hudBar.top, hudBar.right - 430.0f, hudBar.bottom);
-        m_solidBrush->SetColor(HexColor(0xECEFF4));
-        DrawTextCached(infoBuf, static_cast<UINT32>(wcslen(infoBuf)), m_fmtViewerHud, infoR, m_solidBrush);
-    }
-
-    auto drawHudBtn = [&](int cmdId, float rightOffset, float w, const wchar_t* label, uint32_t bgRgb = 0x262B33) {
-        D2D1_RECT_F br = D2D1::RectF(hudBar.right - rightOffset - w, hudBar.top + 6.0f, hudBar.right - rightOffset, hudBar.bottom - 6.0f);
+        D2D1_RECT_F br = D2D1::RectF(hudBar.right - hudNextRight - w, hudBar.top + 6.0f, hudBar.right - hudNextRight, hudBar.bottom - 6.0f);
+        hudNextRight += w + 4.0f;
         m_ribbonHits.push_back({ cmdId, br });
         m_solidBrush->SetColor(m_hoverRibbonBtn == cmdId ? HexColor(0x3B4252) : HexColor(bgRgb));
         m_rt->FillRoundedRectangle(D2D1::RoundedRect(br, 3.0f, 3.0f), m_solidBrush);
@@ -4311,18 +4517,59 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     };
 
-    drawHudBtn(CMD_VIEWER_CLOSE,       8.0f,   56.0f, m_lang == Lang::PL ? L"Zamknij" : L"Close", 0x3B4252);
-    drawHudBtn(CMD_VIEWER_FULLSCREEN,  68.0f,  72.0f, m_isFullScreen ? (m_lang == Lang::PL ? L"W oknie" : L"Window") : L"F11 Full");
-    drawHudBtn(CMD_VIEWER_ZOOM_100,    144.0f, 42.0f, L"1:1");
-    drawHudBtn(CMD_VIEWER_ZOOM_FIT,    190.0f, 48.0f, m_lang == Lang::PL ? L"Dopasuj" : L"Fit");
-    drawHudBtn(CMD_VIEWER_DELETE,      244.0f, 78.0f, m_lang == Lang::PL ? L"Usuń (Del)" : L"Del (Bin)", 0x6E2B2B);
-    drawHudBtn(CMD_VIEWER_NEXT,        328.0f, 34.0f, L"\x2192");
-    drawHudBtn(CMD_VIEWER_PREV,        366.0f, 34.0f, L"\x2190");
-    if (activeIdx >= 0 && activeIdx < static_cast<int>(m_items.size()) && m_items[activeIdx].isImage) {
-        drawHudBtn(CMD_IMG_TOOL_MENU,    406.0f, 108.0f, m_lang == Lang::PL ? L"\xD83D\xDCD0 Rozmiar / KB \x25BE" : L"\xD83D\xDCD0 Resize / KB \x25BE", 0x1E3A5F);
-        drawHudBtn(CMD_VIEWER_COMPARE,   518.0f, 68.0f,  m_lang == Lang::PL ? L"2-Up Por." : L"2-Up Cmp", m_viewerCompareMode ? 0x0284C7 : 0x262B33);
-        drawHudBtn(CMD_VIEWER_HISTOGRAM, 590.0f, 74.0f,  L"Histogram", m_viewerShowHistogram ? 0x0284C7 : 0x262B33);
-        drawHudBtn(CMD_VIEWER_SLIDESHOW, 668.0f, 68.0f,  m_viewerSlideshow ? (m_lang == Lang::PL ? L"\x23F8 Pokaz" : L"\x23F8 Slide") : (m_lang == Lang::PL ? L"\x25B6 Pokaz" : L"\x25B6 Slide"), m_viewerSlideshow ? 0x16A34A : 0x262B33);
+    const bool hudOnImage = activeIdx >= 0 && activeIdx < static_cast<int>(m_items.size()) && m_items[activeIdx].isImage;
+    if (m_viewerCropMode) {
+        // While the crop frame is on, the bar holds only what is done with it
+        drawHudBtn(CMD_VIEWER_CROP_CANCEL,    96.0f,  hudPl ? L"Anuluj (Esc)" : L"Cancel (Esc)", 0x3B4252);
+        drawHudBtn(CMD_VIEWER_CROP_SAVE_COPY, 104.0f, hudPl ? L"Zapisz kopię" : L"Save a copy");
+        drawHudBtn(CMD_VIEWER_CROP_SAVE,      112.0f, hudPl ? L"Zapisz (Enter)" : L"Save (Enter)", 0x16A34A);
+    } else {
+        drawHudBtn(CMD_VIEWER_CLOSE,       56.0f, hudPl ? L"Zamknij" : L"Close", 0x3B4252);
+        drawHudBtn(CMD_VIEWER_FULLSCREEN,  72.0f, m_isFullScreen ? (hudPl ? L"W oknie" : L"Window") : L"F11 Full");
+        drawHudBtn(CMD_VIEWER_ZOOM_100,    42.0f, L"1:1");
+        drawHudBtn(CMD_VIEWER_ZOOM_FIT,    50.0f, hudPl ? L"Dopasuj" : L"Fit");
+        drawHudBtn(CMD_VIEWER_DELETE,      78.0f, hudPl ? L"Usuń (Del)" : L"Del (Bin)", 0x6E2B2B);
+        drawHudBtn(CMD_VIEWER_NEXT,        34.0f, L"\x2192");
+        drawHudBtn(CMD_VIEWER_PREV,        34.0f, L"\x2190");
+        if (hudOnImage) {
+            drawHudBtn(CMD_IMG_TOOL_MENU,       108.0f, hudPl ? L"\xD83D\xDCD0 Rozmiar / KB \x25BE" : L"\xD83D\xDCD0 Resize / KB \x25BE", 0x1E3A5F);
+            // Turning and cropping are saved into the file (ShellMenuEmulator::TransformImageFile)
+            drawHudBtn(CMD_VIEWER_CROP,         66.0f,  hudPl ? L"Przytnij" : L"Crop", 0x1E3A5F);
+            drawHudBtn(CMD_VIEWER_ROTATE_RIGHT, 54.0f,  L"\x21BB 90\x00B0", 0x1E3A5F);
+            drawHudBtn(CMD_VIEWER_ROTATE_LEFT,  54.0f,  L"\x21BA 90\x00B0", 0x1E3A5F);
+            drawHudBtn(CMD_VIEWER_COMPARE,      68.0f,  hudPl ? L"2-Up Por." : L"2-Up Cmp", m_viewerCompareMode ? 0x0284C7 : 0x262B33);
+            drawHudBtn(CMD_VIEWER_HISTOGRAM,    74.0f,  L"Histogram", m_viewerShowHistogram ? 0x0284C7 : 0x262B33);
+            drawHudBtn(CMD_VIEWER_SLIDESHOW,    68.0f,  m_viewerSlideshow ? (hudPl ? L"\x23F8 Pokaz" : L"\x23F8 Slide") : (hudPl ? L"\x25B6 Pokaz" : L"\x25B6 Slide"), m_viewerSlideshow ? 0x16A34A : 0x262B33);
+        }
+    }
+
+    // What is shown, in the room the buttons left (cut there, never drawn under them)
+    if (activeIdx >= 0 && activeIdx < static_cast<int>(m_items.size())) {
+        const FileEntry& cur = m_items[activeIdx];
+        wchar_t infoBuf[512] = {};
+        if (m_viewerCropMode && imgOrigW > 0 && imgOrigH > 0) {
+            uint32_t cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+            RoundCropRect(CropRectF{ m_viewerCropRect.left, m_viewerCropRect.top, m_viewerCropRect.right, m_viewerCropRect.bottom },
+                          imgOrigW, imgOrigH, cropX, cropY, cropW, cropH);
+            swprintf_s(infoBuf, hudPl ? L"Przycinanie:   %u \xD7 %u px   z   %u \xD7 %u px   \x2022   %s"
+                                      : L"Crop:   %u \xD7 %u px   of   %u \xD7 %u px   \x2022   %s",
+                cropW, cropH, imgOrigW, imgOrigH, cur.name.c_str());
+        } else if (imgOrigW > 0 && imgOrigH > 0) {
+            swprintf_s(infoBuf, L"[%d / %d]   %s   \x2022   %u \xD7 %u px   \x2022   %s   \x2022   %.0f%%",
+                activeIdx + 1, static_cast<int>(m_items.size()),
+                cur.name.c_str(), imgOrigW, imgOrigH, cur.sizeStr.c_str(), effectiveZoomPct);
+        } else {
+            swprintf_s(infoBuf, L"[%d / %d]   %s   \x2022   %s",
+                activeIdx + 1, static_cast<int>(m_items.size()),
+                cur.name.c_str(), cur.sizeStr.c_str());
+        }
+        D2D1_RECT_F infoR = D2D1::RectF(hudBar.left + 14.0f, hudBar.top, hudBar.right - hudNextRight - 6.0f, hudBar.bottom);
+        if (infoR.right > infoR.left + 20.0f) {
+            m_rt->PushAxisAlignedClip(infoR, D2D1_ANTIALIAS_MODE_ALIASED);
+            m_solidBrush->SetColor(HexColor(0xECEFF4));
+            DrawTextCached(infoBuf, static_cast<UINT32>(wcslen(infoBuf)), m_fmtViewerHud, infoR, m_solidBrush);
+            m_rt->PopAxisAlignedClip();
+        }
     }
 
     // 3. Bottom Thumbnail Filmstrip (in In-Window Full Viewer mode)
@@ -7358,6 +7605,186 @@ void ExplorerApp::DrawLogView(const D2D1_RECT_F& rect) {
     m_rt->PopAxisAlignedClip();
 }
 
+void ExplorerApp::DrawClipboardView(const D2D1_RECT_F& rect) {
+    const bool pl = (m_lang == Lang::PL);
+    const std::vector<ClipboardEntry>& entries = m_clipHistory.Entries();
+    size_t nText = 0, nFiles = 0, nImages = 0, nPinned = 0;
+    for (const auto& e : entries) {
+        if (e.kind == ClipboardEntry::Kind::Text) ++nText;
+        else if (e.kind == ClipboardEntry::Kind::Files) ++nFiles;
+        else ++nImages;
+        if (e.pinned) ++nPinned;
+    }
+    if (!m_clipHistory.Find(m_clipSelectedId)) m_clipSelectedId = entries.empty() ? 0 : entries.front().id;
+    // Polish nouns after a number: 1 plik, 2-4 pliki, 5 plików (and 12-14 like 5)
+    auto plForm = [](size_t n, const wchar_t* one, const wchar_t* few, const wchar_t* many) {
+        if (n == 1) return one;
+        const size_t d = n % 10, t = n % 100;
+        return (d >= 2 && d <= 4 && (t < 12 || t > 14)) ? few : many;
+    };
+
+    m_rt->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    m_solidBrush->SetColor(HexColor(0xF3F5F8));
+    m_rt->FillRectangle(rect, m_solidBrush);
+
+    const float padX = 10.0f, gap = 10.0f;
+    const float availW = std::max(520.0f, (rect.right - rect.left) - padX * 2.0f);
+    const float leftX = rect.left + padX;
+    const float startY = rect.top + 8.0f;
+    float curY = startY - m_hwScrollY;
+
+    // ---- Header card ----
+    {
+        const float h = 84.0f;
+        DrawCardShell(leftX, curY, availW, h, pl ? L"SCHOWEK  \x2022  HISTORIA TEJ SESJI PROGRAMU" : L"CLIPBOARD  \x2022  HISTORY OF THIS RUN", 0x0067B8, false, 340.0f);
+        DrawCardTinyButton(D2D1::RectF(leftX + availW - 150.0f, curY + 4.0f, leftX + availW - 8.0f, curY + 25.0f),
+                           pl ? L"\xD83D\xDDD1 Wyczyść historię" : L"\xD83D\xDDD1 Clear history", CMD_CLIP_CLEAR, L"");
+        DrawCardTinyButton(D2D1::RectF(leftX + availW - 334.0f, curY + 4.0f, leftX + availW - 156.0f, curY + 25.0f),
+                           m_clipHistoryEnabled ? (pl ? L"\x2713 Historia: włączona" : L"\x2713 History: on") : (pl ? L"Historia: wyłączona" : L"History: off"),
+                           CMD_CLIP_TOGGLE_HISTORY, L"");
+        wchar_t counts[260] = {};
+        swprintf_s(counts, pl ? L"Wpisów: %zu   \x2022   tekst %zu   \x2022   pliki %zu   \x2022   obrazy %zu   \x2022   przypięte %zu"
+                              : L"Entries: %zu   \x2022   text %zu   \x2022   files %zu   \x2022   pictures %zu   \x2022   pinned %zu",
+                   entries.size(), nText, nFiles, nImages, nPinned);
+        DrawClippedText(counts, D2D1::RectF(leftX + 14.0f, curY + 34.0f, leftX + availW - 10.0f, curY + 52.0f), m_fmtBold, 0x0F172A);
+        if (m_clipHistoryEnabled) {
+            DrawClippedText(pl ? L"Tylko w pamięci: historia znika po zamknięciu programu. Hasła oznaczone przez menedżery haseł nie są zapamiętywane."
+                               : L"In memory only: the history is gone when the program closes. Passwords marked by password managers are not kept.",
+                            D2D1::RectF(leftX + 14.0f, curY + 56.0f, leftX + availW - 10.0f, curY + 74.0f), m_fmtSmall, 0x64748B);
+        } else {
+            DrawClippedText(pl ? L"Historia jest wyłączona: to, co zostanie skopiowane teraz, nie trafi na listę."
+                               : L"The history is switched off: what is copied now does not come onto the list.",
+                            D2D1::RectF(leftX + 14.0f, curY + 56.0f, leftX + availW - 10.0f, curY + 74.0f), m_fmtSmall, 0xB91C1C);
+        }
+        curY += h + gap;
+    }
+
+    // ---- Entries ----
+    {
+        const float rowH = 78.0f;
+        const float h = 32.0f + static_cast<float>(std::max<size_t>(1, entries.size())) * rowH + 8.0f;
+        DrawCardShell(leftX, curY, availW, h, (pl ? L"WPISY (najnowsze na górze)  \x2022  " : L"ENTRIES (newest first)  \x2022  ") + std::to_wstring(entries.size()), 0x64748B, false);
+        const float top0 = curY + 32.0f;
+        if (entries.empty()) {
+            DrawClippedText(pl ? L"Nic jeszcze nie skopiowano. Skopiuj tekst, pliki albo obraz (Ctrl + C) w dowolnym programie - pojawi się tutaj."
+                               : L"Nothing has been copied yet. Copy text, files or a picture (Ctrl + C) in any program - it appears here.",
+                            D2D1::RectF(leftX + 14.0f, top0 + 4.0f, leftX + availW - 14.0f, top0 + 24.0f), m_fmtSmall, 0x64748B);
+        }
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const float ry = top0 + static_cast<float>(i) * rowH;
+            if (ry + rowH < rect.top) continue;
+            if (ry > rect.bottom) break;
+            const ClipboardEntry& e = entries[i];
+            const std::wstring arg = L"clip:" + std::to_wstring(e.id);
+            const D2D1_RECT_F rr = D2D1::RectF(leftX + 6.0f, ry, leftX + availW - 6.0f, ry + rowH - 4.0f);
+            const bool selected = (e.id == m_clipSelectedId);
+            const bool hov = PathUtils::PtInRectF(m_mousePt.x, m_mousePt.y, rr);
+            m_solidBrush->SetColor(HexColor(selected ? 0xDBEAFE : (hov ? 0xF0F9FF : ((i & 1) ? 0xF8FAFC : 0xFFFFFF))));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(rr, 4.0f, 4.0f), m_solidBrush);
+            if (selected) {
+                m_solidBrush->SetColor(HexColor(0x60A5FA));
+                m_rt->DrawRoundedRectangle(D2D1::RoundedRect(rr, 4.0f, 4.0f), m_solidBrush, 1.2f);
+            }
+
+            // What it is and when it came
+            const wchar_t* kindTxt = L"";
+            uint32_t kindCol = 0x0369A1;
+            switch (e.kind) {
+            case ClipboardEntry::Kind::Text:  kindTxt = pl ? L"TEKST" : L"TEXT"; kindCol = 0x0369A1; break;
+            case ClipboardEntry::Kind::Files: kindTxt = e.cut ? (pl ? L"PLIKI (WYCIĘTE)" : L"FILES (CUT)") : (pl ? L"PLIKI" : L"FILES"); kindCol = 0x15803D; break;
+            case ClipboardEntry::Kind::Image: kindTxt = pl ? L"OBRAZ" : L"PICTURE"; kindCol = 0x7C3AED; break;
+            }
+            DrawClippedText(kindTxt, D2D1::RectF(rr.left + 10.0f, ry + 6.0f, rr.left + 118.0f, ry + 24.0f), m_fmtBold, kindCol);
+            wchar_t ts[32] = {};
+            swprintf_s(ts, L"%02u:%02u:%02u", e.time.wHour, e.time.wMinute, e.time.wSecond);
+            DrawClippedText(ts, D2D1::RectF(rr.left + 10.0f, ry + 26.0f, rr.left + 118.0f, ry + 44.0f), m_fmtSmall, 0x64748B);
+            if (e.pinned) {
+                DrawClippedText(pl ? L"\xD83D\xDCCC przypięty" : L"\xD83D\xDCCC pinned", D2D1::RectF(rr.left + 10.0f, ry + 46.0f, rr.left + 118.0f, ry + 64.0f), m_fmtSmall, 0xB45309);
+            }
+
+            // Buttons on the right, before the row's own click target: a click on one of them is theirs
+            float bx = rr.right - 8.0f;
+            auto button = [&](float w, const std::wstring& label, int cmd) {
+                DrawCardTinyButton(D2D1::RectF(bx - w, ry + 8.0f, bx, ry + 30.0f), label, cmd, arg);
+                bx -= w + 6.0f;
+            };
+            button(64.0f, pl ? L"Usuń" : L"Delete", CMD_CLIP_DELETE);
+            button(78.0f, e.pinned ? (pl ? L"Odepnij" : L"Unpin") : (pl ? L"Przypnij" : L"Pin"), CMD_CLIP_PIN);
+            if (e.kind != ClipboardEntry::Kind::Files) button(82.0f, pl ? L"Jako plik" : L"As a file", CMD_CLIP_SAVE_FILE);
+            button(72.0f, pl ? L"Kopiuj" : L"Copy", CMD_CLIP_COPY);
+            const float contentRight = std::max(rr.left + 200.0f, bx - 8.0f);
+            const float cx = rr.left + 124.0f;
+
+            // What it holds
+            if (e.kind == ClipboardEntry::Kind::Text) {
+                // The first two lines that are not empty, tabs as spaces
+                std::vector<std::wstring> lines;
+                size_t lineCount = 1;
+                for (wchar_t c : e.text) if (c == L'\n') ++lineCount;
+                size_t pos = 0;
+                while (pos < e.text.size() && lines.size() < 2) {
+                    size_t eol = e.text.find(L'\n', pos);
+                    if (eol == std::wstring::npos) eol = e.text.size();
+                    std::wstring line = e.text.substr(pos, std::min<size_t>(eol - pos, 400));
+                    for (wchar_t& c : line) if (c == L'\t' || c == L'\r') c = L' ';
+                    if (line.find_first_not_of(L' ') != std::wstring::npos) lines.push_back(line);
+                    pos = eol + 1;
+                }
+                if (!lines.empty()) DrawClippedText(lines[0], D2D1::RectF(cx, ry + 6.0f, contentRight, ry + 24.0f), m_fmtSmall, 0x0F172A);
+                if (lines.size() > 1) DrawClippedText(lines[1], D2D1::RectF(cx, ry + 25.0f, contentRight, ry + 43.0f), m_fmtSmall, 0x334155);
+                wchar_t info[128] = {};
+                swprintf_s(info, pl ? L"%zu %s   \x2022   %zu %s" : L"%zu %s   \x2022   %zu %s",
+                           e.text.size(), pl ? plForm(e.text.size(), L"znak", L"znaki", L"znaków") : (e.text.size() == 1 ? L"character" : L"characters"),
+                           lineCount, pl ? plForm(lineCount, L"wiersz", L"wiersze", L"wierszy") : (lineCount == 1 ? L"line" : L"lines"));
+                DrawClippedText(info, D2D1::RectF(cx, ry + 48.0f, contentRight, ry + 66.0f), m_fmtSmall, 0x64748B);
+            } else if (e.kind == ClipboardEntry::Kind::Files) {
+                std::wstring names;
+                for (size_t f = 0; f < e.files.size() && names.size() < 300; ++f) {
+                    if (f) names += L", ";
+                    names += PathUtils::GetFileName(e.files[f]);
+                }
+                const std::wstring head = std::to_wstring(e.files.size()) + L" " +
+                    (pl ? plForm(e.files.size(), L"plik", L"pliki", L"plików") : (e.files.size() == 1 ? L"item" : L"items")) + L":  " + names;
+                DrawClippedText(head, D2D1::RectF(cx, ry + 6.0f, contentRight, ry + 24.0f), m_fmtSmall, 0x0F172A);
+                DrawClippedText((pl ? L"Folder: " : L"Folder: ") + PathUtils::GetParentPath(e.files.front()),
+                                D2D1::RectF(cx, ry + 25.0f, contentRight, ry + 43.0f), m_fmtSmall, 0x334155);
+                DrawClippedText(e.cut ? (pl ? L"Wycięte: wklejenie je przeniesie" : L"Cut: pasting moves them")
+                                      : (pl ? L"Skopiowane: wklejenie je skopiuje" : L"Copied: pasting copies them"),
+                                D2D1::RectF(cx, ry + 48.0f, contentRight, ry + 66.0f), m_fmtSmall, 0x64748B);
+            } else {
+                const D2D1_RECT_F box = D2D1::RectF(cx, ry + 5.0f, cx + 104.0f, ry + rowH - 9.0f);
+                m_solidBrush->SetColor(HexColor(0xE2E8F0));
+                m_rt->FillRectangle(box, m_solidBrush);
+                if (ID2D1Bitmap* bmp = ClipThumbBitmap(e)) {
+                    const D2D1_SIZE_F bs = bmp->GetSize();
+                    m_rt->DrawBitmap(bmp, PathUtils::FitRectCentered(box, bs.width, bs.height), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                }
+                wchar_t dims[64] = {};
+                swprintf_s(dims, L"%u \xD7 %u px", e.width, e.height);
+                DrawClippedText(dims, D2D1::RectF(box.right + 12.0f, ry + 8.0f, contentRight, ry + 26.0f), m_fmtBold, 0x0F172A);
+                DrawClippedText(pl ? L"Wklej go do programu graficznego albo zapisz jako plik PNG (Jako plik)."
+                                   : L"Paste it into a picture editor, or save it as a PNG file (As a file).",
+                                D2D1::RectF(box.right + 12.0f, ry + 30.0f, contentRight, ry + 48.0f), m_fmtSmall, 0x64748B);
+            }
+
+            HardwareCardHit rowHit;
+            rowHit.rect = rr;
+            rowHit.cmdId = CMD_CLIP_SELECT;
+            rowHit.actionArg = arg;
+            rowHit.label = kindTxt;
+            m_hwCardHits.push_back(rowHit);
+        }
+        curY += h + gap;
+    }
+
+    const float totalHeight = (curY + m_hwScrollY) - startY;
+    const float viewH = std::max(1.0f, rect.bottom - rect.top);
+    m_hwMaxScrollY = std::max(0.0f, totalHeight - viewH + 16.0f);
+    m_hwScrollY = std::clamp(m_hwScrollY, 0.0f, m_hwMaxScrollY);
+
+    m_rt->PopAxisAlignedClip();
+}
+
 void ExplorerApp::DrawBackupsView(const D2D1_RECT_F& rect) {
     const bool pl = (m_lang == Lang::PL);
     const std::vector<BackupJob> jobs = m_backups.SnapshotJobs();
@@ -8029,6 +8456,10 @@ void ExplorerApp::DrawHardwareProView(const D2D1_RECT_F& rect) {
     }
     if (IsLogView()) {
         DrawLogView(rect);
+        return;
+    }
+    if (IsClipboardView()) {
+        DrawClipboardView(rect);
         return;
     }
     if (IsLanView()) {

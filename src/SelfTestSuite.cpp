@@ -31,7 +31,12 @@
 #include "DetailsColumns.h"
 #include "RibbonTabLayout.h"
 #include "LinuxStorage.h"
+#include "ImageOrientation.h"
+#include "ViewerCrop.h"
 #include "WidePrintf.h"
+#include "JpegSegments.h"
+#include "ClipboardHistory.h"
+#include "Blowfish.h"
 #include "UpdateCheck.h"
 #include "WinEOverride.h"
 #include <winver.h>
@@ -7735,6 +7740,899 @@ static void RunStage16Tests(TestCounter& tc) {
              FormatWideC(tiny, 5, L"%ls", L"za\x017C\x00F3\x0142\x0107") == -1 && tiny[0] == L'\0' &&
              FormatWideC(tiny, 5, L"%999999999d", 1) == -1 && tiny[0] == L'\0';
         tc.Record(ok, L"Stage16.Test18_WidePrintf_TextOutsideAsciiIsKept");
+    }
+    {
+        // "Ustawienia" tab. What a double-click opens where: pictures, video and audio go to the built-in viewer
+        // unless the user asked for the system's programs; nothing else ever went there.
+        FileEntry pic, film, song, doc, dir;
+        pic.isImage = true;
+        film.isVideo = true;
+        song.isAudio = true;
+        dir.isDirectory = true;
+        dir.isImage = true;         // a folder named like a picture is still a folder
+        bool ok = OpensInBuiltInViewer(pic, false, false) && OpensInBuiltInViewer(film, false, false) && OpensInBuiltInViewer(song, false, false) &&
+                  !OpensInBuiltInViewer(doc, false, false) && !OpensInBuiltInViewer(dir, false, false) &&
+                  !OpensInBuiltInViewer(pic, true, false) && OpensInBuiltInViewer(film, true, false) && OpensInBuiltInViewer(song, true, false) &&
+                  OpensInBuiltInViewer(pic, false, true) && !OpensInBuiltInViewer(film, false, true) && !OpensInBuiltInViewer(song, false, true) &&
+                  !OpensInBuiltInViewer(pic, true, true) && !OpensInBuiltInViewer(film, true, true) && !OpensInBuiltInViewer(doc, true, true);
+
+        // Tabs of the ribbon: a hidden tab is left out of the strip unless it is in use or busy; File, Home and
+        // Settings cannot be hidden, whatever the settings file says
+        const int fileTab = static_cast<int>(RibbonTab::File), homeTab = static_cast<int>(RibbonTab::Home);
+        const int settingsTab = static_cast<int>(RibbonTab::Settings), lanTab = static_cast<int>(RibbonTab::Lan);
+        const int xferTab = static_cast<int>(RibbonTab::Transfers), logTab = static_cast<int>(RibbonTab::Log);
+        const unsigned hidden = (1u << lanTab) | (1u << xferTab) | (1u << fileTab) | (1u << settingsTab);
+        ok = ok && kRibbonTabsAlwaysShown == ((1u << fileTab) | (1u << homeTab) | (1u << settingsTab)) &&
+             RibbonTabShown(0, kRibbonTabsAlwaysShown, lanTab, homeTab) &&
+             !RibbonTabShown(hidden, kRibbonTabsAlwaysShown, lanTab, homeTab) &&
+             RibbonTabShown(hidden, kRibbonTabsAlwaysShown, lanTab, lanTab) &&               // the tab in use
+             !RibbonTabShown(hidden, kRibbonTabsAlwaysShown, xferTab, homeTab) &&
+             RibbonTabShown(hidden, kRibbonTabsAlwaysShown, xferTab, homeTab, true) &&       // a copy is running
+             RibbonTabShown(hidden, kRibbonTabsAlwaysShown, logTab, homeTab) &&
+             RibbonTabShown(hidden, kRibbonTabsAlwaysShown, fileTab, homeTab) &&
+             RibbonTabShown(hidden, kRibbonTabsAlwaysShown, settingsTab, homeTab) &&
+             RibbonTabShown(~0u, kRibbonTabsAlwaysShown, homeTab, lanTab) && RibbonTabShown(~0u, 0, 40, 0);
+
+        // The language of a first start follows the system's
+        ok = ok && IsPolishLocaleName("pl") && IsPolishLocaleName("pl_PL") && IsPolishLocaleName("pl_PL.UTF-8") && IsPolishLocaleName("pl-PL") &&
+             IsPolishLocaleName("PL_pl@euro") && !IsPolishLocaleName("plt_MG") && !IsPolishLocaleName("en_US.UTF-8") && !IsPolishLocaleName("C") &&
+             !IsPolishLocaleName("p") && !IsPolishLocaleName("") && !IsPolishLocaleName(nullptr);
+        tc.Record(ok, L"Stage16.Test19_Settings_OpenInOwnProgram_HiddenTabs_FirstLanguage");
+    }
+    {
+        // The eight turns of a picture (ImageOrientation.h): a 3 x 2 picture whose pixels are numbered 1 to 6, row
+        // by row, shows where each one lands
+        using namespace ImageTurn;
+        auto numbered = [](uint32_t w, uint32_t h) {
+            std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
+            for (uint32_t i = 0; i < w * h; ++i) px[static_cast<size_t>(i) * 4] = static_cast<uint8_t>(i + 1);
+            return px;
+        };
+        auto digits = [](const std::vector<uint8_t>& px) {
+            std::string s;
+            for (size_t i = 0; i < px.size(); i += 4) s.push_back(static_cast<char>('0' + px[i]));
+            return s;
+        };
+        auto turned = [&](int code) {
+            uint32_t w = 3, h = 2;
+            std::vector<uint8_t> px = numbered(3, 2);
+            TurnPixels(code, w, h, px);
+            return digits(px) + ((w == 3 && h == 2) ? "w" : (w == 2 && h == 3) ? "h" : "?");
+        };
+        bool ok = turned(kNone) == "123456w" && turned(kFlipHorizontal) == "321654w" && turned(kRotate180) == "654321w" &&
+                  turned(kFlipVertical) == "456123w" && turned(kTranspose) == "142536h" && turned(kRotateRight) == "415263h" &&
+                  turned(kTransverse) == "635241h" && turned(kRotateLeft) == "362514h";
+        // One turn after another is the turn Compose names, for all 64 pairs
+        int pairsRight = 0;
+        for (int a = 1; a <= 8; ++a) {
+            for (int b = 1; b <= 8; ++b) {
+                uint32_t w = 3, h = 2;
+                std::vector<uint8_t> px = numbered(3, 2);
+                TurnPixels(a, w, h, px);
+                TurnPixels(b, w, h, px);
+                if (digits(px) + ((w == 3) ? "w" : "h") == turned(Compose(a, b))) ++pairsRight;
+            }
+        }
+        ok = ok && pairsRight == 64 && Compose(kRotateRight, kRotateLeft) == kNone && Compose(kRotateRight, kRotateRight) == kRotate180 &&
+             Compose(kRotateRight, kRotate180) == kRotateLeft && Compose(kFlipHorizontal, kRotateRight) == kTransverse &&
+             Compose(kRotateRight, kFlipHorizontal) == kTranspose && Compose(0, 99) == kNone &&
+             SwapsSides(kRotateRight) && SwapsSides(kTranspose) && !SwapsSides(kRotate180) && !SwapsSides(kFlipVertical);
+
+        // Cutting a part out
+        uint32_t cw = 3, ch = 2;
+        std::vector<uint8_t> cut = numbered(3, 2);
+        ok = ok && CropPixels(cw, ch, cut, 1, 0, 2, 2) && cw == 2 && ch == 2 && digits(cut) == "2356" &&
+             !CropPixels(cw, ch, cut, 1, 1, 2, 1) && !CropPixels(cw, ch, cut, 0, 0, 0, 1) && !CropPixels(cw, ch, cut, 2, 0, 1, 1) &&
+             cw == 2 && ch == 2 && digits(cut) == "2356" && CropPixels(cw, ch, cut, 0, 0, 2, 2) && digits(cut) == "2356";
+
+        // The crop frame of the viewer (ViewerCrop.h): what a press takes hold of, and what a drag makes of the frame
+        const CropRectF drawn{ 100.0f, 100.0f, 300.0f, 200.0f };
+        ok = ok && HitCropGrip(100, 100, drawn, 9) == kCropGripTopLeft && HitCropGrip(200, 104, drawn, 9) == kCropGripTop &&
+             HitCropGrip(296, 100, drawn, 9) == kCropGripTopRight && HitCropGrip(300, 150, drawn, 9) == kCropGripRight &&
+             HitCropGrip(300, 200, drawn, 9) == kCropGripBottomRight && HitCropGrip(200, 200, drawn, 9) == kCropGripBottom &&
+             HitCropGrip(100, 200, drawn, 9) == kCropGripBottomLeft && HitCropGrip(100, 150, drawn, 9) == kCropGripLeft &&
+             HitCropGrip(200, 150, drawn, 9) == kCropGripMove && HitCropGrip(50, 50, drawn, 9) == kCropGripNew &&
+             HitCropGrip(200, 80, drawn, 9) == kCropGripNew;
+        const CropRectF frame{ 100.0f, 100.0f, 900.0f, 700.0f };       // in a picture 1000 x 800
+        auto dragged = [&](int grip, float fromX, float fromY, float toX, float toY) {
+            const CropRectF r = DragCropRect(grip, frame, fromX, fromY, toX, toY, 1000.0f, 800.0f, 50.0f);
+            wchar_t b[96] = {};
+            swprintf_s(b, L"%.0f,%.0f,%.0f,%.0f", r.left, r.top, r.right, r.bottom);
+            return std::wstring(b);
+        };
+        ok = ok && dragged(kCropGripBottomRight, 900, 700, 1400, 1200) == L"100,100,1000,800" &&     // stops at the picture's edge
+             dragged(kCropGripTopLeft, 100, 100, 2100, 2100) == L"850,650,900,700" &&                  // and at the least size
+             dragged(kCropGripTop, 500, 100, 500, 200) == L"100,200,900,700" &&
+             dragged(kCropGripLeft, 100, 400, 60, 999) == L"60,100,900,700" &&
+             dragged(kCropGripMove, 500, 400, 0, -100) == L"0,0,800,600" &&
+             dragged(kCropGripMove, 500, 400, 1000, 900) == L"200,200,1000,800" &&
+             dragged(kCropGripNew, 300, 300, 100, 500) == L"100,300,300,500" &&
+             dragged(kCropGripNew, 995, 795, 996, 796) == L"950,750,1000,800";
+        uint32_t rx = 0, ry = 0, rw = 0, rh = 0;
+        RoundCropRect(CropRectF{ 100.4f, 99.6f, 899.7f, 700.2f }, 1000, 800, rx, ry, rw, rh);
+        ok = ok && rx == 100 && ry == 100 && rw == 800 && rh == 600;
+        RoundCropRect(CropRectF{ 5.0f, 5.0f, 5.0f, 5.0f }, 1000, 800, rx, ry, rw, rh);
+        ok = ok && rx == 5 && ry == 5 && rw == 1 && rh == 1;
+        RoundCropRect(CropRectF{ 5000.0f, 5000.0f, -50.0f, -50.0f }, 1000, 800, rx, ry, rw, rh);
+        ok = ok && rx == 0 && ry == 0 && rw == 1000 && rh == 800;
+        tc.Record(ok, L"Stage16.Test20_ImageTurns_Crop_And_TheViewersCropFrame", L"pairs composed right: " + std::to_wstring(pairsRight) + L" of 64");
+    }
+    {
+        // Turning and cropping saved into the file (ShellMenuEmulator::TransformImageFile): a picture written by
+        // hand as a 24-bit BMP, 6 x 4, in which pixel (x, y) is blue 20 + 30x, green 20 + 40y, red 200
+        const std::wstring dir = GetScratchTestDir() + L"\\Stage16_Images";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const uint32_t W = 6, H = 4;
+        const std::wstring src = dir + L"\\picture.bmp";
+        {
+            const uint32_t rowBytes = (W * 3 + 3) & ~3u;
+            std::vector<uint8_t> bmp(54 + static_cast<size_t>(rowBytes) * H, 0);
+            auto put32 = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; ++i) bmp[at + i] = static_cast<uint8_t>(v >> (8 * i)); };
+            bmp[0] = 'B'; bmp[1] = 'M';
+            put32(2, static_cast<uint32_t>(bmp.size()));
+            put32(10, 54);
+            put32(14, 40);
+            put32(18, W);
+            put32(22, H);                   // positive: the rows are stored from the bottom
+            bmp[26] = 1; bmp[28] = 24;
+            put32(34, rowBytes * H);
+            for (uint32_t y = 0; y < H; ++y) {
+                uint8_t* row = &bmp[54 + static_cast<size_t>(H - 1 - y) * rowBytes];
+                for (uint32_t x = 0; x < W; ++x) {
+                    row[x * 3 + 0] = static_cast<uint8_t>(20 + 30 * x);
+                    row[x * 3 + 1] = static_cast<uint8_t>(20 + 40 * y);
+                    row[x * 3 + 2] = 200;
+                }
+            }
+            PathUtils::WriteFileBytes(src, bmp.data(), bmp.size());
+        }
+        Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+        // A file's pixels as they are stored (not made upright), and what it says about its orientation
+        struct Decoded { uint32_t w = 0, h = 0; std::vector<uint8_t> bgra; int orientation = 0; };
+        auto decode = [&](const std::wstring& path, Decoded& out) {
+            out = {};
+            Microsoft::WRL::ComPtr<IWICBitmapDecoder> dec;
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+            Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
+            UINT w = 0, h = 0;
+            if (!wic || FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) || !dec ||
+                FAILED(dec->GetFrame(0, &frame)) || !frame || FAILED(wic->CreateFormatConverter(&conv)) || !conv ||
+                FAILED(conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+                FAILED(conv->GetSize(&w, &h)) || w == 0 || h == 0) {
+                return false;
+            }
+            out.bgra.resize(static_cast<size_t>(w) * h * 4);
+            if (FAILED(conv->CopyPixels(nullptr, w * 4, static_cast<UINT>(out.bgra.size()), out.bgra.data()))) return false;
+            out.w = w;
+            out.h = h;
+            out.orientation = ShellMenuEmulator::ReadExifOrientation(frame.Get());
+            return true;
+        };
+        auto isPixel = [](const Decoded& d, uint32_t x, uint32_t y, int blue, int green, int red, int tolerance) {
+            if (x >= d.w || y >= d.h) return false;
+            const uint8_t* p = &d.bgra[(static_cast<size_t>(y) * d.w + x) * 4];
+            return std::abs(p[0] - blue) <= tolerance && std::abs(p[1] - green) <= tolerance && std::abs(p[2] - red) <= tolerance;
+        };
+
+        // A crop into a copy: the rectangle (2, 1) 3 x 2 holds the source's pixels (2..4, 1..2)
+        ImageTransformParams crop;
+        crop.kind = ImageTransformKind::Crop;
+        crop.cropX = 2; crop.cropY = 1; crop.cropW = 3; crop.cropH = 2;
+        crop.suffix = L"_crop";
+        ImageTransformResult res;
+        Decoded got;
+        auto samePath = [](const std::wstring& a, const std::wstring& b) { return PathUtils::NormalizePathKey(a) == PathUtils::NormalizePathKey(b); };
+        bool ok = ShellMenuEmulator::TransformImageFile(src, crop, res) && res.ok && res.origW == 6 && res.origH == 4 &&
+                  res.newW == 3 && res.newH == 2 && samePath(res.outPath, dir + L"\\picture_crop.bmp") &&
+                  decode(res.outPath, got) && got.w == 3 && got.h == 2 &&
+                  isPixel(got, 0, 0, 80, 60, 200, 0) && isPixel(got, 2, 1, 140, 100, 200, 0);
+        // A rectangle that reaches past the picture is cut at its edge; an empty one is refused
+        ImageTransformParams wide = crop;
+        wide.cropX = 4; wide.cropY = 3; wide.cropW = 50; wide.cropH = 50;
+        wide.overwriteOriginal = true;
+        const std::wstring corner = dir + L"\\corner.bmp";
+        CopyFileW(src.c_str(), corner.c_str(), FALSE);
+        ImageTransformParams none = crop;
+        none.cropW = 0;
+        ok = ok && ShellMenuEmulator::TransformImageFile(corner, wide, res) && res.newW == 2 && res.newH == 1 && samePath(res.outPath, corner) &&
+             decode(corner, got) && got.w == 2 && got.h == 1 && isPixel(got, 0, 0, 140, 140, 200, 0) &&
+             !ShellMenuEmulator::TransformImageFile(src, none, res) && !res.ok;
+
+        // A quarter turn to the right, saved into the file itself: the left column becomes the top row
+        ok = ok && ShellMenuEmulator::RotateImageFile(src, true) && decode(src, got) && got.w == 4 && got.h == 6 &&
+             isPixel(got, 0, 0, 20, 140, 200, 0) && isPixel(got, 3, 0, 20, 20, 200, 0) && isPixel(got, 0, 5, 170, 140, 200, 0) &&
+             ShellMenuEmulator::RotateImageFile(src, false) && decode(src, got) && got.w == 6 && got.h == 4 &&
+             isPixel(got, 0, 0, 20, 20, 200, 0) && isPixel(got, 5, 3, 170, 140, 200, 0);
+
+        // The quality a JPEG was saved at, read from its brightness table (the standard table times a factor): a
+        // photo that has to be compressed again is written at about that quality
+        auto jpegWithTable = [](uint8_t value, bool twoByteValues) {
+            std::vector<uint8_t> b = { 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xDB };
+            const size_t length = 2 + 1 + (twoByteValues ? 128 : 64);
+            b.push_back(static_cast<uint8_t>(length >> 8));
+            b.push_back(static_cast<uint8_t>(length));
+            b.push_back(twoByteValues ? 0x10 : 0x00);
+            for (int k = 0; k < 64; ++k) {
+                if (twoByteValues) b.push_back(0);
+                b.push_back(value);
+            }
+            b.push_back(0xFF);
+            b.push_back(0xDA);
+            return b;
+        };
+        auto qualityOf = [](const std::vector<uint8_t>& b) { return ShellMenuEmulator::EstimateJpegQuality(b.data(), b.size()); };
+        std::vector<uint8_t> cutShort = jpegWithTable(16, false);
+        cutShort.resize(40);
+        ok = ok && qualityOf(jpegWithTable(16, false)) == 86 && qualityOf(jpegWithTable(16, true)) == 86 &&
+             qualityOf(jpegWithTable(1, false)) == 99 && qualityOf(jpegWithTable(58, false)) == 50 && qualityOf(jpegWithTable(255, false)) == 11 &&
+             qualityOf(cutShort) == 0 && qualityOf({ 0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02 }) == 0 && qualityOf({ 'B', 'M', 0, 0, 0, 0 }) == 0 &&
+             ShellMenuEmulator::EstimateJpegQuality(nullptr, 0) == 0;
+
+        std::wstring photoNote = L"-";
+#ifdef _WIN32
+        // A photo as a phone stores it: turned (EXIF orientation 6: it is shown a quarter turn to the right), with
+        // a date and a small preview picture inside. 96 x 64 stored, so 64 x 96 as shown; a white block in the
+        // stored top left corner and a black bar in the stored bottom right one tell which way round it is.
+        auto writePhoto = [&](const std::wstring& path, uint32_t w, uint32_t h, int orientation) {
+            std::vector<uint8_t> bgr(static_cast<size_t>(w) * h * 3);
+            for (uint32_t y = 0; y < h; ++y) {
+                for (uint32_t x = 0; x < w; ++x) {
+                    uint8_t* p = &bgr[(static_cast<size_t>(y) * w + x) * 3];
+                    p[0] = static_cast<uint8_t>(60 + x * 120 / w);
+                    p[1] = static_cast<uint8_t>(60 + y * 120 / h);
+                    p[2] = 120;
+                    if (x < 16 && y < 16) p[0] = p[1] = p[2] = 255;
+                    if (x >= w - 16 && y >= h - 16) p[0] = p[1] = p[2] = 0;
+                }
+            }
+            Microsoft::WRL::ComPtr<IWICStream> stream;
+            Microsoft::WRL::ComPtr<IWICBitmapEncoder> enc;
+            Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+            Microsoft::WRL::ComPtr<IPropertyBag2> bag;
+            WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+            if (!wic || FAILED(wic->CreateStream(&stream)) || FAILED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) ||
+                FAILED(wic->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc)) || FAILED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)) ||
+                FAILED(enc->CreateNewFrame(&frame, &bag)) || FAILED(frame->Initialize(bag.Get())) || FAILED(frame->SetSize(w, h)) ||
+                FAILED(frame->SetPixelFormat(&format))) {
+                return false;
+            }
+            Microsoft::WRL::ComPtr<IWICMetadataQueryWriter> query;
+            if (FAILED(frame->GetMetadataQueryWriter(&query)) || !query) return false;
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            value.vt = VT_UI2;
+            value.uiVal = static_cast<USHORT>(orientation);
+            if (FAILED(query->SetMetadataByName(L"/app1/ifd/{ushort=274}", &value))) return false;
+            PropVariantInit(&value);
+            value.vt = VT_LPSTR;
+            value.pszVal = const_cast<char*>("2026:11:19 15:55:30");
+            if (FAILED(query->SetMetadataByName(L"/app1/ifd/{ushort=306}", &value))) return false;
+            Microsoft::WRL::ComPtr<IWICBitmap> whole;
+            Microsoft::WRL::ComPtr<IWICBitmapScaler> small_;
+            if (SUCCEEDED(wic->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat24bppBGR, w * 3, static_cast<UINT>(bgr.size()), bgr.data(), &whole)) &&
+                SUCCEEDED(wic->CreateBitmapScaler(&small_)) && SUCCEEDED(small_->Initialize(whole.Get(), 32, 32 * h / w, WICBitmapInterpolationModeFant))) {
+                frame->SetThumbnail(small_.Get());
+            }
+            return SUCCEEDED(frame->WritePixels(h, w * 3, static_cast<UINT>(bgr.size()), bgr.data())) &&
+                   SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit());
+        };
+        // What a saved photo still says about itself
+        auto photoFacts = [&](const std::wstring& path, std::string& date, bool& preview) {
+            date.clear();
+            preview = false;
+            Microsoft::WRL::ComPtr<IWICBitmapDecoder> dec;
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+            Microsoft::WRL::ComPtr<IWICMetadataQueryReader> query;
+            if (!wic || FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) || !dec ||
+                FAILED(dec->GetFrame(0, &frame)) || !frame) {
+                return false;
+            }
+            if (SUCCEEDED(frame->GetMetadataQueryReader(&query)) && query) {
+                PROPVARIANT value;
+                PropVariantInit(&value);
+                if (SUCCEEDED(query->GetMetadataByName(L"/app1/ifd/{ushort=306}", &value)) && value.vt == VT_LPSTR && value.pszVal) date = value.pszVal;
+                PropVariantClear(&value);
+            }
+            Microsoft::WRL::ComPtr<IWICBitmapSource> thumb;
+            preview = SUCCEEDED(frame->GetThumbnail(&thumb)) && thumb;
+            return true;
+        };
+
+        const std::wstring photo = dir + L"\\photo.jpg";
+        uint32_t shownW = 0, shownH = 0;
+        std::string date;
+        bool preview = false;
+        Decoded stored;
+        bool photoOk = writePhoto(photo, 96, 64, 6) && decode(photo, stored) && stored.w == 96 && stored.orientation == 6 &&
+                       photoFacts(photo, date, preview) && date == "2026:11:19 15:55:30" && preview &&
+                       ShellMenuEmulator::ProbeImageDimensions(photo, shownW, shownH) && shownW == 64 && shownH == 96;
+        // Rotated right once more it is upside down compared with what is stored. Both sides are multiples of 16:
+        // the compressed data is moved, nothing is compressed again. The date stays, the orientation becomes
+        // "as stored", and the preview picture - it would show the old picture - is gone.
+        ImageTransformParams turn;
+        turn.kind = ImageTransformKind::RotateCW;
+        turn.overwriteOriginal = true;
+        turn.sameFormatOnly = true;
+        auto fileBytes = [](const std::wstring& path) {
+            WIN32_FILE_ATTRIBUTE_DATA data = {};
+            return GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)
+                ? ((static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow) : 0ull;
+        };
+        auto fileQuality = [&](const std::wstring& path) {
+            std::vector<uint8_t> bytes;
+            return PathUtils::ReadFileBytes(path, 16ull * 1024 * 1024, bytes) ? ShellMenuEmulator::EstimateJpegQuality(bytes.data(), bytes.size()) : -1;
+        };
+        const uint64_t bytesBefore = fileBytes(photo);
+        photoOk = photoOk && fileQuality(photo) == 90 &&
+                  ShellMenuEmulator::TransformImageFile(photo, turn, res) && res.ok && res.lossless && fileQuality(photo) == 90 &&
+                  res.origW == 64 && res.origH == 96 && res.newW == 96 && res.newH == 64 &&
+                  decode(photo, got) && got.w == 96 && got.h == 64 && got.orientation == 1 &&
+                  isPixel(got, 88, 56, 255, 255, 255, 40) && isPixel(got, 6, 6, 0, 0, 0, 40) &&
+                  photoFacts(photo, date, preview) && date == "2026:11:19 15:55:30" && !preview;
+        const uint64_t bytesAfter = fileBytes(photo);
+
+        // A photo whose sides are no multiples of 16 (100 x 70, orientation 8: shown a quarter turn to the left,
+        // 70 x 100). Turned to the right it is the stored picture as it is: only the orientation note is
+        // corrected, which loses nothing at any size.
+        const std::wstring odd = dir + L"\\photo_odd.jpg";
+        photoOk = photoOk && writePhoto(odd, 100, 70, 8) && ShellMenuEmulator::ProbeImageDimensions(odd, shownW, shownH) && shownW == 70 && shownH == 100 &&
+                  ShellMenuEmulator::TransformImageFile(odd, turn, res) && res.ok && res.lossless && res.newW == 100 && res.newH == 70 &&
+                  decode(odd, got) && got.w == 100 && got.h == 70 && got.orientation == 1 &&
+                  isPixel(got, 6, 6, 255, 255, 255, 40) && isPixel(got, 94, 64, 0, 0, 0, 40) &&
+                  photoFacts(odd, date, preview) && date == "2026:11:19 15:55:30" && !preview;
+        // Turned once more, its compressed blocks cannot simply be moved (no multiples of 16): it is compressed
+        // again, at a quality at which that does not show. And a crop always is. Both keep the date.
+        ImageTransformParams cropPhoto;
+        cropPhoto.kind = ImageTransformKind::Crop;
+        cropPhoto.cropX = 0; cropPhoto.cropY = 0; cropPhoto.cropW = 30; cropPhoto.cropH = 40;      // the top left corner
+        cropPhoto.overwriteOriginal = true;
+        photoOk = photoOk && ShellMenuEmulator::TransformImageFile(odd, turn, res) && res.ok && !res.lossless && res.newW == 70 && res.newH == 100 &&
+                  decode(odd, got) && got.w == 70 && got.h == 100 && got.orientation == 1 &&
+                  // the stored top left corner is the top right one after a quarter turn to the right
+                  isPixel(got, 63, 6, 255, 255, 255, 40) && isPixel(got, 6, 94, 0, 0, 0, 40) &&
+                  photoFacts(odd, date, preview) && date == "2026:11:19 15:55:30" &&
+                  // it was written at 90 (the codec's own setting) and is written again a little above that
+                  fileQuality(odd) == 92 &&
+                  ShellMenuEmulator::TransformImageFile(odd, cropPhoto, res) && res.ok && !res.lossless && res.newW == 30 && res.newH == 40 &&
+                  // (15, 20) of the crop is the stored pixel (20, 54): blue 60 + 20 * 120 / 100, green 60 + 54 * 120 / 70
+                  decode(odd, got) && got.w == 30 && got.h == 40 && got.orientation == 1 && isPixel(got, 15, 20, 84, 152, 120, 40) &&
+                  photoFacts(odd, date, preview) && date == "2026:11:19 15:55:30";
+        ok = ok && photoOk;
+
+        // A palette PNG (4 x 2: red, green, blue, white over a white row) is turned as a palette PNG, not made a
+        // 32-bit one four times the size
+        const std::wstring pal = dir + L"\\palette.png";
+        bool paletteOk = false;
+        {
+            bool written = false;
+            {
+                // (in a scope of its own: the encoder holds the file open until it is released)
+                Microsoft::WRL::ComPtr<IWICPalette> palette;
+                Microsoft::WRL::ComPtr<IWICStream> stream;
+                Microsoft::WRL::ComPtr<IWICBitmapEncoder> enc;
+                Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+                Microsoft::WRL::ComPtr<IPropertyBag2> bag;
+                WICColor colors[4] = { 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF };
+                std::vector<uint8_t> indexes = { 0, 1, 2, 3, 3, 3, 3, 3 };
+                WICPixelFormatGUID format = GUID_WICPixelFormat8bppIndexed;
+                written = wic && SUCCEEDED(wic->CreatePalette(&palette)) && SUCCEEDED(palette->InitializeCustom(colors, 4)) &&
+                    SUCCEEDED(wic->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(pal.c_str(), GENERIC_WRITE)) &&
+                    SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) && SUCCEEDED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+                    SUCCEEDED(enc->CreateNewFrame(&frame, &bag)) && SUCCEEDED(frame->Initialize(bag.Get())) && SUCCEEDED(frame->SetSize(4, 2)) &&
+                    SUCCEEDED(frame->SetPixelFormat(&format)) && format == GUID_WICPixelFormat8bppIndexed && SUCCEEDED(frame->SetPalette(palette.Get())) &&
+                    SUCCEEDED(frame->WritePixels(2, 4, static_cast<UINT>(indexes.size()), indexes.data())) && SUCCEEDED(frame->Commit()) &&
+                    SUCCEEDED(enc->Commit());
+            }
+            auto formatOf = [&](const std::wstring& path) {
+                WICPixelFormatGUID pf = {};
+                Microsoft::WRL::ComPtr<IWICBitmapDecoder> dec;
+                Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> fr;
+                if (SUCCEEDED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) && dec &&
+                    SUCCEEDED(dec->GetFrame(0, &fr)) && fr) {
+                    fr->GetPixelFormat(&pf);
+                }
+                return pf;
+            };
+            // Turned right: the left column, read from the bottom up, becomes the top row
+            paletteOk = written && formatOf(pal) == GUID_WICPixelFormat8bppIndexed && ShellMenuEmulator::RotateImageFile(pal, true) &&
+                        formatOf(pal) == GUID_WICPixelFormat8bppIndexed && decode(pal, got) && got.w == 2 && got.h == 4 &&
+                        isPixel(got, 0, 0, 255, 255, 255, 0) && isPixel(got, 1, 0, 0, 0, 255, 0) && isPixel(got, 1, 1, 0, 255, 0, 0) &&
+                        isPixel(got, 1, 2, 255, 0, 0, 0) && isPixel(got, 1, 3, 255, 255, 255, 0);
+        }
+        ok = ok && paletteOk;
+        photoNote = std::wstring(photoOk ? L"photo ok" : L"photo FAILED") + L", lossless turn " + std::to_wstring(bytesBefore) + L" -> " +
+                    std::to_wstring(bytesAfter) + L" bytes" + (paletteOk ? L", palette PNG kept" : L", palette PNG FAILED");
+        DeleteFileW(photo.c_str());
+        DeleteFileW(odd.c_str());
+        DeleteFileW(pal.c_str());
+#endif
+        DeleteFileW(src.c_str());
+        DeleteFileW(corner.c_str());
+        DeleteFileW((dir + L"\\picture_crop.bmp").c_str());
+        RemoveDirectoryW(dir.c_str());
+        tc.Record(ok, L"Stage16.Test21_ImageFiles_CropAndTurnSaved_PhotoKeepsItsData", photoNote);
+    }
+    {
+        // A photo's EXIF block as bytes (JpegSegments.h): what the Linux build carries from a photo into a JPEG it
+        // writes, and what it corrects there. A block made by hand, in both byte orders: IFD0 with the orientation
+        // (6), the date and a link to the EXIF sub-IFD (pixel size 96 x 64); an IFD1 (the preview picture) after it.
+        auto makeExif = [](bool bigEndian, bool withPreview) {
+            std::vector<uint8_t> t;
+            auto put16 = [&](uint32_t v) {
+                t.push_back(static_cast<uint8_t>(bigEndian ? v >> 8 : v));
+                t.push_back(static_cast<uint8_t>(bigEndian ? v : v >> 8));
+            };
+            auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) t.push_back(static_cast<uint8_t>(bigEndian ? v >> (24 - 8 * i) : v >> (8 * i))); };
+            auto entry = [&](uint32_t tag, uint32_t type, uint32_t count, uint32_t value) {
+                put16(tag); put16(type); put32(count);
+                if (type == 3) { put16(value); put16(0); }
+                else put32(value);
+            };
+            t.push_back(bigEndian ? 'M' : 'I');
+            t.push_back(bigEndian ? 'M' : 'I');
+            put16(42); put32(8);
+            put16(3);                                   // IFD0 at 8: 3 entries, the next IFD's offset at 46
+            entry(0x0112, 3, 1, 6);
+            entry(0x0132, 2, 20, 50);                   // the date at 50
+            entry(0x8769, 4, 1, 70);                    // the sub-IFD at 70
+            put32(withPreview ? 100 : 0);
+            const char* date = "2026:11:19 15:55:30";
+            t.insert(t.end(), date, date + 20);
+            put16(2);                                   // the sub-IFD: 2 entries
+            entry(0xA002, 4, 1, 96);
+            entry(0xA003, 3, 1, 64);
+            put32(0);
+            put16(1);                                   // IFD1 at 100: the compression of a preview picture
+            entry(0x0103, 3, 1, 6);
+            put32(0);
+            std::vector<uint8_t> exif = { 'E', 'x', 'i', 'f', 0, 0 };
+            exif.insert(exif.end(), t.begin(), t.end());
+            return exif;
+        };
+        auto tiffU16 = [](const std::vector<uint8_t>& e, size_t at, bool be) {
+            return be ? (e[6 + at] << 8) | e[7 + at] : e[6 + at] | (e[7 + at] << 8);
+        };
+        auto tiffU32 = [&](const std::vector<uint8_t>& e, size_t at, bool be) {
+            return be ? (static_cast<uint32_t>(tiffU16(e, at, true)) << 16) | static_cast<uint32_t>(tiffU16(e, at + 2, true))
+                      : static_cast<uint32_t>(tiffU16(e, at, false)) | (static_cast<uint32_t>(tiffU16(e, at + 2, false)) << 16);
+        };
+        bool ok = true;
+        for (bool be : { false, true }) {
+            std::vector<uint8_t> exif = makeExif(be, true);
+            ok = ok && JpegSegments::ExifOrientation(exif) == 6 && JpegSegments::ExifDateTime(exif) == "2026:11:19 15:55:30" &&
+                 JpegSegments::FixExifForSavedPicture(exif, 64, 96) &&
+                 // orientation 1, the sub-IFD's width (a LONG) and height (a SHORT) are the new ones, IFD1 is unlinked
+                 JpegSegments::ExifOrientation(exif) == 1 && tiffU16(exif, 18, be) == 1 && tiffU32(exif, 80, be) == 64 &&
+                 tiffU16(exif, 92, be) == 96 && tiffU32(exif, 46, be) == 0 && JpegSegments::ExifDateTime(exif) == "2026:11:19 15:55:30";
+        }
+
+        // The header of a JPEG: SOI, a JFIF APP0, an EXIF APP1, a colour profile APP2, a DQT, then the scan
+        auto segment = [](std::vector<uint8_t>& out, uint8_t marker, const std::vector<uint8_t>& payload) {
+            out.push_back(0xFF);
+            out.push_back(marker);
+            out.push_back(static_cast<uint8_t>((payload.size() + 2) >> 8));
+            out.push_back(static_cast<uint8_t>(payload.size() + 2));
+            out.insert(out.end(), payload.begin(), payload.end());
+        };
+        const std::vector<uint8_t> jfif = { 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0 };
+        const std::vector<uint8_t> icc = { 'I', 'C', 'C', '_', 'P', 'R', 'O', 'F', 'I', 'L', 'E', 0, 1, 1, 'p', 'r', 'o', 'f' };
+        std::vector<uint8_t> dqt(65, 1);
+        dqt[0] = 0;
+        const std::vector<uint8_t> scan = { 0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9 };
+        std::vector<uint8_t> source = { 0xFF, 0xD8 };
+        segment(source, 0xE0, jfif);
+        segment(source, 0xE1, makeExif(false, true));
+        segment(source, 0xE2, icc);
+        segment(source, 0xDB, dqt);
+        source.insert(source.end(), scan.begin(), scan.end());
+        // What an encoder wrote without the photo data gets it back, corrected, right after its APP0
+        std::vector<uint8_t> written = { 0xFF, 0xD8 };
+        segment(written, 0xE0, jfif);
+        segment(written, 0xDB, dqt);
+        written.insert(written.end(), scan.begin(), scan.end());
+        std::vector<JpegSegments::Segment> segs;
+        ok = ok && JpegSegments::CarryPhotoSegments(source.data(), source.size(), written, 64, 96) &&
+             JpegSegments::ListHeaderSegments(written.data(), written.size(), segs) && segs.size() == 4 && segs[0].marker == 0xE0 &&
+             segs[1].marker == 0xE1 && segs[2].marker == 0xE2 && segs[3].marker == 0xDB &&
+             std::equal(scan.begin(), scan.end(), written.end() - static_cast<std::ptrdiff_t>(scan.size()));
+        const std::vector<uint8_t> carried = JpegSegments::FindExif(written.data(), written.size());
+        ok = ok && JpegSegments::ExifOrientation(carried) == 1 && JpegSegments::ExifDateTime(carried) == "2026:11:19 15:55:30" &&
+             JpegSegments::FindIccSegments(written.data(), written.size()).size() == 1;
+        // Replaced in a file that has them already: the old segments go, nothing is doubled
+        std::vector<uint8_t> again = source;
+        ok = ok && JpegSegments::ReplacePhotoSegments(again, makeExif(true, false), {}) &&
+             JpegSegments::ListHeaderSegments(again.data(), again.size(), segs) && segs.size() == 3 && segs[1].marker == 0xE1 &&
+             JpegSegments::ExifOrientation(JpegSegments::FindExif(again.data(), again.size())) == 6 &&
+             JpegSegments::FindIccSegments(again.data(), again.size()).empty();
+        // Damaged input is turned down without reading past its end
+        std::vector<uint8_t> cut(source.begin(), source.begin() + 30);
+        std::vector<uint8_t> shortExif = makeExif(false, true);
+        shortExif.resize(20);
+        ok = ok && !JpegSegments::ListHeaderSegments(cut.data(), cut.size(), segs) && JpegSegments::FindExif(cut.data(), cut.size()).empty() &&
+             !JpegSegments::ReplacePhotoSegments(cut, {}, {}) && !JpegSegments::FixExifForSavedPicture(shortExif, 1, 1) &&
+             JpegSegments::ExifOrientation(shortExif) == 1 && JpegSegments::ExifDateTime({ 'E', 'x', 'i', 'f', 0, 0, 'X', 'X', 0, 0 }).empty();
+
+        // A photo from the platform's own JPEG encoder (32 x 16, a white block in its top left corner) with that
+        // EXIF block put in: orientation 6, so it is shown turned right, 16 x 32. Turned right once more and saved
+        // into itself it is stored upside down (32 x 16) with orientation 1 - and it still has its date. Windows
+        // keeps the date through its imaging library, Linux through JpegSegments (after jpegtran, or a new encode).
+        const std::wstring dir = GetScratchTestDir() + L"\\Stage16_Exif";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const std::wstring photo = dir + L"\\turn.jpg";
+        Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+        bool encoded = false;
+        {
+            // (in a scope of its own: the encoder holds the file open until it is released)
+            Microsoft::WRL::ComPtr<IWICStream> stream;
+            Microsoft::WRL::ComPtr<IWICBitmapEncoder> enc;
+            Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+            Microsoft::WRL::ComPtr<IPropertyBag2> bag;
+            WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+            const UINT W = 32, H = 16;
+            if (wic && SUCCEEDED(wic->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(photo.c_str(), GENERIC_WRITE)) &&
+                SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &enc)) && SUCCEEDED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+                SUCCEEDED(enc->CreateNewFrame(&frame, &bag)) && SUCCEEDED(frame->Initialize(bag.Get())) && SUCCEEDED(frame->SetSize(W, H)) &&
+                SUCCEEDED(frame->SetPixelFormat(&format))) {
+                const UINT bpp = (format == GUID_WICPixelFormat24bppBGR) ? 3 : 4;    // Windows' JPEG encoder takes 24-bit
+                std::vector<uint8_t> px(static_cast<size_t>(W) * H * bpp, 255);
+                for (UINT y = 0; y < H; ++y) {
+                    for (UINT x = 0; x < W; ++x) {
+                        uint8_t* p = &px[(static_cast<size_t>(y) * W + x) * bpp];
+                        p[0] = p[1] = p[2] = (x < 8 && y < 8) ? 255 : 40;
+                    }
+                }
+                encoded = SUCCEEDED(frame->WritePixels(H, W * bpp, static_cast<UINT>(px.size()), px.data())) && SUCCEEDED(frame->Commit()) &&
+                          SUCCEEDED(enc->Commit());
+            }
+        }
+        std::vector<uint8_t> bytes;
+        uint32_t shownW = 0, shownH = 0;
+        bool photoOk = encoded && PathUtils::ReadFileBytes(photo, 1u << 20, bytes) && JpegSegments::ReplacePhotoSegments(bytes, makeExif(false, false), {}) &&
+                       PathUtils::WriteFileBytes(photo, bytes.data(), bytes.size()) &&
+                       ShellMenuEmulator::ProbeImageDimensions(photo, shownW, shownH) && shownW == 16 && shownH == 32;
+        ImageTransformParams turn;
+        turn.kind = ImageTransformKind::RotateCW;
+        turn.overwriteOriginal = true;
+        ImageTransformResult res;
+        photoOk = photoOk && ShellMenuEmulator::TransformImageFile(photo, turn, res) && res.ok && res.newW == 32 && res.newH == 16 &&
+                  PathUtils::ReadFileBytes(photo, 1u << 20, bytes);
+        const std::vector<uint8_t> after = photoOk ? JpegSegments::FindExif(bytes.data(), bytes.size()) : std::vector<uint8_t>();
+        photoOk = photoOk && JpegSegments::ExifOrientation(after) == 1 && JpegSegments::ExifDateTime(after) == "2026:11:19 15:55:30";
+        // The white block is in the stored bottom right corner now
+        {
+            Microsoft::WRL::ComPtr<IWICBitmapDecoder> dec;
+            Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+            Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
+            UINT w = 0, h = 0;
+            std::vector<uint8_t> px;
+            const bool decoded = photoOk && SUCCEEDED(wic->CreateDecoderFromFilename(photo.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)) &&
+                dec && SUCCEEDED(dec->GetFrame(0, &frame)) && frame && SUCCEEDED(wic->CreateFormatConverter(&conv)) && conv &&
+                SUCCEEDED(conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) &&
+                SUCCEEDED(conv->GetSize(&w, &h)) && w == 32 && h == 16;
+            if (decoded) {
+                px.resize(static_cast<size_t>(w) * h * 4);
+                conv->CopyPixels(nullptr, w * 4, static_cast<UINT>(px.size()), px.data());
+            }
+            auto grey = [&](UINT x, UINT y) { return px.empty() ? -1 : static_cast<int>(px[(static_cast<size_t>(y) * w + x) * 4 + 1]); };
+            photoOk = decoded && grey(28, 12) > 200 && grey(3, 3) < 90;
+        }
+        const std::wstring note = !photoOk ? L"photo FAILED" : (res.lossless ? L"photo turned without loss" : L"photo compressed again");
+        DeleteFileW(photo.c_str());
+        RemoveDirectoryW(dir.c_str());
+        tc.Record(ok && photoOk, L"Stage16.Test22_JpegSegments_ExifCarried_AndATurnKeepsTheDate", note);
+    }
+    {
+        // The clipboard history (ClipboardHistory.h), without the clipboard itself: a self-test must not change
+        // what the user copied. The same content again moves up instead of adding a row; copied and cut are two
+        // things; pinned rows survive the trimming and "clear"; a picture gets a premultiplied preview; an entry is
+        // saved as a file under a free name.
+        ClipboardHistory h;
+        auto text = [](const std::wstring& s) {
+            ClipboardEntry e;
+            e.kind = ClipboardEntry::Kind::Text;
+            e.text = s;
+            e.time.wYear = 2026; e.time.wMonth = 11; e.time.wDay = 20; e.time.wHour = 9; e.time.wMinute = 5; e.time.wSecond = 7;
+            return e;
+        };
+        std::wstring failed;
+        auto check = [&failed](bool good, const wchar_t* step) { if (!good) failed += std::wstring(failed.empty() ? L"" : L", ") + step; };
+        const uint64_t first = h.Add(text(L"pierwszy"));
+        const uint64_t second = h.Add(text(L"drugi"));
+        check(first && second && first != second && h.Add(text(L"pierwszy")) == first && h.Entries().size() == 2 &&
+              h.Entries().front().id == first && h.Add(text(L"")) == 0 && h.Entries().size() == 2, L"same text again");
+        ClipboardEntry copied;
+        copied.kind = ClipboardEntry::Kind::Files;
+        copied.files = { L"C:\\a.txt", L"C:\\b.txt" };
+        ClipboardEntry cut = copied;
+        cut.cut = true;
+        const uint64_t copiedId = h.Add(copied), cutId = h.Add(cut);
+        check(copiedId && cutId && copiedId != cutId && h.Entries().size() == 4, L"copied and cut files");
+        check(h.TogglePin(second) && h.Find(second) && h.Find(second)->pinned, L"pin");
+        for (size_t i = 0; i < ClipboardHistory::kMaxEntries + 5; ++i) h.Add(text(L"tekst " + std::to_wstring(i)));
+        check(h.Entries().size() == ClipboardHistory::kMaxEntries && h.Find(second) && !h.Find(first) && !h.Find(copiedId), L"trimmed to the limit");
+
+        // A picture: 400 x 200, half transparent; its preview is 160 x 80 and premultiplied
+        ClipboardEntry pic;
+        pic.kind = ClipboardEntry::Kind::Image;
+        pic.width = 400;
+        pic.height = 200;
+        pic.pixels.resize(400u * 200u * 4u);
+        for (size_t i = 0; i < 400u * 200u; ++i) {
+            pic.pixels[i * 4 + 0] = 200; pic.pixels[i * 4 + 1] = 100; pic.pixels[i * 4 + 2] = 50; pic.pixels[i * 4 + 3] = 128;
+        }
+        pic.time = text(L"x").time;
+        const uint64_t picId = h.Add(pic);
+        const ClipboardEntry* pe = h.Find(picId);
+        check(pe && pe->thumbW == 160 && pe->thumbH == 80 && pe->thumb.size() == 160u * 80u * 4u &&
+              pe->thumb[0] == 100 && pe->thumb[1] == 50 && pe->thumb[2] == 25 && pe->thumb[3] == 128, L"preview");
+        ClipboardEntry huge;
+        huge.kind = ClipboardEntry::Kind::Image;
+        huge.width = 8000;
+        huge.height = 6000;
+        check(h.Add(huge) == 0, L"too large a picture");
+        // No more than kMaxImages pictures: the oldest unpinned ones go (with the oldest entries beyond kMaxEntries,
+        // so the list can end up shorter than kMaxEntries)
+        for (uint32_t i = 0; i < ClipboardHistory::kMaxImages + 3; ++i) {
+            ClipboardEntry small_;
+            small_.kind = ClipboardEntry::Kind::Image;
+            small_.width = small_.height = 2;
+            small_.pixels.assign(16, static_cast<uint8_t>(i + 1));
+            h.Add(small_);
+        }
+        size_t images = 0;
+        for (const auto& e : h.Entries()) images += (e.kind == ClipboardEntry::Kind::Image) ? 1 : 0;
+        check(images == ClipboardHistory::kMaxImages && !h.Find(picId) && h.Find(second) && h.Entries().size() <= ClipboardHistory::kMaxEntries,
+              L"pictures trimmed");
+        const size_t before = h.Entries().size();
+        const size_t cleared = h.ClearUnpinned();
+        check(h.Entries().size() == 1 && h.Entries().front().id == second && cleared == before - 1 &&
+              h.Remove(second) && h.Entries().empty() && !h.Remove(second), L"clear keeps the pinned one");
+
+        // Saved as files: "Schowek 2026-11-20 09.05.07.txt", then " (2)" while that one is there; a picture as a PNG
+        const std::wstring dir = GetScratchTestDir() + L"\\Stage16_Clipboard";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const ClipboardEntry note = text(L"zażółć gęślą jaźń");
+        std::wstring savedText, savedAgain, savedPicture;
+        std::vector<uint8_t> back;
+        check(PathUtils::GetFileName(ClipboardIo::FileNameFor(note, Lang::PL, dir)) == L"Schowek 2026-11-20 09.05.07.txt", L"file name");
+        check(ClipboardIo::SaveAsFile(note, dir, Lang::PL, savedText) &&
+              PathUtils::ReadFileBytes(savedText, 1024, back) && std::string(back.begin(), back.end()) == PathUtils::WideToUtf8(note.text), L"text saved");
+        check(ClipboardIo::SaveAsFile(note, dir, Lang::PL, savedAgain) && PathUtils::GetFileName(savedAgain) == L"Schowek 2026-11-20 09.05.07 (2).txt",
+              L"second name");
+        uint32_t pw = 0, ph = 0;
+        std::vector<uint8_t> pixels;
+        check(ClipboardIo::SaveAsFile(pic, dir, Lang::EN, savedPicture) && PathUtils::GetFileName(savedPicture) == L"Clipboard 2026-11-20 09.05.07.png" &&
+              PathUtils::ReadFileBytes(savedPicture, 4u << 20, back) &&
+              ClipboardIo::Detail::DecodePicture(back.data(), back.size(), pw, ph, pixels) && pw == 400 && ph == 200 &&
+              pixels.size() == pic.pixels.size() && pixels[0] == 200 && pixels[1] == 100 && pixels[2] == 50 && pixels[3] == 128, L"picture saved");
+        // A list of files is no file of its own
+        std::wstring none;
+        check(!ClipboardIo::SaveAsFile(copied, dir, Lang::PL, none) && none.empty(), L"no file for a file list");
+        for (const std::wstring& p : { savedText, savedAgain, savedPicture }) if (!p.empty()) DeleteFileW(p.c_str());
+        RemoveDirectoryW(dir.c_str());
+        tc.Record(failed.empty(), L"Stage16.Test23_ClipboardHistory_SameMovesUp_PinnedStay_SavedAsFiles", failed.empty() ? L"" : L"failed: " + failed);
+    }
+    {
+        // Game archives: Blowfish against the published test vectors (and pi, which its tables start from); a Joymax
+        // PK2 whose directory is encrypted as Silkroad Online's is; GTA IMG version 2 and version 1 (.img + .dir);
+        // SiN's SPAK; the ZIP-based packages of Doom 3, Call of Duty and GZDoom.
+        const std::vector<uint32_t>& pi = Blowfish::PiFractionWords();
+        bool piOk = pi.size() == Blowfish::kPiWords && pi[0] == 0x243F6A88u && pi[1] == 0x85A308D3u && pi[17] == 0x8979FB1Bu &&
+                    pi[18] == 0xD1310BA6u && pi[1041] == 0x3AC372E6u;
+        auto fishVector = [](const std::vector<uint8_t>& key, uint32_t l, uint32_t r, uint32_t wantL, uint32_t wantR) {
+            Blowfish::Cipher c;
+            c.Initialize(key.data(), key.size());
+            uint32_t a = l, b = r;
+            c.Encrypt(a, b);
+            const bool enc = a == wantL && b == wantR;
+            c.Decrypt(a, b);
+            return enc && a == l && b == r;
+        };
+        const std::string alphabet = "abcdefghijklmnopqrstuvwxyz";
+        const bool fishOk = fishVector(std::vector<uint8_t>(8, 0x00), 0, 0, 0x4EF99745u, 0x6198DD78u) &&
+                            fishVector(std::vector<uint8_t>(8, 0xFF), 0xFFFFFFFFu, 0xFFFFFFFFu, 0x51866FD5u, 0xB85ECB8Au) &&
+                            fishVector({ 0x30, 0, 0, 0, 0, 0, 0, 0 }, 0x10000000u, 0x00000001u, 0x7D856F9Au, 0x613063F2u) &&
+                            fishVector(std::vector<uint8_t>(alphabet.begin(), alphabet.end()), 0x424C4F57u, 0x46495348u, 0x324ED0FEu, 0xF413A203u);
+
+        const std::wstring dir = GetScratchTestDir() + L"\\Stage16_GameArchives";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        auto put = [](std::vector<uint8_t>& b, size_t at, uint64_t v, int bytes) {
+            for (int i = 0; i < bytes; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i));
+        };
+        auto rd32 = [](const std::vector<uint8_t>& b, size_t at) {
+            return static_cast<uint32_t>(b[at]) | (static_cast<uint32_t>(b[at + 1]) << 8) | (static_cast<uint32_t>(b[at + 2]) << 16) |
+                   (static_cast<uint32_t>(b[at + 3]) << 24);
+        };
+        auto write = [&](const wchar_t* name, const std::vector<uint8_t>& b) {
+            const std::wstring path = dir + L"\\" + name;
+            PathUtils::WriteFileBytes(path, b.data(), b.size());
+            return path;
+        };
+        // An archive's entries by path; the bytes of one
+        auto inspect = [](const std::wstring& path, ArchiveSummaryInfo& info) { info = ArchiveSummaryInfo(); return ArchiveExplorer::InspectArchiveFile(path, info); };
+        auto entry = [](const ArchiveSummaryInfo& info, const wchar_t* path) -> const ArchiveItemEntry* {
+            for (const auto& e : info.entries) if (e.pathInArchive == path) return &e;
+            return nullptr;
+        };
+        auto extracted = [](const std::wstring& archive, const wchar_t* inner, const std::string& want) {
+            std::vector<uint8_t> out;
+            return ArchiveExplorer::ExtractSingleEntryToMemory(archive, inner, out) && out.size() >= want.size() &&
+                   std::equal(want.begin(), want.end(), out.begin());
+        };
+
+        // PK2: header, the root block, the block of the folder "Media", then the files' data
+        const uint8_t kBase[] = { 0x03, 0xF8, 0xE4, 0x44, 0x88, 0x99, 0x3F, 0x64, 0xFE, 0x35 };
+        uint8_t key[6];
+        for (int i = 0; i < 6; ++i) key[i] = static_cast<uint8_t>("169841"[i] ^ kBase[i]);
+        Blowfish::Cipher joymax;
+        joymax.Initialize(key, sizeof(key));
+        const size_t root = 256, media = 256 + 2560, dataAt = 256 + 2 * 2560;
+        const std::string readme = "Hello PK2", icon = "DDJ picture";
+        std::vector<uint8_t> pk2(dataAt, 0);
+        std::memcpy(pk2.data(), "JoyMax File Manager!\n", 21);
+        put(pk2, 30, 0x01000002u, 4);
+        pk2[34] = 1;
+        auto pk2Entry = [&](size_t block, size_t index, uint8_t type, const char* name, uint64_t position, uint32_t size) {
+            const size_t e = block + index * 128;
+            pk2[e] = type;
+            std::memcpy(&pk2[e + 1], name, std::strlen(name));
+            put(pk2, e + 106, position, 8);
+            put(pk2, e + 114, size, 4);
+        };
+        pk2Entry(root, 0, 1, ".", root, 0);
+        pk2Entry(root, 1, 1, "..", root, 0);
+        pk2Entry(root, 2, 1, "Media", media, 0);
+        pk2Entry(root, 3, 2, "readme.txt", dataAt, static_cast<uint32_t>(readme.size()));
+        pk2Entry(media, 0, 1, ".", media, 0);
+        pk2Entry(media, 1, 1, "..", root, 0);
+        pk2Entry(media, 2, 2, "icon.ddj", dataAt + readme.size(), static_cast<uint32_t>(icon.size()));
+        for (size_t at = root; at < dataAt; at += 8) {
+            uint32_t l = rd32(pk2, at), r = rd32(pk2, at + 4);
+            joymax.Encrypt(l, r);
+            put(pk2, at, l, 4);
+            put(pk2, at + 4, r, 4);
+        }
+        pk2.insert(pk2.end(), readme.begin(), readme.end());
+        pk2.insert(pk2.end(), icon.begin(), icon.end());
+        const std::wstring pk2Path = write(L"media.pk2", pk2);
+        ArchiveSummaryInfo info;
+        const ArchiveItemEntry* found = nullptr;
+        const bool pk2Ok = inspect(pk2Path, info) && info.formatName == L"Joymax PK2 (Silkroad Online)" && info.entries.size() == 3 &&
+                           (found = entry(info, L"Media")) && found->isDirectory &&
+                           (found = entry(info, L"readme.txt")) && found->uncompressedSize == readme.size() &&
+                           (found = entry(info, L"Media/icon.ddj")) && found->uncompressedSize == icon.size() &&
+                           extracted(pk2Path, L"Media/icon.ddj", icon) && extracted(pk2Path, L"readme.txt", readme);
+
+        // GTA IMG v2: "VER2", 2 entries of 32 bytes, each file in whole 2048-byte sectors
+        std::vector<uint8_t> img(3 * 2048, 0);
+        std::memcpy(img.data(), "VER2", 4);
+        put(img, 4, 2, 4);
+        put(img, 8, 1, 4); put(img, 12, 1, 2); std::memcpy(&img[16], "infernus.dff", 12);
+        put(img, 40, 2, 4); put(img, 44, 1, 2); std::memcpy(&img[48], "infernus.txd", 12);
+        std::memcpy(&img[2048], "DFF data", 8);
+        std::memcpy(&img[4096], "TXD data", 8);
+        const std::wstring imgPath = write(L"gta3.img", img);
+        const bool imgV2Ok = inspect(imgPath, info) && info.formatName == L"GTA IMG v2 (San Andreas)" && info.entries.size() == 2 &&
+                             (found = entry(info, L"infernus.txd")) && found->uncompressedSize == 2048 && extracted(imgPath, L"infernus.txd", "TXD data");
+        // GTA IMG v1: the data alone, its directory in the .dir of the same name
+        std::vector<uint8_t> oldImg(2 * 2048, 0), oldDir(64, 0);
+        std::memcpy(&oldImg[0], "COLL", 4);
+        std::memcpy(&oldImg[2048], "IFP data", 8);
+        put(oldDir, 0, 0, 4); put(oldDir, 4, 1, 4); std::memcpy(&oldDir[8], "generic.col", 11);
+        put(oldDir, 32, 1, 4); put(oldDir, 36, 1, 4); std::memcpy(&oldDir[40], "ped.ifp", 7);
+        const std::wstring oldImgPath = write(L"gta3_old.img", oldImg);
+        write(L"gta3_old.dir", oldDir);
+        const bool imgV1Ok = inspect(oldImgPath, info) && info.formatName == L"GTA IMG v1 (GTA III / Vice City, .img + .dir)" &&
+                             info.entries.size() == 2 && entry(info, L"generic.col") && extracted(oldImgPath, L"ped.ifp", "IFP data");
+
+        // SiN: "SPAK", entries of 128 bytes (a name of 120)
+        std::vector<uint8_t> spak(12, 0);
+        std::memcpy(spak.data(), "SPAK", 4);
+        const std::string bsp = "IBSP level";
+        spak.insert(spak.end(), bsp.begin(), bsp.end());
+        const size_t spakDir = spak.size();
+        spak.resize(spakDir + 128, 0);
+        std::memcpy(&spak[spakDir], "maps/sin1.bsp", 13);
+        put(spak, spakDir + 120, 12, 4);
+        put(spak, spakDir + 124, bsp.size(), 4);
+        put(spak, 4, spakDir, 4);
+        put(spak, 8, 128, 4);
+        const std::wstring spakPath = write(L"pak0.pak", spak);
+        const bool spakOk = inspect(spakPath, info) && info.formatName == L"SiN PAK (SPAK)" && entry(info, L"maps/sin1.bsp") &&
+                            extracted(spakPath, L"maps/sin1.bsp", bsp);
+
+        // A stored ZIP named .pk4 is a Doom 3 package
+        const std::string def = "entityDef monster {}";
+        const std::string defName = "def/monster.def";
+        const uint32_t crc = Checksum::Crc32(reinterpret_cast<const uint8_t*>(def.data()), def.size());
+        std::vector<uint8_t> zip(30, 0);
+        put(zip, 0, 0x04034B50u, 4); put(zip, 4, 20, 2); put(zip, 14, crc, 4); put(zip, 18, def.size(), 4); put(zip, 22, def.size(), 4);
+        put(zip, 26, defName.size(), 2);
+        zip.insert(zip.end(), defName.begin(), defName.end());
+        zip.insert(zip.end(), def.begin(), def.end());
+        const size_t cdAt = zip.size();
+        zip.resize(cdAt + 46, 0);
+        put(zip, cdAt, 0x02014B50u, 4); put(zip, cdAt + 4, 20, 2); put(zip, cdAt + 6, 20, 2); put(zip, cdAt + 16, crc, 4);
+        put(zip, cdAt + 20, def.size(), 4); put(zip, cdAt + 24, def.size(), 4); put(zip, cdAt + 28, defName.size(), 2);
+        zip.insert(zip.end(), defName.begin(), defName.end());
+        const size_t endAt = zip.size();
+        zip.resize(endAt + 22, 0);
+        put(zip, endAt, 0x06054B50u, 4); put(zip, endAt + 8, 1, 2); put(zip, endAt + 10, 1, 2);
+        put(zip, endAt + 12, endAt - cdAt, 4); put(zip, endAt + 16, cdAt, 4);
+        const std::wstring pk4Path = write(L"pak000.pk4", zip);
+        const bool pk4Ok = inspect(pk4Path, info) && info.formatName == L"PK4 (Doom 3 engine package, ZIP)" && extracted(pk4Path, L"def/monster.def", def);
+
+        const bool extOk = ArchiveExplorer::IsArchiveExtension(L".pk2") && ArchiveExplorer::IsArchiveExtension(L".img") &&
+                           ArchiveExplorer::IsArchiveExtension(L".pk3") && ArchiveExplorer::IsArchiveExtension(L".pk4") &&
+                           ArchiveExplorer::IsArchiveExtension(L".iwd") && ArchiveExplorer::IsArchiveExtension(L".ipk3") &&
+                           ArchiveExplorer::IsArchiveExtension(L".pak");
+        for (const wchar_t* name : { L"media.pk2", L"gta3.img", L"gta3_old.img", L"gta3_old.dir", L"pak0.pak", L"pak000.pk4" }) {
+            DeleteFileW((dir + L"\\" + name).c_str());
+        }
+        RemoveDirectoryW(dir.c_str());
+        std::wstring failed;
+        for (const auto& [part, good] : { std::pair<const wchar_t*, bool>{ L"pi ", piOk }, { L"blowfish ", fishOk }, { L"pk2 ", pk2Ok },
+                                          { L"img2 ", imgV2Ok }, { L"img1 ", imgV1Ok }, { L"spak ", spakOk }, { L"pk4 ", pk4Ok }, { L"extensions", extOk } }) {
+            if (!good) failed += part;
+        }
+        tc.Record(failed.empty(), L"Stage16.Test24_GameArchives_Blowfish_Pk2_GtaImg_SinPak_Pk4", failed.empty() ? L"" : L"failed: " + failed);
+    }
+    {
+        // GTA collision files (.col): a GTA III model (one sphere, one box and a triangle) and a San Andreas COL3
+        // model (two faces over four int16 vertices) in one file, then the zeros an IMG archive pads with. Both are
+        // drawn: 1 + 12 + 100 triangles and 2; an empty model and the padding add nothing.
+        const std::wstring dir = GetScratchTestDir() + L"\\Stage16_Col";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::vector<uint8_t> col;
+        auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) col.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+        auto u16 = [&](uint32_t v) { col.push_back(static_cast<uint8_t>(v)); col.push_back(static_cast<uint8_t>(v >> 8)); };
+        auto f32 = [&](float f) { uint32_t v = 0; std::memcpy(&v, &f, 4); u32(v); };
+        auto vec = [&](float x, float y, float z) { f32(x); f32(y); f32(z); };
+        auto header = [&](const char* fourcc, uint32_t modelSize, const char* name) {
+            col.insert(col.end(), fourcc, fourcc + 4);
+            u32(modelSize - 8);
+            const size_t at = col.size();
+            col.resize(at + 24, 0);
+            std::memcpy(&col[at], name, std::strlen(name));
+            col.resize(col.size() + 40, 0);                         // the bounds, not used
+        };
+        header("COLL", 192, "lamppost");
+        u32(1); f32(1.0f); vec(0, 0, 3); u32(0);                     // a sphere: radius, centre, surface
+        u32(0);                                                      // the unused section
+        u32(1); vec(-1, -1, 0); vec(1, 1, 2); u32(0);                // a box
+        u32(3); vec(0, 0, 0); vec(1, 0, 0); vec(0, 1, 0);            // 3 vertices
+        u32(1); u32(0); u32(1); u32(2); u32(0);                      // a face
+        header("COL2", 108, "nothing");                              // an empty model: counts 0, offsets 0
+        col.resize(col.size() + 36, 0);
+        const size_t col3 = col.size();
+        header("COL3", 160, "ramp");
+        u16(0); u16(0); u16(2); col.push_back(0); col.push_back(0); u32(2);       // spheres, boxes, faces, lines, flags
+        u32(0); u32(0); u32(0); u32(116); u32(140); u32(0);                       // offsets: vertices at 120, faces at 144
+        u32(0); u32(0); u32(0);                                                   // no shadow mesh
+        for (int v : { 0, 0, 0, 256, 0, 0, 256, 256, 128, 0, 256, 128 }) u16(static_cast<uint16_t>(v));
+        u16(0); u16(1); u16(2); u16(0);
+        u16(0); u16(2); u16(3); u16(0);
+        const bool laidOut = col.size() - col3 == 160;
+        col.resize(col.size() + 64, 0);
+        const std::wstring path = dir + L"\\props.col";
+        PathUtils::WriteFileBytes(path, col.data(), col.size());
+        LoadedMesh3D mesh;
+        const bool loaded = Model3DViewer::Is3DModelExtension(L".col") && Model3DViewer::InspectMeshFile(path, mesh) && mesh.loadedOk;
+        bool ok = laidOut && loaded && mesh.rawTriangleCount == 115 && mesh.rawVertexCount == 67 &&
+                  mesh.formatName == L"GTA collision (.col, COL3), 2 models";
+        // A model that says it is longer than the file is not read
+        std::vector<uint8_t> bad(col.begin(), col.begin() + 100);
+        const std::wstring badPath = dir + L"\\cut.col";
+        PathUtils::WriteFileBytes(badPath, bad.data(), bad.size());
+        LoadedMesh3D badMesh;
+        ok = ok && !Model3DViewer::InspectMeshFile(badPath, badMesh) && !badMesh.loadedOk;
+        DeleteFileW(path.c_str());
+        DeleteFileW(badPath.c_str());
+        RemoveDirectoryW(dir.c_str());
+        tc.Record(ok, L"Stage16.Test25_GtaCollision_ModelsDrawn", L"tris=" + std::to_wstring(mesh.rawTriangleCount) + L" verts=" +
+                  std::to_wstring(mesh.rawVertexCount) + L" " + mesh.formatName);
     }
 #ifdef _WIN32
     {

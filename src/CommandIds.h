@@ -409,7 +409,35 @@ enum CommandId : int {
     CMD_UI_SCALE_DOWN            = 1049,
     CMD_BASE_UI_SCALE            = 1050,     // 1050..1069: the entries of the UI scale menu
     CMD_NAV_SECTIONS_MENU        = 1070,     // "sections of the navigation pane" drop-down
-    CMD_BASE_NAV_SECTION         = 1071      // 1071..1078: its entries, one per FileEngine::NavSection bit
+    CMD_BASE_NAV_SECTION         = 1071,     // 1071..1078: its entries, one per FileEngine::NavSection bit
+
+    // The "Ustawienia" (Settings) tab
+    CMD_TAB_SETTINGS             = 1080,
+    CMD_LANG_SET_PL              = 1081,
+    CMD_LANG_SET_EN              = 1082,
+    CMD_TOGGLE_IMAGES_EXTERNAL   = 1083,     // pictures open in the system's default program
+    CMD_TOGGLE_CONFIRM_DELETE    = 1084,     // ask before deleting (the switch the list's context menu has too)
+    CMD_RIBBON_TABS_MENU         = 1085,     // "ribbon tabs" drop-down: which tabs the strip shows
+    CMD_BASE_RIBBON_TAB          = 1086,     // 1086..1117: its entries, one per RibbonTab value
+
+    // Full viewer: turning and cropping the picture, saved into the file
+    CMD_VIEWER_ROTATE_LEFT       = 1120,
+    CMD_VIEWER_ROTATE_RIGHT      = 1121,
+    CMD_VIEWER_CROP              = 1122,     // starts the crop rectangle
+    CMD_VIEWER_CROP_SAVE         = 1123,     // the file itself is replaced by the cropped picture
+    CMD_VIEWER_CROP_SAVE_COPY    = 1124,     // the cropped picture goes into a new file next to it
+    CMD_VIEWER_CROP_CANCEL       = 1125,
+
+    // The "Schowek" (Clipboard) tab. The entry commands act on the entry whose id a card button carries
+    // (m_hwActionArg), else on the selected one.
+    CMD_TAB_CLIPBOARD            = 1130,
+    CMD_CLIP_SELECT              = 1131,     // card hit: a click on an entry
+    CMD_CLIP_COPY                = 1132,     // the entry goes back on the clipboard
+    CMD_CLIP_SAVE_FILE           = 1133,     // a text or a picture becomes a file in the current folder
+    CMD_CLIP_PIN                 = 1134,     // a pinned entry stays when the rest is cleared
+    CMD_CLIP_DELETE              = 1135,
+    CMD_CLIP_CLEAR               = 1136,     // every entry that is not pinned
+    CMD_CLIP_TOGGLE_HISTORY      = 1137      // keep a history at all
 };
 
 // Layout constants (in DIPs / pixels)

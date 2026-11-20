@@ -7,7 +7,8 @@ A native file manager for Windows, written in C++20 on plain Win32, Direct2D and
 
 Explorer2 has no third-party library dependencies. The file views, the previewers and every
 file-format reader live in this repository and build into a single `Explorer2.exe`.
-The interface is available in Polish and English.
+The interface is available in Polish and English: the first start follows the system's language, and the
+Settings tab switches it.
 
 Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.zip` and
 `SHA256SUMS.txt`) are built automatically by GitHub Actions on every push and published on the
@@ -27,7 +28,13 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
   and the folder opens by itself when it answers
 - Subversion and git repositories by their URL, read-only, like folders (see [Things to know](#things-to-know))
 - In-window image and media viewer with a filmstrip. For video and audio the mouse wheel moves through the file
-  and the transport bar has a volume slider; they can also be set to open in the system's default player
+  and the transport bar has a volume slider. Pictures, and video and audio, can each be set to open in the
+  system's default program instead (Settings tab); Space still shows the built-in viewer
+- The viewer turns a picture by 90° and crops it, and saves the result into the file (or, for a crop, into a copy
+  next to it). Photos are shown upright, the way their EXIF orientation says (see [Things to know](#things-to-know))
+- A Settings tab with the language, the text size, the theme, how pictures and films open, and which ribbon tabs
+  and navigation pane sections are shown - the tool tabs (transfers, hardware, programs, monitoring, LAN, backups,
+  log) can be hidden for a plain file manager
 - A details view that stays usable in a narrow window or split pane: the columns give up width, the name first,
   and the least needed ones are left out, so the row buttons on the right never end up out of reach
 
@@ -53,6 +60,8 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
   USB and COM ports
 - Long-term system monitoring, recorded by an optional background process
 - Installed programs list, LAN scanner, Git and Subversion panel and an operation log
+- A Clipboard tab ("Schowek"): what was copied while Explorer2 runs - texts, lists of files and pictures - to put
+  back on the clipboard, pin, or save into the open folder as a file (see [Things to know](#things-to-know))
 
 ## File formats
 
@@ -66,6 +75,7 @@ code in [`src/formats/`](src/formats), one header per format family. A sample of
 | Electronics and CAD | KiCad, Eagle, Gerber, Excellon, DXF, Specctra DSN, Intel HEX, GDSII |
 | Documents and data | CSV, XLSX, ODS, DOCX, ODT, RTF, PPTX, EPUB, FB2, PDF, SQLite, DBF |
 | Archives | ZIP, TAR, gzip, RAR4, RAR5, 7z |
+| Game files | PK3 / PK4 / IWD packages, Quake and SiN PAK, GTA IMG (with its DFF models, TXD textures and COL collisions), Silkroad PK2, Valve VPK, Blizzard MPQ, Bethesda BSA, Doom WAD |
 
 Depth varies. The common formats get a full viewer, while many of the rarer ones are inspectors
 that show a file's header, structure and metadata rather than rendering it.
@@ -175,15 +185,46 @@ Explorer2 uses these when they are installed, and works without them:
   data of SATA and NVMe drives without root rights, and mounting a USB stick or card from the drive list.
   NVMe health data needs UDisks2 2.10 or newer. **smartmontools** (`smartctl`) is used as well when Explorer2
   may open the disk itself (run as root); `gio` can do the mounting when `udisksctl` is missing.
+- **jpegtran** (Linux; libjpeg-turbo's command-line tool): turning a JPEG without compressing it again
 
 ### Things to know
 
-- The File tab has a "UI scale" setting (also Ctrl and +, Ctrl and -, Ctrl and 0) that makes the whole interface
-  larger or smaller without changing the display scaling of Windows. It is not available in the Linux build yet.
-- "Navigation pane sections" on the File tab chooses what the tree on the left shows: Quick access, Dropbox and
+- The Settings tab has a "UI scale" setting with "Larger text" and "Smaller text" buttons (also Ctrl and +, Ctrl
+  and -, Ctrl and 0) that makes the whole interface larger or smaller without changing the display scaling of
+  Windows. It is not available in the Linux build yet.
+- A photo that is stored turned (EXIF orientation: phones store what the sensor saw and note how the phone was
+  held) is shown upright in the list, the preview pane and the viewer, with its sides as you see them. Turning,
+  cropping and resizing work on that upright picture and write a file that needs no turning.
+- "↻ 90°" and "↺ 90°" in the viewer (and "Rotate" in the context menu) save the turned picture into the file. A
+  JPEG whose sides are both multiples of 16 pixels - which is what cameras and phones produce - is turned without
+  being compressed again, so nothing is lost however often it is turned; any other JPEG, and every crop, is
+  compressed again at a quality at which that does not show. A JPEG keeps its EXIF data (date, camera, GPS) and
+  colour profile, and on Windows its other metadata too; the small preview picture inside the EXIF data is
+  dropped, because it would keep showing the old picture. On Linux the turn without loss is done by `jpegtran`
+  (libjpeg-turbo's tool, package `libjpeg-turbo-progs` or `libjpeg-turbo-utils`) when it is installed; without it
+  the JPEG is compressed again. PNG, GIF and BMP keep their pixel format on Windows (a palette PNG stays one). A
+  format Explorer2 cannot write (WebP, RAW, HEIC; on Linux also GIF and TIFF) is not turned or cropped in place.
+- "Przytnij" / "Crop" in the viewer puts a frame on the picture: drag its corners and edges, its middle to move
+  it, or outside it to draw a new one. "Save" (Enter) replaces the file with the cropped picture, "Save a copy"
+  writes `name_crop.jpg` next to it (for WebP, RAW and HEIC a JPEG or PNG copy), Esc gives the frame up.
+- The Clipboard tab keeps up to 60 entries, 12 of them pictures, in memory only: nothing is written to disk and
+  the list is gone when Explorer2 closes; pinned entries stay when the history is cleared or full. What a password
+  manager marks as private is not kept (on Windows the `ExcludeClipboardContentFromMonitorProcessing` and
+  `CanIncludeInClipboardHistory` formats, on Linux KeePassXC's and KDE's `x-kde-passwordManagerHint`), and "Keep a
+  clipboard history" on the tab switches the history off. "Paste as a file" saves a text as a UTF-8 `.txt` and a
+  picture as a `.png` in the open folder. On Linux the clipboard is looked at once a second, so something copied
+  and replaced again within that second can be missed.
+- An `.img` file opens like a folder when it is a GTA archive (San Andreas' `VER2`, or GTA III / Vice City's
+  `.img` with its `.dir` next to it) or a disk image Explorer2 can read; any other `.img` opens as a file.
+- "Pictures in the default program" and "Video/audio in the default program" on the Settings tab decide what a
+  double-click or Enter does with such files: the built-in viewer, which takes the place of the file list, or the
+  program the system opens them with. Space and the context menu show the built-in viewer either way.
+- "Ribbon tabs" on the Settings tab hides tabs you do not use; File, Home and Settings always stay. A hidden tab
+  comes back while it is in use (a shortcut opened it, or files are being copied) and goes again afterwards.
+- "Navigation pane sections" on the Settings tab chooses what the tree on the left shows: Quick access, Dropbox and
   OneDrive, the Recycle Bin and the FTP servers can each be switched off; the drives are always there. Pinning a
   folder brings a hidden Quick access section back.
-- "Win+E opens Explorer2" on the File tab gives that shortcut to Explorer2 for the current user. It writes one key
+- "Win+E opens Explorer2" on the Settings tab gives that shortcut to Explorer2 for the current user. It writes one key
   under `HKEY_CURRENT_USER\Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}` and removes it when
   switched off; nothing else in the system is changed and no administrator rights are needed. Switch it off before
   deleting a portable copy (the uninstaller of the Setup version does that itself; a copy that was only moved is
@@ -191,7 +232,7 @@ Explorer2 uses these when they are installed, and works without them:
 - Once a day Explorer2 asks GitHub for the tag of the newest release
   (`api.github.com/repos/openshwprojects/Explorer2/releases/latest`) and shows a note in the status bar when it
   is newer than the running version. Nothing else is sent, nothing is downloaded or installed, and the check can
-  be switched off on the File tab. The version number in the status bar opens the releases page.
+  be switched off on the Settings tab. The version number in the status bar opens the releases page.
 - A USB stick or card that is plugged in or removed shows up in the drive list by itself; a drive letter made in
   another way (`subst`, `net use`) appears when you come back to the window or press F5. On Linux a mounted
   drive appears by itself, and a stick or card that is plugged in but not mounted is listed as "not mounted":

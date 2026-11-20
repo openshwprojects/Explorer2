@@ -1712,6 +1712,22 @@ struct ClipboardState {
     Window window = 0;                  // unmapped window that owns the selection and receives conversions
     ULONGLONG targetsTick = 0;
     std::vector<Atom> targetsCache;     // what the other program offers, asked again after 1.5 s
+    std::map<UINT, Atom> mimeTargets;   // registered formats named like X targets ("image/png"), 0 = not one
+
+    // Change notices (AddClipboardFormatListener). Without XFixes nothing tells a program that another one copied:
+    // the owner of CLIPBOARD is looked at about once a second, and the owner's TIMESTAMP tells a second copy in the
+    // same program. The TIMESTAMP is asked for without waiting, through a window of its own, so that a program that
+    // does not answer never holds up this one.
+    std::vector<HWND> listeners;
+    DWORD sequence = 1;
+    bool dirty = false;                 // this process changed the clipboard: announced when it closes it
+    Window pollWindow = 0;
+    Window lastOwner = 0;
+    long lastStamp = -1;                // -1: not known yet
+    bool stampPending = false;
+    bool ownerHasNoStamp = false;       // the owner did not answer TIMESTAMP: only a new owner is noticed
+    ULONGLONG stampAskedTick = 0;
+    ULONGLONG nextPollTick = 0;
 };
 
 ClipboardState& Clip() {
@@ -1733,6 +1749,37 @@ Window ClipboardWindow() {
 UINT DropEffectFormat() {
     static const UINT s_fmt = RegisterClipboardFormatW(L"Preferred DropEffect");
     return s_fmt;
+}
+
+// The X target of a registered clipboard format whose name is one ("image/png", "text/html",
+// "x-kde-passwordManagerHint"); 0 for every other format. Such a format travels as the bytes it holds.
+Atom MimeTargetForFormat(UINT format) {
+    if (format < 0xC000u) return 0;
+    auto& x = X11();
+    auto& c = Clip();
+    std::lock_guard<std::recursive_mutex> lk(c.mutex);
+    if (auto it = c.mimeTargets.find(format); it != c.mimeTargets.end()) return it->second;
+    Atom atom = 0;
+    wchar_t name[256] = {};
+    if (GetClipboardFormatNameW(format, name, 256) > 0 && x.ready && x.dpy && x.InternAtom) {
+        const std::wstring n(name);
+        const bool looksLikeTarget = n.find(L'/') != std::wstring::npos || n.rfind(L"x-", 0) == 0;
+        bool plain = !n.empty();
+        for (wchar_t ch : n) plain = plain && ch > 0x20 && ch < 0x7F;
+        if (looksLikeTarget && plain) atom = x.InternAtom(x.dpy, Explorer2::PathUtils::WideToUtf8(n).c_str(), False);
+    }
+    c.mimeTargets[format] = atom;
+    return atom;
+}
+
+HGLOBAL HGlobalFromBytes(const unsigned char* bytes, size_t n) {
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, std::max<size_t>(1, n));
+    if (!h) return nullptr;
+    if (auto* dst = static_cast<unsigned char*>(GlobalLock(h))) {
+        if (n) std::memcpy(dst, bytes, n);
+        GlobalUnlock(h);
+    }
+    return h;
 }
 
 std::vector<std::wstring> PathsFromHDrop(HGLOBAL h) {
@@ -1832,6 +1879,17 @@ bool ClipboardBytesFor(Atom target, std::string& out) {
     auto& c = Clip();
     std::lock_guard<std::recursive_mutex> lk(c.mutex);
     out.clear();
+    // A format registered under a target's name ("image/png") goes out as the bytes it holds
+    for (const auto& [fmt, h] : c.data) {
+        if (fmt >= 0xC000u && h && target != 0 && MimeTargetForFormat(fmt) == target) {
+            const SIZE_T n = GlobalSize(h);
+            if (const auto* p = static_cast<const char*>(GlobalLock(h))) {
+                out.assign(p, p + n);
+                GlobalUnlock(h);
+            }
+            return true;
+        }
+    }
     std::vector<std::wstring> files;
     if (auto it = c.data.find(CF_HDROP); it != c.data.end() && it->second) files = PathsFromHDrop(it->second);
     if (target == x.utf8String || target == x.textPlainUtf8) {
@@ -1895,6 +1953,13 @@ void HandleSelectionRequest(const XSelectionRequestEvent& req) {
             std::string probe;
             for (Atom a : { x.utf8String, x.textPlainUtf8, x.uriList, x.gnomeCopiedFiles }) {
                 if (a && ClipboardBytesFor(a, probe)) list.push_back(static_cast<long>(a));
+            }
+            {
+                std::lock_guard<std::recursive_mutex> lk(c.mutex);
+                for (const auto& [fmt, h] : c.data) {
+                    const Atom a = h ? MimeTargetForFormat(fmt) : 0;
+                    if (a) list.push_back(static_cast<long>(a));
+                }
             }
             x.ChangeProperty(x.dpy, req.requestor, prop, XA_ATOM, 32, PropModeReplace,
                              reinterpret_cast<const unsigned char*>(list.data()), static_cast<int>(list.size()));
@@ -2002,6 +2067,16 @@ HGLOBAL ImportForeignClipboard(UINT format) {
         }
         return nullptr;
     }
+    if (const Atom target = MimeTargetForFormat(format)) {
+        // A format named like an X target ("image/png"): the bytes the other program gives for it
+        if (!FetchSelection(target, bytes, type, fmtBits, count) || fmtBits != 8) return nullptr;
+        HGLOBAL h = HGlobalFromBytes(bytes.data(), bytes.size());
+        auto& c = Clip();
+        std::lock_guard<std::recursive_mutex> lk(c.mutex);
+        if (auto it = c.imported.find(format); it != c.imported.end() && it->second && it->second != h) GlobalFree(it->second);
+        c.imported[format] = h;
+        return h;
+    }
     if (format != CF_HDROP && format != DropEffectFormat()) return nullptr;
     std::vector<std::wstring> paths;
     bool cut = false;
@@ -2039,6 +2114,105 @@ HGLOBAL ImportForeignClipboard(UINT format) {
     }
     c.imported[DropEffectFormat()] = effect;
     return c.imported[format];
+}
+
+// ---- Clipboard change notices (AddClipboardFormatListener) ---------------------------------------------------
+void NotifyClipboardListeners() {
+    std::vector<HWND> to;
+    {
+        auto& c = Clip();
+        std::lock_guard<std::recursive_mutex> lk(c.mutex);
+        ++c.sequence;
+        to = c.listeners;
+    }
+    for (HWND h : to) {
+        if (FindWnd(h)) PostMessageW(h, WM_CLIPBOARDUPDATE, 0, 0);
+    }
+}
+
+Window ClipboardPollWindow() {
+    auto& x = X11();
+    auto& c = Clip();
+    std::lock_guard<std::recursive_mutex> lk(c.mutex);
+    if (c.pollWindow == 0 && x.ready && x.dpy) c.pollWindow = x.CreateSimpleWindow(x.dpy, x.root, -10, -10, 1, 1, 0, 0, 0);
+    return c.pollWindow;
+}
+
+// About once a second while a window listens: has another program put something on the clipboard? A new owner
+// says so at once; the same owner is asked for its TIMESTAMP, and the answer is handled when it comes
+// (HandleClipboardStampReply), never waited for.
+void PollForeignClipboard() {
+    auto& x = X11();
+    auto& c = Clip();
+    const ULONGLONG now = GetTickCount64();
+    {
+        std::lock_guard<std::recursive_mutex> lk(c.mutex);
+        if (c.listeners.empty() || now < c.nextPollTick) return;
+        c.nextPollTick = now + 1000;
+    }
+    if (!x.ready || !x.dpy || !x.GetSelectionOwner || !x.ConvertSelection || !x.clipboard || !x.InternAtom) return;
+    const Window owner = x.GetSelectionOwner(x.dpy, x.clipboard);
+    const Window mine = ClipboardWindow();
+    bool notify = false, askStamp = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(c.mutex);
+        if (owner != c.lastOwner) {
+            c.lastOwner = owner;
+            c.lastStamp = -1;
+            c.stampPending = false;
+            c.ownerHasNoStamp = false;
+            notify = (owner != 0 && owner != mine);         // this process announces its own copies (CloseClipboard)
+        }
+        if (owner != 0 && owner != mine && !c.ownerHasNoStamp && (!c.stampPending || now - c.stampAskedTick > 3000)) {
+            c.stampPending = true;
+            c.stampAskedTick = now;
+            askStamp = true;
+        }
+    }
+    if (notify) NotifyClipboardListeners();
+    if (askStamp) {
+        static const Atom s_timestamp = x.InternAtom(x.dpy, "TIMESTAMP", False);
+        static const Atom s_prop = x.InternAtom(x.dpy, "EXPLORER2_CLIPSTAMP", False);
+        const Window w = ClipboardPollWindow();
+        if (w && s_timestamp && s_prop) {
+            if (x.DeleteProperty) x.DeleteProperty(x.dpy, w, s_prop);
+            x.ConvertSelection(x.dpy, x.clipboard, s_timestamp, s_prop, w, CurrentTime);
+            x.Flush(x.dpy);
+        }
+    }
+}
+
+// The owner's TIMESTAMP: a different one than last time means that it copied again
+void HandleClipboardStampReply(const XSelectionEvent& sel) {
+    auto& x = X11();
+    auto& c = Clip();
+    long stamp = -1;
+    bool answered = false;
+    if (sel.property != 0 && x.GetWindowProperty) {
+        Atom type = 0;
+        int format = 0;
+        unsigned long count = 0, after = 0;
+        unsigned char* data = nullptr;
+        if (x.GetWindowProperty(x.dpy, sel.requestor, sel.property, 0, 4, True, AnyPropertyType, &type, &format, &count, &after, &data) == Success && data) {
+            if (format == 32 && count >= 1) {
+                stamp = *reinterpret_cast<const long*>(data);
+                answered = true;
+            }
+            if (x.Free) x.Free(data);
+        }
+    }
+    bool notify = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(c.mutex);
+        c.stampPending = false;
+        if (!answered) {
+            c.ownerHasNoStamp = true;
+            return;
+        }
+        notify = (c.lastStamp != -1 && stamp != c.lastStamp);
+        c.lastStamp = stamp;
+    }
+    if (notify) NotifyClipboardListeners();
 }
 
 // ==============================================================================================================
@@ -2096,8 +2270,21 @@ void HandleX11Event(XEvent& ev) {
             c.owner = false;
             FreeClipboardMap(c.data);
             c.targetsTick = 0;
+            c.nextPollTick = 0;         // and the change notice goes out at the next look
         }
         return;
+    }
+    if (ev.type == SelectionNotify) {
+        Window pollWindow = 0;
+        {
+            auto& c = Clip();
+            std::lock_guard<std::recursive_mutex> lk(c.mutex);
+            pollWindow = c.pollWindow;
+        }
+        if (pollWindow != 0 && ev.xselection.requestor == pollWindow) {
+            HandleClipboardStampReply(ev.xselection);
+            return;
+        }
     }
 
     HWND hwnd = nullptr;
@@ -2368,6 +2555,8 @@ void PumpX11AndTimers(ULONGLONG* outNextTimerWaitMs = nullptr) {
         x.NextEvent(x.dpy, &ev);
         HandleX11Event(ev);
     }
+    // 1b. Has another program copied something? (only while a window listens: AddClipboardFormatListener)
+    PollForeignClipboard();
 
     // 2. Fire due Win32 timers & check optional EXPLORER2_AUTO_CLOSE_MS smoke-test hook
     const ULONGLONG now = GetTickCount64();
@@ -3286,13 +3475,25 @@ BOOL OpenClipboard(HWND) {
     return TRUE;
 }
 
-BOOL CloseClipboard() { return TRUE; }
+BOOL CloseClipboard() {
+    // As on Windows, a change is announced once, when the program that made it closes the clipboard
+    bool changed = false;
+    {
+        auto& c = Clip();
+        std::lock_guard<std::recursive_mutex> lk(c.mutex);
+        changed = c.dirty;
+        c.dirty = false;
+    }
+    if (changed) NotifyClipboardListeners();
+    return TRUE;
+}
 
 BOOL EmptyClipboard() {
     auto& c = Clip();
     std::lock_guard<std::recursive_mutex> lk(c.mutex);
     FreeClipboardMap(c.data);
     FreeClipboardMap(c.imported);
+    c.dirty = true;
     return TRUE;
 }
 
@@ -3303,6 +3504,7 @@ HANDLE SetClipboardData(UINT uFormat, HANDLE hMem) {
         auto it = c.data.find(uFormat);
         if (it != c.data.end() && it->second && it->second != hMem) GlobalFree(it->second);
         c.data[uFormat] = static_cast<HGLOBAL>(hMem);
+        c.dirty = true;
     }
     // Other programs get it through the CLIPBOARD selection, which this process now owns
     auto& x = X11();
@@ -3350,7 +3552,30 @@ BOOL IsClipboardFormatAvailable(UINT format) {
     auto offers = [&](Atom a) { return a != 0 && std::find(targets.begin(), targets.end(), a) != targets.end(); };
     if (format == CF_UNICODETEXT || format == CF_TEXT) return (offers(x.utf8String) || offers(x.textPlainUtf8) || offers(XA_STRING)) ? TRUE : FALSE;
     if (format == CF_HDROP) return (offers(x.uriList) || offers(x.gnomeCopiedFiles)) ? TRUE : FALSE;
+    if (const Atom target = MimeTargetForFormat(format)) return offers(target) ? TRUE : FALSE;
     return FALSE;
+}
+
+BOOL AddClipboardFormatListener(HWND hwnd) {
+    if (!hwnd) return FALSE;
+    auto& c = Clip();
+    std::lock_guard<std::recursive_mutex> lk(c.mutex);
+    if (std::find(c.listeners.begin(), c.listeners.end(), hwnd) == c.listeners.end()) c.listeners.push_back(hwnd);
+    c.nextPollTick = 0;
+    return TRUE;
+}
+
+BOOL RemoveClipboardFormatListener(HWND hwnd) {
+    auto& c = Clip();
+    std::lock_guard<std::recursive_mutex> lk(c.mutex);
+    c.listeners.erase(std::remove(c.listeners.begin(), c.listeners.end(), hwnd), c.listeners.end());
+    return TRUE;
+}
+
+DWORD GetClipboardSequenceNumber() {
+    auto& c = Clip();
+    std::lock_guard<std::recursive_mutex> lk(c.mutex);
+    return c.sequence;
 }
 
 UINT_PTR SetTimer(HWND hWnd, UINT_PTR nIDEvent, UINT uElapse, TIMERPROC lpTimerFunc) {

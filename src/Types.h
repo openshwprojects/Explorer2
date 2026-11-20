@@ -73,8 +73,16 @@ enum class RibbonTab : int {
     Lan = 8,        // "LAN": network scanner + SSDP (rendered through the dashboard view host)
     Log = 9,        // "Log": this run's operation log (rendered through the dashboard view host)
     Backups = 10,   // "Kopie zapasowe": rclone + incremental sync backup manager
-    Transfers = 11  // "Transfery": CopyHandler-style high-speed file transfer queue & engine
+    Transfers = 11, // "Transfery": CopyHandler-style high-speed file transfer queue & engine
+    Settings = 12,  // "Ustawienia": language, text size, how files open, which tabs and tree sections are shown
+    Clipboard = 13  // "Schowek": what was copied while the program runs (ClipboardHistory.h)
 };
+constexpr int kRibbonTabCount = 14;
+
+// The tabs the user cannot switch off in "Ustawienia" > "Karty wstążki" (RibbonTabLayout.h, RibbonTabShown): the
+// strip always has File and Home, and Settings is where a hidden tab is brought back
+constexpr unsigned kRibbonTabsAlwaysShown = (1u << static_cast<int>(RibbonTab::File)) | (1u << static_cast<int>(RibbonTab::Home)) |
+                                            (1u << static_cast<int>(RibbonTab::Settings));
 
 enum class HardwareSubTab : int {
     All = 0,
@@ -179,6 +187,17 @@ struct FileEntry {
     bool isSelected = false;
     bool isCut = false;
 };
+
+// What double-click, Enter and "Open" do with a file: true shows it in the built-in viewer, which takes the place
+// of the file list; false hands it to the program the system opens that kind of file with. Pictures, video and
+// audio go to the viewer unless the user asked for their own programs ("Ustawienia" tab); everything else has
+// always gone to its program.
+inline bool OpensInBuiltInViewer(const FileEntry& item, bool imagesInOwnProgram, bool mediaInOwnProgram) {
+    if (item.isDirectory) return false;
+    if (item.isImage) return !imagesInOwnProgram;
+    if (item.isVideo || item.isAudio) return !mediaInOwnProgram;
+    return false;
+}
 
 struct TreeNode {
     std::wstring label;

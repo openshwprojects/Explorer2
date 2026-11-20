@@ -1,12 +1,20 @@
 #include "ShellMenuEmulator.h"
 #include "ThreadUtils.h"
 #include "ImageFormatLoader.h"
+#include "ImageOrientation.h"
+#include "JpegSegments.h"
 #include "PathUtils.h"
+#ifndef _WIN32
+#include "ToolProcess.h"    // jpegtran: JPEG turned without loss on Linux
+#endif
 #include <wrl/client.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <wincodec.h>
+#ifdef _WIN32
+#include <wincodecsdk.h>    // IWICMetadataBlockReader / Writer: a photo's EXIF data goes along into the saved file
+#endif
 #include <thread>
 #include <algorithm>
 #include <cmath>
@@ -568,89 +576,329 @@ bool ShellMenuEmulator::CreateNewEmptyFile(const std::wstring& parentDir, const 
     return false;
 }
 
+// A quarter turn saved into the file itself. It goes through TransformImageFile like every other change to a
+// picture, so it sees the picture upright, keeps a photo's EXIF data and turns a JPEG without compressing it
+// again where that is possible.
 bool ShellMenuEmulator::RotateImageFile(const std::wstring& imagePath, bool clockwise) {
-    ComPtr<IWICImagingFactory> wic;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) || !wic) {
-        return false;
+    ImageTransformParams params;
+    params.kind = clockwise ? ImageTransformKind::RotateCW : ImageTransformKind::RotateCCW;
+    params.overwriteOriginal = true;
+    params.sameFormatOnly = true;
+    ImageTransformResult result;
+    return TransformImageFile(imagePath, params, result);
+}
+
+int ShellMenuEmulator::ReadExifOrientation(IWICBitmapFrameDecode* frame) {
+    if (!frame) return ImageTurn::kNone;
+    ComPtr<IWICMetadataQueryReader> query;
+    if (FAILED(frame->GetMetadataQueryReader(&query)) || !query) return ImageTurn::kNone;
+    for (const wchar_t* name : { L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}" }) {       // JPEG, TIFF
+        PROPVARIANT value;
+        PropVariantInit(&value);
+        const bool found = SUCCEEDED(query->GetMetadataByName(name, &value)) && value.vt == VT_UI2;
+        const int code = found ? static_cast<int>(value.uiVal) : 0;
+        PropVariantClear(&value);
+        if (found) return ImageTurn::IsValid(code) ? code : ImageTurn::kNone;
     }
+    return ImageTurn::kNone;
+}
 
-    HANDLE hIn = CreateFileW(imagePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (hIn == INVALID_HANDLE_VALUE) return false;
-
-    LARGE_INTEGER sz = {};
-    if (!GetFileSizeEx(hIn, &sz) || sz.QuadPart <= 0) {
-        CloseHandle(hIn);
-        return false;
-    }
-    std::vector<uint8_t> bytes(static_cast<size_t>(sz.QuadPart));
-    DWORD readBytes = 0;
-    BOOL readOk = ReadFile(hIn, bytes.data(), static_cast<DWORD>(bytes.size()), &readBytes, nullptr);
-    CloseHandle(hIn);
-    if (!readOk || readBytes == 0) return false;
-
-    ComPtr<IWICStream> memStream;
-    if (FAILED(wic->CreateStream(&memStream)) || FAILED(memStream->InitializeFromMemory(bytes.data(), readBytes))) {
-        return false;
-    }
-
-    ComPtr<IWICBitmapDecoder> decoder;
-    if (FAILED(wic->CreateDecoderFromStream(memStream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder)) || !decoder) {
-        return false;
-    }
-
-    GUID containerFormat = GUID_ContainerFormatPng;
-    decoder->GetContainerFormat(&containerFormat);
-
-    ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(decoder->GetFrame(0, &frame)) || !frame) return false;
-
-    // CRITICAL: Cache the decoded frame ONCE in RAM (WICBitmapCacheOnLoad) before rotating!
-    // Without this, IWICBitmapFlipRotator re-decodes the JPEG stream from byte 0 for every output scanline!
-    ComPtr<IWICBitmap> cachedBitmap;
-    if (FAILED(wic->CreateBitmapFromSource(frame.Get(), WICBitmapCacheOnLoad, &cachedBitmap)) || !cachedBitmap) {
-        return false;
-    }
-
-    ComPtr<IWICBitmapFlipRotator> rotator;
-    WICBitmapTransformOptions opt = clockwise ? WICBitmapTransformRotate90 : WICBitmapTransformRotate270;
-    if (FAILED(wic->CreateBitmapFlipRotator(&rotator)) || FAILED(rotator->Initialize(cachedBitmap.Get(), opt))) {
-        return false;
-    }
-
-    // Encode to a temporary sibling file first, then atomically replace the original file
-    std::wstring tmpPath = imagePath + L".rot_tmp";
-    DeleteFileW(tmpPath.c_str());
-
-    {
-        ComPtr<IWICStream> outStream;
-        if (FAILED(wic->CreateStream(&outStream)) || FAILED(outStream->InitializeFromFilename(tmpPath.c_str(), GENERIC_WRITE))) {
-            return false;
+// A JPEG's brightness quantisation table is libjpeg's standard table multiplied by a factor that depends on the
+// quality it was saved at, so the table tells the quality. Windows' encoder is on the same scale (measured: a
+// file written at 0.85 gives 85 here, at every step from 0.50 to 0.97), so a photo compressed again at this
+// quality comes out about as large as it was, instead of growing because a higher quality was picked for it.
+int ShellMenuEmulator::EstimateJpegQuality(const uint8_t* data, size_t size) {
+    if (!data || size < 4 || data[0] != 0xFF || data[1] != 0xD8) return 0;
+    size_t at = 2;
+    while (at + 4 <= size) {
+        if (data[at] != 0xFF) return 0;
+        const uint8_t marker = data[at + 1];
+        if (marker == 0xFF) { ++at; continue; }                                                 // a fill byte
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8)) { at += 2; continue; }        // markers without a length
+        if (marker == 0xD9 || marker == 0xDA) return 0;                                         // the picture begins: no table came before it
+        const size_t length = (static_cast<size_t>(data[at + 2]) << 8) | data[at + 3];
+        if (length < 2 || length > size - at - 2) return 0;
+        if (marker == 0xDB) {
+            size_t p = at + 4;
+            const size_t end = at + 2 + length;
+            while (p < end) {
+                const int precision = data[p] >> 4;             // 0: one byte for a value, 1: two
+                const int tableId = data[p] & 0x0F;             // 0 is the brightness table
+                ++p;
+                const size_t valueBytes = precision ? 128 : 64;
+                if (precision > 1 || valueBytes > end - p) return 0;
+                if (tableId == 0) {
+                    uint32_t sum = 0;
+                    for (size_t k = 0; k < 64; ++k) {
+                        sum += precision ? ((static_cast<uint32_t>(data[p + 2 * k]) << 8) | data[p + 2 * k + 1]) : data[p + k];
+                    }
+                    const double scale = 100.0 * static_cast<double>(sum) / 3688.0;     // the standard table's 64 values add up to 3688
+                    const double quality = (scale <= 100.0) ? (200.0 - scale) / 2.0 : 5000.0 / scale;
+                    return static_cast<int>(std::clamp(std::lround(quality), 1L, 100L));
+                }
+                p += valueBytes;
+            }
         }
-
-        ComPtr<IWICBitmapEncoder> encoder;
-        if (FAILED(wic->CreateEncoder(containerFormat, nullptr, &encoder)) ||
-            FAILED(encoder->Initialize(outStream.Get(), WICBitmapEncoderNoCache))) {
-            return false;
-        }
-
-        ComPtr<IWICBitmapFrameEncode> frameEncode;
-        if (FAILED(encoder->CreateNewFrame(&frameEncode, nullptr)) ||
-            FAILED(frameEncode->Initialize(nullptr)) ||
-            FAILED(frameEncode->WriteSource(rotator.Get(), nullptr)) ||
-            FAILED(frameEncode->Commit()) ||
-            FAILED(encoder->Commit())) {
-            outStream.Reset();
-            DeleteFileW(tmpPath.c_str());
-            return false;
-        }
+        at += 2 + length;
     }
+    return 0;
+}
 
-    if (!MoveFileExW(tmpPath.c_str(), imagePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(tmpPath.c_str());
+// A decoded picture as 4-byte BGRA pixels, rows from the top
+static bool CopySourceToBgra(IWICImagingFactory* wic, IWICBitmapSource* source, uint32_t& outW, uint32_t& outH, std::vector<uint8_t>& outPixels) {
+    UINT w = 0, h = 0;
+    if (!wic || !source || FAILED(source->GetSize(&w, &h)) || w == 0 || h == 0) return false;
+    const uint64_t byteCount = static_cast<uint64_t>(w) * h * 4;
+    if (byteCount > 0x7FFFFFF0ull) return false;        // CopyPixels takes the buffer size as 32 bits
+    ComPtr<IWICFormatConverter> conv;
+    if (FAILED(wic->CreateFormatConverter(&conv)) || !conv ||
+        FAILED(conv->Initialize(source, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
         return false;
     }
+    outPixels.resize(static_cast<size_t>(byteCount));
+    if (FAILED(conv->CopyPixels(nullptr, w * 4, static_cast<UINT>(byteCount), outPixels.data()))) {
+        outPixels.clear();
+        return false;
+    }
+    outW = w;
+    outH = h;
     return true;
 }
+
+static bool ReadStreamBytes(IStream* stream, std::vector<uint8_t>& outBytes) {
+    outBytes.clear();
+    STATSTG stat = {};
+    HGLOBAL hMem = nullptr;
+    if (!stream || FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart == 0 ||
+        FAILED(GetHGlobalFromStream(stream, &hMem)) || !hMem) {
+        return false;
+    }
+    void* ptr = GlobalLock(hMem);
+    if (!ptr) return false;
+    const size_t byteCount = static_cast<size_t>(stat.cbSize.QuadPart);
+    outBytes.assign(static_cast<const uint8_t*>(ptr), static_cast<const uint8_t*>(ptr) + byteCount);
+    GlobalUnlock(hMem);
+    return !outBytes.empty();
+}
+
+// Whether a picture can be written in this format. Windows' CreateEncoder says no itself when it cannot. The Linux
+// build's encoders write JPEG, PNG and BMP only, and its CreateEncoder accepts any format - writing PNG bytes for
+// all others, so a GIF or a TIFF turned in place used to become a PNG under its old name.
+static bool PlatformEncodes(const GUID& container) {
+#ifdef _WIN32
+    (void)container;
+    return true;
+#else
+    return container == GUID_ContainerFormatJpeg || container == GUID_ContainerFormatPng || container == GUID_ContainerFormatBmp;
+#endif
+}
+
+// A picture written in the format it came in and with its own pixel format, as the encoder takes it: a palette
+// PNG or a GIF stays a palette picture, a 16-bit PNG keeps its depth
+static bool EncodeSameFormat(IWICImagingFactory* wic, IWICBitmapSource* source, const GUID& container, std::vector<uint8_t>& outBytes) {
+    outBytes.clear();
+    if (!PlatformEncodes(container)) return false;
+    ComPtr<IStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    if (!wic || !source || FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream ||
+        FAILED(wic->CreateEncoder(container, nullptr, &encoder)) || !encoder ||
+        FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) ||
+        FAILED(encoder->CreateNewFrame(&frame, nullptr)) || !frame || FAILED(frame->Initialize(nullptr)) ||
+        FAILED(frame->WriteSource(source, nullptr)) || FAILED(frame->Commit()) || FAILED(encoder->Commit())) {
+        return false;
+    }
+    return ReadStreamBytes(stream.Get(), outBytes);
+}
+
+#ifdef _WIN32
+// A photo's metadata (EXIF, XMP, IPTC), colour profile and resolution go from the decoded frame into the frame
+// being written, and what the turn or the crop made untrue is corrected: the orientation becomes "as stored",
+// the small preview picture embedded in the EXIF data is dropped (it would keep showing the old picture, and
+// Windows shows it in thumbnails), and the noted pixel size follows. Best effort throughout: a file that cannot
+// take some of it is saved without it.
+static void CarryPhotoMetadata(IWICImagingFactory* wic, IWICBitmapFrameDecode* from, IWICBitmapFrameEncode* to, UINT newW, UINT newH) {
+    if (!wic || !from || !to) return;
+
+    double dpiX = 0.0, dpiY = 0.0;
+    if (SUCCEEDED(from->GetResolution(&dpiX, &dpiY)) && dpiX > 0.0 && dpiY > 0.0) to->SetResolution(dpiX, dpiY);
+
+    UINT profileCount = 0;
+    if (SUCCEEDED(from->GetColorContexts(0, nullptr, &profileCount)) && profileCount > 0 && profileCount <= 8) {
+        std::vector<ComPtr<IWICColorContext>> profiles(profileCount);
+        std::vector<IWICColorContext*> raw(profileCount, nullptr);
+        bool created = true;
+        for (UINT i = 0; i < profileCount && created; ++i) {
+            created = SUCCEEDED(wic->CreateColorContext(&profiles[i])) && profiles[i];
+            raw[i] = profiles[i].Get();
+        }
+        UINT got = 0;
+        if (created && SUCCEEDED(from->GetColorContexts(profileCount, raw.data(), &got)) && got > 0) to->SetColorContexts(got, raw.data());
+    }
+
+    ComPtr<IWICMetadataBlockReader> reader;
+    ComPtr<IWICMetadataBlockWriter> writer;
+    if (FAILED(from->QueryInterface(IID_PPV_ARGS(&reader))) || !reader ||
+        FAILED(to->QueryInterface(IID_PPV_ARGS(&writer))) || !writer ||
+        FAILED(writer->InitializeFromBlockReader(reader.Get()))) {
+        return;
+    }
+    ComPtr<IWICMetadataQueryReader> have;
+    ComPtr<IWICMetadataQueryWriter> query;
+    if (FAILED(from->GetMetadataQueryReader(&have)) || !have || FAILED(to->GetMetadataQueryWriter(&query)) || !query) return;
+
+    // A tag is corrected only where the file has it, and with the type it has there
+    auto correct = [&](const wchar_t* name, UINT newValue) {
+        PROPVARIANT old;
+        PropVariantInit(&old);
+        if (SUCCEEDED(have->GetMetadataByName(name, &old)) && (old.vt == VT_UI2 || old.vt == VT_UI4)) {
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            if (old.vt == VT_UI2 && newValue <= 0xFFFFu) {
+                value.vt = VT_UI2;
+                value.uiVal = static_cast<USHORT>(newValue);
+            } else {
+                value.vt = VT_UI4;
+                value.ulVal = newValue;
+            }
+            query->SetMetadataByName(name, &value);
+        }
+        PropVariantClear(&old);
+    };
+    correct(L"/app1/ifd/{ushort=274}", static_cast<UINT>(ImageTurn::kNone));
+    correct(L"/app1/ifd/exif/{ushort=40962}", newW);        // PixelXDimension
+    correct(L"/app1/ifd/exif/{ushort=40963}", newH);        // PixelYDimension
+    query->RemoveMetadataByName(L"/app1/thumb");
+}
+
+// Turns a JPEG without decoding it to pixels: Windows' codec moves the compressed blocks, so nothing is lost and
+// the file keeps its size. That works only when both sides are multiples of 16 and for one quarter turn or one
+// flip at a time - measured on Windows 10: any other size, and a turn combined with a flip, is quietly decoded
+// and compressed again at the codec's own quality. Those cases return false here and take the ordinary way.
+static bool TurnJpegLossless(IWICImagingFactory* wic, const std::vector<uint8_t>& srcBytes, DWORD srcSize, int turn,
+                             std::vector<uint8_t>& outBytes, UINT& outW, UINT& outH) {
+    int option = WICBitmapTransformRotate0;
+    switch (turn) {
+    case ImageTurn::kNone:           option = WICBitmapTransformRotate0; break;
+    case ImageTurn::kFlipHorizontal: option = WICBitmapTransformFlipHorizontal; break;
+    case ImageTurn::kRotate180:      option = WICBitmapTransformRotate180; break;
+    case ImageTurn::kFlipVertical:   option = WICBitmapTransformFlipVertical; break;
+    case ImageTurn::kRotateRight:    option = WICBitmapTransformRotate90; break;
+    case ImageTurn::kRotateLeft:     option = WICBitmapTransformRotate270; break;
+    default: return false;
+    }
+
+    ComPtr<IWICStream> inStream;
+    ComPtr<IWICBitmapDecoder> decoder;
+    // WICDecodeMetadataCacheOnDemand keeps the decoder on the stream, which is what lets the encoder take the
+    // compressed data instead of pixels
+    if (FAILED(wic->CreateStream(&inStream)) || !inStream ||
+        FAILED(inStream->InitializeFromMemory(const_cast<BYTE*>(srcBytes.data()), srcSize)) ||
+        FAILED(wic->CreateDecoderFromStream(inStream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) || !decoder) {
+        return false;
+    }
+    GUID container = {};
+    ComPtr<IWICBitmapFrameDecode> frame;
+    UINT w = 0, h = 0;
+    if (FAILED(decoder->GetContainerFormat(&container)) || container != GUID_ContainerFormatJpeg ||
+        FAILED(decoder->GetFrame(0, &frame)) || !frame || FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0) {
+        return false;
+    }
+    // (A picture that only has its orientation note corrected - the stored turn and the user's cancel out - is
+    // copied as it is, whatever its size.)
+    if (option != WICBitmapTransformRotate0 && ((w % 16) != 0 || (h % 16) != 0)) return false;
+
+    ComPtr<IStream> outStream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frameEncode;
+    ComPtr<IPropertyBag2> propBag;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &outStream)) || !outStream ||
+        FAILED(wic->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder)) || !encoder ||
+        FAILED(encoder->Initialize(outStream.Get(), WICBitmapEncoderNoCache)) ||
+        FAILED(encoder->CreateNewFrame(&frameEncode, &propBag)) || !frameEncode) {
+        return false;
+    }
+    if (option != WICBitmapTransformRotate0) {
+        if (!propBag) return false;
+        PROPBAG2 name = {};
+        name.pstrName = const_cast<LPOLESTR>(L"BitmapTransform");
+        VARIANT value;
+        VariantInit(&value);
+        value.vt = VT_UI1;
+        value.bVal = static_cast<BYTE>(option);
+        if (FAILED(propBag->Write(1, &name, &value))) return false;
+    }
+    if (FAILED(frameEncode->Initialize(propBag.Get()))) return false;
+
+    outW = ImageTurn::SwapsSides(turn) ? h : w;
+    outH = ImageTurn::SwapsSides(turn) ? w : h;
+    CarryPhotoMetadata(wic, frame.Get(), frameEncode.Get(), outW, outH);     // before the picture, so that it has its room
+
+    // The decoder's own frame and no rectangle: this is the call that copies the compressed data
+    if (FAILED(frameEncode->WriteSource(frame.Get(), nullptr)) || FAILED(frameEncode->Commit()) || FAILED(encoder->Commit())) {
+        return false;
+    }
+    return ReadStreamBytes(outStream.Get(), outBytes);
+}
+#else
+// Linux: a JPEG turned without being compressed again. A turn that only undoes the stored orientation needs no
+// tool: the orientation note is corrected and the picture stays as it is. Any other turn is left to jpegtran
+// (libjpeg's tool: "libjpeg-turbo-progs" or "libjpeg-progs" in most distributions) when it is installed; -perfect
+// makes it refuse a picture whose edge blocks it could not move, and the caller then compresses the picture again.
+// The EXIF block comes along (-copy all) and is corrected here as on Windows. storedW x storedH: the picture as it
+// is stored, before any turn.
+static bool TurnJpegLosslessLinux(const std::vector<uint8_t>& srcBytes, size_t srcSize, int turn, UINT storedW, UINT storedH,
+                                  std::vector<uint8_t>& outBytes, UINT& outW, UINT& outH) {
+    outW = ImageTurn::SwapsSides(turn) ? storedH : storedW;
+    outH = ImageTurn::SwapsSides(turn) ? storedW : storedH;
+    std::vector<uint8_t> turned;
+    if (turn == ImageTurn::kNone) {
+        turned.assign(srcBytes.begin(), srcBytes.begin() + static_cast<std::ptrdiff_t>(srcSize));
+    } else {
+        std::vector<std::wstring> how;
+        switch (turn) {
+        case ImageTurn::kFlipHorizontal: how = { L"-flip", L"horizontal" }; break;
+        case ImageTurn::kRotate180:      how = { L"-rotate", L"180" }; break;
+        case ImageTurn::kFlipVertical:   how = { L"-flip", L"vertical" }; break;
+        case ImageTurn::kTranspose:      how = { L"-transpose" }; break;
+        case ImageTurn::kRotateRight:    how = { L"-rotate", L"90" }; break;
+        case ImageTurn::kTransverse:     how = { L"-transverse" }; break;
+        case ImageTurn::kRotateLeft:     how = { L"-rotate", L"270" }; break;
+        default: return false;
+        }
+        const std::wstring tool = ToolProcess::FindExecutable(L"jpegtran", { L"/usr/bin/jpegtran", L"/bin/jpegtran", L"/usr/local/bin/jpegtran" });
+        if (tool.empty()) return false;
+        // The tool works on files: a copy of the picture in the temporary folder, so that the path given to it is
+        // a plain one this process chose
+        static std::atomic<unsigned> s_counter{ 0 };
+        wchar_t tmpDir[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, tmpDir);
+        const std::wstring stem = std::wstring(tmpDir) + L"explorer2_turn_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(++s_counter);
+        const std::wstring inPath = stem + L"_in.jpg";
+        const std::wstring outPath = stem + L"_out.jpg";
+        if (!PathUtils::WriteFileBytes(inPath, srcBytes.data(), srcSize)) return false;
+        std::vector<std::wstring> args = { L"-copy", L"all", L"-perfect" };
+        args.insert(args.end(), how.begin(), how.end());
+        args.insert(args.end(), { L"-outfile", outPath, inPath });
+        ToolProcess::Options opt;
+        opt.timeoutMs = 60000;
+        opt.maxBytes = 1u << 20;
+        static const std::atomic<bool> s_never{ false };
+        const ToolProcess::Result res = ToolProcess::Run(tool, args, opt, s_never);
+        const bool ok = res.ok() && PathUtils::ReadFileBytes(outPath, 1024ull << 20, turned) && turned.size() > 4;
+        DeleteFileW(inPath.c_str());
+        DeleteFileW(outPath.c_str());
+        if (!ok) return false;
+    }
+    std::vector<uint8_t> exif = JpegSegments::FindExif(turned.data(), turned.size());
+    if (!exif.empty() && JpegSegments::FixExifForSavedPicture(exif, outW, outH) &&
+        !JpegSegments::ReplacePhotoSegments(turned, exif, JpegSegments::FindIccSegments(turned.data(), turned.size()))) {
+        return false;
+    }
+    outBytes = std::move(turned);
+    return true;
+}
+#endif // _WIN32
 
 bool ShellMenuEmulator::ProbeImageDimensions(const std::wstring& imagePath, uint32_t& outW, uint32_t& outH, uint64_t* outFileBytes) {
     outW = 0;
@@ -679,6 +927,8 @@ bool ShellMenuEmulator::ProbeImageDimensions(const std::wstring& imagePath, uint
 
     UINT w = 0, h = 0;
     if (FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0) return false;
+    // The size of the picture as it is shown: a photo stored turned by a quarter has its sides the other way round
+    if (ImageTurn::SwapsSides(ReadExifOrientation(frame.Get()))) std::swap(w, h);
     outW = w;
     outH = h;
     return true;
@@ -690,7 +940,8 @@ static bool EncodeWicSourceToMemory(
     GUID containerFormat,
     float jpegQuality,
     std::vector<uint8_t>& outEncoded,
-    GUID* outActualContainer = nullptr) {
+    GUID* outActualContainer = nullptr,
+    IWICBitmapFrameDecode* metadataFrom = nullptr) {    // a JPEG written from a JPEG: the frame whose EXIF data goes along
     outEncoded.clear();
     if (!wic || !source) return false;
 
@@ -700,8 +951,9 @@ static bool EncodeWicSourceToMemory(
     }
 
     ComPtr<IWICBitmapEncoder> encoder;
-    if (FAILED(wic->CreateEncoder(containerFormat, nullptr, &encoder)) || !encoder) {
+    if (!PlatformEncodes(containerFormat) || FAILED(wic->CreateEncoder(containerFormat, nullptr, &encoder)) || !encoder) {
         // Fallback for formats without a built-in WIC encoder (e.g. WebP / RAW): encode as JPEG
+        encoder.Reset();
         containerFormat = GUID_ContainerFormatJpeg;
         if (FAILED(wic->CreateEncoder(containerFormat, nullptr, &encoder)) || !encoder) {
             return false;
@@ -732,6 +984,16 @@ static bool EncodeWicSourceToMemory(
     if (FAILED(frameEncode->Initialize(propBag.Get()))) {
         return false;
     }
+
+#ifdef _WIN32
+    if (metadataFrom && containerFormat == GUID_ContainerFormatJpeg) {
+        UINT newW = 0, newH = 0;
+        source->GetSize(&newW, &newH);
+        CarryPhotoMetadata(wic, metadataFrom, frameEncode.Get(), newW, newH);    // before the pixels, so that it has its room
+    }
+#else
+    (void)metadataFrom;     // the Linux build's encoders write the picture only
+#endif
 
     // Ensure pixel format compatibility with the target container (e.g. 32bpp RGBA PNG -> 24bpp BGR JPEG)
     ComPtr<IWICBitmapSource> writeSource = source;
@@ -865,6 +1127,7 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
 
     ComPtr<IWICStream> inStream;
     ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> srcFrame;     // stays empty for the formats our own readers decode
     if (!ImageFormatLoader::IsExtendedImageExtension(extCheck) &&
         SUCCEEDED(wic->CreateStream(&inStream)) &&
         SUCCEEDED(inStream->InitializeFromMemory(srcBytes.data(), readBytes)) &&
@@ -872,17 +1135,20 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
         decoder)
     {
         decoder->GetContainerFormat(&containerFormat);
-        ComPtr<IWICBitmapFrameDecode> frame;
-        if (FAILED(decoder->GetFrame(0, &frame)) || !frame ||
-            FAILED(frame->GetSize(&origW, &origH)) || origW == 0 || origH == 0) {
+        if (FAILED(decoder->GetFrame(0, &srcFrame)) || !srcFrame ||
+            FAILED(srcFrame->GetSize(&origW, &origH)) || origW == 0 || origH == 0) {
             outRes.errorMsg = L"Cannot decode image frame";
             return false;
         }
-        if (FAILED(wic->CreateBitmapFromSource(frame.Get(), WICBitmapCacheOnLoad, &cachedBitmap)) || !cachedBitmap) {
+        if (FAILED(wic->CreateBitmapFromSource(srcFrame.Get(), WICBitmapCacheOnLoad, &cachedBitmap)) || !cachedBitmap) {
             outRes.errorMsg = L"Out of memory caching bitmap";
             return false;
         }
     } else {
+        if (params.sameFormatOnly) {
+            outRes.errorMsg = L"This format cannot be written";
+            return false;
+        }
         ExtendedImageInfo extInfo;
         if (!ImageFormatLoader::DecodeImageMemory(srcBytes.data(), readBytes, extCheck, 0, extInfo) || !extInfo.valid) {
             outRes.errorMsg = L"Unsupported image format";
@@ -902,6 +1168,27 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
             return false;
         }
     }
+
+    // The picture as the viewer shows it. A photo that is stored turned (EXIF orientation; phones do that) is made
+    // upright first, so that "rotate right" and a crop rectangle mean what the user saw; the saved file then
+    // needs no turning. One pass over the pixels does the stored turn and the user's together.
+    const int storedTurn = ReadExifOrientation(srcFrame.Get());
+    int userTurn = ImageTurn::kNone;
+    switch (params.kind) {
+    case ImageTransformKind::RotateCW:  userTurn = ImageTurn::kRotateRight; break;
+    case ImageTransformKind::RotateCCW: userTurn = ImageTurn::kRotateLeft; break;
+    case ImageTransformKind::Rotate180: userTurn = ImageTurn::kRotate180; break;
+    case ImageTransformKind::FlipH:     userTurn = ImageTurn::kFlipHorizontal; break;
+    case ImageTransformKind::FlipV:     userTurn = ImageTurn::kFlipVertical; break;
+    default: break;
+    }
+    const bool isTurnKind = userTurn != ImageTurn::kNone;
+    const bool isCrop = params.kind == ImageTransformKind::Crop;
+    const int totalTurn = ImageTurn::Compose(storedTurn, userTurn);
+    const UINT storedW = origW, storedH = origH;
+    (void)storedW;
+    (void)storedH;
+    if (ImageTurn::SwapsSides(storedTurn)) std::swap(origW, origH);
     outRes.origW = origW;
     outRes.origH = origH;
 
@@ -933,7 +1220,98 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
     float finalQuality = params.jpegQuality;
     GUID actualContainer = targetContainer;
 
-    if (params.kind == ImageTransformKind::TargetFileSize) {
+    // A JPEG that is only turned keeps every pixel where Windows can move its compressed blocks around
+    bool turnedLossless = false;
+#ifdef _WIN32
+    if (isTurnKind && srcFrame && containerFormat == GUID_ContainerFormatJpeg && targetContainer == GUID_ContainerFormatJpeg) {
+        UINT turnedW = 0, turnedH = 0;
+        if (TurnJpegLossless(wic.Get(), srcBytes, readBytes, totalTurn, finalBytes, turnedW, turnedH)) {
+            finalW = turnedW;
+            finalH = turnedH;
+            finalQuality = 1.0f;
+            turnedLossless = true;
+            outRes.lossless = true;
+        } else {
+            finalBytes.clear();
+        }
+    }
+#else
+    if (isTurnKind && srcFrame && containerFormat == GUID_ContainerFormatJpeg && targetContainer == GUID_ContainerFormatJpeg) {
+        UINT turnedW = 0, turnedH = 0;
+        if (TurnJpegLosslessLinux(srcBytes, readBytes, totalTurn, storedW, storedH, finalBytes, turnedW, turnedH)) {
+            finalW = turnedW;
+            finalH = turnedH;
+            finalQuality = 1.0f;
+            turnedLossless = true;
+            outRes.lossless = true;
+        } else {
+            finalBytes.clear();
+        }
+    }
+#endif
+
+    // A picture that is no JPEG and is not stored turned (PNG, GIF, BMP, a TIFF without an orientation) is turned
+    // the way it always was: Windows' flip-rotator over the decoded frame, written back in the same format with
+    // the same pixel format
+    bool turnedSameFormat = false;
+    if (!turnedLossless && isTurnKind && srcFrame && storedTurn == ImageTurn::kNone &&
+        containerFormat != GUID_ContainerFormatJpeg && targetContainer == containerFormat) {
+        WICBitmapTransformOptions option = WICBitmapTransformRotate0;
+        switch (userTurn) {
+        case ImageTurn::kRotateRight:    option = WICBitmapTransformRotate90; break;
+        case ImageTurn::kRotateLeft:     option = WICBitmapTransformRotate270; break;
+        case ImageTurn::kRotate180:      option = WICBitmapTransformRotate180; break;
+        case ImageTurn::kFlipHorizontal: option = WICBitmapTransformFlipHorizontal; break;
+        case ImageTurn::kFlipVertical:   option = WICBitmapTransformFlipVertical; break;
+        default: break;
+        }
+        ComPtr<IWICBitmapFlipRotator> rotator;
+        UINT turnedW = 0, turnedH = 0;
+        if (SUCCEEDED(wic->CreateBitmapFlipRotator(&rotator)) && rotator &&
+            SUCCEEDED(rotator->Initialize(cachedBitmap.Get(), option)) && SUCCEEDED(rotator->GetSize(&turnedW, &turnedH)) &&
+            EncodeSameFormat(wic.Get(), rotator.Get(), containerFormat, finalBytes)) {
+            finalW = turnedW;
+            finalH = turnedH;
+            finalQuality = 1.0f;
+            turnedSameFormat = true;
+        } else {
+            finalBytes.clear();     // the way through the pixels below is tried instead
+        }
+    }
+
+    // Otherwise the turns and the crop are done on the pixels; what follows (scaling, encoding) gets the result
+    if (!turnedLossless && !turnedSameFormat && (storedTurn != ImageTurn::kNone || isTurnKind || isCrop)) {
+        uint32_t w = 0, h = 0;
+        std::vector<uint8_t> pixels;
+        if (!CopySourceToBgra(wic.Get(), cachedBitmap.Get(), w, h, pixels)) {
+            outRes.errorMsg = L"Out of memory turning the picture";
+            return false;
+        }
+        ImageTurn::TurnPixels(totalTurn, w, h, pixels);
+        if (isCrop) {
+            const uint32_t cropX = std::min(params.cropX, w - 1u);
+            const uint32_t cropY = std::min(params.cropY, h - 1u);
+            const uint32_t cropW = std::min(params.cropW, w - cropX);
+            const uint32_t cropH = std::min(params.cropH, h - cropY);
+            if (!ImageTurn::CropPixels(w, h, pixels, cropX, cropY, cropW, cropH)) {
+                outRes.errorMsg = L"The crop rectangle is empty";
+                return false;
+            }
+        }
+        ComPtr<IWICBitmap> turned;
+        if (FAILED(wic->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGRA, w * 4, static_cast<UINT>(pixels.size()),
+                                               pixels.data(), &turned)) || !turned) {
+            outRes.errorMsg = L"Out of memory turning the picture";
+            return false;
+        }
+        cachedBitmap = turned;
+        finalW = w;
+        finalH = h;
+    }
+
+    if (turnedLossless || turnedSameFormat) {
+        // nothing more to do to the picture
+    } else if (params.kind == ImageTransformKind::TargetFileSize) {
         uint64_t targetB = std::max<uint64_t>(2048, params.targetBytes);
         targetContainer = GUID_ContainerFormatJpeg;
         actualContainer = GUID_ContainerFormatJpeg;
@@ -1102,28 +1480,8 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
         // Geometric or format transform
         ComPtr<IWICBitmapSource> transformed = cachedBitmap;
 
-        if (params.kind == ImageTransformKind::RotateCW ||
-            params.kind == ImageTransformKind::RotateCCW ||
-            params.kind == ImageTransformKind::Rotate180 ||
-            params.kind == ImageTransformKind::FlipH ||
-            params.kind == ImageTransformKind::FlipV) {
-            WICBitmapTransformOptions opt = WICBitmapTransformRotate0;
-            if (params.kind == ImageTransformKind::RotateCW)       opt = WICBitmapTransformRotate90;
-            else if (params.kind == ImageTransformKind::RotateCCW) opt = WICBitmapTransformRotate270;
-            else if (params.kind == ImageTransformKind::Rotate180) opt = WICBitmapTransformRotate180;
-            else if (params.kind == ImageTransformKind::FlipH)     opt = WICBitmapTransformFlipHorizontal;
-            else if (params.kind == ImageTransformKind::FlipV)     opt = WICBitmapTransformFlipVertical;
-
-            ComPtr<IWICBitmapFlipRotator> rotator;
-            if (FAILED(wic->CreateBitmapFlipRotator(&rotator)) || FAILED(rotator->Initialize(cachedBitmap.Get(), opt))) {
-                outRes.errorMsg = L"Flip/Rotate initialization failed";
-                return false;
-            }
-            UINT rw = origW, rh = origH;
-            rotator->GetSize(&rw, &rh);
-            finalW = rw;
-            finalH = rh;
-            transformed = rotator;
+        if (isTurnKind || isCrop) {
+            // done above, on the pixels: finalW and finalH are the picture's new sides
         } else if (params.kind == ImageTransformKind::ScalePercent) {
             double s = std::clamp(params.scalePct, 1, 800) / 100.0;
             finalW = std::max(1u, static_cast<uint32_t>(std::lround(origW * s)));
@@ -1163,8 +1521,35 @@ bool ShellMenuEmulator::TransformImageFile(const std::wstring& imagePath, const 
             }
         }
 
-        if (!EncodeWicSourceToMemory(wic.Get(), transformed.Get(), targetContainer, params.jpegQuality, finalBytes, &actualContainer)) {
+        // A turn or a crop is not meant to change anything else about a photo. A JPEG that has to be compressed
+        // again is written at the quality it has (a little above it, so that the second compression costs less; 0.95
+        // when its bytes do not tell), and it keeps its EXIF data, colour profile and resolution.
+        const bool keepsPhotoData = (isTurnKind || isCrop) && srcFrame && containerFormat == GUID_ContainerFormatJpeg;
+        float quality = params.jpegQuality;
+        if (isTurnKind || isCrop) {
+            const int had = (containerFormat == GUID_ContainerFormatJpeg) ? EstimateJpegQuality(srcBytes.data(), readBytes) : 0;
+            quality = (had > 0) ? std::clamp(static_cast<float>(had + 2) / 100.0f, 0.80f, 0.97f) : 0.95f;
+        }
+        bool encoded = EncodeWicSourceToMemory(wic.Get(), transformed.Get(), targetContainer, quality, finalBytes, &actualContainer,
+                                               keepsPhotoData ? srcFrame.Get() : nullptr);
+        // A photo whose metadata the encoder will not take back is saved without it rather than not at all
+        if (!encoded && keepsPhotoData) {
+            encoded = EncodeWicSourceToMemory(wic.Get(), transformed.Get(), targetContainer, quality, finalBytes, &actualContainer);
+        }
+        if (!encoded) {
             outRes.errorMsg = L"Failed encoding output image";
+            return false;
+        }
+#ifndef _WIN32
+        // The Linux build's JPEG encoder writes the picture only: the photo's EXIF block (corrected for the upright,
+        // possibly smaller picture) and its colour profile are put back from the source file
+        if (keepsPhotoData && actualContainer == GUID_ContainerFormatJpeg) {
+            JpegSegments::CarryPhotoSegments(srcBytes.data(), readBytes, finalBytes, finalW, finalH);
+        }
+#endif
+        finalQuality = quality;
+        if (params.sameFormatOnly && actualContainer != containerFormat) {
+            outRes.errorMsg = L"This format cannot be written";
             return false;
         }
         if (actualContainer == GUID_ContainerFormatJpeg && targetContainer != GUID_ContainerFormatJpeg) {

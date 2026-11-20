@@ -66,4 +66,17 @@ inline std::vector<float> FitRibbonTabWidths(const std::vector<float>& natural, 
     return w;
 }
 
+// ---- Which tabs the strip shows --------------------------------------------------------------------------------
+// The user can switch tabs off ("Ustawienia" tab, "Karty wstążki"): hiddenMask has bit t set for the tab whose
+// RibbonTab value is t, alwaysShown names the ones that cannot be switched off. A hidden tab is still drawn while
+// it is the one in use - a shortcut or a command can open it, and the ribbon body under the strip then needs its
+// caption - and while it is busy (the transfers tab during a copy shows the progress).
+inline bool RibbonTabShown(unsigned hiddenMask, unsigned alwaysShown, int tab, int activeTab, bool busy = false) {
+    if (tab < 0 || tab >= 32) return true;
+    const unsigned bit = 1u << tab;
+    if (alwaysShown & bit) return true;
+    if (tab == activeTab || busy) return true;
+    return (hiddenMask & bit) == 0;
+}
+
 } // namespace Explorer2

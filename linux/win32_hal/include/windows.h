@@ -739,6 +739,9 @@ using LPCMENUITEMINFOW = const MENUITEMINFOW*;
 #define CF_BITMAP 2
 #define CF_UNICODETEXT 13
 #define CF_HDROP 15
+#ifndef WM_CLIPBOARDUPDATE
+#define WM_CLIPBOARDUPDATE 0x031D
+#endif
 
 // ---- GDI Structs & Constants ----------------------------------------------------------------------------------
 #define BI_RGB 0u
@@ -1388,6 +1391,13 @@ HANDLE GetClipboardData(UINT uFormat);
 HANDLE SetClipboardData(UINT uFormat, HANDLE hMem);
 BOOL IsClipboardFormatAvailable(UINT format);
 UINT RegisterClipboardFormatW(LPCWSTR lpszFormat);
+int GetClipboardFormatNameW(UINT format, LPWSTR lpszFormatName, int cchMaxCount);
+// Clipboard change notices: WM_CLIPBOARDUPDATE goes to the listeners when another program (or this one) puts
+// something on the clipboard. X11 has no such notice without the XFixes extension: the owner of CLIPBOARD and its
+// TIMESTAMP are looked at about once a second.
+BOOL AddClipboardFormatListener(HWND hwnd);
+BOOL RemoveClipboardFormatListener(HWND hwnd);
+DWORD GetClipboardSequenceNumber();
 
 struct ICONINFO {
     BOOL fIcon;

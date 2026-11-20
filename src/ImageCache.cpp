@@ -1,6 +1,7 @@
 #include "ImageCache.h"
 #include "ThreadUtils.h"
 #include "ImageFormatLoader.h"
+#include "ImageOrientation.h"
 #include "ArchiveExplorer.h"
 #include "FtpClient.h"
 #include "RepoBrowser.h"
@@ -291,6 +292,14 @@ bool ImageCache::DecodeImageFromDiskZeroLock(
         outBuf.bgraPixels.clear();
         outBuf.failed = true;
         return false;
+    }
+
+    // A photo that is stored turned (EXIF orientation: phones store what the sensor saw and note how the phone was
+    // held) is shown upright, as Windows and the phone itself show it. The sizes reported are the upright ones.
+    const int storedTurn = ShellMenuEmulator::ReadExifOrientation(frame.Get());
+    if (storedTurn != ImageTurn::kNone) {
+        ImageTurn::TurnPixels(storedTurn, outBuf.width, outBuf.height, outBuf.bgraPixels);
+        if (ImageTurn::SwapsSides(storedTurn)) std::swap(outBuf.origWidth, outBuf.origHeight);
     }
 
     return true;

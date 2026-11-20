@@ -77,7 +77,7 @@ public:
 
     // Navigation tree builder (Quick Access + Drives) & dynamic subfolder expansion
     static std::vector<std::pair<std::wstring, std::wstring>> GetDefaultQuickAccessFolders(Lang lang);
-    // Sections of the tree that the user can switch off (File tab, "Ustawienia"); the drives are always shown
+    // Sections of the tree that the user can switch off ("Ustawienia" tab); the drives are always shown
     enum NavSection : unsigned {
         kNavQuickAccess  = 1u << 0,
         kNavCloudFolders = 1u << 1,     // Dropbox, OneDrive

@@ -98,6 +98,7 @@ namespace Explorer2 {
 #include "formats/3d/WorldOfWarcraftM2.h"
 #include "formats/3d/WorldOfWarcraftWmo.h"
 #include "formats/3d/RenderWareDff.h"
+#include "formats/3d/GtaCol.h"
 #include "formats/3d/Quake3Md4.h"
 #include "formats/3d/RtcwMds.h"
 #include "formats/3d/WolfEtMdm.h"
@@ -200,7 +201,8 @@ bool Is3DModelExtension(const std::wstring& extLower) {
            extLower == L".spz"   || extLower == L".vdb"     || extLower == L".bsp"     ||
            extLower == L".shp"   || extLower == L".geojson" || extLower == L".geotiff" ||
            extLower == L".ldr"   || extLower == L".mpd"     || extLower == L".vmf"     ||
-           extLower == L".map"   || extLower == L".c3d"     || extLower == L".nrrd";
+           extLower == L".map"   || extLower == L".c3d"     || extLower == L".nrrd"    ||
+           extLower == L".col";
 }
 
 bool IsLikelyQuakeMapFile(const std::wstring& fullPath) {
@@ -426,6 +428,8 @@ try {
         else if (ext == L".wmo") parsedMod = Formats::ParseWowWmo(buf.data(), buf.size(), fullPath, mesh);
         else if (ext == L".dff" || ext == L".rws")
             parsedMod = Formats::ParseRenderWareDffOrRws(buf.data(), buf.size(), ext, mesh);
+        else if (ext == L".col")
+            parsedMod = Formats::ParseGtaCol(buf.data(), buf.size(), mesh);
         else if (ext == L".md4" || ext == L".mdr")
             parsedMod = Formats::ParseIdTech3Md4(buf.data(), buf.size(), mesh);
         else if (ext == L".mds")

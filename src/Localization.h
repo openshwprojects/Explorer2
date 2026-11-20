@@ -349,4 +349,14 @@ inline const Strings& GetStrings(Lang lang) {
     return (lang == Lang::PL) ? kStringsPL : kStringsEN;
 }
 
+// Whether a system's name for its language means Polish: "pl", "pl_PL", "pl_PL.UTF-8", "pl-PL" (what LANG and
+// LC_ALL hold on Linux). Decides the language of a first start there; a name that only begins with these two
+// letters ("plt_MG", Malagasy) is something else.
+inline bool IsPolishLocaleName(const char* name) {
+    if (!name) return false;
+    if ((name[0] != 'p' && name[0] != 'P') || (name[1] != 'l' && name[1] != 'L')) return false;
+    const char next = name[2];
+    return next == '\0' || next == '_' || next == '-' || next == '.' || next == '@';
+}
+
 } // namespace Explorer2

@@ -3219,6 +3219,24 @@ __attribute__((weak)) UINT RegisterClipboardFormatW(LPCWSTR lpszFormat) {
     g_clipFormats[lpszFormat] = id;
     return id;
 }
+// The name a format was registered under (a MIME type such as "image/png" is also the X11 target of that name)
+int GetClipboardFormatNameW(UINT format, LPWSTR lpszFormatName, int cchMaxCount) {
+    if (!lpszFormatName || cchMaxCount <= 0) return 0;
+    std::lock_guard<std::mutex> lk(g_clipMutex);
+    for (const auto& [name, id] : g_clipFormats) {
+        if (id != format) continue;
+        const int n = static_cast<int>(std::min<size_t>(name.size(), static_cast<size_t>(cchMaxCount - 1)));
+        std::wmemcpy(lpszFormatName, name.c_str(), static_cast<size_t>(n));
+        lpszFormatName[n] = L'\0';
+        return n;
+    }
+    lpszFormatName[0] = L'\0';
+    return 0;
+}
+// Without the X11 layer (the command-line programs) nothing announces clipboard changes
+__attribute__((weak)) BOOL AddClipboardFormatListener(HWND) { return TRUE; }
+__attribute__((weak)) BOOL RemoveClipboardFormatListener(HWND) { return TRUE; }
+__attribute__((weak)) DWORD GetClipboardSequenceNumber() { return 0; }
 
 // GDI DIBSection & Objects
 namespace {
