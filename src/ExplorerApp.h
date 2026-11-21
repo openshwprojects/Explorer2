@@ -704,8 +704,10 @@ private:
     LanScanner m_lan;
     std::vector<LanAdapterInfo> m_lanAdapters;
     int m_lanAdapterIdx = 0;
-    bool m_lanInit = false;
+    bool m_lanInit = false;            // the adapters were listed (first visit of the tab; that starts no scan)
+    bool m_lanScanStarted = false;     // the user started a host scan ("Skanuj sieć"): the button then says "ponownie"
     std::wstring m_lanSelectedIp;
+    void StartLanScan();               // the chosen adapter's network, only on the user's click (CMD_LAN_SCAN / _ADAPTER)
 
     // Version-control dock state (the git / svn CLI work happens on GitIntegration's worker thread)
     enum GitHitKind { GH_Tab = 1, GH_Refresh, GH_Fetch, GH_Pull, GH_Push, GH_DiffStat, GH_File, GH_Commit,

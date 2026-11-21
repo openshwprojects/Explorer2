@@ -24,6 +24,7 @@
 #include <cfgmgr32.h>
 
 #include "HardwareInfo.h"
+#include "AppLog.h"
 #include "FileEngine.h"
 #include "LinuxStorage.h"
 #include "PathUtils.h"
@@ -211,6 +212,86 @@ bool QueryNvmeHealthLog(HANDLE h, uint8_t* out512) {
     std::memcpy(out512, reinterpret_cast<const uint8_t*>(rpsd) + rpsd->ProtocolDataOffset, kLen);
     return true;
 }
+
+#ifdef _WIN32
+// What \\.\PhysicalDrive<index> tells through a handle without access rights (no elevation, nothing sent to the
+// disk itself): vendor, model, firmware, serial and bus from its descriptor, TRIM, seek penalty and size, and with
+// withTemperature the temperature its driver reports. False for a drive that does not exist or tells nothing. The
+// fast list of disk names (the window's thread) and the full inventory (the worker) both read the disks with this.
+static bool ReadPhysicalDisk(int index, bool withTemperature, HwPhysicalDisk& pd) {
+    HANDLE hDisk = OpenPhysicalDrive(index, 0);
+    if (hDisk == INVALID_HANDLE_VALUE) return false;
+    pd = HwPhysicalDisk();
+    pd.index = index;
+    pd.tempHistory.assign(60, 0.0f);
+
+    STORAGE_PROPERTY_QUERY spq = {};
+    spq.PropertyId = StorageDeviceProperty;
+    spq.QueryType  = PropertyStandardQuery;
+    uint8_t propBuf[1024] = {};
+    DWORD bytesRet = 0;
+    if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &spq, sizeof(spq), propBuf, sizeof(propBuf), &bytesRet, nullptr)) {
+        const auto* desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(propBuf);
+        auto text = [&](DWORD offset) {
+            return (offset && offset < sizeof(propBuf)) ? Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + offset)) : std::wstring();
+        };
+        pd.vendor = text(desc->VendorIdOffset);
+        pd.model = text(desc->ProductIdOffset);
+        pd.firmwareRev = text(desc->ProductRevisionOffset);
+        pd.serialNumber = text(desc->SerialNumberOffset);
+        pd.supportsCommandQueueing = (desc->CommandQueueing != FALSE);
+        switch (desc->BusType) {
+        case BusTypeNvme:   pd.busType = L"NVMe PCIe"; pd.mediaType = L"NVMe SSD"; pd.isNvme = true; break;
+        case BusTypeSata:   pd.busType = L"SATA";      pd.mediaType = L"SATA SSD / HDD"; break;
+        case BusTypeUsb:    pd.busType = L"USB";       pd.mediaType = L"USB Flash / External"; break;
+        case BusTypeRAID:   pd.busType = L"RAID";      pd.mediaType = L"RAID Array"; break;
+        case BusTypeSas:    pd.busType = L"SAS";       pd.mediaType = L"Enterprise SAS"; break;
+        case BusTypeSpaces: pd.busType = L"Spaces";    pd.mediaType = L"Storage Pool"; break;
+        default:            pd.busType = L"Storage";   pd.mediaType = L"Disk Drive"; break;
+        }
+    }
+
+    // TRIM: a SATA drive with it is an SSD
+    STORAGE_PROPERTY_QUERY trimQ = {};
+    trimQ.PropertyId = StorageDeviceTrimProperty;
+    trimQ.QueryType  = PropertyStandardQuery;
+    DEVICE_TRIM_DESCRIPTOR trimDesc = {};
+    if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &trimQ, sizeof(trimQ), &trimDesc, sizeof(trimDesc), &bytesRet, nullptr)) {
+        pd.supportsTrim = (trimDesc.TrimEnabled != FALSE);
+        if (pd.busType == L"SATA") pd.mediaType = pd.supportsTrim ? L"SATA SSD" : L"SATA HDD / Drive";
+    }
+
+    // Seek penalty: spinning disks
+    STORAGE_PROPERTY_QUERY seekQ = {};
+    seekQ.PropertyId = StorageDeviceSeekPenaltyProperty;
+    seekQ.QueryType  = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR seekDesc = {};
+    if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &seekQ, sizeof(seekQ), &seekDesc, sizeof(seekDesc), &bytesRet, nullptr)) {
+        pd.isRotational = (seekDesc.IncursSeekPenalty != FALSE);
+    }
+
+    DISK_GEOMETRY_EX geom = {};
+    if (DeviceIoControl(hDisk, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, nullptr, 0, &geom, sizeof(geom), &bytesRet, nullptr)) {
+        pd.capacityBytes = static_cast<uint64_t>(geom.DiskSize.QuadPart);
+        pd.bytesPerSector = geom.Geometry.BytesPerSector;
+    }
+
+    if (withTemperature) {
+        int tNow = -1, tWarn = -1, tCrit = -1;
+        if (QueryStorageTemperature(hDisk, tNow, tWarn, tCrit)) {
+            pd.tempC = tNow;
+            pd.tempPeakC = tNow;
+            pd.tempWarnC = tWarn;
+            pd.tempCritC = tCrit;
+        }
+    }
+    CloseHandle(hDisk);
+
+    if (pd.model.empty() && pd.capacityBytes == 0) return false;
+    if (pd.model.empty()) pd.model = L"Physical Drive #" + std::to_wstring(index);
+    return true;
+}
+#endif
 
 // Legacy ATA SMART IOCTLs (SMART_RCV_DRIVE_DATA). The handle must be opened GENERIC_READ|GENERIC_WRITE,
 // which in practice requires an elevated process.
@@ -1177,8 +1258,17 @@ void HardwareInspector::WaitForAsync() {
     });
 }
 
+// The steps that talk to drivers and devices are logged, and the log put on the disk, before they start. A user saw
+// the whole machine freeze while clicking through the tabs and found nothing in the log; should a step here ever do
+// that, the log of that run ends with it. The live readings (every 450 ms) are logged only the first time.
+static void LogHardwareStep(const std::wstring& step) {
+    AppLog::Info(L"Hardware", step);
+    AppLog::Flush();
+}
+
 void HardwareInspector::WorkerLoop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool sensorsLogged = false;
 
     while (!m_stopWorker.load(std::memory_order_acquire)) {
         {
@@ -1205,6 +1295,7 @@ void HardwareInspector::WorkerLoop() {
         // 1. One-time NVML initialization on background thread (never blocks UI!)
         if (!m_nvmlTried) {
             m_nvmlTried = true;
+            LogHardwareStep(L"Loading the NVIDIA management library (nvml.dll), if there is one");
             m_hNvml = LoadLibraryW(L"nvml.dll");
             if (!m_hNvml) {
                 wchar_t sysDir[MAX_PATH] = {};
@@ -1224,17 +1315,25 @@ void HardwareInspector::WorkerLoop() {
 
         // 2. Full hardware & OS/Audio/Network/USB/COM inventory
         if (doFull) {
+            const ULONGLONG fullStart = GetTickCount64();
+            LogHardwareStep(L"Inventory: graphics cards and displays");
             QueryGpusAndDisplays();
             if (m_stopWorker.load(std::memory_order_acquire)) break;
+            LogHardwareStep(L"Inventory: disks and volumes");
             QueryPhysicalDisksAndVolumes();
             if (m_stopWorker.load(std::memory_order_acquire)) break;
+            LogHardwareStep(L"Inventory: network adapters");
             QueryNetworkAdapters(false);
             if (m_stopWorker.load(std::memory_order_acquire)) break;
+            LogHardwareStep(L"Inventory: system, sound devices and processes");
             QuerySystemAndAudio(true);
             if (m_stopWorker.load(std::memory_order_acquire)) break;
+            LogHardwareStep(L"Inventory: USB devices and COM ports");
             QueryUsbAndComPorts();
             if (m_stopWorker.load(std::memory_order_acquire)) break;
+            LogHardwareStep(L"Inventory: graphics card sensors");
             UpdateGpuLiveTelemetry();
+            AppLog::Info(L"Hardware", L"Inventory read in " + std::to_wstring(GetTickCount64() - fullStart) + L" ms");
             // Publish immediately so GPUs, Displays, Networks, USB/COM, Audio & Processes appear before SMART IOCTLs run
             PublishWorkerStateToStaged();
         } else if (doUsbCom) {
@@ -1243,13 +1342,23 @@ void HardwareInspector::WorkerLoop() {
         }
 
         // 3. SMART disk attributes (can take 50-500ms on SATA/USB drives; runs purely in background)
+        auto logSmart = [this](int physIndex) {
+            for (const auto& d : m_wState.physDisks) {
+                if (d.index == physIndex) {
+                    LogHardwareStep(L"SMART: disk " + std::to_wstring(physIndex) + L" (" + d.model + L", " + d.busType + L")");
+                    return;
+                }
+            }
+        };
         if (doAllSm) {
             for (size_t i = 0; i < m_wState.physDisks.size(); ++i) {
                 if (m_stopWorker.load(std::memory_order_acquire)) break;
+                logSmart(m_wState.physDisks[i].index);
                 RefreshDiskSmartOnVector(m_wState.physDisks, m_wState.physDisks[i].index);
             }
             PublishWorkerStateToStaged();
         } else if (singleSm >= 0) {
+            logSmart(singleSm);
             RefreshDiskSmartOnVector(m_wState.physDisks, singleSm);
             PublishWorkerStateToStaged();
         }
@@ -1265,6 +1374,10 @@ void HardwareInspector::WorkerLoop() {
             ULONGLONG nowTick = GetTickCount64();
             if (doFull || m_lastDiskTempTick == 0 || nowTick - m_lastDiskTempTick >= 3000) {
                 m_lastDiskTempTick = nowTick;
+                if (!sensorsLogged) {
+                    sensorsLogged = true;
+                    LogHardwareStep(L"Sensors: disk temperatures and ACPI thermal zones (from now on every 3 s, not logged)");
+                }
                 if (!m_stopWorker.load(std::memory_order_acquire)) UpdateDiskTemperatures();
                 if (!m_stopWorker.load(std::memory_order_acquire)) UpdateAcpiThermalZones();
             }
@@ -1299,6 +1412,7 @@ void HardwareInspector::InitializeStaticInventory(bool syncForCli) {
     m_initialized = true;
 
     // 1. Run ONLY microsecond (< 0.4 ms total) in-memory / CPUID / cached-kernel queries on the calling thread:
+    LogHardwareStep(L"Inventory: processor, board (SMBIOS), memory and disk names");
     QueryCpuStatic();
     QueryMotherboardAndSmbios();
     QueryFastSystemAndRam(true);
@@ -1322,74 +1436,8 @@ void HardwareInspector::EnsureDiskModelsLoaded() {
     return;
 #else
     for (int d = 0; d < 16; ++d) {
-        std::wstring devPath = L"\\\\.\\PhysicalDrive" + std::to_wstring(d);
-        HANDLE hDisk = CreateFileW(devPath.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hDisk == INVALID_HANDLE_VALUE) continue;
-
         HwPhysicalDisk pd;
-        pd.index = d;
-        pd.tempHistory.assign(60, 0.0f);
-
-        STORAGE_PROPERTY_QUERY query = {};
-        query.PropertyId = StorageDeviceProperty;
-        query.QueryType  = PropertyStandardQuery;
-        BYTE propBuf[1024] = {};
-        DWORD bytesRet = 0;
-        if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), propBuf, sizeof(propBuf), &bytesRet, nullptr)) {
-            auto* desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(propBuf);
-            if (desc->VendorIdOffset && desc->VendorIdOffset < sizeof(propBuf)) {
-                pd.vendor = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->VendorIdOffset));
-            }
-            if (desc->ProductIdOffset && desc->ProductIdOffset < sizeof(propBuf)) {
-                pd.model = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->ProductIdOffset));
-            }
-            if (desc->ProductRevisionOffset && desc->ProductRevisionOffset < sizeof(propBuf)) {
-                pd.firmwareRev = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->ProductRevisionOffset));
-            }
-            if (desc->SerialNumberOffset && desc->SerialNumberOffset < sizeof(propBuf)) {
-                pd.serialNumber = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->SerialNumberOffset));
-            }
-            pd.supportsCommandQueueing = (desc->CommandQueueing != FALSE);
-            switch (desc->BusType) {
-            case BusTypeNvme:   pd.busType = L"NVMe PCIe"; pd.mediaType = L"NVMe SSD"; pd.isNvme = true; break;
-            case BusTypeSata:   pd.busType = L"SATA";      pd.mediaType = L"SATA SSD / HDD"; break;
-            case BusTypeUsb:    pd.busType = L"USB";       pd.mediaType = L"USB Flash / External"; break;
-            case BusTypeRAID:   pd.busType = L"RAID";      pd.mediaType = L"RAID Array"; break;
-            case BusTypeSas:    pd.busType = L"SAS";       pd.mediaType = L"Enterprise SAS"; break;
-            case BusTypeSpaces: pd.busType = L"Spaces";    pd.mediaType = L"Storage Pool"; break;
-            default:            pd.busType = L"Storage";   pd.mediaType = L"Disk Drive"; break;
-            }
-        }
-
-        STORAGE_PROPERTY_QUERY trimQ = {};
-        trimQ.PropertyId = StorageDeviceTrimProperty;
-        trimQ.QueryType  = PropertyStandardQuery;
-        DEVICE_TRIM_DESCRIPTOR trimDesc = {};
-        if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &trimQ, sizeof(trimQ), &trimDesc, sizeof(trimDesc), &bytesRet, nullptr)) {
-            pd.supportsTrim = (trimDesc.TrimEnabled != FALSE);
-            if (pd.supportsTrim && pd.busType == L"SATA") pd.mediaType = L"SATA SSD";
-            else if (!pd.supportsTrim && pd.busType == L"SATA") pd.mediaType = L"SATA HDD / Drive";
-        }
-
-        STORAGE_PROPERTY_QUERY seekQ = {};
-        seekQ.PropertyId = StorageDeviceSeekPenaltyProperty;
-        seekQ.QueryType  = PropertyStandardQuery;
-        DEVICE_SEEK_PENALTY_DESCRIPTOR seekDesc = {};
-        if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &seekQ, sizeof(seekQ), &seekDesc, sizeof(seekDesc), &bytesRet, nullptr)) {
-            pd.isRotational = (seekDesc.IncursSeekPenalty != FALSE);
-        }
-
-        DISK_GEOMETRY_EX geom = {};
-        if (DeviceIoControl(hDisk, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, nullptr, 0, &geom, sizeof(geom), &bytesRet, nullptr)) {
-            pd.capacityBytes = static_cast<uint64_t>(geom.DiskSize.QuadPart);
-            pd.bytesPerSector = geom.Geometry.BytesPerSector;
-        }
-
-        CloseHandle(hDisk);
-        if (!pd.model.empty() || pd.capacityBytes > 0) {
-            if (pd.model.empty()) pd.model = L"Physical Drive #" + std::to_wstring(d);
-            m_physDisks.push_back(pd);
-        }
+        if (ReadPhysicalDisk(d, false, pd)) m_physDisks.push_back(std::move(pd));
     }
 #endif
 }
@@ -2071,88 +2119,11 @@ void HardwareInspector::QueryPhysicalDisksAndVolumes() {
     m_wState.volumes = DiscoverLinuxVolumes(true);   // the worker: network and FUSE sizes, each with a time limit
     return;
 #else
-    // 1. Query Physical Drives (\\.\PhysicalDrive0..15) via zero-access handle + IOCTL_STORAGE_QUERY_PROPERTY
+    // 1. Physical drives (\\.\PhysicalDrive0..15), with their first temperature; what the last pass learned about a
+    // drive (temperature history, SMART) stays with it
     for (int d = 0; d < 16; ++d) {
-        HANDLE hDisk = OpenPhysicalDrive(d, 0);
-        if (hDisk == INVALID_HANDLE_VALUE) continue;
-
         HwPhysicalDisk pd;
-        pd.index = d;
-        pd.tempHistory.assign(60, 0.0f);
-
-        STORAGE_PROPERTY_QUERY spq = {};
-        spq.PropertyId = StorageDeviceProperty;
-        spq.QueryType  = PropertyStandardQuery;
-        uint8_t propBuf[1024] = {};
-        DWORD bytesRet = 0;
-        if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &spq, sizeof(spq), propBuf, sizeof(propBuf), &bytesRet, nullptr)) {
-            auto desc = reinterpret_cast<STORAGE_DEVICE_DESCRIPTOR*>(propBuf);
-            if (desc->VendorIdOffset && desc->VendorIdOffset < sizeof(propBuf)) {
-                pd.vendor = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->VendorIdOffset));
-            }
-            if (desc->ProductIdOffset && desc->ProductIdOffset < sizeof(propBuf)) {
-                pd.model = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->ProductIdOffset));
-            }
-            if (desc->ProductRevisionOffset && desc->ProductRevisionOffset < sizeof(propBuf)) {
-                pd.firmwareRev = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->ProductRevisionOffset));
-            }
-            if (desc->SerialNumberOffset && desc->SerialNumberOffset < sizeof(propBuf)) {
-                pd.serialNumber = Utf8OrAsciiToWide(reinterpret_cast<const char*>(propBuf + desc->SerialNumberOffset));
-            }
-            pd.supportsCommandQueueing = (desc->CommandQueueing != FALSE);
-
-            switch (desc->BusType) {
-            case BusTypeNvme:   pd.busType = L"NVMe PCIe"; pd.mediaType = L"NVMe SSD"; pd.isNvme = true; break;
-            case BusTypeSata:   pd.busType = L"SATA";      pd.mediaType = L"SATA SSD / HDD"; break;
-            case BusTypeUsb:    pd.busType = L"USB";       pd.mediaType = L"USB Flash / External"; break;
-            case BusTypeRAID:   pd.busType = L"RAID";      pd.mediaType = L"RAID Array"; break;
-            case BusTypeSas:    pd.busType = L"SAS";       pd.mediaType = L"Enterprise SAS"; break;
-            case BusTypeSpaces: pd.busType = L"Spaces";    pd.mediaType = L"Storage Pool"; break;
-            default:            pd.busType = L"Storage";   pd.mediaType = L"Disk Drive"; break;
-            }
-        }
-
-        // Check TRIM support (if TRIM is enabled or BusType is NVMe, it's definitely an SSD)
-        STORAGE_PROPERTY_QUERY trimQ = {};
-        trimQ.PropertyId = StorageDeviceTrimProperty;
-        trimQ.QueryType  = PropertyStandardQuery;
-        DEVICE_TRIM_DESCRIPTOR trimDesc = {};
-        if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &trimQ, sizeof(trimQ), &trimDesc, sizeof(trimDesc), &bytesRet, nullptr)) {
-            pd.supportsTrim = (trimDesc.TrimEnabled != FALSE);
-            if (pd.supportsTrim && pd.busType == L"SATA") {
-                pd.mediaType = L"SATA SSD";
-            } else if (!pd.supportsTrim && pd.busType == L"SATA") {
-                pd.mediaType = L"SATA HDD / Drive";
-            }
-        }
-
-        // Rotational media detection (seek penalty => spinning HDD)
-        STORAGE_PROPERTY_QUERY seekQ = {};
-        seekQ.PropertyId = StorageDeviceSeekPenaltyProperty;
-        seekQ.QueryType  = PropertyStandardQuery;
-        DEVICE_SEEK_PENALTY_DESCRIPTOR seekDesc = {};
-        if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &seekQ, sizeof(seekQ), &seekDesc, sizeof(seekDesc), &bytesRet, nullptr)) {
-            pd.isRotational = (seekDesc.IncursSeekPenalty != FALSE);
-        }
-
-        DISK_GEOMETRY_EX geom = {};
-        if (DeviceIoControl(hDisk, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, nullptr, 0, &geom, sizeof(geom), &bytesRet, nullptr)) {
-            pd.capacityBytes = static_cast<uint64_t>(geom.DiskSize.QuadPart);
-            pd.bytesPerSector = geom.Geometry.BytesPerSector;
-        }
-
-        // Initial temperature reading (no elevation needed where the driver supports it)
-        int tNow = -1, tWarn = -1, tCrit = -1;
-        if (QueryStorageTemperature(hDisk, tNow, tWarn, tCrit)) {
-            pd.tempC = tNow;
-            pd.tempPeakC = tNow;
-            pd.tempWarnC = tWarn;
-            pd.tempCritC = tCrit;
-        }
-
-        CloseHandle(hDisk);
-        if (!pd.model.empty() || pd.capacityBytes > 0) {
-            if (pd.model.empty()) pd.model = L"Physical Drive #" + std::to_wstring(d);
+        if (ReadPhysicalDisk(d, true, pd)) {
             for (const auto& old : previousDisks) {
                 if (old.index == pd.index && old.model == pd.model) {
                     pd.tempHistory = old.tempHistory;
@@ -2374,20 +2345,9 @@ void HardwareInspector::RefreshDiskSmartOnVector(std::vector<HwPhysicalDisk>& di
             pd->smartState = (GetLastError() == ERROR_ACCESS_DENIED) ? HwSmartState::NeedsAdmin : HwSmartState::Unsupported;
             return;
         }
-        // Make sure SMART is enabled (harmless if it already is)
-        {
-            SENDCMDINPARAMS en = {};
-            en.cBufferSize = 0;
-            en.bDriveNumber = static_cast<BYTE>(physIndex);
-            en.irDriveRegs.bFeaturesReg  = 0xD8;
-            en.irDriveRegs.bCylLowReg    = 0x4F;
-            en.irDriveRegs.bCylHighReg   = 0xC2;
-            en.irDriveRegs.bDriveHeadReg = static_cast<BYTE>(0xA0 | ((physIndex & 1) << 4));
-            en.irDriveRegs.bCommandReg   = 0xB0;
-            SENDCMDOUTPARAMS eo = {};
-            DWORD r = 0;
-            DeviceIoControl(h, SMART_SEND_DRIVE_COMMAND, &en, sizeof(SENDCMDINPARAMS) - 1, &eo, sizeof(eo), &r, nullptr);
-        }
+        // Only read. A "SMART ENABLE OPERATIONS" command used to go to every SATA drive first, each time the tab opened
+        // and every hour from the recorder: it changes a setting of the drive, which looking at it never should. A
+        // drive with SMART switched off now shows as unsupported.
         uint8_t attrBuf[512] = {};
         uint8_t thrBuf[512] = {};
         bool okA = AtaSmartRead(h, physIndex, 0xD0, attrBuf);

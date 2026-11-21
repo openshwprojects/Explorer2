@@ -1,4 +1,5 @@
 #include "EdaViewer.h"
+#include "EdaTrackDraw.h"
 #include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
@@ -21,6 +22,18 @@ namespace {
 
 static D2D1_COLOR_F EdaColor(uint32_t rgb, float a = 1.0f) {
     return PathUtils::ColorFromRgb(rgb, a);
+}
+
+// One opaque colour for `rgb` seen through with `alpha` over the board: tracks are drawn with round ends that
+// overlap at every joint (EdaTrackDraw.h), where a see-through colour would come out darker
+static D2D1_COLOR_F EdaColorOverBoard(uint32_t rgb, float alpha) {
+    constexpr uint32_t kBoard = 0x0E261E;       // the board's fill (0x0F291E at 85 %) as it shows over the canvas
+    uint32_t out = 0;
+    for (int shift : { 16, 8, 0 }) {
+        const float c = static_cast<float>((rgb >> shift) & 0xFF) * alpha + static_cast<float>((kBoard >> shift) & 0xFF) * (1.0f - alpha);
+        out |= static_cast<uint32_t>(std::lround(c)) << shift;
+    }
+    return EdaColor(out);
 }
 
 struct Vec3 {
@@ -157,14 +170,13 @@ void EdaViewer::Draw2DCanvas(
         rt->DrawRectangle(brdR, brush, 1.4f);
     }
 
+    // Tracks and silk lines have round ends, as in KiCad, in opaque colours (EdaTrackDraw.h)
     // 1. Bottom Copper traces
     if (m_showBotCu) {
-        brush->SetColor(EdaColor(0x3B82F6, 0.85f));
+        brush->SetColor(EdaColorOverBoard(0x3B82F6, 0.85f));
         for (const auto& t : board.traces) {
             if (t.layer != EdaLayerId::BottomCopper) continue;
-            D2D1_POINT_2F p1 = toScreen(t.x1, t.y1);
-            D2D1_POINT_2F p2 = toScreen(t.x2, t.y2);
-            rt->DrawLine(p1, p2, brush, std::max(1.2f, t.width * scale));
+            DrawTrack(rt, brush, toScreen(t.x1, t.y1), toScreen(t.x2, t.y2), std::max(1.2f, t.width * scale));
         }
     }
 
@@ -175,12 +187,9 @@ void EdaViewer::Draw2DCanvas(
             if (t.layer == EdaLayerId::EdgeCuts) brush->SetColor(EdaColor(0xFACC15));
             else if (t.layer == EdaLayerId::SchWire) brush->SetColor(EdaColor(0x15803D));
             else if (t.layer == EdaLayerId::SchSymbol) brush->SetColor(EdaColor(0x991B1B));
-            else if (t.layer == EdaLayerId::InnerCopper) brush->SetColor(EdaColor(0xA855F7, 0.8f));
-            else brush->SetColor(EdaColor(0xEF4444, 0.9f));
-
-            D2D1_POINT_2F p1 = toScreen(t.x1, t.y1);
-            D2D1_POINT_2F p2 = toScreen(t.x2, t.y2);
-            rt->DrawLine(p1, p2, brush, std::max(1.2f, t.width * scale));
+            else if (t.layer == EdaLayerId::InnerCopper) brush->SetColor(EdaColorOverBoard(0xA855F7, 0.8f));
+            else brush->SetColor(EdaColorOverBoard(0xEF4444, 0.9f));
+            DrawTrack(rt, brush, toScreen(t.x1, t.y1), toScreen(t.x2, t.y2), std::max(1.2f, t.width * scale));
         }
     }
 
@@ -188,8 +197,8 @@ void EdaViewer::Draw2DCanvas(
     if (m_showSilk) {
         for (const auto& t : board.traces) {
             if (t.layer != EdaLayerId::TopSilk && t.layer != EdaLayerId::BottomSilk) continue;
-            brush->SetColor(t.layer == EdaLayerId::BottomSilk ? EdaColor(0xC084FC, 0.8f) : EdaColor(0xF8FAFC, 0.9f));
-            rt->DrawLine(toScreen(t.x1, t.y1), toScreen(t.x2, t.y2), brush, std::max(1.0f, t.width * scale));
+            brush->SetColor(t.layer == EdaLayerId::BottomSilk ? EdaColorOverBoard(0xC084FC, 0.8f) : EdaColorOverBoard(0xF8FAFC, 0.9f));
+            DrawTrack(rt, brush, toScreen(t.x1, t.y1), toScreen(t.x2, t.y2), std::max(1.0f, t.width * scale));
         }
         for (const auto& c : board.circles) {
             D2D1_POINT_2F pc = toScreen(c.cx, c.cy);

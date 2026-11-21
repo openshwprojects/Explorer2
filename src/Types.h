@@ -279,6 +279,9 @@ struct HardwareCardHit {
 
 struct UndoDeleteBatch {
     std::vector<std::pair<std::wstring, std::wstring>> originalToTrashPaths; // <originalFullPath, stagingTrashPath>
+    // Folders sent to the Recycle Bin (whole, as the shell takes them): no undo copy can be made of a folder, so
+    // undoing restores the newest Recycle Bin item that was there (FileEngine::UndoLastDelete)
+    std::vector<std::wstring> recycledFolders;
 };
 
 } // namespace Explorer2

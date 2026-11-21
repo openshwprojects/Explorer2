@@ -346,11 +346,9 @@ bool ExplorerApp::Initialize(HINSTANCE hInstance, int nCmdShow, const std::wstri
             if (v >= 72 && v <= 480) m_systemDpi = static_cast<UINT>(v);
         }
     }
-#ifdef _WIN32
-    // The user's own scale (File tab) is needed before the window gets its size, so it is read ahead of the other
-    // settings. (Not on Linux: its software renderer draws at 96 DPI only.)
+    // The user's own scale (Settings tab) is needed before the window gets its size, so it is read ahead of the other
+    // settings. (The Linux build's software renderer scales by the render target's DPI since 2026-11-20.)
     m_uiScalePct = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"UiScalePct", 100, UiSettingsPath().c_str())), 75, 250);
-#endif
     m_dpi = EffectiveDpi();
     {
         // CreateWindowExW took 1240 x 760 as pixels: give the window that size in DIPs instead, and never more than
@@ -2821,9 +2819,7 @@ void ExplorerApp::LoadUiSettings() {
     m_showPreviewPane = GetPrivateProfileIntW(L"UI", L"ShowPreviewPane", 0, ini.c_str()) != 0;
     int prevW = GetPrivateProfileIntW(L"UI", L"PreviewPaneWidth", 450, ini.c_str());
     m_previewPaneWidth = std::clamp(static_cast<float>(prevW), 260.0f, 1000.0f);
-#ifdef _WIN32
     m_uiScalePct = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"UI", L"UiScalePct", 100, ini.c_str())), 75, 250);
-#endif
     m_openMediaExternally = GetPrivateProfileIntW(L"UI", L"MediaOpenExternal", 0, ini.c_str()) != 0;
     m_openImagesExternally = GetPrivateProfileIntW(L"UI", L"ImagesOpenExternal", 0, ini.c_str()) != 0;
     m_hiddenRibbonTabs = static_cast<unsigned>(GetPrivateProfileIntW(L"UI", L"HiddenTabs", 0, ini.c_str())) &
@@ -5741,7 +5737,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         m_hwScrollY = 0.0f;
         break;
 
-    // "LAN" tab: network scanner (first visit starts the scan from the draw code)
+    // "LAN" tab: network scanner. Opening the tab only lists the adapters; a scan starts on "Skanuj sieć" (CMD_LAN_SCAN)
     case CMD_TAB_LAN:
         m_activeRibbonTab = RibbonTab::Lan;
         m_ribbonCollapsed = false;
@@ -5754,12 +5750,8 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
             m_lan.CancelScan();
         } else {
             m_lanAdapters = LanScanner::EnumerateAdapters();
-            if (!m_lanAdapters.empty()) {
-                m_lanAdapterIdx = std::clamp(m_lanAdapterIdx, 0, static_cast<int>(m_lanAdapters.size()) - 1);
-                m_lan.StartScan(m_lanAdapters[static_cast<size_t>(m_lanAdapterIdx)]);
-                m_lan.StartSsdp();   // after StartScan so it binds to the same adapter
-                AppLog::Info(L"LAN", L"Network scan started on " + m_lanAdapters[static_cast<size_t>(m_lanAdapterIdx)].name);
-            }
+            m_lanInit = true;
+            StartLanScan();
         }
         EnsureWorkAnimTimerState();
         break;
@@ -5771,8 +5763,9 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         if (!m_lanAdapters.empty()) {
             m_lanAdapterIdx = (m_lanAdapterIdx + 1) % static_cast<int>(m_lanAdapters.size());
             m_lanSelectedIp.clear();
-            m_lan.StartScan(m_lanAdapters[static_cast<size_t>(m_lanAdapterIdx)]);
-            m_lan.StartSsdp();
+            // Once the user has scanned, the next adapter is scanned at once; before that this only picks the
+            // adapter that "Skanuj sieć" will scan
+            if (m_lanScanStarted) StartLanScan();
         }
         EnsureWorkAnimTimerState();
         break;
@@ -8664,13 +8657,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
 #else
             // The X11 menus do not tell when a submenu opens: the list goes in now
             m_openWithMenuApps = m_shellEmulator.OpenWithAppsFor(item.ext, isImg);
-            if (m_openWithMenuApps.size() > 25) m_openWithMenuApps.resize(25);
-            for (size_t i = 0; i < m_openWithMenuApps.size(); ++i) {
-                const UINT id = CMD_BASE_OPENWITH + static_cast<UINT>(i);
-                AppendMenuW(hOpenWith, MF_STRING, id, m_openWithMenuApps[i].name.c_str());
-                if (m_openWithMenuApps[i].hMenuBmp) ShellMenuEmulator::AttachMenuBitmap(hOpenWith, id, false, m_openWithMenuApps[i].hMenuBmp);
-            }
-            if (!m_openWithMenuApps.empty()) AppendMenuW(hOpenWith, MF_SEPARATOR, 0, nullptr);
+            ShellMenuEmulator::AddOpenWithItems(hOpenWith, m_openWithMenuApps, CMD_BASE_OPENWITH);
 #endif
             AppendMenuW(hOpenWith, MF_STRING, CMD_CTX_OPEN_WITH_DIALOG, s.ctxChooseAnotherApp);
             AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hOpenWith), s.ctxOpenWith);
@@ -9634,6 +9621,22 @@ void ExplorerApp::SetSearchEditText(const wchar_t* text) {
     m_settingSearchEditText = wasSetting;
 }
 
+// ---- The LAN tab's scan --------------------------------------------------------------------------------------
+
+// Scans the network of the chosen adapter and asks it for SSDP devices. Never from opening the tab: a scan pings
+// every address of the network (a whole-system freeze was once reported right after opening the tab). The start
+// goes to the log, and on the disk, before the first packet.
+void ExplorerApp::StartLanScan() {
+    if (m_lanAdapters.empty()) return;
+    m_lanAdapterIdx = std::clamp(m_lanAdapterIdx, 0, static_cast<int>(m_lanAdapters.size()) - 1);
+    const LanAdapterInfo& a = m_lanAdapters[static_cast<size_t>(m_lanAdapterIdx)];
+    AppLog::Info(L"LAN", L"Network scan started on " + a.name + L" (" + a.ip + L"/" + std::to_wstring(a.prefix) + L")");
+    AppLog::Flush();
+    m_lan.StartScan(a);
+    m_lan.StartSsdp();   // after StartScan so it binds to the same adapter
+    m_lanScanStarted = true;
+}
+
 // ---- UI scale ------------------------------------------------------------------------------------------------
 
 UINT ExplorerApp::EffectiveDpi() const {
@@ -9642,9 +9645,8 @@ UINT ExplorerApp::EffectiveDpi() const {
 }
 
 void ExplorerApp::SetUiScale(int pct) {
-#ifndef _WIN32
-    (void)pct;      // the Linux build's software renderer draws at 96 DPI only: the setting is not offered there
-#else
+    // On Linux too since 2026-11-20 (a forum user's 27-inch screen): the HAL's software renderer scales by the
+    // render target's DPI, and its edit boxes take the height of the font they are given
     pct = std::clamp(pct, 75, 250);
     if (pct == m_uiScalePct) return;
     m_uiScalePct = pct;
@@ -9656,7 +9658,6 @@ void ExplorerApp::SetUiScale(int pct) {
     m_statusToastExpireTick = GetTickCount64() + 3500;
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
-#endif
 }
 
 void ExplorerApp::ShowUiScaleMenu() {
@@ -9736,17 +9737,13 @@ bool ExplorerApp::FillOpenWithPopup(HMENU popup) {
     HCURSOR before = SetCursor(LoadCursor(nullptr, IDC_WAIT));
     m_openWithMenuApps = m_shellEmulator.OpenWithAppsFor(m_openWithExt, m_openWithIsImage);
     SetCursor(before);
-    if (m_openWithMenuApps.size() > 25) m_openWithMenuApps.resize(25);      // the command ids 320..344
-    UINT pos = 0;
-    for (size_t i = 0; i < m_openWithMenuApps.size(); ++i) {
-        const UINT id = CMD_BASE_OPENWITH + static_cast<UINT>(i);
-        InsertMenuW(popup, pos++, MF_BYPOSITION | MF_STRING, id, m_openWithMenuApps[i].name.c_str());
-        if (m_openWithMenuApps[i].hMenuBmp) ShellMenuEmulator::AttachMenuBitmap(popup, id, false, m_openWithMenuApps[i].hMenuBmp);
-    }
-    if (pos > 0) InsertMenuW(popup, pos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+    ShellMenuEmulator::AddOpenWithItems(popup, m_openWithMenuApps, CMD_BASE_OPENWITH);
     return true;
 }
 #endif
+// Each program of the list takes one command ID of the range CommandIds.h keeps for them
+static_assert(CMD_BASE_OPENWITH + static_cast<int>(ShellMenuEmulator::kMaxOpenWithApps) <= CMD_BASE_SENDTO,
+              "the \"Open with\" programs need one command ID each, below CMD_BASE_SENDTO");
 
 // ---- The "Schowek" (Clipboard) tab ----------------------------------------------------------------------------
 

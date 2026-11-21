@@ -23,6 +23,7 @@
 #include <tlhelp32.h>
 
 #include "PathUtils.h"
+#include "LinuxTrash.h"     // which trash an item goes to (the home one or its drive's own), shared with the app
 
 #include <algorithm>
 #include <atomic>
@@ -2378,131 +2379,22 @@ __attribute__((weak)) HRESULT CreateWicImagingFactory(REFIID riid, void** ppv) {
 
 namespace {
 
-std::string GetFreeDesktopTrashBase() {
-    const char* xdg = std::getenv("XDG_DATA_HOME");
-    if (xdg && *xdg) return std::string(xdg) + "/Trash";
-    const char* home = std::getenv("HOME");
-    if (home && *home) return std::string(home) + "/.local/share/Trash";
-    return "/tmp/Trash-" + std::to_string(::geteuid());
-}
-
-std::string UrlEncodeTrashPath(const std::string& raw) {
-    std::string out;
-    out.reserve(raw.size() + 16);
-    static const char kHex[] = "0123456789ABCDEF";
-    for (unsigned char c : raw) {
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-            c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
-            out.push_back(static_cast<char>(c));
-        } else {
-            out.push_back('%');
-            out.push_back(kHex[(c >> 4) & 0xF]);
-            out.push_back(kHex[c & 0xF]);
-        }
-    }
-    return out;
-}
-
-// Creates a folder and any missing folders above it with mode 0700, the mode the trash specification asks for
-// (the names in the trash say what the user deleted). True when the folder exists afterwards.
-bool MakePrivateDirs(const std::string& path) {
-    for (size_t i = 1; i <= path.size(); ++i) {
-        if (i < path.size() && path[i] != '/') continue;
-        const std::string sub = path.substr(0, i);
-        if (sub.back() == '/') continue;
-        if (::mkdir(sub.c_str(), 0700) != 0 && errno != EEXIST) return false;
-    }
-    struct stat st = {};
-    return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-// Moves one item into the freedesktop.org trash: its .trashinfo first (created exclusively, so that the name is
-// ours), then the item itself by rename(), never by a copy. Returns S_OK or the failure; on a failure the item
-// stays where it was and no .trashinfo is left behind.
-HRESULT MoveItemToTrash(const std::string& srcNative, const std::string& trashFiles, const std::string& trashInfo) {
-    // Path= names the item itself: its folder resolved, its own name as it is, so that a symbolic link is
-    // restored as that link and not as the file it points to
+// Moves one item into a trash folder (Explorer2::LinuxTrash::MoveToTrash), unless this program holds it open the
+// Windows way: Windows refuses to delete an item that is open without delete sharing, and so does this. Returns
+// S_OK or the failure; on a failure the item stays where it was and no .trashinfo is left behind.
+HRESULT MoveItemToTrash(const std::string& srcNative, const std::string& trashDir) {
     std::string clean = srcNative;
     while (clean.size() > 1 && clean.back() == '/') clean.pop_back();
-    const size_t sl = clean.find_last_of('/');
-    const std::string parentDir = (sl == std::string::npos || sl == 0) ? std::string("/") : clean.substr(0, sl);
-    const std::string leafName = (sl == std::string::npos) ? clean : clean.substr(sl + 1);
-    char realBuf[PATH_MAX] = {};
-    const std::string parentAbs = ::realpath(parentDir.c_str(), realBuf) ? std::string(realBuf) : parentDir;
-    const std::string origAbs = (!parentAbs.empty() && parentAbs.back() == '/') ? parentAbs + leafName : parentAbs + "/" + leafName;
-
-    const std::string leaf = leafName.empty() ? std::string("trashed_item") : leafName;
-    std::string stem = leaf, ext;
-    const size_t dot = leaf.find_last_of('.');
-    if (dot != std::string::npos && dot > 0) {
-        stem = leaf.substr(0, dot);
-        ext = leaf.substr(dot);
-    }
-    std::string chosenName;
-    int infoFd = -1;
-    int lastErr = EEXIST;
-    for (int attempt = 1; attempt < 10000; ++attempt) {
-        const std::string cand = (attempt == 1) ? leaf : (stem + "." + std::to_string(attempt) + ext);
-        struct stat stExist = {};
-        if (::lstat((trashFiles + "/" + cand).c_str(), &stExist) == 0) continue;
-        infoFd = ::open((trashInfo + "/" + cand + ".trashinfo").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        if (infoFd >= 0) {
-            chosenName = cand;
-            break;
-        }
-        lastErr = errno;
-        if (lastErr != EEXIST) break;           // the info folder itself is the problem: another name does not help
-    }
-    if (infoFd < 0) {
-        const DWORD e = (lastErr == EEXIST) ? static_cast<DWORD>(ERROR_FILE_EXISTS) : Explorer2::Compat::Win32ErrorFromErrno(lastErr);
-        return HRESULT_FROM_WIN32(e);
-    }
-    const std::string infoPath = trashInfo + "/" + chosenName + ".trashinfo";
-
-    time_t now = ::time(nullptr);
-    struct tm lt = {};
-    localtime_r(&now, &lt);
-    char dtBuf[64] = {};
-    std::snprintf(dtBuf, sizeof(dtBuf), "%04d-%02d-%02dT%02d:%02d:%02d",
-                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
-    const std::string infoBody = "[Trash Info]\nPath=" + UrlEncodeTrashPath(origAbs) + "\nDeletionDate=" + dtBuf + "\n";
-    // An item in the trash without its complete .trashinfo could not be restored, so it is only moved once the
-    // .trashinfo is written (a full disk shows up here)
-    int infoErr = 0;
-    size_t off = 0;
-    while (off < infoBody.size()) {
-        const ssize_t wr = ::write(infoFd, infoBody.data() + off, infoBody.size() - off);
-        if (wr < 0) {
-            if (errno == EINTR) continue;
-            infoErr = errno;
-            break;
-        }
-        off += static_cast<size_t>(wr);
-    }
-    if (::close(infoFd) != 0 && infoErr == 0) infoErr = errno;
-    if (infoErr != 0) {
-        ::unlink(infoPath.c_str());
-        const DWORD e = Explorer2::Compat::Win32ErrorFromErrno(infoErr);
-        return HRESULT_FROM_WIN32(e ? e : static_cast<DWORD>(ERROR_WRITE_FAULT));
-    }
-
-    // rename() only. Should the item be on another file system after all (a bind mount of the same disk, which
-    // rename refuses with EXDEV), it stays where it is instead of being copied into the home trash.
-    DWORD mvErr = 0;
     struct stat stNow = {};
-    if (::lstat(clean.c_str(), &stNow) != 0) {
-        mvErr = Explorer2::Compat::Win32ErrorFromErrno(errno);
-    } else if (!S_ISLNK(stNow.st_mode) &&
-               Explorer2::Compat::IsDeleteBlockedByOpenHandle(static_cast<uint64_t>(stNow.st_dev), static_cast<uint64_t>(stNow.st_ino))) {
-        mvErr = ERROR_SHARING_VIOLATION;
-    } else if (::rename(clean.c_str(), (trashFiles + "/" + chosenName).c_str()) != 0) {
-        mvErr = Explorer2::Compat::Win32ErrorFromErrno(errno);
+    if (::lstat(clean.c_str(), &stNow) != 0) return HRESULT_FROM_WIN32(Explorer2::Compat::Win32ErrorFromErrno(errno));
+    if (!S_ISLNK(stNow.st_mode) &&
+        Explorer2::Compat::IsDeleteBlockedByOpenHandle(static_cast<uint64_t>(stNow.st_dev), static_cast<uint64_t>(stNow.st_ino))) {
+        return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
     }
-    if (mvErr != 0) {
-        ::unlink(infoPath.c_str());
-        return HRESULT_FROM_WIN32(mvErr);
-    }
-    return S_OK;
+    const int e = Explorer2::LinuxTrash::MoveToTrash(clean, trashDir);
+    if (e == 0) return S_OK;
+    const DWORD w = (e == EEXIST) ? static_cast<DWORD>(ERROR_FILE_EXISTS) : Explorer2::Compat::Win32ErrorFromErrno(e);
+    return HRESULT_FROM_WIN32(w ? w : static_cast<DWORD>(ERROR_WRITE_FAULT));
 }
 
 class LinuxShellItem final : public IShellItem {
@@ -2599,15 +2491,6 @@ public:
     }
     HRESULT STDMETHODCALLTYPE PerformOperations() override {
         const bool recycle = (m_flags & (FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE)) != 0;
-        const std::string trashBase = GetFreeDesktopTrashBase();
-        const std::string trashFiles = trashBase + "/files";
-        const std::string trashInfo  = trashBase + "/info";
-        // The file system of the trash: items reach it by rename() only, so only from that file system
-        struct stat stTrash = {};
-        bool haveTrash = false;
-        if (recycle) {
-            haveTrash = MakePrivateDirs(trashFiles) && MakePrivateDirs(trashInfo) && ::stat(trashFiles.c_str(), &stTrash) == 0;
-        }
 
         for (auto& [item, sink] : m_items) {
             LPWSTR rawW = nullptr;
@@ -2618,13 +2501,15 @@ public:
             std::string srcNative = Explorer2::Compat::NativePath(srcW.c_str());
             const bool wantRecycle = recycle && !srcNative.empty() && srcNative[0] == '/' &&
                                      srcNative.rfind("/proc/", 0) != 0 && srcNative.rfind("/sys/", 0) != 0 && srcNative.rfind("/dev/", 0) != 0;
-            // The home trash takes only items of its own file system. One on a USB stick, another partition or a
-            // network share would have to be copied into it (filling the home disk, and slow): for such an item
-            // there is no recycle bin, as for a Windows drive without one. The sink hears TSF_NORMAL (the shell
+            // Items reach a trash by rename() only: an item on the home folder's drive goes to the home trash, one on
+            // a USB stick or another partition to that drive's own trash (".Trash-<uid>" in its top folder), as GNOME
+            // and KDE do. A drive kept in memory, a system or a network drive has none (LinuxTrash.h): for such an
+            // item there is no recycle bin, as for a Windows drive without one. The sink hears TSF_NORMAL (the shell
             // would delete the item for good), which Explorer2 refuses and then offers a permanent delete.
             struct stat stSrc = {};
             const bool srcKnown = wantRecycle && ::lstat(srcNative.c_str(), &stSrc) == 0;
-            const bool noBinForItem = srcKnown && (!haveTrash || stSrc.st_dev != stTrash.st_dev);
+            const std::string trashDir = srcKnown ? Explorer2::LinuxTrash::TrashDirFor(srcNative, true) : std::string();
+            const bool noBinForItem = srcKnown && trashDir.empty();
             const bool canRecycle = wantRecycle && !noBinForItem;
 
             const DWORD tsf = canRecycle ? TSF_DELETE_RECYCLE_IF_POSSIBLE : TSF_NORMAL;
@@ -2638,7 +2523,7 @@ public:
 
             HRESULT opHr = S_OK;
             if (canRecycle) {
-                opHr = MoveItemToTrash(srcNative, trashFiles, trashInfo);
+                opHr = MoveItemToTrash(srcNative, trashDir);      // an item that is gone fails at its lstat there
             } else if (wantRecycle) {
                 // The trash was asked for and cannot take this item: nothing is deleted
                 opHr = HRESULT_FROM_WIN32(ERROR_NOT_SAME_DEVICE);
@@ -3340,7 +3225,9 @@ __attribute__((weak)) HGDIOBJ SelectObject(HDC hdc, HGDIOBJ h) {
     }
     return h;
 }
+int HalForgetFont(HGDIOBJ ho);   // below, with CreateFontW
 __attribute__((weak)) BOOL DeleteObject(HGDIOBJ ho) {
+    HalForgetFont(ho);
     std::lock_guard<std::mutex> lk(g_dibMutex);
     g_dibs.erase(reinterpret_cast<HBITMAP>(ho));
     g_brushes.erase(reinterpret_cast<HBRUSH>(ho));
@@ -3464,9 +3351,31 @@ __attribute__((weak)) BOOL FillRect(HDC hDC, const RECT* lprc, HBRUSH hbr) {
     }
     return TRUE;
 }
-__attribute__((weak)) HFONT CreateFontW(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCWSTR) {
-    static intptr_t s_fontId = 0x3000;
-    return reinterpret_cast<HFONT>(++s_fontId);
+// A font is only a handle here, but its height is kept: the HAL's EDIT draws its text at the height of the font it
+// was given with WM_SETFONT (the main window's edit boxes then follow its UI scale)
+namespace {
+std::mutex g_fontMutex;
+std::map<intptr_t, int> g_fontPx;   // handle -> character height in pixels
+}
+__attribute__((weak)) HFONT CreateFontW(int cHeight, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCWSTR) {
+    static std::atomic<intptr_t> s_fontId{ 0x3000 };
+    const intptr_t id = ++s_fontId;
+    if (cHeight != 0) {
+        std::lock_guard<std::mutex> lk(g_fontMutex);
+        g_fontPx[id] = std::abs(cHeight);
+    }
+    return reinterpret_cast<HFONT>(id);
+}
+// The character height CreateFontW was given for the font, or 0 for an unknown one
+int HalFontPixelHeight(HFONT font) {
+    std::lock_guard<std::mutex> lk(g_fontMutex);
+    const auto it = g_fontPx.find(reinterpret_cast<intptr_t>(font));
+    return it == g_fontPx.end() ? 0 : it->second;
+}
+// DeleteObject of a font (any other handle is not in the table)
+int HalForgetFont(HGDIOBJ ho) {
+    std::lock_guard<std::mutex> lk(g_fontMutex);
+    return static_cast<int>(g_fontPx.erase(reinterpret_cast<intptr_t>(ho)));
 }
 
 // Genuine [MS-EMF] Binary Metafile Recorder & Handle Store
@@ -4226,17 +4135,20 @@ __attribute__((weak)) HRESULT SHQueryRecycleBinW(LPCWSTR, SHQUERYRBINFO* pSHQuer
     if (!pSHQueryRBInfo) return E_POINTER;
     pSHQueryRBInfo->i64Size = 0;
     pSHQueryRBInfo->i64NumItems = 0;
-    const std::string trashFiles = GetFreeDesktopTrashBase() + "/files";      // the trash the delete code fills
-    if (DIR* d = ::opendir(trashFiles.c_str())) {
-        while (struct dirent* de = ::readdir(d)) {
-            if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
-            ++pSHQueryRBInfo->i64NumItems;
-            struct stat st = {};
-            if (::lstat((trashFiles + "/" + de->d_name).c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-                pSHQueryRBInfo->i64Size += st.st_size;
+    // Every trash the delete code fills: the home one and those of the drives
+    for (const std::string& trashDir : Explorer2::LinuxTrash::AllTrashDirs()) {
+        const std::string trashFiles = trashDir + "/files";
+        if (DIR* d = ::opendir(trashFiles.c_str())) {
+            while (struct dirent* de = ::readdir(d)) {
+                if (std::strcmp(de->d_name, ".") == 0 || std::strcmp(de->d_name, "..") == 0) continue;
+                ++pSHQueryRBInfo->i64NumItems;
+                struct stat st = {};
+                if (::lstat((trashFiles + "/" + de->d_name).c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+                    pSHQueryRBInfo->i64Size += st.st_size;
+                }
             }
+            ::closedir(d);
         }
-        ::closedir(d);
     }
     return S_OK;
 }
@@ -4303,10 +4215,6 @@ bool SystemLocaleIsPolish() {
 } // namespace
 
 __attribute__((weak)) HRESULT SHEmptyRecycleBinW(HWND hwnd, LPCWSTR, DWORD dwFlags) {
-    const std::string base = GetFreeDesktopTrashBase();
-    const std::string filesDir = base + "/files";
-    const std::string infoDir = base + "/info";
-
     // Emptying deletes everything in the trash for good. Windows asks first unless told not to, and so does this.
     if (!(dwFlags & SHERB_NOCONFIRMATION)) {
         SHQUERYRBINFO info = {};
@@ -4331,28 +4239,33 @@ __attribute__((weak)) HRESULT SHEmptyRecycleBinW(HWND hwnd, LPCWSTR, DWORD dwFla
         }
     }
 
+    // Every trash: the home one and those of the drives (a USB stick's ".Trash-<uid>")
     DWORD firstErr = 0;
-    struct stat stFiles = {};
-    if (::lstat(filesDir.c_str(), &stFiles) == 0 && S_ISDIR(stFiles.st_mode)) {
-        for (const std::string& name : ListFolderNames(filesDir)) {
-            const int e = RemovePosixTree(filesDir + "/" + name, stFiles.st_dev);
-            if (e == 0) {
-                // The .trashinfo goes only after its item: an item that stays keeps what it needs to be restored
-                ::unlink((infoDir + "/" + name + ".trashinfo").c_str());
-            } else if (firstErr == 0) {
-                const DWORD w = Explorer2::Compat::Win32ErrorFromErrno(e);
-                firstErr = w ? w : static_cast<DWORD>(ERROR_ACCESS_DENIED);
+    for (const std::string& trashDir : Explorer2::LinuxTrash::AllTrashDirs()) {
+        const std::string filesDir = trashDir + "/files";
+        const std::string infoDir = trashDir + "/info";
+        struct stat stFiles = {};
+        if (::lstat(filesDir.c_str(), &stFiles) == 0 && S_ISDIR(stFiles.st_mode)) {
+            for (const std::string& name : ListFolderNames(filesDir)) {
+                const int e = RemovePosixTree(filesDir + "/" + name, stFiles.st_dev);
+                if (e == 0) {
+                    // The .trashinfo goes only after its item: an item that stays keeps what it needs to be restored
+                    ::unlink((infoDir + "/" + name + ".trashinfo").c_str());
+                } else if (firstErr == 0) {
+                    const DWORD w = Explorer2::Compat::Win32ErrorFromErrno(e);
+                    firstErr = w ? w : static_cast<DWORD>(ERROR_ACCESS_DENIED);
+                }
             }
         }
-    }
-    // A .trashinfo whose item is gone already describes nothing. Anything else in info/ is not ours to delete.
-    static const char kInfoSuffix[] = ".trashinfo";
-    const size_t suffixLen = sizeof(kInfoSuffix) - 1;
-    for (const std::string& name : ListFolderNames(infoDir)) {
-        if (name.size() <= suffixLen || name.compare(name.size() - suffixLen, suffixLen, kInfoSuffix) != 0) continue;
-        struct stat st = {};
-        const std::string item = filesDir + "/" + name.substr(0, name.size() - suffixLen);
-        if (::lstat(item.c_str(), &st) != 0 && errno == ENOENT) ::unlink((infoDir + "/" + name).c_str());
+        // A .trashinfo whose item is gone already describes nothing. Anything else in info/ is not ours to delete.
+        static const char kInfoSuffix[] = ".trashinfo";
+        const size_t suffixLen = sizeof(kInfoSuffix) - 1;
+        for (const std::string& name : ListFolderNames(infoDir)) {
+            if (name.size() <= suffixLen || name.compare(name.size() - suffixLen, suffixLen, kInfoSuffix) != 0) continue;
+            struct stat st = {};
+            const std::string item = filesDir + "/" + name.substr(0, name.size() - suffixLen);
+            if (::lstat(item.c_str(), &st) != 0 && errno == ENOENT) ::unlink((infoDir + "/" + name).c_str());
+        }
     }
     return firstErr ? HRESULT_FROM_WIN32(firstErr) : S_OK;
 }

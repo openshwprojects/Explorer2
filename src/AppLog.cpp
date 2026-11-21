@@ -193,6 +193,11 @@ void AppLog::Write(LogLevel level, const std::wstring& category, const std::wstr
     }
 }
 
+void AppLog::Flush() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_file != INVALID_HANDLE_VALUE) FlushFileBuffers(g_file);
+}
+
 std::vector<LogEntry> AppLog::Snapshot() {
     g_notifyPending = false;   // the UI is about to read everything that was posted so far
     std::lock_guard<std::mutex> lock(g_mutex);

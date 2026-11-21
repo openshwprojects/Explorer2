@@ -114,4 +114,21 @@ inline void RoundCropRect(const CropRectF& r, uint32_t w, uint32_t h, uint32_t& 
     outH = static_cast<uint32_t>(bottom - top);
 }
 
+// ---- Clicking the sides of the viewer -------------------------------------------------------------------------
+// A click on the left part of the picture area shows the previous file, on the right part the next one. Each part
+// is a quarter of the area's width, at least 60 and at most 320 DIPs, and never more than a third of it.
+inline float ViewerSideZoneWidth(float areaWidth) {
+    if (!(areaWidth > 0.0f)) return 0.0f;
+    return std::min(std::clamp(areaWidth * 0.25f, 60.0f, 320.0f), areaWidth / 3.0f);
+}
+
+// -1 when x is in the left part of [left, right], +1 in the right part, 0 in the middle or outside
+inline int ViewerSideZone(float x, float left, float right) {
+    const float zone = ViewerSideZoneWidth(right - left);
+    if (zone <= 0.0f || x < left || x > right) return 0;
+    if (x < left + zone) return -1;
+    if (x > right - zone) return 1;
+    return 0;
+}
+
 } // namespace Explorer2

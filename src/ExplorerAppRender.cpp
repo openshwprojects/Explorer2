@@ -1094,6 +1094,48 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, textR, m_solidBrush);
     };
 
+    // A switch (Widok: extensions, hidden items, Git / SVN; Ustawienia): a box that is blue with a white tick when it
+    // is on, like the check boxes of the Search tab, or with radio set a round button with a dot (the language). Until
+    // 2026-11-20 a switch was a row button with the default ribbon icon - a small blue square - and on showed only as
+    // a highlighted row (in the Settings tab with a tick of nearly the same blue inside the square: hard to see in the
+    // light theme, invisible in the dark one); a forum user asked why the square never gets a tick. The caption starts
+    // where drawSmallRowButton puts it, so widths made for that still fit.
+    // The square of a check box (drawCheckRow here, drawCheckboxItem in the Search tab): blue with a white tick when
+    // it is checked, white with a grey edge when not
+    auto drawCheckBox = [&](const D2D1_RECT_F& box, bool checked) {
+        m_solidBrush->SetColor(checked ? HexColor(0x0078D7) : HexColor(0xFFFFFF));
+        m_rt->FillRoundedRectangle(D2D1::RoundedRect(box, 2.0f, 2.0f), m_solidBrush);
+        m_solidBrush->SetColor(checked ? HexColor(0x005A9E) : HexColor(0x8A95A5));
+        m_rt->DrawRoundedRectangle(D2D1::RoundedRect(box, 2.0f, 2.0f), m_solidBrush, 1.1f);
+        if (checked) {
+            m_solidBrush->SetColor(HexColor(0xFEFEFE));   // the white that stays white in the dark theme
+            m_rt->DrawLine(D2D1::Point2F(box.left + 3.0f, box.top + 7.0f), D2D1::Point2F(box.left + 6.0f, box.bottom - 3.0f), m_solidBrush, 1.8f);
+            m_rt->DrawLine(D2D1::Point2F(box.left + 6.0f, box.bottom - 3.0f), D2D1::Point2F(box.right - 2.5f, box.top + 3.0f), m_solidBrush, 1.8f);
+        }
+    };
+    auto drawCheckRow = [&](int cmdId, float x, float y, float w, const wchar_t* label, bool checked, bool radio = false) {
+        const D2D1_RECT_F br = D2D1::RectF(x, y, x + w, y + 22.0f);
+        m_ribbonHits.push_back({ cmdId, br });
+        if (m_hoverRibbonBtn == cmdId) {
+            m_solidBrush->SetColor(HexColor(0xE1ECF4));
+            m_rt->FillRoundedRectangle(D2D1::RoundedRect(br, 2.0f, 2.0f), m_solidBrush);
+        }
+        const D2D1_RECT_F box = D2D1::RectF(x + 4.0f, y + 4.5f, x + 17.5f, y + 18.0f);
+        if (radio) {
+            const D2D1_ELLIPSE ring = D2D1::Ellipse(D2D1::Point2F((box.left + box.right) * 0.5f, (box.top + box.bottom) * 0.5f), 6.5f, 6.5f);
+            m_solidBrush->SetColor(HexColor(0xFFFFFF));
+            m_rt->FillEllipse(ring, m_solidBrush);
+            m_solidBrush->SetColor(checked ? HexColor(0x0078D7) : HexColor(0x8A95A5));
+            m_rt->DrawEllipse(ring, m_solidBrush, 1.2f);
+            if (checked) m_rt->FillEllipse(D2D1::Ellipse(ring.point, 3.6f, 3.6f), m_solidBrush);
+        } else {
+            drawCheckBox(box, checked);
+        }
+        const D2D1_RECT_F textR = D2D1::RectF(x + 23.0f, y, x + w - 2.0f, y + 22.0f);
+        m_solidBrush->SetColor(HexColor(0x1E1E1E));
+        DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, textR, m_solidBrush);
+    };
+
     auto drawGroupSeparatorAndTitle = [&](float groupStartX, float groupEndX, const wchar_t* groupTitle) {
         m_solidBrush->SetColor(HexColor(0xDFDFDF));
         m_rt->DrawLine(D2D1::Point2F(groupEndX, body.top + 5.0f), D2D1::Point2F(groupEndX, body.bottom - 5.0f), m_solidBrush, 1.0f);
@@ -1135,9 +1177,9 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         drawGroupSeparatorAndTitle(lx, lx + 538.0f, s.grpLayout);
 
         float sx = lx + 546.0f;
-        drawSmallRowButton(CMD_TOGGLE_EXT,    sx, body.top + 6.0f,  175.0f, s.chkFileExt,    m_showExtensions);
-        drawSmallRowButton(CMD_TOGGLE_HIDDEN, sx, body.top + 29.0f, 175.0f, s.chkHiddenItems, m_showHidden);
-        drawSmallRowButton(CMD_TOGGLE_GIT,    sx, body.top + 52.0f, 175.0f, pl ? L"Integracja Git / SVN" : L"Git / SVN integration", m_gitEnabled);
+        drawCheckRow(CMD_TOGGLE_EXT,    sx, body.top + 6.0f,  175.0f, s.chkFileExt,    m_showExtensions);
+        drawCheckRow(CMD_TOGGLE_HIDDEN, sx, body.top + 29.0f, 175.0f, s.chkHiddenItems, m_showHidden);
+        drawCheckRow(CMD_TOGGLE_GIT,    sx, body.top + 52.0f, 175.0f, pl ? L"Integracja Git / SVN" : L"Git / SVN integration", m_gitEnabled);
         drawGroupSeparatorAndTitle(sx, sx + 182.0f, s.grpShowHide);
 
         float dx = sx + 190.0f;
@@ -1163,16 +1205,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
                 m_solidBrush->SetColor(HexColor(0xE1ECF4));
                 m_rt->FillRoundedRectangle(D2D1::RoundedRect(br, 2.0f, 2.0f), m_solidBrush);
             }
-            D2D1_RECT_F boxR = D2D1::RectF(x + 3.0f, y + 3.5f, x + 16.5f, y + 17.0f);
-            m_solidBrush->SetColor(checked ? HexColor(0x0078D7) : HexColor(0xFFFFFF));
-            m_rt->FillRoundedRectangle(D2D1::RoundedRect(boxR, 2.0f, 2.0f), m_solidBrush);
-            m_solidBrush->SetColor(checked ? HexColor(0x005A9E) : HexColor(0x8A95A5));
-            m_rt->DrawRoundedRectangle(D2D1::RoundedRect(boxR, 2.0f, 2.0f), m_solidBrush, 1.1f);
-            if (checked) {
-                m_solidBrush->SetColor(HexColor(0xFFFFFF));
-                m_rt->DrawLine(D2D1::Point2F(boxR.left + 3.0f, boxR.top + 7.0f), D2D1::Point2F(boxR.left + 6.0f, boxR.bottom - 3.0f), m_solidBrush, 1.8f);
-                m_rt->DrawLine(D2D1::Point2F(boxR.left + 6.0f, boxR.bottom - 3.0f), D2D1::Point2F(boxR.right - 2.5f, boxR.top + 3.0f), m_solidBrush, 1.8f);
-            }
+            drawCheckBox(D2D1::RectF(x + 3.0f, y + 3.5f, x + 16.5f, y + 17.0f), checked);
             D2D1_RECT_F txtR = D2D1::RectF(x + 21.0f, y, x + w - 2.0f, y + 21.0f);
             m_solidBrush->SetColor(HexColor(0x1E1E1E));
             DrawTextCached(label, static_cast<UINT32>(wcslen(label)), m_fmtSmall, txtR, m_solidBrush);
@@ -1349,16 +1382,7 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         // the text size in plain sight, pictures and films in the user's own programs, fewer tabs.
         const bool pl = (m_lang == Lang::PL);
         const float r1 = body.top + 6.0f, r2 = body.top + 29.0f, r3 = body.top + 52.0f;
-        // A switch that is on has a tick in its box
-        auto drawCheckRow = [&](int cmdId, float x, float y, float w, const wchar_t* label, bool checked) {
-            drawSmallRowButton(cmdId, x, y, w, label, checked);
-            if (checked) {
-                const float bx = x + 11.0f, by = y + 11.0f;
-                m_solidBrush->SetColor(HexColor(0x0067B8));
-                m_rt->DrawLine(D2D1::Point2F(bx - 2.8f, by + 0.1f), D2D1::Point2F(bx - 0.9f, by + 2.1f), m_solidBrush, 1.6f);
-                m_rt->DrawLine(D2D1::Point2F(bx - 0.9f, by + 2.1f), D2D1::Point2F(bx + 2.9f, by - 2.3f), m_solidBrush, 1.6f);
-            }
-        };
+        // The switches are drawCheckRow's boxes (and round buttons for the language)
 
         // The widths below leave each caption (measured in both languages) at least 8 DIPs to spare and add up to
         // 1012: the whole tab fits a window 1024 wide without having to scroll the ribbon sideways.
@@ -1367,21 +1391,19 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         // someone who reads only one of them.
         float x = rect.left + 8.0f;
         float g = x;
-        drawCheckRow(CMD_LANG_SET_PL, x, r1, 92.0f, L"Polski", m_lang == Lang::PL);
-        drawCheckRow(CMD_LANG_SET_EN, x, r2, 92.0f, L"English", m_lang == Lang::EN);
+        drawCheckRow(CMD_LANG_SET_PL, x, r1, 92.0f, L"Polski", m_lang == Lang::PL, true);
+        drawCheckRow(CMD_LANG_SET_EN, x, r2, 92.0f, L"English", m_lang == Lang::EN, true);
         x += 98.0f;
         drawGroupSeparatorAndTitle(g, x, L"J\x0119zyk / Language");
         x += 8.0f;
 
-        // Appearance: the size of everything (the Linux build draws at one size only) and the theme
+        // Appearance: the size of everything (on Linux too since 2026-11-20) and the theme
         g = x;
-#ifdef _WIN32
         const std::wstring scaleLbl = (pl ? L"Skala interfejsu: " : L"UI scale: ") + std::to_wstring(m_uiScalePct) + L"% \x25BE";
         drawSmallRowButton(CMD_UI_SCALE_MENU, x, r1, 156.0f, scaleLbl.c_str());
         drawSmallRowButton(CMD_UI_SCALE_UP,   x, r2, 156.0f, pl ? L"Większe napisy (Ctrl i +)" : L"Larger text (Ctrl and +)");
         drawSmallRowButton(CMD_UI_SCALE_DOWN, x, r3, 156.0f, pl ? L"Mniejsze napisy (Ctrl i -)" : L"Smaller text (Ctrl and -)");
         x += 160.0f;
-#endif
         drawCheckRow(CMD_TOGGLE_THEME, x, r1, 110.0f, pl ? L"Ciemny motyw" : L"Dark theme", m_darkMode);
         x += 116.0f;
         drawGroupSeparatorAndTitle(g, x, pl ? L"Wygląd" : L"Appearance");
@@ -1430,7 +1452,9 @@ void ExplorerApp::DrawRibbon(const D2D1_RECT_F& rect) {
         float lx = rect.left + 6.0f;
 
         float lg1 = lx;
-        drawLargeButton(CMD_LAN_SCAN, lx, 96.0f, scanning ? (pl ? L"Zatrzymaj\nskanowanie" : L"Stop\nscan") : (pl ? L"Skanuj sieć\nponownie" : L"Rescan\nnetwork"), scanning);
+        drawLargeButton(CMD_LAN_SCAN, lx, 96.0f, scanning ? (pl ? L"Zatrzymaj\nskanowanie" : L"Stop\nscan")
+                                                          : m_lanScanStarted ? (pl ? L"Skanuj sieć\nponownie" : L"Rescan\nnetwork")
+                                                                             : (pl ? L"Skanuj\nsieć" : L"Scan\nnetwork"), scanning);
         lx += 98.0f;
         drawLargeButton(CMD_LAN_SSDP, lx, 84.0f, pl ? L"Szukaj\nSSDP / UPnP" : L"Find\nSSDP / UPnP", m_lan.IsSsdpRunning());
         lx += 86.0f;
@@ -4072,6 +4096,7 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
     float stripH = (includeFilmstrip && !m_isFullScreen) ? kFilmstripHeight : 0.0f;
     float hudTopH = 38.0f;
     D2D1_RECT_F canvasR = D2D1::RectF(rect.left, rect.top + hudTopH, rect.right, rect.bottom - stripH);
+    m_viewerCanvasRect = canvasR;       // the sides a click steps through the files on (ViewerSideForClick)
 
     int activeIdx = m_focusedIndex;
     if (activeIdx < 0 && !m_items.empty()) activeIdx = 0;
@@ -4485,6 +4510,29 @@ void ExplorerApp::DrawFullViewerCanvas(const D2D1_RECT_F& rect, bool includeFilm
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         DrawTextCached(s.viewerHelpHint, static_cast<UINT32>(wcslen(s.viewerHelpHint)), m_fmtSmall, hintR, m_solidBrush);
         m_fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+
+    // The side the mouse is over: a light shade over it and a round arrow - a click there shows the previous / next
+    // file. The colours are meant as they are in both themes.
+    if (m_viewerSideHover != 0 && ViewerSideForClick(m_mousePt.x, m_mousePt.y) == m_viewerSideHover) {
+        const bool toLeft = (m_viewerSideHover < 0);
+        const float zone = ViewerSideZoneWidth(canvasR.right - canvasR.left);
+        m_solidBrush->SetColor(PathUtils::ColorFromRgb(0x000000, 0.10f));
+        m_rt->FillRectangle(toLeft ? D2D1::RectF(canvasR.left, canvasR.top, canvasR.left + zone, canvasR.bottom)
+                                   : D2D1::RectF(canvasR.right - zone, canvasR.top, canvasR.right, canvasR.bottom), m_solidBrush);
+        const float acx = toLeft ? canvasR.left + 40.0f : canvasR.right - 40.0f;
+        const float acy = (canvasR.top + canvasR.bottom) * 0.5f;
+        m_solidBrush->SetColor(PathUtils::ColorFromRgb(0x000000, 0.55f));
+        m_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(acx, acy), 24.0f, 24.0f), m_solidBrush);
+        // the chevron, with round ends and tip
+        const float dir = toLeft ? -1.0f : 1.0f;
+        const D2D1_POINT_2F a = D2D1::Point2F(acx - 4.0f * dir, acy - 10.0f);
+        const D2D1_POINT_2F tip = D2D1::Point2F(acx + 6.0f * dir, acy);
+        const D2D1_POINT_2F b = D2D1::Point2F(acx - 4.0f * dir, acy + 10.0f);
+        m_solidBrush->SetColor(PathUtils::ColorFromRgb(0xFFFFFF, 0.95f));
+        m_rt->DrawLine(a, tip, m_solidBrush, 3.0f);
+        m_rt->DrawLine(tip, b, m_solidBrush, 3.0f);
+        for (const D2D1_POINT_2F& p : { a, tip, b }) m_rt->FillEllipse(D2D1::Ellipse(p, 1.5f, 1.5f), m_solidBrush);
     }
 
     m_rt->PopAxisAlignedClip();
@@ -7141,16 +7189,12 @@ void ExplorerApp::DrawGitDock(const D2D1_RECT_F& dock) {
 void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
     const bool pl = (m_lang == Lang::PL);
 
-    // First visit: pick the adapter and kick off a scan + SSDP discovery
+    // First visit: only pick the adapter. A scan pings every address of the network and asks each device for its
+    // name, so it starts only when the user clicks "Skanuj sieć" (CMD_LAN_SCAN), never by opening the tab.
     if (!m_lanInit) {
         m_lanInit = true;
         m_lanAdapters = LanScanner::EnumerateAdapters();   // adapters with a gateway first
         m_lanAdapterIdx = 0;
-        if (!m_lanAdapters.empty()) {
-            m_lan.StartScan(m_lanAdapters[0]);
-            m_lan.StartSsdp();
-            EnsureWorkAnimTimerState();   // keeps the view repainting while the scan runs
-        }
     }
 
     const bool scanning = m_lan.IsScanning();
@@ -7186,7 +7230,9 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
         DrawCardTinyButton(D2D1::RectF(leftX + availW - 138.0f, curY + 4.0f, leftX + availW - 8.0f, curY + 25.0f),
                            pl ? L"\xD83D\xDCE1 Szukaj SSDP" : L"\xD83D\xDCE1 Find SSDP", CMD_LAN_SSDP, L"");
         DrawCardTinyButton(D2D1::RectF(leftX + availW - 308.0f, curY + 4.0f, leftX + availW - 144.0f, curY + 25.0f),
-                           scanning ? (pl ? L"\x23F9 Zatrzymaj skanowanie" : L"\x23F9 Stop scan") : (pl ? L"\xD83D\xDD0D Skanuj sieć ponownie" : L"\xD83D\xDD0D Rescan network"),
+                           scanning ? (pl ? L"\x23F9 Zatrzymaj skanowanie" : L"\x23F9 Stop scan")
+                                    : m_lanScanStarted ? (pl ? L"\xD83D\xDD0D Skanuj sieć ponownie" : L"\xD83D\xDD0D Rescan network")
+                                                       : (pl ? L"\xD83D\xDD0D Skanuj sieć" : L"\xD83D\xDD0D Scan network"),
                            CMD_LAN_SCAN, L"");
         DrawCardTinyButton(D2D1::RectF(leftX + availW - 386.0f, curY + 4.0f, leftX + availW - 314.0f, curY + 25.0f),
                            L"\x23F1 " + std::to_wstring(pingSec) + L"s",
@@ -7198,7 +7244,7 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
 
         std::wstring adapterTxt;
         if (m_lanAdapters.empty()) {
-            adapterTxt = pl ? L"Brak aktywnych adapterów IPv4 (podłącz się do sieci i kliknij „Skanuj”)" : L"No active IPv4 adapter (connect to a network and click \"Rescan\")";
+            adapterTxt = pl ? L"Brak aktywnych adapterów IPv4 (podłącz się do sieci i kliknij \"Skanuj sieć\")" : L"No active IPv4 adapter (connect to a network and click \"Scan network\")";
         } else {
             const LanAdapterInfo& a = m_lanAdapters[static_cast<size_t>(m_lanAdapterIdx) % m_lanAdapters.size()];
             adapterTxt = (pl ? L"Adapter: " : L"Adapter: ") + a.name + L"   \x2022   " + a.ip + L"/" + std::to_wstring(a.prefix) +
@@ -7212,7 +7258,12 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
         }
 
         wchar_t st[300] = {};
-        if (scanning) {
+        if (!scanning && !m_lanScanStarted) {
+            // Nothing scanned yet: say how to start (the search for SSDP devices alone may have run)
+            swprintf_s(st, pl ? L"Sieć nie była jeszcze skanowana - kliknij \"Skanuj sieć\", aby wyszukać urządzenia%s"
+                              : L"The network has not been scanned yet - click \"Scan network\" to look for devices%s",
+                       ssdpRun ? (pl ? L"  \x2022  SSDP: szukanie\x2026" : L"  \x2022  SSDP: searching\x2026") : L"");
+        } else if (scanning) {
             swprintf_s(st, pl ? L"Skanowanie… %d / %d adresów  \x2022  znaleziono hostów: %zu  \x2022  SSDP: %zu%s"
                               : L"Scanning… %d / %d addresses  \x2022  hosts found: %zu  \x2022  SSDP: %zu%s",
                        done, total, hosts.size(), ssdp.size(), ssdpRun ? (pl ? L" (szukanie…)" : L" (searching…)") : L"");
@@ -7275,7 +7326,9 @@ void ExplorerApp::DrawLanView(const D2D1_RECT_F& rect) {
         float ry = curY + hdrY + 24.0f;
         if (hosts.empty()) {
             DrawClippedText(scanning ? (pl ? L"Skanowanie sieci… hosty pojawią się tutaj w miarę odpowiedzi." : L"Scanning… hosts will appear here as they answer.")
-                                     : (pl ? L"Nie znaleziono żadnych urządzeń. Sprawdź adapter i kliknij „Skanuj sieć ponownie”." : L"No devices found. Check the adapter and click \"Rescan network\"."),
+                            : !m_lanScanStarted ? (pl ? L"Kliknij \"Skanuj sieć\": urządzenia tej sieci pojawią się tutaj (ping i ARP jej adresów, nazwy, SSDP / UPnP)."
+                                                      : L"Click \"Scan network\": the devices of this network will appear here (ping and ARP of its addresses, names, SSDP / UPnP).")
+                                     : (pl ? L"Nie znaleziono żadnych urządzeń. Sprawdź adapter i kliknij \"Skanuj sieć ponownie\"." : L"No devices found. Check the adapter and click \"Rescan network\"."),
                             D2D1::RectF(leftX + pad, ry + 3.0f, leftX + availW - pad, ry + rowH), m_fmtSmall, 0x64748B);
         }
         size_t rowIdx = 0;

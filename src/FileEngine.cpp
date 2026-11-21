@@ -17,6 +17,7 @@
 #ifndef _WIN32
 #include "ToolProcess.h"
 #include "LinuxStorage.h"
+#include "LinuxTrash.h"
 #include <climits>
 #include <cstdlib>
 #include <dirent.h>
@@ -168,14 +169,6 @@ std::vector<LinuxMountInfo> EnumerateLinuxMounts(Lang lang) {
     return out;
 }
 
-std::string GetLinuxTrashBaseDir() {
-    const char* xdg = std::getenv("XDG_DATA_HOME");
-    if (xdg && *xdg) return std::string(xdg) + "/Trash";
-    const char* home = std::getenv("HOME");
-    if (home && *home) return std::string(home) + "/.local/share/Trash";
-    return "/tmp/Trash-" + std::to_string(::geteuid());
-}
-
 std::string UrlDecodeTrashPath(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -200,7 +193,9 @@ std::string UrlDecodeTrashPath(std::string_view s) {
     return out;
 }
 
-bool ParseFreeDesktopTrashInfo(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord) {
+// A .trashinfo. A relative Path= is relative to relativeBase: the drive's top folder for a drive's own trash (GNOME
+// writes it so), the folder holding the home trash for that one (LinuxTrash::RelativePathBase)
+bool ParseFreeDesktopTrashInfo(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord, const std::string& relativeBase) {
     std::string txt(reinterpret_cast<const char*>(raw.data()), raw.size());
     if (txt.find("[Trash Info]") == std::string::npos) return false;
     std::istringstream iss(txt);
@@ -212,7 +207,7 @@ bool ParseFreeDesktopTrashInfo(const std::vector<uint8_t>& raw, RecycleBinRecord
     }
     if (origUtf8.empty()) return false;
     if (origUtf8[0] != '/') {
-        origUtf8 = GetLinuxTrashBaseDir() + "/" + origUtf8;
+        origUtf8 = (relativeBase == "/" ? std::string() : relativeBase) + "/" + origUtf8;
     }
 
     FILETIME ft = {};
@@ -1542,9 +1537,10 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
         }
 
 #ifndef _WIN32
-        // FreeDesktop.org Trash (~/.local/share/Trash/{files,info})
-        {
-            const std::string trashBase = GetLinuxTrashBaseDir();
+        // FreeDesktop.org Trash: the home one (~/.local/share/Trash/{files,info}) and the drives' own (a USB stick's
+        // ".Trash-<uid>"), each item with its .trashinfo
+        for (const std::string& trashBase : LinuxTrash::AllTrashDirs()) {
+            const std::string relativeBase = LinuxTrash::RelativePathBase(trashBase);
             const std::wstring trashInfoDir = PathUtils::Utf8ToWide(trashBase + "/info");
             const std::wstring trashFilesDir = PathUtils::Utf8ToWide(trashBase + "/files");
             WIN32_FIND_DATAW ffd = {};
@@ -1565,7 +1561,7 @@ std::vector<FileEntry> FileEngine::EnumerateDirectory(
 
                     std::vector<uint8_t> raw;
                     RecycleBinRecord rec;
-                    if (!PathUtils::ReadFileBytes(infoPath, 65536, raw) || !ParseFreeDesktopTrashInfo(raw, rec)) continue;
+                    if (!PathUtils::ReadFileBytes(infoPath, 65536, raw) || !ParseFreeDesktopTrashInfo(raw, rec, relativeBase)) continue;
 
                     FileEntry entry;
                     entry.name = PathUtils::GetFileName(rec.originalPath);
@@ -2577,10 +2573,13 @@ void FileEngine::BeginDelete(const std::vector<std::wstring>& paths, bool perman
                 if (CreateHardLinkW(backupPath.c_str(), origPath.c_str(), nullptr)) {
                     batch.originalToTrashPaths.push_back({ origPath, backupPath });
                 }
+            } else if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                // A folder: it goes to the Recycle Bin whole, and undoing takes it back out of there
+                batch.recycledFolders.push_back(PathUtils::TrimTrailingSlashes(origPath));
             }
         }
 
-        if (!batch.originalToTrashPaths.empty()) {
+        if (!batch.originalToTrashPaths.empty() || !batch.recycledFolders.empty()) {
             std::lock_guard<std::mutex> lock(m_undoMutex);
             m_undoStack.push_back(std::move(batch));
             if (m_undoStack.size() > 64) {
@@ -2668,6 +2667,27 @@ bool FileEngine::UndoLastDelete(std::wstring& outRestoredDir) {
             anyRestored = true;
             if (outRestoredDir.empty()) {
                 outRestoredDir = PathUtils::GetParentPath(origPath);
+            }
+        }
+    }
+
+    // Folders: each comes back from the Recycle Bin, its newest item from that place (a folder deleted there
+    // before, under the same name, stays in the bin). A folder that is there again by now is not replaced: the
+    // restored one gets " (restored)" added (RestoreRecycleBinItem).
+    if (!batch.recycledFolders.empty()) {
+        const std::vector<FileEntry> bin = EnumerateDirectory(L"RECYCLE_BIN", true, true, Lang::EN);
+        auto ticks = [](const FILETIME& ft) { return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime; };
+        for (const std::wstring& folder : batch.recycledFolders) {
+            const std::wstring key = PathUtils::NormalizePathKey(folder);
+            const FileEntry* newest = nullptr;
+            for (const FileEntry& e : bin) {
+                if (!e.isDirectory || PathUtils::NormalizePathKey(e.originalPath) != key) continue;
+                if (!newest || ticks(e.writeTime) > ticks(newest->writeTime)) newest = &e;
+            }
+            std::wstring restoredPath;
+            if (newest && RestoreRecycleBinItem(newest->fullPath, Lang::EN, restoredPath)) {
+                anyRestored = true;
+                if (outRestoredDir.empty()) outRestoredDir = PathUtils::GetParentPath(restoredPath);
             }
         }
     }
@@ -2980,12 +3000,18 @@ std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const s
     return clean;
 }
 
-bool FileEngine::ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord) {
+bool FileEngine::ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord, const std::wstring& infoPath) {
     outRecord = {};
 #ifndef _WIN32
     if (raw.size() >= 12 && std::memcmp(raw.data(), "[Trash Info]", 12) == 0) {
-        return ParseFreeDesktopTrashInfo(raw, outRecord);
+        // <trash>/info/<name>.trashinfo: the trash folder is two levels up
+        const std::string trashDir = infoPath.empty()
+            ? LinuxTrash::HomeTrashDir()
+            : LinuxTrash::ParentOf(LinuxTrash::ParentOf(Explorer2::Compat::NativePath(infoPath.c_str())));
+        return ParseFreeDesktopTrashInfo(raw, outRecord, LinuxTrash::RelativePathBase(trashDir));
     }
+#else
+    (void)infoPath;
 #endif
     if (raw.size() < 26) return false;
 
@@ -3079,9 +3105,10 @@ bool FileEngine::GetRecycleBinCompanionInfoPath(const std::wstring& dataPath, st
     std::wstring leaf = PathUtils::GetFileName(clean);
 #ifndef _WIN32
     {
-        std::wstring trashFilesW = PathUtils::Utf8ToWide(GetLinuxTrashBaseDir() + "/files");
-        if (!leaf.empty() && PathUtils::NormalizePathKey(parentDir) == PathUtils::NormalizePathKey(trashFilesW)) {
-            outInfoPath = PathUtils::Utf8ToWide(GetLinuxTrashBaseDir() + "/info/") + leaf + L".trashinfo";
+        // An item in any trash's files/: the home trash or a drive's own
+        const std::string info = LinuxTrash::InfoPathFor(Explorer2::Compat::NativePath(clean.c_str()));
+        if (!leaf.empty() && !info.empty()) {
+            outInfoPath = PathUtils::Utf8ToWide(info);
             return true;
         }
     }
@@ -3123,7 +3150,7 @@ bool FileEngine::RestoreRecycleBinItem(
 
     std::vector<uint8_t> raw;
     RecycleBinRecord rec;
-    if (!PathUtils::ReadFileBytes(infoPath, 65536, raw) || !ParseRecycleBinInfoBytes(raw, rec) || rec.originalPath.empty()) {
+    if (!PathUtils::ReadFileBytes(infoPath, 65536, raw) || !ParseRecycleBinInfoBytes(raw, rec, infoPath) || rec.originalPath.empty()) {
         if (outError) *outError = ERROR_INVALID_DATA;
         return false;
     }
@@ -3488,7 +3515,7 @@ void FileEngine::OpenFileOrProperties(HWND hwnd, const std::wstring& path, bool 
 void FileEngine::OpenInClassicExplorer(const std::wstring& path, bool selectItem) {
 #ifndef _WIN32
     std::wstring target = path;
-    if (path == L"RECYCLE_BIN") target = PathUtils::Utf8ToWide(GetLinuxTrashBaseDir() + "/files");
+    if (path == L"RECYCLE_BIN") target = PathUtils::Utf8ToWide(LinuxTrash::HomeTrashDir() + "/files");
     else if (path == L"THIS_PC") target = L"/";
     else if (selectItem) {
         std::wstring par = PathUtils::GetParentPath(path);

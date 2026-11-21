@@ -26,23 +26,34 @@ using Microsoft::WRL::ComPtr;
 
 namespace Explorer2 {
 
-static HBITMAP HIconToMenuBitmap16(HICON hIcon) {
-    if (!hIcon) return nullptr;
-
+// An empty 16 x 16 menu picture: 32 bits per pixel, top-down, with its pixels in *bits (nullptr when it failed)
+static HBITMAP CreateMenuDib16(void** bits) {
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = 16;
-    bmi.bmiHeader.biHeight = -16; // Top-down
+    bmi.bmiHeader.biHeight = -16;           // top-down
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
+    *bits = nullptr;
+    HDC screenDc = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, bits, nullptr, 0);
+    ReleaseDC(nullptr, screenDc);
+    if (dib && !*bits) {
+        DeleteObject(dib);
+        return nullptr;
+    }
+    return dib;
+}
+
+static HBITMAP HIconToMenuBitmap16(HICON hIcon) {
+    if (!hIcon) return nullptr;
 
     void* bits = nullptr;
-    HDC screenDc = GetDC(nullptr);
-    HBITMAP hDib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (hDib && bits) {
+    HBITMAP hDib = CreateMenuDib16(&bits);
+    if (hDib) {
         memset(bits, 0, 16 * 16 * 4);
-        HDC memDc = CreateCompatibleDC(screenDc);
+        HDC memDc = CreateCompatibleDC(nullptr);
         HGDIOBJ oldObj = SelectObject(memDc, hDib);
         DrawIconEx(memDc, 0, 0, hIcon, 16, 16, 0, nullptr, DI_NORMAL);
         SelectObject(memDc, oldObj);
@@ -63,7 +74,6 @@ static HBITMAP HIconToMenuBitmap16(HICON hIcon) {
             }
         }
     }
-    ReleaseDC(nullptr, screenDc);
     return hDib;
 }
 
@@ -423,18 +433,9 @@ static HBITMAP PictureFileToMenuBitmap16(const std::wstring& path) {
         FAILED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
         return nullptr;
     }
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = 16;
-    bmi.bmiHeader.biHeight = -16;           // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
-    HDC screenDc = GetDC(nullptr);
-    HBITMAP dib = CreateDIBSection(screenDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    ReleaseDC(nullptr, screenDc);
-    if (!dib || !bits || FAILED(converter->CopyPixels(nullptr, 16 * 4, 16 * 16 * 4, static_cast<BYTE*>(bits)))) {
+    HBITMAP dib = CreateMenuDib16(&bits);
+    if (!dib || FAILED(converter->CopyPixels(nullptr, 16 * 4, 16 * 16 * 4, static_cast<BYTE*>(bits)))) {
         if (dib) DeleteObject(dib);
         return nullptr;
     }
@@ -475,7 +476,7 @@ std::vector<OpenWithApp> ShellMenuEmulator::OpenWithAppsFor(const std::wstring& 
             if (SUCCEEDED(SHAssocEnumHandlers(extLower.c_str(), ASSOC_FILTER_RECOMMENDED, &handlers)) && handlers) {
                 IAssocHandler* raw = nullptr;
                 ULONG fetched = 0;
-                while (entry.apps.size() < 25 && handlers->Next(1, &raw, &fetched) == S_OK && fetched == 1 && raw) {
+                while (entry.apps.size() < kMaxOpenWithApps && handlers->Next(1, &raw, &fetched) == S_OK && fetched == 1 && raw) {
                     std::shared_ptr<void> holder(raw, [](void* p) { static_cast<IAssocHandler*>(p)->Release(); });
                     LPWSTR uiName = nullptr, name = nullptr, icon = nullptr;
                     int iconIndex = 0;
@@ -508,6 +509,27 @@ std::vector<OpenWithApp> ShellMenuEmulator::OpenWithAppsFor(const std::wstring& 
     }
 #endif
     return GetOpenWithApps(isImage);
+}
+
+void ShellMenuEmulator::AddOpenWithItems(HMENU popup, std::vector<OpenWithApp>& apps, UINT firstCmdId) {
+    if (!popup) return;
+    if (apps.size() > kMaxOpenWithApps) apps.resize(kMaxOpenWithApps);
+    UINT pos = 0;
+    for (size_t i = 0; i < apps.size(); ++i, ++pos) {
+        const UINT id = firstCmdId + static_cast<UINT>(i);
+#ifdef _WIN32
+        InsertMenuW(popup, pos, MF_BYPOSITION | MF_STRING, id, apps[i].name.c_str());
+#else
+        AppendMenuW(popup, MF_STRING, id, apps[i].name.c_str());     // the HAL's menus have no InsertMenuW
+#endif
+        if (apps[i].hMenuBmp) AttachMenuBitmap(popup, id, false, apps[i].hMenuBmp);
+    }
+    if (pos == 0) return;
+#ifdef _WIN32
+    InsertMenuW(popup, pos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+#else
+    AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+#endif
 }
 
 void ShellMenuEmulator::ReleaseOpenWithCache() {

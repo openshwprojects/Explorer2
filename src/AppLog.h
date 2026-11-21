@@ -35,6 +35,10 @@ public:
     static void Ok   (const std::wstring& category, const std::wstring& message) { Write(LogLevel::Ok,    category, message); }
     static void Warn (const std::wstring& category, const std::wstring& message) { Write(LogLevel::Warn,  category, message); }
     static void Error(const std::wstring& category, const std::wstring& message) { Write(LogLevel::Error, category, message); }
+    // Puts everything written so far on the disk now. The file is written without a buffer of its own, but Windows
+    // keeps the newest writes in its cache for a moment, and a machine that hangs and is switched off loses them:
+    // call it after the line that announces a step which talks to drivers or devices.
+    static void Flush();
 
     static std::vector<LogEntry> Snapshot();     // oldest first
     static uint64_t Version();                   // grows with every entry

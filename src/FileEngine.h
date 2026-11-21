@@ -177,7 +177,9 @@ public:
 
     // File management operations
     static std::wstring ResolveAddressInput(std::wstring_view rawInput, const std::wstring& currentDir = L"");
-    static bool ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord);
+    // infoPath: where the bytes came from. On Linux it says which trash they belong to, which a relative Path= of a
+    // drive's own trash needs (without it the home trash is assumed).
+    static bool ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, RecycleBinRecord& outRecord, const std::wstring& infoPath = L"");
     static bool GetRecycleBinCompanionInfoPath(const std::wstring& dataPath, std::wstring& outInfoPath);
     static bool RestoreRecycleBinItem(const std::wstring& dataPath, Lang lang, std::wstring& outRestoredPath, DWORD* outError = nullptr);
     static bool DeleteRecycleBinItemPermanently(const std::wstring& dataPath, DWORD* outError = nullptr);

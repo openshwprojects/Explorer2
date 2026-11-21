@@ -244,7 +244,7 @@ inline const Strings kStringsPL = {
     L"Czy na pewno chcesz TRWALE usunąć wybrane elementy?",
     L"Zmień nazwę",
     L"Nowy folder",
-    L"[←/→] Nawigacja   [Del] Kosz   [Shift+Del] Trwale usuń   [Scroll] Zoom   [1] 100%   [0] Dopasuj   [F11] Pełny ekran   [Esc/Space] Wróć",
+    L"[←/→, klik z boku] Nawigacja   [Del] Kosz   [Shift+Del] Trwale usuń   [Scroll] Zoom   [1] 100%   [0] Dopasuj   [F11] Pełny ekran   [Esc/Space] Wróć",
     L"Brak obrazów w tym folderze (wybierz obraz lub przełącz widok)",
 
     L"Kosz",
@@ -333,7 +333,7 @@ inline const Strings kStringsEN = {
     L"Are you sure you want to PERMANENTLY delete the selected items?",
     L"Rename",
     L"New folder",
-    L"[←/→] Prev/Next   [Del] Recycle   [Shift+Del] Perm Delete   [Scroll] Zoom   [1] 100%   [0] Fit   [F11] Fullscreen   [Esc/Space] Back",
+    L"[←/→, click a side] Prev/Next   [Del] Recycle   [Shift+Del] Perm Delete   [Scroll] Zoom   [1] 100%   [0] Fit   [F11] Fullscreen   [Esc/Space] Back",
     L"No images in this folder (select an image or switch view mode)",
 
     L"Recycle Bin",

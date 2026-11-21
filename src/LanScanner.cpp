@@ -17,6 +17,7 @@
 #include <icmpapi.h>
 
 #include "LanScanner.h"
+#include "AppLog.h"
 #include "XmlTagScan.h"
 
 #include <algorithm>
@@ -42,11 +43,18 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr int kDiscoveryThreads = 96;     // blocking echo calls -> many threads, tiny CPU cost
-constexpr int kNameThreads = 24;          // reverse DNS / NBSTAT workers
+// At most this many echo requests are out at once. An echo to an address nobody owns makes the OS send ARP
+// requests for it (and repeat them), so this also bounds the burst of ARP traffic a scan puts on the network.
+// It was 96 (with 24 name workers), started by merely opening the LAN tab, when a user reported a whole-system
+// freeze right after that click (GitHub issue #2, never reproduced): a scan now waits for "Skanuj sieć" and goes
+// at a third of that pace.
+constexpr int kDiscoveryThreads = 32;
+constexpr int kNameThreads = 8;           // reverse DNS / NBSTAT workers
 constexpr int kPingTimeoutMs = 400;
 constexpr int kNbstatTimeoutMs = 600;
-constexpr int kScanBudgetMs = 15000;      // global wall-clock budget of one scan (incl. name resolution)
+// Global wall-clock budget of one scan (incl. name resolution). 1024 addresses that do not answer take
+// 1024 / 32 * 0.4 s = 13 s of it.
+constexpr int kScanBudgetMs = 25000;
 constexpr int kPortTimeoutMs = 300;
 constexpr int kHttpTimeoutMs = 1500;
 constexpr size_t kHttpMaxBytes = 64 * 1024;
@@ -801,7 +809,8 @@ void LanScanner::ScanThreadMain(uint32_t gen, LanAdapterInfo adapter, int maxHos
     auto finish = [&] { if (!stale()) scanning_ = false; };
     if (stale()) return;                       // superseded before we even started
 
-    const auto deadline = Clock::now() + std::chrono::milliseconds(kScanBudgetMs);
+    const auto started = Clock::now();
+    const auto deadline = started + std::chrono::milliseconds(kScanBudgetMs);
     const uint32_t self = adapter.ipHostOrder;
     uint32_t gateway = 0;
     bool haveGateway = ParseIp(adapter.gateway, gateway);
@@ -968,6 +977,18 @@ void LanScanner::ScanThreadMain(uint32_t gen, LanAdapterInfo adapter, int maxHos
     while (!stale() && Clock::now() < deadline && pendingNames.load() > 0)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
+    // The start is logged where the user clicks; the end here, so that a log cut short shows a scan under way
+    if (!stale()) {
+        size_t found = 0;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            found = hosts_.size();
+        }
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+        AppLog::Info(L"LAN", L"Network scan finished: " + std::to_wstring(found) + L" devices, " +
+                                 std::to_wstring(done_.load()) + L" of " + std::to_wstring(total_.load()) + L" addresses in " +
+                                 std::to_wstring(ms / 1000) + L"." + std::to_wstring((ms % 1000) / 100) + L" s");
+    }
     finish();                                  // UI sees "done" now; stragglers are joined below
     stopNames = true;
     nq.cv.notify_all();

@@ -1962,7 +1962,7 @@ public:
         const D2D1_POINT_2F a = XformPt(p0);
         const D2D1_POINT_2F b = XformPt(p1);
         if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(b.x) || !std::isfinite(b.y)) return;
-        const float rad = std::clamp(0.5f * strokeWidth, 0.5f, kCoordLimit);
+        const float rad = std::clamp(0.5f * strokeWidth * DpiScale(), 0.5f, kCoordLimit);
         const int ix0 = std::max(m_clipX0, FloorToInt(std::min(a.x, b.x) - rad - 1.0f));
         const int iy0 = std::max(m_clipY0, FloorToInt(std::min(a.y, b.y) - rad - 1.0f));
         const int ix1 = std::min(m_clipX1, CeilToInt(std::max(a.x, b.x) + rad + 1.0f));
@@ -2260,11 +2260,17 @@ public:
         if (col.a == 0) return;
 
         const D2D1_POINT_2F baseOrig = XformPt(origin);
-        const float boxW = sw->GetMaxWidth();
-        const float boxH = sw->GetMaxHeight();
-        const float lineH = sw->LineHeightPx();
-        const float ascent = sw->AscentPx();
-        const int pxH = sw->PixelFontHeight();
+        // The layout was measured in DIPs. Above 96 DPI its sizes are turned into pixels here and the glyphs are
+        // rasterized at the bigger size (sharp, not stretched), while each glyph keeps the place the layout gave it,
+        // so wrapping and alignment stay as measured. At 96 DPI nothing below changes.
+        const float sx = m_dpiX / 96.0f, sy = m_dpiY / 96.0f;
+        const bool scaled = (sx != 1.0f || sy != 1.0f);
+        const float boxW = sw->GetMaxWidth() * sx;
+        const float boxH = sw->GetMaxHeight() * sy;
+        const float lineH = sw->LineHeightPx() * sy;
+        const float ascent = sw->AscentPx() * sy;
+        const int layoutPxH = sw->PixelFontHeight();
+        const int pxH = scaled ? std::max(1, RoundToInt(static_cast<float>(layoutPxH) * sy)) : layoutPxH;
         const float totalH = static_cast<float>(lines.size()) * lineH;
 
         float startY = baseOrig.y;
@@ -2289,15 +2295,18 @@ public:
 
         for (size_t li = 0; li < lines.size(); ++li) {
             const auto& line = lines[li];
-            float penX = baseOrig.x;
-            if (tAlign == DWRITE_TEXT_ALIGNMENT_CENTER && boxW > 0.0f) penX += 0.5f * (boxW - line.widthPx);
-            else if (tAlign == DWRITE_TEXT_ALIGNMENT_TRAILING && boxW > 0.0f) penX += (boxW - line.widthPx);
+            float lineX = baseOrig.x;
+            if (tAlign == DWRITE_TEXT_ALIGNMENT_CENTER && boxW > 0.0f) lineX += 0.5f * (boxW - line.widthPx * sx);
+            else if (tAlign == DWRITE_TEXT_ALIGNMENT_TRAILING && boxW > 0.0f) lineX += (boxW - line.widthPx * sx);
             const int baselineY = RoundToInt(startY + li * lineH + ascent);
+            float penX = lineX;           // unscaled: the pen moves by the drawn glyphs' own advances
+            float penDip = 0.0f;          // scaled: the pen in the layout's units, by the advances it was measured with
 
             for (uint32_t cp : line.cps) {
                 // Held while drawing: the glyph cache may drop its entry in the meantime
                 const GlyphPtr glyph = face.GetGlyph(cp, pxH);
                 const RasterGlyph& rg = *glyph;
+                if (scaled) penX = lineX + penDip * sx;
                 // A pen beyond the coordinate limit (or NaN) cannot be rounded to a pixel safely; such a glyph
                 // lies far outside the target anyway
                 if (rg.width > 0 && rg.height > 0 && !rg.alpha.empty() && std::fabs(penX) < kCoordLimit) {
@@ -2319,7 +2328,8 @@ public:
                         }
                     }
                 }
-                penX += rg.advancePx;
+                if (scaled) penDip += face.GetGlyph(cp, layoutPxH)->advancePx;
+                else penX += rg.advancePx;
             }
         }
     }
@@ -2365,11 +2375,17 @@ private:
         UpdateEffectiveClip();
     }
 
+    // The pixel of a point given in DIPs: the caller's transform, then the target's DPI, as in Direct2D. Above 96 DPI
+    // (the UI scale of the Settings tab, or EXPLORER2_FORCE_DPI) a DIP is more than one pixel; at 96 the factors are
+    // exactly 1, so drawing at 100 % is unchanged.
     D2D1_POINT_2F XformPt(D2D1_POINT_2F p) const {
         return D2D1::Point2F(
-            p.x * m_transform._11 + p.y * m_transform._21 + m_transform._31,
-            p.x * m_transform._12 + p.y * m_transform._22 + m_transform._32);
+            (p.x * m_transform._11 + p.y * m_transform._21 + m_transform._31) * (m_dpiX / 96.0f),
+            (p.x * m_transform._12 + p.y * m_transform._22 + m_transform._32) * (m_dpiY / 96.0f));
     }
+
+    // The same factor for lengths that are not points: stroke widths (radii and font sizes use each axis's own)
+    float DpiScale() const { return 0.5f * (m_dpiX + m_dpiY) / 96.0f; }
 
     D2D1_RECT_F XformRect(const D2D1_RECT_F& r) const {
         const D2D1_POINT_2F a = XformPt(D2D1::Point2F(r.left, r.top));
@@ -2455,8 +2471,10 @@ private:
         const D2D1_RECT_F tr = XformRect(rr.rect);
         const float w = tr.right - tr.left, h = tr.bottom - tr.top;
         if (!IsFiniteRect(tr) || !(w > 0.0f) || !(h > 0.0f)) return;
-        const float rx = std::clamp(std::isfinite(rr.radiusX) ? std::abs(rr.radiusX) : 0.0f, 0.0f, 0.5f * w);
-        const float ry = std::clamp(std::isfinite(rr.radiusY) ? std::abs(rr.radiusY) : 0.0f, 0.0f, 0.5f * h);
+        // The rectangle is in pixels now; the radii and the stroke still in DIPs
+        strokeW *= DpiScale();
+        const float rx = std::clamp(std::isfinite(rr.radiusX) ? std::abs(rr.radiusX) * (m_dpiX / 96.0f) : 0.0f, 0.0f, 0.5f * w);
+        const float ry = std::clamp(std::isfinite(rr.radiusY) ? std::abs(rr.radiusY) * (m_dpiY / 96.0f) : 0.0f, 0.0f, 0.5f * h);
         const float cx = 0.5f * (tr.left + tr.right), cy = 0.5f * (tr.top + tr.bottom);
         const float bx = 0.5f * w - rx, by = 0.5f * h - ry;
         const float rAvg = std::max(0.0f, 0.5f * (rx + ry));
@@ -2505,8 +2523,10 @@ private:
         if (col.a == 0) return;
         const D2D1_POINT_2F c = XformPt(el.point);
         if (!std::isfinite(c.x) || !std::isfinite(c.y) || !std::isfinite(el.radiusX) || !std::isfinite(el.radiusY)) return;
-        const float rx = std::max(0.5f, std::abs(el.radiusX));
-        const float ry = std::max(0.5f, std::abs(el.radiusY));
+        // The centre is in pixels now; the radii and the stroke still in DIPs
+        strokeW *= DpiScale();
+        const float rx = std::max(0.5f, std::abs(el.radiusX) * (m_dpiX / 96.0f));
+        const float ry = std::max(0.5f, std::abs(el.radiusY) * (m_dpiY / 96.0f));
         const float pad = fill ? 1.0f : (0.5f * strokeW + 1.0f);
         const int ix0 = std::max(m_clipX0, FloorToInt(c.x - rx - pad));
         const int iy0 = std::max(m_clipY0, FloorToInt(c.y - ry - pad));
@@ -2575,33 +2595,41 @@ public:
         return S_OK;
     }
 
+    // The DPI of the properties is taken as Direct2D takes it (0, the default, stays 96): the window's target gets
+    // the user's UI scale this way, and a test can draw at 144 DPI into a bitmap
     HRESULT STDMETHODCALLTYPE CreateHwndRenderTarget(
-        const D2D1_RENDER_TARGET_PROPERTIES*,
+        const D2D1_RENDER_TARGET_PROPERTIES* props,
         const D2D1_HWND_RENDER_TARGET_PROPERTIES* hp,
         ID2D1HwndRenderTarget** out) override
     {
         if (!out || !hp) return E_POINTER;
         const D2D1_SIZE_U sz = (hp->pixelSize.width > 0 && hp->pixelSize.height > 0)
             ? hp->pixelSize : D2D1::SizeU(1280, 800);
-        *out = new SwRenderTarget(hp->hwnd, sz, nullptr);
+        auto* rt = new SwRenderTarget(hp->hwnd, sz, nullptr);
+        if (props) rt->SetDpi(props->dpiX, props->dpiY);
+        *out = rt;
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE CreateDCRenderTarget(
-        const D2D1_RENDER_TARGET_PROPERTIES*, ID2D1DCRenderTarget** out) override
+        const D2D1_RENDER_TARGET_PROPERTIES* props, ID2D1DCRenderTarget** out) override
     {
         if (!out) return E_POINTER;
-        *out = new SwRenderTarget(nullptr, D2D1::SizeU(256, 256), nullptr);
+        auto* rt = new SwRenderTarget(nullptr, D2D1::SizeU(256, 256), nullptr);
+        if (props) rt->SetDpi(props->dpiX, props->dpiY);
+        *out = rt;
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE CreateWicBitmapRenderTarget(
-        IWICBitmap* target, const D2D1_RENDER_TARGET_PROPERTIES*, ID2D1RenderTarget** out) override
+        IWICBitmap* target, const D2D1_RENDER_TARGET_PROPERTIES* props, ID2D1RenderTarget** out) override
     {
         if (!out || !target) return E_POINTER;
         UINT w = 0, h = 0;
         target->GetSize(&w, &h);
-        *out = static_cast<ID2D1HwndRenderTarget*>(new SwRenderTarget(nullptr, D2D1::SizeU(w ? w : 64u, h ? h : 64u), target));
+        auto* rt = new SwRenderTarget(nullptr, D2D1::SizeU(w ? w : 64u, h ? h : 64u), target);
+        if (props) rt->SetDpi(props->dpiX, props->dpiY);
+        *out = static_cast<ID2D1HwndRenderTarget*>(rt);
         return S_OK;
     }
 

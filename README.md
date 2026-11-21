@@ -192,7 +192,8 @@ Explorer2 uses these when they are installed, and works without them:
 
 - The Settings tab has a "UI scale" setting with "Larger text" and "Smaller text" buttons (also Ctrl and +, Ctrl
   and -, Ctrl and 0) that makes the whole interface larger or smaller without changing the display scaling of
-  Windows. It is not available in the Linux build yet.
+  Windows or of the Linux desktop. The Linux build has it too: its software renderer draws everything at the
+  chosen size (text rasterized at that size, not stretched), the address and search boxes included.
 - A photo that is stored turned (EXIF orientation: phones store what the sensor saw and note how the phone was
   held) is shown upright in the list, the preview pane and the viewer, with its sides as you see them. Turning,
   cropping and resizing work on that upright picture and write a file that needs no turning.
@@ -250,6 +251,11 @@ Explorer2 uses these when they are installed, and works without them:
 - Ctrl+Z after a Recycle Bin delete works from hidden copies (hard links, so they take no extra
   space) that Explorer2 keeps in `.explorer2_undo` at the root of the drive while it runs. They
   are removed when it exits; what a crashed session leaves behind is removed at the next start.
+  A deleted folder comes back out of the Recycle Bin itself.
+- On Linux, Delete uses the desktop's trash as GNOME and KDE do: the home trash for the home folder's
+  drive, and on a USB stick or another partition that drive's own `.Trash-<uid>` folder, so nothing is
+  copied between drives. The Recycle Bin view shows and restores the items of every drive. Drives kept in
+  memory (tmpfs), system and network drives have no trash: Explorer2 asks before deleting there for good.
 - Extracting an archive never replaces a file that is already there. From ZIP and TAR archives
   the new file is saved next to it as `name (2)`; where 7-Zip, UnRAR or tar does the unpacking,
   that file is skipped. Entries that point outside the destination folder are never written.
@@ -290,10 +296,13 @@ $p.ExitCode
 Subversion panel's back end alone, or `100x`, which repeats stages 1 to 10 a hundred times.
 
 The tests read sample files from `testdata/`, which must sit next to the executable or in the
-current directory. Some of them exercise the real machine: they ping 127.0.0.1, ask `\\localhost` for
+current directory. The release packages do not include it: to run every test, start the self-test with a
+copy of the repository as the current directory. Without it, every test that reads a sample file fails, and
+the report starts with a `[NOTE]` that says so. Some of them exercise the real machine: they ping 127.0.0.1,
+scan the loopback addresses 127.0.0.1 - 127.0.0.6 the way the LAN tab scans a network (Windows), ask `\\localhost` for
 its shared folders, try to reach `\\10.255.255.1` (a host that never answers) in the background, enumerate USB
 controllers, render a PDF through Windows, start a second copy of the executable to check that
-it ends cleanly, move one small file to the Recycle Bin and take it out again, write and remove a
+it ends cleanly, move one small file and one small folder to the Recycle Bin and take them out again, write and remove a
 scratch key under `HKEY_CURRENT_USER\Software\Explorer2SelfTest`, and briefly use
 the hidden undo folder on the drive that holds `%TEMP%`. When git is installed, they create a small
 local git repository and browse it by its `file://` URL; when a Subversion client with `svnadmin.exe`

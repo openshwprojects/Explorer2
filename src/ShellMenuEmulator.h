@@ -116,6 +116,13 @@ public:
     // Opens the files with a program from that list: through its shell handler (all the files, as Explorer does),
     // else its .exe with the first file as the argument
     static bool LaunchOpenWithApp(HWND hwnd, const OpenWithApp& app, const std::vector<std::wstring>& paths, const std::wstring& workDir);
+    // At most this many programs per kind of file: the window gives them the command IDs CMD_BASE_OPENWITH + 0..24
+    // (CommandIds.h keeps 320..349 for them)
+    static constexpr size_t kMaxOpenWithApps = 25;
+    // Puts the programs (cut to kMaxOpenWithApps) at the top of an "Open with" submenu, each with its picture and the
+    // command ID firstCmdId + its index, and a separator under them when there are any. On Windows they go in front
+    // of what the submenu already holds; the Linux menu is filled while it is still empty.
+    static void AddOpenWithItems(HMENU popup, std::vector<OpenWithApp>& apps, UINT firstCmdId);
 
     HBITMAP Get7ZipMenuBitmap() const { std::lock_guard<std::mutex> lk(m_mutex); return m_7zMenuBmp; }
     HBITMAP GetTerminalMenuBitmap() const { std::lock_guard<std::mutex> lk(m_mutex); return m_terminalMenuBmp; }

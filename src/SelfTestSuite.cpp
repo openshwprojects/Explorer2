@@ -13,6 +13,7 @@
 #include "PdfViewer.h"
 #include "HardwareInfo.h"
 #include "LanScanner.h"
+#include "EdaTrackDraw.h"
 #include "BackupManager.h"
 #include "FtpClient.h"
 #include "FileEngine.h"
@@ -56,6 +57,7 @@
 #include <csignal>
 #include <dlfcn.h>
 #include <ucontext.h>
+#include "LinuxTrash.h"
 #endif
 
 namespace Explorer2::SelfTestSuite {
@@ -1455,6 +1457,39 @@ void RunStage8Tests(TestCounter& tc) {
         bool afterStop = !lan.IsPingAutoRefreshEnabled();
         tc.Record(wasOn && afterToggleOff && afterToggleOn && afterStop, L"Stage8.Test5_AutoRefreshThread_Lifecycle");
     }
+
+#ifdef _WIN32
+    // Test 8.6: a whole host scan that never leaves this computer: a made-up adapter 127.0.0.1/29, whose addresses
+    // 127.0.0.1 - 127.0.0.6 all belong to the loopback interface. The scan has to end by itself within its time
+    // budget (25 s, now with 32 pings and 8 name lookups at a time at most), count all six addresses and find this PC.
+    // Windows only for now: it has not run on a real Linux machine yet (the Cygwin build of the Linux code used for
+    // checks on the development machine dies in this stage even without it), and a crash would end the whole run.
+    {
+        LanScanner lan;
+        LanAdapterInfo a;
+        a.name = L"loopback (self-test)";
+        a.ip = L"127.0.0.1";
+        a.mask = L"255.255.255.248";
+        a.prefix = 29;
+        const ULONGLONG t0 = GetTickCount64();
+        lan.StartScan(a);
+        while (lan.IsScanning() && GetTickCount64() - t0 < 40000) Sleep(20);
+        const ULONGLONG tookMs = GetTickCount64() - t0;
+        int done = 0, total = 0;
+        lan.GetScanProgress(done, total);
+        const std::vector<LanHost> hosts = lan.SnapshotHosts();
+        bool selfFound = false;
+        for (const LanHost& h : hosts) {
+            if (h.ip == L"127.0.0.1" && h.isSelf) selfFound = true;
+        }
+        const bool ended = !lan.IsScanning();
+        tc.Record(ended && total == 6 && done == total && selfFound,
+                  L"Stage8.Test6_WholeScan_LoopbackSubnet_EndsAndFindsThisPc",
+                  L"ended=" + std::to_wstring(ended ? 1 : 0) + L", " + std::to_wstring(done) + L"/" + std::to_wstring(total) +
+                      L" addresses, hosts=" + std::to_wstring(hosts.size()) + L", self=" + std::to_wstring(selfFound ? 1 : 0) +
+                      L", " + std::to_wstring(tookMs) + L" ms");
+    }
+#endif
 }
 
 // ============================================================================
@@ -4526,6 +4561,93 @@ static void RunStage13Tests(TestCounter& tc) {
                    restore2Ok ? 1 : 0, purgeOk ? 1 : 0, liveRoundTripOk ? 1 : 0);
         tc.Record(ok, L"Stage13.Test20c_RecycleBin_KoszAddressAliasAndV1V2RestorePurge", detail);
     }
+
+    // Test 13.20d: a folder (with a file in it) in the Recycle Bin: listed there, restored from there whole, and
+    // after a second delete brought back with Ctrl+Z, which takes it out of the bin again (no undo copy can be made
+    // of a folder: only files had undo). A forum user on Linux could not get deleted folders back. Where the drive
+    // has no usable bin the delete is reported and the folder kept, and there is nothing more to test.
+    {
+        const std::wstring made = baseDir + L"\\t20d_folder_" + std::to_wstring(GetTickCount64());
+        CreateDirectoryW(made.c_str(), nullptr);
+        wchar_t longBuf[1024] = {};
+        const std::wstring folder = (GetLongPathNameW(made.c_str(), longBuf, 1024) > 0) ? std::wstring(longBuf) : made;
+        const std::wstring inner = folder + L"\\inside.txt";
+        PathUtils::WriteFileBytes(inner, "t20d", 4);
+
+        const int jid = tm.EnqueueDelete({ folder }, false);
+        const bool waited = tm.WaitForJob(jid, 30000);
+        TransferJobSnapshot snap;
+        const bool have = FindJobSnapshot(tm, jid, snap);
+        const bool noBin = waited && have && snap.state == TransferJobState::CompletedWithErrors && existsOnDisk(inner);
+        bool listed = false, restored = false, undone = false;
+        if (!noBin && waited && !existsOnDisk(folder)) {
+            FileEngine fe;
+            std::wstring dataPath;
+            for (const FileEntry& be : fe.EnumerateDirectory(L"RECYCLE_BIN", true, true, Lang::PL)) {
+                if (be.isDirectory && PathUtils::NormalizePathKey(be.originalPath) == PathUtils::NormalizePathKey(folder)) dataPath = be.fullPath;
+            }
+            listed = !dataPath.empty();
+            std::wstring back;
+            restored = listed && FileEngine::RestoreRecycleBinItem(dataPath, Lang::PL, back) && existsOnDisk(inner);
+            if (restored) {
+                // Again as the window does it: the undo record first, then the delete job, then Ctrl+Z
+                fe.BeginDelete({ folder }, false);
+                const int jid2 = tm.EnqueueDelete({ folder }, false);
+                const bool gone2 = tm.WaitForJob(jid2, 30000) && !existsOnDisk(folder);
+                fe.EndDelete({ folder });
+                std::wstring restoredDir;
+                undone = gone2 && fe.UndoLastDelete(restoredDir) && existsOnDisk(inner);
+            }
+        }
+        TransferManager::DeleteTreeNow(folder);      // nothing of the test stays behind, nor in the bin
+        tc.Record(noBin || (listed && restored && undone), L"Stage13.Test20d_RecycleBin_Folder_RestoredFromBin_And_ByUndo",
+                  noBin ? std::wstring(L"no usable Recycle Bin on this drive: reported and kept")
+                        : (L"listed=" + std::to_wstring(listed ? 1 : 0) + L", restored=" + std::to_wstring(restored ? 1 : 0) +
+                           L", undone=" + std::to_wstring(undone ? 1 : 0)));
+    }
+
+#ifndef _WIN32
+    // Test 13.20e: a drive's own trash, as on a USB stick or another partition: "<top>/.Trash-<uid>", with Path=
+    // relative to the drive's top folder (the item finds its place when the stick is mounted elsewhere next time),
+    // its .trashinfo found from the item and the item restored by the Recycle Bin view's code. A scratch folder stands
+    // in for the drive's top folder (a test cannot mount one). With a sticky "<top>/.Trash" (made by an
+    // administrator) the trash is "<top>/.Trash/<uid>". Before this, an item on another drive had no bin at all.
+    {
+        std::string top = Explorer2::Compat::NativePath((baseDir + L"\\t20e_drive_" + std::to_wstring(GetTickCount64())).c_str());
+        LinuxTrash::MakePrivateDirs(top + "/photos/2026");
+        char realBuf[PATH_MAX] = {};
+        if (::realpath(top.c_str(), realBuf)) top = realBuf;    // MoveToTrash writes the resolved path
+        const std::string uid = std::to_string(::geteuid());
+        const std::wstring photo = PathUtils::Utf8ToWide(top + "/photos/2026/a b.jpg");
+        PathUtils::WriteFileBytes(photo, "jpeg", 4);
+
+        const std::string trash = LinuxTrash::TopDirTrash(top, true);
+        const bool trashOk = trash == top + "/.Trash-" + uid && LinuxTrash::RelativePathBase(trash) == top;
+        const bool moved = trashOk && LinuxTrash::MoveToTrash(top + "/photos/2026/a b.jpg", trash) == 0 && !existsOnDisk(photo);
+        std::vector<uint8_t> info;
+        PathUtils::ReadFileBytes(PathUtils::Utf8ToWide(trash + "/info/a b.jpg.trashinfo"), 4096, info);
+        const std::string infoText(info.begin(), info.end());
+        const bool relative = moved && infoText.find("\nPath=photos/2026/a%20b.jpg\n") != std::string::npos;
+        const std::wstring dataPath = PathUtils::Utf8ToWide(trash + "/files/a b.jpg");
+        std::wstring infoPathW, back;
+        const bool companion = FileEngine::GetRecycleBinCompanionInfoPath(dataPath, infoPathW) &&
+                               infoPathW == PathUtils::Utf8ToWide(trash + "/info/a b.jpg.trashinfo");
+        const bool restored = companion && FileEngine::RestoreRecycleBinItem(dataPath, Lang::PL, back) &&
+                              back == photo && existsOnDisk(photo);
+
+        const std::string top2 = top + "_shared";
+        LinuxTrash::MakePrivateDirs(top2 + "/.Trash");
+        ::chmod((top2 + "/.Trash").c_str(), 01777);
+        const bool shared = LinuxTrash::TopDirTrash(top2, true) == top2 + "/.Trash/" + uid;
+
+        TransferManager::DeleteTreeNow(PathUtils::Utf8ToWide(top));
+        TransferManager::DeleteTreeNow(PathUtils::Utf8ToWide(top2));
+        tc.Record(trashOk && moved && relative && companion && restored && shared, L"Stage13.Test20e_LinuxTrash_DriveOwnTrash_RelativePathRestored",
+                  L"trash=" + std::to_wstring(trashOk ? 1 : 0) + L", moved=" + std::to_wstring(moved ? 1 : 0) +
+                  L", relative=" + std::to_wstring(relative ? 1 : 0) + L", companion=" + std::to_wstring(companion ? 1 : 0) +
+                  L", restored=" + std::to_wstring(restored ? 1 : 0) + L", sharedTrash=" + std::to_wstring(shared ? 1 : 0));
+    }
+#endif
 
     // Test 13.21: a file that appears in a folder after the folder was listed (a thumbnail cache, a log,
     // a late download) does not leave the folder behind: the engine takes a second pass
@@ -8714,6 +8836,126 @@ static void RunStage16Tests(TestCounter& tc) {
                   (delegateEmpty ? L"" : L"[DelegateExecute] ") + (removed ? L"" : L"[not removed] ") + (keyGone ? L"" : L"[key left behind]"));
     }
 #endif
+
+    // Test 16.28: drawing at 144 DPI, as with a UI scale of 150 %: every length in DIPs becomes one and a half pixels -
+    // a filled square, a line's width, a circle, and text, whose glyphs are rasterized bigger. On Windows Direct2D does
+    // it; on Linux the HAL's software renderer, which until 2026-11-20 drew at 96 DPI whatever the target's DPI (so the
+    // Settings tab offered no text size there, and a forum user with a 27-inch screen could not enlarge anything).
+    {
+        Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+        Microsoft::WRL::ComPtr<ID2D1Factory> d2d;
+        Microsoft::WRL::ComPtr<IDWriteFactory> dwrite;
+        Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+        const bool ready = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+                           SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf())) &&
+                           SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwrite.GetAddressOf()))) &&
+                           SUCCEEDED(dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                                              DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"pl-PL", &format));
+        constexpr int kW = 300, kH = 240;
+        auto paint = [&](float dpi, std::vector<uint8_t>& px) -> bool {
+            Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
+            Microsoft::WRL::ComPtr<ID2D1RenderTarget> rt;
+            Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+            const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+            if (FAILED(wic->CreateBitmap(kW, kH, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &bitmap)) ||
+                FAILED(d2d->CreateWicBitmapRenderTarget(bitmap.Get(), props, &rt)) ||
+                FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0x000000), &brush))) {
+                return false;
+            }
+            rt->BeginDraw();
+            rt->Clear(D2D1::ColorF(D2D1::ColorF::White));
+            rt->FillRectangle(D2D1::RectF(10.0f, 10.0f, 50.0f, 50.0f), brush.Get());                       // 40 x 40
+            rt->DrawLine(D2D1::Point2F(70.0f, 30.0f), D2D1::Point2F(150.0f, 30.0f), brush.Get(), 4.0f);    // 4 wide
+            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(30.0f, 100.0f), 15.0f, 15.0f), brush.Get());       // 30 across
+            rt->DrawText(L"MMMM", 4, format.Get(), D2D1::RectF(70.0f, 80.0f, 190.0f, 120.0f), brush.Get());
+            if (FAILED(rt->EndDraw())) return false;
+            px.assign(static_cast<size_t>(kW) * kH * 4, 0);
+            return SUCCEEDED(bitmap->CopyPixels(nullptr, kW * 4, static_cast<UINT>(px.size()), px.data()));
+        };
+        // The box of the dark (at least half covered) pixels in a region given in pixels
+        struct Ink {
+            int l = 1 << 30, t = 1 << 30, r = -(1 << 30), b = -(1 << 30);
+            int w() const { return r > l ? r - l : 0; }
+            int h() const { return b > t ? b - t : 0; }
+        };
+        auto inkIn = [&](const std::vector<uint8_t>& px, int x0, int y0, int x1, int y1) {
+            Ink ink;
+            for (int y = std::max(0, y0); y < std::min(kH, y1); ++y) {
+                for (int x = std::max(0, x0); x < std::min(kW, x1); ++x) {
+                    const uint8_t* p = px.data() + (static_cast<size_t>(y) * kW + x) * 4;
+                    if (p[0] < 128 && p[1] < 128 && p[2] < 128) {
+                        ink.l = std::min(ink.l, x); ink.r = std::max(ink.r, x + 1);
+                        ink.t = std::min(ink.t, y); ink.b = std::max(ink.b, y + 1);
+                    }
+                }
+            }
+            return ink;
+        };
+        std::vector<uint8_t> at96, at144;
+        const bool painted = ready && paint(96.0f, at96) && paint(144.0f, at144);
+        Ink sq96, sq144, ln96, ln144, el96, el144, tx96, tx144;
+        if (painted) {   // each shape is looked for where it lies at that DPI
+            sq96 = inkIn(at96, 0, 0, 60, 60);         sq144 = inkIn(at144, 0, 0, 90, 90);
+            ln96 = inkIn(at96, 65, 20, 160, 40);      ln144 = inkIn(at144, 98, 30, 240, 60);
+            el96 = inkIn(at96, 0, 70, 60, 130);       el144 = inkIn(at144, 0, 105, 90, 195);
+            tx96 = inkIn(at96, 65, 75, 200, 125);     tx144 = inkIn(at144, 98, 113, 300, 188);
+        }
+        auto within = [](int got, int want, int tol) { return got >= want - tol && got <= want + tol; };
+        const bool square = within(sq96.w(), 40, 1) && within(sq144.w(), 60, 1) && within(sq144.h(), 60, 1) &&
+                            within(sq144.l, 15, 1) && within(sq144.t, 15, 1);
+        // The line's ends differ (Direct2D's caps are flat, the HAL's round), its width must not
+        const bool lineOk = within(ln96.h(), 4, 1) && within(ln144.h(), 6, 1) && ln144.w() >= 118 && ln144.w() <= 130;
+        const bool circle = within(el96.w(), 30, 2) && within(el144.w(), 45, 2) && within(el144.h(), 45, 2);
+        const double textH = tx96.h() > 0 ? static_cast<double>(tx144.h()) / tx96.h() : 0.0;
+        const double textW = tx96.w() > 0 ? static_cast<double>(tx144.w()) / tx96.w() : 0.0;
+        const bool text = tx96.h() >= 6 && textH > 1.3 && textH < 1.7 && textW > 1.3 && textW < 1.7;
+        wchar_t detail[300] = {};
+        swprintf_s(detail, L"square %dx%d -> %dx%d at %d,%d; line %d -> %d wide; circle %d -> %dx%d; text %dx%d -> %dx%d",
+                   sq96.w(), sq96.h(), sq144.w(), sq144.h(), sq144.l, sq144.t, ln96.h(), ln144.h(), el96.w(), el144.w(), el144.h(),
+                   tx96.w(), tx96.h(), tx144.w(), tx144.h());
+        tc.Record(painted && square && lineOk && circle && text, L"Stage16.Test28_Drawing_At144Dpi_DipsBecomeOneAndAHalfPixels",
+                  painted ? std::wstring(detail) : std::wstring(L"could not paint"));
+    }
+
+    // Test 16.29: PCB tracks drawn as KiCad draws them, with round ends (EdaTrackDraw.h): where two tracks meet at a
+    // right angle the outside of the bend is filled, and nothing reaches further than half a track's width from the
+    // tracks. With Direct2D's flat line ends the bend had a notch there, and in the preview a chamfered corner's
+    // short diagonal stood out as a diamond (forum post #45).
+    {
+        Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+        Microsoft::WRL::ComPtr<ID2D1Factory> d2d;
+        Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
+        Microsoft::WRL::ComPtr<ID2D1RenderTarget> rt;
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+        constexpr int kW = 100, kH = 100;
+        std::vector<uint8_t> px;
+        const bool painted =
+            SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+            SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf())) &&
+            SUCCEEDED(wic->CreateBitmap(kW, kH, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &bitmap)) &&
+            SUCCEEDED(d2d->CreateWicBitmapRenderTarget(bitmap.Get(), D2D1::RenderTargetProperties(), &rt)) &&
+            SUCCEEDED(rt->CreateSolidColorBrush(D2D1::ColorF(0x000000), &brush)) &&
+            [&] {
+                rt->BeginDraw();
+                rt->Clear(D2D1::ColorF(D2D1::ColorF::White));
+                DrawTrack(rt.Get(), brush.Get(), D2D1::Point2F(20.0f, 60.0f), D2D1::Point2F(60.0f, 60.0f), 10.0f);   // to the bend
+                DrawTrack(rt.Get(), brush.Get(), D2D1::Point2F(60.0f, 60.0f), D2D1::Point2F(60.0f, 20.0f), 10.0f);   // and up
+                if (FAILED(rt->EndDraw())) return false;
+                px.assign(static_cast<size_t>(kW) * kH * 4, 0);
+                return SUCCEEDED(bitmap->CopyPixels(nullptr, kW * 4, static_cast<UINT>(px.size()), px.data()));
+            }();
+        auto dark = [&](int x, int y) {
+            const uint8_t* p = px.data() + (static_cast<size_t>(y) * kW + x) * 4;
+            return p[0] < 100 && p[1] < 100 && p[2] < 100;
+        };
+        const bool tracks = painted && dark(40, 60) && dark(60, 40);
+        const bool bendFilled = painted && dark(62, 62);       // 3.5 px from the bend: a round end covers it, flat ends left it
+        const bool notBeyond = painted && !dark(66, 66);       // 9 px from the bend, more than half the width
+        tc.Record(tracks && bendFilled && notBeyond, L"Stage16.Test29_PcbTracks_RoundEnds_BendWithoutNotch",
+                  L"tracks=" + std::to_wstring(tracks ? 1 : 0) + L", outside of the bend filled=" + std::to_wstring(bendFilled ? 1 : 0) +
+                  L", nothing beyond=" + std::to_wstring(notBeyond ? 1 : 0));
+    }
 }
 
 } // namespace
@@ -8824,6 +9066,27 @@ int RunStageTests(const std::wstring& stageName, const std::wstring& outReportPa
     if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docsa") RunFormatTestsDocs(tc);
     if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docsb") RunFormatTestsDocsB(tc);
     if (stage15 || stageLower == L"15.archives") RunFormatTestsArchives(tc);
+
+    // Run from a release package, the program has no testdata folder beside it, and every test that reads one of its
+    // sample files fails. Say so at both ends of the report: a run like that once showed 217 failures and nothing else
+    // wrong. (The last line stays the summary, which CI shows.)
+    if (tc.failed > 0) {
+        const DWORD tdAttr = GetFileAttributesW(GetTestDataDir().c_str());
+        if (tdAttr == INVALID_FILE_ATTRIBUTES || !(tdAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+            wchar_t cwd[MAX_PATH] = {};
+            GetCurrentDirectoryW(MAX_PATH, cwd);
+            auto shown = [](std::wstring p) {
+                if (!p.empty() && p[0] == L'/') std::replace(p.begin(), p.end(), L'\\', L'/');
+                return p;
+            };
+            tc.log = L"[NOTE] No testdata folder (looked for " + shown(GetExeDir() + L"\\testdata") + L" and " +
+                     shown(std::wstring(cwd) + L"\\testdata") + L"): every test that reads one of the repository's sample "
+                     L"files fails without it, and the release packages do not include it. To run them, start the "
+                     L"self-test with a copy of the repository as the current folder "
+                     L"(https://github.com/openshwprojects/Explorer2).\r\n" + tc.log;
+            tc.log += L"[NOTE] No testdata folder (see the first line): the tests that read a sample file failed for that reason.\r\n";
+        }
+    }
 
     wchar_t summary[256] = {};
     swprintf_s(summary, L"=== SELF-TEST SUMMARY (%s): %d PASSED, %d FAILED ===\r\n",

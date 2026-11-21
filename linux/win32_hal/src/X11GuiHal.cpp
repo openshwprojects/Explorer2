@@ -120,6 +120,9 @@ void PresentHwndFramebuffer(HWND hwnd, const uint8_t* bgra, uint32_t w, uint32_t
 #include <unistd.h>
 #include <vector>
 
+// Win32HalCore.cpp: the character height a font was created with (0 for an unknown one)
+int HalFontPixelHeight(HFONT font);
+
 namespace {
 
 bool IsCliHeadlessMode() {
@@ -466,6 +469,7 @@ struct WndRecord {
     float scrollY = 0.0f;           // STATIC: text scrolled up by this much (a message taller than the screen)
     float contentH = 0.0f;          // STATIC: height of its whole text, measured when drawn
     float editScrollX = 0.0f;       // EDIT: horizontal scroll of the last drawn frame
+    int fontPx = 0;                 // EDIT: character height of the WM_SETFONT font in pixels (0: the default 13)
     HWND focusChild = nullptr;      // top level: the child that had the keyboard focus when the window lost it
     HWND hotChild = nullptr;        // top level: the BUTTON under the pointer
     int msgBoxBandTop = 0;          // MessageBoxW: where the grey button band starts
@@ -937,6 +941,12 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (lParam) *reinterpret_cast<DWORD*>(lParam) = b;
         return static_cast<LRESULT>(static_cast<DWORD>(MAKELONG(std::min<DWORD>(a, 0xFFFF), std::min<DWORD>(b, 0xFFFF))));
     }
+    case WM_SETFONT:
+        // The text is drawn and measured at this font's height from now on: the main window's edit boxes follow its
+        // UI scale this way
+        rec->fontPx = HalFontPixelHeight(reinterpret_cast<HFONT>(wParam));
+        if (LOWORD(lParam)) repaint();
+        return 0;
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
         repaint();
@@ -1256,6 +1266,28 @@ void WriteBmp24Or32(const char* path, const uint8_t* bgra, uint32_t w, uint32_t 
 }
 
 // Overlay visible child EDIT boxes (address/search/rename) onto top-level window BGRA buffer using TrueType DirectWrite
+// The EDIT's text format for a character height in pixels (fontPx; 0 gives 13, the size the HAL always used): one
+// line, centred vertically. Drawing and the click-to-caret mapping must use the same one.
+IDWriteTextFormat* EditTextFormat(int px) {
+    static std::mutex s_mutex;
+    static Microsoft::WRL::ComPtr<IDWriteFactory> s_dw;
+    static std::map<int, Microsoft::WRL::ComPtr<IDWriteTextFormat>> s_formats;
+    std::lock_guard<std::mutex> lk(s_mutex);
+    if (!s_dw) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(s_dw.GetAddressOf()));
+    if (!s_dw) return nullptr;
+    px = (px > 0) ? std::clamp(px, 6, 96) : 13;
+    auto& f = s_formats[px];
+    if (!f) {
+        s_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                               DWRITE_FONT_STRETCH_NORMAL, static_cast<float>(px), L"en-us", &f);
+        if (f) {
+            f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+    }
+    return f.Get();
+}
+
 void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint32_t w, uint32_t h) {
     std::vector<std::shared_ptr<WndRecord>> edits;
     {
@@ -1286,11 +1318,11 @@ void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint
         }
     }
 
-    auto measurePrefixW = [&](const std::wstring& txt, size_t len) -> float {
+    auto measurePrefixW = [&](IDWriteTextFormat* tf, const std::wstring& txt, size_t len) -> float {
         len = std::min(len, txt.size());
-        if (len == 0 || !s_dw || !s_tf) return 0.0f;
+        if (len == 0 || !s_dw || !tf) return 0.0f;
         Microsoft::WRL::ComPtr<IDWriteTextLayout> tl;
-        if (FAILED(s_dw->CreateTextLayout(txt.c_str(), static_cast<UINT32>(len), s_tf.Get(), 8192.0f, 64.0f, &tl)) || !tl) {
+        if (FAILED(s_dw->CreateTextLayout(txt.c_str(), static_cast<UINT32>(len), tf, 8192.0f, 64.0f, &tl)) || !tl) {
             return static_cast<float>(len) * 7.0f;
         }
         DWRITE_TEXT_METRICS tm = {};
@@ -1323,14 +1355,16 @@ void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint
                 rt->CreateSolidColorBrush(D2D1::ColorF(0x1E1E1E), &brText);
                 rt->CreateSolidColorBrush(D2D1::ColorF(0x005A9E), &brCaret);
 
+                IDWriteTextFormat* tf = EditTextFormat(ed->fontPx);
+                if (!tf) tf = s_tf.Get();
                 const size_t caretIdx = std::min(ed->caretPos, ed->text.size());
                 const size_t selIdx   = std::min(ed->selStart, ed->text.size());
-                const float caretPx   = measurePrefixW(ed->text, caretIdx);
-                const float selPx     = (selIdx == caretIdx) ? caretPx : measurePrefixW(ed->text, selIdx);
+                const float caretPx   = measurePrefixW(tf, ed->text, caretIdx);
+                const float selPx     = (selIdx == caretIdx) ? caretPx : measurePrefixW(tf, ed->text, selIdx);
                 const float padX      = 6.0f;
                 const float innerW    = std::max(8.0f, static_cast<float>(ew) - padX * 2.0f);
                 // The text scrolls only as far as needed to keep the caret in view (a click maps back through it)
-                const float textW     = (caretIdx == ed->text.size()) ? caretPx : measurePrefixW(ed->text, ed->text.size());
+                const float textW     = (caretIdx == ed->text.size()) ? caretPx : measurePrefixW(tf, ed->text, ed->text.size());
                 float scrollX = ed->editScrollX;
                 if (caretPx - scrollX > innerW - 4.0f) scrollX = caretPx - (innerW - 4.0f);
                 if (caretPx - scrollX < 0.0f) scrollX = caretPx;
@@ -1348,7 +1382,7 @@ void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint
                     rt->FillRectangle(D2D1::RectF(sx0, 3.0f, sx1, eh - 3.0f), brSel.Get());
                 }
                 if (!ed->text.empty()) {
-                    rt->DrawText(ed->text.c_str(), static_cast<UINT32>(ed->text.size()), s_tf.Get(),
+                    rt->DrawText(ed->text.c_str(), static_cast<UINT32>(ed->text.size()), tf,
                                  D2D1::RectF(padX - scrollX, 0.0f, padX - scrollX + 8192.0f, static_cast<float>(eh)),
                                  brText.Get());
                 }
@@ -1577,7 +1611,9 @@ size_t EditCaretFromX(const WndRecord& ed, int relX) {
     if (target <= 0.0f || ed.text.empty()) return 0;
     auto& ui = HalUi();
     if (!ui.ok) return std::min(ed.text.size(), static_cast<size_t>((target + 3.0f) / 7.0f));
-    auto widthOf = [&](size_t n) { return n == 0 ? 0.0f : MeasureHalText(ui.text.Get(), ed.text.substr(0, n), 100000.0f).width; };
+    IDWriteTextFormat* tf = EditTextFormat(ed.fontPx);   // the size the text is drawn at (CompositeChildEdits)
+    if (!tf) tf = ui.text.Get();
+    auto widthOf = [&](size_t n) { return n == 0 ? 0.0f : MeasureHalText(tf, ed.text.substr(0, n), 100000.0f).width; };
     size_t lo = 0, hi = ed.text.size();
     while (lo < hi) {                       // the longest prefix that ends left of the click
         const size_t mid = (lo + hi + 1) / 2;

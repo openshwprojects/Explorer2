@@ -299,6 +299,10 @@ jobs:
               if grep -q '^\[FAIL\]' "$report"; then
                   echo "=== FAILED TESTS ==="
                   grep '^\[FAIL\]' "$report"
+                  # as annotations too: those can be read without signing in, the log cannot
+                  grep -m 8 '^\[FAIL\]' "$report" | tr -d '\r' | sed 's/%/%25/g' | while IFS= read -r line; do
+                      echo "::error title=Linux x64 Self-Test Failure::$line"
+                  done
               fi
               summary=$(tail -n 1 "$report" | tr -d '\r')
               echo "$summary"
@@ -459,6 +463,10 @@ jobs:
               if grep -q '^\[FAIL\]' "$report"; then
                   echo "=== FAILED TESTS ==="
                   grep '^\[FAIL\]' "$report"
+                  # as annotations too: those can be read without signing in, the log cannot
+                  grep -m 8 '^\[FAIL\]' "$report" | tr -d '\r' | sed 's/%/%25/g' | while IFS= read -r line; do
+                      echo "::error title=Linux x86 Self-Test Failure::$line"
+                  done
               fi
               summary=$(tail -n 1 "$report" | tr -d '\r')
               echo "$summary"

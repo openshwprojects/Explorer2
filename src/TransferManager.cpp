@@ -2,6 +2,7 @@
 #include "AppLog.h"
 #include "FileEngine.h"
 #include "FtpClient.h"
+#include "LinuxTrash.h"     // Linux: which trash an item goes to (empty on Windows)
 #include "PathUtils.h"
 #include <winioctl.h>
 #include <objbase.h>
@@ -4207,26 +4208,8 @@ bool LinuxPathHasNoTrash(const std::wstring& path) {
     const std::string native = Explorer2::Compat::NativePath(path.c_str());
     struct stat st = {};
     if (::lstat(native.c_str(), &st) != 0) return false;   // gone or unreadable: the delete itself reports that
-    const auto mounts = LinuxMounts::Current();
-    if (const LinuxMounts::Mount* m = LinuxMounts::FindByDevice(*mounts, static_cast<uint64_t>(st.st_dev))) {
-        if (LinuxMounts::IsNetworkFsType(m->fsType)) return true;
-    }
-    // The same trash folder as the HAL's delete uses
-    std::string trash;
-    const char* xdg = std::getenv("XDG_DATA_HOME");
-    const char* home = std::getenv("HOME");
-    if (xdg && *xdg) trash = std::string(xdg) + "/Trash/files";
-    else if (home && *home) trash = std::string(home) + "/.local/share/Trash/files";
-    else trash = "/tmp/Trash-" + std::to_string(::geteuid()) + "/files";
-    // It may not exist yet: it is then made inside the nearest folder above it that does
-    for (int depth = 0; depth < 64; ++depth) {
-        struct stat tst = {};
-        if (::stat(trash.c_str(), &tst) == 0) return tst.st_dev != st.st_dev;
-        const size_t slash = trash.find_last_of('/');
-        if (slash == std::string::npos || trash == "/") break;
-        trash = (slash == 0) ? std::string("/") : trash.substr(0, slash);
-    }
-    return true;    // no part of the trash path exists: there is no trash to move the item to
+    // The same rule as the HAL's delete: the home trash, or the item's own drive's (LinuxTrash.h)
+    return LinuxTrash::TrashDirFor(native, false).empty();
 }
 #endif
 
