@@ -174,6 +174,18 @@ public:
     // The data object Windows Explorer puts on a file drag (CF_HDROP, shell ID list, file names...), for a drag out
     // of the window. Paths may come from different folders. Caller releases it; nullptr when no path parses.
     static IDataObject* CreateShellDataObject(const std::vector<std::wstring>& paths);
+    // Windows' own "Compressed (zipped) folder" (zipfldr.dll, what Send to in Windows Explorer runs): "<name>.zip" next
+    // to the items, any number of them, with Windows' progress window. False when it could not be started (always on
+    // Linux). Runs on in the background: the window's message loop must keep going.
+    static bool CompressWithWindowsZip(const std::vector<std::wstring>& paths);
+    // Hands the items to a SendTo entry (a shortcut, a program, "Adresat poczty", "Dokumenty", Bluetooth...) through
+    // its own drop handler, as Windows Explorer's Send to menu does: all of them at once, copied or linked, never
+    // moved. False when the entry has no such handler or refused them (always on Linux).
+    static bool DropOnShellItem(const std::wstring& itemPath, const std::vector<std::wstring>& paths);
+    // Whether a mail program that takes attachments through MAPI is set (Outlook, Thunderbird...)
+    static bool HasMapiMailClient();
+    // A new message of that mail program with the files attached; false without one
+    static bool SendToMailRecipient(const std::vector<std::wstring>& paths);
 
     // File management operations
     static std::wstring ResolveAddressInput(std::wstring_view rawInput, const std::wstring& currentDir = L"");

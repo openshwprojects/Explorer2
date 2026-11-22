@@ -1,5 +1,6 @@
 #include "ExplorerApp.h"
 #include "CommandIds.h"
+#include "DragRules.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
 #include "NetShares.h"
@@ -2663,22 +2664,13 @@ void ExplorerApp::DrawDragOverlay() {
         ? PathUtils::GetFileName(m_dragPaths[0])
         : (std::to_wstring(m_dragPaths.size()) + (pl ? L" elem." : L" items"));
 
-    if (!m_dragTargetDir.empty()) {
-        std::wstring srcDrive = (m_dragPaths[0].size() >= 2 && m_dragPaths[0][1] == L':') ? m_dragPaths[0].substr(0, 2) : L"";
-        std::wstring dstDrive = (m_dragTargetDir.size() >= 2 && m_dragTargetDir[1] == L':') ? m_dragTargetDir.substr(0, 2) : L"";
-        bool sameVol = (!srcDrive.empty() && !dstDrive.empty() && _wcsicmp(srcDrive.c_str(), dstDrive.c_str()) == 0);
-#ifndef _WIN32
-        if (!sameVol && !m_dragPaths[0].empty() && !m_dragTargetDir.empty() && m_dragPaths[0][0] == L'/' && m_dragTargetDir[0] == L'/') {
-            struct stat stSrc = {}, stDst = {};
-            std::wstring srcParent = PathUtils::GetParentPath(m_dragPaths[0]);
-            if (srcParent.empty()) srcParent = L"/";
-            if (::stat(Explorer2::Compat::NativePath(srcParent.c_str()).c_str(), &stSrc) == 0 &&
-                ::stat(Explorer2::Compat::NativePath(m_dragTargetDir.c_str()).c_str(), &stDst) == 0) {
-                sameVol = (stSrc.st_dev == stDst.st_dev);
-            }
-        }
-#endif
-        bool isMove = shift ? true : (ctrl ? false : sameVol);
+    if (!m_dragTargetDir.empty() && m_dragWithRightButton) {
+        // With the right button a menu at the drop asks: copy, move or shortcuts
+        badgeText = (pl ? L"? Kopiuj lub przenieś " : L"? Copy or move ") + countStr + (pl ? L" do: " : L" to: ") + m_dragTargetLabel;
+        bgHex = 0x312E81;
+        borderHex = 0xA78BFA;
+    } else if (!m_dragTargetDir.empty()) {
+        const bool isMove = shift ? true : (ctrl ? false : DropStaysOnDrive(m_dragPaths[0], m_dragTargetDir));
         std::wstring verb = isMove ? (pl ? L"\x2192 Przenieś " : L"\x2192 Move ") : (pl ? L"+ Kopiuj " : L"+ Copy ");
         badgeText = verb + countStr + (pl ? L" do: " : L" to: ") + m_dragTargetLabel;
         bgHex = isMove ? 0x0F172A : 0x064E3B;

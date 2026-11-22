@@ -2878,6 +2878,99 @@ IDataObject* FileEngine::CreateShellDataObject(const std::vector<std::wstring>& 
     return data;
 }
 
+#ifdef _WIN32
+// The items are "dropped" on a handler as Windows Explorer's Send to menu does it (shell32's SHSimulateDrop, which the
+// SDK no longer declares): DragEnter + Drop with the left button "held". Only the given effects are offered - never
+// a move unless asked for, so no handler takes the files away.
+static bool DropItemsOn(IDropTarget* target, const std::vector<std::wstring>& paths, DWORD allowedEffects) {
+    IDataObject* data = FileEngine::CreateShellDataObject(paths);
+    if (!data) return false;
+    const POINTL pt = { 0, 0 };
+    DWORD effect = allowedEffects;
+    bool dropped = false;
+    if (SUCCEEDED(target->DragEnter(data, MK_LBUTTON, pt, &effect)) && effect != DROPEFFECT_NONE) {
+        effect = allowedEffects;
+        dropped = SUCCEEDED(target->Drop(data, MK_LBUTTON, pt, &effect));
+    } else {
+        target->DragLeave();
+    }
+    data->Release();
+    return dropped;
+}
+
+// The same, on the handler Windows registers for a kind of SendTo entry (the class behind ".ZFSendToTarget" etc.)
+static bool DropItemsOnHandler(const CLSID& handler, const std::vector<std::wstring>& paths, DWORD allowedEffects) {
+    IDropTarget* target = nullptr;
+    if (FAILED(CoCreateInstance(handler, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&target))) || !target) return false;
+    const bool dropped = DropItemsOn(target, paths, allowedEffects);
+    target->Release();
+    return dropped;
+}
+#endif
+
+// The handler of ".ZFSendToTarget" files ("Folder skompresowany (zip)" in the SendTo folder). This used to be
+// PowerShell's Compress-Archive in a hidden window: only the first item, a file name with an apostrophe ended the
+// quoted path and ran the rest as a command, and a hidden PowerShell is just what antivirus programs look for
+// (forum post #47: Defender flagged v1.0.32 as Trojan:Win32/Wacatac.B!ml).
+bool FileEngine::CompressWithWindowsZip(const std::vector<std::wstring>& paths) {
+#ifdef _WIN32
+    static const CLSID kCompressedFolderSendTo = { 0x888DCA60, 0xFC0A, 0x11CF, { 0x8F, 0x0F, 0x00, 0xC0, 0x4F, 0xD7, 0xD0, 0x62 } };
+    return DropItemsOnHandler(kCompressedFolderSendTo, paths, DROPEFFECT_COPY);
+#else
+    (void)paths;
+    return false;
+#endif
+}
+
+bool FileEngine::DropOnShellItem(const std::wstring& itemPath, const std::vector<std::wstring>& paths) {
+#ifdef _WIN32
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (FAILED(SHParseDisplayName(itemPath.c_str(), nullptr, &pidl, 0, nullptr)) || !pidl) return false;
+    IShellFolder* folder = nullptr;
+    PCUITEMID_CHILD child = nullptr;
+    IDropTarget* target = nullptr;
+    if (SUCCEEDED(SHBindToParent(pidl, IID_PPV_ARGS(&folder), &child)) && folder) {
+        folder->GetUIObjectOf(nullptr, 1, &child, IID_IDropTarget, nullptr, reinterpret_cast<void**>(&target));
+        folder->Release();
+    }
+    ILFree(pidl);
+    if (!target) return false;
+    const bool dropped = DropItemsOn(target, paths, DROPEFFECT_COPY | DROPEFFECT_LINK);
+    target->Release();
+    return dropped;
+#else
+    (void)itemPath; (void)paths;
+    return false;
+#endif
+}
+
+bool FileEngine::HasMapiMailClient() {
+#ifdef _WIN32
+    // The mail program MAPI hands messages to: the default value of Software\Clients\Mail (Outlook, Thunderbird...).
+    // Windows' own Mail app does not register there.
+    for (HKEY root : { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE }) {
+        wchar_t name[256] = {};
+        DWORD size = sizeof(name);
+        if (RegGetValueW(root, L"SOFTWARE\\Clients\\Mail", nullptr, RRF_RT_REG_SZ, nullptr, name, &size) == ERROR_SUCCESS && name[0]) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+// The handler of ".MAPIMail" files ("Adresat poczty" in the SendTo folder, sendmail.dll): a new message of the mail
+// program with the files attached, as Windows Explorer's "E-mail" button does
+bool FileEngine::SendToMailRecipient(const std::vector<std::wstring>& paths) {
+#ifdef _WIN32
+    static const CLSID kMailRecipient = { 0x9E56BE60, 0xC50F, 0x11CF, { 0x9A, 0x2C, 0x00, 0xA0, 0xC9, 0x0A, 0x90, 0xCE } };
+    return HasMapiMailClient() && DropItemsOnHandler(kMailRecipient, paths, DROPEFFECT_COPY);
+#else
+    (void)paths;
+    return false;
+#endif
+}
+
 std::wstring FileEngine::ResolveAddressInput(std::wstring_view rawInput, const std::wstring& currentDir) {
     std::wstring s = PathUtils::Trim(rawInput);
     if (s.size() >= 2 && ((s.front() == L'"' && s.back() == L'"') || (s.front() == L'\'' && s.back() == L'\''))) {

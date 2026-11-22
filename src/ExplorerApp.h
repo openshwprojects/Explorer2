@@ -119,6 +119,12 @@ private:
     void StartRenameJob(const std::wstring& oldPath, const std::wstring& oldName, const std::wstring& newName);
     // Unpacks a whole archive on a worker thread; the outcome arrives as WM_APP_EXTRACT_DONE
     void StartExtractJob(const std::wstring& archivePath, const std::wstring& targetFolder, bool toSubfolder);
+    // ZIP of the items with 7-Zip when it is installed, else with Windows' own "Compressed (zipped) folder"
+    void CompressToZip(const std::vector<std::wstring>& paths);
+    // Deletes these items (Recycle Bin or for good) as a job of the transfer queue: the selection, or a drop on "Kosz"
+    void DeletePaths(std::vector<std::wstring> toDelete, bool permanent);
+    // "E-mail" on the Share tab: a new message with the files attached (MAPI), else a message listing the paths
+    void EmailItems(const std::vector<std::wstring>& paths);
     void ShowRenameFailure(const std::wstring& oldName, const std::wstring& newName, const std::wstring& reason, DWORD err);
 
     // Version-control dock (right side) for folders inside a git repository or a Subversion working copy
@@ -297,7 +303,21 @@ private:
     // A file drag that leaves the window continues as a Windows drag and drop, so the files can be dropped on other
     // programs (a browser upload, a chat window, Windows Explorer, the desktop). Returns false when none of the
     // paths is a file on disk (e.g. FTP), and the drag stays inside the window.
-    bool StartShellDragOut(const std::vector<std::wstring>& paths);
+    // rightButton: the drag goes on while the right button is held, and the program it ends in shows its own menu
+    bool StartShellDragOut(const std::vector<std::wstring>& paths, bool rightButton = false);
+    // Ends a drag of items inside the window without dropping them anywhere
+    void EndItemDrag();
+    // Continues a drag of items as a Windows drag and drop (it left the window, or the window lost the mouse, e.g.
+    // to Win+D showing the desktop while the button is still held); ends it when the button is not really held
+    void HandOffItemDrag();
+    // Whether the button the current drag is done with is still held down
+    bool DragButtonHeld() const;
+    // The window lost the mouse in the middle of a drag of items: hands it off while the button is held, else ends it
+    void InterruptItemDrag();
+    // The menu at the end of a drag with the right button: copy, move or create shortcuts here, or cancel
+    void ShowDropMenu(const std::vector<std::wstring>& paths, const std::wstring& targetDir, POINT screenPt);
+    // A shortcut to target in folder, named "<name> - skrót.lnk" (or " - Shortcut.lnk"), "(2)" etc. when taken
+    bool CreateShortcutIn(const std::wstring& folder, const std::wstring& target, std::wstring* outLink = nullptr);
     void DrawDragOverlay();
     D2D1_RECT_F GetFullWorkspaceRect() const;
     D2D1_RECT_F GetSplitPaneOuterRect(int paneIdx) const;
@@ -562,6 +582,7 @@ private:
     int m_dragSourceItemIdx = -1;
     D2D1_POINT_2F m_dragStartPt = {};
     bool m_isDraggingItems = false;
+    bool m_dragWithRightButton = false;     // the drag (or the press that may start one) is done with the right button
     std::vector<std::wstring> m_dragPaths;
     std::wstring m_dragTargetDir;
     std::wstring m_dragTargetLabel;

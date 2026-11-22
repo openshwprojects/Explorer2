@@ -1,4 +1,5 @@
 #include "ShellMenuEmulator.h"
+#include "ShareRules.h"
 #include "ThreadUtils.h"
 #include "ImageFormatLoader.h"
 #include "ImageOrientation.h"
@@ -277,22 +278,26 @@ void ShellMenuEmulator::ScanStartupData() {
         HANDLE hFind = FindFirstFileW(pattern.c_str(), &ffd);
         if (hFind != INVALID_HANDLE_VALUE) {
             do {
-                if (ffd.cFileName[0] == L'.') continue;
-                if (ffd.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) continue;
-                std::wstring fname = ffd.cFileName;
-                size_t dot = fname.find_last_of(L'.');
-                std::wstring ext = (dot != std::wstring::npos) ? fname.substr(dot) : L"";
-                std::wstring cleanTitle = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
-                if (_wcsicmp(ext.c_str(), L".lnk") == 0 || _wcsicmp(ext.c_str(), L".exe") == 0) {
-                    SendToTarget st;
-                    st.label = cleanTitle;
-                    st.targetPath = sendToDir + fname;
-                    st.hMenuBmp = ExtractSmallMenuBitmap(st.targetPath);
-                    sendTo.push_back(std::move(st));
+                if (!IsSendToMenuEntry(ffd.cFileName, ffd.dwFileAttributes)) continue;
+                const std::wstring fname = ffd.cFileName;
+                SendToTarget st;
+                st.targetPath = sendToDir + fname;
+                // The name Windows shows: "Adresat poczty" for "Mail Recipient.MAPIMail" (desktop.ini of the folder)
+                SHFILEINFOW sfi = {};
+                if (SHGetFileInfoW(st.targetPath.c_str(), 0, &sfi, sizeof(sfi), SHGFI_DISPLAYNAME) && sfi.szDisplayName[0]) {
+                    st.label = sfi.szDisplayName;
+                } else {
+                    const size_t dot = fname.find_last_of(L'.');
+                    st.label = (dot != std::wstring::npos) ? fname.substr(0, dot) : fname;
                 }
+                st.hMenuBmp = ExtractSmallMenuBitmap(st.targetPath);
+                sendTo.push_back(std::move(st));
             } while (FindNextFileW(hFind, &ffd));
             FindClose(hFind);
         }
+        std::sort(sendTo.begin(), sendTo.end(), [](const SendToTarget& a, const SendToTarget& b) {
+            return _wcsicmp(a.label.c_str(), b.label.c_str()) < 0;     // by the shown name, as in Windows Explorer
+        });
     }
 
     {

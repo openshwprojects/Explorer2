@@ -1,4 +1,6 @@
 #include "ExplorerApp.h"
+#include "DragRules.h"
+#include "ShareRules.h"
 #include "CommandIds.h"
 #include "PathUtils.h"
 #include "FtpClient.h"
@@ -191,9 +193,12 @@ static void ShowItemProperties(HWND hwnd, const std::wstring& path, Lang lang) {
 
 // ---- Drag out of the window (OLE drag and drop to other programs) ----
 
-// Ends the drop when the left button is released and cancels it on Escape, like Windows Explorer
+// Drops when the button the drag is done with is released, and cancels on Escape or a press of the other button,
+// like Windows Explorer (DragQueryContinue). A drag with the right button ends at a Windows Explorer target in its
+// menu of Copy here / Move here / Create shortcuts here.
 class DragOutDropSource final : public IDropSource {
 public:
+    explicit DragOutDropSource(bool rightButton) : m_rightButton(rightButton) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDropSource)) {
@@ -211,14 +216,13 @@ public:
         return static_cast<ULONG>(left);
     }
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override {
-        if (escapePressed) return DRAGDROP_S_CANCEL;
-        if (!(keyState & MK_LBUTTON)) return DRAGDROP_S_DROP;
-        return S_OK;
+        return DragQueryContinue(escapePressed, keyState, m_rightButton);
     }
     HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
 
 private:
     LONG m_refs = 1;
+    bool m_rightButton = false;
 };
 
 static std::wstring FormatNavFolderTitle(const std::wstring& path, Lang lang) {
@@ -974,6 +978,19 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         OnMouseMove(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), wParam);
         return 0;
 
+#ifdef _WIN32
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        // The mouse went to another window in the middle of a drag of items: Win+D showing the desktop, Alt+Tab,
+        // another window coming to the front (WM_ACTIVATEAPP below). See InterruptItemDrag.
+        if (!(msg == WM_CAPTURECHANGED && reinterpret_cast<HWND>(lParam) == m_hwnd)) InterruptItemDrag();
+        break;
+#endif
+
+    case WM_APP_DRAG_HANDOFF:
+        if (m_isDraggingItems) HandOffItemDrag();       // (ends the drag instead when the button is no longer held)
+        return 0;
+
     case WM_LBUTTONUP:
         OnMouseUp(PxToDip(GET_X_LPARAM(lParam)), PxToDip(GET_Y_LPARAM(lParam)), false, wParam);
         return 0;
@@ -1069,6 +1086,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         // A drive letter can come or go without any device notification (subst, net use in a console window, a
         // mapped drive Windows reconnects): looked at when the user comes back to this window. One cheap call.
         if (wParam && DriveListSignature() != m_driveListSignature) SetTimer(m_hwnd, ID_TIMER_DRIVES, 150, nullptr);
+        if (!wParam) InterruptItemDrag();       // Win+D, Alt+Tab in the middle of a drag of items
         break;
 
     case WM_DEVICECHANGE:
@@ -2469,7 +2487,7 @@ void ExplorerApp::StartManagedTransfer(
     }
 }
 
-bool ExplorerApp::StartShellDragOut(const std::vector<std::wstring>& paths) {
+bool ExplorerApp::StartShellDragOut(const std::vector<std::wstring>& paths, bool rightButton) {
     std::vector<std::wstring> local;
     for (const auto& p : paths) {
         if (!p.empty() && !FtpClient::IsFtpPath(p) && !RepoBrowser::IsRepoUrl(p) && !IsVirtualFolder(p)) local.push_back(p);
@@ -2482,7 +2500,7 @@ bool ExplorerApp::StartShellDragOut(const std::vector<std::wstring>& paths) {
         return false;
     }
     AppLog::Info(L"Drag", L"Dragging out of the window: " + DescribePaths(local));
-    DragOutDropSource* source = new DragOutDropSource();
+    DragOutDropSource* source = new DragOutDropSource(rightButton);
     DWORD effect = DROPEFFECT_NONE;
     // Runs its own message loop until the drop or Escape; the target decides between copy, move and shortcut.
     // A target that moves files on disk (Windows Explorer) does the move itself.
@@ -2526,11 +2544,136 @@ bool ExplorerApp::StartShellDragOut(const std::vector<std::wstring>& paths) {
     return true;
 }
 
+void ExplorerApp::EndItemDrag() {
+    const bool wasDragging = m_isDraggingItems;
+    m_isDraggingItems = false;          // first: letting go of the mouse below sends WM_CAPTURECHANGED
+    m_dragWithRightButton = false;
+    m_dragPaths.clear();
+    m_dragTargetDir.clear();
+    m_dragTargetLabel.clear();
+    if (wasDragging && GetCapture() == m_hwnd) ReleaseCapture();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void ExplorerApp::HandOffItemDrag() {
+    // Only with the button really held down: Windows' drag would otherwise drop at once, on whatever window is under
+    // the pointer (the button let go a moment ago, or mouse messages that did not come from the mouse)
+    if (!DragButtonHeld()) {
+        EndItemDrag();
+        return;
+    }
+    const std::vector<std::wstring> paths = m_dragPaths;
+    const bool rightButton = m_dragWithRightButton;
+    EndItemDrag();
+    StartShellDragOut(paths, rightButton);
+}
+
+bool ExplorerApp::DragButtonHeld() const {
+#ifdef SM_SWAPBUTTON
+    const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+#else
+    const bool swapped = false;
+#endif
+    // GetAsyncKeyState reads the physical buttons: with the buttons swapped (a left-handed mouse) the left one is the
+    // physical right button
+    const bool physicalRight = (m_dragWithRightButton != swapped);
+    return (GetAsyncKeyState(physicalRight ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0;
+}
+
+// Win+D showing the desktop, Alt+Tab or another window coming to the front take the mouse from this window. With the
+// button still held the drag goes on as a Windows drag and drop, so the items can still be dropped on the desktop or
+// in another program (GitHub issue #4: the drag used to just stop). The hand-off is posted: it runs a message loop of
+// its own, which must not start inside the message that reported the loss.
+void ExplorerApp::InterruptItemDrag() {
+    if (!m_isDraggingItems) return;
+    if (DragButtonHeld()) PostMessageW(m_hwnd, WM_APP_DRAG_HANDOFF, 0, 0);
+    else EndItemDrag();
+}
+
+void ExplorerApp::ShowDropMenu(const std::vector<std::wstring>& paths, const std::wstring& targetDir, POINT screenPt) {
+    if (paths.empty() || targetDir.empty() || targetDir == L"THIS_PC") return;
+    const bool pl = (m_lang == Lang::PL);
+    const bool toBin = (targetDir == L"RECYCLE_BIN");
+    auto isLocal = [](const std::wstring& p) {
+        return !p.empty() && !FtpClient::IsFtpPath(p) && !RepoBrowser::IsRepoUrl(p) && !IsVirtualFolder(p);
+    };
+    bool canLink = isLocal(targetDir) && std::all_of(paths.begin(), paths.end(), isLocal);
+#ifdef E2_WIN32_HAL
+    canLink = false;                    // the Linux build makes no shortcuts (.lnk files are a Windows thing)
+#endif
+    enum : UINT { kCopy = 1, kMove, kLink, kCancel };
+    HMENU hMenu = CreatePopupMenu();
+    if (!toBin) AppendMenuW(hMenu, MF_STRING, kCopy, pl ? L"Kopiuj tutaj" : L"Copy here");
+    AppendMenuW(hMenu, MF_STRING, kMove, pl ? L"Przenieś tutaj" : L"Move here");
+    if (canLink) AppendMenuW(hMenu, MF_STRING, kLink, pl ? L"Utwórz skróty tutaj" : L"Create shortcuts here");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, kCancel, pl ? L"Anuluj" : L"Cancel");
+    // In bold what a drag with the left button would do: move on the same drive, copy elsewhere
+    SetMenuDefaultItem(hMenu, (toBin || DropStaysOnDrive(paths[0], targetDir)) ? kMove : kCopy, FALSE);
+    const UINT sel = static_cast<UINT>(TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+                                                      screenPt.x, screenPt.y, 0, m_hwnd, nullptr));
+    DestroyMenu(hMenu);
+    if (sel == kCopy || sel == kMove) {
+        ExecuteDropFiles(paths, targetDir, sel == kCopy, sel == kMove);
+    } else if (sel == kLink) {
+        size_t made = 0;
+        std::wstring lastLink;
+        for (const auto& p : paths) {
+            if (CreateShortcutIn(targetDir, p, &lastLink)) ++made;
+        }
+        if (made > 0 && PathUtils::NormalizePathKey(targetDir) == PathUtils::NormalizePathKey(m_currentPath)) {
+            RefreshCurrentFolder(lastLink);
+        }
+        std::wstring leaf = PathUtils::GetFileName(targetDir);
+        if (leaf.empty()) leaf = targetDir;
+        m_statusToast = (made == paths.size())
+            ? (pl ? L"Utworzono skróty: " : L"Shortcuts created: ") + std::to_wstring(made) + L"  \x2192  " + leaf
+            : (pl ? L"\x26A0 Nie utworzono skrótów: " : L"\x26A0 Shortcuts not created: ") + std::to_wstring(paths.size() - made) +
+              (pl ? L" z " : L" of ") + std::to_wstring(paths.size());
+        m_statusToastExpireTick = GetTickCount64() + 3500;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    }
+}
+
+bool ExplorerApp::CreateShortcutIn(const std::wstring& folder, const std::wstring& target, std::wstring* outLink) {
+    std::wstring name = PathUtils::GetFileName(target);
+    if (name.empty()) {
+        for (wchar_t c : target) {              // a drive: "D:\" gives "D - skrót.lnk"
+            if (c != L':' && c != L'\\' && c != L'/') name += c;
+        }
+    }
+    if (name.empty() || folder.empty() || IsVirtualFolder(folder)) return false;
+    const std::wstring stem = PathUtils::EnsureTrailingSlash(folder) + name + (m_lang == Lang::PL ? L" - skrót" : L" - Shortcut");
+    // A shortcut of that name may be there already (a second drop of the same file): "(2)", "(3)"... as in Windows
+    // Explorer, instead of overwriting it
+    for (int i = 1; i < 1000; ++i) {
+        const std::wstring lnk = stem + (i > 1 ? L" (" + std::to_wstring(i) + L")" : std::wstring()) + L".lnk";
+        if (GetFileAttributesW(lnk.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        if (!ShellMenuEmulator::CreateShortcutFile(target, lnk)) return false;
+        if (outLink) *outLink = lnk;
+        return true;
+    }
+    return false;
+}
+
 void ExplorerApp::ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, const std::wstring& targetDir, bool forceCopy, bool forceMove) {
     if (srcPaths.empty() || targetDir.empty() || targetDir == L"THIS_PC") return;
     if (targetDir == L"RECYCLE_BIN") {
-        // Dropping items onto Kosz sends them to the Recycle Bin just like Windows Explorer
-        DeleteSelectedItems(false);
+        // Dropping items onto Kosz sends them to the Recycle Bin just like Windows Explorer. These items: it used to
+        // delete the selection, so files dropped from another program stayed and whatever was selected went to the
+        // bin (in the Recycle Bin view: was offered for deleting for good).
+        std::vector<std::wstring> toBin;
+        std::wstring readOnly;
+        for (const auto& p : srcPaths) {
+            const bool shownInBin = m_currentPath == L"RECYCLE_BIN" &&
+                std::any_of(m_items.begin(), m_items.end(), [&p](const FileEntry& e) { return e.fullPath == p; });
+            if (shownInBin || IsInsideWindowsRecycleBin(p)) continue;      // already in the bin
+            if (RepoBrowser::IsRepoUrl(p) || NetShares::IsServerRoot(p)) { readOnly = p; continue; }
+            toBin.push_back(p);
+        }
+        if (!readOnly.empty()) RefuseReadOnlyFolder(readOnly);
+        if (!toBin.empty()) DeletePaths(toBin, false);
         return;
     }
     std::wstring dstNorm = PathUtils::NormalizePathKey(targetDir);
@@ -2551,21 +2694,7 @@ void ExplorerApp::ExecuteDropFiles(const std::vector<std::wstring>& srcPaths, co
     }
     if (validSrc.empty()) return;
 
-    bool sameDrive = (validSrc[0].size() >= 2 && targetDir.size() >= 2 &&
-                      towupper(validSrc[0][0]) == towupper(targetDir[0]) &&
-                      validSrc[0][1] == L':' && targetDir[1] == L':');
-#ifndef _WIN32
-    if (!sameDrive && !validSrc[0].empty() && !targetDir.empty() && validSrc[0][0] == L'/' && targetDir[0] == L'/') {
-        struct stat stSrc = {}, stDst = {};
-        std::wstring srcParent = PathUtils::GetParentPath(validSrc[0]);
-        if (srcParent.empty()) srcParent = L"/";
-        if (::stat(Explorer2::Compat::NativePath(srcParent.c_str()).c_str(), &stSrc) == 0 &&
-            ::stat(Explorer2::Compat::NativePath(targetDir.c_str()).c_str(), &stDst) == 0) {
-            sameDrive = (stSrc.st_dev == stDst.st_dev);
-        }
-    }
-#endif
-    bool doMove = forceMove ? true : (forceCopy ? false : sameDrive);
+    const bool doMove = forceMove ? true : (forceCopy ? false : DropStaysOnDrive(validSrc[0], targetDir));
     StartManagedTransfer(validSrc, targetDir, doMove, false);
 }
 
@@ -3541,6 +3670,18 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
     bool ctrlHeld  = (keyFlags & MK_CONTROL) != 0;
     bool shiftHeld = (keyFlags & MK_SHIFT) != 0;
 
+    // A press of the other button in the middle of a drag of items cancels the drag, as in Windows Explorer
+    if (m_isDraggingItems) {
+        EndItemDrag();
+        return;
+    }
+    // Set again below when this press may start a drag: one left from a press whose release this window never saw
+    // (let go over another window) must not open a menu or change the selection at the next release
+    m_dragCandidate = false;
+    m_dragWithRightButton = false;
+    m_dragDeferSingleSelect = false;
+    m_dragSourceItemIdx = -1;
+
     // Git dock splitter (drag its left edge to resize the dock)
     if (!rightButton && HitResizeHandle(x, y) == 2) {
         m_draggingGitSplitter = true;
@@ -3966,6 +4107,18 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                 } else {
                     m_focusedIndex = hitIdx;
                 }
+                // On an item the menu comes when the button is let go (OnMouseUp), as in Windows Explorer: moved
+                // away with the button held, the press is a drag with the right button, which ends in a menu of
+                // Copy here / Move here / Create shortcuts here (GitHub issue #4)
+                if (onItem && !IsVirtualFolder(m_currentPath) && !IsProgramsView()) {
+                    m_dragCandidate = true;
+                    m_dragWithRightButton = true;
+                    m_dragDeferSingleSelect = false;
+                    m_dragSourceItemIdx = hitIdx;
+                    m_dragStartPt = D2D1::Point2F(x, y);
+                    InvalidateRect(m_hwnd, nullptr, FALSE);
+                    return;
+                }
             } else if (!ctrlHeld && !shiftHeld) {
                 SelectNone();
             }
@@ -3993,6 +4146,7 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
             }
             if (!IsVirtualFolder(m_currentPath) && !IsProgramsView()) {
                 m_dragCandidate = true;
+                m_dragWithRightButton = false;
                 m_dragSourceItemIdx = hitIdx;
                 m_dragStartPt = D2D1::Point2F(x, y);
             }
@@ -4105,7 +4259,9 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         return;
     }
 
-    if (m_dragCandidate && (keyFlags & MK_LBUTTON)) {
+    // The button a drag of items is done with: the left one, or the right one (which ends in a menu)
+    const WPARAM dragButton = m_dragWithRightButton ? MK_RBUTTON : MK_LBUTTON;
+    if (m_dragCandidate && (keyFlags & dragButton)) {
         if (std::hypot(x - m_dragStartPt.x, y - m_dragStartPt.y) >= 6.0f) {
             m_dragCandidate = false;
             m_dragDeferSingleSelect = false;
@@ -4118,17 +4274,15 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
     }
 
     if (m_isDraggingItems) {
-        if (!(keyFlags & MK_LBUTTON)) {
-            m_isDraggingItems = false;
-            m_dragPaths.clear();
-            m_dragTargetDir.clear();
-            m_dragTargetLabel.clear();
-            ReleaseCapture();
-            InvalidateRect(m_hwnd, nullptr, FALSE);
+        if (!(keyFlags & dragButton)) {
+            EndItemDrag();
             return;
         }
-        // The cursor left the window (the capture still reports it): continue as a Windows drag and drop.
-        // FTP items are not files Windows can take, so a drag of only those stays inside the window.
+        // The cursor left the window (the capture still reports it), or it is over another program's window that
+        // lies on top of this one - an Android emulator kept in front, any window "always on top", a window moved
+        // over this one: the drop is meant for that program (GitHub issue #4: an .apk dropped on the emulator went
+        // nowhere). The drag continues as a Windows drag and drop. FTP items are not files Windows can take, so a
+        // drag of only those stays inside the window.
         const D2D1_SIZE_F client = ClientSizeDip();
 #ifdef E2_WIN32_HAL
         // The Linux build has no drag and drop with other programs yet (no XDND): a drag that overshoots the window's
@@ -4136,18 +4290,15 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
         (void)client;
         const bool outside = false;
 #else
-        const bool outside = (x < 0.0f || y < 0.0f || x >= client.width || y >= client.height);
+        POINT cursor = {};
+        GetCursorPos(&cursor);
+        const HWND under = WindowFromPoint(cursor);
+        const bool overOtherWindow = under && GetAncestor(under, GA_ROOT) != m_hwnd;
+        const bool outside = (x < 0.0f || y < 0.0f || x >= client.width || y >= client.height) || overOtherWindow;
 #endif
         if (outside && std::any_of(m_dragPaths.begin(), m_dragPaths.end(),
                                    [](const std::wstring& p) { return !p.empty() && !FtpClient::IsFtpPath(p) && !RepoBrowser::IsRepoUrl(p) && !IsVirtualFolder(p); })) {
-            const std::vector<std::wstring> paths = m_dragPaths;
-            m_isDraggingItems = false;
-            m_dragPaths.clear();
-            m_dragTargetDir.clear();
-            m_dragTargetLabel.clear();
-            ReleaseCapture();
-            InvalidateRect(m_hwnd, nullptr, FALSE);
-            StartShellDragOut(paths);
+            HandOffItemDrag();
             return;
         }
         m_dragTargetDir = ResolveDropTargetFolder(x, y, &m_dragTargetLabel);
@@ -4355,7 +4506,19 @@ void ExplorerApp::OnMouseMove(float x, float y, WPARAM keyFlags) {
 }
 
 void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags) {
-    (void)x; (void)y; (void)rightButton;
+    // A right-button press on an item that did not become a drag: the item's menu, which the press left for now
+    if (rightButton && m_dragCandidate && m_dragWithRightButton) {
+        // (the folder may have been read again in between: no item any more gives the folder's own menu)
+        const int idx = (m_dragSourceItemIdx < static_cast<int>(m_items.size())) ? m_dragSourceItemIdx : -1;
+        m_dragCandidate = false;
+        m_dragWithRightButton = false;
+        m_dragSourceItemIdx = -1;
+        const POINT pt = ClientDipToScreen(x, y);
+        ShowContextMenu(pt.x, pt.y, idx);
+        return;
+    }
+    if (m_isDraggingItems && rightButton != m_dragWithRightButton) return;    // the other button: the drag goes on
+
     if (m_dragDeferSingleSelect && !m_isDraggingItems && m_dragSourceItemIdx >= 0 && m_dragSourceItemIdx < static_cast<int>(m_items.size())) {
         SelectSingle(m_dragSourceItemIdx, true);
         InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -4365,18 +4528,18 @@ void ExplorerApp::OnMouseUp(float x, float y, bool rightButton, WPARAM keyFlags)
     m_dragSourceItemIdx = -1;
 
     if (m_isDraggingItems) {
-        std::vector<std::wstring> dropPaths = m_dragPaths;
-        std::wstring dropTarget = ResolveDropTargetFolder(x, y, nullptr);
-        m_isDraggingItems = false;
-        m_dragPaths.clear();
-        m_dragTargetDir.clear();
-        m_dragTargetLabel.clear();
-        ReleaseCapture();
-        InvalidateRect(m_hwnd, nullptr, FALSE);
+        const std::vector<std::wstring> dropPaths = m_dragPaths;
+        const std::wstring dropTarget = ResolveDropTargetFolder(x, y, nullptr);
+        const bool withRightButton = m_dragWithRightButton;
+        EndItemDrag();
         if (!dropPaths.empty() && !dropTarget.empty()) {
-            bool forceCopy = (keyFlags & MK_CONTROL) != 0 || (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            bool forceMove = (keyFlags & MK_SHIFT) != 0 || (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            ExecuteDropFiles(dropPaths, dropTarget, forceCopy, forceMove);
+            if (withRightButton) {
+                ShowDropMenu(dropPaths, dropTarget, ClientDipToScreen(x, y));
+            } else {
+                bool forceCopy = (keyFlags & MK_CONTROL) != 0 || (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                bool forceMove = (keyFlags & MK_SHIFT) != 0 || (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                ExecuteDropFiles(dropPaths, dropTarget, forceCopy, forceMove);
+            }
         }
         return;
     }
@@ -4691,12 +4854,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
     }
     if (vk == VK_ESCAPE) {
         if (m_isDraggingItems) {
-            m_isDraggingItems = false;
-            m_dragPaths.clear();
-            m_dragTargetDir.clear();
-            m_dragTargetLabel.clear();
-            ReleaseCapture();
-            InvalidateRect(m_hwnd, nullptr, FALSE);
+            EndItemDrag();
             return;
         }
         if (IsViewerCropping()) {
@@ -5019,9 +5177,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
                     UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
                     std::wstring src(len, L'\0');
                     DragQueryFileW(hDrop, i, src.data(), len + 1);
-                    std::wstring bn = PathUtils::GetFileName(src);
-                    std::wstring lnk = PathUtils::EnsureTrailingSlash(m_currentPath) + bn + (m_lang == Lang::PL ? L" - skrót.lnk" : L" - Shortcut.lnk");
-                    ShellMenuEmulator::CreateShortcutFile(src, lnk);
+                    CreateShortcutIn(m_currentPath, src);
                 }
             }
             CloseClipboard();
@@ -5471,21 +5627,7 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
             m_statusToastExpireTick = GetTickCount64() + 2600;
             break;
         }
-        if (m_shellEmulator.Has7Zip()) {
-            m_shellEmulator.Execute7ZipAction(SZ_ADD_ZIP, paths, m_currentPath);
-        } else {
-            std::wstring firstName = PathUtils::GetFileName(paths[0]);
-            size_t dotPos = firstName.find_last_of(L'.');
-            if (dotPos != std::wstring::npos && dotPos > 0) firstName = firstName.substr(0, dotPos);
-            std::wstring zipOut = PathUtils::EnsureTrailingSlash(m_currentPath) + firstName + L".zip";
-            std::wstring args = L"-a -c -f \"" + zipOut + L"\"";
-            for (const auto& p : paths) {
-                args += L" \"" + PathUtils::GetFileName(p) + L"\"";
-            }
-            ShellExecuteW(m_hwnd, L"open", L"tar.exe", args.c_str(), m_currentPath.c_str(), SW_HIDE);
-            m_statusToast = (m_lang == Lang::PL ? L"Tworzenie archiwum ZIP: " : L"Creating ZIP archive: ") + firstName + L".zip";
-            m_statusToastExpireTick = GetTickCount64() + 3000;
-        }
+        CompressToZip(paths);
         break;
     }
     case CMD_SHARE_EXTRACT_ZIP: {
@@ -5494,24 +5636,19 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         if (m_shellEmulator.Has7Zip()) {
             m_shellEmulator.Execute7ZipAction(SZ_EXTRACT_SUBFOLDER, paths, m_currentPath);
         } else {
-            std::wstring args = L"-x -f \"" + paths[0] + L"\"";
-            ShellExecuteW(m_hwnd, L"open", L"tar.exe", args.c_str(), m_currentPath.c_str(), SW_SHOWNORMAL);
+            // Explorer2's own unpacking, into a folder named after each archive as 7-Zip does above; it never
+            // replaces a file (tar.exe did, and Windows 7 / 8.1 have no tar.exe)
+            for (const auto& archive : paths) {
+                const std::wstring target = PathUtils::EnsureTrailingSlash(PathUtils::GetParentPath(archive)) +
+                                            PathUtils::GetStem(PathUtils::GetFileName(archive), false);
+                StartExtractJob(archive, target, true);
+            }
         }
         break;
     }
-    case CMD_SHARE_EMAIL: {
-        auto paths = GetSelectedPaths();
-        std::wstring subj = L"Udostepnione pliki";
-        std::wstring body;
-        for (const auto& p : paths) {
-            if (!body.empty()) body += L"%0D%0A";
-            body += p;
-        }
-        if (body.empty()) body = m_currentPath;
-        std::wstring mailUrl = L"mailto:?subject=" + subj + L"&body=" + body;
-        ShellExecuteW(m_hwnd, L"open", mailUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    case CMD_SHARE_EMAIL:
+        EmailItems(GetSelectedPaths());
         break;
-    }
     case CMD_SHARE_PRINT: {
         auto paths = GetSelectedPaths();
         if (!paths.empty()) {
@@ -7303,7 +7440,12 @@ void ExplorerApp::DeleteSelectedItems(bool permanent) {
         return;
     }
 
-    std::vector<std::wstring> toDelete = GetSelectedPaths();
+    DeletePaths(GetSelectedPaths(), permanent);
+}
+
+// Deletes these items as one job of the transfer queue (to the Recycle Bin, or for good): the selection (Delete,
+// Shift+Delete), or items dropped on "Kosz"
+void ExplorerApp::DeletePaths(std::vector<std::wstring> toDelete, bool permanent) {
     // Whole drives and share roots are never deleted; the delete engine refuses them too
 #ifndef _WIN32
     const size_t selectedCount = toDelete.size();
@@ -7383,19 +7525,23 @@ void ExplorerApp::DeleteSelectedItems(bool permanent) {
         return deleteKeys.find(e.normKey) != deleteKeys.end();
     };
 
+    const size_t shownBefore = m_items.size();
     m_items.erase(std::remove_if(m_items.begin(), m_items.end(), shouldRemove), m_items.end());
     m_allItems.erase(std::remove_if(m_allItems.begin(), m_allItems.end(), shouldRemove), m_allItems.end());
 
-    if (!m_items.empty()) {
-        nextFocusIdx = std::clamp(nextFocusIdx, 0, static_cast<int>(m_items.size()) - 1);
-        SelectSingle(nextFocusIdx, true);
-        if (m_viewMode == ViewMode::FullViewer) {
-            ResetViewerZoom();
+    // (items dropped on "Kosz" from another folder or program leave this folder's selection as it is)
+    if (m_items.size() != shownBefore) {
+        if (!m_items.empty()) {
+            nextFocusIdx = std::clamp(nextFocusIdx, 0, static_cast<int>(m_items.size()) - 1);
+            SelectSingle(nextFocusIdx, true);
+            if (m_viewMode == ViewMode::FullViewer) {
+                ResetViewerZoom();
+            }
+            EnsureItemVisible(nextFocusIdx);
+        } else {
+            m_focusedIndex = -1;
+            m_anchorIndex = -1;
         }
-        EnsureItemVisible(nextFocusIdx);
-    } else {
-        m_focusedIndex = -1;
-        m_anchorIndex = -1;
     }
 
     ClampScrollOffset();
@@ -7834,6 +7980,65 @@ void ExplorerApp::MergeFolderInto(const std::wstring& srcDir, const std::wstring
         FileEngine::MergeDirectoryContents(srcDir, dstDir, progress.get(), *r);
         if (!PostMessageW(hwnd, WM_APP_MERGE_DONE, 0, reinterpret_cast<LPARAM>(r))) delete r;
     }).detach();
+}
+
+// "ZIP" on the Share tab and "Wyślij do > Folder skompresowany (zip)": no hidden helper programs (PowerShell and
+// tar.exe were used without 7-Zip; see FileEngine::CompressWithWindowsZip)
+void ExplorerApp::CompressToZip(const std::vector<std::wstring>& paths) {
+    if (paths.empty()) return;
+    if (m_shellEmulator.Has7Zip()) {
+        m_shellEmulator.Execute7ZipAction(SZ_ADD_ZIP, paths, m_currentPath);
+        return;
+    }
+    const bool pl = (m_lang == Lang::PL);
+    if (FileEngine::CompressWithWindowsZip(paths)) {
+        m_statusToast = (pl ? L"Tworzenie archiwum ZIP: " : L"Creating ZIP archive: ") + PathUtils::GetFileName(paths[0]) +
+                        (paths.size() > 1 ? L" +" + std::to_wstring(paths.size() - 1) : std::wstring());
+        m_statusToastExpireTick = GetTickCount64() + 3000;
+    } else {
+#ifdef E2_WIN32_HAL
+        m_statusToast = pl ? L"\x26A0 Do tworzenia archiwów ZIP potrzebny jest program 7-Zip (7z)"
+                           : L"\x26A0 Creating ZIP archives needs 7-Zip (7z)";
+#else
+        m_statusToast = pl ? L"\x26A0 Nie udało się uruchomić tworzenia archiwum ZIP" : L"\x26A0 Could not start creating the ZIP archive";
+#endif
+        m_statusToastExpireTick = GetTickCount64() + 5000;
+    }
+    EnsureWorkAnimTimerState();
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+// The files are attached by the mail program, as with Windows Explorer's "E-mail" button. It used to open an empty
+// message with the paths as text (cut short at the first "&" or "#" in a name), which gave the recipient nothing.
+void ExplorerApp::EmailItems(const std::vector<std::wstring>& paths) {
+    const bool pl = (m_lang == Lang::PL);
+    std::vector<std::wstring> files;            // attachments: files on this computer (folders are not attached)
+    for (const auto& p : paths) {
+        if (FtpClient::IsFtpPath(p) || RepoBrowser::IsRepoUrl(p) || IsVirtualFolder(p)) continue;
+        const DWORD attrs = GetFileAttributesW(p.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(p);
+    }
+    if (!files.empty() && FileEngine::SendToMailRecipient(files)) return;
+
+    // No mail program that takes attachments (Windows' own Mail app does not), or nothing to attach: a new message
+    // of the default mail app listing the items, to be attached by hand
+    std::wstring body;
+    for (const auto& p : paths) body += (body.empty() ? L"" : L"\n") + p;
+    if (body.empty()) body = m_currentPath;
+    if (body.size() > 1500) {                   // mail apps refuse very long links: whole lines only
+        const size_t cut = body.rfind(L'\n', 1500);
+        body = body.substr(0, cut == std::wstring::npos ? 1500 : cut) + L"\n...";
+    }
+    ShellExecuteW(m_hwnd, L"open", MailtoUrl(pl ? L"Udostępnione pliki" : L"Shared files", body).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (!files.empty()) {
+        m_statusToast = FileEngine::HasMapiMailClient()
+            ? (pl ? L"\x26A0 Program pocztowy nie przyjął plików: dołącz je ręcznie" : L"\x26A0 The mail program did not take the files: attach them by hand")
+            : (pl ? L"\x26A0 Brak programu pocztowego, który dołącza pliki (np. Outlook, Thunderbird): dołącz je ręcznie"
+                  : L"\x26A0 No mail program that attaches files (e.g. Outlook, Thunderbird): attach them by hand");
+        m_statusToastExpireTick = GetTickCount64() + 6000;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    }
 }
 
 void ExplorerApp::StartExtractJob(const std::wstring& archivePath, const std::wstring& targetFolder, bool toSubfolder) {
@@ -8958,24 +9163,19 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
                 if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &pszDesk)) && pszDesk) {
                     std::wstring deskDir = PathUtils::EnsureTrailingSlash(pszDesk);
                     CoTaskMemFree(pszDesk);
-                    for (const auto& p : paths) {
-                        std::wstring bn = PathUtils::GetFileName(p);
-                        std::wstring lnk = deskDir + bn + L" - skrót.lnk";
-                        ShellMenuEmulator::CreateShortcutFile(p, lnk);
-                    }
+                    for (const auto& p : paths) CreateShortcutIn(deskDir, p);
                 }
             } else if (target.isZipArchive) {
-                if (m_shellEmulator.Has7Zip()) {
-                    m_shellEmulator.Execute7ZipAction(SZ_ADD_ZIP, paths, m_currentPath);
-                } else {
-                    std::wstring bn = PathUtils::GetFileName(paths[0]);
-                    std::wstring zipPath = PathUtils::EnsureTrailingSlash(m_currentPath) + bn + L".zip";
-                    std::wstring psCmd = L"-NoProfile -Command \"Compress-Archive -Force -LiteralPath '" + paths[0] + L"' -DestinationPath '" + zipPath + L"'\"";
-                    ShellExecuteW(nullptr, L"open", L"powershell.exe", psCmd.c_str(), m_currentPath.c_str(), SW_HIDE);
+                CompressToZip(paths);
+            } else if (!FileEngine::DropOnShellItem(target.targetPath, paths)) {
+                // Through the entry's own handler, as Windows Explorer does; without one (Linux), a shortcut or a
+                // program gets every item on its command line (it used to get only the first)
+                const std::wstring ext = PathUtils::GetExtension(target.targetPath);     // (lower case)
+                if (ext == L".lnk" || ext == L".exe") {
+                    std::wstring args;
+                    for (const auto& p : paths) args += (args.empty() ? L"\"" : L" \"") + p + L"\"";
+                    ShellExecuteW(m_hwnd, L"open", target.targetPath.c_str(), args.c_str(), m_currentPath.c_str(), SW_SHOWNORMAL);
                 }
-            } else {
-                std::wstring qArg = L"\"" + paths[0] + L"\"";
-                ShellExecuteW(m_hwnd, L"open", target.targetPath.c_str(), qArg.c_str(), m_currentPath.c_str(), SW_SHOWNORMAL);
             }
         }
         return;
@@ -9089,32 +9289,15 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         break;
     case CMD_CTX_CREATE_SHORTCUT:
         if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
-            const auto& it = m_items[hitIndex];
-            std::wstring lnkPath = PathUtils::EnsureTrailingSlash(m_currentPath) + it.name + (m_lang == Lang::PL ? L" - skrót.lnk" : L" - Shortcut.lnk");
-            if (ShellMenuEmulator::CreateShortcutFile(it.fullPath, lnkPath)) {
+            std::wstring lnkPath;
+            if (CreateShortcutIn(m_currentPath, m_items[hitIndex].fullPath, &lnkPath)) {
                 RefreshCurrentFolder(lnkPath);
             }
         }
         break;
-    case CMD_CTX_PASTE_SHORTCUT: {
-        if (OpenClipboard(m_hwnd)) {
-            HDROP hDrop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
-            if (hDrop) {
-                UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
-                for (UINT i = 0; i < count; ++i) {
-                    UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
-                    std::wstring src(len, L'\0');
-                    DragQueryFileW(hDrop, i, src.data(), len + 1);
-                    std::wstring bn = PathUtils::GetFileName(src);
-                    std::wstring lnk = PathUtils::EnsureTrailingSlash(m_currentPath) + bn + (m_lang == Lang::PL ? L" - skrót.lnk" : L" - Shortcut.lnk");
-                    ShellMenuEmulator::CreateShortcutFile(src, lnk);
-                }
-            }
-            CloseClipboard();
-            RefreshCurrentFolder();
-        }
+    case CMD_CTX_PASTE_SHORTCUT:
+        ExecuteRibbonCommand(CMD_PASTE_SHORTCUT);       // the same as "Wklej skrót" on the ribbon
         break;
-    }
     case CMD_CTX_EXPLORER:
         if (hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size()))
             FileEngine::OpenInClassicExplorer(m_items[hitIndex].fullPath, true);

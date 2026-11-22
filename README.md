@@ -181,7 +181,10 @@ Explorer2 uses these when they are installed, and works without them:
   paths, a summary of the local diff, and what the repository has that the working copy has not. svn and git
   run without prompts, so a server that needs a password the client has not stored is reported as an error.
 - **rclone**: cloud backup targets
-- **7-Zip or WinRAR** (default install location): extracting compressed entries from RAR and 7z archives
+- **7-Zip or WinRAR** (default install location): extracting compressed entries from RAR and 7z archives. The
+  "ZIP" button and "Wyślij do" / "Send to" > "Folder skompresowany (zip)" use 7-Zip when it is installed and
+  Windows' own compressed folders otherwise (on Linux they need `7z`); "Wyodrębnij" / "Extract" without 7-Zip
+  unpacks with Explorer2's own reader.
 - **UDisks2** (Linux; `udisksctl`, part of every desktop, with `gdbus` or `busctl` for the attribute table): SMART
   data of SATA and NVMe drives without root rights, and mounting a USB stick or card from the drive list.
   NVMe health data needs UDisks2 2.10 or newer. **smartmontools** (`smartctl`) is used as well when Explorer2
@@ -245,7 +248,17 @@ Explorer2 uses these when they are installed, and works without them:
   opening it mounts it (through UDisks2, as the desktop's own file manager does) and shows its folder. Fixed
   disks that are not mounted are not listed.
 - Files dragged out of the window can be dropped on other programs (a browser upload, a chat window,
-  Windows Explorer, the desktop). The program you drop them on decides whether they are copied or moved.
+  Windows Explorer, the desktop, an Android emulator kept on top of Explorer2). The program you drop them on
+  decides whether they are copied or moved. Win+D or Alt+Tab with the button still held keeps the drag going,
+  so the files can still be dropped on the desktop or the window you switched to.
+- "Wyślij do" / "Send to" lists everything in Windows' SendTo folder ("Adresat poczty", "Dokumenty", Bluetooth,
+  shortcuts to programs) and hands all the selected items to the entry, as Windows Explorer does. "E-mail" on
+  the Share tab attaches the files through the mail program (one that supports MAPI: Outlook, Thunderbird...);
+  with none, for example only Windows' own Mail app, it opens a new message that lists their paths.
+- Dragging with the right mouse button ends in a menu: "Kopiuj tutaj" / "Copy here", "Przenieś tutaj" /
+  "Move here", "Utwórz skróty tutaj" / "Create shortcuts here" (Windows only) or "Anuluj" / "Cancel"; the one in
+  bold is what a left-button drag would do. Dropped on another program, that program shows its own menu. A
+  right click that does not move opens the item's menu when the button is let go, as in Windows Explorer.
 - Delete moves items to the Recycle Bin and Shift+Delete removes them for good. Neither asks for
   confirmation unless you switch that on in the Delete button's menu.
 - Ctrl+Z after a Recycle Bin delete works from hidden copies (hard links, so they take no extra

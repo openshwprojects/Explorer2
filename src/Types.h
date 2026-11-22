@@ -31,6 +31,7 @@ constexpr UINT WM_APP_TRANSFER_UPDATE     = WM_APP + 111;   // CopyHandler-style
 constexpr UINT WM_APP_NET_REACHED         = WM_APP + 115;   // a network server asked in the background has answered (NetShares)
 constexpr UINT WM_APP_UPDATE_INFO         = WM_APP + 116;   // lParam = heap std::wstring*: newest release tag ("" = no answer)
 constexpr UINT WM_APP_VOLUME_MOUNTED      = WM_APP + 117;   // lParam = heap VolumeMountResult*: a volume was mounted, or not
+constexpr UINT WM_APP_DRAG_HANDOFF        = WM_APP + 118;   // a drag of items lost the mouse with the button held: go on as an OLE drag
 
 enum class ViewMode : int {
     Details = 0,         // Szczegóły (table with columns)

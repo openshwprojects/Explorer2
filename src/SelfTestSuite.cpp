@@ -30,6 +30,8 @@
 #include "SelfTestCommon.h"
 #include "Version.h"
 #include "DetailsColumns.h"
+#include "DragRules.h"
+#include "ShareRules.h"
 #include "RibbonTabLayout.h"
 #include "LinuxStorage.h"
 #include "ImageOrientation.h"
@@ -8955,6 +8957,71 @@ static void RunStage16Tests(TestCounter& tc) {
         tc.Record(tracks && bendFilled && notBeyond, L"Stage16.Test29_PcbTracks_RoundEnds_BendWithoutNotch",
                   L"tracks=" + std::to_wstring(tracks ? 1 : 0) + L", outside of the bend filled=" + std::to_wstring(bendFilled ? 1 : 0) +
                   L", nothing beyond=" + std::to_wstring(notBeyond ? 1 : 0));
+    }
+
+    // Test 16.30: the rules of a drag of items (DragRules.h, GitHub issue #4). Windows asks the drop source whether a
+    // drag that left the window goes on: it does while the button the drag is done with is held - also the right
+    // button, which the old answer did not look at, so such a drag dropped at once - letting go of it drops, and
+    // Escape or a press of the other button cancels. A drop on the same drive moves, elsewhere it copies.
+    {
+        const bool left = DragQueryContinue(FALSE, MK_LBUTTON, false) == S_OK &&
+                          DragQueryContinue(FALSE, MK_LBUTTON | MK_SHIFT, false) == S_OK &&
+                          DragQueryContinue(FALSE, 0, false) == DRAGDROP_S_DROP &&
+                          DragQueryContinue(TRUE, MK_LBUTTON, false) == DRAGDROP_S_CANCEL &&
+                          DragQueryContinue(FALSE, MK_LBUTTON | MK_RBUTTON, false) == DRAGDROP_S_CANCEL;
+        const bool right = DragQueryContinue(FALSE, MK_RBUTTON, true) == S_OK &&
+                           DragQueryContinue(FALSE, MK_RBUTTON | MK_CONTROL, true) == S_OK &&
+                           DragQueryContinue(FALSE, 0, true) == DRAGDROP_S_DROP &&
+                           DragQueryContinue(TRUE, MK_RBUTTON, true) == DRAGDROP_S_CANCEL &&
+                           DragQueryContinue(FALSE, MK_RBUTTON | MK_LBUTTON, true) == DRAGDROP_S_CANCEL;
+        bool drive = DropStaysOnDrive(L"C:\\Dane\\a.apk", L"c:\\Inne") &&
+                     !DropStaysOnDrive(L"C:\\Dane\\a.apk", L"D:\\") &&
+                     !DropStaysOnDrive(L"ftp://serwer/a.apk", L"C:\\Inne") &&
+                     !DropStaysOnDrive(L"\\\\serwer\\udzial\\a.apk", L"C:\\Inne");
+#ifndef _WIN32
+        // On Linux the device of the folders: the same one inside the scratch folder
+        const std::wstring scratch = GetScratchTestDir();
+        drive = drive && DropStaysOnDrive(scratch + L"/a.apk", scratch);
+#ifdef __linux__
+        drive = drive && !DropStaysOnDrive(scratch + L"/a.apk", L"/proc");     // another file system
+#endif
+#endif
+        tc.Record(left && right && drive, L"Stage16.Test30_DragRules_RightButtonDrag_SameDriveMoves",
+                  L"left button=" + std::to_wstring(left ? 1 : 0) + L", right button=" + std::to_wstring(right ? 1 : 0) +
+                  L", same drive=" + std::to_wstring(drive ? 1 : 0));
+    }
+
+    // Test 16.31: the "E-mail" link when no mail program attaches the files (ShareRules.h, MailtoUrl): subject and
+    // body as UTF-8 with %XX for everything but letters, digits and "-._~", line breaks as %0D%0A. The paths used to
+    // go in raw, so the first "&" or "#" in a name cut the message short, and the subject had no Polish letters.
+    {
+        const std::wstring url = MailtoUrl(L"Udostępnione pliki", L"C:\\Dane\\R&D #1.txt\nC:\\b c.png");
+        const std::wstring expected =
+            L"mailto:?subject=Udost%C4%99pnione%20pliki&body=C%3A%5CDane%5CR%26D%20%231.txt%0D%0AC%3A%5Cb%20c.png";
+        tc.Record(url == expected, L"Stage16.Test31_EmailLink_EncodesNamesAndPolishLetters", url);
+    }
+
+    // Test 16.32: what "Wyślij do" lists from the SendTo folder (ShareRules.h): shortcuts, programs, "Adresat poczty"
+    // (.MAPIMail), "Dokumenty" (.mydocs) - but not desktop.ini, hidden files, folders, or the two entries Explorer2
+    // makes itself (.DeskLink, .ZFSendToTarget); only .lnk and .exe used to be listed. And a drop on "Kosz" leaves
+    // alone what is already in the Recycle Bin (DragRules.h, IsInsideWindowsRecycleBin).
+    {
+        const bool listed = IsSendToMenuEntry(L"Notepad++.lnk", 0) && IsSendToMenuEntry(L"Mail Recipient.MAPIMail", 0) &&
+                            IsSendToMenuEntry(L"Dokumenty.mydocs", 0) && IsSendToMenuEntry(L"Transfer plików Bluetooth.LNK", 0) &&
+                            IsSendToMenuEntry(L"tool.exe", 0);
+        const bool skipped = !IsSendToMenuEntry(L"desktop.ini", FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) &&
+                             !IsSendToMenuEntry(L"desktop.ini", 0) &&
+                             !IsSendToMenuEntry(L"Desktop (create shortcut).DeskLink", 0) &&
+                             !IsSendToMenuEntry(L"Compressed (zipped) Folder.ZFSendToTarget", 0) &&
+                             !IsSendToMenuEntry(L"hidden.lnk", FILE_ATTRIBUTE_HIDDEN) &&
+                             !IsSendToMenuEntry(L"Podfolder", FILE_ATTRIBUTE_DIRECTORY);
+        const bool bin = IsInsideWindowsRecycleBin(L"C:\\$Recycle.Bin\\S-1-5-21-1\\$RAB12CD.txt") &&
+                         IsInsideWindowsRecycleBin(L"d:/$RECYCLE.BIN/S-1-5-21-1/$R1.png") &&
+                         !IsInsideWindowsRecycleBin(L"C:\\Users\\a\\$Recycle.Bin.txt") &&
+                         !IsInsideWindowsRecycleBin(L"C:\\Users\\a\\b.txt");
+        tc.Record(listed && skipped && bin, L"Stage16.Test32_SendToEntries_AndRecycleBinItems",
+                  L"listed=" + std::to_wstring(listed ? 1 : 0) + L", skipped=" + std::to_wstring(skipped ? 1 : 0) +
+                  L", items already in the bin=" + std::to_wstring(bin ? 1 : 0));
     }
 }
 
