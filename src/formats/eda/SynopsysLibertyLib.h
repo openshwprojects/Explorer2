@@ -178,7 +178,7 @@ inline bool ParseLibertyLibBoard(std::string_view sv, ParsedEdaBoard& out) {
                                         if (p < clean.size() && clean[p] == ':') {
                                             ++p;
                                             std::string pv = readIdentOrStr();
-                                            if (pkw == "direction") pin.dir = DetailGateTdms::LowerAsciiCopy(pv);
+                                            if (pkw == "direction") pin.dir = DetailGateAndDaqEda::LowerAsciiCopy(pv);
                                             else if (pkw == "function") pin.func = pv;
                                         } else if (p < clean.size() && clean[p] == '(') {
                                             readParenArg();

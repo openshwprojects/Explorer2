@@ -195,6 +195,8 @@ public:
     bool OnMouseMove(float x, float y, WPARAM keyFlags);
     bool OnMouseUp();
     bool OnMouseWheel(short delta, float x, float y);
+    bool OnMouseHWheel(short delta, float x, float y);
+    bool WantsHorizontalResizeCursor(float x, float y) const;
 
 private:
     ResolvedContentKind ResolveKindForCurrentEntry() const;
@@ -268,6 +270,9 @@ private:
     };
 
     HWND m_parentHwnd = nullptr;
+    IDWriteTextFormat* m_fmtSmallTrim = nullptr;
+    IDWriteTextFormat* m_fmtBoldTrim = nullptr;
+    std::wstring m_lineScratch;
     NotepadViewer m_notepad;
     HexViewer m_hex;
     Model3DViewer m_model3D;
@@ -315,6 +320,11 @@ private:
     AiModelInfoSummary m_aiModelInfo = {};
     std::wstring m_aiModelPath;
     float m_aiModelScrollY = 0.0f;
+    float m_aiModelMaxScrollY = 0.0f;
+    D2D1_RECT_F m_aiModelScrollTrackRect = {};
+    D2D1_RECT_F m_aiModelScrollThumbRect = {};
+    bool m_aiModelDraggingScroll = false;
+    float m_aiModelScrollDragOffset = 0.0f;
     std::wstring m_hashFilePath;
     std::wstring m_hashSummary; // "CRC32: ... • xxHash64: ... • SHA-256: ..."
     std::wstring m_sha256Hex;

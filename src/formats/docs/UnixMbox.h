@@ -23,15 +23,15 @@ inline bool ParseUnixMboxDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocume
             std::string_view slice = (nextMsg != std::string_view::npos)
                 ? sv.substr(pos, nextMsg - pos)
                 : sv.substr(pos);
-            if (DetailMedia100::ParseSingleEmailMessage(slice, parsedCount, out)) ++parsedCount;
+            if (DetailMediaAndScoreDoc::ParseSingleEmailMessage(slice, parsedCount, out)) ++parsedCount;
             if (nextMsg == std::string_view::npos) break;
             pos = nextMsg + 1;
         }
     } else {
-        if (DetailMedia100::ParseSingleEmailMessage(sv, 0, out)) parsedCount = 1;
+        if (DetailMediaAndScoreDoc::ParseSingleEmailMessage(sv, 0, out)) parsedCount = 1;
     }
     if (parsedCount == 0 || out.paragraphs.empty()) return false;
-    DetailMedia100::ComputeDocCounts(out);
+    DetailMediaAndScoreDoc::ComputeDocCounts(out);
     out.valid = true;
     return true;
 }

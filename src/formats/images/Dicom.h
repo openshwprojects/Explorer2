@@ -194,72 +194,8 @@ inline bool SkipUndefinedLengthElement(const uint8_t* data, size_t size, size_t&
 }
 
 inline bool DecodeWicFragment(const uint8_t* fragData, size_t fragSize, ExtendedImageInfo& outInfo) {
-#if !defined(_WIN32) && !defined(E2_WIN32_HAL)
-    return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
-#else
-    if (!fragData || fragSize < 8 || fragSize > 0x7FFFFFFFu) return false;
-    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    bool needUninit = (hrCo == S_OK || hrCo == S_FALSE);
-
-    bool ok = false;
-    IWICImagingFactory* factory = nullptr;
-    IWICStream* stream = nullptr;
-    IWICBitmapDecoder* decoder = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICFormatConverter* converter = nullptr;
-
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-    if (SUCCEEDED(hr) && factory) {
-        hr = factory->CreateStream(&stream);
-        if (SUCCEEDED(hr) && stream) {
-            hr = stream->InitializeFromMemory(const_cast<BYTE*>(fragData), static_cast<DWORD>(fragSize));
-        }
-        if (SUCCEEDED(hr)) {
-            hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
-        }
-        if (SUCCEEDED(hr) && decoder) {
-            hr = decoder->GetFrame(0, &frame);
-        }
-        UINT w = 0, h = 0;
-        if (SUCCEEDED(hr) && frame) {
-            hr = frame->GetSize(&w, &h);
-            if (SUCCEEDED(hr) && (w == 0 || h == 0 || w > kMaxRasterDimension || h > kMaxRasterDimension)) {
-                hr = E_FAIL;
-            }
-        }
-        if (SUCCEEDED(hr) && frame) {
-            hr = factory->CreateFormatConverter(&converter);
-        }
-        if (SUCCEEDED(hr) && converter) {
-            hr = converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA,
-                                       WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
-        }
-        if (SUCCEEDED(hr) && converter) {
-            uint64_t totalBytes = static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * 4ull;
-            if (totalBytes <= 0x7FFFFFFFull) {
-                outInfo.bgraPixels.resize(static_cast<size_t>(totalBytes));
-                hr = converter->CopyPixels(nullptr, w * 4u, static_cast<UINT>(totalBytes), outInfo.bgraPixels.data());
-                if (SUCCEEDED(hr)) {
-                    outInfo.width = w;
-                    outInfo.height = h;
-                    outInfo.channels = 4;
-                    outInfo.bitsPerChannel = 8;
-                    outInfo.formatName = L"DICOM Medical Image (.dcm)";
-                    outInfo.valid = true;
-                    ok = true;
-                }
-            }
-        }
-    }
-
-    if (converter) converter->Release();
-    if (frame) frame->Release();
-    if (decoder) decoder->Release();
-    if (stream) stream->Release();
-    if (factory) factory->Release();
-    if (needUninit) CoUninitialize();
-    return ok;
-#endif
+    return DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(
+        fragData, fragSize, L"DICOM Medical Image (.dcm)", outInfo, kMaxRasterDimension);
 }
 
 // Decompress DICOM PS3.5 Annex G RLE Lossless frame into Little-Endian pixel-interleaved native buffer
@@ -652,8 +588,8 @@ inline bool DecodeDICOM(const uint8_t* data, size_t size, ExtendedImageInfo& out
             }
 
             if (!decodedPureCpp && (wantLosslessJpegSof3 || (frame0Frag.size() >= 16 && frame0Frag[0] == 0xFFu && frame0Frag[1] == 0xD8u))) {
-                DetailImg200::LosslessJpegResult lj;
-                if (DetailImg200::DecodeLosslessJpegSOF3(frame0Frag.data(), frame0Frag.size(), lj) &&
+                DetailVectorAndRawImg::LosslessJpegResult lj;
+                if (DetailVectorAndRawImg::DecodeLosslessJpegSOF3(frame0Frag.data(), frame0Frag.size(), lj) &&
                     lj.width > 0 && lj.height > 0)
                 {
                     decodedPureCpp = packSamplesToNativeLE(lj.samples, lj.width, lj.height, lj.components, lj.precision);

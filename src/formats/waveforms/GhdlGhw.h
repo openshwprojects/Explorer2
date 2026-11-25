@@ -15,10 +15,10 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
     const bool be = (endian == 2);
 
     auto rd32 = [&](const uint8_t* p) -> uint32_t {
-        return be ? DetailEda100::RdU32BE(p) : DetailEda100::RdU32LE(p);
+        return be ? DetailSiliconAndBusEda::RdU32BE(p) : DetailSiliconAndBusEda::RdU32LE(p);
     };
     auto rd64 = [&](const uint8_t* p) -> int64_t {
-        return static_cast<int64_t>(be ? DetailEda100::RdU64BE(p) : DetailEda100::RdU64LE(p));
+        return static_cast<int64_t>(be ? DetailSiliconAndBusEda::RdU64BE(p) : DetailSiliconAndBusEda::RdU64LE(p));
     };
 
     std::vector<std::string> strTable(1); // 1-based
@@ -34,6 +34,7 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
     struct GhwBasicSig {
         uint32_t typeId = 1;
         std::vector<std::pair<uint64_t, char>> changes;
+        std::vector<std::pair<uint64_t, double>> realChanges;
     };
     std::vector<GhwBasicSig> basicSigs; // 1-based
 
@@ -130,62 +131,62 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
                     if (sid < strTable.size() && !strTable[sid].empty()) {
                         const std::string& s = strTable[sid];
                         if (s.size() >= 3 && s[0] == '\'') return s[1];
-                        if (DetailEda100::ContainsAsciiI(s, "true")) return '1';
-                        if (DetailEda100::ContainsAsciiI(s, "false")) return '0';
+                        if (DetailSiliconAndBusEda::ContainsAsciiI(s, "true")) return '1';
+                        if (DetailSiliconAndBusEda::ContainsAsciiI(s, "false")) return '0';
                         return s[0];
                     }
                     return '0';
                 };
                 if (rtik == 22) { // ghw_rtik_type_b2
-                    DetailEda100::ReadULeb128(data, eosPos, tp); // name
-                    uint64_t l0 = DetailEda100::ReadULeb128(data, eosPos, tp);
-                    uint64_t l1 = DetailEda100::ReadULeb128(data, eosPos, tp);
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp); // name
+                    uint64_t l0 = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
+                    uint64_t l1 = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                     td.kind = GhwScalarKind::Enum1B;
                     td.enumChars = { litCharFromStrId(l0), litCharFromStrId(l1) };
                 } else if (rtik == 23) { // ghw_rtik_type_e8
-                    DetailEda100::ReadULeb128(data, eosPos, tp); // name
-                    uint64_t nLits = DetailEda100::ReadULeb128(data, eosPos, tp);
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp); // name
+                    uint64_t nLits = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                     td.kind = GhwScalarKind::Enum1B;
                     for (uint64_t li = 0; li < nLits && li < 256 && tp < eosPos; ++li) {
-                        uint64_t lsid = DetailEda100::ReadULeb128(data, eosPos, tp);
+                        uint64_t lsid = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                         td.enumChars.push_back(litCharFromStrId(lsid));
                     }
                 } else if (rtik == 25 || rtik == 26) { // i32 / i64
-                    DetailEda100::ReadULeb128(data, eosPos, tp);
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                     td.kind = GhwScalarKind::IntLeb;
                 } else if (rtik == 27) { // f64
-                    DetailEda100::ReadULeb128(data, eosPos, tp);
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                     td.kind = GhwScalarKind::Float64;
                 } else if (rtik == 28 || rtik == 29) { // p32 / p64
-                    DetailEda100::ReadULeb128(data, eosPos, tp);
-                    uint64_t nUnits = DetailEda100::ReadULeb128(data, eosPos, tp);
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
+                    uint64_t nUnits = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                     for (uint64_t ui = 0; ui < nUnits && tp < eosPos; ++ui) {
-                        DetailEda100::ReadULeb128(data, eosPos, tp);
-                        DetailEda100::ReadSLeb128(data, eosPos, tp);
+                        DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
+                        DetailSiliconAndBusEda::ReadSLeb128(data, eosPos, tp);
                     }
                     td.kind = GhwScalarKind::IntLeb;
                 } else if (rtik == 31) { // type_array
-                    DetailEda100::ReadULeb128(data, eosPos, tp);
-                    td.elemTypeId = static_cast<uint32_t>(DetailEda100::ReadULeb128(data, eosPos, tp));
-                    uint64_t nDims = DetailEda100::ReadULeb128(data, eosPos, tp);
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
+                    td.elemTypeId = static_cast<uint32_t>(DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp));
+                    uint64_t nDims = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                     for (uint64_t di = 0; di < nDims && tp < eosPos; ++di) {
-                        DetailEda100::ReadULeb128(data, eosPos, tp);
+                        DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
                     }
                 } else if (rtik == 34) { // subtype_scalar
-                    DetailEda100::ReadULeb128(data, eosPos, tp);
-                    uint32_t baseId = static_cast<uint32_t>(DetailEda100::ReadULeb128(data, eosPos, tp));
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
+                    uint32_t baseId = static_cast<uint32_t>(DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp));
                     if (baseId < ti) td = types[baseId];
                     if (tp < eosPos) {
                         uint8_t rkind = data[tp++] & 0x7Fu;
                         if (rkind == 22 || rkind == 23) tp += 2;
                         else if (rkind == 25 || rkind == 26 || rkind == 28 || rkind == 29) {
-                            DetailEda100::ReadSLeb128(data, eosPos, tp);
-                            DetailEda100::ReadSLeb128(data, eosPos, tp);
+                            DetailSiliconAndBusEda::ReadSLeb128(data, eosPos, tp);
+                            DetailSiliconAndBusEda::ReadSLeb128(data, eosPos, tp);
                         } else if (rkind == 27) tp += 16;
                     }
                 } else if (rtik == 35) { // subtype_array (constrained 1D array e.g. std_logic_vector(7 downto 0))
-                    DetailEda100::ReadULeb128(data, eosPos, tp);
-                    uint32_t baseArr = static_cast<uint32_t>(DetailEda100::ReadULeb128(data, eosPos, tp));
+                    DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp);
+                    uint32_t baseArr = static_cast<uint32_t>(DetailSiliconAndBusEda::ReadULeb128(data, eosPos, tp));
                     if (baseArr < ti) {
                         td.elemTypeId = types[baseArr].elemTypeId;
                         if (td.elemTypeId < ti) td.kind = types[td.elemTypeId].kind;
@@ -198,8 +199,8 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
                         if (rk == 22 || rk == 23) {
                             if (tp + 2 <= eosPos) { left = data[tp]; right = data[tp + 1]; tp += 2; }
                         } else {
-                            left  = DetailEda100::ReadSLeb128(data, eosPos, tp);
-                            right = DetailEda100::ReadSLeb128(data, eosPos, tp);
+                            left  = DetailSiliconAndBusEda::ReadSLeb128(data, eosPos, tp);
+                            right = DetailSiliconAndBusEda::ReadSLeb128(data, eosPos, tp);
                         }
                         int64_t len = desc ? (left - right + 1) : (right - left + 1);
                         td.elemCount = static_cast<uint32_t>(std::clamp<int64_t>(len, 1, 512));
@@ -236,17 +237,17 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
                 if (hkind == 15) { // ghw_hie_eos (upscope)
                     if (!scopes.empty()) scopes.pop_back();
                 } else if (hkind == 1 || hkind == 3 || hkind == 4 || hkind == 5 || hkind == 6 || hkind == 7 || hkind == 13) {
-                    uint64_t sid = DetailEda100::ReadULeb128(data, eosPos, hp);
+                    uint64_t sid = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, hp);
                     std::string sname = (sid < strTable.size()) ? strTable[sid] : "";
                     if (hkind == 5) { // generate_for
-                        uint32_t itType = static_cast<uint32_t>(DetailEda100::ReadULeb128(data, eosPos, hp));
+                        uint32_t itType = static_cast<uint32_t>(DetailSiliconAndBusEda::ReadULeb128(data, eosPos, hp));
                         if (itType < types.size() && types[itType].kind == GhwScalarKind::Enum1B) ++hp;
-                        else DetailEda100::ReadSLeb128(data, eosPos, hp);
+                        else DetailSiliconAndBusEda::ReadSLeb128(data, eosPos, hp);
                     }
                     if (hkind != 13) scopes.push_back(std::move(sname)); // process has no upscope
                 } else if (hkind >= 16 && hkind <= 21) { // signal / port_*
-                    uint64_t sid = DetailEda100::ReadULeb128(data, eosPos, hp);
-                    uint32_t tid = static_cast<uint32_t>(DetailEda100::ReadULeb128(data, eosPos, hp));
+                    uint64_t sid = DetailSiliconAndBusEda::ReadULeb128(data, eosPos, hp);
+                    uint32_t tid = static_cast<uint32_t>(DetailSiliconAndBusEda::ReadULeb128(data, eosPos, hp));
                     std::string vname = (sid < strTable.size()) ? strTable[sid] : ("sig_" + std::to_string(declSignals.size()));
                     if (!scopes.empty() && !scopes.back().empty()) vname = scopes.back() + "." + vname;
 
@@ -255,7 +256,7 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
                     GhwSignalDecl decl;
                     decl.name = PathUtils::Utf8ToWide(vname);
                     for (uint32_t ei = 0; ei < nElems && hp < eosPos; ++ei) {
-                        uint32_t elId = static_cast<uint32_t>(DetailEda100::ReadULeb128(data, eosPos, hp));
+                        uint32_t elId = static_cast<uint32_t>(DetailSiliconAndBusEda::ReadULeb128(data, eosPos, hp));
                         if (elId >= 1 && elId < basicSigs.size()) {
                             basicSigs[elId].typeId = scalarTid;
                             decl.elIds.push_back(elId);
@@ -270,21 +271,40 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
             continue;
         }
 
-        auto readBasicSigChar = [&](uint32_t sigId, size_t& cur, size_t limit) -> char {
+        auto readBasicSigSample = [&](uint32_t sigId, uint64_t tFs, size_t& cur, size_t limit) {
             uint32_t tid = (sigId < basicSigs.size()) ? basicSigs[sigId].typeId : 1u;
             const GhwTypeDef* td = (tid < types.size()) ? &types[tid] : nullptr;
             if (!td || td->kind == GhwScalarKind::Enum1B) {
-                if (cur >= limit) return '0';
+                if (cur >= limit) return;
                 uint8_t idx = data[cur++];
-                if (td && idx < td->enumChars.size()) return td->enumChars[idx];
-                return (idx == 3 || idx == 1) ? '1' : '0';
+                char ch = (td && idx < td->enumChars.size()) ? td->enumChars[idx]
+                        : ((idx == 3 || idx == 1) ? '1' : '0');
+                if (sigId >= 1 && sigId < basicSigs.size() && basicSigs[sigId].changes.size() < 8192) {
+                    basicSigs[sigId].changes.push_back({ tFs, ch });
+                }
+                return;
             }
             if (td->kind == GhwScalarKind::IntLeb) {
-                int64_t v = DetailEda100::ReadSLeb128(data, limit, cur);
-                return (v != 0) ? '1' : '0';
+                int64_t v = DetailSiliconAndBusEda::ReadSLeb128(data, limit, cur);
+                if (sigId >= 1 && sigId < basicSigs.size() && basicSigs[sigId].changes.size() < 8192) {
+                    basicSigs[sigId].changes.push_back({ tFs, (v != 0) ? '1' : '0' });
+                }
+                return;
             }
-            cur = std::min(limit, cur + 8);
-            return '0';
+            // GhwScalarKind::Float64 (`rtik == 27`): 8-byte IEEE-754 double in file endianness!
+            if (cur + 8u <= limit) {
+                const uint64_t bits = be ? DetailSiliconAndBusEda::RdU64BE(data + cur)
+                                         : DetailSiliconAndBusEda::RdU64LE(data + cur);
+                cur += 8u;
+                double dv = 0.0;
+                std::memcpy(&dv, &bits, 8);
+                if (!std::isfinite(dv)) dv = 0.0;
+                if (sigId >= 1 && sigId < basicSigs.size() && basicSigs[sigId].realChanges.size() < 8192) {
+                    basicSigs[sigId].realChanges.push_back({ tFs, dv });
+                }
+            } else {
+                cur = limit;
+            }
         };
 
         if (std::memcmp(sec, "SNP\0", 4) == 0) {
@@ -296,8 +316,7 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
             size_t esnPos = findMarker("ESN\0", sp);
             size_t limit = (esnPos != std::string_view::npos) ? esnPos : size;
             for (size_t si = 1; si < basicSigs.size() && sp < limit; ++si) {
-                char ch = readBasicSigChar(static_cast<uint32_t>(si), sp, limit);
-                basicSigs[si].changes.push_back({ static_cast<uint64_t>(snapFs), ch });
+                readBasicSigSample(static_cast<uint32_t>(si), static_cast<uint64_t>(snapFs), sp, limit);
             }
             if (esnPos == std::string_view::npos) break;
             pos = esnPos + 4;
@@ -314,17 +333,14 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
             while (cp < limit) {
                 uint32_t sigIdx = 0;
                 while (cp < limit) {
-                    uint64_t deltaSig = DetailEda100::ReadULeb128(data, limit, cp);
+                    uint64_t deltaSig = DetailSiliconAndBusEda::ReadULeb128(data, limit, cp);
                     if (deltaSig == 0) break;
                     sigIdx += static_cast<uint32_t>(deltaSig);
-                    char ch = readBasicSigChar(sigIdx, cp, limit);
-                    if (sigIdx >= 1 && sigIdx < basicSigs.size() && basicSigs[sigIdx].changes.size() < 8192) {
-                        basicSigs[sigIdx].changes.push_back({ static_cast<uint64_t>(curFs), ch });
-                    }
+                    readBasicSigSample(sigIdx, static_cast<uint64_t>(curFs), cp, limit);
                 }
                 maxTimeFs = std::max(maxTimeFs, static_cast<uint64_t>(curFs));
                 if (cp >= limit) break;
-                int64_t dtFs = DetailEda100::ReadSLeb128(data, limit, cp);
+                int64_t dtFs = DetailSiliconAndBusEda::ReadSLeb128(data, limit, cp);
                 if (dtFs < 0) break; // -1 terminates CYC
                 curFs += dtFs;
             }
@@ -345,8 +361,16 @@ inline bool ParseGhdlGhw(const uint8_t* data, size_t size, ParsedEdaBoard& out) 
         ws.name = d.name;
         ws.bitWidth = static_cast<int>(d.elIds.size());
         if (d.elIds.size() == 1) {
-            for (const auto& kv : basicSigs[d.elIds[0]].changes) {
-                ws.changes.push_back({ kv.first, std::string(1, kv.second) });
+            const GhwBasicSig& bs = basicSigs[d.elIds[0]];
+            const uint32_t tid = bs.typeId;
+            if (tid < types.size() && types[tid].kind == GhwScalarKind::Float64 && !bs.realChanges.empty()) {
+                ws.isReal = true;
+                ws.bitWidth = 64;
+                ws.realChanges = bs.realChanges;
+            } else {
+                for (const auto& kv : bs.changes) {
+                    ws.changes.push_back({ kv.first, std::string(1, kv.second) });
+                }
             }
         } else {
             // Merge multi-bit vector timestamps across scalar element signals

@@ -6,7 +6,7 @@ namespace Formats {
 
 inline bool ParseJedecPldJedBoard(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
     std::string_view sv(reinterpret_cast<const char*>(data), size);
-    // #69. JEDEC JESD3-C PLD/CPLD/GAL Fuse Map (.jed)
+    // JEDEC JESD3-C PLD/CPLD/GAL Fuse Map (.jed)
     if (ext == L".jed") {
         if (sv.find("*L") == std::string_view::npos && sv.find("QF") == std::string_view::npos &&
             sv.find("\nL") == std::string_view::npos) return false;
@@ -47,7 +47,7 @@ inline bool ParseJedecPldJedBoard(const uint8_t* data, size_t size, const std::w
         int cols = static_cast<int>(fuseRows[0].size());
         float pitch = 1.4f;
         float w = cols * pitch, h = rows * pitch;
-        DetailEda100::AddRectOutline(out, 0.0f, 0.0f, w + 6.0f, h + 6.0f, EdaLayerId::EdgeCuts, 0.35f);
+        DetailSiliconAndBusEda::AddRectOutline(out, 0.0f, 0.0f, w + 6.0f, h + 6.0f, EdaLayerId::EdgeCuts, 0.35f);
 
         for (int r = 0; r < rows; ++r) {
             float y = ((rows - 1) * 0.5f - r) * pitch;

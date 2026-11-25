@@ -12,18 +12,18 @@ inline bool ParseUf2Firmware(const std::vector<uint8_t>& raw, ParsedOfficeDocume
     const size_t totalBlocks = raw.size() / 512;
     uint32_t minAddr = 0xFFFFFFFFu, maxAddr = 0;
     uint64_t totalPayloadBytes = 0;
-    uint32_t familyId = DetailSys100::RdU32LE(raw.data() + 28);
-    uint32_t hdrNumBlocks = DetailSys100::RdU32LE(raw.data() + 24);
+    uint32_t familyId = DetailBinarySysDoc::RdU32LE(raw.data() + 28);
+    uint32_t hdrNumBlocks = DetailBinarySysDoc::RdU32LE(raw.data() + 24);
     uint64_t fnvHash = 14695981039346656037ULL;
     std::wstring extDeviceDesc, extFwVer;
 
     for (size_t b = 0; b < totalBlocks && b < 65536; ++b) {
         const uint8_t* blk = raw.data() + b * 512;
         if (std::memcmp(blk, "UF2\n", 4) != 0) break;
-        const uint32_t flags = DetailSys100::RdU32LE(blk + 8);
-        const uint32_t addr  = DetailSys100::RdU32LE(blk + 12);
-        const uint32_t paySz = std::min<uint32_t>(DetailSys100::RdU32LE(blk + 16), 476u);
-        if (familyId == 0 && (flags & 0x2000u) != 0) familyId = DetailSys100::RdU32LE(blk + 28);
+        const uint32_t flags = DetailBinarySysDoc::RdU32LE(blk + 8);
+        const uint32_t addr  = DetailBinarySysDoc::RdU32LE(blk + 12);
+        const uint32_t paySz = std::min<uint32_t>(DetailBinarySysDoc::RdU32LE(blk + 16), 476u);
+        if (familyId == 0 && (flags & 0x2000u) != 0) familyId = DetailBinarySysDoc::RdU32LE(blk + 28);
 
         minAddr = std::min(minAddr, addr);
         maxAddr = std::max(maxAddr, addr + paySz);
@@ -51,10 +51,10 @@ inline bool ParseUf2Firmware(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         }
     }
 
-    if (minAddr == 0xFFFFFFFFu) minAddr = DetailSys100::RdU32LE(raw.data() + 12);
+    if (minAddr == 0xFFFFFFFFu) minAddr = DetailBinarySysDoc::RdU32LE(raw.data() + 12);
     if (hdrNumBlocks == 0) hdrNumBlocks = static_cast<uint32_t>(totalBlocks);
 
-    std::wstring famName = DetailSys100::Hex32(familyId);
+    std::wstring famName = DetailBinarySysDoc::Hex32(familyId);
     if (familyId == 0xE48BFF56u) famName = L"Raspberry Pi RP2040 (0xE48BFF56)";
     else if (familyId == 0xE48BFF59u) famName = L"Raspberry Pi RP2350 ARM-S (0xE48BFF59)";
     else if (familyId == 0xE48BFF5Au) famName = L"Raspberry Pi RP2350 RISC-V (0xE48BFF5A)";
@@ -69,12 +69,12 @@ inline bool ParseUf2Firmware(const std::vector<uint8_t>& raw, ParsedOfficeDocume
     sh.rows = {
         { L"UF2 Firmware Property", L"Value" },
         { L"Target MCU Family", famName },
-        { L"Base Flash Address", DetailSys100::Hex32(minAddr) },
-        { L"End Flash Address", DetailSys100::Hex32(maxAddr) },
+        { L"Base Flash Address", DetailBinarySysDoc::Hex32(minAddr) },
+        { L"End Flash Address", DetailBinarySysDoc::Hex32(maxAddr) },
         { L"Total 512B Blocks", std::to_wstring(hdrNumBlocks) + L" (" + std::to_wstring(totalBlocks) + L" present)" },
         { L"Total Firmware Payload", PathUtils::FormatByteSize(totalPayloadBytes) },
-        { L"Payload FNV-1a Digest", DetailSys100::Hex64(fnvHash) },
-        { L"Initial Vector Bytes", DetailSys100::HexBytes(raw.data() + 32, 16, L' ') }
+        { L"Payload FNV-1a Digest", DetailBinarySysDoc::Hex64(fnvHash) },
+        { L"Initial Vector Bytes", DetailBinarySysDoc::HexBytes(raw.data() + 32, 16, L' ') }
     };
     if (!extDeviceDesc.empty()) sh.rows.push_back({ L"Device Description Tag", extDeviceDesc });
     if (!extFwVer.empty())      sh.rows.push_back({ L"Firmware Version Tag", extFwVer });

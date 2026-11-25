@@ -1,0 +1,11 @@
+# Digilent Atlys Spartan-6 XC6SLX45 CSG324 User Constraints
+CONFIG VCCAUX = "3.3" ;
+
+NET "clk_100mhz" LOC = "L15" | IOSTANDARD = LVCMOS33 | TNM_NET = "sys_clk_pin" ;
+TIMESPEC "TS_sys_clk_pin" = PERIOD "sys_clk_pin" 10.0 ns HIGH 50% ;
+
+NET "rst_n"    LOC = "T15" | IOSTANDARD = LVCMOS33 | PULLUP ;
+NET "uart_rxd" LOC = "A16" | IOSTANDARD = LVCMOS33 ;
+NET "uart_txd" LOC = "B16" | IOSTANDARD = LVCMOS33 | SLEW = FAST ;
+NET "led<0>"   LOC = "U18" | IOSTANDARD = LVCMOS33 ;
+NET "led<1>"   LOC = "M14" | IOSTANDARD = LVCMOS33 ;

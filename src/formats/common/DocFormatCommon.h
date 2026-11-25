@@ -2,41 +2,14 @@
 // DocFormatCommon.h — Shared detail namespaces for Document, AI/Data, GIS, Media & Security readers.
 // Included inside namespace Explorer2 in DocReaders.cpp after Parquet.h, Kml.h, Sqlite.h, ContentLines.h, GpsTrackMap.h.
 
+#ifndef E2_DOC_FORMAT_CORE_ONLY
+#include "ContentLines.h"
 namespace DetailExcelOds {
 
-inline bool AsciiEqCI(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-        unsigned char ca = static_cast<unsigned char>(a[i]);
-        unsigned char cb = static_cast<unsigned char>(b[i]);
-        if (ca >= 'A' && ca <= 'Z') ca = static_cast<unsigned char>(ca + ('a' - 'A'));
-        if (cb >= 'A' && cb <= 'Z') cb = static_cast<unsigned char>(cb + ('a' - 'A'));
-        if (ca != cb) return false;
-    }
-    return true;
-}
-
-inline bool EndsWithWideCI(std::wstring_view s, std::wstring_view suffix) {
-    if (s.size() < suffix.size()) return false;
-    size_t off = s.size() - suffix.size();
-    for (size_t i = 0; i < suffix.size(); ++i) {
-        wchar_t ca = s[off + i];
-        wchar_t cb = suffix[i];
-        if (ca >= L'A' && ca <= L'Z') ca = static_cast<wchar_t>(ca + (L'a' - L'A'));
-        if (cb >= L'A' && cb <= L'Z') cb = static_cast<wchar_t>(cb + (L'a' - L'A'));
-        if (ca != cb) return false;
-    }
-    return true;
-}
-
-inline std::string_view TrimAsciiSV(std::string_view s) { return ::Explorer2::PathUtils::TrimAscii(s); }
-
-inline int HexValChar(wchar_t c) {
-    if (c >= L'0' && c <= L'9') return static_cast<int>(c - L'0');
-    if (c >= L'A' && c <= L'F') return static_cast<int>(c - L'A' + 10);
-    if (c >= L'a' && c <= L'f') return static_cast<int>(c - L'a' + 10);
-    return -1;
-}
+using ::Explorer2::ReaderText::AsciiEqCI;
+using ::Explorer2::ReaderText::EndsWithWideCI;
+inline std::string_view TrimAsciiSV(std::string_view s) { return ::Explorer2::ReaderText::TrimSv(s); }
+inline int HexValChar(wchar_t c) { return ::Explorer2::ReaderText::HexValWide(c); }
 
 // Single-pass XML entity + ECMA-376 ST_Xstring control escape decoder
 inline std::wstring DecodeSpreadsheetXml(std::string_view utf8Raw, bool decodeOoxmlXstr = false) {
@@ -519,20 +492,7 @@ inline ExcelStyleFmt ClassifyExcelNumberFormat(uint32_t numFmtId, std::string_vi
     return { ExcelNumFmtKind::General, 0 };
 }
 
-inline void CivilFromDays1970(int64_t z, int& outY, int& outM, int& outD) {
-    z += 719468LL;
-    const int64_t era = (z >= 0 ? z : z - 146096LL) / 146097LL;
-    const uint32_t doe = static_cast<uint32_t>(z - era * 146097LL);
-    const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
-    const int64_t y = static_cast<int64_t>(yoe) + era * 400LL;
-    const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
-    const uint32_t mp = (5u * doy + 2u) / 153u;
-    const uint32_t d = doy - (153u * mp + 2u) / 5u + 1u;
-    const uint32_t m = (mp < 10u) ? (mp + 3u) : (mp - 9u);
-    outY = static_cast<int>(y + (m <= 2u ? 1 : 0));
-    outM = static_cast<int>(m);
-    outD = static_cast<int>(d);
-}
+using ::Explorer2::ReaderText::CivilFromDays1970;
 
 inline std::wstring FormatExcelNumericCell(
     std::string_view rawV,
@@ -1118,9 +1078,11 @@ inline void ParseOoxmlRelsXml(std::string_view xmlUtf8, std::vector<OoxmlRel>& o
 #ifndef CERT_SHA256_HASH_PROP_ID
 #define CERT_SHA256_HASH_PROP_ID 107
 #endif
+#endif // E2_DOC_FORMAT_CORE_ONLY
 
 namespace Formats {
 
+#ifndef E2_DOC_FORMAT_CORE_ONLY
 namespace LegacyOfficeDetail {
 
 using ::Explorer2::ByteIO::RdU16LE;
@@ -1162,10 +1124,10 @@ inline void PushOfficeParagraph(ParsedOfficeDocument& out, std::wstring text, in
 
 namespace DetailAudio {
 
-inline uint32_t Le32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24); }
-inline uint16_t Le16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
-inline uint32_t Be32(const uint8_t* p) { return (static_cast<uint32_t>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
-inline uint16_t Be16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
+inline uint32_t Le32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline uint16_t Le16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
+inline uint32_t Be32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32BE(p); }
+inline uint16_t Be16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16BE(p); }
 
 // IEEE 754 80-bit extended (AIFF sample rate)
 inline double Extended80(const uint8_t* p) {
@@ -1199,15 +1161,36 @@ inline std::wstring TextField(const uint8_t* p, size_t n) {
 }
 
 } // namespace DetailAudio
+#endif // E2_DOC_FORMAT_CORE_ONLY
 
-namespace DetailSys100 {
+namespace DetailBinarySysDoc {
 
 using ::Explorer2::ByteIO::RdU16LE;
 using ::Explorer2::ByteIO::RdU32LE;
+using ::Explorer2::ByteIO::RdI32LE;
 using ::Explorer2::ByteIO::RdU64LE;
 using ::Explorer2::ByteIO::RdU16BE;
 using ::Explorer2::ByteIO::RdU32BE;
 using ::Explorer2::ByteIO::RdU64BE;
+
+inline bool ReadSourceExact(SourceBytes& src, uint64_t off, uint8_t* dst, size_t len) {
+    std::vector<uint8_t> tmp;
+    const uint8_t* p = src.Read(off, len, tmp);
+    if (!p) return false;
+    if (len > 0) std::memcpy(dst, p, len);
+    return true;
+}
+
+inline bool ReadSourceVec(SourceBytes& src, uint64_t off, size_t len, std::vector<uint8_t>& outVec) {
+    outVec.clear();
+    if (len == 0) return true;
+    std::vector<uint8_t> tmp;
+    const uint8_t* p = src.Read(off, len, tmp);
+    if (!p) return false;
+    if (!tmp.empty() && p == tmp.data()) outVec = std::move(tmp);
+    else outVec.assign(p, p + len);
+    return true;
+}
 
 inline std::wstring Hex32(uint32_t v) {
     wchar_t buf[32] = {};
@@ -1269,8 +1252,9 @@ inline std::string ReadCStrBounded(const std::vector<uint8_t>& raw, size_t off, 
     return std::string(reinterpret_cast<const char*>(raw.data() + off), n);
 }
 
-} // namespace DetailSys100
+} // namespace DetailBinarySysDoc
 
+#ifndef E2_DOC_FORMAT_CORE_ONLY
 namespace DetailX509 {
 
 inline bool DecodeBase64Clean(std::string_view b64, std::vector<uint8_t>& outBytes) {
@@ -1300,11 +1284,39 @@ inline std::wstring MapKnownOid(const std::string& oid) {
     if (oid == "1.2.840.113549.1.7.1")  return L"pkcs7-data";
     if (oid == "1.2.840.113549.1.7.2")  return L"pkcs7-signedData";
     if (oid == "1.2.840.113549.1.7.6")  return L"pkcs7-encryptedData";
+    if (oid == "1.2.840.113549.1.12.10.1.1") return L"keyBag";
     if (oid == "1.2.840.113549.1.12.10.1.2") return L"pkcs8ShroudedKeyBag";
     if (oid == "1.2.840.113549.1.12.10.1.3") return L"certBag";
+    if (oid == "1.2.840.113549.1.12.10.1.4") return L"crlBag";
+    if (oid == "1.2.840.113549.1.12.10.1.5") return L"secretBag";
+    if (oid == "1.2.840.113549.1.12.10.1.6") return L"safeContentsBag";
+    if (oid == "1.2.840.113549.1.12.1.1") return L"pbeWithSHAAnd128BitRC4";
+    if (oid == "1.2.840.113549.1.12.1.3") return L"pbeWithSHAAnd3-KeyTripleDES-CBC";
+    if (oid == "1.2.840.113549.1.12.1.6") return L"pbeWithSHAAnd40BitRC2-CBC";
+    if (oid == "1.2.840.113549.1.5.12")  return L"PBKDF2";
+    if (oid == "1.2.840.113549.1.5.13")  return L"PBES2";
+    if (oid == "1.2.840.113549.2.7")     return L"hmacWithSHA1";
+    if (oid == "1.2.840.113549.2.9")     return L"hmacWithSHA256";
+    if (oid == "1.2.840.113549.2.10")    return L"hmacWithSHA384";
+    if (oid == "1.2.840.113549.2.11")    return L"hmacWithSHA512";
+    if (oid == "1.3.14.3.2.26")          return L"SHA-1";
+    if (oid == "2.16.840.1.101.3.4.2.1") return L"SHA-256";
+    if (oid == "2.16.840.1.101.3.4.2.2") return L"SHA-384";
+    if (oid == "2.16.840.1.101.3.4.2.3") return L"SHA-512";
+    if (oid == "2.16.840.1.101.3.4.1.2") return L"AES-128-CBC";
+    if (oid == "2.16.840.1.101.3.4.1.42") return L"AES-256-CBC";
+    if (oid == "1.2.840.113549.1.9.14")  return L"extensionRequest";
+    if (oid == "1.2.840.113549.1.9.20")  return L"friendlyName";
+    if (oid == "1.2.840.113549.1.9.21")  return L"localKeyId";
+    if (oid == "1.2.840.113549.1.9.22.1") return L"x509Certificate";
+    if (oid == "1.3.132.0.35")           return L"secp521r1";
+    if (oid == "1.3.132.0.10")           return L"secp256k1";
+    if (oid == "1.3.101.110")            return L"X25519";
+    if (oid == "1.3.101.113")            return L"Ed448";
     if (oid == "2.5.29.17") return L"subjectAltName";
     if (oid == "2.5.29.19") return L"basicConstraints";
     if (oid == "2.5.29.15") return L"keyUsage";
+    if (oid == "2.5.29.37") return L"extKeyUsage";
     return PathUtils::Utf8ToWide(oid);
 }
 
@@ -1372,7 +1384,7 @@ inline void WalkAsn1Der(const uint8_t* p, size_t len, int depth, std::wstring& l
         } else if (tag == 0x1E && (valLen % 2 == 0)) { // BMPString (UTF-16BE)
             std::wstring s;
             for (size_t i = 0; i + 2 <= valLen; i += 2) {
-                wchar_t wc = static_cast<wchar_t>(DetailSys100::RdU16BE(val + i));
+                wchar_t wc = static_cast<wchar_t>(DetailBinarySysDoc::RdU16BE(val + i));
                 if (wc != 0) s.push_back(wc);
             }
             rows.push_back({ lastOidLabel.empty() ? L"ASN.1 BMPString" : lastOidLabel, s });
@@ -1384,10 +1396,10 @@ inline void WalkAsn1Der(const uint8_t* p, size_t len, int depth, std::wstring& l
                 rows.push_back({ L"ASN.1 Integer", std::to_wstring(iv) });
             } else {
                 rows.push_back({ L"ASN.1 BigInteger (" + std::to_wstring(valLen * 8) + L"-bit)",
-                    DetailSys100::HexBytes(val, std::min<size_t>(valLen, 24), L':') + (valLen > 24 ? L"..." : L"") });
+                    DetailBinarySysDoc::HexBytes(val, std::min<size_t>(valLen, 24), L':') + (valLen > 24 ? L"..." : L"") });
             }
         } else if (tag == 0x03 && valLen > 1) { // BIT STRING
-            rows.push_back({ L"ASN.1 BitString", std::to_wstring((valLen - 1) * 8) + L" bits (" + DetailSys100::HexBytes(val + 1, std::min<size_t>(valLen - 1, 16)) + L"...)" });
+            rows.push_back({ L"ASN.1 BitString", std::to_wstring((valLen - 1) * 8) + L" bits (" + DetailBinarySysDoc::HexBytes(val + 1, std::min<size_t>(valLen - 1, 16)) + L"...)" });
         } else if (tag == 0x04 && valLen > 0) { // OCTET STRING
             // Check if encapsulated ASN.1 SEQUENCE inside OCTET STRING
             uint8_t innerTag = 0; size_t ih = 0, iv = 0;
@@ -1395,7 +1407,7 @@ inline void WalkAsn1Der(const uint8_t* p, size_t len, int depth, std::wstring& l
                 WalkAsn1Der(val, valLen, depth + 1, lastOidLabel, rows);
             } else {
                 rows.push_back({ L"ASN.1 OctetString (" + std::to_wstring(valLen) + L" B)",
-                    DetailSys100::HexBytes(val, std::min<size_t>(valLen, 20), L':') + (valLen > 20 ? L"..." : L"") });
+                    DetailBinarySysDoc::HexBytes(val, std::min<size_t>(valLen, 20), L':') + (valLen > 20 ? L"..." : L"") });
             }
         }
         pos += hdrLen + valLen;
@@ -1419,7 +1431,7 @@ inline void AppendCertContextRows(PCCERT_CONTEXT pCert, const std::wstring& pref
     for (size_t i = 0; i < serRev.size(); ++i) {
         serRev[i] = pCert->pCertInfo->SerialNumber.pbData[serRev.size() - 1 - i];
     }
-    rows.push_back({ prefix + L"Serial Number", DetailSys100::HexBytes(serRev.data(), serRev.size(), L':') });
+    rows.push_back({ prefix + L"Serial Number", DetailBinarySysDoc::HexBytes(serRev.data(), serRev.size(), L':') });
 
     if (pCert->pCertInfo->SignatureAlgorithm.pszObjId) {
         std::string sigOid = pCert->pCertInfo->SignatureAlgorithm.pszObjId;
@@ -1433,8 +1445,8 @@ inline void AppendCertContextRows(PCCERT_CONTEXT pCert, const std::wstring& pref
 
     uint64_t ftBefore = (static_cast<uint64_t>(pCert->pCertInfo->NotBefore.dwHighDateTime) << 32) | pCert->pCertInfo->NotBefore.dwLowDateTime;
     uint64_t ftAfter  = (static_cast<uint64_t>(pCert->pCertInfo->NotAfter.dwHighDateTime)  << 32) | pCert->pCertInfo->NotAfter.dwLowDateTime;
-    rows.push_back({ prefix + L"Valid Not Before", DetailSys100::FormatFileTimeUtc(ftBefore) });
-    rows.push_back({ prefix + L"Valid Not After",  DetailSys100::FormatFileTimeUtc(ftAfter) });
+    rows.push_back({ prefix + L"Valid Not Before", DetailBinarySysDoc::FormatFileTimeUtc(ftBefore) });
+    rows.push_back({ prefix + L"Valid Not After",  DetailBinarySysDoc::FormatFileTimeUtc(ftAfter) });
 
     // Subject Alternative Names (SAN)
     PCERT_EXTENSION pSanExt = CertFindExtension(szOID_SUBJECT_ALT_NAME2, pCert->pCertInfo->cExtension, pCert->pCertInfo->rgExtension);
@@ -1469,12 +1481,12 @@ inline void AppendCertContextRows(PCCERT_CONTEXT pCert, const std::wstring& pref
     uint8_t sha256[32] = {};
     DWORD cbSha256 = sizeof(sha256);
     if (CertGetCertificateContextProperty(pCert, CERT_SHA256_HASH_PROP_ID, sha256, &cbSha256) && cbSha256 == 32) {
-        rows.push_back({ prefix + L"SHA-256 Thumbprint", DetailSys100::HexBytes(sha256, 32, L':') });
+        rows.push_back({ prefix + L"SHA-256 Thumbprint", DetailBinarySysDoc::HexBytes(sha256, 32, L':') });
     } else {
         uint8_t sha1[20] = {};
         DWORD cbSha1 = sizeof(sha1);
         if (CertGetCertificateContextProperty(pCert, CERT_SHA1_HASH_PROP_ID, sha1, &cbSha1) && cbSha1 == 20) {
-            rows.push_back({ prefix + L"SHA-1 Thumbprint", DetailSys100::HexBytes(sha1, 20, L':') });
+            rows.push_back({ prefix + L"SHA-1 Thumbprint", DetailBinarySysDoc::HexBytes(sha1, 20, L':') });
         }
     }
 }
@@ -1563,6 +1575,377 @@ inline bool FinalizePkiDoc(const std::wstring& title, std::vector<std::vector<st
     out.valid = true;
     return true;
 }
+
+inline std::wstring DecodeDerAnyString(uint8_t tag, const uint8_t* val, size_t valLen) {
+    if (tag == 0x1E && (valLen % 2u) == 0u) { // BMPString (UTF-16BE)
+        std::wstring s;
+        s.reserve(valLen / 2u);
+        for (size_t i = 0; i + 2 <= valLen; i += 2) {
+            uint16_t cu = DetailBinarySysDoc::RdU16BE(val + i);
+            if (cu != 0) s.push_back(static_cast<wchar_t>(cu));
+        }
+        return s;
+    }
+    if (tag == 0x1C && (valLen % 4u) == 0u) { // UniversalString (UTF-32BE)
+        std::wstring s;
+        for (size_t i = 0; i + 4 <= valLen; i += 4) {
+            uint32_t cp = DetailBinarySysDoc::RdU32BE(val + i);
+            if (cp == 0) continue;
+            if (cp <= 0xFFFFu) {
+                s.push_back(static_cast<wchar_t>(cp));
+            } else if (cp <= 0x10FFFFu) {
+                if constexpr (sizeof(wchar_t) == 2) {
+                    uint32_t u = cp - 0x10000u;
+                    s.push_back(static_cast<wchar_t>(0xD800u | (u >> 10)));
+                    s.push_back(static_cast<wchar_t>(0xDC00u | (u & 0x3FFu)));
+                } else {
+                    s.push_back(static_cast<wchar_t>(cp));
+                }
+            }
+        }
+        return s;
+    }
+    return PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(val), valLen));
+}
+
+inline std::wstring ParseDerTimeUtc(uint8_t tag, const uint8_t* val, size_t valLen) {
+    std::string_view sv(reinterpret_cast<const char*>(val), valLen);
+    auto digits = [&](size_t off, size_t n) -> bool {
+        if (off + n > sv.size()) return false;
+        for (size_t i = 0; i < n; ++i) {
+            if (sv[off + i] < '0' || sv[off + i] > '9') return false;
+        }
+        return true;
+    };
+    if (tag == 0x17 && digits(0, 10)) { // UTCTime YYMMDDHHMM[SS]Z
+        int yy = (sv[0] - '0') * 10 + (sv[1] - '0');
+        int year = (yy >= 50) ? (1900 + yy) : (2000 + yy);
+        std::string sec = digits(10, 2) ? std::string(sv.substr(10, 2)) : "00";
+        wchar_t buf[64] = {};
+        swprintf_s(buf, L"%04d-%c%c-%c%c %c%c:%c%c:%c%c UTC",
+            year, sv[2], sv[3], sv[4], sv[5], sv[6], sv[7], sv[8], sv[9], sec[0], sec[1]);
+        return buf;
+    }
+    if (tag == 0x18 && digits(0, 12)) { // GeneralizedTime YYYYMMDDHHMM[SS]Z
+        std::string sec = digits(12, 2) ? std::string(sv.substr(12, 2)) : "00";
+        wchar_t buf[64] = {};
+        swprintf_s(buf, L"%c%c%c%c-%c%c-%c%c %c%c:%c%c:%c%c UTC",
+            sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7],
+            sv[8], sv[9], sv[10], sv[11], sec[0], sec[1]);
+        return buf;
+    }
+    return PathUtils::Utf8ToWide(sv);
+}
+
+inline std::wstring ParseDerDistinguishedName(const uint8_t* p, size_t len) {
+    std::wstring dn;
+    size_t pos = 0;
+    while (pos < len) {
+        uint8_t setTag = 0; size_t sh = 0, sv = 0;
+        if (!ReadDerTlv(p + pos, len - pos, setTag, sh, sv)) break;
+        const uint8_t* setVal = p + pos + sh;
+        pos += sh + sv;
+        if (setTag != 0x31) continue;
+        size_t sp = 0;
+        while (sp < sv) {
+            uint8_t seqTag = 0; size_t qh = 0, qv = 0;
+            if (!ReadDerTlv(setVal + sp, sv - sp, seqTag, qh, qv)) break;
+            const uint8_t* seqVal = setVal + sp + qh;
+            sp += qh + qv;
+            if (seqTag != 0x30) continue;
+            uint8_t oidTag = 0; size_t oh = 0, ov = 0;
+            if (!ReadDerTlv(seqVal, qv, oidTag, oh, ov) || oidTag != 0x06 || oh + ov >= qv) continue;
+            std::string oid = DecodeDerOid(seqVal + oh, ov);
+            uint8_t valTag = 0; size_t vh = 0, vv = 0;
+            if (!ReadDerTlv(seqVal + oh + ov, qv - (oh + ov), valTag, vh, vv)) continue;
+            std::wstring attrVal = DecodeDerAnyString(valTag, seqVal + oh + ov + vh, vv);
+            std::wstring shortKey;
+            if (oid == "2.5.4.3") shortKey = L"CN";
+            else if (oid == "2.5.4.6") shortKey = L"C";
+            else if (oid == "2.5.4.7") shortKey = L"L";
+            else if (oid == "2.5.4.8") shortKey = L"ST";
+            else if (oid == "2.5.4.10") shortKey = L"O";
+            else if (oid == "2.5.4.11") shortKey = L"OU";
+            else if (oid == "2.5.4.5") shortKey = L"serialNumber";
+            else if (oid == "1.2.840.113549.1.9.1") shortKey = L"emailAddress";
+            else if (oid == "0.9.2342.19200300.100.1.25") shortKey = L"DC";
+            else shortKey = PathUtils::Utf8ToWide(oid);
+            if (!dn.empty()) dn += L", ";
+            dn += shortKey + L"=" + attrVal;
+        }
+    }
+    return dn;
+}
+
+inline bool ParseDerAlgorithmIdentifier(const uint8_t* p, size_t len, std::string& outOid, std::string& outParamOid, const uint8_t*& outParamsRaw, size_t& outParamsRawLen) {
+    outOid.clear();
+    outParamOid.clear();
+    outParamsRaw = nullptr;
+    outParamsRawLen = 0;
+    uint8_t oidTag = 0; size_t oh = 0, ov = 0;
+    if (!ReadDerTlv(p, len, oidTag, oh, ov) || oidTag != 0x06) return false;
+    outOid = DecodeDerOid(p + oh, ov);
+    if (oh + ov < len) {
+        outParamsRaw = p + oh + ov;
+        outParamsRawLen = len - (oh + ov);
+        uint8_t pTag = 0; size_t ph = 0, pv = 0;
+        if (ReadDerTlv(outParamsRaw, outParamsRawLen, pTag, ph, pv) && pTag == 0x06) {
+            outParamOid = DecodeDerOid(outParamsRaw + ph, pv);
+        }
+    }
+    return true;
+}
+
+inline bool ParseDerSubjectPublicKeyInfo(const uint8_t* spkiVal, size_t spkiLen, std::wstring& outAlgSummary, uint32_t& outKeyBits) {
+    outAlgSummary.clear();
+    outKeyBits = 0;
+    uint8_t algTag = 0; size_t ah = 0, av = 0;
+    if (!ReadDerTlv(spkiVal, spkiLen, algTag, ah, av) || algTag != 0x30 || ah + av >= spkiLen) return false;
+    std::string algOid, paramOid;
+    const uint8_t* pRaw = nullptr; size_t pRawLen = 0;
+    if (!ParseDerAlgorithmIdentifier(spkiVal + ah, av, algOid, paramOid, pRaw, pRawLen)) return false;
+
+    uint8_t bsTag = 0; size_t bh = 0, bv = 0;
+    if (!ReadDerTlv(spkiVal + ah + av, spkiLen - (ah + av), bsTag, bh, bv) || bsTag != 0x03 || bv < 1) return false;
+    const uint8_t unusedBits = spkiVal[ah + av + bh];
+    const uint8_t* keyBytes = spkiVal + ah + av + bh + 1;
+    const size_t keyLen = bv - 1;
+
+    if (algOid == "1.2.840.113549.1.1.1") { // RSA: RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+        uint8_t rTag = 0; size_t rh = 0, rv = 0;
+        if (ReadDerTlv(keyBytes, keyLen, rTag, rh, rv) && rTag == 0x30) {
+            uint8_t mTag = 0; size_t mh = 0, mv = 0;
+            if (ReadDerTlv(keyBytes + rh, rv, mTag, mh, mv) && mTag == 0x02 && mv > 0) {
+                const uint8_t* modPtr = keyBytes + rh + mh;
+                size_t modLen = mv;
+                while (modLen > 1 && modPtr[0] == 0x00u) { ++modPtr; --modLen; }
+                uint32_t topByte = modPtr[0];
+                uint32_t leadBits = 0;
+                while (topByte > 0) { ++leadBits; topByte >>= 1; }
+                outKeyBits = static_cast<uint32_t>((modLen - 1) * 8u + leadBits);
+            }
+        }
+        if (outKeyBits == 0) outKeyBits = static_cast<uint32_t>(keyLen * 8u);
+        outAlgSummary = L"RSA (" + std::to_wstring(outKeyBits) + L"-bit)";
+    } else if (algOid == "1.2.840.10045.2.1") { // ECDSA / ECDH
+        if (paramOid == "1.2.840.10045.3.1.7" || paramOid == "1.3.132.0.10") outKeyBits = 256;
+        else if (paramOid == "1.3.132.0.34") outKeyBits = 384;
+        else if (paramOid == "1.3.132.0.35") outKeyBits = 521;
+        else if (keyLen >= 1 && keyBytes[0] == 0x04u) outKeyBits = static_cast<uint32_t>(((keyLen - 1) / 2u) * 8u);
+        std::wstring curve = paramOid.empty() ? L"EC" : MapKnownOid(paramOid);
+        outAlgSummary = L"ECDSA / " + curve + (outKeyBits ? (L" (" + std::to_wstring(outKeyBits) + L"-bit)") : L"");
+    } else if (algOid == "1.3.101.112" || algOid == "1.3.101.110") {
+        outKeyBits = 256;
+        outAlgSummary = MapKnownOid(algOid) + L" (256-bit)";
+    } else if (algOid == "1.3.101.113") {
+        outKeyBits = 448;
+        outAlgSummary = L"Ed448 (448-bit)";
+    } else {
+        outKeyBits = static_cast<uint32_t>(keyLen * 8u - std::min<uint32_t>(unusedBits, 7u));
+        outAlgSummary = MapKnownOid(algOid) + L" (" + std::to_wstring(outKeyBits) + L"-bit)";
+    }
+    return true;
+}
+
+inline void ParseDerX509Extensions(const uint8_t* extSeqVal, size_t extSeqLen, std::wstring& outSan, std::wstring& outKeyUsage, std::wstring& outBasicConstraints) {
+    size_t pos = 0;
+    while (pos < extSeqLen) {
+        uint8_t eTag = 0; size_t eh = 0, ev = 0;
+        if (!ReadDerTlv(extSeqVal + pos, extSeqLen - pos, eTag, eh, ev)) break;
+        const uint8_t* eVal = extSeqVal + pos + eh;
+        pos += eh + ev;
+        if (eTag != 0x30) continue;
+        size_t ep = 0;
+        uint8_t oidTag = 0; size_t oh = 0, ov = 0;
+        if (!ReadDerTlv(eVal, ev, oidTag, oh, ov) || oidTag != 0x06) continue;
+        std::string oid = DecodeDerOid(eVal + oh, ov);
+        ep = oh + ov;
+        if (ep < ev && eVal[ep] == 0x01u) { // optional BOOLEAN critical
+            uint8_t bTag = 0; size_t bh = 0, bv = 0;
+            if (!ReadDerTlv(eVal + ep, ev - ep, bTag, bh, bv)) continue;
+            ep += bh + bv;
+        }
+        uint8_t octTag = 0; size_t xh = 0, xv = 0;
+        if (ep >= ev || !ReadDerTlv(eVal + ep, ev - ep, octTag, xh, xv) || octTag != 0x04) continue;
+        const uint8_t* xVal = eVal + ep + xh;
+
+        if (oid == "2.5.29.17") { // subjectAltName: GeneralNames ::= SEQUENCE OF GeneralName
+            uint8_t gnTag = 0; size_t gh = 0, gv = 0;
+            if (ReadDerTlv(xVal, xv, gnTag, gh, gv) && gnTag == 0x30) {
+                size_t gp = 0;
+                while (gp < gv) {
+                    uint8_t nTag = 0; size_t nh = 0, nv = 0;
+                    if (!ReadDerTlv(xVal + gh + gp, gv - gp, nTag, nh, nv)) break;
+                    const uint8_t* nVal = xVal + gh + gp + nh;
+                    gp += nh + nv;
+                    std::wstring item;
+                    if (nTag == 0x82u) item = L"DNS:" + PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(nVal), nv));
+                    else if (nTag == 0x81u) item = L"Email:" + PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(nVal), nv));
+                    else if (nTag == 0x86u) item = L"URI:" + PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(nVal), nv));
+                    else if (nTag == 0x87u && nv == 4) {
+                        wchar_t ipb[32] = {};
+                        swprintf_s(ipb, L"IP:%u.%u.%u.%u", nVal[0], nVal[1], nVal[2], nVal[3]);
+                        item = ipb;
+                    } else if (nTag == 0x87u && nv == 16) {
+                        item = L"IP6:" + DetailBinarySysDoc::HexBytes(nVal, 16, L':');
+                    }
+                    if (!item.empty()) {
+                        if (!outSan.empty()) outSan += L", ";
+                        outSan += item;
+                    }
+                }
+            }
+        } else if (oid == "2.5.29.15") { // keyUsage BIT STRING
+            uint8_t kuTag = 0; size_t kh = 0, kv = 0;
+            if (ReadDerTlv(xVal, xv, kuTag, kh, kv) && kuTag == 0x03 && kv >= 2) {
+                uint16_t bits = static_cast<uint16_t>(xVal[kh + 1]) << 8;
+                if (kv >= 3) bits |= xVal[kh + 2];
+                static const wchar_t* const kNames[9] = {
+                    L"DigitalSignature", L"NonRepudiation", L"KeyEncipherment", L"DataEncipherment",
+                    L"KeyAgreement", L"KeyCertSign", L"CRLSign", L"EncipherOnly", L"DecipherOnly"
+                };
+                for (int b = 0; b < 9; ++b) {
+                    if ((bits & (0x8000u >> b)) != 0) {
+                        if (!outKeyUsage.empty()) outKeyUsage += L", ";
+                        outKeyUsage += kNames[b];
+                    }
+                }
+            }
+        } else if (oid == "2.5.29.19") { // basicConstraints SEQUENCE { cA BOOLEAN OPTIONAL, pathLenConstraint INTEGER OPTIONAL }
+            uint8_t bcTag = 0; size_t bh = 0, bv = 0;
+            if (ReadDerTlv(xVal, xv, bcTag, bh, bv) && bcTag == 0x30) {
+                bool isCa = false;
+                if (bv >= 3 && xVal[bh] == 0x01u && xVal[bh + 1] == 0x01u && xVal[bh + 2] != 0) isCa = true;
+                outBasicConstraints = isCa ? L"CA:TRUE" : L"CA:FALSE";
+            }
+        }
+    }
+}
+
+struct ParsedX509CertSummary {
+    uint32_t version = 1;
+    std::wstring serialHex;
+    std::wstring sigAlg;
+    std::wstring issuerDn;
+    std::wstring subjectDn;
+    std::wstring notBefore;
+    std::wstring notAfter;
+    std::wstring pubKeySummary;
+    std::wstring san;
+    std::wstring keyUsage;
+    std::wstring basicConstraints;
+};
+
+inline bool ParseDerX509CertificateSummary(const uint8_t* der, size_t len, ParsedX509CertSummary& out) {
+    out = {};
+    uint8_t outerTag = 0; size_t oh = 0, ov = 0;
+    if (!ReadDerTlv(der, len, outerTag, oh, ov) || outerTag != 0x30) return false;
+    const uint8_t* certVal = der + oh;
+    uint8_t tbsTag = 0; size_t th = 0, tv = 0;
+    if (!ReadDerTlv(certVal, ov, tbsTag, th, tv) || tbsTag != 0x30) return false;
+    const uint8_t* tbs = certVal + th;
+    size_t tp = 0;
+
+    // 1. Optional [0] EXPLICIT Version
+    if (tp < tv && tbs[tp] == 0xA0u) {
+        uint8_t vTag = 0; size_t vh = 0, vv = 0;
+        if (!ReadDerTlv(tbs + tp, tv - tp, vTag, vh, vv)) return false;
+        uint8_t iTag = 0; size_t ih = 0, iv = 0;
+        if (ReadDerTlv(tbs + tp + vh, vv, iTag, ih, iv) && iTag == 0x02 && iv == 1) {
+            out.version = static_cast<uint32_t>(tbs[tp + vh + ih]) + 1u;
+        }
+        tp += vh + vv;
+    }
+    // 2. serialNumber INTEGER
+    uint8_t sTag = 0; size_t sh = 0, sv = 0;
+    if (tp >= tv || !ReadDerTlv(tbs + tp, tv - tp, sTag, sh, sv) || sTag != 0x02 || sv == 0) return false;
+    out.serialHex = DetailBinarySysDoc::HexBytes(tbs + tp + sh, sv, L':');
+    tp += sh + sv;
+
+    // 3. signature AlgorithmIdentifier
+    uint8_t sigTag = 0; size_t sigh = 0, sigv = 0;
+    if (tp >= tv || !ReadDerTlv(tbs + tp, tv - tp, sigTag, sigh, sigv) || sigTag != 0x30) return false;
+    {
+        std::string oid, pOid; const uint8_t* pr = nullptr; size_t prl = 0;
+        if (ParseDerAlgorithmIdentifier(tbs + tp + sigh, sigv, oid, pOid, pr, prl)) {
+            out.sigAlg = MapKnownOid(oid);
+        }
+    }
+    tp += sigh + sigv;
+
+    // 4. issuer Name (SEQUENCE)
+    uint8_t issTag = 0; size_t issh = 0, issv = 0;
+    if (tp >= tv || !ReadDerTlv(tbs + tp, tv - tp, issTag, issh, issv) || issTag != 0x30) return false;
+    out.issuerDn = ParseDerDistinguishedName(tbs + tp + issh, issv);
+    tp += issh + issv;
+
+    // 5. validity Validity ::= SEQUENCE { notBefore Time, notAfter Time }
+    uint8_t valTag = 0; size_t valh = 0, valv = 0;
+    if (tp >= tv || !ReadDerTlv(tbs + tp, tv - tp, valTag, valh, valv) || valTag != 0x30) return false;
+    {
+        const uint8_t* vPtr = tbs + tp + valh;
+        uint8_t t1Tag = 0; size_t t1h = 0, t1v = 0;
+        if (ReadDerTlv(vPtr, valv, t1Tag, t1h, t1v)) {
+            out.notBefore = ParseDerTimeUtc(t1Tag, vPtr + t1h, t1v);
+            uint8_t t2Tag = 0; size_t t2h = 0, t2v = 0;
+            if (t1h + t1v < valv && ReadDerTlv(vPtr + t1h + t1v, valv - (t1h + t1v), t2Tag, t2h, t2v)) {
+                out.notAfter = ParseDerTimeUtc(t2Tag, vPtr + t1h + t1v + t2h, t2v);
+            }
+        }
+    }
+    tp += valh + valv;
+
+    // 6. subject Name (SEQUENCE)
+    uint8_t subTag = 0; size_t subh = 0, subv = 0;
+    if (tp >= tv || !ReadDerTlv(tbs + tp, tv - tp, subTag, subh, subv) || subTag != 0x30) return false;
+    out.subjectDn = ParseDerDistinguishedName(tbs + tp + subh, subv);
+    tp += subh + subv;
+
+    // 7. subjectPublicKeyInfo SubjectPublicKeyInfo (SEQUENCE)
+    uint8_t pkTag = 0; size_t pkh = 0, pkv = 0;
+    if (tp >= tv || !ReadDerTlv(tbs + tp, tv - tp, pkTag, pkh, pkv) || pkTag != 0x30) return false;
+    uint32_t pkBits = 0;
+    ParseDerSubjectPublicKeyInfo(tbs + tp + pkh, pkv, out.pubKeySummary, pkBits);
+    tp += pkh + pkv;
+
+    // 8. Optional issuerUniqueID [1], subjectUniqueID [2], extensions [3] EXPLICIT Extensions
+    while (tp < tv) {
+        uint8_t oTag = 0; size_t xh = 0, xv = 0;
+        if (!ReadDerTlv(tbs + tp, tv - tp, oTag, xh, xv)) break;
+        if (oTag == 0xA3u) {
+            uint8_t esTag = 0; size_t esh = 0, esv = 0;
+            if (ReadDerTlv(tbs + tp + xh, xv, esTag, esh, esv) && esTag == 0x30) {
+                ParseDerX509Extensions(tbs + tp + xh + esh, esv, out.san, out.keyUsage, out.basicConstraints);
+            }
+        }
+        tp += xh + xv;
+    }
+    return true;
+}
+
+inline void AppendPortableX509Rows(const uint8_t* der, size_t len, const std::wstring& prefix, std::vector<std::vector<std::wstring>>& rows) {
+#ifdef _WIN32
+    PCCERT_CONTEXT pCert = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, der, static_cast<DWORD>(len));
+    if (pCert) {
+        AppendCertContextRows(pCert, prefix, rows);
+        CertFreeCertificateContext(pCert);
+        return;
+    }
+#endif
+    ParsedX509CertSummary s;
+    if (ParseDerX509CertificateSummary(der, len, s)) {
+        rows.push_back({ prefix + L"X.509 Version", L"v" + std::to_wstring(s.version) });
+        if (!s.subjectDn.empty()) rows.push_back({ prefix + L"Subject DN", s.subjectDn });
+        if (!s.issuerDn.empty())  rows.push_back({ prefix + L"Issuer DN", s.issuerDn });
+        if (!s.serialHex.empty()) rows.push_back({ prefix + L"Serial Number", s.serialHex });
+        if (!s.sigAlg.empty())    rows.push_back({ prefix + L"Signature Algorithm", s.sigAlg });
+        if (!s.pubKeySummary.empty()) rows.push_back({ prefix + L"Public Key", s.pubKeySummary });
+        if (!s.notBefore.empty()) rows.push_back({ prefix + L"Valid Not Before", s.notBefore });
+        if (!s.notAfter.empty())  rows.push_back({ prefix + L"Valid Not After", s.notAfter });
+        if (!s.san.empty())       rows.push_back({ prefix + L"Subject Alt Names (SAN)", s.san });
+        if (!s.keyUsage.empty())  rows.push_back({ prefix + L"Key Usage", s.keyUsage });
+    }
+}
 } // namespace DetailX509
 
 namespace DetailPcap {
@@ -1586,17 +1969,17 @@ inline void DissectPacketL2L4(
 
     if (linkType == 1) { // Ethernet II
         if (capLen < 14) return;
-        outSrc = DetailSys100::HexBytes(pkt + 6, 6, L':');
-        outDst = DetailSys100::HexBytes(pkt + 0, 6, L':');
-        ethType = DetailSys100::RdU16BE(pkt + 12);
+        outSrc = DetailBinarySysDoc::HexBytes(pkt + 6, 6, L':');
+        outDst = DetailBinarySysDoc::HexBytes(pkt + 0, 6, L':');
+        ethType = DetailBinarySysDoc::RdU16BE(pkt + 12);
         l3Off = 14;
         if ((ethType == 0x8100 || ethType == 0x88A8) && capLen >= 18) { // 802.1Q VLAN
-            ethType = DetailSys100::RdU16BE(pkt + 16);
+            ethType = DetailBinarySysDoc::RdU16BE(pkt + 16);
             l3Off = 18;
         }
         outProto = L"Ethernet";
     } else if (linkType == 113 && capLen >= 16) { // Linux SLL
-        ethType = DetailSys100::RdU16BE(pkt + 14);
+        ethType = DetailBinarySysDoc::RdU16BE(pkt + 14);
         l3Off = 16;
     } else if (linkType == 101 || linkType == 228 || linkType == 229) { // Raw IP
         if (capLen < 1) return;
@@ -1604,14 +1987,14 @@ inline void DissectPacketL2L4(
         ethType = (v == 4) ? 0x0800 : ((v == 6) ? 0x86DD : 0);
         l3Off = 0;
     } else if (linkType == 0 && capLen >= 4) { // BSD Loopback
-        const uint32_t af = DetailSys100::RdU32LE(pkt);
+        const uint32_t af = DetailBinarySysDoc::RdU32LE(pkt);
         ethType = (af == 2) ? 0x0800 : 0x86DD;
         l3Off = 4;
     }
 
     if (ethType == 0x0806 && l3Off + 28 <= capLen) { // ARP
         const uint8_t* arp = pkt + l3Off;
-        const uint16_t oper = DetailSys100::RdU16BE(arp + 6);
+        const uint16_t oper = DetailBinarySysDoc::RdU16BE(arp + 6);
         wchar_t sIp[32] = {}, tIp[32] = {};
         swprintf_s(sIp, L"%u.%u.%u.%u", arp[14], arp[15], arp[16], arp[17]);
         swprintf_s(tIp, L"%u.%u.%u.%u", arp[24], arp[25], arp[26], arp[27]);
@@ -1619,7 +2002,7 @@ inline void DissectPacketL2L4(
         outSrc = sIp;
         outDst = tIp;
         if (oper == 1) outInfo = std::wstring(L"Who has ") + tIp + L"? Tell " + sIp;
-        else if (oper == 2) outInfo = std::wstring(sIp) + L" is at " + DetailSys100::HexBytes(arp + 8, 6, L':');
+        else if (oper == 2) outInfo = std::wstring(sIp) + L" is at " + DetailBinarySysDoc::HexBytes(arp + 8, 6, L':');
         return;
     }
 
@@ -1644,10 +2027,10 @@ inline void DissectPacketL2L4(
         auto fmtIp6 = [](const uint8_t* a) -> std::wstring {
             wchar_t b[64] = {};
             swprintf_s(b, L"%x:%x:%x:%x:%x:%x:%x:%x",
-                DetailSys100::RdU16BE(a + 0), DetailSys100::RdU16BE(a + 2),
-                DetailSys100::RdU16BE(a + 4), DetailSys100::RdU16BE(a + 6),
-                DetailSys100::RdU16BE(a + 8), DetailSys100::RdU16BE(a + 10),
-                DetailSys100::RdU16BE(a + 12), DetailSys100::RdU16BE(a + 14));
+                DetailBinarySysDoc::RdU16BE(a + 0), DetailBinarySysDoc::RdU16BE(a + 2),
+                DetailBinarySysDoc::RdU16BE(a + 4), DetailBinarySysDoc::RdU16BE(a + 6),
+                DetailBinarySysDoc::RdU16BE(a + 8), DetailBinarySysDoc::RdU16BE(a + 10),
+                DetailBinarySysDoc::RdU16BE(a + 12), DetailBinarySysDoc::RdU16BE(a + 14));
             return b;
         };
         outSrc = fmtIp6(ip6 + 8);
@@ -1660,12 +2043,12 @@ inline void DissectPacketL2L4(
 
     if (ipProto == 6 && l4Off + 20 <= capLen) { // TCP
         const uint8_t* tcp = pkt + l4Off;
-        const uint16_t sp = DetailSys100::RdU16BE(tcp + 0);
-        const uint16_t dp = DetailSys100::RdU16BE(tcp + 2);
-        const uint32_t seq = DetailSys100::RdU32BE(tcp + 4);
+        const uint16_t sp = DetailBinarySysDoc::RdU16BE(tcp + 0);
+        const uint16_t dp = DetailBinarySysDoc::RdU16BE(tcp + 2);
+        const uint32_t seq = DetailBinarySysDoc::RdU32BE(tcp + 4);
         const size_t doff = static_cast<size_t>(tcp[12] >> 4) * 4;
         const uint8_t flg = tcp[13];
-        const uint16_t win = DetailSys100::RdU16BE(tcp + 14);
+        const uint16_t win = DetailBinarySysDoc::RdU16BE(tcp + 14);
 
         outProto = L"TCP";
         std::wstring fstr;
@@ -1693,18 +2076,18 @@ inline void DissectPacketL2L4(
         }
     } else if (ipProto == 17 && l4Off + 8 <= capLen) { // UDP
         const uint8_t* udp = pkt + l4Off;
-        const uint16_t sp = DetailSys100::RdU16BE(udp + 0);
-        const uint16_t dp = DetailSys100::RdU16BE(udp + 2);
-        const uint16_t ulen = DetailSys100::RdU16BE(udp + 4);
+        const uint16_t sp = DetailBinarySysDoc::RdU16BE(udp + 0);
+        const uint16_t dp = DetailBinarySysDoc::RdU16BE(udp + 2);
+        const uint16_t ulen = DetailBinarySysDoc::RdU16BE(udp + 4);
         outProto = L"UDP";
         outInfo = std::to_wstring(sp) + L" -> " + std::to_wstring(dp) + L" Len=" + std::to_wstring(ulen);
 
         if ((sp == 53 || dp == 53 || sp == 5353 || dp == 5353) && l4Off + 8 + 12 <= capLen) {
             const uint8_t* dns = udp + 8;
             const size_t dnsLen = capLen - (l4Off + 8);
-            const uint16_t txId  = DetailSys100::RdU16BE(dns + 0);
-            const uint16_t flags = DetailSys100::RdU16BE(dns + 2);
-            const uint16_t qdCnt = DetailSys100::RdU16BE(dns + 4);
+            const uint16_t txId  = DetailBinarySysDoc::RdU16BE(dns + 0);
+            const uint16_t flags = DetailBinarySysDoc::RdU16BE(dns + 2);
+            const uint16_t qdCnt = DetailBinarySysDoc::RdU16BE(dns + 4);
             outProto = (sp == 5353 || dp == 5353) ? L"mDNS" : L"DNS";
             std::string qname;
             if (qdCnt > 0 && dnsLen > 12) {
@@ -1733,6 +2116,7 @@ inline void DissectPacketL2L4(
 }
 
 } // namespace DetailPcap
+#endif // E2_DOC_FORMAT_CORE_ONLY
 
 namespace AiDataDetail {
 
@@ -2090,8 +2474,7 @@ inline void PopulateSheetsFromBinTree(
     outSheets.push_back(std::move(flat));
 }
 
-
-
+#ifndef E2_DOC_FORMAT_CORE_ONLY
 struct ArrowColSchema {
     std::wstring name;
     std::wstring typeLabel;
@@ -2520,8 +2903,9 @@ inline bool ParseArrowRandomAccessMemory(
     return false;
 }
 
+template <typename RandomFileT>
 inline bool ParseArrowRandomAccessFile(
-    ParquetDetail::WinParquetRandomFile& rf,
+    RandomFileT& rf,
     const std::wstring& extLower,
     const wchar_t* titlePrefix,
     ParsedOfficeDocument& out)
@@ -2599,6 +2983,7 @@ inline bool ParseArrowRandomAccessFile(
         return FinalizeArrowSheets(extLower, compLabel, batchCount, totalRows, cols, dataRows, out, titlePrefix);
     }
 }
+#endif // E2_DOC_FORMAT_CORE_ONLY
 } // namespace AiDataDetail
 
 namespace GeoSciDetail {
@@ -2654,30 +3039,13 @@ inline std::wstring FmtNum(double v, int prec = 6) {
 inline std::wstring FmtCoord(double v) {
     if (!std::isfinite(v)) return L"0";
     wchar_t buf[64] = {};
-    swprintf_s(buf, L"%.6f", v);
+    if (std::fabs(v) >= 1e12) swprintf_s(buf, L"%.6g", v);
+    else swprintf_s(buf, L"%.6f", v);
     return buf;
 }
 
 inline std::wstring FormatUtcEpoch(int64_t unixSec) {
-    int64_t days = unixSec / 86400;
-    int64_t rem  = unixSec % 86400;
-    if (rem < 0) { rem += 86400; --days; }
-    int64_t z = days + 719468;
-    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    uint32_t doe = static_cast<uint32_t>(z - era * 146097);
-    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t y = static_cast<int64_t>(yoe) + era * 400;
-    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    uint32_t mp = (5 * doy + 2) / 153;
-    uint32_t d = doy - (153 * mp + 2) / 5 + 1;
-    uint32_t m = mp + (mp < 10 ? 3 : -9);
-    y += (m <= 2 ? 1 : 0);
-    int hr = static_cast<int>(rem / 3600);
-    int mn = static_cast<int>((rem % 3600) / 60);
-    int sc = static_cast<int>(rem % 60);
-    wchar_t buf[64] = {};
-    swprintf_s(buf, L"%04lld-%02u-%02u %02d:%02d:%02d UTC", y, m, d, hr, mn, sc);
-    return buf;
+    return ::Explorer2::ReaderText::FormatUnixUtc(unixSec);
 }
 
 inline void FinalizeCols(SpreadsheetSheet& sh) {
@@ -2689,7 +3057,7 @@ inline void FinalizeCols(SpreadsheetSheet& sh) {
 
 } // namespace GeoSciDetail
 
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline std::wstring Latin1OrCp1252ToWide(const uint8_t* p, size_t len) {
     static const uint16_t kCp1252_80_9F[32] = {
@@ -2726,13 +3094,15 @@ inline std::wstring Utf16BytesToWide(const uint8_t* p, size_t len, bool bigEndia
     std::wstring out;
     out.reserve(len / 2);
     for (size_t i = 0; i + 2 <= len; i += 2) {
-        uint16_t u = bigEndian ? DetailSys100::RdU16BE(p + i) : DetailSys100::RdU16LE(p + i);
+        uint16_t u = bigEndian ? DetailBinarySysDoc::RdU16BE(p + i) : DetailBinarySysDoc::RdU16LE(p + i);
         if (u == 0) break;
         if (u == 0xFEFF || u == 0xFFFE) continue;
         out.push_back(static_cast<wchar_t>(u));
     }
     return PathUtils::Trim(out);
 }
+
+#ifndef E2_DOC_FORMAT_CORE_ONLY
 
 inline std::wstring FormatDurationSec(double sec) {
     if (!(sec >= 0.0) || sec > 3600000.0) return L"00:00";
@@ -3192,9 +3562,9 @@ inline bool ParseSingleEmailMessage(std::string_view msgSv, int msgIndex, Parsed
 inline bool DecompressRtfLzfu(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
     out.clear();
     if (in.size() < 16) return false;
-    const uint32_t compSize = DetailSys100::RdU32LE(in.data());
-    const uint32_t rawSize = DetailSys100::RdU32LE(in.data() + 4);
-    const uint32_t compType = DetailSys100::RdU32LE(in.data() + 8);
+    const uint32_t compSize = DetailBinarySysDoc::RdU32LE(in.data());
+    const uint32_t rawSize = DetailBinarySysDoc::RdU32LE(in.data() + 4);
+    const uint32_t compType = DetailBinarySysDoc::RdU32LE(in.data() + 8);
     if (rawSize > 64u * 1024 * 1024) return false;
     const size_t end = std::min<size_t>(in.size(), static_cast<size_t>(compSize) + 4);
     if (compType == 0x414C454Du) { // "MELA"
@@ -3256,7 +3626,7 @@ inline bool WalkOggBitstream(const std::vector<uint8_t>& raw, const std::vector<
     size_t& pageCount = res.pageCount;
     size_t& packetCount = res.packetCount;
     uint32_t& serial = res.serial;
-    serial = DetailSys100::RdU32LE(raw.data() + 14);
+    serial = DetailBinarySysDoc::RdU32LE(raw.data() + 14);
     int64_t& maxGranule = res.maxGranule;
 
     std::vector<uint8_t> curPkt;
@@ -3277,9 +3647,9 @@ inline bool WalkOggBitstream(const std::vector<uint8_t>& raw, const std::vector<
             if (!resynced) break;
         }
         // Only the first logical stream is read (pages of multiplexed streams, e.g. video, are skipped)
-        const bool ours = DetailSys100::RdU32LE(raw.data() + pos + 14) == serial;
-        if ((raw[pos + 5] & 0x02u) != 0) streamSerials.insert(DetailSys100::RdU32LE(raw.data() + pos + 14));
-        uint64_t gpU = DetailSys100::RdU64LE(raw.data() + pos + 6);
+        const bool ours = DetailBinarySysDoc::RdU32LE(raw.data() + pos + 14) == serial;
+        if ((raw[pos + 5] & 0x02u) != 0) streamSerials.insert(DetailBinarySysDoc::RdU32LE(raw.data() + pos + 14));
+        uint64_t gpU = DetailBinarySysDoc::RdU64LE(raw.data() + pos + 6);
         if (ours && gpU != 0xFFFFFFFFFFFFFFFFULL) {
             int64_t gp = static_cast<int64_t>(gpU);
             if (gp > maxGranule) maxGranule = gp;
@@ -3317,8 +3687,8 @@ inline bool WalkOggBitstream(const std::vector<uint8_t>& raw, const std::vector<
         const auto& t = sourceTail;
         for (size_t p = 0; p + 27 <= t.size(); ++p) {
             if (t[p] != 'O' || std::memcmp(t.data() + p, "OggS", 4) != 0 || t[p + 4] != 0) continue;
-            if (DetailSys100::RdU32LE(t.data() + p + 14) != serial) continue;
-            const uint64_t g = DetailSys100::RdU64LE(t.data() + p + 6);
+            if (DetailBinarySysDoc::RdU32LE(t.data() + p + 14) != serial) continue;
+            const uint64_t g = DetailBinarySysDoc::RdU64LE(t.data() + p + 6);
             if (g != 0xFFFFFFFFFFFFFFFFULL && static_cast<int64_t>(g) > maxGranule) maxGranule = static_cast<int64_t>(g);
         }
     }
@@ -3332,16 +3702,16 @@ inline void ParseOggVorbisComments(
     std::vector<std::pair<std::wstring, std::wstring>>& comments)
 {
         if (cOff != SIZE_MAX && cOff + 4 <= cpkt.size()) {
-            uint32_t vLen = DetailSys100::RdU32LE(cpkt.data() + cOff);
+            uint32_t vLen = DetailBinarySysDoc::RdU32LE(cpkt.data() + cOff);
             cOff += 4;
             if (vLen <= cpkt.size() - cOff) {
                 vendor = PathUtils::Trim(PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(cpkt.data() + cOff), vLen)));
                 cOff += vLen;
                 if (cOff + 4 <= cpkt.size()) {
-                    uint32_t numComments = DetailSys100::RdU32LE(cpkt.data() + cOff);
+                    uint32_t numComments = DetailBinarySysDoc::RdU32LE(cpkt.data() + cOff);
                     cOff += 4;
                     for (uint32_t i = 0; i < numComments && i < 512 && cOff + 4 <= cpkt.size(); ++i) {
-                        uint32_t clen = DetailSys100::RdU32LE(cpkt.data() + cOff);
+                        uint32_t clen = DetailBinarySysDoc::RdU32LE(cpkt.data() + cOff);
                         cOff += 4;
                         if (clen > cpkt.size() - cOff) break;
                         std::string_view sv(reinterpret_cast<const char*>(cpkt.data() + cOff), clen);
@@ -3392,7 +3762,7 @@ inline bool FinalizeOggStreamDoc(
     info.name = L"Ogg_Stream";
     info.rows.push_back({ L"Property", L"Value" });
     info.rows.push_back({ L"Codec", codec });
-    info.rows.push_back({ L"Bitstream Serial", DetailSys100::Hex32(serial) });
+    info.rows.push_back({ L"Bitstream Serial", DetailBinarySysDoc::Hex32(serial) });
     info.rows.push_back({ L"Ogg Pages / Packets", std::to_wstring(pageCount) + L" / " + std::to_wstring(packetCount) });
     if (streamSerials.size() > 1) info.rows.push_back({ L"Logical Streams", std::to_wstring(streamSerials.size()) + L" (the first is described)" });
     if (channels > 0) info.rows.push_back({ L"Channels", std::to_wstring(channels) });
@@ -3420,9 +3790,10 @@ inline bool FinalizeOggStreamDoc(
     out.valid = true;
     return true;
 }
-} // namespace DetailMedia100
+#endif // E2_DOC_FORMAT_CORE_ONLY
+} // namespace DetailMediaAndScoreDoc
 
-namespace DetailDocs200 {
+namespace DetailStructuredDataDoc {
 
 using ::Explorer2::ByteIO::RdU16LE;
 using ::Explorer2::ByteIO::RdU32LE;
@@ -3472,7 +3843,7 @@ inline std::wstring TrimNullAscii(const uint8_t* p, size_t maxLen) {
     return PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(p), n));
 }
 
-
+#ifndef E2_DOC_FORMAT_CORE_ONLY
 inline bool UnframeIwaStream(const std::vector<uint8_t>& framed, std::vector<uint8_t>& outStream) {
     auto snappyDecompress = [](const uint8_t* src, size_t srcLen, std::vector<uint8_t>& dst) {
         return ::Explorer2::StreamCodecs::SnappyDecompress(src, srcLen, dst, 16 * 1024 * 1024, true);
@@ -3524,11 +3895,11 @@ inline bool ParseIwaProtobufStream(
     size_t& validIwaObjects)
 {
         auto pbSkip = [](const uint8_t* buf, size_t sz, size_t& p, uint8_t wt) -> bool {
-            if (wt == 0u) { uint64_t v = 0; return DetailDocs200::ReadVarint64(buf, sz, p, v); }
+            if (wt == 0u) { uint64_t v = 0; return DetailStructuredDataDoc::ReadVarint64(buf, sz, p, v); }
             if (wt == 1u) { if (p + 8u > sz) return false; p += 8u; return true; }
             if (wt == 2u) {
                 uint64_t l = 0;
-                if (!DetailDocs200::ReadVarint64(buf, sz, p, l) || l > sz - p) return false;
+                if (!DetailStructuredDataDoc::ReadVarint64(buf, sz, p, l) || l > sz - p) return false;
                 p += static_cast<size_t>(l);
                 return true;
             }
@@ -3584,7 +3955,7 @@ inline bool ParseIwaProtobufStream(
                 size_t localObjs = 0;
                 while (pos < decomp.size()) {
                     uint64_t aiLen = 0;
-                    if (!DetailDocs200::ReadVarint64(decomp.data(), decomp.size(), pos, aiLen) ||
+                    if (!DetailStructuredDataDoc::ReadVarint64(decomp.data(), decomp.size(), pos, aiLen) ||
                         aiLen == 0 || aiLen > decomp.size() - pos)
                     {
                         streamOk = false;
@@ -3601,14 +3972,14 @@ inline bool ParseIwaProtobufStream(
                     size_t ap = 0;
                     while (ap < aiSize) {
                         uint64_t tag = 0;
-                        if (!DetailDocs200::ReadVarint64(aiBuf, aiSize, ap, tag) || tag == 0) { streamOk = false; break; }
+                        if (!DetailStructuredDataDoc::ReadVarint64(aiBuf, aiSize, ap, tag) || tag == 0) { streamOk = false; break; }
                         const uint32_t fn = static_cast<uint32_t>(tag >> 3);
                         const uint8_t wt  = static_cast<uint8_t>(tag & 0x07u);
                         if (fn == 1 && wt == 0u) {
-                            if (!DetailDocs200::ReadVarint64(aiBuf, aiSize, ap, archiveId)) { streamOk = false; break; }
+                            if (!DetailStructuredDataDoc::ReadVarint64(aiBuf, aiSize, ap, archiveId)) { streamOk = false; break; }
                         } else if (fn == 2 && wt == 2u) {
                             uint64_t miLen = 0;
-                            if (!DetailDocs200::ReadVarint64(aiBuf, aiSize, ap, miLen) || miLen > aiSize - ap) { streamOk = false; break; }
+                            if (!DetailStructuredDataDoc::ReadVarint64(aiBuf, aiSize, ap, miLen) || miLen > aiSize - ap) { streamOk = false; break; }
                             const uint8_t* miBuf = aiBuf + ap;
                             const size_t miSize = static_cast<size_t>(miLen);
                             ap += miSize;
@@ -3616,16 +3987,16 @@ inline bool ParseIwaProtobufStream(
                             size_t mp = 0;
                             while (mp < miSize) {
                                 uint64_t mtag = 0;
-                                if (!DetailDocs200::ReadVarint64(miBuf, miSize, mp, mtag) || mtag == 0) { streamOk = false; break; }
+                                if (!DetailStructuredDataDoc::ReadVarint64(miBuf, miSize, mp, mtag) || mtag == 0) { streamOk = false; break; }
                                 const uint32_t mfn = static_cast<uint32_t>(mtag >> 3);
                                 const uint8_t mwt  = static_cast<uint8_t>(mtag & 0x07u);
                                 if (mfn == 1 && mwt == 0u) {
                                     uint64_t tv = 0;
-                                    if (!DetailDocs200::ReadVarint64(miBuf, miSize, mp, tv)) { streamOk = false; break; }
+                                    if (!DetailStructuredDataDoc::ReadVarint64(miBuf, miSize, mp, tv)) { streamOk = false; break; }
                                     md.type = static_cast<uint32_t>(tv);
                                 } else if (mfn == 3 && mwt == 0u) {
                                     uint64_t lv = 0;
-                                    if (!DetailDocs200::ReadVarint64(miBuf, miSize, mp, lv) || lv > decomp.size()) { streamOk = false; break; }
+                                    if (!DetailStructuredDataDoc::ReadVarint64(miBuf, miSize, mp, lv) || lv > decomp.size()) { streamOk = false; break; }
                                     md.length = static_cast<size_t>(lv);
                                 } else if (!pbSkip(miBuf, miSize, mp, mwt)) {
                                     streamOk = false;
@@ -3653,12 +4024,12 @@ inline bool ParseIwaProtobufStream(
                             size_t sp = 0;
                             while (sp < mLen) {
                                 uint64_t stag = 0;
-                                if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                                if (!DetailStructuredDataDoc::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
                                 const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
                                 const uint8_t swt  = static_cast<uint8_t>(stag & 0x07u);
                                 if (sfn == 3 && swt == 2u) {
                                     uint64_t sLen = 0;
-                                    if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, sLen) || sLen > mLen - sp) break;
+                                    if (!DetailStructuredDataDoc::ReadVarint64(mPtr, mLen, sp, sLen) || sLen > mLen - sp) break;
                                     std::string_view sv(reinterpret_cast<const char*>(mPtr + sp), static_cast<size_t>(sLen));
                                     sp += static_cast<size_t>(sLen);
                                     for (auto& line : cleanIworkText(sv)) {
@@ -3680,12 +4051,12 @@ inline bool ParseIwaProtobufStream(
                             size_t sp = 0;
                             while (sp < mLen) {
                                 uint64_t stag = 0;
-                                if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                                if (!DetailStructuredDataDoc::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
                                 const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
                                 const uint8_t swt  = static_cast<uint8_t>(stag & 0x07u);
                                 if (sfn == 3 && swt == 2u) {
                                     uint64_t eLen = 0;
-                                    if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, eLen) || eLen > mLen - sp) break;
+                                    if (!DetailStructuredDataDoc::ReadVarint64(mPtr, mLen, sp, eLen) || eLen > mLen - sp) break;
                                     const uint8_t* ePtr = mPtr + sp;
                                     const size_t eSz = static_cast<size_t>(eLen);
                                     sp += eSz;
@@ -3694,18 +4065,18 @@ inline bool ParseIwaProtobufStream(
                                     size_t ep = 0;
                                     while (ep < eSz) {
                                         uint64_t etag = 0;
-                                        if (!DetailDocs200::ReadVarint64(ePtr, eSz, ep, etag) || etag == 0) break;
+                                        if (!DetailStructuredDataDoc::ReadVarint64(ePtr, eSz, ep, etag) || etag == 0) break;
                                         const uint32_t efn = static_cast<uint32_t>(etag >> 3);
                                         const uint8_t ewt  = static_cast<uint8_t>(etag & 0x07u);
                                         if (efn == 1 && ewt == 0u) {
-                                            DetailDocs200::ReadVarint64(ePtr, eSz, ep, key);
+                                            DetailStructuredDataDoc::ReadVarint64(ePtr, eSz, ep, key);
                                         } else if ((efn == 3 || efn == 8) && ewt == 2u) {
                                             uint64_t sl = 0;
-                                            if (!DetailDocs200::ReadVarint64(ePtr, eSz, ep, sl) || sl > eSz - ep) break;
+                                            if (!DetailStructuredDataDoc::ReadVarint64(ePtr, eSz, ep, sl) || sl > eSz - ep) break;
                                             cellVal = PathUtils::Trim(PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(ePtr + ep), static_cast<size_t>(sl))));
                                             ep += static_cast<size_t>(sl);
                                         } else if (efn == 6 && ewt == 1u && ep + 8u <= eSz) {
-                                            uint64_t bits = DetailDocs200::RdU64LE(ePtr + ep);
+                                            uint64_t bits = DetailStructuredDataDoc::RdU64LE(ePtr + ep);
                                             ep += 8u;
                                             double dv = 0.0;
                                             std::memcpy(&dv, &bits, 8);
@@ -3734,13 +4105,13 @@ inline bool ParseIwaProtobufStream(
                             size_t sp = 0;
                             while (sp < mLen) {
                                 uint64_t stag = 0;
-                                if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                                if (!DetailStructuredDataDoc::ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
                                 const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
                                 const uint8_t swt  = static_cast<uint8_t>(stag & 0x07u);
                                 if (((md.type == 6001u && (sfn == 4u || sfn == 8u)) || (md.type == 2u && sfn == 1u)) && swt == 2u) {
                                     uint64_t sl = 0;
-                                    if (!DetailDocs200::ReadVarint64(mPtr, mLen, sp, sl) || sl > mLen - sp) break;
-                                    if (sl > 0 && sl <= 256u && DetailDocs200::IsMostlyPrintableUtf8(mPtr + sp, static_cast<size_t>(sl))) {
+                                    if (!DetailStructuredDataDoc::ReadVarint64(mPtr, mLen, sp, sl) || sl > mLen - sp) break;
+                                    if (sl > 0 && sl <= 256u && DetailStructuredDataDoc::IsMostlyPrintableUtf8(mPtr + sp, static_cast<size_t>(sl))) {
                                         std::wstring nm = PathUtils::Trim(PathUtils::Utf8ToWide(std::string(reinterpret_cast<const char*>(mPtr + sp), static_cast<size_t>(sl))));
                                         if (!nm.empty() && sh.rows.size() <= 500) {
                                             sh.rows.push_back({
@@ -3767,14 +4138,626 @@ inline bool ParseIwaProtobufStream(
     return streamOk && localObjs > 0;
 }
 
+inline bool ListZipPackage(
+    const std::vector<uint8_t>& raw,
+    ParsedOfficeDocument& out,
+    std::vector<ZipDeflate::ArchiveItemMeta>& entries,
+    bool& outUsedFile)
+{
+    entries.clear();
+    outUsedFile = false;
+    if (!out.filePath.empty() && ZipDeflate::ListZipEntriesFromFile(out.filePath, entries)) {
+        outUsedFile = true;
+        out.sourceReadFully = true;
+        return true;
+    }
+    if (raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K') {
+        return ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries);
+    }
+    return false;
+}
+
+inline bool ExtractZipPackageEntry(
+    const std::vector<uint8_t>& raw,
+    const ParsedOfficeDocument& out,
+    bool usedFile,
+    const ZipDeflate::ArchiveItemMeta& entry,
+    std::vector<uint8_t>& outBytes)
+{
+    if (usedFile && !out.filePath.empty()) {
+        return ZipDeflate::ExtractZipEntryFromFile(out.filePath, entry, outBytes);
+    }
+    return ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), entry, outBytes);
+}
+
+struct IWorkNumbersCtx {
+    struct TileRowRec {
+        uint32_t tileRowIndex = 0;
+        uint32_t cellCount = 0;
+        uint32_t storageVersion = 0;
+        bool hasWideOffsets = false;
+        std::vector<uint8_t> cellStorage;
+        std::vector<uint8_t> cellOffsets;
+    };
+    struct TileObj {
+        uint32_t maxColumn = 0;
+        uint32_t maxRow = 0;
+        uint32_t storageVersion = 0;
+        std::vector<TileRowRec> rows;
+    };
+    struct TableModel {
+        uint64_t archiveId = 0;
+        std::wstring name;
+        uint32_t numRows = 0;
+        uint32_t numCols = 0;
+        uint64_t stringTableId = 0;
+        uint64_t formulaTableId = 0;
+        uint64_t formatTableId = 0;
+        uint64_t richTextTableId = 0;
+        uint32_t tileSize = 256;
+        std::vector<std::pair<uint32_t, uint64_t>> tiles; // (tileId, tileArchiveId)
+        std::unordered_map<uint32_t, uint32_t> tileBaseRow;
+        std::unordered_map<uint32_t, uint32_t> tileBaseCol;
+    };
+
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::wstring>> dataLists;
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint64_t>> dataListRefs;
+    std::unordered_map<uint64_t, std::wstring> storageTexts;
+    std::unordered_map<uint64_t, uint64_t> richPayloadToStorage;
+    std::unordered_map<uint64_t, TileObj> tilesById;
+    std::vector<TableModel> tables;
+};
+
+inline uint64_t ReadTspReferenceId(const uint8_t* p, size_t len) {
+    size_t pos = 0;
+    while (pos < len) {
+        uint64_t tag = 0;
+        if (!ReadVarint64(p, len, pos, tag) || tag == 0) break;
+        const uint32_t fn = static_cast<uint32_t>(tag >> 3);
+        const uint8_t wt = static_cast<uint8_t>(tag & 0x07u);
+        if (fn == 1 && wt == 0u) {
+            uint64_t id = 0;
+            if (ReadVarint64(p, len, pos, id)) return id;
+            break;
+        }
+        if (wt == 0u) { uint64_t v = 0; if (!ReadVarint64(p, len, pos, v)) break; }
+        else if (wt == 1u) { if (pos + 8 > len) break; pos += 8; }
+        else if (wt == 2u) { uint64_t l = 0; if (!ReadVarint64(p, len, pos, l) || l > len - pos) break; pos += static_cast<size_t>(l); }
+        else if (wt == 5u) { if (pos + 4 > len) break; pos += 4; }
+        else break;
+    }
+    return 0;
+}
+
+inline std::wstring DecodeAppleBid128(const uint8_t* b16) {
+    uint64_t lo = RdU64LE(b16);
+    uint64_t hi = RdU64LE(b16 + 8);
+    const bool neg = ((hi >> 63) & 1u) != 0;
+    uint32_t comb = static_cast<uint32_t>((hi >> 49) & 0x3FFFu);
+    int32_t exp = 0;
+    uint64_t coeffHi = 0;
+    if ((comb >> 12) == 3u) {
+        if ((comb >> 10) == 0xFu) return L"NaN";
+        if ((comb >> 11) == 0x7u) return neg ? L"-Inf" : L"Inf";
+        exp = static_cast<int32_t>((hi >> 47) & 0x3FFFu) - 6176;
+        coeffHi = (1ULL << 49) | (hi & ((1ULL << 47) - 1ULL));
+    } else {
+        exp = static_cast<int32_t>(comb) - 6176;
+        coeffHi = hi & ((1ULL << 49) - 1ULL);
+    }
+    if (coeffHi == 0 && lo == 0) return L"0";
+    if (coeffHi == 0 && exp >= -18 && exp <= 18) {
+        double dv = static_cast<double>(lo) * std::pow(10.0, static_cast<double>(exp));
+        if (neg) dv = -dv;
+        wchar_t buf[64] = {};
+        swprintf_s(buf, L"%.12g", dv);
+        return buf;
+    }
+    long double ldv = (static_cast<long double>(coeffHi) * 18446744073709551616.0L + static_cast<long double>(lo)) *
+                      std::pow(10.0L, static_cast<long double>(exp));
+    if (neg) ldv = -ldv;
+    wchar_t buf[64] = {};
+    swprintf_s(buf, L"%.12g", static_cast<double>(ldv));
+    return buf;
+}
+
+inline void CollectIWorkNumbersProtobuf(const std::vector<uint8_t>& decomp, IWorkNumbersCtx& ctx) {
+    auto pbSkip = [](const uint8_t* buf, size_t sz, size_t& p, uint8_t wt) -> bool {
+        if (wt == 0u) { uint64_t v = 0; return ReadVarint64(buf, sz, p, v); }
+        if (wt == 1u) { if (p + 8u > sz) return false; p += 8u; return true; }
+        if (wt == 2u) { uint64_t l = 0; if (!ReadVarint64(buf, sz, p, l) || l > sz - p) return false; p += static_cast<size_t>(l); return true; }
+        if (wt == 5u) { if (p + 4u > sz) return false; p += 4u; return true; }
+        return false;
+    };
+
+    size_t pos = 0;
+    while (pos < decomp.size()) {
+        uint64_t aiLen = 0;
+        if (!ReadVarint64(decomp.data(), decomp.size(), pos, aiLen) || aiLen == 0 || aiLen > decomp.size() - pos) break;
+        const uint8_t* aiBuf = decomp.data() + pos;
+        const size_t aiSize = static_cast<size_t>(aiLen);
+        pos += aiSize;
+
+        uint64_t archiveId = 0;
+        struct MsgDesc { uint32_t type = 0; size_t length = 0; };
+        std::vector<MsgDesc> msgs;
+        bool ok = true;
+        size_t ap = 0;
+        while (ap < aiSize) {
+            uint64_t tag = 0;
+            if (!ReadVarint64(aiBuf, aiSize, ap, tag) || tag == 0) { ok = false; break; }
+            const uint32_t fn = static_cast<uint32_t>(tag >> 3);
+            const uint8_t wt = static_cast<uint8_t>(tag & 0x07u);
+            if (fn == 1 && wt == 0u) {
+                if (!ReadVarint64(aiBuf, aiSize, ap, archiveId)) { ok = false; break; }
+            } else if (fn == 2 && wt == 2u) {
+                uint64_t miLen = 0;
+                if (!ReadVarint64(aiBuf, aiSize, ap, miLen) || miLen > aiSize - ap) { ok = false; break; }
+                const uint8_t* miBuf = aiBuf + ap;
+                const size_t miSize = static_cast<size_t>(miLen);
+                ap += miSize;
+                MsgDesc md;
+                size_t mp = 0;
+                while (mp < miSize) {
+                    uint64_t mtag = 0;
+                    if (!ReadVarint64(miBuf, miSize, mp, mtag) || mtag == 0) { ok = false; break; }
+                    const uint32_t mfn = static_cast<uint32_t>(mtag >> 3);
+                    const uint8_t mwt = static_cast<uint8_t>(mtag & 0x07u);
+                    if (mfn == 1 && mwt == 0u) {
+                        uint64_t tv = 0;
+                        if (!ReadVarint64(miBuf, miSize, mp, tv)) { ok = false; break; }
+                        md.type = static_cast<uint32_t>(tv);
+                    } else if (mfn == 3 && mwt == 0u) {
+                        uint64_t lv = 0;
+                        if (!ReadVarint64(miBuf, miSize, mp, lv) || lv > decomp.size()) { ok = false; break; }
+                        md.length = static_cast<size_t>(lv);
+                    } else if (!pbSkip(miBuf, miSize, mp, mwt)) {
+                        ok = false; break;
+                    }
+                }
+                if (!ok) break;
+                msgs.push_back(md);
+            } else if (!pbSkip(aiBuf, aiSize, ap, wt)) {
+                ok = false; break;
+            }
+        }
+        if (!ok) break;
+
+        for (size_t mi = 0; mi < msgs.size(); ++mi) {
+            const auto& md = msgs[mi];
+            if (md.length > decomp.size() - pos) { ok = false; break; }
+            const uint8_t* mPtr = decomp.data() + pos;
+            const size_t mLen = md.length;
+            pos += mLen;
+            const uint64_t objId = (mi == 0) ? archiveId : 0;
+
+            if (md.type >= 2000u && md.type <= 2030u && objId != 0) {
+                size_t sp = 0;
+                while (sp < mLen) {
+                    uint64_t stag = 0;
+                    if (!ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                    const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                    const uint8_t swt = static_cast<uint8_t>(stag & 0x07u);
+                    if (sfn == 3 && swt == 2u) {
+                        uint64_t sl = 0;
+                        if (!ReadVarint64(mPtr, mLen, sp, sl) || sl > mLen - sp) break;
+                        ctx.storageTexts[objId] = PathUtils::Trim(PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(mPtr + sp), static_cast<size_t>(sl))));
+                        sp += static_cast<size_t>(sl);
+                    } else if (!pbSkip(mPtr, mLen, sp, swt)) break;
+                }
+            } else if ((md.type == 6003u || md.type == 6218u || md.type == 6220u) && objId != 0) {
+                // RichTextPayloadArchive: field 1 = TSP::Reference storage
+                size_t sp = 0;
+                while (sp < mLen) {
+                    uint64_t stag = 0;
+                    if (!ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                    const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                    const uint8_t swt = static_cast<uint8_t>(stag & 0x07u);
+                    if (sfn == 1 && swt == 2u) {
+                        uint64_t rl = 0;
+                        if (!ReadVarint64(mPtr, mLen, sp, rl) || rl > mLen - sp) break;
+                        uint64_t refId = ReadTspReferenceId(mPtr + sp, static_cast<size_t>(rl));
+                        if (refId != 0) ctx.richPayloadToStorage[objId] = refId;
+                        sp += static_cast<size_t>(rl);
+                    } else if (!pbSkip(mPtr, mLen, sp, swt)) break;
+                }
+            } else if ((md.type == 6005u || md.type == 6201u) && objId != 0) {
+                auto& kvMap = ctx.dataLists[objId];
+                auto& refMap = ctx.dataListRefs[objId];
+                size_t sp = 0;
+                while (sp < mLen) {
+                    uint64_t stag = 0;
+                    if (!ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                    const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                    const uint8_t swt = static_cast<uint8_t>(stag & 0x07u);
+                    if (sfn == 3 && swt == 2u) {
+                        uint64_t el = 0;
+                        if (!ReadVarint64(mPtr, mLen, sp, el) || el > mLen - sp) break;
+                        const uint8_t* epPtr = mPtr + sp;
+                        const size_t epSz = static_cast<size_t>(el);
+                        sp += epSz;
+                        uint64_t key = 0, refTarget = 0;
+                        std::wstring val;
+                        size_t ep = 0;
+                        while (ep < epSz) {
+                            uint64_t etag = 0;
+                            if (!ReadVarint64(epPtr, epSz, ep, etag) || etag == 0) break;
+                            const uint32_t efn = static_cast<uint32_t>(etag >> 3);
+                            const uint8_t ewt = static_cast<uint8_t>(etag & 0x07u);
+                            if (efn == 1 && ewt == 0u) {
+                                ReadVarint64(epPtr, epSz, ep, key);
+                            } else if ((efn == 3 || efn == 8) && ewt == 2u) {
+                                uint64_t sl = 0;
+                                if (!ReadVarint64(epPtr, epSz, ep, sl) || sl > epSz - ep) break;
+                                val = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(epPtr + ep), static_cast<size_t>(sl)));
+                                ep += static_cast<size_t>(sl);
+                            } else if ((efn == 4 || efn == 9) && ewt == 2u) {
+                                uint64_t rl = 0;
+                                if (!ReadVarint64(epPtr, epSz, ep, rl) || rl > epSz - ep) break;
+                                refTarget = ReadTspReferenceId(epPtr + ep, static_cast<size_t>(rl));
+                                ep += static_cast<size_t>(rl);
+                            } else if (efn == 6 && ewt == 1u && ep + 8u <= epSz) {
+                                uint64_t bits = RdU64LE(epPtr + ep); ep += 8u;
+                                double dv = 0.0; std::memcpy(&dv, &bits, 8);
+                                wchar_t dbuf[64] = {}; swprintf_s(dbuf, L"%.12g", dv);
+                                val = dbuf;
+                            } else if (!pbSkip(epPtr, epSz, ep, ewt)) break;
+                        }
+                        if (key != 0 || !val.empty() || refTarget != 0) {
+                            if (!val.empty()) kvMap[key] = std::move(val);
+                            if (refTarget != 0) refMap[key] = refTarget;
+                        }
+                    } else if (!pbSkip(mPtr, mLen, sp, swt)) break;
+                }
+            } else if (md.type == 6002u && objId != 0) {
+                // TST::TileArchive
+                IWorkNumbersCtx::TileObj tile;
+                size_t sp = 0;
+                while (sp < mLen) {
+                    uint64_t stag = 0;
+                    if (!ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                    const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                    const uint8_t swt = static_cast<uint8_t>(stag & 0x07u);
+                    if (sfn == 1 && swt == 0u) { uint64_t v = 0; ReadVarint64(mPtr, mLen, sp, v); tile.maxColumn = static_cast<uint32_t>(v); }
+                    else if (sfn == 2 && swt == 0u) { uint64_t v = 0; ReadVarint64(mPtr, mLen, sp, v); tile.maxRow = static_cast<uint32_t>(v); }
+                    else if (sfn == 6 && swt == 0u) { uint64_t v = 0; ReadVarint64(mPtr, mLen, sp, v); tile.storageVersion = static_cast<uint32_t>(v); }
+                    else if (sfn == 5 && swt == 2u) {
+                        uint64_t rl = 0;
+                        if (!ReadVarint64(mPtr, mLen, sp, rl) || rl > mLen - sp) break;
+                        const uint8_t* rPtr = mPtr + sp;
+                        const size_t rSz = static_cast<size_t>(rl);
+                        sp += rSz;
+                        IWorkNumbersCtx::TileRowRec rr;
+                        std::vector<uint8_t> preStorage, preOffsets;
+                        size_t rp = 0;
+                        while (rp < rSz) {
+                            uint64_t rtag = 0;
+                            if (!ReadVarint64(rPtr, rSz, rp, rtag) || rtag == 0) break;
+                            const uint32_t rfn = static_cast<uint32_t>(rtag >> 3);
+                            const uint8_t rwt = static_cast<uint8_t>(rtag & 0x07u);
+                            if (rfn == 1 && rwt == 0u) { uint64_t v = 0; ReadVarint64(rPtr, rSz, rp, v); rr.tileRowIndex = static_cast<uint32_t>(v); }
+                            else if (rfn == 2 && rwt == 0u) { uint64_t v = 0; ReadVarint64(rPtr, rSz, rp, v); rr.cellCount = static_cast<uint32_t>(v); }
+                            else if (rfn == 5 && rwt == 0u) { uint64_t v = 0; ReadVarint64(rPtr, rSz, rp, v); rr.storageVersion = static_cast<uint32_t>(v); }
+                            else if (rfn == 8 && rwt == 0u) { uint64_t v = 0; ReadVarint64(rPtr, rSz, rp, v); rr.hasWideOffsets = (v != 0); }
+                            else if ((rfn == 3 || rfn == 4 || rfn == 6 || rfn == 7) && rwt == 2u) {
+                                uint64_t bl = 0;
+                                if (!ReadVarint64(rPtr, rSz, rp, bl) || bl > rSz - rp) break;
+                                std::vector<uint8_t> chunk(rPtr + rp, rPtr + rp + static_cast<size_t>(bl));
+                                rp += static_cast<size_t>(bl);
+                                if (rfn == 3) rr.cellStorage = std::move(chunk);
+                                else if (rfn == 4) rr.cellOffsets = std::move(chunk);
+                                else if (rfn == 6) preStorage = std::move(chunk);
+                                else if (rfn == 7) preOffsets = std::move(chunk);
+                            } else if (!pbSkip(rPtr, rSz, rp, rwt)) break;
+                        }
+                        if (rr.cellStorage.empty() && !preStorage.empty()) {
+                            rr.cellStorage = std::move(preStorage);
+                            rr.cellOffsets = std::move(preOffsets);
+                        }
+                        if (!rr.cellStorage.empty() && !rr.cellOffsets.empty()) {
+                            tile.rows.push_back(std::move(rr));
+                        }
+                    } else if (!pbSkip(mPtr, mLen, sp, swt)) break;
+                }
+                ctx.tilesById[objId] = std::move(tile);
+            } else if (md.type == 6001u) {
+                // TST::TableModelArchive
+                IWorkNumbersCtx::TableModel tm;
+                tm.archiveId = objId;
+                auto parseRbTree = [&](const uint8_t* tp, size_t tsz, std::unordered_map<uint32_t, uint32_t>& outMap) {
+                    size_t p = 0;
+                    while (p < tsz) {
+                        uint64_t tag = 0;
+                        if (!ReadVarint64(tp, tsz, p, tag) || tag == 0) break;
+                        if ((tag >> 3) == 1 && (tag & 7u) == 2u) {
+                            uint64_t nl = 0;
+                            if (!ReadVarint64(tp, tsz, p, nl) || nl > tsz - p) break;
+                            const uint8_t* np = tp + p; size_t nsz = static_cast<size_t>(nl); p += nsz;
+                            uint64_t k = 0, v = 0; size_t q = 0;
+                            while (q < nsz) {
+                                uint64_t nt = 0;
+                                if (!ReadVarint64(np, nsz, q, nt) || nt == 0) break;
+                                if ((nt >> 3) == 1 && (nt & 7u) == 0u) ReadVarint64(np, nsz, q, k);
+                                else if ((nt >> 3) == 2 && (nt & 7u) == 0u) ReadVarint64(np, nsz, q, v);
+                                else if (!pbSkip(np, nsz, q, static_cast<uint8_t>(nt & 7u))) break;
+                            }
+                            outMap[static_cast<uint32_t>(v)] = static_cast<uint32_t>(k);
+                        } else if (!pbSkip(tp, tsz, p, static_cast<uint8_t>(tag & 7u))) break;
+                    }
+                };
+
+                size_t sp = 0;
+                while (sp < mLen) {
+                    uint64_t stag = 0;
+                    if (!ReadVarint64(mPtr, mLen, sp, stag) || stag == 0) break;
+                    const uint32_t sfn = static_cast<uint32_t>(stag >> 3);
+                    const uint8_t swt = static_cast<uint8_t>(stag & 0x07u);
+                    if (sfn == 6 && swt == 0u) { uint64_t v = 0; ReadVarint64(mPtr, mLen, sp, v); tm.numRows = static_cast<uint32_t>(v); }
+                    else if (sfn == 7 && swt == 0u) { uint64_t v = 0; ReadVarint64(mPtr, mLen, sp, v); tm.numCols = static_cast<uint32_t>(v); }
+                    else if (sfn == 8 && swt == 2u) {
+                        uint64_t sl = 0;
+                        if (!ReadVarint64(mPtr, mLen, sp, sl) || sl > mLen - sp) break;
+                        tm.name = PathUtils::Trim(PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(mPtr + sp), static_cast<size_t>(sl))));
+                        sp += static_cast<size_t>(sl);
+                    } else if (sfn == 4 && swt == 2u) {
+                        // base_data_store (TST::TableDataStore)
+                        uint64_t dl = 0;
+                        if (!ReadVarint64(mPtr, mLen, sp, dl) || dl > mLen - sp) break;
+                        const uint8_t* dsPtr = mPtr + sp;
+                        const size_t dsSz = static_cast<size_t>(dl);
+                        sp += dsSz;
+                        size_t dp = 0;
+                        while (dp < dsSz) {
+                            uint64_t dtag = 0;
+                            if (!ReadVarint64(dsPtr, dsSz, dp, dtag) || dtag == 0) break;
+                            const uint32_t dfn = static_cast<uint32_t>(dtag >> 3);
+                            const uint8_t dwt = static_cast<uint8_t>(dtag & 0x07u);
+                            if (dwt == 2u && (dfn == 3 || dfn == 4 || dfn == 6 || dfn == 9 || dfn == 10 || dfn == 11 || dfn == 17)) {
+                                uint64_t fl = 0;
+                                if (!ReadVarint64(dsPtr, dsSz, dp, fl) || fl > dsSz - dp) break;
+                                const uint8_t* fPtr = dsPtr + dp;
+                                const size_t fSz = static_cast<size_t>(fl);
+                                dp += fSz;
+                                if (dfn == 4) tm.stringTableId = ReadTspReferenceId(fPtr, fSz);
+                                else if (dfn == 6) tm.formulaTableId = ReadTspReferenceId(fPtr, fSz);
+                                else if (dfn == 11) tm.formatTableId = ReadTspReferenceId(fPtr, fSz);
+                                else if (dfn == 17) tm.richTextTableId = ReadTspReferenceId(fPtr, fSz);
+                                else if (dfn == 9) parseRbTree(fPtr, fSz, tm.tileBaseRow);
+                                else if (dfn == 10) parseRbTree(fPtr, fSz, tm.tileBaseCol);
+                                else if (dfn == 3) {
+                                    // TileStorage { repeated Tile tiles = 1; optional uint32 tile_size = 2; }
+                                    size_t tsp = 0;
+                                    while (tsp < fSz) {
+                                        uint64_t tstag = 0;
+                                        if (!ReadVarint64(fPtr, fSz, tsp, tstag) || tstag == 0) break;
+                                        const uint32_t tsfn = static_cast<uint32_t>(tstag >> 3);
+                                        const uint8_t tswt = static_cast<uint8_t>(tstag & 0x07u);
+                                        if (tsfn == 2 && tswt == 0u) {
+                                            uint64_t tszVal = 0; ReadVarint64(fPtr, fSz, tsp, tszVal);
+                                            if (tszVal > 0 && tszVal <= 65536u) tm.tileSize = static_cast<uint32_t>(tszVal);
+                                        } else if (tsfn == 1 && tswt == 2u) {
+                                            uint64_t el = 0;
+                                            if (!ReadVarint64(fPtr, fSz, tsp, el) || el > fSz - tsp) break;
+                                            const uint8_t* tePtr = fPtr + tsp; size_t teSz = static_cast<size_t>(el); tsp += teSz;
+                                            uint32_t tileId = 0; uint64_t tileRef = 0; size_t q = 0;
+                                            while (q < teSz) {
+                                                uint64_t tet = 0;
+                                                if (!ReadVarint64(tePtr, teSz, q, tet) || tet == 0) break;
+                                                if ((tet >> 3) == 1 && (tet & 7u) == 0u) { uint64_t v = 0; ReadVarint64(tePtr, teSz, q, v); tileId = static_cast<uint32_t>(v); }
+                                                else if ((tet >> 3) == 2 && (tet & 7u) == 2u) {
+                                                    uint64_t rl = 0;
+                                                    if (!ReadVarint64(tePtr, teSz, q, rl) || rl > teSz - q) break;
+                                                    tileRef = ReadTspReferenceId(tePtr + q, static_cast<size_t>(rl));
+                                                    q += static_cast<size_t>(rl);
+                                                } else if (!pbSkip(tePtr, teSz, q, static_cast<uint8_t>(tet & 7u))) break;
+                                            }
+                                            if (tileRef != 0) tm.tiles.push_back({ tileId, tileRef });
+                                        } else if (!pbSkip(fPtr, fSz, tsp, tswt)) break;
+                                    }
+                                }
+                            } else if (!pbSkip(dsPtr, dsSz, dp, dwt)) break;
+                        }
+                    } else if (!pbSkip(mPtr, mLen, sp, swt)) break;
+                }
+                if (!tm.tiles.empty() || !tm.name.empty()) ctx.tables.push_back(std::move(tm));
+            }
+        }
+        if (!ok) break;
+    }
+}
+
+inline void BuildIWorkNumbersGridSheets(const IWorkNumbersCtx& ctx, std::vector<SpreadsheetSheet>& outGridSheets) {
+    constexpr int64_t kAppleEpoch2001 = 978307200LL;
+    auto lookupString = [&](uint64_t tableId, uint32_t key) -> std::wstring {
+        auto it = ctx.dataLists.find(tableId);
+        if (it != ctx.dataLists.end()) {
+            auto kit = it->second.find(key);
+            if (kit != it->second.end()) return kit->second;
+        }
+        for (const auto& [id, mp] : ctx.dataLists) {
+            (void)id;
+            auto kit = mp.find(key);
+            if (kit != mp.end()) return kit->second;
+        }
+        return {};
+    };
+    auto lookupRichText = [&](uint64_t tableId, uint32_t key) -> std::wstring {
+        auto resolveRef = [&](uint64_t refId) -> std::wstring {
+            auto sit = ctx.storageTexts.find(refId);
+            if (sit != ctx.storageTexts.end()) return sit->second;
+            auto pit = ctx.richPayloadToStorage.find(refId);
+            if (pit != ctx.richPayloadToStorage.end()) {
+                auto sit2 = ctx.storageTexts.find(pit->second);
+                if (sit2 != ctx.storageTexts.end()) return sit2->second;
+            }
+            return {};
+        };
+        auto rit = ctx.dataListRefs.find(tableId);
+        if (rit != ctx.dataListRefs.end()) {
+            auto kit = rit->second.find(key);
+            if (kit != rit->second.end()) {
+                std::wstring s = resolveRef(kit->second);
+                if (!s.empty()) return s;
+            }
+        }
+        for (const auto& [id, mp] : ctx.dataListRefs) {
+            (void)id;
+            auto kit = mp.find(key);
+            if (kit != mp.end()) {
+                std::wstring s = resolveRef(kit->second);
+                if (!s.empty()) return s;
+            }
+        }
+        return lookupString(tableId, key);
+    };
+
+    size_t tblIdx = 0;
+    for (const auto& tm : ctx.tables) {
+        ++tblIdx;
+        if (tm.tiles.empty()) continue;
+        const uint32_t maxRowsCap = std::min<uint32_t>(tm.numRows > 0 ? tm.numRows : 2048u, 2048u);
+        const uint32_t maxColsCap = std::min<uint32_t>(tm.numCols > 0 ? tm.numCols : 256u, 256u);
+        std::vector<std::vector<std::wstring>> grid;
+        size_t decodedCells = 0;
+
+        for (size_t ti = 0; ti < tm.tiles.size(); ++ti) {
+            const uint32_t tileId = tm.tiles[ti].first;
+            const uint64_t tileRef = tm.tiles[ti].second;
+            auto tit = ctx.tilesById.find(tileRef);
+            if (tit == ctx.tilesById.end()) continue;
+            const auto& tile = tit->second;
+
+            uint32_t baseRow = 0, baseCol = 0;
+            auto brit = tm.tileBaseRow.find(tileId);
+            if (brit != tm.tileBaseRow.end()) baseRow = brit->second;
+            else baseRow = static_cast<uint32_t>(ti) * tm.tileSize;
+            auto bcit = tm.tileBaseCol.find(tileId);
+            if (bcit != tm.tileBaseCol.end()) baseCol = bcit->second;
+
+            for (const auto& rr : tile.rows) {
+                const uint32_t absRow = baseRow + rr.tileRowIndex;
+                if (absRow >= maxRowsCap) continue;
+                const size_t nOffs = rr.cellOffsets.size() / 2u;
+                const uint32_t rowVer = rr.storageVersion ? rr.storageVersion : tile.storageVersion;
+
+                for (size_t ci = 0; ci < nOffs; ++ci) {
+                    const uint32_t absCol = baseCol + static_cast<uint32_t>(ci);
+                    if (absCol >= maxColsCap) break;
+                    const uint16_t rawOff = RdU16LE(rr.cellOffsets.data() + ci * 2u);
+                    if (rawOff == 0xFFFFu) continue;
+                    const size_t byteOff = rr.hasWideOffsets ? (static_cast<size_t>(rawOff) * 4u) : static_cast<size_t>(rawOff);
+                    if (byteOff + 8u > rr.cellStorage.size()) continue;
+
+                    const uint8_t* c = rr.cellStorage.data() + byteOff;
+                    const size_t rem = rr.cellStorage.size() - byteOff;
+                    const uint8_t ver = c[0] ? c[0] : static_cast<uint8_t>(rowVer);
+                    const uint8_t cellType = c[1];
+                    std::wstring cellText;
+
+                    if (ver == 5 && rem >= 12u) {
+                        const uint32_t flags = RdU32LE(c + 4);
+                        size_t p = 12u;
+                        bool hasDec = false, hasDbl = false, hasDate = false, hasStr = false, hasRich = false;
+                        std::wstring decStr;
+                        double dblVal = 0.0, dateVal = 0.0;
+                        uint32_t strKey = 0, richKey = 0;
+                        if ((flags & 0x0001u) && p + 16u <= rem) { decStr = DecodeAppleBid128(c + p); p += 16u; hasDec = true; }
+                        if ((flags & 0x0002u) && p + 8u <= rem)  { uint64_t b = RdU64LE(c + p); std::memcpy(&dblVal, &b, 8); p += 8u; hasDbl = true; }
+                        if ((flags & 0x0004u) && p + 8u <= rem)  { uint64_t b = RdU64LE(c + p); std::memcpy(&dateVal, &b, 8); p += 8u; hasDate = true; }
+                        if ((flags & 0x0008u) && p + 4u <= rem)  { strKey = RdU32LE(c + p); p += 4u; hasStr = true; }
+                        if ((flags & 0x0010u) && p + 4u <= rem)  { richKey = RdU32LE(c + p); p += 4u; hasRich = true; }
+
+                        if (cellType == 3 && hasStr) cellText = lookupString(tm.stringTableId, strKey);
+                        else if (cellType == 9 && hasRich) cellText = lookupRichText(tm.richTextTableId, richKey);
+                        else if (cellType == 6 && (hasDbl || hasDec)) cellText = (hasDbl ? (dblVal != 0.0) : (decStr != L"0")) ? L"TRUE" : L"FALSE";
+                        else if (cellType == 5 && (hasDate || hasDbl)) {
+                            double sec = hasDate ? dateVal : dblVal;
+                            cellText = GeoSciDetail::FormatUtcEpoch(kAppleEpoch2001 + static_cast<int64_t>(std::llround(sec)));
+                        } else if ((cellType == 2 || cellType == 10 || cellType == 7) && hasDec) {
+                            cellText = decStr;
+                        } else if (hasDbl) {
+                            wchar_t dbuf[64] = {}; swprintf_s(dbuf, L"%.12g", dblVal); cellText = dbuf;
+                        } else if (hasStr) {
+                            cellText = lookupString(tm.stringTableId, strKey);
+                        } else if (hasRich) {
+                            cellText = lookupRichText(tm.richTextTableId, richKey);
+                        }
+                    } else if ((ver == 4 || ver == 3) && rem >= 8u) {
+                        const uint8_t ct = (ver == 4) ? c[1] : ((c[1] == 3 && rem >= 12u) ? c[2] : c[1]);
+                        const uint16_t flags = RdU16LE(c + ((c[1] == 3 && c[0] != 3) ? 4 : 2));
+                        size_t p = 8u;
+                        if (ver == 4) {
+                            if (flags & 0x0002u) p += 4u; // cell style
+                            if (flags & 0x0004u) p += 4u; // text style
+                            if (flags & 0x0008u) p += 8u; // cond style + rule
+                            if (flags & 0x0010u) p += 4u; // formula error
+                            if (flags & 0x0020u) p += 4u; // formula key
+                            double dblVal = 0.0, dateVal = 0.0;
+                            uint32_t strKey = 0, richKey = 0;
+                            bool hasDbl = false, hasStr = false, hasDate = false, hasRich = false;
+                            if ((flags & 0x0040u) && p + 8u <= rem) { uint64_t b = RdU64LE(c + p); std::memcpy(&dblVal, &b, 8); p += 8u; hasDbl = true; }
+                            if ((flags & 0x0080u) && p + 4u <= rem) { strKey = RdU32LE(c + p); p += 4u; hasStr = true; }
+                            if ((flags & 0x0100u) && p + 8u <= rem) { uint64_t b = RdU64LE(c + p); std::memcpy(&dateVal, &b, 8); p += 8u; hasDate = true; }
+                            if ((flags & 0x0200u) && p + 4u <= rem) { richKey = RdU32LE(c + p); p += 4u; hasRich = true; }
+
+                            if (ct == 3 && hasStr) cellText = lookupString(tm.stringTableId, strKey);
+                            else if (ct == 9 && hasRich) cellText = lookupRichText(tm.richTextTableId, richKey);
+                            else if (ct == 6 && hasDbl) cellText = (dblVal != 0.0) ? L"TRUE" : L"FALSE";
+                            else if (ct == 5 && (hasDate || hasDbl)) {
+                                double sec = hasDate ? dateVal : dblVal;
+                                cellText = GeoSciDetail::FormatUtcEpoch(kAppleEpoch2001 + static_cast<int64_t>(std::llround(sec)));
+                            } else if (hasDbl) {
+                                wchar_t dbuf[64] = {}; swprintf_s(dbuf, L"%.12g", dblVal); cellText = dbuf;
+                            } else if (hasStr) {
+                                cellText = lookupString(tm.stringTableId, strKey);
+                            } else if (hasRich) {
+                                cellText = lookupRichText(tm.richTextTableId, richKey);
+                            }
+                        } else if (rem >= 16u) {
+                            // Classic v3 cell record fallback
+                            if (ct == 3) cellText = lookupString(tm.stringTableId, RdU32LE(c + 12));
+                            else if (ct == 9) cellText = lookupRichText(tm.richTextTableId, RdU32LE(c + 12));
+                            else if (ct == 2 || ct == 6 || ct == 5) {
+                                uint64_t b = RdU64LE(c + (rem >= 20u ? 12u : 8u));
+                                double dv = 0.0; std::memcpy(&dv, &b, 8);
+                                if (std::isfinite(dv)) {
+                                    if (ct == 6) cellText = (dv != 0.0) ? L"TRUE" : L"FALSE";
+                                    else if (ct == 5) cellText = GeoSciDetail::FormatUtcEpoch(kAppleEpoch2001 + static_cast<int64_t>(std::llround(dv)));
+                                    else { wchar_t dbuf[64] = {}; swprintf_s(dbuf, L"%.12g", dv); cellText = dbuf; }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!cellText.empty()) {
+                        if (grid.size() <= absRow) grid.resize(absRow + 1u);
+                        if (grid[absRow].size() <= absCol) grid[absRow].resize(absCol + 1u);
+                        grid[absRow][absCol] = std::move(cellText);
+                        ++decodedCells;
+                    }
+                }
+            }
+        }
+
+        if (decodedCells > 0 && !grid.empty()) {
+            SpreadsheetSheet tsh;
+            tsh.name = tm.name.empty() ? (L"Numbers_Table_" + std::to_wstring(tblIdx)) : tm.name;
+            tsh.maxCols = 0;
+            for (const auto& r : grid) tsh.maxCols = std::max(tsh.maxCols, r.size());
+            tsh.rows = std::move(grid);
+            outGridSheets.push_back(std::move(tsh));
+        }
+    }
+}
+
 inline bool ParseIWorkZipPackage(
     const std::vector<uint8_t>& raw,
     const wchar_t* formatTitle,
     ParsedOfficeDocument& out)
 {
-    if (raw.size() < 4 || raw[0] != 'P' || raw[1] != 'K') return false;
     std::vector<ZipDeflate::ArchiveItemMeta> entries;
-    if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries)) return false;
+    bool usedFile = false;
+    if (!ListZipPackage(raw, out, entries, usedFile)) return false;
 
         SpreadsheetSheet sh;
         sh.name = L"Package_And_Text";
@@ -3786,6 +4769,7 @@ inline bool ParseIWorkZipPackage(
         cellsSh.maxCols = 3;
         cellsSh.rows.push_back({ L"Table / Stream", L"Entry Key", L"Cell Value" });
 
+        IWorkNumbersCtx numCtx;
         size_t validIwaFiles = 0;
         size_t validIwaObjects = 0;
         bool validLegacyXml = false;
@@ -3804,14 +4788,16 @@ inline bool ParseIWorkZipPackage(
 
             if (PathUtils::GetExtension(lp) == L".iwa" && e.uncompressedSize <= 32u * 1024u * 1024u) {
                 std::vector<uint8_t> rawIwa, decomp;
-                if (!ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, rawIwa) || rawIwa.empty()) continue;
+                if (!ExtractZipPackageEntry(raw, out, usedFile, e, rawIwa) || rawIwa.empty()) continue;
                 if (!UnframeIwaStream(rawIwa, decomp)) continue;
-                ParseIwaProtobufStream(decomp, e.pathInArchive, sh, cellsSh, validIwaFiles, validIwaObjects);
+                if (ParseIwaProtobufStream(decomp, e.pathInArchive, sh, cellsSh, validIwaFiles, validIwaObjects)) {
+                    CollectIWorkNumbersProtobuf(decomp, numCtx);
+                }
             }
             // iWork '09 XML format: index.xml / index.apxl (plain or gzip-compressed inside ZIP)
             else if (lp == L"index.xml" || lp == L"index.apxl" || lp == L"index.xml.gz" || lp == L"index.apxl.gz") {
                 std::vector<uint8_t> xmlRaw, xmlBuf;
-                if (!ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, xmlRaw) || xmlRaw.empty()) continue;
+                if (!ExtractZipPackageEntry(raw, out, usedFile, e, xmlRaw) || xmlRaw.empty()) continue;
                 if (xmlRaw.size() >= 2 && xmlRaw[0] == 0x1Fu && xmlRaw[1] == 0x8Bu) {
                     if (!ZipDeflate::InflateGzip(xmlRaw.data(), xmlRaw.size(), xmlBuf)) continue;
                 } else {
@@ -3866,18 +4852,26 @@ inline bool ParseIWorkZipPackage(
             sh.rows.push_back({ L"QuickLook Preview", L"Supplemental Preview", quickLookNote });
         }
 
+        std::vector<SpreadsheetSheet> gridSheets;
+        BuildIWorkNumbersGridSheets(numCtx, gridSheets);
+
         out.kind = OfficeFileKind::SqliteDb;
         out.isSpreadsheet = true;
         out.formatTitle = formatTitle;
+        for (auto& gs : gridSheets) {
+            out.sheets.push_back(std::move(gs));
+        }
         out.sheets.push_back(std::move(sh));
-        if (cellsSh.rows.size() > 1) {
+        if (gridSheets.empty() && cellsSh.rows.size() > 1) {
             out.sheets.push_back(std::move(cellsSh));
         }
         out.valid = true;
         return true;
 }
-} // namespace DetailDocs200
+#endif // E2_DOC_FORMAT_CORE_ONLY
+} // namespace DetailStructuredDataDoc
 
+#ifndef E2_DOC_FORMAT_CORE_ONLY
 namespace DetailCloudSecOps {
 
 using JVal = ::Explorer2::Json::Value;
@@ -4003,7 +4997,7 @@ inline void SpdxJsonPackage(const JVal& p, SpreadsheetSheet& sh, size_t& count) 
     PushSbomRow(sh, r);
 }
 
-inline bool ParseSbomJson(std::string_view text, ParsedOfficeDocument& out) {
+inline bool ParseSbomJson(std::string_view text, ParsedOfficeDocument& out, bool wantCycloneDx) {
     SpreadsheetSheet sh = NewSbomSheet();
     size_t count = 0;
     JParser parser(text, StreamLimits());
@@ -4011,11 +5005,11 @@ inline bool ParseSbomJson(std::string_view text, ParsedOfficeDocument& out) {
     root.kind = JVal::Kind::Object;
     bool sawComponents = false, sawPackages = false;
     bool complete = parser.StreamObject([&](const std::string& key) {
-        if (key == "components" && !sawComponents && parser.Peek() == '[') {
+        if (wantCycloneDx && key == "components" && !sawComponents && parser.Peek() == '[') {
             sawComponents = true;
             return parser.StreamArray([&](JVal&& c) { CycloneDxJsonComponent(c, sh, count, 0); });
         }
-        if (key == "packages" && !sawPackages && parser.Peek() == '[') {
+        if (!wantCycloneDx && key == "packages" && !sawPackages && parser.Peek() == '[') {
             sawPackages = true;
             return parser.StreamArray([&](JVal&& p) { SpdxJsonPackage(p, sh, count); });
         }
@@ -4026,9 +5020,13 @@ inline bool ParseSbomJson(std::string_view text, ParsedOfficeDocument& out) {
     }) && parser.AtEnd();
 
     std::string bomFormat = root.GetString("bomFormat"), spdxVersion = root.GetString("spdxVersion");
-    bool isCdx = bomFormat == "CycloneDX" || (bomFormat.empty() && sawComponents && !complete);
-    bool isSpdx = spdxVersion.rfind("SPDX-", 0) == 0 || (spdxVersion.empty() && sawPackages && !complete);
-    if (isCdx == isSpdx) return false; // neither (or a document claiming to be both)
+    bool isCdx = bomFormat == "CycloneDX" || (bomFormat.empty() && spdxVersion.empty() && sawComponents && !complete);
+    bool isSpdx = spdxVersion.rfind("SPDX-", 0) == 0 || (spdxVersion.empty() && bomFormat.empty() && sawPackages && !complete);
+    if (wantCycloneDx) {
+        if (!isCdx || isSpdx) return false;
+    } else {
+        if (!isSpdx || isCdx) return false;
+    }
     if (!complete && count == 0) return false;
 
     out.kind = OfficeFileKind::SqliteDb;
@@ -4194,5 +5192,61 @@ inline bool ParseDelimitedRowsToSheet(
 }
 
 } // namespace DetailCsvTsv
+
+inline std::wstring NormalizeZipArchiveKey(std::wstring_view sv) {
+    std::wstring r;
+    r.reserve(sv.size());
+    for (wchar_t ch : sv) {
+        if (ch == L'\\') ch = L'/';
+        if (r.empty() && ch == L'/') continue;
+        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch + (L'a' - L'A'));
+        r.push_back(ch);
+    }
+    return r;
+}
+
+struct ZipPackageReader {
+    std::wstring filePath;
+    const uint8_t* memData = nullptr;
+    size_t memLen = 0;
+    bool fromDisk = false;
+    std::vector<ZipDeflate::ArchiveItemMeta> entries;
+
+    bool Open(const std::wstring& fullPath, const std::vector<uint8_t>& raw) {
+        entries.clear();
+        if (!fullPath.empty() && ZipDeflate::ListZipEntriesFromFile(fullPath, entries) && !entries.empty()) {
+            filePath = fullPath;
+            fromDisk = true;
+            return true;
+        }
+        if (!raw.empty() && ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries) && !entries.empty()) {
+            memData = raw.data();
+            memLen = raw.size();
+            fromDisk = false;
+            return true;
+        }
+        return false;
+    }
+
+    const ZipDeflate::ArchiveItemMeta* FindEntry(std::wstring_view wantNormPath) const {
+        std::wstring want = NormalizeZipArchiveKey(wantNormPath);
+        for (const auto& e : entries) {
+            if (!e.isDirectory && NormalizeZipArchiveKey(e.pathInArchive) == want) return &e;
+        }
+        return nullptr;
+    }
+
+    bool ExtractEntry(const ZipDeflate::ArchiveItemMeta& e, std::vector<uint8_t>& outBytes, size_t maxBytes = 64u * 1024u * 1024u) const {
+        outBytes.clear();
+        if (fromDisk) return ZipDeflate::ExtractZipEntryFromFile(filePath, e, outBytes, maxBytes);
+        return ZipDeflate::ExtractZipEntryFromMemory(memData, memLen, e, outBytes, maxBytes);
+    }
+
+    bool ExtractByPath(std::wstring_view wantPath, std::vector<uint8_t>& outBytes, size_t maxBytes = 64u * 1024u * 1024u) const {
+        const auto* e = FindEntry(wantPath);
+        return e ? ExtractEntry(*e, outBytes, maxBytes) : false;
+    }
+};
+#endif // E2_DOC_FORMAT_CORE_ONLY
 
 } // namespace Formats

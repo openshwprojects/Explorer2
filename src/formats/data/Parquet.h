@@ -1399,45 +1399,6 @@ inline bool BuildParquetDocument(
     return true;
 }
 
-inline bool ParseLegacyPar1TokenContainer(const uint8_t* data, size_t size, ParsedOfficeDocument& out) {
-    if (size < 12 || size > 65536) return false;
-    bool allValidIdentOrNul = true;
-    std::vector<std::string> tokens;
-    std::string cur;
-    for (size_t i = 4; i < size - 8; ++i) {
-        uint8_t b = data[i];
-        if (b == 0) {
-            if (!cur.empty()) { tokens.push_back(std::move(cur)); cur.clear(); }
-        } else if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
-                   (b >= '0' && b <= '9') || b == '_' || b == '-' || b == '.') {
-            cur.push_back(static_cast<char>(b));
-        } else {
-            allValidIdentOrNul = false;
-            break;
-        }
-    }
-    if (!cur.empty()) tokens.push_back(std::move(cur));
-    if (!allValidIdentOrNul || tokens.size() < 2) return false;
-
-    out.kind = OfficeFileKind::SqliteDb;
-    out.isSpreadsheet = true;
-    out.formatTitle = L"Apache Parquet Columnar (.parquet)";
-    SpreadsheetSheet sheet;
-    sheet.name = L"Parquet_Schema_And_Stats";
-    sheet.maxCols = 3;
-    sheet.rows.push_back({ L"#", L"Column / Metadata Token", L"Segment" });
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        sheet.rows.push_back({
-            std::to_wstring(i + 1),
-            PathUtils::Utf8ToWide(tokens[i]),
-            (i + 1 == tokens.size()) ? L"Created By" : L"Schema Column"
-        });
-    }
-    out.sheets.push_back(std::move(sheet));
-    out.valid = true;
-    return true;
-}
-
 } // namespace ParquetDetail
 
 inline bool ParseApacheParquet(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
@@ -1461,7 +1422,7 @@ inline bool ParseApacheParquet(const std::vector<uint8_t>& raw, ParsedOfficeDocu
         return ParquetDetail::BuildParquetDocument(raw.size(), footerStart, footer, sliceFn, out);
     }
 
-    return ParquetDetail::ParseLegacyPar1TokenContainer(raw.data(), raw.size(), out);
+    return false;
 }
 
 inline bool ParseApacheParquetFile(const std::wstring& fullPath, ParsedOfficeDocument& out) {

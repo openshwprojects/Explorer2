@@ -26,9 +26,9 @@ inline bool ParseStm32Dfu(const uint8_t* data, size_t size, const std::wstring& 
     if (size >= 16) {
         const uint8_t* sfx = data + size - 16;
         if (sfx[8] == 'U' && sfx[9] == 'F' && sfx[10] == 'D' && sfx[11] >= 16) {
-            bcdDev = DetailEda100::RdU16LE(sfx + 0);
-            pid    = DetailEda100::RdU16LE(sfx + 2);
-            vid    = DetailEda100::RdU16LE(sfx + 4);
+            bcdDev = DetailSiliconAndBusEda::RdU16LE(sfx + 0);
+            pid    = DetailSiliconAndBusEda::RdU16LE(sfx + 2);
+            vid    = DetailSiliconAndBusEda::RdU16LE(sfx + 4);
             hasUfdSuffix = true;
         }
     }
@@ -41,22 +41,22 @@ inline bool ParseStm32Dfu(const uint8_t* data, size_t size, const std::wstring& 
         size_t limit = hasUfdSuffix ? (size - 16) : size;
         for (uint8_t ti = 0; ti < numTargets && pos + 274 <= limit; ++ti) {
             if (std::memcmp(data + pos, "Target", 6) != 0) return false;
-            bool named = DetailEda100::RdU32LE(data + pos + 7) != 0;
+            bool named = DetailSiliconAndBusEda::RdU32LE(data + pos + 7) != 0;
             std::string tname;
             if (named) {
                 size_t nlen = 0;
                 while (nlen < 255 && data[pos + 11 + nlen] != 0) ++nlen;
-                tname = DetailEda100::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + pos + 11), nlen));
+                tname = DetailSiliconAndBusEda::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + pos + 11), nlen));
             }
             if (tname.empty()) tname = "Target_" + std::to_string(data[pos + 6]);
-            uint32_t nbElems = DetailEda100::RdU32LE(data + pos + 270);
+            uint32_t nbElems = DetailSiliconAndBusEda::RdU32LE(data + pos + 270);
             pos += 274;
             if (nbElems == 0 || nbElems > 512) return false;
 
             for (uint32_t ei = 0; ei < nbElems; ++ei) {
                 if (pos + 8 > limit) return false;
-                uint32_t elAddr = DetailEda100::RdU32LE(data + pos);
-                uint32_t elSize = DetailEda100::RdU32LE(data + pos + 4);
+                uint32_t elAddr = DetailSiliconAndBusEda::RdU32LE(data + pos);
+                uint32_t elSize = DetailSiliconAndBusEda::RdU32LE(data + pos + 4);
                 pos += 8;
                 if (elSize > limit - pos) return false;
 
@@ -95,7 +95,7 @@ inline bool ParseStm32Dfu(const uint8_t* data, size_t size, const std::wstring& 
 
     const float mapW = 72.0f;
     float totalH = static_cast<float>(elems.size()) * 11.0f + 8.0f;
-    DetailEda100::AddRectOutline(out, 0.0f, 0.0f, mapW + 8.0f, totalH, EdaLayerId::EdgeCuts, 0.40f);
+    DetailSiliconAndBusEda::AddRectOutline(out, 0.0f, 0.0f, mapW + 8.0f, totalH, EdaLayerId::EdgeCuts, 0.40f);
 
     uint64_t totalBytes = 0;
     for (size_t i = 0; i < elems.size(); ++i) {
@@ -120,7 +120,7 @@ inline bool ParseStm32Dfu(const uint8_t* data, size_t size, const std::wstring& 
         secComp.category = EdaPartCategory::IC_Package;
         out.components.push_back(secComp);
 
-        DetailEda100::AddRectOutline(out, 0.0f, cy, mapW, 7.5f, EdaLayerId::TopSilk, 0.25f);
+        DetailSiliconAndBusEda::AddRectOutline(out, 0.0f, cy, mapW, 7.5f, EdaLayerId::TopSilk, 0.25f);
         float fillW = std::clamp(e.fillRatio * (mapW - 2.0f), 1.0f, mapW - 2.0f);
         float fillCx = -(mapW - 2.0f) * 0.5f + fillW * 0.5f;
         out.pads.push_back({ fillCx, cy, fillW, 5.2f, 0.0f, 0.0f, 1, EdaLayerId::TopCopper, addrHex, valStr });

@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailDocs200 {
+namespace DetailStructuredDataDoc {
 
 inline bool DecompressPmTilesStream(const uint8_t* src, size_t srcLen, uint8_t comp, std::vector<uint8_t>& out,
                                     size_t maxOut = 32u * 1024u * 1024u) {
@@ -107,7 +107,7 @@ inline bool DecodePmTilesDirectory(const uint8_t* dir, size_t dirSize, std::vect
     return true;
 }
 
-} // namespace DetailDocs200
+} // namespace DetailStructuredDataDoc
 
 
 inline bool ParsePmTilesMapDoc(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
@@ -118,36 +118,36 @@ inline bool ParsePmTilesMapDoc(const std::vector<uint8_t>& raw, const std::wstri
         const uint64_t fileSize = source.Size();
         const uint8_t* h = raw.data();
 
-        uint64_t rootDirOff     = DetailDocs200::RdU64LE(h + 8);
-        uint64_t rootDirLen     = DetailDocs200::RdU64LE(h + 16);
-        uint64_t jsonOff        = DetailDocs200::RdU64LE(h + 24);
-        uint64_t jsonLen        = DetailDocs200::RdU64LE(h + 32);
-        uint64_t leafDirsOff    = DetailDocs200::RdU64LE(h + 40);
-        uint64_t leafDirsLen    = DetailDocs200::RdU64LE(h + 48);
-        uint64_t tileDataOff    = DetailDocs200::RdU64LE(h + 56);
-        uint64_t tileDataLen    = DetailDocs200::RdU64LE(h + 64);
-        uint64_t addressedTiles = DetailDocs200::RdU64LE(h + 72);
-        uint64_t tileEntries    = DetailDocs200::RdU64LE(h + 80);
-        uint64_t tileContents   = DetailDocs200::RdU64LE(h + 88);
+        uint64_t rootDirOff     = DetailStructuredDataDoc::RdU64LE(h + 8);
+        uint64_t rootDirLen     = DetailStructuredDataDoc::RdU64LE(h + 16);
+        uint64_t jsonOff        = DetailStructuredDataDoc::RdU64LE(h + 24);
+        uint64_t jsonLen        = DetailStructuredDataDoc::RdU64LE(h + 32);
+        uint64_t leafDirsOff    = DetailStructuredDataDoc::RdU64LE(h + 40);
+        uint64_t leafDirsLen    = DetailStructuredDataDoc::RdU64LE(h + 48);
+        uint64_t tileDataOff    = DetailStructuredDataDoc::RdU64LE(h + 56);
+        uint64_t tileDataLen    = DetailStructuredDataDoc::RdU64LE(h + 64);
+        uint64_t addressedTiles = DetailStructuredDataDoc::RdU64LE(h + 72);
+        uint64_t tileEntries    = DetailStructuredDataDoc::RdU64LE(h + 80);
+        uint64_t tileContents   = DetailStructuredDataDoc::RdU64LE(h + 88);
         uint8_t clustered       = h[96];
         uint8_t internalComp    = h[97];
         uint8_t tileComp        = h[98];
         uint8_t tileType        = h[99];
         uint8_t minZoom         = h[100];
         uint8_t maxZoom         = h[101];
-        double minLon = DetailDocs200::RdI32LE(h + 102) * 1e-7;
-        double minLat = DetailDocs200::RdI32LE(h + 106) * 1e-7;
-        double maxLon = DetailDocs200::RdI32LE(h + 110) * 1e-7;
-        double maxLat = DetailDocs200::RdI32LE(h + 114) * 1e-7;
+        double minLon = DetailStructuredDataDoc::RdI32LE(h + 102) * 1e-7;
+        double minLat = DetailStructuredDataDoc::RdI32LE(h + 106) * 1e-7;
+        double maxLon = DetailStructuredDataDoc::RdI32LE(h + 110) * 1e-7;
+        double maxLat = DetailStructuredDataDoc::RdI32LE(h + 114) * 1e-7;
         uint8_t centerZoom = h[118];
-        double centerLon = DetailDocs200::RdI32LE(h + 119) * 1e-7;
-        double centerLat = DetailDocs200::RdI32LE(h + 123) * 1e-7;
+        double centerLon = DetailStructuredDataDoc::RdI32LE(h + 119) * 1e-7;
+        double centerLat = DetailStructuredDataDoc::RdI32LE(h + 123) * 1e-7;
 
         if (internalComp > 4u || minZoom > maxZoom || maxZoom > 30u) return false;
         const bool headerOnlyEmptyDir = (rootDirOff == 0ULL && rootDirLen == 0ULL && internalComp == 0u && tileEntries == 0ULL);
 
         std::vector<uint8_t> rootRawBuf, rootDec;
-        std::vector<DetailDocs200::PmTilesDirEntry> dirEntries;
+        std::vector<DetailStructuredDataDoc::PmTilesDirEntry> dirEntries;
         if (!headerOnlyEmptyDir) {
             if (internalComp < 1u || rootDirOff < 127ULL || rootDirLen == 0 || rootDirLen > 32ULL * 1024ULL * 1024ULL ||
                 rootDirOff > fileSize || rootDirLen > fileSize - rootDirOff) {
@@ -155,10 +155,10 @@ inline bool ParsePmTilesMapDoc(const std::vector<uint8_t>& raw, const std::wstri
             }
             // Decompress & decode PMTiles v3 Root Directory
             const uint8_t* rootRaw = source.Read(rootDirOff, static_cast<size_t>(rootDirLen), rootRawBuf);
-            if (!rootRaw || !DetailDocs200::DecompressPmTilesStream(rootRaw, static_cast<size_t>(rootDirLen), internalComp, rootDec)) {
+            if (!rootRaw || !DetailStructuredDataDoc::DecompressPmTilesStream(rootRaw, static_cast<size_t>(rootDirLen), internalComp, rootDec)) {
                 return false;
             }
-            if (!DetailDocs200::DecodePmTilesDirectory(rootDec.data(), rootDec.size(), dirEntries)) {
+            if (!DetailStructuredDataDoc::DecodePmTilesDirectory(rootDec.data(), rootDec.size(), dirEntries)) {
                 return false;
             }
             if (dirEntries.empty() && tileEntries > 0) return false;
@@ -228,7 +228,7 @@ inline bool ParsePmTilesMapDoc(const std::vector<uint8_t>& raw, const std::wstri
         if (jsonLen > 0 && jsonLen <= 32ULL * 1024ULL * 1024ULL && jsonOff <= fileSize && jsonLen <= fileSize - jsonOff) {
             std::vector<uint8_t> metaRawBuf, metaDec;
             const uint8_t* metaRaw = source.Read(jsonOff, static_cast<size_t>(jsonLen), metaRawBuf);
-            if (metaRaw && DetailDocs200::DecompressPmTilesStream(metaRaw, static_cast<size_t>(jsonLen), internalComp, metaDec)) {
+            if (metaRaw && DetailStructuredDataDoc::DecompressPmTilesStream(metaRaw, static_cast<size_t>(jsonLen), internalComp, metaDec)) {
                 std::string_view jsv(reinterpret_cast<const char*>(metaDec.data()), metaDec.size());
                 ::Explorer2::Json::Value jroot;
                 if (::Explorer2::Json::ParseDocument(jsv, jroot) && jroot.IsObject()) {
@@ -267,7 +267,7 @@ inline bool ParsePmTilesMapDoc(const std::vector<uint8_t>& raw, const std::wstri
                             vlSh.rows.push_back({ lid, lz, ldesc, fieldsDesc });
                         }
                     }
-                } else if (DetailDocs200::IsMostlyPrintableUtf8(metaDec.data(), std::min<size_t>(metaDec.size(), 512u))) {
+                } else if (DetailStructuredDataDoc::IsMostlyPrintableUtf8(metaDec.data(), std::min<size_t>(metaDec.size(), 512u))) {
                     sh.rows.push_back({ L"JSON Metadata", PathUtils::Utf8ToWide(jsv.substr(0, std::min<size_t>(jsv.size(), 512u))), L"", L"" });
                 }
             }
@@ -281,7 +281,7 @@ inline bool ParsePmTilesMapDoc(const std::vector<uint8_t>& raw, const std::wstri
         for (size_t i = 0; i < maxDirRows; ++i) {
             const auto& de = dirEntries[i];
             uint8_t z = 0; uint32_t x = 0, y = 0;
-            std::wstring zxyStr = DetailDocs200::PmTilesTileIdToZXY(de.tileId, z, x, y)
+            std::wstring zxyStr = DetailStructuredDataDoc::PmTilesTileIdToZXY(de.tileId, z, x, y)
                 ? (std::to_wstring(z) + L"/" + std::to_wstring(x) + L"/" + std::to_wstring(y))
                 : L"(invalid)";
             bool isLeaf = (de.runLength == 0);

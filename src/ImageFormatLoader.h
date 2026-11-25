@@ -47,6 +47,13 @@ public:
         const std::wstring& fullPath,
         uint32_t maxDimension,
         ExtendedImageInfo& outInfo);
+
+    static bool TryDecodeConsoleOrGameImage(
+        const uint8_t* data,
+        size_t size,
+        const std::wstring& extLower,
+        uint32_t maxDimension,
+        ExtendedImageInfo& outInfo);
 };
 
 } // namespace Explorer2

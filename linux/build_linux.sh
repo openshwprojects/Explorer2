@@ -73,7 +73,7 @@ cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
 cmake --build "${BUILD_DIR}" --parallel "$(nproc)"
 
 echo "Built targets in ${BUILD_DIR}:"
-file "${BUILD_DIR}/explorer2" "${BUILD_DIR}/explorer2-stage15" "${BUILD_DIR}/explorer2-readers"
+file "${BUILD_DIR}/explorer2" "${BUILD_DIR}/explorer2-format-tests" "${BUILD_DIR}/explorer2-readers"
 
 if [[ "${RUN_TEST}" -eq 1 ]]; then
     (

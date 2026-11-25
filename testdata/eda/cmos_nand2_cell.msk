@@ -1,0 +1,53 @@
+VERSION 3.5
+TITLE CMOS_NAND2_65NM_STDCELL
+FOUNDRY cmos65nm.rul
+LAMBDA 0.035
+VIEW -6 -6 46 54
+BB 0 0 36 42
+* N-Well tub for dual parallel PMOS pull-up network
+C NTUB 0 22 36 20
+* VDD and VSS Metal-1 power rails
+C ME1 0 37 36 5
+C ME1 0 0 36 5
+* P+ active diffusion (PMOS M_PA, M_PB) & N+ active diffusion (series NMOS M_NA, M_NB)
+C DP 4 25 28 9
+C DN 4 7 28 9
+* Polysilicon gates for inputs A and B crossing both N+ and P+ active regions
+C POLY 10 5 4 32
+C POLY 22 5 4 32
+* Source/Drain diffusion-to-Metal1 contacts
+C CO 5 30 2 2
+C CO 5 38 2 2
+C CO 16 28 2 2
+C CO 28 30 2 2
+C CO 28 38 2 2
+C CO 5 9 2 2
+C CO 5 1 2 2
+C CO 28 9 2 2
+* Metal-1 local interconnect straps (VDD ties, VSS tie, output Y drain strap)
+C ME1 4 29 4 11
+C ME1 27 29 4 11
+C ME1 4 1 4 10
+C ME1 15 26 4 8
+C ME1 15 18 16 4
+C ME1 27 8 4 14
+* Input A / B poly contact landing pads + Metal-2 vertical signal pins
+C POLY 8 17 6 5
+C CO 9 18 2 2
+C ME1 8 17 5 5
+C VIA 9 18 2 2
+C ME2 8 14 4 12
+C POLY 21 12 6 5
+C CO 22 13 2 2
+C ME1 21 12 5 5
+C VIA 22 13 2 2
+C ME2 21 10 4 12
+C VIA 16 19 2 2
+C ME2 15 16 4 14
+* Signal & Supply Port Labels
+T ME1 2 39 VDD
+T ME1 2 2 VSS
+T ME2 10 20 A
+T ME2 23 15 B
+T ME2 17 24 Y
+END

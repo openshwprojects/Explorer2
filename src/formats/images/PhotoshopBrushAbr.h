@@ -7,12 +7,12 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
     if (!data) return false;
     const std::wstring extLower = L".abr";
     if (extLower != L".abr" || size < 10) return false;
-    uint16_t ver = DetailImg100::RdU16BE(data + 0);
+    uint16_t ver = DetailLayeredAndHdrImg::RdU16BE(data + 0);
     if (ver != 1 && ver != 2 && ver != 6 && ver != 7 && ver != 10) return false;
     uint16_t subVer = 0;
     if (ver == 6 || ver == 7 || ver == 10) {
         if (size < 16) return false;
-        subVer = DetailImg100::RdU16BE(data + 2);
+        subVer = DetailLayeredAndHdrImg::RdU16BE(data + 2);
         if (subVer != 1 && subVer != 2) return false;
     }
 
@@ -51,7 +51,7 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
             size_t rpos = tblBytes;
             bool rowByRowOk = true;
             for (uint32_t ry = 0; ry < bh; ++ry) {
-                uint16_t rowCnt = DetailImg100::RdU16BE(pix + static_cast<size_t>(ry) * 2u);
+                uint16_t rowCnt = DetailLayeredAndHdrImg::RdU16BE(pix + static_cast<size_t>(ry) * 2u);
                 if (rowCnt == 0 || rpos + rowCnt > availBytes) {
                     rowByRowOk = false;
                     break;
@@ -121,11 +121,11 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
         } else {
             uint16_t maxV16 = 0;
             for (size_t i = 0; i < pxCount; ++i) {
-                uint16_t v16 = DetailImg100::RdU16BE(rawPlane.data() + i * 2u);
+                uint16_t v16 = DetailLayeredAndHdrImg::RdU16BE(rawPlane.data() + i * 2u);
                 if (v16 > maxV16) maxV16 = v16;
             }
             for (size_t i = 0; i < pxCount; ++i) {
-                uint16_t v16 = DetailImg100::RdU16BE(rawPlane.data() + i * 2u);
+                uint16_t v16 = DetailLayeredAndHdrImg::RdU16BE(rawPlane.data() + i * 2u);
                 if (maxV16 > 32768u) {
                     outAlpha[i] = static_cast<uint8_t>((static_cast<uint32_t>(v16) * 255u + 32767u) / 65535u);
                 } else if (maxV16 > 255u) {
@@ -144,12 +144,12 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
     };
 
     if (ver == 1 || ver == 2) {
-        uint16_t count = DetailImg100::RdU16BE(data + 2);
+        uint16_t count = DetailLayeredAndHdrImg::RdU16BE(data + 2);
         if (count == 0) return false;
         size_t pos = 4;
         for (uint16_t b = 0; b < count && pos + 6 <= size && tips.size() < 8; ++b) {
-            uint16_t btype = DetailImg100::RdU16BE(data + pos);
-            uint32_t bsize = DetailImg100::RdU32BE(data + pos + 2);
+            uint16_t btype = DetailLayeredAndHdrImg::RdU16BE(data + pos);
+            uint32_t bsize = DetailLayeredAndHdrImg::RdU32BE(data + pos + 2);
             pos += 6;
             if (bsize > size - pos) break;
 
@@ -160,17 +160,17 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
                 auto tryParseV12At = [&](const uint8_t* afterName, const std::wstring& bName) -> bool {
                     if (afterName + 28 > recEnd) return false;
                     // afterName[0] = antialias (1 byte), afterName[1..8] = shortBounds[4]
-                    int16_t sTop    = static_cast<int16_t>(DetailImg100::RdU16BE(afterName + 1));
-                    int16_t sLeft   = static_cast<int16_t>(DetailImg100::RdU16BE(afterName + 3));
-                    int16_t sBottom = static_cast<int16_t>(DetailImg100::RdU16BE(afterName + 5));
-                    int16_t sRight  = static_cast<int16_t>(DetailImg100::RdU16BE(afterName + 7));
+                    int16_t sTop    = static_cast<int16_t>(DetailLayeredAndHdrImg::RdU16BE(afterName + 1));
+                    int16_t sLeft   = static_cast<int16_t>(DetailLayeredAndHdrImg::RdU16BE(afterName + 3));
+                    int16_t sBottom = static_cast<int16_t>(DetailLayeredAndHdrImg::RdU16BE(afterName + 5));
+                    int16_t sRight  = static_cast<int16_t>(DetailLayeredAndHdrImg::RdU16BE(afterName + 7));
 
                     const uint8_t* bp = afterName + 9;
-                    int32_t top    = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 0));
-                    int32_t left   = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 4));
-                    int32_t bottom = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 8));
-                    int32_t right  = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 12));
-                    uint16_t depth = DetailImg100::RdU16BE(bp + 16);
+                    int32_t top    = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 0));
+                    int32_t left   = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 4));
+                    int32_t bottom = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 8));
+                    int32_t right  = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 12));
+                    uint16_t depth = DetailLayeredAndHdrImg::RdU16BE(bp + 16);
                     uint8_t comp   = bp[18];
                     const uint8_t* pix = bp + 19;
 
@@ -200,11 +200,11 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
                 } else {
                     bool parsed = false;
                     if (pName + 4 <= recEnd) {
-                        uint32_t nameLen = DetailImg100::RdU32BE(pName);
+                        uint32_t nameLen = DetailLayeredAndHdrImg::RdU32BE(pName);
                         if (nameLen <= 2048 && pName + 4 + static_cast<size_t>(nameLen) * 2u <= recEnd) {
                             std::wstring bName;
                             for (uint32_t ci = 0; ci < nameLen; ++ci) {
-                                wchar_t wc = static_cast<wchar_t>(DetailImg100::RdU16BE(pName + 4 + static_cast<size_t>(ci) * 2u));
+                                wchar_t wc = static_cast<wchar_t>(DetailLayeredAndHdrImg::RdU16BE(pName + 4 + static_cast<size_t>(ci) * 2u));
                                 if (wc != 0) bName.push_back(wc);
                             }
                             parsed = tryParseV12At(pName + 4 + static_cast<size_t>(nameLen) * 2u, bName);
@@ -225,7 +225,7 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
         auto parseSampSection = [&](size_t secStart, size_t secEnd) {
             size_t p = secStart;
             while (p + 4 <= secEnd && tips.size() < 8) {
-                uint32_t bLen = DetailImg100::RdU32BE(data + p);
+                uint32_t bLen = DetailLayeredAndHdrImg::RdU32BE(data + p);
                 p += 4;
                 if (bLen == 0 || bLen > secEnd - p) break;
 
@@ -259,11 +259,11 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
                     size_t hdrSkip = candidates[ci];
                     if (hdrSkip + 19u >= bLen) continue;
                     const uint8_t* bp = entryStart + hdrSkip;
-                    int32_t top    = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 0));
-                    int32_t left   = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 4));
-                    int32_t bottom = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 8));
-                    int32_t right  = static_cast<int32_t>(DetailImg100::RdU32BE(bp + 12));
-                    uint16_t depth = DetailImg100::RdU16BE(bp + 16);
+                    int32_t top    = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 0));
+                    int32_t left   = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 4));
+                    int32_t bottom = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 8));
+                    int32_t right  = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(bp + 12));
+                    uint16_t depth = DetailLayeredAndHdrImg::RdU16BE(bp + 16);
                     uint8_t comp   = bp[18];
 
                     int64_t bw64 = static_cast<int64_t>(right) - static_cast<int64_t>(left);
@@ -293,7 +293,7 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
         size_t pos = 4;
         while (pos + 12 <= size && std::memcmp(data + pos, "8BIM", 4) == 0) {
             const uint8_t* key = data + pos + 4;
-            uint32_t secLen = DetailImg100::RdU32BE(data + pos + 8);
+            uint32_t secLen = DetailLayeredAndHdrImg::RdU32BE(data + pos + 8);
             size_t secStart = pos + 12;
             if (secLen > size - secStart) {
                 secLen = static_cast<uint32_t>(size - secStart);
@@ -315,7 +315,7 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
         if (!foundSampBlock) {
             for (size_t i = 4; i + 12 <= size; ++i) {
                 if (std::memcmp(data + i, "8BIMsamp", 8) == 0) {
-                    uint32_t secLen = DetailImg100::RdU32BE(data + i + 8);
+                    uint32_t secLen = DetailLayeredAndHdrImg::RdU32BE(data + i + 8);
                     size_t secStart = i + 12;
                     size_t secEnd = (secLen <= size - secStart) ? (secStart + secLen) : size;
                     parseSampSection(secStart, secEnd);
@@ -383,7 +383,7 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
     outInfo.bitsPerChannel = 8;
     outInfo.formatName = L"Adobe Photoshop Brush Set (.abr)";
     outInfo.bgraPixels.resize(static_cast<size_t>(W) * H * 4u);
-    DetailImg200::FillRectBGRA(outInfo.bgraPixels, W, H, 0, 0, static_cast<int>(W), static_cast<int>(H), 20, 20, 24);
+    DetailVectorAndRawImg::FillRectBGRA(outInfo.bgraPixels, W, H, 0, 0, static_cast<int>(W), static_cast<int>(H), 20, 20, 24);
 
     size_t maxCells = static_cast<size_t>(gridCols) * gridRows;
     for (size_t t = 0; t < tips.size() && t < maxCells; ++t) {
@@ -391,7 +391,7 @@ inline bool DecodePhotoshopBrushAbr(const uint8_t* data, size_t size, ExtendedIm
         uint32_t gy = static_cast<uint32_t>(t) / gridCols;
         uint32_t cellX = pad + gx * (cellSize + pad);
         uint32_t cellY = pad + gy * (cellSize + pad);
-        DetailImg200::FillRectBGRA(
+        DetailVectorAndRawImg::FillRectBGRA(
             outInfo.bgraPixels, W, H,
             static_cast<int>(cellX), static_cast<int>(cellY),
             static_cast<int>(cellX + cellSize), static_cast<int>(cellY + cellSize),

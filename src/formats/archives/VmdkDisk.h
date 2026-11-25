@@ -2,10 +2,11 @@
 // VmdkDisk.h — VMware Sparse VMDK virtual disk reader (.vmdk — "KDMV").
 
 #include "../common/ArchiveFormatCommon.h"
+#include "../common/VirtualDiskCommon.h"
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
 inline bool BuildVmdkDiskReader(
     const uint8_t* data,
@@ -15,7 +16,7 @@ inline bool BuildVmdkDiskReader(
     outReader = {};
     if (!data || size < 512) return false;
 
-    // 4. VMware Sparse VMDK ("KDMV")
+    // VMware Sparse VMDK ("KDMV")
     if (size >= 512 && std::memcmp(data, "KDMV", 4) == 0) {
         uint32_t flags        = RdU32LE(data + 8);
         uint64_t capacitySec  = RdU64LE(data + 12);
@@ -24,7 +25,9 @@ inline bool BuildVmdkDiskReader(
         uint64_t rgdSec       = RdU64LE(data + 48);
         uint64_t gdSec        = RdU64LE(data + 56);
         if (gdSec == 0xFFFFFFFFFFFFFFFFULL) gdSec = rgdSec;
-        if (capacitySec == 0 || grainSec == 0 || numGtesPerGt == 0 || gdSec * 512ULL >= size) return false;
+        if (capacitySec == 0 || capacitySec > (UINT64_MAX / 512ULL)) return false;
+        if (grainSec == 0 || grainSec > (256ULL * 1024 * 1024 / 512ULL) || numGtesPerGt == 0) return false;
+        if (gdSec >= size / 512ULL) return false;
 
         uint64_t virtSize   = capacitySec * 512ULL;
         uint64_t grainBytes = grainSec * 512ULL;
@@ -34,7 +37,7 @@ inline bool BuildVmdkDiskReader(
         outReader.virtualSize = virtSize;
         outReader.formatName  = L"VMware VMDK Disk";
         outReader.readBytes = [=](uint64_t diskOff, uint8_t* dst, size_t len) -> bool {
-            if (diskOff + len > virtSize) return false;
+            if (diskOff > virtSize || len > virtSize - diskOff) return false;
             size_t done = 0;
             while (done < len) {
                 uint64_t cur = diskOff + done;
@@ -44,24 +47,24 @@ inline bool BuildVmdkDiskReader(
                 uint64_t gtIdx  = grainIdx / numGtesPerGt;
                 uint64_t gteIdx = grainIdx % numGtesPerGt;
                 bool filled = false;
-                if (gdByteOff + (gtIdx + 1) * 4 <= size) {
-                    uint32_t gtSec = RdU32LE(data + static_cast<size_t>(gdByteOff + gtIdx * 4));
+                if ((gtIdx + 1ULL) * 4ULL <= size - gdByteOff) {
+                    uint32_t gtSec = RdU32LE(data + static_cast<size_t>(gdByteOff + gtIdx * 4ULL));
                     uint64_t gtByteOff = static_cast<uint64_t>(gtSec) * 512ULL;
-                    if (gtSec > 0 && gtByteOff + (gteIdx + 1) * 4 <= size) {
-                        uint32_t gSec = RdU32LE(data + static_cast<size_t>(gtByteOff + gteIdx * 4));
+                    if (gtSec > 0 && gtByteOff <= size && (gteIdx + 1ULL) * 4ULL <= size - gtByteOff) {
+                        uint32_t gSec = RdU32LE(data + static_cast<size_t>(gtByteOff + gteIdx * 4ULL));
                         uint64_t gByteOff = static_cast<uint64_t>(gSec) * 512ULL;
                         if (gSec > 0 && gByteOff < size) {
                             if (!compressedGrains) {
-                                if (gByteOff + offInGrain + chunk <= size) {
+                                if (offInGrain <= size - gByteOff && chunk <= size - gByteOff - offInGrain) {
                                     std::memcpy(dst + done, data + static_cast<size_t>(gByteOff + offInGrain), chunk);
                                     filled = true;
                                 }
-                            } else if (gByteOff + 12 <= size) {
+                            } else if (size - gByteOff >= 12) {
                                 uint32_t cmpSz = RdU32LE(data + static_cast<size_t>(gByteOff + 8));
-                                if (gByteOff + 12 + cmpSz <= size) {
+                                if (cmpSz <= size - gByteOff - 12) {
                                     std::vector<uint8_t> dec;
                                     if (ZipDeflate::InflateZlib(data + static_cast<size_t>(gByteOff + 12), cmpSz, dec, static_cast<size_t>(grainBytes)) &&
-                                        offInGrain + chunk <= dec.size())
+                                        offInGrain <= dec.size() && chunk <= dec.size() - static_cast<size_t>(offInGrain))
                                     {
                                         std::memcpy(dst + done, dec.data() + static_cast<size_t>(offInGrain), chunk);
                                         filled = true;
@@ -82,7 +85,7 @@ inline bool BuildVmdkDiskReader(
     return false;
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool ParseOrExtractVmdkDisk(
     const uint8_t* data,
@@ -91,9 +94,9 @@ inline bool ParseOrExtractVmdkDisk(
     const std::wstring* extractTargetNorm = nullptr,
     std::vector<uint8_t>* outExtracted = nullptr)
 {
-    DetailArc100::VirtualDiskReader reader;
-    if (!DetailArc100::BuildVmdkDiskReader(data, size, reader)) return false;
-    return DetailArc100::InspectOrExtractVirtualDiskReader(reader, size, outInfo, extractTargetNorm, outExtracted);
+    DetailDiskAndGameArc::VirtualDiskReader reader;
+    if (!DetailDiskAndGameArc::BuildVmdkDiskReader(data, size, reader)) return false;
+    return DetailDiskAndGameArc::InspectOrExtractVirtualDiskReader(reader, size, outInfo, extractTargetNorm, outExtracted);
 }
 
 inline bool InspectVmdkDisk(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {

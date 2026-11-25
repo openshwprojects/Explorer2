@@ -2,7 +2,7 @@
 // ChmHelp.h — Microsoft Compiled HTML Help (.chm) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // ============================================================================
 // 12. Microsoft Compiled HTML Help (.chm — ITSF / ITSP / PMGL, section 1 LZX-decoded)
@@ -21,15 +21,15 @@ inline bool ReadChmEncInt(const uint8_t*& p, const uint8_t* end, uint64_t& outVa
 inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 88 || std::memcmp(raw.data(), "ITSF", 4) != 0) return false;
 
-    uint32_t itsfVer = DetailSys100::RdU32LE(raw.data() + 4);
-    uint32_t hdrLen  = DetailSys100::RdU32LE(raw.data() + 8);
-    uint32_t langId  = DetailSys100::RdU32LE(raw.data() + 20);
+    uint32_t itsfVer = DetailBinarySysDoc::RdU32LE(raw.data() + 4);
+    uint32_t hdrLen  = DetailBinarySysDoc::RdU32LE(raw.data() + 8);
+    uint32_t langId  = DetailBinarySysDoc::RdU32LE(raw.data() + 20);
     if (itsfVer < 2 || itsfVer > 4) return false;
 
-    uint64_t dirOff  = DetailSys100::RdU64LE(raw.data() + 72);
-    uint64_t dirLen  = DetailSys100::RdU64LE(raw.data() + 80);
+    uint64_t dirOff  = DetailBinarySysDoc::RdU64LE(raw.data() + 72);
+    uint64_t dirLen  = DetailBinarySysDoc::RdU64LE(raw.data() + 80);
     uint64_t dataOff = (itsfVer >= 3 && hdrLen >= 96 && raw.size() >= 96)
-        ? DetailSys100::RdU64LE(raw.data() + 88)
+        ? DetailBinarySysDoc::RdU64LE(raw.data() + 88)
         : (dirOff + dirLen);
 
     if (dirOff >= raw.size() || dirOff + 84 > raw.size() || std::memcmp(raw.data() + static_cast<size_t>(dirOff), "ITSP", 4) != 0) {
@@ -37,10 +37,10 @@ inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
     }
 
     const uint8_t* itsp = raw.data() + static_cast<size_t>(dirOff);
-    uint32_t itspVer      = DetailSys100::RdU32LE(itsp + 4);
-    uint32_t itspHdrLen   = DetailSys100::RdU32LE(itsp + 8);
-    uint32_t dirBlockSize = DetailSys100::RdU32LE(itsp + 16);
-    uint32_t numDirBlocks = DetailSys100::RdU32LE(itsp + 48);
+    uint32_t itspVer      = DetailBinarySysDoc::RdU32LE(itsp + 4);
+    uint32_t itspHdrLen   = DetailBinarySysDoc::RdU32LE(itsp + 8);
+    uint32_t dirBlockSize = DetailBinarySysDoc::RdU32LE(itsp + 16);
+    uint32_t numDirBlocks = DetailBinarySysDoc::RdU32LE(itsp + 48);
     if (dirBlockSize < 64 || dirBlockSize > 1048576 || itspHdrLen < 84) return false;
 
     struct ChmEntry {
@@ -60,7 +60,7 @@ inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
         const uint8_t* blk = raw.data() + bOff;
         if (std::memcmp(blk, "PMGL", 4) != 0) continue;
 
-        uint32_t freeSpace = DetailSys100::RdU32LE(blk + 4);
+        uint32_t freeSpace = DetailBinarySysDoc::RdU32LE(blk + 4);
         const uint8_t* p = blk + 20;
         const uint8_t* pEnd = (freeSpace <= blkAvail - 20) ? (blk + blkAvail - freeSpace) : (blk + blkAvail);
 
@@ -119,21 +119,21 @@ inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
     const uint8_t* cont = sec0Bytes(contE, contBuf, 64u << 20);
     std::wstring lzxNote;
     if (ctl && ctlE->length >= 24 && std::memcmp(ctl + 4, "LZXC", 4) == 0 && rt && rtE->length >= 40 && cont) {
-        const uint32_t ver = DetailSys100::RdU32LE(ctl + 8);
-        uint64_t resetInterval = DetailSys100::RdU32LE(ctl + 12), windowSize = DetailSys100::RdU32LE(ctl + 16);
+        const uint32_t ver = DetailBinarySysDoc::RdU32LE(ctl + 8);
+        uint64_t resetInterval = DetailBinarySysDoc::RdU32LE(ctl + 12), windowSize = DetailBinarySysDoc::RdU32LE(ctl + 16);
         if (ver == 2) {
             resetInterval *= 0x8000;
             windowSize *= 0x8000;
         }
         int windowBits = 0;
         for (int b = 15; b <= 21; ++b) if (windowSize == (uint64_t(1) << b)) windowBits = b;
-        const uint32_t numFrames = DetailSys100::RdU32LE(rt + 4), entrySize = DetailSys100::RdU32LE(rt + 8);
-        const uint32_t tableOff = DetailSys100::RdU32LE(rt + 12);
-        const uint64_t uncompLen = DetailSys100::RdU64LE(rt + 16), frameLen = DetailSys100::RdU64LE(rt + 32);
+        const uint32_t numFrames = DetailBinarySysDoc::RdU32LE(rt + 4), entrySize = DetailBinarySysDoc::RdU32LE(rt + 8);
+        const uint32_t tableOff = DetailBinarySysDoc::RdU32LE(rt + 12);
+        const uint64_t uncompLen = DetailBinarySysDoc::RdU64LE(rt + 16), frameLen = DetailBinarySysDoc::RdU64LE(rt + 32);
         std::vector<uint64_t> frameOffsets;
         if (entrySize == 8) {
             for (uint64_t i = 0; i < numFrames && tableOff + (i + 1) * 8 <= rtE->length && frameOffsets.size() < (1u << 20); ++i) {
-                frameOffsets.push_back(DetailSys100::RdU64LE(rt + tableOff + static_cast<size_t>(i) * 8));
+                frameOffsets.push_back(DetailBinarySysDoc::RdU64LE(rt + tableOff + static_cast<size_t>(i) * 8));
             }
         }
         if (windowBits && resetInterval && resetInterval % 0x8000 == 0 && frameLen == 0x8000 && uncompLen > 0) {
@@ -218,7 +218,7 @@ inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
     hdr.name = L"CHM_Header";
     hdr.rows.push_back({ L"Property", L"Value" });
     hdr.rows.push_back({ L"ITSF / ITSP Version", std::to_wstring(itsfVer) + L" / " + std::to_wstring(itspVer) });
-    hdr.rows.push_back({ L"Language LCID", DetailSys100::Hex32(langId) });
+    hdr.rows.push_back({ L"Language LCID", DetailBinarySysDoc::Hex32(langId) });
     hdr.rows.push_back({ L"Directory Block Size", std::to_wstring(dirBlockSize) + L" B (" + std::to_wstring(numDirBlocks) + L" blocks)" });
     hdr.rows.push_back({ L"Total Directory Entries", std::to_wstring(entries.size()) });
     if (!lzxNote.empty()) hdr.rows.push_back({ L"Compressed Section", lzxNote });
@@ -245,8 +245,8 @@ inline bool ParseChmHelp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseChmHelpDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseChmHelp(raw, out); }
+inline bool ParseChmHelpDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseChmHelp(raw, out); }
 
 } // namespace Formats

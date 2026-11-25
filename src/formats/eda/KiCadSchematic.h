@@ -251,22 +251,7 @@ inline bool ParseKiCadSchematic(std::string_view txt, ParsedEdaBoard& out) {
         if (kw == "segment" || kw == "gr_line" || kw == "gr_rect") {
             size_t closeP = FindMatchingParen(txt, openP);
             if (closeP == std::string_view::npos) break;
-            std::string_view blk = txt.substr(openP, closeP - openP + 1);
-            float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f, w = 0.25f, dummy = 0.0f;
-            if (ExtractSExprFloats(blk, "(start ", x1, y1) && ExtractSExprFloats(blk, "(end ", x2, y2)) {
-                ExtractSExprFloats(blk, "(width ", w, dummy);
-                if (w <= 0.01f) ExtractSExprFloats(blk, "(stroke (width ", w, dummy);
-                std::string lyr = ExtractSExprQuotedOrAtom(blk, "(layer ");
-                EdaLayerId lid = MapKiCadLayer(lyr);
-                if (kw == "gr_rect") {
-                    out.traces.push_back({ x1, -y1, x2, -y1, std::max(0.15f, w), lid, 0 });
-                    out.traces.push_back({ x2, -y1, x2, -y2, std::max(0.15f, w), lid, 0 });
-                    out.traces.push_back({ x2, -y2, x1, -y2, std::max(0.15f, w), lid, 0 });
-                    out.traces.push_back({ x1, -y2, x1, -y1, std::max(0.15f, w), lid, 0 });
-                } else {
-                    out.traces.push_back({ x1, -y1, x2, -y2, std::max(0.15f, w), lid, 0 });
-                }
-            }
+            ParseKiCadGraphicSExprBlock(kw, txt.substr(openP, closeP - openP + 1), out);
             pos = closeP + 1;
             continue;
         }

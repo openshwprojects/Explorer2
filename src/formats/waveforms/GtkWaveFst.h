@@ -118,11 +118,11 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
     // FST_BL_GWRAPPER (9): entire FST image wrapped in [type=9][seclen:8][uncompLen:8][gzip/zlib]
     if (data[0] == 9) {
         if (size < 26) return false;
-        uint64_t secLen = DetailEda100::RdU64BE(data + 1);
+        uint64_t secLen = DetailSiliconAndBusEda::RdU64BE(data + 1);
         if (secLen < 16 || 1 + secLen > size) return false;
         size_t payLen = static_cast<size_t>(secLen - 8);
         const uint8_t* pay = data + 9;
-        uint64_t uncompLen = DetailEda100::RdU64BE(pay);
+        uint64_t uncompLen = DetailSiliconAndBusEda::RdU64BE(pay);
         if (uncompLen < 33 || uncompLen > 128ULL * 1024 * 1024) return false;
         std::vector<uint8_t> inner;
         bool okW = false;
@@ -171,7 +171,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
     while (pos < size) {
         if (pos + 9 > size) return false; // Truncated block header
         uint8_t blkType = data[pos];
-        uint64_t blkLen = DetailEda100::RdU64BE(data + pos + 1);
+        uint64_t blkLen = DetailSiliconAndBusEda::RdU64BE(data + pos + 1);
         if (blkLen < 8) return false;
 
         // In fstapi.c, seclen includes the 8-byte length field (next = pos + 1 + blkLen).
@@ -194,8 +194,8 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
 
         if (blkType == 0) { // FST_BL_HDR
             if (payLen < 65) return false;
-            hdrStartTime = DetailEda100::RdU64BE(pay + 0);
-            hdrEndTime   = DetailEda100::RdU64BE(pay + 8);
+            hdrStartTime = DetailSiliconAndBusEda::RdU64BE(pay + 0);
+            hdrEndTime   = DetailSiliconAndBusEda::RdU64BE(pay + 8);
             double dLE = 0.0, dBE = 0.0;
             std::memcpy(&dLE, pay + 16, 8);
             uint8_t rev[8] = { pay[23], pay[22], pay[21], pay[20], pay[19], pay[18], pay[17], pay[16] };
@@ -228,7 +228,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             } else if (blkType == 6) {
                 // FST_BL_HIER_LZ4: [uncompLen:8 BE][LZ4 raw block]
                 if (payLen < 9) return false;
-                uint64_t uncompLen = DetailEda100::RdU64BE(pay);
+                uint64_t uncompLen = DetailSiliconAndBusEda::RdU64BE(pay);
                 if (uncompLen == 0 || uncompLen > 32 * 1024 * 1024) return false;
                 if (!DecompressFstLz4RawBlock(pay + 8, payLen - 8, static_cast<size_t>(uncompLen), hierBuf, 32 * 1024 * 1024)) {
                     return false;
@@ -238,8 +238,8 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             } else if (blkType == 7) {
                 // FST_BL_HIER_LZ4DUO: [uncompLen:8 BE][midLen:8 BE][LZ4 outer -> LZ4 inner]
                 if (payLen < 17) return false;
-                uint64_t uncompLen = DetailEda100::RdU64BE(pay + 0);
-                uint64_t midLen    = DetailEda100::RdU64BE(pay + 8);
+                uint64_t uncompLen = DetailSiliconAndBusEda::RdU64BE(pay + 0);
+                uint64_t midLen    = DetailSiliconAndBusEda::RdU64BE(pay + 8);
                 if (uncompLen == 0 || midLen == 0 || uncompLen > 32 * 1024 * 1024 || midLen > 32 * 1024 * 1024) return false;
                 std::vector<uint8_t> midBuf;
                 if (!DecompressFstLz4RawBlock(pay + 16, payLen - 16, static_cast<size_t>(midLen), midBuf, 32 * 1024 * 1024)) {
@@ -273,7 +273,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                     hpos += 2;
                     while (hpos < hlen && hp[hpos] != 0) ++hpos;
                     if (hpos < hlen) ++hpos;
-                    DetailEda100::ReadULeb128(hp, hlen, hpos);
+                    DetailSiliconAndBusEda::ReadULeb128(hp, hlen, hpos);
                 } else if (tag == 253) { // FST_ST_GEN_ATTREND
                     continue;
                 } else if (tag <= 30) { // FST_VT_* variable declaration
@@ -283,8 +283,8 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                     while (hpos < hlen && hp[hpos] != 0) ++hpos;
                     std::string vname(reinterpret_cast<const char*>(hp + n1), hpos - n1);
                     if (hpos < hlen) ++hpos;
-                    uint64_t bitLen = DetailEda100::ReadULeb128(hp, hlen, hpos);
-                    uint64_t alias  = DetailEda100::ReadULeb128(hp, hlen, hpos);
+                    uint64_t bitLen = DetailSiliconAndBusEda::ReadULeb128(hp, hlen, hpos);
+                    uint64_t alias  = DetailSiliconAndBusEda::ReadULeb128(hp, hlen, hpos);
 
                     std::string fullName;
                     for (const auto& sc : scopeStack) { fullName += sc; fullName.push_back('.'); }
@@ -305,14 +305,14 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             }
         } else if ((blkType == 1 || blkType == 3 || blkType == 8) && !handles.empty() && payLen >= 56) {
             // FST_BL_VCDATA / DYN_ALIAS / DYN_ALIAS2
-            uint64_t vcStart = DetailEda100::RdU64BE(pay + 0);
-            uint64_t vcEnd   = DetailEda100::RdU64BE(pay + 8);
+            uint64_t vcStart = DetailSiliconAndBusEda::RdU64BE(pay + 0);
+            uint64_t vcEnd   = DetailSiliconAndBusEda::RdU64BE(pay + 8);
             hdrEndTime = std::max(hdrEndTime, vcEnd);
 
             // 1. Decode Time Table from end of VCDATA block
-            uint64_t timeUncompLen = DetailEda100::RdU64BE(pay + payLen - 24);
-            uint64_t timeCompLen   = DetailEda100::RdU64BE(pay + payLen - 16);
-            uint64_t timeCount     = DetailEda100::RdU64BE(pay + payLen - 8);
+            uint64_t timeUncompLen = DetailSiliconAndBusEda::RdU64BE(pay + payLen - 24);
+            uint64_t timeCompLen   = DetailSiliconAndBusEda::RdU64BE(pay + payLen - 16);
+            uint64_t timeCount     = DetailSiliconAndBusEda::RdU64BE(pay + payLen - 8);
             if (timeCompLen > payLen - 32 || timeCount == 0 || timeCount > 1000000) {
                 return false;
             }
@@ -330,15 +330,15 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             size_t tcur = 0;
             uint64_t accTime = 0;
             for (uint64_t ti = 0; ti < timeCount && tcur < tlen; ++ti) {
-                accTime += DetailEda100::ReadULeb128(tp, tlen, tcur);
+                accTime += DetailSiliconAndBusEda::ReadULeb128(tp, tlen, tcur);
                 timestamps.push_back(accTime);
             }
             if (timestamps.empty()) timestamps.push_back(vcStart);
 
             // 2. Decode Initial Value Bits at pay + 24 (digital char-per-bit + 8-byte IEEE-754 double for isReal)
             size_t vpos = 24;
-            uint64_t bitsUncomp = DetailEda100::ReadULeb128(pay, timeOff, vpos);
-            uint64_t bitsComp   = DetailEda100::ReadULeb128(pay, timeOff, vpos);
+            uint64_t bitsUncomp = DetailSiliconAndBusEda::ReadULeb128(pay, timeOff, vpos);
+            uint64_t bitsComp   = DetailSiliconAndBusEda::ReadULeb128(pay, timeOff, vpos);
             if (bitsComp > timeOff - vpos) return false;
             std::vector<uint8_t> initBits;
             if (bitsComp == bitsUncomp) {
@@ -373,12 +373,12 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
 
             // 3. Waves header + Position table just before timeOff
             if (vpos + 2 > timeOff || timeOff < 8) { pos = nextPos; continue; }
-            uint64_t wavesCount = DetailEda100::ReadULeb128(pay, timeOff - 8, vpos);
+            uint64_t wavesCount = DetailSiliconAndBusEda::ReadULeb128(pay, timeOff - 8, vpos);
             if (vpos >= timeOff - 8) { pos = nextPos; continue; }
             uint8_t packType = pay[vpos++];
             size_t wavesDataStart = vpos;
 
-            uint64_t posTableLen = DetailEda100::RdU64BE(pay + timeOff - 8);
+            uint64_t posTableLen = DetailSiliconAndBusEda::RdU64BE(pay + timeOff - 8);
             if (posTableLen > (timeOff - 8) - wavesDataStart) return false;
             size_t posTableStart = (timeOff - 8) - static_cast<size_t>(posTableLen);
             size_t wavesDataEnd = posTableStart;
@@ -389,14 +389,14 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
             size_t pcur = posTableStart;
             if (blkType == 1) {
                 for (size_t hi = 0; hi < nHandles && pcur < timeOff - 8; ++hi) {
-                    chunkLens[hi] = static_cast<int64_t>(DetailEda100::ReadULeb128(pay, timeOff - 8, pcur));
+                    chunkLens[hi] = static_cast<int64_t>(DetailSiliconAndBusEda::ReadULeb128(pay, timeOff - 8, pcur));
                 }
             } else if (blkType == 3) {
                 size_t hi = 0;
                 while (hi < nHandles && pcur < timeOff - 8) {
-                    uint64_t v = DetailEda100::ReadULeb128(pay, timeOff - 8, pcur);
+                    uint64_t v = DetailSiliconAndBusEda::ReadULeb128(pay, timeOff - 8, pcur);
                     if (v == 0) {
-                        uint64_t run = DetailEda100::ReadULeb128(pay, timeOff - 8, pcur);
+                        uint64_t run = DetailSiliconAndBusEda::ReadULeb128(pay, timeOff - 8, pcur);
                         hi += std::max<size_t>(1, static_cast<size_t>(run));
                     } else if ((v & 1ULL) != 0) {
                         chunkLens[hi++] = -static_cast<int64_t>(v >> 1);
@@ -409,10 +409,10 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                 while (hi < nHandles && pcur < timeOff - 8) {
                     if (pay[pcur] == 0) {
                         ++pcur;
-                        uint64_t run = DetailEda100::ReadULeb128(pay, timeOff - 8, pcur);
+                        uint64_t run = DetailSiliconAndBusEda::ReadULeb128(pay, timeOff - 8, pcur);
                         hi += std::max<size_t>(1, static_cast<size_t>(run));
                     } else {
-                        chunkLens[hi++] = DetailEda100::ReadSLeb128(pay, timeOff - 8, pcur);
+                        chunkLens[hi++] = DetailSiliconAndBusEda::ReadSLeb128(pay, timeOff - 8, pcur);
                     }
                 }
             }
@@ -435,7 +435,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                 wcur += clen;
 
                 size_t subPos = 0;
-                uint64_t uncompWaveLen = DetailEda100::ReadULeb128(cptr, clen, subPos);
+                uint64_t uncompWaveLen = DetailSiliconAndBusEda::ReadULeb128(cptr, clen, subPos);
                 std::vector<uint8_t> waveRaw;
                 const uint8_t* wp = cptr + subPos;
                 size_t wlen = clen - subPos;
@@ -459,7 +459,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                 size_t timeIdx = 0;
                 if (hd.isReal) {
                     while (vp < wlen && hd.realChanges.size() < 8192) {
-                        uint64_t vli = DetailEda100::ReadULeb128(wp, wlen, vp);
+                        uint64_t vli = DetailSiliconAndBusEda::ReadULeb128(wp, wlen, vp);
                         timeIdx += static_cast<size_t>(vli >> 1);
                         double dv = 0.0;
                         if ((vli & 1ULL) == 0) {
@@ -482,7 +482,7 @@ inline bool ParseGtkWaveFst(const uint8_t* data, size_t size, ParsedEdaBoard& ou
                 }
 
                 while (vp < wlen && hd.changes.size() < 8192) {
-                    uint64_t vli = DetailEda100::ReadULeb128(wp, wlen, vp);
+                    uint64_t vli = DetailSiliconAndBusEda::ReadULeb128(wp, wlen, vp);
                     if (hd.bitLen == 1) {
                         if ((vli & 1ULL) == 0) {
                             timeIdx += static_cast<size_t>(vli >> 2);

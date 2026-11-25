@@ -56,13 +56,20 @@ EdaViewer::~EdaViewer() {
     Shutdown();
 }
 
-void EdaViewer::Initialize(HWND notifyHwnd, ID2D1Factory* d2dFactory) {
+void EdaViewer::Initialize(HWND notifyHwnd, ID2D1Factory* d2dFactory, IDWriteFactory* dwriteFactory) {
     m_notifyHwnd = notifyHwnd;
     m_d2dFactory = d2dFactory;
+    if (dwriteFactory && !m_fmtSmallTrim) {
+        PathUtils::CreateTrimmedTextFormat(dwriteFactory, L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 11.0f, &m_fmtSmallTrim);
+    }
 }
 
 void EdaViewer::Shutdown() {
     Clear();
+    if (m_fmtSmallTrim) {
+        m_fmtSmallTrim->Release();
+        m_fmtSmallTrim = nullptr;
+    }
 }
 
 void EdaViewer::Clear() {
@@ -646,8 +653,8 @@ void EdaViewer::Draw(
             const auto& c = m_board.components[i];
             std::wstring lbl = c.refDes + (c.value.empty() ? L"" : (L"  " + c.value)) + (c.footprint.empty() ? L"" : (L" (" + c.footprint + L")"));
             brush->SetColor(EdaColor(0x0F172A));
-            rt->DrawTextW(lbl.c_str(), static_cast<UINT32>(lbl.size()), fmtSmall,
-                D2D1::RectF(rr.left + 4.0f, rr.top, rr.right - 4.0f, rr.bottom), brush);
+            PathUtils::DrawSingleLineClipped(rt, lbl, m_fmtSmallTrim ? m_fmtSmallTrim : fmtSmall,
+                D2D1::RectF(rr.left + 4.0f, rr.top, rr.right - 4.0f, rr.bottom), brush, m_lineScratch);
         }
         rt->PopAxisAlignedClip();
     }
@@ -677,8 +684,8 @@ void EdaViewer::Draw(
             std::abs(m_board.maxY - m_board.minY));
     }
     brush->SetColor(EdaColor(0x334155));
-    rt->DrawTextW(stBuf, static_cast<UINT32>(wcslen(stBuf)), fmtSmall,
-        D2D1::RectF(stR.left + 8.0f, stR.top, stR.right - 8.0f, stR.bottom), brush);
+    PathUtils::DrawSingleLineClipped(rt, stBuf, m_fmtSmallTrim ? m_fmtSmallTrim : fmtSmall,
+        D2D1::RectF(stR.left + 8.0f, stR.top, stR.right - 8.0f, stR.bottom), brush, m_lineScratch);
     (void)fmtRegular;
 }
 

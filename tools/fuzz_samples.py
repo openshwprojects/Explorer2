@@ -279,8 +279,14 @@ def main():
     if not exe.exists():
         print('not found: %s' % exe)
         return 2
-    samples = sorted(p for p in (REPO / 'testdata').iterdir()
-                     if p.is_file() and p.name != 'README.md' and fnmatch.fnmatch(p.name, args.only))
+    td_root = REPO / 'testdata'
+    samples = sorted(
+        p for p in td_root.rglob('*')
+        if p.is_file() and p.name != 'README.md' and p.suffix.lower() not in ('.uexp', '.ubulk') and (
+            fnmatch.fnmatch(p.name, args.only) or
+            fnmatch.fnmatch(p.relative_to(td_root).as_posix(), args.only)
+        )
+    )
     findings_dir = Path(args.findings)
     if findings_dir.exists():
         shutil.rmtree(findings_dir)

@@ -23,12 +23,32 @@ static D2D1_COLOR_F ArcColor(uint32_t rgb, float a = 1.0f) {
 // ============================================================================
 // Right-Side FileContentPane UI Implementation
 // ============================================================================
-void ArchiveExplorer::Initialize(HWND parentHwnd) {
+ArchiveExplorer::~ArchiveExplorer() {
+    Shutdown();
+}
+
+void ArchiveExplorer::Initialize(HWND parentHwnd, IDWriteFactory* dwriteFactory) {
     m_parentHwnd = parentHwnd;
+    if (dwriteFactory) {
+        if (!m_fmtSmallTrim) {
+            PathUtils::CreateTrimmedTextFormat(dwriteFactory, L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 11.0f, &m_fmtSmallTrim);
+        }
+        if (!m_fmtBoldTrim) {
+            PathUtils::CreateTrimmedTextFormat(dwriteFactory, L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.0f, &m_fmtBoldTrim);
+        }
+    }
 }
 
 void ArchiveExplorer::Shutdown() {
     Clear();
+    if (m_fmtSmallTrim) {
+        m_fmtSmallTrim->Release();
+        m_fmtSmallTrim = nullptr;
+    }
+    if (m_fmtBoldTrim) {
+        m_fmtBoldTrim->Release();
+        m_fmtBoldTrim = nullptr;
+    }
 }
 
 void ArchiveExplorer::Clear() {
@@ -138,9 +158,12 @@ void ArchiveExplorer::Draw(
         m_summary.formatName.c_str(), pathBadge.c_str(),
         m_summary.totalFiles, m_summary.totalFolders,
         unpStr.c_str(), cmpStr.c_str(), ratioPct);
+    IDWriteTextFormat* smallTrim = m_fmtSmallTrim ? m_fmtSmallTrim : fmtSmall;
+    IDWriteTextFormat* boldTrim  = m_fmtBoldTrim ? m_fmtBoldTrim : fmtBold;
+
     brush->SetColor(ArcColor(0x1E3A8A));
-    rt->DrawText(infoBuf, static_cast<UINT32>(wcslen(infoBuf)), fmtSmall,
-        D2D1::RectF(infoR.left + 8.0f, infoR.top + 4.0f, infoR.right - 8.0f, infoR.bottom), brush);
+    PathUtils::DrawSingleLineClipped(rt, infoBuf, smallTrim,
+        D2D1::RectF(infoR.left + 8.0f, infoR.top + 2.0f, infoR.right - 8.0f, infoR.bottom), brush, m_lineScratch);
 
     // 3. Column Headers (22px)
     float colH = 22.0f;
@@ -157,16 +180,16 @@ void ArchiveExplorer::Draw(
     float nameRight = std::max(colR.left + 80.0f, listRight - packColW - unpColW);
 
     brush->SetColor(ArcColor(0x475569));
-    rt->DrawText(pl ? L"Nazwa w archiwum" : L"Name in archive", pl ? 16 : 15, fmtBold,
-        D2D1::RectF(colR.left + 10.0f, colR.top + 2.0f, nameRight - 4.0f, colR.bottom), brush);
-    fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    PathUtils::DrawSingleLineClipped(rt, pl ? L"Nazwa w archiwum" : L"Name in archive", boldTrim,
+        D2D1::RectF(colR.left + 10.0f, colR.top + 2.0f, nameRight - 4.0f, colR.bottom), brush, m_lineScratch);
+    boldTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     if (nameRight + unpColW <= listRight) {
-        rt->DrawText(pl ? L"Rozmiar" : L"Size", pl ? 7 : 4, fmtBold,
-            D2D1::RectF(nameRight, colR.top + 2.0f, nameRight + unpColW - 6.0f, colR.bottom), brush);
+        PathUtils::DrawSingleLineClipped(rt, pl ? L"Rozmiar" : L"Size", boldTrim,
+            D2D1::RectF(nameRight, colR.top + 2.0f, nameRight + unpColW - 6.0f, colR.bottom), brush, m_lineScratch);
     }
-    rt->DrawText(pl ? L"Skompres." : L"Packed", pl ? 9 : 6, fmtBold,
-        D2D1::RectF(listRight - packColW, colR.top + 2.0f, listRight - 8.0f, colR.bottom), brush);
-    fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    PathUtils::DrawSingleLineClipped(rt, pl ? L"Skompres." : L"Packed", boldTrim,
+        D2D1::RectF(listRight - packColW, colR.top + 2.0f, listRight - 8.0f, colR.bottom), brush, m_lineScratch);
+    boldTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
     // 4. Scrollable Archive Entries List
     m_listRect = D2D1::RectF(rect.left, colR.bottom, listRight, rect.bottom);
@@ -208,21 +231,21 @@ void ArchiveExplorer::Draw(
         }
 
         brush->SetColor(ArcColor(0x0F172A));
-        rt->DrawText(item.name.c_str(), static_cast<UINT32>(item.name.size()), fmtRegular,
-            D2D1::RectF(rowR.left + 26.0f, rowR.top + 1.0f, nameRight - 4.0f, rowR.bottom), brush);
+        PathUtils::DrawSingleLineClipped(rt, item.name, fmtRegular,
+            D2D1::RectF(rowR.left + 26.0f, rowR.top + 1.0f, nameRight - 4.0f, rowR.bottom), brush, m_lineScratch);
 
-        fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        smallTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
         std::wstring uStr = PathUtils::FormatByteSize(item.uncompressedSize);
         std::wstring cStr = PathUtils::FormatByteSize(item.compressedSize);
         if (nameRight + unpColW <= listRight) {
             brush->SetColor(ArcColor(0x475569));
-            rt->DrawText(uStr.c_str(), static_cast<UINT32>(uStr.size()), fmtSmall,
-                D2D1::RectF(nameRight, rowR.top + 2.0f, nameRight + unpColW - 6.0f, rowR.bottom), brush);
+            PathUtils::DrawSingleLineClipped(rt, uStr, smallTrim,
+                D2D1::RectF(nameRight, rowR.top + 2.0f, nameRight + unpColW - 6.0f, rowR.bottom), brush, m_lineScratch);
         }
         brush->SetColor(ArcColor(0x64748B));
-        rt->DrawText(cStr.c_str(), static_cast<UINT32>(cStr.size()), fmtSmall,
-            D2D1::RectF(listRight - packColW, rowR.top + 2.0f, listRight - 8.0f, rowR.bottom), brush);
-        fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        PathUtils::DrawSingleLineClipped(rt, cStr, smallTrim,
+            D2D1::RectF(listRight - packColW, rowR.top + 2.0f, listRight - 8.0f, rowR.bottom), brush, m_lineScratch);
+        smallTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
     rt->PopAxisAlignedClip();
 

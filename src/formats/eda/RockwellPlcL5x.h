@@ -4,8 +4,8 @@
 
 namespace Formats {
 
-// #79. Rockwell Studio 5000 Logix Designer PLC Ladder Export (.l5x)
-inline bool ParseRockwellL5x200(std::string_view sv, ParsedEdaBoard& out) {
+// Rockwell Studio 5000 Logix Designer PLC Ladder Export (.l5x)
+inline bool ParseRockwellPlcL5xBoard(std::string_view sv, ParsedEdaBoard& out) {
     auto drawSchRect = [&](float cx, float cy, float w, float h, float strokeW, EdaLayerId lid, int netId = 0) {
         DrawFieldbusSchRect(out, cx, cy, w, h, strokeW, lid, netId);
     };

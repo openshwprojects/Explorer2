@@ -49,10 +49,10 @@ inline bool ExrHufUncompress(const uint8_t* comp, size_t compSize, uint16_t* out
     if (nRaw == 0) return true;
     if (!comp || compSize < 20) return false;
 
-    uint32_t im      = DetailImg100::RdU32LE(comp + 0);
-    uint32_t iM      = DetailImg100::RdU32LE(comp + 4);
-    uint32_t nBits   = DetailImg100::RdU32LE(comp + 12);
-    uint32_t future  = DetailImg100::RdU32LE(comp + 16);
+    uint32_t im      = DetailLayeredAndHdrImg::RdU32LE(comp + 0);
+    uint32_t iM      = DetailLayeredAndHdrImg::RdU32LE(comp + 4);
+    uint32_t nBits   = DetailLayeredAndHdrImg::RdU32LE(comp + 12);
+    uint32_t future  = DetailLayeredAndHdrImg::RdU32LE(comp + 16);
     if (im > 65536u || iM > 65536u || im > iM || future != 0) return false;
 
     constexpr uint32_t kHufEncSize = 65537u;
@@ -441,8 +441,8 @@ inline bool DecompressExrChunkAny(
             return true;
         }
         if (packedSize < 8) return false;
-        uint16_t minNonZero = DetailImg100::RdU16LE(packed + 0);
-        uint16_t maxNonZero = DetailImg100::RdU16LE(packed + 2);
+        uint16_t minNonZero = DetailLayeredAndHdrImg::RdU16LE(packed + 0);
+        uint16_t maxNonZero = DetailLayeredAndHdrImg::RdU16LE(packed + 2);
         uint8_t bitmap[8192] = {};
         size_t hp = 4;
         if (minNonZero <= maxNonZero) {
@@ -453,7 +453,7 @@ inline bool DecompressExrChunkAny(
             hp += bmBytes;
         }
         if (hp + 4 > packedSize) return false;
-        uint32_t hufLen = DetailImg100::RdU32LE(packed + hp);
+        uint32_t hufLen = DetailLayeredAndHdrImg::RdU32LE(packed + hp);
         hp += 4;
         if (hufLen > packedSize - hp) return false;
 
@@ -656,7 +656,7 @@ inline bool DecompressExrChunkAny(
         // Note: OpenEXR DWA stores the 11 int64 header fields in BIG-ENDIAN (network order) in ImfDwaCompressor!
         // Let's support both BE (standard IlmImf htonll) and LE gracefully by checking version in [1..2]:
         auto rdDwa64 = [&](size_t idx, bool be) -> uint64_t {
-            return be ? DetailImg100::RdU64BE(packed + idx * 8) : DetailImg100::RdU64LE(packed + idx * 8);
+            return be ? DetailLayeredAndHdrImg::RdU64BE(packed + idx * 8) : DetailLayeredAndHdrImg::RdU64LE(packed + idx * 8);
         };
         uint64_t verBE = rdDwa64(0, true);
         uint64_t verLE = rdDwa64(0, false);
@@ -675,6 +675,12 @@ inline bool DecompressExrChunkAny(
         uint64_t totalDcCount     = rdDwa64(9, hdrBE);
         uint64_t acCompression    = rdDwa64(10, hdrBE);
 
+        const uint64_t maxDwaBytes = std::max<uint64_t>(static_cast<uint64_t>(expectedRawSize) * 8ULL + 65536ULL, 64ULL * 1024ULL * 1024ULL);
+        if (unkUncompSize > maxDwaBytes || rleUncompSize > maxDwaBytes || rleRawSize > maxDwaBytes ||
+            totalAcCount > maxDwaBytes / 2ULL || totalDcCount > maxDwaBytes / 2ULL) {
+            return false;
+        }
+
         size_t dp = 88;
         struct DwaRule {
             std::string name;
@@ -686,7 +692,7 @@ inline bool DecompressExrChunkAny(
         std::vector<DwaRule> rules;
         if (dwaVer >= 2) {
             if (dp + 2 > packedSize) return false;
-            uint16_t ruleBytes = hdrBE ? DetailImg100::RdU16BE(packed + dp) : DetailImg100::RdU16LE(packed + dp);
+            uint16_t ruleBytes = hdrBE ? DetailLayeredAndHdrImg::RdU16BE(packed + dp) : DetailLayeredAndHdrImg::RdU16LE(packed + dp);
             if (ruleBytes < 2 || dp + ruleBytes > packedSize) return false;
             size_t rEnd = dp + ruleBytes;
             size_t rp = dp + 2;
@@ -770,12 +776,12 @@ inline bool DecompressExrChunkAny(
             auto dot = suffix.rfind('.');
             if (dot != std::string::npos) suffix = suffix.substr(dot + 1);
             for (const auto& rl : rules) {
-                bool nameMatch = rl.caseInsens ? DetailImg100::EqualsIgnoreCaseAscii(suffix, rl.name) : (suffix == rl.name);
+                bool nameMatch = rl.caseInsens ? DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(suffix, rl.name) : (suffix == rl.name);
                 if (nameMatch && (rl.reqType < 0 || rl.reqType == channels[ci].pixelType)) {
                     chScheme[ci] = rl.scheme;
-                    if (rl.csc && DetailImg100::EqualsIgnoreCaseAscii(suffix, "R")) cscR = static_cast<int>(ci);
-                    if (rl.csc && DetailImg100::EqualsIgnoreCaseAscii(suffix, "G")) cscG = static_cast<int>(ci);
-                    if (rl.csc && DetailImg100::EqualsIgnoreCaseAscii(suffix, "B")) cscB = static_cast<int>(ci);
+                    if (rl.csc && DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(suffix, "R")) cscR = static_cast<int>(ci);
+                    if (rl.csc && DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(suffix, "G")) cscG = static_cast<int>(ci);
+                    if (rl.csc && DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(suffix, "B")) cscB = static_cast<int>(ci);
                     break;
                 }
             }
@@ -945,11 +951,11 @@ inline bool DecompressExrChunkAny(
 
 } // namespace ExrDetail
 
-inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo, uint32_t requestedPart = UINT32_MAX) {
+inline bool DecodeOpenExrPart(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo, uint32_t requestedPart = UINT32_MAX) {
     if (!data || size < 32 || data[0] != 0x76 || data[1] != 0x2F || data[2] != 0x31 || data[3] != 0x01) {
         return false;
     }
-    uint32_t verFlags = DetailImg100::RdU32LE(data + 4);
+    uint32_t verFlags = DetailLayeredAndHdrImg::RdU32LE(data + 4);
     uint32_t version = verFlags & 0xFFu;
     if (version != 1 && version != 2) return false;
     bool globalTiled     = (verFlags & 0x0200u) != 0;
@@ -979,7 +985,7 @@ inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImag
             if (typeEnd + 5 > size) return false;
             pos = typeEnd + 1;
 
-            uint32_t attrSize = DetailImg100::RdU32LE(data + pos);
+            uint32_t attrSize = DetailLayeredAndHdrImg::RdU32LE(data + pos);
             pos += 4;
             if (attrSize > size - pos) return false;
 
@@ -993,25 +999,25 @@ inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImag
                 else if (pt.partType == "scanlineimage") pt.isTiled = false;
                 else if (pt.partType == "deepscanline" || pt.partType == "deeptile") return false;
             } else if (attrName == "dataWindow" && attrSize == 16) {
-                pt.minX = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 0));
-                pt.minY = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 4));
-                pt.maxX = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 8));
-                pt.maxY = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 12));
+                pt.minX = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 0));
+                pt.minY = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 4));
+                pt.maxX = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 8));
+                pt.maxY = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 12));
                 pt.hasDataWindow = true;
             } else if (attrName == "displayWindow" && attrSize == 16 && !pt.hasDataWindow) {
-                pt.minX = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 0));
-                pt.minY = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 4));
-                pt.maxX = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 8));
-                pt.maxY = static_cast<int32_t>(DetailImg100::RdU32LE(data + pos + 12));
+                pt.minX = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 0));
+                pt.minY = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 4));
+                pt.maxX = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 8));
+                pt.maxY = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + pos + 12));
                 pt.hasDisplayWindow = true;
             } else if (attrName == "compression" && attrSize >= 1) {
                 pt.compression = data[pos];
             } else if (attrName == "chunkCount" && attrSize == 4) {
-                pt.chunkCount = DetailImg100::RdU32LE(data + pos);
+                pt.chunkCount = DetailLayeredAndHdrImg::RdU32LE(data + pos);
                 pt.hasChunkCount = true;
             } else if (attrName == "tiles" && attrSize >= 8) {
-                pt.tileDescX = DetailImg100::RdU32LE(data + pos + 0);
-                pt.tileDescY = DetailImg100::RdU32LE(data + pos + 4);
+                pt.tileDescX = DetailLayeredAndHdrImg::RdU32LE(data + pos + 0);
+                pt.tileDescY = DetailLayeredAndHdrImg::RdU32LE(data + pos + 4);
             } else if (attrName == "channels" && attrSize >= 1) {
                 size_t cpos = pos;
                 size_t cend = pos + attrSize;
@@ -1022,9 +1028,9 @@ inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImag
                     ExrDetail::ExrChannelDesc ch;
                     ch.name.assign(reinterpret_cast<const char*>(data + cpos), ce - cpos);
                     const uint8_t* meta = data + ce + 1;
-                    ch.pixelType = static_cast<int32_t>(DetailImg100::RdU32LE(meta + 0));
-                    ch.xSampling = std::max(1, static_cast<int32_t>(DetailImg100::RdU32LE(meta + 8)));
-                    ch.ySampling = std::max(1, static_cast<int32_t>(DetailImg100::RdU32LE(meta + 12)));
+                    ch.pixelType = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(meta + 0));
+                    ch.xSampling = std::max(1, static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(meta + 8)));
+                    ch.ySampling = std::max(1, static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(meta + 12)));
                     if (ch.pixelType == 0 || ch.pixelType == 2) ch.bytesPerSample = 4;
                     else if (ch.pixelType == 1) ch.bytesPerSample = 2;
                     else return false;
@@ -1151,9 +1157,9 @@ inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImag
     for (const auto& ch : channels) if (ch.pixelType == 0) hasUintChannel = true;
 
     auto readSampleAsFloat = [&](int32_t pixelType, const uint8_t* sp) -> float {
-        if (pixelType == 1) return GpuTex::HalfToFloat(DetailImg100::RdU16LE(sp));
+        if (pixelType == 1) return GpuTex::HalfToFloat(DetailLayeredAndHdrImg::RdU16LE(sp));
         if (pixelType == 2) return GpuTex::ReadF32LE(sp);
-        uint32_t u = DetailImg100::RdU32LE(sp);
+        uint32_t u = DetailLayeredAndHdrImg::RdU32LE(sp);
         float fv = static_cast<float>(u);
         if (fv > maxUintVal) maxUintVal = fv;
         return fv;
@@ -1169,21 +1175,21 @@ inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImag
         size_t decodedTiles = 0;
 
         for (size_t ti = 0; ti < numTiles; ++ti) {
-            uint64_t cOff64 = DetailImg100::RdU64LE(data + partOffsetTablePos + ti * 8);
+            uint64_t cOff64 = DetailLayeredAndHdrImg::RdU64LE(data + partOffsetTablePos + ti * 8);
             size_t cOff = (cOff64 >= allTablesEnd && cOff64 + 20 <= size) ? static_cast<size_t>(cOff64) : seqOff;
             if (isMultiPart) {
                 if (cOff + 24 > size) return false;
-                uint32_t partNum = DetailImg100::RdU32LE(data + cOff);
+                uint32_t partNum = DetailLayeredAndHdrImg::RdU32LE(data + cOff);
                 if (partNum != selectedPart) continue;
                 cOff += 4;
             } else if (cOff + 20 > size) {
                 return false;
             }
-            uint32_t tx = DetailImg100::RdU32LE(data + cOff + 0);
-            uint32_t ty = DetailImg100::RdU32LE(data + cOff + 4);
-            uint32_t lx = DetailImg100::RdU32LE(data + cOff + 8);
-            uint32_t lyLvl = DetailImg100::RdU32LE(data + cOff + 12);
-            uint32_t pSize = DetailImg100::RdU32LE(data + cOff + 16);
+            uint32_t tx = DetailLayeredAndHdrImg::RdU32LE(data + cOff + 0);
+            uint32_t ty = DetailLayeredAndHdrImg::RdU32LE(data + cOff + 4);
+            uint32_t lx = DetailLayeredAndHdrImg::RdU32LE(data + cOff + 8);
+            uint32_t lyLvl = DetailLayeredAndHdrImg::RdU32LE(data + cOff + 12);
+            uint32_t pSize = DetailLayeredAndHdrImg::RdU32LE(data + cOff + 16);
             if (pSize > size - (cOff + 20)) return false;
             seqOff = cOff + 20 + pSize;
             if (lx != 0 || lyLvl != 0 || tx >= tilesX || ty >= tilesY) continue;
@@ -1238,18 +1244,18 @@ inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImag
         uint32_t decodedLines = 0;
 
         for (uint32_t b = 0; b < numBlocks; ++b) {
-            uint64_t cOff64 = DetailImg100::RdU64LE(data + partOffsetTablePos + static_cast<size_t>(b) * 8);
+            uint64_t cOff64 = DetailLayeredAndHdrImg::RdU64LE(data + partOffsetTablePos + static_cast<size_t>(b) * 8);
             size_t cOff = (cOff64 >= allTablesEnd && cOff64 + 8 <= size) ? static_cast<size_t>(cOff64) : seqOff;
             if (isMultiPart) {
                 if (cOff + 12 > size) return false;
-                uint32_t partNum = DetailImg100::RdU32LE(data + cOff);
+                uint32_t partNum = DetailLayeredAndHdrImg::RdU32LE(data + cOff);
                 if (partNum != selectedPart) continue;
                 cOff += 4;
             } else if (cOff + 8 > size) {
                 return false;
             }
-            int32_t chunkY = static_cast<int32_t>(DetailImg100::RdU32LE(data + cOff + 0));
-            uint32_t pSize = DetailImg100::RdU32LE(data + cOff + 4);
+            int32_t chunkY = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + cOff + 0));
+            uint32_t pSize = DetailLayeredAndHdrImg::RdU32LE(data + cOff + 4);
             if (pSize > size - (cOff + 8)) return false;
             seqOff = cOff + 8 + pSize;
 
@@ -1342,7 +1348,7 @@ inline bool DecodeOpenEXRUpgraded(const uint8_t* data, size_t size, ExtendedImag
 //    Delegates to ExrUpgrade.h (NO, RLE, ZIPS, ZIP, PIZ, PXR24, B44, B44A, DWAA, DWAB + Multi-Part v2)
 // ============================================================================
 inline bool DecodeOpenEXR(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DecodeOpenEXRUpgraded(data, size, outInfo);
+    return DecodeOpenExrPart(data, size, outInfo);
 }
 
 

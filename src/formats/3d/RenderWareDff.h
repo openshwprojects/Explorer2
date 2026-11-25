@@ -422,7 +422,9 @@ inline bool ParseRenderWareDffOrRws(const uint8_t* data, size_t size, const std:
     }
 
     if (mesh.vertices.empty() || mesh.tris.empty()) return false;
-    if (ext == L".rws" || gotWorld) {
+    if (ext == L".bsp" && gotWorld) {
+        mesh.formatName = L"RenderWare World Sector Map (.bsp)";
+    } else if (ext == L".rws" || gotWorld) {
         mesh.formatName = L"RenderWare World / Stream (.rws)";
     } else {
         mesh.formatName = L"RenderWare 3D Clump (.dff)";

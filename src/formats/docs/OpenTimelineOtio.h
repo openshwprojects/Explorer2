@@ -2,7 +2,7 @@
 // OpenTimelineOtio.h — OpenTimelineIO JSON (.otio) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // OpenTimelineIO (.otio): a JSON tree of schema objects, Timeline -> tracks (Stack) -> Track -> Clip / Gap /
 // Transition / nested Stack, with markers on any item. Walked in document order; each item is one row, indented
@@ -101,8 +101,8 @@ inline bool ParseOpenTimelineOtio(const std::vector<uint8_t>& raw, ParsedOfficeD
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseOpenTimelineOtioDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseOpenTimelineOtio(raw, out); }
+inline bool ParseOpenTimelineOtioDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseOpenTimelineOtio(raw, out); }
 
 } // namespace Formats

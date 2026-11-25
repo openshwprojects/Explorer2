@@ -26,24 +26,42 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
             bool xbBigEndian = true;
 
             if (eohBin != std::string_view::npos &&
-                (hasPsBinPrefix || sv.find("PARASOLID") != std::string_view::npos || sv.find("SCH_") != std::string_view::npos))
+                (hasPsBinPrefix || sv.find("PARASOLID") != std::string_view::npos ||
+                 sv.find("SCH_") != std::string_view::npos || sv.find("**PART") != std::string_view::npos))
             {
                 if (hasPsBinPrefix) xbBigEndian = (data[3] == 0);
                 size_t afterEoh = eohBin + 17;
                 while (afterEoh < size && data[afterEoh] == '*') ++afterEoh;
                 while (afterEoh < size && (data[afterEoh] == '\r' || data[afterEoh] == '\n' || data[afterEoh] == ' ')) ++afterEoh;
-                if (hasPsBinPrefix || (afterEoh + 4 <= size && data[afterEoh] == 'B' && data[afterEoh + 1] == 0)) {
+                bool bodyHasBinaryNul = false;
+                for (size_t k = afterEoh; k < std::min<size_t>(size, afterEoh + 64); ++k) {
+                    if (data[k] == 0) { bodyHasBinaryNul = true; break; }
+                }
+                if (hasPsBinPrefix || bodyHasBinaryNul ||
+                    (afterEoh + 4 <= size && (data[afterEoh] == 'B' || data[afterEoh] == 'L') && data[afterEoh + 1] == 0))
+                {
                     isNeutralBinaryXb = true;
-                    xbStart = (afterEoh < size && data[afterEoh] == 'B') ? (afterEoh + 2) : afterEoh;
+                    if (afterEoh + 2 <= size && (data[afterEoh] == 'B' || data[afterEoh] == 'L') && data[afterEoh + 1] == 0) {
+                        xbBigEndian = (data[afterEoh] == 'B');
+                        xbStart = afterEoh + 2;
+                    } else {
+                        if (!hasPsBinPrefix && afterEoh + 2 <= size) {
+                            // Infer endianness from first 16-bit nodeType in 1..60
+                            uint16_t beNt = DetailMeshSciCad::RdU16BE(data + afterEoh);
+                            uint16_t leNt = DetailMeshSciCad::RdU16LE(data + afterEoh);
+                            if (leNt >= 1 && leNt <= 60 && (beNt == 0 || beNt > 255)) xbBigEndian = false;
+                        }
+                        xbStart = afterEoh;
+                    }
                 }
             }
 
             if (isNeutralBinaryXb) {
-                auto rdU16 = [&](const uint8_t* p) -> uint16_t { return xbBigEndian ? Detail3D200::RdU16BE(p) : Detail3D200::RdU16LE(p); };
-                auto rdI32 = [&](const uint8_t* p) -> int32_t  { return static_cast<int32_t>(xbBigEndian ? Detail3D200::RdU32BE(p) : Detail3D200::RdU32LE(p)); };
+                auto rdU16 = [&](const uint8_t* p) -> uint16_t { return xbBigEndian ? DetailMeshSciCad::RdU16BE(p) : DetailMeshSciCad::RdU16LE(p); };
+                auto rdI32 = [&](const uint8_t* p) -> int32_t  { return static_cast<int32_t>(xbBigEndian ? DetailMeshSciCad::RdU32BE(p) : DetailMeshSciCad::RdU32LE(p)); };
                 auto rdF64 = [&](const uint8_t* p) -> double {
-                    if (!xbBigEndian) return Detail3D200::RdF64LE(p);
-                    uint64_t u = Detail3D200::RdU64BE(p);
+                    if (!xbBigEndian) return DetailMeshSciCad::RdF64LE(p);
+                    uint64_t u = DetailMeshSciCad::RdU64BE(p);
                     double d = 0.0;
                     std::memcpy(&d, &u, 8);
                     return d;
@@ -148,6 +166,15 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
                         c.majorAxis = vMul(ux, std::fabs(rdF64(data + bp + 72)));
                         bp += 80;
                         g.curves[nid] = std::move(c);
+                    } else if (nt == 32) { // ellipse: origin(24B) + normal(24B) + majorAxis(24B) + ratio(8B)
+                        if (bp + 80 > size) return false;
+                        BRepCurve c; c.kind = CurveKind::Ellipse;
+                        c.origin    = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        c.normal    = { rdF64(data + bp + 24), rdF64(data + bp + 32), rdF64(data + bp + 40) };
+                        c.majorAxis = { rdF64(data + bp + 48), rdF64(data + bp + 56), rdF64(data + bp + 64) };
+                        c.ratio     = rdF64(data + bp + 72);
+                        bp += 80;
+                        g.curves[nid] = std::move(c);
                     } else if (nt == 35) { // plane: origin(24B) + normal(24B) + uAxis(24B)
                         if (bp + 72 > size) return false;
                         BRepSurf s; s.kind = SurfKind::Plane;
@@ -170,6 +197,24 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
                         s.origin  = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
                         s.radius1 = std::fabs(rdF64(data + bp + 24));
                         bp += 32;
+                        g.surfaces[nid] = s;
+                    } else if (nt == 38) { // cone: origin(24B) + axis(24B) + radius(8B) + semiAngleSinOrRatio(8B)
+                        if (bp + 64 > size) return false;
+                        BRepSurf s; s.kind = SurfKind::CylinderCone;
+                        s.origin  = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        s.normal  = { rdF64(data + bp + 24), rdF64(data + bp + 32), rdF64(data + bp + 40) };
+                        s.radius1 = std::fabs(rdF64(data + bp + 48));
+                        s.ratio   = rdF64(data + bp + 56);
+                        bp += 64;
+                        g.surfaces[nid] = s;
+                    } else if (nt == 39) { // torus: origin(24B) + axis(24B) + majorRad(8B) + minorRad(8B)
+                        if (bp + 64 > size) return false;
+                        BRepSurf s; s.kind = SurfKind::Torus;
+                        s.origin  = { rdF64(data + bp + 0), rdF64(data + bp + 8), rdF64(data + bp + 16) };
+                        s.normal  = { rdF64(data + bp + 24), rdF64(data + bp + 32), rdF64(data + bp + 40) };
+                        s.radius1 = std::fabs(rdF64(data + bp + 48));
+                        s.radius2 = std::fabs(rdF64(data + bp + 56));
+                        bp += 64;
                         g.surfaces[nid] = s;
                     } else if (nt == 41) { // b_surface (NURBS): uDeg(u16), vDeg(u16), nU(i32), nV(i32), isRat(u8), knotsU, knotsV, poles
                         if (bp + 13 > size) return false;
@@ -289,13 +334,16 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
                 if (c == ';' || c == '#') {
                     // '#<digits>' is an entity ref; standalone '#' or ';' is a record separator
                     if (c == '#' && p + 1 < sv.size() && ((sv[p + 1] >= '0' && sv[p + 1] <= '9') || sv[p + 1] == '-')) {
-                        const char* sp = sv.data() + p + 1;
-                        char* ep = nullptr;
-                        long rv = std::strtol(sp, &ep, 10);
-                        if (ep != sp) {
+                        size_t dEnd = p + 1;
+                        if (sv[dEnd] == '-') ++dEnd;
+                        while (dEnd < sv.size() && sv[dEnd] >= '0' && sv[dEnd] <= '9') ++dEnd;
+                        int64_t rv = 0;
+                        if (dEnd > p + 1 && ReaderText::ParseInt64Sv(sv.substr(p + 1, dEnd - (p + 1)), rv) &&
+                            rv >= -2147483647LL && rv <= 2147483647LL)
+                        {
                             toks.push_back({ PkTok::Ref, {}, static_cast<int32_t>(rv), 0.0, atLineStart });
                             atLineStart = false;
-                            p = static_cast<size_t>(ep - sv.data());
+                            p = dEnd;
                             continue;
                         }
                     }
@@ -305,7 +353,7 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
                     continue;
                 }
                 // Stop at Parasolid end-of-part trailer
-                if (c == '*' && sv.substr(p, 15) == "**END_OF_PART**") break;
+                if (c == '*' && sv.substr(p).starts_with("**END_OF_PART**")) break;
 
                 // Quoted string '...' or "..."
                 if (c == '\'' || c == '"') {
@@ -318,12 +366,14 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
 
                 // Parasolid counted string T<len>:<chars>
                 if ((c == 'T' || c == 'U') && p + 2 < sv.size() && sv[p + 1] >= '0' && sv[p + 1] <= '9') {
-                    const char* sp = sv.data() + p + 1;
-                    char* ep = nullptr;
-                    long slen = std::strtol(sp, &ep, 10);
-                    if (ep != sp && ep < sv.data() + sv.size() && *ep == ':' && slen >= 0) {
-                        p = static_cast<size_t>((ep + 1) - sv.data());
-                        size_t adv = std::min<size_t>(static_cast<size_t>(slen), sv.size() - p);
+                    size_t dEnd = p + 1;
+                    while (dEnd < sv.size() && sv[dEnd] >= '0' && sv[dEnd] <= '9') ++dEnd;
+                    int64_t slen = -1;
+                    if (dEnd < sv.size() && sv[dEnd] == ':' &&
+                        ReaderText::ParseInt64Sv(sv.substr(p + 1, dEnd - (p + 1)), slen) && slen >= 0)
+                    {
+                        p = dEnd + 1;
+                        size_t adv = std::min<size_t>(static_cast<size_t>(std::min<int64_t>(slen, 10000000)), sv.size() - p);
                         p += adv;
                         atLineStart = false;
                         continue;
@@ -334,13 +384,16 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
                 if ((c == '$' || c == '@') && p + 1 < sv.size() &&
                     ((sv[p + 1] >= '0' && sv[p + 1] <= '9') || sv[p + 1] == '-'))
                 {
-                    const char* sp = sv.data() + p + 1;
-                    char* ep = nullptr;
-                    long rv = std::strtol(sp, &ep, 10);
-                    if (ep != sp) {
+                    size_t dEnd = p + 1;
+                    if (sv[dEnd] == '-') ++dEnd;
+                    while (dEnd < sv.size() && sv[dEnd] >= '0' && sv[dEnd] <= '9') ++dEnd;
+                    int64_t rv = 0;
+                    if (dEnd > p + 1 && ReaderText::ParseInt64Sv(sv.substr(p + 1, dEnd - (p + 1)), rv) &&
+                        rv >= -2147483647LL && rv <= 2147483647LL)
+                    {
                         toks.push_back({ PkTok::Ref, {}, static_cast<int32_t>(rv), 0.0, atLineStart });
                         atLineStart = false;
-                        p = static_cast<size_t>(ep - sv.data());
+                        p = dEnd;
                         continue;
                     }
                 }
@@ -373,11 +426,25 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
 
                 // Number (Int vs Real)
                 if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.') {
-                    const char* sp = sv.data() + p;
-                    char* epD = nullptr;
-                    double dv = std::strtod(sp, &epD);
-                    if (epD != sp) {
-                        std::string_view rawNum(sp, static_cast<size_t>(epD - sp));
+                    size_t nEnd = p;
+                    if (sv[nEnd] == '+' || sv[nEnd] == '-') ++nEnd;
+                    bool hasDigit = false;
+                    while (nEnd < sv.size() && sv[nEnd] >= '0' && sv[nEnd] <= '9') { ++nEnd; hasDigit = true; }
+                    if (nEnd < sv.size() && sv[nEnd] == '.') {
+                        ++nEnd;
+                        while (nEnd < sv.size() && sv[nEnd] >= '0' && sv[nEnd] <= '9') { ++nEnd; hasDigit = true; }
+                    }
+                    if (hasDigit && nEnd < sv.size() && (sv[nEnd] == 'e' || sv[nEnd] == 'E')) {
+                        size_t ePos = nEnd + 1;
+                        if (ePos < sv.size() && (sv[ePos] == '+' || sv[ePos] == '-')) ++ePos;
+                        if (ePos < sv.size() && sv[ePos] >= '0' && sv[ePos] <= '9') {
+                            nEnd = ePos;
+                            while (nEnd < sv.size() && sv[nEnd] >= '0' && sv[nEnd] <= '9') ++nEnd;
+                        }
+                    }
+                    double dv = 0.0;
+                    if (hasDigit && ReaderText::ParseDoubleSv(sv.substr(p, nEnd - p), dv)) {
+                        std::string_view rawNum = sv.substr(p, nEnd - p);
                         bool isFloat = (rawNum.find('.') != std::string_view::npos ||
                                         rawNum.find('e') != std::string_view::npos ||
                                         rawNum.find('E') != std::string_view::npos);
@@ -387,7 +454,7 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
                             toks.push_back({ PkTok::Real, std::string(rawNum), 0, std::isfinite(dv) ? dv : 0.0, atLineStart });
                         }
                         atLineStart = false;
-                        p = static_cast<size_t>(epD - sv.data());
+                        p = nEnd;
                         continue;
                     }
                 }
@@ -512,7 +579,9 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
             BRepGraph g;
             std::unordered_map<int32_t, CadXform> pkTransforms;
             for (int32_t id : pkOrder) {
-                const PkEntityRec& rc = pkMap.at(id);
+                auto pkIt = pkMap.find(id);
+                if (pkIt == pkMap.end()) continue;
+                const PkEntityRec& rc = pkIt->second;
                 const std::string& tp = rc.type;
 
                 if (tp == "point") {
@@ -670,7 +739,9 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
 
             // Second pass: topology entities (edges, fins, loops, faces, bodies)
             for (int32_t id : pkOrder) {
-                const PkEntityRec& rc = pkMap.at(id);
+                auto pkIt = pkMap.find(id);
+                if (pkIt == pkMap.end()) continue;
+                const PkEntityRec& rc = pkIt->second;
                 const std::string& tp = rc.type;
 
                 if (tp == "edge") {
@@ -751,15 +822,18 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
                     int32_t cur = kv.second.firstCoedge;
                     std::set<int32_t> seen;
                     while (cur >= 0 && seen.insert(cur).second && ring.size() < 4096) {
-                        ring.push_back(cur);
                         auto cit = g.coedges.find(cur);
                         if (cit == g.coedges.end()) break;
+                        ring.push_back(cur);
                         cur = cit->second.nextCoedge;
                         if (cur == kv.second.firstCoedge) break;
                     }
                     for (size_t i = 0; i < ring.size(); ++i) {
-                        const BRepCoedge& ce = g.coedges.at(ring[i]);
-                        const BRepCoedge& pv = g.coedges.at(ring[(i + ring.size() - 1) % ring.size()]);
+                        auto ceIt = g.coedges.find(ring[i]);
+                        auto pvIt = g.coedges.find(ring[(i + ring.size() - 1) % ring.size()]);
+                        if (ceIt == g.coedges.end() || pvIt == g.coedges.end()) continue;
+                        const BRepCoedge& ce = ceIt->second;
+                        const BRepCoedge& pv = pvIt->second;
                         if (ce.headVert >= 0 && pv.headVert >= 0 && ce.edgeId >= 0) {
                             auto eit = g.edges.find(ce.edgeId);
                             if (eit != g.edges.end() && eit->second.startVert < 0 && eit->second.endVert < 0) {
@@ -775,7 +849,7 @@ inline bool ParseParasolidXt(const uint8_t* data, size_t size, const std::wstrin
         }
 }
 
-inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstring& ext, LoadedMesh3D& mesh) {
+bool ParseCadKernelArchiveOrStream(const uint8_t* data, size_t size, const std::wstring& ext, LoadedMesh3D& mesh) {
     if (ext == L".3dxml") return ParseCatia3dxml(data, size, ext, mesh);
     if (ext == L".jt")    return ParseSiemensJt(data, size, ext, mesh);
     if (ext == L".brep")  return ParseOpenCascadeBrep(data, size, ext, mesh);

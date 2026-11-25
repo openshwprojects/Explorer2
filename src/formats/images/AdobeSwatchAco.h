@@ -1,78 +1,118 @@
 #pragma once
-// AdobeSwatchAco.h — Adobe Color Swatch (.aco) & Adobe Swatch Exchange ('ASEF') Renderer
+// AdobeSwatchAco.h — Adobe Photoshop Color Swatch (.aco v1 & v2) Renderer
+// Strictly handles .aco binary swatch tables (RGB, HSB, CMYK, CIE Lab D50, and Grayscale 0..10000).
 
 namespace Formats {
 
 inline bool DecodeAdobeSwatchAco(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    if (!data || size < 4) return false;
+    if (!data || size < 14) return false;
+    if (std::memcmp(data, "ASEF", 4) == 0) return false;
+
+    auto parseSection = [&](size_t startPos, uint16_t expectedVer, size_t& outEndPos,
+                            std::vector<DetailPalette::Rgb>& outColors,
+                            std::vector<std::wstring>& outNames) -> bool
+    {
+        if (startPos + 4 > size) return false;
+        uint16_t ver = ::Explorer2::ByteIO::RdU16BE(data + startPos);
+        uint16_t cnt = ::Explorer2::ByteIO::RdU16BE(data + startPos + 2);
+        if (ver != expectedVer || cnt == 0 || cnt > 4096) return false;
+
+        size_t pos = startPos + 4;
+        outColors.clear();
+        outNames.clear();
+        for (uint16_t i = 0; i < cnt; ++i) {
+            if (pos + 10 > size) return false;
+            uint16_t cspace = ::Explorer2::ByteIO::RdU16BE(data + pos);
+            uint16_t w0 = ::Explorer2::ByteIO::RdU16BE(data + pos + 2);
+            uint16_t w1 = ::Explorer2::ByteIO::RdU16BE(data + pos + 4);
+            uint16_t w2 = ::Explorer2::ByteIO::RdU16BE(data + pos + 6);
+            uint16_t w3 = ::Explorer2::ByteIO::RdU16BE(data + pos + 8);
+            pos += 10;
+
+            DetailPalette::Rgb rgb{ 0, 0, 0 };
+            if (cspace == 0) { // RGB: 0..65535
+                rgb.r = static_cast<uint8_t>((static_cast<uint32_t>(w0) * 255u + 32767u) / 65535u);
+                rgb.g = static_cast<uint8_t>((static_cast<uint32_t>(w1) * 255u + 32767u) / 65535u);
+                rgb.b = static_cast<uint8_t>((static_cast<uint32_t>(w2) * 255u + 32767u) / 65535u);
+            } else if (cspace == 1) { // HSB / HSV: H, S, B in 0..65535
+                rgb = DetailPalette::HsvToSrgb(w0 / 65535.0, w1 / 65535.0, w2 / 65535.0);
+            } else if (cspace == 2) { // CMYK in .aco: 65535 = 0% ink, 0 = 100% ink
+                double r01 = (w0 / 65535.0) * (w3 / 65535.0);
+                double g01 = (w1 / 65535.0) * (w3 / 65535.0);
+                double b01 = (w2 / 65535.0) * (w3 / 65535.0);
+                rgb.r = static_cast<uint8_t>(std::clamp(std::lround(r01 * 255.0), 0l, 255l));
+                rgb.g = static_cast<uint8_t>(std::clamp(std::lround(g01 * 255.0), 0l, 255l));
+                rgb.b = static_cast<uint8_t>(std::clamp(std::lround(b01 * 255.0), 0l, 255l));
+            } else if (cspace == 7) { // CIE Lab (Photoshop): L in 0..10000 (L*100), a & b signed in -12800..12700 (a*100, b*100)
+                double L = static_cast<double>(w0) / 100.0;
+                double a = static_cast<double>(static_cast<int16_t>(w1)) / 100.0;
+                double b = static_cast<double>(static_cast<int16_t>(w2)) / 100.0;
+                rgb = DetailPalette::CieLabD50ToSrgb(L, a, b);
+            } else if (cspace == 8) { // Grayscale: w0 in 0..10000 (0 = black, 10000 = white)
+                uint32_t clamped = std::min<uint32_t>(w0, 10000u);
+                uint8_t g = static_cast<uint8_t>((clamped * 255u + 5000u) / 10000u);
+                rgb = { g, g, g };
+            } else if (cspace == 9) { // Wide CMYK: 0..10000 ink (0 = 0% ink, 10000 = 100% ink)
+                double c = std::clamp(w0 / 10000.0, 0.0, 1.0);
+                double m = std::clamp(w1 / 10000.0, 0.0, 1.0);
+                double y = std::clamp(w2 / 10000.0, 0.0, 1.0);
+                double k = std::clamp(w3 / 10000.0, 0.0, 1.0);
+                rgb.r = static_cast<uint8_t>(std::clamp(std::lround((1.0 - c) * (1.0 - k) * 255.0), 0l, 255l));
+                rgb.g = static_cast<uint8_t>(std::clamp(std::lround((1.0 - m) * (1.0 - k) * 255.0), 0l, 255l));
+                rgb.b = static_cast<uint8_t>(std::clamp(std::lround((1.0 - y) * (1.0 - k) * 255.0), 0l, 255l));
+            } else {
+                // Unknown/custom color space rejected unless standard 0,1,2,7,8,9
+                return false;
+            }
+
+            if (ver == 2) {
+                if (pos + 4 > size) return false;
+                uint32_t nlen = ::Explorer2::ByteIO::RdU32BE(data + pos);
+                pos += 4;
+                if (nlen > 4096 || static_cast<uint64_t>(nlen) * 2ull > size - pos) return false;
+                if (outNames.size() < 64 && nlen > 0) {
+                    std::wstring nm = DetailPalette::ReadUtf16BeName(data + pos, nlen);
+                    if (!nm.empty()) outNames.push_back(std::move(nm));
+                }
+                pos += static_cast<size_t>(nlen) * 2u;
+            }
+
+            if (outColors.size() < 256) {
+                outColors.push_back(rgb);
+            }
+        }
+        outEndPos = pos;
+        return !outColors.empty();
+    };
+
+    uint16_t topVer = ::Explorer2::ByteIO::RdU16BE(data);
     std::vector<DetailPalette::Rgb> colors;
-    if (size >= 12 && std::memcmp(data, "ASEF", 4) == 0) {
-        // Adobe Swatch Exchange (.ase "ASEF")
-        uint32_t numBlocks = (static_cast<uint32_t>(data[8]) << 24) |
-                             (static_cast<uint32_t>(data[9]) << 16) |
-                             (static_cast<uint32_t>(data[10]) << 8) | data[11];
-        size_t pos = 12;
-        for (uint32_t b = 0; b < numBlocks && pos + 6 <= size && colors.size() < 256; ++b) {
-            uint16_t btype = static_cast<uint16_t>((data[pos] << 8) | data[pos + 1]);
-            uint32_t blen  = (static_cast<uint32_t>(data[pos + 2]) << 24) |
-                             (static_cast<uint32_t>(data[pos + 3]) << 16) |
-                             (static_cast<uint32_t>(data[pos + 4]) << 8) | data[pos + 5];
-            pos += 6;
-            if (pos + blen > size) break;
-            if (btype == 0x0001 && blen >= 18) {
-                uint16_t nameLen = static_cast<uint16_t>((data[pos] << 8) | data[pos + 1]);
-                size_t cpos = pos + 2 + static_cast<size_t>(nameLen) * 2;
-                if (cpos + 16 <= pos + blen && std::memcmp(data + cpos, "RGB ", 4) == 0) {
-                    auto rdF32BE = [&](size_t off) -> float {
-                        uint32_t u = (static_cast<uint32_t>(data[off]) << 24) |
-                                     (static_cast<uint32_t>(data[off + 1]) << 16) |
-                                     (static_cast<uint32_t>(data[off + 2]) << 8) | data[off + 3];
-                        float f = 0.0f; std::memcpy(&f, &u, 4); return f;
-                    };
-                    float rf = std::clamp(rdF32BE(cpos + 4), 0.0f, 1.0f);
-                    float gf = std::clamp(rdF32BE(cpos + 8), 0.0f, 1.0f);
-                    float bf = std::clamp(rdF32BE(cpos + 12), 0.0f, 1.0f);
-                    colors.push_back({
-                        static_cast<uint8_t>(rf * 255.0f),
-                        static_cast<uint8_t>(gf * 255.0f),
-                        static_cast<uint8_t>(bf * 255.0f)
-                    });
-                }
-            }
-            pos += blen;
+    std::vector<std::wstring> names;
+    size_t v1End = 0;
+
+    if (topVer == 1) {
+        if (!parseSection(0, 1, v1End, colors, names)) return false;
+        // Standard Photoshop .aco appends a v2 section with UTF-16BE names immediately after v1
+        std::vector<DetailPalette::Rgb> v2Colors;
+        std::vector<std::wstring> v2Names;
+        size_t v2End = 0;
+        if (v1End + 4 <= size && ::Explorer2::ByteIO::RdU16BE(data + v1End) == 2 &&
+            parseSection(v1End, 2, v2End, v2Colors, v2Names))
+        {
+            colors = std::move(v2Colors);
+            names = std::move(v2Names);
         }
+    } else if (topVer == 2) {
+        size_t v2End = 0;
+        if (!parseSection(0, 2, v2End, colors, names)) return false;
     } else {
-        // Adobe Color Swatch (.aco v1/v2 big-endian)
-        uint16_t ver = static_cast<uint16_t>((data[0] << 8) | data[1]);
-        uint16_t cnt = static_cast<uint16_t>((data[2] << 8) | data[3]);
-        if ((ver == 1 || ver == 2) && cnt > 0) {
-            size_t pos = 4;
-            for (uint16_t i = 0; i < cnt && pos + 10 <= size && colors.size() < 256; ++i) {
-                uint16_t cspace = static_cast<uint16_t>((data[pos] << 8) | data[pos + 1]);
-                uint8_t w0 = data[pos + 2], w1 = data[pos + 4], w2 = data[pos + 6];
-                if (cspace == 0) { // RGB
-                    colors.push_back({ w0, w1, w2 });
-                } else if (cspace == 2) { // CMYK
-                    uint8_t k = data[pos + 8];
-                    colors.push_back({
-                        static_cast<uint8_t>((w0 * k) / 255),
-                        static_cast<uint8_t>((w1 * k) / 255),
-                        static_cast<uint8_t>((w2 * k) / 255)
-                    });
-                } else {
-                    colors.push_back({ w0, w0, w0 });
-                }
-                pos += 10;
-                if (ver == 2 && pos + 4 <= size) {
-                    uint32_t nlen = (static_cast<uint32_t>(data[pos]) << 24) |
-                                    (static_cast<uint32_t>(data[pos + 1]) << 16) |
-                                    (static_cast<uint32_t>(data[pos + 2]) << 8) | data[pos + 3];
-                    pos += 4 + static_cast<size_t>(nlen) * 2;
-                }
-            }
-        }
+        return false;
     }
-    return DetailPalette::RenderPaletteSwatchGrid(colors, outInfo);
+
+    if (!DetailPalette::RenderPaletteSwatchGrid(colors, outInfo)) return false;
+    outInfo.formatName = L"Adobe Photoshop Swatch (.aco, " + std::to_wstring(colors.size()) + L" colors)";
+    outInfo.layerNames = std::move(names);
+    return true;
 }
 
 } // namespace Formats

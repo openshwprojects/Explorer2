@@ -1,0 +1,12 @@
+SiiNunit
+{
+accessory_engine_data : dc16_730.scania.s_2016.engine
+{
+	name: "Scania DC16 108 730 Euro 6 V8"
+	price: 29400
+	unlock: 25
+	info[]: "730 @@hp@@ (537@@kw@@)"
+	torque: 3500
+	volume: 16.4
+}
+}

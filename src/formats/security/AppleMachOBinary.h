@@ -14,18 +14,18 @@ inline bool IsValidMachOMagic(uint32_t m) {
 inline bool IsValidMachOFatArchive(const std::vector<uint8_t>& raw, uint64_t fileSize = 0) {
     if (raw.size() < 28) return false;
     fileSize = std::max<uint64_t>(fileSize, raw.size());
-    const uint32_t m = DetailSys100::RdU32BE(raw.data());
+    const uint32_t m = DetailBinarySysDoc::RdU32BE(raw.data());
     if (m != 0xCAFEBABEu && m != 0xCAFEBABFu) return false;
-    const uint32_t nArch = DetailSys100::RdU32BE(raw.data() + 4);
+    const uint32_t nArch = DetailBinarySysDoc::RdU32BE(raw.data() + 4);
     if (nArch == 0 || nArch > 32) return false;
     const size_t entSz = (m == 0xCAFEBABFu) ? 32 : 20;
     if (8 + static_cast<size_t>(nArch) * entSz > raw.size()) return false;
     for (uint32_t i = 0; i < nArch; ++i) {
         const uint8_t* ap = raw.data() + 8 + i * entSz;
-        const uint64_t off = (m == 0xCAFEBABFu) ? DetailSys100::RdU64BE(ap + 8) : DetailSys100::RdU32BE(ap + 8);
+        const uint64_t off = (m == 0xCAFEBABFu) ? DetailBinarySysDoc::RdU64BE(ap + 8) : DetailBinarySysDoc::RdU32BE(ap + 8);
         if (off > fileSize || fileSize - off < 28) return false;
         if (off > raw.size() || raw.size() - off < 28) continue;
-        const uint32_t sliceMagic = DetailSys100::RdU32LE(raw.data() + static_cast<size_t>(off));
+        const uint32_t sliceMagic = DetailBinarySysDoc::RdU32LE(raw.data() + static_cast<size_t>(off));
         if (!IsValidMachOMagic(sliceMagic)) return false;
     }
     return true;
@@ -40,7 +40,7 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
             case 0x0100000Cu: return L"ARM64 / Apple Silicon";
             case 18:          return L"PowerPC";
             case 0x01000012u: return L"PowerPC 64";
-            default:          return DetailSys100::Hex32(cpu);
+            default:          return DetailBinarySysDoc::Hex32(cpu);
         }
     };
 
@@ -69,15 +69,15 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
         std::vector<uint8_t> hdrBuf;
         const uint8_t* hdr = src.Read(baseOff, 28, hdrBuf);
         if (!hdr) return false;
-        const uint32_t magicLE = DetailSys100::RdU32LE(hdr);
+        const uint32_t magicLE = DetailBinarySysDoc::RdU32LE(hdr);
         if (!IsValidMachOMagic(magicLE)) return false;
 
         const bool is64 = (magicLE == 0xFEEDFACFu || magicLE == 0xCFFAEDFEu);
         const bool isBE = (magicLE == 0xCEFAEDFEu || magicLE == 0xCFFAEDFEu);
         const size_t machHdrSz = is64 ? 32 : 28;
         if (sliceSz < machHdrSz) return false;
-        auto ld32 = [&](const uint8_t* p) -> uint32_t { return isBE ? DetailSys100::RdU32BE(p) : DetailSys100::RdU32LE(p); };
-        auto ld64 = [&](const uint8_t* p) -> uint64_t { return isBE ? DetailSys100::RdU64BE(p) : DetailSys100::RdU64LE(p); };
+        auto ld32 = [&](const uint8_t* p) -> uint32_t { return isBE ? DetailBinarySysDoc::RdU32BE(p) : DetailBinarySysDoc::RdU32LE(p); };
+        auto ld64 = [&](const uint8_t* p) -> uint64_t { return isBE ? DetailBinarySysDoc::RdU64BE(p) : DetailBinarySysDoc::RdU64LE(p); };
         const uint32_t sizeofcmds = ld32(hdr + 20);
         if (machHdrSz + sizeofcmds > sliceSz || sizeofcmds > (16u << 20)) return false;
         std::vector<uint8_t> cmdBuf; // the header and the load commands
@@ -102,7 +102,7 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
         hdrSh.rows.push_back({ sliceLabel + L" Architecture", cpuName(cpuType) + (is64 ? L" (64-bit)" : L" (32-bit)") });
         hdrSh.rows.push_back({ sliceLabel + L" File Type", ftStr });
         hdrSh.rows.push_back({ sliceLabel + L" Load Commands", std::to_wstring(ncmds) + L" (" + std::to_wstring(sizeofcmds) + L" B)" });
-        hdrSh.rows.push_back({ sliceLabel + L" Header Flags", DetailSys100::Hex32(flags) });
+        hdrSh.rows.push_back({ sliceLabel + L" Header Flags", DetailBinarySysDoc::Hex32(flags) });
 
         size_t lp = machHdrSz;
         const size_t lEnd = machHdrSz + sizeofcmds;
@@ -129,7 +129,7 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
                     sliceLabel,
                     seg64 ? L"LC_SEGMENT_64" : L"LC_SEGMENT",
                     PathUtils::Utf8ToWide(segName),
-                    DetailSys100::Hex64(vmaddr) + L" (" + PathUtils::FormatByteSize(vmsize) + L")" + (secList.empty() ? L"" : (L" [" + secList + L"]"))
+                    DetailBinarySysDoc::Hex64(vmaddr) + L" (" + PathUtils::FormatByteSize(vmsize) + L")" + (secList.empty() ? L"" : (L" [" + secList + L"]"))
                 });
             } else if ((cmd == 0x0Cu || cmd == 0x0Du || cmd == 0x80000018u || cmd == 0x8000001Cu) && cmdSz >= 12) {
                 const uint32_t strOff = rd32(lp + 8);
@@ -144,9 +144,9 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
                 cmdSh.rows.push_back({ sliceLabel, cname, PathUtils::Utf8ToWide(dylib), L"-" });
             } else if (cmd == 0x80000028u && cmdSz >= 16) { // LC_MAIN
                 const uint64_t entryOff = rd64(lp + 8);
-                cmdSh.rows.push_back({ sliceLabel, L"LC_MAIN", L"Entry Offset", DetailSys100::Hex64(entryOff) });
+                cmdSh.rows.push_back({ sliceLabel, L"LC_MAIN", L"Entry Offset", DetailBinarySysDoc::Hex64(entryOff) });
             } else if (cmd == 0x1Bu && cmdSz >= 24) { // LC_UUID
-                cmdSh.rows.push_back({ sliceLabel, L"LC_UUID", L"Image UUID", DetailSys100::HexBytes(base + lp + 8, 16, L'-') });
+                cmdSh.rows.push_back({ sliceLabel, L"LC_UUID", L"Image UUID", DetailBinarySysDoc::HexBytes(base + lp + 8, 16, L'-') });
             } else if (cmd == 0x02u && cmdSz >= 24) { // LC_SYMTAB
                 const uint32_t symOff  = rd32(lp + 8);
                 const uint32_t nSyms   = rd32(lp + 12);
@@ -176,7 +176,7 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
                         }
                         if (sname.empty()) continue;
                         const wchar_t* kind = ((ntype & 0x0Eu) == 0u) ? L"UNDEF" : ((ntype & 0x01u) ? L"EXT" : L"LOCAL");
-                        symSh.rows.push_back({ sliceLabel, PathUtils::Utf8ToWide(sname), DetailSys100::Hex64(nval), kind });
+                        symSh.rows.push_back({ sliceLabel, PathUtils::Utf8ToWide(sname), DetailBinarySysDoc::Hex64(nval), kind });
                     }
                 }
             }
@@ -186,20 +186,20 @@ inline bool ParseAppleMachOBinary(const std::vector<uint8_t>& raw, ParsedOfficeD
     };
 
     if (IsValidMachOFatArchive(raw, out.sourceFileSize)) {
-        const uint32_t m = DetailSys100::RdU32BE(raw.data());
-        const uint32_t nArch = DetailSys100::RdU32BE(raw.data() + 4);
+        const uint32_t m = DetailBinarySysDoc::RdU32BE(raw.data());
+        const uint32_t nArch = DetailBinarySysDoc::RdU32BE(raw.data() + 4);
         const size_t entSz = (m == 0xCAFEBABFu) ? 32 : 20;
         hdrSh.rows.push_back({ L"Container", L"Universal Fat Binary (" + std::to_wstring(nArch) + L" architectures)" });
         for (uint32_t i = 0; i < nArch; ++i) {
             const uint8_t* ap = raw.data() + 8 + i * entSz;
-            const uint32_t cpu = DetailSys100::RdU32BE(ap + 0);
-            const uint64_t off = (m == 0xCAFEBABFu) ? DetailSys100::RdU64BE(ap + 8) : DetailSys100::RdU32BE(ap + 8);
-            const uint64_t sz  = (m == 0xCAFEBABFu) ? DetailSys100::RdU64BE(ap + 16): DetailSys100::RdU32BE(ap + 12);
+            const uint32_t cpu = DetailBinarySysDoc::RdU32BE(ap + 0);
+            const uint64_t off = (m == 0xCAFEBABFu) ? DetailBinarySysDoc::RdU64BE(ap + 8) : DetailBinarySysDoc::RdU32BE(ap + 8);
+            const uint64_t sz  = (m == 0xCAFEBABFu) ? DetailBinarySysDoc::RdU64BE(ap + 16): DetailBinarySysDoc::RdU32BE(ap + 12);
             if (off <= fileSize && sz <= fileSize - off) {
                 parseThinSlice(off, sz, cpuName(cpu));
             }
         }
-    } else if (raw.size() >= 28 && IsValidMachOMagic(DetailSys100::RdU32LE(raw.data()))) {
+    } else if (raw.size() >= 28 && IsValidMachOMagic(DetailBinarySysDoc::RdU32LE(raw.data()))) {
         if (!parseThinSlice(0, fileSize, L"Main")) return false;
     } else {
         return false;

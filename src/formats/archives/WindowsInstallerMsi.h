@@ -6,7 +6,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
 // ============================================================================
 // 25. Windows Installer (.msi / .msp) via Ole2Compound + Embedded MSCF CABs
@@ -101,7 +101,7 @@ inline bool ExtractOle2ArchiveEntry(
     return false;
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool InspectWindowsInstallerMsi(
     const uint8_t* data,
@@ -109,7 +109,7 @@ inline bool InspectWindowsInstallerMsi(
     const std::wstring& extLower,
     ArchiveSummaryInfo& outInfo)
 {
-    return DetailArc100::ParseOle2Archive(data, size, extLower, outInfo);
+    return DetailDiskAndGameArc::ParseOle2Archive(data, size, extLower, outInfo);
 }
 
 inline bool ExtractWindowsInstallerMsiEntry(
@@ -119,7 +119,7 @@ inline bool ExtractWindowsInstallerMsiEntry(
     const std::wstring& normTarget,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc100::ExtractOle2ArchiveEntry(data, size, extLower, normTarget, outBytes);
+    return DetailDiskAndGameArc::ExtractOle2ArchiveEntry(data, size, extLower, normTarget, outBytes);
 }
 
 } // namespace Explorer2::Formats

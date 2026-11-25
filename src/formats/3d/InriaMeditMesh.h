@@ -18,7 +18,7 @@ inline bool ParseInriaMeditMesh(const uint8_t* data, size_t size, LoadedMesh3D& 
         int dim = 3;
         std::string_view tok;
 
-        std::unordered_map<DetailVtk::SortedFaceKey, DetailVtk::BoundaryFaceRec, DetailVtk::SortedFaceKeyHash> faceMap;
+        DetailVtk::VtkFaceMap faceMap;
 
         while (DetailVtk::NextTokenVtk(cur, end, tok)) {
             if (!tok.empty() && tok[0] == '#') {
@@ -97,16 +97,7 @@ inline bool ParseInriaMeditMesh(const uint8_t* data, size_t size, LoadedMesh3D& 
             }
         }
 
-        for (const auto& kv : faceMap) {
-            const auto& f = kv.second;
-            if (f.volCount == 1 || (f.volCount == 0 && f.explicit2D)) {
-                if (f.n == 3) mesh.tris.push_back({ f.orig[0], f.orig[1], f.orig[2], {} });
-                else if (f.n == 4) {
-                    mesh.tris.push_back({ f.orig[0], f.orig[1], f.orig[2], {} });
-                    mesh.tris.push_back({ f.orig[0], f.orig[2], f.orig[3], {} });
-                }
-            }
-        }
+        FemSolidSurface::EmitBoundaryFacesDirect(faceMap, mesh);
         if (mesh.vertices.empty() || mesh.tris.empty()) return false;
         mesh.formatName = L"INRIA Medit Scientific FEM Mesh (.mesh)";
         return true;

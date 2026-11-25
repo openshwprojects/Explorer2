@@ -2437,7 +2437,7 @@ E2_DRACO_NOINLINE inline bool DecodeDracoBufferToMesh(
 }
 
 // Standalone .drc entry point
-E2_DRACO_NOINLINE inline bool ParseDracoDrcComplete(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
+E2_DRACO_NOINLINE inline bool ParseGoogleDracoMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     std::vector<Vec3f> positions;
     std::vector<std::array<uint32_t, 3>> tris;
     uint8_t encType = 0, maj = 0, minV = 0;

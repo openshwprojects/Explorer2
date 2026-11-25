@@ -8,13 +8,15 @@ inline bool ParseMusicXmlScoreDoc(const std::vector<uint8_t>& raw, const std::ws
     if (ext == L".musicxml" || ext == L".mxl") {
         std::vector<uint8_t> xmlBuf;
         std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
-        if (raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K') {
+        if ((raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K') || ext == L".mxl") {
             std::vector<ZipDeflate::ArchiveItemMeta> entries;
-            if (ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries)) {
+            bool usedFile = false;
+            if (DetailStructuredDataDoc::ListZipPackage(raw, out, entries, usedFile)) {
                 for (const auto& e : entries) {
-                    std::wstring eExt = PathUtils::GetExtension(e.pathInArchive);
+                    if (e.isDirectory) continue;
+                    std::wstring eExt = PathUtils::ToLower(PathUtils::GetExtension(e.pathInArchive));
                     if ((eExt == L".xml" || eExt == L".musicxml") && e.pathInArchive.find(L"META-INF") == std::wstring::npos) {
-                        if (ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, xmlBuf) && !xmlBuf.empty()) {
+                        if (DetailStructuredDataDoc::ExtractZipPackageEntry(raw, out, usedFile, e, xmlBuf) && !xmlBuf.empty()) {
                             sv = std::string_view(reinterpret_cast<const char*>(xmlBuf.data()), xmlBuf.size());
                             break;
                         }

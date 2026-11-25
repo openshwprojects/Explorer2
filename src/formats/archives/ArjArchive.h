@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 inline bool DecodeArjMethod4(const uint8_t* src, size_t compSize, uint64_t uncompSize, std::vector<uint8_t>& outBytes) {
     outBytes.clear();
@@ -119,10 +119,10 @@ inline bool ParseArjArchive(const uint8_t* data, size_t size, ArchiveSummaryInfo
     return false;
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectArjArchive(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseArjArchive(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseArjArchive(data, size, outInfo);
 }
 
 inline bool ExtractArjArchiveEntry(
@@ -133,7 +133,7 @@ inline bool ExtractArjArchiveEntry(
 {
     if (size >= 34 && data[0] == 0x60 && data[1] == 0xEA) {
         ArchiveSummaryInfo info;
-        if (DetailArc200::ParseArjArchive(data, size, info)) {
+        if (DetailUnixAndLegacyArc::ParseArjArchive(data, size, info)) {
             for (const auto& e : info.entries) {
                 if (!e.isDirectory && _wcsicmp(e.pathInArchive.c_str(), want.c_str()) == 0) {
                     if (e.rawDataOffset > size || e.compressedSize > size - static_cast<size_t>(e.rawDataOffset)) {
@@ -148,9 +148,9 @@ inline bool ExtractArjArchiveEntry(
                         outBytes.assign(p, p + static_cast<size_t>(e.uncompressedSize));
                         ok = true;
                     } else if (e.compressionMethod >= 1 && e.compressionMethod <= 3) {
-                        ok = DetailArc200::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 17u, 5u, outBytes);
+                        ok = DetailUnixAndLegacyArc::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 17u, 5u, outBytes);
                     } else if (e.compressionMethod == 4) {
-                        ok = DetailArc200::DecodeArjMethod4(p, cLen, e.uncompressedSize, outBytes);
+                        ok = DetailUnixAndLegacyArc::DecodeArjMethod4(p, cLen, e.uncompressedSize, outBytes);
                     }
                     if (!ok) {
                         outBytes.clear();

@@ -116,8 +116,10 @@ inline bool ParseKmlGeography(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     size_t placemarks = 0, folders = 0, vertices = 0;
     std::string docName;
 
-    auto fmt = [](double v) {
-        wchar_t buf[40];
+    auto fmt = [](double v) -> std::wstring {
+        if (!std::isfinite(v)) return L"0";
+        wchar_t buf[64] = {};
+        if (std::fabs(v) >= 1e12) { swprintf_s(buf, L"%.6g", v); return buf; }
         swprintf_s(buf, L"%.6f", v);
         std::wstring s = buf;
         while (!s.empty() && s.back() == L'0') s.pop_back();

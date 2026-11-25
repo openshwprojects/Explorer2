@@ -4,7 +4,7 @@
 
 namespace Formats {
 
-namespace DetailMfg69 {
+namespace DetailBoardFabEda {
 
 // ============================================================================
 // gEDA / PCB-rnd Layout Parser (.pcb)
@@ -59,7 +59,7 @@ inline float ParseGedaCoordMm(const std::string& tok, bool bracketHiRes) {
     char* ep = nullptr;
     double val = std::strtod(tok.c_str(), &ep);
     if (!ep || ep == tok.c_str()) return 0.0f;
-    std::string unit = DetailEda100::TrimAsciiView(std::string_view(ep));
+    std::string unit = DetailSiliconAndBusEda::TrimAsciiView(std::string_view(ep));
     for (char& c : unit) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     if (unit == "mm")  return static_cast<float>(val);
     if (unit == "cm")  return static_cast<float>(val * 10.0);
@@ -141,7 +141,7 @@ inline bool ParseGedaPcbBoard(std::string_view sv, ParsedEdaBoard& out) {
             std::string val    = eArgs[3].text;
             float mx = ParseGedaCoordMm(eArgs[4].text, hi);
             float my = -ParseGedaCoordMm(eArgs[5].text, hi);
-            bool onBottom = DetailEda100::ContainsAsciiI(flags, "onsolder");
+            bool onBottom = DetailSiliconAndBusEda::ContainsAsciiI(flags, "onsolder");
 
             float minPx = mx - 1.2f, maxPx = mx + 1.2f, minPy = my - 0.8f, maxPy = my + 0.8f;
             int pinCount = 0;
@@ -164,7 +164,7 @@ inline bool ParseGedaPcbBoard(std::string_view sv, ParsedEdaBoard& out) {
                         float thick = std::max(0.5f, ParseGedaCoordMm(pArgs[2].text, subHi));
                         float drill = std::max(0.2f, ParseGedaCoordMm(pArgs[5].text, subHi));
                         std::string pFlags = (pArgs.size() >= 9) ? pArgs[8].text : "";
-                        uint8_t sh = DetailEda100::ContainsAsciiI(pFlags, "square") ? 1 : 0;
+                        uint8_t sh = DetailSiliconAndBusEda::ContainsAsciiI(pFlags, "square") ? 1 : 0;
                         out.pads.push_back({ px, py, thick, thick, 0.0f, drill, sh, EdaLayerId::PadsThrough,
                                              PathUtils::Utf8ToWide(pArgs[7].text), PathUtils::Utf8ToWide(pArgs[6].text) });
                         minPx = std::min(minPx, px - thick * 0.5f); maxPx = std::max(maxPx, px + thick * 0.5f);
@@ -177,13 +177,13 @@ inline bool ParseGedaPcbBoard(std::string_view sv, ParsedEdaBoard& out) {
                         float y2 = my - ParseGedaCoordMm(pArgs[3].text, subHi);
                         float thick = std::max(0.25f, ParseGedaCoordMm(pArgs[4].text, subHi));
                         std::string pFlags = (pArgs.size() >= 10) ? pArgs[9].text : "";
-                        bool padBot = onBottom ^ DetailEda100::ContainsAsciiI(pFlags, "onsolder");
+                        bool padBot = onBottom ^ DetailSiliconAndBusEda::ContainsAsciiI(pFlags, "onsolder");
                         float cx = (x1 + x2) * 0.5f, cy = (y1 + y2) * 0.5f;
                         float dx = x2 - x1, dy = y2 - y1;
                         float segLen = std::hypot(dx, dy);
                         float pw = segLen + thick, ph = thick;
                         float rot = (segLen > 1e-3f) ? static_cast<float>(std::atan2(dy, dx) * (180.0 / 3.14159265358979323846)) : 0.0f;
-                        uint8_t sh = DetailEda100::ContainsAsciiI(pFlags, "square") ? 1 : 3;
+                        uint8_t sh = DetailSiliconAndBusEda::ContainsAsciiI(pFlags, "square") ? 1 : 3;
                         EdaLayerId lid = padBot ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
                         out.pads.push_back({ cx, cy, pw, ph, rot, 0.0f, sh, lid,
                                              PathUtils::Utf8ToWide(pArgs[8].text), PathUtils::Utf8ToWide(pArgs[7].text) });
@@ -234,11 +234,11 @@ inline bool ParseGedaPcbBoard(std::string_view sv, ParsedEdaBoard& out) {
             if (!collectArgs(i, hi, lArgs) || lArgs.size() < 2) continue;
             std::string lName = lArgs[1].text;
             std::string lType = (lArgs.size() >= 3) ? lArgs[2].text : "";
-            EdaLayerId lid = DetailEda100::ClassifyIpcLayerName(lName, lType);
-            if (DetailEda100::ContainsAsciiI(lName, "solder") && !DetailEda100::ContainsAsciiI(lName, "mask")) {
+            EdaLayerId lid = DetailSiliconAndBusEda::ClassifyIpcLayerName(lName, lType);
+            if (DetailSiliconAndBusEda::ContainsAsciiI(lName, "solder") && !DetailSiliconAndBusEda::ContainsAsciiI(lName, "mask")) {
                 lid = EdaLayerId::BottomCopper;
-            } else if (DetailEda100::ContainsAsciiI(lName, "component") || DetailEda100::ContainsAsciiI(lName, "top")) {
-                if (!DetailEda100::ContainsAsciiI(lName, "silk")) lid = EdaLayerId::TopCopper;
+            } else if (DetailSiliconAndBusEda::ContainsAsciiI(lName, "component") || DetailSiliconAndBusEda::ContainsAsciiI(lName, "top")) {
+                if (!DetailSiliconAndBusEda::ContainsAsciiI(lName, "silk")) lid = EdaLayerId::TopCopper;
             }
 
             if (i < toks.size() && toks[i].kind == GedaTok::LParen) {
@@ -350,11 +350,11 @@ inline bool ParseGedaPcbBoard(std::string_view sv, ParsedEdaBoard& out) {
     return true;
 }
 
-} // namespace DetailMfg69
+} // namespace DetailBoardFabEda
 
 inline bool ParseGedaPcbBoard(std::string_view sv, ParsedEdaBoard& out) {
     if (sv.size() < 12) return false;
-    return DetailMfg69::ParseGedaPcbBoard(sv, out);
+    return DetailBoardFabEda::ParseGedaPcbBoard(sv, out);
 }
 
 } // namespace Formats

@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailImg200 {
+namespace DetailVectorAndRawImg {
 
 // ============================================================================
 // 2. Sony Alpha ARW2 Delta-Compressed Raw Unpacker (Compression == 32767)
@@ -57,10 +57,10 @@ inline bool UnpackSonyArw2Sensor(
     return true;
 }
 
-} // namespace DetailImg200
+} // namespace DetailVectorAndRawImg
 
 inline bool DecodeSonyArw(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DetailImg200::ParseTiffRawIfds(data, size, L"Sony Alpha ARW RAW (.arw)", outInfo);
+    return DetailVectorAndRawImg::ParseTiffRawIfds(data, size, L"Sony Alpha ARW RAW (.arw)", outInfo);
 }
 
 } // namespace Formats

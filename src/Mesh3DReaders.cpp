@@ -1,10 +1,13 @@
 // Mesh3DReaders.cpp - the 3D model readers behind Model3DViewer: src/formats/*.h, dispatched by extension.
 // Moved out of Model3DViewer.cpp so that they build without the viewer, also on Linux (see linux/).
+// CAD B-Rep readers compile in Mesh3DReadersCadBrep.cpp and rigged/engine/VTK readers in Mesh3DReadersRiggedEngine.cpp.
 #include "Mesh3DReaders.h"
 #include "FormatSupport.h"
 #include "ReaderGuard.h"
 #include "PathUtils.h"
 #include "ZipDeflate.h"
+#include "StreamCodecs.h"
+#include "Base64.h"
 #include "Ole2Compound.h"
 #include "CharConvCompat.h"
 #include <unordered_map>
@@ -44,15 +47,15 @@ namespace Explorer2 {
 #include "formats/3d/VroidVrm.h"
 #include "formats/3d/Wrl.h"
 #include "formats/3d/X3d.h"
-#include "formats/cad/Scad.h"
+#include "formats/3d/GaussianSplat.h"
+#include "formats/3d/KelloggKsplat.h"
+#include "formats/3d/NianticSpz.h"
+#include "formats/3d/OpenVdbVolume.h"
 #include "formats/3d/Pcd.h"
 #include "formats/3d/Ply.h"
 #include "formats/3d/Vtk.h"
 #include "formats/3d/Ase3dsMax.h"
 #include "formats/3d/Xyz.h"
-#include "formats/cad/StepCad.h"
-#include "formats/cad/IgesCad.h"
-#include "formats/cad/Gcode3D.h"
 #include "formats/3d/ProteinPdb.h"
 #include "formats/3d/ChemMol.h"
 #include "formats/3d/GmshMsh.h"
@@ -62,7 +65,6 @@ namespace Explorer2 {
 #include "formats/gis/UsgsDem.h"
 #include "formats/3d/LasLidar.h"
 #include "formats/3d/MagicaVox.h"
-#include "formats/cad/IfcBim.h"
 #include "formats/3d/LightWaveLwo.h"
 #include "formats/3d/MayaAsciiMa.h"
 #include "formats/3d/MayaBinaryMb.h"
@@ -70,86 +72,27 @@ namespace Explorer2 {
 #include "formats/3d/DirectXMeshX.h"
 #include "formats/3d/MilkShapeMs3d.h"
 #include "formats/3d/InterQuakeIqm.h"
-#include "formats/3d/QuakeAliasMdl.h"
-#include "formats/3d/ValveSourceMdl.h"
 #include "formats/3d/NetImmerseNif.h"
 #include "formats/3d/Blitz3DB3d.h"
 #include "formats/3d/Ac3dMesh.h"
-#include "formats/cad/Catia3dxml.h"
-#include "formats/cad/SiemensJt.h"
-#include "formats/cad/OpenCascadeBrep.h"
-#include "formats/cad/SpatialAcisSat.h"
-#include "formats/cad/ParasolidXt.h"
 #include "formats/3d/AstmE57.h"
 #include "formats/cad/RosUrdf.h"
 #include "formats/3d/CrystallographyCif.h"
 #include "formats/3d/TriposMol2.h"
 #include "formats/3d/GromacsGro.h"
 #include "formats/3d/Fbx.h"
-#include "formats/3d/Md5Mesh.h"
-#include "formats/3d/Md5Anim.h"
-#include "formats/3d/ActorXPsk.h"
-#include "formats/3d/ActorXPsa.h"
-#include "formats/3d/MmdPmx.h"
-#include "formats/3d/MmdPmd.h"
-#include "formats/3d/MmdVmd.h"
-#include "formats/3d/Warcraft3Mdx.h"
-#include "formats/3d/Warcraft3Mdl.h"
-#include "formats/3d/WorldOfWarcraftM2.h"
-#include "formats/3d/WorldOfWarcraftWmo.h"
-#include "formats/3d/RenderWareDff.h"
-#include "formats/3d/GtaCol.h"
-#include "formats/3d/Quake3Md4.h"
-#include "formats/3d/RtcwMds.h"
-#include "formats/3d/WolfEtMdm.h"
-#include "formats/3d/WolfEtMdx.h"
-#include "formats/3d/UberToolsTan.h"
-#include "formats/3d/BioWareAuroraMdl.h"
-#include "formats/3d/GodotTextScene.h"
-#include "formats/3d/GodotBinaryRes.h"
-#include "formats/3d/UnrealStaticMesh.h"
-#include "formats/3d/Cal3DCmf.h"
-#include "formats/3d/Cal3DXmf.h"
-#include "formats/3d/Cal3DCsf.h"
-#include "formats/3d/CryEngineGeometry.h"
-#include "formats/cad/FreeCadFcstd.h"
-#include "formats/cad/SpaceClaimScdoc.h"
-#include "formats/cad/AutodeskInventor3D.h"
-#include "formats/cad/SolidEdge3D.h"
 #include "formats/3d/FoundryModoLxo.h"
 #include "formats/3d/Autodesk3dsMax.h"
 #include "formats/3d/MaxonCinema4d.h"
 #include "formats/3d/ZBrushZpr.h"
 #include "formats/3d/ZBrushZtl.h"
-#include "formats/cad/Rhino3dm.h"
-#include "formats/cad/AutoCadDwg.h"
-#include "formats/cad/AutoCadDxf3D.h"
-#include "formats/cad/SolidWorks3D.h"
-#include "formats/3d/PixarUsd.h"
-#include "formats/3d/AlembicOgawa.h"
-#include "formats/3d/VtkXmlUnstructured.h"
-#include "formats/3d/VtkXmlPolyData.h"
-#include "formats/3d/VtkXmlImageData.h"
-#include "formats/3d/VtkXmlRectilinear.h"
-#include "formats/3d/VtkXmlStructured.h"
-#include "formats/3d/ParaViewPvd.h"
-#include "formats/3d/GaussianSplat.h"
-#include "formats/3d/KelloggKsplat.h"
-#include "formats/3d/NianticSpz.h"
-#include "formats/3d/OpenVdbVolume.h"
 #include "formats/gis/SrtmHgt.h"
 #include "formats/gis/GeoTiffDem.h"
 #include "formats/gis/Shapefile3D.h"
 #include "formats/gis/GeoJson3D.h"
 #include "formats/3d/OpenCtm.h"
-#include "formats/3d/QuakeSourceBsp.h"
-#include "formats/3d/OgreMesh.h"
-#include "formats/3d/InriaMeditMesh.h"
-#include "formats/cad/LDrawCad.h"
 #include "formats/3d/QuakeMap.h"
 #include "formats/3d/ValveVmf.h"
-#include "formats/3d/C3dMocap.h"
-#include "formats/3d/NrrdVolume.h"
 
 namespace MeshReaders {
 
@@ -161,8 +104,8 @@ bool Is3DModelExtension(const std::wstring& extLower) {
            extLower == L".fbx"   || extLower == L".ase"   || extLower == L".step"  ||
            extLower == L".stp"   || extLower == L".stpz"  || extLower == L".p21"   || extLower == L".iges"  ||
            extLower == L".igs"   ||
-           extLower == L".vtk"   || extLower == L".amf"   || extLower == L".x3d"   ||
-           extLower == L".wrl"   || extLower == L".scad"  || extLower == L".pcd"   ||
+           extLower == L".vtk"   || extLower == L".amf"   || extLower == L".x3d"   || extLower == L".x3dz" ||
+           extLower == L".wrl"   || extLower == L".wrz"   || extLower == L".scad"  || extLower == L".pcd"  ||
            extLower == L".xyz"   || extLower == L".pts"   || extLower == L".gcode" ||
            extLower == L".nc"    || extLower == L".pdb"   || extLower == L".mol"   ||
            extLower == L".sdf"   || extLower == L".msh"   || extLower == L".bvh"   ||
@@ -176,7 +119,7 @@ bool Is3DModelExtension(const std::wstring& extLower) {
            extLower == L".ms3d"  || extLower == L".iqm"   || extLower == L".mdl"   ||
            extLower == L".nif"   || extLower == L".b3d"   || extLower == L".ac"    ||
            extLower == L".ctm"   || extLower == L".drc"   || extLower == L".3dxml" ||
-           extLower == L".jt"    || extLower == L".brep"  || extLower == L".sat"   ||
+           extLower == L".jt"    || extLower == L".brep"  || extLower == L".brp"   || extLower == L".sat"  ||
            extLower == L".sab"   || extLower == L".x_t"   || extLower == L".x_b"   ||
            extLower == L".e57"   || extLower == L".laz"   || extLower == L".urdf"  ||
            extLower == L".vrm"   || extLower == L".cif"   || extLower == L".mol2"  ||
@@ -201,8 +144,8 @@ bool Is3DModelExtension(const std::wstring& extLower) {
            extLower == L".spz"   || extLower == L".vdb"     || extLower == L".bsp"     ||
            extLower == L".shp"   || extLower == L".geojson" || extLower == L".geotiff" ||
            extLower == L".ldr"   || extLower == L".mpd"     || extLower == L".vmf"     ||
-           extLower == L".map"   || extLower == L".c3d"     || extLower == L".nrrd"    ||
-           extLower == L".col";
+           extLower == L".map"   || extLower == L".c3d"     || extLower == L".nrrd"    || extLower == L".nhdr" ||
+           extLower == L".col"   || IsModular3DModelExtension(extLower);
 }
 
 bool IsLikelyQuakeMapFile(const std::wstring& fullPath) {
@@ -214,7 +157,7 @@ bool IsLikelyQuakeMapFile(const std::wstring& fullPath) {
 bool IsLikely3DDxfFile(const std::wstring& fullPath) {
     std::vector<uint8_t> hdr;
     if (!PathUtils::ReadFileBytes(fullPath, 131072, hdr) || hdr.empty()) return false;
-    return Formats::IsLikely3DDxfBuffer(hdr.data(), hdr.size());
+    return CheckLikely3DDxfHeader(hdr.data(), hdr.size());
 }
 
 bool IsLikely3DGeoOrDemFile(const std::wstring& fullPath, const std::wstring& extLower) {
@@ -234,6 +177,101 @@ bool InspectMeshFile(const std::wstring& fullPath, LoadedMesh3D& outMesh) {
 }
 
 using Formats::MeshBuild3D::FinalizeMeshBoundsAndNormals;
+
+namespace {
+
+E2_DRACO_NOINLINE bool DispatchDccChemAndGeoTerrain(
+    const std::wstring& ext,
+    const uint8_t* data,
+    size_t size,
+    std::string_view sv,
+    const std::wstring& fullPath,
+    LoadedMesh3D& mesh,
+    bool& outMatched)
+{
+    outMatched = true;
+    if (ext == L".amf")  return Formats::ParseAmfMesh(data, size, mesh);
+    if (ext == L".x3d" || ext == L".x3dz") {
+        bool ok = Formats::ParseX3dMesh(data, size, mesh);
+        if (ok && ext == L".x3dz") mesh.formatName = L"Compressed Extensible 3D (.x3dz)";
+        return ok;
+    }
+    if (ext == L".wrl" || ext == L".wrz") {
+        bool ok = Formats::ParseWrlMesh(data, size, mesh);
+        if (ok && ext == L".wrz") mesh.formatName = L"Compressed VRML World (.wrz)";
+        return ok;
+    }
+    if (ext == L".ase")  return Formats::ParseAseMesh(sv, mesh);
+    if (ext == L".pcd")  return Formats::ParsePcdPointCloud(data, size, mesh);
+    if (ext == L".xyz" || ext == L".pts") return Formats::ParseXyzPointCloud(sv, mesh);
+    if (ext == L".pdb") return Formats::ParseProteinPdbMesh(sv, mesh);
+    if (ext == L".mol" || ext == L".sdf") return Formats::ParseChemMolMesh(sv, mesh);
+    if (ext == L".msh") return Formats::ParseGmshMesh(data, size, mesh);
+    if (ext == L".bvh") return Formats::ParseBvhSkeletonMesh(sv, mesh);
+    if (ext == L".smd") return Formats::ParseValveSmdMesh(sv, mesh);
+    if (ext == L".ascgrid") return Formats::ParseEsriAsciiGridMesh(sv, mesh);
+    if (ext == L".dem") return Formats::ParseEsriAsciiGridMesh(sv, mesh) || Formats::ParseUsgsDemMesh(sv, mesh);
+    if (ext == L".hgt") return Formats::BspGeoDetail::ParseVoidSafeSrtmHgt(data, size, mesh);
+    if (ext == L".geotiff" || ext == L".tif" || ext == L".tiff")
+        return Formats::BspGeoDetail::ParseGeoTiffDemMesh(data, size, ext != L".geotiff", mesh);
+    if (ext == L".shp") return Formats::BspGeoDetail::ParseShapefile3DMesh(data, size, mesh);
+    if (ext == L".geojson") return Formats::BspGeoDetail::ParseGeoJson3DMesh(sv, mesh);
+    if (ext == L".ctm") return Formats::BspGeoDetail::ParseOpenCtmMesh(data, size, mesh);
+    if (ext == L".las" || ext == L".laz") {
+        bool ok = Formats::ParseLasLidarMesh(data, size, mesh);
+        if (ok && ext == L".laz" && mesh.formatName.find(L".laz") == std::wstring::npos) {
+            mesh.formatName = L"LAS / LASzip LiDAR (.laz)";
+        }
+        return ok;
+    }
+    if (ext == L".vox") return Formats::ParseMagicaVoxMesh(data, size, mesh);
+    outMatched = false;
+    return false;
+}
+
+E2_DRACO_NOINLINE bool DispatchSculptSplatsAndStudioDcc(
+    const std::wstring& ext,
+    const uint8_t* data,
+    size_t size,
+    std::string_view sv,
+    const std::wstring& fullPath,
+    LoadedMesh3D& mesh,
+    bool& outMatched)
+{
+    outMatched = true;
+    if (ext == L".lwo") return Formats::ParseLightWaveLwo(data, size, mesh);
+    if (ext == L".lxo") return Formats::ParseModoLxo(data, size, mesh);
+    if (ext == L".max") return Formats::Parse3dsMaxEnhanced(data, size, mesh);
+    if (ext == L".c4d") return Formats::ParseCinema4dEnhanced(data, size, mesh);
+    if (ext == L".zpr") return Formats::ParseZBrushZpr(data, size, mesh);
+    if (ext == L".ztl") return Formats::ParseZBrushZtl(data, size, mesh);
+    if (ext == L".drc") return Formats::ParseGoogleDracoMesh(data, size, mesh);
+    if (ext == L".splat") return Formats::ParseGaussianSplat(data, size, mesh);
+    if (ext == L".ksplat") return Formats::ParseKelloggKsplatFile(data, size, mesh);
+    if (ext == L".spz") return Formats::ParseNianticSpzFile(data, size, mesh);
+    if (ext == L".vdb") return Formats::ParseOpenVdbVolumeFile(data, size, mesh);
+    if (ext == L".vmf") return Formats::ParseValveVmfMesh(data, size, mesh);
+    if (ext == L".map") return Formats::ParseQuakeMapMesh(data, size, mesh);
+    if (ext == L".ma")  return Formats::ParseMayaAsciiMa(sv, mesh);
+    if (ext == L".mb")  return Formats::ParseMayaBinaryMb(data, size, mesh);
+    if (ext == L".lws") return Formats::ParseLightWaveSceneLws(sv, fullPath, mesh);
+    if (ext == L".x")   return Formats::ParseDirectXMeshX(data, size, mesh);
+    if (ext == L".ms3d") return Formats::ParseMilkShapeMs3d(data, size, mesh);
+    if (ext == L".iqm") return Formats::ParseInterQuakeIqm(data, size, mesh);
+    if (ext == L".nif") return Formats::ParseNetImmerseNif(data, size, mesh);
+    if (ext == L".b3d") return Formats::ParseBlitz3DB3d(data, size, ext, mesh);
+    if (ext == L".ac")  return Formats::ParseAc3dMesh(data, size, ext, mesh);
+    if (ext == L".e57") return Formats::ParseAstmE57(data, size, ext, mesh);
+    if (ext == L".urdf") return Formats::ParseRosUrdf(data, size, ext, mesh);
+    if (ext == L".vrm") return Formats::ParseVroidVrm(data, size, ext, mesh);
+    if (ext == L".cif") return Formats::ParseCrystallographyCif(data, size, ext, mesh);
+    if (ext == L".mol2") return Formats::ParseTriposMol2(data, size, ext, mesh);
+    if (ext == L".gro") return Formats::ParseGromacsGro(data, size, ext, mesh);
+    outMatched = false;
+    return false;
+}
+
+} // namespace
 
 LoadedMesh3D ParseMeshFromDisk(
     const std::wstring& fullPath,
@@ -273,7 +311,6 @@ try {
         mesh.statusMessage = L"Pusty plik (0 B)";
         return mesh;
     }
-    // Another file was selected while this one was being read: skip the parse (the result would be dropped)
     if (activeGen && activeGen->load() != generation) return mesh;
 
     if (Formats::ParseStlFile(ext, buf, fileSize, mesh, generation, activeGen)) return mesh;
@@ -340,8 +377,6 @@ try {
         unreadable.statusMessage = L"Nie udało się odczytać modelu VTK";
         return unreadable;
     }
-
-    // 11b. Autodesk FBX, binary and text (formats/Fbx.h)
     if (ext == L".fbx") {
         if (Formats::ParseFbxMesh(buf.data(), buf.size(), mesh)) {
             FinalizeMeshBoundsAndNormals(mesh);
@@ -354,256 +389,26 @@ try {
         return unreadable;
     }
 
-    // 11c. Modular 3D & Point Cloud Formats (.amf, .x3d, .wrl, .ase, .scad, .pcd, .xyz / .pts, + Extended 100)
     {
         std::string_view sv(reinterpret_cast<const char*>(buf.data()), buf.size());
-        bool parsedMod = false;
-        if (ext == L".amf")  parsedMod = Formats::ParseAmfMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".x3d")  parsedMod = Formats::ParseX3dMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".wrl")  parsedMod = Formats::ParseWrlMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".ase")  parsedMod = Formats::ParseAseMesh(sv, mesh);
-        else if (ext == L".scad") parsedMod = Formats::ParseOpenScadMesh(sv, mesh);
-        else if (ext == L".pcd")  parsedMod = Formats::ParsePcdPointCloud(buf.data(), buf.size(), mesh);
-        else if (ext == L".xyz" || ext == L".pts") parsedMod = Formats::ParseXyzPointCloud(sv, mesh);
-        else if (ext == L".step" || ext == L".stp" || ext == L".stpz" || ext == L".p21") {
-            std::vector<uint8_t> stepInf;
-            if (buf.size() >= 10 && buf[0] == 0x1Fu && buf[1] == 0x8Bu) {
-                if (ZipDeflate::InflateGzip(buf.data(), buf.size(), stepInf, 128 * 1024 * 1024) && !stepInf.empty()) {
-                    parsedMod = Formats::ParseStepCadMesh(std::string_view(reinterpret_cast<const char*>(stepInf.data()), stepInf.size()), mesh);
-                    if (parsedMod && ext == L".stpz") mesh.formatName = L"Compressed ISO 10303-21 STEP (.stpz)";
-                }
-            } else if (buf.size() >= 30 && buf[0] == 'P' && buf[1] == 'K') {
-                std::vector<ZipDeflate::ArchiveItemMeta> zEnts;
-                if (ZipDeflate::ListZipEntriesFromMemory(buf.data(), buf.size(), zEnts)) {
-                    for (const auto& ze : zEnts) {
-                        if (!ze.isDirectory && ZipDeflate::ExtractZipEntryFromMemory(buf.data(), buf.size(), ze, stepInf, 128 * 1024 * 1024) && !stepInf.empty()) {
-                            if (Formats::ParseStepCadMesh(std::string_view(reinterpret_cast<const char*>(stepInf.data()), stepInf.size()), mesh)) {
-                                parsedMod = true;
-                                mesh.formatName = L"Compressed ISO 10303-21 STEP (.stpz)";
-                                break;
-                            }
-                        }
-                    }
-                }
-            } else if (ext != L".stpz") {
-                parsedMod = Formats::ParseStepCadMesh(sv, mesh);
-            }
-        }
-        else if (ext == L".iges" || ext == L".igs") parsedMod = Formats::ParseIgesCadMesh(sv, mesh);
-        else if (ext == L".gcode" || ext == L".nc") parsedMod = Formats::ParseGcodeToolpathMesh(sv, mesh);
-        else if (ext == L".pdb") parsedMod = Formats::ParseProteinPdbMesh(sv, mesh);
-        else if (ext == L".mol" || ext == L".sdf") parsedMod = Formats::ParseChemMolMesh(sv, mesh);
-        else if (ext == L".msh") parsedMod = Formats::ParseGmshMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".bvh") parsedMod = Formats::ParseBvhSkeletonMesh(sv, mesh);
-        else if (ext == L".smd") parsedMod = Formats::ParseValveSmdMesh(sv, mesh);
-        else if (ext == L".ascgrid") parsedMod = Formats::ParseEsriAsciiGridMesh(sv, mesh);
-        else if (ext == L".dem") parsedMod = Formats::ParseEsriAsciiGridMesh(sv, mesh) || Formats::ParseUsgsDemMesh(sv, mesh);
-        else if (ext == L".hgt") parsedMod = Formats::BspGeoDetail::ParseVoidSafeSrtmHgt(buf.data(), buf.size(), mesh);
-        else if (ext == L".geotiff" || ext == L".tif" || ext == L".tiff")
-            parsedMod = Formats::BspGeoDetail::ParseGeoTiffDemMesh(buf.data(), buf.size(), ext != L".geotiff", mesh);
-        else if (ext == L".shp") parsedMod = Formats::BspGeoDetail::ParseShapefile3DMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".geojson") parsedMod = Formats::BspGeoDetail::ParseGeoJson3DMesh(sv, mesh);
-        else if (ext == L".ctm") parsedMod = Formats::BspGeoDetail::ParseOpenCtmComplete(buf.data(), buf.size(), mesh);
-        else if (ext == L".bsp") parsedMod = Formats::BspGeoDetail::ParseBspLevelMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".las" || ext == L".laz") {
-            parsedMod = Formats::ParseLasLidarMesh(buf.data(), buf.size(), mesh);
-            if (parsedMod && ext == L".laz" && mesh.formatName.find(L".laz") == std::wstring::npos) {
-                mesh.formatName = L"LAS / LASzip LiDAR (.laz)";
-            }
-        }
-        else if (ext == L".vox") parsedMod = Formats::ParseMagicaVoxMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".ifc") parsedMod = Formats::ParseIfcBimMesh(sv, mesh);
-        else if (ext == L".usd" || ext == L".usda" || ext == L".usdc" || ext == L".usdz")
-            parsedMod = Formats::ParsePixarUsdComplete(buf.data(), buf.size(), ext, fullPath, mesh);
-        else if (ext == L".abc")
-            parsedMod = Formats::ParseAlembicOgawaComplete(buf.data(), buf.size(), mesh);
-        else if (ext == L".md5mesh") parsedMod = Formats::ParseMd5Mesh(sv, mesh);
-        else if (ext == L".md5anim") parsedMod = Formats::ParseMd5Anim(sv, fullPath, mesh);
-        else if (ext == L".psk" || ext == L".pskx") parsedMod = Formats::ParseActorXPsk(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".psa") parsedMod = Formats::ParseActorXPsa(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".pmx") parsedMod = Formats::ParseMmdPmx(buf.data(), buf.size(), mesh);
-        else if (ext == L".pmd") parsedMod = Formats::ParseMmdPmd(buf.data(), buf.size(), mesh);
-        else if (ext == L".vmd") parsedMod = Formats::ParseMmdVmd(buf.data(), buf.size(), mesh);
-        else if (ext == L".m2")  parsedMod = Formats::ParseWowM2(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".wmo") parsedMod = Formats::ParseWowWmo(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".dff" || ext == L".rws")
-            parsedMod = Formats::ParseRenderWareDffOrRws(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".col")
-            parsedMod = Formats::ParseGtaCol(buf.data(), buf.size(), mesh);
-        else if (ext == L".md4" || ext == L".mdr")
-            parsedMod = Formats::ParseIdTech3Md4(buf.data(), buf.size(), mesh);
-        else if (ext == L".mds")
-            parsedMod = Formats::ParseRtcwMds(buf.data(), buf.size(), mesh);
-        else if (ext == L".mdm")
-            parsedMod = Formats::ParseWolfEtMdm(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".tan")
-            parsedMod = Formats::ParseUberToolsTan(buf.data(), buf.size(), mesh);
-        else if (ext == L".tscn" || ext == L".tres")
-            parsedMod = Formats::ParseGodotTextScene(sv, fullPath, mesh);
-        else if (ext == L".scn" || ext == L".res")
-            parsedMod = Formats::ParseGodotBinaryRes(buf.data(), buf.size(), mesh);
-        else if (ext == L".mesh" && Formats::IsLikelyGodotResourceHeader(buf.data(), buf.size()))
-            parsedMod = Formats::GodotDetail::IsLikelyGodotBinaryHeader(buf.data(), buf.size())
-                ? Formats::ParseGodotBinaryRes(buf.data(), buf.size(), mesh)
-                : Formats::ParseGodotTextScene(sv, fullPath, mesh);
-        else if (ext == L".mesh")
-            parsedMod = Formats::BspGeoDetail::ParseOgreBinaryMesh(buf.data(), buf.size(), mesh) ||
-                        Formats::BspGeoDetail::ParseInriaMeditMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".uasset" || ext == L".umap")
-            parsedMod = Formats::ParseUnrealStaticMeshPackage(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".cmf")
-            parsedMod = Formats::ParseCal3DCmf(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".xmf")
-            parsedMod = Formats::ParseCal3DXmf(sv, fullPath, mesh);
-        else if (ext == L".csf" || ext == L".xsf")
-            parsedMod = Formats::ParseCal3DCsf(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".cgf" || ext == L".chr" || ext == L".cga")
-            parsedMod = Formats::ParseCryEngineGeometry(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".fcstd")
-            parsedMod = Formats::ParseFreeCadFcstd(buf.data(), buf.size(), mesh);
-        else if (ext == L".scdoc")
-            parsedMod = Formats::ParseSpaceClaimScdoc(buf.data(), buf.size(), mesh);
-        else if (ext == L".ipt" || ext == L".iam")
-            parsedMod = Formats::ParseAutodeskInventor3D(buf.data(), buf.size(), ext, fullPath, mesh);
-        else if (ext == L".par" || ext == L".psm")
-            parsedMod = Formats::ParseSolidEdge3D(buf.data(), buf.size(), ext, fullPath, mesh);
-        else if (ext == L".skin") {
-            if (Formats::IsLikelyCryEngineContainer(buf.data(), buf.size())) {
-                parsedMod = Formats::ParseCryEngineGeometry(buf.data(), buf.size(), ext, mesh);
-            } else if (buf.size() >= 44 && std::memcmp(buf.data(), "SKIN", 4) == 0 && !fullPath.empty()) {
-                std::wstring dir = PathUtils::GetParentPath(fullPath);
-                std::wstring stem = PathUtils::GetStem(PathUtils::GetFileName(fullPath), false);
-                std::vector<uint8_t> m2Bytes;
-                std::wstring m2Path = dir + L"\\" + stem + L".m2";
-                if (!PathUtils::ReadFileBytes(m2Path, 64 * 1024 * 1024, m2Bytes) &&
-                    stem.size() > 2 && iswdigit(stem[stem.size() - 1]) && iswdigit(stem[stem.size() - 2])) {
-                    m2Path = dir + L"\\" + stem.substr(0, stem.size() - 2) + L".m2";
-                    PathUtils::ReadFileBytes(m2Path, 64 * 1024 * 1024, m2Bytes);
-                }
-                if (!m2Bytes.empty()) {
-                    parsedMod = Formats::ParseWowM2(m2Bytes.data(), m2Bytes.size(), m2Path, mesh);
-                }
-            }
-        }
-        else if (ext == L".mdx") {
-            if (buf.size() >= 4 && std::memcmp(buf.data(), "MDLX", 4) == 0)
-                parsedMod = Formats::ParseWarcraftMdx(buf.data(), buf.size(), mesh);
-            else if (buf.size() >= 4 && std::memcmp(buf.data(), "MDXW", 4) == 0)
-                parsedMod = Formats::ParseWolfEtMdx(buf.data(), buf.size(), fullPath, mesh);
-            else
-                parsedMod = Formats::ParseBioWarePairedMdx(buf.data(), buf.size(), fullPath, mesh);
-        }
-        else if (ext == L".mdl") {
-            if (buf.size() >= 4 && std::memcmp(buf.data(), "MDLX", 4) == 0)
-                parsedMod = Formats::ParseWarcraftMdx(buf.data(), buf.size(), mesh);
-            else if (Formats::BioWare3DDetail::IsLikelyBioWareBinaryMdl(buf.data(), buf.size()))
-                parsedMod = Formats::ParseBioWareBinaryMdl(buf.data(), buf.size(), fullPath, mesh);
-            else if (Formats::BioWare3DDetail::IsLikelyBioWareAsciiMdl(sv))
-                parsedMod = Formats::ParseBioWareAsciiMdl(sv, mesh);
-            else if (sv.find("FormatVersion") != std::string_view::npos && sv.find("Geoset") != std::string_view::npos)
-                parsedMod = Formats::ParseWarcraftAsciiMdl(sv, mesh);
-            else if (buf.size() >= 4 && std::memcmp(buf.data(), "IDPO", 4) == 0)
-                parsedMod = Formats::ParseQuakeAliasMdl(buf.data(), buf.size(), mesh);
-            else
-                parsedMod = Formats::ParseValveSourceMdl(buf.data(), buf.size(), mesh);
-        }
-        else if (ext == L".lwo") parsedMod = Formats::ParseLightWaveLwo(buf.data(), buf.size(), mesh);
-        else if (ext == L".lxo") parsedMod = Formats::ParseModoLxo(buf.data(), buf.size(), mesh);
-        else if (ext == L".max") parsedMod = Formats::Parse3dsMaxEnhanced(buf.data(), buf.size(), mesh);
-        else if (ext == L".c4d") parsedMod = Formats::ParseCinema4dEnhanced(buf.data(), buf.size(), mesh);
-        else if (ext == L".zpr") parsedMod = Formats::ParseZBrushZpr(buf.data(), buf.size(), mesh);
-        else if (ext == L".ztl") parsedMod = Formats::ParseZBrushZtl(buf.data(), buf.size(), mesh);
-        else if (ext == L".drc") parsedMod = Formats::ParseDracoDrcComplete(buf.data(), buf.size(), mesh);
-        else if (ext == L".3dm") parsedMod = Formats::ParseRhino3dmComplete(buf.data(), buf.size(), mesh);
-        else if (ext == L".dwg") parsedMod = Formats::ParseAutoCadDwgComplete(buf.data(), buf.size(), mesh);
-        else if (ext == L".dxf") parsedMod = Formats::ParseAutoCadDxf3DMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".sldprt" || ext == L".sldasm")
-            parsedMod = Formats::ParseSolidWorksPartOrAssembly(buf.data(), buf.size(), ext, fullPath, mesh);
-        else if (ext == L".vtu")
-            parsedMod = Formats::ParseVtkXmlUnstructured(buf.data(), buf.size(), mesh);
-        else if (ext == L".vtp")
-            parsedMod = Formats::ParseVtkXmlPolyData(buf.data(), buf.size(), mesh);
-        else if (ext == L".vti")
-            parsedMod = Formats::ParseVtkXmlImageData(buf.data(), buf.size(), mesh);
-        else if (ext == L".vtr")
-            parsedMod = Formats::ParseVtkXmlRectilinear(buf.data(), buf.size(), mesh);
-        else if (ext == L".vts")
-            parsedMod = Formats::ParseVtkXmlStructured(buf.data(), buf.size(), mesh);
-        else if (ext == L".pvd")
-            parsedMod = Formats::ParseParaViewPvd(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".splat")
-            parsedMod = Formats::ParseGaussianSplat(buf.data(), buf.size(), mesh);
-        else if (ext == L".ksplat")
-            parsedMod = Formats::ParseKelloggKsplatFile(buf.data(), buf.size(), mesh);
-        else if (ext == L".spz")
-            parsedMod = Formats::ParseNianticSpzFile(buf.data(), buf.size(), mesh);
-        else if (ext == L".vdb")
-            parsedMod = Formats::ParseOpenVdbVolumeFile(buf.data(), buf.size(), mesh);
-        else if (ext == L".ldr" || ext == L".mpd")
-            parsedMod = Formats::ParseLDrawMesh(buf.data(), buf.size(), fullPath, ext, mesh);
-        else if (ext == L".vmf")
-            parsedMod = Formats::ParseValveVmfMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".map")
-            parsedMod = Formats::ParseQuakeMapMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".c3d")
-            parsedMod = Formats::ParseC3dMocapMesh(buf.data(), buf.size(), mesh);
-        else if (ext == L".nrrd")
-            parsedMod = Formats::ParseNrrdVolumeMesh(buf.data(), buf.size(), fullPath, mesh);
-        else if (ext == L".ma")
-            parsedMod = Formats::ParseMayaAsciiMa(sv, mesh);
-        else if (ext == L".mb")
-            parsedMod = Formats::ParseMayaBinaryMb(buf.data(), buf.size(), mesh);
-        else if (ext == L".lws")
-            parsedMod = Formats::ParseLightWaveSceneLws(sv, fullPath, mesh);
-        else if (ext == L".x")
-            parsedMod = Formats::ParseDirectXMeshX(buf.data(), buf.size(), mesh);
-        else if (ext == L".ms3d")
-            parsedMod = Formats::ParseMilkShapeMs3d(buf.data(), buf.size(), mesh);
-        else if (ext == L".iqm")
-            parsedMod = Formats::ParseInterQuakeIqm(buf.data(), buf.size(), mesh);
-        else if (ext == L".nif")
-            parsedMod = Formats::ParseNetImmerseNif(buf.data(), buf.size(), mesh);
-        else if (ext == L".b3d")
-            parsedMod = Formats::ParseBlitz3DB3d(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".ac")
-            parsedMod = Formats::ParseAc3dMesh(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".3dxml")
-            parsedMod = Formats::ParseCatia3dxml(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".jt")
-            parsedMod = Formats::ParseSiemensJt(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".brep")
-            parsedMod = Formats::ParseOpenCascadeBrep(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".sat" || ext == L".sab")
-            parsedMod = Formats::ParseSpatialAcisSat(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".x_t" || ext == L".x_b")
-            parsedMod = Formats::ParseParasolidXt(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".e57")
-            parsedMod = Formats::ParseAstmE57(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".urdf")
-            parsedMod = Formats::ParseRosUrdf(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".vrm")
-            parsedMod = Formats::ParseVroidVrm(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".cif")
-            parsedMod = Formats::ParseCrystallographyCif(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".mol2")
-            parsedMod = Formats::ParseTriposMol2(buf.data(), buf.size(), ext, mesh);
-        else if (ext == L".gro")
-            parsedMod = Formats::ParseGromacsGro(buf.data(), buf.size(), ext, mesh);
+        bool matched = false;
+        bool parsedMod = DispatchDccChemAndGeoTerrain(ext, buf.data(), buf.size(), sv, fullPath, mesh, matched);
+        if (!matched) parsedMod = DispatchSculptSplatsAndStudioDcc(ext, buf.data(), buf.size(), sv, fullPath, mesh, matched);
+        if (!matched) parsedMod = DispatchMeshCadAndBrep(ext, buf.data(), buf.size(), sv, fullPath, mesh, matched);
+        if (!matched) parsedMod = DispatchMeshRiggedAndEngine(ext, buf.data(), buf.size(), sv, fullPath, mesh, matched);
+        if (!matched) parsedMod = TryParseModularMesh(ext, buf.data(), buf.size(), fullPath, mesh);
         if (parsedMod) {
             FinalizeMeshBoundsAndNormals(mesh);
             if (mesh.loadedOk) return mesh;
         }
     }
 
-    // 12. No reader could read the file. Nothing is shown in its place (this used to be a made-up crystal
-    // shape, which looked like the model): the view says that the file could not be read.
     LoadedMesh3D unreadable;
     unreadable.filePath = fullPath;
     std::wstring extUp = (ext.size() > 1) ? ext.substr(1) : ext;
     for (wchar_t& ch : extUp) ch = static_cast<wchar_t>(towupper(ch));
     unreadable.formatName = extUp.empty() ? std::wstring(L"3D") : extUp;
     unreadable.statusMessage = L"Nie udało się odczytać modelu 3D z tego pliku";
-    // A scene (.lws) whose objects could not be found says which files are missing, instead of the generic line
     if (ext == L".lws" && !mesh.statusMessage.empty()) unreadable.statusMessage = mesh.statusMessage;
     return unreadable;
 } E2_READER_CATCH(L"3D model reader", fullPath, { LoadedMesh3D unreadable; unreadable.filePath = fullPath; return unreadable; })

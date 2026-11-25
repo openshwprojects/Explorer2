@@ -2,6 +2,7 @@
 // NeroNrg.h — Nero Burning ROM NER5 / NERO optical disc image reader (.nrg).
 
 #include "../common/ArchiveFormatCommon.h"
+#include "../common/VirtualDiskCommon.h"
 #include "UdfImage.h"
 
 namespace Explorer2::Formats {
@@ -11,7 +12,7 @@ namespace DetailUdfNrg {
 inline bool BuildNeroNrgReader(
     const uint8_t* data,
     size_t size,
-    DetailArc100::VirtualDiskReader& outReader)
+    DetailDiskAndGameArc::VirtualDiskReader& outReader)
 {
     if (!data || size < 64u) return false;
 
@@ -179,7 +180,7 @@ inline bool ParseOrExtractNeroNrg(
     std::vector<uint8_t>* outExtracted)
 {
     // 1. Nero Burning ROM Optical Image (.nrg — NER5 / NERO trailer)
-    DetailArc100::VirtualDiskReader nrgReader;
+    DetailDiskAndGameArc::VirtualDiskReader nrgReader;
     if (DetailUdfNrg::BuildNeroNrgReader(data, size, nrgReader)) {
         if (DetailUdfNrg::ParseOrExtractUdfOnReader(nrgReader, 0, L"", outInfo, extractTargetNorm, outExtracted)) {
             if (outInfo) outInfo->formatName = L"Nero Optical Image (.nrg / " + outInfo->formatName + L")";
@@ -187,7 +188,7 @@ inline bool ParseOrExtractNeroNrg(
         }
         ArchiveSummaryInfo isoInfo;
         ArchiveSummaryInfo& targetInfo = outInfo ? *outInfo : isoInfo;
-        if (DetailArc100::InspectOrExtractIsoOnReader(nrgReader, 0, L"", targetInfo, extractTargetNorm, outExtracted)) {
+        if (DetailDiskAndGameArc::InspectOrExtractIsoOnReader(nrgReader, 0, L"", targetInfo, extractTargetNorm, outExtracted)) {
             if (outInfo) {
                 outInfo->formatName = L"Nero Optical Image (.nrg / ISO 9660)";
                 outInfo->valid = true;

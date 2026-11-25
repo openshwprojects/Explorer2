@@ -214,19 +214,10 @@ inline const wchar_t* DuckTypeName(const DuckColDef& c) {
 }
 
 inline std::wstring FormatDuckDateDays(int32_t z) {
-    // Howard Hinnant civil_from_days (days since 1970-01-01)
-    int64_t zz = static_cast<int64_t>(z) + 719468LL;
-    const int64_t era = (zz >= 0 ? zz : zz - 146096LL) / 146097LL;
-    const uint32_t doe = static_cast<uint32_t>(zz - era * 146097LL);
-    const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
-    int64_t y = static_cast<int64_t>(yoe) + era * 400LL;
-    const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
-    const uint32_t mp = (5u * doy + 2u) / 153u;
-    const uint32_t d = doy - (153u * mp + 2u) / 5u + 1u;
-    const uint32_t m = mp < 10u ? (mp + 3u) : (mp - 9u);
-    y += (m <= 2u) ? 1 : 0;
+    int y = 1970, m = 1, d = 1;
+    ::Explorer2::ReaderText::CivilFromDays1970(static_cast<int64_t>(z), y, m, d);
     wchar_t buf[32] = {};
-    swprintf_s(buf, L"%04lld-%02u-%02u", static_cast<long long>(y), m, d);
+    swprintf_s(buf, L"%04d-%02d-%02d", y, m, d);
     return buf;
 }
 

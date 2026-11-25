@@ -302,16 +302,7 @@ inline bool DecodeOrcIntRle(const std::vector<uint8_t>& stream, size_t wantCount
 }
 
 inline void CivilFromDays(int64_t z, int& y, int& m, int& d) {
-    z += 719468LL;
-    const int64_t era = (z >= 0 ? z : z - 146096LL) / 146097LL;
-    const uint32_t doe = static_cast<uint32_t>(z - era * 146097LL);
-    const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
-    const int64_t yr = static_cast<int64_t>(yoe) + era * 400LL;
-    const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
-    const uint32_t mp = (5u * doy + 2u) / 153u;
-    d = static_cast<int>(doy - (153u * mp + 2u) / 5u + 1u);
-    m = static_cast<int>((mp < 10u) ? (mp + 3u) : (mp - 9u));
-    y = static_cast<int>(yr + (m <= 2 ? 1 : 0));
+    ::Explorer2::ReaderText::CivilFromDays1970(z, y, m, d);
 }
 
 inline std::wstring FormatOrcDate(int64_t daysSince1970) {

@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailImg200 {
+namespace DetailVectorAndRawImg {
 
 // ============================================================================
 // 7. Olympus ORF 12/14-bit Adaptive Golomb-Rice Lossless Sensor Unpacker
@@ -127,10 +127,10 @@ inline bool UnpackOlympusOrfSensor(
     return true;
 }
 
-} // namespace DetailImg200
+} // namespace DetailVectorAndRawImg
 
 inline bool DecodeOlympusOrf(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DetailImg200::ParseTiffRawIfds(data, size, L"Olympus ORF RAW (.orf)", outInfo);
+    return DetailVectorAndRawImg::ParseTiffRawIfds(data, size, L"Olympus ORF RAW (.orf)", outInfo);
 }
 
 } // namespace Formats

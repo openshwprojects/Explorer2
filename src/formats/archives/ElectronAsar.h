@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
 // ============================================================================
 // 36. Electron App Archive (.asar — Chromium Pickle + Recursive JSON Virtual FS)
@@ -171,7 +171,7 @@ inline bool ParseElectronAsar(const uint8_t* data, size_t size, ArchiveSummaryIn
     return ParseOrExtractElectronAsar(data, size, diskPath, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool InspectElectronAsar(
     const uint8_t* data,
@@ -179,7 +179,7 @@ inline bool InspectElectronAsar(
     ArchiveSummaryInfo& outInfo,
     const std::wstring* diskPath = nullptr)
 {
-    return DetailArc100::ParseElectronAsar(data, size, outInfo, diskPath);
+    return DetailDiskAndGameArc::ParseElectronAsar(data, size, outInfo, diskPath);
 }
 
 inline bool ExtractElectronAsarEntry(
@@ -189,7 +189,7 @@ inline bool ExtractElectronAsarEntry(
     const std::wstring& normTarget,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc100::ParseOrExtractElectronAsar(data, size, &archivePath, nullptr, &normTarget, &outBytes);
+    return DetailDiskAndGameArc::ParseOrExtractElectronAsar(data, size, &archivePath, nullptr, &normTarget, &outBytes);
 }
 
 } // namespace Explorer2::Formats

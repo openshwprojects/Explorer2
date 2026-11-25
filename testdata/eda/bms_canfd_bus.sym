@@ -1,0 +1,20 @@
+FormatVersion=6.0 // Do not edit this line!
+Title="BMS_CANFD_Telemetry"
+
+{SENDRECEIVE}
+
+[BMS_PackStatus]
+ID=18FF50E5h
+Type=CANFD
+Len=8
+CycleTime=20
+Var=PackVoltage unsigned 0,16 -u:V -f:0.1
+Var=PackCurrent signed 16,16 -u:A -f:0.1
+Var=StateOfCharge unsigned 32,8 -u:% -f:0.5
+Var=ContactorClosed bit 40,1
+
+[BMS_CellLimits]
+ID=18FF51E5h
+Len=8
+Var=MaxCellMv unsigned 0,16 -u:mV
+Var=MinCellMv unsigned 16,16 -u:mV

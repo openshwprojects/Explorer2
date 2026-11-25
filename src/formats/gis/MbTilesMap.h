@@ -170,14 +170,12 @@ inline bool ParseMbTilesMapDoc(const std::vector<uint8_t>& raw, const std::wstri
             hasCenter = true;
         }
 
-        uint16_t pageSzRaw = DetailDocs200::RdU16BE(raw.data() + 16);
+        uint16_t pageSzRaw = DetailStructuredDataDoc::RdU16BE(raw.data() + 16);
         uint32_t pageSz = (pageSzRaw == 1) ? 65536u : pageSzRaw;
-        uint32_t pageCnt = DetailDocs200::RdU32BE(raw.data() + 28);
+        uint32_t pageCnt = DetailStructuredDataDoc::RdU32BE(raw.data() + 28);
 
         auto fmtCoord = [](double c) {
-            wchar_t b[32] = {};
-            swprintf_s(b, L"%.6f", c);
-            return std::wstring(b);
+            return GeoSciDetail::FmtCoord(c);
         };
 
         out.kind = OfficeFileKind::SqliteDb;

@@ -1,0 +1,31 @@
+** Abaqus / CalculiX Cantilever Beam Assembly
+*HEADING
+Cantilever Beam with Tip Cap
+*PART, NAME=BEAM_PART
+*NODE
+1, 0.0, 0.0, 0.0
+2, 2.0, 0.0, 0.0
+3, 2.0, 1.0, 0.0
+4, 0.0, 1.0, 0.0
+5, 0.0, 0.0, 1.0
+6, 2.0, 0.0, 1.0
+7, 2.0, 1.0, 1.0
+8, 0.0, 1.0, 1.0
+9, 4.0, 0.0, 0.0
+10, 4.0, 1.0, 0.0
+11, 4.0, 0.0, 1.0
+12, 4.0, 1.0, 1.0
+13, 5.0, 0.5, 0.5
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+2, 2, 9, 10, 3, 6, 11, 12, 7
+*ELEMENT, TYPE=C3D4, ELSET=ETIP
+3, 9, 10, 12, 13
+4, 9, 12, 11, 13
+*END PART
+*ASSEMBLY, NAME=ASSY1
+*INSTANCE, NAME=BEAM-1, PART=BEAM_PART
+1.0, 0.5, 0.0
+0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 15.0
+*END INSTANCE
+*END ASSEMBLY

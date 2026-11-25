@@ -326,57 +326,102 @@ inline bool ReadCellArrayVtk(
     return true;
 }
 
-struct SortedFaceKey {
-    uint32_t v[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
-    uint8_t n = 0;
-    bool operator==(const SortedFaceKey& o) const noexcept {
-        return n == o.n && v[0] == o.v[0] && v[1] == o.v[1] && v[2] == o.v[2] && v[3] == o.v[3];
-    }
-};
+using VtkFaceMap = FemSolidSurface::FaceMap;
 
-struct SortedFaceKeyHash {
-    size_t operator()(const SortedFaceKey& k) const noexcept {
-        uint64_t h = 1469598103934665603ULL;
-        for (uint8_t i = 0; i < k.n; ++i) {
-            h ^= static_cast<uint64_t>(k.v[i]);
-            h *= 1099511628211ULL;
+inline void RecordFace3DVtk(VtkFaceMap& map, const uint32_t* verts, uint8_t n, bool isVolumetric) {
+    FemSolidSurface::RecordFace(map, verts, n, isVolumetric);
+}
+
+// Records standard VTK 3D solid cells (Tetra/Voxel/Hex/Wedge/Pyramid) and 2D surface cells (Tri/Pixel/Quad).
+// Returns true if cellType was handled here, false if caller should handle Polygon/Strip/Line/Vertex.
+inline bool RecordVtkVolOrSurfaceCell(VtkFaceMap& faceMap, int64_t ct, const uint32_t* cv, size_t n) {
+    switch (ct) {
+    case 10: // VTK_TETRA
+    case 24: // VTK_QUADRATIC_TETRA
+        if (n >= 4) {
+            const uint32_t f0[3] = { cv[0], cv[2], cv[1] };
+            const uint32_t f1[3] = { cv[0], cv[1], cv[3] };
+            const uint32_t f2[3] = { cv[1], cv[2], cv[3] };
+            const uint32_t f3[3] = { cv[2], cv[0], cv[3] };
+            RecordFace3DVtk(faceMap, f0, 3, true);
+            RecordFace3DVtk(faceMap, f1, 3, true);
+            RecordFace3DVtk(faceMap, f2, 3, true);
+            RecordFace3DVtk(faceMap, f3, 3, true);
         }
-        return static_cast<size_t>(h ^ (h >> 32));
-    }
-};
-
-struct BoundaryFaceRec {
-    uint32_t orig[4] = {};
-    uint8_t n = 0;
-    uint32_t volCount = 0;
-    bool explicit2D = false;
-};
-
-inline void RecordFace3DVtk(
-    std::unordered_map<SortedFaceKey, BoundaryFaceRec, SortedFaceKeyHash>& map,
-    const uint32_t* verts, uint8_t n, bool isVolumetric)
-{
-    SortedFaceKey key;
-    key.n = n;
-    for (uint8_t i = 0; i < n; ++i) key.v[i] = verts[i];
-    std::sort(key.v, key.v + n);
-    // Ignore degenerate faces with duplicate corner indices
-    for (uint8_t i = 1; i < n; ++i) {
-        if (key.v[i] == key.v[i - 1]) return;
-    }
-
-    auto [it, inserted] = map.try_emplace(key);
-    if (inserted) {
-        it->second.n = n;
-        for (uint8_t i = 0; i < n; ++i) it->second.orig[i] = verts[i];
-    }
-    if (isVolumetric) {
-        ++it->second.volCount;
-    } else {
-        it->second.explicit2D = true;
-        if (it->second.volCount == 0) {
-            for (uint8_t i = 0; i < n; ++i) it->second.orig[i] = verts[i];
+        return true;
+    case 11: // VTK_VOXEL (convert Z-order 0,1,3,2,4,5,7,6 -> hex order)
+    case 12: // VTK_HEXAHEDRON
+    case 25: // VTK_QUADRATIC_HEXAHEDRON
+    case 29: // VTK_TRIQUADRATIC_HEXAHEDRON
+        if (n >= 8) {
+            uint32_t h[8];
+            if (ct == 11) {
+                h[0] = cv[0]; h[1] = cv[1]; h[2] = cv[3]; h[3] = cv[2];
+                h[4] = cv[4]; h[5] = cv[5]; h[6] = cv[7]; h[7] = cv[6];
+            } else {
+                for (int k = 0; k < 8; ++k) h[k] = cv[k];
+            }
+            const uint32_t q0[4] = { h[0], h[3], h[2], h[1] };
+            const uint32_t q1[4] = { h[4], h[5], h[6], h[7] };
+            const uint32_t q2[4] = { h[0], h[1], h[5], h[4] };
+            const uint32_t q3[4] = { h[1], h[2], h[6], h[5] };
+            const uint32_t q4[4] = { h[2], h[3], h[7], h[6] };
+            const uint32_t q5[4] = { h[3], h[0], h[4], h[7] };
+            RecordFace3DVtk(faceMap, q0, 4, true);
+            RecordFace3DVtk(faceMap, q1, 4, true);
+            RecordFace3DVtk(faceMap, q2, 4, true);
+            RecordFace3DVtk(faceMap, q3, 4, true);
+            RecordFace3DVtk(faceMap, q4, 4, true);
+            RecordFace3DVtk(faceMap, q5, 4, true);
         }
+        return true;
+    case 13: // VTK_WEDGE
+    case 26: // VTK_QUADRATIC_WEDGE
+        if (n >= 6) {
+            const uint32_t t0[3] = { cv[0], cv[1], cv[2] };
+            const uint32_t t1[3] = { cv[3], cv[5], cv[4] };
+            const uint32_t q0[4] = { cv[0], cv[3], cv[4], cv[1] };
+            const uint32_t q1[4] = { cv[1], cv[4], cv[5], cv[2] };
+            const uint32_t q2[4] = { cv[2], cv[5], cv[3], cv[0] };
+            RecordFace3DVtk(faceMap, t0, 3, true);
+            RecordFace3DVtk(faceMap, t1, 3, true);
+            RecordFace3DVtk(faceMap, q0, 4, true);
+            RecordFace3DVtk(faceMap, q1, 4, true);
+            RecordFace3DVtk(faceMap, q2, 4, true);
+        }
+        return true;
+    case 14: // VTK_PYRAMID
+    case 27: // VTK_QUADRATIC_PYRAMID
+        if (n >= 5) {
+            const uint32_t q0[4] = { cv[0], cv[3], cv[2], cv[1] };
+            const uint32_t t0[3] = { cv[0], cv[1], cv[4] };
+            const uint32_t t1[3] = { cv[1], cv[2], cv[4] };
+            const uint32_t t2[3] = { cv[2], cv[3], cv[4] };
+            const uint32_t t3[3] = { cv[3], cv[0], cv[4] };
+            RecordFace3DVtk(faceMap, q0, 4, true);
+            RecordFace3DVtk(faceMap, t0, 3, true);
+            RecordFace3DVtk(faceMap, t1, 3, true);
+            RecordFace3DVtk(faceMap, t2, 3, true);
+            RecordFace3DVtk(faceMap, t3, 3, true);
+        }
+        return true;
+    case 5:  // VTK_TRIANGLE
+    case 22: // VTK_QUADRATIC_TRIANGLE
+        if (n >= 3) RecordFace3DVtk(faceMap, cv, 3, false);
+        return true;
+    case 8:  // VTK_PIXEL (0,1,3,2)
+        if (n >= 4) {
+            const uint32_t q[4] = { cv[0], cv[1], cv[3], cv[2] };
+            RecordFace3DVtk(faceMap, q, 4, false);
+        }
+        return true;
+    case 9:  // VTK_QUAD
+    case 23: // VTK_QUADRATIC_QUAD
+    case 28: // VTK_BIQUADRATIC_QUAD
+        if (n >= 4) RecordFace3DVtk(faceMap, cv, 4, false);
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -466,6 +511,144 @@ inline void EmitStructuredBoundaryVtk(LoadedMesh3D& mesh, size_t nx, size_t ny, 
     }
 }
 
+inline double EvalRectilinearCoordVtk(const std::vector<double>& arr, size_t n, double g) {
+    if (n == 0 || arr.empty()) return g;
+    if (n == 1) return arr[0];
+    if (g <= 0.0) return arr[0] + g * (arr[1] - arr[0]);
+    if (g >= static_cast<double>(n - 1)) {
+        return arr[n - 1] + (g - static_cast<double>(n - 1)) * (arr[n - 1] - arr[n - 2]);
+    }
+    size_t i0 = static_cast<size_t>(std::floor(g));
+    if (i0 + 1 >= n) return arr[n - 1];
+    double f = g - static_cast<double>(i0);
+    return arr[i0] * (1.0 - f) + arr[i0 + 1] * f;
+}
+
+// Extracts 3D exposed active-voxel iso-surface from POINT_DATA or CELL_DATA scalars when non-constant.
+template <typename GridPtFn>
+inline bool TryEmitScalarVolumeIsoSurface(
+    LoadedMesh3D& mesh,
+    size_t nx, size_t ny, size_t nz,
+    const std::vector<double>& pointScalars,
+    const std::vector<double>& cellScalars,
+    GridPtFn&& gridPt)
+{
+    if (nx < 2 || ny < 2 || nz < 2) return false;
+    const uint64_t totalPts = static_cast<uint64_t>(nx) * ny * nz;
+    if (totalPts > 16000000ULL) return false;
+
+    auto emitQuad = [&](Vec3f a, Vec3f b, Vec3f c, Vec3f d) {
+        uint32_t vb = static_cast<uint32_t>(mesh.vertices.size());
+        mesh.vertices.push_back(a);
+        mesh.vertices.push_back(b);
+        mesh.vertices.push_back(c);
+        mesh.vertices.push_back(d);
+        mesh.tris.push_back({ vb + 0, vb + 1, vb + 2, {} });
+        mesh.tris.push_back({ vb + 0, vb + 2, vb + 3, {} });
+    };
+
+    const size_t nPts = static_cast<size_t>(totalPts);
+    if (pointScalars.size() >= nPts) {
+        double mn = 1e300, mx = -1e300;
+        for (size_t i = 0; i < nPts; ++i) {
+            if (std::isfinite(pointScalars[i])) {
+                mn = std::min(mn, pointScalars[i]);
+                mx = std::max(mx, pointScalars[i]);
+            }
+        }
+        if (mx > mn + 1e-6) {
+            const double iso = 0.5 * (mn + mx);
+            const size_t stepX = std::max<size_t>(1, (nx + 127) / 128);
+            const size_t stepY = std::max<size_t>(1, (ny + 127) / 128);
+            const size_t stepZ = std::max<size_t>(1, (nz + 127) / 128);
+            const int sxN = static_cast<int>((nx + stepX - 1) / stepX);
+            const int syN = static_cast<int>((ny + stepY - 1) / stepY);
+            const int szN = static_cast<int>((nz + stepZ - 1) / stepZ);
+            auto voxOn = [&](int ix, int iy, int iz) -> bool {
+                if (ix < 0 || iy < 0 || iz < 0 || ix >= sxN || iy >= syN || iz >= szN) return false;
+                size_t rx = std::min(static_cast<size_t>(ix) * stepX, nx - 1);
+                size_t ry = std::min(static_cast<size_t>(iy) * stepY, ny - 1);
+                size_t rz = std::min(static_cast<size_t>(iz) * stepZ, nz - 1);
+                double v = pointScalars[(rz * ny + ry) * nx + rx];
+                return std::isfinite(v) && v >= iso;
+            };
+            size_t trisBefore = mesh.tris.size();
+            for (int iz = 0; iz < szN; ++iz) {
+                for (int iy = 0; iy < syN; ++iy) {
+                    for (int ix = 0; ix < sxN; ++ix) {
+                        if (!voxOn(ix, iy, iz)) continue;
+                        double x0 = (static_cast<double>(ix) - 0.5) * static_cast<double>(stepX);
+                        double x1 = (static_cast<double>(ix) + 0.5) * static_cast<double>(stepX);
+                        double y0 = (static_cast<double>(iy) - 0.5) * static_cast<double>(stepY);
+                        double y1 = (static_cast<double>(iy) + 0.5) * static_cast<double>(stepY);
+                        double z0 = (static_cast<double>(iz) - 0.5) * static_cast<double>(stepZ);
+                        double z1 = (static_cast<double>(iz) + 0.5) * static_cast<double>(stepZ);
+                        if (!voxOn(ix - 1, iy, iz)) emitQuad(gridPt(x0, y0, z0), gridPt(x0, y0, z1), gridPt(x0, y1, z1), gridPt(x0, y1, z0));
+                        if (!voxOn(ix + 1, iy, iz)) emitQuad(gridPt(x1, y0, z0), gridPt(x1, y1, z0), gridPt(x1, y1, z1), gridPt(x1, y0, z1));
+                        if (!voxOn(ix, iy - 1, iz)) emitQuad(gridPt(x0, y0, z0), gridPt(x1, y0, z0), gridPt(x1, y0, z1), gridPt(x0, y0, z1));
+                        if (!voxOn(ix, iy + 1, iz)) emitQuad(gridPt(x0, y1, z0), gridPt(x0, y1, z1), gridPt(x1, y1, z1), gridPt(x1, y1, z0));
+                        if (!voxOn(ix, iy, iz - 1)) emitQuad(gridPt(x0, y0, z0), gridPt(x0, y1, z0), gridPt(x1, y1, z0), gridPt(x1, y0, z0));
+                        if (!voxOn(ix, iy, iz + 1)) emitQuad(gridPt(x0, y0, z1), gridPt(x1, y0, z1), gridPt(x1, y1, z1), gridPt(x0, y1, z1));
+                    }
+                }
+            }
+            if (mesh.tris.size() > trisBefore) return true;
+        }
+    }
+
+    const size_t cxN = nx - 1, cyN = ny - 1, czN = nz - 1;
+    const size_t nCells = cxN * cyN * czN;
+    if (nCells > 0 && cellScalars.size() >= nCells) {
+        double mn = 1e300, mx = -1e300;
+        for (size_t i = 0; i < nCells; ++i) {
+            if (std::isfinite(cellScalars[i])) {
+                mn = std::min(mn, cellScalars[i]);
+                mx = std::max(mx, cellScalars[i]);
+            }
+        }
+        if (mx > mn + 1e-6) {
+            const double iso = 0.5 * (mn + mx);
+            const size_t stepX = std::max<size_t>(1, (cxN + 127) / 128);
+            const size_t stepY = std::max<size_t>(1, (cyN + 127) / 128);
+            const size_t stepZ = std::max<size_t>(1, (czN + 127) / 128);
+            const int sxN = static_cast<int>((cxN + stepX - 1) / stepX);
+            const int syN = static_cast<int>((cyN + stepY - 1) / stepY);
+            const int szN = static_cast<int>((czN + stepZ - 1) / stepZ);
+            auto cellOn = [&](int ix, int iy, int iz) -> bool {
+                if (ix < 0 || iy < 0 || iz < 0 || ix >= sxN || iy >= syN || iz >= szN) return false;
+                size_t rx = std::min(static_cast<size_t>(ix) * stepX, cxN - 1);
+                size_t ry = std::min(static_cast<size_t>(iy) * stepY, cyN - 1);
+                size_t rz = std::min(static_cast<size_t>(iz) * stepZ, czN - 1);
+                double v = cellScalars[(rz * cyN + ry) * cxN + rx];
+                return std::isfinite(v) && v >= iso;
+            };
+            size_t trisBefore = mesh.tris.size();
+            for (int iz = 0; iz < szN; ++iz) {
+                for (int iy = 0; iy < syN; ++iy) {
+                    for (int ix = 0; ix < sxN; ++ix) {
+                        if (!cellOn(ix, iy, iz)) continue;
+                        double x0 = static_cast<double>(ix * static_cast<int>(stepX));
+                        double x1 = std::min(static_cast<double>(cxN), static_cast<double>((ix + 1) * static_cast<int>(stepX)));
+                        double y0 = static_cast<double>(iy * static_cast<int>(stepY));
+                        double y1 = std::min(static_cast<double>(cyN), static_cast<double>((iy + 1) * static_cast<int>(stepY)));
+                        double z0 = static_cast<double>(iz * static_cast<int>(stepZ));
+                        double z1 = std::min(static_cast<double>(czN), static_cast<double>((iz + 1) * static_cast<int>(stepZ)));
+                        if (!cellOn(ix - 1, iy, iz)) emitQuad(gridPt(x0, y0, z0), gridPt(x0, y0, z1), gridPt(x0, y1, z1), gridPt(x0, y1, z0));
+                        if (!cellOn(ix + 1, iy, iz)) emitQuad(gridPt(x1, y0, z0), gridPt(x1, y1, z0), gridPt(x1, y1, z1), gridPt(x1, y0, z1));
+                        if (!cellOn(ix, iy - 1, iz)) emitQuad(gridPt(x0, y0, z0), gridPt(x1, y0, z0), gridPt(x1, y0, z1), gridPt(x0, y0, z1));
+                        if (!cellOn(ix, iy + 1, iz)) emitQuad(gridPt(x0, y1, z0), gridPt(x0, y1, z1), gridPt(x1, y1, z1), gridPt(x1, y1, z0));
+                        if (!cellOn(ix, iy, iz - 1)) emitQuad(gridPt(x0, y0, z0), gridPt(x0, y1, z0), gridPt(x1, y1, z0), gridPt(x1, y0, z0));
+                        if (!cellOn(ix, iy, iz + 1)) emitQuad(gridPt(x0, y0, z1), gridPt(x1, y0, z1), gridPt(x1, y1, z1), gridPt(x0, y1, z1));
+                    }
+                }
+            }
+            if (mesh.tris.size() > trisBefore) return true;
+        }
+    }
+
+    return false;
+}
+
 } // namespace DetailVtk
 
 inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
@@ -527,8 +710,9 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     double origin[3] = { 0.0, 0.0, 0.0 };
     double spacing[3] = { 1.0, 1.0, 1.0 };
     std::vector<double> xCoords, yCoords, zCoords;
-    std::vector<double> pointScalars;
+    std::vector<double> pointScalars, cellScalars;
     bool inPointData = false;
+    bool inCellData  = false;
 
     while (cur < end) {
         DetailVtk::SkipWsVtk(cur, end);
@@ -619,9 +803,12 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
             }
         } else if (kw == "point_data") {
             inPointData = true;
+            inCellData  = false;
         } else if (kw == "cell_data") {
             inPointData = false;
-        } else if (inPointData && kw == "scalars" && toks.size() >= 3 && pointScalars.empty()) {
+            inCellData  = true;
+        } else if ((inPointData || inCellData) && kw == "scalars" && toks.size() >= 3 &&
+                   ((inPointData && pointScalars.empty()) || (inCellData && cellScalars.empty()))) {
             DetailVtk::VtkScalarKind sk = DetailVtk::ParseVtkScalarKind(toks[2]);
             size_t numComp = 1;
             if (toks.size() >= 4) {
@@ -640,13 +827,21 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
                     cur = saveCur;
                 }
             }
-            size_t nPtsExpected = !pts.empty() ? pts.size() : (hasDims ? (dimX * dimY * dimZ) : 0);
-            if (nPtsExpected > 0 && sk != DetailVtk::VtkScalarKind::Invalid) {
+            size_t nExpected = 0;
+            if (inPointData) {
+                nExpected = !pts.empty() ? pts.size() : (hasDims ? (dimX * dimY * dimZ) : 0);
+            } else {
+                nExpected = (ugridCells.offsets.size() >= 2)
+                    ? (ugridCells.offsets.size() - 1)
+                    : ((hasDims && dimX >= 2 && dimY >= 2 && dimZ >= 2) ? ((dimX - 1) * (dimY - 1) * (dimZ - 1)) : 0);
+            }
+            if (nExpected > 0 && sk != DetailVtk::VtkScalarKind::Invalid) {
                 std::vector<double> rawSc;
-                if (DetailVtk::ReadScalarArrayVtk(cur, end, isBinary, nPtsExpected * numComp, sk, rawSc)) {
-                    pointScalars.resize(nPtsExpected);
-                    for (size_t i = 0; i < nPtsExpected; ++i) {
-                        pointScalars[i] = std::isfinite(rawSc[i * numComp]) ? rawSc[i * numComp] : 0.0;
+                if (DetailVtk::ReadScalarArrayVtk(cur, end, isBinary, nExpected * numComp, sk, rawSc)) {
+                    std::vector<double>& dst = inPointData ? pointScalars : cellScalars;
+                    dst.resize(nExpected);
+                    for (size_t i = 0; i < nExpected; ++i) {
+                        dst[i] = std::isfinite(rawSc[i * numComp]) ? rawSc[i * numComp] : 0.0;
                     }
                 } else {
                     break;
@@ -755,7 +950,7 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
 
         mesh.vertices = pts;
         const size_t nv = pts.size();
-        std::unordered_map<DetailVtk::SortedFaceKey, DetailVtk::BoundaryFaceRec, DetailVtk::SortedFaceKeyHash> faceMap;
+        DetailVtk::VtkFaceMap faceMap;
         faceMap.reserve(numCells * 2);
         std::vector<std::pair<uint32_t, uint32_t>> fallbackLines;
         std::vector<uint32_t> fallbackVerts;
@@ -771,91 +966,8 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
             if (!validIdx || n == 0) continue;
 
             const int64_t ct = cellTypes[c];
+            if (DetailVtk::RecordVtkVolOrSurfaceCell(faceMap, ct, cv, n)) continue;
             switch (ct) {
-            case 10: // VTK_TETRA
-            case 24: // VTK_QUADRATIC_TETRA
-                if (n >= 4) {
-                    const uint32_t f0[3] = { cv[0], cv[2], cv[1] };
-                    const uint32_t f1[3] = { cv[0], cv[1], cv[3] };
-                    const uint32_t f2[3] = { cv[1], cv[2], cv[3] };
-                    const uint32_t f3[3] = { cv[2], cv[0], cv[3] };
-                    DetailVtk::RecordFace3DVtk(faceMap, f0, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, f1, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, f2, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, f3, 3, true);
-                }
-                break;
-            case 11: // VTK_VOXEL (convert Z-order 0,1,3,2,4,5,7,6 -> hex order)
-            case 12: // VTK_HEXAHEDRON
-            case 25: // VTK_QUADRATIC_HEXAHEDRON
-            case 29: // VTK_TRIQUADRATIC_HEXAHEDRON
-                if (n >= 8) {
-                    uint32_t h[8];
-                    if (ct == 11) {
-                        h[0] = cv[0]; h[1] = cv[1]; h[2] = cv[3]; h[3] = cv[2];
-                        h[4] = cv[4]; h[5] = cv[5]; h[6] = cv[7]; h[7] = cv[6];
-                    } else {
-                        for (int k = 0; k < 8; ++k) h[k] = cv[k];
-                    }
-                    const uint32_t q0[4] = { h[0], h[3], h[2], h[1] };
-                    const uint32_t q1[4] = { h[4], h[5], h[6], h[7] };
-                    const uint32_t q2[4] = { h[0], h[1], h[5], h[4] };
-                    const uint32_t q3[4] = { h[1], h[2], h[6], h[5] };
-                    const uint32_t q4[4] = { h[2], h[3], h[7], h[6] };
-                    const uint32_t q5[4] = { h[3], h[0], h[4], h[7] };
-                    DetailVtk::RecordFace3DVtk(faceMap, q0, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q1, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q2, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q3, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q4, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q5, 4, true);
-                }
-                break;
-            case 13: // VTK_WEDGE
-            case 26: // VTK_QUADRATIC_WEDGE
-                if (n >= 6) {
-                    const uint32_t t0[3] = { cv[0], cv[1], cv[2] };
-                    const uint32_t t1[3] = { cv[3], cv[5], cv[4] };
-                    const uint32_t q0[4] = { cv[0], cv[3], cv[4], cv[1] };
-                    const uint32_t q1[4] = { cv[1], cv[4], cv[5], cv[2] };
-                    const uint32_t q2[4] = { cv[2], cv[5], cv[3], cv[0] };
-                    DetailVtk::RecordFace3DVtk(faceMap, t0, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, t1, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q0, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q1, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, q2, 4, true);
-                }
-                break;
-            case 14: // VTK_PYRAMID
-            case 27: // VTK_QUADRATIC_PYRAMID
-                if (n >= 5) {
-                    const uint32_t q0[4] = { cv[0], cv[3], cv[2], cv[1] };
-                    const uint32_t t0[3] = { cv[0], cv[1], cv[4] };
-                    const uint32_t t1[3] = { cv[1], cv[2], cv[4] };
-                    const uint32_t t2[3] = { cv[2], cv[3], cv[4] };
-                    const uint32_t t3[3] = { cv[3], cv[0], cv[4] };
-                    DetailVtk::RecordFace3DVtk(faceMap, q0, 4, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, t0, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, t1, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, t2, 3, true);
-                    DetailVtk::RecordFace3DVtk(faceMap, t3, 3, true);
-                }
-                break;
-            case 5:  // VTK_TRIANGLE
-            case 22: // VTK_QUADRATIC_TRIANGLE
-                if (n >= 3) DetailVtk::RecordFace3DVtk(faceMap, cv, 3, false);
-                break;
-            case 8:  // VTK_PIXEL (0,1,3,2)
-                if (n >= 4) {
-                    const uint32_t q[4] = { cv[0], cv[1], cv[3], cv[2] };
-                    DetailVtk::RecordFace3DVtk(faceMap, q, 4, false);
-                }
-                break;
-            case 9:  // VTK_QUAD
-            case 23: // VTK_QUADRATIC_QUAD
-            case 28: // VTK_BIQUADRATIC_QUAD
-                if (n >= 4) DetailVtk::RecordFace3DVtk(faceMap, cv, 4, false);
-                break;
             case 7:  // VTK_POLYGON
                 if (n == 3) DetailVtk::RecordFace3DVtk(faceMap, cv, 3, false);
                 else if (n == 4) DetailVtk::RecordFace3DVtk(faceMap, cv, 4, false);
@@ -889,17 +1001,7 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
             }
         }
 
-        for (const auto& kv : faceMap) {
-            const auto& f = kv.second;
-            if (f.volCount == 1 || (f.volCount == 0 && f.explicit2D)) {
-                if (f.n == 3) {
-                    mesh.tris.push_back({ f.orig[0], f.orig[1], f.orig[2], {} });
-                } else if (f.n == 4) {
-                    mesh.tris.push_back({ f.orig[0], f.orig[1], f.orig[2], {} });
-                    mesh.tris.push_back({ f.orig[0], f.orig[2], f.orig[3], {} });
-                }
-            }
-        }
+        FemSolidSurface::EmitBoundaryFacesDirect(faceMap, mesh);
 
         if (mesh.tris.empty() && !fallbackLines.empty()) {
             mesh.vertices.clear();
@@ -924,30 +1026,52 @@ inline bool ParseVtkMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
         });
     } else if (datasetType == "structured_points") {
         if (!hasDims) return false;
-        const bool is2DXY = (dimZ == 1 && dimX >= 2 && dimY >= 2);
-        const bool hasHeight = (pointScalars.size() >= dimX * dimY * dimZ);
-        DetailVtk::EmitStructuredBoundaryVtk(mesh, dimX, dimY, dimZ, [&](size_t i, size_t j, size_t k) -> Vec3f {
-            double x = origin[0] + static_cast<double>(i) * spacing[0];
-            double y = origin[1] + static_cast<double>(j) * spacing[1];
-            double z = origin[2] + static_cast<double>(k) * spacing[2];
-            if (is2DXY && hasHeight) {
-                z += pointScalars[j * dimX + i];
-            }
-            return { static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
-        });
+        bool emittedIso = DetailVtk::TryEmitScalarVolumeIsoSurface(
+            mesh, dimX, dimY, dimZ, pointScalars, cellScalars,
+            [&](double gx, double gy, double gz) -> Vec3f {
+                return {
+                    static_cast<float>(origin[0] + gx * spacing[0]),
+                    static_cast<float>(origin[1] + gy * spacing[1]),
+                    static_cast<float>(origin[2] + gz * spacing[2])
+                };
+            });
+        if (!emittedIso) {
+            const bool is2DXY = (dimZ == 1 && dimX >= 2 && dimY >= 2);
+            const bool hasHeight = (pointScalars.size() >= dimX * dimY * dimZ);
+            DetailVtk::EmitStructuredBoundaryVtk(mesh, dimX, dimY, dimZ, [&](size_t i, size_t j, size_t k) -> Vec3f {
+                double x = origin[0] + static_cast<double>(i) * spacing[0];
+                double y = origin[1] + static_cast<double>(j) * spacing[1];
+                double z = origin[2] + static_cast<double>(k) * spacing[2];
+                if (is2DXY && hasHeight) {
+                    z += pointScalars[j * dimX + i];
+                }
+                return { static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
+            });
+        }
     } else if (datasetType == "rectilinear_grid") {
         if (!hasDims || xCoords.size() < dimX || yCoords.size() < dimY || zCoords.size() < dimZ) return false;
-        const bool is2DXY = (dimZ == 1 && dimX >= 2 && dimY >= 2);
-        const bool hasHeight = (pointScalars.size() >= dimX * dimY * dimZ);
-        DetailVtk::EmitStructuredBoundaryVtk(mesh, dimX, dimY, dimZ, [&](size_t i, size_t j, size_t k) -> Vec3f {
-            double x = xCoords[i];
-            double y = yCoords[j];
-            double z = zCoords[k];
-            if (is2DXY && hasHeight) {
-                z += pointScalars[j * dimX + i];
-            }
-            return { static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
-        });
+        bool emittedIso = DetailVtk::TryEmitScalarVolumeIsoSurface(
+            mesh, dimX, dimY, dimZ, pointScalars, cellScalars,
+            [&](double gx, double gy, double gz) -> Vec3f {
+                return {
+                    static_cast<float>(DetailVtk::EvalRectilinearCoordVtk(xCoords, dimX, gx)),
+                    static_cast<float>(DetailVtk::EvalRectilinearCoordVtk(yCoords, dimY, gy)),
+                    static_cast<float>(DetailVtk::EvalRectilinearCoordVtk(zCoords, dimZ, gz))
+                };
+            });
+        if (!emittedIso) {
+            const bool is2DXY = (dimZ == 1 && dimX >= 2 && dimY >= 2);
+            const bool hasHeight = (pointScalars.size() >= dimX * dimY * dimZ);
+            DetailVtk::EmitStructuredBoundaryVtk(mesh, dimX, dimY, dimZ, [&](size_t i, size_t j, size_t k) -> Vec3f {
+                double x = xCoords[i];
+                double y = yCoords[j];
+                double z = zCoords[k];
+                if (is2DXY && hasHeight) {
+                    z += pointScalars[j * dimX + i];
+                }
+                return { static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
+            });
+        }
     } else {
         return false;
     }

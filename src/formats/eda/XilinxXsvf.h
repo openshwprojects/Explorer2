@@ -18,7 +18,7 @@ inline bool ParseXilinxXsvfBoard(const uint8_t* data, size_t size, const std::ws
             return static_cast<uint32_t>((v + (v >> 4)) & 0x0Fu);
         };
 
-        DetailEda200::JtagTapTracker tap;
+        DetailIndustrialAndWaveEda::JtagTapTracker tap;
         uint32_t xsdrSizeBits = 0;
         uint8_t xrepeat = 32;
         uint8_t xendir = 0; // 0 = Run-Test/Idle (0x01), 1 = Pause-IR (0x0D)
@@ -62,7 +62,7 @@ inline bool ParseXilinxXsvfBoard(const uint8_t* data, size_t size, const std::ws
                 ++shiftOrStateCmds;
             } else if (op == 0x04u) { // XRUNTEST (4B uint32 BE)
                 if (4u > size - pos) return false;
-                uint32_t runClks = DetailEda200::RdU32BE(data + pos);
+                uint32_t runClks = DetailIndustrialAndWaveEda::RdU32BE(data + pos);
                 pos += 4u;
                 if (runClks > 0u) {
                     tap.EmitIdleClocks(runClks, 0x01u);
@@ -73,7 +73,7 @@ inline bool ParseXilinxXsvfBoard(const uint8_t* data, size_t size, const std::ws
                 (void)xrepeat;
             } else if (op == 0x08u) { // XSDRSIZE (4B uint32 BE)
                 if (4u > size - pos) return false;
-                xsdrSizeBits = DetailEda200::RdU32BE(data + pos);
+                xsdrSizeBits = DetailIndustrialAndWaveEda::RdU32BE(data + pos);
                 pos += 4u;
                 if (xsdrSizeBits > 16777216u) return false;
             } else if (op == 0x09u) { // XSDRTDO (TDI + TDO expected)
@@ -148,7 +148,7 @@ inline bool ParseXilinxXsvfBoard(const uint8_t* data, size_t size, const std::ws
                 xenddr = v;
             } else if (op == 0x15u) { // XSIR2 (2B uint16 BE lengthBits + TDI)
                 if (2u > size - pos) return false;
-                uint16_t lenBits = DetailEda200::RdU16BE(data + pos);
+                uint16_t lenBits = DetailIndustrialAndWaveEda::RdU16BE(data + pos);
                 pos += 2u;
                 if (lenBits == 0u) return false;
                 size_t nb = bytesForBits(lenBits);
@@ -170,7 +170,7 @@ inline bool ParseXilinxXsvfBoard(const uint8_t* data, size_t size, const std::ws
                 if (6u > size - pos) return false;
                 uint8_t waitSt = data[pos];
                 uint8_t endSt  = data[pos + 1];
-                uint32_t waitUs = DetailEda200::RdU32BE(data + pos + 2);
+                uint32_t waitUs = DetailIndustrialAndWaveEda::RdU32BE(data + pos + 2);
                 pos += 6u;
                 if (waitSt > 0x0Fu || endSt > 0x0Fu) return false;
                 tap.EmitIdleClocks(waitUs > 0u ? 4u : 1u, waitSt);
@@ -180,7 +180,7 @@ inline bool ParseXilinxXsvfBoard(const uint8_t* data, size_t size, const std::ws
                 if (10u > size - pos) return false;
                 uint8_t waitSt = data[pos];
                 uint8_t endSt  = data[pos + 1];
-                uint32_t clks  = DetailEda200::RdU32BE(data + pos + 2);
+                uint32_t clks  = DetailIndustrialAndWaveEda::RdU32BE(data + pos + 2);
                 pos += 10u;
                 if (waitSt > 0x0Fu || endSt > 0x0Fu) return false;
                 tap.EmitIdleClocks(std::max<uint32_t>(clks, 1u), waitSt);
@@ -201,7 +201,7 @@ inline bool ParseXilinxXsvfBoard(const uint8_t* data, size_t size, const std::ws
         if (!firstComment.empty()) {
             summary += L" - " + PathUtils::Utf8ToWide(firstComment);
         }
-        DetailEda200::RenderJtag4LaneWaveforms(out, tap.cycles, summary);
+        DetailIndustrialAndWaveEda::RenderJtag4LaneWaveforms(out, tap.cycles, summary);
         return true;
     }
     return false;

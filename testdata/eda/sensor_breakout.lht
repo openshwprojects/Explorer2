@@ -1,0 +1,34 @@
+li:pcb-rnd-board-v8 {
+    ha:data {
+        li:objects {
+            ha:subc.1 {
+                x = 12.5mm; y = 8.0mm;
+                ha:attributes { refdes = U1; }
+                ha:data {
+                    li:objects {
+                        ha:padstack_ref.1 { x = -1.27mm; y = 0.0mm; ha:attributes { term = 1; } }
+                        ha:padstack_ref.2 { x =  1.27mm; y = 0.0mm; ha:attributes { term = 2; } }
+                    }
+                }
+            }
+        }
+        li:layers {
+            ha:top-copper {
+                purpose = copper;
+                li:objects {
+                    ha:line.1 { x1 = 4.0mm; y1 = 8.0mm; x2 = 11.23mm; y2 = 8.0mm; thickness = 0.35mm; }
+                    ha:line.2 { x1 = 13.77mm; y1 = 8.0mm; x2 = 22.0mm; y2 = 8.0mm; thickness = 0.35mm; }
+                }
+            }
+            ha:outline {
+                purpose = uroute;
+                li:objects {
+                    ha:line.10 { x1 = 0.0mm; y1 = 0.0mm; x2 = 26.0mm; y2 = 0.0mm; thickness = 0.2mm; }
+                    ha:line.11 { x1 = 26.0mm; y1 = 0.0mm; x2 = 26.0mm; y2 = 16.0mm; thickness = 0.2mm; }
+                    ha:line.12 { x1 = 26.0mm; y1 = 16.0mm; x2 = 0.0mm; y2 = 16.0mm; thickness = 0.2mm; }
+                    ha:line.13 { x1 = 0.0mm; y1 = 16.0mm; x2 = 0.0mm; y1_dummy = 0; y2 = 0.0mm; thickness = 0.2mm; }
+                }
+            }
+        }
+    }
+}

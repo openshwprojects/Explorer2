@@ -22,50 +22,9 @@ using ::Explorer2::ByteIO::RdF64LE;
 using ::Explorer2::ByteIO::RdF64BE;
 
 
-inline std::wstring DecodeUtf16Span(const uint8_t* p, size_t charCount, bool bigEndian) {
-    std::wstring out;
-    out.reserve(std::min<size_t>(charCount, 65536u));
-    for (size_t i = 0; i < charCount; ++i) {
-        uint16_t u = bigEndian ? RdU16BE(p + i * 2u) : RdU16LE(p + i * 2u);
-        if (u == 0) break;
-        if (u >= 0xD800u && u <= 0xDBFFu && i + 1u < charCount) {
-            uint16_t lo = bigEndian ? RdU16BE(p + (i + 1u) * 2u) : RdU16LE(p + (i + 1u) * 2u);
-            if (lo >= 0xDC00u && lo <= 0xDFFFu) {
-                PathUtils::AppendUtf16(out, 0x10000u + (((static_cast<uint32_t>(u) - 0xD800u) << 10) | (lo - 0xDC00u)));
-                ++i;
-                continue;
-            }
-        }
-        PathUtils::AppendUtf16(out, u);
-    }
-    return out;
-}
-
-inline void CivilFromDays1970(int64_t z, int& outY, int& outM, int& outD) {
-    z += 719468LL;
-    const int64_t era = (z >= 0 ? z : z - 146096LL) / 146097LL;
-    const uint32_t doe = static_cast<uint32_t>(z - era * 146097LL);
-    const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
-    const int64_t y = static_cast<int64_t>(yoe) + era * 400LL;
-    const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
-    const uint32_t mp = (5u * doy + 2u) / 153u;
-    outD = static_cast<int>(doy - (153u * mp + 2u) / 5u + 1u);
-    outM = static_cast<int>((mp < 10u) ? (mp + 3u) : (mp - 9u));
-    outY = static_cast<int>(y + (outM <= 2 ? 1 : 0));
-}
-
-inline std::wstring FormatUnixUtc(int64_t unixSec) {
-    int64_t days = (unixSec >= 0) ? (unixSec / 86400LL) : ((unixSec - 86399LL) / 86400LL);
-    int64_t sod = unixSec - days * 86400LL;
-    int y = 1970, m = 1, d = 1;
-    CivilFromDays1970(days, y, m, d);
-    int hh = static_cast<int>(sod / 3600LL);
-    int mm = static_cast<int>((sod % 3600LL) / 60LL);
-    int ss = static_cast<int>(sod % 60LL);
-    wchar_t buf[64] = {};
-    swprintf_s(buf, L"%04d-%02d-%02d %02d:%02d:%02d UTC", y, m, d, hh, mm, ss);
-    return buf;
-}
+using ::Explorer2::ReaderText::DecodeUtf16Span;
+using ::Explorer2::ReaderText::CivilFromDays1970;
+using ::Explorer2::ReaderText::FormatUnixUtc;
 
 inline uint64_t RdBeUintN(const uint8_t* p, uint8_t nBytes) {
     uint64_t v = 0;

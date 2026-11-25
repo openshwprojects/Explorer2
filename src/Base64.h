@@ -3,6 +3,7 @@
 // data URIs, Godot resources, VTK XML data arrays.
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -49,6 +50,24 @@ inline bool Decode(std::string_view in, std::vector<uint8_t>& out, Mode mode = M
         }
     }
     return true;
+}
+
+inline std::string Encode(const uint8_t* data, size_t len) {
+    static constexpr char kAlpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!data || len == 0) return {};
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        const uint32_t b0 = data[i];
+        const uint32_t b1 = (i + 1 < len) ? data[i + 1] : 0u;
+        const uint32_t b2 = (i + 2 < len) ? data[i + 2] : 0u;
+        const uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push_back(kAlpha[(triple >> 18) & 0x3Fu]);
+        out.push_back(kAlpha[(triple >> 12) & 0x3Fu]);
+        out.push_back((i + 1 < len) ? kAlpha[(triple >> 6) & 0x3Fu] : '=');
+        out.push_back((i + 2 < len) ? kAlpha[triple & 0x3Fu] : '=');
+    }
+    return out;
 }
 
 } // namespace Explorer2::Base64

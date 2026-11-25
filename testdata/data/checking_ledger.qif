@@ -1,0 +1,28 @@
+!Account
+NOperating Checking
+TBank
+DPrimary Engineering Account
+$12500.00
+^
+!Type:Bank
+D2026-03-01
+T2500.00
+CX
+PClient Retainer Deposit
+LConsulting:Revenue
+MInvoice #2026-031
+^
+D2026-03-05
+T-340.50
+C*
+N1042
+PCloud Infrastructure Co
+LHosting
+MMonthly compute & storage split
+SHosting:Compute
+ECPU cluster nodes
+$-240.50
+SHosting:Storage
+EObject store S3 backups
+$-100.00
+^

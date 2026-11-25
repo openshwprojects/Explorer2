@@ -4,7 +4,7 @@
 
 namespace Formats {
 
-namespace DetailMfg69 {
+namespace DetailBoardFabEda {
 
 // ============================================================================
 // Fritzing Sketch (.fzz / .fz) & Part Bundle (.fzpz / .fzp) Parser
@@ -30,12 +30,12 @@ inline float ParseSvgDimMm(std::string_view sv, float viewScaleMmPerUnit = 0.254
     if (!ep || ep == s.c_str()) return 0.0f;
     std::string_view unit(ep);
     while (!unit.empty() && unit.front() == ' ') unit.remove_prefix(1);
-    if (DetailEda100::ContainsAsciiI(unit, "mm")) return val;
-    if (DetailEda100::ContainsAsciiI(unit, "cm")) return val * 10.0f;
-    if (DetailEda100::ContainsAsciiI(unit, "in")) return val * 25.4f;
-    if (DetailEda100::ContainsAsciiI(unit, "mil")) return val * 0.0254f;
-    if (DetailEda100::ContainsAsciiI(unit, "pt")) return val * (25.4f / 72.0f);
-    if (DetailEda100::ContainsAsciiI(unit, "px")) return val * (25.4f / 90.0f);
+    if (DetailSiliconAndBusEda::ContainsAsciiI(unit, "mm")) return val;
+    if (DetailSiliconAndBusEda::ContainsAsciiI(unit, "cm")) return val * 10.0f;
+    if (DetailSiliconAndBusEda::ContainsAsciiI(unit, "in")) return val * 25.4f;
+    if (DetailSiliconAndBusEda::ContainsAsciiI(unit, "mil")) return val * 0.0254f;
+    if (DetailSiliconAndBusEda::ContainsAsciiI(unit, "pt")) return val * (25.4f / 72.0f);
+    if (DetailSiliconAndBusEda::ContainsAsciiI(unit, "px")) return val * (25.4f / 90.0f);
     return val * viewScaleMmPerUnit;
 }
 
@@ -264,17 +264,17 @@ inline bool ParseFritzingSketchXml(
             std::string_view pn, pv;
             GetXmlAttr(ptag, "name", pn);
             GetXmlAttr(ptag, "value", pv);
-            if (DetailEda100::ContainsAsciiI(pn, "package")) pkgProp = std::string(pv);
-            else if (DetailEda100::ContainsAsciiI(pn, "width")) propWMm = ParseSvgDimMm(pv, 1.0f);
-            else if (DetailEda100::ContainsAsciiI(pn, "height")) propHMm = ParseSvgDimMm(pv, 1.0f);
-            else if (DetailEda100::ContainsAsciiI(pn, "hole size")) holeD = std::max(0.2f, std::strtof(std::string(pv).c_str(), nullptr));
+            if (DetailSiliconAndBusEda::ContainsAsciiI(pn, "package")) pkgProp = std::string(pv);
+            else if (DetailSiliconAndBusEda::ContainsAsciiI(pn, "width")) propWMm = ParseSvgDimMm(pv, 1.0f);
+            else if (DetailSiliconAndBusEda::ContainsAsciiI(pn, "height")) propHMm = ParseSvgDimMm(pv, 1.0f);
+            else if (DetailSiliconAndBusEda::ContainsAsciiI(pn, "hole size")) holeD = std::max(0.2f, std::strtof(std::string(pv).c_str(), nullptr));
             else if (valProp.empty() &&
-                     (DetailEda100::ContainsAsciiI(pn, "resistance") ||
-                      DetailEda100::ContainsAsciiI(pn, "capacitance") ||
-                      DetailEda100::ContainsAsciiI(pn, "voltage") ||
-                      DetailEda100::ContainsAsciiI(pn, "chip label") ||
-                      DetailEda100::ContainsAsciiI(pn, "part number") ||
-                      DetailEda100::ContainsAsciiI(pn, "type")))
+                     (DetailSiliconAndBusEda::ContainsAsciiI(pn, "resistance") ||
+                      DetailSiliconAndBusEda::ContainsAsciiI(pn, "capacitance") ||
+                      DetailSiliconAndBusEda::ContainsAsciiI(pn, "voltage") ||
+                      DetailSiliconAndBusEda::ContainsAsciiI(pn, "chip label") ||
+                      DetailSiliconAndBusEda::ContainsAsciiI(pn, "part number") ||
+                      DetailSiliconAndBusEda::ContainsAsciiI(pn, "type")))
             {
                 valProp = std::string(pv);
             }
@@ -305,14 +305,14 @@ inline bool ParseFritzingSketchXml(
 
         std::string_view lyrSv;
         GetXmlAttr(viewBlk.substr(0, viewBlk.find('>')), "layer", lyrSv);
-        bool isBot = DetailEda100::ContainsAsciiI(lyrSv, "copper0") || DetailEda100::ContainsAsciiI(lyrSv, "bottom");
+        bool isBot = DetailSiliconAndBusEda::ContainsAsciiI(lyrSv, "copper0") || DetailSiliconAndBusEda::ContainsAsciiI(lyrSv, "bottom");
 
-        const bool isWire = DetailEda100::ContainsAsciiI(modId, "WireModuleID") ||
-                            DetailEda100::ContainsAsciiI(modId, "TraceModuleID") ||
+        const bool isWire = DetailSiliconAndBusEda::ContainsAsciiI(modId, "WireModuleID") ||
+                            DetailSiliconAndBusEda::ContainsAsciiI(modId, "TraceModuleID") ||
                             viewBlk.find("<wireExtras") != std::string_view::npos;
-        const bool isBoard = DetailEda100::ContainsAsciiI(modId, "RectanglePCB") ||
-                             DetailEda100::ContainsAsciiI(modId, "PCBModuleID");
-        const bool isVia   = DetailEda100::ContainsAsciiI(modId, "ViaModuleID");
+        const bool isBoard = DetailSiliconAndBusEda::ContainsAsciiI(modId, "RectanglePCB") ||
+                             DetailSiliconAndBusEda::ContainsAsciiI(modId, "PCBModuleID");
+        const bool isVia   = DetailSiliconAndBusEda::ContainsAsciiI(modId, "ViaModuleID");
 
         if (isWire) {
             FzWire w;
@@ -455,13 +455,13 @@ inline bool ParseFritzingSketchXml(
                                      pd.shape, lid, PathUtils::Utf8ToWide(pd.id), L"" });
             }
         } else {
-            bool smd = DetailEda100::ContainsAsciiI(p.pkgProp, "0402") ||
-                       DetailEda100::ContainsAsciiI(p.pkgProp, "0603") ||
-                       DetailEda100::ContainsAsciiI(p.pkgProp, "0805") ||
-                       DetailEda100::ContainsAsciiI(p.pkgProp, "1206") ||
-                       DetailEda100::ContainsAsciiI(p.pkgProp, "SMD")  ||
-                       DetailEda100::ContainsAsciiI(p.pkgProp, "SOIC") ||
-                       DetailEda100::ContainsAsciiI(p.pkgProp, "SOT");
+            bool smd = DetailSiliconAndBusEda::ContainsAsciiI(p.pkgProp, "0402") ||
+                       DetailSiliconAndBusEda::ContainsAsciiI(p.pkgProp, "0603") ||
+                       DetailSiliconAndBusEda::ContainsAsciiI(p.pkgProp, "0805") ||
+                       DetailSiliconAndBusEda::ContainsAsciiI(p.pkgProp, "1206") ||
+                       DetailSiliconAndBusEda::ContainsAsciiI(p.pkgProp, "SMD")  ||
+                       DetailSiliconAndBusEda::ContainsAsciiI(p.pkgProp, "SOIC") ||
+                       DetailSiliconAndBusEda::ContainsAsciiI(p.pkgProp, "SOT");
             size_t half = (pinCnt + 1) / 2;
             for (size_t i = 0; i < pinCnt; ++i) {
                 float rx = 0.0f, ry = 0.0f;
@@ -608,11 +608,11 @@ inline bool ParseFritzingFile(const uint8_t* data, size_t size, const std::wstri
     return ParseFritzingSketchXml(sv, emptyFps, out);
 }
 
-} // namespace DetailMfg69
+} // namespace DetailBoardFabEda
 
 inline bool ParseFritzingProjectBoard(const uint8_t* data, size_t size, const std::wstring& extLower, ParsedEdaBoard& out) {
     if (!data || size < 12) return false;
-    return DetailMfg69::ParseFritzingFile(data, size, extLower, out);
+    return DetailBoardFabEda::ParseFritzingFile(data, size, extLower, out);
 }
 
 } // namespace Formats

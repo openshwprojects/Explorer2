@@ -80,7 +80,7 @@ inline bool ParseJtagSvfBoard(const uint8_t* data, size_t size, const std::wstri
             return false;
         };
 
-        DetailEda200::JtagTapTracker tap;
+        DetailIndustrialAndWaveEda::JtagTapTracker tap;
         uint8_t svfEndIr = 0x01u; // IDLE
         uint8_t svfEndDr = 0x01u; // IDLE
         size_t validSvfCmds = 0;
@@ -189,7 +189,7 @@ inline bool ParseJtagSvfBoard(const uint8_t* data, size_t size, const std::wstri
 
         out.kind = EdaDocKind::KiCadSch;
         out.formatTitle = L"IEEE 1149.1 JTAG Serial Vector (.svf)";
-        DetailEda200::RenderJtag4LaneWaveforms(out, tap.cycles,
+        DetailIndustrialAndWaveEda::RenderJtag4LaneWaveforms(out, tap.cycles,
             L"IEEE 1149.1 SVF (" + std::to_wstring(validSvfCmds) + L" cmds, " + std::to_wstring(totalShiftedBits) + L" bits)");
         return true;
     }

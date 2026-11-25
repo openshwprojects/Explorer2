@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 inline bool ParseOrExtractLinuxSquashFs(
     const uint8_t* data,
@@ -51,7 +51,7 @@ inline bool ParseOrExtractLinuxSquashFs(
             return false;
         }
         if (inodeTblStart < 96 || dirTblStart < 96 ||
-            sqOff + inodeTblStart >= size || sqOff + dirTblStart >= size)
+            inodeTblStart >= size - sqOff || dirTblStart >= size - sqOff)
         {
             return false;
         }
@@ -78,11 +78,11 @@ inline bool ParseOrExtractLinuxSquashFs(
             auto it = metaCache.find(absPos);
             if (it != metaCache.end()) return &it->second;
             if (metaCache.size() >= 512) metaCache.clear();
-            if (absPos + 2 > size) return nullptr;
+            if (absPos > size || size - absPos < 2u) return nullptr;
             uint16_t hdr = RdU16LE(data + static_cast<size_t>(absPos));
             bool isUncomp = (hdr & 0x8000u) != 0;
             size_t cLen = hdr & 0x7FFFu;
-            if (cLen == 0 || absPos + 2 + cLen > size) return nullptr;
+            if (cLen == 0 || cLen > size - static_cast<size_t>(absPos) - 2u) return nullptr;
 
             SqfsMetaCacheEntry entry;
             if (isUncomp) {
@@ -106,8 +106,9 @@ inline bool ParseOrExtractLinuxSquashFs(
             outBuf.clear();
             if (wantLen == 0) return true;
             if (wantLen > 16 * 1024 * 1024) return false;
+            if (tableRelStart > size - sqOff || metaBlkRelOff > size - sqOff - tableRelStart) return false;
             uint64_t curAbs = sqOff + tableRelStart + metaBlkRelOff;
-            if (curAbs < sqOff || curAbs >= size) return false;
+            if (curAbs >= size) return false;
 
             outBuf.reserve(wantLen);
             size_t skip = innerOff;
@@ -149,6 +150,7 @@ inline bool ParseOrExtractLinuxSquashFs(
                 return false;
             }
 
+            if (blocksStart > size - sqOff) return false;
             fileOut.clear();
             fileOut.reserve(static_cast<size_t>(fileSize));
             uint64_t curDataAbs = sqOff + blocksStart;
@@ -162,7 +164,7 @@ inline bool ParseOrExtractLinuxSquashFs(
                 } else {
                     bool blkUncomp = (rawBSz & (1u << 24)) != 0;
                     uint32_t cSz = rawBSz & 0x00FFFFFFu;
-                    if (cSz == 0 || curDataAbs + cSz > size) return false;
+                    if (cSz == 0 || curDataAbs > size || cSz > size - curDataAbs) return false;
                     if (blkUncomp) {
                         if (cSz < expectLen) return false;
                         fileOut.insert(fileOut.end(),
@@ -182,11 +184,12 @@ inline bool ParseOrExtractLinuxSquashFs(
 
             if (fileOut.size() < fileSize) {
                 if (!hasFrag || fragIdx >= fragCount || fragTblStart == UINT64_MAX) return false;
+                if (fragTblStart > size - sqOff) return false;
                 size_t tailLen = static_cast<size_t>(fileSize) - fileOut.size();
                 uint32_t ptrIdx = fragIdx / 512u;
                 uint32_t subIdx = fragIdx % 512u;
+                if (static_cast<uint64_t>(ptrIdx + 1ULL) * 8ULL > size - sqOff - fragTblStart) return false;
                 uint64_t ptrAbs = sqOff + fragTblStart + static_cast<uint64_t>(ptrIdx) * 8ULL;
-                if (ptrAbs + 8 > size) return false;
                 uint64_t fragMetaRelOff = RdU64LE(data + static_cast<size_t>(ptrAbs));
 
                 std::vector<uint8_t> fragEnt;
@@ -197,16 +200,17 @@ inline bool ParseOrExtractLinuxSquashFs(
                 uint32_t fragRawSz    = RdU32LE(fragEnt.data() + 8);
                 bool fragUncomp       = (fragRawSz & (1u << 24)) != 0;
                 uint32_t fragCSz      = fragRawSz & 0x00FFFFFFu;
+                if (fragStartBlk > size - sqOff) return false;
                 uint64_t fragDataAbs  = sqOff + fragStartBlk;
-                if (fragCSz == 0 || fragDataAbs + fragCSz > size) return false;
+                if (fragCSz == 0 || fragCSz > size - fragDataAbs) return false;
 
                 if (fragUncomp) {
-                    if (static_cast<uint64_t>(fragOff) + tailLen > fragCSz) return false;
+                    if (fragOff > fragCSz || tailLen > fragCSz - fragOff) return false;
                     const uint8_t* fp = data + static_cast<size_t>(fragDataAbs) + fragOff;
                     fileOut.insert(fileOut.end(), fp, fp + tailLen);
                 } else {
                     if (!DecompressSqfsChunk(data + static_cast<size_t>(fragDataAbs), fragCSz, blkSize, compId, chunkBuf) ||
-                        static_cast<uint64_t>(fragOff) + tailLen > chunkBuf.size())
+                        fragOff > chunkBuf.size() || tailLen > chunkBuf.size() - fragOff)
                     {
                         return false;
                     }
@@ -356,7 +360,7 @@ inline bool ParseOrExtractLinuxSquashFs(
     return false;
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectLinuxSquashFs(
     const uint8_t* data,
@@ -364,7 +368,7 @@ inline bool InspectLinuxSquashFs(
     const std::wstring& extLower,
     ArchiveSummaryInfo& outInfo)
 {
-    return DetailArc200::ParseOrExtractLinuxSquashFs(data, size, extLower, &outInfo, nullptr, nullptr);
+    return DetailUnixAndLegacyArc::ParseOrExtractLinuxSquashFs(data, size, extLower, &outInfo, nullptr, nullptr);
 }
 
 inline bool ExtractLinuxSquashFsEntry(
@@ -374,7 +378,7 @@ inline bool ExtractLinuxSquashFsEntry(
     const std::wstring& want,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc200::ParseOrExtractLinuxSquashFs(data, size, extLower, nullptr, &want, &outBytes);
+    return DetailUnixAndLegacyArc::ParseOrExtractLinuxSquashFs(data, size, extLower, nullptr, &want, &outBytes);
 }
 
 } // namespace Explorer2::Formats

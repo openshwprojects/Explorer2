@@ -1,4 +1,5 @@
 #include "ExplorerApp.h"
+#include "FileLockInspector.h"
 #include "DragRules.h"
 #include "ShareRules.h"
 #include "CommandIds.h"
@@ -782,6 +783,17 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 m_lanWasScanning = lanScan;
             }
+            // Folder sizes the workers have found since the last look. They are fetched here, at the pace of
+            // this timer, and not on a message for each result: WM_TIMER comes after input and after WM_PAINT,
+            // so a scan of thousands of folders cannot keep the window from painting or from the user.
+            // Fetching them reads every size of the folder, and sorts the list again when it is sorted by size
+            // (170 ms for 15,000 entries): it gets a fifth of the window's time at most.
+            if (GetTickCount64() >= m_nextFolderSizeSyncTick && m_fileEngine.TakeFolderSizesChanged()) {
+                const ULONGLONG syncStartedTick = GetTickCount64();
+                SyncFolderSizesFromCache();
+                const ULONGLONG syncEndedTick = GetTickCount64();
+                m_nextFolderSizeSyncTick = syncEndedTick + std::min<ULONGLONG>((syncEndedTick - syncStartedTick) * 4, 2000);
+            }
             EnsureWorkAnimTimerState();
             InvalidateRect(m_hwnd, nullptr, FALSE);
         } else if (wParam == ID_TIMER_DRIVES) {
@@ -929,7 +941,8 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             GetCursorPos(&pt);
             ScreenToClient(m_hwnd, &pt);
             if (m_draggingTreeSplitter || m_draggingGitSplitter || m_draggingSplitSplitter || m_draggingPreviewSplitter || m_resizingCol >= 0 ||
-                HitResizeHandle(PxToDip(pt.x), PxToDip(pt.y)) != 0) {
+                HitResizeHandle(PxToDip(pt.x), PxToDip(pt.y)) != 0 ||
+                (PreviewPaneVisible() && m_contentPane.WantsHorizontalResizeCursor(PxToDip(pt.x), PxToDip(pt.y)))) {
                 SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                 return TRUE;
             }
@@ -1009,6 +1022,18 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam), PxToDip(pt.x), PxToDip(pt.y), GET_KEYSTATE_WPARAM(wParam));
         return 0;
     }
+
+#ifdef WM_MOUSEHWHEEL
+    case WM_MOUSEHWHEEL: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(m_hwnd, &pt);
+        if (PreviewPaneVisible() && m_contentPane.OnMouseHWheel(GET_WHEEL_DELTA_WPARAM(wParam), PxToDip(pt.x), PxToDip(pt.y))) {
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+            return TRUE;
+        }
+        break;
+    }
+#endif
 
     case WM_DPICHANGED: {
         // Moved to a monitor with another scale factor (or the scaling changed): draw at the new DPI and take the
@@ -1146,10 +1171,12 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
-    case WM_APP_DIR_CHANGED:
-        if (!m_isSearchActive && m_renamingIndex < 0 && m_renamingPath.empty() &&
-            m_renamePending.load() == 0 && m_mergePending.load() == 0 &&
-            !m_imageCache.IsAnyImageTransforming()) {
+    case WM_APP_DIR_CHANGED: {
+        const ULONGLONG startedTick = GetTickCount64();
+        bool refresh = !m_isSearchActive && m_renamingIndex < 0 && m_renamingPath.empty() &&
+                       m_renamePending.load() == 0 && m_mergePending.load() == 0 &&
+                       !m_imageCache.IsAnyImageTransforming();
+        if (refresh) {
             // A running delete job counts as "touching" the folders it works in, like a copy or a move
             bool activeXferHere = m_transfers.IsTouchingDirectory(m_currentNormKey);
             if (!activeXferHere && IsSplitViewActive() && !m_otherPane.currentPath.empty()) {
@@ -1159,16 +1186,21 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 ULONGLONG nowTick = GetTickCount64();
                 if (nowTick - m_lastDirChangedWhileXferTick < 1500) {
                     m_pendingDeferredDirRefresh = true;
-                    return 0;
+                    refresh = false;
+                } else {
+                    m_lastDirChangedWhileXferTick = nowTick;
+                    m_pendingDeferredDirRefresh = false;
                 }
-                m_lastDirChangedWhileXferTick = nowTick;
-                m_pendingDeferredDirRefresh = false;
             } else {
                 m_pendingDeferredDirRefresh = false;
             }
-            RefreshCurrentFolder();
         }
+        if (refresh) RefreshCurrentFolder();
+        // The folder watcher waits for this before it posts its next message, and then leaves the window alone
+        // for a few times as long as the refresh took (see FileEngine::DirChangeHandled)
+        m_fileEngine.DirChangeHandled(GetTickCount64() - startedTick);
         return 0;
+    }
 
     case WM_APP_IMAGE_ROTATED: {
         m_imageCache.TakeCompletedRotations();
@@ -1233,6 +1265,9 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_APP_FOLDER_SIZE_UPDATED:
+        // Sent once when the size workers have run out of work (and by the drive probes). Acknowledged before
+        // the sizes are read, so that a result stored from here on is announced again.
+        m_fileEngine.AcknowledgeSizeNotification();
         SyncFolderSizesFromCache();
         EnsureWorkAnimTimerState();
         InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -1287,6 +1322,55 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         EnsureWorkAnimTimerState();
         InvalidateRect(m_hwnd, nullptr, FALSE);
+
+        // When an inline rename failed because a process holds an open handle / CWD / DLL lock on the file or folder,
+        // open the Lock Inspector so the user can surgically unlock handles or close the process and retry in 1 click!
+        if (!r->ok && !r->oldPath.empty() &&
+            !IsVirtualFolder(r->oldPath) && !FtpClient::IsFtpPath(r->oldPath) && !RepoBrowser::IsRepoUrl(r->oldPath) &&
+            (r->error == ERROR_SHARING_VIOLATION || r->error == ERROR_LOCK_VIOLATION ||
+             r->error == ERROR_ACCESS_DENIED     || r->error == ERROR_DIR_NOT_EMPTY))
+        {
+            const std::wstring oldPathCopy = r->oldPath;
+            const std::wstring oldNameCopy = r->oldName;
+            const std::wstring newNameCopy = r->newName;
+
+            LockDialogCallbacks cb;
+            cb.failureOp = LockFailureOpKind::Rename;
+            cb.operationSummary = oldNameCopy + L"  \x2192  " + newNameCopy;
+            cb.failedDeleteCount = 1u;
+            cb.deleteErrors = { { oldPathCopy, r->newPath, r->error, SystemErrorText(r->error), 0u } };
+            cb.querySelfHold = [this]() -> SelfHoldInfo {
+                SelfHoldInfo sh;
+                sh.mediaPath = m_mediaPlayer.GetCurrentPath();
+                sh.previewPath = m_contentPane.GetPreviewStateForTesting().currentPath;
+                if (!IsVirtualFolder(m_currentPath) && !FtpClient::IsFtpPath(m_currentPath) && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+                    sh.activeFolderPath = m_currentPath;
+                }
+                return sh;
+            };
+            cb.releaseSelfHold = [this, oldPathCopy]() {
+                m_mediaPlayer.CloseMedia();
+                KillTimer(m_hwnd, ID_TIMER_MEDIA);
+                m_contentPane.SyncToSelection(nullptr, false);
+                m_imageCache.EvictPath(oldPathCopy);
+                const std::wstring curNorm = PathUtils::NormalizePathKey(m_currentPath);
+                const std::wstring tgtNorm = PathUtils::NormalizePathKey(oldPathCopy);
+                if (!curNorm.empty() && !tgtNorm.empty() &&
+                    (curNorm == tgtNorm ||
+                     (curNorm.size() > tgtNorm.size() + 1u &&
+                      (curNorm[tgtNorm.size()] == L'\\' || curNorm[tgtNorm.size()] == L'/') &&
+                      curNorm.compare(0, tgtNorm.size(), tgtNorm) == 0)))
+                {
+                    const std::wstring parent = PathUtils::GetParentPath(oldPathCopy);
+                    if (!parent.empty() && parent != oldPathCopy) NavigateTo(parent, true);
+                }
+            };
+            cb.retryDeleteJob = [this, oldPathCopy, oldNameCopy, newNameCopy]() {
+                StartRenameJob(oldPathCopy, oldNameCopy, newNameCopy);
+            };
+            FileLockInspector::ShowFileLockInspectorDialog(
+                m_hwnd, m_hInstance, m_editFont, m_lang, { oldPathCopy }, cb);
+        }
         return 0;
     }
 
@@ -1388,6 +1472,7 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         std::wstring otherNorm = m_otherPane.currentPath.empty() ? L"" : PathUtils::NormalizePathKey(m_otherPane.currentPath);
 
         std::vector<TransferCompletionEvent> deleteProblems;
+        std::vector<TransferCompletionEvent> transferLockProblems;
         for (const auto& ev : events) {
             if (ev.op == TransferOp::Delete) {
                 // Whatever the job could not remove is still on disk and has to be listed again
@@ -1427,6 +1512,17 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 m_statusToastExpireTick = GetTickCount64() + 5500;
                 AppLog::Warn(L"Transfer", L"Job #" + std::to_wstring(ev.jobId) + L" finished with " +
                              std::to_wstring(ev.errorCount) + L" error(s) -> " + ev.targetDir);
+                for (const auto& fe : ev.firstErrors) {
+                    const bool isLockErr = (fe.win32Error == ERROR_SHARING_VIOLATION || fe.win32Error == ERROR_LOCK_VIOLATION ||
+                                            (ev.op == TransferOp::Move &&
+                                             (fe.win32Error == ERROR_ACCESS_DENIED || fe.win32Error == ERROR_DIR_NOT_EMPTY)));
+                    if (isLockErr && !fe.srcPath.empty() &&
+                        !IsVirtualFolder(fe.srcPath) && !FtpClient::IsFtpPath(fe.srcPath) && !RepoBrowser::IsRepoUrl(fe.srcPath))
+                    {
+                        transferLockProblems.push_back(ev);
+                        break;
+                    }
+                }
             } else {
                 wchar_t secBuf[32] = {};
                 swprintf_s(secBuf, L"%.2f s", static_cast<double>(ev.elapsedMs) / 1000.0);
@@ -1458,8 +1554,9 @@ LRESULT ExplorerApp::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         UpdateTaskbarProgress();
         EnsureWorkAnimTimerState();
         InvalidateRect(m_hwnd, nullptr, FALSE);
-        // Shown last, once the lists are up to date: what a delete job could not remove, and why
+        // Shown last, once the lists are up to date: what a delete or transfer job could not move/copy/remove, and why
         for (const auto& ev : deleteProblems) ShowDeleteFailures(ev);
+        for (const auto& ev : transferLockProblems) ShowTransferLockFailures(ev);
         return 0;
     }
 
@@ -1835,6 +1932,23 @@ bool ExplorerApp::RefuseReadOnlyFolder(const std::wstring& path) {
 }
 
 void ExplorerApp::RefreshFromUser() {
+    if (m_viewMode == ViewMode::Hardware) {
+        if (IsProgramsView()) {
+            ExecuteRibbonCommand(CMD_PROG_REFRESH);
+        } else if (IsMonitoringView()) {
+            ExecuteRibbonCommand(CMD_MON_REFRESH);
+        } else if (IsLanView()) {
+            m_lan.PingAllHostsOnce();
+            m_statusToast = m_lang == Lang::PL ? L"\x2713 Odświeżono ping dla wszystkich wykrytych hostów"
+                                               : L"\x2713 Refreshed ping for all discovered hosts";
+            m_statusToastExpireTick = GetTickCount64() + 2600;
+            EnsureWorkAnimTimerState();
+        } else if (!IsLogView() && !IsBackupsView() && !IsTransfersView() && !IsClipboardView()) {
+            ExecuteRibbonCommand(CMD_HW_REFRESH);
+        }
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
     if (DriveListSignature() != m_driveListSignature) OnDrivesChanged();    // also the drive list, when it is out of date
     if (RepoBrowser::IsRepoUrl(m_currentPath)) RepoBrowser::Invalidate(m_currentPath);
     if (NetShares::IsNetworkPath(m_currentPath)) NetShares::Invalidate(m_currentPath);   // the server is asked again
@@ -3234,7 +3348,20 @@ void ExplorerApp::SyncGitRepo(bool force, bool full) {
 bool ExplorerApp::HandleGitDockClick(float x, float y, bool rightButton) {
     if (!GitDockVisible()) return false;
     if (!PathUtils::PtInRectF(x, y, GetGitDockRect())) return false;
-    if (rightButton) return true;
+    if (rightButton) {
+        HMENU hMenu = CreatePopupMenu();
+        if (hMenu) {
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_REFRESH, GetStrings(m_lang).ctxRefresh);
+            POINT pt = ClientDipToScreen(x, y);
+            int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr);
+            DestroyMenu(hMenu);
+            if (cmd == CMD_CTX_REFRESH) {
+                SyncGitRepo(true, true);
+                InvalidateRect(m_hwnd, nullptr, FALSE);
+            }
+        }
+        return true;
+    }
 
     const bool pl = (m_lang == Lang::PL);
     for (const GitDockHit& h : m_gitHits) {
@@ -3975,12 +4102,17 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
         return;
     }
 
-    // 3. Check Details Header column click / resize
+    // 3. Check Details Header column click / resize (right-click opens View / Sort / Group / Refresh menu)
     float hdrTop = mainRect.top + (IsTabBarVisible() ? 26.0f : 0.0f) + (m_isSearchActive ? 28.0f : 0.0f);
-    if (m_viewMode == ViewMode::Details && !rightButton &&
+    if (m_viewMode == ViewMode::Details &&
         y >= hdrTop && y <= hdrTop + kDetailsHeaderHeight &&
         x >= mainRect.left && x <= mainRect.right)
     {
+        if (rightButton) {
+            POINT pt = ClientDipToScreen(x, y);
+            ShowContextMenu(pt.x, pt.y, -1);
+            return;
+        }
         float colW[5];
         GetDetailsColumnWidths(colW);
         float colX = mainRect.left + 6.0f;
@@ -4063,6 +4195,35 @@ void ExplorerApp::OnMouseDown(float x, float y, bool rightButton, WPARAM keyFlag
                             InvalidateRect(m_hwnd, nullptr, FALSE);
                         }
                         return;
+                    }
+                }
+            } else {
+                const Strings& s = GetStrings(m_lang);
+                std::wstring hoveredCopyText, hoveredLabel;
+                for (const auto& card : m_hwCardHits) {
+                    if (PathUtils::PtInRectF(x, y, card.rect) && !card.copyText.empty()) {
+                        hoveredCopyText = card.copyText;
+                        hoveredLabel = card.label;
+                        break;
+                    }
+                }
+                HMENU hMenu = CreatePopupMenu();
+                if (hMenu) {
+                    if (!hoveredCopyText.empty()) {
+                        AppendMenuW(hMenu, MF_STRING, CMD_CTX_COPY, s.ctxCopy);
+                        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                    }
+                    AppendMenuW(hMenu, MF_STRING, CMD_CTX_REFRESH, s.ctxRefresh);
+                    POINT pt = ClientDipToScreen(x, y);
+                    int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, m_hwnd, nullptr);
+                    DestroyMenu(hMenu);
+                    if (cmd == CMD_CTX_COPY && !hoveredCopyText.empty()) {
+                        FileEngine::CopyTextToClipboard(m_hwnd, hoveredCopyText);
+                        m_statusToast = (m_lang == Lang::PL ? L"\x2713 Skopiowano do schowka: " : L"\x2713 Copied to clipboard: ") + hoveredLabel;
+                        m_statusToastExpireTick = GetTickCount64() + 2600;
+                        InvalidateRect(m_hwnd, nullptr, FALSE);
+                    } else if (cmd == CMD_CTX_REFRESH) {
+                        RefreshFromUser();
                     }
                 }
             }
@@ -4911,7 +5072,7 @@ void ExplorerApp::OnKeyDown(WPARAM vk) {
             OnMouseDown(m_searchBarRect.left + 10.0f, m_searchBarRect.top + 5.0f, false, 0);
             return;
         }
-        if (vk == 'R') { RefreshCurrentFolder(); return; }
+        if (vk == 'R') { RefreshFromUser(); return; }
         if (vk == 'T') { CreateNewTab(L"", true); return; }
         if (vk == 'W') { CloseTab(m_activeTab); return; }
         if (vk == 'M') { ExecuteRibbonCommand(CMD_BATCH_RENAME); return; }
@@ -6431,6 +6592,17 @@ void ExplorerApp::ExecuteRibbonCommand(int cmdId) {
         }
         break;
     }
+    case CMD_CTX_CHECK_LOCKS: {
+        if (IsTransfersView()) {
+            const int jid = !m_hwActionArg.empty() ? _wtoi(m_hwActionArg.c_str()) : m_xferSelectedJobId;
+            if (jid > 0) OpenLockInspectorForTransferJob(jid);
+            break;
+        }
+        auto paths = GetSelectedPaths();
+        if (paths.empty() && !m_currentPath.empty()) paths.push_back(m_currentPath);
+        OpenLockInspectorForPaths(paths);
+        break;
+    }
     case CMD_XFER_NEW_TRANSFER_DLG: {
         const bool pl = (m_lang == Lang::PL);
         std::wstring defaultSrc = (!m_currentPath.empty() && m_currentPath != L"THIS_PC") ? m_currentPath : L"";
@@ -7507,9 +7679,10 @@ void ExplorerApp::DeletePaths(std::vector<std::wstring> toDelete, bool permanent
         }
     }
 
-    // Release any active video/audio stream before deleting so files are never locked!
+    // Release any active video/audio stream or preview pane hold before deleting so files are never locked!
     m_mediaPlayer.CloseMedia();
     KillTimer(m_hwnd, ID_TIMER_MEDIA);
+    m_contentPane.SyncToSelection(nullptr, false);
 
     int nextFocusIdx = m_focusedIndex;
 
@@ -7649,24 +7822,305 @@ void ExplorerApp::ShowDeleteFailures(const TransferCompletionEvent& ev) {
     std::wstring msg = pl ? (std::to_wstring(ev.errorCount) + L" element(ów) nie udało się usunąć:\n\n")
                           : (std::to_wstring(ev.errorCount) + L" item(s) could not be deleted:\n\n");
     bool sawLockOrAccess = false;
+    std::vector<std::wstring> failedLocalPaths;
     size_t shown = 0;
     for (const auto& e : ev.firstErrors) {
         if (ev.recycle && e.win32Error == ERROR_NOT_SUPPORTED && !ev.notRecyclablePaths.empty()) continue;
-        if (shown++ >= 6) break;
-        msg += e.srcPath + L"\n    \x2192 " + e.message + L"\n";
-        if (e.win32Error == ERROR_SHARING_VIOLATION || e.win32Error == ERROR_ACCESS_DENIED || e.win32Error == ERROR_LOCK_VIOLATION) {
+        if (!e.srcPath.empty() && !IsVirtualFolder(e.srcPath) &&
+            !FtpClient::IsFtpPath(e.srcPath) && !RepoBrowser::IsRepoUrl(e.srcPath)) {
+            failedLocalPaths.push_back(e.srcPath);
+        }
+        if (shown < 6) {
+            msg += e.srcPath + L"\n    \x2192 " + e.message + L"\n";
+        }
+        ++shown;
+        if (e.win32Error == ERROR_SHARING_VIOLATION || e.win32Error == ERROR_ACCESS_DENIED ||
+            e.win32Error == ERROR_LOCK_VIOLATION    || e.win32Error == ERROR_DIR_NOT_EMPTY) {
             sawLockOrAccess = true;
         }
     }
     if (shown == 0) return;
-    if (ev.errorCount > shown) msg += L"...\n";
-    if (sawLockOrAccess) {
-        msg += pl ? L"\nPlik jest prawdopodobnie używany przez inny program (maszyna wirtualna, Unity, indeksowanie, antywirus) albo wymaga uprawnień administratora."
-                  : L"\nThe file is probably in use by another program (VM, Unity, indexer, antivirus) or needs administrator rights.";
+
+    if (sawLockOrAccess && !failedLocalPaths.empty()) {
+        // Include original top-level requested delete folders/files so CWD/handle locks on parent folders are caught too
+        for (const auto& sp : ev.sources) {
+            if (!sp.empty() && !IsVirtualFolder(sp) && !FtpClient::IsFtpPath(sp) && !RepoBrowser::IsRepoUrl(sp)) {
+                failedLocalPaths.push_back(sp);
+            }
+        }
+
+        LockDialogCallbacks cb;
+        cb.isDeleteFailureMode = true;
+        cb.failedDeleteCount = ev.errorCount;
+        cb.deleteErrors = ev.firstErrors;
+        cb.querySelfHold = [this]() -> SelfHoldInfo {
+            SelfHoldInfo sh;
+            sh.mediaPath = m_mediaPlayer.GetCurrentPath();
+            sh.previewPath = m_contentPane.GetPreviewStateForTesting().currentPath;
+            if (!IsVirtualFolder(m_currentPath) && !FtpClient::IsFtpPath(m_currentPath) && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+                sh.activeFolderPath = m_currentPath;
+            }
+            return sh;
+        };
+        cb.releaseSelfHold = [this, failedLocalPaths]() {
+            m_mediaPlayer.CloseMedia();
+            KillTimer(m_hwnd, ID_TIMER_MEDIA);
+            m_contentPane.SyncToSelection(nullptr, false);
+            for (const auto& fp : failedLocalPaths) {
+                m_imageCache.EvictPath(fp);
+                const std::wstring curNorm = PathUtils::NormalizePathKey(m_currentPath);
+                const std::wstring tgtNorm = PathUtils::NormalizePathKey(fp);
+                if (!curNorm.empty() && !tgtNorm.empty() &&
+                    (curNorm == tgtNorm ||
+                     (curNorm.size() > tgtNorm.size() + 1u &&
+                      curNorm[tgtNorm.size()] == L'\\' &&
+                      curNorm.compare(0, tgtNorm.size(), tgtNorm) == 0)))
+                {
+                    const std::wstring parent = PathUtils::GetParentPath(fp);
+                    if (!parent.empty() && parent != fp) NavigateTo(parent, true);
+                }
+            }
+        };
+        const int jobId = ev.jobId;
+        cb.retryDeleteJob = [this, jobId]() {
+            m_transfers.RetryFailedInJob(jobId);
+            EnsureWorkAnimTimerState();
+            InvalidateRect(m_hwnd, nullptr, FALSE);
+        };
+        cb.onAdminDeleteSucceeded = [this, jobId, pl]() {
+            m_transfers.CancelOrRemoveJob(jobId);
+            m_statusToast = pl ? L"\x2713 Usunięto z uprawnieniami Administratora"
+                               : L"\x2713 Deleted with Administrator privileges";
+            m_statusToastExpireTick = GetTickCount64() + 3500;
+            RefreshCurrentFolder();
+        };
+
+        FileLockInspector::ShowFileLockInspectorDialog(
+            m_hwnd, m_hInstance, m_editFont, m_lang, failedLocalPaths, cb);
+        return;
     }
+
+    if (ev.errorCount > 6) msg += L"...\n";
     msg += pl ? L"\n\nPo usunięciu przyczyny: karta [Transfery] \x2192 Ponów."
               : L"\n\nOnce the cause is gone: [Transfers] tab \x2192 Retry.";
     MessageBoxW(m_hwnd, msg.c_str(), pl ? L"Nie wszystko zostało usunięte" : L"Not everything was deleted", MB_OK | MB_ICONWARNING);
+}
+
+void ExplorerApp::ShowTransferLockFailures(const TransferCompletionEvent& ev) {
+    std::vector<std::wstring> lockedPaths;
+    auto pushLocal = [&](const std::wstring& p) {
+        if (p.empty() || IsVirtualFolder(p) || FtpClient::IsFtpPath(p) || RepoBrowser::IsRepoUrl(p)) return;
+        const std::wstring k = PathUtils::NormalizePathKey(p);
+        for (const auto& ex : lockedPaths) {
+            if (PathUtils::NormalizePathKey(ex) == k) return;
+        }
+        lockedPaths.push_back(p);
+    };
+    for (const auto& fe : ev.firstErrors) {
+        pushLocal(fe.srcPath);
+        if (!fe.dstPath.empty() && GetFileAttributesW(PathUtils::ToExtendedWinPath(fe.dstPath).c_str()) != INVALID_FILE_ATTRIBUTES) {
+            pushLocal(fe.dstPath);
+        }
+    }
+    if (ev.op == TransferOp::Move) {
+        for (const auto& sp : ev.sources) pushLocal(sp);
+    }
+    if (lockedPaths.empty()) return;
+
+    LockDialogCallbacks cb;
+    cb.failureOp = (ev.op == TransferOp::Move) ? LockFailureOpKind::Move : LockFailureOpKind::Copy;
+    cb.failedDeleteCount = ev.errorCount;
+    cb.deleteErrors = ev.firstErrors;
+    cb.querySelfHold = [this]() -> SelfHoldInfo {
+        SelfHoldInfo sh;
+        sh.mediaPath = m_mediaPlayer.GetCurrentPath();
+        sh.previewPath = m_contentPane.GetPreviewStateForTesting().currentPath;
+        if (!IsVirtualFolder(m_currentPath) && !FtpClient::IsFtpPath(m_currentPath) && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+            sh.activeFolderPath = m_currentPath;
+        }
+        return sh;
+    };
+    cb.releaseSelfHold = [this, lockedPaths]() {
+        m_mediaPlayer.CloseMedia();
+        KillTimer(m_hwnd, ID_TIMER_MEDIA);
+        m_contentPane.SyncToSelection(nullptr, false);
+        for (const auto& lp : lockedPaths) {
+            m_imageCache.EvictPath(lp);
+            const std::wstring curNorm = PathUtils::NormalizePathKey(m_currentPath);
+            const std::wstring tgtNorm = PathUtils::NormalizePathKey(lp);
+            if (!curNorm.empty() && !tgtNorm.empty() &&
+                (curNorm == tgtNorm ||
+                 (curNorm.size() > tgtNorm.size() + 1u &&
+                  (curNorm[tgtNorm.size()] == L'\\' || curNorm[tgtNorm.size()] == L'/') &&
+                  curNorm.compare(0, tgtNorm.size(), tgtNorm) == 0)))
+            {
+                const std::wstring parent = PathUtils::GetParentPath(lp);
+                if (!parent.empty() && parent != lp) NavigateTo(parent, true);
+            }
+        }
+    };
+    const int jobId = ev.jobId;
+    cb.retryDeleteJob = [this, jobId]() {
+        m_transfers.RetryFailedInJob(jobId);
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    };
+
+    FileLockInspector::ShowFileLockInspectorDialog(
+        m_hwnd, m_hInstance, m_editFont, m_lang, lockedPaths, cb);
+}
+
+void ExplorerApp::OpenLockInspectorForTransferJob(int jobId) {
+    const bool pl = (m_lang == Lang::PL);
+    const auto jobs = m_transfers.SnapshotJobs();
+    const TransferJobSnapshot* found = nullptr;
+    for (const auto& j : jobs) {
+        if (j.id == jobId) { found = &j; break; }
+    }
+    if (!found) return;
+
+    std::vector<std::wstring> targetPaths;
+    auto pushLocal = [&](const std::wstring& p) {
+        if (p.empty() || IsVirtualFolder(p) || FtpClient::IsFtpPath(p) || RepoBrowser::IsRepoUrl(p)) return;
+        const std::wstring k = PathUtils::NormalizePathKey(p);
+        for (const auto& ex : targetPaths) {
+            if (PathUtils::NormalizePathKey(ex) == k) return;
+        }
+        targetPaths.push_back(p);
+    };
+    for (const auto& fe : found->errors) {
+        pushLocal(fe.srcPath);
+        if (!fe.dstPath.empty() && GetFileAttributesW(PathUtils::ToExtendedWinPath(fe.dstPath).c_str()) != INVALID_FILE_ATTRIBUTES) {
+            pushLocal(fe.dstPath);
+        }
+    }
+    if (found->op == TransferOp::Delete || found->op == TransferOp::Move || targetPaths.empty()) {
+        for (const auto& sp : found->sources) pushLocal(sp);
+    }
+    if (targetPaths.empty()) {
+        OpenLockInspectorForPaths(found->sources);
+        return;
+    }
+
+    LockDialogCallbacks cb;
+    cb.isDeleteFailureMode = (found->op == TransferOp::Delete);
+    cb.failureOp = (found->op == TransferOp::Delete) ? LockFailureOpKind::Delete
+                 : (found->op == TransferOp::Move)   ? LockFailureOpKind::Move
+                                                     : LockFailureOpKind::Copy;
+    cb.failedDeleteCount = found->errors.size();
+    cb.deleteErrors = found->errors;
+    cb.querySelfHold = [this]() -> SelfHoldInfo {
+        SelfHoldInfo sh;
+        sh.mediaPath = m_mediaPlayer.GetCurrentPath();
+        sh.previewPath = m_contentPane.GetPreviewStateForTesting().currentPath;
+        if (!IsVirtualFolder(m_currentPath) && !FtpClient::IsFtpPath(m_currentPath) && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+            sh.activeFolderPath = m_currentPath;
+        }
+        return sh;
+    };
+    cb.releaseSelfHold = [this, targetPaths]() {
+        m_mediaPlayer.CloseMedia();
+        KillTimer(m_hwnd, ID_TIMER_MEDIA);
+        m_contentPane.SyncToSelection(nullptr, false);
+        for (const auto& lp : targetPaths) {
+            m_imageCache.EvictPath(lp);
+            const std::wstring curNorm = PathUtils::NormalizePathKey(m_currentPath);
+            const std::wstring tgtNorm = PathUtils::NormalizePathKey(lp);
+            if (!curNorm.empty() && !tgtNorm.empty() &&
+                (curNorm == tgtNorm ||
+                 (curNorm.size() > tgtNorm.size() + 1u &&
+                  (curNorm[tgtNorm.size()] == L'\\' || curNorm[tgtNorm.size()] == L'/') &&
+                  curNorm.compare(0, tgtNorm.size(), tgtNorm) == 0)))
+            {
+                const std::wstring parent = PathUtils::GetParentPath(lp);
+                if (!parent.empty() && parent != lp) NavigateTo(parent, true);
+            }
+        }
+    };
+    cb.retryDeleteJob = [this, jobId]() {
+        m_transfers.RetryFailedInJob(jobId);
+        UpdateTaskbarProgress();
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    };
+    if (found->op == TransferOp::Delete) {
+        cb.onAdminDeleteSucceeded = [this, jobId, pl]() {
+            m_transfers.CancelOrRemoveJob(jobId);
+            m_statusToast = pl ? L"\x2713 Usunięto z uprawnieniami Administratora"
+                               : L"\x2713 Deleted with Administrator privileges";
+            m_statusToastExpireTick = GetTickCount64() + 3500;
+            RefreshCurrentFolder();
+        };
+    }
+
+    FileLockInspector::ShowFileLockInspectorDialog(
+        m_hwnd, m_hInstance, m_editFont, m_lang, targetPaths, cb);
+}
+
+void ExplorerApp::OpenLockInspectorForPaths(const std::vector<std::wstring>& rawPaths) {
+    const bool pl = (m_lang == Lang::PL);
+    std::vector<std::wstring> localTargets;
+    for (const auto& rp : rawPaths) {
+        if (rp.empty() || IsVirtualFolder(rp) || FtpClient::IsFtpPath(rp) || RepoBrowser::IsRepoUrl(rp)) {
+            continue;
+        }
+        std::wstring arcFile, innerPath;
+        if (ArchiveExplorer::SplitVirtualArchivePath(rp, arcFile, innerPath) && !arcFile.empty()) {
+            localTargets.push_back(arcFile);
+        } else {
+            localTargets.push_back(rp);
+        }
+    }
+
+    if (localTargets.empty()) {
+        m_statusToast = pl ? L"\x26A0 Inspektor blokad działa dla lokalnych plików i folderów"
+                           : L"\x26A0 Lock Inspector works on local files and folders";
+        m_statusToastExpireTick = GetTickCount64() + 3200;
+        EnsureWorkAnimTimerState();
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    LockDialogCallbacks cb;
+    cb.querySelfHold = [this]() -> SelfHoldInfo {
+        SelfHoldInfo sh;
+        sh.mediaPath = m_mediaPlayer.GetCurrentPath();
+        sh.previewPath = m_contentPane.GetPreviewStateForTesting().currentPath;
+        if (!IsVirtualFolder(m_currentPath) && !FtpClient::IsFtpPath(m_currentPath) && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+            sh.activeFolderPath = m_currentPath;
+        }
+        return sh;
+    };
+    cb.releaseSelfHold = [this, localTargets]() {
+        m_mediaPlayer.CloseMedia();
+        KillTimer(m_hwnd, ID_TIMER_MEDIA);
+        m_contentPane.SyncToSelection(nullptr, false);
+        for (const auto& lp : localTargets) {
+            m_imageCache.EvictPath(lp);
+            // If Explorer2 itself is currently navigated inside a folder the user wants to unlock, step up to parent
+            const std::wstring curNorm = PathUtils::NormalizePathKey(m_currentPath);
+            const std::wstring tgtNorm = PathUtils::NormalizePathKey(lp);
+            if (!curNorm.empty() && !tgtNorm.empty() &&
+                (curNorm == tgtNorm ||
+                 (curNorm.size() > tgtNorm.size() + 1u &&
+                  curNorm[tgtNorm.size()] == L'\\' &&
+                  curNorm.compare(0, tgtNorm.size(), tgtNorm) == 0)))
+            {
+                const std::wstring parent = PathUtils::GetParentPath(lp);
+                if (!parent.empty() && parent != lp) NavigateTo(parent, true);
+            }
+        }
+    };
+    cb.onAdminDeleteSucceeded = [this, pl]() {
+        m_statusToast = pl ? L"\x2713 Usunięto z uprawnieniami Administratora"
+                           : L"\x2713 Deleted with Administrator privileges";
+        m_statusToastExpireTick = GetTickCount64() + 3500;
+        RefreshCurrentFolder();
+    };
+
+    FileLockInspector::ShowFileLockInspectorDialog(
+        m_hwnd, m_hInstance, m_editFont, m_lang, localTargets, cb);
 }
 
 void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
@@ -7745,6 +8199,7 @@ void ExplorerApp::ConfirmAndDeleteRowItem(int itemIndex, bool permanent) {
 
     m_mediaPlayer.CloseMedia();
     KillTimer(m_hwnd, ID_TIMER_MEDIA);
+    m_contentPane.SyncToSelection(nullptr, false);
 
     std::wstring delPath = itemCopy.fullPath;
     std::wstring delKey  = itemCopy.normKey;
@@ -8091,16 +8546,9 @@ void ExplorerApp::StartRenameJob(const std::wstring& oldPath, const std::wstring
     const std::wstring target = isFtp ? FtpClient::JoinFtpPath(parent, newName) : (PathUtils::EnsureTrailingSlash(parent) + newName);
     const bool caseOnly = (_wcsicmp(oldName.c_str(), newName.c_str()) == 0);
 
-    auto toExt = [](const std::wstring& p) -> std::wstring {
-        if (p.rfind(L"\\\\?\\", 0) == 0) return p;
-        if (p.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + p.substr(2);
-        if (p.size() >= 2 && p[1] == L':') return L"\\\\?\\" + p;
-        return p;
-    };
-
-    const DWORD targetAttrs = isFtp ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(toExt(target).c_str());
+    const DWORD targetAttrs = isFtp ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(PathUtils::ToExtendedWinPath(target).c_str());
     if (!caseOnly && targetAttrs != INVALID_FILE_ATTRIBUTES) {
-        const DWORD srcAttrs = GetFileAttributesW(toExt(oldPath).c_str());
+        const DWORD srcAttrs = GetFileAttributesW(PathUtils::ToExtendedWinPath(oldPath).c_str());
         const bool targetIsDir = (targetAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const bool srcIsDir = srcAttrs != INVALID_FILE_ATTRIBUTES && (srcAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
         if (targetIsDir && srcIsDir) {
@@ -8146,7 +8594,7 @@ void ExplorerApp::StartRenameJob(const std::wstring& oldPath, const std::wstring
     InvalidateRect(m_hwnd, nullptr, FALSE);
 
     HWND hwnd = m_hwnd;
-    std::thread([hwnd, oldPath, oldName, newName, caseOnly, toExt]() {
+    std::thread([hwnd, oldPath, oldName, newName, caseOnly]() {
         auto* r = new RenameJobResult();
         r->oldPath = oldPath; r->oldName = oldName; r->newName = newName;
         DWORD err = 0;
@@ -8157,11 +8605,11 @@ void ExplorerApp::StartRenameJob(const std::wstring& oldPath, const std::wstring
                 r->verified = true;
             } else if (caseOnly) {
                 WIN32_FIND_DATAW fd = {};
-                HANDLE h = FindFirstFileW(toExt(r->newPath).c_str(), &fd);
+                HANDLE h = FindFirstFileW(PathUtils::ToExtendedWinPath(r->newPath).c_str(), &fd);
                 if (h != INVALID_HANDLE_VALUE) { r->verified = (newName == fd.cFileName); FindClose(h); }
             } else {
-                r->verified = GetFileAttributesW(toExt(r->newPath).c_str()) != INVALID_FILE_ATTRIBUTES &&
-                              GetFileAttributesW(toExt(oldPath).c_str()) == INVALID_FILE_ATTRIBUTES;
+                r->verified = GetFileAttributesW(PathUtils::ToExtendedWinPath(r->newPath).c_str()) != INVALID_FILE_ATTRIBUTES &&
+                              GetFileAttributesW(PathUtils::ToExtendedWinPath(oldPath).c_str()) == INVALID_FILE_ATTRIBUTES;
             }
         }
         if (!PostMessageW(hwnd, WM_APP_RENAME_DONE, 0, reinterpret_cast<LPARAM>(r))) delete r;
@@ -8270,6 +8718,7 @@ void ExplorerApp::ShowDeleteDropdownMenu(int screenX, int screenY) {
     } else {
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_RECYCLE, s.menuDeleteRecycle);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_PERM, s.menuDeletePerm);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_CHECK_LOCKS, s.ctxCheckLocks);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING | (m_confirmDelete ? MF_CHECKED : MF_UNCHECKED), CMD_CTX_TOGGLE_CONFIRM, s.menuDeleteConfirmToggle);
     }
@@ -8281,6 +8730,11 @@ void ExplorerApp::ShowDeleteDropdownMenu(int screenX, int screenY) {
     else if (cmd == CMD_CTX_EMPTY_RECYCLE_BIN) EmptyRecycleBinAction();
     else if (cmd == CMD_CTX_DELETE_RECYCLE) DeleteSelectedItems(false);
     else if (cmd == CMD_CTX_DELETE_PERM) DeleteSelectedItems(true);
+    else if (cmd == CMD_CTX_CHECK_LOCKS) {
+        auto sel = GetSelectedPaths();
+        if (sel.empty() && !m_currentPath.empty()) sel.push_back(m_currentPath);
+        OpenLockInspectorForPaths(sel);
+    }
     else if (cmd == CMD_CTX_TOGGLE_CONFIRM) m_confirmDelete = !m_confirmDelete;
 }
 
@@ -8585,9 +9039,21 @@ void ExplorerApp::ShowRecentDirsDropdown(int triggerCmdId) {
 }
 
 void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeIndex) {
-    if (treeNodeIndex < 0 || treeNodeIndex >= static_cast<int>(m_treeNodes.size())) return;
-    const TreeNode nodeCopy = m_treeNodes[treeNodeIndex];
     const Strings& s = GetStrings(m_lang);
+    if (treeNodeIndex < 0 || treeNodeIndex >= static_cast<int>(m_treeNodes.size())) {
+        HMENU hEmptyMenu = CreatePopupMenu();
+        if (hEmptyMenu) {
+            AppendMenuW(hEmptyMenu, MF_STRING, CMD_CTX_REFRESH, s.ctxRefresh);
+            int cmd = TrackPopupMenu(hEmptyMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, screenX, screenY, 0, m_hwnd, nullptr);
+            DestroyMenu(hEmptyMenu);
+            if (cmd == CMD_CTX_REFRESH) {
+                RebuildTreeNodes();
+                RefreshFromUser();
+            }
+        }
+        return;
+    }
+    const TreeNode nodeCopy = m_treeNodes[treeNodeIndex];
 
     HMENU hMenu = CreatePopupMenu();
 
@@ -8661,6 +9127,7 @@ void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeInde
 
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_COPY_PATH, s.ctxCopyPath);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_CHECK_LOCKS, s.ctxCheckLocks);
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_PROPERTIES, s.ctxProperties);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_EXPLORER, s.ctxOpenExplorer);
@@ -8669,9 +9136,20 @@ void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeInde
         }
     }
 
+    if (GetMenuItemCount(hMenu) > 0) {
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    }
+    AppendMenuW(hMenu, MF_STRING, CMD_CTX_REFRESH, s.ctxRefresh);
+
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, screenX, screenY, 0, m_hwnd, nullptr);
     DestroyMenu(hMenu);
     if (cmd <= 0) return;
+
+    if (cmd == CMD_CTX_REFRESH) {
+        RebuildTreeNodes();
+        RefreshFromUser();
+        return;
+    }
 
     if (cmd == CMD_CTX_EXPAND_COLLAPSE) {
         ToggleTreeNodeExpand(treeNodeIndex);
@@ -8710,6 +9188,10 @@ void ExplorerApp::ShowTreeContextMenu(int screenX, int screenY, int treeNodeInde
     }
     if (cmd == CMD_CTX_PROPERTIES) {
         ShowItemProperties(m_hwnd, nodeCopy.path, m_lang);
+        return;
+    }
+    if (cmd == CMD_CTX_CHECK_LOCKS) {
+        OpenLockInspectorForPaths({ nodeCopy.path });
         return;
     }
     if (cmd == CMD_CTX_EXPLORER) {
@@ -8761,6 +9243,7 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
             AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_PERM, s.ctxDeletePerm);
             AppendMenuW(hMenu, MF_STRING, CMD_CTX_EMPTY_RECYCLE_BIN, s.ctxEmptyRecycleBin);
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_REFRESH, s.ctxRefresh);
             AppendMenuW(hMenu, MF_STRING, CMD_CTX_COPY_PATH, s.ctxCopyPath);
             AppendMenuW(hMenu, MF_STRING, CMD_CTX_PROPERTIES, s.ctxProperties);
         } else {
@@ -8957,7 +9440,12 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_CREATE_SHORTCUT, s.ctxCreateShortcut);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_RECYCLE, s.ctxDeleteRecycle);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_DELETE_PERM, s.ctxDeletePerm);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_CHECK_LOCKS, s.ctxCheckLocks);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_RENAME, s.ctxRename);
+
+        // Refresh without an empty spot to click (in Details / Treemap / Sunburst / FullViewer, rows cover the view)
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING, CMD_CTX_REFRESH, s.ctxRefresh);
 
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_PROPERTIES, s.ctxProperties);
@@ -9058,6 +9546,9 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
         AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hNewMenu), s.ctxNew);
 
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        if (!IsVirtualFolder(m_currentPath) && !FtpClient::IsFtpPath(m_currentPath) && !RepoBrowser::IsRepoUrl(m_currentPath)) {
+            AppendMenuW(hMenu, MF_STRING, CMD_CTX_CHECK_LOCKS, s.ctxCheckLocks);
+        }
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_PROPERTIES, s.ctxProperties);
         AppendMenuW(hMenu, MF_STRING, CMD_CTX_EXPLORER, s.ctxOpenExplorer);
         if (HBITMAP hExpBmp = m_shellEmulator.GetExplorerMenuBitmap()) {
@@ -9340,6 +9831,17 @@ void ExplorerApp::ShowContextMenu(int screenX, int screenY, int hitIndex) {
             ShellMenuEmulator::ShowNativeShellContextMenu(m_hwnd, selPaths, screenX, screenY);
             RefreshCurrentFolder();
         }
+        break;
+    }
+    case CMD_CTX_CHECK_LOCKS: {
+        auto paths = GetSelectedPaths();
+        if (paths.empty() && hitIndex >= 0 && hitIndex < static_cast<int>(m_items.size())) {
+            paths.push_back(m_items[hitIndex].fullPath);
+        }
+        if (paths.empty() && !m_currentPath.empty()) {
+            paths.push_back(m_currentPath);
+        }
+        OpenLockInspectorForPaths(paths);
         break;
     }
     case CMD_CTX_PROPERTIES: {
@@ -9631,17 +10133,22 @@ void ExplorerApp::OnViewerCropMouseMove(float x, float y) {
 }
 
 void ExplorerApp::TriggerFolderSizeCalculation() {
-    m_fileEngine.RequestTreeFolderSizes(m_treeNodes, false);
+    // The listing first, the navigation tree after it: a forced rescan of the listing ends the scans of the
+    // folders it lists and of everything inside them, and a tree folder that is one of those is asked for
+    // again right away. (The tree used to be asked first, and the forced rescan then emptied the whole queue:
+    // from the second click on, the tree's sizes were never worked out.)
     if (!m_currentPath.empty() && m_currentPath != L"THIS_PC") {
         bool anyAlreadyCached = m_fileEngine.HasAnyCachedFolderSizes(m_allItems);
         m_fileEngine.RequestFolderSizes(m_allItems, anyAlreadyCached);
     }
+    m_fileEngine.RequestTreeFolderSizes(m_treeNodes, false);
     SyncFolderSizesFromCache();
     EnsureWorkAnimTimerState();
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
 void ExplorerApp::SyncFolderSizesFromCache() {
+    m_fileEngine.TakeFolderSizesChanged();      // what is read below is all there is (a size stored later sets it again)
     m_fileEngine.SyncTreeNodeSizes(m_treeNodes);
     if (m_currentPath == L"THIS_PC") {
 #ifndef _WIN32

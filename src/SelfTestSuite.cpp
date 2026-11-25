@@ -22,12 +22,14 @@
 #include "TextLayoutCache.h"
 #include "ImageCache.h"
 #include "FileContentPane.h"
+#include "FileLockInspector.h"
 #include "GitIntegration.h"
 #include "NetShares.h"
 #include "OsCompat.h"
 #include "ProgramsInfo.h"
 #include "ReaderInspect.h"
 #include "SelfTestCommon.h"
+#include "TestBytes.h"
 #include "Version.h"
 #include "DetailsColumns.h"
 #include "DragRules.h"
@@ -59,6 +61,7 @@
 #include <csignal>
 #include <dlfcn.h>
 #include <ucontext.h>
+#include <unistd.h>
 #include "LinuxTrash.h"
 #endif
 
@@ -1313,17 +1316,20 @@ void RunStage7Tests(TestCounter& tc) {
     {
         std::vector<uint8_t> sz = {
             '7', 'z', 0xBC, 0xAF, 0x27, 0x1C, // 6-byte signature
-            0, 4,                             // version 0.4
-            0, 0, 0, 0                        // StartHeaderCRC
-        };
-        auto push64 = [&](uint64_t v) {
-            for (int i = 0; i < 8; ++i) sz.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+            0, 4                              // version 0.4
         };
         const char* rawPayload = "7ZIP_DATA_STREAM"; // 16 bytes @ offset 32
-        // Build NextHeader with kHeader(0x01), kFilesInfo(0x05), kName(0x11), size, external=0, UTF-16LE "bin/tool.exe\0"
+        // Build spec-valid NextHeader with kHeader(0x01) + kMainStreamsInfo(0x04, Copy coder, 16B) + kFilesInfo(0x05, numFiles=1, kName)
         const wchar_t* wname = L"bin/tool.exe";
         size_t wlen = wcslen(wname);
-        std::vector<uint8_t> nextHdr = { 0x01, 0x05, 0x11 };
+        std::vector<uint8_t> nextHdr = {
+            0x01,                               // kHeader
+            0x04,                               // kMainStreamsInfo
+            0x06, 0x00, 0x01, 0x09, 0x10, 0x00, // kPackInfo: packPos=0, numPack=1, kSize=16, kEnd
+            0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00, 0x0C, 0x10, 0x00, // kUnPackInfo: 1 folder, Copy(0x00), unpackSize=16, kEnd
+            0x00,                               // kEnd (MainStreamsInfo)
+            0x05, 0x01, 0x11                    // kFilesInfo: numFiles=1, kName
+        };
         uint8_t propSize = static_cast<uint8_t>(1 + (wlen + 1) * 2);
         nextHdr.push_back(propSize);
         nextHdr.push_back(0); // external = 0
@@ -1332,11 +1338,15 @@ void RunStage7Tests(TestCounter& tc) {
             nextHdr.push_back(ch & 0xFF);
             nextHdr.push_back((ch >> 8) & 0xFF);
         }
-        nextHdr.push_back(0x00); // kEnd
+        nextHdr.push_back(0x00); // kEnd (FilesInfo)
+        nextHdr.push_back(0x00); // kEnd (Header)
 
-        push64(16); // NextHeaderOffset = 16 (after 16-byte payload)
-        push64(nextHdr.size());
-        sz.insert(sz.end(), { 0, 0, 0, 0 }); // NextHeaderCRC
+        uint8_t startHdr[20] = {};
+        TestBytes::PutU64LE(startHdr + 0, 16ULL); // NextHeaderOffset = 16 (after 16-byte payload)
+        TestBytes::PutU64LE(startHdr + 8, nextHdr.size());
+        TestBytes::PutU32LE(startHdr + 16, Checksum::Crc32(nextHdr.data(), nextHdr.size()));
+        TestBytes::AppendU32LE(sz, Checksum::Crc32(startHdr, 20)); // StartHeaderCRC
+        sz.insert(sz.end(), startHdr, startHdr + 20);
         sz.insert(sz.end(), rawPayload, rawPayload + 16);
         sz.insert(sz.end(), nextHdr.begin(), nextHdr.end());
 
@@ -2708,7 +2718,7 @@ static void RunStage12Tests(TestCounter& tc) {
 #endif
             (void)u32be;
 
-            bool ok100Img =
+            bool okExtImg =
                 ImageFormatLoader::DecodeImageMemory(exrBytes.data(), exrBytes.size(), L".exr", 256, iExr) && iExr.valid &&
                 ImageFormatLoader::DecodeImageMemory(ktx2Bytes.data(), ktx2Bytes.size(), L".ktx2", 256, iKtx2) && iKtx2.valid &&
                 ImageFormatLoader::DecodeImageMemory(aseBytes.data(), aseBytes.size(), L".aseprite", 256, iAse) && iAse.valid &&
@@ -2751,7 +2761,7 @@ static void RunStage12Tests(TestCounter& tc) {
 
             ArchiveSummaryInfo pakInfo, wadInfo;
             std::vector<uint8_t> pakExtracted, wadExtracted;
-            bool ok100Arc =
+            bool okExtArc =
                 ArchiveExplorer::InspectArchiveFile(pakPath, pakInfo) && pakInfo.valid && pakInfo.entries.size() == 1 &&
                 ArchiveExplorer::ExtractSingleEntryToMemory(pakPath, L"maps/e1m1.bsp", pakExtracted) &&
                 pakExtracted.size() == 8 && std::memcmp(pakExtracted.data(), "HELLO123", 8) == 0 &&
@@ -2769,7 +2779,7 @@ static void RunStage12Tests(TestCounter& tc) {
             const char* usdaTxt = "#usda 1.0\ndef Mesh \"Cube\" {\n point3f[] points = [(0,0,0), (1,0,0), (1,1,0), (0,1,0)]\n int[] faceVertexCounts = [4]\n int[] faceVertexIndices = [0, 1, 2, 3]\n}\n";
             PathUtils::WriteFileBytes(usdaPath, usdaTxt, std::strlen(usdaTxt));
             LoadedMesh3D mIfc, mUsda;
-            bool ok100Mesh =
+            bool okExtMesh =
                 Model3DViewer::InspectMeshFile(ifcPath, mIfc) && mIfc.loadedOk && !mIfc.tris.empty() &&
                 Model3DViewer::InspectMeshFile(usdaPath, mUsda) && mUsda.loadedOk && mUsda.tris.size() == 2;
             DeleteFileW(ifcPath.c_str());
@@ -2788,7 +2798,7 @@ static void RunStage12Tests(TestCounter& tc) {
             const char* canAscTxt = "date Mon Nov 10 02:00:00 2026\nbase hex timestamps absolute\n0.001000 1 100 Rx d 8 11 22 33 44 55 66 77 88\n";
             PathUtils::WriteFileBytes(canAscPath, canAscTxt, std::strlen(canAscTxt));
             ParsedEdaBoard eDbc, eSpd, eCanAsc;
-            bool ok100Eda =
+            bool okExtEda =
                 EdaViewer::InspectEdaFile(dbcPath, eDbc) && eDbc.valid && !eDbc.components.empty() &&
                 EdaViewer::InspectEdaFile(spdPath, eSpd) && eSpd.valid && eSpd.components.size() >= 8 &&
                 EdaViewer::InspectEdaFile(canAscPath, eCanAsc) && eCanAsc.valid && !eCanAsc.traces.empty();
@@ -2825,7 +2835,7 @@ static void RunStage12Tests(TestCounter& tc) {
             PathUtils::WriteFileBytes(emlPath, emlTxt, std::strlen(emlTxt));
 
             ParsedOfficeDocument dUf2, dNpy, dShp, dIpynb, dEml, dExe;
-            bool ok100Doc =
+            bool okExtDoc =
                 SpreadsheetDocViewer::InspectOfficeFile(uf2Path, dUf2) && dUf2.valid && !dUf2.sheets.empty() &&
                 SpreadsheetDocViewer::InspectOfficeFile(npyPath, dNpy) && dNpy.valid && !dNpy.sheets.empty() &&
                 SpreadsheetDocViewer::InspectOfficeFile(shpPath, dShp) && dShp.valid && dShp.hasGeoTrack &&
@@ -2839,13 +2849,13 @@ static void RunStage12Tests(TestCounter& tc) {
             DeleteFileW(emlPath.c_str());
             RemoveDirectoryW(fmtDir.c_str());
 
-            tc.Record(ok100Img && ok100Arc && ok100Mesh && ok100Eda && ok100Doc,
-                L"Stage12.Test13_Next100FileFormats_And_ExtendedFormats",
-                L"IMG=" + std::to_wstring(ok100Img) +
-                L" ARC=" + std::to_wstring(ok100Arc) +
-                L" MESH=" + std::to_wstring(ok100Mesh) +
-                L" EDA=" + std::to_wstring(ok100Eda) +
-                L" DOC=" + std::to_wstring(ok100Doc));
+            tc.Record(okExtImg && okExtArc && okExtMesh && okExtEda && okExtDoc,
+                L"Stage12.Test13_CoreAndExtendedFileFormats",
+                L"IMG=" + std::to_wstring(okExtImg) +
+                L" ARC=" + std::to_wstring(okExtArc) +
+                L" MESH=" + std::to_wstring(okExtMesh) +
+                L" EDA=" + std::to_wstring(okExtEda) +
+                L" DOC=" + std::to_wstring(okExtDoc));
         }
 
         // 16. Test14: Unreachable Localhost FTP (127.0.0.1) Fast Pre-Flight Fail, Negative Cooldown Cache & Zero Worker Storm
@@ -6212,28 +6222,22 @@ static std::vector<uint8_t> BuildMiniValidPng4x4() {
 
 static void RunStage14Tests(TestCounter& tc) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    std::wstring baseDir = GetScratchTestDir() + L"\\Stage14_Formats200";
+    std::wstring baseDir = GetScratchTestDir() + L"\\Stage14_ExtendedDomainFormats";
     RemoveTestTreeRecursive(baseDir);
     CreateDirectoryW(baseDir.c_str(), nullptr);
 
-    auto p16le = [](std::vector<uint8_t>& b, uint16_t v) { b.push_back(v & 0xFFu); b.push_back((v >> 8) & 0xFFu); };
-    auto p32le = [](std::vector<uint8_t>& b, uint32_t v) {
-        b.push_back(v & 0xFFu); b.push_back((v >> 8) & 0xFFu);
-        b.push_back((v >> 16) & 0xFFu); b.push_back((v >> 24) & 0xFFu);
-    };
-    auto p64le = [&](std::vector<uint8_t>& b, uint64_t v) { p32le(b, static_cast<uint32_t>(v)); p32le(b, static_cast<uint32_t>(v >> 32)); };
-    auto p16be = [](std::vector<uint8_t>& b, uint16_t v) { b.push_back((v >> 8) & 0xFFu); b.push_back(v & 0xFFu); };
-    auto p32be = [](std::vector<uint8_t>& b, uint32_t v) {
-        b.push_back((v >> 24) & 0xFFu); b.push_back((v >> 16) & 0xFFu);
-        b.push_back((v >> 8) & 0xFFu);  b.push_back(v & 0xFFu);
-    };
-    auto p64be = [&](std::vector<uint8_t>& b, uint64_t v) { p32be(b, static_cast<uint32_t>(v >> 32)); p32be(b, static_cast<uint32_t>(v)); };
-    auto pf32  = [](std::vector<uint8_t>& b, float f) { uint8_t t[4]; std::memcpy(t, &f, 4); b.insert(b.end(), t, t + 4); };
+    auto p16le = [](std::vector<uint8_t>& b, uint16_t v) { TestBytes::AppendU16LE(b, v); };
+    auto p32le = [](std::vector<uint8_t>& b, uint32_t v) { TestBytes::AppendU32LE(b, v); };
+    auto p64le = [](std::vector<uint8_t>& b, uint64_t v) { TestBytes::AppendU64LE(b, v); };
+    auto p16be = [](std::vector<uint8_t>& b, uint16_t v) { TestBytes::AppendU16BE(b, v); };
+    auto p32be = [](std::vector<uint8_t>& b, uint32_t v) { TestBytes::AppendU32BE(b, v); };
+    auto p64be = [](std::vector<uint8_t>& b, uint64_t v) { TestBytes::AppendU64BE(b, v); };
+    auto pf32  = [](std::vector<uint8_t>& b, float f)    { TestBytes::AppendF32LE(b, f); };
 
     std::vector<uint8_t> miniPng = BuildMiniValidPng4x4();
 
     // ------------------------------------------------------------------------
-    // Test 14.1: Formats #1–#20 — ExtendedImages200 (20 Camera RAW, Vector, Design & Stitch formats)
+    // Test 14.1: Formats #1–#20 — ExtendedVectorRawImages (20 Camera RAW, Vector, Design & Stitch formats)
     // ------------------------------------------------------------------------
     {
         auto buildTiffCfa = [&](const char magic[4], uint16_t photometric) -> std::vector<uint8_t> {
@@ -6262,20 +6266,33 @@ static void RunStage14Tests(TestCounter& tc) {
         std::vector<uint8_t> orfBytes  = buildTiffCfa("IIRO", 32803);
         std::vector<uint8_t> rw2Bytes  = buildTiffCfa("IIU\0", 32803);
 
-        // #2 CR3: ftypcrx  + PRVW box containing miniPng
+        // Spec-compliant 8x8 1-component Baseline JPEG (ITU-T T.81 SOI + DQT + SOF0 + DHT + SOS + EOI)
+        std::vector<uint8_t> miniJpeg = { 0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00 };
+        miniJpeg.insert(miniJpeg.end(), 64, 0x08);
+        miniJpeg.insert(miniJpeg.end(), {
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, 0x01, 0x11, 0x00,
+            0xFF, 0xC4, 0x00, 0x14, 0x00, 1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0x06,
+            0xFF, 0xC4, 0x00, 0x14, 0x10, 1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0x00,
+            0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+            0x40, 0x7F, 0xFF, 0xD9
+        });
+
+        // #2 CR3: ftypcrx  + Canon PRVW fullbox (16B header + baseline JPEG preview)
         std::vector<uint8_t> cr3;
         p32be(cr3, 16); cr3.insert(cr3.end(), {'f','t','y','p','c','r','x',' '}); p32be(cr3, 1);
-        p32be(cr3, static_cast<uint32_t>(8 + miniPng.size()));
+        p32be(cr3, static_cast<uint32_t>(8 + 16 + miniJpeg.size()));
         cr3.insert(cr3.end(), {'P','R','V','W'});
-        cr3.insert(cr3.end(), miniPng.begin(), miniPng.end());
+        p32be(cr3, 0); p16be(cr3, 0); p16be(cr3, 8); p16be(cr3, 8); p16be(cr3, 0);
+        p32be(cr3, static_cast<uint32_t>(miniJpeg.size()));
+        cr3.insert(cr3.end(), miniJpeg.begin(), miniJpeg.end());
 
-        // #6 RAF: FUJIFILMCCD-RAW + offset @ 0x54 + len @ 0x58
+        // #6 RAF: FUJIFILMCCD-RAW + JPEG preview @ 0x54/0x58
         std::vector<uint8_t> raf(0x80, 0);
         std::memcpy(raf.data(), "FUJIFILMCCD-RAW 0201", 20);
-        uint32_t rafOff = 0x80, rafLen = static_cast<uint32_t>(miniPng.size());
+        uint32_t rafOff = 0x80, rafLen = static_cast<uint32_t>(miniJpeg.size());
         raf[0x54] = (rafOff >> 24) & 0xFF; raf[0x55] = (rafOff >> 16) & 0xFF; raf[0x56] = (rafOff >> 8) & 0xFF; raf[0x57] = rafOff & 0xFF;
         raf[0x58] = (rafLen >> 24) & 0xFF; raf[0x59] = (rafLen >> 16) & 0xFF; raf[0x5A] = (rafLen >> 8) & 0xFF; raf[0x5B] = rafLen & 0xFF;
-        raf.insert(raf.end(), miniPng.begin(), miniPng.end());
+        raf.insert(raf.end(), miniJpeg.begin(), miniJpeg.end());
 
         // #14 Real Win32 EMF created via CreateEnhMetaFileW
         std::vector<uint8_t> emfBytes;
@@ -6296,9 +6313,20 @@ static void RunStage14Tests(TestCounter& tc) {
             }
         }
 
-        // #13 Affinity .afphoto: 00 FF 4B 41 + miniPng
-        std::vector<uint8_t> afp = { 0x00, 0xFF, 0x4B, 0x41, 0x0B, 0x00, 0x00, 0x00 };
+        // #13 Affinity .afphoto: Serif Persona container (00 FF 4B 41 + #Fil Thmb piece + #FAT table + #Inf trailer)
+        std::vector<uint8_t> afp(16, 0);
+        afp[0] = 0x00; afp[1] = 0xFF; afp[2] = 0x4B; afp[3] = 0x41; afp[4] = 0x0B;
+        const uint64_t afpPieceOff = afp.size();
+        afp.insert(afp.end(), { '#', 'F', 'i', 'l', 0x00 });
         afp.insert(afp.end(), miniPng.begin(), miniPng.end());
+        const uint64_t afpPieceLen = afp.size() - afpPieceOff;
+        const uint64_t afpFatOff = afp.size();
+        afp.insert(afp.end(), { '#', 'F', 'A', 'T' });
+        p64le(afp, afpPieceOff); p64le(afp, afpPieceLen); p64le(afp, afpPieceLen); p64le(afp, 0);
+        afp.insert(afp.end(), { 'T', 'h', 'm', 'b', 0x00, 0x00, 0x00, 0x00 });
+        const uint64_t afpFatLen = afp.size() - afpFatOff;
+        afp.insert(afp.end(), { '#', 'I', 'n', 'f' });
+        p64le(afp, afpFatOff); p64le(afp, afpFatLen); p32le(afp, 0);
 
         // #16 Photoshop .abr v1 brush
         std::vector<uint8_t> abr;
@@ -6369,13 +6397,13 @@ static void RunStage14Tests(TestCounter& tc) {
             else if (firstFail.empty()) firstFail = cases[i].ext;
         }
         tc.Record(okCnt == static_cast<int>(cases.size()),
-            L"Stage14.Test1_ExtendedImages200_All20Formats",
+            L"Stage14.Test1_VectorRawDesignImages",
             firstFail.empty() ? (std::to_wstring(okCnt) + L"/" + std::to_wstring(cases.size()) + L" decoded")
                               : (L"FAILED at " + firstFail));
     }
 
     // ------------------------------------------------------------------------
-    // Test 14.2: Formats #21–#40 — ExtendedArchives200 (20 Game, Linux FS & Retro Archives)
+    // Test 14.2: Formats #21–#40 — ExtendedUnixGameArchives (20 Game, Linux FS & Retro Archives)
     // ------------------------------------------------------------------------
     {
         // #21 .unitypackage (TAR with <guid>/pathname + <guid>/asset)
@@ -6678,13 +6706,13 @@ static void RunStage14Tests(TestCounter& tc) {
             else if (firstFail.empty()) firstFail = acases[i].ext;
         }
         tc.Record(okCnt == static_cast<int>(acases.size()),
-            L"Stage14.Test2_ExtendedArchives200_All20Formats",
+            L"Stage14.Test2_UnixFsAndGameArchives",
             firstFail.empty() ? (std::to_wstring(okCnt) + L"/20 archives inspected + extracted")
                               : (L"FAILED at " + firstFail));
     }
 
     // ------------------------------------------------------------------------
-    // Test 14.3: Formats #41–#60 — Extended3D200 (20 Game, CAD, LiDAR, Robotics & Chemistry 3D formats)
+    // Test 14.3: Formats #41–#60 — ExtendedCadSciMeshes (20 Game, CAD, LiDAR, Robotics & Chemistry 3D formats)
     // ------------------------------------------------------------------------
     {
         auto strVec = [](const char* s) { return std::vector<uint8_t>(s, s + std::strlen(s)); };
@@ -6973,13 +7001,13 @@ static void RunStage14Tests(TestCounter& tc) {
             else if (firstFail.empty()) firstFail = mcases[i].ext;
         }
         tc.Record(okCnt == static_cast<int>(mcases.size()),
-            L"Stage14.Test3_Extended3D200_All20Formats",
+            L"Stage14.Test3_CadLidarChemAndGameMeshes",
             firstFail.empty() ? (std::to_wstring(okCnt) + L"/" + std::to_wstring(mcases.size()) + L" 3D models parsed")
                               : (L"FAILED at " + firstFail));
     }
 
     // ------------------------------------------------------------------------
-    // Test 14.4: Formats #61–#80 — ExtendedEda200 (20 Schematics, OASIS, FPGA, Scope, Auto & PLC formats)
+    // Test 14.4: Formats #61–#80 — ExtendedIndustrialWaveEda (20 Schematics, OASIS, FPGA, Scope, Auto & PLC formats)
     // ------------------------------------------------------------------------
     {
         auto strVec = [](const char* s) { return std::vector<uint8_t>(s, s + std::strlen(s)); };
@@ -7086,9 +7114,10 @@ static void RunStage14Tests(TestCounter& tc) {
             std::memcpy(mf4.data() + 88, &dgOff, 8); // ##HD.hd_dg_first
         }
 
-        // #80 .sof (Intel/Altera SRAM Object File packet directory + bitstream)
+        // #80 .sof (Intel/Altera 12-byte SRAM Object File header + TLV packet directory + bitstream)
         std::vector<uint8_t> sof = { 'S','O','F',0 };
-        p32le(sof, 2); // 2 packets
+        p32le(sof, 0); // reserved/version word @ 4..7
+        p32le(sof, 2); // 2 packets @ 8..11
         p16le(sof, 2); p32le(sof, 13);
         const char sofPart[] = "EP4CE22F17C6";
         sof.insert(sof.end(), sofPart, sofPart + 13);
@@ -7133,13 +7162,13 @@ static void RunStage14Tests(TestCounter& tc) {
             else if (firstFail.empty()) firstFail = ecases[i].ext;
         }
         tc.Record(okCnt == static_cast<int>(ecases.size()),
-            L"Stage14.Test4_ExtendedEda200_All20Formats",
+            L"Stage14.Test4_IndustrialFpgaAndWaveEda",
             firstFail.empty() ? (std::to_wstring(okCnt) + L"/20 EDA/Silicon/FPGA/Auto/PLC boards rendered")
                               : (L"FAILED at " + firstFail));
     }
 
     // ------------------------------------------------------------------------
-    // Test 14.5: Formats #81–#100 — ExtendedDocs200 (20 DB, Protobuf, SecOps, Forensics, Audio & Doc formats)
+    // Test 14.5: Formats #81–#100 — ExtendedDatabaseSystemDocs (20 DB, Protobuf, SecOps, Forensics, Audio & Doc formats)
     // ------------------------------------------------------------------------
     {
         auto strVec = [](const char* s) { return std::vector<uint8_t>(s, s + std::strlen(s)); };
@@ -7332,9 +7361,9 @@ static void RunStage14Tests(TestCounter& tc) {
         p32le(uas, 5); uas.insert(uas.end(), {'N','o','n','e',0}); // FolderName FString
         p32le(uas, 0); // PackageFlags
         p32le(uas, 1); // NameCount = 1
-        uint32_t nmOff = static_cast<uint32_t>(uas.size() + 4 + 16);
+        uint32_t nmOff = static_cast<uint32_t>(uas.size() + 4 + 28);
         p32le(uas, nmOff);
-        uas.insert(uas.end(), 16, 0);
+        uas.insert(uas.end(), 28, 0); // LocalizationId(4) + GatherableTextData(8) + Export/Import counts & offsets(16)
         p32le(uas, 11); uas.insert(uas.end(), {'B','P','_','P','l','a','y','e','r','1',0});
         p32le(uas, 0);
 
@@ -7389,7 +7418,7 @@ static void RunStage14Tests(TestCounter& tc) {
         bool ntOk = SpreadsheetDocViewer::InspectOfficeFile(ntuserPath, ntDoc) && ntDoc.valid && !ntDoc.sheets.empty();
 
         tc.Record(okCnt == static_cast<int>(dcases.size()) && ntOk,
-            L"Stage14.Test5_ExtendedDocs200_All20Formats_And_NTUSER_DAT",
+            L"Stage14.Test5_DatabaseSecOpsDocs_And_NTUSER_DAT",
             firstFail.empty() ? (std::to_wstring(okCnt) + L"/20 doc/db/secops formats + NTUSER.DAT + PMTiles GeoMap")
                               : (L"FAILED at " + firstFail));
     }
@@ -9023,6 +9052,952 @@ static void RunStage16Tests(TestCounter& tc) {
                   L"listed=" + std::to_wstring(listed ? 1 : 0) + L", skipped=" + std::to_wstring(skipped ? 1 : 0) +
                   L", items already in the bin=" + std::to_wstring(bin ? 1 : 0));
     }
+
+    // Test 16.33–16.37c: FileLockInspector — clean folder, Read-Only & SelfHoldInfo detection, nested file lock,
+    // Working Directory (CWD) lock, graceful close, TOCTOU startTimeTicks & handle-slot reuse guards,
+    // non-destructive surgical CloseRemoteFileHandles (DUPLICATE_CLOSE_SOURCE), ReadDirectoryChangesW + blocked
+    // synchronous named pipe resilience, memory-mapped sections after CloseHandle(hFile), and loaded DLL/.so locks.
+    {
+        const std::wstring lockRoot = GetScratchTestDir() + L"\\LockInspector_" + std::to_wstring(GetCurrentProcessId());
+        TransferManager::DeleteTreeNow(lockRoot);
+        CreateDirectoryW(lockRoot.c_str(), nullptr);
+        const std::wstring subDir = lockRoot + L"\\nested";
+        CreateDirectoryW(subDir.c_str(), nullptr);
+        const std::wstring plainFile = subDir + L"\\plain.txt";
+        PathUtils::WriteFileBytes(plainFile, "ok", 2);
+
+        FileLockReport cleanRep;
+        FileLockInspector::InspectFileLocks({ lockRoot }, cleanRep);
+
+        // Verify SelfHoldInfo (previewPath + activeFolderPath) on both Windows and Linux
+        SelfHoldInfo shTest;
+        shTest.previewPath = plainFile;
+        shTest.activeFolderPath = subDir;
+        FileLockReport selfRep;
+        FileLockInspector::InspectFileLocks({ lockRoot }, selfRep, &shTest);
+        bool selfHoldOk = false;
+        for (const auto& sp : selfRep.processes) {
+            if (sp.isSelfProcess &&
+                !sp.DefaultCheckedForUnlock() &&
+                (sp.reasonMask & kLockReasonSelfPreview) != 0 &&
+                (sp.reasonMask & kLockReasonOpenHandle) != 0 &&
+                (sp.reasonMask & kLockReasonFolderOrCwd) != 0)
+            {
+                selfHoldOk = true;
+            }
+        }
+
+        bool roDetectedAndCleared = true;
+#ifdef _WIN32
+        SetFileAttributesW(plainFile.c_str(), FILE_ATTRIBUTE_READONLY);
+        FileLockReport roRep;
+        FileLockInspector::InspectFileLocks({ lockRoot }, roRep);
+        const size_t nCleared = FileLockInspector::ClearReadOnlyAttributes({ lockRoot });
+        FileLockReport afterClearRep;
+        FileLockInspector::InspectFileLocks({ lockRoot }, afterClearRep);
+        roDetectedAndCleared = roRep.HasReadOnlyBlockers() && nCleared >= 1u && !afterClearRep.HasReadOnlyBlockers();
+#endif
+        tc.Record(!cleanRep.HasAnyBlockers() && cleanRep.scannedFiles >= 1u && cleanRep.scannedDirs >= 2u &&
+                  selfHoldOk && roDetectedAndCleared,
+                  L"Stage16.Test33_FileLockInspector_CleanDirAndReadOnlyClear",
+                  L"scannedFiles=" + std::to_wstring(cleanRep.scannedFiles) +
+                  L", scannedDirs=" + std::to_wstring(cleanRep.scannedDirs) +
+                  L", selfHoldOk=" + std::to_wstring(selfHoldOk) +
+                  L", roOk=" + std::to_wstring(roDetectedAndCleared));
+
+        wchar_t selfExe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, selfExe, MAX_PATH);
+
+        auto spawnLockHelper = [&](const wchar_t* mode, const std::wstring& target, const std::wstring& readyFile,
+                                   PROCESS_INFORMATION& outPi) -> bool
+        {
+            outPi = {};
+            DeleteFileW(readyFile.c_str());
+            std::wstring cmd = L"\"" + std::wstring(selfExe) + L"\" --hold-lock-test " + mode +
+                               L" \"" + target + L"\" \"" + readyFile + L"\" 9000";
+            STARTUPINFOW si = { sizeof(si) };
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+            if (!CreateProcessW(selfExe, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &outPi)) {
+                return false;
+            }
+            const ULONGLONG waitEnd = GetTickCount64() + 4000ULL;
+            while (GetTickCount64() < waitEnd) {
+                if (GetFileAttributesW(readyFile.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+                if (WaitForSingleObject(outPi.hProcess, 15) == WAIT_OBJECT_0) break;
+            }
+            TerminateProcess(outPi.hProcess, 9u);
+            WaitForSingleObject(outPi.hProcess, 1000u);
+            if (outPi.hThread) CloseHandle(outPi.hThread);
+            if (outPi.hProcess) CloseHandle(outPi.hProcess);
+            outPi = {};
+            return false;
+        };
+
+        auto closeProcHandles = [](PROCESS_INFORMATION& pi) {
+            if (pi.hThread) { CloseHandle(pi.hThread); pi.hThread = nullptr; }
+            if (pi.hProcess) { CloseHandle(pi.hProcess); pi.hProcess = nullptr; }
+        };
+
+        // Test 16.34: File handle lock inside nested subfolder detected when inspecting parent directory (Windows & Linux)
+        {
+            const std::wstring lockedFile = subDir + L"\\xampp_sim.ini";
+            const std::wstring readyFile  = lockRoot + L"\\rdy_file.flg";
+            PROCESS_INFORMATION pi = {};
+            bool foundPid = false, foundPath = false, delWhileLockedFailed = true, delAfterKillOk = false;
+            if (spawnLockHelper(L"file", lockedFile, readyFile, pi)) {
+#ifdef _WIN32
+                delWhileLockedFailed = !DeleteFileW(lockedFile.c_str()) && GetLastError() == ERROR_SHARING_VIOLATION;
+#endif
+                FileLockReport rep;
+                FileLockInspector::InspectFileLocks({ lockRoot }, rep);
+                for (const auto& p : rep.processes) {
+                    if (p.pid == pi.dwProcessId && (p.reasonMask & kLockReasonOpenHandle) != 0) {
+                        foundPid = true;
+                        for (const auto& lp : p.lockedPaths) {
+                            if (PathUtils::ToLower(lp).find(L"xampp_sim.ini") != std::wstring::npos) foundPath = true;
+                        }
+                    }
+                }
+                FileLockInspector::TerminateLockingProcesses({ pi.dwProcessId }, 2000u);
+                WaitForSingleObject(pi.hProcess, 2000u);
+                closeProcHandles(pi);
+                delAfterKillOk = (DeleteFileW(lockedFile.c_str()) != FALSE);
+            }
+            tc.Record(delWhileLockedFailed && foundPid && foundPath && delAfterKillOk,
+                      L"Stage16.Test34_FileLockInspector_DetectsNestedFileLockInDir_AndKills",
+                      L"lockedRefused=" + std::to_wstring(delWhileLockedFailed) +
+                      L", foundPid=" + std::to_wstring(foundPid) +
+                      L", foundPath=" + std::to_wstring(foundPath) +
+                      L", deletedAfterKill=" + std::to_wstring(delAfterKillOk));
+        }
+
+        // Test 16.35: Current Working Directory (CWD / "cd") lock on an empty subfolder (Windows & Linux)
+        {
+            const std::wstring cwdSub = lockRoot + L"\\cwd_held_dir";
+            CreateDirectoryW(cwdSub.c_str(), nullptr);
+            const std::wstring readyFile = lockRoot + L"\\rdy_cwd.flg";
+            PROCESS_INFORMATION pi = {};
+            bool rmdirRefused = true, foundCwdLock = false, rmdirAfterOk = false;
+            if (spawnLockHelper(L"cwd", cwdSub, readyFile, pi)) {
+#ifdef _WIN32
+                rmdirRefused = !RemoveDirectoryW(cwdSub.c_str());
+#endif
+                FileLockReport rep;
+                FileLockInspector::InspectFileLocks({ lockRoot }, rep);
+                for (const auto& p : rep.processes) {
+                    if (p.pid == pi.dwProcessId && (p.reasonMask & kLockReasonFolderOrCwd) != 0) {
+                        foundCwdLock = true;
+                    }
+                }
+                FileLockInspector::TerminateLockingProcesses({ pi.dwProcessId }, 2000u);
+                WaitForSingleObject(pi.hProcess, 2000u);
+                closeProcHandles(pi);
+                rmdirAfterOk = (RemoveDirectoryW(cwdSub.c_str()) != FALSE);
+            }
+            tc.Record(rmdirRefused && foundCwdLock && rmdirAfterOk,
+                      L"Stage16.Test35_FileLockInspector_DetectsWorkingDirectoryCwdLock",
+                      L"rmdirRefused=" + std::to_wstring(rmdirRefused) +
+                      L", foundCwd=" + std::to_wstring(foundCwdLock) +
+                      L", rmdirAfter=" + std::to_wstring(rmdirAfterOk));
+        }
+
+        // Test 16.36: Graceful WM_CLOSE / SIGTERM unlock releases file with exit code 0 (Windows & Linux)
+        {
+            const std::wstring graceFile = subDir + L"\\graceful.dat";
+            const std::wstring readyFile = lockRoot + L"\\rdy_win.flg";
+            PROCESS_INFORMATION pi = {};
+            bool closedCleanly = false, delOk = false;
+            DWORD exitCode = 99u;
+            if (spawnLockHelper(L"window", graceFile, readyFile, pi)) {
+                closedCleanly = FileLockInspector::CloseProcessesGracefully({ pi.dwProcessId }, 3000u);
+                WaitForSingleObject(pi.hProcess, 2000u);
+                GetExitCodeProcess(pi.hProcess, &exitCode);
+                closeProcHandles(pi);
+                delOk = (DeleteFileW(graceFile.c_str()) != FALSE);
+            }
+            tc.Record(closedCleanly && exitCode == 0u && delOk,
+                      L"Stage16.Test36_FileLockInspector_GracefulCloseUnlocksCleanly",
+                      L"closed=" + std::to_wstring(closedCleanly) +
+                      L", exitCode=" + std::to_wstring(exitCode) +
+                      L", delOk=" + std::to_wstring(delOk));
+        }
+
+        // Test 16.37: PID-reuse TOCTOU startTimeTicks guard + AdminUnlock CLI Read-Only tree delete & drive-root guard
+        {
+            const std::wstring adminSimDir = lockRoot + L"\\admin_sim";
+            const std::wstring deepDir     = adminSimDir + L"\\a\\b";
+            CreateDirectoryW(adminSimDir.c_str(), nullptr);
+            CreateDirectoryW((adminSimDir + L"\\a").c_str(), nullptr);
+            CreateDirectoryW(deepDir.c_str(), nullptr);
+            for (int k = 0; k < 10; ++k) {
+                PathUtils::WriteFileBytes(deepDir + L"\\pad_" + std::to_wstring(k) + L".txt", "pad", 3);
+            }
+            const std::wstring targetLocked = deepDir + L"\\deep_locked.bin";
+            const std::wstring roInAdmin    = deepDir + L"\\ro_cfg.ini";
+            PathUtils::WriteFileBytes(roInAdmin, "cfg", 3);
+#ifdef _WIN32
+            SetFileAttributesW(roInAdmin.c_str(), FILE_ATTRIBUTE_READONLY);
+#endif
+
+            const std::wstring readyFile = lockRoot + L"\\rdy_toctou.flg";
+            PROCESS_INFORMATION pi = {};
+            bool toctouProtected = false, exactDeepFound = false, adminCliSucceeded = false, adminCleanedDir = false;
+            if (spawnLockHelper(L"file", targetLocked, readyFile, pi)) {
+                FileLockReport rep;
+                FileLockInspector::InspectFileLocks({ adminSimDir }, rep);
+                uint64_t realStartTick = 0u;
+                for (const auto& p : rep.processes) {
+                    if (p.pid == pi.dwProcessId) {
+                        realStartTick = p.startTimeTicks;
+                        for (const auto& lp : p.lockedPaths) {
+                            if (PathUtils::ToLower(lp).find(L"deep_locked.bin") != std::wstring::npos) exactDeepFound = true;
+                        }
+                    }
+                }
+
+                // Wrong startTimeTicks MUST NOT kill the process (simulates recycled PID on both Windows & Linux!)
+                const std::vector<uint64_t> wrongTicks = { (realStartTick != 0u) ? (realStartTick ^ 0x123456ULL) : 999999ULL };
+                FileLockInspector::TerminateLockingProcesses({ pi.dwProcessId }, 400u, nullptr, nullptr, &wrongTicks);
+                DWORD liveCode = 0u;
+                toctouProtected = (realStartTick != 0u) &&
+                                  GetExitCodeProcess(pi.hProcess, &liveCode) &&
+                                  (liveCode == STILL_ACTIVE);
+
+                const std::wstring reqPath = lockRoot + L"\\admin_test.req";
+                const std::wstring resPath = lockRoot + L"\\admin_test.res";
+                const std::wstring reqBody =
+                    L"KILL\t" + std::to_wstring(pi.dwProcessId) + L"\t" + std::to_wstring(realStartTick) + L"\n"
+#ifdef _WIN32
+                    L"DEL\tC:\\\n"
+#else
+                    L"DEL\t/\n"
+#endif
+                    L"DEL\t" + adminSimDir + L"\n";
+                const std::string reqUtf8 = PathUtils::WideToUtf8(reqBody);
+                PathUtils::WriteFileBytes(reqPath, reqUtf8.data(), reqUtf8.size());
+
+                adminCliSucceeded = (FileLockInspector::HandleAdminUnlockCli(reqPath, resPath) == 0);
+                WaitForSingleObject(pi.hProcess, 2000u);
+                closeProcHandles(pi);
+                adminCleanedDir = (GetFileAttributesW(adminSimDir.c_str()) == INVALID_FILE_ATTRIBUTES);
+#ifdef _WIN32
+                adminCleanedDir = adminCleanedDir && (GetFileAttributesW(L"C:\\Windows") != INVALID_FILE_ATTRIBUTES);
+#else
+                adminCleanedDir = adminCleanedDir && (GetFileAttributesW(L"/proc") != INVALID_FILE_ATTRIBUTES);
+#endif
+            }
+            tc.Record(exactDeepFound && toctouProtected && adminCliSucceeded && adminCleanedDir,
+                      L"Stage16.Test37_FileLockInspector_ToctouStartTickGuardAndAdminUnlockCli",
+                      L"deepFound=" + std::to_wstring(exactDeepFound) +
+                      L", toctouSafe=" + std::to_wstring(toctouProtected) +
+                      L", cliOk=" + std::to_wstring(adminCliSucceeded) +
+                      L", cleaned=" + std::to_wstring(adminCleanedDir));
+        }
+
+#ifdef _WIN32
+        // Test 16.37b: Surgical Non-Destructive Handle Unlock (CloseRemoteFileHandles via DUPLICATE_CLOSE_SOURCE)
+        // Verifies: (1) wrong expectedPath (recycled handle slot simulation) is REFUSED, (2) matching handle is closed
+        // cleanly, (3) exclusively locked file deletes immediately, AND (4) the target process stays ALIVE!
+        {
+            const std::wstring surgFile  = subDir + L"\\surgical_unlock.dat";
+            const std::wstring otherFile = subDir + L"\\unrelated_other.dat";
+            PathUtils::WriteFileBytes(otherFile, "other", 5);
+            const std::wstring readyFile = lockRoot + L"\\rdy_surg.flg";
+            PROCESS_INFORMATION pi = {};
+            bool lockedBefore = false, wrongPathRejected = false, unlockedOk = false, deletedWhileAlive = false, helperStayedAlive = false;
+            if (spawnLockHelper(L"file", surgFile, readyFile, pi)) {
+                lockedBefore = !DeleteFileW(surgFile.c_str()) && GetLastError() == ERROR_SHARING_VIOLATION;
+                FileLockReport rep;
+                FileLockInspector::InspectFileLocks({ lockRoot }, rep);
+
+                std::vector<FileLockInspector::RemoteHandleCloseRequest> realReqs;
+                std::vector<FileLockInspector::RemoteHandleCloseRequest> wrongPathReqs;
+                for (const auto& p : rep.processes) {
+                    if (p.pid == pi.dwProcessId && p.HasClosableHandles()) {
+                        for (const auto& h : p.openHandles) {
+                            realReqs.push_back({ p.pid, p.startTimeTicks, h.handleValue, h.handleAttributes, h.path });
+                            wrongPathReqs.push_back({ p.pid, p.startTimeTicks, h.handleValue, h.handleAttributes, otherFile });
+                        }
+                    }
+                }
+
+                // 1. Mismatched expectedPath MUST NOT close the handle!
+                size_t wrongClosed = 99u;
+                FileLockInspector::CloseRemoteFileHandles(wrongPathReqs, &wrongClosed, nullptr, nullptr);
+                wrongPathRejected = (wrongClosed == 0u) && !DeleteFileW(surgFile.c_str());
+
+                // 2. Matching RemoteHandleCloseRequest closes the remote handle while keeping helper alive!
+                size_t realClosed = 0u;
+                FileLockInspector::CloseRemoteFileHandles(realReqs, &realClosed, nullptr, nullptr);
+                unlockedOk = (realClosed >= 1u);
+                deletedWhileAlive = (DeleteFileW(surgFile.c_str()) != FALSE);
+                DWORD liveCode = 0u;
+                helperStayedAlive = (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) &&
+                                    GetExitCodeProcess(pi.hProcess, &liveCode) && (liveCode == STILL_ACTIVE);
+
+                FileLockInspector::TerminateLockingProcesses({ pi.dwProcessId }, 2000u);
+                WaitForSingleObject(pi.hProcess, 2000u);
+                closeProcHandles(pi);
+            }
+            tc.Record(lockedBefore && wrongPathRejected && unlockedOk && deletedWhileAlive && helperStayedAlive,
+                      L"Stage16.Test37b_FileLockInspector_SurgicalHandleUnlock_KeepsProcessAlive",
+                      L"lockedBefore=" + std::to_wstring(lockedBefore) +
+                      L", wrongPathRejected=" + std::to_wstring(wrongPathRejected) +
+                      L", unlockedOk=" + std::to_wstring(unlockedOk) +
+                      L", deletedWhileAlive=" + std::to_wstring(deletedWhileAlive) +
+                      L", helperAlive=" + std::to_wstring(helperStayedAlive));
+        }
+#endif
+
+        // Test 16.37c: ReadDirectoryChangesW folder watcher + simultaneous blocked synchronous named pipe (< 2s, zero hang),
+        // memory-mapped data file after CloseHandle(hFile), and loaded .dll / .so shared library detection (Windows & Linux)
+        {
+            // 1. dirwatch_pipe
+            const std::wstring watchedSub = lockRoot + L"\\watched_with_pipe";
+            CreateDirectoryW(watchedSub.c_str(), nullptr);
+            const std::wstring rdyWatch = lockRoot + L"\\rdy_watch.flg";
+            PROCESS_INFORMATION piWatch = {};
+            bool watchFound = false, watchFast = false;
+            if (spawnLockHelper(L"dirwatch_pipe", watchedSub, rdyWatch, piWatch)) {
+                const ULONGLONG t0 = GetTickCount64();
+                FileLockReport rep;
+                FileLockInspector::InspectFileLocks({ lockRoot }, rep);
+                const ULONGLONG dt = GetTickCount64() - t0;
+                watchFast = (dt < 2200ULL);
+                for (const auto& p : rep.processes) {
+                    if (p.pid == piWatch.dwProcessId && (p.reasonMask & kLockReasonFolderOrCwd) != 0) {
+                        watchFound = true;
+                    }
+                }
+                FileLockInspector::TerminateLockingProcesses({ piWatch.dwProcessId }, 2000u);
+                WaitForSingleObject(piWatch.hProcess, 2000u);
+                closeProcHandles(piWatch);
+            }
+
+            // 2. mmap (file handle closed by helper; ONLY virtual memory section mapping remains!)
+            const std::wstring mmapFile = subDir + L"\\mapped_no_handle.bin";
+            const std::wstring rdyMmap  = lockRoot + L"\\rdy_mmap.flg";
+            PROCESS_INFORMATION piMmap = {};
+            bool mmapFound = false;
+            if (spawnLockHelper(L"mmap", mmapFile, rdyMmap, piMmap)) {
+                FileLockReport rep;
+                FileLockInspector::InspectFileLocks({ lockRoot }, rep);
+                for (const auto& p : rep.processes) {
+                    if (p.pid == piMmap.dwProcessId && (p.reasonMask & kLockReasonOpenHandle) != 0) {
+                        for (const auto& lp : p.lockedPaths) {
+                            if (PathUtils::ToLower(lp).find(L"mapped_no_handle.bin") != std::wstring::npos) mmapFound = true;
+                        }
+                    }
+                }
+                FileLockInspector::TerminateLockingProcesses({ piMmap.dwProcessId }, 2000u);
+                WaitForSingleObject(piMmap.hProcess, 2000u);
+                closeProcHandles(piMmap);
+            }
+
+            // 3. dll / .so loaded module (kLockReasonLoadedDll)
+            bool dllFound = false;
+#ifdef _WIN32
+            wchar_t sysDir[MAX_PATH] = {};
+            GetSystemDirectoryW(sysDir, MAX_PATH);
+            const std::wstring srcSysDll = std::wstring(sysDir) + L"\\lz32.dll";
+            const std::wstring testDll   = subDir + L"\\test_plugin.dll";
+            if (CopyFileW(srcSysDll.c_str(), testDll.c_str(), FALSE)) {
+                const std::wstring rdyDll = lockRoot + L"\\rdy_dll.flg";
+                PROCESS_INFORMATION piDll = {};
+                if (spawnLockHelper(L"dll", testDll, rdyDll, piDll)) {
+                    FileLockReport rep;
+                    FileLockInspector::InspectFileLocks({ lockRoot }, rep);
+                    for (const auto& p : rep.processes) {
+                        if (p.pid == piDll.dwProcessId && (p.reasonMask & kLockReasonLoadedDll) != 0) {
+                            dllFound = true;
+                        }
+                    }
+                    FileLockInspector::TerminateLockingProcesses({ piDll.dwProcessId }, 2000u);
+                    WaitForSingleObject(piDll.hProcess, 2000u);
+                    closeProcHandles(piDll);
+                }
+            }
+#else
+            const std::wstring testSo = subDir + L"\\libtest_plugin.so";
+            char soSeed[128] = { 0x7F, 'E', 'L', 'F', 2, 1, 1, 0 };
+            PathUtils::WriteFileBytes(testSo, soSeed, sizeof(soSeed));
+            const std::wstring rdySo = lockRoot + L"\\rdy_so.flg";
+            PROCESS_INFORMATION piSo = {};
+            if (spawnLockHelper(L"dll", testSo, rdySo, piSo)) {
+                FileLockReport rep;
+                FileLockInspector::InspectFileLocks({ lockRoot }, rep);
+                for (const auto& p : rep.processes) {
+                    if (p.pid == piSo.dwProcessId && (p.reasonMask & kLockReasonLoadedDll) != 0) {
+                        dllFound = true;
+                    }
+                }
+                FileLockInspector::TerminateLockingProcesses({ piSo.dwProcessId }, 2000u);
+                WaitForSingleObject(piSo.hProcess, 2000u);
+                closeProcHandles(piSo);
+            }
+#endif
+
+            tc.Record(watchFound && watchFast && mmapFound && dllFound,
+                      L"Stage16.Test37c_FileLockInspector_DirWatchPipe_MmapSection_AndLoadedDll",
+                      L"watchFound=" + std::to_wstring(watchFound) +
+                      L", watchFast=" + std::to_wstring(watchFast) +
+                      L", mmapFound=" + std::to_wstring(mmapFound) +
+                      L", dllFound=" + std::to_wstring(dllFound));
+        }
+
+        TransferManager::DeleteTreeNow(lockRoot);
+    }
+
+    // Test 16.38-16.41: the folder-size scan and the folder watcher must not flood the window. On 2026-11-22 the
+    // Proporcje view of a Temp folder (11,954 subfolders, 11,040 of them without any data) stopped painting for
+    // minutes: Windows paints only when no posted message waits, and the window was sent messages faster than it
+    // could handle them. (FileEngine.h: RequestFolderSizes, TakeFolderSizesChanged, DirChangeHandled.)
+    {
+        const std::wstring root = GetScratchTestDir() + L"\\SizeScan_" + std::to_wstring(GetCurrentProcessId());
+        TransferManager::DeleteTreeNow(root);
+        CreateDirectoryW(root.c_str(), nullptr);
+        auto makeDir = [](const std::wstring& path) { CreateDirectoryW(path.c_str(), nullptr); };
+        auto waitUntilScanned = [](FileEngine& fe) {
+            for (int i = 0; i < 6000 && fe.IsAnyFolderSizeCalculating(); ++i) Sleep(5);
+            return !fe.IsAnyFolderSizeCalculating();
+        };
+        auto entryNamed = [](const std::vector<FileEntry>& entries, const wchar_t* name) -> const FileEntry* {
+            for (const auto& e : entries) {
+                if (e.name == name) return &e;
+            }
+            return nullptr;
+        };
+        auto sizeShown = [](const FileEntry* e) { return e && !e->sizeStr.empty() && e->sizeStr != L"..."; };
+
+        // "full" holds its data three folders down, "full2" beside it has a name that starts the same, "empty"
+        // holds nothing, and "zero" only an empty file and an empty folder
+        const std::wstring listed = root + L"\\listed";
+        makeDir(listed);
+        makeDir(listed + L"\\full");
+        makeDir(listed + L"\\full\\a");
+        makeDir(listed + L"\\full\\a\\b");
+        PathUtils::WriteFileBytes(listed + L"\\full\\a\\b\\data.bin", "0123456789", 10);
+        makeDir(listed + L"\\full2");
+        PathUtils::WriteFileBytes(listed + L"\\full2\\data.bin", "01234", 5);
+        makeDir(listed + L"\\empty");
+        makeDir(listed + L"\\zero");
+        makeDir(listed + L"\\zero\\sub");
+        PathUtils::WriteFileBytes(listed + L"\\zero\\nothing.txt", "", 0);
+
+        // Test 16.38: a folder without data is scanned once. It gets no list of children (there is nothing to
+        // list), and for that reason it counted as "not scanned yet": every refresh of the listing queued all
+        // such folders again.
+        {
+            FileEngine fe;
+            fe.Initialize(nullptr);
+            auto entries = fe.EnumerateDirectory(listed, true, true, Lang::EN);
+            fe.RequestFolderSizes(entries, false);
+            const uint64_t firstPass = fe.FolderScansQueued();
+            const bool scanned = waitUntilScanned(fe);
+            fe.SyncDirectorySizes(entries);
+            const FileEntry* full = entryNamed(entries, L"full");
+            const FileEntry* full2 = entryNamed(entries, L"full2");
+            const FileEntry* empty = entryNamed(entries, L"empty");
+            const FileEntry* zero = entryNamed(entries, L"zero");
+            const bool sizes = full && full->size == 10 && full2 && full2->size == 5 &&
+                               empty && empty->size == 0 && sizeShown(empty) && zero && zero->size == 0 && sizeShown(zero);
+            std::vector<TreemapChildNode> kids;
+            const bool childLists = full && fe.GetFolderTreemapChildren(full->normKey, kids) && !kids.empty() &&
+                                    empty && !fe.GetFolderTreemapChildren(empty->normKey, kids);
+
+            // The listing is read again, as after every change in the folder: nothing is left to scan, and the
+            // sizes are there at once
+            auto again = fe.EnumerateDirectory(listed, true, true, Lang::EN);
+            fe.RequestFolderSizes(again, false);
+            const uint64_t afterRefresh = fe.FolderScansQueued();
+            const bool shownAtOnce = sizeShown(entryNamed(again, L"empty")) && sizeShown(entryNamed(again, L"zero")) &&
+                                     sizeShown(entryNamed(again, L"full"));
+            const bool idle = !fe.IsAnyFolderSizeCalculating();
+            fe.Shutdown();
+
+            tc.Record(scanned && firstPass == 4 && sizes && childLists && afterRefresh == firstPass && shownAtOnce && idle,
+                      L"Stage16.Test38_FolderSizes_FoldersWithoutDataAreScannedOnce",
+                      L"folders queued by the first request: " + std::to_wstring(firstPass) + L", after the listing was read again: " +
+                      std::to_wstring(afterRefresh) + L", sizes right=" + std::to_wstring(sizes ? 1 : 0) +
+                      L", child lists=" + std::to_wstring(childLists ? 1 : 0) + L", shown at once=" + std::to_wstring(shownAtOnce ? 1 : 0));
+        }
+
+        // Test 16.39: the forced rescan ("Przelicz") forgets what is known about the folders it is given and about
+        // everything inside them, and nothing else. It walked both tables once for each folder; now once in all.
+        // The data of "full" is deleted before, so that a list of children which stayed behind would show (the
+        // rescan of a folder without data stores none).
+        {
+            FileEngine fe;
+            fe.Initialize(nullptr);
+            auto entries = fe.EnumerateDirectory(listed, true, true, Lang::EN);
+            fe.RequestFolderSizes(entries, false);
+            const bool scanned = waitUntilScanned(fe);
+            const FileEntry* full = entryNamed(entries, L"full");
+            const FileEntry* full2 = entryNamed(entries, L"full2");
+            const std::wstring innerKey = PathUtils::NormalizePathKey(listed + L"\\full\\a");
+            std::vector<TreemapChildNode> kids;
+            const bool knownBefore = full && full2 && fe.GetFolderTreemapChildren(full->normKey, kids) &&
+                                     fe.GetFolderTreemapChildren(innerKey, kids) && fe.GetFolderTreemapChildren(full2->normKey, kids);
+
+            DeleteFileW((listed + L"\\full\\a\\b\\data.bin").c_str());
+            std::vector<FileEntry> onlyFull;
+            if (full) onlyFull.push_back(*full);
+            const uint64_t before = fe.FolderScansQueued();
+            fe.RequestFolderSizes(onlyFull, true);
+            const uint64_t after = fe.FolderScansQueued();
+            const bool rescanned = waitUntilScanned(fe);
+            const bool forgotten = full && !fe.GetFolderTreemapChildren(full->normKey, kids) && !fe.GetFolderTreemapChildren(innerKey, kids);
+            const bool othersKept = full2 && fe.GetFolderTreemapChildren(full2->normKey, kids) && !kids.empty();
+            auto now = fe.EnumerateDirectory(listed, true, true, Lang::EN);
+            const FileEntry* fullNow = entryNamed(now, L"full");
+            const FileEntry* full2Now = entryNamed(now, L"full2");
+            const bool sizes = fullNow && fullNow->size == 0 && sizeShown(fullNow) && full2Now && full2Now->size == 5 &&
+                               sizeShown(entryNamed(now, L"empty"));
+            fe.RequestFolderSizes(now, false);          // and nothing is asked for again after that
+            const uint64_t atEnd = fe.FolderScansQueued();
+            fe.Shutdown();
+
+            tc.Record(scanned && knownBefore && after == before + 1 && rescanned && forgotten && othersKept && sizes && atEnd == after,
+                      L"Stage16.Test39_FolderSizes_ForcedRescan_ForgetsTheFolderAndWhatIsInside_NothingElse",
+                      L"known before=" + std::to_wstring(knownBefore ? 1 : 0) + L", queued by the forced request: " + std::to_wstring(after - before) +
+                      L", forgotten=" + std::to_wstring(forgotten ? 1 : 0) + L", the folder beside it kept=" + std::to_wstring(othersKept ? 1 : 0) +
+                      L", sizes right=" + std::to_wstring(sizes ? 1 : 0));
+        }
+
+        // Test 16.40: the window is not told about every folder a worker finishes. It is told once, when the last
+        // worker has run out of work, and not again while it has not answered; in between it asks on its timer
+        // (TakeFolderSizesChanged). The workers used to post after every folder as soon as the window had read
+        // the sizes, so that a message was always waiting and WM_PAINT never got its turn.
+        {
+            const std::wstring many = root + L"\\many";
+            makeDir(many);
+            const int kFolders = 300;
+            for (int i = 0; i < kFolders; ++i) {
+                makeDir(many + L"\\d" + std::to_wstring(i));
+                if (i % 25 == 0) PathUtils::WriteFileBytes(many + L"\\d" + std::to_wstring(i) + L"\\x.bin", "abcd", 4);
+            }
+            HWND notify = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+            auto countTold = [&](int waitMs) {
+                // The message is posted just after the engine has become idle: wait for the first one, then see
+                // whether more follow
+                int told = 0;
+                MSG msg = {};
+                for (int waited = 0; notify && waited <= waitMs; waited += 5) {
+                    while (PeekMessageW(&msg, notify, WM_APP_FOLDER_SIZE_UPDATED, WM_APP_FOLDER_SIZE_UPDATED, PM_REMOVE)) ++told;
+                    if (told > 0 && waited >= 60) break;
+                    Sleep(5);
+                }
+                return told;
+            };
+            FileEngine fe;
+            fe.Initialize(notify);
+            auto entries = fe.EnumerateDirectory(many, true, true, Lang::EN);
+
+            // 1. One scan of 300 folders, while the window reads the sizes all the time (as it does on its timer)
+            fe.RequestFolderSizes(entries, false);
+            bool news = false;
+            for (int i = 0; i < 6000 && fe.IsAnyFolderSizeCalculating(); ++i) {
+                news = fe.TakeFolderSizesChanged() || news;
+                fe.SyncDirectorySizes(entries);
+                Sleep(1);
+            }
+            news = fe.TakeFolderSizesChanged() || news;
+            const int toldFirst = countTold(2000);
+            fe.SyncDirectorySizes(entries);
+            int known = 0;
+            uint64_t bytes = 0;
+            for (const auto& e : entries) {
+                if (sizeShown(&e)) ++known;
+                bytes += e.size;
+            }
+
+            // 2. The window has not answered: a second scan ends without another message (the news is still
+            //    to be had on the timer)
+            fe.RequestFolderSizes(entries, true);
+            const bool second = waitUntilScanned(fe);
+            const int toldUnanswered = countTold(150);
+            const bool newsSecond = fe.TakeFolderSizesChanged();
+
+            // 3. It answers: the end of the next scan is told again, once
+            fe.AcknowledgeSizeNotification();
+            fe.RequestFolderSizes(entries, true);
+            const bool third = waitUntilScanned(fe);
+            const int toldAnswered = countTold(2000);
+            fe.Shutdown();
+            if (notify) DestroyWindow(notify);
+
+            tc.Record(entries.size() == static_cast<size_t>(kFolders) && news && toldFirst == 1 && known == kFolders && bytes == 48 &&
+                      second && toldUnanswered == 0 && newsSecond && third && toldAnswered == 1,
+                      L"Stage16.Test40_FolderSizes_WindowToldOnceWhenTheWorkersAreDone",
+                      L"folders: " + std::to_wstring(entries.size()) + L", messages for the first scan: " + std::to_wstring(toldFirst) +
+                      L", sizes known: " + std::to_wstring(known) + L" (" + std::to_wstring(bytes) + L" bytes), messages while unanswered: " +
+                      std::to_wstring(toldUnanswered) + L", after the answer: " + std::to_wstring(toldAnswered) +
+                      L", news on the timer=" + std::to_wstring((news && newsSecond) ? 1 : 0));
+        }
+
+#ifdef _WIN32
+        // Test 16.41: the folder watcher posts one WM_APP_DIR_CHANGED and waits for the window (DirChangeHandled)
+        // before the next, then leaves it alone for four times as long as its refresh took. It posted every 250 ms
+        // as long as the folder kept changing, whether or not the window kept up. (Windows only: whether the
+        // watcher works at all where the Linux tests run is not known.)
+        {
+            const std::wstring watched = root + L"\\watched";
+            makeDir(watched);
+            HWND notify = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+            auto countPosted = [&]() {
+                int posted = 0;
+                MSG msg = {};
+                while (notify && PeekMessageW(&msg, notify, WM_APP_DIR_CHANGED, WM_APP_DIR_CHANGED, PM_REMOVE)) ++posted;
+                return posted;
+            };
+            auto change = [&](int n) { PathUtils::WriteFileBytes(watched + L"\\f" + std::to_wstring(n) + L".tmp", "x", 1); };
+            // waits for the next message and gives the time it came after `sinceTick`, or -1
+            auto nextPostedAfter = [&](ULONGLONG sinceTick, int withinMs) -> long long {
+                for (int waited = 0; waited <= withinMs; waited += 10) {
+                    if (countPosted() > 0) return static_cast<long long>(GetTickCount64() - sinceTick);
+                    Sleep(10);
+                }
+                return -1;
+            };
+            FileEngine fe;
+            fe.Initialize(notify);
+            fe.WatchDirectory(watched);
+            Sleep(300);                                     // the watcher thread opens the folder
+
+            // 1. The folder changes for a second and a half and the window does not answer: one message
+            for (int n = 0; n < 30; ++n) {
+                change(n);
+                Sleep(50);
+            }
+            Sleep(400);
+            const int whileUnanswered = countPosted();
+
+            // 2. The window answers: it is told about the next change
+            fe.DirChangeHandled(0);
+            change(100);
+            const long long afterAnswer = nextPostedAfter(GetTickCount64(), 5000);
+
+            // 3. Its refresh took 300 ms: the next message does not come before 1200 ms have passed
+            Sleep(300);                                     // (anything the watcher still held is posted by now)
+            countPosted();
+            fe.DirChangeHandled(300);
+            const ULONGLONG pauseFrom = GetTickCount64();
+            change(101);
+            const long long afterPause = nextPostedAfter(pauseFrom, 8000);
+            fe.Shutdown();
+            if (notify) DestroyWindow(notify);
+
+            tc.Record(whileUnanswered == 1 && afterAnswer >= 0 && afterPause >= 1100,
+                      L"Stage16.Test41_FolderWatcher_OneMessageUntilTheWindowAnswers_ThenAPause",
+                      L"messages while the window did not answer: " + std::to_wstring(whileUnanswered) +
+                      L", next one after the answer: " + std::to_wstring(afterAnswer) + L" ms, after a 300 ms refresh: " +
+                      std::to_wstring(afterPause) + L" ms (not before 1200)");
+        }
+#endif
+
+        // Test 16.42: a forced rescan ("Przelicz") ends the scans of the folders it is given and of what is inside
+        // them, goes to the head of the queue, and loses no other scan: one that waits keeps its place behind, one
+        // that runs makes way and starts over. It used to empty the whole queue and stop every running scan: the
+        // sizes of the navigation tree asked for by the same click were never worked out, and of a scan of another
+        // folder that was stopped half way the part counted so far stayed behind and passed for the whole size.
+        {
+            const std::wstring many = root + L"\\many";         // 300 folders, 12 of them with a 4-byte file (Test 16.40)
+            auto rootEntries = FileEngine().EnumerateDirectory(root, true, true, Lang::EN);
+            std::vector<FileEntry> onlyMany;
+            if (const FileEntry* m = entryNamed(rootEntries, L"many")) onlyMany.push_back(*m);
+            const std::wstring manyKey = PathUtils::NormalizePathKey(many);
+
+            // 1. Without workers (an engine that was not started only queues), so that nothing depends on timing:
+            //    300 folders wait, the last ten of them are asked for again by force - all 300 still wait, and
+            //    those ten are now the first to be taken, in the order of the listing
+            bool queueKept = false;
+            {
+                FileEngine idle;
+                auto entries = idle.EnumerateDirectory(many, true, true, Lang::EN);
+                idle.RequestFolderSizes(entries, false);
+                std::vector<FileEntry> ten(entries.end() - std::min<size_t>(10, entries.size()), entries.end());
+                idle.RequestFolderSizes(ten, true);
+                std::vector<std::wstring> order = idle.WaitingFolderScans();
+                bool forcedFirst = order.size() == entries.size() && ten.size() == 10;
+                for (size_t i = 0; i < ten.size() && forcedFirst; ++i) forcedFirst = (order[i] == ten[i].normKey);
+                // the 290 others behind them, as they were
+                for (size_t i = ten.size(); i < order.size() && forcedFirst; ++i) forcedFirst = (order[i] == entries[i - ten.size()].normKey);
+                const std::vector<std::wstring> manyOrder = order;
+
+                // Another listing is opened: its four folders go before everything that waits. The first
+                // listing is opened again: its folders, waiting all the while, move back up in their order.
+                // A folder of the navigation tree is asked for: it goes to the end.
+                auto other = idle.EnumerateDirectory(listed, true, true, Lang::EN);
+                idle.RequestFolderSizes(other, false);
+                order = idle.WaitingFolderScans();
+                bool shownFirst = other.size() == 4 && order.size() == manyOrder.size() + 4;
+                for (size_t i = 0; i < other.size() && shownFirst; ++i) shownFirst = (order[i] == other[i].normKey);
+                idle.RequestFolderSizes(entries, false);
+                std::vector<TreeNode> treeFolder(1);
+                treeFolder[0].path = root;
+                treeFolder[0].normKey = PathUtils::NormalizePathKey(root);
+                treeFolder[0].indent = 1;
+                idle.RequestTreeFolderSizes(treeFolder, false);
+                order = idle.WaitingFolderScans();
+                shownFirst = shownFirst && order.size() == manyOrder.size() + 5 && order.back() == treeFolder[0].normKey;
+                for (size_t i = 0; i < manyOrder.size() && shownFirst; ++i) shownFirst = (order[i] == manyOrder[i]);
+                for (size_t i = 0; i < other.size() && shownFirst; ++i) shownFirst = (order[manyOrder.size() + i] == other[i].normKey);
+                forcedFirst = forcedFirst && shownFirst;
+                std::vector<char> waiting;
+                idle.GetFoldersInFlight(entries, waiting);
+                size_t stillWaiting = 0;
+                bool sameAsOneByOne = waiting.size() == entries.size();
+                for (size_t i = 0; i < entries.size() && sameAsOneByOne; ++i) {
+                    if (waiting[i]) ++stillWaiting;
+                    sameAsOneByOne = (waiting[i] != 0) == idle.IsFolderInFlight(entries[i].normKey);
+                }
+                // an entry that is no folder, and one without a key, are never "in flight"
+                std::vector<FileEntry> odd(2);
+                odd[0].name = L"file.bin";
+                odd[0].normKey = entries.empty() ? L"" : entries[0].normKey;
+                odd[1].isDirectory = true;
+                idle.GetFoldersInFlight(odd, waiting);
+                queueKept = entries.size() == 300 && stillWaiting == 300 && sameAsOneByOne && idle.FolderScansQueued() == 315 &&
+                            forcedFirst && waiting.size() == 2 && !waiting[0] && !waiting[1];
+            }
+
+            // 2. With workers. The tree's folder is asked for, then another folder's listing is rescanned by force
+            //    (the order the window used): the tree's size is worked out all the same
+            FileEngine fe;
+            fe.Initialize(nullptr);
+            auto listedEntries = fe.EnumerateDirectory(listed, true, true, Lang::EN);
+            std::vector<TreeNode> tree(1);
+            tree[0].path = many;
+            tree[0].normKey = manyKey;
+            tree[0].indent = 1;
+            fe.RequestTreeFolderSizes(tree, false);
+            fe.RequestFolderSizes(listedEntries, true);
+            const bool first = waitUntilScanned(fe);
+            fe.SyncTreeNodeSizes(tree);
+            const bool treeSurvived = first && tree[0].size == 48 && !tree[0].sizeStr.empty() && tree[0].sizeStr != L"...";
+
+            // 3. The same for a scan of a listing: "many" is being scanned when another listing is rescanned by force
+            fe.RequestFolderSizes(onlyMany, true);
+            fe.RequestFolderSizes(listedEntries, true);
+            const bool second = waitUntilScanned(fe);
+            auto manyNow = onlyMany;
+            fe.SyncDirectorySizes(manyNow);
+            std::vector<TreemapChildNode> kids;
+            const bool listingSurvived = second && manyNow.size() == 1 && manyNow[0].size == 48 && sizeShown(&manyNow[0]) &&
+                                         fe.GetFolderTreemapChildren(manyKey, kids) && !kids.empty();
+
+            // 4. A folder rescanned by force while it is being scanned: one whole result, nothing left waiting
+            const uint64_t before = fe.FolderScansQueued();
+            fe.RequestFolderSizes(onlyMany, true);
+            fe.RequestFolderSizes(onlyMany, true);
+            const bool third = waitUntilScanned(fe);
+            manyNow = onlyMany;
+            fe.SyncDirectorySizes(manyNow);
+            const bool sameFolderTwice = third && fe.FolderScansQueued() == before + 2 && manyNow.size() == 1 && manyNow[0].size == 48 &&
+                                         !fe.IsFolderInFlight(manyKey) && fe.GetFolderTreemapChildren(manyKey, kids) && !kids.empty();
+            // and the other listing's own folders came out right each time ("full" lost its data in Test 16.39)
+            auto listedNow = fe.EnumerateDirectory(listed, true, true, Lang::EN);
+            const FileEntry* full2 = entryNamed(listedNow, L"full2");
+            const bool othersRight = full2 && full2->size == 5 && sizeShown(entryNamed(listedNow, L"empty")) && sizeShown(entryNamed(listedNow, L"full"));
+
+            // 5. Folders of two different listings rescanned by force in one go: those two anew, and nothing
+            //    else of either listing is forgotten (a request for all of "many" finds nothing to queue)
+            auto manyEntries = fe.EnumerateDirectory(many, true, true, Lang::EN);
+            std::vector<FileEntry> mixed;
+            if (const FileEntry* d0 = entryNamed(manyEntries, L"d0")) mixed.push_back(*d0);
+            if (full2) mixed.push_back(*full2);
+            const uint64_t beforeMixed = fe.FolderScansQueued();
+            fe.RequestFolderSizes(mixed, true);
+            const bool fourth = waitUntilScanned(fe);
+            fe.RequestFolderSizes(manyEntries, false);
+            fe.RequestFolderSizes(listedNow, false);
+            const uint64_t afterMixed = fe.FolderScansQueued();
+            auto mixedNow = mixed;
+            fe.SyncDirectorySizes(mixedNow);
+            const bool twoListings = fourth && mixedNow.size() == 2 && afterMixed == beforeMixed + 2 &&
+                                     mixedNow[0].size == 4 && mixedNow[1].size == 5 && !fe.IsAnyFolderSizeCalculating();
+            fe.Shutdown();
+
+            tc.Record(queueKept && treeSurvived && listingSurvived && sameFolderTwice && othersRight && twoListings,
+                      L"Stage16.Test42_FolderSizes_ForcedRescan_StopsOnlyTheFoldersItIsGiven",
+                      L"waiting scans kept, shown listing first=" + std::to_wstring(queueKept ? 1 : 0) + L", tree size still worked out=" + std::to_wstring(treeSurvived ? 1 : 0) +
+                      L" (" + std::to_wstring(tree[0].size) + L" bytes), other listing's scan went on=" + std::to_wstring(listingSurvived ? 1 : 0) +
+                      L", same folder twice=" + std::to_wstring(sameFolderTwice ? 1 : 0) + L", forced folders right=" + std::to_wstring(othersRight ? 1 : 0) +
+                      L", two listings at once=" + std::to_wstring(twoListings ? 1 : 0) + L" (queued: " + std::to_wstring(afterMixed - beforeMixed) + L")");
+        }
+        TransferManager::DeleteTreeNow(root);
+    }
+
+    // Test 16.43: SpreadsheetDocViewer trims and clips overflowing cell text strictly within each column (including
+    // header row, odd/even data rows, and multiline cell values) so long text never bleeds into adjacent columns,
+    // and draws interactive vertical and horizontal scrollbars for spreadsheets and rich documents.
+    {
+        Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+        Microsoft::WRL::ComPtr<ID2D1Factory> d2d;
+        Microsoft::WRL::ComPtr<IDWriteFactory> dwrite;
+        Microsoft::WRL::ComPtr<IDWriteTextFormat> fmtReg, fmtSmall, fmtBold;
+        Microsoft::WRL::ComPtr<IWICBitmap> bitmap;
+        Microsoft::WRL::ComPtr<ID2D1RenderTarget> rt;
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+        constexpr int kW = 460, kH = 320;
+
+        const bool ready =
+            SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+            SUCCEEDED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf())) &&
+            SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwrite.GetAddressOf()))) &&
+            SUCCEEDED(dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"pl-PL", &fmtReg)) &&
+            SUCCEEDED(dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"pl-PL", &fmtSmall)) &&
+            SUCCEEDED(dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"pl-PL", &fmtBold)) &&
+            SUCCEEDED(wic->CreateBitmap(kW, kH, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &bitmap)) &&
+            SUCCEEDED(d2d->CreateWicBitmapRenderTarget(bitmap.Get(), D2D1::RenderTargetProperties(), &rt)) &&
+            SUCCEEDED(rt->CreateSolidColorBrush(D2D1::ColorF(0x000000), &brush));
+
+        bool colADrawn = false;
+        bool colBNoBleed = false;
+        bool scrollbarsShown = false;
+        bool scrollbarsInteractive = false;
+        bool colResizeWorks = false;
+        bool docScrollbarWorks = false;
+
+        if (ready) {
+            // Configure shared formats identically to ExplorerApp (fmtSmall and fmtBold have NO trimming of their own)
+            fmtReg->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            fmtReg->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            fmtSmall->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            fmtSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            fmtBold->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            fmtBold->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+            ParsedOfficeDocument sheetDoc;
+            sheetDoc.valid = true;
+            sheetDoc.isSpreadsheet = true;
+            sheetDoc.formatTitle = L"OpenDocument Spreadsheet (.ods)";
+            SpreadsheetSheet sh;
+            sh.name = L"Umowy";
+            sh.maxCols = 12;
+            for (int r = 0; r < 40; ++r) {
+                std::vector<std::wstring> row(12);
+                if (r == 0) {
+                    row[0] = L"Tytuł umowy z bardzo długim nagłówkiem kolumny który wykracza poza szerokość komórki";
+                } else if (r == 1) {
+                    row[0] = L"Zaprojektowanie i implementacja kompletnego systemu raportowania finansowego";
+                } else if (r == 2) {
+                    row[0] = L"Własny szablon wordpress dla witryny korporacyjnej klienta zewnętrznego";
+                } else if (r == 3) {
+                    row[0] = L"Rozwój aplikacji mobilnej\ni panelu administracyjnego\nze statystykami";
+                } else {
+                    row[0] = L"Wiersz testowy nr " + std::to_wstring(r);
+                }
+                row[1] = L""; // Column B intentionally empty to detect any text bleed from Column A
+                for (int c = 2; c < 12; ++c) {
+                    row[c] = L"12,00%";
+                }
+                sh.rows.push_back(std::move(row));
+            }
+            sheetDoc.sheets.push_back(std::move(sh));
+
+            SpreadsheetDocViewer viewer;
+            viewer.Initialize(nullptr, dwrite.Get());
+            viewer.ShowLoadedDocument(L"test.ods", std::move(sheetDoc));
+
+            const D2D1_RECT_F viewR = D2D1::RectF(0.0f, 0.0f, static_cast<float>(kW), static_cast<float>(kH));
+            rt->BeginDraw();
+            rt->Clear(D2D1::ColorF(D2D1::ColorF::White));
+            viewer.Draw(rt.Get(), brush.Get(), fmtReg.Get(), fmtSmall.Get(), fmtBold.Get(), viewR, Lang::PL, D2D1::Point2F(-1.0f, -1.0f));
+            const bool drewOk = SUCCEEDED(rt->EndDraw());
+
+            std::vector<uint8_t> px(static_cast<size_t>(kW) * kH * 4, 255);
+            if (drewOk && SUCCEEDED(bitmap->CopyPixels(nullptr, kW * 4, static_cast<UINT>(px.size()), px.data()))) {
+                auto countDarkInk = [&](int x0, int y0, int x1, int y1) -> size_t {
+                    size_t cnt = 0;
+                    for (int y = std::max(0, y0); y < std::min(kH, y1); ++y) {
+                        for (int x = std::max(0, x0); x < std::min(kW, x1); ++x) {
+                            const uint8_t* p = px.data() + (static_cast<size_t>(y) * kW + x) * 4;
+                            if (p[0] < 110 && p[1] < 100 && p[2] < 100) ++cnt;
+                        }
+                    }
+                    return cnt;
+                };
+                // Rows 0..3 occupy y=[76..160]; Column A is x=[46..154], empty Column B interior is x=[158..258]
+                const size_t inkR0 = countDarkInk(51, 78, 149, 95);
+                const size_t inkR1 = countDarkInk(51, 99, 149, 116);
+                const size_t inkR2 = countDarkInk(51, 120, 149, 137);
+                const size_t inkR3 = countDarkInk(51, 141, 149, 158);
+                colADrawn = (inkR0 > 20 && inkR1 > 20 && inkR2 > 20 && inkR3 > 20);
+                colBNoBleed = (countDarkInk(158, 78, 258, 158) == 0);
+            }
+
+            const D2D1_RECT_F vThumb = viewer.VScrollThumbRect();
+            const D2D1_RECT_F hThumb = viewer.HScrollThumbRect();
+            scrollbarsShown = (vThumb.bottom > vThumb.top + 10.0f) && (hThumb.right > hThumb.left + 10.0f);
+
+            if (scrollbarsShown) {
+                // Drag vertical scrollbar thumb to bottom -> TopRow advances
+                float vx = (vThumb.left + vThumb.right) * 0.5f;
+                float vy = (vThumb.top + vThumb.bottom) * 0.5f;
+                viewer.OnMouseDown(vx, vy, false, Lang::PL, nullptr);
+                viewer.OnMouseMove(vx, vy + 220.0f);
+                viewer.OnMouseUp();
+                const int scrolledTopRow = viewer.TopRow();
+
+                // Drag horizontal scrollbar thumb to right -> LeftCol advances
+                float hx = (hThumb.left + hThumb.right) * 0.5f;
+                float hy = (hThumb.top + hThumb.bottom) * 0.5f;
+                viewer.OnMouseDown(hx, hy, false, Lang::PL, nullptr);
+                viewer.OnMouseMove(hx + 360.0f, hy);
+                viewer.OnMouseUp();
+                const int scrolledLeftCol = viewer.LeftCol();
+
+                // Horizontal tilt-wheel scrolls back left
+                viewer.OnMouseHWheel(-WHEEL_DELTA, 120.0f, 120.0f);
+                scrollbarsInteractive = (scrolledTopRow > 15) && (scrolledLeftCol >= 6) && (viewer.LeftCol() == scrolledLeftCol - 1);
+            }
+
+            // Column divider resize handle in header bar (y ~ 65, first visible divider at x = 46 + 108 = 154)
+            if (viewer.WantsHorizontalResizeCursor(154.0f, 65.0f)) {
+                viewer.OnMouseDown(154.0f, 65.0f, false, Lang::PL, nullptr);
+                viewer.OnMouseMove(214.0f, 65.0f);
+                viewer.OnMouseUp();
+                rt->BeginDraw();
+                viewer.Draw(rt.Get(), brush.Get(), fmtReg.Get(), fmtSmall.Get(), fmtBold.Get(), viewR, Lang::PL, D2D1::Point2F(-1.0f, -1.0f));
+                rt->EndDraw();
+                colResizeWorks = viewer.WantsHorizontalResizeCursor(214.0f, 65.0f);
+            }
+
+            // Rich Document mode (.odt / .docx) also exposes a working vertical scrollbar
+            ParsedOfficeDocument textDoc;
+            textDoc.valid = true;
+            textDoc.isSpreadsheet = false;
+            textDoc.formatTitle = L"OpenDocument Text (.odt)";
+            for (int p = 0; p < 30; ++p) {
+                textDoc.paragraphs.push_back({ L"Akapit dokumentu nr " + std::to_wstring(p + 1) + L" z dłuższą treścią testową.", 0, false, false });
+            }
+            viewer.ShowLoadedDocument(L"test.odt", std::move(textDoc));
+            rt->BeginDraw();
+            viewer.Draw(rt.Get(), brush.Get(), fmtReg.Get(), fmtSmall.Get(), fmtBold.Get(), viewR, Lang::PL, D2D1::Point2F(-1.0f, -1.0f));
+            rt->EndDraw();
+            const D2D1_RECT_F docThumb = viewer.VScrollThumbRect();
+            if (docThumb.bottom > docThumb.top + 10.0f) {
+                float dx = (docThumb.left + docThumb.right) * 0.5f;
+                float dy = (docThumb.top + docThumb.bottom) * 0.5f;
+                viewer.OnMouseDown(dx, dy, false, Lang::PL, nullptr);
+                viewer.OnMouseMove(dx, dy + 180.0f);
+                viewer.OnMouseUp();
+                docScrollbarWorks = (viewer.DocScrollY() > 100.0f);
+            }
+            viewer.Shutdown();
+        }
+
+        tc.Record(ready && colADrawn && colBNoBleed && scrollbarsShown && scrollbarsInteractive && colResizeWorks && docScrollbarWorks,
+                  L"Stage16.Test43_SpreadsheetViewer_TrimsColumnTextAndScrollbars",
+                  L"colADrawn=" + std::to_wstring(colADrawn ? 1 : 0) +
+                  L", colBNoBleed=" + std::to_wstring(colBNoBleed ? 1 : 0) +
+                  L", scrollbarsShown=" + std::to_wstring(scrollbarsShown ? 1 : 0) +
+                  L", scrollbarsInteractive=" + std::to_wstring(scrollbarsInteractive ? 1 : 0) +
+                  L", colResizeWorks=" + std::to_wstring(colResizeWorks ? 1 : 0) +
+                  L", docScrollbarWorks=" + std::to_wstring(docScrollbarWorks ? 1 : 0));
+    }
 }
 
 } // namespace
@@ -9118,20 +10093,20 @@ int RunStageTests(const std::wstring& stageName, const std::wstring& outReportPa
     if (stageLower == L"13" || stageLower == L"stage13" || stageLower == L"transfers" || stageLower == L"all") {
         RunStage13Tests(tc);
     }
-    if (stageLower == L"14" || stageLower == L"stage14" || stageLower == L"formats200" || stageLower == L"all") {
+    if (stageLower == L"14" || stageLower == L"stage14" || stageLower == L"formats" || stageLower == L"all") {
         RunStage14Tests(tc);
     }
     if (stageLower == L"16" || stageLower == L"stage16" || stageLower == L"ui" || stageLower == L"all") {
         RunStage16Tests(tc);
     }
     // Stage 15: the format readers, one file per family; "15.3d", "15.eda", "15.images", "15.docs" (both
-    // document files, or "15.docsa" / "15.docsb" alone) and "15.archives" run one family alone
+    // document files, or "15.docs.office" / "15.docs.system" alone) and "15.archives" run one family alone
     const bool stage15 = (stageLower == L"15" || stageLower == L"stage15" || stageLower == L"formats" || stageLower == L"all");
     if (stage15 || stageLower == L"15.3d") RunFormatTests3D(tc);
     if (stage15 || stageLower == L"15.eda") RunFormatTestsEda(tc);
     if (stage15 || stageLower == L"15.images") RunFormatTestsImages(tc);
-    if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docsa") RunFormatTestsDocs(tc);
-    if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docsb") RunFormatTestsDocsB(tc);
+    if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docs.office") RunFormatTestsDocs(tc);
+    if (stage15 || stageLower == L"15.docs" || stageLower == L"15.docs.system") RunFormatTestsDocsSystem(tc);
     if (stage15 || stageLower == L"15.archives") RunFormatTestsArchives(tc);
 
     // Run from a release package, the program has no testdata folder beside it, and every test that reads one of its
@@ -9229,16 +10204,65 @@ void InspectPosixCrashHandler(int sig, siginfo_t*, void* context) {
     uintptr_t offset = pc;
     Dl_info where{};
     if (pc && ::dladdr(reinterpret_cast<void*>(pc), &where) && where.dli_fname && *where.dli_fname) {
-        const char* slash = std::strrchr(where.dli_fname, '/');
-        modName = slash ? (slash + 1) : where.dli_fname;
+        const char* base = where.dli_fname;
+        for (const char* p = where.dli_fname; *p; ++p) {
+            if (*p == '/') base = p + 1;
+        }
+        modName = base;
         offset = pc - reinterpret_cast<uintptr_t>(where.dli_fbase);
     }
+
+    // Async-signal-safe formatting (avoids non-signal-safe snprintf / stdio / locale / heap locks)
     char buf[384];
-    const int n = std::snprintf(buf, sizeof(buf), "X\t%ld\t%s\t%s\t%s\t%llX\n",
-                                static_cast<long>(g_inspectIndex), g_inspectReader ? g_inspectReader : "",
-                                sigName, modName, static_cast<unsigned long long>(offset));
-    if (fd >= 0 && n > 0) {
-        const ssize_t wr = ::write(fd, buf, static_cast<size_t>(n));
+    size_t pos = 0;
+    auto putCh = [&](char c) {
+        if (pos + 1 < sizeof(buf)) buf[pos++] = c;
+    };
+    auto putStr = [&](const char* s) {
+        if (!s) return;
+        while (*s && pos + 1 < sizeof(buf)) buf[pos++] = *s++;
+    };
+    auto putSignedDec = [&](long v) {
+        unsigned long u = 0;
+        if (v < 0) {
+            putCh('-');
+            u = static_cast<unsigned long>(-(v + 1)) + 1ul;
+        } else {
+            u = static_cast<unsigned long>(v);
+        }
+        char tmp[32];
+        int n = 0;
+        do {
+            tmp[n++] = static_cast<char>('0' + (u % 10ul));
+            u /= 10ul;
+        } while (u > 0 && n < 30);
+        while (n > 0) putCh(tmp[--n]);
+    };
+    auto putHex = [&](unsigned long long v) {
+        static const char kHex[] = "0123456789ABCDEF";
+        char tmp[24];
+        int n = 0;
+        do {
+            tmp[n++] = kHex[v & 0xFu];
+            v >>= 4;
+        } while (v > 0 && n < 20);
+        while (n > 0) putCh(tmp[--n]);
+    };
+
+    putStr("X\t");
+    putSignedDec(static_cast<long>(g_inspectIndex));
+    putCh('\t');
+    putStr(g_inspectReader ? g_inspectReader : "");
+    putCh('\t');
+    putStr(sigName);
+    putCh('\t');
+    putStr(modName);
+    putCh('\t');
+    putHex(static_cast<unsigned long long>(offset));
+    putCh('\n');
+
+    if (fd >= 0 && pos > 0) {
+        const ssize_t wr = ::write(fd, buf, pos);
         (void)wr;
     }
     ::_exit(3);

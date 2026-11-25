@@ -56,14 +56,23 @@ inline void ConvertRawChannelBytesToFloat(
 
     if (depth == 16) {
         size_t rowBytes = static_cast<size_t>(w) * 2u;
+        std::vector<uint16_t> samples16(nPx, 0u);
+        uint16_t maxSample = 0u;
         for (uint32_t y = 0; y < h; ++y) {
             const uint8_t* r = rawBytes + static_cast<size_t>(y) * rowBytes;
             uint16_t acc = 0;
             for (uint32_t x = 0; x < w; ++x) {
                 uint16_t v = ReadU16BE(r + static_cast<size_t>(x) * 2u);
                 acc = predictedZip ? static_cast<uint16_t>(acc + v) : v;
-                outPlane[static_cast<size_t>(y) * w + x] = static_cast<float>(acc) * (1.0f / 65535.0f);
+                samples16[static_cast<size_t>(y) * w + x] = acc;
+                if (acc > maxSample) maxSample = acc;
             }
+        }
+        // Adobe Photoshop 16-bit channels use 15-bit+1 fixed point where 32768 (0x8000) == 1.0 white point.
+        // Fall back to 65535 only if a third-party encoder wrote samples > 32768.
+        const float invWhite = (maxSample <= 32768u) ? (1.0f / 32768.0f) : (1.0f / 65535.0f);
+        for (size_t i = 0; i < nPx; ++i) {
+            outPlane[i] = std::min(1.0f, static_cast<float>(samples16[i]) * invWhite);
         }
         return;
     }

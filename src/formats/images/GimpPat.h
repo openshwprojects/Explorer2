@@ -6,10 +6,10 @@ namespace Formats {
 inline bool DecodeGimpPat(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
     if (!data || size < 24) return false;
         if (size >= 24 && std::memcmp(data + 20, "GPAT", 4) == 0) {
-            uint32_t hdrSize = DetailImg100::RdU32BE(data + 0);
-            uint32_t pw      = DetailImg100::RdU32BE(data + 8);
-            uint32_t ph      = DetailImg100::RdU32BE(data + 12);
-            uint32_t bpp     = DetailImg100::RdU32BE(data + 16);
+            uint32_t hdrSize = DetailLayeredAndHdrImg::RdU32BE(data + 0);
+            uint32_t pw      = DetailLayeredAndHdrImg::RdU32BE(data + 8);
+            uint32_t ph      = DetailLayeredAndHdrImg::RdU32BE(data + 12);
+            uint32_t bpp     = DetailLayeredAndHdrImg::RdU32BE(data + 16);
             if (pw == 0 || ph == 0 || pw > 4096 || ph > 4096 || bpp < 1 || bpp > 4) return false;
             if (hdrSize < 24 || hdrSize + static_cast<size_t>(pw) * ph * bpp > size) return false;
 

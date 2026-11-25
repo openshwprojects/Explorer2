@@ -80,9 +80,9 @@ inline bool ParseCycloneDxSbomDoc(const std::vector<uint8_t>& raw, ParsedOfficeD
         std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size()));
     size_t firstPos = text.find_first_not_of(" \t\r\n");
     char first = (firstPos == std::string_view::npos) ? '\0' : text[firstPos];
-    if (first == '{') return ParseSbomJson(text, out);
+    if (first == '{') return ParseSbomJson(text, out, true);
     if (first == '<') return ParseCycloneDxXml(raw, out);
-    return ParseSpdxTagValue(text, out);
+    return false;
 }
 
 } // namespace Formats

@@ -27,7 +27,7 @@ inline bool ParseTriposMol2(const uint8_t* data, size_t size, const std::wstring
             int id = 0; char sym[64] = {}; float x = 0, y = 0, z = 0;
             if (sscanf_s(ln.c_str() + s, "%d %63s %f %f %f", &id, sym, static_cast<unsigned>(sizeof(sym)), &x, &y, &z) == 5) {
                 atoms.push_back({ x, y, z });
-                Detail3D200::AddOctaSphere(mesh, x, y, z, 0.34f);
+                DetailMeshSciCad::AddOctaSphere(mesh, x, y, z, 0.34f);
             }
         }
 
@@ -47,7 +47,7 @@ inline bool ParseTriposMol2(const uint8_t* data, size_t size, const std::wstring
                     int bid = 0, a1 = 0, a2 = 0;
                     if (sscanf_s(bln.c_str() + s, "%d %d %d", &bid, &a1, &a2) == 3) {
                         if (a1 >= 1 && a2 >= 1 && static_cast<size_t>(a1) <= atoms.size() && static_cast<size_t>(a2) <= atoms.size()) {
-                            Detail3D200::AddStrut3D(mesh, atoms[static_cast<size_t>(a1 - 1)], atoms[static_cast<size_t>(a2 - 1)], 0.10f);
+                            DetailMeshSciCad::AddStrut3D(mesh, atoms[static_cast<size_t>(a1 - 1)], atoms[static_cast<size_t>(a2 - 1)], 0.10f);
                         }
                     }
                 }

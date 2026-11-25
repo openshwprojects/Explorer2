@@ -1,0 +1,21 @@
+# KiCad PCB Editor Localization Catalog
+msgid ""
+msgstr ""
+"Project-Id-Version: KiCad 8.0\n"
+"Language: de\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#: pcbnew/router/pns_tool.cpp:142
+#, fuzzy, c-format
+msgctxt "Router"
+msgid "Interactive Push & Shove (%d vias)"
+msgstr "Interaktives Schieben & Drängen (%d Durchkontaktierungen)"
+
+#: pcbnew/drc/drc_engine.cpp:88
+msgid "%d DRC violation"
+msgid_plural "%d DRC violations"
+msgstr[0] "%d DRC-Fehler"
+msgstr[1] "%d DRC-Fehler"
+
+#~ msgid "Obsolete Entry"
+#~ msgstr "Veraltet"

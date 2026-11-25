@@ -6,12 +6,8 @@ namespace Formats {
 
 namespace DetailHyperLynx {
 
-inline void DrawBoxRect(ParsedEdaBoard& out, float x0, float y0, float x1, float y1, float strokeW, EdaLayerId lid, int netId = 0) {
-    out.traces.push_back({ x0, y0, x1, y0, strokeW, lid, netId });
-    out.traces.push_back({ x1, y0, x1, y1, strokeW, lid, netId });
-    out.traces.push_back({ x1, y1, x0, y1, strokeW, lid, netId });
-    out.traces.push_back({ x0, y1, x0, y0, strokeW, lid, netId });
-}
+using ::Explorer2::DrawEdaBoxRect;
+inline void DrawBoxRect(ParsedEdaBoard& out, float x0, float y0, float x1, float y1, float strokeW, EdaLayerId lid, int netId = 0) { DrawEdaBoxRect(out, x0, y0, x1, y1, strokeW, lid, netId); }
 
 inline void HatchCopperPolygon(
     const std::vector<std::pair<float, float>>& pts,
@@ -19,37 +15,7 @@ inline void HatchCopperPolygon(
     int netId,
     ParsedEdaBoard& out)
 {
-    if (pts.size() < 3 || out.traces.size() > 55000) return;
-    float minY = pts[0].second, maxY = pts[0].second;
-    float minX = pts[0].first,  maxX = pts[0].first;
-    for (const auto& p : pts) {
-        minX = std::min(minX, p.first);  maxX = std::max(maxX, p.first);
-        minY = std::min(minY, p.second); maxY = std::max(maxY, p.second);
-    }
-    const float spanY = maxY - minY;
-    if (spanY < 0.05f || (maxX - minX) < 0.05f) return;
-
-    const float pitch = std::clamp(spanY / 18.0f, 0.30f, 1.40f);
-    const float strokeW = pitch * 0.55f;
-    std::vector<float> xs;
-    xs.reserve(16);
-    for (float y = minY + pitch * 0.5f; y < maxY - 1e-4f && out.traces.size() < 58000; y += pitch) {
-        xs.clear();
-        for (size_t i = 0; i < pts.size(); ++i) {
-            const auto& a = pts[i];
-            const auto& b = pts[(i + 1u) % pts.size()];
-            if ((a.second <= y && b.second > y) || (b.second <= y && a.second > y)) {
-                float t = (y - a.second) / (b.second - a.second);
-                xs.push_back(a.first + t * (b.first - a.first));
-            }
-        }
-        std::sort(xs.begin(), xs.end());
-        for (size_t k = 0; k + 1u < xs.size(); k += 2u) {
-            if (xs[k + 1u] - xs[k] > 0.02f) {
-                out.traces.push_back({ xs[k], y, xs[k + 1u], y, strokeW, layer, netId });
-            }
-        }
-    }
+    DetailBoardFabEda::HatchPolygonHorizontal(pts, layer, netId, out, 18.0f, 0.30f, 1.40f, 0.55f);
 }
 
 struct HypNode {

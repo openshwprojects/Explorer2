@@ -93,24 +93,16 @@ inline bool DecodeSvdXmlText(std::string_view rawBytes, std::string& outUtf8) {
     const auto* b = reinterpret_cast<const uint8_t*>(rawBytes.data());
     const size_t n = rawBytes.size();
 
-    // UTF-16LE / UTF-16BE BOM check
+    // UTF-16LE / UTF-16BE BOM check (portable via ReaderText::DecodeUtf16Span)
     if (n >= 4 && ((b[0] == 0xFF && b[1] == 0xFE) || (b[0] == 0xFE && b[1] == 0xFF))) {
         const bool be = (b[0] == 0xFE);
-        size_t nCu = (n - 2) / 2;
-        std::wstring ws;
-        ws.reserve(nCu);
+        const size_t nCu = (n - 2) / 2;
         for (size_t i = 0; i < nCu; ++i) {
-            uint16_t cu = be
-                ? static_cast<uint16_t>((static_cast<uint16_t>(b[2 + i * 2]) << 8) | b[2 + i * 2 + 1])
-                : static_cast<uint16_t>(b[2 + i * 2] | (static_cast<uint16_t>(b[2 + i * 2 + 1]) << 8));
+            const uint16_t cu = be ? ByteIO::RdU16BE(b + 2 + i * 2) : ByteIO::RdU16LE(b + 2 + i * 2);
             if (cu == 0) return false;
-            ws.push_back(static_cast<wchar_t>(cu));
         }
-        int u8Len = WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
-        if (u8Len <= 0) return false;
-        outUtf8.resize(static_cast<size_t>(u8Len));
-        WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), outUtf8.data(), u8Len, nullptr, nullptr);
-        return true;
+        outUtf8 = PathUtils::WideToUtf8(ReaderText::DecodeUtf16Span(b + 2, nCu, be));
+        return !outUtf8.empty();
     }
 
     size_t start = 0;

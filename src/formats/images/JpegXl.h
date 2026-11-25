@@ -228,7 +228,7 @@ struct JxlOpsinParams {
 inline bool ReadJxlF16(DetailBrotli::BitReader& br, float& outVal) {
     uint16_t h = static_cast<uint16_t>(br.ReadBits(16u));
     if (br.eof || (h & 0x7C00u) == 0x7C00u) return false; // Inf/NaN disallowed by ISO 18181-1
-    outVal = DetailImg100::HalfToFloat(h);
+    outVal = DetailLayeredAndHdrImg::HalfToFloat(h);
     return true;
 }
 
@@ -983,7 +983,8 @@ inline bool DecodeModularChannelsInStream(
     const JxlHistogramSet& globalHist,
     bool headerAlreadyRead,
     bool useGlobalTreeIn,
-    const JxlWpHeader& wpIn)
+    const JxlWpHeader& wpIn,
+    uint32_t bitsPerSampleIn = 8u)
 {
     if (streamChs.empty()) return true;
 
@@ -1223,7 +1224,7 @@ inline bool DecodeModularChannelsInStream(
 
     if (!headerAlreadyRead) {
         for (int ti = static_cast<int>(localTransforms.size()) - 1; ti >= 0; --ti) {
-            if (!UndoModularTransform(workingChs, localTransforms[ti], 8u)) return false;
+            if (!UndoModularTransform(workingChs, localTransforms[ti], bitsPerSampleIn)) return false;
         }
         if (workingChs.size() != streamChs.size()) return false;
         for (size_t i = 0; i < streamChs.size(); ++i) {
@@ -1676,9 +1677,11 @@ inline bool DecodeJxlVarDctSections(
                 int32_t dctSel = hfMetaChs[2].pixels[blkCursor];
                 int32_t rawMul = hfMetaChs[2].pixels[static_cast<size_t>(nbBlocks) + blkCursor];
                 ++blkCursor;
-                if (dctSel < 0 || dctSel > 26 || rawMul < 0) return false;
-                uint32_t spanX = (dctSel == 2) ? 2u : 1u;
-                uint32_t spanY = (dctSel == 2) ? 2u : 1u;
+                // Only DCT8 (0) and Hornuss/IDENTITY (1) are decoded in-process; return false on larger/multi-block
+                // VarDCT transforms (DCT16x16, DCT32x32, DCT4x8, AFV, etc.) so WIC fallback handles them cleanly.
+                if ((dctSel != 0 && dctSel != 1) || rawMul < 0) return false;
+                uint32_t spanX = 1u;
+                uint32_t spanY = 1u;
                 if (x + spanX > bw || y + spanY > bh) return false;
                 for (uint32_t dy = 0; dy < spanY; ++dy) {
                     for (uint32_t dx = 0; dx < spanX; ++dx) {
@@ -2545,7 +2548,7 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
                 for (auto& tc : tileChs) ptrs.push_back(&tc);
                 if (!DecodeModularChannelsInStream(
                         lfgBr, ptrs, 1u + lfg, hasGlobalTree, globalTree, globalHist,
-                        false, false, JxlWpHeader{})) {
+                        false, false, JxlWpHeader{}, bitsPerSample)) {
                     return false;
                 }
                 for (size_t k = 0; k < tileChs.size(); ++k) {
@@ -2593,7 +2596,7 @@ inline bool DecodeJxlCodestreamModular(const uint8_t* cs, size_t csLen, Extended
                 for (auto& tc : tileChs) ptrs.push_back(&tc);
                 if (!DecodeModularChannelsInStream(
                         pgBr, ptrs, 1u + numLfGroups + g, hasGlobalTree, globalTree, globalHist,
-                        false, false, JxlWpHeader{})) {
+                        false, false, JxlWpHeader{}, bitsPerSample)) {
                     return false;
                 }
                 for (size_t k = 0; k < tileChs.size(); ++k) {
@@ -2758,12 +2761,12 @@ inline bool DecodeJpegXl(const uint8_t* data, size_t size, ExtendedImageInfo& ou
 
             while (pos < size) {
                 if (pos + 8u > size) return false;
-                uint64_t boxSize = DetailImg100::RdU32BE(data + pos);
+                uint64_t boxSize = DetailLayeredAndHdrImg::RdU32BE(data + pos);
                 const uint8_t* boxType = data + pos + 4u;
                 size_t hdrLen = 8u;
                 if (boxSize == 1ull) {
                     if (pos + 16u > size) return false;
-                    boxSize = DetailImg100::RdU64BE(data + pos + 8u);
+                    boxSize = DetailLayeredAndHdrImg::RdU64BE(data + pos + 8u);
                     hdrLen = 16u;
                 } else if (boxSize == 0ull) {
                     boxSize = size - pos;
@@ -2780,7 +2783,7 @@ inline bool DecodeJpegXl(const uint8_t* data, size_t size, ExtendedImageInfo& ou
                         assembled.insert(assembled.end(), innerData, innerData + innerLen);
                     } else if (std::memcmp(innerType, "jxlp", 4) == 0) {
                         if (sawJxlc || jxlpDone || innerLen < 4u) return false;
-                        uint32_t seqWord = DetailImg100::RdU32BE(innerData);
+                        uint32_t seqWord = DetailLayeredAndHdrImg::RdU32BE(innerData);
                         uint32_t seqIdx = seqWord & 0x7FFFFFFFu;
                         if (seqIdx != expectedJxlpSeq) return false;
                         ++expectedJxlpSeq;
@@ -2822,7 +2825,7 @@ inline bool DecodeJpegXl(const uint8_t* data, size_t size, ExtendedImageInfo& ou
             return true;
         }
         // 3. Fallback to Windows 11 24H2+ native WIC JPEG XL codec (e.g. compressed ICC streams)
-        return DetailImg100::DecodeEmbeddedWicBuffer(data, size, L"JPEG XL Raster (.jxl)", outInfo);
+        return DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data, size, L"JPEG XL Raster (.jxl)", outInfo);
     }
     return false;
 }

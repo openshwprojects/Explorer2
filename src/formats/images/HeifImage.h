@@ -199,6 +199,21 @@ inline bool DecodeAvc1StillItem(
     }
 
 #ifdef _WIN32
+    // Verify at least one complete VCL slice NALU (type 1 or 5) exists before spinning up Media Foundation
+    size_t vclSlices = 0;
+    {
+        size_t vp = 0;
+        while (vp + lenSize <= itemLen) {
+            uint64_t nl = RdVarBE(itemData + vp, lenSize);
+            vp += lenSize;
+            if (nl == 0 || nl > itemLen - vp) { vclSlices = 0; break; }
+            uint8_t nt = itemData[vp] & 0x1Fu;
+            if (nt == 1u || nt == 5u) ++vclSlices;
+            vp += static_cast<size_t>(nl);
+        }
+    }
+    if (vclSlices == 0) return false;
+
     // Fallback to Windows inbox Media Foundation H.264 MFT (CLSID_CMSH264DecoderMFT via MFTEnumEx)
     if (!::Explorer2::IsMediaFoundationAvailable() || FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) return false;
     bool mfDecoded = false;

@@ -5,13 +5,13 @@ namespace Formats {
 
 inline bool DecodeKodakCineon(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
     if (!data || size < 1024) return false;
-    const bool isCinBE = (DetailImg100::RdU32BE(data) == 0x802A5FD7u);
-    const bool isCinLE = (DetailImg100::RdU32LE(data) == 0x802A5FD7u);
+    const bool isCinBE = (DetailLayeredAndHdrImg::RdU32BE(data) == 0x802A5FD7u);
+    const bool isCinLE = (DetailLayeredAndHdrImg::RdU32LE(data) == 0x802A5FD7u);
     if (!isCinBE && !isCinLE) return false;
     const bool isLittle = isCinLE;
     auto rd32 = [&](size_t off) -> uint32_t {
         if (off + 4 > size) return 0;
-        return isLittle ? DetailImg100::RdU32LE(data + off) : DetailImg100::RdU32BE(data + off);
+        return isLittle ? DetailLayeredAndHdrImg::RdU32LE(data + off) : DetailLayeredAndHdrImg::RdU32BE(data + off);
     };
     using DpxElemSpec = DetailDpxCin::DpxElemSpec;
     uint32_t dataOff = rd32(4);

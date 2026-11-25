@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
 inline std::wstring ResolveVpkChunkPath(const std::wstring& dirVpkPath, uint16_t archiveIdx) {
     if (dirVpkPath.empty()) return L"";
@@ -208,7 +208,7 @@ inline bool ParseValveVpk(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
     return ParseOrExtractValveVpk(data, size, vpkDiskPath, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool InspectValveVpk(
     const uint8_t* data,
@@ -216,7 +216,7 @@ inline bool InspectValveVpk(
     ArchiveSummaryInfo& outInfo,
     const std::wstring* vpkDiskPath = nullptr)
 {
-    return DetailArc100::ParseValveVpk(data, size, outInfo, vpkDiskPath);
+    return DetailDiskAndGameArc::ParseValveVpk(data, size, outInfo, vpkDiskPath);
 }
 
 inline bool ExtractValveVpkEntry(
@@ -226,7 +226,7 @@ inline bool ExtractValveVpkEntry(
     const std::wstring& normTarget,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc100::ParseOrExtractValveVpk(data, size, &archivePath, nullptr, &normTarget, &outBytes);
+    return DetailDiskAndGameArc::ParseOrExtractValveVpk(data, size, &archivePath, nullptr, &normTarget, &outBytes);
 }
 
 } // namespace Explorer2::Formats

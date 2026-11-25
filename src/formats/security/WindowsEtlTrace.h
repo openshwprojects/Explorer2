@@ -6,24 +6,24 @@ namespace Formats {
 inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
     // #93. Windows Event Trace Log (.etl — WMI_BUFFER_HEADER + TRACE_LOGFILE_HEADER + ETW Event Records)
     if (ext == L".etl" && raw.size() >= 1024) {
-        const uint32_t buf0Size = DetailDocs200::RdU32LE(raw.data() + 0);
+        const uint32_t buf0Size = DetailStructuredDataDoc::RdU32LE(raw.data() + 0);
         // WMI_BUFFER_HEADER BufferSize must be a 1 KB multiple in [1024, 16 MB] and fit inside raw
         if (buf0Size < 1024u || buf0Size > (16u * 1024u * 1024u) || (buf0Size % 1024u) != 0 || buf0Size > raw.size()) {
             return false;
         }
 
         auto getValidBufferEnd = [](const uint8_t* bHdr, uint32_t bSize) -> uint32_t {
-            const uint32_t savedOff = DetailDocs200::RdU32LE(bHdr + 4);
-            const uint32_t wnodeOff = DetailDocs200::RdU32LE(bHdr + 48);
+            const uint32_t savedOff = DetailStructuredDataDoc::RdU32LE(bHdr + 4);
+            const uint32_t wnodeOff = DetailStructuredDataDoc::RdU32LE(bHdr + 48);
             if (wnodeOff >= 72u && wnodeOff <= bSize) return wnodeOff;
             if (savedOff >= 72u && savedOff <= bSize) return savedOff;
             return 0u;
         };
 
         auto formatGuid = [](const uint8_t* g) -> std::wstring {
-            const uint32_t d1 = DetailDocs200::RdU32LE(g + 0);
-            const uint16_t d2 = DetailDocs200::RdU16LE(g + 4);
-            const uint16_t d3 = DetailDocs200::RdU16LE(g + 6);
+            const uint32_t d1 = DetailStructuredDataDoc::RdU32LE(g + 0);
+            const uint16_t d2 = DetailStructuredDataDoc::RdU16LE(g + 4);
+            const uint16_t d3 = DetailStructuredDataDoc::RdU16LE(g + 6);
             wchar_t buf[64] = {};
             swprintf_s(buf, L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
                 d1, d2, d3, g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
@@ -61,7 +61,7 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
 
         auto isValidEtwRecordAt = [](const uint8_t* rec, size_t maxBytes) -> bool {
             if (maxBytes < 16) return false;
-            const uint16_t recSize = DetailDocs200::RdU16LE(rec + 0);
+            const uint16_t recSize = DetailStructuredDataDoc::RdU16LE(rec + 0);
             const uint8_t hdrType  = rec[2];
             const uint8_t marker   = rec[3];
             if (marker != 0xC0u || recSize > maxBytes) return false;
@@ -103,7 +103,7 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
         size_t bufFileOff = 0;
         while (bufFileOff + 72u <= raw.size()) {
             const uint8_t* bHdr = raw.data() + bufFileOff;
-            const uint32_t bSize = DetailDocs200::RdU32LE(bHdr + 0);
+            const uint32_t bSize = DetailStructuredDataDoc::RdU32LE(bHdr + 0);
             if (bSize < 1024u || bSize > (16u * 1024u * 1024u) || (bSize % 1024u) != 0) break;
             if (bufFileOff + bSize > raw.size()) break;
 
@@ -114,27 +114,27 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
                 while (rOff + 16u <= vEnd) {
                     const uint8_t* rec = bHdr + rOff;
                     if (rec[3] != 0xC0u) break;
-                    const uint16_t recSize = DetailDocs200::RdU16LE(rec + 0);
+                    const uint16_t recSize = DetailStructuredDataDoc::RdU16LE(rec + 0);
                     const uint8_t hdrType  = rec[2];
                     if (recSize < 16u || rOff + recSize > vEnd) break;
 
                     if ((hdrType == 0x12u || hdrType == 0x13u) && recSize >= 80u) {
                         // Vista+ Crimson EVENT_HEADER (80 bytes)
-                        const uint16_t flags   = DetailDocs200::RdU16LE(rec + 4);
-                        const uint32_t tid     = DetailDocs200::RdU32LE(rec + 8);
-                        const uint32_t pid     = DetailDocs200::RdU32LE(rec + 12);
-                        const uint64_t ts      = DetailDocs200::RdU64LE(rec + 16);
+                        const uint16_t flags   = DetailStructuredDataDoc::RdU16LE(rec + 4);
+                        const uint32_t tid     = DetailStructuredDataDoc::RdU32LE(rec + 8);
+                        const uint32_t pid     = DetailStructuredDataDoc::RdU32LE(rec + 12);
+                        const uint64_t ts      = DetailStructuredDataDoc::RdU64LE(rec + 16);
                         const std::wstring gid = formatGuid(rec + 24);
-                        const uint16_t evtId   = DetailDocs200::RdU16LE(rec + 40);
+                        const uint16_t evtId   = DetailStructuredDataDoc::RdU16LE(rec + 40);
                         const uint8_t level    = rec[44];
                         const uint8_t opcode   = rec[45];
                         uint32_t payloadLen    = recSize - 80u;
                         if ((flags & 0x0001u) != 0 && payloadLen >= 2u) {
                             // Adjust for extended data items if present
-                            const uint16_t extCnt = DetailDocs200::RdU16LE(rec + 80);
+                            const uint16_t extCnt = DetailStructuredDataDoc::RdU16LE(rec + 80);
                             size_t extPos = 82u;
                             for (uint16_t e = 0; e < extCnt && extPos + 8u <= recSize; ++e) {
-                                const uint16_t dSz = DetailDocs200::RdU16LE(rec + extPos + 6u);
+                                const uint16_t dSz = DetailStructuredDataDoc::RdU16LE(rec + extPos + 6u);
                                 extPos += 8u + dSz;
                             }
                             if (extPos <= recSize) payloadLen = static_cast<uint32_t>(recSize - extPos);
@@ -164,9 +164,9 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
                         // Kernel SYSTEM_TRACE_HEADER (32 bytes)
                         const uint8_t opcode = rec[4];
                         const uint8_t group  = rec[5];
-                        const uint32_t tid   = DetailDocs200::RdU32LE(rec + 8);
-                        const uint32_t pid   = DetailDocs200::RdU32LE(rec + 12);
-                        const uint64_t ts    = DetailDocs200::RdU64LE(rec + 16);
+                        const uint32_t tid   = DetailStructuredDataDoc::RdU32LE(rec + 8);
+                        const uint32_t pid   = DetailStructuredDataDoc::RdU32LE(rec + 12);
+                        const uint64_t ts    = DetailStructuredDataDoc::RdU64LE(rec + 16);
                         const uint16_t synId = static_cast<uint16_t>((static_cast<uint16_t>(group) << 8) | opcode);
                         const std::wstring kGuid = L"{9E814AAD-3204-11D2-9A82-006008A86939}"; // SystemTraceControlGuid
 
@@ -194,9 +194,9 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
                         // Classic EVENT_TRACE_HEADER (48 bytes)
                         const uint8_t opcode   = rec[4];
                         const uint8_t level    = rec[5];
-                        const uint32_t tid     = DetailDocs200::RdU32LE(rec + 8);
-                        const uint32_t pid     = DetailDocs200::RdU32LE(rec + 12);
-                        const uint64_t ts      = DetailDocs200::RdU64LE(rec + 16);
+                        const uint32_t tid     = DetailStructuredDataDoc::RdU32LE(rec + 8);
+                        const uint32_t pid     = DetailStructuredDataDoc::RdU32LE(rec + 12);
+                        const uint64_t ts      = DetailStructuredDataDoc::RdU64LE(rec + 16);
                         const std::wstring gid = formatGuid(rec + 24);
                         const uint32_t payLen  = recSize - 48u;
 
@@ -205,14 +205,14 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
                             const uint8_t* lh = rec + 48;
                             const uint8_t majVer  = lh[4];
                             const uint8_t minVer  = lh[5];
-                            const uint32_t build  = DetailDocs200::RdU32LE(lh + 8);
-                            const uint32_t nProcs = DetailDocs200::RdU32LE(lh + 12);
-                            const uint64_t endFt  = DetailDocs200::RdU64LE(lh + 16);
-                            const uint32_t timRes = DetailDocs200::RdU32LE(lh + 24);
-                            const uint32_t bufWr  = DetailDocs200::RdU32LE(lh + 36);
-                            const uint32_t ptrSz  = DetailDocs200::RdU32LE(lh + 44);
-                            const uint32_t evtLst = DetailDocs200::RdU32LE(lh + 48);
-                            const uint32_t cpuMhz = DetailDocs200::RdU32LE(lh + 52);
+                            const uint32_t build  = DetailStructuredDataDoc::RdU32LE(lh + 8);
+                            const uint32_t nProcs = DetailStructuredDataDoc::RdU32LE(lh + 12);
+                            const uint64_t endFt  = DetailStructuredDataDoc::RdU64LE(lh + 16);
+                            const uint32_t timRes = DetailStructuredDataDoc::RdU32LE(lh + 24);
+                            const uint32_t bufWr  = DetailStructuredDataDoc::RdU32LE(lh + 36);
+                            const uint32_t ptrSz  = DetailStructuredDataDoc::RdU32LE(lh + 44);
+                            const uint32_t evtLst = DetailStructuredDataDoc::RdU32LE(lh + 48);
+                            const uint32_t cpuMhz = DetailStructuredDataDoc::RdU32LE(lh + 52);
 
                             sessSh.rows.push_back({ L"OS Version",
                                 std::to_wstring(majVer) + L"." + std::to_wstring(minVer) + L" (Build " + std::to_wstring(build) + L")" });
@@ -227,9 +227,9 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
 
                             const size_t tailBase = (ptrSz == 4u) ? 240u : 248u;
                             if (payLen >= tailBase + 32u) {
-                                const uint64_t bootFt  = DetailDocs200::RdU64LE(lh + tailBase + 0);
-                                const uint64_t startFt = DetailDocs200::RdU64LE(lh + tailBase + 16);
-                                const uint32_t bufLost = DetailDocs200::RdU32LE(lh + tailBase + 28);
+                                const uint64_t bootFt  = DetailStructuredDataDoc::RdU64LE(lh + tailBase + 0);
+                                const uint64_t startFt = DetailStructuredDataDoc::RdU64LE(lh + tailBase + 16);
+                                const uint32_t bufLost = DetailStructuredDataDoc::RdU32LE(lh + tailBase + 28);
                                 if (bootFt > 0)  sessSh.rows.push_back({ L"Boot Time (UTC)", formatFileTime(bootFt) });
                                 if (startFt > 0) sessSh.rows.push_back({ L"Session Start Time (UTC)", formatFileTime(startFt) });
                                 if (endFt > 0)   sessSh.rows.push_back({ L"Session End Time (UTC)", formatFileTime(endFt) });
@@ -237,12 +237,12 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
 
                                 const size_t strOff = tailBase + 32u;
                                 if (payLen > strOff + 2u) {
-                                    std::wstring loggerName = DetailDocs200::ReadUtf16LE(lh + strOff, payLen - strOff);
+                                    std::wstring loggerName = DetailStructuredDataDoc::ReadUtf16LE(lh + strOff, payLen - strOff);
                                     if (!loggerName.empty()) {
                                         sessSh.rows.push_back({ L"Logger Name", loggerName });
                                         const size_t nextStr = strOff + (loggerName.size() + 1u) * 2u;
                                         if (payLen > nextStr + 2u) {
-                                            std::wstring logFile = DetailDocs200::ReadUtf16LE(lh + nextStr, payLen - nextStr);
+                                            std::wstring logFile = DetailStructuredDataDoc::ReadUtf16LE(lh + nextStr, payLen - nextStr);
                                             if (!logFile.empty()) sessSh.rows.push_back({ L"Log File Name", logFile });
                                         }
                                     }
@@ -272,8 +272,8 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
                         }
                     } else {
                         // PERFINFO_TRACE_HEADER (0x03/0x0C/0x0D)
-                        const uint16_t hookId = DetailDocs200::RdU16LE(rec + 4);
-                        const uint64_t ts     = DetailDocs200::RdU64LE(rec + 8);
+                        const uint16_t hookId = DetailStructuredDataDoc::RdU16LE(rec + 4);
+                        const uint64_t ts     = DetailStructuredDataDoc::RdU64LE(rec + 8);
                         const std::wstring pGuid = L"{CE1DBFB4-137E-4DA6-87B0-3F59AA102CBC}";
                         ++totalEvents;
                         auto& pa = providers[pGuid];
@@ -311,7 +311,7 @@ inline bool ParseWindowsEtlTraceDoc(const std::vector<uint8_t>& raw, const std::
         sessSh.rows.insert(sessSh.rows.begin() + 2, { L"Parsed ETW Buffers", std::to_wstring(totalBuffers) });
         sessSh.rows.insert(sessSh.rows.begin() + 3, { L"Total Decoded Event Records", std::to_wstring(totalEvents) });
         sessSh.rows.insert(sessSh.rows.begin() + 4, { L"Distinct Provider GUIDs", std::to_wstring(providers.size()) });
-        sessSh.rows.push_back({ L"First Buffer LoggerId", std::to_wstring(DetailDocs200::RdU16LE(raw.data() + 42)) });
+        sessSh.rows.push_back({ L"First Buffer LoggerId", std::to_wstring(DetailStructuredDataDoc::RdU16LE(raw.data() + 42)) });
         sessSh.rows.push_back({ L"First Buffer Processor", std::to_wstring(raw[40]) });
 
         SpreadsheetSheet provSh;

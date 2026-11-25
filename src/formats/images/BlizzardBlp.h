@@ -9,14 +9,14 @@ inline bool DecodeBlizzardBlp(const uint8_t* data, size_t size, ExtendedImageInf
         const bool isBlp2 = (data[3] == '2');
         if (!isBlp2 && size < 156) return false; // BLP1 header is 7*4 + 16*4 + 16*4 = 156 bytes
 
-        uint32_t w = DetailImg100::RdU32LE(data + 12);
-        uint32_t h = DetailImg100::RdU32LE(data + 16);
+        uint32_t w = DetailLayeredAndHdrImg::RdU32LE(data + 12);
+        uint32_t h = DetailLayeredAndHdrImg::RdU32LE(data + 16);
         if (w == 0 || h == 0 || w > 4096 || h > 4096) return false;
 
         // BLP2: [magic, type, enc/alpha/mips(4B), w, h] = 20B -> mipOffsets[0]@20, mipSizes[0]@84
         // BLP1: [magic, compression, flags, w, h, pictureType, pictureSubType] = 28B -> mipOffsets[0]@28, mipSizes[0]@92
-        uint32_t mip0Off = DetailImg100::RdU32LE(data + (isBlp2 ? 20 : 28));
-        uint32_t mip0Len = DetailImg100::RdU32LE(data + (isBlp2 ? 84 : 92));
+        uint32_t mip0Off = DetailLayeredAndHdrImg::RdU32LE(data + (isBlp2 ? 20 : 28));
+        uint32_t mip0Len = DetailLayeredAndHdrImg::RdU32LE(data + (isBlp2 ? 84 : 92));
         if (mip0Off == 0 || mip0Len == 0 || mip0Off > size || mip0Len > size - mip0Off) return false;
 
         outInfo.width = w;
@@ -82,7 +82,7 @@ inline bool DecodeBlizzardBlp(const uint8_t* data, size_t size, ExtendedImageInf
                 outInfo.valid = true;
                 return true;
             }
-            if (mip0Len > 16 && DetailImg100::DecodeEmbeddedWicBuffer(data + mip0Off, mip0Len, outInfo.formatName, outInfo)) {
+            if (mip0Len > 16 && DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data + mip0Off, mip0Len, outInfo.formatName, outInfo)) {
                 return true;
             }
             return false;
@@ -92,9 +92,9 @@ inline bool DecodeBlizzardBlp(const uint8_t* data, size_t size, ExtendedImageInf
         //   compression (u32@4): 0 = Split JPEG, 1 = Paletted
         //   flags       (u32@8): 0x8 = has alpha
         //   pictureType (u32@20): 3/4 = index + alpha, 5 = index only
-        const uint32_t compression = DetailImg100::RdU32LE(data + 4);
-        const uint32_t flags       = DetailImg100::RdU32LE(data + 8);
-        const uint32_t pictureType = DetailImg100::RdU32LE(data + 20);
+        const uint32_t compression = DetailLayeredAndHdrImg::RdU32LE(data + 4);
+        const uint32_t flags       = DetailLayeredAndHdrImg::RdU32LE(data + 8);
+        const uint32_t pictureType = DetailLayeredAndHdrImg::RdU32LE(data + 20);
 
         if (compression == 1u) { // Paletted BLP1: 256-entry BGRA palette at offset 156 (1024 bytes)
             if (size < 156u + 1024u || mip0Len < pxCount) return false;
@@ -133,7 +133,7 @@ inline bool DecodeBlizzardBlp(const uint8_t* data, size_t size, ExtendedImageInf
 
         if (compression == 0u) { // Split-JPEG BLP1: [u32 jpegHeaderSize @ 156] + [shared header @ 160] + [mip0 @ mip0Off]
             if (size < 160u) return false;
-            uint32_t jpegHeaderSize = DetailImg100::RdU32LE(data + 156u);
+            uint32_t jpegHeaderSize = DetailLayeredAndHdrImg::RdU32LE(data + 156u);
             if (jpegHeaderSize > 65536u || 160u + static_cast<size_t>(jpegHeaderSize) > size) return false;
 
             const uint8_t* hdrPtr = data + 160u;
@@ -202,7 +202,7 @@ inline bool DecodeBlizzardBlp(const uint8_t* data, size_t size, ExtendedImageInf
             }
 
             // Fallback for progressive SOF2 BLP1 JPEGs via WIC (swapping R<->B for BLP1 BGR channel order)
-            if (jpgBuf.size() > 16u && DetailImg100::DecodeEmbeddedWicBuffer(jpgBuf.data(), jpgBuf.size(), outInfo.formatName, outInfo)) {
+            if (jpgBuf.size() > 16u && DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(jpgBuf.data(), jpgBuf.size(), outInfo.formatName, outInfo)) {
                 for (size_t i = 0; i + 3u < outInfo.bgraPixels.size(); i += 4u) {
                     std::swap(outInfo.bgraPixels[i + 0u], outInfo.bgraPixels[i + 2u]);
                 }

@@ -61,7 +61,7 @@ inline bool ParseCryEngineGeometry(
         if (size < 20) return false;
         fileVer = RdU32(data + 12);
         uint32_t tableOff = RdU32(data + 16);
-        if ((fileVer != 0x0744u && fileVer != 0x0745u) || tableOff + 4u > size) return false;
+        if ((fileVer != 0x0744u && fileVer != 0x0745u) || static_cast<uint64_t>(tableOff) + 4ULL > size) return false;
         uint32_t numChunks = RdU32(data + tableOff);
         size_t entrySz = (fileVer == 0x0745u) ? 20u : 16u;
         if (numChunks == 0 || numChunks > 65536 ||
@@ -110,8 +110,11 @@ inline bool ParseCryEngineGeometry(
 
     for (const CryChunk& ch : chunks) {
         if (!isDataStreamType(ch.type)) continue;
-        size_t bodyOff = ch.offset + (ch.hasInlineHeader ? 16u : 0u);
-        if (bodyOff + 24u > ch.offset + ch.byteSize) continue;
+        uint64_t chEnd = static_cast<uint64_t>(ch.offset) + ch.byteSize;
+        if (chEnd > size) continue;
+        uint64_t bodyOff64 = static_cast<uint64_t>(ch.offset) + (ch.hasInlineHeader ? 16ULL : 0ULL);
+        if (bodyOff64 + 24ULL > chEnd) continue;
+        size_t bodyOff = static_cast<size_t>(bodyOff64);
         const uint8_t* sp = data + bodyOff;
         /*uint32_t flags =*/ RdU32(sp + 0);
         uint32_t streamType = RdU32(sp + 4);
@@ -120,7 +123,7 @@ inline bool ParseCryEngineGeometry(
         // reserved[2] at +16..+24
         size_t payloadOff = bodyOff + 24u;
         uint64_t payloadBytes = static_cast<uint64_t>(elemCount) * elemSize;
-        if (elemCount == 0 || elemCount > 4000000u || payloadOff + payloadBytes > ch.offset + ch.byteSize) continue;
+        if (elemCount == 0 || elemCount > 4000000u || static_cast<uint64_t>(payloadOff) + payloadBytes > chEnd) continue;
 
         const uint8_t* pay = data + payloadOff;
         // CGF_STREAM_POSITIONS = 0 (float3 = 12B, or half4 = 8B), CGF_STREAM_P3S_C4B_T2S = 15 (half3/half4 + color + uv = 16B)
@@ -187,8 +190,12 @@ inline bool ParseCryEngineGeometry(
     // Match Mesh chunks (0x0800 / 0x0801 / 0x0802 stream references, or legacy 0x0744 inline CryVertex/CryFace)
     for (const CryChunk& ch : chunks) {
         if (!isMeshChunkType(ch.type)) continue;
-        size_t bodyOff = ch.offset + (ch.hasInlineHeader ? 16u : 0u);
-        size_t bodyLen = (ch.offset + ch.byteSize > bodyOff) ? (ch.offset + ch.byteSize - bodyOff) : 0u;
+        uint64_t chEnd = static_cast<uint64_t>(ch.offset) + ch.byteSize;
+        if (chEnd > size) continue;
+        uint64_t bodyOff64 = static_cast<uint64_t>(ch.offset) + (ch.hasInlineHeader ? 16ULL : 0ULL);
+        if (bodyOff64 > chEnd) continue;
+        size_t bodyOff = static_cast<size_t>(bodyOff64);
+        size_t bodyLen = static_cast<size_t>(chEnd - bodyOff64);
         const uint8_t* mp = data + bodyOff;
 
         if (ch.version == 0x0744u && bodyLen >= 20u) {

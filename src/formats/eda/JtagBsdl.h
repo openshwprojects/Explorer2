@@ -1,5 +1,5 @@
 #pragma once
-// JtagBsdl.h — #29 IEEE 1149.1 JTAG Boundary-Scan (.bsdl / .bsd) BGA Ball Map, QFP Perimeter, IDCODE & Boundary-Register Viewer
+// JtagBsdl.h — IEEE 1149.1 JTAG Boundary-Scan (.bsdl / .bsd) BGA Ball Map, QFP Perimeter, IDCODE & Boundary-Register Viewer
 
 namespace Formats {
 

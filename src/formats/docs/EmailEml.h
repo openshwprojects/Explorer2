@@ -15,8 +15,8 @@ inline bool ParseEmailEmlDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocume
     out.kind = OfficeFileKind::WordDocx;
     out.isSpreadsheet = false;
     out.formatTitle = L"RFC 5322 Email Message (.eml)";
-    if (!DetailMedia100::ParseSingleEmailMessage(sv, 0, out) || out.paragraphs.empty()) return false;
-    DetailMedia100::ComputeDocCounts(out);
+    if (!DetailMediaAndScoreDoc::ParseSingleEmailMessage(sv, 0, out) || out.paragraphs.empty()) return false;
+    DetailMediaAndScoreDoc::ComputeDocCounts(out);
     out.valid = true;
     return true;
 }

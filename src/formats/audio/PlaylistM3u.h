@@ -1,7 +1,6 @@
 #pragma once
-// PlaylistM3u.h — media playlists: extended M3U / M3U8 (#EXTINF with IPTV-style attributes), HTTP Live
-// Streaming (master playlists with #EXT-X-STREAM-INF variants, media playlists with segments) and
-// PLS ([playlist] File<n>= / Title<n>= / Length<n>=). Text that is neither is rejected.
+// PlaylistM3u.h — media playlists: extended M3U / M3U8 (#EXTINF with IPTV-style attributes) and HTTP Live
+// Streaming (master playlists with #EXT-X-STREAM-INF variants, media playlists with segments).
 
 namespace Formats {
 
@@ -78,47 +77,10 @@ inline bool ParsePlaylistM3uDoc(const std::vector<uint8_t>& raw, ParsedOfficeDoc
     bool unknownDurations = false;
     constexpr size_t kMaxRows = 20000;
 
-    // --- PLS ---
     if (lines[0].size() >= 10 && _strnicmp(lines[0].data(), "[playlist]", 10) == 0) {
-        std::map<int, std::array<std::string, 3>> items; // n -> File, Title, Length
-        std::string declared;
-        for (size_t i = 1; i < lines.size(); ++i) {
-            std::string_view ln = lines[i];
-            size_t eq = ln.find('=');
-            if (eq == std::string_view::npos) continue;
-            std::string key(TrimSv(ln.substr(0, eq)));
-            for (char& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            std::string val(TrimSv(ln.substr(eq + 1)));
-            int slot = -1;
-            size_t digits = 0;
-            if (key.rfind("file", 0) == 0) { slot = 0; digits = 4; }
-            else if (key.rfind("title", 0) == 0) { slot = 1; digits = 5; }
-            else if (key.rfind("length", 0) == 0) { slot = 2; digits = 6; }
-            else if (key == "numberofentries") { declared = val; continue; }
-            if (slot < 0 || digits >= key.size()) continue;
-            int n = 0;
-            auto res = std::from_chars(key.data() + digits, key.data() + key.size(), n);
-            if (res.ec != std::errc{} || res.ptr != key.data() + key.size() || n <= 0) continue;
-            items[n][static_cast<size_t>(slot)] = val;
-        }
-        if (items.empty()) return false;
-        sheet.rows.push_back({ L"#", L"Duration", L"Title", L"URI / Path" });
-        for (const auto& kv : items) {
-            if (kv.second[0].empty()) continue;
-            ++entries;
-            double len = -1.0;
-            if (!kv.second[2].empty()) {
-                std::from_chars(kv.second[2].data(), kv.second[2].data() + kv.second[2].size(), len);
-            }
-            if (len >= 0.0) totalSec += len; else unknownDurations = true;
-            if (sheet.rows.size() <= kMaxRows) {
-                sheet.rows.push_back({ std::to_wstring(kv.first), len >= 0.0 ? FormatDuration(len) : L"(stream)",
-                                       w(kv.second[1]), w(kv.second[0]) });
-            }
-        }
-        out.formatTitle = L"PLS Media Playlist (.pls)";
-        if (!declared.empty()) summary.rows.push_back({ L"Declared entries", w(declared) });
-    } else {
+        return false; // PLS is handled by PlaylistPls.h
+    }
+    {
         // --- M3U / M3U8 / HLS ---
         bool extended = (lines[0].rfind("#EXTM3U", 0) == 0);
         bool hlsMaster = false, hlsMedia = false;
@@ -209,7 +171,7 @@ inline bool ParsePlaylistM3uDoc(const std::vector<uint8_t>& raw, ParsedOfficeDoc
         if (entries == 0 || (!extended && nonUriText > entries)) return false;
         out.formatTitle = hlsMaster ? L"HTTP Live Streaming Master Playlist (.m3u8)"
                         : hlsMedia ? L"HTTP Live Streaming Media Playlist (.m3u8)"
-                        : L"Media Playlist (.m3u / .m3u8 / .pls)";
+                        : L"Media Playlist (.m3u / .m3u8)";
         if (hlsMaster) summary.rows.push_back({ L"Variant streams", std::to_wstring(entries) });
     }
     if (entries == 0) return false;

@@ -230,6 +230,7 @@ enum CommandId : int {
     CMD_CTX_UNPIN_QUICK = 226,
     CMD_CTX_EXPAND_COLLAPSE = 227,
     CMD_CTX_OPEN_ARCHIVE_HERE = 228,
+    CMD_CTX_CHECK_LOCKS = 229,
 
     // Sort By & Group By Submenus
     CMD_SORT_NAME = 240,

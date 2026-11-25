@@ -124,62 +124,15 @@ inline bool ReadLineGmsh(const uint8_t*& bp, const uint8_t* bend, std::string_vi
     return true;
 }
 
-struct GmshFaceKey {
-    uint32_t v[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
-    uint8_t n = 0;
-    bool operator==(const GmshFaceKey& o) const noexcept {
-        return n == o.n && v[0] == o.v[0] && v[1] == o.v[1] && v[2] == o.v[2] && v[3] == o.v[3];
-    }
-};
+using GmshFaceMap = FemSolidSurface::FaceMap;
 
-struct GmshFaceKeyHash {
-    size_t operator()(const GmshFaceKey& k) const noexcept {
-        uint64_t h = 1469598103934665603ULL;
-        for (uint8_t i = 0; i < k.n; ++i) {
-            h ^= static_cast<uint64_t>(k.v[i]);
-            h *= 1099511628211ULL;
-        }
-        return static_cast<size_t>(h ^ (h >> 32));
-    }
-};
-
-struct GmshFaceRec {
-    uint32_t orig[4] = {};
-    uint8_t n = 0;
-    uint32_t volCount = 0;
-    bool explicit2D = false;
-};
-
-inline void RecordGmshFace(
-    std::unordered_map<GmshFaceKey, GmshFaceRec, GmshFaceKeyHash>& map,
-    const uint32_t* fverts, uint8_t n, bool volumetric)
-{
-    GmshFaceKey key;
-    key.n = n;
-    for (uint8_t i = 0; i < n; ++i) key.v[i] = fverts[i];
-    std::sort(key.v, key.v + n);
-    for (uint8_t i = 1; i < n; ++i) {
-        if (key.v[i] == key.v[i - 1]) return;
-    }
-
-    auto [it, inserted] = map.try_emplace(key);
-    if (inserted) {
-        it->second.n = n;
-        for (uint8_t i = 0; i < n; ++i) it->second.orig[i] = fverts[i];
-    }
-    if (volumetric) {
-        ++it->second.volCount;
-    } else {
-        it->second.explicit2D = true;
-        if (it->second.volCount == 0) {
-            for (uint8_t i = 0; i < n; ++i) it->second.orig[i] = fverts[i];
-        }
-    }
+inline void RecordGmshFace(GmshFaceMap& map, const uint32_t* fverts, uint8_t n, bool volumetric) {
+    FemSolidSurface::RecordFace(map, fverts, n, volumetric);
 }
 
 inline void EmitGmshElement(
     int elmType, const uint32_t* v, int npe,
-    std::unordered_map<GmshFaceKey, GmshFaceRec, GmshFaceKeyHash>& faceMap,
+    GmshFaceMap& faceMap,
     std::vector<std::pair<uint32_t, uint32_t>>& lineSegs)
 {
     switch (elmType) {
@@ -283,7 +236,7 @@ inline bool ParseGmshMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) 
     const uint8_t* const bend = data + size;
 
     std::unordered_map<uint64_t, uint32_t> nodeTagToIdx;
-    std::unordered_map<DetailGmsh::GmshFaceKey, DetailGmsh::GmshFaceRec, DetailGmsh::GmshFaceKeyHash> faceMap;
+    DetailGmsh::GmshFaceMap faceMap;
     std::vector<std::pair<uint32_t, uint32_t>> lineSegs;
 
     while (bp < bend) {
@@ -761,17 +714,7 @@ inline bool ParseGmshMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) 
         ? ((fileType == 1) ? L"Gmsh 4.x FEM Mesh (.msh Binary)" : L"Gmsh 4.x FEM Mesh (.msh)")
         : ((fileType == 1) ? L"Gmsh 2.x FEM Mesh (.msh Binary)" : L"Gmsh Finite Element Mesh (.msh)");
 
-    for (const auto& kv : faceMap) {
-        const auto& f = kv.second;
-        if (f.volCount == 1 || (f.volCount == 0 && f.explicit2D)) {
-            if (f.n == 3) {
-                mesh.tris.push_back({ f.orig[0], f.orig[1], f.orig[2], {} });
-            } else if (f.n == 4) {
-                mesh.tris.push_back({ f.orig[0], f.orig[1], f.orig[2], {} });
-                mesh.tris.push_back({ f.orig[0], f.orig[2], f.orig[3], {} });
-            }
-        }
-    }
+    FemSolidSurface::EmitBoundaryFacesDirect(faceMap, mesh);
 
     if (mesh.tris.empty() && !lineSegs.empty() && !mesh.vertices.empty()) {
         std::vector<Vec3f> baseVerts = std::move(mesh.vertices);

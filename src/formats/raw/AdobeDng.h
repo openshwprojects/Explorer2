@@ -4,7 +4,7 @@
 namespace Formats {
 
 inline bool DecodeAdobeDng(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DetailImg200::ParseTiffRawIfds(data, size, L"Adobe Digital Negative (.dng)", outInfo);
+    return DetailVectorAndRawImg::ParseTiffRawIfds(data, size, L"Adobe Digital Negative (.dng)", outInfo);
 }
 
 } // namespace Formats

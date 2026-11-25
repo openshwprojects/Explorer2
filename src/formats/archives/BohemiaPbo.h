@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 // ============================================================================
 // #29. Bohemia Interactive Packed Bank (.pbo — Arma / DayZ)
@@ -137,7 +137,7 @@ inline bool ParseBohemiaPbo(const uint8_t* data, size_t size, ArchiveSummaryInfo
     return outInfo.valid;
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectBohemiaPbo(
     const uint8_t* data,
@@ -145,7 +145,7 @@ inline bool InspectBohemiaPbo(
     const std::wstring& extLower,
     ArchiveSummaryInfo& outInfo)
 {
-    return (extLower == L".pbo") && DetailArc200::ParseBohemiaPbo(data, size, outInfo);
+    return (extLower == L".pbo") && DetailUnixAndLegacyArc::ParseBohemiaPbo(data, size, outInfo);
 }
 
 inline bool ExtractBohemiaPboEntry(
@@ -157,7 +157,7 @@ inline bool ExtractBohemiaPboEntry(
 {
     if (extLower == L".pbo") {
         ArchiveSummaryInfo info;
-        if (DetailArc200::ParseBohemiaPbo(data, size, info)) {
+        if (DetailUnixAndLegacyArc::ParseBohemiaPbo(data, size, info)) {
             for (const auto& e : info.entries) {
                 if (!e.isDirectory && _wcsicmp(e.pathInArchive.c_str(), want.c_str()) == 0) {
                     if (e.rawDataOffset > size || e.compressedSize > size - static_cast<size_t>(e.rawDataOffset)) {
@@ -169,7 +169,7 @@ inline bool ExtractBohemiaPboEntry(
                         outBytes.assign(p, p + static_cast<size_t>(e.uncompressedSize));
                         return true;
                     }
-                    return DetailArc200::DecompressBohemiaPboLzss(
+                    return DetailUnixAndLegacyArc::DecompressBohemiaPboLzss(
                         p, static_cast<size_t>(e.compressedSize), e.uncompressedSize, outBytes);
                 }
             }

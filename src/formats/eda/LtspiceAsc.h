@@ -1,5 +1,5 @@
 #pragma once
-// LtspiceAsc.h — #22 LTspice Schematic (.asc) & Symbol (.asy) Parser with UTF-16LE, Built-in/Companion .asy Geometry & R0..M270 Pin Transforms
+// LtspiceAsc.h — LTspice Schematic (.asc) & Symbol (.asy) Parser with UTF-16LE, Built-in/Companion .asy Geometry & R0..M270 Pin Transforms
 
 namespace Formats {
 
@@ -18,6 +18,24 @@ struct LtspiceSymDef {
     std::string defaultValue;
     bool valid = false;
 };
+
+inline void AppendCodepointUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80u) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800u) {
+        out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp < 0x10000u) {
+        out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else {
+        out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+}
 
 inline bool DecodeLtspiceTextBuffer(const uint8_t* data, size_t size, std::string& outUtf8) {
     outUtf8.clear();
@@ -38,19 +56,12 @@ inline bool DecodeLtspiceTextBuffer(const uint8_t* data, size_t size, std::strin
     if (isUtf16LE) {
         size_t nChars = (size - startByte) / 2;
         if (nChars < 8) return false;
-        std::wstring ws;
-        ws.reserve(nChars);
         for (size_t i = 0; i < nChars; ++i) {
-            uint16_t ch = static_cast<uint16_t>(data[startByte + i * 2]) |
-                          (static_cast<uint16_t>(data[startByte + i * 2 + 1]) << 8);
+            uint16_t ch = ByteIO::RdU16LE(data + startByte + i * 2);
             if (ch == 0) return false; // Embedded NUL code unit in text
-            ws.push_back(static_cast<wchar_t>(ch));
         }
-        int u8Len = WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
-        if (u8Len <= 0) return false;
-        outUtf8.resize(static_cast<size_t>(u8Len));
-        WideCharToMultiByte(CP_UTF8, 0, ws.data(), static_cast<int>(ws.size()), outUtf8.data(), u8Len, nullptr, nullptr);
-        return true;
+        outUtf8 = PathUtils::WideToUtf8(ReaderText::DecodeUtf16Span(data + startByte, nChars, false));
+        return !outUtf8.empty();
     }
 
     // UTF-8 BOM or plain ASCII / CP1252 (LTspice legacy writes 0xB5 for micro 'u')
@@ -60,24 +71,31 @@ inline bool DecodeLtspiceTextBuffer(const uint8_t* data, size_t size, std::strin
     for (size_t i = startByte; i < size; ++i) {
         if (data[i] == 0) return false; // Reject binary files
     }
-    // Check if valid UTF-8; if legacy CP1252 byte (like 0xB5 micro), transcode CP1252 -> UTF-8
-    int wLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                   reinterpret_cast<const char*>(data + startByte),
-                                   static_cast<int>(size - startByte), nullptr, 0);
-    if (wLen > 0) {
-        outUtf8.assign(reinterpret_cast<const char*>(data + startByte), size - startByte);
+    const size_t bodyLen = size - startByte;
+    std::string_view bodySv(reinterpret_cast<const char*>(data + startByte), bodyLen);
+    if (PathUtils::ValidUtf8PrefixLength(bodySv) == bodyLen) {
+        outUtf8.assign(bodySv);
         return true;
     }
-    wLen = MultiByteToWideChar(1252, 0, reinterpret_cast<const char*>(data + startByte),
-                               static_cast<int>(size - startByte), nullptr, 0);
-    if (wLen <= 0) return false;
-    std::wstring ws(static_cast<size_t>(wLen), L'\0');
-    MultiByteToWideChar(1252, 0, reinterpret_cast<const char*>(data + startByte),
-                        static_cast<int>(size - startByte), ws.data(), wLen);
-    int u8Len = WideCharToMultiByte(CP_UTF8, 0, ws.data(), wLen, nullptr, 0, nullptr, nullptr);
-    if (u8Len <= 0) return false;
-    outUtf8.resize(static_cast<size_t>(u8Len));
-    WideCharToMultiByte(CP_UTF8, 0, ws.data(), wLen, outUtf8.data(), u8Len, nullptr, nullptr);
+
+    // Portable CP1252 -> UTF-8 transcoding (handles 0x80..0x9F Windows-1252 extensions + 0xA0..0xFF Latin-1 such as 0xB5 micro)
+    static constexpr uint16_t kCp1252Hi32[32] = {
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+        0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+    };
+    outUtf8.reserve(bodyLen + 16);
+    for (size_t i = startByte; i < size; ++i) {
+        const uint8_t b = data[i];
+        if (b < 0x80u) {
+            outUtf8.push_back(static_cast<char>(b));
+        } else if (b < 0xA0u) {
+            AppendCodepointUtf8(outUtf8, kCp1252Hi32[b - 0x80u]);
+        } else {
+            AppendCodepointUtf8(outUtf8, b);
+        }
+    }
     return true;
 }
 
@@ -564,7 +582,7 @@ inline bool ParseLtspiceTextInternal(std::string_view sv, const std::wstring& fu
             if (sscanf_s(std::string(ln.substr(5)).c_str(), "%f %f %127s", &fx, &fy, netName, (unsigned)_countof(netName)) == 3) {
                 float bx = fx * 0.1f, by = -fy * 0.1f;
                 distinctNets.insert(netName);
-                if (std::strcmp(netName, "0") == 0 || _stricmp(netName, "GND") == 0) {
+                if (std::strcmp(netName, "0") == 0 || ReaderText::AsciiEqCI(netName, "GND")) {
                     // Draw standard IEEE Ground triangle/bars at (bx, by)
                     out.traces.push_back({ bx, by, bx, by - 0.8f, 0.22f, EdaLayerId::SchSymbol, 0 });
                     out.traces.push_back({ bx - 1.1f, by - 0.8f, bx + 1.1f, by - 0.8f, 0.24f, EdaLayerId::SchSymbol, 0 });

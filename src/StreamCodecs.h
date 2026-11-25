@@ -1,10 +1,11 @@
 #pragma once
-// StreamCodecs.h — in-process decompressors implemented in ArchiveExplorer.cpp.
+// StreamCodecs.h — in-process decompressors implemented in StreamCodecs.cpp and inline headers.
 // Every decoder clears `out` first; maxOut caps how much it may produce.
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 #include "BrotliDecode.h"
+#include "LzfseDecode.h"
 
 namespace Explorer2::StreamCodecs {
 
@@ -100,6 +101,72 @@ bool DecompressZstdFrame(const uint8_t* data, size_t size, std::vector<uint8_t>&
 inline bool DecompressBrotliStream(const uint8_t* data, size_t size, std::vector<uint8_t>& out,
                                    size_t maxOut = 128 * 1024 * 1024, bool requireExactEnd = false) {
     return ::Explorer2::Brotli::Decompress(data, size, out, maxOut, requireExactEnd);
+}
+
+inline bool DecompressLzfseStream(const uint8_t* data, size_t size, std::vector<uint8_t>& out,
+                                  size_t maxOut = 128 * 1024 * 1024) {
+    return ::Explorer2::Lzfse::Decompress(data, size, out, maxOut);
+}
+
+// Shared Marc Lehmann LibLZF block decompressor (used by PCD binary_compressed, Redis RDB, and Krita .kra tiles).
+inline bool DecompressLibLzf(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out,
+                             size_t expectedSize, size_t maxOut = 128 * 1024 * 1024) {
+    out.clear();
+    if (!src || expectedSize > maxOut) return false;
+    if (expectedSize == 0) return true;
+    out.reserve(expectedSize);
+    size_t ip = 0;
+    while (ip < srcLen && out.size() < expectedSize) {
+        const uint8_t ctrl = src[ip++];
+        if (ctrl < 32u) {
+            const size_t litLen = static_cast<size_t>(ctrl) + 1u;
+            if (litLen > srcLen - ip || litLen > expectedSize - out.size()) return false;
+            out.insert(out.end(), src + ip, src + ip + litLen);
+            ip += litLen;
+        } else {
+            size_t len = ctrl >> 5;
+            size_t refOff = (static_cast<size_t>(ctrl & 0x1Fu) << 8) + 1u;
+            if (len == 7u) {
+                if (ip >= srcLen) return false;
+                len += src[ip++];
+            }
+            if (ip >= srcLen) return false;
+            refOff += src[ip++];
+            len += 2u;
+            if (refOff > out.size() || len > expectedSize - out.size()) return false;
+            for (size_t k = 0; k < len; ++k) {
+                out.push_back(out[out.size() - refOff]);
+            }
+        }
+    }
+    return out.size() == expectedSize;
+}
+
+// Shared Apple Macintosh / TIFF / PSD / ILBM PackBits RLE decompressor.
+inline bool DecompressPackBits(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& out,
+                               size_t expectedOut, size_t* outConsumed = nullptr) {
+    out.clear();
+    if (!src && expectedOut > 0) return false;
+    out.reserve(expectedOut);
+    size_t pos = 0;
+    while (pos < srcLen && out.size() < expectedOut) {
+        const int8_t hdr = static_cast<int8_t>(src[pos++]);
+        if (hdr >= 0) {
+            const size_t count = static_cast<size_t>(hdr) + 1u;
+            if (count > srcLen - pos) return false;
+            const size_t take = (count < expectedOut - out.size()) ? count : (expectedOut - out.size());
+            out.insert(out.end(), src + pos, src + pos + take);
+            pos += count;
+        } else if (hdr != -128) {
+            const size_t count = static_cast<size_t>(1 - static_cast<int>(hdr));
+            if (pos >= srcLen) return false;
+            const uint8_t val = src[pos++];
+            const size_t take = (count < expectedOut - out.size()) ? count : (expectedOut - out.size());
+            out.insert(out.end(), take, val);
+        }
+    }
+    if (outConsumed) *outConsumed = pos;
+    return out.size() == expectedOut;
 }
 
 } // namespace Explorer2::StreamCodecs

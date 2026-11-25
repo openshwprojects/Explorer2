@@ -1,0 +1,10 @@
+# iCEBreaker V1.0e iCE40UP5K-SG48 QFN48 Pin Constraints
+set_io -nowarn clk_12mhz     35
+set_frequency clk_12mhz      12.0
+set_io -nowarn -pullup yes btn_n 10
+set_io --warn-no-port led_red_n  11
+set_io --warn-no-port led_grn_n  37
+set_io uart_rx 6
+set_io uart_tx 9
+set_io spi_sck 15
+set_io spi_ssn 16

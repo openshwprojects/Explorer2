@@ -5,11 +5,8 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
-// ============================================================================
-// #25. KiriKiri Visual Novel Archive (.xp3 — "XP3\r\n \n\x1A\x8B\x67\x01")
-// ============================================================================
 inline bool ParseOrExtractKiriKiriXp3(
     const uint8_t* data,
     size_t size,
@@ -18,35 +15,38 @@ inline bool ParseOrExtractKiriKiriXp3(
     std::vector<uint8_t>* outExtractedBytes)
 {
     static const uint8_t kXp3Sig[11] = { 'X','P','3','\r','\n',' ','\n',0x1A,0x8B,0x67,0x01 };
-    if (size < 28 || std::memcmp(data, kXp3Sig, 11) != 0) return false;
+    if (!data || size < 28 || std::memcmp(data, kXp3Sig, 11) != 0) return false;
     if (outInfo) outInfo->formatName = L"KiriKiri XP3 Archive (.xp3)";
 
     uint64_t idxOff = RdU64LE(data + 11);
-    if (idxOff + 9 <= size && data[idxOff] == 0x80) {
+    if (idxOff > size || size - idxOff < 9u) return false;
+    if (data[static_cast<size_t>(idxOff)] == 0x80u) {
         // v2 extended index header: [0x80:1][hdrSize:8][minorVer:4][realIdxOff:8]
-        if (idxOff + 21 <= size) idxOff = RdU64LE(data + idxOff + 13);
+        if (size - idxOff < 21u) return false;
+        idxOff = RdU64LE(data + static_cast<size_t>(idxOff) + 13u);
+        if (idxOff > size || size - idxOff < 9u) return false;
     }
-    if (idxOff + 9 > size) return false;
 
-    uint8_t idxFlags = data[idxOff];
+    const size_t idxPos = static_cast<size_t>(idxOff);
+    uint8_t idxFlags = data[idxPos];
     std::vector<uint8_t> idxBuf;
     const uint8_t* idxPtr = nullptr;
     size_t idxLen = 0;
 
-    if ((idxFlags & 0x07) == 1) {
-        if (idxOff + 17 > size) return false;
-        uint64_t compSz   = RdU64LE(data + idxOff + 1);
-        uint64_t uncompSz = RdU64LE(data + idxOff + 9);
-        if (idxOff + 17 + compSz > size || uncompSz > 64 * 1024 * 1024) return false;
-        if (!ZipDeflate::InflateZlib(data + idxOff + 17, static_cast<size_t>(compSz), idxBuf, static_cast<size_t>(uncompSz) + 64)) {
+    if ((idxFlags & 0x07u) == 1u) {
+        if (size - idxPos < 17u) return false;
+        uint64_t compSz   = RdU64LE(data + idxPos + 1u);
+        uint64_t uncompSz = RdU64LE(data + idxPos + 9u);
+        if (compSz > size - idxPos - 17u || uncompSz > 64ULL * 1024 * 1024) return false;
+        if (!ZipDeflate::InflateZlib(data + idxPos + 17u, static_cast<size_t>(compSz), idxBuf, static_cast<size_t>(uncompSz) + 64u)) {
             return false;
         }
         idxPtr = idxBuf.data();
         idxLen = idxBuf.size();
     } else {
-        uint64_t rawSz = RdU64LE(data + idxOff + 1);
-        if (idxOff + 9 + rawSz > size) return false;
-        idxPtr = data + idxOff + 9;
+        uint64_t rawSz = RdU64LE(data + idxPos + 1u);
+        if (rawSz > size - idxPos - 9u) return false;
+        idxPtr = data + idxPos + 9u;
         idxLen = static_cast<size_t>(rawSz);
     }
 
@@ -60,73 +60,77 @@ inline bool ParseOrExtractKiriKiriXp3(
     std::wstring wantNorm = extractTargetPath ? ArchivePath::Normalize(*extractTargetPath) : std::wstring{};
     size_t p = 0;
     size_t count = 0;
-    while (p + 12 <= idxLen && count < 40000) {
-        uint64_t chunkSz = RdU64LE(idxPtr + p + 4);
-        if (chunkSz > idxLen - p - 12) break;
+    while (idxLen - p >= 12u && count < 40000u) {
+        uint64_t chunkSz = RdU64LE(idxPtr + p + 4u);
+        if (chunkSz > idxLen - p - 12u) break;
         if (std::memcmp(idxPtr + p, "File", 4) == 0) {
-            size_t sp = p + 12, send = p + 12 + static_cast<size_t>(chunkSz);
+            size_t sp = p + 12u, send = p + 12u + static_cast<size_t>(chunkSz);
             std::wstring fname;
             uint64_t origSz = 0, compSz = 0, rawStart = 0;
             bool segCompressed = false;
             std::vector<Xp3Seg> segs;
-            while (sp + 12 <= send) {
-                uint64_t subSz = RdU64LE(idxPtr + sp + 4);
-                if (subSz > send - sp - 12) break;
-                const uint8_t* sub = idxPtr + sp + 12;
-                if (std::memcmp(idxPtr + sp, "info", 4) == 0 && subSz >= 22) {
-                    origSz = RdU64LE(sub + 4);
-                    compSz = RdU64LE(sub + 12);
-                    uint16_t nChars = RdU16LE(sub + 20);
-                    if (22 + static_cast<size_t>(nChars) * 2 <= subSz) {
+            while (send - sp >= 12u) {
+                uint64_t subSz = RdU64LE(idxPtr + sp + 4u);
+                if (subSz > send - sp - 12u) break;
+                const uint8_t* sub = idxPtr + sp + 12u;
+                if (std::memcmp(idxPtr + sp, "info", 4) == 0 && subSz >= 22u) {
+                    origSz = RdU64LE(sub + 4u);
+                    compSz = RdU64LE(sub + 12u);
+                    uint16_t nChars = RdU16LE(sub + 20u);
+                    if (static_cast<uint64_t>(nChars) * 2ULL <= subSz - 22u) {
                         fname.resize(nChars);
                         for (uint16_t c = 0; c < nChars; ++c) {
-                            fname[c] = static_cast<wchar_t>(RdU16LE(sub + 22 + c * 2));
+                            fname[c] = static_cast<wchar_t>(RdU16LE(sub + 22u + static_cast<size_t>(c) * 2u));
                         }
                     }
-                } else if (std::memcmp(idxPtr + sp, "segm", 4) == 0 && subSz >= 28) {
-                    size_t numSegs = static_cast<size_t>(subSz / 28);
+                } else if (std::memcmp(idxPtr + sp, "segm", 4) == 0 && subSz >= 28u) {
+                    size_t numSegs = static_cast<size_t>(subSz / 28u);
                     for (size_t s = 0; s < numSegs; ++s) {
-                        const uint8_t* se = sub + s * 28;
+                        const uint8_t* se = sub + s * 28u;
                         Xp3Seg seg;
-                        seg.flags  = RdU32LE(se + 0);
-                        seg.start  = RdU64LE(se + 4);
-                        seg.origSz = RdU64LE(se + 12);
-                        seg.compSz = RdU64LE(se + 20);
+                        seg.flags  = RdU32LE(se + 0u);
+                        seg.start  = RdU64LE(se + 4u);
+                        seg.origSz = RdU64LE(se + 12u);
+                        seg.compSz = RdU64LE(se + 20u);
+                        const uint64_t needBytes = ((seg.flags & 0x07u) != 0u) ? seg.compSz : seg.origSz;
+                        if (seg.start > size || needBytes > size - seg.start) return false;
                         if (s == 0) {
                             rawStart = seg.start;
                             if (origSz == 0) origSz = seg.origSz;
                             if (compSz == 0) compSz = seg.compSz;
                         }
-                        if ((seg.flags & 0x07u) != 0 || segs.size() > 0) {
-                            if ((seg.flags & 0x07u) != 0) segCompressed = true;
-                        }
+                        if ((seg.flags & 0x07u) != 0u) segCompressed = true;
                         segs.push_back(seg);
                     }
-                    if (segs.size() > 1) segCompressed = true;
+                    if (segs.size() > 1u) segCompressed = true;
                 }
-                sp += 12 + static_cast<size_t>(subSz);
+                sp += 12u + static_cast<size_t>(subSz);
             }
             std::wstring normP = ArchivePath::Normalize(fname);
-            if (!normP.empty()) {
+            if (!normP.empty() && !segs.empty()) {
                 ++count;
                 if (extractTargetPath && outExtractedBytes) {
                     if (_wcsicmp(normP.c_str(), wantNorm.c_str()) == 0) {
-                        if (segs.empty() || origSz > 256 * 1024 * 1024) return false;
+                        if (origSz > 256ULL * 1024 * 1024) return false;
                         outExtractedBytes->clear();
                         outExtractedBytes->reserve(static_cast<size_t>(origSz));
                         std::vector<uint8_t> segOut;
                         for (const auto& seg : segs) {
-                            if ((seg.flags & 0x07u) != 0) {
-                                if (seg.start + seg.compSz > size || seg.origSz > 256 * 1024 * 1024) return false;
-                                if (!ZipDeflate::InflateZlib(data + seg.start, static_cast<size_t>(seg.compSz), segOut, static_cast<size_t>(seg.origSz) + 64) &&
-                                    !ZipDeflate::InflateRaw(data + seg.start, static_cast<size_t>(seg.compSz), segOut, static_cast<size_t>(seg.origSz) + 64))
+                            if ((seg.flags & 0x07u) != 0u) {
+                                if (seg.start > size || seg.compSz > size - seg.start || seg.origSz > 256ULL * 1024 * 1024) {
+                                    return false;
+                                }
+                                const uint8_t* segPtr = data + static_cast<size_t>(seg.start);
+                                if (!ZipDeflate::InflateZlib(segPtr, static_cast<size_t>(seg.compSz), segOut, static_cast<size_t>(seg.origSz) + 64u) &&
+                                    !ZipDeflate::InflateRaw(segPtr, static_cast<size_t>(seg.compSz), segOut, static_cast<size_t>(seg.origSz) + 64u))
                                 {
                                     return false;
                                 }
                                 outExtractedBytes->insert(outExtractedBytes->end(), segOut.begin(), segOut.end());
                             } else {
-                                if (seg.start + seg.origSz > size) return false;
-                                outExtractedBytes->insert(outExtractedBytes->end(), data + seg.start, data + seg.start + static_cast<size_t>(seg.origSz));
+                                if (seg.start > size || seg.origSz > size - seg.start) return false;
+                                const uint8_t* segPtr = data + static_cast<size_t>(seg.start);
+                                outExtractedBytes->insert(outExtractedBytes->end(), segPtr, segPtr + static_cast<size_t>(seg.origSz));
                             }
                         }
                         return true;
@@ -143,7 +147,7 @@ inline bool ParseOrExtractKiriKiriXp3(
                 }
             }
         }
-        p += 12 + static_cast<size_t>(chunkSz);
+        p += 12u + static_cast<size_t>(chunkSz);
     }
 
     if (extractTargetPath) return false;
@@ -156,10 +160,10 @@ inline bool ParseKiriKiriXp3(const uint8_t* data, size_t size, ArchiveSummaryInf
     return ParseOrExtractKiriKiriXp3(data, size, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectKiriKiriXp3(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseKiriKiriXp3(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseKiriKiriXp3(data, size, outInfo);
 }
 
 inline bool ExtractKiriKiriXp3Entry(
@@ -168,7 +172,7 @@ inline bool ExtractKiriKiriXp3Entry(
     const std::wstring& want,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc200::ParseOrExtractKiriKiriXp3(data, size, nullptr, &want, &outBytes);
+    return DetailUnixAndLegacyArc::ParseOrExtractKiriKiriXp3(data, size, nullptr, &want, &outBytes);
 }
 
 } // namespace Explorer2::Formats

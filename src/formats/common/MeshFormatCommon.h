@@ -4,6 +4,7 @@
 #include "../../ByteIO.h"
 #include "../../Lz4Block.h"
 #include "MeshBuild3D.h"
+#include "FemSolidSurfaceCommon.h"
 #include "../cad/Scad.h"
 #include "../cad/StepCad.h"
 #include "../3d/Vtk.h"
@@ -20,7 +21,7 @@
 
 namespace Formats {
 
-inline bool ParseCadKernels200(const uint8_t* data, size_t size, const std::wstring& ext, LoadedMesh3D& mesh);
+bool ParseCadKernelArchiveOrStream(const uint8_t* data, size_t size, const std::wstring& ext, LoadedMesh3D& mesh);
 
 namespace DetailQuakeVmf {
 
@@ -39,91 +40,14 @@ using ::Explorer2::ByteIO::RdU64BE;
 using ::Explorer2::ByteIO::RdF32BE;
 using ::Explorer2::ByteIO::RdF64BE;
 
-inline std::string_view TrimSv(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) s.remove_prefix(1);
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.remove_suffix(1);
-    return s;
-}
-
-inline std::string ToLowerStr(std::string_view s) {
-    std::string out(s);
-    for (char& c : out) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return out;
-}
-
-inline std::string ToUpperStr(std::string_view s) {
-    std::string out(s);
-    for (char& c : out) {
-        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    }
-    return out;
-}
-
-inline bool NextTokenSv(std::string_view& line, std::string_view& outTok) {
-    while (!line.empty() && (line.front() == ' ' || line.front() == '\t' || line.front() == '\r')) line.remove_prefix(1);
-    if (line.empty()) return false;
-    size_t i = 0;
-    while (i < line.size() && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') ++i;
-    outTok = line.substr(0, i);
-    line.remove_prefix(i);
-    return true;
-}
-
-inline bool ParseFloatSv(std::string_view tok, float& outVal) {
-    tok = TrimSv(tok);
-    if (tok.empty()) return false;
-    if (tok.front() == '+') tok.remove_prefix(1);
-    if (tok.empty()) return false;
-    float v = 0.0f;
-    auto res = std::from_chars(tok.data(), tok.data() + tok.size(), v);
-    if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size() || !std::isfinite(v)) return false;
-    outVal = v;
-    return true;
-}
-
-inline bool ParseDoubleSv(std::string_view tok, double& outVal) {
-    tok = TrimSv(tok);
-    if (tok.empty()) return false;
-    if (tok.front() == '+') tok.remove_prefix(1);
-    if (tok.empty()) return false;
-    double v = 0.0;
-    auto res = std::from_chars(tok.data(), tok.data() + tok.size(), v);
-    if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size() || !std::isfinite(v)) return false;
-    outVal = v;
-    return true;
-}
-
-inline bool ParseIntSv(std::string_view tok, int& outVal) {
-    tok = TrimSv(tok);
-    if (tok.empty()) return false;
-    if (tok.front() == '+') tok.remove_prefix(1);
-    if (tok.size() >= 3 && tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
-        uint32_t u = 0;
-        auto res = std::from_chars(tok.data() + 2, tok.data() + tok.size(), u, 16);
-        if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size()) return false;
-        outVal = static_cast<int>(u);
-        return true;
-    }
-    int v = 0;
-    auto res = std::from_chars(tok.data(), tok.data() + tok.size(), v, 10);
-    if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size()) return false;
-    outVal = v;
-    return true;
-}
-
-inline bool IsSafeRelativeSubFile(std::string_view rel) {
-    if (rel.empty() || rel.size() > 260) return false;
-    if (rel.front() == '/' || rel.front() == '\\') return false;
-    if (rel.find(':') != std::string_view::npos) return false;
-    if (rel.find("..") != std::string_view::npos) return false;
-    for (char c : rel) {
-        unsigned char uc = static_cast<unsigned char>(c);
-        if (uc < 32u) return false;
-    }
-    return true;
-}
+using ::Explorer2::ReaderText::TrimSv;
+inline std::string ToLowerStr(std::string_view s) { return ::Explorer2::ReaderText::ToLowerAscii(s); }
+inline std::string ToUpperStr(std::string_view s) { return ::Explorer2::ReaderText::ToUpperAscii(s); }
+using ::Explorer2::ReaderText::NextTokenSv;
+using ::Explorer2::ReaderText::ParseFloatSv;
+using ::Explorer2::ReaderText::ParseDoubleSv;
+using ::Explorer2::ReaderText::ParseIntSv;
+using ::Explorer2::ReaderText::IsSafeRelativeSubFile;
 
 struct CsgVec3d {
     double x = 0.0, y = 0.0, z = 0.0;
@@ -504,7 +428,7 @@ inline bool EmitBrushSolidsToMesh(const std::vector< std::vector<BrushSideDef> >
 
 } // namespace DetailQuakeVmf
 
-namespace Detail3D100 {
+namespace DetailDccScene {
 
 using ::Explorer2::ByteIO::RdU16BE;
 using ::Explorer2::ByteIO::RdU32BE;
@@ -610,7 +534,7 @@ inline bool UsdDecompressInts32(const uint8_t* comp, size_t compSize, size_t cou
     return true;
 }
 
-} // namespace Detail3D100
+} // namespace DetailDccScene
 
 
 namespace DetailMaya {
@@ -662,7 +586,7 @@ inline void EmitMayaMeshNode(
 namespace DetailCadDcc {
 // AutoCAD Native Drawing (.dwg — unencrypted R11/R12 AC1009 3DFACE / LINE entities; returns false on compressed/encrypted/empty)
 inline bool ParseAutoCadDwg(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
-    using namespace Detail3D100;
+    using namespace DetailDccScene;
     if (size < 64 || std::memcmp(data, "AC10", 4) != 0) return false;
     mesh.formatName = L"AutoCAD Native Drawing (.dwg)";
 
@@ -713,7 +637,7 @@ inline bool ParseAutoCadDwg(const uint8_t* data, size_t size, LoadedMesh3D& mesh
 } // namespace DetailCadDcc
 
 
-namespace Detail3D200 {
+namespace DetailMeshSciCad {
 
 using ::Explorer2::ByteIO::RdU16LE;
 using ::Explorer2::ByteIO::RdU32LE;
@@ -794,7 +718,7 @@ inline float ComputePointCloudSpan(const std::vector<Vec3f>& pts) {
     return std::max({ mx.x - mn.x, mx.y - mn.y, mx.z - mn.z, 1e-3f });
 }
 
-} // namespace Detail3D200
+} // namespace DetailMeshSciCad
 
 
 namespace DetailAcisParasolid {
@@ -1313,16 +1237,18 @@ E2_DRACO_NOINLINE inline bool EvaluateBRepGraph(const BRepGraph& g, LoadedMesh3D
                         int32_t curCe = lp.firstCoedge;
                         std::set<int32_t> seenCe;
                         while (curCe >= 0 && seenCe.insert(curCe).second && ceChain.size() < 4096) {
-                            ceChain.push_back(curCe);
                             auto ceIt = g.coedges.find(curCe);
                             if (ceIt == g.coedges.end()) break;
+                            ceChain.push_back(curCe);
                             int32_t nxt = ceIt->second.nextCoedge;
                             if (nxt == lp.firstCoedge) break;
                             curCe = nxt;
                         }
 
                         for (size_t ci = 0; ci < ceChain.size(); ++ci) {
-                            const BRepCoedge& ce = g.coedges.at(ceChain[ci]);
+                            auto ceCurIt = g.coedges.find(ceChain[ci]);
+                            if (ceCurIt == g.coedges.end()) continue;
+                            const BRepCoedge& ce = ceCurIt->second;
                             auto edIt = g.edges.find(ce.edgeId);
                             if (edIt == g.edges.end()) continue;
                             const BRepEdge& ed = edIt->second;
@@ -1332,9 +1258,11 @@ E2_DRACO_NOINLINE inline bool EvaluateBRepGraph(const BRepGraph& g, LoadedMesh3D
                             int32_t vEnd   = ceFwd ? ed.endVert   : ed.startVert;
                             // Parasolid PK fin head-vertex fallback when edge doesn't store direct vertex refs
                             if (vStart < 0 && vEnd < 0 && ce.headVert >= 0 && !ceChain.empty()) {
-                                const BRepCoedge& prevCe = g.coedges.at(ceChain[(ci + ceChain.size() - 1) % ceChain.size()]);
-                                vStart = prevCe.headVert;
-                                vEnd   = ce.headVert;
+                                auto prevIt = g.coedges.find(ceChain[(ci + ceChain.size() - 1) % ceChain.size()]);
+                                if (prevIt != g.coedges.end()) {
+                                    vStart = prevIt->second.headVert;
+                                    vEnd   = ce.headVert;
+                                }
                             }
 
                             auto segPts = sampleEdgePoints(ed, vStart, vEnd, ceFwd);
@@ -1460,38 +1388,7 @@ E2_DRACO_NOINLINE inline bool EvaluateBRepGraph(const BRepGraph& g, LoadedMesh3D
                     static_cast<int>(surf->knotsV.size()) >= surf->nV + surf->vDeg + 1 &&
                     surf->poles.size() >= static_cast<size_t>(surf->nU) * static_cast<size_t>(surf->nV))
                 {
-                    auto evalBasis = [](int n, int deg, const std::vector<double>& U, double t, std::vector<double>& outB) {
-                        outB.assign(static_cast<size_t>(n), 0.0);
-                        int order = deg + 1;
-                        double tMin = U[static_cast<size_t>(deg)];
-                        double tMax = U[static_cast<size_t>(n)];
-                        if (t <= tMin) t = tMin;
-                        if (t >= tMax) { outB[static_cast<size_t>(n - 1)] = 1.0; return; }
-                        int span = deg;
-                        for (int i = deg; i < n; ++i) {
-                            if (t >= U[static_cast<size_t>(i)] && t < U[static_cast<size_t>(i + 1)]) { span = i; break; }
-                        }
-                        std::vector<double> N(static_cast<size_t>(order), 0.0);
-                        std::vector<double> L(static_cast<size_t>(order), 0.0);
-                        std::vector<double> R(static_cast<size_t>(order), 0.0);
-                        N[0] = 1.0;
-                        for (int j = 1; j <= deg; ++j) {
-                            L[static_cast<size_t>(j)] = t - U[static_cast<size_t>(span + 1 - j)];
-                            R[static_cast<size_t>(j)] = U[static_cast<size_t>(span + j)] - t;
-                            double saved = 0.0;
-                            for (int r = 0; r < j; ++r) {
-                                double denom = R[static_cast<size_t>(r + 1)] + L[static_cast<size_t>(j - r)];
-                                double tmp = (std::fabs(denom) > 1e-15) ? (N[static_cast<size_t>(r)] / denom) : 0.0;
-                                N[static_cast<size_t>(r)] = saved + R[static_cast<size_t>(r + 1)] * tmp;
-                                saved = L[static_cast<size_t>(j - r)] * tmp;
-                            }
-                            N[static_cast<size_t>(j)] = saved;
-                        }
-                        for (int j = 0; j <= deg; ++j) {
-                            int idx = span - deg + j;
-                            if (idx >= 0 && idx < n) outB[static_cast<size_t>(idx)] = N[static_cast<size_t>(j)];
-                        }
-                    };
+                    const auto& evalBasis = MeshBuild3D::EvalNurbsBasisAll;
 
                     double u0 = surf->knotsU[static_cast<size_t>(surf->uDeg)];
                     double u1 = surf->knotsU[static_cast<size_t>(surf->nU)];
@@ -1777,11 +1674,11 @@ E2_DRACO_NOINLINE inline bool EvaluateBRepGraph(const BRepGraph& g, LoadedMesh3D
                     edgePolylines.push_back(std::move(wPoly));
                 }
                 if (!edgePolylines.empty() && allWirePts.size() >= 2) {
-                    float span = Detail3D200::ComputePointCloudSpan(allWirePts);
+                    float span = DetailMeshSciCad::ComputePointCloudSpan(allWirePts);
                     float strutR = std::max(1e-4f, span * 0.016f);
                     for (const auto& wp : edgePolylines) {
                         for (size_t i = 0; i + 1 < wp.size(); ++i) {
-                            Detail3D200::AddStrut3D(mesh, wp[i], wp[i + 1], strutR);
+                            DetailMeshSciCad::AddStrut3D(mesh, wp[i], wp[i + 1], strutR);
                         }
                     }
                 }
@@ -1942,85 +1839,6 @@ inline bool ParseFreeCadBinaryMeshStream(const uint8_t* data, size_t size, Loade
     return !out.tris.empty();
 }
 
-// Parse binary CAD display tessellation payload:
-// Supports RSeSeg / SCFACETS / SEDFACETS magic header (optional 8B magic + version) or direct
-// [uint32 nVerts][float3 verts[nVerts]][optional uint32 hasNormals / float3 normals][uint32 nTrisOrIndices][indices]
-inline bool ParseBinaryCadFacetBuffer(const uint8_t* data, size_t size, LoadedMesh3D& dst) {
-    if (!data || size < 24) return false;
-    size_t startOff = 0;
-    if (size >= 12 && (std::memcmp(data, "RSEG3D\0\0", 8) == 0 ||
-                       std::memcmp(data, "SCFACETS", 8) == 0 ||
-                       std::memcmp(data, "SEFACETS", 8) == 0))
-    {
-        uint32_t ver = RdU32(data + 8);
-        if (ver == 0 || ver > 100) return false;
-        startOff = 12;
-    }
-
-    // Scan for structured tessellation record within stream
-    for (size_t off = startOff; off + 20 <= size && off <= startOff + 256; off += 4) {
-        uint32_t nVerts = RdU32(data + off);
-        if (nVerts < 3 || nVerts > 2000000u) continue;
-        uint64_t vBytes = static_cast<uint64_t>(nVerts) * 12ULL;
-        if (off + 4ULL + vBytes + 4ULL > size) continue;
-
-        const uint8_t* vp = data + off + 4;
-        std::vector<Vec3f> verts;
-        verts.reserve(nVerts);
-        bool okV = true;
-        float minC = 1e30f, maxC = -1e30f;
-        for (uint32_t i = 0; i < nVerts; ++i) {
-            float x = RdF32(vp + static_cast<size_t>(i) * 12 + 0);
-            float y = RdF32(vp + static_cast<size_t>(i) * 12 + 4);
-            float z = RdF32(vp + static_cast<size_t>(i) * 12 + 8);
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
-                std::fabs(x) > 1e7f || std::fabs(y) > 1e7f || std::fabs(z) > 1e7f) {
-                okV = false; break;
-            }
-            minC = std::min({ minC, x, y, z });
-            maxC = std::max({ maxC, x, y, z });
-            verts.push_back({ x, y, z });
-        }
-        if (!okV || (maxC - minC) < 1e-5f) continue;
-
-        // Try index table directly after positions, OR after nVerts*12 normal buffer
-        for (size_t skipNormals : { size_t(0), static_cast<size_t>(vBytes) }) {
-            size_t ip = off + 4 + static_cast<size_t>(vBytes) + skipNormals;
-            if (ip + 4 > size) continue;
-            uint32_t countVal = RdU32(data + ip);
-            if (countVal < 3 || countVal > 6000000u || (countVal % 3u) != 0) continue;
-
-            // Try uint32 indices first, then uint16 indices
-            for (size_t idxElemSz : { size_t(4), size_t(2) }) {
-                if (idxElemSz == 2 && nVerts > 65535u) continue;
-                uint64_t iBytes = static_cast<uint64_t>(countVal) * idxElemSz;
-                if (ip + 4ULL + iBytes > size) continue;
-
-                const uint8_t* ib = data + ip + 4;
-                std::vector<std::array<uint32_t, 3>> tris;
-                tris.reserve(countVal / 3u);
-                bool okI = true;
-                for (uint32_t t = 0; t + 2 < countVal; t += 3) {
-                    uint32_t i0 = (idxElemSz == 4) ? RdU32(ib + (t + 0) * 4) : RdU16(ib + (t + 0) * 2);
-                    uint32_t i1 = (idxElemSz == 4) ? RdU32(ib + (t + 1) * 4) : RdU16(ib + (t + 1) * 2);
-                    uint32_t i2 = (idxElemSz == 4) ? RdU32(ib + (t + 2) * 4) : RdU16(ib + (t + 2) * 2);
-                    if (i0 >= nVerts || i1 >= nVerts || i2 >= nVerts) { okI = false; break; }
-                    if (i0 != i1 && i1 != i2 && i0 != i2) tris.push_back({ i0, i1, i2 });
-                }
-                if (okI && !tris.empty()) {
-                    uint32_t base = static_cast<uint32_t>(dst.vertices.size());
-                    dst.vertices.insert(dst.vertices.end(), verts.begin(), verts.end());
-                    for (const auto& ct : tris) {
-                        dst.tris.push_back({ base + ct[0], base + ct[1], base + ct[2], {} });
-                    }
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
 // Try inflating an RSe / Solid Edge OLE2 stream (raw zlib at offset 0, +4, +8, +12, or +16)
 inline bool TryInflateCadStream(const std::vector<uint8_t>& raw, std::vector<uint8_t>& outInflated) {
     outInflated.clear();
@@ -2043,13 +1861,13 @@ inline bool TryDecodeCadPayloadBuffer(const uint8_t* data, size_t size, LoadedMe
     std::string_view sv(reinterpret_cast<const char*>(data), size);
     LoadedMesh3D sub;
     if (sv.find("DBRep_DrawableShape") != std::string_view::npos || sv.find("CASCADE Topology") != std::string_view::npos) {
-        if (ParseCadKernels200(data, size, L".brep", sub)) {
+        if (ParseCadKernelArchiveOrStream(data, size, L".brep", sub)) {
             AppendSubMeshPlaced(sub, {}, dst);
             return true;
         }
     }
     if (size >= 15 && (std::memcmp(data, "ACIS BinaryFile", 15) == 0 || std::memcmp(data, "ASM BinaryFile", 14) == 0)) {
-        if (ParseCadKernels200(data, size, L".sab", sub)) {
+        if (ParseCadKernelArchiveOrStream(data, size, L".sab", sub)) {
             AppendSubMeshPlaced(sub, {}, dst);
             return true;
         }
@@ -2057,7 +1875,16 @@ inline bool TryDecodeCadPayloadBuffer(const uint8_t* data, size_t size, LoadedMe
     if (sv.substr(0, std::min<size_t>(size, 256)).find("ACIS ") != std::string_view::npos ||
         (size >= 8 && std::isdigit(static_cast<unsigned char>(data[0])) && sv.find("body ") != std::string_view::npos && sv.find("End-of-ACIS") != std::string_view::npos))
     {
-        if (ParseCadKernels200(data, size, L".sat", sub)) {
+        if (ParseCadKernelArchiveOrStream(data, size, L".sat", sub)) {
+            AppendSubMeshPlaced(sub, {}, dst);
+            return true;
+        }
+    }
+    if ((size >= 4 && data[0] == 'P' && data[1] == 'S' && data[2] == 0) ||
+        sv.find("**END_OF_HEADER**") != std::string_view::npos)
+    {
+        if (ParseCadKernelArchiveOrStream(data, size, L".x_b", sub) ||
+            ParseCadKernelArchiveOrStream(data, size, L".x_t", sub)) {
             AppendSubMeshPlaced(sub, {}, dst);
             return true;
         }
@@ -2065,12 +1892,12 @@ inline bool TryDecodeCadPayloadBuffer(const uint8_t* data, size_t size, LoadedMe
     if (sv.find("**PART") != std::string_view::npos || sv.find("T-_SCH") != std::string_view::npos ||
         sv.find("SCH_TXT") != std::string_view::npos || sv.find("PARASOLID") != std::string_view::npos)
     {
-        if (ParseCadKernels200(data, size, L".x_t", sub)) {
+        if (ParseCadKernelArchiveOrStream(data, size, L".x_t", sub)) {
             AppendSubMeshPlaced(sub, {}, dst);
             return true;
         }
     }
-    return ParseBinaryCadFacetBuffer(data, size, dst);
+    return false;
 }
 
 } // namespace CadPkgDetail
@@ -2271,41 +2098,7 @@ inline void AppendOctahedralBonePrism(
     std::vector<Vec3f>& verts,
     std::vector<MeshTriangle>& tris)
 {
-    Vec3f d = { b.x - a.x, b.y - a.y, b.z - a.z };
-    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (!std::isfinite(len) || len < 1e-5f) return;
-    Vec3f dir = { d.x / len, d.y / len, d.z / len };
-    Vec3f up = (std::fabs(dir.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    // u = normalize(cross(dir, up))
-    Vec3f u = {
-        dir.y * up.z - dir.z * up.y,
-        dir.z * up.x - dir.x * up.z,
-        dir.x * up.y - dir.y * up.x
-    };
-    float uLen = std::sqrt(u.x * u.x + u.y * u.y + u.z * u.z);
-    if (uLen < 1e-6f) return;
-    u.x /= uLen; u.y /= uLen; u.z /= uLen;
-    Vec3f v = {
-        dir.y * u.z - dir.z * u.y,
-        dir.z * u.x - dir.x * u.z,
-        dir.x * u.y - dir.y * u.x
-    };
-    float rad = len * 0.10f;
-    Vec3f mid = { a.x + d.x * 0.25f, a.y + d.y * 0.25f, a.z + d.z * 0.25f };
-    uint32_t base = static_cast<uint32_t>(verts.size());
-    verts.push_back(a);   // 0 root
-    verts.push_back(b);   // 1 tip
-    verts.push_back({ mid.x + u.x * rad, mid.y + u.y * rad, mid.z + u.z * rad }); // 2
-    verts.push_back({ mid.x + v.x * rad, mid.y + v.y * rad, mid.z + v.z * rad }); // 3
-    verts.push_back({ mid.x - u.x * rad, mid.y - u.y * rad, mid.z - u.z * rad }); // 4
-    verts.push_back({ mid.x - v.x * rad, mid.y - v.y * rad, mid.z - v.z * rad }); // 5
-    const uint32_t faces[8][3] = {
-        {0,2,3}, {0,3,4}, {0,4,5}, {0,5,2},
-        {1,3,2}, {1,4,3}, {1,5,4}, {1,2,5}
-    };
-    for (const auto& f : faces) {
-        tris.push_back({ base + f[0], base + f[1], base + f[2], {} });
-    }
+    MeshBuild3D::AppendOctahedralBonePrism(verts, tris, a, b, 0.10f, 1e-4f);
 }
 
 inline void ParseXmlFloatsSimple(std::string_view sv, std::vector<float>& out) {
@@ -2334,7 +2127,7 @@ inline std::string_view ExtractXmlAttr(std::string_view tag, std::string_view at
 } // namespace CalCryDetail
 
 
-namespace ModoZbMaxC4dDetail {
+namespace DetailDccSculpt {
 
 using ::Explorer2::ByteIO::RdU16LE;
 using ::Explorer2::ByteIO::RdU32LE;
@@ -2388,98 +2181,7 @@ inline bool TryFindAndInflateZlib(const uint8_t* data, size_t size, size_t maxSc
 }
 
 
-E2_DRACO_NOINLINE inline bool DecodeZBrushPm3dContainer(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
-    if (!data || size < 32) return false;
-
-    std::string_view hdrSv(reinterpret_cast<const char*>(data), std::min<size_t>(size, 128));
-    bool hasZbSig = hdrSv.find("ZBrush File") != std::string_view::npos ||
-                    hdrSv.find("ZBRUSH") != std::string_view::npos ||
-                    hdrSv.find("Pixologic") != std::string_view::npos ||
-                    std::memcmp(data, "ZPR\0", 4) == 0 ||
-                    std::memcmp(data, "ZTL\0", 4) == 0;
-    if (!hasZbSig) return false;
-
-    mesh.vertices.clear();
-    mesh.tris.clear();
-
-    auto decodePm3dSubTools = [&](const uint8_t* buf, size_t len) {
-        size_t pos = 0;
-        while (pos + 24 <= len) {
-            if (std::memcmp(buf + pos, "PM3D", 4) != 0) {
-                ++pos;
-                continue;
-            }
-            // PM3D block: ["PM3D" 4B][uint32LE subToolVersion][uint32LE nVerts][uint32LE nPolys][float3 verts[nVerts]][uint32[4] polys[nPolys]]
-            uint32_t ver = RdU32LE(buf + pos + 4);
-            uint32_t nVerts = RdU32LE(buf + pos + 8);
-            uint32_t nPolys = RdU32LE(buf + pos + 12);
-            if (ver == 0 || ver > 64 || nVerts < 3 || nVerts > 5000000u || nPolys < 1 || nPolys > 5000000u) {
-                pos += 4;
-                continue;
-            }
-            uint64_t vBytes = static_cast<uint64_t>(nVerts) * 12ULL;
-            uint64_t pBytes = static_cast<uint64_t>(nPolys) * 16ULL;
-            if (pos + 16ULL + vBytes + pBytes > len) {
-                pos += 4;
-                continue;
-            }
-
-            const uint8_t* vp = buf + pos + 16;
-            const uint8_t* pp = vp + static_cast<size_t>(vBytes);
-            uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-            bool okSub = true;
-            for (uint32_t i = 0; i < nVerts; ++i) {
-                float x = RdF32LE(vp + static_cast<size_t>(i) * 12u + 0);
-                float y = RdF32LE(vp + static_cast<size_t>(i) * 12u + 4);
-                float z = RdF32LE(vp + static_cast<size_t>(i) * 12u + 8);
-                if (!IsValidCoord3(x, y, z)) { okSub = false; break; }
-                mesh.vertices.push_back({ x, y, z });
-            }
-            if (!okSub) {
-                mesh.vertices.resize(base);
-                pos += 4;
-                continue;
-            }
-            for (uint32_t f = 0; f < nPolys; ++f) {
-                uint32_t a = RdU32LE(pp + static_cast<size_t>(f) * 16u + 0);
-                uint32_t b = RdU32LE(pp + static_cast<size_t>(f) * 16u + 4);
-                uint32_t c = RdU32LE(pp + static_cast<size_t>(f) * 16u + 8);
-                uint32_t d = RdU32LE(pp + static_cast<size_t>(f) * 16u + 12);
-                if (a >= nVerts || b >= nVerts || c >= nVerts) continue;
-                if (a != b && b != c && a != c) {
-                    mesh.tris.push_back({ base + a, base + b, base + c, {} });
-                }
-                if (d != 0xFFFFFFFFu && d < nVerts && d != c && a != d) {
-                    mesh.tris.push_back({ base + a, base + c, base + d, {} });
-                }
-            }
-            pos += 16u + static_cast<size_t>(vBytes + pBytes);
-        }
-    };
-
-    // Scan raw file for PM3D SubTool blocks AND decompress any zlib-compressed SubTool streams ("ZBCZ" + uint32 compLen + zlib)
-    decodePm3dSubTools(data, size);
-
-    size_t zp = 16;
-    while (zp + 12 <= size) {
-        if (std::memcmp(data + zp, "ZBCZ", 4) == 0) {
-            uint32_t compLen = RdU32LE(data + zp + 4);
-            if (compLen >= 8 && zp + 8ULL + compLen <= size) {
-                std::vector<uint8_t> subDec;
-                if (ZipDeflate::InflateZlib(data + zp + 8, compLen, subDec, 128 * 1024 * 1024) && !subDec.empty()) {
-                    decodePm3dSubTools(subDec.data(), subDec.size());
-                }
-                zp += 8u + compLen;
-                continue;
-            }
-        }
-        ++zp;
-    }
-
-    if (mesh.vertices.empty() || mesh.tris.empty()) return false;
-    return true;
-}
-} // namespace ModoZbMaxC4dDetail
+} // namespace DetailDccSculpt
 
 
 namespace SplatVdbDetail {
@@ -3265,43 +2967,7 @@ inline bool DecodeWolfCompressedBones(
 }
 
 inline void AppendOctahedralBonePrism(const Vec3f& p0, const Vec3f& p1, LoadedMesh3D& mesh) {
-    Vec3f d = { p1.x - p0.x, p1.y - p0.y, p1.z - p0.z };
-    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    if (len < 1e-4f) return;
-    Vec3f dir = { d.x / len, d.y / len, d.z / len };
-    Vec3f up = (std::fabs(dir.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    Vec3f s1 = {
-        dir.y * up.z - dir.z * up.y,
-        dir.z * up.x - dir.x * up.z,
-        dir.x * up.y - dir.y * up.x
-    };
-    float s1L = std::sqrt(s1.x * s1.x + s1.y * s1.y + s1.z * s1.z);
-    if (s1L < 1e-6f) return;
-    s1.x /= s1L; s1.y /= s1L; s1.z /= s1L;
-    Vec3f s2 = {
-        dir.y * s1.z - dir.z * s1.y,
-        dir.z * s1.x - dir.x * s1.z,
-        dir.x * s1.y - dir.y * s1.x
-    };
-
-    float rad = len * 0.12f;
-    Vec3f mid = { p0.x + d.x * 0.28f, p0.y + d.y * 0.28f, p0.z + d.z * 0.28f };
-    uint32_t b = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back(p0);
-    mesh.vertices.push_back(p1);
-    mesh.vertices.push_back({ mid.x + s1.x * rad, mid.y + s1.y * rad, mid.z + s1.z * rad });
-    mesh.vertices.push_back({ mid.x + s2.x * rad, mid.y + s2.y * rad, mid.z + s2.z * rad });
-    mesh.vertices.push_back({ mid.x - s1.x * rad, mid.y - s1.y * rad, mid.z - s1.z * rad });
-    mesh.vertices.push_back({ mid.x - s2.x * rad, mid.y - s2.y * rad, mid.z - s2.z * rad });
-
-    mesh.tris.push_back({ b + 0, b + 2, b + 3, {} });
-    mesh.tris.push_back({ b + 0, b + 3, b + 4, {} });
-    mesh.tris.push_back({ b + 0, b + 4, b + 5, {} });
-    mesh.tris.push_back({ b + 0, b + 5, b + 2, {} });
-    mesh.tris.push_back({ b + 1, b + 3, b + 2, {} });
-    mesh.tris.push_back({ b + 1, b + 4, b + 3, {} });
-    mesh.tris.push_back({ b + 1, b + 5, b + 4, {} });
-    mesh.tris.push_back({ b + 1, b + 2, b + 5, {} });
+    MeshBuild3D::AppendOctahedralBonePrism(mesh, p0, p1, 0.12f, 1e-4f);
 }
 
 inline bool ParseWolfMdxBonesOnly(
@@ -3607,57 +3273,10 @@ inline void AppendBoneOctahedron(LoadedMesh3D& mesh, const Vec3f& a, const Vec3f
     Vec3f d = { b.x - a.x, b.y - a.y, b.z - a.z };
     float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
     if (len < 1e-5f) {
-        float r = std::max(0.05f, fallbackRadius);
-        uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-        mesh.vertices.push_back({ a.x,     a.y + r, a.z     });
-        mesh.vertices.push_back({ a.x,     a.y - r, a.z     });
-        mesh.vertices.push_back({ a.x + r, a.y,     a.z     });
-        mesh.vertices.push_back({ a.x - r, a.y,     a.z     });
-        mesh.vertices.push_back({ a.x,     a.y,     a.z + r });
-        mesh.vertices.push_back({ a.x,     a.y,     a.z - r });
-        mesh.tris.push_back({ base + 0, base + 4, base + 2, {} });
-        mesh.tris.push_back({ base + 0, base + 2, base + 5, {} });
-        mesh.tris.push_back({ base + 0, base + 5, base + 3, {} });
-        mesh.tris.push_back({ base + 0, base + 3, base + 4, {} });
-        mesh.tris.push_back({ base + 1, base + 2, base + 4, {} });
-        mesh.tris.push_back({ base + 1, base + 5, base + 2, {} });
-        mesh.tris.push_back({ base + 1, base + 3, base + 5, {} });
-        mesh.tris.push_back({ base + 1, base + 4, base + 3, {} });
+        MeshBuild3D::EmitOctahedron(mesh, a, std::max(0.05f, fallbackRadius));
         return;
     }
-
-    Vec3f dir = { d.x / len, d.y / len, d.z / len };
-    Vec3f ref = (std::fabs(dir.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
-    Vec3f u = {
-        dir.y * ref.z - dir.z * ref.y,
-        dir.z * ref.x - dir.x * ref.z,
-        dir.x * ref.y - dir.y * ref.x
-    };
-    float uLen = std::sqrt(u.x * u.x + u.y * u.y + u.z * u.z);
-    if (uLen > 1e-6f) { u.x /= uLen; u.y /= uLen; u.z /= uLen; }
-    Vec3f v = {
-        dir.y * u.z - dir.z * u.y,
-        dir.z * u.x - dir.x * u.z,
-        dir.x * u.y - dir.y * u.x
-    };
-
-    float r = std::max(fallbackRadius * 0.35f, len * 0.11f);
-    Vec3f waist = { a.x + d.x * 0.25f, a.y + d.y * 0.25f, a.z + d.z * 0.25f };
-    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-    mesh.vertices.push_back(a);
-    mesh.vertices.push_back(b);
-    mesh.vertices.push_back({ waist.x + u.x * r, waist.y + u.y * r, waist.z + u.z * r });
-    mesh.vertices.push_back({ waist.x - u.x * r, waist.y - u.y * r, waist.z - u.z * r });
-    mesh.vertices.push_back({ waist.x + v.x * r, waist.y + v.y * r, waist.z + v.z * r });
-    mesh.vertices.push_back({ waist.x - v.x * r, waist.y - v.y * r, waist.z - v.z * r });
-    mesh.tris.push_back({ base + 0, base + 4, base + 2, {} });
-    mesh.tris.push_back({ base + 0, base + 2, base + 5, {} });
-    mesh.tris.push_back({ base + 0, base + 5, base + 3, {} });
-    mesh.tris.push_back({ base + 0, base + 3, base + 4, {} });
-    mesh.tris.push_back({ base + 1, base + 2, base + 4, {} });
-    mesh.tris.push_back({ base + 1, base + 5, base + 2, {} });
-    mesh.tris.push_back({ base + 1, base + 3, base + 5, {} });
-    mesh.tris.push_back({ base + 1, base + 4, base + 3, {} });
+    MeshBuild3D::AppendOctahedralBonePrism(mesh, a, b, 0.11f, fallbackRadius * 0.35f);
 }
 
 struct Md5SubMeshRaw {
@@ -4220,7 +3839,10 @@ inline bool DecodeGodot4SurfaceRawBytes(
         if (useTight12 && hasAabb) {
             float f0x = GdF32(vData.data(), false), f0y = GdF32(vData.data() + 4, false), f0z = GdF32(vData.data() + 8, false);
             float f1x = GdF32(vData.data() + 12, false), f1y = GdF32(vData.data() + 16, false), f1z = GdF32(vData.data() + 20, false);
-            if (!std::isfinite(f0x) || !std::isfinite(f1x)) useTight12 = false;
+            if (!std::isfinite(f0x) || !std::isfinite(f0y) || !std::isfinite(f0z) ||
+                !std::isfinite(f1x) || !std::isfinite(f1y) || !std::isfinite(f1z)) {
+                useTight12 = false;
+            }
         }
         size_t posStride = useTight12 ? 12u : stride;
         for (uint32_t v = 0; v < vertexCount; ++v) {
@@ -4334,9 +3956,9 @@ struct VtkXmlDocConfig {
 
 inline uint64_t RdHdrWord(const uint8_t* p, bool bigEndian, bool hdr64) {
     if (hdr64) {
-        return bigEndian ? DetailVtk::RdBE64Vtk(p) : Detail3D100::RdU64LE(p);
+        return bigEndian ? DetailVtk::RdBE64Vtk(p) : DetailDccScene::RdU64LE(p);
     }
-    return bigEndian ? DetailVtk::RdBE32Vtk(p) : Detail3D100::RdU32LE(p);
+    return bigEndian ? DetailVtk::RdBE32Vtk(p) : DetailDccScene::RdU32LE(p);
 }
 
 inline bool UnpackFramedVtkPayload(

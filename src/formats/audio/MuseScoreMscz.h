@@ -2,20 +2,18 @@
 // MuseScoreMscz.h — MuseScore Compressed Score (.mscz) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
-// ============================================================================
-// 6. Score & DAW Formats (.mscz, .als, .flp, .gp/.gp3/.gp4/.gp5, .rpp)
-// ============================================================================
 inline bool ParseMuseScoreMscz(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     std::vector<ZipDeflate::ArchiveItemMeta> entries;
-    if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries) || entries.empty()) return false;
+    bool usedFile = false;
+    if (!DetailStructuredDataDoc::ListZipPackage(raw, out, entries, usedFile) || entries.empty()) return false;
 
     std::vector<uint8_t> mscxBytes;
     std::wstring mscxName;
     for (const auto& e : entries) {
-        if (!e.isDirectory && PathUtils::GetExtension(e.pathInArchive) == L".mscx") {
-            if (ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, mscxBytes) && !mscxBytes.empty()) {
+        if (!e.isDirectory && PathUtils::ToLower(PathUtils::GetExtension(e.pathInArchive)) == L".mscx") {
+            if (DetailStructuredDataDoc::ExtractZipPackageEntry(raw, out, usedFile, e, mscxBytes) && !mscxBytes.empty()) {
                 mscxName = e.pathInArchive;
                 break;
             }
@@ -23,8 +21,10 @@ inline bool ParseMuseScoreMscz(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     }
     if (mscxBytes.empty()) return false;
 
-    std::string_view xml(reinterpret_cast<const char*>(mscxBytes.data()), mscxBytes.size());
-    if (xml.find("<museScore") == std::string_view::npos) return false;
+    namespace X = ::Explorer2::XmlTagScan;
+    std::string xml = X::DocumentToUtf8(mscxBytes.data(), mscxBytes.size());
+    X::Element msRoot;
+    if (!X::FindChild(xml, "museScore", msRoot)) return false;
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
@@ -35,85 +35,95 @@ inline bool ParseMuseScoreMscz(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     meta.rows.push_back({ L"Field", L"Value" });
     meta.rows.push_back({ L"Score XML Entry", mscxName });
 
-    size_t msPos = xml.find("<museScore");
-    if (msPos != std::string_view::npos) {
-        size_t gt = xml.find('>', msPos);
-        if (gt != std::string_view::npos) {
-            std::string ver = ExtractXmlAttr(xml.substr(msPos, gt - msPos), "version");
-            if (!ver.empty()) meta.rows.push_back({ L"MuseScore Version", PathUtils::Utf8ToWide(ver) });
-        }
-    }
+    std::string ver = X::AttrText(msRoot.attrs, "version");
+    if (!ver.empty()) meta.rows.push_back({ L"MuseScore Version", PathUtils::Utf8ToWide(ver) });
 
-    // Parse <metaTag name="...">...</metaTag>
-    size_t p = 0;
-    while ((p = xml.find("<metaTag", p)) != std::string_view::npos) {
-        size_t gt = xml.find('>', p);
-        size_t cl = (gt != std::string_view::npos) ? xml.find("</metaTag>", gt) : std::string_view::npos;
-        if (gt == std::string_view::npos || cl == std::string_view::npos) break;
-        std::string name = ExtractXmlAttr(xml.substr(p, gt - p), "name");
-        std::wstring val = ::Explorer2::XmlTagScan::DecodeEntitiesWide(PathUtils::Trim(PathUtils::Utf8ToWide(xml.substr(gt + 1, cl - gt - 1))));
-        if (!name.empty() && !val.empty()) {
-            meta.rows.push_back({ L"Meta: " + PathUtils::Utf8ToWide(name), val });
-        }
-        p = cl + 10;
-    }
-
-    // Parse <TimeSig> and <Tempo>
-    size_t tsPos = xml.find("<TimeSig>");
-    if (tsPos != std::string_view::npos) {
-        size_t tsEnd = xml.find("</TimeSig>", tsPos);
-        if (tsEnd != std::string_view::npos) {
-            std::string_view tsBlk = xml.substr(tsPos, tsEnd - tsPos);
-            std::wstring sigN = ExtractFirstXmlTagText(tsBlk, "sigN");
-            std::wstring sigD = ExtractFirstXmlTagText(tsBlk, "sigD");
-            if (!sigN.empty() && !sigD.empty()) meta.rows.push_back({ L"Time Signature", sigN + L"/" + sigD });
-        }
-    }
-    size_t tmpPos = xml.find("<Tempo>");
-    if (tmpPos != std::string_view::npos) {
-        size_t tmpEnd = xml.find("</Tempo>", tmpPos);
-        if (tmpEnd != std::string_view::npos) {
-            std::wstring tVal = ExtractFirstXmlTagText(xml.substr(tmpPos, tmpEnd - tmpPos), "tempo");
-            if (!tVal.empty()) {
-                double bps = std::wcstod(tVal.c_str(), nullptr);
-                int bpm = static_cast<int>(bps * 60.0 + 0.5);
-                meta.rows.push_back({ L"Tempo", std::to_wstring(bpm) + L" BPM" });
-            }
-        }
+    X::Element scoreEl;
+    std::string_view scoreBody = msRoot.body;
+    if (X::FindChild(msRoot.body, "Score", scoreEl)) {
+        scoreBody = scoreEl.body;
     }
 
     SpreadsheetSheet parts;
     parts.name = L"Parts_&_Staves";
     parts.rows.push_back({ L"Item", L"Name / ID", L"Details" });
-    p = 0;
-    int partIdx = 0;
-    while ((p = xml.find("<Part", p)) != std::string_view::npos) {
-        if (p + 5 < xml.size() && xml[p + 5] != '>' && xml[p + 5] != ' ') { p += 5; continue; }
-        size_t cl = xml.find("</Part>", p);
-        if (cl == std::string_view::npos) break;
-        std::string_view blk = xml.substr(p, cl - p);
-        std::wstring tName = ExtractFirstXmlTagText(blk, "trackName");
-        if (tName.empty()) tName = ExtractFirstXmlTagText(blk, "longName");
-        std::wstring instId = ExtractFirstXmlTagText(blk, "instrumentId");
-        parts.rows.push_back({ L"Part " + std::to_wstring(++partIdx), tName.empty() ? L"(Part)" : tName, instId });
-        p = cl + 7;
-    }
 
-    p = 0;
-    while ((p = xml.find("<Staff ", p)) != std::string_view::npos) {
-        size_t gt = xml.find('>', p);
-        size_t cl = (gt != std::string_view::npos) ? xml.find("</Staff>", gt) : std::string_view::npos;
-        if (gt == std::string_view::npos || cl == std::string_view::npos) break;
-        std::string sid = ExtractXmlAttr(xml.substr(p, gt - p), "id");
-        std::string_view blk = xml.substr(gt + 1, cl - gt - 1);
-        size_t mCount = 0;
-        size_t mp = 0;
-        while ((mp = blk.find("<Measure", mp)) != std::string_view::npos) { ++mCount; mp += 8; }
-        if (mCount > 0) {
-            parts.rows.push_back({ L"Staff", L"ID " + PathUtils::Utf8ToWide(sid), std::to_wstring(mCount) + L" measures" });
+    bool gotTimeSig = false, gotTempo = false;
+    int partIdx = 0;
+
+    X::ForEachChild(scoreBody, [&](std::string_view tagName, const X::Element& el) {
+        if (tagName == "metaTag") {
+            std::string name = X::AttrText(el.attrs, "name");
+            std::wstring val = PathUtils::Trim(PathUtils::Utf8ToWide(X::DecodeText(el.body)));
+            if (!name.empty() && !val.empty()) {
+                meta.rows.push_back({ L"Meta: " + PathUtils::Utf8ToWide(name), std::move(val) });
+            }
+        } else if (tagName == "Part") {
+            std::string tName = X::ChildText(el.body, "trackName");
+            if (tName.empty()) {
+                X::Element inst;
+                if (X::FindChild(el.body, "Instrument", inst)) {
+                    tName = X::ChildText(inst.body, "longName");
+                    if (tName.empty()) tName = X::ChildText(inst.body, "trackName");
+                }
+            }
+            std::string instId;
+            X::Element inst;
+            if (X::FindChild(el.body, "Instrument", inst)) {
+                instId = X::ChildText(inst.body, "instrumentId");
+            }
+            parts.rows.push_back({
+                L"Part " + std::to_wstring(++partIdx),
+                tName.empty() ? L"(Part)" : PathUtils::Utf8ToWide(tName),
+                PathUtils::Utf8ToWide(instId)
+            });
+        } else if (tagName == "Staff") {
+            std::string sid = X::AttrText(el.attrs, "id");
+            size_t mCount = 0;
+            X::ForEachChild(el.body, [&](std::string_view sn, const X::Element& mel) {
+                if (sn != "Measure") return true;
+                ++mCount;
+                if (!gotTimeSig || !gotTempo) {
+                    size_t vp = 0;
+                    X::XmlTag vt;
+                    while (X::NextTag(mel.body, vp, vt)) {
+                        if (vt.isClosing || vt.isSelfClosing) continue;
+                        if (!gotTimeSig && vt.localName == "TimeSig") {
+                            std::string_view tbody; size_t after = 0;
+                            if (X::FindElementBody(mel.body, vt.afterTag, "TimeSig", tbody, after)) {
+                                std::string sigN = X::ChildText(tbody, "sigN");
+                                std::string sigD = X::ChildText(tbody, "sigD");
+                                if (!sigN.empty() && !sigD.empty()) {
+                                    meta.rows.push_back({ L"Time Signature", PathUtils::Utf8ToWide(sigN + "/" + sigD) });
+                                    gotTimeSig = true;
+                                }
+                                vp = after;
+                            }
+                        } else if (!gotTempo && vt.localName == "Tempo") {
+                            std::string_view tbody; size_t after = 0;
+                            if (X::FindElementBody(mel.body, vt.afterTag, "Tempo", tbody, after)) {
+                                std::string tVal = X::ChildText(tbody, "tempo");
+                                if (!tVal.empty()) {
+                                    double bps = std::strtod(tVal.c_str(), nullptr);
+                                    if (bps > 0.0) {
+                                        int bpm = static_cast<int>(bps * 60.0 + 0.5);
+                                        meta.rows.push_back({ L"Tempo", std::to_wstring(bpm) + L" BPM" });
+                                        gotTempo = true;
+                                    }
+                                }
+                                vp = after;
+                            }
+                        }
+                    }
+                }
+                return true;
+            });
+            if (mCount > 0) {
+                parts.rows.push_back({ L"Staff", L"ID " + PathUtils::Utf8ToWide(sid), std::to_wstring(mCount) + L" measures" });
+            }
         }
-        p = cl + 8;
-    }
+        return true;
+    });
 
     FinalizeSheetCols(meta);
     out.sheets.push_back(std::move(meta));
@@ -122,9 +132,8 @@ inline bool ParseMuseScoreMscz(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     return true;
 }
 
+} // namespace DetailMediaAndScoreDoc
 
-} // namespace DetailMedia100
-
-inline bool ParseMuseScoreMsczDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseMuseScoreMscz(raw, out); }
+inline bool ParseMuseScoreMsczDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseMuseScoreMscz(raw, out); }
 
 } // namespace Formats

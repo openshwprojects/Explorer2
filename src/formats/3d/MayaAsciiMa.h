@@ -140,17 +140,15 @@ inline bool ParseMayaAscii(std::string_view sv, LoadedMesh3D& mesh) {
             if (curKind == Xf && !curXfName.empty()) {
                 auto& xn = xforms[curXfName];
                 if (attrName == ".t" || attrName == ".r" || attrName == ".s") {
-                    const char* cur = stmt.data() + valStart;
-                    const char* end = stmt.data() + stmt.size();
-                    char* ep = nullptr;
-                    float x = std::strtof(cur, &ep); if (ep != cur) {
-                        cur = ep; float y = std::strtof(cur, &ep); if (ep != cur) {
-                            cur = ep; float z = std::strtof(cur, &ep); if (ep != cur) {
-                                if (attrName == ".t") xn.t = { x, y, z };
-                                if (attrName == ".r") xn.r = { x, y, z };
-                                if (attrName == ".s") xn.s = { x, y, z };
-                            }
-                        }
+                    std::string_view rem = stmt.substr(valStart);
+                    std::string_view tx, ty, tz;
+                    float x = 0.0f, y = 0.0f, z = 0.0f;
+                    if (DetailQuakeVmf::NextTokenSv(rem, tx) && DetailQuakeVmf::ParseFloatSv(tx, x) &&
+                        DetailQuakeVmf::NextTokenSv(rem, ty) && DetailQuakeVmf::ParseFloatSv(ty, y) &&
+                        DetailQuakeVmf::NextTokenSv(rem, tz) && DetailQuakeVmf::ParseFloatSv(tz, z)) {
+                        if (attrName == ".t") xn.t = { x, y, z };
+                        if (attrName == ".r") xn.r = { x, y, z };
+                        if (attrName == ".s") xn.s = { x, y, z };
                     }
                 }
             } else if (curKind == Me && !meshes.empty()) {
@@ -160,13 +158,15 @@ inline bool ParseMayaAscii(std::string_view sv, LoadedMesh3D& mesh) {
                     size_t sIdx = 0, eIdx = 0;
                     if (parseSliceRange(attrName, 3, sIdx, eIdx) && eIdx < 1000000) {
                         if (dst.size() <= eIdx) dst.resize(eIdx + 1, { 0, 0, 0 });
-                        const char* cur = stmt.data() + valStart;
-                        const char* end = stmt.data() + stmt.size();
-                        for (size_t k = sIdx; k <= eIdx && cur < end; ++k) {
-                            char* ep = nullptr;
-                            float x = std::strtof(cur, &ep); if (ep == cur) break; cur = ep;
-                            float y = std::strtof(cur, &ep); if (ep == cur) break; cur = ep;
-                            float z = std::strtof(cur, &ep); if (ep == cur) break; cur = ep;
+                        std::string_view rem = stmt.substr(valStart);
+                        for (size_t k = sIdx; k <= eIdx; ++k) {
+                            std::string_view tx, ty, tz;
+                            float x = 0.0f, y = 0.0f, z = 0.0f;
+                            if (!DetailQuakeVmf::NextTokenSv(rem, tx) || !DetailQuakeVmf::ParseFloatSv(tx, x) ||
+                                !DetailQuakeVmf::NextTokenSv(rem, ty) || !DetailQuakeVmf::ParseFloatSv(ty, y) ||
+                                !DetailQuakeVmf::NextTokenSv(rem, tz) || !DetailQuakeVmf::ParseFloatSv(tz, z)) {
+                                break;
+                            }
                             dst[k] = { x, y, z };
                         }
                     }
@@ -236,15 +236,18 @@ inline bool ParseMayaAscii(std::string_view sv, LoadedMesh3D& mesh) {
     if (mesh.tris.empty() && xforms.size() >= 2) {
         std::vector<std::pair<Vec3f, Vec3f>> bones;
         for (const auto& [nm, xn] : xforms) {
-            if (!xn.parent.empty() && xforms.find(xn.parent) != xforms.end()) {
-                Vec3f p0 = getWorldMat(xn.parent, 0).TransformPoint({ 0, 0, 0 });
-                Vec3f p1 = getWorldMat(nm, 0).TransformPoint({ 0, 0, 0 });
-                bones.push_back({ p0, p1 });
+            if (!xn.parent.empty()) {
+                auto pit = xforms.find(xn.parent);
+                if (pit != xforms.end() && (xn.isJointOrLoc || pit->second.isJointOrLoc)) {
+                    Vec3f p0 = getWorldMat(xn.parent, 0).TransformPoint({ 0, 0, 0 });
+                    Vec3f p1 = getWorldMat(nm, 0).TransformPoint({ 0, 0, 0 });
+                    bones.push_back({ p0, p1 });
+                }
             }
         }
         if (!bones.empty()) {
             for (const auto& b : bones) {
-                Detail3D100::AddLineStrut(mesh, b.first, b.second, 0.05f);
+                DetailDccScene::AddLineStrut(mesh, b.first, b.second, 0.05f);
             }
         }
     }

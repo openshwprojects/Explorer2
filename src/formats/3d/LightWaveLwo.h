@@ -24,21 +24,21 @@ inline bool ParseLightWaveLwoLayer(const uint8_t* data, size_t size, LoadedMesh3
     while (pos + 8 <= size) {
         char tag[5] = {};
         std::memcpy(tag, data + pos, 4);
-        uint32_t clen = Detail3D100::RdU32BE(data + pos + 4);
+        uint32_t clen = DetailDccScene::RdU32BE(data + pos + 4);
         pos += 8;
         if (pos + clen > size) break;
         const bool keepLayer = (wantLayer < 0 || curLayer == wantLayer);
 
         if (std::memcmp(tag, "LAYR", 4) == 0 && clen >= 2) {
-            curLayer = Detail3D100::RdU16BE(data + pos);
+            curLayer = DetailDccScene::RdU16BE(data + pos);
             ++layersSeen;
         } else if (std::memcmp(tag, "PNTS", 4) == 0 && keepLayer) {
             layerVBase = static_cast<uint32_t>(mesh.vertices.size());
             uint32_t numPts = clen / 12;
             for (uint32_t i = 0; i < numPts && mesh.vertices.size() < 200000; ++i) {
-                float x = Detail3D100::RdF32BE(data + pos + i * 12 + 0);
-                float y = Detail3D100::RdF32BE(data + pos + i * 12 + 4);
-                float z = Detail3D100::RdF32BE(data + pos + i * 12 + 8);
+                float x = DetailDccScene::RdF32BE(data + pos + i * 12 + 0);
+                float y = DetailDccScene::RdF32BE(data + pos + i * 12 + 4);
+                float z = DetailDccScene::RdF32BE(data + pos + i * 12 + 8);
                 mesh.vertices.push_back({ x, y, z });
             }
         } else if (std::memcmp(tag, "POLS", 4) == 0 && keepLayer) {
@@ -48,17 +48,17 @@ inline bool ParseLightWaveLwoLayer(const uint8_t* data, size_t size, LoadedMesh3
                 p += 4; // 4-byte polygon type ("FACE", "PTCH", "SUBD")
             }
             while (p + 2 <= pend && mesh.tris.size() < 400000) {
-                uint16_t numVerts = Detail3D100::RdU16BE(data + p) & 0x03FFu;
+                uint16_t numVerts = DetailDccScene::RdU16BE(data + p) & 0x03FFu;
                 p += 2;
                 std::vector<uint32_t> poly;
                 for (uint16_t v = 0; v < numVerts && p + 2 <= pend; ++v) {
                     uint32_t idx = 0;
                     if (isLwo2 && data[p] == 0xFF) {
                         if (p + 4 > pend) break;
-                        idx = Detail3D100::RdU32BE(data + p) & 0x00FFFFFFu;
+                        idx = DetailDccScene::RdU32BE(data + p) & 0x00FFFFFFu;
                         p += 4;
                     } else {
-                        idx = Detail3D100::RdU16BE(data + p);
+                        idx = DetailDccScene::RdU16BE(data + p);
                         p += 2;
                     }
                     uint32_t absIdx = layerVBase + idx;

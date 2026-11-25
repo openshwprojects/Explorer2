@@ -47,17 +47,21 @@ void RunFormatTests3D(TestCounter& tc);        // FormatTests3D.cpp
 void RunFormatTestsEda(TestCounter& tc);       // FormatTestsEda.cpp
 void RunFormatTestsImages(TestCounter& tc);    // FormatTestsImages.cpp
 void RunFormatTestsDocs(TestCounter& tc);      // FormatTestsDocs.cpp (office, data and text formats)
-void RunFormatTestsDocsB(TestCounter& tc);     // FormatTestsDocsB.cpp (binary, media and system formats)
+void RunFormatTestsDocsSystem(TestCounter& tc);     // FormatTestsDocsSystem.cpp (binary, media and system formats)
 void RunFormatTestsArchives(TestCounter& tc);  // FormatTestsArchives.cpp
 
 // Stage 12 (also alone as "vcs"): the version-control dock's back end, Subversion working copies (SelfTestVcs.cpp)
 void RunVcsTests(TestCounter& tc);
 
-// 70-Format Roadmap Batch Suite (FormatTestsBatch70.cpp — fast incremental compilation unit)
-void RunFormatTests3DBatch70(TestCounter& tc);
-void RunFormatTestsImagesBatch70(TestCounter& tc);
-void RunFormatTestsEdaBatch70(TestCounter& tc);
-void RunFormatTestsDocsBatch70(TestCounter& tc);
-void RunFormatTestsArchivesBatch70(TestCounter& tc);
+// Stage 15 domain-split verification suites (standalone compilation units)
+void RunFormatTests3DCadSci(TestCounter& tc);              // FormatTests3DCadSci.cpp
+void RunFormatTests3DGameConsole(TestCounter& tc);         // FormatTests3DGameConsole.cpp
+void RunFormatTestsImagesStudioRaw(TestCounter& tc);       // FormatTestsImagesStudioRaw.cpp
+void RunFormatTestsImagesGpuGame(TestCounter& tc);         // FormatTestsImagesGpuGame.cpp
+void RunFormatTestsEdaVlsiFpga(TestCounter& tc);           // FormatTestsEdaVlsiFpga.cpp
+void RunFormatTestsEdaWaveformsBus(TestCounter& tc);       // FormatTestsEdaWaveformsBus.cpp
+void RunFormatTestsDocsAnalyticsForensics(TestCounter& tc);// FormatTestsDocsAnalyticsForensics.cpp
+void RunFormatTestsDocsGameLoc(TestCounter& tc);           // FormatTestsDocsGameLoc.cpp
+void RunFormatTestsArchivesSystemPak(TestCounter& tc);     // FormatTestsArchivesSystemPak.cpp
 
 } // namespace Explorer2::SelfTestSuite

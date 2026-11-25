@@ -17,6 +17,7 @@
 #include <wrl/client.h>
 
 #include "PathUtils.h"
+#include "ThemeColors.h"
 #include "ToolProcess.h"
 
 #include <X11/Xlib.h>
@@ -144,7 +145,9 @@ bool IsCliHeadlessMode() {
                 std::strcmp(arg, "-v") == 0 ||
                 std::strcmp(arg, "--inspect-files") == 0 ||
                 std::strcmp(arg, "--dump-hw") == 0 ||
-                std::strcmp(arg, "--monitor-daemon") == 0) {
+                std::strcmp(arg, "--monitor-daemon") == 0 ||
+                std::strcmp(arg, "--admin-unlock") == 0 ||
+                std::strcmp(arg, "--hold-lock-test") == 0) {
                 return true;
             }
             pos += len + 1;
@@ -469,6 +472,8 @@ struct WndRecord {
     float scrollY = 0.0f;           // STATIC: text scrolled up by this much (a message taller than the screen)
     float contentH = 0.0f;          // STATIC: height of its whole text, measured when drawn
     float editScrollX = 0.0f;       // EDIT: horizontal scroll of the last drawn frame
+    float editScrollY = 0.0f;       // EDIT (ES_MULTILINE): vertical scroll offset
+    float editContentH = 0.0f;      // EDIT (ES_MULTILINE): measured wrapped content height
     int fontPx = 0;                 // EDIT: character height of the WM_SETFONT font in pixels (0: the default 13)
     HWND focusChild = nullptr;      // top level: the child that had the keyboard focus when the window lost it
     HWND hotChild = nullptr;        // top level: the BUTTON under the pointer
@@ -852,10 +857,15 @@ int X11Lib::DisplayLostHandler(Display*) {
     _exit(1);
 }
 
-// Built-in Win32 EDIT control window procedure (address bar, search bar, inline rename)
+size_t EditCaretFromX(const WndRecord& ed, int relX);
+
+// Built-in Win32 EDIT control window procedure (address bar, search bar, inline rename, and dialog multiline views)
 LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto rec = FindWnd(hwnd);
     if (!rec) return 0;
+
+    const bool readOnly  = (rec->style & ES_READONLY) != 0;
+    const bool multiline = (rec->style & ES_MULTILINE) != 0;
 
     auto notifyParent = [&](WORD code) {
         if (rec->parent) {
@@ -866,7 +876,7 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
     auto repaint = [&]() { if (rec->parent) InvalidateRect(rec->parent, nullptr, FALSE); };
     auto eraseSelection = [&]() -> bool {
-        if (rec->selStart == rec->caretPos) return false;
+        if (readOnly || rec->selStart == rec->caretPos) return false;
         const size_t a = std::min(rec->selStart, rec->caretPos);
         const size_t b = std::max(rec->selStart, rec->caretPos);
         rec->text.erase(a, b - a);
@@ -892,15 +902,17 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         CloseClipboard();
     };
     auto paste = [&]() {
-        if (!OpenClipboard(hwnd)) return;
+        if (readOnly || !OpenClipboard(hwnd)) return;
         HANDLE hData = GetClipboardData(CF_UNICODETEXT);
         if (hData) {
             if (const auto* w = static_cast<const wchar_t*>(GlobalLock(hData))) {
                 std::wstring ins(w);
                 GlobalUnlock(hData);
-                // A one-line box takes the first line of a multi-line text
-                const size_t eol = ins.find_first_of(L"\r\n");
-                if (eol != std::wstring::npos) ins.resize(eol);
+                if (!multiline) {
+                    // A one-line box takes the first line of a multi-line text
+                    const size_t eol = ins.find_first_of(L"\r\n");
+                    if (eol != std::wstring::npos) ins.resize(eol);
+                }
                 eraseSelection();
                 rec->text.insert(rec->caretPos, ins);
                 rec->caretPos += ins.size();
@@ -909,6 +921,14 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
         }
         CloseClipboard();
+    };
+    auto scrollMultilineBy = [&](float dy) {
+        const float maxScroll = std::max(0.0f, rec->editContentH - static_cast<float>(rec->height));
+        const float nextY = std::clamp(rec->editScrollY + dy, 0.0f, maxScroll);
+        if (nextY != rec->editScrollY) {
+            rec->editScrollY = nextY;
+            repaint();
+        }
     };
     // Ctrl+Left / Ctrl+Right: the start of the previous / next word (separators: spaces and path characters)
     auto isWordBreak = [](wchar_t c) { return c == L' ' || c == L'\t' || c == L'/' || c == L'\\' || c == L'.' || c == L'-' || c == L'_'; };
@@ -928,12 +948,48 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_SETTEXT: {
         const wchar_t* s = reinterpret_cast<const wchar_t*>(lParam);
         rec->text = s ? s : L"";
-        rec->caretPos = rec->text.size();
+        rec->caretPos = multiline ? 0 : rec->text.size();
         rec->selStart = rec->caretPos;
         rec->editScrollX = 0.0f;
+        rec->editScrollY = 0.0f;
         repaint();
         return TRUE;
     }
+    case EM_SETREADONLY:
+        if (wParam) rec->style |= ES_READONLY;
+        else        rec->style &= ~static_cast<DWORD>(ES_READONLY);
+        repaint();
+        return TRUE;
+    case WM_LBUTTONDOWN:
+        if (!rec->enabled) return 0;
+        ChangeFocus(hwnd);
+        if (!multiline) {
+            const size_t pos = EditCaretFromX(*rec, GET_X_LPARAM(lParam));
+            rec->caretPos = pos;
+            if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) rec->selStart = pos;
+        }
+        repaint();
+        return 0;
+    case WM_LBUTTONDBLCLK:
+        if (!rec->enabled) return 0;
+        ChangeFocus(hwnd);
+        rec->selStart = 0;
+        rec->caretPos = rec->text.size();
+        repaint();
+        return 0;
+    case WM_MOUSEMOVE:
+        if ((wParam & MK_LBUTTON) && !multiline) {
+            rec->caretPos = EditCaretFromX(*rec, GET_X_LPARAM(lParam));
+            repaint();
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (multiline) {
+            const short delta = static_cast<short>(HIWORD(wParam));
+            scrollMultilineBy(-(static_cast<float>(delta) / WHEEL_DELTA) * 48.0f);
+            return 0;
+        }
+        break;
     case EM_GETSEL: {
         const DWORD a = static_cast<DWORD>(std::min(rec->selStart, rec->caretPos));
         const DWORD b = static_cast<DWORD>(std::max(rec->selStart, rec->caretPos));
@@ -986,6 +1042,18 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         };
         const bool hasSel = rec->selStart != rec->caretPos;
         switch (wParam) {
+        case VK_UP:
+            if (multiline) { scrollMultilineBy(-22.0f); return 0; }
+            break;
+        case VK_DOWN:
+            if (multiline) { scrollMultilineBy(22.0f); return 0; }
+            break;
+        case VK_PRIOR:
+            if (multiline) { scrollMultilineBy(-std::max(40.0f, static_cast<float>(rec->height - 24))); return 0; }
+            break;
+        case VK_NEXT:
+            if (multiline) { scrollMultilineBy(std::max(40.0f, static_cast<float>(rec->height - 24))); return 0; }
+            break;
         case VK_LEFT:
             if (!shift && !ctrl && hasSel) { moveCaret(std::min(rec->selStart, rec->caretPos)); return 0; }
             moveCaret(ctrl ? wordLeft(rec->caretPos) : (rec->caretPos > 0 ? rec->caretPos - 1 : 0));
@@ -995,12 +1063,15 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             moveCaret(ctrl ? wordRight(rec->caretPos) : rec->caretPos + 1);
             return 0;
         case VK_HOME:
+            if (multiline && (ctrl || readOnly)) scrollMultilineBy(-1e7f);
             moveCaret(0);
             return 0;
         case VK_END:
+            if (multiline && (ctrl || readOnly)) scrollMultilineBy(1e7f);
             moveCaret(rec->text.size());
             return 0;
         case VK_BACK:
+            if (readOnly) return 0;
             if (!eraseSelection() && rec->caretPos > 0) {
                 const size_t from = ctrl ? wordLeft(rec->caretPos) : rec->caretPos - 1;
                 rec->text.erase(from, rec->caretPos - from);
@@ -1009,6 +1080,10 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             notifyParent(EN_CHANGE);
             return 0;
         case VK_DELETE:
+            if (readOnly) {
+                if (shift && hasSel) copySelection();
+                return 0;
+            }
             if (shift && hasSel) {                      // Shift+Delete: cut
                 copySelection();
                 eraseSelection();
@@ -1019,9 +1094,19 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             notifyParent(EN_CHANGE);
             return 0;
         case VK_INSERT:
-            if (shift) paste();                         // Shift+Insert: paste
+            if (shift && !readOnly) paste();            // Shift+Insert: paste
             else if (ctrl) copySelection();             // Ctrl+Insert: copy
             return 0;
+        case VK_RETURN:
+            if (multiline && !readOnly && (rec->style & ES_WANTRETURN)) {
+                eraseSelection();
+                rec->text.insert(rec->caretPos, 1, L'\n');
+                ++rec->caretPos;
+                rec->selStart = rec->caretPos;
+                notifyParent(EN_CHANGE);
+                return 0;
+            }
+            break;
         default:
             break;
         }
@@ -1038,7 +1123,7 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (ch == 3 || ch == 24) { // Ctrl+C / Ctrl+X
             if (rec->selStart != rec->caretPos) {
                 copySelection();
-                if (ch == 24) {
+                if (ch == 24 && !readOnly) {
                     eraseSelection();
                     notifyParent(EN_CHANGE);
                 }
@@ -1046,10 +1131,11 @@ LRESULT CALLBACK BuiltinEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             return 0;
         }
         if (ch == 22) { // Ctrl+V
-            paste();
+            if (!readOnly) paste();
             return 0;
         }
         if (ch >= 32 && ch != 127) {
+            if (readOnly) return 0;
             eraseSelection();
             rec->text.insert(rec->caretPos, 1, ch);
             ++rec->caretPos;
@@ -1268,21 +1354,22 @@ void WriteBmp24Or32(const char* path, const uint8_t* bgra, uint32_t w, uint32_t 
 // Overlay visible child EDIT boxes (address/search/rename) onto top-level window BGRA buffer using TrueType DirectWrite
 // The EDIT's text format for a character height in pixels (fontPx; 0 gives 13, the size the HAL always used): one
 // line, centred vertically. Drawing and the click-to-caret mapping must use the same one.
-IDWriteTextFormat* EditTextFormat(int px) {
+IDWriteTextFormat* EditTextFormat(int px, bool multiline = false) {
     static std::mutex s_mutex;
     static Microsoft::WRL::ComPtr<IDWriteFactory> s_dw;
     static std::map<int, Microsoft::WRL::ComPtr<IDWriteTextFormat>> s_formats;
+    static std::map<int, Microsoft::WRL::ComPtr<IDWriteTextFormat>> s_mlFormats;
     std::lock_guard<std::mutex> lk(s_mutex);
     if (!s_dw) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(s_dw.GetAddressOf()));
     if (!s_dw) return nullptr;
     px = (px > 0) ? std::clamp(px, 6, 96) : 13;
-    auto& f = s_formats[px];
+    auto& f = multiline ? s_mlFormats[px] : s_formats[px];
     if (!f) {
         s_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
                                DWRITE_FONT_STRETCH_NORMAL, static_cast<float>(px), L"en-us", &f);
         if (f) {
-            f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-            f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            f->SetWordWrapping(multiline ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+            f->SetParagraphAlignment(multiline ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
     }
     return f.Get();
@@ -1330,6 +1417,7 @@ void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint
         return tm.widthIncludingTrailingWhitespace;
     };
 
+    const bool dark = Explorer2::g_darkTheme;
     std::vector<uint8_t> editBuf;
     for (const auto& ed : edits) {
         const int x0 = std::clamp(ed->x, 0, static_cast<int>(w));
@@ -1340,7 +1428,9 @@ void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint
         const int eh = y1 - y0;
         if (ew <= 2 || eh <= 2) continue;
 
-        const bool focused = (g_focusedHwnd == ed->hwnd);
+        const bool focused   = (g_focusedHwnd == ed->hwnd);
+        const bool multiline = (ed->style & ES_MULTILINE) != 0;
+        const bool readOnly  = (ed->style & ES_READONLY) != 0;
         if (s_wic && s_d2d && s_tf) {
             Microsoft::WRL::ComPtr<IWICBitmap> bmp;
             Microsoft::WRL::ComPtr<ID2D1RenderTarget> rt;
@@ -1349,46 +1439,91 @@ void CompositeChildEdits(const WndRecord& parent, std::vector<uint8_t>& fb, uint
                                               GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bmp)) &&
                 bmp && SUCCEEDED(s_d2d->CreateWicBitmapRenderTarget(bmp.Get(), &rtp, &rt)) && rt)
             {
-                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brBorder, brSel, brText, brCaret;
-                rt->CreateSolidColorBrush(D2D1::ColorF(focused ? 0x0078D7 : 0xCBD5E1), &brBorder);
-                rt->CreateSolidColorBrush(D2D1::ColorF(0xCCE8FF), &brSel);
-                rt->CreateSolidColorBrush(D2D1::ColorF(0x1E1E1E), &brText);
-                rt->CreateSolidColorBrush(D2D1::ColorF(0x005A9E), &brCaret);
+                const uint32_t bgRgb     = dark ? (readOnly ? 0x16191F : 0x1E222A) : (readOnly ? 0xF8FAFC : 0xFFFFFF);
+                const uint32_t borderRgb = focused ? 0x0078D7 : (dark ? 0x3A4352 : 0xCBD5E1);
+                const uint32_t selRgb    = dark ? 0x1E4976 : 0xCCE8FF;
+                const uint32_t textRgb   = dark ? 0xE2E8F0 : 0x1E1E1E;
+                const uint32_t caretRgb  = dark ? 0x60A5FA : 0x005A9E;
 
-                IDWriteTextFormat* tf = EditTextFormat(ed->fontPx);
+                Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brBorder, brSel, brText, brCaret;
+                rt->CreateSolidColorBrush(D2D1::ColorF(borderRgb), &brBorder);
+                rt->CreateSolidColorBrush(D2D1::ColorF(selRgb), &brSel);
+                rt->CreateSolidColorBrush(D2D1::ColorF(textRgb), &brText);
+                rt->CreateSolidColorBrush(D2D1::ColorF(caretRgb), &brCaret);
+
+                IDWriteTextFormat* tf = EditTextFormat(ed->fontPx, multiline);
                 if (!tf) tf = s_tf.Get();
-                const size_t caretIdx = std::min(ed->caretPos, ed->text.size());
-                const size_t selIdx   = std::min(ed->selStart, ed->text.size());
-                const float caretPx   = measurePrefixW(tf, ed->text, caretIdx);
-                const float selPx     = (selIdx == caretIdx) ? caretPx : measurePrefixW(tf, ed->text, selIdx);
-                const float padX      = 6.0f;
-                const float innerW    = std::max(8.0f, static_cast<float>(ew) - padX * 2.0f);
-                // The text scrolls only as far as needed to keep the caret in view (a click maps back through it)
-                const float textW     = (caretIdx == ed->text.size()) ? caretPx : measurePrefixW(tf, ed->text, ed->text.size());
-                float scrollX = ed->editScrollX;
-                if (caretPx - scrollX > innerW - 4.0f) scrollX = caretPx - (innerW - 4.0f);
-                if (caretPx - scrollX < 0.0f) scrollX = caretPx;
-                scrollX = std::clamp(scrollX, 0.0f, std::max(0.0f, textW - (innerW - 4.0f)));
-                ed->editScrollX = scrollX;
 
                 rt->BeginDraw();
-                rt->Clear(D2D1::ColorF(0xFFFFFF));
+                rt->Clear(D2D1::ColorF(bgRgb));
                 rt->DrawRectangle(D2D1::RectF(0.5f, 0.5f, ew - 0.5f, eh - 0.5f), brBorder.Get(), 1.0f);
                 rt->PushAxisAlignedClip(D2D1::RectF(2.0f, 1.0f, ew - 2.0f, eh - 1.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-                if (focused && selIdx != caretIdx) {
-                    const float sx0 = padX - scrollX + std::min(selPx, caretPx);
-                    const float sx1 = padX - scrollX + std::max(selPx, caretPx);
-                    rt->FillRectangle(D2D1::RectF(sx0, 3.0f, sx1, eh - 3.0f), brSel.Get());
-                }
-                if (!ed->text.empty()) {
-                    rt->DrawText(ed->text.c_str(), static_cast<UINT32>(ed->text.size()), tf,
-                                 D2D1::RectF(padX - scrollX, 0.0f, padX - scrollX + 8192.0f, static_cast<float>(eh)),
-                                 brText.Get());
-                }
-                if (focused) {
-                    const float cx = std::clamp(padX - scrollX + caretPx, 2.0f, static_cast<float>(ew - 3));
-                    rt->DrawLine(D2D1::Point2F(cx, 4.0f), D2D1::Point2F(cx, static_cast<float>(eh - 4)), brCaret.Get(), 1.4f);
+                if (multiline) {
+                    const float padX = 7.0f;
+                    const float padY = 5.0f;
+                    float availW = std::max(12.0f, static_cast<float>(ew) - padX * 2.0f - 8.0f);
+                    float textH = 0.0f;
+                    if (!ed->text.empty() && s_dw) {
+                        Microsoft::WRL::ComPtr<IDWriteTextLayout> tl;
+                        if (SUCCEEDED(s_dw->CreateTextLayout(ed->text.c_str(), static_cast<UINT32>(ed->text.size()),
+                                                             tf, availW, 100000.0f, &tl)) && tl) {
+                            DWRITE_TEXT_METRICS tm = {};
+                            if (SUCCEEDED(tl->GetMetrics(&tm))) textH = tm.height;
+                        }
+                    }
+                    ed->editContentH = textH + padY * 2.0f;
+                    const float maxScrollY = std::max(0.0f, ed->editContentH - static_cast<float>(eh));
+                    ed->editScrollY = std::clamp(ed->editScrollY, 0.0f, maxScrollY);
+                    if (focused && ed->selStart == 0 && ed->caretPos == ed->text.size() && !ed->text.empty()) {
+                        rt->FillRectangle(D2D1::RectF(padX - 2.0f, 2.0f, ew - 10.0f, eh - 2.0f), brSel.Get());
+                    }
+                    if (!ed->text.empty()) {
+                        rt->DrawText(ed->text.c_str(), static_cast<UINT32>(ed->text.size()), tf,
+                                     D2D1::RectF(padX, padY - ed->editScrollY, padX + availW,
+                                                 padY - ed->editScrollY + std::max(static_cast<float>(eh), ed->editContentH)),
+                                     brText.Get());
+                    }
+                    if (maxScrollY > 0.0f) {
+                        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brTrack, brThumb;
+                        rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x262C36 : 0xEDEDED), &brTrack);
+                        rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x4A5464 : 0xA8A8A8), &brThumb);
+                        const D2D1_RECT_F track = D2D1::RectF(ew - 7.0f, 2.0f, ew - 2.0f, eh - 2.0f);
+                        if (brTrack) rt->FillRectangle(track, brTrack.Get());
+                        const float trackH = std::max(8.0f, track.bottom - track.top);
+                        const float thumbH = std::max(20.0f, trackH * static_cast<float>(eh) / std::max(1.0f, ed->editContentH));
+                        const float thumbTop = track.top + (trackH - thumbH) * (ed->editScrollY / maxScrollY);
+                        if (brThumb) rt->FillRectangle(D2D1::RectF(track.left, thumbTop, track.right, thumbTop + thumbH), brThumb.Get());
+                    }
+                } else {
+                    const size_t caretIdx = std::min(ed->caretPos, ed->text.size());
+                    const size_t selIdx   = std::min(ed->selStart, ed->text.size());
+                    const float caretPx   = measurePrefixW(tf, ed->text, caretIdx);
+                    const float selPx     = (selIdx == caretIdx) ? caretPx : measurePrefixW(tf, ed->text, selIdx);
+                    const float padX      = 6.0f;
+                    const float innerW    = std::max(8.0f, static_cast<float>(ew) - padX * 2.0f);
+                    // The text scrolls only as far as needed to keep the caret in view (a click maps back through it)
+                    const float textW     = (caretIdx == ed->text.size()) ? caretPx : measurePrefixW(tf, ed->text, ed->text.size());
+                    float scrollX = ed->editScrollX;
+                    if (caretPx - scrollX > innerW - 4.0f) scrollX = caretPx - (innerW - 4.0f);
+                    if (caretPx - scrollX < 0.0f) scrollX = caretPx;
+                    scrollX = std::clamp(scrollX, 0.0f, std::max(0.0f, textW - (innerW - 4.0f)));
+                    ed->editScrollX = scrollX;
+
+                    if (focused && selIdx != caretIdx) {
+                        const float sx0 = padX - scrollX + std::min(selPx, caretPx);
+                        const float sx1 = padX - scrollX + std::max(selPx, caretPx);
+                        rt->FillRectangle(D2D1::RectF(sx0, 3.0f, sx1, eh - 3.0f), brSel.Get());
+                    }
+                    if (!ed->text.empty()) {
+                        rt->DrawText(ed->text.c_str(), static_cast<UINT32>(ed->text.size()), tf,
+                                     D2D1::RectF(padX - scrollX, 0.0f, padX - scrollX + 8192.0f, static_cast<float>(eh)),
+                                     brText.Get());
+                    }
+                    if (focused && !readOnly) {
+                        const float cx = std::clamp(padX - scrollX + caretPx, 2.0f, static_cast<float>(ew - 3));
+                        rt->DrawLine(D2D1::Point2F(cx, 4.0f), D2D1::Point2F(cx, static_cast<float>(eh - 4)), brCaret.Get(), 1.4f);
+                    }
                 }
 
                 rt->PopAxisAlignedClip();
@@ -1496,17 +1631,24 @@ std::wstring StripMnemonics(const std::wstring& s) {
 void DrawHalButton(ID2D1RenderTarget* rt, const WndRecord& b, bool focused) {
     const D2D1_RECT_F r = D2D1::RectF(b.x + 0.5f, b.y + 0.5f, b.x + b.width - 0.5f, b.y + b.height - 0.5f);
     const bool isDefault = (b.style & 0x0Fu) == static_cast<DWORD>(BS_DEFPUSHBUTTON);
-    uint32_t fill = 0xE1E1E1, border = 0xADADAD, textColor = 0x000000;
+    const bool dark = Explorer2::g_darkTheme;
+    uint32_t fill      = dark ? 0x2A313C : 0xE1E1E1;
+    uint32_t border    = dark ? 0x4A5464 : 0xADADAD;
+    uint32_t textColor = dark ? 0xE2E8F0 : 0x000000;
     float borderW = 1.0f;
     if (!b.enabled) {
-        fill = 0xCCCCCC; border = 0xBFBFBF; textColor = 0x838383;
+        fill      = dark ? 0x20252E : 0xCCCCCC;
+        border    = dark ? 0x333B48 : 0xBFBFBF;
+        textColor = dark ? 0x64748B : 0x838383;
     } else if (b.pressed) {
-        fill = 0xCCE4F7; border = 0x005499;
+        fill   = dark ? 0x1E4976 : 0xCCE4F7;
+        border = dark ? 0x38BDF8 : 0x005499;
     } else if (b.hot) {
-        fill = 0xE5F1FB; border = 0x0078D7;
+        fill   = dark ? 0x243B55 : 0xE5F1FB;
+        border = 0x0078D7;
     }
     if (b.enabled && (focused || isDefault)) {
-        border = 0x0078D7;
+        border = dark ? 0x38BDF8 : 0x0078D7;
         borderW = 2.0f;
     }
     FillHalRect(rt, r, fill);
@@ -1542,6 +1684,7 @@ void DrawHalStatic(ID2D1RenderTarget* rt, WndRecord& s) {
         DrawMessageBoxIcon(rt, s.staticIcon, box);
         return;
     }
+    const bool dark = Explorer2::g_darkTheme;
     auto& ui = HalUi();
     const float w = static_cast<float>(std::max(1, s.width));
     const float h = static_cast<float>(std::max(1, s.height));
@@ -1552,24 +1695,27 @@ void DrawHalStatic(ID2D1RenderTarget* rt, WndRecord& s) {
     DrawHalText(rt, s.text, ui.text.Get(),
                 D2D1::RectF(box.left, box.top - s.scrollY, box.right - (maxScroll > 0.0f ? 10.0f : 0.0f),
                             box.top - s.scrollY + std::max(h, s.contentH) + 2.0f),
-                s.enabled ? 0x1E1E1E : 0x838383);
+                s.enabled ? (dark ? 0xE2E8F0 : 0x1E1E1E) : (dark ? 0x64748B : 0x838383));
     rt->PopAxisAlignedClip();
     if (maxScroll > 0.0f) {
         // A text taller than its box (the shortcuts help on a 768 px screen) scrolls: a thin bar shows where
         const D2D1_RECT_F track = D2D1::RectF(box.right - 6.0f, box.top, box.right - 2.0f, box.bottom);
-        FillHalRect(rt, track, 0xEDEDED);
+        FillHalRect(rt, track, dark ? 0x262C36 : 0xEDEDED);
         const float thumbH = std::max(24.0f, h * h / s.contentH);
         const float thumbTop = box.top + (h - thumbH) * (s.scrollY / maxScroll);
-        FillHalRect(rt, D2D1::RectF(track.left, thumbTop, track.right, thumbTop + thumbH), 0xA8A8A8);
+        FillHalRect(rt, D2D1::RectF(track.left, thumbTop, track.right, thumbTop + thumbH), dark ? 0x4A5464 : 0xA8A8A8);
     }
 }
 
 // The window class's background (COLOR_WINDOW + 1: white), as a 0xRRGGBB colour
 uint32_t HalWindowBackground(const WndRecord& w) {
+    const bool dark = Explorer2::g_darkTheme;
     std::lock_guard<std::recursive_mutex> lk(g_guiMutex);
     auto it = g_wndClasses.find(Explorer2::PathUtils::ToLower(w.className));
-    if (it != g_wndClasses.end() && reinterpret_cast<intptr_t>(it->second.hbrBackground) == COLOR_WINDOW + 1) return 0xFFFFFF;
-    return 0xF0F0F0;
+    if (it != g_wndClasses.end() && reinterpret_cast<intptr_t>(it->second.hbrBackground) == COLOR_WINDOW + 1) {
+        return dark ? 0x181B20 : 0xFFFFFF;
+    }
+    return dark ? 0x1E222A : 0xF0F0F0;
 }
 
 // Draws a top-level window the HAL is responsible for (an owned dialog, MessageBoxW): background, labels and
@@ -1585,12 +1731,13 @@ void PaintHalWindow(const std::shared_ptr<WndRecord>& win) {
         FAILED(ui.d2d->CreateWicBitmapRenderTarget(bmp.Get(), &rtp, &rt)) || !rt) {
         return;
     }
+    const bool dark = Explorer2::g_darkTheme;
     rt->BeginDraw();
     rt->Clear(D2D1::ColorF(HalWindowBackground(*win)));
     if (win->msgBoxBandTop > 0 && win->msgBoxBandTop < win->height) {
         const D2D1_RECT_F band = D2D1::RectF(0.0f, static_cast<float>(win->msgBoxBandTop), static_cast<float>(w), static_cast<float>(h));
-        FillHalRect(rt.Get(), band, 0xF0F0F0);
-        FillHalRect(rt.Get(), D2D1::RectF(band.left, band.top, band.right, band.top + 1.0f), 0xDFDFDF);
+        FillHalRect(rt.Get(), band, dark ? 0x15181D : 0xF0F0F0);
+        FillHalRect(rt.Get(), D2D1::RectF(band.left, band.top, band.right, band.top + 1.0f), dark ? 0x2B333F : 0xDFDFDF);
     }
     for (const auto& ch : ChildrenOf(win->hwnd)) {
         if (!ch->visible) continue;
@@ -2452,7 +2599,10 @@ void HandleX11Event(XEvent& ev) {
             if (down) {
                 const short delta = (button == Button4) ? WHEEL_DELTA : -WHEEL_DELTA;
                 HWND wheelTarget = hwnd;
-                if (auto ch = ChildControlAt(hwnd, mx, my); ch && ch->isStatic) wheelTarget = ch->hwnd;
+                if (auto ch = ChildControlAt(hwnd, mx, my);
+                    ch && (ch->isStatic || (ch->isEdit && (ch->style & ES_MULTILINE) != 0))) {
+                    wheelTarget = ch->hwnd;
+                }
                 PostMessageEx(wheelTarget, WM_MOUSEWHEEL, MAKEWPARAM(mk, static_cast<USHORT>(delta)),
                               MAKELPARAM(ev.xbutton.x_root, ev.xbutton.y_root), kMsgHasKeyState | mods);
             }

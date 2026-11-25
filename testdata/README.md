@@ -63,6 +63,16 @@ formulas and text it contains:
 `shapes_presentation.odp`, `word_document.docx`, `calc_spreadsheet.ods`, `parcels_gis.dbf`,
 `bootloader_image.srec`.
 
+Domain-organized sample files live in semantic subdirectories matching `src/formats/`
+(`3d/`, `cad/`, `images/`, `raw/`, `eda/`, `waveforms/`, `archives/`, `docs/`, `data/`,
+`gis/`, `audio/`, `security/`) and are regenerated deterministically by:
+
+- [`tools/generate_samples_3d_cad.py`](../tools/generate_samples_3d_cad.py)
+- [`tools/generate_samples_images.py`](../tools/generate_samples_images.py)
+- [`tools/generate_samples_eda_waveforms.py`](../tools/generate_samples_eda_waveforms.py)
+- [`tools/generate_samples_archives.py`](../tools/generate_samples_archives.py)
+- [`tools/generate_samples_docs_data.py`](../tools/generate_samples_docs_data.py)
+
 ## Adding a sample
 
 Add a file here only if you made it yourself or its licence clearly allows redistribution, and

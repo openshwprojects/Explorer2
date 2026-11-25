@@ -23,7 +23,8 @@ struct ArchiveItemMeta {
     uint64_t compressedSize = 0;
     uint64_t localHeaderOffset = 0;
     uint32_t crc32 = 0;
-    uint16_t compressionMethod = 0; // 0 = Store, 8 = Deflate
+    uint16_t compressionMethod = 0; // 0=Store, 8=Deflate, 12=BZip2, 14=LZMA, 93=Zstd, 95=XZ
+    uint16_t generalFlags = 0;
     uint16_t dosTime = 0;
     uint16_t dosDate = 0;
     bool isDirectory = false;
@@ -37,12 +38,13 @@ bool InflateRaw(
     std::vector<uint8_t>& outData,
     size_t maxOutputBytes = 128 * 1024 * 1024);
 
-// Appends raw RFC 1951 DEFLATE stream onto ioData, preserving prior bytes in ioData as LZ77 sliding-window history (for MSZIP multi-block CAB folders)
+// Appends raw RFC 1951 DEFLATE stream onto ioData, preserving prior bytes in ioData as LZ77 sliding-window history
 bool InflateRawAppend(
     const uint8_t* src,
     size_t srcLen,
     std::vector<uint8_t>& ioData,
-    size_t maxOutputBytes = 128 * 1024 * 1024);
+    size_t maxOutputBytes = 128 * 1024 * 1024,
+    size_t* outBytesConsumed = nullptr);
 
 // Decompresses RFC 1950 Zlib stream (2-byte header + raw deflate)
 bool InflateZlib(
@@ -51,14 +53,14 @@ bool InflateZlib(
     std::vector<uint8_t>& outData,
     size_t maxOutputBytes = 128 * 1024 * 1024);
 
-// Decompresses RFC 1952 Gzip stream (10+ byte header + raw deflate)
+// Decompresses single-member or multi-member concatenated RFC 1952 Gzip stream
 bool InflateGzip(
     const uint8_t* src,
     size_t srcLen,
     std::vector<uint8_t>& outData,
     size_t maxOutputBytes = 128 * 1024 * 1024);
 
-// Reads ZIP Central Directory from an in-memory buffer or directly from disk file
+// Reads ZIP / ZIP64 Central Directory from an in-memory buffer or directly from disk file
 bool ListZipEntriesFromFile(
     const std::wstring& zipFilePath,
     std::vector<ArchiveItemMeta>& outEntries,
@@ -96,7 +98,7 @@ bool ExtractZipFileByName(
     std::vector<uint8_t>& outBytes,
     size_t maxOutputBytes = 64 * 1024 * 1024);
 
-// Lists TAR (POSIX ustar / GNU tar) or .tar.gz / .tgz entries
+// Lists TAR (POSIX ustar / V7 / GNU / PAX) or .tar.gz / .tgz entries via unified StreamCodecs::ParsePosixTarFromMemory
 bool ListTarEntriesFromFile(
     const std::wstring& tarFilePath,
     std::vector<ArchiveItemMeta>& outEntries,

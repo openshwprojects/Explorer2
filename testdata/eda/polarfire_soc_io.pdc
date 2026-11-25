@@ -1,0 +1,9 @@
+# Microchip PolarFire SoC MPFS095T I/O Constraints
+set_iobank -bank_name Bank0 -vcci 1.80 -fixed true
+set_io -port_name REF_CLK_50M \
+    -pin_name E2 \
+    -io_std LVCMOS18 \
+    -DIRECTION INPUT
+set_io -port_name UART_TX -pin_name F4 -io_std LVCMOS18 -DIRECTION OUTPUT
+set_io -port_name UART_RX -pin_name G4 -io_std LVCMOS18 -RES_PULL Up -DIRECTION INPUT
+set_io -port_name SPI_SCK -pin_name H6 -io_std LVCMOS18 -DIRECTION OUTPUT

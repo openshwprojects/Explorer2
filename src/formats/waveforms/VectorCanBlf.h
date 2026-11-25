@@ -19,17 +19,17 @@ inline void WalkBlfObjects(const uint8_t* buf, size_t sz, std::vector<CanFrame>&
                 break;
             }
         }
-        uint16_t hdrSize = DetailEda100::RdU16LE(buf + pos + 4);
-        uint32_t objSize = DetailEda100::RdU32LE(buf + pos + 8);
-        uint32_t objType = DetailEda100::RdU32LE(buf + pos + 12);
+        uint16_t hdrSize = DetailSiliconAndBusEda::RdU16LE(buf + pos + 4);
+        uint32_t objSize = DetailSiliconAndBusEda::RdU32LE(buf + pos + 8);
+        uint32_t objType = DetailSiliconAndBusEda::RdU32LE(buf + pos + 12);
         if (hdrSize < 16 || objSize < hdrSize || objSize > sz - pos) break;
 
         if (objType == 10) { // BL_OBJ_TYPE_LOG_CONTAINER
             if (objSize > static_cast<uint32_t>(hdrSize) + 16u) {
                 const uint8_t* cpay = buf + pos + hdrSize;
                 size_t cpayLen = objSize - hdrSize;
-                uint16_t compMethod = DetailEda100::RdU16LE(cpay);
-                uint32_t uncompLen  = DetailEda100::RdU32LE(cpay + 8);
+                uint16_t compMethod = DetailSiliconAndBusEda::RdU16LE(cpay);
+                uint32_t uncompLen  = DetailSiliconAndBusEda::RdU32LE(cpay + 8);
                 const uint8_t* inner = cpay + 16;
                 size_t innerLen = cpayLen - 16;
                 if (compMethod == 0) {
@@ -43,8 +43,8 @@ inline void WalkBlfObjects(const uint8_t* buf, size_t sz, std::vector<CanFrame>&
                 }
             }
         } else if ((objType == 1 || objType == 86 || objType == 100 || objType == 101) && hdrSize >= 32) {
-            uint32_t objFlags = DetailEda100::RdU32LE(buf + pos + 16);
-            uint64_t tsRaw    = DetailEda100::RdU64LE(buf + pos + 24);
+            uint32_t objFlags = DetailSiliconAndBusEda::RdU32LE(buf + pos + 16);
+            uint64_t tsRaw    = DetailSiliconAndBusEda::RdU64LE(buf + pos + 24);
             double tsSec = (objFlags == 1) ? (static_cast<double>(tsRaw) * 1e-5) : (static_cast<double>(tsRaw) * 1e-9);
             const uint8_t* pay = buf + pos + hdrSize;
             size_t payLen = objSize - hdrSize;
@@ -52,10 +52,10 @@ inline void WalkBlfObjects(const uint8_t* buf, size_t sz, std::vector<CanFrame>&
             if ((objType == 1 || objType == 86) && payLen >= 16) { // CAN_MESSAGE / CAN_MESSAGE2
                 CanFrame f;
                 f.timestamp = tsSec;
-                f.channel = DetailEda100::RdU16LE(pay);
+                f.channel = DetailSiliconAndBusEda::RdU16LE(pay);
                 f.isTx = (pay[2] & 0x01) != 0;
                 f.dlcBytes = std::min<uint8_t>(pay[3], 8);
-                uint32_t rawId = DetailEda100::RdU32LE(pay + 4);
+                uint32_t rawId = DetailSiliconAndBusEda::RdU32LE(pay + 4);
                 f.extId = (rawId & 0x80000000u) != 0;
                 f.canId = rawId & 0x1FFFFFFFu;
                 std::memcpy(f.data, pay + 8, f.dlcBytes);
@@ -63,12 +63,12 @@ inline void WalkBlfObjects(const uint8_t* buf, size_t sz, std::vector<CanFrame>&
             } else if (objType == 100 && payLen >= 20) { // CAN_FD_MESSAGE
                 CanFrame f;
                 f.timestamp = tsSec;
-                f.channel = DetailEda100::RdU16LE(pay);
+                f.channel = DetailSiliconAndBusEda::RdU16LE(pay);
                 f.isTx = (pay[2] & 0x01) != 0;
                 f.isFd = true;
                 uint8_t validBytes = (pay[14] > 0) ? pay[14] : CanFdDlcToBytes(pay[3]);
                 f.dlcBytes = static_cast<uint8_t>(std::min<size_t>({ validBytes, size_t(64), payLen - 20 }));
-                uint32_t rawId = DetailEda100::RdU32LE(pay + 4);
+                uint32_t rawId = DetailSiliconAndBusEda::RdU32LE(pay + 4);
                 f.extId = (rawId & 0x80000000u) != 0;
                 f.canId = rawId & 0x1FFFFFFFu;
                 if (f.dlcBytes > 0) std::memcpy(f.data, pay + 20, f.dlcBytes);
@@ -80,7 +80,7 @@ inline void WalkBlfObjects(const uint8_t* buf, size_t sz, std::vector<CanFrame>&
                 f.isFd = true;
                 uint8_t validBytes = (pay[2] > 0) ? pay[2] : CanFdDlcToBytes(pay[1]);
                 f.dlcBytes = static_cast<uint8_t>(std::min<size_t>({ validBytes, size_t(64), payLen - 40 }));
-                uint32_t rawId = DetailEda100::RdU32LE(pay + 4);
+                uint32_t rawId = DetailSiliconAndBusEda::RdU32LE(pay + 4);
                 f.extId = (rawId & 0x80000000u) != 0;
                 f.canId = rawId & 0x1FFFFFFFu;
                 if (f.dlcBytes > 0) std::memcpy(f.data, pay + 40, f.dlcBytes);
@@ -106,7 +106,7 @@ inline bool ParseVectorCanBlfBoard(const uint8_t* data, size_t size, const std::
     // 1. Vector Binary Logging Format (.blf, "LOGG" magic)
     if (extLower == L".blf" || (size >= 72 && std::memcmp(data, "LOGG", 4) == 0)) {
         if (size < 72 || std::memcmp(data, "LOGG", 4) != 0) return false;
-        uint32_t hdrSize = DetailEda100::RdU32LE(data + 4);
+        uint32_t hdrSize = DetailSiliconAndBusEda::RdU32LE(data + 4);
         if (hdrSize < 32 || hdrSize > size) return false;
 
         std::vector<DetailCan::CanFrame> frames;

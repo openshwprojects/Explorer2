@@ -16,26 +16,7 @@ using ::Explorer2::ByteIO::RdF64;
 // 1. Pure-C++ PackBits & TIFF MSB-First LZW Decompressors
 // ============================================================================
 inline bool DecompressPackBits(const uint8_t* src, size_t srcLen, size_t expectedLen, std::vector<uint8_t>& out) {
-    out.clear();
-    out.reserve(expectedLen);
-    size_t p = 0;
-    while (p < srcLen && out.size() < expectedLen) {
-        int8_t hdr = static_cast<int8_t>(src[p++]);
-        if (hdr >= 0) {
-            size_t run = static_cast<size_t>(hdr) + 1u;
-            if (p + run > srcLen) return false;
-            size_t take = std::min(run, expectedLen - out.size());
-            out.insert(out.end(), src + p, src + p + take);
-            p += run;
-        } else if (hdr != -128) {
-            if (p >= srcLen) return false;
-            uint8_t val = src[p++];
-            size_t run = static_cast<size_t>(1 - static_cast<int>(hdr));
-            size_t take = std::min(run, expectedLen - out.size());
-            out.insert(out.end(), take, val);
-        }
-    }
-    return out.size() >= expectedLen;
+    return ::Explorer2::StreamCodecs::DecompressPackBits(src, srcLen, out, expectedLen);
 }
 
 inline bool DecompressTiffLzwCore(const uint8_t* src, size_t srcLen, size_t expectedLen, bool earlyBump, std::vector<uint8_t>& out) {
@@ -539,7 +520,7 @@ inline bool DecodeTiffPureCpp(const uint8_t* data, size_t size, const std::wstri
         if (bps == 16u) {
             const uint8_t* p = row + sIdx * 2u;
             if (smpFmt == 3u) {
-                float fv = DetailImg100::HalfToFloat(Rd16(p, be));
+                float fv = DetailLayeredAndHdrImg::HalfToFloat(Rd16(p, be));
                 if (!std::isfinite(fv) || fv <= 0.0f) return 0.0f;
                 return (fv > 1.0f) ? (fv / (1.0f + fv)) : fv;
             }
@@ -672,10 +653,20 @@ inline bool DecodeTiffPureCpp(const uint8_t* data, size_t size, const std::wstri
 
 inline bool DecodeTiffOrBigTiff(const uint8_t* data, size_t size, const std::wstring& extLower, ExtendedImageInfo& outInfo) {
     if (TiffDetail::DecodeTiffPureCpp(data, size, extLower, outInfo)) return true;
-    // Fallback to OS WIC for JPEG-in-TIFF (compression == 7) if Classic TIFF 42
-    if (size >= 8 && ((data[0] == 'I' && data[1] == 'I' && data[2] == 42 && data[3] == 0) ||
-                      (data[0] == 'M' && data[1] == 'M' && data[2] == 0  && data[3] == 42))) {
-        return DetailImg100::DecodeEmbeddedWicBuffer(data, size, L"TIFF Raster (.tif)", outInfo);
+    // Fallback to OS WIC ONLY when Classic TIFF 42 has a structurally valid IFD using a compression
+    // method not already decoded by DecodeTiffPureCpp (e.g. JPEG-in-TIFF 6/7 or CCITT fax 2/3/4).
+    if (data && size >= 26 && ((data[0] == 'I' && data[1] == 'I' && data[2] == 42 && data[3] == 0) ||
+                               (data[0] == 'M' && data[1] == 'M' && data[2] == 0  && data[3] == 42))) {
+        const bool be = (data[0] == 'M');
+        const uint64_t ifd0Off = TiffDetail::Rd32(data + 4, be);
+        TiffDetail::TiffIfdInfo ifd0;
+        uint64_t nxt = 0;
+        if (ifd0Off >= 8ull && ifd0Off < size && TiffDetail::ParseTiffIfd(data, size, be, false, ifd0Off, ifd0, nxt)) {
+            const uint16_t c = ifd0.compression;
+            if (c != 1u && c != 5u && c != 8u && c != 32946u && c != 32773u) {
+                return DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data, size, L"TIFF Raster (.tif)", outInfo);
+            }
+        }
     }
     return false;
 }

@@ -1,0 +1,109 @@
+# Acclaim ASF v1.10 Bipedal Runner Skeleton
+:version 1.10
+:name cmu_runner
+:units
+  mass 1.0
+  length 0.45
+  angle deg
+:root
+  order TX TY TZ RX RY RZ
+  axis XYZ
+  position 0.0 18.0 0.0
+  orientation 0.0 0.0 0.0
+:bonedata
+  begin
+    id 1
+    name lhipjoint
+    direction -0.65 -0.75 0.0
+    length 3.2
+    axis 0.0 0.0 0.0 XYZ
+  end
+  begin
+    id 2
+    name lfemur
+    direction -0.05 -0.98 0.18
+    length 7.8
+    axis 0.0 0.0 15.0 XYZ
+    dof rx ry rz
+  end
+  begin
+    id 3
+    name ltibia
+    direction 0.0 -0.97 -0.24
+    length 7.4
+    axis 0.0 0.0 10.0 XYZ
+    dof rx
+  end
+  begin
+    id 4
+    name rhipjoint
+    direction 0.65 -0.75 0.0
+    length 3.2
+    axis 0.0 0.0 0.0 XYZ
+  end
+  begin
+    id 5
+    name rfemur
+    direction 0.05 -0.96 -0.26
+    length 7.8
+    axis 0.0 0.0 -15.0 XYZ
+    dof rx ry rz
+  end
+  begin
+    id 6
+    name rtibia
+    direction 0.0 -0.98 0.19
+    length 7.4
+    axis 0.0 0.0 -10.0 XYZ
+    dof rx
+  end
+  begin
+    id 7
+    name lowerback
+    direction 0.0 0.99 0.12
+    length 4.5
+    axis 0.0 0.0 0.0 XYZ
+    dof rx ry rz
+  end
+  begin
+    id 8
+    name thorax
+    direction 0.0 0.99 0.08
+    length 5.2
+    axis 0.0 0.0 0.0 XYZ
+    dof rx ry rz
+  end
+  begin
+    id 9
+    name head
+    direction 0.0 1.0 0.0
+    length 3.6
+    axis 0.0 0.0 0.0 XYZ
+    dof rx ry rz
+  end
+  begin
+    id 10
+    name lhumerus
+    direction -0.82 -0.55 0.15
+    length 6.1
+    axis 0.0 0.0 40.0 XYZ
+    dof rx ry rz
+  end
+  begin
+    id 11
+    name rhumerus
+    direction 0.82 -0.55 -0.15
+    length 6.1
+    axis 0.0 0.0 -40.0 XYZ
+    dof rx ry rz
+  end
+:hierarchy
+  begin
+    root lhipjoint rhipjoint lowerback
+    lhipjoint lfemur
+    lfemur ltibia
+    rhipjoint rfemur
+    rfemur rtibia
+    lowerback thorax
+    thorax head lhumerus rhumerus
+  end

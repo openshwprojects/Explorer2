@@ -1,0 +1,44 @@
+##RenderMan RIB-Structure 1.1
+version 3.03
+Display "pavilion.tif" "file" "rgba"
+Projection "perspective" "fov" [ 40 ]
+WorldBegin
+  # Stepped temple plinth (PointsPolygons with quads)
+  AttributeBegin
+    PointsPolygons [ 4 4 4 4 4 ]
+      [ 0 1 2 3  0 4 5 1  1 5 6 2  2 6 7 3  3 7 4 0 ]
+      "P" [
+        -12 0 -12   12 0 -12   12 0  12  -12 0  12
+        -10 3 -10   10 3 -10   10 3  10  -10 3  10
+      ]
+  AttributeEnd
+
+  # Four corner columns via TransformBegin / Translate / Rotate + Cylinder
+  TransformBegin
+    Translate -8 3 -8
+    Rotate -90 1 0 0
+    Cylinder 1.2 0 14 360
+  TransformEnd
+  TransformBegin
+    Translate 8 3 -8
+    Rotate -90 1 0 0
+    Cylinder 1.2 0 14 360
+  TransformEnd
+  TransformBegin
+    Translate -8 3 8
+    Rotate -90 1 0 0
+    Cylinder 1.2 0 14 360
+  TransformEnd
+  TransformBegin
+    Translate 8 3 8
+    Rotate -90 1 0 0
+    Cylinder 1.2 0 14 360
+  TransformEnd
+
+  # Domed roof cupola
+  TransformBegin
+    Translate 0 17 0
+    Rotate -90 1 0 0
+    Sphere 9.5 0 9.5 360
+  TransformEnd
+WorldEnd

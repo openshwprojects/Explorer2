@@ -6,7 +6,6 @@ namespace Formats {
 
 inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
     if (!data || size < 16) return false;
-        std::vector<float> samples;
         std::wstring fmtTitle;
         std::wstring metaLabel;
 
@@ -17,9 +16,9 @@ inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const s
         };
         std::vector<RigolChannelWave> multiChans;
 
-        // 2. Rigol Binary WFM (0xA5 0xA5 header magic: DS1000Z 0x0038, DS1000E/D 0x0000, DS2000/4000/6000 0x01A4, + fallback)
+        // Rigol Binary WFM (0xA5 0xA5 header magic: DS1000Z 0x0038, DS1000E/D 0x0000, DS2000/4000/6000 0x01A4)
         if (ext == L".wfm" && size >= 260 && data[0] == 0xA5u && data[1] == 0xA5u) {
-            const uint16_t rigolSubMagic = DetailEda200::RdU16LE(data + 2);
+            const uint16_t rigolSubMagic = DetailIndustrialAndWaveEda::RdU16LE(data + 2);
             auto readAsciiTrim = [&](size_t off, size_t maxLen) -> std::string {
                 if (off >= size) return {};
                 size_t lim = std::min<size_t>(maxLen, size - off);
@@ -90,12 +89,12 @@ inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const s
 
                 if (!zChans.empty()) {
                     const size_t minHdr = isDs2k ? 420u : 256u;
-                    uint32_t explOff = DetailEda200::RdU32LE(data + 52);
-                    uint32_t hdrPts  = DetailEda200::RdU32LE(data + 56);
-                    if (hdrPts == 0u) hdrPts = DetailEda200::RdU32LE(data + 28);
+                    uint32_t explOff = DetailIndustrialAndWaveEda::RdU32LE(data + 52);
+                    uint32_t hdrPts  = DetailIndustrialAndWaveEda::RdU32LE(data + 56);
+                    if (hdrPts == 0u) hdrPts = DetailIndustrialAndWaveEda::RdU32LE(data + 28);
                     float sampleRate = ::Explorer2::ByteIO::RdFiniteF32LE(data + 60);
                     if (sampleRate <= 0.0f && size >= 104u) sampleRate = ::Explorer2::ByteIO::RdFiniteF32LE(data + 100);
-                    uint64_t timeScalePs = (size >= 72u) ? DetailEda200::RdU64LE(data + 64) : 0ULL;
+                    uint64_t timeScalePs = (size >= 72u) ? DetailIndustrialAndWaveEda::RdU64LE(data + 64) : 0ULL;
 
                     size_t dataOff = minHdr;
                     if (explOff >= 248u && explOff + 2u <= size) {
@@ -165,7 +164,7 @@ inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const s
                      data[49] <= 1u && data[73] <= 1u && (data[49] == 1u || data[73] == 1u))
             {
                 const size_t dataOff = 276u;
-                uint32_t hdrPts = DetailEda200::RdU32LE(data + 28);
+                uint32_t hdrPts = DetailIndustrialAndWaveEda::RdU32LE(data + 28);
                 float sampleRate = ::Explorer2::ByteIO::RdFiniteF32LE(data + 100);
                 size_t nAct = (data[49] == 1u ? 1u : 0u) + (data[73] == 1u ? 1u : 0u);
                 size_t avail = size - dataOff;
@@ -177,7 +176,7 @@ inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const s
                     for (int c = 0; c < 2; ++c) {
                         size_t chHdr = (c == 0) ? 36u : 60u;
                         if (data[chHdr + 13u] != 1u) continue;
-                        int32_t vsUv = static_cast<int32_t>(DetailEda200::RdU32LE(data + chHdr));
+                        int32_t vsUv = static_cast<int32_t>(DetailIndustrialAndWaveEda::RdU32LE(data + chHdr));
                         float vs = (vsUv > 0 && vsUv <= 100000000) ? (static_cast<float>(vsUv) * 1e-6f) : 1.0f;
                         float pr = ::Explorer2::ByteIO::RdFiniteF32LE(data + chHdr + 8u);
                         if (pr >= 0.05f && pr <= 1000.0f) vs *= pr;
@@ -209,26 +208,8 @@ inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const s
                 }
             }
 
-            // 2c. Clean Fallback for minimal synthetic Rigol .wfm buffers with zero structured channel flags
             if (multiChans.empty()) {
-                size_t dataOff = 256u;
-                uint32_t candPts = DetailEda200::RdU32LE(data + 28);
-                size_t avail = size - dataOff;
-                size_t totalPts = (candPts >= 2 && candPts <= avail) ? static_cast<size_t>(candPts) : avail;
-                if (totalPts < 2) return false;
-
-                float vScale = 1.0f;
-                uint32_t vsRaw = DetailEda200::RdU32LE(data + 36);
-                if (vsRaw >= 100u && vsRaw <= 50000000u) {
-                    vScale = static_cast<float>(vsRaw) * 1e-6f / 25.0f; // Rigol uV/div -> V/LSB
-                }
-                size_t stepPts = std::max<size_t>(1, totalPts / 1024);
-                for (size_t i = 0; i < totalPts && samples.size() < 1024; i += stepPts) {
-                    int adc = static_cast<int>(data[dataOff + i]) - 128;
-                    samples.push_back(static_cast<float>(adc) * vScale);
-                }
-                fmtTitle = L"Rigol Digital Oscilloscope Waveform (.wfm)";
-                metaLabel = L"Rigol WFM (" + std::to_wstring(totalPts) + L" pts)";
+                return false;
             }
         }
         else {
@@ -252,7 +233,7 @@ inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const s
             out.kind = EdaDocKind::KiCadSch;
             out.formatTitle = fmtTitle;
             out.netCount = multiChans.size();
-            DetailEda200::DrawGraticule(out, -40.0f, -25.0f, 80.0f, 50.0f, 10, 8);
+            DetailIndustrialAndWaveEda::DrawGraticule(out, -40.0f, -25.0f, 80.0f, 50.0f, 10, 8);
 
             float span = std::max(1e-6f, mx - mn);
             float yZeroLine = std::clamp(-20.0f + ((0.0f - mn) / span) * 40.0f, -24.0f, 24.0f);
@@ -282,7 +263,7 @@ inline bool ParseRigolWaveformWfmBoard(const uint8_t* data, size_t size, const s
             return true;
         }
 
-        return DetailEda200::RenderSingleScopeTrace(out, samples, fmtTitle, metaLabel);
+        return false;
 }
 
 } // namespace Formats

@@ -4,8 +4,8 @@
 
 namespace Formats {
 
-// #78. PROFINET IO GSDML Device Profile (.gsdml) — Backplane, DAP & IO Module Slots
-inline bool ParseProfinetGsdml200(std::string_view sv, ParsedEdaBoard& out) {
+// PROFINET IO GSDML Device Profile (.gsdml) — Backplane, DAP & IO Module Slots
+inline bool ParseProfinetGsdmlBoard(std::string_view sv, ParsedEdaBoard& out) {
     auto drawSchRect = [&](float cx, float cy, float w, float h, float strokeW, EdaLayerId lid, int netId = 0) {
         DrawFieldbusSchRect(out, cx, cy, w, h, strokeW, lid, netId);
     };

@@ -4,7 +4,7 @@
 
 namespace Formats {
 
-namespace DetailKiCadSymSesPos {
+namespace DetailBoardPlacementEda {
 
 inline void TessellateKiCad3PtArc(
     float x1, float y1, float xm, float ym, float x2, float y2,
@@ -270,7 +270,7 @@ inline void ParseKiSymPrimitives(const DetailSpecctra::SNode& container, int uni
     }
 }
 
-} // namespace DetailKiCadSymSesPos
+} // namespace DetailBoardPlacementEda
 
 inline bool ParseKiCadSymbolLibBoard(std::string_view sv, const std::wstring& ext, ParsedEdaBoard& out) {
     if (sv.size() >= 3 &&
@@ -281,9 +281,9 @@ inline bool ParseKiCadSymbolLibBoard(std::string_view sv, const std::wstring& ex
         sv.remove_prefix(3);
     }
 
-    // #61. KiCad v6–v9 Schematic Symbol Library (.kicad_sym)
+    // KiCad v6–v9 Schematic Symbol Library (.kicad_sym)
     if (ext == L".kicad_sym" || sv.find("(kicad_symbol_lib") != std::string_view::npos) {
-        using namespace DetailKiCadSymSesPos;
+        using namespace DetailBoardPlacementEda;
         if (sv.find("(kicad_symbol_lib") == std::string_view::npos && sv.find("(symbol ") == std::string_view::npos) {
             return false;
         }

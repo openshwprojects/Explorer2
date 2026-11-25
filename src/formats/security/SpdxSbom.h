@@ -92,7 +92,7 @@ inline bool ParseSpdxSbomDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size()));
     size_t firstPos = text.find_first_not_of(" \t\r\n");
     char first = (firstPos == std::string_view::npos) ? '\0' : text[firstPos];
-    if (first == '{') return ParseSbomJson(text, out);
+    if (first == '{') return ParseSbomJson(text, out, false);
     if (first == '<') return false;
     return ParseSpdxTagValue(text, out);
 }

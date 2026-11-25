@@ -6,12 +6,15 @@
 // #include of these files would then be nested in that namespace. Including them here first makes the
 // nested includes no-ops (#pragma once), so `::Explorer2::ByteIO` and friends always name the real thing.
 #include "Base64.h"
+#include "BrotliDecode.h"
 #include "ByteIO.h"
 #include "Crc32.h"
 #include "JsonDom.h"
 #include "Lz4Block.h"
+#include "LzfseDecode.h"
 #include "LzxDecoder.h"
 #include "MemberDetect.h"
+#include "ReaderTextUtils.h"
 #include "StreamCodecs.h"
 #include "XmlTagScan.h"
 #include "ZipDeflate.h"

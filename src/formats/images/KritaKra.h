@@ -8,36 +8,6 @@ namespace DetailArtFont {
 // ----------------------------------------------------------------------------
 // 2. Krita (.kra) Native VERSION 2 Tile-Engine Decompressor & Layer Compositor
 // ----------------------------------------------------------------------------
-inline bool DecompressLibLzf(const uint8_t* src, size_t srcLen, uint8_t* dst, size_t dstCap, size_t& outLen) {
-    size_t sp = 0, dp = 0;
-    while (sp < srcLen) {
-        uint8_t ctrl = src[sp++];
-        if (ctrl < 32u) {
-            size_t lit = static_cast<size_t>(ctrl) + 1u;
-            if (sp + lit > srcLen || dp + lit > dstCap) return false;
-            std::memcpy(dst + dp, src + sp, lit);
-            sp += lit;
-            dp += lit;
-        } else {
-            size_t len = (static_cast<size_t>(ctrl) >> 5) + 2u;
-            size_t refOff = (static_cast<size_t>(ctrl & 0x1Fu) << 8) + 1u;
-            if (len == 9u) {
-                if (sp >= srcLen) return false;
-                len += src[sp++];
-            }
-            if (sp >= srcLen) return false;
-            refOff += src[sp++];
-            if (refOff > dp || dp + len > dstCap) return false;
-            for (size_t k = 0; k < len; ++k) {
-                dst[dp] = dst[dp - refOff];
-                ++dp;
-            }
-        }
-    }
-    outLen = dp;
-    return true;
-}
-
 inline bool DecodeKritaTileLayer(
     const uint8_t* tileStream,
     size_t streamLen,
@@ -116,10 +86,8 @@ inline bool DecodeKritaTileLayer(
                 if (static_cast<size_t>(byteCount - 1) < rawTileBytes) return false;
                 pxData = payload + 1;
             } else if (compFlag == 1u) {
-                size_t outLen = 0;
-                if (!DecompressLibLzf(payload + 1, static_cast<size_t>(byteCount - 1),
-                                      decodedTile.data(), rawTileBytes, outLen) ||
-                    outLen != rawTileBytes) {
+                if (!::Explorer2::StreamCodecs::DecompressLibLzf(
+                        payload + 1, static_cast<size_t>(byteCount - 1), decodedTile, rawTileBytes, rawTileBytes)) {
                     return false;
                 }
                 // Krita KisTileCompressor2 delinearize: planar [ch0_all, ch1_all, ...] -> interleaved

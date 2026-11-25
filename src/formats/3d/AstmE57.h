@@ -4,7 +4,7 @@
 
 namespace Formats {
 
-namespace DetailE57_200 {
+namespace DetailAstmE57 {
 
 inline std::string_view XmlAttr(std::string_view tag, std::string_view attrName) {
     size_t pos = 0;
@@ -87,12 +87,12 @@ struct E57BitStream {
     uint64_t ReadBitsLSB(uint32_t nBits) {
         if (nBits == 0) return 0;
         if (nBits == 32 && (bitPos & 7u) == 0) {
-            uint32_t v = Detail3D200::RdU32LE(bytes.data() + (bitPos >> 3));
+            uint32_t v = DetailMeshSciCad::RdU32LE(bytes.data() + (bitPos >> 3));
             bitPos += 32;
             return v;
         }
         if (nBits == 64 && (bitPos & 7u) == 0) {
-            uint64_t v = Detail3D200::RdU64LE(bytes.data() + (bitPos >> 3));
+            uint64_t v = DetailMeshSciCad::RdU64LE(bytes.data() + (bitPos >> 3));
             bitPos += 64;
             return v;
         }
@@ -107,7 +107,7 @@ struct E57BitStream {
     }
 };
 
-} // namespace DetailE57_200
+} // namespace DetailAstmE57
 
 
 inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& ext, LoadedMesh3D& mesh) {
@@ -115,13 +115,13 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
     if (ext == L".e57" || (size >= 48 && std::memcmp(data, "ASTM-E57", 8) == 0)) {
         if (size < 48 || std::memcmp(data, "ASTM-E57", 8) != 0) return false;
 
-        uint32_t majVer      = Detail3D200::RdU32LE(data + 8);
-        uint32_t minVer      = Detail3D200::RdU32LE(data + 12);
+        uint32_t majVer      = DetailMeshSciCad::RdU32LE(data + 8);
+        uint32_t minVer      = DetailMeshSciCad::RdU32LE(data + 12);
         (void)minVer;
-        uint64_t filePhysLen = Detail3D200::RdU64LE(data + 16);
-        uint64_t xmlPhysOff  = Detail3D200::RdU64LE(data + 24);
-        uint64_t xmlLogLen   = Detail3D200::RdU64LE(data + 32);
-        uint64_t pageSize    = Detail3D200::RdU64LE(data + 40);
+        uint64_t filePhysLen = DetailMeshSciCad::RdU64LE(data + 16);
+        uint64_t xmlPhysOff  = DetailMeshSciCad::RdU64LE(data + 24);
+        uint64_t xmlLogLen   = DetailMeshSciCad::RdU64LE(data + 32);
+        uint64_t pageSize    = DetailMeshSciCad::RdU64LE(data + 40);
 
         if (majVer == 0 || majVer > 2) return false;
         if (pageSize < 64 || pageSize > 65536 || (pageSize % 4u) != 0) return false;
@@ -149,8 +149,8 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
                 return false;
             }
             uint32_t expected = ::Explorer2::Checksum::Crc32C(data + pageStart, usable);
-            uint32_t storedBE = Detail3D200::RdU32BE(data + pageStart + usable);
-            uint32_t storedLE = Detail3D200::RdU32LE(data + pageStart + usable);
+            uint32_t storedBE = DetailMeshSciCad::RdU32BE(data + pageStart + usable);
+            uint32_t storedLE = DetailMeshSciCad::RdU32LE(data + pageStart + usable);
             bool ok = (storedBE == expected || storedLE == expected);
             pageCrcState[pageIdx] = ok ? 1 : 2;
             return ok;
@@ -246,10 +246,10 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
                     size_t rotOpen = poseSv.find("<rotation"), rotClose = poseSv.find("</rotation>", rotOpen == std::string_view::npos ? 0 : rotOpen);
                     if (rotOpen != std::string_view::npos && rotClose != std::string_view::npos) {
                         std::string_view rotSv = poseSv.substr(rotOpen + 9, rotClose - rotOpen - 9);
-                        qw = DetailE57_200::XmlChildFloat(rotSv, "w", 1.0);
-                        qx = DetailE57_200::XmlChildFloat(rotSv, "x", 0.0);
-                        qy = DetailE57_200::XmlChildFloat(rotSv, "y", 0.0);
-                        qz = DetailE57_200::XmlChildFloat(rotSv, "z", 0.0);
+                        qw = DetailAstmE57::XmlChildFloat(rotSv, "w", 1.0);
+                        qx = DetailAstmE57::XmlChildFloat(rotSv, "x", 0.0);
+                        qy = DetailAstmE57::XmlChildFloat(rotSv, "y", 0.0);
+                        qz = DetailAstmE57::XmlChildFloat(rotSv, "z", 0.0);
                         double qn = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
                         if (qn > 1e-12) { qw /= qn; qx /= qn; qy /= qn; qz /= qn; }
                         else { qw = 1.0; qx = qy = qz = 0.0; }
@@ -257,9 +257,9 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
                     size_t trOpen = poseSv.find("<translation"), trClose = poseSv.find("</translation>", trOpen == std::string_view::npos ? 0 : trOpen);
                     if (trOpen != std::string_view::npos && trClose != std::string_view::npos) {
                         std::string_view trSv = poseSv.substr(trOpen + 12, trClose - trOpen - 12);
-                        tx = DetailE57_200::XmlChildFloat(trSv, "x", 0.0);
-                        ty = DetailE57_200::XmlChildFloat(trSv, "y", 0.0);
-                        tz = DetailE57_200::XmlChildFloat(trSv, "z", 0.0);
+                        tx = DetailAstmE57::XmlChildFloat(trSv, "x", 0.0);
+                        ty = DetailAstmE57::XmlChildFloat(trSv, "y", 0.0);
+                        tz = DetailAstmE57::XmlChildFloat(trSv, "z", 0.0);
                     }
                 }
             }
@@ -289,9 +289,9 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
             if (ptsTagGt == std::string_view::npos || ptsClose == std::string_view::npos || ptsClose <= ptsTagGt) return false;
 
             std::string_view ptsOpenTag = scanSv.substr(ptsOpen, ptsTagGt - ptsOpen + 1);
-            std::string_view ptsType    = DetailE57_200::XmlAttr(ptsOpenTag, "type");
-            std::string_view fileOffSv  = DetailE57_200::XmlAttr(ptsOpenTag, "fileOffset");
-            std::string_view recCntSv   = DetailE57_200::XmlAttr(ptsOpenTag, "recordCount");
+            std::string_view ptsType    = DetailAstmE57::XmlAttr(ptsOpenTag, "type");
+            std::string_view fileOffSv  = DetailAstmE57::XmlAttr(ptsOpenTag, "fileOffset");
+            std::string_view recCntSv   = DetailAstmE57::XmlAttr(ptsOpenTag, "recordCount");
             if (ptsType != "CompressedVector" || fileOffSv.empty() || recCntSv.empty()) return false;
 
             char* ep1 = nullptr;
@@ -309,7 +309,7 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
             if (protoGt == std::string_view::npos || protoGt >= protoClose) return false;
             std::string_view protoBody = ptsBody.substr(protoGt + 1, protoClose - protoGt - 1);
 
-            std::vector<DetailE57_200::E57FieldDesc> fields;
+            std::vector<DetailAstmE57::E57FieldDesc> fields;
             int idxCartX = -1, idxCartY = -1, idxCartZ = -1, idxCartInv = -1;
             int idxSphR  = -1, idxSphAz = -1, idxSphEl = -1, idxSphInv  = -1;
 
@@ -333,26 +333,26 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
                 size_t colon = qName.rfind(':');
                 std::string fieldName(colon == std::string_view::npos ? qName : qName.substr(colon + 1));
 
-                std::string_view fType = DetailE57_200::XmlAttr(fTag, "type");
-                DetailE57_200::E57FieldDesc fd;
+                std::string_view fType = DetailAstmE57::XmlAttr(fTag, "type");
+                DetailAstmE57::E57FieldDesc fd;
                 fd.name = fieldName;
 
                 auto parseAttrI64 = [&](std::string_view key, int64_t defV) -> int64_t {
-                    std::string_view s = DetailE57_200::XmlAttr(fTag, key);
+                    std::string_view s = DetailAstmE57::XmlAttr(fTag, key);
                     if (s.empty()) return defV;
                     return std::strtoll(std::string(s).c_str(), nullptr, 10);
                 };
                 auto parseAttrF64 = [&](std::string_view key, double defV) -> double {
-                    std::string_view s = DetailE57_200::XmlAttr(fTag, key);
+                    std::string_view s = DetailAstmE57::XmlAttr(fTag, key);
                     if (s.empty()) return defV;
                     double v = std::strtod(std::string(s).c_str(), nullptr);
                     return std::isfinite(v) ? v : defV;
                 };
 
                 if (fType == "Float") {
-                    std::string_view prec = DetailE57_200::XmlAttr(fTag, "precision");
-                    if (prec == "single") { fd.kind = DetailE57_200::E57FieldDesc::Float32; fd.bitWidth = 32; }
-                    else                  { fd.kind = DetailE57_200::E57FieldDesc::Float64; fd.bitWidth = 64; }
+                    std::string_view prec = DetailAstmE57::XmlAttr(fTag, "precision");
+                    if (prec == "single") { fd.kind = DetailAstmE57::E57FieldDesc::Float32; fd.bitWidth = 32; }
+                    else                  { fd.kind = DetailAstmE57::E57FieldDesc::Float64; fd.bitWidth = 64; }
                 } else if (fType == "Integer" || fType == "ScaledInteger") {
                     fd.minimum = parseAttrI64("minimum", -2147483648LL);
                     fd.maximum = parseAttrI64("maximum",  2147483647LL);
@@ -367,11 +367,11 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
                     }
                     fd.bitWidth = bits;
                     if (fType == "ScaledInteger") {
-                        fd.kind   = DetailE57_200::E57FieldDesc::ScaledInteger;
+                        fd.kind   = DetailAstmE57::E57FieldDesc::ScaledInteger;
                         fd.scale  = parseAttrF64("scale",  1.0);
                         fd.offset = parseAttrF64("offset", 0.0);
                     } else {
-                        fd.kind = DetailE57_200::E57FieldDesc::Integer;
+                        fd.kind = DetailAstmE57::E57FieldDesc::Integer;
                     }
                 } else {
                     return false;
@@ -409,8 +409,8 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
             if (!readLogicalBytes(secLogOff, 32, secHdr)) return false;
             if (secHdr[0] != 1) return false; // sectionId == 1 (CompressedVectorSection)
 
-            uint64_t secLogLen   = Detail3D200::RdU64LE(secHdr + 8);
-            uint64_t dataPhysOff = Detail3D200::RdU64LE(secHdr + 16);
+            uint64_t secLogLen   = DetailMeshSciCad::RdU64LE(secHdr + 8);
+            uint64_t dataPhysOff = DetailMeshSciCad::RdU64LE(secHdr + 16);
             uint64_t pktLogPos   = 0;
             if (secLogLen < 32 || !physToLogical(dataPhysOff, pktLogPos)) return false;
             uint64_t secLogEnd = secLogOff + secLogLen;
@@ -418,7 +418,7 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
 
             // 5. Iterate DataPackets & unpack planar bitstreams
             const size_t nFields = fields.size();
-            std::vector<DetailE57_200::E57BitStream> streams(nFields);
+            std::vector<DetailAstmE57::E57BitStream> streams(nFields);
             std::vector<double> recVals(nFields, 0.0);
             std::vector<uint8_t> pktBuf;
             uint64_t decodedCount = 0;
@@ -428,7 +428,7 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
                 uint8_t pktHdr[4] = {};
                 if (!readLogicalBytes(pktLogPos, 4, pktHdr)) return false;
                 uint8_t pktType = pktHdr[0];
-                size_t pktLen   = static_cast<size_t>(Detail3D200::RdU16LE(pktHdr + 2)) + 1;
+                size_t pktLen   = static_cast<size_t>(DetailMeshSciCad::RdU16LE(pktHdr + 2)) + 1;
                 if (pktLogPos + pktLen > secLogEnd) return false;
 
                 pktBuf.resize(pktLen);
@@ -436,12 +436,12 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
 
                 if (pktType == 1) { // DataPacket
                     if (pktLen < 6 + nFields * 2) return false;
-                    uint16_t bsCount = Detail3D200::RdU16LE(pktBuf.data() + 4);
+                    uint16_t bsCount = DetailMeshSciCad::RdU16LE(pktBuf.data() + 4);
                     if (bsCount != nFields) return false;
 
                     size_t payCursor = 6 + nFields * 2;
                     for (size_t f = 0; f < nFields; ++f) {
-                        uint16_t bsLen = Detail3D200::RdU16LE(pktBuf.data() + 6 + f * 2);
+                        uint16_t bsLen = DetailMeshSciCad::RdU16LE(pktBuf.data() + 6 + f * 2);
                         if (payCursor + bsLen > pktLen) return false;
                         if (bsLen > 0) streams[f].Append(pktBuf.data() + payCursor, bsLen);
                         payCursor += bsLen;
@@ -462,18 +462,18 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
                         for (size_t f = 0; f < nFields; ++f) {
                             const auto& fd = fields[f];
                             uint64_t rawBits = streams[f].ReadBitsLSB(fd.bitWidth);
-                            if (fd.kind == DetailE57_200::E57FieldDesc::Float32) {
+                            if (fd.kind == DetailAstmE57::E57FieldDesc::Float32) {
                                 uint32_t u32 = static_cast<uint32_t>(rawBits);
                                 float fv = 0.0f;
                                 std::memcpy(&fv, &u32, 4);
                                 if (!std::isfinite(fv)) finiteOk = false;
                                 recVals[f] = static_cast<double>(fv);
-                            } else if (fd.kind == DetailE57_200::E57FieldDesc::Float64) {
+                            } else if (fd.kind == DetailAstmE57::E57FieldDesc::Float64) {
                                 double dv = 0.0;
                                 std::memcpy(&dv, &rawBits, 8);
                                 if (!std::isfinite(dv)) finiteOk = false;
                                 recVals[f] = dv;
-                            } else if (fd.kind == DetailE57_200::E57FieldDesc::Integer) {
+                            } else if (fd.kind == DetailAstmE57::E57FieldDesc::Integer) {
                                 int64_t iv = static_cast<int64_t>(static_cast<uint64_t>(fd.minimum) + rawBits);
                                 recVals[f] = static_cast<double>(iv);
                             } else { // ScaledInteger
@@ -521,8 +521,8 @@ inline bool ParseAstmE57(const uint8_t* data, size_t size, const std::wstring& e
         }
 
         if (allPts.empty()) return false;
-        float r = Detail3D200::ComputePointCloudSpan(allPts) * 0.018f;
-        for (const auto& pt : allPts) Detail3D200::AddPointTetra(mesh, pt, r);
+        float r = DetailMeshSciCad::ComputePointCloudSpan(allPts) * 0.018f;
+        for (const auto& pt : allPts) DetailMeshSciCad::AddPointTetra(mesh, pt, r);
         return !mesh.vertices.empty() && !mesh.tris.empty();
     }
     return false;

@@ -19,7 +19,7 @@ inline bool ParseWindowsPrefetch(const std::vector<uint8_t>& raw, ParsedOfficeDo
 #ifndef _WIN32
         return false;   // Windows 10+ compressed Prefetch: Xpress Huffman comes from ntdll, which Linux does not have
 #else
-        const uint32_t uncompSz = DetailSys100::RdU32LE(raw.data() + 4);
+        const uint32_t uncompSz = DetailBinarySysDoc::RdU32LE(raw.data() + 4);
         if (uncompSz < 84 || uncompSz > 32u * 1024u * 1024u) return false;
 
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
@@ -64,37 +64,37 @@ inline bool ParseWindowsPrefetch(const std::vector<uint8_t>& raw, ParsedOfficeDo
 #endif
     }
 
-    const uint32_t sccaVer = DetailSys100::RdU32LE(scca + 0);
+    const uint32_t sccaVer = DetailBinarySysDoc::RdU32LE(scca + 0);
     if (sccaVer != 17 && sccaVer != 23 && sccaVer != 26 && sccaVer != 30 && sccaVer != 31) return false;
 
-    const std::wstring exeName = DetailSys100::ReadUtf16LEBounded(scca + 16, 60, true);
-    const uint32_t pfHash      = DetailSys100::RdU32LE(scca + 76);
+    const std::wstring exeName = DetailBinarySysDoc::ReadUtf16LEBounded(scca + 16, 60, true);
+    const uint32_t pfHash      = DetailBinarySysDoc::RdU32LE(scca + 76);
 
     uint32_t metricsOff = 0, metricsCnt = 0, fnStringsOff = 0, fnStringsSz = 0, volsCnt = 0, runCount = 0;
     std::vector<std::wstring> runTimes;
 
     if (sccaLen >= 156) {
-        metricsOff   = DetailSys100::RdU32LE(scca + 84);
-        metricsCnt   = DetailSys100::RdU32LE(scca + 88);
-        fnStringsOff = DetailSys100::RdU32LE(scca + 100);
-        fnStringsSz  = DetailSys100::RdU32LE(scca + 104);
-        volsCnt      = DetailSys100::RdU32LE(scca + 112);
+        metricsOff   = DetailBinarySysDoc::RdU32LE(scca + 84);
+        metricsCnt   = DetailBinarySysDoc::RdU32LE(scca + 88);
+        fnStringsOff = DetailBinarySysDoc::RdU32LE(scca + 100);
+        fnStringsSz  = DetailBinarySysDoc::RdU32LE(scca + 104);
+        volsCnt      = DetailBinarySysDoc::RdU32LE(scca + 112);
 
         if (sccaVer == 17) {
-            const uint64_t ft = DetailSys100::RdU64LE(scca + 120);
-            if (ft != 0) runTimes.push_back(DetailSys100::FormatFileTimeUtc(ft));
-            runCount = DetailSys100::RdU32LE(scca + 144);
+            const uint64_t ft = DetailBinarySysDoc::RdU64LE(scca + 120);
+            if (ft != 0) runTimes.push_back(DetailBinarySysDoc::FormatFileTimeUtc(ft));
+            runCount = DetailBinarySysDoc::RdU32LE(scca + 144);
         } else if (sccaVer == 23 && sccaLen >= 160) {
-            const uint64_t ft = DetailSys100::RdU64LE(scca + 128);
-            if (ft != 0) runTimes.push_back(DetailSys100::FormatFileTimeUtc(ft));
-            runCount = DetailSys100::RdU32LE(scca + 152);
+            const uint64_t ft = DetailBinarySysDoc::RdU64LE(scca + 128);
+            if (ft != 0) runTimes.push_back(DetailBinarySysDoc::FormatFileTimeUtc(ft));
+            runCount = DetailBinarySysDoc::RdU32LE(scca + 152);
         } else if ((sccaVer == 26 || sccaVer >= 30) && sccaLen >= 212) {
             for (int t = 0; t < 8; ++t) {
-                const uint64_t ft = DetailSys100::RdU64LE(scca + 128 + t * 8);
-                if (ft != 0) runTimes.push_back(DetailSys100::FormatFileTimeUtc(ft));
+                const uint64_t ft = DetailBinarySysDoc::RdU64LE(scca + 128 + t * 8);
+                if (ft != 0) runTimes.push_back(DetailBinarySysDoc::FormatFileTimeUtc(ft));
             }
             const size_t rcOff = (sccaVer >= 30 && metricsOff == 296) ? 200 : 208;
-            if (rcOff + 4 <= sccaLen) runCount = DetailSys100::RdU32LE(scca + rcOff);
+            if (rcOff + 4 <= sccaLen) runCount = DetailBinarySysDoc::RdU32LE(scca + rcOff);
         }
     }
 
@@ -111,7 +111,7 @@ inline bool ParseWindowsPrefetch(const std::vector<uint8_t>& raw, ParsedOfficeDo
     infoSh.rows.push_back({ L"Container Encoding", isMam ? L"MAM XPRESS Huffman Compressed" : L"Raw Uncompressed SCCA" });
     infoSh.rows.push_back({ L"Prefetch Version", verLabel });
     infoSh.rows.push_back({ L"Executable Name", exeName });
-    infoSh.rows.push_back({ L"Prefetch Hash", DetailSys100::Hex32(pfHash) });
+    infoSh.rows.push_back({ L"Prefetch Hash", DetailBinarySysDoc::Hex32(pfHash) });
     infoSh.rows.push_back({ L"Execution Run Count", std::to_wstring(runCount) });
     infoSh.rows.push_back({ L"File Metrics Count", std::to_wstring(metricsCnt) });
     infoSh.rows.push_back({ L"Volumes Count", std::to_wstring(volsCnt) });
@@ -131,7 +131,7 @@ inline bool ParseWindowsPrefetch(const std::vector<uint8_t>& raw, ParsedOfficeDo
         std::wstring cur;
         int idx = 1;
         for (size_t off = 0; off + 2 <= avail && filesSh.rows.size() <= 3000; off += 2) {
-            const wchar_t wc = static_cast<wchar_t>(DetailSys100::RdU16LE(fp + off));
+            const wchar_t wc = static_cast<wchar_t>(DetailBinarySysDoc::RdU16LE(fp + off));
             if (wc == 0) {
                 if (!cur.empty()) {
                     filesSh.rows.push_back({ std::to_wstring(idx++), cur });

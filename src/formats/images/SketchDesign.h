@@ -13,288 +13,13 @@ using ::Explorer2::ByteIO::RdU32BE;
 using ::Explorer2::ByteIO::RdU64LE;
 using ::Explorer2::ByteIO::RdU64BE;
 
-inline std::wstring Utf8ToWideStr(std::string_view sv) {
-    std::wstring out;
-    out.reserve(sv.size());
-    size_t i = 0;
-    while (i < sv.size()) {
-        uint8_t b0 = static_cast<uint8_t>(sv[i]);
-        uint32_t cp = 0xFFFDu;
-        if (b0 < 0x80u) {
-            cp = b0;
-            ++i;
-        } else if ((b0 & 0xE0u) == 0xC0u && i + 1 < sv.size()) {
-            uint8_t b1 = static_cast<uint8_t>(sv[i + 1]);
-            if ((b1 & 0xC0u) == 0x80u) {
-                cp = ((static_cast<uint32_t>(b0 & 0x1Fu) << 6) | (b1 & 0x3Fu));
-                if (cp < 0x80u) cp = 0xFFFDu;
-                i += 2;
-            } else {
-                ++i;
-            }
-        } else if ((b0 & 0xF0u) == 0xE0u && i + 2 < sv.size()) {
-            uint8_t b1 = static_cast<uint8_t>(sv[i + 1]);
-            uint8_t b2 = static_cast<uint8_t>(sv[i + 2]);
-            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
-                cp = (static_cast<uint32_t>(b0 & 0x0Fu) << 12) |
-                     (static_cast<uint32_t>(b1 & 0x3Fu) << 6) |
-                     (b2 & 0x3Fu);
-                if (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu)) cp = 0xFFFDu;
-                i += 3;
-            } else {
-                ++i;
-            }
-        } else if ((b0 & 0xF8u) == 0xF0u && i + 3 < sv.size()) {
-            uint8_t b1 = static_cast<uint8_t>(sv[i + 1]);
-            uint8_t b2 = static_cast<uint8_t>(sv[i + 2]);
-            uint8_t b3 = static_cast<uint8_t>(sv[i + 3]);
-            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
-                cp = (static_cast<uint32_t>(b0 & 0x07u) << 18) |
-                     (static_cast<uint32_t>(b1 & 0x3Fu) << 12) |
-                     (static_cast<uint32_t>(b2 & 0x3Fu) << 6) |
-                     (b3 & 0x3Fu);
-                if (cp < 0x10000u || cp > 0x10FFFFu) cp = 0xFFFDu;
-                i += 4;
-            } else {
-                ++i;
-            }
-        } else {
-            ++i;
-        }
-
-        if constexpr (sizeof(wchar_t) == 2) {
-            if (cp <= 0xFFFFu) {
-                out.push_back(static_cast<wchar_t>(cp));
-            } else {
-                uint32_t v = cp - 0x10000u;
-                out.push_back(static_cast<wchar_t>(0xD800u + (v >> 10)));
-                out.push_back(static_cast<wchar_t>(0xDC00u + (v & 0x3FFu)));
-            }
-        } else {
-            out.push_back(static_cast<wchar_t>(cp));
-        }
-    }
-    return out;
-}
-
-// Pure-C++ PNG decoder (1/2/4/8/16-bit Gray, RGB, Indexed+PLTE+tRNS, GrayAlpha, RGBA; non-interlaced & Adam7)
-inline uint8_t PngPaethPredictor(int a, int b, int c) {
-    int p = a + b - c;
-    int pa = std::abs(p - a);
-    int pb = std::abs(p - b);
-    int pc = std::abs(p - c);
-    if (pa <= pb && pa <= pc) return static_cast<uint8_t>(a);
-    if (pb <= pc) return static_cast<uint8_t>(b);
-    return static_cast<uint8_t>(c);
-}
-
-inline bool DecodePngPureCpp(
-    const uint8_t* data, size_t size,
-    uint32_t& outW, uint32_t& outH,
-    std::vector<uint8_t>& outStraightRgba)
-{
-    static constexpr uint8_t kPngSig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
-    if (!data || size < 33 || std::memcmp(data, kPngSig, 8) != 0) return false;
-
-    uint32_t w = 0, h = 0;
-    uint8_t bitDepth = 0, colorType = 0, compMethod = 0, filterMethod = 0, interlace = 0;
-    bool hasIhdr = false;
-    uint8_t palette[256][4] = {};
-    uint32_t palCount = 0;
-    bool hasTrnsKey = false;
-    uint16_t trnsGray = 0, trnsR = 0, trnsG = 0, trnsB = 0;
-    std::vector<uint8_t> idatCompressed;
-
-    size_t pos = 8;
-    while (pos + 12 <= size) {
-        uint32_t cLen = RdU32BE(data + pos);
-        const uint8_t* cType = data + pos + 4;
-        if (cLen > size - (pos + 12)) break;
-        const uint8_t* cData = data + pos + 8;
-
-        if (std::memcmp(cType, "IHDR", 4) == 0) {
-            if (cLen < 13) return false;
-            w = RdU32BE(cData);
-            h = RdU32BE(cData + 4);
-            bitDepth = cData[8];
-            colorType = cData[9];
-            compMethod = cData[10];
-            filterMethod = cData[11];
-            interlace = cData[12];
-            if (w == 0 || h == 0 || w > 16384 || h > 16384) return false;
-            if (compMethod != 0 || filterMethod != 0 || interlace > 1) return false;
-            if (static_cast<uint64_t>(w) * h > 64ull * 1024ull * 1024ull) return false;
-            hasIhdr = true;
-        } else if (std::memcmp(cType, "PLTE", 4) == 0) {
-            palCount = std::min<uint32_t>(256u, cLen / 3u);
-            for (uint32_t i = 0; i < palCount; ++i) {
-                palette[i][0] = cData[i * 3 + 0];
-                palette[i][1] = cData[i * 3 + 1];
-                palette[i][2] = cData[i * 3 + 2];
-                palette[i][3] = 255;
-            }
-        } else if (std::memcmp(cType, "tRNS", 4) == 0 && hasIhdr) {
-            if (colorType == 3) {
-                uint32_t n = std::min<uint32_t>(256u, cLen);
-                for (uint32_t i = 0; i < n; ++i) palette[i][3] = cData[i];
-            } else if (colorType == 0 && cLen >= 2) {
-                trnsGray = RdU16BE(cData);
-                hasTrnsKey = true;
-            } else if (colorType == 2 && cLen >= 6) {
-                trnsR = RdU16BE(cData);
-                trnsG = RdU16BE(cData + 2);
-                trnsB = RdU16BE(cData + 4);
-                hasTrnsKey = true;
-            }
-        } else if (std::memcmp(cType, "IDAT", 4) == 0) {
-            if (idatCompressed.size() + cLen > 128ull * 1024ull * 1024ull) return false;
-            idatCompressed.insert(idatCompressed.end(), cData, cData + cLen);
-        } else if (std::memcmp(cType, "IEND", 4) == 0) {
-            break;
-        }
-        pos += 12ull + cLen;
-    }
-
-    if (!hasIhdr || idatCompressed.empty()) return false;
-    uint32_t channels = 0;
-    if (colorType == 0) channels = 1;
-    else if (colorType == 2) channels = 3;
-    else if (colorType == 3) channels = 1;
-    else if (colorType == 4) channels = 2;
-    else if (colorType == 6) channels = 4;
-    else return false;
-
-    if (colorType == 3 && (bitDepth != 1 && bitDepth != 2 && bitDepth != 4 && bitDepth != 8)) return false;
-    if (colorType == 0 && (bitDepth != 1 && bitDepth != 2 && bitDepth != 4 && bitDepth != 8 && bitDepth != 16)) return false;
-    if ((colorType == 2 || colorType == 4 || colorType == 6) && (bitDepth != 8 && bitDepth != 16)) return false;
-    if (colorType == 3 && palCount == 0) return false;
-
-    const uint32_t bitsPerPixel = channels * bitDepth;
-    const size_t filterBpp = std::max<size_t>(1u, (bitsPerPixel + 7u) / 8u);
-
-    std::vector<uint8_t> inflated;
-    size_t maxInflated = static_cast<size_t>(h) * (static_cast<size_t>(w) * 8u + 16u) + 4096u;
-    if (!ZipDeflate::InflateZlib(idatCompressed.data(), idatCompressed.size(), inflated, maxInflated)) {
-        return false;
-    }
-
-    outW = w;
-    outH = h;
-    outStraightRgba.assign(static_cast<size_t>(w) * h * 4u, 0u);
-
-    auto unpackPixelRun = [&](const uint8_t* rowBytes, uint32_t passW, uint32_t x0, uint32_t dx, uint32_t dstY) {
-        for (uint32_t px = 0; px < passW; ++px) {
-            uint32_t dstX = x0 + px * dx;
-            if (dstX >= w || dstY >= h) continue;
-            uint8_t r = 0, g = 0, b = 0, a = 255;
-            if (bitDepth < 8) {
-                uint32_t bitIdx = px * bitDepth;
-                uint8_t byte = rowBytes[bitIdx >> 3];
-                uint32_t shift = 8u - bitDepth - (bitIdx & 7u);
-                uint8_t val = static_cast<uint8_t>((byte >> shift) & ((1u << bitDepth) - 1u));
-                if (colorType == 3) {
-                    r = palette[val][0]; g = palette[val][1]; b = palette[val][2]; a = palette[val][3];
-                } else {
-                    uint8_t maxV = static_cast<uint8_t>((1u << bitDepth) - 1u);
-                    r = g = b = static_cast<uint8_t>((val * 255u + (maxV >> 1)) / maxV);
-                    if (hasTrnsKey && val == trnsGray) a = 0;
-                }
-            } else if (bitDepth == 8) {
-                const uint8_t* p = rowBytes + static_cast<size_t>(px) * channels;
-                if (colorType == 0) {
-                    r = g = b = p[0];
-                    if (hasTrnsKey && p[0] == (trnsGray & 0xFFu)) a = 0;
-                } else if (colorType == 2) {
-                    r = p[0]; g = p[1]; b = p[2];
-                    if (hasTrnsKey && p[0] == (trnsR & 0xFFu) && p[1] == (trnsG & 0xFFu) && p[2] == (trnsB & 0xFFu)) a = 0;
-                } else if (colorType == 3) {
-                    uint8_t idx = p[0];
-                    r = palette[idx][0]; g = palette[idx][1]; b = palette[idx][2]; a = palette[idx][3];
-                } else if (colorType == 4) {
-                    r = g = b = p[0]; a = p[1];
-                } else {
-                    r = p[0]; g = p[1]; b = p[2]; a = p[3];
-                }
-            } else { // 16-bit
-                const uint8_t* p = rowBytes + static_cast<size_t>(px) * channels * 2u;
-                if (colorType == 0) {
-                    uint16_t v16 = RdU16BE(p);
-                    r = g = b = static_cast<uint8_t>(v16 >> 8);
-                    if (hasTrnsKey && v16 == trnsGray) a = 0;
-                } else if (colorType == 2) {
-                    uint16_t r16 = RdU16BE(p), g16 = RdU16BE(p + 2), b16 = RdU16BE(p + 4);
-                    r = static_cast<uint8_t>(r16 >> 8);
-                    g = static_cast<uint8_t>(g16 >> 8);
-                    b = static_cast<uint8_t>(b16 >> 8);
-                    if (hasTrnsKey && r16 == trnsR && g16 == trnsG && b16 == trnsB) a = 0;
-                } else if (colorType == 4) {
-                    r = g = b = p[0]; a = p[2];
-                } else {
-                    r = p[0]; g = p[2]; b = p[4]; a = p[6];
-                }
-            }
-            size_t di = (static_cast<size_t>(dstY) * w + dstX) * 4u;
-            outStraightRgba[di + 0] = r;
-            outStraightRgba[di + 1] = g;
-            outStraightRgba[di + 2] = b;
-            outStraightRgba[di + 3] = a;
-        }
-    };
-
-    size_t srcOff = 0;
-    auto decodePass = [&](uint32_t x0, uint32_t dx, uint32_t y0, uint32_t dy) -> bool {
-        if (x0 >= w || y0 >= h) return true;
-        uint32_t passW = (w - x0 + dx - 1u) / dx;
-        uint32_t passH = (h - y0 + dy - 1u) / dy;
-        size_t rowBytes = (static_cast<size_t>(passW) * bitsPerPixel + 7u) / 8u;
-        if (srcOff + static_cast<size_t>(passH) * (1u + rowBytes) > inflated.size()) return false;
-
-        std::vector<uint8_t> prevRow(rowBytes, 0u);
-        std::vector<uint8_t> curRow(rowBytes, 0u);
-        for (uint32_t py = 0; py < passH; ++py) {
-            uint8_t filt = inflated[srcOff++];
-            const uint8_t* raw = inflated.data() + srcOff;
-            srcOff += rowBytes;
-            for (size_t i = 0; i < rowBytes; ++i) {
-                int left = (i >= filterBpp) ? curRow[i - filterBpp] : 0;
-                int up = prevRow[i];
-                int upLeft = (i >= filterBpp) ? prevRow[i - filterBpp] : 0;
-                uint8_t v = raw[i];
-                switch (filt) {
-                    case 0: curRow[i] = v; break;
-                    case 1: curRow[i] = static_cast<uint8_t>(v + left); break;
-                    case 2: curRow[i] = static_cast<uint8_t>(v + up); break;
-                    case 3: curRow[i] = static_cast<uint8_t>(v + ((left + up) >> 1)); break;
-                    case 4: curRow[i] = static_cast<uint8_t>(v + PngPaethPredictor(left, up, upLeft)); break;
-                    default: return false;
-                }
-            }
-            unpackPixelRun(curRow.data(), passW, x0, dx, y0 + py * dy);
-            prevRow.swap(curRow);
-        }
-        return true;
-    };
-
-    if (interlace == 0) {
-        return decodePass(0, 1, 0, 1);
-    }
-    static constexpr uint32_t kAdam7[7][4] = {
-        {0, 8, 0, 8}, {4, 8, 0, 8}, {0, 4, 4, 8}, {2, 4, 0, 4},
-        {0, 2, 2, 4}, {1, 2, 0, 2}, {0, 1, 1, 2}
-    };
-    for (int p = 0; p < 7; ++p) {
-        if (!decodePass(kAdam7[p][0], kAdam7[p][1], kAdam7[p][2], kAdam7[p][3])) return false;
-    }
-    return true;
-}
-
 inline bool DecodeEmbeddedRasterStraightRgba(
     const uint8_t* bytes, size_t len,
     uint32_t& outW, uint32_t& outH,
     std::vector<uint8_t>& outRgba)
 {
     if (!bytes || len < 12) return false;
-    if (DecodePngPureCpp(bytes, len, outW, outH, outRgba)) return true;
+    if (DetailPngPure::DecodePng(bytes, len, outW, outH, outRgba)) return true;
 
     if (len >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
         DetailBlpJpeg::RawJpegDecoded jpg;
@@ -349,7 +74,7 @@ inline bool DecodeEmbeddedRasterStraightRgba(
     }
 
     ExtendedImageInfo wicInfo;
-    if (DetailImg100::DecodeEmbeddedWicBuffer(bytes, len, L"", wicInfo) && wicInfo.valid && wicInfo.width > 0 && wicInfo.height > 0) {
+    if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(bytes, len, L"", wicInfo) && wicInfo.valid && wicInfo.width > 0 && wicInfo.height > 0) {
         outW = wicInfo.width;
         outH = wicInfo.height;
         size_t n = static_cast<size_t>(outW) * outH;
@@ -965,7 +690,7 @@ struct SketchZipImageCache {
         if (it != cache.end()) return it->second.ok ? &it->second : nullptr;
 
         DecodedImg& slot = cache[refPath];
-        std::wstring wRef = DetailSketch::Utf8ToWideStr(refPath);
+        std::wstring wRef = PathUtils::Utf8ToWide(refPath);
         for (wchar_t& ch : wRef) {
             if (ch == L'\\') ch = L'/';
             ch = static_cast<wchar_t>(towlower(ch));
@@ -1132,7 +857,7 @@ inline void DrawSketchTextLayer(
         if (fh > 4.0 && curY > fh) break;
         if (ch != ' ') {
             for (int ry = 0; ry < 7; ++ry) {
-                uint8_t bits = DetailImg100::GlyphRow5x7(ch, ry);
+                uint8_t bits = DetailLayeredAndHdrImg::GlyphRow5x7(ch, ry);
                 for (int rx = 0; rx < 5; ++rx) {
                     if (((bits >> (4 - rx)) & 1) == 0) continue;
                     SkPt lp{ curX + (rx * glyphScale) / std::max(1e-4, scale),
@@ -1169,7 +894,7 @@ inline void RenderSketchLayerRecursive(
     std::string cls = layer.GetString("_class");
     std::string nm = layer.GetString("name");
     if (!nm.empty() && ioLayerNames.size() < 64) {
-        ioLayerNames.push_back(DetailSketch::Utf8ToWideStr(nm));
+        ioLayerNames.push_back(PathUtils::Utf8ToWide(nm));
     }
 
     float localOp = 1.0f;
@@ -1337,7 +1062,7 @@ inline bool DecodeSketchDocument(const uint8_t* data, size_t size, uint32_t maxD
                         std::string ref = pr.GetString("_ref");
                         if (!ref.empty()) {
                             if (ref.size() < 5 || ref.substr(ref.size() - 5) != ".json") ref += ".json";
-                            std::wstring wref = Utf8ToWideStr(ref);
+                            std::wstring wref = PathUtils::Utf8ToWide(ref);
                             for (wchar_t& ch : wref) {
                                 if (ch == L'\\') ch = L'/';
                                 ch = static_cast<wchar_t>(towlower(ch));
@@ -1441,6 +1166,18 @@ inline bool DecodeSketchDocument(const uint8_t* data, size_t size, uint32_t maxD
         }
 
         const size_t numPx = static_cast<size_t>(outW) * outH;
+        bool drewVisiblePixel = false;
+        for (size_t i = 0; i < numPx; ++i) {
+            if (canvas.premulRgba[i * 4u + 3] > (1.0f / 512.0f)) {
+                drewVisiblePixel = true;
+                break;
+            }
+        }
+        if (!drewVisiblePixel) {
+            // 0 visible shapes/bitmaps/backgrounds rendered on this page -> try next page or fall back to previews/preview.png
+            continue;
+        }
+
         outInfo.width = outW;
         outInfo.height = outH;
         outInfo.origWidth = static_cast<uint32_t>(std::max(1l, std::lround(docW)));

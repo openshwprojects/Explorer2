@@ -441,14 +441,8 @@ inline bool ParseApacheAvro(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
         }
     }
 
-    // Fallback ONLY for unframed schema-only container ("Obj\x01avro.schema{...}" in testdata/device_events.avro)
     if (!hasBinaryOcf) {
-        if (raw.size() > 16 && std::memcmp(raw.data() + 4, "avro.schema", 11) == 0) {
-            schemaJson.assign(reinterpret_cast<const char*>(raw.data() + 15), raw.size() - 15);
-            pos = raw.size();
-        } else {
-            return false;
-        }
+        return false;
     }
 
     // 2. Parse avro.schema JSON into recursive AvroType tree
@@ -518,7 +512,19 @@ inline bool ParseApacheAvro(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                 decPtr = decompressed.data();
                 decLen = decompressed.size();
             } else if (codec == "snappy") {
-                if (blkLen < 4 || !ParquetDetail::SnappyDecompress(blkPtr, blkLen - 4, decompressed, 32 * 1024 * 1024)) break;
+                if (blkLen < 4 || !::Explorer2::StreamCodecs::SnappyDecompress(blkPtr, blkLen - 4, decompressed, 32 * 1024 * 1024)) break;
+                decPtr = decompressed.data();
+                decLen = decompressed.size();
+            } else if (codec == "zstandard" || codec == "zstd") {
+                if (!::Explorer2::StreamCodecs::DecompressZstdFrame(blkPtr, blkLen, decompressed, 32 * 1024 * 1024)) break;
+                decPtr = decompressed.data();
+                decLen = decompressed.size();
+            } else if (codec == "bzip2") {
+                if (!::Explorer2::StreamCodecs::DecompressBzip2Stream(blkPtr, blkLen, decompressed, 32 * 1024 * 1024)) break;
+                decPtr = decompressed.data();
+                decLen = decompressed.size();
+            } else if (codec == "xz") {
+                if (!::Explorer2::StreamCodecs::DecompressXzStream(blkPtr, blkLen, decompressed, 32 * 1024 * 1024)) break;
                 decPtr = decompressed.data();
                 decLen = decompressed.size();
             } else if (codec != "null" && !codec.empty()) {

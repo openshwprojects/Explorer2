@@ -3784,7 +3784,6 @@ std::vector<uint8_t> CompressBrotliRfc7932ForTest(const uint8_t* raw, size_t len
         // emit a small uncompressed non-last meta-block for it, else emit a compressed meta-block!
         size_t chunkLen = std::min<size_t>(len - chunkOff, 32768u);
         const uint8_t* src = raw + chunkOff;
-        const bool isLastChunk = (chunkOff + chunkLen == len);
 
         struct BrCmd { size_t litStart; size_t insLen; size_t copyLen; size_t dist; };
         std::vector<BrCmd> cmds;
@@ -5600,7 +5599,7 @@ void RunFormatTestsArchives(TestCounter& tc) {
     }
 
     RemoveDirTreeForStage15(baseDir);
-    RunFormatTestsArchivesBatch70(tc);
+    RunFormatTestsArchivesSystemPak(tc);
 }
 
 } // namespace Explorer2::SelfTestSuite

@@ -2,9 +2,39 @@
 // ImageFormatCommon.h — Shared non-format codecs, bit-readers, color/RAW/GPU/ISOBMFF helpers
 // Included inside `namespace Explorer2` in `ImageFormatLoader.cpp` before `formats/*.h`.
 
+#include "../../BrotliDecode.h"
+#include "../../StreamCodecs.h"
+
+namespace Explorer2_DetailForward {} // keep file self-documenting when included inside namespace Explorer2
+
 namespace Formats {
 
-namespace DetailImg100 {
+namespace DetailPngPure {
+
+inline bool DecodePng(
+    const uint8_t* data,
+    size_t size,
+    uint32_t& outW,
+    uint32_t& outH,
+    std::vector<uint8_t>& outStraightRgba,
+    uint32_t* outOrigChannels = nullptr,
+    uint32_t* outOrigBitDepth = nullptr)
+{
+    return GpuTex::DecodePng(data, size, outW, outH, outStraightRgba, outOrigChannels, outOrigBitDepth);
+}
+
+inline bool DecodePngToImageInfo(
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& fmtLabel,
+    ExtendedImageInfo& outInfo)
+{
+    return GpuTex::DecodePngToImageInfo(data, size, fmtLabel, outInfo);
+}
+
+} // namespace DetailPngPure
+
+namespace DetailLayeredAndHdrImg {
 
 using ::Explorer2::ByteIO::RdU16LE;
 using ::Explorer2::ByteIO::RdU16BE;
@@ -15,6 +45,96 @@ using ::Explorer2::ByteIO::RdU32BE;
 using ::Explorer2::ByteIO::RdU64LE;
 using ::Explorer2::ByteIO::RdU64BE;
 using ::Explorer2::ByteIO::HalfToFloat;
+
+enum class LayerBlendOp {
+    SrcOver,
+    Multiply,
+    Screen,
+    Plus,
+    Add = Plus,
+    Lighten,
+    Darken,
+    Overlay,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Subtract,
+    Divide
+};
+
+// Blend premultiplied BGRA source pixel onto premultiplied BGRA canvas
+inline void BlendPremulBgraPixel(
+    uint8_t* dstBgra,
+    uint8_t srcB_pm, uint8_t srcG_pm, uint8_t srcR_pm, uint8_t srcA,
+    float opacity,
+    LayerBlendOp op)
+{
+    if (srcA == 0 || opacity <= 0.0f) return;
+    float sa = (static_cast<float>(srcA) / 255.0f) * std::clamp(opacity, 0.0f, 1.0f);
+    if (sa <= 0.0f) return;
+
+    float scaleSrc = std::clamp(opacity, 0.0f, 1.0f);
+    float sr_pm = (static_cast<float>(srcR_pm) / 255.0f) * scaleSrc;
+    float sg_pm = (static_cast<float>(srcG_pm) / 255.0f) * scaleSrc;
+    float sb_pm = (static_cast<float>(srcB_pm) / 255.0f) * scaleSrc;
+
+    float da = static_cast<float>(dstBgra[3]) / 255.0f;
+    float dr_pm = static_cast<float>(dstBgra[2]) / 255.0f;
+    float dg_pm = static_cast<float>(dstBgra[1]) / 255.0f;
+    float db_pm = static_cast<float>(dstBgra[0]) / 255.0f;
+
+    float outA = sa + da * (1.0f - sa);
+    float outR_pm = 0.0f, outG_pm = 0.0f, outB_pm = 0.0f;
+
+    if (op == LayerBlendOp::SrcOver || da <= 1e-5f) {
+        outR_pm = sr_pm + dr_pm * (1.0f - sa);
+        outG_pm = sg_pm + dg_pm * (1.0f - sa);
+        outB_pm = sb_pm + db_pm * (1.0f - sa);
+    } else if (op == LayerBlendOp::Plus) {
+        outR_pm = std::min(1.0f, sr_pm + dr_pm);
+        outG_pm = std::min(1.0f, sg_pm + dg_pm);
+        outB_pm = std::min(1.0f, sb_pm + db_pm);
+        outA = std::min(1.0f, sa + da);
+    } else {
+        float sr = std::clamp(sr_pm / sa, 0.0f, 1.0f);
+        float sg = std::clamp(sg_pm / sa, 0.0f, 1.0f);
+        float sb = std::clamp(sb_pm / sa, 0.0f, 1.0f);
+        float dr = std::clamp(dr_pm / da, 0.0f, 1.0f);
+        float dg = std::clamp(dg_pm / da, 0.0f, 1.0f);
+        float db = std::clamp(db_pm / da, 0.0f, 1.0f);
+        auto blendCh = [&](float s, float d) -> float {
+            switch (op) {
+                case LayerBlendOp::Multiply:   return s * d;
+                case LayerBlendOp::Screen:     return s + d - s * d;
+                case LayerBlendOp::Lighten:    return std::max(s, d);
+                case LayerBlendOp::Darken:     return std::min(s, d);
+                case LayerBlendOp::Overlay:    return (d <= 0.5f) ? (2.0f * s * d) : (1.0f - 2.0f * (1.0f - s) * (1.0f - d));
+                case LayerBlendOp::HardLight:  return (s <= 0.5f) ? (2.0f * s * d) : (1.0f - 2.0f * (1.0f - s) * (1.0f - d));
+                case LayerBlendOp::SoftLight:  return (s <= 0.5f)
+                    ? (d - (1.0f - 2.0f * s) * d * (1.0f - d))
+                    : (d + (2.0f * s - 1.0f) * (((d <= 0.25f) ? (((16.0f * d - 12.0f) * d + 4.0f) * d) : std::sqrt(d)) - d));
+                case LayerBlendOp::ColorDodge: return (s >= 1.0f - 1e-5f) ? 1.0f : std::min(1.0f, d / (1.0f - s));
+                case LayerBlendOp::ColorBurn:  return (s <= 1e-5f) ? 0.0f : (1.0f - std::min(1.0f, (1.0f - d) / s));
+                case LayerBlendOp::Difference: return std::abs(d - s);
+                case LayerBlendOp::Exclusion:  return s + d - 2.0f * s * d;
+                case LayerBlendOp::Subtract:   return std::max(0.0f, d - s);
+                case LayerBlendOp::Divide:     return (s <= 1e-5f) ? 1.0f : std::min(1.0f, d / s);
+                default: return s;
+            }
+        };
+        outR_pm = sr_pm * (1.0f - da) + dr_pm * (1.0f - sa) + sa * da * blendCh(sr, dr);
+        outG_pm = sg_pm * (1.0f - da) + dg_pm * (1.0f - sa) + sa * da * blendCh(sg, dg);
+        outB_pm = sb_pm * (1.0f - da) + db_pm * (1.0f - sa) + sa * da * blendCh(sb, db);
+    }
+
+    dstBgra[0] = static_cast<uint8_t>(std::clamp(outB_pm * 255.0f + 0.5f, 0.0f, 255.0f));
+    dstBgra[1] = static_cast<uint8_t>(std::clamp(outG_pm * 255.0f + 0.5f, 0.0f, 255.0f));
+    dstBgra[2] = static_cast<uint8_t>(std::clamp(outR_pm * 255.0f + 0.5f, 0.0f, 255.0f));
+    dstBgra[3] = static_cast<uint8_t>(std::clamp(outA    * 255.0f + 0.5f, 0.0f, 255.0f));
+}
 
 // Minimal 5x7 ASCII bitmap font for rendering technical badges
 inline uint8_t GlyphRow5x7(char c, int row) {
@@ -93,15 +213,41 @@ inline void DrawBitmapText5x7(
     }
 }
 
-// Decode an embedded PNG, JPEG, JP2, or JXL buffer via Windows WIC into ExtendedImageInfo
-inline bool DecodeEmbeddedWicBuffer(const uint8_t* bytes, size_t len, const std::wstring& fmtLabel, ExtendedImageInfo& outInfo) {
+// Decode an embedded PNG, JPEG, JP2, or JXL buffer (pure-C++ PNG first, then Windows WIC) into ExtendedImageInfo
+inline bool DecodeEmbeddedWicBuffer(
+    const uint8_t* bytes,
+    size_t len,
+    const std::wstring& fmtLabel,
+    ExtendedImageInfo& outInfo,
+    uint32_t maxDim = 16384u)
+{
+    if (!bytes || len < 8 || len > 0x7FFFFFFFu || maxDim == 0u) return false;
+    if (len >= 33 && bytes[0] == 0x89 && bytes[1] == 'P' && bytes[2] == 'N' && bytes[3] == 'G') {
+        if (std::memcmp(bytes + 12, "IHDR", 4) == 0) {
+            uint32_t pw = RdU32BE(bytes + 16);
+            uint32_t ph = RdU32BE(bytes + 20);
+            if (pw == 0 || ph == 0 || pw > maxDim || ph > maxDim) return false;
+        }
+        if (DetailPngPure::DecodePngToImageInfo(bytes, len, fmtLabel, outInfo)) {
+            if (outInfo.width > 0 && outInfo.height > 0 && outInfo.width <= maxDim && outInfo.height <= maxDim) {
+                return true;
+            }
+            outInfo = {};
+            return false;
+        }
+    }
 #if !defined(_WIN32) && !defined(E2_WIN32_HAL)
     return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
 #else
-    if (!bytes || len < 16) return false;
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool needUninit = (hrCo == S_OK || hrCo == S_FALSE);
+
     IWICImagingFactory* factory = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-    if (FAILED(hr) || !factory) return false;
+    if (FAILED(hr) || !factory) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
 
     IWICStream* stream = nullptr;
     bool decoded = false;
@@ -113,7 +259,8 @@ inline bool DecodeEmbeddedWicBuffer(const uint8_t* bytes, size_t len, const std:
                 if (SUCCEEDED(decoder->GetFrame(0, &frame)) && frame) {
                     UINT w = 0, h = 0;
                     frame->GetSize(&w, &h);
-                    if (w > 0 && h > 0 && w <= 16384 && h <= 16384) {
+                    uint64_t totalBytes = static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * 4ull;
+                    if (w > 0 && h > 0 && w <= maxDim && h <= maxDim && totalBytes <= 0x7FFFFFFFull) {
                         IWICFormatConverter* conv = nullptr;
                         if (SUCCEEDED(factory->CreateFormatConverter(&conv)) && conv) {
                             if (SUCCEEDED(conv->Initialize(frame, GUID_WICPixelFormat32bppPBGRA,
@@ -124,12 +271,14 @@ inline bool DecodeEmbeddedWicBuffer(const uint8_t* bytes, size_t len, const std:
                                 outInfo.channels = 4;
                                 outInfo.bitsPerChannel = 8;
                                 outInfo.formatName = fmtLabel;
-                                outInfo.bgraPixels.resize(static_cast<size_t>(w) * h * 4);
-                                if (SUCCEEDED(conv->CopyPixels(nullptr, w * 4,
-                                    static_cast<UINT>(outInfo.bgraPixels.size()), outInfo.bgraPixels.data())))
+                                outInfo.bgraPixels.resize(static_cast<size_t>(totalBytes));
+                                if (SUCCEEDED(conv->CopyPixels(nullptr, w * 4u,
+                                    static_cast<UINT>(totalBytes), outInfo.bgraPixels.data())))
                                 {
                                     outInfo.valid = true;
                                     decoded = true;
+                                } else {
+                                    outInfo.bgraPixels.clear();
                                 }
                             }
                             conv->Release();
@@ -143,6 +292,7 @@ inline bool DecodeEmbeddedWicBuffer(const uint8_t* bytes, size_t len, const std:
         stream->Release();
     }
     factory->Release();
+    if (needUninit) CoUninitialize();
     return decoded;
 #endif
 }
@@ -159,7 +309,7 @@ inline bool EqualsIgnoreCaseAscii(std::string_view a, std::string_view b) {
     return true;
 }
 
-} // namespace DetailImg100
+} // namespace DetailLayeredAndHdrImg
 
 namespace DetailBasis {
 
@@ -947,680 +1097,7 @@ inline bool DecodeEtc1sSliceToRgba(
 
 } // namespace DetailBasis
 
-namespace DetailBrotli {
-
-struct BitReader {
-    const uint8_t* data = nullptr;
-    size_t size = 0;
-    size_t bitPos = 0;
-    bool eof = false;
-
-    BitReader(const uint8_t* d, size_t s) : data(d), size(s) {}
-
-    uint32_t PeekBits(uint32_t n) const {
-        if (n == 0u) return 0u;
-        uint64_t acc = 0;
-        size_t byteIdx = bitPos >> 3;
-        uint32_t bitOff = static_cast<uint32_t>(bitPos & 7u);
-        for (uint32_t k = 0; k < 5u; ++k) {
-            uint64_t b = (byteIdx + k < size) ? data[byteIdx + k] : 0ull;
-            acc |= (b << (k * 8u));
-        }
-        uint64_t mask = (n >= 32u) ? 0xFFFFFFFFull : ((1ull << n) - 1ull);
-        return static_cast<uint32_t>((acc >> bitOff) & mask);
-    }
-
-    void DropBits(uint32_t n) {
-        bitPos += n;
-        if (bitPos > size * 8u) {
-            eof = true;
-        }
-    }
-
-    uint32_t ReadBits(uint32_t n) {
-        if (n == 0u) return 0u;
-        uint32_t v = PeekBits(n);
-        DropBits(n);
-        return v;
-    }
-
-    bool AlignToByteZero() {
-        while ((bitPos & 7u) != 0u) {
-            if (ReadBits(1u) != 0u) return false;
-        }
-        return !eof;
-    }
-};
-
-inline uint32_t CeilLog2(uint32_t v) {
-    if (v <= 1u) return 0u;
-    uint32_t r = 0u;
-    uint32_t x = v - 1u;
-    while (x > 0u) {
-        x >>= 1u;
-        ++r;
-    }
-    return r;
-}
-
-inline uint32_t ReverseBits16(uint32_t v, uint32_t len) {
-    uint32_t r = 0u;
-    for (uint32_t i = 0; i < len; ++i) {
-        r = (r << 1u) | ((v >> i) & 1u);
-    }
-    return r;
-}
-
-struct PrefixTree {
-    uint32_t maxLen = 0;
-    uint32_t singleSym = 0;
-    bool isSingle = false;
-    std::vector<uint32_t> table; // (len << 16) | sym, size = 1 << maxLen
-
-    bool BuildFromLengths(const uint8_t* lengths, uint32_t alphabetSize) {
-        uint32_t count[16] = {};
-        uint32_t maxL = 0u;
-        uint32_t nonZeroCount = 0u;
-        uint32_t lastSym = 0u;
-        for (uint32_t s = 0; s < alphabetSize; ++s) {
-            uint8_t l = lengths[s];
-            if (l > 15u) return false;
-            if (l > 0u) {
-                ++count[l];
-                if (l > maxL) maxL = l;
-                ++nonZeroCount;
-                lastSym = s;
-            }
-        }
-        if (nonZeroCount == 0u) return false;
-        if (nonZeroCount == 1u) {
-            isSingle = true;
-            singleSym = lastSym;
-            maxLen = 0u;
-            table.clear();
-            return true;
-        }
-        // Kraft sum check: sum(count[l] << (15 - l)) == 32768
-        uint32_t kraft = 0u;
-        for (uint32_t l = 1u; l <= 15u; ++l) {
-            kraft += count[l] << (15u - l);
-        }
-        if (kraft != 32768u) return false;
-
-        isSingle = false;
-        maxLen = maxL;
-        uint32_t nextCode[16] = {};
-        uint32_t code = 0u;
-        for (uint32_t l = 1u; l <= maxL; ++l) {
-            code = (code + count[l - 1u]) << 1u;
-            nextCode[l] = code;
-        }
-        const uint32_t tabSize = 1u << maxL;
-        table.assign(tabSize, 0u);
-        for (uint32_t s = 0; s < alphabetSize; ++s) {
-            uint8_t l = lengths[s];
-            if (l == 0u) continue;
-            uint32_t c = nextCode[l]++;
-            uint32_t rev = ReverseBits16(c, l);
-            uint32_t entry = (static_cast<uint32_t>(l) << 16u) | s;
-            uint32_t step = 1u << l;
-            for (uint32_t idx = rev; idx < tabSize; idx += step) {
-                table[idx] = entry;
-            }
-        }
-        return true;
-    }
-
-    bool Decode(BitReader& br, uint32_t& outSym) const {
-        if (isSingle) {
-            outSym = singleSym;
-            return !br.eof;
-        }
-        if (table.empty()) return false;
-        uint32_t peek = br.PeekBits(maxLen);
-        uint32_t entry = table[peek];
-        uint32_t len = entry >> 16u;
-        if (len == 0u) return false;
-        br.DropBits(len);
-        if (br.eof) return false;
-        outSym = entry & 0xFFFFu;
-        return true;
-    }
-};
-
-inline bool ReadPrefixCode(BitReader& br, uint32_t alphabetSize, PrefixTree& outTree) {
-    if (alphabetSize == 0u || alphabetSize > 4096u) return false;
-    if (alphabetSize == 1u) {
-        outTree.isSingle = true;
-        outTree.singleSym = 0u;
-        outTree.maxLen = 0u;
-        outTree.table.clear();
-        return true;
-    }
-
-    uint32_t hskip = br.ReadBits(2u);
-    if (br.eof) return false;
-
-    if (hskip == 1u) {
-        // Simple prefix code (1..4 symbols)
-        uint32_t nsym = br.ReadBits(2u) + 1u;
-        uint32_t maxBits = CeilLog2(alphabetSize);
-        uint32_t syms[4] = {};
-        for (uint32_t i = 0; i < nsym; ++i) {
-            syms[i] = br.ReadBits(maxBits);
-            if (br.eof || syms[i] >= alphabetSize) return false;
-            for (uint32_t j = 0; j < i; ++j) {
-                if (syms[j] == syms[i]) return false;
-            }
-        }
-        if (nsym == 1u) {
-            outTree.isSingle = true;
-            outTree.singleSym = syms[0];
-            outTree.maxLen = 0u;
-            outTree.table.clear();
-            return true;
-        }
-        std::vector<uint8_t> lengths(alphabetSize, 0u);
-        if (nsym == 2u) {
-            lengths[syms[0]] = 1u;
-            lengths[syms[1]] = 1u;
-        } else if (nsym == 3u) {
-            // sym[0] has code '0' (len 1), sym[1..2] have len 2 ('01','11' in LSB)
-            outTree.isSingle = false;
-            outTree.maxLen = 2u;
-            outTree.table.resize(4u);
-            if (syms[1] > syms[2]) std::swap(syms[1], syms[2]);
-            outTree.table[0] = (1u << 16u) | syms[0];
-            outTree.table[2] = (1u << 16u) | syms[0];
-            outTree.table[1] = (2u << 16u) | syms[1];
-            outTree.table[3] = (2u << 16u) | syms[2];
-            return true;
-        } else {
-            uint32_t treeSelect = br.ReadBits(1u);
-            if (br.eof) return false;
-            if (treeSelect == 0u) {
-                for (uint32_t i = 0; i < 4u; ++i) lengths[syms[i]] = 2u;
-            } else {
-                outTree.isSingle = false;
-                outTree.maxLen = 3u;
-                outTree.table.resize(8u);
-                if (syms[2] > syms[3]) std::swap(syms[2], syms[3]);
-                for (uint32_t k = 0; k < 8u; k += 2u) outTree.table[k] = (1u << 16u) | syms[0];
-                outTree.table[1] = (2u << 16u) | syms[1];
-                outTree.table[5] = (2u << 16u) | syms[1];
-                outTree.table[3] = (3u << 16u) | syms[2];
-                outTree.table[7] = (3u << 16u) | syms[3];
-                return true;
-            }
-        }
-        return outTree.BuildFromLengths(lengths.data(), alphabetSize);
-    }
-
-    // Complex prefix code (RFC 7932 Section 3.5 & ISO/IEC 18181-1)
-    static constexpr uint8_t kCodeLenOrder[18] = {
-        1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15
-    };
-    uint8_t clLengths[18] = {};
-    uint32_t space = 32u;
-    uint32_t numCodes = 0u;
-    for (uint32_t i = hskip; i < 18u && space > 0u; ++i) {
-        uint32_t p4 = br.PeekBits(4u);
-        uint32_t v = 0u, drop = 2u;
-        if ((p4 & 3u) == 0u)      { v = 0u; drop = 2u; }
-        else if ((p4 & 3u) == 2u) { v = 3u; drop = 2u; }
-        else if ((p4 & 3u) == 1u) { v = 4u; drop = 2u; }
-        else if ((p4 & 7u) == 3u) { v = 2u; drop = 3u; }
-        else if (p4 == 7u)        { v = 1u; drop = 4u; }
-        else                      { v = 5u; drop = 4u; }
-        br.DropBits(drop);
-        if (br.eof) return false;
-        uint8_t sym = kCodeLenOrder[i];
-        clLengths[sym] = static_cast<uint8_t>(v);
-        if (v != 0u) {
-            uint32_t cost = 32u >> v;
-            if (cost > space) return false;
-            space -= cost;
-            ++numCodes;
-        }
-    }
-    if (numCodes != 1u && space != 0u) return false;
-
-    PrefixTree clTree;
-    if (numCodes == 1u) {
-        for (uint32_t s = 0; s < 18u; ++s) {
-            if (clLengths[s] != 0u) {
-                clTree.isSingle = true;
-                clTree.singleSym = s;
-                break;
-            }
-        }
-    } else if (!clTree.BuildFromLengths(clLengths, 18u)) {
-        return false;
-    }
-
-    std::vector<uint8_t> lengths(alphabetSize, 0u);
-    uint32_t symIdx = 0u;
-    uint8_t prevCodeLen = 8u;
-    uint32_t repeat = 0u;
-    uint8_t repeatLen = 0u;
-    uint32_t mainSpace = 32768u;
-
-    while (symIdx < alphabetSize && mainSpace > 0u) {
-        uint32_t codeLenSym = 0u;
-        if (!clTree.Decode(br, codeLenSym)) return false;
-        if (codeLenSym < 16u) {
-            repeat = 0u;
-            lengths[symIdx++] = static_cast<uint8_t>(codeLenSym);
-            if (codeLenSym != 0u) {
-                prevCodeLen = static_cast<uint8_t>(codeLenSym);
-                uint32_t cost = 32768u >> codeLenSym;
-                if (cost > mainSpace) return false;
-                mainSpace -= cost;
-            }
-        } else {
-            uint32_t extraBits = (codeLenSym == 16u) ? 2u : 3u;
-            uint8_t newLen = (codeLenSym == 16u) ? prevCodeLen : 0u;
-            if (repeatLen != newLen) {
-                repeat = 0u;
-                repeatLen = newLen;
-            }
-            uint32_t oldRepeat = repeat;
-            if (repeat > 0u) {
-                repeat = (repeat - 2u) << extraBits;
-            }
-            repeat += br.ReadBits(extraBits) + 3u;
-            if (br.eof || repeat <= oldRepeat) return false;
-            uint32_t delta = repeat - oldRepeat;
-            if (symIdx + delta > alphabetSize) return false;
-            for (uint32_t k = 0; k < delta; ++k) {
-                lengths[symIdx++] = repeatLen;
-            }
-            if (repeatLen != 0u) {
-                uint64_t cost = static_cast<uint64_t>(delta) * (32768ull >> repeatLen);
-                if (cost > mainSpace) return false;
-                mainSpace -= static_cast<uint32_t>(cost);
-            }
-        }
-    }
-    if (mainSpace != 0u) return false;
-    return outTree.BuildFromLengths(lengths.data(), alphabetSize);
-}
-
-inline uint32_t ReadVarLenUint8(BitReader& br) {
-    if (br.ReadBits(1u) == 0u) return 0u;
-    uint32_t n = br.ReadBits(3u);
-    if (n == 0u) return 1u;
-    return (1u << n) + br.ReadBits(n);
-}
-
-inline uint32_t DecodeBlockLength(BitReader& br, const PrefixTree& tree) {
-    static constexpr uint32_t kBlockLenBase[26] = {
-        1, 5, 9, 13, 17, 25, 33, 41, 49, 65, 81, 97, 113,
-        145, 177, 209, 241, 305, 369, 497, 753, 1265, 2289, 4337, 8433, 16625
-    };
-    static constexpr uint8_t kBlockLenExtra[26] = {
-        2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5,
-        5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13, 24
-    };
-    uint32_t code = 0u;
-    if (!tree.Decode(br, code) || code >= 26u) return 0u;
-    return kBlockLenBase[code] + br.ReadBits(kBlockLenExtra[code]);
-}
-
-inline bool ReadContextMap(BitReader& br, uint32_t mapSize, uint32_t& outNumTrees, std::vector<uint8_t>& outMap) {
-    outNumTrees = ReadVarLenUint8(br) + 1u;
-    if (br.eof || outNumTrees > 256u) return false;
-    outMap.assign(mapSize, 0u);
-    if (outNumTrees == 1u) return true;
-
-    bool useRle = br.ReadBits(1u) != 0u;
-    uint32_t rleMax = useRle ? (br.ReadBits(4u) + 1u) : 0u;
-    if (br.eof) return false;
-
-    PrefixTree cmTree;
-    if (!ReadPrefixCode(br, outNumTrees + rleMax, cmTree)) return false;
-
-    uint32_t i = 0u;
-    while (i < mapSize) {
-        uint32_t code = 0u;
-        if (!cmTree.Decode(br, code)) return false;
-        if (code == 0u) {
-            outMap[i++] = 0u;
-        } else if (code <= rleMax) {
-            uint32_t reps = (1u << code) + br.ReadBits(code);
-            if (br.eof || i + reps > mapSize) return false;
-            for (uint32_t k = 0; k < reps; ++k) outMap[i++] = 0u;
-        } else {
-            outMap[i++] = static_cast<uint8_t>(code - rleMax);
-        }
-    }
-
-    if (br.ReadBits(1u) != 0u) { // IMTF
-        uint8_t mtf[256];
-        for (uint32_t k = 0; k < 256u; ++k) mtf[k] = static_cast<uint8_t>(k);
-        for (uint32_t k = 0; k < mapSize; ++k) {
-            uint8_t idx = outMap[k];
-            uint8_t val = mtf[idx];
-            outMap[k] = val;
-            for (uint8_t m = idx; m > 0u; --m) mtf[m] = mtf[m - 1u];
-            mtf[0] = val;
-        }
-    }
-    return !br.eof;
-}
-
-inline uint8_t LiteralContext(uint8_t p1, uint8_t p2, uint8_t mode) {
-    if (mode == 0u) return p1 & 0x3Fu;         // LSB6
-    if (mode == 1u) return p1 >> 2u;           // MSB6
-    static constexpr uint8_t kLut0[256] = {
-        0,0,0,0,0,0,0,0,0,4,4,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        8,12,16,12,12,20,12,16,24,28,12,12,32,12,36,12,44,44,44,44,44,44,44,44,44,44,32,32,24,40,28,12,
-        12,48,52,52,52,48,52,52,52,48,52,52,52,52,52,48,52,52,52,52,52,48,52,52,52,52,52,24,12,28,12,12,
-        12,56,60,60,60,56,60,60,60,56,60,60,60,60,60,56,60,60,60,60,60,56,60,60,60,60,60,24,12,28,12,0,
-        0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,
-        0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,
-        2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,
-        2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3
-    };
-    static constexpr uint8_t kLut1[256] = {
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,
-        1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,
-        1,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,1,1,1,1,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2
-    };
-    static constexpr uint8_t kLut2[256] = {
-        0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-        2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-        3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
-        3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,
-        4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
-        4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
-        5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
-        6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7
-    };
-    if (mode == 2u) return static_cast<uint8_t>(kLut0[p1] | kLut1[p2]); // UTF8
-    return static_cast<uint8_t>((kLut2[p1] << 3u) | kLut2[p2]);        // Signed
-}
-
-inline bool Decompress(const uint8_t* src, size_t srcSize, std::vector<uint8_t>& out, size_t maxOutSize) {
-    out.clear();
-    if (!src || srcSize == 0u || maxOutSize == 0u) return false;
-    BitReader br(src, srcSize);
-
-    // 1. WBITS (RFC 7932 Section 9.1)
-    uint32_t wbits = 16u;
-    if (br.ReadBits(1u) != 0u) {
-        uint32_t n = br.ReadBits(3u);
-        if (n != 0u) {
-            wbits = 17u + n;
-        } else {
-            n = br.ReadBits(3u);
-            if (n == 1u) return false; // Reserved invalid WBITS pattern
-            wbits = (n != 0u) ? (8u + n) : 17u;
-        }
-    }
-    if (br.eof) return false;
-    const size_t maxBackDist = (size_t(1u) << wbits) - 16u;
-
-    int32_t distRing[4] = { 16, 15, 11, 4 };
-    uint32_t distRingIdx = 0u;
-    uint8_t prevByte1 = 0u, prevByte2 = 0u;
-
-    static constexpr uint32_t kInsBase[24] = {
-        0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98,
-        130, 194, 322, 578, 1090, 2114, 6210, 22594
-    };
-    static constexpr uint8_t kInsExtra[24] = {
-        0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5,
-        6, 7, 8, 9, 10, 12, 14, 24
-    };
-    static constexpr uint32_t kCopyBase[24] = {
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54,
-        70, 102, 134, 198, 326, 582, 1094, 2118
-    };
-    static constexpr uint8_t kCopyExtra[24] = {
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4,
-        5, 5, 6, 7, 8, 9, 10, 24
-    };
-    // RFC 7932 Section 5 Table of 11 ranges (each 64 codes, bits [5:3] = ins low 3, bits [2:0] = copy low 3):
-    // Range 0 (0..63):     ins 0..7,   copy 0..7   (dist 0)
-    // Range 1 (64..127):   ins 0..7,   copy 8..15  (dist 0)
-    // Range 2 (128..191):  ins 0..7,   copy 0..7
-    // Range 3 (192..255):  ins 0..7,   copy 8..15
-    // Range 4 (256..319):  ins 8..15,  copy 0..7
-    // Range 5 (320..383):  ins 8..15,  copy 8..15
-    // Range 6 (384..447):  ins 0..7,   copy 16..23
-    // Range 7 (448..511):  ins 16..23, copy 0..7
-    // Range 8 (512..575):  ins 8..15,  copy 16..23
-    // Range 9 (576..639):  ins 16..23, copy 8..15
-    // Range 10 (640..703): ins 16..23, copy 16..23
-    static constexpr uint8_t kRangeIns[11]  = { 0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16 };
-    static constexpr uint8_t kRangeCopy[11] = { 0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16 };
-
-    bool isLast = false;
-    while (!isLast) {
-        isLast = br.ReadBits(1u) != 0u;
-        if (br.eof) return false;
-        if (isLast) {
-            bool isLastEmpty = br.ReadBits(1u) != 0u;
-            if (br.eof) return false;
-            if (isLastEmpty) break;
-        }
-
-        uint32_t mnibblesCode = br.ReadBits(2u);
-        if (br.eof) return false;
-        if (mnibblesCode == 3u) {
-            if (isLast) return false;
-            if (br.ReadBits(1u) != 0u) return false; // Reserved bit must be 0
-            uint32_t mskipBytes = br.ReadBits(2u);
-            uint32_t metaLen = 0u;
-            if (mskipBytes > 0u) {
-                for (uint32_t i = 0; i < mskipBytes; ++i) {
-                    uint32_t b = br.ReadBits(8u);
-                    if (i + 1u == mskipBytes && mskipBytes > 1u && b == 0u) return false;
-                    metaLen |= (b << (i * 8u));
-                }
-                ++metaLen;
-            }
-            if (!br.AlignToByteZero()) return false;
-            size_t curByte = br.bitPos >> 3;
-            if (metaLen > srcSize - curByte) return false;
-            br.bitPos += static_cast<size_t>(metaLen) * 8u;
-            continue;
-        }
-
-        uint32_t mnibbles = mnibblesCode + 4u;
-        uint32_t mlenMinus1 = 0u;
-        for (uint32_t i = 0; i < mnibbles; ++i) {
-            uint32_t nib = br.ReadBits(4u);
-            if (i + 1u == mnibbles && mnibbles > 4u && nib == 0u) return false;
-            mlenMinus1 |= (nib << (i * 4u));
-        }
-        if (br.eof) return false;
-        size_t mlen = static_cast<size_t>(mlenMinus1) + 1u;
-        if (mlen > maxOutSize - out.size()) return false;
-
-        if (!isLast) {
-            bool isUncompressed = br.ReadBits(1u) != 0u;
-            if (br.eof) return false;
-            if (isUncompressed) {
-                if (!br.AlignToByteZero()) return false;
-                size_t curByte = br.bitPos >> 3;
-                if (mlen > srcSize - curByte) return false;
-                out.insert(out.end(), src + curByte, src + curByte + mlen);
-                if (mlen >= 1u) {
-                    prevByte2 = (mlen >= 2u) ? src[curByte + mlen - 2u] : prevByte1;
-                    prevByte1 = src[curByte + mlen - 1u];
-                }
-                br.bitPos += mlen * 8u;
-                continue;
-            }
-        }
-
-        // Compressed meta-block
-        uint32_t nblTypes[3] = { 1u, 1u, 1u };
-        PrefixTree blockTypeTrees[3];
-        PrefixTree blockLenTrees[3];
-        uint32_t blockType[3] = { 0u, 0u, 0u };
-        uint32_t prevBlockType[3] = { 1u, 1u, 1u };
-        uint32_t blockRem[3] = { 1u << 28u, 1u << 28u, 1u << 28u };
-
-        for (int cat = 0; cat < 3; ++cat) {
-            nblTypes[cat] = ReadVarLenUint8(br) + 1u;
-            if (br.eof || nblTypes[cat] > 256u) return false;
-            if (nblTypes[cat] >= 2u) {
-                if (!ReadPrefixCode(br, nblTypes[cat] + 2u, blockTypeTrees[cat]) ||
-                    !ReadPrefixCode(br, 26u, blockLenTrees[cat])) {
-                    return false;
-                }
-                blockRem[cat] = DecodeBlockLength(br, blockLenTrees[cat]);
-                if (br.eof || blockRem[cat] == 0u) return false;
-            }
-        }
-
-        uint32_t npostfix = br.ReadBits(2u);
-        uint32_t ndirect = br.ReadBits(4u) << npostfix;
-        if (br.eof) return false;
-
-        std::vector<uint8_t> ctxModes(nblTypes[0], 0u);
-        for (uint32_t i = 0; i < nblTypes[0]; ++i) {
-            ctxModes[i] = static_cast<uint8_t>(br.ReadBits(2u));
-        }
-        if (br.eof) return false;
-
-        uint32_t numLitTrees = 1u, numDistTrees = 1u;
-        std::vector<uint8_t> litCtxMap, distCtxMap;
-        if (!ReadContextMap(br, nblTypes[0] * 64u, numLitTrees, litCtxMap) ||
-            !ReadContextMap(br, nblTypes[2] * 4u, numDistTrees, distCtxMap)) {
-            return false;
-        }
-
-        std::vector<PrefixTree> litTrees(numLitTrees);
-        std::vector<PrefixTree> iacTrees(nblTypes[1]);
-        uint32_t distAlpha = 16u + ndirect + (48u << npostfix);
-        std::vector<PrefixTree> distTrees(numDistTrees);
-
-        for (uint32_t i = 0; i < numLitTrees; ++i) {
-            if (!ReadPrefixCode(br, 256u, litTrees[i])) return false;
-        }
-        for (uint32_t i = 0; i < nblTypes[1]; ++i) {
-            if (!ReadPrefixCode(br, 704u, iacTrees[i])) return false;
-        }
-        for (uint32_t i = 0; i < numDistTrees; ++i) {
-            if (!ReadPrefixCode(br, distAlpha, distTrees[i])) return false;
-        }
-
-        auto stepBlockSwitch = [&](int cat) -> bool {
-            if (nblTypes[cat] < 2u) return true;
-            uint32_t code = 0u;
-            if (!blockTypeTrees[cat].Decode(br, code)) return false;
-            uint32_t nextType = 0u;
-            if (code == 0u) nextType = prevBlockType[cat];
-            else if (code == 1u) nextType = (blockType[cat] + 1u) % nblTypes[cat];
-            else nextType = code - 2u;
-            if (nextType >= nblTypes[cat]) return false;
-            prevBlockType[cat] = blockType[cat];
-            blockType[cat] = nextType;
-            blockRem[cat] = DecodeBlockLength(br, blockLenTrees[cat]);
-            return !br.eof && blockRem[cat] > 0u;
-        };
-
-        out.reserve(out.size() + mlen);
-        size_t produced = 0u;
-        while (produced < mlen) {
-            if (blockRem[1] == 0u && !stepBlockSwitch(1)) return false;
-            --blockRem[1];
-
-            uint32_t iacSym = 0u;
-            if (!iacTrees[blockType[1]].Decode(br, iacSym) || iacSym >= 704u) return false;
-            uint32_t rangeIdx = iacSym >> 6u;
-            uint32_t insCode  = static_cast<uint32_t>(kRangeIns[rangeIdx]) + ((iacSym >> 3u) & 7u);
-            uint32_t copyCode = static_cast<uint32_t>(kRangeCopy[rangeIdx]) + (iacSym & 7u);
-            bool distZeroFlag = (rangeIdx < 2u);
-
-            size_t insLen  = kInsBase[insCode]  + br.ReadBits(kInsExtra[insCode]);
-            size_t copyLen = kCopyBase[copyCode] + br.ReadBits(kCopyExtra[copyCode]);
-            if (br.eof || insLen > mlen - produced) return false;
-
-            for (size_t k = 0; k < insLen; ++k) {
-                if (blockRem[0] == 0u && !stepBlockSwitch(0)) return false;
-                --blockRem[0];
-                uint8_t cMode = ctxModes[blockType[0]];
-                uint8_t lCtx = LiteralContext(prevByte1, prevByte2, cMode);
-                uint8_t treeIdx = litCtxMap[blockType[0] * 64u + lCtx];
-                uint32_t lit = 0u;
-                if (treeIdx >= numLitTrees || !litTrees[treeIdx].Decode(br, lit) || lit > 255u) return false;
-                uint8_t b = static_cast<uint8_t>(lit);
-                out.push_back(b);
-                prevByte2 = prevByte1;
-                prevByte1 = b;
-            }
-            produced += insLen;
-            if (produced == mlen) break;
-            if (copyLen > mlen - produced) return false;
-
-            int32_t dist = 0;
-            bool recordInRing = false;
-            if (distZeroFlag) {
-                dist = distRing[(distRingIdx - 1u) & 3u];
-            } else {
-                if (blockRem[2] == 0u && !stepBlockSwitch(2)) return false;
-                --blockRem[2];
-                uint32_t dCtx = (copyLen > 4u) ? 3u : static_cast<uint32_t>(copyLen - 2u);
-                uint8_t dTreeIdx = distCtxMap[blockType[2] * 4u + dCtx];
-                uint32_t dSym = 0u;
-                if (dTreeIdx >= numDistTrees || !distTrees[dTreeIdx].Decode(br, dSym)) return false;
-
-                if (dSym < 16u) {
-                    static constexpr uint8_t kRingBack[16]  = { 1, 2, 3, 4, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2 };
-                    static constexpr int8_t  kRingDelta[16] = { 0, 0, 0, 0,-1, 1,-2, 2,-3, 3,-1, 1,-2, 2,-3, 3 };
-                    dist = distRing[(distRingIdx - kRingBack[dSym]) & 3u] + kRingDelta[dSym];
-                    recordInRing = (dSym > 0u);
-                } else if (dSym < 16u + ndirect) {
-                    dist = static_cast<int32_t>(dSym - 15u);
-                    recordInRing = true;
-                } else {
-                    uint32_t dRem = dSym - 16u - ndirect;
-                    uint32_t postfix = dRem & ((1u << npostfix) - 1u);
-                    uint32_t hcode = dRem >> npostfix;
-                    uint32_t ndistbits = 1u + (hcode >> 1u);
-                    uint32_t offset = ((2u + (hcode & 1u)) << ndistbits) - 4u;
-                    uint32_t dextra = br.ReadBits(ndistbits);
-                    if (br.eof) return false;
-                    uint64_t fullDist = ((static_cast<uint64_t>(offset) + dextra) << npostfix) + postfix + ndirect + 1ull;
-                    if (fullDist > 0x7FFFFFFFull) return false;
-                    dist = static_cast<int32_t>(fullDist);
-                    recordInRing = true;
-                }
-            }
-            if (dist <= 0) return false;
-            size_t uDist = static_cast<size_t>(dist);
-            size_t maxAllowed = std::min(out.size(), maxBackDist);
-            if (uDist > maxAllowed) return false; // Out-of-window or unsupported static dict word
-            if (recordInRing) {
-                distRing[distRingIdx & 3u] = dist;
-                ++distRingIdx;
-            }
-
-            for (size_t k = 0; k < copyLen; ++k) {
-                uint8_t b = out[out.size() - uDist];
-                out.push_back(b);
-                prevByte2 = prevByte1;
-                prevByte1 = b;
-            }
-            produced += copyLen;
-        }
-    }
-
-    if (!br.AlignToByteZero()) return false;
-    return !out.empty() || maxOutSize == 0u;
-}
-
-} // namespace DetailBrotli
+namespace DetailBrotli = ::Explorer2::Brotli;
 
 namespace DetailBlpJpeg {
 
@@ -1736,7 +1213,7 @@ inline bool DecodeBaselineJpegRawChannels(const uint8_t* data, size_t size, RawJ
         if (marker == 0xD8u || marker == 0x00u || (marker >= 0xD0u && marker <= 0xD7u)) continue;
         if (marker == 0xD9u) break;
         if (p + 2 > size) return false;
-        uint16_t segLen = DetailImg100::RdU16BE(data + p);
+        uint16_t segLen = DetailLayeredAndHdrImg::RdU16BE(data + p);
         if (segLen < 2u || p + segLen > size) return false;
         const uint8_t* seg = data + p + 2u;
         size_t payLen = segLen - 2u;
@@ -1756,7 +1233,7 @@ inline bool DecodeBaselineJpegRawChannels(const uint8_t* data, size_t size, RawJ
                 size_t need = (pq == 0u) ? 64u : 128u;
                 if (q + need > payLen) return false;
                 for (int i = 0; i < 64; ++i) {
-                    qt[tq][kZigZag8[i]] = (pq == 0u) ? seg[q + i] : DetailImg100::RdU16BE(seg + q + i * 2);
+                    qt[tq][kZigZag8[i]] = (pq == 0u) ? seg[q + i] : DetailLayeredAndHdrImg::RdU16BE(seg + q + i * 2);
                 }
                 qtValid[tq] = true;
                 q += need;
@@ -1777,11 +1254,11 @@ inline bool DecodeBaselineJpegRawChannels(const uint8_t* data, size_t size, RawJ
                 q += totalSyms;
             }
         } else if (marker == 0xDDu && payLen >= 2u) { // DRI
-            restartInterval = DetailImg100::RdU16BE(seg);
+            restartInterval = DetailLayeredAndHdrImg::RdU16BE(seg);
         } else if (marker == 0xC0u || marker == 0xC1u) { // SOF0 / SOF1
             if (payLen < 6u || seg[0] != 8u) return false;
-            uint16_t h = DetailImg100::RdU16BE(seg + 1);
-            uint16_t w = DetailImg100::RdU16BE(seg + 3);
+            uint16_t h = DetailLayeredAndHdrImg::RdU16BE(seg + 1);
+            uint16_t w = DetailLayeredAndHdrImg::RdU16BE(seg + 3);
             uint8_t nf = seg[5];
             if (w == 0 || h == 0 || w > 16384 || h > 16384 || (nf != 1u && nf != 3u && nf != 4u)) return false;
             if (payLen < 6u + static_cast<size_t>(nf) * 3u) return false;
@@ -2038,20 +1515,20 @@ inline bool RenderDpxOrCineonElements(
 {
     auto rd16 = [&](size_t off) -> uint16_t {
         if (off + 2 > size) return 0;
-        return isLittle ? DetailImg100::RdU16LE(data + off) : DetailImg100::RdU16BE(data + off);
+        return isLittle ? DetailLayeredAndHdrImg::RdU16LE(data + off) : DetailLayeredAndHdrImg::RdU16BE(data + off);
     };
     auto rd32 = [&](size_t off) -> uint32_t {
         if (off + 4 > size) return 0;
-        return isLittle ? DetailImg100::RdU32LE(data + off) : DetailImg100::RdU32BE(data + off);
+        return isLittle ? DetailLayeredAndHdrImg::RdU32LE(data + off) : DetailLayeredAndHdrImg::RdU32BE(data + off);
     };
     auto rd64 = [&](size_t off) -> uint64_t {
         if (off + 8 > size) return 0;
         if (isLittle) {
-            return static_cast<uint64_t>(DetailImg100::RdU32LE(data + off)) |
-                   (static_cast<uint64_t>(DetailImg100::RdU32LE(data + off + 4)) << 32);
+            return static_cast<uint64_t>(DetailLayeredAndHdrImg::RdU32LE(data + off)) |
+                   (static_cast<uint64_t>(DetailLayeredAndHdrImg::RdU32LE(data + off + 4)) << 32);
         }
-        return (static_cast<uint64_t>(DetailImg100::RdU32BE(data + off)) << 32) |
-               static_cast<uint64_t>(DetailImg100::RdU32BE(data + off + 4));
+        return (static_cast<uint64_t>(DetailLayeredAndHdrImg::RdU32BE(data + off)) << 32) |
+               static_cast<uint64_t>(DetailLayeredAndHdrImg::RdU32BE(data + off + 4));
     };
 
     // Build Kodak Cineon 10-bit Printing-Density Log -> sRGB 8-bit LUT (black=95, white=685, gamma=0.6)
@@ -2555,75 +2032,23 @@ inline float ParseFloatOr(const std::string& s, float defVal) {
     return (endP != s.c_str() && std::isfinite(v)) ? v : defVal;
 }
 
-enum class LayerBlendOp { SrcOver, Multiply, Screen, Plus, Lighten, Darken };
+using DetailLayeredAndHdrImg::LayerBlendOp;
+using DetailLayeredAndHdrImg::BlendPremulBgraPixel;
 
 inline LayerBlendOp ParseBlendOp(std::string_view op) {
-    if (op.find("multiply") != std::string_view::npos) return LayerBlendOp::Multiply;
-    if (op.find("screen") != std::string_view::npos)   return LayerBlendOp::Screen;
+    if (op.find("multiply") != std::string_view::npos)   return LayerBlendOp::Multiply;
+    if (op.find("screen") != std::string_view::npos)     return LayerBlendOp::Screen;
     if (op.find("plus") != std::string_view::npos || op.find("add") != std::string_view::npos) return LayerBlendOp::Plus;
-    if (op.find("lighten") != std::string_view::npos)  return LayerBlendOp::Lighten;
-    if (op.find("darken") != std::string_view::npos)   return LayerBlendOp::Darken;
+    if (op.find("lighten") != std::string_view::npos)    return LayerBlendOp::Lighten;
+    if (op.find("darken") != std::string_view::npos)     return LayerBlendOp::Darken;
+    if (op.find("overlay") != std::string_view::npos)    return LayerBlendOp::Overlay;
+    if (op.find("hard-light") != std::string_view::npos) return LayerBlendOp::HardLight;
+    if (op.find("soft-light") != std::string_view::npos) return LayerBlendOp::SoftLight;
+    if (op.find("color-dodge") != std::string_view::npos) return LayerBlendOp::ColorDodge;
+    if (op.find("color-burn") != std::string_view::npos) return LayerBlendOp::ColorBurn;
+    if (op.find("difference") != std::string_view::npos) return LayerBlendOp::Difference;
+    if (op.find("exclusion") != std::string_view::npos)  return LayerBlendOp::Exclusion;
     return LayerBlendOp::SrcOver;
-}
-
-// Blend straight or premultiplied BGRA source pixel onto premultiplied BGRA canvas
-inline void BlendPremulBgraPixel(
-    uint8_t* dstBgra,
-    uint8_t srcB_pm, uint8_t srcG_pm, uint8_t srcR_pm, uint8_t srcA,
-    float opacity,
-    LayerBlendOp op)
-{
-    if (srcA == 0 || opacity <= 0.0f) return;
-    float sa = (static_cast<float>(srcA) / 255.0f) * std::clamp(opacity, 0.0f, 1.0f);
-    if (sa <= 0.0f) return;
-
-    float scaleSrc = std::clamp(opacity, 0.0f, 1.0f);
-    float sr_pm = (static_cast<float>(srcR_pm) / 255.0f) * scaleSrc;
-    float sg_pm = (static_cast<float>(srcG_pm) / 255.0f) * scaleSrc;
-    float sb_pm = (static_cast<float>(srcB_pm) / 255.0f) * scaleSrc;
-
-    float da = static_cast<float>(dstBgra[3]) / 255.0f;
-    float dr_pm = static_cast<float>(dstBgra[2]) / 255.0f;
-    float dg_pm = static_cast<float>(dstBgra[1]) / 255.0f;
-    float db_pm = static_cast<float>(dstBgra[0]) / 255.0f;
-
-    float outA = sa + da * (1.0f - sa);
-    float outR_pm = 0.0f, outG_pm = 0.0f, outB_pm = 0.0f;
-
-    if (op == LayerBlendOp::SrcOver || da <= 1e-5f) {
-        outR_pm = sr_pm + dr_pm * (1.0f - sa);
-        outG_pm = sg_pm + dg_pm * (1.0f - sa);
-        outB_pm = sb_pm + db_pm * (1.0f - sa);
-    } else if (op == LayerBlendOp::Plus) {
-        outR_pm = std::min(1.0f, sr_pm + dr_pm);
-        outG_pm = std::min(1.0f, sg_pm + dg_pm);
-        outB_pm = std::min(1.0f, sb_pm + db_pm);
-        outA = std::min(1.0f, sa + da);
-    } else {
-        float sr = std::clamp(sr_pm / sa, 0.0f, 1.0f);
-        float sg = std::clamp(sg_pm / sa, 0.0f, 1.0f);
-        float sb = std::clamp(sb_pm / sa, 0.0f, 1.0f);
-        float dr = std::clamp(dr_pm / da, 0.0f, 1.0f);
-        float dg = std::clamp(dg_pm / da, 0.0f, 1.0f);
-        float db = std::clamp(db_pm / da, 0.0f, 1.0f);
-        auto blendCh = [&](float s, float d) -> float {
-            switch (op) {
-                case LayerBlendOp::Multiply: return s * d;
-                case LayerBlendOp::Screen:   return s + d - s * d;
-                case LayerBlendOp::Lighten:  return std::max(s, d);
-                case LayerBlendOp::Darken:   return std::min(s, d);
-                default: return s;
-            }
-        };
-        outR_pm = sr_pm * (1.0f - da) + dr_pm * (1.0f - sa) + sa * da * blendCh(sr, dr);
-        outG_pm = sg_pm * (1.0f - da) + dg_pm * (1.0f - sa) + sa * da * blendCh(sg, dg);
-        outB_pm = sb_pm * (1.0f - da) + db_pm * (1.0f - sa) + sa * da * blendCh(sb, db);
-    }
-
-    dstBgra[0] = static_cast<uint8_t>(std::clamp(outB_pm * 255.0f + 0.5f, 0.0f, 255.0f));
-    dstBgra[1] = static_cast<uint8_t>(std::clamp(outG_pm * 255.0f + 0.5f, 0.0f, 255.0f));
-    dstBgra[2] = static_cast<uint8_t>(std::clamp(outR_pm * 255.0f + 0.5f, 0.0f, 255.0f));
-    dstBgra[3] = static_cast<uint8_t>(std::clamp(outA    * 255.0f + 0.5f, 0.0f, 255.0f));
 }
 
 inline const ZipDeflate::ArchiveItemMeta* FindZipEntryCaseInsensitive(
@@ -2685,7 +2110,7 @@ inline bool DecodeZipArtworkFallback(
         std::vector<uint8_t> pngBytes;
         if (ZipDeflate::ExtractZipEntryFromMemory(data, size, *bestPng, pngBytes) && !pngBytes.empty()) {
             std::vector<std::wstring> savedLayers = std::move(outInfo.layerNames);
-            if (DetailImg100::DecodeEmbeddedWicBuffer(pngBytes.data(), pngBytes.size(), label, outInfo)) {
+            if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(pngBytes.data(), pngBytes.size(), label, outInfo)) {
                 if (outInfo.layerNames.empty()) outInfo.layerNames = std::move(savedLayers);
                 return true;
             }
@@ -2699,6 +2124,94 @@ inline bool DecodeZipArtworkFallback(
 namespace DetailPalette {
 
 struct Rgb { uint8_t r, g, b; };
+
+inline Rgb HsvToSrgb(double h01, double s01, double v01) {
+    h01 = h01 - std::floor(h01);
+    s01 = std::clamp(s01, 0.0, 1.0);
+    v01 = std::clamp(v01, 0.0, 1.0);
+    if (s01 <= 1e-6) {
+        uint8_t g = static_cast<uint8_t>(std::clamp(std::lround(v01 * 255.0), 0l, 255l));
+        return { g, g, g };
+    }
+    double hh = h01 * 6.0;
+    if (hh >= 6.0) hh = 0.0;
+    int sector = static_cast<int>(std::floor(hh));
+    double f = hh - static_cast<double>(sector);
+    double p = v01 * (1.0 - s01);
+    double q = v01 * (1.0 - s01 * f);
+    double t = v01 * (1.0 - s01 * (1.0 - f));
+    double r = 0.0, g = 0.0, b = 0.0;
+    switch (sector) {
+        case 0: r = v01; g = t;   b = p;   break;
+        case 1: r = q;   g = v01; b = p;   break;
+        case 2: r = p;   g = v01; b = t;   break;
+        case 3: r = p;   g = q;   b = v01; break;
+        case 4: r = t;   g = p;   b = v01; break;
+        default:r = v01; g = p;   b = q;   break;
+    }
+    return {
+        static_cast<uint8_t>(std::clamp(std::lround(r * 255.0), 0l, 255l)),
+        static_cast<uint8_t>(std::clamp(std::lround(g * 255.0), 0l, 255l)),
+        static_cast<uint8_t>(std::clamp(std::lround(b * 255.0), 0l, 255l))
+    };
+}
+
+// CIE L*a*b* (D50 illuminant, standard for Adobe Photoshop .aco & .ase) -> sRGB (D65 via Bradford chromatic adaptation)
+inline Rgb CieLabD50ToSrgb(double L, double a, double b) {
+    L = std::clamp(L, 0.0, 100.0);
+    a = std::clamp(a, -128.0, 128.0);
+    b = std::clamp(b, -128.0, 128.0);
+
+    const double fy = (L + 16.0) / 116.0;
+    const double fx = fy + (a / 500.0);
+    const double fz = fy - (b / 200.0);
+
+    auto finv = [](double t) -> double {
+        constexpr double d = 6.0 / 29.0;
+        return (t > d) ? (t * t * t) : (3.0 * d * d * (t - 4.0 / 29.0));
+    };
+
+    // D50 reference white: Xn = 0.96422, Yn = 1.00000, Zn = 0.82521
+    const double X50 = 0.96422 * finv(fx);
+    const double Y50 = 1.00000 * finv(fy);
+    const double Z50 = 0.82521 * finv(fz);
+
+    // XYZ(D50) -> linear sRGB(D65) Bradford-adapted matrix
+    const double rl =  3.1338561 * X50 - 1.6168667 * Y50 - 0.4906146 * Z50;
+    const double gl = -0.9787684 * X50 + 1.9161415 * Y50 + 0.0334540 * Z50;
+    const double bl =  0.0719453 * X50 - 0.2289914 * Y50 + 1.4052427 * Z50;
+
+    auto linToSrgb8 = [](double c) -> uint8_t {
+        c = std::clamp(c, 0.0, 1.0);
+        double s = (c <= 0.0031308) ? (12.92 * c) : (1.055 * std::pow(c, 1.0 / 2.4) - 0.055);
+        return static_cast<uint8_t>(std::clamp(std::lround(s * 255.0), 0l, 255l));
+    };
+    return { linToSrgb8(rl), linToSrgb8(gl), linToSrgb8(bl) };
+}
+
+inline std::wstring ReadUtf16BeName(const uint8_t* p, size_t codeUnits) {
+    std::wstring ws;
+    ws.reserve(codeUnits);
+    for (size_t i = 0; i < codeUnits; ++i) {
+        uint16_t u = ::Explorer2::ByteIO::RdU16BE(p + i * 2u);
+        if (u == 0) break;
+        if constexpr (sizeof(wchar_t) == 2) {
+            ws.push_back(static_cast<wchar_t>(u));
+        } else {
+            if (u >= 0xD800u && u <= 0xDBFFu && i + 1 < codeUnits) {
+                uint16_t lo = ::Explorer2::ByteIO::RdU16BE(p + (i + 1) * 2u);
+                if (lo >= 0xDC00u && lo <= 0xDFFFu) {
+                    uint32_t cp = 0x10000u + ((static_cast<uint32_t>(u - 0xD800u) << 10) | (lo - 0xDC00u));
+                    ws.push_back(static_cast<wchar_t>(cp));
+                    ++i;
+                    continue;
+                }
+            }
+            ws.push_back(static_cast<wchar_t>(u));
+        }
+    }
+    return ws;
+}
 
 inline void ParseTextPaletteLines(std::string_view sv, std::vector<Rgb>& colors) {
         size_t pos = 0;
@@ -2844,8 +2357,8 @@ inline bool RenderColorLutTestCard(
             dst[3] = 255;
         }
     }
-    DetailImg100::DrawBitmapText5x7(outInfo.bgraPixels, w, h, 6, 6, "ORIGINAL", 1, 255, 255, 255);
-    DetailImg100::DrawBitmapText5x7(outInfo.bgraPixels, w, h, half + 6, 6, "LUT APPLIED", 1, 255, 255, 120);
+    DetailLayeredAndHdrImg::DrawBitmapText5x7(outInfo.bgraPixels, w, h, 6, 6, "ORIGINAL", 1, 255, 255, 255);
+    DetailLayeredAndHdrImg::DrawBitmapText5x7(outInfo.bgraPixels, w, h, half + 6, 6, "LUT APPLIED", 1, 255, 255, 120);
     outInfo.valid = true;
     return true;
 }
@@ -2854,7 +2367,7 @@ inline bool RenderColorLutTestCard(
 
 inline bool DecodeWindowsWmf(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo);
 
-namespace DetailImg200 {
+namespace DetailVectorAndRawImg {
 
 inline uint16_t Rd16(const uint8_t* p, bool be) { return ::Explorer2::ByteIO::RdU16(p, be); }
 
@@ -2905,15 +2418,15 @@ inline void CollectAllZipEntryNames(const uint8_t* data, size_t size, std::vecto
     if (size >= 22) {
         size_t minSearch = (size > 65557u) ? (size - 65557u) : 0u;
         for (size_t i = size - 22; ; --i) {
-            if (DetailImg100::RdU32LE(data + i) == 0x06054B50u) {
-                uint16_t cdCount = DetailImg100::RdU16LE(data + i + 10);
-                uint32_t cdOff   = DetailImg100::RdU32LE(data + i + 16);
+            if (DetailLayeredAndHdrImg::RdU32LE(data + i) == 0x06054B50u) {
+                uint16_t cdCount = DetailLayeredAndHdrImg::RdU16LE(data + i + 10);
+                uint32_t cdOff   = DetailLayeredAndHdrImg::RdU32LE(data + i + 16);
                 size_t p = cdOff;
                 for (uint16_t c = 0; c < cdCount && p + 46 <= size; ++c) {
-                    if (DetailImg100::RdU32LE(data + p) != 0x02014B50u) break;
-                    uint16_t fnLen = DetailImg100::RdU16LE(data + p + 28);
-                    uint16_t exLen = DetailImg100::RdU16LE(data + p + 30);
-                    uint16_t cmLen = DetailImg100::RdU16LE(data + p + 32);
+                    if (DetailLayeredAndHdrImg::RdU32LE(data + p) != 0x02014B50u) break;
+                    uint16_t fnLen = DetailLayeredAndHdrImg::RdU16LE(data + p + 28);
+                    uint16_t exLen = DetailLayeredAndHdrImg::RdU16LE(data + p + 30);
+                    uint16_t cmLen = DetailLayeredAndHdrImg::RdU16LE(data + p + 32);
                     if (p + 46u + fnLen > size) break;
                     outNames.emplace_back(reinterpret_cast<const char*>(data + p + 46), fnLen);
                     p += 46u + fnLen + exLen + cmLen;
@@ -2925,11 +2438,11 @@ inline void CollectAllZipEntryNames(const uint8_t* data, size_t size, std::vecto
     }
     if (outNames.empty()) {
         size_t p = 0;
-        while (p + 30 <= size && DetailImg100::RdU32LE(data + p) == 0x04034B50u) {
-            uint16_t flags = DetailImg100::RdU16LE(data + p + 6);
-            uint32_t cSize = DetailImg100::RdU32LE(data + p + 18);
-            uint16_t fnLen = DetailImg100::RdU16LE(data + p + 26);
-            uint16_t exLen = DetailImg100::RdU16LE(data + p + 28);
+        while (p + 30 <= size && DetailLayeredAndHdrImg::RdU32LE(data + p) == 0x04034B50u) {
+            uint16_t flags = DetailLayeredAndHdrImg::RdU16LE(data + p + 6);
+            uint32_t cSize = DetailLayeredAndHdrImg::RdU32LE(data + p + 18);
+            uint16_t fnLen = DetailLayeredAndHdrImg::RdU16LE(data + p + 26);
+            uint16_t exLen = DetailLayeredAndHdrImg::RdU16LE(data + p + 28);
             if (p + 30u + fnLen > size) break;
             outNames.emplace_back(reinterpret_cast<const char*>(data + p + 30), fnLen);
             if ((flags & 0x08u) != 0 || p + 30u + fnLen + exLen + cSize > size) break;
@@ -3095,7 +2608,7 @@ inline bool FindAndDecodeBestEmbeddedRaster(
             size_t p = i + 8;
             bool validChunks = false;
             while (p + 12 <= size) {
-                uint32_t cLen = DetailImg100::RdU32BE(data + p);
+                uint32_t cLen = DetailLayeredAndHdrImg::RdU32BE(data + p);
                 if (cLen > size - p - 12) break;
                 bool isIend = (std::memcmp(data + p + 4, "IEND", 4) == 0);
                 p += 12 + static_cast<size_t>(cLen);
@@ -3103,7 +2616,7 @@ inline bool FindAndDecodeBestEmbeddedRaster(
             }
             if (validChunks && (p - i) >= 32) {
                 ExtendedImageInfo cand;
-                if (DetailImg100::DecodeEmbeddedWicBuffer(data + i, p - i, fmtLabel, cand) &&
+                if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data + i, p - i, fmtLabel, cand) &&
                     cand.valid && cand.width > 0 && cand.height > 0 && !cand.bgraPixels.empty())
                 {
                     uint64_t area = static_cast<uint64_t>(cand.width) * cand.height;
@@ -3139,7 +2652,7 @@ inline bool FindAndDecodeBestEmbeddedRaster(
                     sawSof = true;
                 }
                 if (p + 2 > size) break;
-                uint16_t segLen = DetailImg100::RdU16BE(data + p);
+                uint16_t segLen = DetailLayeredAndHdrImg::RdU16BE(data + p);
                 if (segLen < 2 || p + segLen > size) break;
                 p += segLen;
                 if (marker == 0xDA) {
@@ -3162,7 +2675,7 @@ inline bool FindAndDecodeBestEmbeddedRaster(
             if (sawSof && endJpg > i + 32) {
                 size_t jpgLen = endJpg - i;
                 ExtendedImageInfo cand;
-                if (DetailImg100::DecodeEmbeddedWicBuffer(data + i, jpgLen, fmtLabel, cand) &&
+                if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data + i, jpgLen, fmtLabel, cand) &&
                     cand.valid && cand.width > 0 && cand.height > 0 && !cand.bgraPixels.empty())
                 {
                     uint64_t area = static_cast<uint64_t>(cand.width) * cand.height;
@@ -3234,7 +2747,7 @@ inline bool DecodeLosslessJpegSOF3(const uint8_t* data, size_t size, LosslessJpe
             return false;
         }
         if (p + 2 > size) return false;
-        uint16_t segLen = DetailImg100::RdU16BE(data + p);
+        uint16_t segLen = DetailLayeredAndHdrImg::RdU16BE(data + p);
         if (segLen < 2 || p + segLen > size) return false;
         const uint8_t* seg = data + p + 2;
         size_t payloadLen = segLen - 2;
@@ -3277,12 +2790,12 @@ inline bool DecodeLosslessJpegSOF3(const uint8_t* data, size_t size, LosslessJpe
                 ht.valid = true;
             }
         } else if (marker == 0xDD && payloadLen >= 2) { // DRI
-            restartInterval = DetailImg100::RdU16BE(seg);
+            restartInterval = DetailLayeredAndHdrImg::RdU16BE(seg);
         } else if (marker == 0xC3) { // SOF3 — Lossless JPEG
             if (payloadLen < 6) return false;
             uint8_t prec = seg[0];
-            uint16_t h = DetailImg100::RdU16BE(seg + 1);
-            uint16_t w = DetailImg100::RdU16BE(seg + 3);
+            uint16_t h = DetailLayeredAndHdrImg::RdU16BE(seg + 1);
+            uint16_t w = DetailLayeredAndHdrImg::RdU16BE(seg + 3);
             uint8_t nf = seg[5];
             if (prec < 2 || prec > 16 || w == 0 || h == 0 || nf < 1 || nf > 4) return false;
             if (payloadLen < 6u + static_cast<size_t>(nf) * 3u) return false;
@@ -3652,24 +3165,7 @@ inline bool UnpackRawSamplesFromBytes(
 }
 
 inline bool DecodePackBitsBuffer(const uint8_t* src, size_t srcLen, size_t expectedBytes, std::vector<uint8_t>& out) {
-    out.clear();
-    out.reserve(expectedBytes);
-    size_t p = 0;
-    while (p < srcLen && out.size() < expectedBytes) {
-        int8_t n = static_cast<int8_t>(src[p++]);
-        if (n >= 0) {
-            size_t cnt = static_cast<size_t>(n) + 1u;
-            if (p + cnt > srcLen) cnt = srcLen - p;
-            out.insert(out.end(), src + p, src + p + cnt);
-            p += cnt;
-        } else if (n != -128) {
-            if (p >= srcLen) break;
-            size_t cnt = static_cast<size_t>(1 - static_cast<int>(n));
-            uint8_t val = src[p++];
-            out.insert(out.end(), cnt, val);
-        }
-    }
-    return out.size() >= expectedBytes;
+    return ::Explorer2::StreamCodecs::DecompressPackBits(src, srcLen, out, expectedBytes);
 }
 
 inline void ApplyExifOrientationBGRA(uint16_t orientation, uint32_t& w, uint32_t& h, std::vector<uint8_t>& bgra) {
@@ -4073,7 +3569,7 @@ inline bool ParseTiffRawIfds(
     if (magic != 42 && magic != 0x4F52 && magic != 0x5352 && magic != 0x0055) return false;
 
     uint32_t firstIfd = Rd32(data + 4, be);
-    if ((magic == 0x4F52 || magic == 0x5352) && (firstIfd < 8 || firstIfd + 2 > size)) {
+    if ((magic == 0x4F52 || magic == 0x5352) && (firstIfd < 8 || static_cast<uint64_t>(firstIfd) + 2ULL > size)) {
         firstIfd = 8;
     }
 
@@ -4124,7 +3620,7 @@ inline bool ParseTiffRawIfds(
     std::vector<uint32_t> ifdQueue;
     std::vector<uint32_t> visitedOffsets;
     auto enqueueIfd = [&](uint32_t off) {
-        if (off < 8 || off + 2 > size) return;
+        if (off < 8 || static_cast<uint64_t>(off) + 2ULL > size) return;
         for (uint32_t v : visitedOffsets) if (v == off) return;
         for (uint32_t q : ifdQueue) if (q == off) return;
         ifdQueue.push_back(off);
@@ -4156,9 +3652,10 @@ inline bool ParseTiffRawIfds(
         ifdQueue.erase(ifdQueue.begin());
         visitedOffsets.push_back(ifdOff);
 
-        if (ifdOff + 2 > size) continue;
+        if (static_cast<uint64_t>(ifdOff) + 2ULL > size) continue;
         uint16_t numEntries = Rd16(data + ifdOff, be);
-        if (numEntries == 0 || numEntries > 1024 || ifdOff + 2u + static_cast<size_t>(numEntries) * 12u > size) {
+        if (numEntries == 0 || numEntries > 1024 ||
+            static_cast<uint64_t>(ifdOff) + 2ULL + static_cast<uint64_t>(numEntries) * 12ULL > size) {
             continue;
         }
 
@@ -4490,7 +3987,7 @@ inline bool ParseTiffRawIfds(
         if (ifd.rw2JpgOff > 0 && ifd.rw2JpgLen > 32 &&
             static_cast<uint64_t>(ifd.rw2JpgOff) + ifd.rw2JpgLen <= size)
         {
-            if (DetailImg100::DecodeEmbeddedWicBuffer(data + ifd.rw2JpgOff, ifd.rw2JpgLen, fmtLabel, outInfo)) {
+            if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data + ifd.rw2JpgOff, ifd.rw2JpgLen, fmtLabel, outInfo)) {
                 if (bestRawW > outInfo.origWidth) { outInfo.origWidth = bestRawW; outInfo.origHeight = bestRawH; }
                 return true;
             }
@@ -4512,7 +4009,7 @@ inline bool ParseTiffRawIfds(
                     return true;
                 }
             }
-            if (DetailImg100::DecodeEmbeddedWicBuffer(jp, ifd.jpegLength, fmtLabel, outInfo)) {
+            if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(jp, ifd.jpegLength, fmtLabel, outInfo)) {
                 if (bestRawW > outInfo.origWidth) { outInfo.origWidth = bestRawW; outInfo.origHeight = bestRawH; }
                 return true;
             }
@@ -4534,7 +4031,7 @@ inline bool ParseTiffRawIfds(
             {
                 LosslessJpegResult ljCheck;
                 if (!DecodeLosslessJpegSOF3(data + sOff, sLen, ljCheck)) {
-                    if (DetailImg100::DecodeEmbeddedWicBuffer(data + sOff, sLen, fmtLabel, outInfo)) {
+                    if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data + sOff, sLen, fmtLabel, outInfo)) {
                         if (bestRawW > outInfo.origWidth) { outInfo.origWidth = bestRawW; outInfo.origHeight = bestRawH; }
                         return true;
                     }
@@ -4658,7 +4155,7 @@ inline bool ParseTiffRawIfds(
                 }
                 if (lj.isLossyJpeg && blockSpp >= 1) {
                     ExtendedImageInfo tileImg;
-                    if (DetailImg100::DecodeEmbeddedWicBuffer(cPtr, cLen, fmtLabel, tileImg) &&
+                    if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(cPtr, cLen, fmtLabel, tileImg) &&
                         tileImg.valid && tileImg.width >= bw && tileImg.height >= bh)
                     {
                         detectedNominalBps = 8;
@@ -4785,7 +4282,7 @@ inline bool ParseTiffRawIfds(
     }
 
     // Final WIC fallback (e.g. Microsoft Raw Image Extension for proprietary vendor compressed streams)
-    if (DetailImg100::DecodeEmbeddedWicBuffer(data, size, fmtLabel, outInfo)) {
+    if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data, size, fmtLabel, outInfo)) {
         return true;
     }
 
@@ -4798,16 +4295,16 @@ inline bool DecodeDibBufferToInfo(
     ExtendedImageInfo& outInfo)
 {
     if (dibLen < 40) return false;
-    uint32_t biSize = DetailImg100::RdU32LE(dib + 0);
+    uint32_t biSize = DetailLayeredAndHdrImg::RdU32LE(dib + 0);
     if (biSize != 40 && biSize != 108 && biSize != 124) return false;
     if (biSize > dibLen) return false;
 
     int32_t  biWidth  = RdS32(dib + 4, false);
     int32_t  biHeight = RdS32(dib + 8, false);
-    uint16_t biPlanes = DetailImg100::RdU16LE(dib + 12);
-    uint16_t biBits   = DetailImg100::RdU16LE(dib + 14);
-    uint32_t biComp   = DetailImg100::RdU32LE(dib + 16);
-    uint32_t biClr    = DetailImg100::RdU32LE(dib + 32);
+    uint16_t biPlanes = DetailLayeredAndHdrImg::RdU16LE(dib + 12);
+    uint16_t biBits   = DetailLayeredAndHdrImg::RdU16LE(dib + 14);
+    uint32_t biComp   = DetailLayeredAndHdrImg::RdU32LE(dib + 16);
+    uint32_t biClr    = DetailLayeredAndHdrImg::RdU32LE(dib + 32);
 
     if (biWidth <= 0 || biWidth > 16384 || biHeight == 0 || std::abs(biHeight) > 16384 || biPlanes != 1) return false;
     if (biBits != 1 && biBits != 4 && biBits != 8 && biBits != 16 && biBits != 24 && biBits != 32) return false;
@@ -4827,7 +4324,7 @@ inline bool DecodeDibBufferToInfo(
     std::memcpy(bmp.data() + 2, &fileSz, 4);
     std::memcpy(bmp.data() + 10, &bfOffBits, 4);
     std::memcpy(bmp.data() + 14, dib, dibLen);
-    if (DetailImg100::DecodeEmbeddedWicBuffer(bmp.data(), bmp.size(), label, outInfo) &&
+    if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(bmp.data(), bmp.size(), label, outInfo) &&
         outInfo.valid && outInfo.width > 0 && outInfo.height > 0)
     {
         return true;
@@ -4870,8 +4367,8 @@ inline bool DecodeDibBufferToInfo(
                 uint8_t idx = row[x];
                 if (idx < palEntries) { b = pal[idx * 4 + 0]; g = pal[idx * 4 + 1]; r = pal[idx * 4 + 2]; }
             } else if (biBits == 16) {
-                uint16_t v = DetailImg100::RdU16LE(row + x * 2u);
-                if (biComp == 3u && palEntries >= 3 && DetailImg100::RdU32LE(pal + 4) == 0x07E0u) {
+                uint16_t v = DetailLayeredAndHdrImg::RdU16LE(row + x * 2u);
+                if (biComp == 3u && palEntries >= 3 && DetailLayeredAndHdrImg::RdU32LE(pal + 4) == 0x07E0u) {
                     r = static_cast<uint8_t>(((v >> 11) & 0x1Fu) * 255u / 31u);
                     g = static_cast<uint8_t>(((v >> 5)  & 0x3Fu) * 255u / 63u);
                     b = static_cast<uint8_t>((v & 0x1Fu) * 255u / 31u);
@@ -4948,7 +4445,7 @@ inline bool TryDecodeBestZipThumbnail(
     for (const auto& m : matches) {
         std::vector<uint8_t> thumb;
         if (ZipDeflate::ExtractZipEntryFromMemory(data, size, m.origName.c_str(), thumb) && !thumb.empty()) {
-            if (DetailImg100::DecodeEmbeddedWicBuffer(thumb.data(), thumb.size(), label, outInfo) && outInfo.valid) {
+            if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(thumb.data(), thumb.size(), label, outInfo) && outInfo.valid) {
                 return true;
             }
             if (thumb.size() > 54 && thumb[0] == 'B' && thumb[1] == 'M') {
@@ -5053,13 +4550,13 @@ inline bool WalkRiffCdrForDisp(
     size_t pos = startPos;
     while (pos + 8 <= endPos) {
         const uint8_t* hdr = fileData + pos;
-        uint32_t chunkLen = DetailImg100::RdU32LE(hdr + 4);
+        uint32_t chunkLen = DetailLayeredAndHdrImg::RdU32LE(hdr + 4);
         size_t payloadPos = pos + 8;
         if (chunkLen > endPos - payloadPos) break;
 
         if (std::memcmp(hdr, "DISP", 4) == 0 && chunkLen >= 40) {
             const uint8_t* cp = fileData + payloadPos;
-            // Corel RIFF DISP typically has a 4-byte CF_DIB prefix (offset 4), or BITMAPINFOHEADER at offset 0/8/12
+            // Corel RIFF DISP stores a 4-byte CF_DIB cfType prefix at +0 followed by BITMAPINFOHEADER at +4
             static const size_t kProbeOffsets[] = { 4, 0, 8, 2, 6, 10, 12 };
             for (size_t off : kProbeOffsets) {
                 if (off + 40 <= chunkLen) {
@@ -5069,8 +4566,47 @@ inline bool WalkRiffCdrForDisp(
                 }
             }
         } else if ((std::memcmp(hdr, "LIST", 4) == 0 || std::memcmp(hdr, "RIFF", 4) == 0) && chunkLen >= 4) {
-            if (WalkRiffCdrForDisp(fileData, fileSize, payloadPos + 4, payloadPos + chunkLen, depth + 1, label, outInfo)) {
-                return true;
+            const uint8_t* subType = fileData + payloadPos;
+            if (std::memcmp(subType, "cmpr", 4) == 0 && chunkLen > 4) {
+                // CorelDRAW v7..X3 zlib-compressed RIFF sub-container:
+                // Header inside 'cmpr': [compSz:u32LE, uncompSz:u32LE, blocksSz:u32LE, flags:u32LE, zlibStream...]
+                // or direct zlib stream starting at +4 or +20 / +16 / +12.
+                const uint8_t* cmprBody = subType + 4;
+                size_t cmprAvail = chunkLen - 4;
+                static const size_t kZlibOffsets[] = { 16, 12, 8, 4, 0, 20, 24 };
+                for (size_t zOff : kZlibOffsets) {
+                    if (zOff + 2 >= cmprAvail) continue;
+                    const uint8_t* zp = cmprBody + zOff;
+                    size_t zLen = cmprAvail - zOff;
+                    if (zOff == 16 && cmprAvail >= 20) {
+                        uint32_t declaredComp = DetailLayeredAndHdrImg::RdU32LE(cmprBody);
+                        if (declaredComp >= 2 && declaredComp <= zLen) zLen = declaredComp;
+                    }
+                    std::vector<uint8_t> inflated;
+                    if (InflateZlibOrRaw(zp, zLen, inflated, 64u * 1024u * 1024u) && inflated.size() >= 8) {
+                        if (WalkRiffCdrForDisp(inflated.data(), inflated.size(), 0, inflated.size(), depth + 1, label, outInfo)) {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+            } else {
+                if (WalkRiffCdrForDisp(fileData, fileSize, payloadPos + 4, payloadPos + chunkLen, depth + 1, label, outInfo)) {
+                    return true;
+                }
+            }
+        } else if (std::memcmp(hdr, "cmpr", 4) == 0 && chunkLen > 6) {
+            const uint8_t* cmprBody = fileData + payloadPos;
+            static const size_t kZlibOffsets[] = { 16, 12, 8, 4, 0 };
+            for (size_t zOff : kZlibOffsets) {
+                if (zOff + 2 >= chunkLen) continue;
+                std::vector<uint8_t> inflated;
+                if (InflateZlibOrRaw(cmprBody + zOff, chunkLen - zOff, inflated, 64u * 1024u * 1024u) && inflated.size() >= 8) {
+                    if (WalkRiffCdrForDisp(inflated.data(), inflated.size(), 0, inflated.size(), depth + 1, label, outInfo)) {
+                        return true;
+                    }
+                    break;
+                }
             }
         }
 
@@ -5169,32 +4705,55 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
     const uint8_t* workData = data;
     size_t workSize = size;
 
+    bool isDosEps = false;
+    uint32_t dosWmfStart = 0, dosWmfLen = 0, dosTiffStart = 0, dosTiffLen = 0;
+
     // 1. DOS Binary EPS Header (C5 D0 D3 C6): [psStart:4][psLen:4][wmfStart:4][wmfLen:4][tiffStart:4][tiffLen:4]
     if (size >= 30 && data[0] == 0xC5 && data[1] == 0xD0 && data[2] == 0xD3 && data[3] == 0xC6) {
-        uint32_t psStart   = DetailImg100::RdU32LE(data + 4);
-        uint32_t psLen     = DetailImg100::RdU32LE(data + 8);
-        uint32_t wmfStart  = DetailImg100::RdU32LE(data + 12);
-        uint32_t wmfLen    = DetailImg100::RdU32LE(data + 16);
-        uint32_t tiffStart = DetailImg100::RdU32LE(data + 20);
-        uint32_t tiffLen   = DetailImg100::RdU32LE(data + 24);
+        isDosEps = true;
+        uint32_t psStart = DetailLayeredAndHdrImg::RdU32LE(data + 4);
+        uint32_t psLen   = DetailLayeredAndHdrImg::RdU32LE(data + 8);
+        dosWmfStart      = DetailLayeredAndHdrImg::RdU32LE(data + 12);
+        dosWmfLen        = DetailLayeredAndHdrImg::RdU32LE(data + 16);
+        dosTiffStart     = DetailLayeredAndHdrImg::RdU32LE(data + 20);
+        dosTiffLen       = DetailLayeredAndHdrImg::RdU32LE(data + 24);
 
-        if (tiffLen > 16 && static_cast<uint64_t>(tiffStart) + tiffLen <= size) {
-            if (DetailImg100::DecodeEmbeddedWicBuffer(data + tiffStart, tiffLen, label, outInfo)) return true;
-            if (DetailImg200::ParseTiffRawIfds(data + tiffStart, tiffLen, label, outInfo)) return true;
-        }
-        if (wmfLen > 16 && static_cast<uint64_t>(wmfStart) + wmfLen <= size) {
-            if (DecodeWindowsWmf(data + wmfStart, wmfLen, outInfo)) {
-                outInfo.formatName = label;
-                return true;
+        auto tryDosEmbeddedPreviews = [&]() -> bool {
+            if (dosTiffLen >= 16 && static_cast<uint64_t>(dosTiffStart) + dosTiffLen <= size) {
+                if (DetailVectorAndRawImg::ParseTiffRawIfds(data + dosTiffStart, dosTiffLen, label, outInfo)) return true;
+                if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data + dosTiffStart, dosTiffLen, label, outInfo)) return true;
             }
-        }
+            if (dosWmfLen >= 16 && static_cast<uint64_t>(dosWmfStart) + dosWmfLen <= size) {
+                if (DecodeWindowsWmf(data + dosWmfStart, dosWmfLen, outInfo)) {
+                    outInfo.formatName = label;
+                    return true;
+                }
+            }
+            return false;
+        };
+
         if (psLen > 0 && static_cast<uint64_t>(psStart) + psLen <= size) {
             workData = data + psStart;
             workSize = psLen;
         } else {
-            return false;
+            return tryDosEmbeddedPreviews();
         }
     }
+
+    auto tryDosPreviewFallback = [&]() -> bool {
+        if (!isDosEps) return false;
+        if (dosTiffLen >= 16 && static_cast<uint64_t>(dosTiffStart) + dosTiffLen <= size) {
+            if (DetailVectorAndRawImg::ParseTiffRawIfds(data + dosTiffStart, dosTiffLen, label, outInfo)) return true;
+            if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data + dosTiffStart, dosTiffLen, label, outInfo)) return true;
+        }
+        if (dosWmfLen >= 16 && static_cast<uint64_t>(dosWmfStart) + dosWmfLen <= size) {
+            if (DecodeWindowsWmf(data + dosWmfStart, dosWmfLen, outInfo)) {
+                outInfo.formatName = label;
+                return true;
+            }
+        }
+        return false;
+    };
 
     const bool isPdf = (workSize >= 5 && std::memcmp(workData, "%PDF-", 5) == 0);
     std::string inflatedPdfOps;
@@ -5202,118 +4761,483 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
     bool hasExplicitBox = false;
     float bx0 = 0.0f, by0 = 0.0f, bx1 = 400.0f, by1 = 300.0f;
 
-    // 2. PDF-based .ai / EPS container: inflate /FlateDecode content streams & collect /Subtype /Image XObjects
+    // 2. PDF-based .ai / EPS container: parse xref & indirect objects (/Type /Page -> /Contents & /Resources /XObject Form/Image)
     if (isPdf) {
-        std::string_view fullPdfSv(reinterpret_cast<const char*>(workData), std::min<size_t>(workSize, 16u * 1024u * 1024u));
-        float pdfBox[4] = {};
-        if (DetailImg200::ExtractPdfBox(fullPdfSv, "/ArtBox", pdfBox) ||
-            DetailImg200::ExtractPdfBox(fullPdfSv, "/CropBox", pdfBox) ||
-            DetailImg200::ExtractPdfBox(fullPdfSv, "/MediaBox", pdfBox))
-        {
-            bx0 = pdfBox[0]; by0 = pdfBox[1]; bx1 = pdfBox[2]; by1 = pdfBox[3];
-            hasExplicitBox = true;
-        }
+        const size_t pdfLimit = std::min<size_t>(workSize, 16u * 1024u * 1024u);
+        std::string_view fullPdfSv(reinterpret_cast<const char*>(workData), pdfLimit);
 
-        size_t pos = 0;
-        while (pos < fullPdfSv.size()) {
-            size_t stPos = fullPdfSv.find("stream", pos);
-            if (stPos == std::string_view::npos) break;
-            char prevCh = (stPos > 0) ? fullPdfSv[stPos - 1] : ' ';
-            if ((prevCh >= 'A' && prevCh <= 'Z') || (prevCh >= 'a' && prevCh <= 'z') || prevCh == '/') {
-                pos = stPos + 6;
-                continue;
+        struct PdfObjSlice {
+            uint32_t objNum = 0;
+            std::string_view body; // between "N G obj" and "endobj"
+            std::string_view dict; // "<< ... >>" header before stream (or whole dict)
+            bool hasStream = false;
+            size_t streamStart = 0;
+            size_t streamLen = 0;
+        };
+        std::unordered_map<uint32_t, PdfObjSlice> pdfObjs;
+
+        auto parseObjAt = [&](size_t objHdrPos, uint32_t knownObjNum) {
+            size_t kwObj = fullPdfSv.find("obj", objHdrPos);
+            if (kwObj == std::string_view::npos || kwObj - objHdrPos > 48) return;
+            size_t bodyStart = kwObj + 3;
+            size_t endObj = fullPdfSv.find("endobj", bodyStart);
+            if (endObj == std::string_view::npos) endObj = fullPdfSv.size();
+            PdfObjSlice s;
+            s.objNum = knownObjNum;
+            s.body = fullPdfSv.substr(bodyStart, endObj - bodyStart);
+
+            size_t stRel = std::string_view::npos;
+            size_t searchPos = 0;
+            while (searchPos < s.body.size()) {
+                size_t p = s.body.find("stream", searchPos);
+                if (p == std::string_view::npos) break;
+                char prev = (p > 0) ? s.body[p - 1] : ' ';
+                char next = (p + 6 < s.body.size()) ? s.body[p + 6] : '\0';
+                if (!((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') || prev == '/') &&
+                    (next == '\r' || next == '\n'))
+                {
+                    stRel = p;
+                    break;
+                }
+                searchPos = p + 6;
             }
-            size_t dataStart = stPos + 6;
-            if (dataStart < fullPdfSv.size() && fullPdfSv[dataStart] == '\r') ++dataStart;
-            if (dataStart < fullPdfSv.size() && fullPdfSv[dataStart] == '\n') ++dataStart;
-            else if (dataStart == stPos + 6) { pos = stPos + 6; continue; }
 
-            size_t dictStart = fullPdfSv.rfind("<<", stPos);
-            std::string_view dictSv = (dictStart != std::string_view::npos && stPos - dictStart < 2048)
-                ? fullPdfSv.substr(dictStart, stPos - dictStart)
-                : std::string_view{};
+            if (stRel != std::string_view::npos) {
+                size_t d0 = s.body.find("<<");
+                s.dict = (d0 != std::string_view::npos && d0 < stRel) ? s.body.substr(d0, stRel - d0) : s.body.substr(0, stRel);
+                size_t ds = bodyStart + stRel + 6;
+                if (ds < fullPdfSv.size() && fullPdfSv[ds] == '\r') ++ds;
+                if (ds < fullPdfSv.size() && fullPdfSv[ds] == '\n') ++ds;
+                size_t endSt = fullPdfSv.find("endstream", ds);
+                if (endSt != std::string_view::npos && endSt <= endObj) {
+                    size_t de = endSt;
+                    if (de > ds && fullPdfSv[de - 1] == '\n') --de;
+                    if (de > ds && fullPdfSv[de - 1] == '\r') --de;
+                    s.hasStream = true;
+                    s.streamStart = ds;
+                    s.streamLen = (de > ds) ? (de - ds) : 0;
+                }
+            } else {
+                size_t d0 = s.body.find("<<");
+                s.dict = (d0 != std::string_view::npos) ? s.body.substr(d0) : s.body;
+            }
+            pdfObjs[knownObjNum] = s;
+        };
 
-            size_t endSt = fullPdfSv.find("endstream", dataStart);
-            if (endSt == std::string_view::npos) break;
-            size_t dataEnd = endSt;
-            if (dataEnd > dataStart && fullPdfSv[dataEnd - 1] == '\n') --dataEnd;
-            if (dataEnd > dataStart && fullPdfSv[dataEnd - 1] == '\r') --dataEnd;
-            size_t rawLen = (dataEnd > dataStart) ? (dataEnd - dataStart) : 0;
-
-            bool isFlate = (dictSv.find("/FlateDecode") != std::string_view::npos);
-            bool isImageXObj = (dictSv.find("/Image") != std::string_view::npos && dictSv.find("/Subtype") != std::string_view::npos);
-            bool isBinaryOther = (dictSv.find("/DCTDecode") != std::string_view::npos ||
-                                  dictSv.find("/JPXDecode") != std::string_view::npos ||
-                                  dictSv.find("/CCITTFaxDecode") != std::string_view::npos ||
-                                  dictSv.find("/JBIG2Decode") != std::string_view::npos);
-
-            if (rawLen > 0) {
-                const uint8_t* sp = workData + dataStart;
-                if (isImageXObj) {
-                    if (!pdfImageFallback.valid && DetailImg100::DecodeEmbeddedWicBuffer(sp, rawLen, label, pdfImageFallback)) {
-                        // Stored in pdfImageFallback if vector content streams produce no geometry
-                    } else if (!pdfImageFallback.valid) {
-                        std::vector<uint8_t> imgBytes;
-                        const uint8_t* rawPix = sp;
-                        size_t rawPixLen = rawLen;
-                        if (isFlate && DetailImg200::InflateZlibOrRaw(sp, rawLen, imgBytes, 32u * 1024u * 1024u)) {
-                            rawPix = imgBytes.data();
-                            rawPixLen = imgBytes.size();
-                        }
-                        auto parseDictInt = [&](std::string_view key) -> int {
-                            size_t kp = dictSv.find(key);
-                            if (kp == std::string_view::npos) return 0;
-                            kp += key.size();
-                            return DetailImg200::ParseAsciiIntOrZero(dictSv.substr(kp));
-                        };
-                        int iw = parseDictInt("/Width");
-                        int ih = parseDictInt("/Height");
-                        int ibpc = parseDictInt("/BitsPerComponent");
-                        if (ibpc == 0) ibpc = 8;
-                        int ich = (dictSv.find("/DeviceGray") != std::string_view::npos) ? 1 :
-                                  (dictSv.find("/DeviceCMYK") != std::string_view::npos) ? 4 : 3;
-                        if (iw > 0 && ih > 0 && iw <= 4096 && ih <= 4096 && ibpc == 8 &&
-                            rawPixLen >= static_cast<size_t>(iw) * ih * ich)
-                        {
-                            pdfImageFallback.width = static_cast<uint32_t>(iw);
-                            pdfImageFallback.height = static_cast<uint32_t>(ih);
-                            pdfImageFallback.origWidth = static_cast<uint32_t>(iw);
-                            pdfImageFallback.origHeight = static_cast<uint32_t>(ih);
-                            pdfImageFallback.channels = 4;
-                            pdfImageFallback.bitsPerChannel = 8;
-                            pdfImageFallback.formatName = label;
-                            pdfImageFallback.bgraPixels.resize(static_cast<size_t>(iw) * ih * 4u);
-                            for (size_t px = 0; px < static_cast<size_t>(iw) * ih; ++px) {
-                                uint8_t r = 0, g = 0, b = 0;
-                                if (ich == 1) { r = g = b = rawPix[px]; }
-                                else if (ich == 3) { r = rawPix[px * 3 + 0]; g = rawPix[px * 3 + 1]; b = rawPix[px * 3 + 2]; }
-                                else {
-                                    uint32_t c = 255u - rawPix[px * 4 + 0], m = 255u - rawPix[px * 4 + 1];
-                                    uint32_t yv = 255u - rawPix[px * 4 + 2], k = 255u - rawPix[px * 4 + 3];
-                                    r = static_cast<uint8_t>((c * k) / 255u);
-                                    g = static_cast<uint8_t>((m * k) / 255u);
-                                    b = static_cast<uint8_t>((yv * k) / 255u);
-                                }
-                                pdfImageFallback.bgraPixels[px * 4 + 0] = b;
-                                pdfImageFallback.bgraPixels[px * 4 + 1] = g;
-                                pdfImageFallback.bgraPixels[px * 4 + 2] = r;
-                                pdfImageFallback.bgraPixels[px * 4 + 3] = 255;
-                            }
-                            pdfImageFallback.valid = true;
+        // First walk explicit `xref` table offsets if present
+        size_t xrefPos = fullPdfSv.rfind("xref");
+        if (xrefPos != std::string_view::npos) {
+            size_t xp = xrefPos + 4;
+            while (xp < fullPdfSv.size() && (fullPdfSv[xp] == ' ' || fullPdfSv[xp] == '\r' || fullPdfSv[xp] == '\n' || fullPdfSv[xp] == '\t')) ++xp;
+            while (xp < fullPdfSv.size() && fullPdfSv[xp] >= '0' && fullPdfSv[xp] <= '9') {
+                size_t lineEnd = fullPdfSv.find_first_of("\r\n", xp);
+                if (lineEnd == std::string_view::npos) break;
+                float hdrNums[2] = {};
+                if (DetailVectorAndRawImg::ParseFloatsFromSv(fullPdfSv.substr(xp, lineEnd - xp), hdrNums, 2) < 2) break;
+                uint32_t firstId = static_cast<uint32_t>(hdrNums[0]);
+                uint32_t count = std::min<uint32_t>(static_cast<uint32_t>(hdrNums[1]), 65536u);
+                xp = lineEnd;
+                while (xp < fullPdfSv.size() && (fullPdfSv[xp] == '\r' || fullPdfSv[xp] == '\n')) ++xp;
+                for (uint32_t idx = 0; idx < count && xp + 18 <= fullPdfSv.size(); ++idx) {
+                    size_t el = fullPdfSv.find_first_of("\r\n", xp);
+                    if (el == std::string_view::npos) el = fullPdfSv.size();
+                    std::string_view entry = fullPdfSv.substr(xp, el - xp);
+                    xp = el;
+                    while (xp < fullPdfSv.size() && (fullPdfSv[xp] == '\r' || fullPdfSv[xp] == '\n')) ++xp;
+                    if (entry.size() >= 17 && entry.find('n') != std::string_view::npos) {
+                        int32_t off = DetailVectorAndRawImg::ParseAsciiIntOrZero(entry.substr(0, 10));
+                        if (off > 0 && static_cast<size_t>(off) + 8 < fullPdfSv.size()) {
+                            parseObjAt(static_cast<size_t>(off), firstId + idx);
                         }
                     }
-                } else if (isFlate && inflatedPdfOps.size() < 8u * 1024u * 1024u) {
+                }
+            }
+        }
+
+        // Also scan top-level `<objNum> <genNum> obj` definitions (covers linearized / hand-crafted / updated PDFs)
+        {
+            size_t p = 0;
+            while (p < fullPdfSv.size()) {
+                while (p < fullPdfSv.size() && (fullPdfSv[p] < '0' || fullPdfSv[p] > '9')) ++p;
+                if (p >= fullPdfSv.size()) break;
+                if (p > 0) {
+                    char prev = fullPdfSv[p - 1];
+                    if ((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') || prev == '/' || prev == '.') {
+                        while (p < fullPdfSv.size() && fullPdfSv[p] >= '0' && fullPdfSv[p] <= '9') ++p;
+                        continue;
+                    }
+                }
+                size_t n1Start = p;
+                uint64_t objId = 0;
+                while (p < fullPdfSv.size() && fullPdfSv[p] >= '0' && fullPdfSv[p] <= '9') {
+                    objId = objId * 10u + static_cast<uint64_t>(fullPdfSv[p++] - '0');
+                    if (objId > 1000000ull) break;
+                }
+                if (objId == 0 || objId > 1000000ull || p >= fullPdfSv.size() || (fullPdfSv[p] != ' ' && fullPdfSv[p] != '\t')) continue;
+                while (p < fullPdfSv.size() && (fullPdfSv[p] == ' ' || fullPdfSv[p] == '\t')) ++p;
+                size_t gStart = p;
+                while (p < fullPdfSv.size() && fullPdfSv[p] >= '0' && fullPdfSv[p] <= '9') ++p;
+                if (p == gStart || p >= fullPdfSv.size() || (fullPdfSv[p] != ' ' && fullPdfSv[p] != '\t' && fullPdfSv[p] != '\r' && fullPdfSv[p] != '\n')) continue;
+                size_t wsEnd = p;
+                while (wsEnd < fullPdfSv.size() && (fullPdfSv[wsEnd] == ' ' || fullPdfSv[wsEnd] == '\t' || fullPdfSv[wsEnd] == '\r' || fullPdfSv[wsEnd] == '\n')) ++wsEnd;
+                if (wsEnd + 3 <= fullPdfSv.size() && fullPdfSv.substr(wsEnd, 3) == "obj") {
+                    char after = (wsEnd + 3 < fullPdfSv.size()) ? fullPdfSv[wsEnd + 3] : ' ';
+                    if (after == ' ' || after == '\t' || after == '\r' || after == '\n' || after == '<' || after == '[') {
+                        uint32_t oid = static_cast<uint32_t>(objId);
+                        if (pdfObjs.find(oid) == pdfObjs.end()) {
+                            parseObjAt(n1Start, oid);
+                        }
+                        auto it = pdfObjs.find(oid);
+                        if (it != pdfObjs.end() && it->second.hasStream) {
+                            p = it->second.streamStart + it->second.streamLen;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        auto decodeStreamBytes = [&](const PdfObjSlice& obj, std::vector<uint8_t>& outBytes) -> bool {
+            if (!obj.hasStream || obj.streamLen == 0 || obj.streamStart + obj.streamLen > workSize) return false;
+            const uint8_t* sp = workData + obj.streamStart;
+            if (obj.dict.find("/FlateDecode") != std::string_view::npos) {
+                return DetailVectorAndRawImg::InflateZlibOrRaw(sp, obj.streamLen, outBytes, 16u * 1024u * 1024u);
+            }
+            outBytes.assign(sp, sp + obj.streamLen);
+            return true;
+        };
+
+        // Unpack PDF 1.5+ /Type /ObjStm compressed object streams if any exist
+        std::vector<uint32_t> objStmIds;
+        for (const auto& kv : pdfObjs) {
+            if (kv.second.hasStream && kv.second.dict.find("/ObjStm") != std::string_view::npos) {
+                objStmIds.push_back(kv.first);
+            }
+        }
+        for (uint32_t osId : objStmIds) {
+            std::vector<uint8_t> dec;
+            const auto& os = pdfObjs[osId];
+            if (!decodeStreamBytes(os, dec) || dec.empty()) continue;
+            auto parseDictInt = [&](std::string_view d, std::string_view key) -> int {
+                size_t kp = d.find(key);
+                if (kp == std::string_view::npos) return 0;
+                return DetailVectorAndRawImg::ParseAsciiIntOrZero(d.substr(kp + key.size()));
+            };
+            int nObjs = parseDictInt(os.dict, "/N");
+            int firstOff = parseDictInt(os.dict, "/First");
+            if (nObjs <= 0 || nObjs > 4096 || firstOff <= 0 || static_cast<size_t>(firstOff) >= dec.size()) continue;
+            // Keep uncompressed text backing in inflated buffer? Only needed for Page/Resources metadata:
+            std::string_view headerSv(reinterpret_cast<const char*>(dec.data()), static_cast<size_t>(firstOff));
+            std::vector<float> pairs(static_cast<size_t>(nObjs) * 2u, 0.0f);
+            size_t got = DetailVectorAndRawImg::ParseFloatsFromSv(headerSv, pairs.data(), pairs.size());
+            for (size_t i = 0; i + 1 < got; i += 2) {
+                uint32_t subId = static_cast<uint32_t>(pairs[i]);
+                size_t relOff = static_cast<size_t>(std::max(0.0f, pairs[i + 1]));
+                size_t nextRel = (i + 3 < got) ? static_cast<size_t>(std::max(0.0f, pairs[i + 3])) : (dec.size() - static_cast<size_t>(firstOff));
+                size_t absStart = static_cast<size_t>(firstOff) + relOff;
+                size_t absEnd = std::min(dec.size(), static_cast<size_t>(firstOff) + nextRel);
+                if (absStart < absEnd && pdfObjs.find(subId) == pdfObjs.end()) {
+                    // Check for Page boxes directly
+                    std::string_view subSv(reinterpret_cast<const char*>(dec.data()) + absStart, absEnd - absStart);
+                    float pbox[4] = {};
+                    if (!hasExplicitBox &&
+                        (DetailVectorAndRawImg::ExtractPdfBox(subSv, "/ArtBox", pbox) ||
+                         DetailVectorAndRawImg::ExtractPdfBox(subSv, "/CropBox", pbox) ||
+                         DetailVectorAndRawImg::ExtractPdfBox(subSv, "/MediaBox", pbox)))
+                    {
+                        bx0 = pbox[0]; by0 = pbox[1]; bx1 = pbox[2]; by1 = pbox[3];
+                        hasExplicitBox = true;
+                    }
+                }
+            }
+        }
+
+        auto extractRefsFromValue = [&](std::string_view sv, std::string_view key, std::vector<uint32_t>& outRefs) {
+            size_t kp = sv.find(key);
+            if (kp == std::string_view::npos) return;
+            size_t p = kp + key.size();
+            while (p < sv.size() && (sv[p] == ' ' || sv[p] == '\t' || sv[p] == '\r' || sv[p] == '\n')) ++p;
+            if (p >= sv.size()) return;
+            std::string_view target = sv.substr(p, std::min<size_t>(sv.size() - p, 512u));
+            if (target[0] == '[') {
+                size_t rb = target.find(']');
+                if (rb != std::string_view::npos) target = target.substr(1, rb - 1);
+            } else if (target.size() >= 2 && target[0] == '<' && target[1] == '<') {
+                int depth = 0;
+                size_t endD = 0;
+                for (; endD + 1 < target.size(); ++endD) {
+                    if (target[endD] == '<' && target[endD + 1] == '<') { ++depth; ++endD; }
+                    else if (target[endD] == '>' && target[endD + 1] == '>') {
+                        --depth; ++endD;
+                        if (depth <= 0) { ++endD; break; }
+                    }
+                }
+                target = target.substr(0, endD);
+            } else {
+                // Single indirect ref: N G R
+                size_t rPos = target.find('R');
+                if (rPos != std::string_view::npos && rPos < 32) target = target.substr(0, rPos + 1);
+                else return;
+            }
+
+            size_t q = 0;
+            while (q < target.size()) {
+                while (q < target.size() && (target[q] < '0' || target[q] > '9')) ++q;
+                if (q >= target.size()) break;
+                uint32_t n1 = static_cast<uint32_t>(DetailVectorAndRawImg::ParseAsciiIntOrZero(target.substr(q)));
+                while (q < target.size() && target[q] >= '0' && target[q] <= '9') ++q;
+                while (q < target.size() && (target[q] == ' ' || target[q] == '\t' || target[q] == '\r' || target[q] == '\n')) ++q;
+                if (q >= target.size() || target[q] < '0' || target[q] > '9') continue;
+                while (q < target.size() && target[q] >= '0' && target[q] <= '9') ++q;
+                while (q < target.size() && (target[q] == ' ' || target[q] == '\t' || target[q] == '\r' || target[q] == '\n')) ++q;
+                if (q < target.size() && target[q] == 'R' && n1 > 0) {
+                    outRefs.push_back(n1);
+                    ++q;
+                }
+            }
+        };
+
+        auto tryDecodeImageXObj = [&](const PdfObjSlice& obj) {
+            if (pdfImageFallback.valid || !obj.hasStream || obj.streamLen == 0) return;
+            const uint8_t* sp = workData + obj.streamStart;
+            if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(sp, obj.streamLen, label, pdfImageFallback)) {
+                return;
+            }
+            std::vector<uint8_t> imgBytes;
+            const uint8_t* rawPix = sp;
+            size_t rawPixLen = obj.streamLen;
+            if (obj.dict.find("/FlateDecode") != std::string_view::npos &&
+                DetailVectorAndRawImg::InflateZlibOrRaw(sp, obj.streamLen, imgBytes, 32u * 1024u * 1024u))
+            {
+                rawPix = imgBytes.data();
+                rawPixLen = imgBytes.size();
+            }
+            auto parseDictInt = [&](std::string_view key) -> int {
+                size_t kp = obj.dict.find(key);
+                if (kp == std::string_view::npos) return 0;
+                return DetailVectorAndRawImg::ParseAsciiIntOrZero(obj.dict.substr(kp + key.size()));
+            };
+            int iw = parseDictInt("/Width");
+            int ih = parseDictInt("/Height");
+            int ibpc = parseDictInt("/BitsPerComponent");
+            if (ibpc == 0) ibpc = 8;
+            int ich = (obj.dict.find("/DeviceGray") != std::string_view::npos) ? 1 :
+                      (obj.dict.find("/DeviceCMYK") != std::string_view::npos) ? 4 : 3;
+            if (iw > 0 && ih > 0 && iw <= 4096 && ih <= 4096 && ibpc == 8 &&
+                rawPixLen >= static_cast<size_t>(iw) * ih * ich)
+            {
+                pdfImageFallback.width = static_cast<uint32_t>(iw);
+                pdfImageFallback.height = static_cast<uint32_t>(ih);
+                pdfImageFallback.origWidth = static_cast<uint32_t>(iw);
+                pdfImageFallback.origHeight = static_cast<uint32_t>(ih);
+                pdfImageFallback.channels = 4;
+                pdfImageFallback.bitsPerChannel = 8;
+                pdfImageFallback.formatName = label;
+                pdfImageFallback.bgraPixels.resize(static_cast<size_t>(iw) * ih * 4u);
+                for (size_t px = 0; px < static_cast<size_t>(iw) * ih; ++px) {
+                    uint8_t r = 0, g = 0, b = 0;
+                    if (ich == 1) { r = g = b = rawPix[px]; }
+                    else if (ich == 3) { r = rawPix[px * 3 + 0]; g = rawPix[px * 3 + 1]; b = rawPix[px * 3 + 2]; }
+                    else {
+                        uint32_t c = 255u - rawPix[px * 4 + 0], m = 255u - rawPix[px * 4 + 1];
+                        uint32_t yv = 255u - rawPix[px * 4 + 2], k = 255u - rawPix[px * 4 + 3];
+                        r = static_cast<uint8_t>((c * k) / 255u);
+                        g = static_cast<uint8_t>((m * k) / 255u);
+                        b = static_cast<uint8_t>((yv * k) / 255u);
+                    }
+                    pdfImageFallback.bgraPixels[px * 4 + 0] = b;
+                    pdfImageFallback.bgraPixels[px * 4 + 1] = g;
+                    pdfImageFallback.bgraPixels[px * 4 + 2] = r;
+                    pdfImageFallback.bgraPixels[px * 4 + 3] = 255;
+                }
+                pdfImageFallback.valid = true;
+            }
+        };
+
+        // Locate the first /Type /Page object (not /Pages!)
+        const PdfObjSlice* pageObj = nullptr;
+        uint32_t bestPageId = 0xFFFFFFFFu;
+        for (const auto& kv : pdfObjs) {
+            std::string_view d = kv.second.dict;
+            size_t tp = 0;
+            while ((tp = d.find("/Page", tp)) != std::string_view::npos) {
+                char next = (tp + 5 < d.size()) ? d[tp + 5] : ' ';
+                if (next != 's' && next != 'L' && next != 'M' && !((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z'))) {
+                    if (kv.first < bestPageId) {
+                        bestPageId = kv.first;
+                        pageObj = &kv.second;
+                    }
+                    break;
+                }
+                tp += 5;
+            }
+        }
+
+        auto extractBoxFromDictOrParent = [&](const PdfObjSlice* pg) {
+            float pdfBox[4] = {};
+            if (pg && (DetailVectorAndRawImg::ExtractPdfBox(pg->dict, "/ArtBox", pdfBox) ||
+                       DetailVectorAndRawImg::ExtractPdfBox(pg->dict, "/CropBox", pdfBox) ||
+                       DetailVectorAndRawImg::ExtractPdfBox(pg->dict, "/MediaBox", pdfBox)))
+            {
+                bx0 = pdfBox[0]; by0 = pdfBox[1]; bx1 = pdfBox[2]; by1 = pdfBox[3];
+                hasExplicitBox = true;
+                return;
+            }
+            if (DetailVectorAndRawImg::ExtractPdfBox(fullPdfSv, "/ArtBox", pdfBox) ||
+                DetailVectorAndRawImg::ExtractPdfBox(fullPdfSv, "/CropBox", pdfBox) ||
+                DetailVectorAndRawImg::ExtractPdfBox(fullPdfSv, "/MediaBox", pdfBox))
+            {
+                bx0 = pdfBox[0]; by0 = pdfBox[1]; bx1 = pdfBox[2]; by1 = pdfBox[3];
+                hasExplicitBox = true;
+            }
+        };
+        extractBoxFromDictOrParent(pageObj);
+
+        std::vector<uint32_t> visitedObjs;
+        auto markVisited = [&](uint32_t id) -> bool {
+            if (std::find(visitedObjs.begin(), visitedObjs.end(), id) != visitedObjs.end()) return false;
+            visitedObjs.push_back(id);
+            return true;
+        };
+
+        std::function<void(uint32_t, int)> appendStreamOrForm = [&](uint32_t id, int depth) {
+            if (depth > 6 || !markVisited(id) || inflatedPdfOps.size() >= 8u * 1024u * 1024u) return;
+            auto it = pdfObjs.find(id);
+            if (it == pdfObjs.end()) return;
+            const PdfObjSlice& obj = it->second;
+            if (!obj.hasStream) {
+                // Could be an indirect array of content stream refs: [ 5 0 R 6 0 R ]
+                std::vector<uint32_t> subRefs;
+                size_t q = 0;
+                while (q < obj.body.size()) {
+                    while (q < obj.body.size() && (obj.body[q] < '0' || obj.body[q] > '9')) ++q;
+                    if (q >= obj.body.size()) break;
+                    uint32_t n1 = static_cast<uint32_t>(DetailVectorAndRawImg::ParseAsciiIntOrZero(obj.body.substr(q)));
+                    while (q < obj.body.size() && obj.body[q] >= '0' && obj.body[q] <= '9') ++q;
+                    while (q < obj.body.size() && (obj.body[q] == ' ' || obj.body[q] == '\t' || obj.body[q] == '\r' || obj.body[q] == '\n')) ++q;
+                    while (q < obj.body.size() && obj.body[q] >= '0' && obj.body[q] <= '9') ++q;
+                    while (q < obj.body.size() && (obj.body[q] == ' ' || obj.body[q] == '\t' || obj.body[q] == '\r' || obj.body[q] == '\n')) ++q;
+                    if (q < obj.body.size() && obj.body[q] == 'R' && n1 > 0) {
+                        subRefs.push_back(n1);
+                        ++q;
+                    }
+                }
+                for (uint32_t sr : subRefs) appendStreamOrForm(sr, depth + 1);
+                return;
+            }
+
+            if (obj.dict.find("/Image") != std::string_view::npos && obj.dict.find("/Subtype") != std::string_view::npos) {
+                tryDecodeImageXObj(obj);
+                return;
+            }
+            if (obj.dict.find("/Metadata") != std::string_view::npos ||
+                obj.dict.find("/ObjStm") != std::string_view::npos ||
+                obj.dict.find("/XRef") != std::string_view::npos) {
+                return;
+            }
+
+            bool isForm = (obj.dict.find("/Form") != std::string_view::npos && obj.dict.find("/Subtype") != std::string_view::npos);
+            std::vector<uint8_t> dec;
+            if (decodeStreamBytes(obj, dec) && !dec.empty()) {
+                if (isForm) inflatedPdfOps.append("q\n");
+                // Apply Form /Matrix [a b c d e f] if present!
+                if (isForm) {
+                    float fm[6] = {};
+                    size_t mp = obj.dict.find("/Matrix");
+                    if (mp != std::string_view::npos) {
+                        size_t lb = obj.dict.find('[', mp);
+                        size_t rb = (lb != std::string_view::npos) ? obj.dict.find(']', lb) : std::string_view::npos;
+                        if (lb != std::string_view::npos && rb != std::string_view::npos &&
+                            DetailVectorAndRawImg::ParseFloatsFromSv(obj.dict.substr(lb + 1, rb - lb - 1), fm, 6) == 6)
+                        {
+                            char matBuf[160];
+                            std::snprintf(matBuf, sizeof(matBuf), "%.6f %.6f %.6f %.6f %.6f %.6f cm\n",
+                                fm[0], fm[1], fm[2], fm[3], fm[4], fm[5]);
+                            inflatedPdfOps.append(matBuf);
+                        }
+                    }
+                }
+                inflatedPdfOps.append(reinterpret_cast<const char*>(dec.data()), dec.size());
+                inflatedPdfOps.push_back('\n');
+                if (isForm) inflatedPdfOps.append("Q\n");
+            }
+
+            // Also inspect nested Form /Resources -> /XObject
+            std::vector<uint32_t> xobjRefs;
+            extractRefsFromValue(obj.dict, "/XObject", xobjRefs);
+            for (uint32_t xr : xobjRefs) {
+                auto xit = pdfObjs.find(xr);
+                if (xit != pdfObjs.end() && !xit->second.hasStream) {
+                    std::vector<uint32_t> innerRefs;
+                    extractRefsFromValue(xit->second.dict, "", innerRefs);
+                    for (uint32_t ir : innerRefs) appendStreamOrForm(ir, depth + 1);
+                } else {
+                    appendStreamOrForm(xr, depth + 1);
+                }
+            }
+        };
+
+        if (pageObj) {
+            std::vector<uint32_t> contentRefs;
+            extractRefsFromValue(pageObj->dict, "/Contents", contentRefs);
+            for (uint32_t cid : contentRefs) appendStreamOrForm(cid, 0);
+
+            // Inspect Page /Resources -> /XObject (both inline dict and indirect /Resources or /XObject dict)
+            auto walkResourcesDict = [&](std::string_view resDict) {
+                std::vector<uint32_t> xobjRefs;
+                extractRefsFromValue(resDict, "/XObject", xobjRefs);
+                for (uint32_t xr : xobjRefs) {
+                    auto xit = pdfObjs.find(xr);
+                    if (xit != pdfObjs.end() && !xit->second.hasStream) {
+                        // xr is the XObject dictionary `<< /Fm0 7 0 R /Im0 8 0 R >>`
+                        size_t q = 0;
+                        std::string_view xd = xit->second.dict;
+                        while (q < xd.size()) {
+                            while (q < xd.size() && (xd[q] < '0' || xd[q] > '9')) ++q;
+                            if (q >= xd.size()) break;
+                            uint32_t n1 = static_cast<uint32_t>(DetailVectorAndRawImg::ParseAsciiIntOrZero(xd.substr(q)));
+                            while (q < xd.size() && xd[q] >= '0' && xd[q] <= '9') ++q;
+                            while (q < xd.size() && (xd[q] == ' ' || xd[q] == '\t' || xd[q] == '\r' || xd[q] == '\n')) ++q;
+                            while (q < xd.size() && xd[q] >= '0' && xd[q] <= '9') ++q;
+                            while (q < xd.size() && (xd[q] == ' ' || xd[q] == '\t' || xd[q] == '\r' || xd[q] == '\n')) ++q;
+                            if (q < xd.size() && xd[q] == 'R' && n1 > 0) {
+                                appendStreamOrForm(n1, 1);
+                                ++q;
+                            }
+                        }
+                    } else {
+                        appendStreamOrForm(xr, 1);
+                    }
+                }
+            };
+
+            walkResourcesDict(pageObj->dict);
+            std::vector<uint32_t> resRefs;
+            extractRefsFromValue(pageObj->dict, "/Resources", resRefs);
+            for (uint32_t rr : resRefs) {
+                auto rit = pdfObjs.find(rr);
+                if (rit != pdfObjs.end()) walkResourcesDict(rit->second.dict);
+            }
+        }
+
+        // Fallback if PDF lacked an explicit `/Type /Page` object (e.g. minimal PDF stream fragment)
+        if (inflatedPdfOps.empty() && !pdfImageFallback.valid) {
+            for (const auto& kv : pdfObjs) {
+                const PdfObjSlice& obj = kv.second;
+                if (!obj.hasStream) continue;
+                if (obj.dict.find("/Image") != std::string_view::npos && obj.dict.find("/Subtype") != std::string_view::npos) {
+                    tryDecodeImageXObj(obj);
+                } else if (obj.dict.find("/Metadata") == std::string_view::npos &&
+                           obj.dict.find("/ObjStm") == std::string_view::npos &&
+                           obj.dict.find("/XRef") == std::string_view::npos)
+                {
                     std::vector<uint8_t> dec;
-                    if (DetailImg200::InflateZlibOrRaw(sp, rawLen, dec, 8u * 1024u * 1024u)) {
+                    if (decodeStreamBytes(obj, dec) && !dec.empty()) {
                         inflatedPdfOps.append(reinterpret_cast<const char*>(dec.data()), dec.size());
                         inflatedPdfOps.push_back('\n');
                     }
-                } else if (!isBinaryOther && !isFlate && inflatedPdfOps.size() < 8u * 1024u * 1024u) {
-                    inflatedPdfOps.append(reinterpret_cast<const char*>(sp), rawLen);
-                    inflatedPdfOps.push_back('\n');
                 }
             }
-            pos = endSt + 9;
         }
     }
 
@@ -5323,7 +5247,7 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
             rawSv.find("%%BoundingBox") == std::string_view::npos &&
             rawSv.find("%AI") == std::string_view::npos)
         {
-            return false;
+            return tryDosPreviewFallback();
         }
 
         auto parseBBoxAt = [&](size_t pos, std::string_view tag) -> bool {
@@ -5331,7 +5255,7 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
             size_t start = pos + tag.size();
             size_t eol = rawSv.find_first_of("\r\n", start);
             float vals[4] = {};
-            if (DetailImg200::ParseFloatsFromSv(rawSv.substr(start, (eol == std::string_view::npos ? rawSv.size() : eol) - start), vals, 4) == 4 &&
+            if (DetailVectorAndRawImg::ParseFloatsFromSv(rawSv.substr(start, (eol == std::string_view::npos ? rawSv.size() : eol) - start), vals, 4) == 4 &&
                 vals[2] > vals[0] && vals[3] > vals[1])
             {
                 bx0 = vals[0]; by0 = vals[1]; bx1 = vals[2]; by1 = vals[3];
@@ -5354,7 +5278,7 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
     // 3. PostScript & PDF Vector Interpreter (CTM, q/Q/gsave/grestore, RGB/CMYK/Gray, Bezier c/v/y, re, scanline fill + stroke)
     struct Mat2D {
         float a = 1.0f, b = 0.0f, c = 0.0f, d = 1.0f, tx = 0.0f, ty = 0.0f;
-        DetailImg200::Pt2f apply(float x, float y) const {
+        DetailVectorAndRawImg::Pt2f apply(float x, float y) const {
             return { a * x + c * y + tx, b * x + d * y + ty };
         }
     };
@@ -5378,7 +5302,7 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
     };
 
     struct SubPath {
-        std::vector<DetailImg200::Pt2f> pts;
+        std::vector<DetailVectorAndRawImg::Pt2f> pts;
         bool closed = false;
     };
 
@@ -5495,7 +5419,7 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
         }
 
         float numVal = 0.0f;
-        if (DetailImg200::ParseAsciiFloatToken(tok, numVal)) {
+        if (DetailVectorAndRawImg::ParseAsciiFloatToken(tok, numVal)) {
             if (stack.size() > 96) stack.erase(stack.begin(), stack.begin() + 32);
             stack.push_back(numVal);
             return;
@@ -5769,8 +5693,8 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
     }
 
     if (displayList.empty()) {
-        if (!isPdf && DetailImg200::DecodeEpsiHexPreview(rawSv, label, outInfo)) return true;
-        if (DetailImg200::FindAndDecodeBestEmbeddedRaster(workData, workSize, label, outInfo)) return true;
+        if (!isPdf && DetailVectorAndRawImg::DecodeEpsiHexPreview(rawSv, label, outInfo)) return true;
+        if (DetailVectorAndRawImg::FindAndDecodeBestEmbeddedRaster(workData, workSize, label, outInfo)) return true;
         if (pdfImageFallback.valid) { outInfo = std::move(pdfImageFallback); return true; }
         return false;
     }
@@ -5802,16 +5726,16 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
     bool drewAny = false;
     for (const auto& item : displayList) {
         if (item.isFill) {
-            std::vector<std::vector<DetailImg200::Pt2f>> rings;
+            std::vector<std::vector<DetailVectorAndRawImg::Pt2f>> rings;
             rings.reserve(item.paths.size());
             for (const auto& sp : item.paths) {
                 if (sp.pts.size() < 3) continue;
-                std::vector<DetailImg200::Pt2f> r;
+                std::vector<DetailVectorAndRawImg::Pt2f> r;
                 r.reserve(sp.pts.size());
                 for (const auto& p : sp.pts) r.push_back({ mapXf(p.x), mapYf(p.y) });
                 rings.push_back(std::move(r));
             }
-            if (DetailImg200::FillPolygonRingsBGRA(canvas, imgW, imgH, rings, item.evenOdd, item.r, item.g, item.b)) {
+            if (DetailVectorAndRawImg::FillPolygonRingsBGRA(canvas, imgW, imgH, rings, item.evenOdd, item.r, item.g, item.b)) {
                 drewAny = true;
             }
         } else {
@@ -5819,7 +5743,7 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
             for (const auto& sp : item.paths) {
                 if (sp.pts.size() < 2) continue;
                 for (size_t k = 0; k + 1 < sp.pts.size(); ++k) {
-                    DetailImg200::DrawLineBGRA(
+                    DetailVectorAndRawImg::DrawLineBGRA(
                         canvas, imgW, imgH,
                         static_cast<int>(std::round(mapXf(sp.pts[k].x))),
                         static_cast<int>(std::round(mapYf(sp.pts[k].y))),
@@ -5829,7 +5753,7 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
                     drewAny = true;
                 }
                 if (sp.closed && sp.pts.size() >= 2) {
-                    DetailImg200::DrawLineBGRA(
+                    DetailVectorAndRawImg::DrawLineBGRA(
                         canvas, imgW, imgH,
                         static_cast<int>(std::round(mapXf(sp.pts.back().x))),
                         static_cast<int>(std::round(mapYf(sp.pts.back().y))),
@@ -5843,8 +5767,8 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
     }
 
     if (!drewAny) {
-        if (!isPdf && DetailImg200::DecodeEpsiHexPreview(rawSv, label, outInfo)) return true;
-        if (DetailImg200::FindAndDecodeBestEmbeddedRaster(workData, workSize, label, outInfo)) return true;
+        if (!isPdf && DetailVectorAndRawImg::DecodeEpsiHexPreview(rawSv, label, outInfo)) return true;
+        if (tryDosPreviewFallback()) return true;
         if (pdfImageFallback.valid) { outInfo = std::move(pdfImageFallback); return true; }
         return false;
     }
@@ -5864,6 +5788,13 @@ inline bool DecodePsOrPdfArtwork(const uint8_t* data, size_t size, const std::ws
 struct StitchPt { float x, y; int colorIdx; bool jump; };
 
 inline bool RenderEmbroideryStitches(const std::vector<StitchPt>& pts, const std::wstring& label, ExtendedImageInfo& outInfo) {
+    if (pts.empty()) return false;
+    bool hasNonJumpStitch = false;
+    for (size_t i = 1; i < pts.size(); ++i) {
+        if (!pts[i].jump) { hasNonJumpStitch = true; break; }
+    }
+    if (!hasNonJumpStitch) return false;
+
     static const uint8_t kThreadColors[12][3] = {
         {239, 68, 68},   {59, 130, 246},  {34, 197, 94},  {250, 204, 21},
         {168, 85, 247},  {249, 115, 22},  {20, 184, 166}, {236, 72, 153},
@@ -5886,33 +5817,31 @@ inline bool RenderEmbroideryStitches(const std::vector<StitchPt>& pts, const std
         }
     }
 
-    if (!pts.empty()) {
-        float minX = pts[0].x, maxX = pts[0].x, minY = pts[0].y, maxY = pts[0].y;
-        for (const auto& p : pts) {
-            minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
-            minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
-        }
-        float span = std::max({ maxX - minX, maxY - minY, 1.0f });
-        float scale = (W - 64.0f) / span;
-        float midX = (minX + maxX) * 0.5f, midY = (minY + maxY) * 0.5f;
+    float minX = pts[0].x, maxX = pts[0].x, minY = pts[0].y, maxY = pts[0].y;
+    for (const auto& p : pts) {
+        minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+        minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+    }
+    float span = std::max({ maxX - minX, maxY - minY, 1.0f });
+    float scale = (W - 64.0f) / span;
+    float midX = (minX + maxX) * 0.5f, midY = (minY + maxY) * 0.5f;
 
-        for (size_t i = 1; i < pts.size(); ++i) {
-            if (pts[i].jump) continue;
-            int x0 = static_cast<int>(W * 0.5f + (pts[i - 1].x - midX) * scale);
-            int y0 = static_cast<int>(H * 0.5f + (pts[i - 1].y - midY) * scale);
-            int x1 = static_cast<int>(W * 0.5f + (pts[i].x - midX) * scale);
-            int y1 = static_cast<int>(H * 0.5f + (pts[i].y - midY) * scale);
-            int ci = pts[i].colorIdx % 12;
-            DetailImg200::DrawLineBGRA(
-                outInfo.bgraPixels, W, H, x0, y0, x1, y1,
-                kThreadColors[ci][0], kThreadColors[ci][1], kThreadColors[ci][2], 2);
-        }
+    for (size_t i = 1; i < pts.size(); ++i) {
+        if (pts[i].jump) continue;
+        int x0 = static_cast<int>(W * 0.5f + (pts[i - 1].x - midX) * scale);
+        int y0 = static_cast<int>(H * 0.5f + (pts[i - 1].y - midY) * scale);
+        int x1 = static_cast<int>(W * 0.5f + (pts[i].x - midX) * scale);
+        int y1 = static_cast<int>(H * 0.5f + (pts[i].y - midY) * scale);
+        int ci = pts[i].colorIdx % 12;
+        DetailVectorAndRawImg::DrawLineBGRA(
+            outInfo.bgraPixels, W, H, x0, y0, x1, y1,
+            kThreadColors[ci][0], kThreadColors[ci][1], kThreadColors[ci][2], 2);
     }
     outInfo.valid = true;
     return true;
 }
 
-} // namespace DetailImg200
+} // namespace DetailVectorAndRawImg
 
 namespace DetailEmfWmf {
 
@@ -5982,7 +5911,7 @@ struct GdiDcState {
 };
 
 struct PathSubfigure {
-    std::vector<DetailImg200::Pt2f> pts; // Already transformed to canvas pixel space
+    std::vector<DetailVectorAndRawImg::Pt2f> pts; // Already transformed to canvas pixel space
     bool closed = false;
 };
 
@@ -6009,7 +5938,7 @@ inline void BlendPixelBgra(uint8_t* dst, uint8_t r, uint8_t g, uint8_t b, float 
 // 4x4 supersampled scanline anti-aliased polygon rasterizer (ALTERNATE even-odd & WINDING fill rules)
 inline bool FillPolygons4x4AA(
     std::vector<uint8_t>& bgra, uint32_t w, uint32_t h,
-    const std::vector<std::vector<DetailImg200::Pt2f>>& rings,
+    const std::vector<std::vector<DetailVectorAndRawImg::Pt2f>>& rings,
     bool evenOdd, const GdiBrush& brush,
     uint32_t bkMode, uint8_t bkR, uint8_t bkG, uint8_t bkB)
 {
@@ -6121,7 +6050,7 @@ inline bool FillPolygons4x4AA(
 // Anti-aliased capsule stroke rasterizer with dash support
 inline bool StrokePolylineAA(
     std::vector<uint8_t>& bgra, uint32_t w, uint32_t h,
-    const std::vector<DetailImg200::Pt2f>& pts, bool closed,
+    const std::vector<DetailVectorAndRawImg::Pt2f>& pts, bool closed,
     const GdiPen& pen, float devWidth)
 {
     uint32_t styleType = pen.style & 0x0Fu;
@@ -6181,9 +6110,9 @@ inline bool StrokePolylineAA(
 }
 
 inline void AppendCubicBezier(
-    std::vector<DetailImg200::Pt2f>& poly,
-    DetailImg200::Pt2f p0, DetailImg200::Pt2f p1,
-    DetailImg200::Pt2f p2, DetailImg200::Pt2f p3)
+    std::vector<DetailVectorAndRawImg::Pt2f>& poly,
+    DetailVectorAndRawImg::Pt2f p0, DetailVectorAndRawImg::Pt2f p1,
+    DetailVectorAndRawImg::Pt2f p2, DetailVectorAndRawImg::Pt2f p3)
 {
     float chord = std::hypot(p3.x - p0.x, p3.y - p0.y) +
                   std::hypot(p1.x - p0.x, p1.y - p0.y) +
@@ -6206,7 +6135,7 @@ inline void AppendCubicBezier(
 
 inline void BuildEllipseRing(
     float x0, float y0, float x1, float y1,
-    std::vector<DetailImg200::Pt2f>& outPts, int segs = 48)
+    std::vector<DetailVectorAndRawImg::Pt2f>& outPts, int segs = 48)
 {
     outPts.clear();
     float cx = (x0 + x1) * 0.5f;
@@ -6222,7 +6151,7 @@ inline void BuildEllipseRing(
 
 inline void BuildRoundRectRing(
     float x0, float y0, float x1, float y1, float cw, float ch,
-    std::vector<DetailImg200::Pt2f>& outPts)
+    std::vector<DetailVectorAndRawImg::Pt2f>& outPts)
 {
     outPts.clear();
     if (x0 > x1) std::swap(x0, x1);
@@ -6252,7 +6181,7 @@ inline void BuildEllipticalArcPoints(
     float left, float top, float right, float bottom,
     float startX, float startY, float endX, float endY,
     bool counterClockwise,
-    std::vector<DetailImg200::Pt2f>& outPts)
+    std::vector<DetailVectorAndRawImg::Pt2f>& outPts)
 {
     outPts.clear();
     float cx = (left + right) * 0.5f;
@@ -6315,7 +6244,7 @@ inline bool BlitSplitOrPackedDib(
     }
 
     ExtendedImageInfo srcImg;
-    if (!DetailImg200::DecodeDibBufferToInfo(dib.data(), dib.size(), L"DIB", srcImg) ||
+    if (!DetailVectorAndRawImg::DecodeDibBufferToInfo(dib.data(), dib.size(), L"DIB", srcImg) ||
         !srcImg.valid || srcImg.width == 0 || srcImg.height == 0)
     {
         return false;
@@ -6740,6 +6669,7 @@ using ::Explorer2::ByteIO::RdI32LE;
 using ::Explorer2::ByteIO::RdU64LE;
 using ::Explorer2::ByteIO::RdU16BE;
 using ::Explorer2::ByteIO::RdU32BE;
+using ::Explorer2::ByteIO::RdU64BE;
 
 enum class GpuSurfaceCodec {
     None,
@@ -6749,6 +6679,7 @@ enum class GpuSurfaceCodec {
     ABGR8,
     RGB565,
     R8,
+    RG8,
     RGBA16F,
     BC1,
     BC2,
@@ -6774,6 +6705,7 @@ inline bool GetCodecBlockLayout(GpuSurfaceCodec c, uint32_t& outBlockW, uint32_t
         case GpuSurfaceCodec::ABGR8:
             outBlockW = 1u; outBlockH = 1u; outBytesPerBlock = 4u; return true;
         case GpuSurfaceCodec::RGB565:
+        case GpuSurfaceCodec::RG8:
             outBlockW = 1u; outBlockH = 1u; outBytesPerBlock = 2u; return true;
         case GpuSurfaceCodec::R8:
             outBlockW = 1u; outBlockH = 1u; outBytesPerBlock = 1u; return true;
@@ -6871,6 +6803,7 @@ inline bool DecodeLinearGpuSurface(
                     break;
                 }
                 case GpuSurfaceCodec::R8: r = g = b = sp[0]; break;
+                case GpuSurfaceCodec::RG8: r = sp[0]; g = sp[1]; b = 0u; break;
                 default: return false;
             }
             WritePremulBGRA(&outBgra[i * 4u], r, g, b, a);
@@ -7169,8 +7102,9 @@ struct DecodedRgbaTile {
 // ============================================================================
 // Backend 1: WIC Stream Decoder (handles JPEG items & OS-supported HEIF/AVIF)
 // ============================================================================
-inline bool TryDecodeViaWicMemory(const uint8_t* bytes, size_t len, DecodedRgbaTile& out) {
+inline bool TryDecodeViaWicMemoryCore(const uint8_t* bytes, size_t len, DecodedRgbaTile& out) {
 #if !defined(_WIN32) && !defined(E2_WIN32_HAL)
+    (void)bytes; (void)len; (void)out;
     return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
 #else
     if (!bytes || len < 16) return false;
@@ -7205,6 +7139,29 @@ inline bool TryDecodeViaWicMemory(const uint8_t* bytes, size_t len, DecodedRgbaT
         return false;
     }
     return true;
+#endif
+}
+
+inline bool TryDecodeViaWicMemory(const uint8_t* bytes, size_t len, DecodedRgbaTile& out) {
+#if defined(_WIN32) && !defined(E2_WIN32_HAL)
+    // Out-of-proc Store WIC codecs (HEIF / AVIF / WebMediaExtensions) deadlock when invoked synchronously
+    // on an STA thread without a pumping message loop. If the caller is on an STA thread, run on an MTA worker.
+    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (hrCom == RPC_E_CHANGED_MODE) {
+        bool ok = false;
+        std::thread mtaWorker([&]() {
+            HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            ok = TryDecodeViaWicMemoryCore(bytes, len, out);
+            if (SUCCEEDED(hr)) CoUninitialize();
+        });
+        mtaWorker.join();
+        return ok;
+    }
+    const bool ok = TryDecodeViaWicMemoryCore(bytes, len, out);
+    if (SUCCEEDED(hrCom)) CoUninitialize();
+    return ok;
+#else
+    return TryDecodeViaWicMemoryCore(bytes, len, out);
 #endif
 }
 
@@ -7277,7 +7234,7 @@ inline bool DecodeUncompressedHeifItem(
 
 inline bool DecodeAvc1StillItem(const uint8_t* itemData, size_t itemLen, const std::vector<uint8_t>& avcC, bool fullRange, uint16_t matrixCoeffs, DecodedRgbaTile& out);
 inline bool DecodeHvc1StillItem(const uint8_t* itemData, size_t itemLen, const std::vector<uint8_t>& hvcC, bool fullRange, uint16_t matrixCoeffs, DecodedRgbaTile& out);
-inline bool DecodeAv01StillItem(const uint8_t* itemData, size_t itemLen, const std::vector<uint8_t>& av1C, bool defaultFullRange, uint16_t defaultMatrix, DecodedRgbaTile& out);
+inline bool DecodeAv01StillItem(const uint8_t* itemData, size_t itemLen, const std::vector<uint8_t>& av1C, bool defaultFullRange, uint16_t defaultMatrix, DecodedRgbaTile& out, bool* outBitstreamCorrupt = nullptr);
 
 inline void ApplyMirrorRgba(DecodedRgbaTile& img, uint8_t axis) {
     // ISO 23008-12 imir: axis == 0 -> top-to-bottom (vertical flip); axis == 1 -> left-to-right (horizontal flip)
@@ -7560,6 +7517,7 @@ inline bool DecodeAvifOrHeifImage(
             uint32_t ispeW = 0, ispeH = 0;
             bool fullRange = true;
             uint16_t matrixCoeffs = 6; // BT.601 default
+            std::vector<uint8_t> pixiBits;
             std::vector<uint8_t> av1C, hvcC, avcC;
             UncConfig unc;
             std::vector<std::pair<char, uint8_t>> xforms; // ('m', axis) or ('r', angle)
@@ -7576,6 +7534,11 @@ inline bool DecodeAvifOrHeifImage(
                 if (pr.type == "ispe" && pl.size() >= 12) {
                     rp.ispeW = RdBE32(pl.data() + 4);
                     rp.ispeH = RdBE32(pl.data() + 8);
+                } else if (pr.type == "pixi" && pl.size() >= 5) {
+                    uint8_t nCh = pl[4];
+                    if (5u + nCh <= pl.size()) {
+                        rp.pixiBits.assign(pl.begin() + 5, pl.begin() + 5 + nCh);
+                    }
                 } else if (pr.type == "colr" && pl.size() >= 11 && std::memcmp(pl.data(), "nclx", 4) == 0) {
                     rp.matrixCoeffs = RdBE16(pl.data() + 8);
                     rp.fullRange    = (pl[10] & 0x80u) != 0;
@@ -7622,23 +7585,29 @@ inline bool DecodeAvifOrHeifImage(
             return rp;
         };
 
+        bool itemBitstreamCorrupt = false;
         std::function<bool(uint32_t, DecodedRgbaTile&, int)> decodeItemRecursive =
             [&](uint32_t iid, DecodedRgbaTile& dst, int depth) -> bool
         {
             if (depth > 4) return false;
             std::string itype = itemTypes[iid];
             ResolvedProps rp = getPropsFor(iid);
+            if ((rp.ispeW > 32768 || rp.ispeH > 32768) ||
+                ((rp.ispeW == 0) != (rp.ispeH == 0))) {
+                itemBitstreamCorrupt = true;
+                return false;
+            }
 
             bool ok = false;
             if (itype == "grid") {
                 std::vector<uint8_t> gBytes;
-                if (!extractItemBytes(iid, gBytes) || gBytes.size() < 8) return false;
+                if (!extractItemBytes(iid, gBytes) || gBytes.size() < 8) { itemBitstreamCorrupt = true; return false; }
                 uint8_t flags = gBytes[1];
                 uint32_t rows = static_cast<uint32_t>(gBytes[2]) + 1u;
                 uint32_t cols = static_cast<uint32_t>(gBytes[3]) + 1u;
                 uint32_t outW = 0, outH = 0;
                 if ((flags & 1u) != 0) {
-                    if (gBytes.size() < 12) return false;
+                    if (gBytes.size() < 12) { itemBitstreamCorrupt = true; return false; }
                     outW = RdBE32(gBytes.data() + 4);
                     outH = RdBE32(gBytes.data() + 8);
                 } else {
@@ -7647,6 +7616,7 @@ inline bool DecodeAvifOrHeifImage(
                 }
                 const auto& tiles = dimgRefs[iid];
                 if (outW == 0 || outH == 0 || outW > 16384 || outH > 16384 || tiles.size() < static_cast<size_t>(rows) * cols) {
+                    itemBitstreamCorrupt = true;
                     return false;
                 }
                 DecodedRgbaTile t0;
@@ -7676,7 +7646,39 @@ inline bool DecodeAvifOrHeifImage(
                 ok = decodeItemRecursive(dimgRefs[iid][0], dst, depth + 1);
             } else {
                 std::vector<uint8_t> pay;
-                if (!extractItemBytes(iid, pay)) return false;
+                if (!extractItemBytes(iid, pay)) { itemBitstreamCorrupt = true; return false; }
+
+                // Check framing integrity of length-prefixed NALU / OBU items so truncated iloc extents
+                // never stall out-of-proc OS WIC decoders
+                if (itype == "avc1" || itype == "hvc1") {
+                    const auto& cfg = (itype == "avc1") ? rp.avcC : rp.hvcC;
+                    const size_t minCfg = (itype == "avc1") ? 7u : 23u;
+                    if (cfg.size() < minCfg || cfg[0] != 1u) { itemBitstreamCorrupt = true; return false; }
+                    const uint8_t lsz = static_cast<uint8_t>((cfg[(itype == "avc1") ? 4u : 21u] & 0x03u) + 1u);
+                    size_t vp = 0, nals = 0;
+                    while (vp < pay.size()) {
+                        if (vp + lsz > pay.size()) { itemBitstreamCorrupt = true; return false; }
+                        uint64_t nl = RdVarBE(pay.data() + vp, lsz);
+                        vp += lsz;
+                        if (nl == 0 || nl > pay.size() - vp) { itemBitstreamCorrupt = true; return false; }
+                        vp += static_cast<size_t>(nl);
+                        ++nals;
+                    }
+                    if (nals == 0) { itemBitstreamCorrupt = true; return false; }
+                } else if (itype == "av01") {
+                    size_t op = 0, obus = 0;
+                    while (op < pay.size()) {
+                        uint8_t hdr = pay[op++];
+                        if ((hdr & 0x80u) != 0) { itemBitstreamCorrupt = true; return false; }
+                        if ((hdr & 0x04u) != 0) { if (op >= pay.size()) { itemBitstreamCorrupt = true; return false; } ++op; }
+                        uint64_t oSz = pay.size() - op;
+                        if ((hdr & 0x02u) != 0 && !::Explorer2::ByteIO::RdLeb128(pay.data(), pay.size(), op, oSz, 8)) { itemBitstreamCorrupt = true; return false; }
+                        if (oSz > pay.size() - op) { itemBitstreamCorrupt = true; return false; }
+                        op += static_cast<size_t>(oSz);
+                        ++obus;
+                    }
+                    if (obus == 0) { itemBitstreamCorrupt = true; return false; }
+                }
 
                 if (itype == "unci" || rp.unc.present) {
                     ok = DecodeUncompressedHeifItem(pay.data(), pay.size(), rp.ispeW, rp.ispeH, rp.unc, rp.fullRange, rp.matrixCoeffs, dst);
@@ -7687,7 +7689,7 @@ inline bool DecodeAvifOrHeifImage(
                 } else if (itype == "hvc1") {
                     ok = DecodeHvc1StillItem(pay.data(), pay.size(), rp.hvcC, rp.fullRange, rp.matrixCoeffs, dst);
                 } else if (itype == "av01") {
-                    ok = DecodeAv01StillItem(pay.data(), pay.size(), rp.av1C, rp.fullRange, rp.matrixCoeffs, dst);
+                    ok = DecodeAv01StillItem(pay.data(), pay.size(), rp.av1C, rp.fullRange, rp.matrixCoeffs, dst, &itemBitstreamCorrupt);
                 }
             }
             if (!ok) return false;
@@ -7728,7 +7730,7 @@ inline bool DecodeAvifOrHeifImage(
                     }
                 }
             }
-        } else if (!TryDecodeViaWicMemory(data, size, finalImg)) {
+        } else if (itemBitstreamCorrupt || !TryDecodeViaWicMemory(data, size, finalImg)) {
             return false;
         }
     }

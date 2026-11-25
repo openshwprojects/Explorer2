@@ -76,24 +76,6 @@ struct LinuxMountInfo {
     bool probeAsync = false;    // the size comes from FileEngine::ProbeLinuxMountAsync, not from here
 };
 
-std::string UnescapeProcMountField(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 3 < s.size() &&
-            s[i + 1] >= '0' && s[i + 1] <= '7' &&
-            s[i + 2] >= '0' && s[i + 2] <= '7' &&
-            s[i + 3] >= '0' && s[i + 3] <= '7') {
-            char ch = static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0'));
-            out.push_back(ch);
-            i += 3;
-        } else {
-            out.push_back(s[i]);
-        }
-    }
-    return out;
-}
-
 std::vector<LinuxMountInfo> EnumerateLinuxMounts(Lang lang) {
     std::vector<LinuxMountInfo> out;
     std::unordered_set<std::string> seenMounts;
@@ -103,8 +85,8 @@ std::vector<LinuxMountInfo> EnumerateLinuxMounts(Lang lang) {
         std::istringstream iss(line);
         std::string devRaw, mntRaw, fsType;
         if (!(iss >> devRaw >> mntRaw >> fsType)) continue;
-        std::string mnt = UnescapeProcMountField(mntRaw);
-        std::string dev = UnescapeProcMountField(devRaw);
+        std::string mnt = LinuxStorage::DecodeMountField(mntRaw);
+        std::string dev = LinuxStorage::DecodeMountField(devRaw);
         if (mnt.empty() || mnt[0] != '/') continue;
         if (mnt != "/") {
             if (mnt.rfind("/proc", 0) == 0 || mnt.rfind("/sys", 0) == 0 || mnt.rfind("/dev", 0) == 0) continue;
@@ -299,9 +281,9 @@ std::vector<LinuxMounts::Mount> ReadMountInfo() {
         unsigned devMajor = 0, devMinor = 0;
         if (std::sscanf(devNumbers.c_str(), "%u:%u", &devMajor, &devMinor) != 2) continue;
         LinuxMounts::Mount m;
-        m.mountPoint = UnescapeProcMountField(mountPoint);
+        m.mountPoint = LinuxStorage::DecodeMountField(mountPoint);
         m.fsType = fsType;
-        m.source = UnescapeProcMountField(source);
+        m.source = LinuxStorage::DecodeMountField(source);
         m.device = static_cast<uint64_t>(makedev(devMajor, devMinor));
         out.push_back(std::move(m));
     }
@@ -452,14 +434,7 @@ std::shared_ptr<const std::vector<Mount>> Current() {
 }
 
 bool IsNetworkFsType(const std::string& fsType) {
-    static const char* const kNetworkTypes[] = {
-        "nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "9p", "ceph", "glusterfs", "lustre",
-        "davfs", "sshfs", "vboxsf", "vmhgfs", "virtiofs", "fuse"
-    };
-    for (const char* t : kNetworkTypes) {
-        if (fsType == t) return true;
-    }
-    return fsType.rfind("fuse.", 0) == 0;   // sshfs, rclone, gvfs, s3fs, ... (but not "fuseblk": a local disk)
+    return LinuxStorage::IsNetworkOrFuseFsType(fsType);
 }
 
 const Mount* FindByDevice(const std::vector<Mount>& mounts, uint64_t device) {
@@ -901,8 +876,8 @@ void FileEngine::Shutdown() {
         // are made under that mutex too, so a worker that has just found nothing to do either sees them or
         // is already waiting and gets the wake-up: no wake-up is lost and no join below waits forever.
         {
+            // (The size workers have no generation, only m_running: the mutex is taken for the same reason.)
             std::lock_guard<std::mutex> lock(m_sizeMutex);
-            m_sizeGeneration.fetch_add(1);
         }
         {
             std::lock_guard<std::mutex> lock(m_searchMutex);
@@ -978,6 +953,7 @@ void FileEngine::WatchDirectory(const std::wstring& dirPath) {
         }
 #endif
         m_watchedDir = clean;
+        m_dirChangeNotBefore.store(0);      // the pause was the last folder's (see DirChangeHandled)
         m_watcherGeneration.fetch_add(1);
         // Set while the mutex is held: the watcher resets the event under this mutex when it takes up the new
         // generation, so it can never reset this wake-up first and then miss it (which stopped auto-refresh)
@@ -986,6 +962,41 @@ void FileEngine::WatchDirectory(const std::wstring& dirPath) {
         }
     }
     m_watcherCv.notify_all();
+}
+
+namespace {
+// The window is given this many times the duration of its last refresh before the watcher sends it the next
+// change, at most kDirChangeMaxPauseMs: a folder that takes long to list is listed less often, and the window
+// keeps most of its time for painting and for the user. A folder listed in a few milliseconds is as live as ever.
+constexpr uint64_t kDirChangePauseFactor = 4;
+constexpr uint64_t kDirChangeMaxPauseMs = 4000;
+// A window that has not answered a message for this long is not waited for any longer (a message that was
+// lost must not end the live refresh for good). Its queue grows by one message in that time at most.
+constexpr uint64_t kDirChangeAnswerTimeoutMs = 15000;
+} // namespace
+
+void FileEngine::DirChangeHandled(uint64_t tookMs) {
+    m_dirChangeNotBefore.store(GetTickCount64() + std::min<uint64_t>(tookMs * kDirChangePauseFactor, kDirChangeMaxPauseMs));
+    // One message less is waiting. (The window answers messages of other senders as well: never below zero.)
+    int waiting = m_dirChangesWaiting.load();
+    while (waiting > 0 && !m_dirChangesWaiting.compare_exchange_weak(waiting, waiting - 1)) {
+    }
+}
+
+bool FileEngine::WindowTakesDirChange(uint64_t nowTick) const {
+    if (m_dirChangesWaiting.load() > 0) {
+        return nowTick - m_dirChangePostedTick.load() >= kDirChangeAnswerTimeoutMs;
+    }
+    return nowTick >= m_dirChangeNotBefore.load();
+}
+
+void FileEngine::PostDirChanged() {
+    if (!m_notifyHwnd) return;
+    m_dirChangePostedTick.store(GetTickCount64());
+    m_dirChangesWaiting.fetch_add(1);
+    if (!PostMessageW(m_notifyHwnd, WM_APP_DIR_CHANGED, 0, 0)) {
+        DirChangeHandled(0);        // it will never be handled
+    }
 }
 
 void FileEngine::DirWatcherWorkerLoop() {
@@ -1037,13 +1048,15 @@ void FileEngine::DirWatcherWorkerLoop() {
                 const ULONGLONG now = GetTickCount64();
                 ULONGLONG due = std::min(lastEventTick + kQuietMs, firstEventTick + kMaxDelayMs);
                 if (lastPostTick != 0) due = std::max(due, lastPostTick + kMinGapMs);
-                if (now >= due) {
-                    if (m_notifyHwnd) PostMessageW(m_notifyHwnd, WM_APP_DIR_CHANGED, 0, 0);
+                if (now >= due && WindowTakesDirChange(now)) {
+                    PostDirChanged();
                     lastPostTick = now;
                     firstEventTick = 0;
                     continue;
                 }
-                timeoutMs = static_cast<int>(std::min<ULONGLONG>(due - now, 100));
+                // Not due yet, or the window is still busy with the last message or in the pause after it
+                // (DirChangeHandled): the change waits here, and the events keep being read meanwhile
+                timeoutMs = (now >= due) ? 50 : static_cast<int>(std::min<ULONGLONG>(due - now, 100));
             } else if (watchEnded) {
                 break;                  // reported; nothing is left to watch until the next folder
             }
@@ -1152,8 +1165,12 @@ void FileEngine::DirWatcherWorkerLoop() {
 
             if (waitRes == WAIT_OBJECT_0 + 1) {
                 DWORD transferred = 0;
-                if (GetOverlappedResult(hDir, &ov, &transferred, FALSE) && transferred > 0) {
-                    bool relevantChange = false;
+                const bool readOk = GetOverlappedResult(hDir, &ov, &transferred, FALSE) != FALSE;
+                // More changes than the buffer holds: Windows drops the whole list and reports no bytes (or
+                // ERROR_NOTIFY_ENUM_DIR). Something did change, and it is not known what: the folder is read
+                // again. This happens more easily now that the watcher waits for the window between two reads.
+                bool relevantChange = readOk ? (transferred == 0) : (GetLastError() == ERROR_NOTIFY_ENUM_DIR);
+                if (readOk && transferred > 0) {
                     const BYTE* ptr = notifyBuf;
                     for (;;) {
                         const auto* fni = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(ptr);
@@ -1165,13 +1182,19 @@ void FileEngine::DirWatcherWorkerLoop() {
                         if (fni->NextEntryOffset == 0) break;
                         ptr += fni->NextEntryOffset;
                     }
+                }
 
-                    if (relevantChange) {
-                        // Coalesce burst writes over a 250ms window before notifying UI
-                        if (WaitForSingleObject(m_watcherWakeEvent, 250) == WAIT_TIMEOUT &&
-                            m_running && m_watcherGeneration.load() == seenGen && m_notifyHwnd) {
-                            PostMessageW(m_notifyHwnd, WM_APP_DIR_CHANGED, 0, 0);
-                        }
+                if (relevantChange) {
+                    // Coalesce burst writes over a 250ms window before notifying UI. Then the change waits
+                    // until the window has dealt with the message before and the pause after its refresh is
+                    // over (DirChangeHandled): the folder is not read meanwhile, Windows keeps the changes.
+                    auto watching = [&]() { return m_running && m_watcherGeneration.load() == seenGen; };
+                    bool undisturbed = WaitForSingleObject(m_watcherWakeEvent, 250) == WAIT_TIMEOUT;
+                    while (undisturbed && watching() && !WindowTakesDirChange(GetTickCount64())) {
+                        undisturbed = WaitForSingleObject(m_watcherWakeEvent, 50) == WAIT_TIMEOUT;
+                    }
+                    if (undisturbed && watching()) {
+                        PostDirChanged();
                     }
                 }
             }
@@ -2715,15 +2738,6 @@ void FileEngine::CleanupAllUndoStaging() {
 
 namespace {
 
-// Extended-length form (\\?\C:\... / \\?\UNC\server\share\...) so deep trees (> MAX_PATH) and names with
-// trailing dots / spaces can be deleted too.
-std::wstring ToExtendedPath(const std::wstring& p) {
-    if (p.rfind(L"\\\\?\\", 0) == 0) return p;
-    if (p.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + p.substr(2);
-    if (p.size() >= 2 && p[1] == L':') return L"\\\\?\\" + p;
-    return p;
-}
-
 bool IsTransientDeleteError(DWORD e) {
     return e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED || e == ERROR_LOCK_VIOLATION || e == ERROR_DIR_NOT_EMPTY;
 }
@@ -3174,12 +3188,7 @@ bool FileEngine::ParseRecycleBinInfoBytes(const std::vector<uint8_t>& raw, Recyc
         return false;
     }
 
-    if (orig.rfind(L"\\\\?\\UNC\\", 0) == 0) {
-        orig = L"\\\\" + orig.substr(8);
-    } else if (orig.rfind(L"\\\\?\\", 0) == 0 && orig.size() > 6 && orig[5] == L':') {
-        orig.erase(0, 4);
-    }
-    orig = PathUtils::TrimTrailingSlashes(orig);
+    orig = PathUtils::TrimTrailingSlashes(PathUtils::StripExtendedWinPrefix(orig));
     if (orig.empty()) return false;
 
     outRecord.version = version;
@@ -3350,8 +3359,8 @@ namespace {
 
 bool MoveFileWithRetry(const std::wstring& srcPath, const std::wstring& dstPath, bool isDirectory, bool replaceExisting, DWORD* outError) {
     if (outError) *outError = 0;
-    const std::wstring extSrc = ToExtendedPath(srcPath);
-    const std::wstring extDst = ToExtendedPath(dstPath);
+    const std::wstring extSrc = PathUtils::ToExtendedWinPath(srcPath);
+    const std::wstring extDst = PathUtils::ToExtendedWinPath(dstPath);
     // Directory moves on Windows must use flags = 0; file moves can use MOVEFILE_COPY_ALLOWED / MOVEFILE_REPLACE_EXISTING
     const DWORD flags = isDirectory ? 0 : (MOVEFILE_COPY_ALLOWED | (replaceExisting ? MOVEFILE_REPLACE_EXISTING : 0));
 
@@ -3392,14 +3401,14 @@ std::wstring NextFreeCollisionPath(const std::wstring& dstDir, const std::wstrin
     std::wstring base = PathUtils::EnsureTrailingSlash(dstDir);
     for (int idx = 2; idx < 10000; ++idx) {
         std::wstring cand = base + stem + L" (" + std::to_wstring(idx) + L")" + ext;
-        if (GetFileAttributesW(ToExtendedPath(cand).c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
+        if (GetFileAttributesW(PathUtils::ToExtendedWinPath(cand).c_str()) == INVALID_FILE_ATTRIBUTES) return cand;
     }
     return base + stem + L"_" + std::to_wstring(GetTickCount64()) + ext;
 }
 
 bool MergeDirectoriesRecursive(const std::wstring& srcDir, const std::wstring& dstDir, std::atomic<int>* progressCounter, MergeFolderResult& outResult) {
-    const std::wstring extSrcDir = ToExtendedPath(srcDir);
-    const std::wstring extDstDir = ToExtendedPath(dstDir);
+    const std::wstring extSrcDir = PathUtils::ToExtendedWinPath(srcDir);
+    const std::wstring extDstDir = PathUtils::ToExtendedWinPath(dstDir);
 
     CreateDirectoryW(extDstDir.c_str(), nullptr);
 
@@ -3448,7 +3457,7 @@ bool MergeDirectoriesRecursive(const std::wstring& srcDir, const std::wstring& d
         }
 #endif
 
-        const std::wstring extDstChild = ToExtendedPath(dstChild);
+        const std::wstring extDstChild = PathUtils::ToExtendedWinPath(dstChild);
         const DWORD dstAttrs = GetFileAttributesW(extDstChild.c_str());
 
         if (dstAttrs == INVALID_FILE_ATTRIBUTES) {
@@ -3482,7 +3491,7 @@ bool MergeDirectoriesRecursive(const std::wstring& srcDir, const std::wstring& d
         if (!isSrcDir && !isDstDir) {
             // Shell cache files in source can be discarded if destination already has them
             if (_wcsicmp(childName.c_str(), L"Thumbs.db") == 0 || _wcsicmp(childName.c_str(), L"desktop.ini") == 0) {
-                const std::wstring extSrcChild = ToExtendedPath(srcChild);
+                const std::wstring extSrcChild = PathUtils::ToExtendedWinPath(srcChild);
                 SetFileAttributesW(extSrcChild.c_str(), FILE_ATTRIBUTE_NORMAL);
                 if (DeleteFileW(extSrcChild.c_str())) continue;
             }
@@ -3567,7 +3576,7 @@ bool FileEngine::RenameFileOrFolder(const std::wstring& oldPath, const std::wstr
     if (parent.empty()) { if (outError) *outError = ERROR_BAD_PATHNAME; return false; }
 
     outNewPath = PathUtils::EnsureTrailingSlash(parent) + newName;
-    DWORD srcAttrs = GetFileAttributesW(ToExtendedPath(oldPath).c_str());
+    DWORD srcAttrs = GetFileAttributesW(PathUtils::ToExtendedWinPath(oldPath).c_str());
     bool isDir = (srcAttrs != INVALID_FILE_ATTRIBUTES) && ((srcAttrs & FILE_ATTRIBUTE_DIRECTORY) != 0);
     return MoveFileWithRetry(oldPath, outNewPath, isDir, false, outError);
 }
@@ -3575,7 +3584,7 @@ bool FileEngine::RenameFileOrFolder(const std::wstring& oldPath, const std::wstr
 void FileEngine::MergeDirectoryContents(const std::wstring& srcDir, const std::wstring& dstDir, std::atomic<int>* progressCounter, MergeFolderResult& outResult) {
     if (_wcsicmp(PathUtils::NormalizePathKey(srcDir).c_str(), PathUtils::NormalizePathKey(dstDir).c_str()) == 0) return;
     MergeDirectoriesRecursive(srcDir, dstDir, progressCounter, outResult);
-    outResult.srcRemoved = (GetFileAttributesW(ToExtendedPath(srcDir).c_str()) == INVALID_FILE_ATTRIBUTES);
+    outResult.srcRemoved = (GetFileAttributesW(PathUtils::ToExtendedWinPath(srcDir).c_str()) == INVALID_FILE_ATTRIBUTES);
 }
 
 void FileEngine::OpenFileOrProperties(HWND hwnd, const std::wstring& path, bool propertiesOnly) {
@@ -3705,6 +3714,18 @@ bool FileEngine::IsFolderInFlight(const std::wstring& normKey) const {
     return m_folderSizeInFlight.find(normKey) != m_folderSizeInFlight.end();
 }
 
+void FileEngine::GetFoldersInFlight(const std::vector<FileEntry>& entries, std::vector<char>& outInFlight) const {
+    outInFlight.assign(entries.size(), 0);
+    std::lock_guard<std::mutex> lock(m_sizeMutex);
+    if (m_folderSizeInFlight.empty()) return;       // the usual case once a scan is over: nothing to look up
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const FileEntry& e = entries[i];
+        if (e.isDirectory && !e.normKey.empty() && m_folderSizeInFlight.find(e.normKey) != m_folderSizeInFlight.end()) {
+            outInFlight[i] = 1;
+        }
+    }
+}
+
 std::wstring FileEngine::GetActiveScanningSamplePath() const {
     std::lock_guard<std::mutex> lock(m_sizeMutex);
     return m_currentScanSample;
@@ -3739,7 +3760,9 @@ void FileEngine::SyncProbedMountSizes(std::vector<FileEntry>& entries) {
 #endif
 
 void FileEngine::SyncDirectorySizes(std::vector<FileEntry>& entries) {
-    m_sizeNotifyPending.store(false, std::memory_order_relaxed);
+    // (This used to clear the "one notification is waiting" mark. It runs twice for each notification and
+    // once for each folder refresh, so the workers posted more than one. The window clears it itself now:
+    // AcknowledgeSizeNotification.)
 #ifndef _WIN32
     SyncProbedMountSizes(entries);
 #endif
@@ -3818,7 +3841,6 @@ void FileEngine::SyncTreeNodeSizes(std::vector<TreeNode>& treeNodes) {
 }
 
 void FileEngine::RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, bool forceRefresh) {
-    uint64_t gen = m_sizeGeneration.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(m_sizeMutex);
         for (const auto& node : treeNodes) {
@@ -3833,11 +3855,26 @@ void FileEngine::RequestTreeFolderSizes(const std::vector<TreeNode>& treeNodes, 
             if (m_folderSizeInFlight.find(node.normKey) != m_folderSizeInFlight.end()) {
                 continue;
             }
-            m_folderSizeInFlight[node.normKey] = true;
-            m_sizeQueue.push_back(FolderSizeTask{ node.path, node.normKey, gen });
+            auto stop = std::make_shared<std::atomic<bool>>(false);
+            m_folderSizeInFlight[node.normKey] = SizeScan{ stop, false };
+            m_sizeQueue.push_back(FolderSizeTask{ node.path, node.normKey, std::move(stop) });
+            ++m_folderScansQueued;
         }
     }
     m_sizeCv.notify_all();
+}
+
+uint64_t FileEngine::FolderScansQueued() const {
+    std::lock_guard<std::mutex> lock(m_sizeMutex);
+    return m_folderScansQueued;
+}
+
+std::vector<std::wstring> FileEngine::WaitingFolderScans() const {
+    std::lock_guard<std::mutex> lock(m_sizeMutex);
+    std::vector<std::wstring> keys;
+    keys.reserve(m_sizeQueue.size());
+    for (const auto& task : m_sizeQueue) keys.push_back(task.normKey);
+    return keys;
 }
 
 bool FileEngine::GetFolderTreemapChildren(const std::wstring& normKey, std::vector<TreemapChildNode>& outChildren) const {
@@ -3851,52 +3888,156 @@ bool FileEngine::GetFolderTreemapChildren(const std::wstring& normKey, std::vect
     return true;
 }
 
-void FileEngine::RequestFolderSizes(const std::vector<FileEntry>& entries, bool forceRefresh) {
-    uint64_t gen = m_sizeGeneration.load(std::memory_order_relaxed);
-    if (forceRefresh) {
-        // Increment generation so any in-progress recursive scans from the previous click abort immediately!
-        gen = m_sizeGeneration.fetch_add(1) + 1;
+namespace {
+
+// The folders a forced rescan is asked for (the folders among the entries, by NormalizePathKey), and the
+// question it has for every scan and for every remembered size: is that folder one of them, or inside one?
+struct ForcedFolders {
+    std::unordered_set<std::wstring> keys;
+    // The folder all of them lie in, with its separator ("c:\users\x\"), which is the case for the entries of
+    // one listing; empty when they lie in different folders
+    std::wstring parent;
+    mutable std::wstring scratch;       // one buffer, so that a walk over a whole table allocates nothing
+
+    explicit ForcedFolders(const std::vector<FileEntry>& entries) {
+        keys.reserve(entries.size());
+        bool haveParent = false;
+        bool sameParent = true;
+        for (const auto& e : entries) {
+            if (!e.isDirectory || e.normKey.empty()) continue;
+            const size_t slash = e.normKey.rfind(L'\\');
+            if (slash == std::wstring::npos) {
+                sameParent = false;
+            } else if (!haveParent) {
+                parent.assign(e.normKey, 0, slash + 1);
+                haveParent = true;
+            } else if (e.normKey.compare(0, slash + 1, parent) != 0) {
+                sameParent = false;
+            }
+            keys.insert(e.normKey);
+        }
+        if (!haveParent || !sameParent) parent.clear();
     }
 
+    bool HasOrHolds(const std::wstring& key) const {
+        if (!parent.empty()) {
+            // Folders of one listing: whatever is inside them starts with the listing's own path, and the name
+            // after it is one of theirs. A comparison settles every folder that lies elsewhere (in a long
+            // session most of what is remembered: the navigation tree's folders, other listings), and one
+            // lookup the rest. Looking up every folder above every remembered folder took a second for 200,000.
+            if (key.size() < parent.size() || key.compare(0, parent.size(), parent) != 0) return false;
+            const size_t end = key.find(L'\\', parent.size());
+            if (end == std::wstring::npos) return keys.find(key) != keys.end();
+            scratch.assign(key, 0, end);
+            return keys.find(scratch) != keys.end();
+        }
+        if (keys.find(key) != keys.end()) return true;
+        for (size_t slash = key.rfind(L'\\'); slash != std::wstring::npos && slash > 0; slash = key.rfind(L'\\', slash - 1)) {
+            scratch.assign(key, 0, slash);
+            if (keys.find(scratch) != keys.end()) return true;
+        }
+        return false;
+    }
+
+    // Removes from a table keyed by folder every one of the folders and everything inside them, in one walk
+    template <typename Table>
+    void ForgetIn(Table& table) const {
+        for (auto it = table.begin(); it != table.end(); ) {
+            if (HasOrHolds(it->first)) it = table.erase(it);
+            else ++it;
+        }
+    }
+};
+
+} // namespace
+
+void FileEngine::RequestFolderSizes(const std::vector<FileEntry>& entries, bool forceRefresh) {
     {
         std::lock_guard<std::mutex> lock(m_sizeMutex);
+        size_t workersBeingFreed = 0;       // running scans of the forced folders that were told to stop
         if (forceRefresh) {
-            m_sizeQueue.clear();
-            m_folderSizeInFlight.clear();
-            for (const auto& e : entries) {
-                if (!e.isDirectory || e.normKey.empty()) continue;
-                std::wstring prefix = e.normKey + L"\\";
-                for (auto it = m_folderSizeCache.begin(); it != m_folderSizeCache.end(); ) {
-                    if (it->first == e.normKey || it->first.rfind(prefix, 0) == 0) {
-                        it = m_folderSizeCache.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-                for (auto it = m_folderChildrenCache.begin(); it != m_folderChildrenCache.end(); ) {
-                    if (it->first == e.normKey || it->first.rfind(prefix, 0) == 0) {
-                        it = m_folderChildrenCache.erase(it);
-                    } else {
-                        ++it;
-                    }
+            const ForcedFolders forced(entries);
+            // The scans of these folders and of the folders inside them end here: one that still waits leaves
+            // the queue, one that runs is told to stop. A scan that was told to stop stores nothing from then
+            // on: its mark is looked at under this lock wherever a scan stores something.
+            m_sizeQueue.erase(std::remove_if(m_sizeQueue.begin(), m_sizeQueue.end(), [&](const FolderSizeTask& task) {
+                return forced.HasOrHolds(task.normKey);
+            }), m_sizeQueue.end());
+            for (auto it = m_folderSizeInFlight.begin(); it != m_folderSizeInFlight.end(); ) {
+                if (forced.HasOrHolds(it->first)) {
+                    if (it->second.running) ++workersBeingFreed;
+                    it->second.stop->store(true, std::memory_order_relaxed);
+                    it = m_folderSizeInFlight.erase(it);
+                } else {
+                    ++it;
                 }
             }
+            // What is known about the entries and about everything inside them is forgotten. (Each table used
+            // to be walked once for every entry, with this lock held: in a folder of 12,000 subfolders with
+            // 70,000 sizes known the "Przelicz" button kept the window thread in here for 100 seconds.)
+            forced.ForgetIn(m_folderSizeCache);
+            forced.ForgetIn(m_folderChildrenCache);
         }
+
+        // What is queued here goes to the head of the queue, in the order of the listing: it is the folder the
+        // window shows now, and the scans of a folder left a moment ago may wait there by the thousand. Folders
+        // of this listing that wait in the queue from an earlier request move up for the same reason.
+        std::vector<FolderSizeTask> first;
+        std::unordered_set<std::wstring_view> waitingAlready;
 
         for (const auto& e : entries) {
             if (!e.isDirectory || e.normKey.empty() || e.isDrive) continue;
             if (FtpClient::IsFtpPath(e.fullPath) || RepoBrowser::IsRepoUrl(e.fullPath) || ArchiveExplorer::IsVirtualArchivePath(e.fullPath)) continue;
-            if (!forceRefresh &&
-                m_folderSizeCache.find(e.normKey) != m_folderSizeCache.end() &&
-                m_folderChildrenCache.find(e.normKey) != m_folderChildrenCache.end()) {
+            if (!forceRefresh) {
+                auto known = m_folderSizeCache.find(e.normKey);
+                // Known: the size and the list of children (a size alone can come from the scan of the folder
+                // above, and then the children still have to be listed). A folder without any data never
+                // gets a list of children, there being nothing to list: its size of 0 is all there is to
+                // know. Such a folder used to count as not known, and every refresh of the listing scanned
+                // all of them again (11,040 of the 11,954 folders of a Temp folder, at every change in it).
+                if (known != m_folderSizeCache.end() &&
+                    (known->second == 0 || m_folderChildrenCache.find(e.normKey) != m_folderChildrenCache.end())) {
+                    continue;
+                }
+            }
+            auto scan = m_folderSizeInFlight.find(e.normKey);
+            if (scan != m_folderSizeInFlight.end()) {
+                if (!scan->second.running) waitingAlready.insert(e.normKey);
                 continue;
             }
-            if (m_folderSizeInFlight.find(e.normKey) != m_folderSizeInFlight.end()) {
-                continue;
-            }
-            m_folderSizeInFlight[e.normKey] = true;
-            m_sizeQueue.push_back(FolderSizeTask{ e.fullPath, e.normKey, gen });
+            auto stop = std::make_shared<std::atomic<bool>>(false);
+            m_folderSizeInFlight[e.normKey] = SizeScan{ stop, false };
+            first.push_back(FolderSizeTask{ e.fullPath, e.normKey, std::move(stop) });
+            ++m_folderScansQueued;
         }
+
+        if (!waitingAlready.empty()) {
+            std::stable_partition(m_sizeQueue.begin(), m_sizeQueue.end(), [&](const FolderSizeTask& task) {
+                return waitingAlready.find(std::wstring_view(task.normKey)) != waitingAlready.end();
+            });
+        }
+        if (forceRefresh && !first.empty()) {
+            // A forced rescan needs workers now, and a scan of some other folder may hold one for minutes. As
+            // many running scans make way as there are workers missing: such a scan is told to stop, the part
+            // of its folder's size it has counted so far is forgotten (it would pass for the whole size), and
+            // its worker puts it back at the end of the queue, where it starts over (FolderSizeWorkerLoop).
+            // Its folder stays "in flight" all the while.
+            const size_t workers = m_sizeThreads.size();
+            const size_t busy = std::min<size_t>(static_cast<size_t>(std::max(0, m_activeSizeWorkers.load(std::memory_order_relaxed))), workers);
+            const size_t freeSoon = (workers - busy) + std::min(workersBeingFreed, busy);
+            const size_t wanted = std::min(first.size(), workers);
+            size_t missing = (wanted > freeSoon) ? wanted - freeSoon : 0;
+            for (auto it = m_folderSizeInFlight.begin(); it != m_folderSizeInFlight.end() && missing > 0; ++it) {
+                if (!it->second.running) continue;
+                if (!it->second.stop->load(std::memory_order_relaxed)) {
+                    it->second.stop->store(true, std::memory_order_relaxed);
+                    m_folderSizeCache.erase(it->first);
+                    m_folderChildrenCache.erase(it->first);
+                }
+                --missing;      // (one that was told to stop before is on its way out already)
+            }
+        }
+        m_sizeQueue.insert(m_sizeQueue.begin(), std::make_move_iterator(first.begin()), std::make_move_iterator(first.end()));
     }
     m_sizeCv.notify_all();
 }
@@ -3909,8 +4050,11 @@ thread_local const MountFence* t_sizeWalkFence = nullptr;
 } // namespace
 #endif
 
-uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int depth, uint64_t generation, bool& outAborted) {
-    if (!m_running || generation != m_sizeGeneration.load(std::memory_order_relaxed)) {
+// `stop` is the scan's own mark (FolderSizeTask::stop). It is set under m_sizeMutex, together with the forgetting
+// of what is known about the folder, and looked at under that mutex before anything is stored here: a scan that
+// was told to stop leaves nothing behind in the tables, however far it had got.
+uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int depth, const std::atomic<bool>& stop, bool& outAborted) {
+    if (!m_running || stop.load(std::memory_order_relaxed)) {
         outAborted = true;
         return 0;
     }
@@ -3947,7 +4091,7 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
     std::wstring dirKey = (depth <= 4) ? PathUtils::NormalizePathKey(dirPath) : L"";
 
     do {
-        if (!m_running || generation != m_sizeGeneration.load(std::memory_order_relaxed)) {
+        if (!m_running || stop.load(std::memory_order_relaxed)) {
             outAborted = true;
             break;
         }
@@ -3966,7 +4110,7 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
             // this folder's size, and a share that does not answer would hold the measurement up forever
             if (t_sizeWalkFence && t_sizeWalkFence->IsMountRoot(childDir)) continue;
 #endif
-            uint64_t subBytes = ComputeFolderSizeRecursive(childDir, depth + 1, generation, outAborted);
+            uint64_t subBytes = ComputeFolderSizeRecursive(childDir, depth + 1, stop, outAborted);
             if (outAborted) break;
             totalBytes += subBytes;
 
@@ -3974,10 +4118,13 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
             if (depth <= 4) {
                 subKey = PathUtils::NormalizePathKey(childDir);
                 std::lock_guard<std::mutex> lock(m_sizeMutex);
-                m_folderSizeCache[subKey] = subBytes;
-                if (depth == 0) {
-                    // Stream partial size of top-level folder while scanning its subfolders!
-                    m_folderSizeCache[dirKey] = totalBytes;
+                if (!stop.load(std::memory_order_relaxed)) {
+                    m_folderSizeCache[subKey] = subBytes;
+                    if (depth == 0 && totalBytes > 0) {
+                        // Stream partial size of top-level folder while scanning its subfolders! (Not while it
+                        // is still 0: a stored 0 means "scanned, holds no data" to RequestFolderSizes.)
+                        m_folderSizeCache[dirKey] = totalBytes;
+                    }
                 }
             }
             if (depth <= 4 && subBytes > 0) {
@@ -4001,11 +4148,11 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
                         if (snapshot.size() > 48) snapshot.resize(48);
                         {
                             std::lock_guard<std::mutex> lock(m_sizeMutex);
-                            m_folderChildrenCache[dirKey] = std::move(snapshot);
+                            if (!stop.load(std::memory_order_relaxed)) {
+                                m_folderChildrenCache[dirKey] = std::move(snapshot);
+                            }
                         }
-                        if (m_notifyHwnd && !m_sizeNotifyPending.exchange(true, std::memory_order_relaxed)) {
-                            PostMessageW(m_notifyHwnd, WM_APP_FOLDER_SIZE_UPDATED, 0, 0);
-                        }
+                        m_folderSizesChanged.store(true, std::memory_order_relaxed);    // the window looks on its timer
                     }
                 }
             }
@@ -4051,7 +4198,9 @@ uint64_t FileEngine::ComputeFolderSizeRecursive(const std::wstring& dirPath, int
         }
 
         std::lock_guard<std::mutex> lock(m_sizeMutex);
-        m_folderChildrenCache[dirKey] = std::move(directChildren);
+        if (!stop.load(std::memory_order_relaxed)) {
+            m_folderChildrenCache[dirKey] = std::move(directChildren);
+        }
     }
 
     return totalBytes;
@@ -4068,6 +4217,8 @@ void FileEngine::FolderSizeWorkerLoop() {
             task = std::move(m_sizeQueue.front());
             m_sizeQueue.pop_front();
             m_activeSizeWorkers.fetch_add(1, std::memory_order_relaxed);
+            auto scan = m_folderSizeInFlight.find(task.normKey);
+            if (scan != m_folderSizeInFlight.end() && scan->second.stop == task.stop) scan->second.running = true;
         }
 
         bool aborted = false;
@@ -4075,24 +4226,45 @@ void FileEngine::FolderSizeWorkerLoop() {
         const MountFence fence(task.path);
         t_sizeWalkFence = &fence;
 #endif
-        uint64_t totalBytes = ComputeFolderSizeRecursive(task.path, 0, task.generation, aborted);
+        uint64_t totalBytes = ComputeFolderSizeRecursive(task.path, 0, *task.stop, aborted);
 #ifndef _WIN32
         t_sizeWalkFence = nullptr;
 #endif
 
-        if (m_running && !aborted && task.generation == m_sizeGeneration.load(std::memory_order_relaxed)) {
-            {
-                std::lock_guard<std::mutex> lock(m_sizeMutex);
+        bool nothingLeftToDo = false;
+        bool startsOver = false;
+        {
+            std::lock_guard<std::mutex> lock(m_sizeMutex);
+            const bool toldToStop = task.stop->load(std::memory_order_relaxed);
+            if (m_running && !aborted && !toldToStop) {
                 m_folderSizeCache[task.normKey] = totalBytes;
+                // The folder's entry here is this scan's: a folder is not queued twice, and a forced rescan,
+                // which takes the entry out and may put in a new one, would have set this scan's stop mark
                 m_folderSizeInFlight.erase(task.normKey);
+            } else if (m_running && toldToStop) {
+                // Told to stop. If the folder's entry is still this scan's, the folder itself was not rescanned
+                // by force: the scan only had to make way for a forced rescan of other folders (see
+                // RequestFolderSizes). It goes to the end of the queue and starts over, with a mark of its own.
+                auto scan = m_folderSizeInFlight.find(task.normKey);
+                if (scan != m_folderSizeInFlight.end() && scan->second.stop == task.stop) {
+                    scan->second.stop = std::make_shared<std::atomic<bool>>(false);
+                    scan->second.running = false;
+                    m_sizeQueue.push_back(FolderSizeTask{ task.path, task.normKey, scan->second.stop });
+                    startsOver = true;
+                }
             }
-            if (m_notifyHwnd && !m_sizeNotifyPending.exchange(true, std::memory_order_relaxed)) {
-                PostMessageW(m_notifyHwnd, WM_APP_FOLDER_SIZE_UPDATED, 0, 0);
-            }
+            // Counted down with the lock held, where the queue is looked at too: "nothing left to do" is then
+            // true at this moment, and not only because the other workers are between two folders
+            nothingLeftToDo = (m_activeSizeWorkers.fetch_sub(1, std::memory_order_relaxed) == 1) && m_sizeQueue.empty();
         }
-        if (m_activeSizeWorkers.fetch_sub(1, std::memory_order_relaxed) == 1 && m_notifyHwnd) {
-            // Ensure final repaint when last active worker finishes
-            PostMessageW(m_notifyHwnd, WM_APP_FOLDER_SIZE_UPDATED, 0, 0);
+        if (startsOver) m_sizeCv.notify_one();
+        // The window is not told about each folder (see TakeFolderSizesChanged): it looks on its work timer,
+        // and gets one message when the work is done, so that the last sizes show even if no timer runs
+        m_folderSizesChanged.store(true, std::memory_order_relaxed);
+        if (nothingLeftToDo && m_notifyHwnd && !m_sizeNotifyPending.exchange(true, std::memory_order_relaxed)) {
+            if (!PostMessageW(m_notifyHwnd, WM_APP_FOLDER_SIZE_UPDATED, 0, 0)) {
+                m_sizeNotifyPending.store(false, std::memory_order_relaxed);
+            }
         }
     }
 }

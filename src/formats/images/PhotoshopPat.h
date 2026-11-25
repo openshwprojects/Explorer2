@@ -8,22 +8,22 @@ inline bool DecodePhotoshopPat(const uint8_t* data, size_t size, ExtendedImageIn
         if (size >= 28 && std::memcmp(data, "8BPT", 4) == 0) {
             size_t pos = 0;
             uint32_t patCount = 0;
-            if (DetailImg100::RdU16BE(data + 4) == 1) {
-                patCount = DetailImg100::RdU32BE(data + 6);
+            if (DetailLayeredAndHdrImg::RdU16BE(data + 4) == 1) {
+                patCount = DetailLayeredAndHdrImg::RdU32BE(data + 6);
                 pos = 10;
-            } else if (DetailImg100::RdU32BE(data + 4) == 1) {
-                patCount = DetailImg100::RdU32BE(data + 8);
+            } else if (DetailLayeredAndHdrImg::RdU32BE(data + 4) == 1) {
+                patCount = DetailLayeredAndHdrImg::RdU32BE(data + 8);
                 pos = 12;
             } else {
                 return false;
             }
             if (patCount == 0 || patCount > 4096 || pos + 16 > size) return false;
 
-            uint32_t patVer    = DetailImg100::RdU32BE(data + pos + 0);
-            uint32_t imageMode = DetailImg100::RdU32BE(data + pos + 4);
-            uint16_t patH      = DetailImg100::RdU16BE(data + pos + 8);
-            uint16_t patW      = DetailImg100::RdU16BE(data + pos + 10);
-            uint32_t nameChars = DetailImg100::RdU32BE(data + pos + 12);
+            uint32_t patVer    = DetailLayeredAndHdrImg::RdU32BE(data + pos + 0);
+            uint32_t imageMode = DetailLayeredAndHdrImg::RdU32BE(data + pos + 4);
+            uint16_t patH      = DetailLayeredAndHdrImg::RdU16BE(data + pos + 8);
+            uint16_t patW      = DetailLayeredAndHdrImg::RdU16BE(data + pos + 10);
+            uint32_t nameChars = DetailLayeredAndHdrImg::RdU32BE(data + pos + 12);
             pos += 16;
             if (patVer != 1 || patW == 0 || patH == 0 || patW > 4096 || patH > 4096 || nameChars > 2048) {
                 return false;
@@ -32,7 +32,7 @@ inline bool DecodePhotoshopPat(const uint8_t* data, size_t size, ExtendedImageIn
 
             std::wstring patName;
             for (uint32_t i = 0; i < nameChars; ++i) {
-                wchar_t wc = static_cast<wchar_t>(DetailImg100::RdU16BE(data + pos + static_cast<size_t>(i) * 2));
+                wchar_t wc = static_cast<wchar_t>(DetailLayeredAndHdrImg::RdU16BE(data + pos + static_cast<size_t>(i) * 2));
                 if (wc != 0) patName.push_back(wc);
             }
             pos += static_cast<size_t>(nameChars) * 2;
@@ -46,24 +46,24 @@ inline bool DecodePhotoshopPat(const uint8_t* data, size_t size, ExtendedImageIn
             if (imageMode == 2) {
                 if (pos + 772 > size) return false;
                 std::memcpy(palRgb, data + pos, 768);
-                transIdx = DetailImg100::RdU16BE(data + pos + 768);
+                transIdx = DetailLayeredAndHdrImg::RdU16BE(data + pos + 768);
                 pos += 772;
             }
 
-            if (pos + 5 <= size && DetailImg100::RdU32BE(data + pos) != 3 &&
-                data[pos] == 0 && DetailImg100::RdU32BE(data + pos + 1) == 3)
+            if (pos + 5 <= size && DetailLayeredAndHdrImg::RdU32BE(data + pos) != 3 &&
+                data[pos] == 0 && DetailLayeredAndHdrImg::RdU32BE(data + pos + 1) == 3)
             {
                 ++pos;
             }
             if (pos + 28 > size) return false;
 
-            uint32_t vmaVer     = DetailImg100::RdU32BE(data + pos + 0);
-            uint32_t vmaLen     = DetailImg100::RdU32BE(data + pos + 4);
-            int32_t  vTop       = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 8));
-            int32_t  vLeft      = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 12));
-            int32_t  vBottom    = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 16));
-            int32_t  vRight     = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 20));
-            uint32_t maxChans   = DetailImg100::RdU32BE(data + pos + 24);
+            uint32_t vmaVer     = DetailLayeredAndHdrImg::RdU32BE(data + pos + 0);
+            uint32_t vmaLen     = DetailLayeredAndHdrImg::RdU32BE(data + pos + 4);
+            int32_t  vTop       = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 8));
+            int32_t  vLeft      = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 12));
+            int32_t  vBottom    = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 16));
+            int32_t  vRight     = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 20));
+            uint32_t maxChans   = DetailLayeredAndHdrImg::RdU32BE(data + pos + 24);
             (void)vmaLen;
             pos += 28;
             if (vmaVer != 3 || maxChans > 64) return false;
@@ -80,22 +80,22 @@ inline bool DecodePhotoshopPat(const uint8_t* data, size_t size, ExtendedImageIn
             uint32_t totalSlots = maxChans + 2u;
 
             for (uint32_t slot = 0; slot < totalSlots && pos + 4 <= size; ++slot) {
-                uint32_t isWritten = DetailImg100::RdU32BE(data + pos);
+                uint32_t isWritten = DetailLayeredAndHdrImg::RdU32BE(data + pos);
                 pos += 4;
                 if (isWritten == 0) continue;
                 if (pos + 4 > size) return false;
-                uint32_t chanLen = DetailImg100::RdU32BE(data + pos);
+                uint32_t chanLen = DetailLayeredAndHdrImg::RdU32BE(data + pos);
                 pos += 4;
                 if (chanLen == 0) continue;
                 if (chanLen < 23 || pos + chanLen > size) return false;
                 size_t chanEnd = pos + chanLen;
 
-                uint32_t pixDepth = DetailImg100::RdU32BE(data + pos + 0);
-                int32_t  cTop     = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 4));
-                int32_t  cLeft    = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 8));
-                int32_t  cBottom  = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 12));
-                int32_t  cRight   = static_cast<int32_t>(DetailImg100::RdU32BE(data + pos + 16));
-                uint16_t depth16  = DetailImg100::RdU16BE(data + pos + 20);
+                uint32_t pixDepth = DetailLayeredAndHdrImg::RdU32BE(data + pos + 0);
+                int32_t  cTop     = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 4));
+                int32_t  cLeft    = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 8));
+                int32_t  cBottom  = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 12));
+                int32_t  cRight   = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32BE(data + pos + 16));
+                uint16_t depth16  = DetailLayeredAndHdrImg::RdU16BE(data + pos + 20);
                 uint8_t  comp     = data[pos + 22];
                 const uint8_t* csrc = data + pos + 23;
                 size_t clen = chanLen - 23;
@@ -119,7 +119,7 @@ inline bool DecodePhotoshopPat(const uint8_t* data, size_t size, ExtendedImageIn
                     if (clen < tblBytes) return false;
                     size_t rpos = tblBytes;
                     for (uint32_t ry = 0; ry < chH; ++ry) {
-                        uint16_t rowCnt = DetailImg100::RdU16BE(csrc + static_cast<size_t>(ry) * 2u);
+                        uint16_t rowCnt = DetailLayeredAndHdrImg::RdU16BE(csrc + static_cast<size_t>(ry) * 2u);
                         if (rpos + rowCnt > clen) return false;
                         const uint8_t* rp = csrc + rpos;
                         const uint8_t* rend = rp + rowCnt;
@@ -151,6 +151,15 @@ inline bool DecodePhotoshopPat(const uint8_t* data, size_t size, ExtendedImageIn
                 DecodedChan dc;
                 dc.slot = slot;
                 dc.plane.assign(tilePx, (slot >= 3) ? 255 : 0);
+                uint16_t maxV16 = 0u;
+                if (sampleBytes == 2u) {
+                    const size_t nChPx = static_cast<size_t>(chW) * chH;
+                    for (size_t i = 0; i < nChPx; ++i) {
+                        uint16_t s16 = DetailLayeredAndHdrImg::RdU16BE(&rawPlane[i * 2u]);
+                        if (s16 > maxV16) maxV16 = s16;
+                    }
+                }
+                const uint32_t white16 = (maxV16 <= 32768u) ? 32768u : 65535u;
                 int offX = cLeft - vLeft;
                 int offY = cTop - vTop;
                 for (uint32_t y = 0; y < chH; ++y) {
@@ -159,7 +168,13 @@ inline bool DecodePhotoshopPat(const uint8_t* data, size_t size, ExtendedImageIn
                     for (uint32_t x = 0; x < chW; ++x) {
                         int dx = offX + static_cast<int>(x);
                         if (dx < 0 || dx >= static_cast<int>(tileW)) continue;
-                        uint8_t v8 = rawPlane[(static_cast<size_t>(y) * chW + x) * sampleBytes];
+                        uint8_t v8 = 0;
+                        if (sampleBytes == 2u) {
+                            uint16_t v16 = DetailLayeredAndHdrImg::RdU16BE(&rawPlane[(static_cast<size_t>(y) * chW + x) * 2u]);
+                            v8 = static_cast<uint8_t>(std::min<uint32_t>(255u, (static_cast<uint32_t>(v16) * 255u + (white16 / 2u)) / white16));
+                        } else {
+                            v8 = rawPlane[static_cast<size_t>(y) * chW + x];
+                        }
                         dc.plane[static_cast<size_t>(dy) * tileW + dx] = v8;
                     }
                 }

@@ -2,7 +2,7 @@
 // SpeexAudio.h — Xiph Speex Audio (.spx) Inspector
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseSpeexAudio(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
     OggStreamWalk walk;
@@ -13,11 +13,11 @@ inline bool ParseSpeexAudio(const std::vector<uint8_t>& raw, const std::wstring&
 
     std::wstring ver = FixedAsciiField(bos.data() + 8, 20);
     std::wstring codec = L"Xiph Speex " + ver;
-    uint32_t sampleRate = DetailSys100::RdU32LE(bos.data() + 36);
+    uint32_t sampleRate = DetailBinarySysDoc::RdU32LE(bos.data() + 36);
     uint32_t granuleRate = sampleRate;
-    uint32_t mode = DetailSys100::RdU32LE(bos.data() + 40);
-    uint32_t channels = DetailSys100::RdU32LE(bos.data() + 48);
-    int32_t nominalBitrate = static_cast<int32_t>(DetailSys100::RdU32LE(bos.data() + 52));
+    uint32_t mode = DetailBinarySysDoc::RdU32LE(bos.data() + 40);
+    uint32_t channels = DetailBinarySysDoc::RdU32LE(bos.data() + 48);
+    int32_t nominalBitrate = static_cast<int32_t>(DetailBinarySysDoc::RdU32LE(bos.data() + 52));
     std::wstring extraCodecInfo = (mode == 0) ? L"Narrowband" : ((mode == 1) ? L"Wideband" : L"Ultra-Wideband");
 
     std::wstring vendor;
@@ -35,10 +35,10 @@ inline bool ParseSpeexAudio(const std::vector<uint8_t>& raw, const std::wstring&
         codec, channels, sampleRate, granuleRate, 0, nominalBitrate, extraCodecInfo, vendor, comments, out);
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
 inline bool ParseSpeexAudioDoc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
-    return DetailMedia100::ParseSpeexAudio(raw, extLower, out);
+    return DetailMediaAndScoreDoc::ParseSpeexAudio(raw, extLower, out);
 }
 
 } // namespace Formats

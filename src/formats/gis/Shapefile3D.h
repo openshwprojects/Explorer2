@@ -39,7 +39,7 @@ inline bool ParseShapefile3DMesh(const uint8_t* data, size_t size, LoadedMesh3D&
             float x = static_cast<float>(RdF64LE(rp + 4));
             float y = static_cast<float>(RdF64LE(rp + 12));
             float z = (st == 11) ? static_cast<float>(RdF64LE(rp + 20)) : 0.0f;
-            Detail3D200::AddOctaSphere(mesh, x, z, -y, 0.5f);
+            DetailMeshSciCad::AddOctaSphere(mesh, x, z, -y, 0.5f);
         }
         else if ((st == 3 || st == 5 || st == 13 || st == 15 || st == 31) && recBytes >= 44) {
             int32_t numParts  = RdI32LE(rp + 36);
@@ -74,7 +74,7 @@ inline bool ParseShapefile3DMesh(const uint8_t* data, size_t size, LoadedMesh3D&
 
                 if (st == 3 || st == 13) {
                     for (int32_t k = startIdx; k + 1 < endIdx; ++k) {
-                        Detail3D200::AddStrut3D(mesh, pts[k], pts[k + 1], 0.25f);
+                        DetailMeshSciCad::AddStrut3D(mesh, pts[k], pts[k + 1], 0.25f);
                     }
                 } else if (st == 31) {
                     int32_t pType = RdI32LE(rp + partTypesOff + static_cast<size_t>(p) * 4u);

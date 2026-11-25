@@ -109,15 +109,15 @@ inline bool ParseJedecSpd(const uint8_t* data, size_t size, ParsedEdaBoard& out)
                 busWidth = std::clamp(subChWidth * numCh, 16, 128);
             }
         }
-        uint16_t tckRaw = DetailEda100::RdU16LE(data + 20);
-        uint16_t taaRaw = DetailEda100::RdU16LE(data + 30);
+        uint16_t tckRaw = DetailSiliconAndBusEda::RdU16LE(data + 20);
+        uint16_t taaRaw = DetailSiliconAndBusEda::RdU16LE(data + 30);
         tCK_ps = (tckRaw >= 100 && tckRaw <= 2000) ? static_cast<double>(tckRaw) : 416.0; // default DDR5-4800
         tAA_ps = (taaRaw >= 1000 && taaRaw <= 60000) ? static_cast<double>(taaRaw) : (tCK_ps * 40.0);
 
         if (size >= 552) {
             mfgName = DecodeJedecMfg(data[512], data[513]);
             if (mfgName == L"JEDEC" && size >= 554) mfgName = DecodeJedecMfg(data[552], data[553]);
-            std::string pn = DetailEda100::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 521), 30));
+            std::string pn = DetailSiliconAndBusEda::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 521), 30));
             partNumber = PathUtils::Utf8ToWide(pn);
         }
     } else if (dramType == 0x0C || dramType == 0x0E || dramType == 0x10 || dramType == 0x11) { // DDR4 (JESD21-C Annex L)
@@ -139,7 +139,7 @@ inline bool ParseJedecSpd(const uint8_t* data, size_t size, ParsedEdaBoard& out)
         if (size >= 349) {
             mfgName = DecodeJedecMfg(data[320], data[321]);
             if (mfgName == L"JEDEC" && size >= 352) mfgName = DecodeJedecMfg(data[350], data[351]);
-            std::string pn = DetailEda100::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 329), 20));
+            std::string pn = DetailSiliconAndBusEda::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 329), 20));
             partNumber = PathUtils::Utf8ToWide(pn);
         }
     } else if (dramType == 0x0B) { // DDR3 (JESD21-C Annex K)
@@ -161,7 +161,7 @@ inline bool ParseJedecSpd(const uint8_t* data, size_t size, ParsedEdaBoard& out)
 
         if (size >= 146) {
             mfgName = DecodeJedecMfg(data[117], data[118]);
-            std::string pn = DetailEda100::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 128), 18));
+            std::string pn = DetailSiliconAndBusEda::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 128), 18));
             partNumber = PathUtils::Utf8ToWide(pn);
         }
     } else { // DDR2 (0x08)
@@ -181,7 +181,7 @@ inline bool ParseJedecSpd(const uint8_t* data, size_t size, ParsedEdaBoard& out)
                 else { code = data[k]; break; }
             }
             mfgName = DecodeJedecMfg(cont, code);
-            std::string pn = DetailEda100::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 73), 18));
+            std::string pn = DetailSiliconAndBusEda::TrimAsciiView(std::string_view(reinterpret_cast<const char*>(data + 73), 18));
             partNumber = PathUtils::Utf8ToWide(pn);
         }
     }
@@ -196,7 +196,7 @@ inline bool ParseJedecSpd(const uint8_t* data, size_t size, ParsedEdaBoard& out)
     bool isSoDimm = (modType == 0x03);
     float pcbW = isSoDimm ? 69.60f : 133.35f;
     float pcbH = isSoDimm ? 30.00f : 31.25f;
-    DetailEda100::AddRectOutline(out, 0.0f, 0.0f, pcbW, pcbH, EdaLayerId::EdgeCuts, 0.50f);
+    DetailSiliconAndBusEda::AddRectOutline(out, 0.0f, 0.0f, pcbW, pcbH, EdaLayerId::EdgeCuts, 0.50f);
 
     bool isDdr5 = (dramType == 0x12 || dramType == 0x13);
     wchar_t chipVal[64] = {};

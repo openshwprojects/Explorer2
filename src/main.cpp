@@ -1,5 +1,6 @@
 #include "ExplorerApp.h"
 #include "AppLog.h"
+#include "FileLockInspector.h"
 #include "Monitoring.h"
 #include "PdfViewer.h"
 #include "SelfTestSuite.h"
@@ -91,6 +92,43 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
     // Hidden background recorder (one per user session, shared by every Explorer2 window)
     if (lpCmdLine && wcsstr(lpCmdLine, L"--monitor-daemon")) {
         int code = Explorer2::MonitorDaemon::Run();
+        CoUninitialize();
+        return code;
+    }
+
+    // Elevated UAC unlock & delete helper (`Explorer2.exe --admin-unlock <reqFile> <resFile>`)
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--admin-unlock")) {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        int code = 2;
+        if (argv) {
+            for (int i = 1; i + 2 < argc; ++i) {
+                if (wcscmp(argv[i], L"--admin-unlock") == 0) {
+                    code = Explorer2::FileLockInspector::HandleAdminUnlockCli(argv[i + 1], argv[i + 2]);
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
+        CoUninitialize();
+        return code;
+    }
+
+    // Self-test bounded lock holder (`Explorer2.exe --hold-lock-test <mode> <targetPath> <readyFile> <maxMs>`)
+    if (lpCmdLine && wcsstr(lpCmdLine, L"--hold-lock-test")) {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        int code = 2;
+        if (argv) {
+            for (int i = 1; i + 4 < argc; ++i) {
+                if (wcscmp(argv[i], L"--hold-lock-test") == 0) {
+                    code = Explorer2::FileLockInspector::HandleLockTestHelperCli(
+                        argv[i + 1], argv[i + 2], argv[i + 3], _wtoi(argv[i + 4]));
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
         CoUninitialize();
         return code;
     }

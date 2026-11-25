@@ -1,6 +1,8 @@
 #include "ZipDeflate.h"
 #include "PathUtils.h"
 #include "ByteIO.h"
+#include "StreamCodecs.h"
+#include "formats/common/ArchiveFormatCommon.h"
 #include <algorithm>
 #include <cstring>
 
@@ -14,8 +16,6 @@ struct BitStream {
     size_t bytePos = 0;
     uint32_t bitBuf = 0;
     int bitCount = 0;
-    // Set as soon as more bits are taken than the input holds. Those bits read as zeros, and zeros can
-    // decode to data for ever, so the decoder has to stop when it sees this instead of going on.
     bool overrun = false;
 
     void Fill(int needBits) {
@@ -52,6 +52,11 @@ struct BitStream {
         if (rem > 0) DropBits(rem);
     }
 
+    size_t ConsumedBytes() const {
+        const size_t unreadWhole = static_cast<size_t>(bitCount / 8);
+        return (bytePos >= unreadWhole) ? (bytePos - unreadWhole) : 0u;
+    }
+
     bool HasBytes(size_t count) const {
         size_t unreadInBuf = static_cast<size_t>(bitCount / 8);
         size_t totalAvail = (size - bytePos) + unreadInBuf;
@@ -72,12 +77,9 @@ struct BitStream {
 
 struct HuffmanTable {
     static constexpr int kMaxBits = 15;
-    // Codes up to kFastBits long are resolved with one lookup of the next kFastBits stream bits;
-    // longer (rare) codes fall back to the canonical bit-by-bit walk below.
     static constexpr int kFastBits = 10;
     uint16_t counts[kMaxBits + 1] = {};
     uint16_t symbols[320] = {};
-    // (codeLength << 9) | symbol, indexed by the next kFastBits bits (LSB first); 0 = code longer than kFastBits
     uint16_t fast[1u << kFastBits] = {};
     int maxCodeLen = 0;
 
@@ -95,7 +97,6 @@ struct HuffmanTable {
         }
         if (maxCodeLen == 0) return true;
 
-        // More codes of one length than a prefix code has room for: damaged data, not a Huffman code
         int room = 1;
         for (int bits = 1; bits <= kMaxBits; ++bits) {
             room = (room << 1) - counts[bits];
@@ -117,7 +118,6 @@ struct HuffmanTable {
             }
         }
 
-        // Canonical codes (RFC 1951 3.2.2), stored bit-reversed because Deflate sends them MSB first
         uint16_t nextCode[kMaxBits + 1] = {};
         uint32_t code = 0;
         for (int bits = 1; bits <= kMaxBits; ++bits) {
@@ -137,7 +137,6 @@ struct HuffmanTable {
         return true;
     }
 
-    // Bits past the end of the input read as zeros and set bs.overrun (through DropBits), as before.
     int Decode(BitStream& bs) const {
         bs.Fill(kMaxBits);
         const uint32_t peek = bs.bitBuf;
@@ -187,8 +186,185 @@ static const uint8_t kCodeLenOrder[19] = {
 };
 
 inline uint16_t ReadLE16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
-
 inline uint32_t ReadLE32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
+inline uint64_t ReadLE64(const uint8_t* p) { return ::Explorer2::ByteIO::RdU64LE(p); }
+
+// Parses ZIP64 (0x0001) and Info-ZIP Unicode Path (0x7075) extra fields on Central Directory or Local File Headers
+void ApplyZipExtraFields(
+    const uint8_t* extra,
+    size_t extraLen,
+    bool isLocalHeader,
+    uint32_t rawUncomp32,
+    uint32_t rawComp32,
+    uint32_t rawOff32,
+    uint64_t& ioUncompSz,
+    uint64_t& ioCompSz,
+    uint64_t& ioLocalHdrOff,
+    std::string& ioUtf8Name)
+{
+    size_t p = 0;
+    while (p + 4u <= extraLen) {
+        const uint16_t hdrId = ReadLE16(extra + p);
+        const uint16_t dSize = ReadLE16(extra + p + 2u);
+        p += 4u;
+        if (dSize > extraLen - p) break;
+        const uint8_t* field = extra + p;
+
+        if (hdrId == 0x0001u) { // ZIP64 Extended Information Extra Field
+            size_t fp = 0;
+            if (isLocalHeader) {
+                if (rawUncomp32 == 0xFFFFFFFFu && fp + 8u <= dSize) {
+                    ioUncompSz = ReadLE64(field + fp);
+                    fp += 8u;
+                }
+                if (rawComp32 == 0xFFFFFFFFu && fp + 8u <= dSize) {
+                    ioCompSz = ReadLE64(field + fp);
+                    fp += 8u;
+                }
+            } else {
+                if (rawUncomp32 == 0xFFFFFFFFu && fp + 8u <= dSize) {
+                    ioUncompSz = ReadLE64(field + fp);
+                    fp += 8u;
+                }
+                if (rawComp32 == 0xFFFFFFFFu && fp + 8u <= dSize) {
+                    ioCompSz = ReadLE64(field + fp);
+                    fp += 8u;
+                }
+                if (rawOff32 == 0xFFFFFFFFu && fp + 8u <= dSize) {
+                    ioLocalHdrOff = ReadLE64(field + fp);
+                    fp += 8u;
+                }
+            }
+        } else if (hdrId == 0x7075u && dSize > 5u && field[0] == 1u) { // Info-ZIP Unicode Path
+            ioUtf8Name.assign(reinterpret_cast<const char*>(field + 5u), dSize - 5u);
+        }
+        p += dSize;
+    }
+}
+
+bool ParseZipCentralDirSlice(
+    const uint8_t* cdBuf,
+    size_t cdLen,
+    uint64_t expectedEntriesHint,
+    std::vector<ArchiveItemMeta>& outEntries)
+{
+    size_t pos = 0;
+    if (expectedEntriesHint > 0 && expectedEntriesHint <= 262144ULL) {
+        outEntries.reserve(static_cast<size_t>(expectedEntriesHint));
+    }
+    while (pos + 46u <= cdLen) {
+        if (ReadLE32(cdBuf + pos) != 0x02014B50u) break;
+        const uint16_t flags       = ReadLE16(cdBuf + pos + 8);
+        const uint16_t method      = ReadLE16(cdBuf + pos + 10);
+        const uint16_t modTime     = ReadLE16(cdBuf + pos + 12);
+        const uint16_t modDate     = ReadLE16(cdBuf + pos + 14);
+        const uint32_t crc         = ReadLE32(cdBuf + pos + 16);
+        const uint32_t compSz32    = ReadLE32(cdBuf + pos + 20);
+        const uint32_t uncompSz32  = ReadLE32(cdBuf + pos + 24);
+        const uint16_t nameLen     = ReadLE16(cdBuf + pos + 28);
+        const uint16_t extraLen    = ReadLE16(cdBuf + pos + 30);
+        const uint16_t commentLen  = ReadLE16(cdBuf + pos + 32);
+        const uint32_t extAttr     = ReadLE32(cdBuf + pos + 38);
+        const uint32_t localOff32  = ReadLE32(cdBuf + pos + 42);
+
+        if (nameLen > cdLen - (pos + 46u)) break;
+        const size_t extraOff = pos + 46u + nameLen;
+        if (extraLen > cdLen - extraOff) break;
+        const size_t nextOff = extraOff + extraLen;
+        if (commentLen > cdLen - nextOff) break;
+
+        std::string rawName(reinterpret_cast<const char*>(cdBuf + pos + 46u), nameLen);
+        uint64_t uncompSz    = uncompSz32;
+        uint64_t compSz      = compSz32;
+        uint64_t localHdrOff = localOff32;
+        if (extraLen > 0u) {
+            ApplyZipExtraFields(
+                cdBuf + extraOff, extraLen, false,
+                uncompSz32, compSz32, localOff32,
+                uncompSz, compSz, localHdrOff, rawName);
+        }
+
+        std::wstring wName = PathUtils::Utf8ToWide(rawName);
+        for (wchar_t& ch : wName) {
+            if (ch == L'\\') ch = L'/';
+        }
+
+        ArchiveItemMeta meta;
+        meta.isDirectory = (!wName.empty() && wName.back() == L'/') || ((extAttr & 0x10u) != 0);
+        while (!wName.empty() && wName.back() == L'/') wName.pop_back();
+        meta.pathInArchive = wName;
+        size_t slash = wName.find_last_of(L'/');
+        meta.name = (slash != std::wstring::npos) ? wName.substr(slash + 1) : wName;
+        meta.uncompressedSize = uncompSz;
+        meta.compressedSize = compSz;
+        meta.localHeaderOffset = localHdrOff;
+        meta.crc32 = crc;
+        meta.compressionMethod = method;
+        meta.generalFlags = flags;
+        meta.dosTime = modTime;
+        meta.dosDate = modDate;
+        meta.isEncrypted = (flags & 0x01u) != 0;
+
+        if (!meta.pathInArchive.empty()) {
+            outEntries.push_back(std::move(meta));
+        }
+        pos = nextOff + commentLen;
+    }
+    return !outEntries.empty() || expectedEntriesHint == 0;
+}
+
+bool DecompressZipPayloadBuffer(
+    uint16_t method,
+    uint16_t flags,
+    const uint8_t* payload,
+    size_t compSz,
+    uint64_t expectedUncompSz,
+    std::vector<uint8_t>& outBytes,
+    size_t maxOutputBytes)
+{
+    outBytes.clear();
+    if (expectedUncompSz > maxOutputBytes) return false;
+    if (method == 0u) { // Stored
+        if (compSz > maxOutputBytes) return false;
+        outBytes.assign(payload, payload + compSz);
+        return true;
+    }
+    if (method == 8u) { // Deflate
+        return InflateRaw(payload, compSz, outBytes, maxOutputBytes);
+    }
+    if (method == 12u) { // BZip2
+        return StreamCodecs::DecompressBzip2Stream(payload, compSz, outBytes, maxOutputBytes);
+    }
+    if (method == 14u) { // LZMA (PKWARE APPNOTE 5.8.8: 4-byte version+propsLen + 5-byte props + raw LZMA1)
+        if (compSz >= 9u && ReadLE16(payload + 2) == 5u) {
+            const uint8_t propsByte = payload[4];
+            const uint32_t dictSize = ReadLE32(payload + 5);
+            const bool eosMarker = (flags & 0x02u) != 0;
+            if (StreamCodecs::DecompressLzma1(
+                    propsByte, dictSize, payload + 9, compSz - 9,
+                    outBytes, expectedUncompSz, !eosMarker, maxOutputBytes))
+            {
+                return true;
+            }
+            return StreamCodecs::DecompressLzma1(
+                propsByte, dictSize, payload + 9, compSz - 9,
+                outBytes, expectedUncompSz, eosMarker, maxOutputBytes);
+        }
+        if (compSz >= 5u) {
+            return StreamCodecs::DecompressLzma1(
+                payload[0], ReadLE32(payload + 1), payload + 5, compSz - 5,
+                outBytes, expectedUncompSz, true, maxOutputBytes);
+        }
+        return false;
+    }
+    if (method == 93u || method == 20u) { // Zstandard (Zstd)
+        return StreamCodecs::DecompressZstdFrame(payload, compSz, outBytes, maxOutputBytes);
+    }
+    if (method == 95u) { // XZ
+        return StreamCodecs::DecompressXzStream(payload, compSz, outBytes, maxOutputBytes);
+    }
+    return false;
+}
 
 } // namespace
 
@@ -196,15 +372,14 @@ bool InflateRawAppend(
     const uint8_t* src,
     size_t srcLen,
     std::vector<uint8_t>& outData,
-    size_t maxOutputBytes)
+    size_t maxOutputBytes,
+    size_t* outBytesConsumed)
 {
+    if (outBytesConsumed) *outBytesConsumed = 0;
     if (!src || srcLen == 0) return false;
 
     BitStream bs{ src, srcLen, 0, 0, 0 };
     uint32_t finalBlock = 0;
-    // Every "if (bs.overrun) return false" below ends the decoding of data that stops in the middle of a
-    // block. Without them a damaged stream of a few hundred bytes kept producing output until it reached
-    // maxOutputBytes, which took seconds.
 
     while (!finalBlock) {
         if (bs.bytePos >= bs.size && bs.bitCount < 3) break;
@@ -212,7 +387,6 @@ bool InflateRawAppend(
         uint32_t blockType = bs.ReadBits(2);
 
         if (blockType == 0) {
-            // Uncompressed stored block
             bs.AlignToByte();
             if (!bs.HasBytes(4)) return false;
             uint16_t len = static_cast<uint16_t>(bs.ReadAlignedByte());
@@ -221,7 +395,7 @@ bool InflateRawAppend(
             nlen |= static_cast<uint16_t>(bs.ReadAlignedByte()) << 8;
             if ((len ^ 0xFFFFu) != nlen) return false;
             if (!bs.HasBytes(len)) return false;
-            if (outData.size() + len > maxOutputBytes) return false;
+            if (len > maxOutputBytes - outData.size()) return false;
             size_t oldSz = outData.size();
             outData.resize(oldSz + len);
             for (uint16_t i = 0; i < len; ++i) {
@@ -287,7 +461,7 @@ bool InflateRawAppend(
                 int sym = litLenTable.Decode(bs);
                 if (sym < 0 || bs.overrun) return false;
                 if (sym < 256) {
-                    if (outData.size() + 1 > maxOutputBytes) return false;
+                    if (outData.size() >= maxOutputBytes) return false;
                     outData.push_back(static_cast<uint8_t>(sym));
                 } else if (sym == 256) {
                     break;
@@ -301,7 +475,7 @@ bool InflateRawAppend(
                     uint32_t matchDist = kDistBase[distSym] + bs.ReadBits(kDistExtra[distSym]);
                     if (bs.overrun) return false;
                     if (matchDist == 0 || matchDist > outData.size()) return false;
-                    if (outData.size() + matchLen > maxOutputBytes) return false;
+                    if (matchLen > maxOutputBytes - outData.size()) return false;
 
                     size_t startIdx = outData.size() - matchDist;
                     for (uint32_t i = 0; i < matchLen; ++i) {
@@ -313,6 +487,8 @@ bool InflateRawAppend(
             return false;
         }
     }
+    bs.AlignToByte();
+    if (outBytesConsumed) *outBytesConsumed = bs.ConsumedBytes();
     return true;
 }
 
@@ -323,7 +499,7 @@ bool InflateRaw(
     size_t maxOutputBytes)
 {
     outData.clear();
-    return InflateRawAppend(src, srcLen, outData, maxOutputBytes);
+    return InflateRawAppend(src, srcLen, outData, maxOutputBytes, nullptr);
 }
 
 bool InflateZlib(
@@ -335,7 +511,7 @@ bool InflateZlib(
     if (!src || srcLen < 6) return false;
     uint8_t cmf = src[0];
     uint8_t flg = src[1];
-    if ((cmf & 0x0F) != 8) return false; // Must be DEFLATE
+    if ((cmf & 0x0F) != 8) return false;
     if (((static_cast<uint16_t>(cmf) << 8) + flg) % 31 != 0) return false;
     size_t hdrSize = (flg & 0x20) ? 6 : 2;
     if (srcLen <= hdrSize) return false;
@@ -348,28 +524,80 @@ bool InflateGzip(
     std::vector<uint8_t>& outData,
     size_t maxOutputBytes)
 {
+    outData.clear();
     if (!src || srcLen < 18) return false;
-    if (src[0] != 0x1F || src[1] != 0x8B || src[2] != 8) return false;
-    uint8_t flags = src[3];
-    size_t pos = 10;
-    if (flags & 0x04) { // FEXTRA
-        if (pos + 2 > srcLen) return false;
-        uint16_t xlen = ReadLE16(src + pos);
-        pos += 2 + xlen;
+    if (src[0] != 0x1Fu || src[1] != 0x8Bu || src[2] != 8u) return false;
+
+    size_t memberStart = 0;
+    size_t membersDecoded = 0;
+
+    while (memberStart < srcLen) {
+        if (srcLen - memberStart < 18u ||
+            src[memberStart] != 0x1Fu ||
+            src[memberStart + 1] != 0x8Bu ||
+            src[memberStart + 2] != 8u)
+        {
+            break;
+        }
+
+        const uint8_t flags = src[memberStart + 3];
+        if ((flags & 0xE0u) != 0u) {
+            if (membersDecoded > 0) break;
+            return false;
+        }
+
+        size_t pos = memberStart + 10u;
+        if (flags & 0x04u) { // FEXTRA
+            if (2u > srcLen - pos) return false;
+            const uint16_t xlen = ReadLE16(src + pos);
+            pos += 2u;
+            if (xlen > srcLen - pos) return false;
+            pos += xlen;
+        }
+        if (flags & 0x08u) { // FNAME
+            while (pos < srcLen && src[pos] != 0u) ++pos;
+            if (pos >= srcLen) return false;
+            ++pos;
+        }
+        if (flags & 0x10u) { // FCOMMENT
+            while (pos < srcLen && src[pos] != 0u) ++pos;
+            if (pos >= srcLen) return false;
+            ++pos;
+        }
+        if (flags & 0x02u) { // FHCRC
+            if (2u > srcLen - pos) return false;
+            pos += 2u;
+        }
+        if (pos >= srcLen) return false;
+
+        // Decode raw DEFLATE member without retaining previous member's LZ77 window across independent GZIP members
+        std::vector<uint8_t> memberOut;
+        size_t consumed = 0;
+        const size_t remCap = maxOutputBytes - outData.size();
+        if (!InflateRawAppend(src + pos, srcLen - pos, memberOut, remCap, &consumed)) {
+            if (membersDecoded > 0) break;
+            return false;
+        }
+        outData.insert(outData.end(), memberOut.begin(), memberOut.end());
+        ++membersDecoded;
+
+        pos += consumed;
+        if (srcLen - pos < 8u) break;
+        pos += 8u; // Skip 4-byte CRC32 + 4-byte ISIZE trailer
+
+        // Skip optional zero padding between concatenated GZIP members
+        size_t nextMember = pos;
+        while (nextMember < srcLen && src[nextMember] == 0u) ++nextMember;
+        if (srcLen - nextMember >= 18u &&
+            src[nextMember] == 0x1Fu && src[nextMember + 1] == 0x8Bu && src[nextMember + 2] == 8u)
+        {
+            memberStart = nextMember;
+        } else {
+            break;
+        }
     }
-    if (flags & 0x08) { // FNAME
-        while (pos < srcLen && src[pos] != 0) ++pos;
-        ++pos;
-    }
-    if (flags & 0x10) { // FCOMMENT
-        while (pos < srcLen && src[pos] != 0) ++pos;
-        ++pos;
-    }
-    if (flags & 0x02) { // FHCRC
-        pos += 2;
-    }
-    if (pos >= srcLen) return false;
-    return InflateRaw(src + pos, srcLen - pos, outData, maxOutputBytes);
+
+    return membersDecoded > 0;
 }
 
 FILETIME DosDateTimeToFileTime(uint16_t dosDate, uint16_t dosTime) {
@@ -388,7 +616,6 @@ bool ListZipEntriesFromMemory(
     outEntries.clear();
     if (!data || dataLen < 22) return false;
 
-    // Locate End of Central Directory (EOCD) signature 0x06054b50 scanning backwards from end
     size_t maxComment = std::min<size_t>(dataLen, 65557);
     size_t eocdPos = SIZE_MAX;
     for (size_t back = 22; back <= maxComment; ++back) {
@@ -400,77 +627,62 @@ bool ListZipEntriesFromMemory(
     }
 
     if (eocdPos != SIZE_MAX) {
-        uint16_t totalEntries = ReadLE16(data + eocdPos + 10);
-        uint32_t cdSize = ReadLE32(data + eocdPos + 12);
-        uint32_t cdOffset = ReadLE32(data + eocdPos + 16);
+        uint64_t totalEntries = ReadLE16(data + eocdPos + 10);
+        uint64_t cdSize       = ReadLE32(data + eocdPos + 12);
+        uint64_t cdOffset     = ReadLE32(data + eocdPos + 16);
 
-        if (cdOffset < dataLen) {
-            size_t pos = cdOffset;
-            size_t endPos = std::min<size_t>(dataLen, static_cast<size_t>(cdOffset) + cdSize);
-            outEntries.reserve(totalEntries);
-            while (pos + 46 <= endPos) {
-                if (ReadLE32(data + pos) != 0x02014B50u) break;
-                uint16_t flags = ReadLE16(data + pos + 8);
-                uint16_t method = ReadLE16(data + pos + 10);
-                uint16_t modTime = ReadLE16(data + pos + 12);
-                uint16_t modDate = ReadLE16(data + pos + 14);
-                uint32_t crc = ReadLE32(data + pos + 16);
-                uint32_t compSz = ReadLE32(data + pos + 20);
-                uint32_t uncompSz = ReadLE32(data + pos + 24);
-                uint16_t nameLen = ReadLE16(data + pos + 28);
-                uint16_t extraLen = ReadLE16(data + pos + 30);
-                uint16_t commentLen = ReadLE16(data + pos + 32);
-                uint32_t extAttr = ReadLE32(data + pos + 38);
-                uint32_t localHdrOff = ReadLE32(data + pos + 42);
-
-                if (pos + 46 + nameLen > dataLen) break;
-                std::string rawName(reinterpret_cast<const char*>(data + pos + 46), nameLen);
-                std::wstring wName = PathUtils::Utf8ToWide(rawName);
-                for (wchar_t& ch : wName) {
-                    if (ch == L'\\') ch = L'/';
-                }
-
-                ArchiveItemMeta meta;
-                meta.isDirectory = (!wName.empty() && wName.back() == L'/') || ((extAttr & 0x10) != 0);
-                while (!wName.empty() && wName.back() == L'/') wName.pop_back();
-                meta.pathInArchive = wName;
-                size_t slash = wName.find_last_of(L'/');
-                meta.name = (slash != std::wstring::npos) ? wName.substr(slash + 1) : wName;
-                meta.uncompressedSize = uncompSz;
-                meta.compressedSize = compSz;
-                meta.localHeaderOffset = localHdrOff;
-                meta.crc32 = crc;
-                meta.compressionMethod = method;
-                meta.dosTime = modTime;
-                meta.dosDate = modDate;
-                meta.isEncrypted = (flags & 0x01) != 0;
-
-                if (!meta.pathInArchive.empty()) {
-                    outEntries.push_back(std::move(meta));
-                }
-                pos += 46 + nameLen + extraLen + commentLen;
+        // Check ZIP64 End of Central Directory Locator (0x06074B50, 20 bytes before EOCD)
+        if (eocdPos >= 20u && ReadLE32(data + eocdPos - 20u) == 0x06074B50u) {
+            const uint64_t zip64EocdOff = ReadLE64(data + eocdPos - 20u + 8u);
+            if (zip64EocdOff <= dataLen && dataLen - static_cast<size_t>(zip64EocdOff) >= 56u &&
+                ReadLE32(data + static_cast<size_t>(zip64EocdOff)) == 0x06064B50u)
+            {
+                const size_t z64 = static_cast<size_t>(zip64EocdOff);
+                totalEntries = ReadLE64(data + z64 + 32u);
+                cdSize       = ReadLE64(data + z64 + 40u);
+                cdOffset     = ReadLE64(data + z64 + 48u);
             }
-            return !outEntries.empty() || totalEntries == 0;
+        }
+
+        if (cdOffset <= dataLen) {
+            const size_t pos = static_cast<size_t>(cdOffset);
+            const size_t avail = dataLen - pos;
+            const size_t sliceLen = (cdSize < avail) ? static_cast<size_t>(cdSize) : avail;
+            if (ParseZipCentralDirSlice(data + pos, sliceLen, totalEntries, outEntries)) {
+                return true;
+            }
         }
     }
 
     // Fallback: sequential Local File Header scan (0x04034B50)
     size_t pos = 0;
-    while (pos + 30 <= dataLen) {
+    while (pos + 30u <= dataLen) {
         uint32_t sig = ReadLE32(data + pos);
         if (sig != 0x04034B50u) break;
-        uint16_t flags = ReadLE16(data + pos + 6);
-        uint16_t method = ReadLE16(data + pos + 8);
-        uint16_t modTime = ReadLE16(data + pos + 10);
-        uint16_t modDate = ReadLE16(data + pos + 12);
-        uint32_t crc = ReadLE32(data + pos + 14);
-        uint32_t compSz = ReadLE32(data + pos + 18);
-        uint32_t uncompSz = ReadLE32(data + pos + 22);
-        uint16_t nameLen = ReadLE16(data + pos + 26);
-        uint16_t extraLen = ReadLE16(data + pos + 28);
-        if (pos + 30 + nameLen > dataLen) break;
+        uint16_t flags      = ReadLE16(data + pos + 6);
+        uint16_t method     = ReadLE16(data + pos + 8);
+        uint16_t modTime    = ReadLE16(data + pos + 10);
+        uint16_t modDate    = ReadLE16(data + pos + 12);
+        uint32_t crc        = ReadLE32(data + pos + 14);
+        uint32_t compSz32   = ReadLE32(data + pos + 18);
+        uint32_t uncompSz32 = ReadLE32(data + pos + 22);
+        uint16_t nameLen    = ReadLE16(data + pos + 26);
+        uint16_t extraLen   = ReadLE16(data + pos + 28);
+        if (nameLen > dataLen - (pos + 30u)) break;
+        const size_t extraOff = pos + 30u + nameLen;
+        if (extraLen > dataLen - extraOff) break;
 
-        std::string rawName(reinterpret_cast<const char*>(data + pos + 30), nameLen);
+        std::string rawName(reinterpret_cast<const char*>(data + pos + 30u), nameLen);
+        uint64_t uncompSz    = uncompSz32;
+        uint64_t compSz      = compSz32;
+        uint64_t localHdrOff = pos;
+        if (extraLen > 0u) {
+            ApplyZipExtraFields(
+                data + extraOff, extraLen, true,
+                uncompSz32, compSz32, 0u,
+                uncompSz, compSz, localHdrOff, rawName);
+        }
+
         std::wstring wName = PathUtils::Utf8ToWide(rawName);
         for (wchar_t& ch : wName) if (ch == L'\\') ch = L'/';
 
@@ -485,13 +697,16 @@ bool ListZipEntriesFromMemory(
         meta.localHeaderOffset = pos;
         meta.crc32 = crc;
         meta.compressionMethod = method;
+        meta.generalFlags = flags;
         meta.dosTime = modTime;
         meta.dosDate = modDate;
-        meta.isEncrypted = (flags & 0x01) != 0;
+        meta.isEncrypted = (flags & 0x01u) != 0;
         if (!meta.pathInArchive.empty()) outEntries.push_back(std::move(meta));
 
-        if (compSz == 0 && (flags & 0x08)) break;
-        pos += 30 + nameLen + extraLen + compSz;
+        if (compSz == 0 && (flags & 0x08u)) break;
+        const size_t payloadOff = extraOff + extraLen;
+        if (compSz > dataLen - payloadOff) break;
+        pos = payloadOff + static_cast<size_t>(compSz);
     }
     return !outEntries.empty();
 }
@@ -505,23 +720,28 @@ bool ExtractZipEntryFromMemory(
 {
     outBytes.clear();
     if (!data || dataLen < 30 || entry.isDirectory || entry.isEncrypted) return false;
-    size_t hdrPos = static_cast<size_t>(entry.localHeaderOffset);
-    if (hdrPos + 30 > dataLen || ReadLE32(data + hdrPos) != 0x04034B50u) return false;
-    uint16_t method = ReadLE16(data + hdrPos + 8);
-    uint16_t nameLen = ReadLE16(data + hdrPos + 26);
-    uint16_t extraLen = ReadLE16(data + hdrPos + 28);
-    size_t payloadPos = hdrPos + 30 + nameLen + extraLen;
-    size_t compSz = static_cast<size_t>(entry.compressedSize);
-    if (payloadPos + compSz > dataLen) return false;
+    if (entry.localHeaderOffset > dataLen || dataLen - static_cast<size_t>(entry.localHeaderOffset) < 30u) return false;
 
-    if (method == 0) {
-        if (compSz > maxOutputBytes) return false;
-        outBytes.assign(data + payloadPos, data + payloadPos + compSz);
-        return true;
-    } else if (method == 8) {
-        return InflateRaw(data + payloadPos, compSz, outBytes, maxOutputBytes);
-    }
-    return false;
+    const size_t hdrPos = static_cast<size_t>(entry.localHeaderOffset);
+    if (ReadLE32(data + hdrPos) != 0x04034B50u) return false;
+    const uint16_t flags    = ReadLE16(data + hdrPos + 6);
+    const uint16_t method   = ReadLE16(data + hdrPos + 8);
+    const uint16_t nameLen  = ReadLE16(data + hdrPos + 26);
+    const uint16_t extraLen = ReadLE16(data + hdrPos + 28);
+    if (nameLen > dataLen - (hdrPos + 30u)) return false;
+    const size_t extraPos = hdrPos + 30u + nameLen;
+    if (extraLen > dataLen - extraPos) return false;
+    const size_t payloadPos = extraPos + extraLen;
+    if (entry.compressedSize > dataLen - payloadPos) return false;
+
+    return DecompressZipPayloadBuffer(
+        method,
+        flags,
+        data + payloadPos,
+        static_cast<size_t>(entry.compressedSize),
+        entry.uncompressedSize,
+        outBytes,
+        maxOutputBytes);
 }
 
 bool ExtractZipEntryFromMemory(
@@ -568,7 +788,6 @@ bool ListZipEntriesFromFile(
     }
     uint64_t fileSize = static_cast<uint64_t>(li.QuadPart);
 
-    // If file is <= 16 MB, read it once; if larger, read tail 65 KB to locate Central Directory!
     if (fileSize <= 16 * 1024 * 1024) {
         std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
         DWORD readBytes = 0;
@@ -580,8 +799,7 @@ bool ListZipEntriesFromFile(
         return parsed;
     }
 
-    // Large ZIP file: read tail for Central Directory
-    size_t tailSize = static_cast<size_t>(std::min<uint64_t>(fileSize, 65557));
+    size_t tailSize = static_cast<size_t>(std::min<uint64_t>(fileSize, 65636));
     LARGE_INTEGER seekPos = {};
     seekPos.QuadPart = static_cast<LONGLONG>(fileSize - tailSize);
     SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
@@ -602,59 +820,48 @@ bool ListZipEntriesFromFile(
         return false;
     }
 
-    uint32_t cdSize = ReadLE32(tail.data() + eocdPos + 12);
-    uint32_t cdOffset = ReadLE32(tail.data() + eocdPos + 16);
-    if (static_cast<uint64_t>(cdOffset) + cdSize > fileSize || cdSize > 64 * 1024 * 1024) {
+    uint64_t totalEntries = ReadLE16(tail.data() + eocdPos + 10);
+    uint64_t cdSize       = ReadLE32(tail.data() + eocdPos + 12);
+    uint64_t cdOffset     = ReadLE32(tail.data() + eocdPos + 16);
+    bool isZip64 = false;
+
+    if (eocdPos >= 20u && ReadLE32(tail.data() + eocdPos - 20u) == 0x06074B50u) {
+        const uint64_t zip64EocdOff = ReadLE64(tail.data() + eocdPos - 20u + 8u);
+        if (zip64EocdOff <= fileSize && fileSize - zip64EocdOff >= 56ULL) {
+            LARGE_INTEGER z64Seek = {};
+            z64Seek.QuadPart = static_cast<LONGLONG>(zip64EocdOff);
+            uint8_t z64Hdr[56] = {};
+            DWORD z64Read = 0;
+            if (SetFilePointerEx(hFile, z64Seek, nullptr, FILE_BEGIN) &&
+                ReadFile(hFile, z64Hdr, 56, &z64Read, nullptr) && z64Read == 56 &&
+                ReadLE32(z64Hdr) == 0x06064B50u)
+            {
+                totalEntries = ReadLE64(z64Hdr + 32);
+                cdSize       = ReadLE64(z64Hdr + 40);
+                cdOffset     = ReadLE64(z64Hdr + 48);
+                isZip64 = true;
+            }
+        }
+    }
+
+    if (cdOffset > fileSize || cdSize > fileSize - cdOffset || cdSize > 64ULL * 1024 * 1024) {
         CloseHandle(hFile);
         return false;
     }
 
-    seekPos.QuadPart = cdOffset;
+    seekPos.QuadPart = static_cast<LONGLONG>(cdOffset);
     SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
-    std::vector<uint8_t> cdBuf(cdSize);
+    std::vector<uint8_t> cdBuf(static_cast<size_t>(cdSize));
     DWORD cdRead = 0;
-    ReadFile(hFile, cdBuf.data(), cdSize, &cdRead, nullptr);
+    ReadFile(hFile, cdBuf.data(), static_cast<DWORD>(cdSize), &cdRead, nullptr);
     CloseHandle(hFile);
 
-    size_t pos = 0;
-    while (pos + 46 <= cdRead) {
-        if (ReadLE32(cdBuf.data() + pos) != 0x02014B50u) break;
-        uint16_t flags = ReadLE16(cdBuf.data() + pos + 8);
-        uint16_t method = ReadLE16(cdBuf.data() + pos + 10);
-        uint16_t modTime = ReadLE16(cdBuf.data() + pos + 12);
-        uint16_t modDate = ReadLE16(cdBuf.data() + pos + 14);
-        uint32_t crc = ReadLE32(cdBuf.data() + pos + 16);
-        uint32_t compSz = ReadLE32(cdBuf.data() + pos + 20);
-        uint32_t uncompSz = ReadLE32(cdBuf.data() + pos + 24);
-        uint16_t nameLen = ReadLE16(cdBuf.data() + pos + 28);
-        uint16_t extraLen = ReadLE16(cdBuf.data() + pos + 30);
-        uint16_t commentLen = ReadLE16(cdBuf.data() + pos + 32);
-        uint32_t extAttr = ReadLE32(cdBuf.data() + pos + 38);
-        uint32_t localHdrOff = ReadLE32(cdBuf.data() + pos + 42);
-        if (pos + 46 + nameLen > cdRead) break;
-
-        std::string rawName(reinterpret_cast<const char*>(cdBuf.data() + pos + 46), nameLen);
-        std::wstring wName = PathUtils::Utf8ToWide(rawName);
-        for (wchar_t& ch : wName) if (ch == L'\\') ch = L'/';
-
-        ArchiveItemMeta meta;
-        meta.isDirectory = (!wName.empty() && wName.back() == L'/') || ((extAttr & 0x10) != 0);
-        while (!wName.empty() && wName.back() == L'/') wName.pop_back();
-        meta.pathInArchive = wName;
-        size_t slash = wName.find_last_of(L'/');
-        meta.name = (slash != std::wstring::npos) ? wName.substr(slash + 1) : wName;
-        meta.uncompressedSize = uncompSz;
-        meta.compressedSize = compSz;
-        meta.localHeaderOffset = localHdrOff;
-        meta.crc32 = crc;
-        meta.compressionMethod = method;
-        meta.dosTime = modTime;
-        meta.dosDate = modDate;
-        meta.isEncrypted = (flags & 0x01) != 0;
-        if (!meta.pathInArchive.empty()) outEntries.push_back(std::move(meta));
-        pos += 46 + nameLen + extraLen + commentLen;
+    if (!ParseZipCentralDirSlice(cdBuf.data(), cdRead, totalEntries, outEntries)) {
+        return false;
     }
-    if (outFormatSummary) *outFormatSummary = L"ZIP Archive (64-bit / Large)";
+    if (outFormatSummary) {
+        *outFormatSummary = isZip64 ? L"ZIP64 Archive" : L"ZIP Archive (64-bit / Large)";
+    }
     return true;
 }
 
@@ -667,6 +874,8 @@ bool ExtractZipEntryFromFile(
     outBytes.clear();
     if (entry.isDirectory || entry.isEncrypted) return false;
     if (entry.uncompressedSize > maxOutputBytes) return false;
+    const uint64_t maxCompCap = static_cast<uint64_t>(maxOutputBytes) + 65536ULL;
+    if (entry.compressedSize > maxCompCap) return false;
 
     HANDLE hFile = CreateFileW(zipFilePath.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -687,16 +896,17 @@ bool ExtractZipEntryFromFile(
         return false;
     }
 
-    uint16_t method = ReadLE16(localHdr + 8);
-    uint16_t nameLen = ReadLE16(localHdr + 26);
-    uint16_t extraLen = ReadLE16(localHdr + 28);
-    seekPos.QuadPart = static_cast<LONGLONG>(entry.localHeaderOffset + 30 + nameLen + extraLen);
+    const uint16_t flags    = ReadLE16(localHdr + 6);
+    const uint16_t method   = ReadLE16(localHdr + 8);
+    const uint16_t nameLen  = ReadLE16(localHdr + 26);
+    const uint16_t extraLen = ReadLE16(localHdr + 28);
+    seekPos.QuadPart = static_cast<LONGLONG>(entry.localHeaderOffset + 30ULL + nameLen + extraLen);
     if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) {
         CloseHandle(hFile);
         return false;
     }
 
-    size_t compSz = static_cast<size_t>(std::min<uint64_t>(entry.compressedSize, maxOutputBytes));
+    const size_t compSz = static_cast<size_t>(entry.compressedSize);
     std::vector<uint8_t> compBuf(compSz);
     DWORD compRead = 0;
     if (compSz > 0 && (!ReadFile(hFile, compBuf.data(), static_cast<DWORD>(compSz), &compRead, nullptr) || compRead != compSz)) {
@@ -705,13 +915,14 @@ bool ExtractZipEntryFromFile(
     }
     CloseHandle(hFile);
 
-    if (method == 0) {
-        outBytes = std::move(compBuf);
-        return true;
-    } else if (method == 8) {
-        return InflateRaw(compBuf.data(), compBuf.size(), outBytes, maxOutputBytes);
-    }
-    return false;
+    return DecompressZipPayloadBuffer(
+        method,
+        flags,
+        compBuf.data(),
+        compBuf.size(),
+        entry.uncompressedSize,
+        outBytes,
+        maxOutputBytes);
 }
 
 bool ExtractZipFileByName(
@@ -737,86 +948,45 @@ bool ExtractZipFileByName(
     return false;
 }
 
-static uint64_t ParseOctalField(const char* field, size_t len) {
-    uint64_t val = 0;
-    for (size_t i = 0; i < len; ++i) {
-        char c = field[i];
-        if (c == '\0' || c == ' ') {
-            if (val > 0) break;
-            continue;
-        }
-        if (c >= '0' && c <= '7') {
-            val = (val << 3) + static_cast<uint64_t>(c - '0');
-        }
-    }
-    return val;
-}
-
-static bool ParseTarBuffer(const uint8_t* buf, size_t len, std::vector<ArchiveItemMeta>& outEntries) {
-    outEntries.clear();
-    size_t pos = 0;
-    while (pos + 512 <= len) {
-        const uint8_t* blk = buf + pos;
-        bool allZero = true;
-        for (int i = 0; i < 512; ++i) {
-            if (blk[i] != 0) { allZero = false; break; }
-        }
-        if (allZero) break;
-
-        char nameBuf[256] = {};
-        std::memcpy(nameBuf, blk, 100);
-        // Check USTAR prefix at offset 345
-        if (std::memcmp(blk + 257, "ustar", 5) == 0 && blk[345] != 0) {
-            char prefixBuf[156] = {};
-            std::memcpy(prefixBuf, blk + 345, 155);
-            std::string combined = std::string(prefixBuf) + "/" + std::string(nameBuf);
-            strncpy_s(nameBuf, sizeof(nameBuf), combined.c_str(), _TRUNCATE);
-        }
-
-        uint64_t fileSz = ParseOctalField(reinterpret_cast<const char*>(blk + 124), 12);
-        char typeFlag = static_cast<char>(blk[156]);
-
-        std::wstring wName = PathUtils::Utf8ToWide(nameBuf);
-        for (wchar_t& ch : wName) if (ch == L'\\') ch = L'/';
-        bool isDir = (typeFlag == '5') || (!wName.empty() && wName.back() == L'/');
-        while (!wName.empty() && wName.back() == L'/') wName.pop_back();
-
-        if (!wName.empty() && typeFlag != 'L' && typeFlag != 'x' && typeFlag != 'g') {
-            ArchiveItemMeta meta;
-            meta.pathInArchive = wName;
-            size_t slash = wName.find_last_of(L'/');
-            meta.name = (slash != std::wstring::npos) ? wName.substr(slash + 1) : wName;
-            meta.uncompressedSize = fileSz;
-            meta.compressedSize = fileSz;
-            meta.localHeaderOffset = pos + 512; // Direct data offset
-            meta.compressionMethod = 0;
-            meta.isDirectory = isDir;
-            outEntries.push_back(std::move(meta));
-        }
-
-        uint64_t paddedData = ((fileSz + 511ULL) / 512ULL) * 512ULL;
-        pos += 512 + static_cast<size_t>(paddedData);
-    }
-    return !outEntries.empty();
-}
-
 bool ListTarEntriesFromFile(
     const std::wstring& tarFilePath,
     std::vector<ArchiveItemMeta>& outEntries,
     std::wstring* outFormatSummary)
 {
+    outEntries.clear();
     std::vector<uint8_t> raw;
     if (!PathUtils::ReadFileBytes(tarFilePath, 64 * 1024 * 1024, raw) || raw.size() < 18) {
         return false;
     }
+    const uint8_t* tarPtr = raw.data();
+    size_t tarLen = raw.size();
+    std::vector<uint8_t> decomp;
     if (raw[0] == 0x1F && raw[1] == 0x8B) {
-        std::vector<uint8_t> decomp;
         if (!InflateGzip(raw.data(), raw.size(), decomp, 128 * 1024 * 1024)) return false;
         if (outFormatSummary) *outFormatSummary = L"TAR.GZ (Gzip Compressed Tarball)";
-        return ParseTarBuffer(decomp.data(), decomp.size(), outEntries);
+        tarPtr = decomp.data();
+        tarLen = decomp.size();
+    } else if (outFormatSummary) {
+        *outFormatSummary = L"POSIX TAR Archive";
     }
-    if (outFormatSummary) *outFormatSummary = L"POSIX TAR Archive";
-    return ParseTarBuffer(raw.data(), raw.size(), outEntries);
+
+    ArchiveSummaryInfo info;
+    if (!StreamCodecs::ParsePosixTarFromMemory(tarPtr, tarLen, info) || info.entries.empty()) {
+        return false;
+    }
+    outEntries.reserve(info.entries.size());
+    for (const auto& e : info.entries) {
+        ArchiveItemMeta meta;
+        meta.pathInArchive     = e.pathInArchive;
+        meta.name              = e.name;
+        meta.uncompressedSize  = e.uncompressedSize;
+        meta.compressedSize    = e.compressedSize;
+        meta.localHeaderOffset = e.rawDataOffset;
+        meta.compressionMethod = 0;
+        meta.isDirectory       = e.isDirectory;
+        outEntries.push_back(std::move(meta));
+    }
+    return !outEntries.empty();
 }
 
 bool ExtractTarEntryFromFile(
@@ -839,10 +1009,15 @@ bool ExtractTarEntryFromFile(
         tarLen = decomp.size();
     }
 
-    if (entry.localHeaderOffset + entry.uncompressedSize > tarLen) return false;
+    if (entry.localHeaderOffset > tarLen || entry.uncompressedSize > tarLen - static_cast<size_t>(entry.localHeaderOffset)) {
+        std::wstring normWant = ArchivePath::Normalize(entry.pathInArchive);
+        ArchiveSummaryInfo dummy;
+        return StreamCodecs::ParsePosixTarFromMemory(tarPtr, tarLen, dummy, &normWant, &outBytes) &&
+               outBytes.size() <= maxOutputBytes;
+    }
     outBytes.assign(
-        tarPtr + entry.localHeaderOffset,
-        tarPtr + entry.localHeaderOffset + static_cast<size_t>(entry.uncompressedSize));
+        tarPtr + static_cast<size_t>(entry.localHeaderOffset),
+        tarPtr + static_cast<size_t>(entry.localHeaderOffset) + static_cast<size_t>(entry.uncompressedSize));
     return true;
 }
 

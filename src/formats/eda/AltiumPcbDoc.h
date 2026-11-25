@@ -83,17 +83,17 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
             size_t binTracks = 0;
             while (pos + 5 <= bytes.size() && out.traces.size() < 80000) {
                 uint8_t recType = bytes[pos];
-                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                uint32_t blkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
                 if (recType != 4 || blkLen < 33 || blkLen > bytes.size() - (pos + 5)) break;
                 const uint8_t* pay = bytes.data() + pos + 5;
                 EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
-                uint16_t netRaw = DetailEda100::RdU16LE(pay + 3);
+                uint16_t netRaw = DetailSiliconAndBusEda::RdU16LE(pay + 3);
                 int netId = (netRaw == 0xFFFFu) ? 0 : static_cast<int>(netRaw + 1);
-                float x1 = static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
-                float y1 = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
-                float x2 = static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm;
-                float y2 = static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm;
-                float w  = std::max(0.06f, static_cast<float>(DetailEda100::RdI32LE(pay + 29)) * kAltiumUnitToMm);
+                float x1 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                float y1 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                float x2 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 21)) * kAltiumUnitToMm;
+                float y2 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 25)) * kAltiumUnitToMm;
+                float w  = std::max(0.06f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 29)) * kAltiumUnitToMm);
                 out.traces.push_back({ x1, y1, x2, y2, w, lid, netId });
                 pos += 5 + blkLen;
                 ++binTracks;
@@ -122,14 +122,14 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
             size_t pos = 0;
             while (pos + 5 <= bytes.size() && out.vias.size() < 40000) {
                 uint8_t recType = bytes[pos];
-                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                uint32_t blkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
                 if (recType != 3 || blkLen < 29 || blkLen > bytes.size() - (pos + 5)) break;
                 const uint8_t* pay = bytes.data() + pos + 5;
-                uint16_t netRaw = DetailEda100::RdU16LE(pay + 3);
-                float vx = static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
-                float vy = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
-                float diam = std::max(0.25f, static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm);
-                float hole = std::max(0.12f, static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm);
+                uint16_t netRaw = DetailSiliconAndBusEda::RdU16LE(pay + 3);
+                float vx = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                float vy = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                float diam = std::max(0.25f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 21)) * kAltiumUnitToMm);
+                float hole = std::max(0.12f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 25)) * kAltiumUnitToMm);
                 out.vias.push_back({ vx, vy, diam, hole, (netRaw == 0xFFFFu) ? 0 : static_cast<int>(netRaw + 1) });
                 pos += 5 + blkLen;
             }
@@ -146,7 +146,7 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
                 ++pos;
                 auto readSub = [&](const uint8_t*& outPtr, uint32_t& outLen) -> bool {
                     if (pos + 4 > bytes.size()) return false;
-                    outLen = DetailEda100::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
+                    outLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
                     pos += 4;
                     if (outLen > bytes.size() - pos) return false;
                     outPtr = bytes.data() + pos;
@@ -180,7 +180,7 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
                     geomLen = l4;
                     // Optional 6th subrecord if next byte is not start of next pad record
                     if (pos + 4 <= bytes.size() && (pos + 4 == bytes.size() || bytes[pos] != 2 ||
-                        (DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu) > 64))
+                        (DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu) > 64))
                     {
                         readSub(s5, l5);
                     }
@@ -189,16 +189,16 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
                 if (geom && geomLen >= 29) {
                     EdaPadPrim p;
                     p.layer = MapAltiumPcbLayerByte(geom[0]);
-                    p.x = static_cast<float>(DetailEda100::RdI32LE(geom + 13)) * kAltiumUnitToMm;
-                    p.y = static_cast<float>(DetailEda100::RdI32LE(geom + 17)) * kAltiumUnitToMm;
-                    p.w = std::max(0.15f, static_cast<float>(DetailEda100::RdI32LE(geom + 21)) * kAltiumUnitToMm);
-                    p.h = std::max(0.15f, static_cast<float>(DetailEda100::RdI32LE(geom + 25)) * kAltiumUnitToMm);
+                    p.x = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 13)) * kAltiumUnitToMm;
+                    p.y = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 17)) * kAltiumUnitToMm;
+                    p.w = std::max(0.15f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 21)) * kAltiumUnitToMm);
+                    p.h = std::max(0.15f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 25)) * kAltiumUnitToMm);
                     if (geomLen >= 49) {
-                        p.drill = std::max(0.0f, static_cast<float>(DetailEda100::RdI32LE(geom + 45)) * kAltiumUnitToMm);
+                        p.drill = std::max(0.0f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 45)) * kAltiumUnitToMm);
                         uint8_t sh = (geomLen >= 50) ? geom[49] : 2;
                         p.shape = (sh == 1) ? 0 : ((sh == 2) ? 1 : 2);
                     } else if (geomLen >= 33) {
-                        p.drill = std::max(0.0f, static_cast<float>(DetailEda100::RdI32LE(geom + 29)) * kAltiumUnitToMm);
+                        p.drill = std::max(0.0f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 29)) * kAltiumUnitToMm);
                         p.shape = (p.drill > 0.05f) ? 0 : 1;
                     }
                     if (p.drill > 0.05f) p.layer = EdaLayerId::PadsThrough;
@@ -221,17 +221,17 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
             size_t pos = 0;
             while (pos + 5 <= bytes.size() && out.traces.size() < 80000) {
                 uint8_t recType = bytes[pos];
-                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                uint32_t blkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
                 if (recType != 1 || blkLen < 45 || blkLen > bytes.size() - (pos + 5)) break;
                 const uint8_t* pay = bytes.data() + pos + 5;
                 EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
-                float cx = static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
-                float cy = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
-                float r  = std::max(0.1f, static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm);
+                float cx = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                float cy = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                float r  = std::max(0.1f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 21)) * kAltiumUnitToMm);
                 double a0Deg = 0.0, a1Deg = 360.0;
                 std::memcpy(&a0Deg, pay + 25, 8);
                 std::memcpy(&a1Deg, pay + 33, 8);
-                float w = std::max(0.08f, static_cast<float>(DetailEda100::RdI32LE(pay + 41)) * kAltiumUnitToMm);
+                float w = std::max(0.08f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 41)) * kAltiumUnitToMm);
                 if (!std::isfinite(a0Deg) || !std::isfinite(a1Deg) || std::fabs(a1Deg - a0Deg) >= 359.5) {
                     out.circles.push_back({ cx, cy, r, w, false, lid });
                 } else {
@@ -240,7 +240,7 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
                     float ys = cy + r * static_cast<float>(std::sin(a0Deg * kDeg2Rad));
                     float xe = cx + r * static_cast<float>(std::cos(a1Deg * kDeg2Rad));
                     float ye = cy + r * static_cast<float>(std::sin(a1Deg * kDeg2Rad));
-                    DetailEda100::AddTessellatedArc(out, xs, ys, xe, ye, cx, cy, false, w, lid, 0);
+                    DetailSiliconAndBusEda::AddTessellatedArc(out, xs, ys, xe, ye, cx, cy, false, w, lid, 0);
                 }
                 pos += 5 + blkLen;
             }
@@ -254,14 +254,14 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
             size_t pos = 0;
             while (pos + 5 <= bytes.size() && out.pads.size() < 60000) {
                 uint8_t recType = bytes[pos];
-                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                uint32_t blkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
                 if (recType != 6 || blkLen < 29 || blkLen > bytes.size() - (pos + 5)) break;
                 const uint8_t* pay = bytes.data() + pos + 5;
                 EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
-                float x1 = static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
-                float y1 = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
-                float x2 = static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm;
-                float y2 = static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm;
+                float x1 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                float y1 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                float x2 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 21)) * kAltiumUnitToMm;
+                float y2 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 25)) * kAltiumUnitToMm;
                 float rotDeg = 0.0f;
                 if (blkLen >= 37) {
                     double rd = 0.0;
@@ -348,17 +348,17 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
             size_t pos = 0;
             while (pos + 5 <= bytes.size()) {
                 uint8_t recType = bytes[pos];
-                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                uint32_t blkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
                 if (recType != 11 || blkLen < 26 || blkLen > bytes.size() - (pos + 5)) break;
                 const uint8_t* pay = bytes.data() + pos + 5;
                 EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
-                uint16_t netRaw = DetailEda100::RdU16LE(pay + 3);
+                uint16_t netRaw = DetailSiliconAndBusEda::RdU16LE(pay + 3);
                 int netId = (netRaw == 0xFFFFu) ? 0 : static_cast<int>(netRaw + 1);
                 // After 18-byte common header: uint32 propLen + propStr + uint32 vertCount + vertCount * 16B (f64 x, f64 y)
-                uint32_t propLen = DetailEda100::RdU32LE(pay + 18);
+                uint32_t propLen = DetailSiliconAndBusEda::RdU32LE(pay + 18);
                 size_t vOff = 22 + static_cast<size_t>(propLen);
                 if (vOff + 4 <= blkLen) {
-                    uint32_t vCnt = DetailEda100::RdU32LE(pay + vOff);
+                    uint32_t vCnt = DetailSiliconAndBusEda::RdU32LE(pay + vOff);
                     vOff += 4;
                     if (vCnt >= 3 && vCnt <= 4096 && vOff + static_cast<size_t>(vCnt) * 16u <= blkLen) {
                         std::vector<std::pair<float, float>> verts;
@@ -406,13 +406,13 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
                 // Binary PcbLib/AD18+ WideStrings6 format: ([idx:u32][byteLen:u32][utf16le...])*
                 size_t p = 0;
                 while (p + 8 <= bytes.size() && wideStrings.size() < 16000) {
-                    uint32_t idx = DetailEda100::RdU32LE(bytes.data() + p);
-                    uint32_t bLen = DetailEda100::RdU32LE(bytes.data() + p + 4);
+                    uint32_t idx = DetailSiliconAndBusEda::RdU32LE(bytes.data() + p);
+                    uint32_t bLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + p + 4);
                     p += 8;
                     if (bLen > bytes.size() - p || (bLen & 1u) != 0) break;
                     std::wstring ws;
                     for (uint32_t i = 0; i + 2 <= bLen; i += 2) {
-                        uint16_t cu = DetailEda100::RdU16LE(bytes.data() + p + i);
+                        uint16_t cu = DetailSiliconAndBusEda::RdU16LE(bytes.data() + p + i);
                         if (cu != 0) ws.push_back(static_cast<wchar_t>(cu));
                     }
                     if (!ws.empty()) wideStrings[static_cast<int>(idx)] = std::move(ws);
@@ -428,21 +428,21 @@ inline bool ParseAltiumPcbOle2(const Explorer2::Ole2::CompoundFile& cf, ParsedEd
             int txtOrd = 0;
             while (pos + 5 <= bytes.size() && out.labels.size() < 8000) {
                 uint8_t recType = bytes[pos];
-                uint32_t geomLen = DetailEda100::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
+                uint32_t geomLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos + 1) & 0x00FFFFFFu;
                 if (recType != 5 || geomLen < 25 || geomLen > bytes.size() - (pos + 5)) break;
                 const uint8_t* geom = bytes.data() + pos + 5;
                 pos += 5 + geomLen;
                 if (pos + 4 > bytes.size()) break;
-                uint32_t strBlkLen = DetailEda100::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
+                uint32_t strBlkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
                 pos += 4;
                 if (strBlkLen > bytes.size() - pos) break;
                 const uint8_t* strPtr = bytes.data() + pos;
                 pos += strBlkLen;
 
                 EdaLayerId lid = MapAltiumPcbLayerByte(geom[0]);
-                float tx = static_cast<float>(DetailEda100::RdI32LE(geom + 13)) * kAltiumUnitToMm;
-                float ty = static_cast<float>(DetailEda100::RdI32LE(geom + 17)) * kAltiumUnitToMm;
-                float th = std::clamp(static_cast<float>(DetailEda100::RdI32LE(geom + 21)) * kAltiumUnitToMm, 0.7f, 4.0f);
+                float tx = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 13)) * kAltiumUnitToMm;
+                float ty = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 17)) * kAltiumUnitToMm;
+                float th = std::clamp(static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 21)) * kAltiumUnitToMm, 0.7f, 4.0f);
 
                 std::wstring labelW;
                 auto itWs = wideStrings.find(txtOrd);
@@ -488,7 +488,7 @@ inline bool ParseAltiumPcbLibOle2(const Explorer2::Ole2::CompoundFile& cf, Parse
         std::vector<uint8_t> bytes;
         if (!Explorer2::Ole2::ExtractStream(cf, e, bytes, 16 * 1024 * 1024) || bytes.size() < 10) continue;
 
-        uint32_t nameBlkLen = DetailEda100::RdU32LE(bytes.data()) & 0x00FFFFFFu;
+        uint32_t nameBlkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data()) & 0x00FFFFFFu;
         if (nameBlkLen == 0 || 4 + nameBlkLen > bytes.size()) continue;
         size_t patLen = std::min<size_t>(bytes[4], nameBlkLen - 1);
         std::wstring patName = PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(bytes.data() + 5), patLen));
@@ -511,7 +511,7 @@ inline bool ParseAltiumPcbLibOle2(const Explorer2::Ole2::CompoundFile& cf, Parse
             if (recType == 2) { // Pad (6 subrecords or 2 compact subrecords)
                 auto readSub = [&](const uint8_t*& outPtr, uint32_t& outLen) -> bool {
                     if (pos + 4 > bytes.size()) return false;
-                    outLen = DetailEda100::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
+                    outLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
                     pos += 4;
                     if (outLen > bytes.size() - pos) return false;
                     outPtr = bytes.data() + pos;
@@ -540,12 +540,12 @@ inline bool ParseAltiumPcbLibOle2(const Explorer2::Ole2::CompoundFile& cf, Parse
                 if (geom && geomLen >= 29) {
                     EdaPadPrim p{};
                     p.layer = MapAltiumPcbLayerByte(geom[0]);
-                    p.x = offX + static_cast<float>(DetailEda100::RdI32LE(geom + 13)) * kAltiumUnitToMm;
-                    p.y = static_cast<float>(DetailEda100::RdI32LE(geom + 17)) * kAltiumUnitToMm;
-                    p.w = std::max(0.15f, static_cast<float>(DetailEda100::RdI32LE(geom + 21)) * kAltiumUnitToMm);
-                    p.h = std::max(0.15f, static_cast<float>(DetailEda100::RdI32LE(geom + 25)) * kAltiumUnitToMm);
-                    if (geomLen >= 49) p.drill = std::max(0.0f, static_cast<float>(DetailEda100::RdI32LE(geom + 45)) * kAltiumUnitToMm);
-                    else if (geomLen >= 33) p.drill = std::max(0.0f, static_cast<float>(DetailEda100::RdI32LE(geom + 29)) * kAltiumUnitToMm);
+                    p.x = offX + static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 13)) * kAltiumUnitToMm;
+                    p.y = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 17)) * kAltiumUnitToMm;
+                    p.w = std::max(0.15f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 21)) * kAltiumUnitToMm);
+                    p.h = std::max(0.15f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 25)) * kAltiumUnitToMm);
+                    if (geomLen >= 49) p.drill = std::max(0.0f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 45)) * kAltiumUnitToMm);
+                    else if (geomLen >= 33) p.drill = std::max(0.0f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(geom + 29)) * kAltiumUnitToMm);
                     p.shape = (p.drill > 0.05f) ? 0 : 1;
                     if (p.drill > 0.05f) p.layer = EdaLayerId::PadsThrough;
                     p.pinName = padDes;
@@ -555,36 +555,36 @@ inline bool ParseAltiumPcbLibOle2(const Explorer2::Ole2::CompoundFile& cf, Parse
                     ++primAdded;
                 }
             } else if (pos + 4 <= bytes.size()) {
-                uint32_t blkLen = DetailEda100::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
+                uint32_t blkLen = DetailSiliconAndBusEda::RdU32LE(bytes.data() + pos) & 0x00FFFFFFu;
                 pos += 4;
                 if (blkLen > bytes.size() - pos) break;
                 const uint8_t* pay = bytes.data() + pos;
                 pos += blkLen;
                 if (recType == 4 && blkLen >= 33) { // Track
                     EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
-                    float x1 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
-                    float y1 = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
-                    float x2 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm;
-                    float y2 = static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm;
-                    float w  = std::max(0.06f, static_cast<float>(DetailEda100::RdI32LE(pay + 29)) * kAltiumUnitToMm);
+                    float x1 = offX + static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                    float y1 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                    float x2 = offX + static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 21)) * kAltiumUnitToMm;
+                    float y2 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 25)) * kAltiumUnitToMm;
+                    float w  = std::max(0.06f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 29)) * kAltiumUnitToMm);
                     expFp(x1, y1); expFp(x2, y2);
                     out.traces.push_back({ x1, y1, x2, y2, w, lid, 0 });
                     ++primAdded;
                 } else if (recType == 1 && blkLen >= 45) { // Arc
                     EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
-                    float cx = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
-                    float cy = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
-                    float r  = std::max(0.1f, static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm);
-                    float w  = std::max(0.08f, static_cast<float>(DetailEda100::RdI32LE(pay + 41)) * kAltiumUnitToMm);
+                    float cx = offX + static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                    float cy = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                    float r  = std::max(0.1f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 21)) * kAltiumUnitToMm);
+                    float w  = std::max(0.08f, static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 41)) * kAltiumUnitToMm);
                     expFp(cx - r, cy - r); expFp(cx + r, cy + r);
                     out.circles.push_back({ cx, cy, r, w, false, lid });
                     ++primAdded;
                 } else if (recType == 6 && blkLen >= 29) { // Fill
                     EdaLayerId lid = MapAltiumPcbLayerByte(pay[0]);
-                    float x1 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 13)) * kAltiumUnitToMm;
-                    float y1 = static_cast<float>(DetailEda100::RdI32LE(pay + 17)) * kAltiumUnitToMm;
-                    float x2 = offX + static_cast<float>(DetailEda100::RdI32LE(pay + 21)) * kAltiumUnitToMm;
-                    float y2 = static_cast<float>(DetailEda100::RdI32LE(pay + 25)) * kAltiumUnitToMm;
+                    float x1 = offX + static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 13)) * kAltiumUnitToMm;
+                    float y1 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 17)) * kAltiumUnitToMm;
+                    float x2 = offX + static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 21)) * kAltiumUnitToMm;
+                    float y2 = static_cast<float>(DetailSiliconAndBusEda::RdI32LE(pay + 25)) * kAltiumUnitToMm;
                     EdaPadPrim fp{};
                     fp.x = (x1 + x2) * 0.5f; fp.y = (y1 + y2) * 0.5f;
                     fp.w = std::max(0.15f, std::fabs(x2 - x1)); fp.h = std::max(0.15f, std::fabs(y2 - y1));
@@ -647,7 +647,7 @@ inline bool ParseAltiumPcbDocBoard(const uint8_t* data, size_t size, const std::
 
     // Case 2: Pipe-delimited ASCII Altium export (|RECORD=...|...)
     std::string_view sv(reinterpret_cast<const char*>(data), size);
-    if (!DetailEda100::ContainsAsciiI(sv, "RECORD=")) return false;
+    if (!DetailSiliconAndBusEda::ContainsAsciiI(sv, "RECORD=")) return false;
 
     std::vector<DetailAltium::KvMap> asciiRecords;
     size_t pos = 0;
@@ -656,7 +656,7 @@ inline bool ParseAltiumPcbDocBoard(const uint8_t* data, size_t size, const std::
         if (eol == std::string_view::npos) eol = sv.size();
         std::string_view ln = sv.substr(pos, eol - pos);
         pos = eol + 1;
-        if (!DetailEda100::ContainsAsciiI(ln, "RECORD=")) continue;
+        if (!DetailSiliconAndBusEda::ContainsAsciiI(ln, "RECORD=")) continue;
         DetailAltium::KvMap kv = DetailAltium::ParsePipeRecord(ln);
         if (!kv.empty()) asciiRecords.push_back(std::move(kv));
     }

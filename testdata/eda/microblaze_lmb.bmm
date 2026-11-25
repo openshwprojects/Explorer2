@@ -1,0 +1,11 @@
+// MicroBlaze LMB 16 KB BRAM floorplan (4 x RAMB36 byte lanes)
+ADDRESS_MAP microblaze_0 MICROBLAZE-LE 100
+    ADDRESS_SPACE lmb_bram_combined RAMB32 [0x00000000:0x00003FFF]
+        BUS_BLOCK
+            mb_sys/lmb_bram/RAMB36_0 [31:24] PLACED = X0Y4;
+            mb_sys/lmb_bram/RAMB36_1 [23:16] PLACED = X0Y5;
+            mb_sys/lmb_bram/RAMB36_2 [15:8]  PLACED = X1Y4;
+            mb_sys/lmb_bram/RAMB36_3 [7:0]   PLACED = X1Y5;
+        END_BUS_BLOCK;
+    END_ADDRESS_SPACE;
+END_ADDRESS_MAP;

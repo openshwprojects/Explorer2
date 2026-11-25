@@ -495,14 +495,14 @@ inline bool ParseRosUrdf(const uint8_t* data, size_t size, const std::wstring& e
             if (mExt == L".stl") {
                 bool isBinStl = false;
                 if (extBuf.size() >= 84) {
-                    uint32_t tc = Detail3D200::RdU32LE(extBuf.data() + 80);
+                    uint32_t tc = DetailMeshSciCad::RdU32LE(extBuf.data() + 80);
                     uint64_t exp = 84ULL + static_cast<uint64_t>(tc) * 50ULL;
                     if (tc > 0 && (exp == extBuf.size() || (extBuf.size() >= exp && std::memcmp(extBuf.data(), "solid", 5) != 0))) {
                         isBinStl = true;
                     }
                 }
                 if (isBinStl) {
-                    uint32_t tc = Detail3D200::RdU32LE(extBuf.data() + 80);
+                    uint32_t tc = DetailMeshSciCad::RdU32LE(extBuf.data() + 80);
                     size_t avail = std::min<size_t>(tc, (extBuf.size() - 84) / 50);
                     for (size_t t = 0; t < avail && outT.size() < 40000; ++t) {
                         float fv[12] = {};

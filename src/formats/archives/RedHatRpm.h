@@ -1,15 +1,14 @@
 #pragma once
 // RedHatRpm.h — Red Hat Package Manager archive reader & CPIO payload extractor (.rpm).
+// Reuses PosixCpio.h's WalkOrExtractPosixCpioBuffer for CPIO payload traversal.
 
 #include "../common/ArchiveFormatCommon.h"
+#include "PosixCpio.h"
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
-// ============================================================================
-// 27. Red Hat Package Manager (.rpm — Lead + Signature + Metadata Tags + CPIO)
-// ============================================================================
 inline bool DecompressRpmPayloadToCpio(
     const uint8_t* payload,
     size_t payloadLen,
@@ -56,107 +55,6 @@ inline bool DecompressRpmPayloadToCpio(
     return true;
 }
 
-inline bool WalkCpioBuffer(
-    const uint8_t* cpio,
-    size_t cpioLen,
-    ArchiveSummaryInfo* outInfo,
-    const std::wstring* extractTargetNorm,
-    std::vector<uint8_t>* outExtracted)
-{
-    if (!cpio || cpioLen < 76) return false;
-    bool isNewc = (cpioLen >= 110 && (std::memcmp(cpio, "070701", 6) == 0 || std::memcmp(cpio, "070702", 6) == 0));
-    bool isOdc  = (!isNewc && std::memcmp(cpio, "070707", 6) == 0);
-    if (!isNewc && !isOdc) return false;
-
-    size_t pos = 0;
-    size_t count = 0;
-    if (isNewc) {
-        while (pos + 110 <= cpioLen && count < 50000) {
-            if (std::memcmp(cpio + pos, "070701", 6) != 0 && std::memcmp(cpio + pos, "070702", 6) != 0) break;
-            auto hex8 = [&](size_t off) -> uint32_t {
-                char b[9] = {};
-                std::memcpy(b, cpio + pos + off, 8);
-                return static_cast<uint32_t>(std::strtoul(b, nullptr, 16));
-            };
-            uint32_t mode     = hex8(14);
-            uint32_t fSize    = hex8(54);
-            uint32_t nameSize = hex8(94);
-            uint32_t check    = hex8(102);
-            if (nameSize == 0 || nameSize > 4096 || pos + 110 + nameSize > cpioLen) break;
-
-            std::string fname(reinterpret_cast<const char*>(cpio + pos + 110),
-                              strnlen(reinterpret_cast<const char*>(cpio + pos + 110), nameSize));
-            size_t dataStart = (pos + 110 + nameSize + 3u) & ~size_t(3u);
-            if (fname == "TRAILER!!!") break;
-            if (dataStart + fSize > cpioLen) break;
-
-            std::wstring norm = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
-            bool isDir = ((mode & 0170000u) == 0040000u);
-            if (!norm.empty() && norm != L".") {
-                if (extractTargetNorm && outExtracted) {
-                    if (!isDir && PathEqualsCI(norm, *extractTargetNorm)) {
-                        outExtracted->assign(cpio + dataStart, cpio + dataStart + fSize);
-                        return true;
-                    }
-                } else if (outInfo) {
-                    ArchiveItemEntry item;
-                    item.pathInArchive = norm;
-                    item.name = ArchivePath::BaseName(norm);
-                    item.isDirectory = isDir;
-                    item.uncompressedSize = isDir ? 0 : fSize;
-                    item.compressedSize   = item.uncompressedSize;
-                    item.crc32 = check;
-                    item.compressionMethod = 1;
-                    outInfo->entries.push_back(std::move(item));
-                }
-                ++count;
-            }
-            pos = (dataStart + fSize + 3u) & ~size_t(3u);
-        }
-    } else {
-        while (pos + 76 <= cpioLen && count < 50000) {
-            if (std::memcmp(cpio + pos, "070707", 6) != 0) break;
-            auto oct = [&](size_t off, size_t len) -> uint64_t {
-                char b[16] = {};
-                std::memcpy(b, cpio + pos + off, len);
-                return static_cast<uint64_t>(std::strtoull(b, nullptr, 8));
-            };
-            uint64_t mode     = oct(18, 6);
-            uint64_t nameSize = oct(59, 6);
-            uint64_t fSize    = oct(65, 11);
-            if (nameSize == 0 || nameSize > 4096 || pos + 76 + nameSize > cpioLen) break;
-            std::string fname(reinterpret_cast<const char*>(cpio + pos + 76),
-                              strnlen(reinterpret_cast<const char*>(cpio + pos + 76), static_cast<size_t>(nameSize)));
-            if (fname == "TRAILER!!!") break;
-            size_t dataStart = pos + 76 + static_cast<size_t>(nameSize);
-            if (dataStart + fSize > cpioLen) break;
-
-            std::wstring norm = ArchivePath::Normalize(PathUtils::Utf8ToWide(fname));
-            bool isDir = ((mode & 0170000u) == 0040000u);
-            if (!norm.empty() && norm != L".") {
-                if (extractTargetNorm && outExtracted) {
-                    if (!isDir && PathEqualsCI(norm, *extractTargetNorm)) {
-                        outExtracted->assign(cpio + dataStart, cpio + dataStart + static_cast<size_t>(fSize));
-                        return true;
-                    }
-                } else if (outInfo) {
-                    ArchiveItemEntry item;
-                    item.pathInArchive = norm;
-                    item.name = ArchivePath::BaseName(norm);
-                    item.isDirectory = isDir;
-                    item.uncompressedSize = isDir ? 0 : fSize;
-                    item.compressedSize   = item.uncompressedSize;
-                    item.compressionMethod = 1;
-                    outInfo->entries.push_back(std::move(item));
-                }
-                ++count;
-            }
-            pos = dataStart + static_cast<size_t>(fSize);
-        }
-    }
-    return extractTargetNorm ? false : (count > 0);
-}
-
 inline bool ParseOrExtractRedHatRpm(
     const uint8_t* data,
     size_t size,
@@ -164,27 +62,26 @@ inline bool ParseOrExtractRedHatRpm(
     const std::wstring* extractTargetNorm,
     std::vector<uint8_t>* outExtracted)
 {
-    if (size < 112 || data[0] != 0xED || data[1] != 0xAB || data[2] != 0xEE || data[3] != 0xDB) return false;
+    if (!data || size < 112 || data[0] != 0xED || data[1] != 0xAB || data[2] != 0xEE || data[3] != 0xDB) return false;
 
     size_t pos = 96; // Skip 96-byte RPM Lead
-    // 1. Skip Signature Header (0x8EADE801), padded to 8-byte boundary
-    if (pos + 16 > size || data[pos] != 0x8E || data[pos + 1] != 0xAD || data[pos + 2] != 0xE8 || data[pos + 3] != 0x01) {
+    if (size - pos < 16 || data[pos] != 0x8E || data[pos + 1] != 0xAD || data[pos + 2] != 0xE8 || data[pos + 3] != 0x01) {
         return false;
     }
     uint32_t sigIdxCnt  = RdU32BE(data + pos + 8);
     uint32_t sigDataLen = RdU32BE(data + pos + 12);
-    if (sigIdxCnt > 65536 || sigDataLen > size) return false;
-    size_t sigBytes = 16 + static_cast<size_t>(sigIdxCnt) * 16 + sigDataLen;
-    size_t alignedSig = (sigBytes + 7u) & ~size_t(7u);
-    if (pos + alignedSig > size) return false;
+    if (sigIdxCnt > 65536 || sigDataLen > size - pos - 16) return false;
+    const uint64_t sigBytes64 = 16ULL + static_cast<uint64_t>(sigIdxCnt) * 16ULL + sigDataLen;
+    const uint64_t alignedSig64 = (sigBytes64 + 7ULL) & ~7ULL;
+    if (alignedSig64 > size - pos) return false;
+    const size_t sigBytes = static_cast<size_t>(sigBytes64);
+    const size_t alignedSig = static_cast<size_t>(alignedSig64);
 
-    // Some older RPMs only have 1 header if pos + alignedSig doesn't start with 0x8EADE801
     size_t metaPos = pos + alignedSig;
-    if (metaPos + 16 > size || data[metaPos] != 0x8E || data[metaPos + 1] != 0xAD ||
+    if (size - metaPos < 16 || data[metaPos] != 0x8E || data[metaPos + 1] != 0xAD ||
         data[metaPos + 2] != 0xE8 || data[metaPos + 3] != 0x01)
     {
-        // Check unaligned sigBytes just in case, else treat first header as Metadata Header
-        if (pos + sigBytes + 16 <= size && data[pos + sigBytes] == 0x8E &&
+        if (size - (pos + sigBytes) >= 16 && data[pos + sigBytes] == 0x8E &&
             data[pos + sigBytes + 1] == 0xAD && data[pos + sigBytes + 2] == 0xE8 && data[pos + sigBytes + 3] == 0x01)
         {
             metaPos = pos + sigBytes;
@@ -195,11 +92,11 @@ inline bool ParseOrExtractRedHatRpm(
 
     uint32_t hdrIdxCnt  = RdU32BE(data + metaPos + 8);
     uint32_t hdrDataLen = RdU32BE(data + metaPos + 12);
-    if (hdrIdxCnt > 131072 || hdrDataLen > size) return false;
+    if (hdrIdxCnt > 131072 || static_cast<uint64_t>(hdrIdxCnt) * 16ULL > size - metaPos - 16u) return false;
     size_t idxBase   = metaPos + 16;
     size_t storeBase = idxBase + static_cast<size_t>(hdrIdxCnt) * 16;
-    if (storeBase > size || hdrDataLen > size - storeBase) return false;
-    size_t storeEnd  = storeBase + hdrDataLen;
+    if (hdrDataLen > size - storeBase) return false;
+    size_t storeEnd   = storeBase + hdrDataLen;
     size_t payloadPos = storeEnd;
 
     std::vector<std::string> baseNames, dirNames, oldFileNames;
@@ -229,45 +126,44 @@ inline bool ParseOrExtractRedHatRpm(
         uint32_t count = RdU32BE(ie + 12);
         if (off >= hdrDataLen) continue;
 
-        if (tag == 1117 && type == 8) { // RPMTAG_BASENAMES
+        if (tag == 1117 && type == 8) {
             readStringArray(off, count, baseNames);
-        } else if (tag == 1118 && type == 8) { // RPMTAG_DIRNAMES
+        } else if (tag == 1118 && type == 8) {
             readStringArray(off, count, dirNames);
-        } else if (tag == 1027 && type == 8) { // RPMTAG_OLDFILENAMES
+        } else if (tag == 1027 && type == 8) {
             readStringArray(off, count, oldFileNames);
-        } else if (tag == 1116 && type == 4 && count <= 100000) { // RPMTAG_DIRINDEXES
-            if (off + static_cast<uint64_t>(count) * 4 <= hdrDataLen) {
+        } else if (tag == 1116 && type == 4 && count <= 100000) {
+            if (static_cast<uint64_t>(count) * 4ULL <= hdrDataLen - off) {
                 dirIndexes.resize(count);
                 for (uint32_t k = 0; k < count; ++k) dirIndexes[k] = RdU32BE(data + storeBase + off + k * 4);
             }
-        } else if (tag == 1028 && type == 4 && fileSizes.empty() && count <= 100000) { // RPMTAG_FILESIZES (INT32)
-            if (off + static_cast<uint64_t>(count) * 4 <= hdrDataLen) {
+        } else if (tag == 1028 && type == 4 && fileSizes.empty() && count <= 100000) {
+            if (static_cast<uint64_t>(count) * 4ULL <= hdrDataLen - off) {
                 fileSizes.resize(count);
                 for (uint32_t k = 0; k < count; ++k) fileSizes[k] = RdU32BE(data + storeBase + off + k * 4);
             }
-        } else if (tag == 1009 && type == 4 && fallbackSizes1009.empty() && count <= 100000) { // RPMTAG_SIZE / synthetic fallback
-            if (off + static_cast<uint64_t>(count) * 4 <= hdrDataLen) {
+        } else if (tag == 1009 && type == 4 && fallbackSizes1009.empty() && count <= 100000) {
+            if (static_cast<uint64_t>(count) * 4ULL <= hdrDataLen - off) {
                 fallbackSizes1009.resize(count);
                 for (uint32_t k = 0; k < count; ++k) fallbackSizes1009[k] = RdU32BE(data + storeBase + off + k * 4);
             }
-        } else if (tag == 5008 && type == 5 && count <= 100000) { // RPMTAG_LONGFILESIZES (INT64)
-            if (off + static_cast<uint64_t>(count) * 8 <= hdrDataLen) {
+        } else if (tag == 5008 && type == 5 && count <= 100000) {
+            if (static_cast<uint64_t>(count) * 8ULL <= hdrDataLen - off) {
                 fileSizes.resize(count);
                 for (uint32_t k = 0; k < count; ++k) fileSizes[k] = RdU64BE(data + storeBase + off + k * 8);
             }
-        } else if (tag == 1030 && type == 3 && count <= 100000) { // RPMTAG_FILEMODES (INT16)
-            if (off + static_cast<uint64_t>(count) * 2 <= hdrDataLen) {
+        } else if (tag == 1030 && type == 3 && count <= 100000) {
+            if (static_cast<uint64_t>(count) * 2ULL <= hdrDataLen - off) {
                 fileModes.resize(count);
                 for (uint32_t k = 0; k < count; ++k) fileModes[k] = RdU16BE(data + storeBase + off + k * 2);
             }
-        } else if (tag == 1125 && type == 6) { // RPMTAG_PAYLOADCOMPRESSOR
+        } else if (tag == 1125 && type == 6) {
             size_t p = storeBase + off, e = p;
             while (e < storeEnd && data[e] != 0) ++e;
             compressor.assign(reinterpret_cast<const char*>(data + p), e - p);
         }
     }
 
-    // Extraction mode: decompress trailing CPIO payload and extract matching path
     if (extractTargetNorm && outExtracted) {
         if (payloadPos >= size) return false;
         std::vector<uint8_t> cpioStorage;
@@ -276,7 +172,8 @@ inline bool ParseOrExtractRedHatRpm(
         if (!DecompressRpmPayloadToCpio(data + payloadPos, size - payloadPos, compressor, cpioStorage, cpioPtr, cpioLen)) {
             return false;
         }
-        return WalkCpioBuffer(cpioPtr, cpioLen, nullptr, extractTargetNorm, outExtracted);
+        return DetailUnixAndLegacyArc::WalkOrExtractPosixCpioBuffer(
+            cpioPtr, cpioLen, false, nullptr, extractTargetNorm, outExtracted);
     }
 
     if (!outInfo) return false;
@@ -319,13 +216,12 @@ inline bool ParseOrExtractRedHatRpm(
         outInfo->entries.push_back(std::move(item));
     }
 
-    // Fallback: if Metadata Header omitted file tags, inspect the trailing CPIO stream directly!
     if (outInfo->entries.empty() && payloadPos < size) {
         std::vector<uint8_t> cpioStorage;
         const uint8_t* cpioPtr = nullptr;
         size_t cpioLen = 0;
         if (DecompressRpmPayloadToCpio(data + payloadPos, size - payloadPos, compressor, cpioStorage, cpioPtr, cpioLen)) {
-            WalkCpioBuffer(cpioPtr, cpioLen, outInfo, nullptr, nullptr);
+            DetailUnixAndLegacyArc::WalkOrExtractPosixCpioBuffer(cpioPtr, cpioLen, false, outInfo, nullptr, nullptr);
         }
     }
 
@@ -337,10 +233,10 @@ inline bool ParseRedHatRpm(const uint8_t* data, size_t size, ArchiveSummaryInfo&
     return ParseOrExtractRedHatRpm(data, size, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool InspectRedHatRpm(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc100::ParseRedHatRpm(data, size, outInfo);
+    return DetailDiskAndGameArc::ParseRedHatRpm(data, size, outInfo);
 }
 
 inline bool ExtractRedHatRpmEntry(
@@ -349,7 +245,7 @@ inline bool ExtractRedHatRpmEntry(
     const std::wstring& normTarget,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc100::ParseOrExtractRedHatRpm(data, size, nullptr, &normTarget, &outBytes);
+    return DetailDiskAndGameArc::ParseOrExtractRedHatRpm(data, size, nullptr, &normTarget, &outBytes);
 }
 
 } // namespace Explorer2::Formats

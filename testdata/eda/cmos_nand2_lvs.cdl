@@ -1,0 +1,12 @@
+*.BIPOLAR
+*.RESI = 2000
+*.SCALE METER
+.GLOBAL VDD VSS
+
+.SUBCKT NAND2_X1 A B Y VDD VSS
+MP0 Y A VDD VDD pmos_svt W=420n L=45n
+MP1 Y B VDD VDD pmos_svt W=420n L=45n
+MN0 Y A net_mid VSS nmos_svt W=280n L=45n
++ M=1
+MN1 net_mid B VSS VSS nmos_svt W=280n L=45n
+.ENDS NAND2_X1

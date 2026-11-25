@@ -1,0 +1,22 @@
+//YOKOGAWA ASCII FILE FORMAT
+
+$PublicInfo
+FormatVersion   1.11
+Model           DL750
+Endian          Little
+DataFormat      Trace
+GroupNumber     1
+TraceTotalNumber 3
+DataOffset      0
+
+$Group1
+TraceNumber     3
+TraceName       U_PHASE_V       V_PHASE_V       I_DCBUS_A
+BlockSize       512     512     512
+VResolution     0.0250000       0.0250000       0.0050000
+VOffset         0.0000000       0.0000000       12.500000
+VDataType       IS2             IS2             IS2
+VUnit           V               V               A
+HResolution     2.0000000E-06        2.0000000E-06        2.0000000E-06
+HOffset         0.0000000E+00   0.0000000E+00   0.0000000E+00
+HUnit           s               s               s

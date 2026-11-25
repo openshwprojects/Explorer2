@@ -1,5 +1,5 @@
 #pragma once
-// IpcD356.h — #29 IPC-D-356 / IPC-D-356A Bare-Board PCB Testpoint & Netlist (.d356 / .ipc) Parser
+// IpcD356.h — IPC-D-356 / IPC-D-356A Bare-Board PCB Testpoint & Netlist (.d356 / .ipc) Parser
 
 namespace Formats {
 

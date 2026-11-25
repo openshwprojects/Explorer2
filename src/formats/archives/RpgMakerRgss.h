@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 // ============================================================================
 // #24. RPG Maker Encrypted Archive (.rgss3a / .rgss2a / .rgssad — "RGSSAD\0")
@@ -136,10 +136,10 @@ inline bool ParseRpgMakerRgss(const uint8_t* data, size_t size, ArchiveSummaryIn
     return ParseOrExtractRpgMakerRgss(data, size, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectRpgMakerRgss(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseRpgMakerRgss(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseRpgMakerRgss(data, size, outInfo);
 }
 
 inline bool ExtractRpgMakerRgssEntry(
@@ -148,7 +148,7 @@ inline bool ExtractRpgMakerRgssEntry(
     const std::wstring& want,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc200::ParseOrExtractRpgMakerRgss(data, size, nullptr, &want, &outBytes);
+    return DetailUnixAndLegacyArc::ParseOrExtractRpgMakerRgss(data, size, nullptr, &want, &outBytes);
 }
 
 } // namespace Explorer2::Formats

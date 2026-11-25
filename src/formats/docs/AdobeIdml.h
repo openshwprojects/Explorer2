@@ -5,60 +5,8 @@ namespace Formats {
 
 namespace DetailIdml {
 
-inline std::wstring NormalizeArchiveKey(std::wstring_view sv) {
-    std::wstring r;
-    r.reserve(sv.size());
-    for (wchar_t ch : sv) {
-        if (ch == L'\\') ch = L'/';
-        if (r.empty() && ch == L'/') continue;
-        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch + (L'a' - L'A'));
-        r.push_back(ch);
-    }
-    return r;
-}
-
-struct ZipPackageReader {
-    std::wstring filePath;
-    const uint8_t* memData = nullptr;
-    size_t memLen = 0;
-    bool fromDisk = false;
-    std::vector<ZipDeflate::ArchiveItemMeta> entries;
-
-    bool Open(const std::wstring& fullPath, const std::vector<uint8_t>& raw) {
-        entries.clear();
-        if (!fullPath.empty() && ZipDeflate::ListZipEntriesFromFile(fullPath, entries) && !entries.empty()) {
-            filePath = fullPath;
-            fromDisk = true;
-            return true;
-        }
-        if (!raw.empty() && ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries) && !entries.empty()) {
-            memData = raw.data();
-            memLen = raw.size();
-            fromDisk = false;
-            return true;
-        }
-        return false;
-    }
-
-    const ZipDeflate::ArchiveItemMeta* FindEntry(std::wstring_view wantNormPath) const {
-        std::wstring want = NormalizeArchiveKey(wantNormPath);
-        for (const auto& e : entries) {
-            if (!e.isDirectory && NormalizeArchiveKey(e.pathInArchive) == want) return &e;
-        }
-        return nullptr;
-    }
-
-    bool ExtractEntry(const ZipDeflate::ArchiveItemMeta& e, std::vector<uint8_t>& outBytes, size_t maxBytes = 64u * 1024u * 1024u) const {
-        outBytes.clear();
-        if (fromDisk) return ZipDeflate::ExtractZipEntryFromFile(filePath, e, outBytes, maxBytes);
-        return ZipDeflate::ExtractZipEntryFromMemory(memData, memLen, e, outBytes, maxBytes);
-    }
-
-    bool ExtractByPath(std::wstring_view wantPath, std::vector<uint8_t>& outBytes, size_t maxBytes = 64u * 1024u * 1024u) const {
-        const auto* e = FindEntry(wantPath);
-        return e ? ExtractEntry(*e, outBytes, maxBytes) : false;
-    }
-};
+inline std::wstring NormalizeArchiveKey(std::wstring_view sv) { return Formats::NormalizeZipArchiveKey(sv); }
+using ZipPackageReader = Formats::ZipPackageReader;
 
 } // namespace DetailIdml
 
@@ -130,7 +78,7 @@ inline bool ParseAdobeIdml(const std::wstring& fullPath, const std::vector<uint8
         std::vector<uint8_t> metaBytes;
         if (zip.ExtractByPath(L"META-INF/metadata.xml", metaBytes)) {
             std::string_view msv(reinterpret_cast<const char*>(metaBytes.data()), metaBytes.size());
-            xmpCreatorTool = DetailMedia100::ExtractFirstXmlTagText(msv, "xmp:CreatorTool");
+            xmpCreatorTool = DetailMediaAndScoreDoc::ExtractFirstXmlTagText(msv, "xmp:CreatorTool");
         }
     }
 

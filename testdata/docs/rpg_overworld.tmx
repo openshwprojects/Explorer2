@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<map version="1.10" tiledversion="1.10.2" orientation="orthogonal" renderorder="right-down" width="4" height="3" tilewidth="16" tileheight="16">
+ <tileset firstgid="1" name="overworld_grass" tilewidth="16" tileheight="16" tilecount="64" columns="8">
+  <image source="overworld_grass.png" width="128" height="128"/>
+ </tileset>
+ <layer id="1" name="Ground" width="4" height="3">
+  <data encoding="csv">
+1,2,2,1,
+5,0,0,6,
+9,10,10,11
+</data>
+ </layer>
+ <objectgroup id="2" name="Spawns">
+  <object id="10" name="HeroStart" class="PlayerSpawn" x="16" y="32" width="16" height="16"/>
+  <object id="11" name="TownChest" class="LootChest" x="48" y="16" width="16" height="16"/>
+ </objectgroup>
+</map>

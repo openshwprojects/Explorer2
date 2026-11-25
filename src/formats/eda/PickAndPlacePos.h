@@ -4,7 +4,7 @@
 
 namespace Formats {
 
-namespace DetailKiCadSymSesPos {
+namespace DetailBoardPlacementEda {
 
 // Split a CSV or whitespace Pick-and-Place line while honoring double-quoted strings containing commas/spaces
 inline std::vector<std::string> SplitPickAndPlaceRow(std::string_view ln, bool csvDelimited) {
@@ -128,7 +128,7 @@ inline int ExtractTrailingPinCount(const std::string& pkgUpper, int defPins) {
     return defPins;
 }
 
-} // namespace DetailKiCadSymSesPos
+} // namespace DetailBoardPlacementEda
 
 inline bool ParsePickAndPlacePosBoard(std::string_view sv, const std::wstring& ext, ParsedEdaBoard& out) {
     if (sv.size() >= 3 &&
@@ -139,9 +139,9 @@ inline bool ParsePickAndPlacePosBoard(std::string_view sv, const std::wstring& e
         sv.remove_prefix(3);
     }
 
-    // #63. SMT Pick-and-Place Centroid File (.pos / .cpl / .mnt)
+    // SMT Pick-and-Place Centroid File (.pos / .cpl / .mnt)
     if (ext == L".pos" || ext == L".cpl" || ext == L".mnt") {
-        using namespace DetailKiCadSymSesPos;
+        using namespace DetailBoardPlacementEda;
         for (unsigned char c : sv) {
             if (c == 0) return false;
         }
@@ -385,7 +385,7 @@ inline bool ParsePickAndPlacePosBoard(std::string_view sv, const std::wstring& e
             mnX = std::min(mnX, c.x - span); mxX = std::max(mxX, c.x + span);
             mnY = std::min(mnY, c.y - span); mxY = std::max(mxY, c.y + span);
         }
-        DetailEda100::AddRectOutline(out, (mnX + mxX) * 0.5f, (mnY + mxY) * 0.5f, mxX - mnX, mxY - mnY, EdaLayerId::EdgeCuts, 0.36f);
+        DetailSiliconAndBusEda::AddRectOutline(out, (mnX + mxX) * 0.5f, (mnY + mxY) * 0.5f, mxX - mnX, mxY - mnY, EdaLayerId::EdgeCuts, 0.36f);
         out.formatTitle = L"SMT Pick-and-Place Assembly (" + ext + L" — " + std::to_wstring(out.components.size()) + L" parts)";
         out.netCount = out.components.size();
         return true;

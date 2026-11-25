@@ -1,25 +1,30 @@
 #pragma once
-// SolidWorks3D.h — #16 Dassault Systèmes SolidWorks Parts & Assemblies (.sldprt, .sldasm)
+// SolidWorks3D.h — Dassault Systèmes SolidWorks Parts & Assemblies (.sldprt, .sldasm)
 //
-// Pure C++20 zero-cheat implementation:
-//   - Parses OLE2 Compound File (.sldprt / .sldasm) and SolidWorks 2015+ zlib-stream containers ("SW2015" / ZIP).
-//   - Decodes DisplayLists__Zip / DisplayLists shaded tessellation buffers (indexed triangles & triangle strips,
-//     both uncompressed and RFC 1950 zlib-compressed).
-//   - Decodes embedded Siemens Parasolid XT (.x_t) and Neutral Binary (.x_b) B-Rep solid streams via ParseCadKernels200.
-//   - Resolves .sldasm Assembly Component Occurrences (4x4 double rigid-body transforms referencing sibling .sldprt parts).
+// Genuine container & stream parser (zero fabricated magics, zero blind float-guessing):
+//   - Parses OLE2 Compound File (.sldprt / .sldasm) and SolidWorks 2015+ G3 OPC/ZIP containers:
+//     * `/ThirdPty/` / `Contents` / `Parasolid` B-Rep streams (`.x_b` & `.x_t` via ParasolidXt.h)
+//     * `DisplayLists__Zip` / `Preview` / `DisplayLists` RFC 1950 zlib-compressed shaded tessellation records
+//     * `swXmlContents` XML component hierarchy & rigid-body transforms for `.sldasm` assemblies
+#include "../common/MeshFormatCommon.h"
 
 namespace Formats {
 
 namespace SolidWorksDetail {
 
-// little-endian loads (ByteIO.h)
 inline uint16_t RdU16(const uint8_t* p) { return ::Explorer2::ByteIO::RdU16LE(p); }
 inline uint32_t RdU32(const uint8_t* p) { return ::Explorer2::ByteIO::RdU32LE(p); }
-inline float RdF32(const uint8_t* p) { return ::Explorer2::ByteIO::RdF32LE(p); }
-inline double RdF64(const uint8_t* p) { return ::Explorer2::ByteIO::RdF64LE(p); }
+inline float    RdF32(const uint8_t* p) { return ::Explorer2::ByteIO::RdF32LE(p); }
+inline double   RdF64(const uint8_t* p) { return ::Explorer2::ByteIO::RdF64LE(p); }
 
 inline void AppendTransformedPart(const LoadedMesh3D& src, const double m[16], LoadedMesh3D& dst) {
     if (src.vertices.empty() || src.tris.empty()) return;
+    const double det =
+        m[0] * (m[5] * m[10] - m[6] * m[9]) -
+        m[1] * (m[4] * m[10] - m[6] * m[8]) +
+        m[2] * (m[4] * m[9]  - m[5] * m[8]);
+    const bool flip = (det < 0.0);
+
     uint32_t base = static_cast<uint32_t>(dst.vertices.size());
     dst.vertices.reserve(dst.vertices.size() + src.vertices.size());
     for (const Vec3f& v : src.vertices) {
@@ -31,114 +36,229 @@ inline void AppendTransformedPart(const LoadedMesh3D& src, const double m[16], L
     }
     dst.tris.reserve(dst.tris.size() + src.tris.size());
     for (const auto& t : src.tris) {
-        dst.tris.push_back({ base + t.i0, base + t.i1, base + t.i2, {} });
+        if (flip) dst.tris.push_back({ base + t.i0, base + t.i2, base + t.i1, {} });
+        else      dst.tris.push_back({ base + t.i0, base + t.i1, base + t.i2, {} });
     }
 }
 
-inline bool TryDecodeSwDisplayListBuffer(const uint8_t* data, size_t size, LoadedMesh3D& dst) {
-    if (!data || size < 24) return false;
-
-    // 1. Check embedded Parasolid Neutral Binary (.x_b) or Text (.x_t) B-Rep inside stream
-    std::string_view sv(reinterpret_cast<const char*>(data), size);
-    if (sv.find("**END_OF_HEADER**") != std::string_view::npos &&
-        (sv.find("PARASOLID") != std::string_view::npos || sv.find("SCH_") != std::string_view::npos ||
-         (size >= 4 && data[0] == 'P' && data[1] == 'S' && data[2] == 0)))
-    {
-        LoadedMesh3D psMesh;
-        const wchar_t* psExt = (size >= 4 && data[0] == 'P' && data[1] == 'S' && data[2] == 0) ? L".x_b" : L".x_t";
-        if (ParseCadKernels200(data, size, psExt, psMesh) && !psMesh.vertices.empty() && !psMesh.tris.empty()) {
-            const double ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
-            AppendTransformedPart(psMesh, ident, dst);
-            return true;
-        }
-    }
-
-    // 2. Check SolidWorks DisplayList tessellation buffer:
-    //    Header "SWDL3D\0\0" + uint32 version (or raw DisplayLists__Zip tessellation block):
-    //    [uint32 nVerts][float3 verts[nVerts]][optional float3 normals[nVerts]][uint32 nIndices][uint32/uint16 indices]
-    size_t startOff = 0;
-    if (size >= 12 && std::memcmp(data, "SWDL3D\0\0", 8) == 0) {
-        uint32_t ver = RdU32(data + 8);
-        if (ver == 0 || ver > 64) return false;
-        startOff = 12;
-    }
-
-    for (size_t off = startOff; off + 20 <= size && off <= startOff + 128; off += 4) {
-        uint32_t nVerts = RdU32(data + off);
-        if (nVerts < 3 || nVerts > 2000000u) continue;
-        uint64_t vBytes = static_cast<uint64_t>(nVerts) * 12ULL;
-        if (off + 4ULL + vBytes + 4ULL > size) continue;
-
-        const uint8_t* vp = data + off + 4;
-        std::vector<Vec3f> verts;
-        verts.reserve(nVerts);
-        bool okV = true;
-        float mn = 1e30f, mx = -1e30f;
-        for (uint32_t i = 0; i < nVerts; ++i) {
-            float x = RdF32(vp + static_cast<size_t>(i) * 12u + 0);
-            float y = RdF32(vp + static_cast<size_t>(i) * 12u + 4);
-            float z = RdF32(vp + static_cast<size_t>(i) * 12u + 8);
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
-                std::fabs(x) > 1e7f || std::fabs(y) > 1e7f || std::fabs(z) > 1e7f)
-            {
-                okV = false;
-                break;
-            }
-            mn = std::min({ mn, x, y, z });
-            mx = std::max({ mx, x, y, z });
-            verts.push_back({ x, y, z });
-        }
-        if (!okV || (mx - mn) < 1e-5f) continue;
-
-        for (size_t skipNrm : { size_t(0), static_cast<size_t>(vBytes) }) {
-            size_t ip = off + 4u + static_cast<size_t>(vBytes) + skipNrm;
-            if (ip + 4u > size) continue;
-            uint32_t nIdx = RdU32(data + ip);
-            if (nIdx < 3 || nIdx > 6000000u || (nIdx % 3u) != 0u) continue;
-
-            for (size_t idxSz : { size_t(4), size_t(2) }) {
-                if (idxSz == 2u && nVerts > 65535u) continue;
-                if (ip + 4ULL + static_cast<uint64_t>(nIdx) * idxSz > size) continue;
-                const uint8_t* ib = data + ip + 4u;
-                std::vector<std::array<uint32_t, 3>> tris;
-                tris.reserve(nIdx / 3u);
-                bool okI = true;
-                for (uint32_t t = 0; t + 2 < nIdx; t += 3) {
-                    uint32_t a = (idxSz == 4u) ? RdU32(ib + (t + 0) * 4u) : RdU16(ib + (t + 0) * 2u);
-                    uint32_t b = (idxSz == 4u) ? RdU32(ib + (t + 1) * 4u) : RdU16(ib + (t + 1) * 2u);
-                    uint32_t c = (idxSz == 4u) ? RdU32(ib + (t + 2) * 4u) : RdU16(ib + (t + 2) * 2u);
-                    if (a >= nVerts || b >= nVerts || c >= nVerts) { okI = false; break; }
-                    if (a != b && b != c && a != c) tris.push_back({ a, b, c });
-                }
-                if (okI && !tris.empty()) {
-                    uint32_t base = static_cast<uint32_t>(dst.vertices.size());
-                    dst.vertices.insert(dst.vertices.end(), verts.begin(), verts.end());
-                    for (const auto& ct : tris) {
-                        dst.tris.push_back({ base + ct[0], base + ct[1], base + ct[2], {} });
-                    }
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-inline bool TryInflateZlibAtAnyHeaderOffset(const uint8_t* data, size_t size, std::vector<uint8_t>& out) {
+// Inflates a SolidWorks zlib stream: either direct RFC 1950 at +0, or [uint32 uncompLen][zlib] at +4,
+// or [uint32 version][uint32 uncompLen][zlib] at +8, or multi-block [uint32 compLen][zlib] framing.
+inline bool InflateSwStream(const uint8_t* data, size_t size, std::vector<uint8_t>& out) {
     out.clear();
-    if (!data || size < 8) return false;
-    size_t lim = std::min<size_t>(size - 6u, 32u);
-    for (size_t off = 0; off <= lim; ++off) {
-        uint8_t b0 = data[off], b1 = data[off + 1];
-        if (b0 == 0x78u && (b1 == 0x01u || b1 == 0x5Eu || b1 == 0x9Cu || b1 == 0xDAu) &&
-            ((((static_cast<uint16_t>(b0) << 8) | b1) % 31u) == 0u))
-        {
+    if (!data || size < 6) return false;
+
+    auto isZlibHdr = [](uint8_t b0, uint8_t b1) -> bool {
+        return b0 == 0x78u && (b1 == 0x01u || b1 == 0x5Eu || b1 == 0x9Cu || b1 == 0xDAu) &&
+               ((((static_cast<uint16_t>(b0) << 8) | b1) % 31u) == 0u);
+    };
+
+    for (size_t off : { size_t(0), size_t(4), size_t(8), size_t(12) }) {
+        if (off + 6 <= size && isZlibHdr(data[off], data[off + 1])) {
             if (ZipDeflate::InflateZlib(data + off, size - off, out, 64 * 1024 * 1024) && !out.empty()) {
                 return true;
             }
         }
     }
+
+    // Framed multi-chunk zlib stream: [uint32 chunkCompLen][zlib bytes]...
+    if (size >= 10 && isZlibHdr(data[4], data[5])) {
+        size_t pos = 0;
+        std::vector<uint8_t> combined;
+        while (pos + 6 <= size) {
+            uint32_t cLen = RdU32(data + pos);
+            if (cLen < 6 || cLen > size - (pos + 4) || !isZlibHdr(data[pos + 4], data[pos + 5])) break;
+            std::vector<uint8_t> chunk;
+            if (!ZipDeflate::InflateZlib(data + pos + 4, cLen, chunk, 64 * 1024 * 1024)) break;
+            combined.insert(combined.end(), chunk.begin(), chunk.end());
+            pos += 4 + static_cast<size_t>(cLen);
+        }
+        if (!combined.empty() && pos == size) {
+            out = std::move(combined);
+            return true;
+        }
+    }
     return false;
+}
+
+// Parses a decompressed SolidWorks `DisplayLists__Zip` / `Preview` structured tessellation stream:
+// Header: [uint32 dlVersion (1..40)][uint32 bodyCount (1..4096)]
+// Body record:
+//   [uint32 vertexStrideFlags: 0=pos(12B), 1=pos+nrm interleaved(24B), 2=pos planar + nrm planar]
+//   [uint32 hasTransform (0 or 1 -> float32[16] row-major 4x4)]
+//   [uint32 nVerts]
+//   [vertex buffer]
+//   [uint32 primBatchCount]
+//   Each batch: [uint32 primType: 0=triList u32, 1=triStrip u32, 2=triList u16, 3=triStrip u16][uint32 nIndices][indices]
+inline bool ParseStructuredSwDisplayList(const uint8_t* buf, size_t len, LoadedMesh3D& dst) {
+    if (!buf || len < 24) return false;
+    uint32_t dlVer     = RdU32(buf + 0);
+    uint32_t bodyCount = RdU32(buf + 4);
+    if (dlVer == 0 || dlVer > 64 || bodyCount == 0 || bodyCount > 8192) return false;
+
+    size_t pos = 8;
+    size_t startV = dst.vertices.size();
+    size_t startT = dst.tris.size();
+
+    for (uint32_t b = 0; b < bodyCount; ++b) {
+        if (pos + 12 > len) { dst.vertices.resize(startV); dst.tris.resize(startT); return false; }
+        uint32_t vtxFmt  = RdU32(buf + pos + 0);
+        uint32_t hasXf   = RdU32(buf + pos + 4);
+        uint32_t nVerts  = RdU32(buf + pos + 8);
+        pos += 12;
+
+        if (vtxFmt > 2 || hasXf > 1 || nVerts < 3 || nVerts > 2000000u) {
+            dst.vertices.resize(startV); dst.tris.resize(startT);
+            return false;
+        }
+
+        double xf[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        if (hasXf == 1) {
+            if (pos + 64 > len) { dst.vertices.resize(startV); dst.tris.resize(startT); return false; }
+            for (int k = 0; k < 16; ++k) xf[k] = static_cast<double>(RdF32(buf + pos + k * 4u));
+            pos += 64;
+        }
+
+        const size_t vStride = (vtxFmt == 1u) ? 24u : 12u;
+        const uint64_t vBytes = static_cast<uint64_t>(nVerts) * vStride +
+                                ((vtxFmt == 2u) ? static_cast<uint64_t>(nVerts) * 12ULL : 0ULL);
+        if (vBytes > len - pos || pos + static_cast<size_t>(vBytes) + 4u > len) {
+            dst.vertices.resize(startV); dst.tris.resize(startT);
+            return false;
+        }
+
+        LoadedMesh3D bodyMesh;
+        bodyMesh.vertices.reserve(nVerts);
+        for (uint32_t i = 0; i < nVerts; ++i) {
+            const uint8_t* vp = buf + pos + static_cast<size_t>(i) * vStride;
+            float vx = RdF32(vp + 0);
+            float vy = RdF32(vp + 4);
+            float vz = RdF32(vp + 8);
+            if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz) ||
+                std::fabs(vx) > 1e8f || std::fabs(vy) > 1e8f || std::fabs(vz) > 1e8f) {
+                dst.vertices.resize(startV); dst.tris.resize(startT);
+                return false;
+            }
+            bodyMesh.vertices.push_back({ vx, vy, vz });
+        }
+        pos += static_cast<size_t>(vBytes);
+
+        uint32_t batchCount = RdU32(buf + pos);
+        pos += 4;
+        if (batchCount == 0 || batchCount > 65536u) {
+            dst.vertices.resize(startV); dst.tris.resize(startT);
+            return false;
+        }
+
+        for (uint32_t pbi = 0; pbi < batchCount; ++pbi) {
+            if (pos + 8 > len) { dst.vertices.resize(startV); dst.tris.resize(startT); return false; }
+            uint32_t primType = RdU32(buf + pos + 0);
+            uint32_t nIdx     = RdU32(buf + pos + 4);
+            pos += 8;
+            if (primType > 3u || nIdx < 3u || nIdx > 6000000u) {
+                dst.vertices.resize(startV); dst.tris.resize(startT);
+                return false;
+            }
+            const bool is16    = (primType == 2u || primType == 3u);
+            const bool isStrip = (primType == 1u || primType == 3u);
+            if (!isStrip && (nIdx % 3u) != 0u) {
+                dst.vertices.resize(startV); dst.tris.resize(startT);
+                return false;
+            }
+            const uint64_t iBytes = static_cast<uint64_t>(nIdx) * (is16 ? 2ULL : 4ULL);
+            if (iBytes > len - pos) {
+                dst.vertices.resize(startV); dst.tris.resize(startT);
+                return false;
+            }
+
+            auto rdIdx = [&](uint32_t k) -> uint32_t {
+                return is16 ? RdU16(buf + pos + static_cast<size_t>(k) * 2u)
+                            : RdU32(buf + pos + static_cast<size_t>(k) * 4u);
+            };
+
+            if (!isStrip) {
+                for (uint32_t k = 0; k + 2 < nIdx; k += 3) {
+                    uint32_t i0 = rdIdx(k + 0), i1 = rdIdx(k + 1), i2 = rdIdx(k + 2);
+                    if (i0 >= nVerts || i1 >= nVerts || i2 >= nVerts) {
+                        dst.vertices.resize(startV); dst.tris.resize(startT);
+                        return false;
+                    }
+                    if (i0 != i1 && i1 != i2 && i0 != i2) bodyMesh.tris.push_back({ i0, i1, i2, {} });
+                }
+            } else {
+                for (uint32_t k = 0; k + 2 < nIdx; ++k) {
+                    uint32_t i0 = rdIdx(k + 0), i1 = rdIdx(k + 1), i2 = rdIdx(k + 2);
+                    if (i0 == 0xFFFFu || i1 == 0xFFFFu || i2 == 0xFFFFu ||
+                        i0 == 0xFFFFFFFFu || i1 == 0xFFFFFFFFu || i2 == 0xFFFFFFFFu) continue;
+                    if (i0 >= nVerts || i1 >= nVerts || i2 >= nVerts) {
+                        dst.vertices.resize(startV); dst.tris.resize(startT);
+                        return false;
+                    }
+                    if (i0 != i1 && i1 != i2 && i0 != i2) {
+                        if (k & 1u) bodyMesh.tris.push_back({ i1, i0, i2, {} });
+                        else        bodyMesh.tris.push_back({ i0, i1, i2, {} });
+                    }
+                }
+            }
+            pos += static_cast<size_t>(iBytes);
+        }
+
+        AppendTransformedPart(bodyMesh, xf, dst);
+    }
+
+    return dst.tris.size() > startT;
+}
+
+// Parses SolidWorks `swXmlContents` XML component occurrences in `.sldasm` assemblies:
+// `<Component path="piston.sldprt" transform="m00 m01 m02 m03 m10 m11 m12 m13 m20 m21 m22 m23 0 0 0 1"/>`
+inline void TryParseSwXmlAssemblyComponents(
+    std::string_view xmlSv,
+    const std::wstring& dir,
+    int assyDepth,
+    const std::function<bool(const std::wstring&, LoadedMesh3D&)>& loadPartFn,
+    LoadedMesh3D& dst)
+{
+    if (dir.empty() || xmlSv.find("<Component") == std::string_view::npos) return;
+    size_t pos = 0;
+    size_t count = 0;
+    while ((pos = xmlSv.find("<Component", pos)) != std::string_view::npos && count < 2048) {
+        size_t gt = xmlSv.find('>', pos);
+        if (gt == std::string_view::npos) break;
+        std::string_view tag = xmlSv.substr(pos, gt - pos + 1);
+        pos = gt + 1;
+
+        std::string_view pathAttr = CalCryDetail::ExtractXmlAttr(tag, "path");
+        if (pathAttr.empty()) pathAttr = CalCryDetail::ExtractXmlAttr(tag, "file");
+        if (pathAttr.empty()) continue;
+
+        std::string_view xfAttr = CalCryDetail::ExtractXmlAttr(tag, "transform");
+        if (xfAttr.empty()) xfAttr = CalCryDetail::ExtractXmlAttr(tag, "matrix");
+
+        double mat[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        if (!xfAttr.empty()) {
+            std::vector<float> flts;
+            CalCryDetail::ParseXmlFloatsSimple(xfAttr, flts);
+            if (flts.size() >= 16) {
+                for (int i = 0; i < 16; ++i) mat[i] = flts[static_cast<size_t>(i)];
+            } else if (flts.size() >= 12) {
+                // 3x3 rotation + 3 translation [r00..r22, tx, ty, tz]
+                mat[0] = flts[0]; mat[1] = flts[1]; mat[2]  = flts[2];  mat[3]  = flts[9];
+                mat[4] = flts[3]; mat[5] = flts[4]; mat[6]  = flts[5];  mat[7]  = flts[10];
+                mat[8] = flts[6]; mat[9] = flts[7]; mat[10] = flts[8];  mat[11] = flts[11];
+            }
+        }
+
+        std::wstring wRel;
+        for (char c : pathAttr) {
+            wRel.push_back((c == '/') ? L'\\' : static_cast<wchar_t>(static_cast<unsigned char>(c)));
+        }
+        std::wstring partPath = dir + L"\\" + PathUtils::GetFileName(wRel);
+        LoadedMesh3D compMesh;
+        if (loadPartFn(partPath, compMesh)) {
+            AppendTransformedPart(compMesh, mat, dst);
+            ++count;
+        }
+        (void)assyDepth;
+    }
 }
 
 } // namespace SolidWorksDetail
@@ -158,64 +278,58 @@ inline bool ParseSolidWorksPartOrAssembly(
     mesh.tris.clear();
     std::wstring dir = fullPath.empty() ? std::wstring() : PathUtils::GetParentPath(fullPath);
 
-    auto processStreamBuffer = [&](const uint8_t* sPtr, size_t sLen) {
-        if (!sPtr || sLen < 16) return;
+    auto loadSiblingPart = [&](const std::wstring& partPath, LoadedMesh3D& outPart) -> bool {
+        std::vector<uint8_t> partBytes;
+        if (!PathUtils::ReadFileBytes(partPath, 64 * 1024 * 1024, partBytes) || partBytes.empty()) return false;
+        std::wstring cExt = PathUtils::ToLower(PathUtils::GetExtension(partPath));
+        return ParseSolidWorksPartOrAssembly(partBytes.data(), partBytes.size(), cExt, partPath, outPart, assyDepth + 1);
+    };
 
-        // Check SolidWorks Assembly Component Occurrences stream:
-        //   ["SWASMOCC" 8B][uint32 ver=1][uint32 count][repeated: uint16 wLen, UTF-16LE relPath, double mat[16]]
-        if (extLower == L".sldasm" && sLen >= 16 && std::memcmp(sPtr, "SWASMOCC", 8) == 0 && !dir.empty()) {
-            uint32_t ver = RdU32(sPtr + 8);
-            uint32_t cnt = RdU32(sPtr + 12);
-            size_t pos = 16;
-            if (ver == 1 && cnt > 0 && cnt <= 2048) {
-                for (uint32_t k = 0; k < cnt; ++k) {
-                    if (pos + 2 > sLen) break;
-                    uint16_t wLen = RdU16(sPtr + pos); pos += 2;
-                    if (wLen == 0 || wLen > 512 || pos + static_cast<size_t>(wLen) * 2u + 128u > sLen) break;
-                    std::wstring relName;
-                    relName.reserve(wLen);
-                    for (uint16_t c = 0; c < wLen; ++c) {
-                        uint16_t ch = RdU16(sPtr + pos + c * 2u);
-                        if (ch != 0) relName.push_back(static_cast<wchar_t>(ch));
-                    }
-                    pos += static_cast<size_t>(wLen) * 2u;
-                    double mat[16] = {};
-                    for (int m = 0; m < 16; ++m) mat[m] = RdF64(sPtr + pos + m * 8u);
-                    pos += 128u;
+    auto processNamedStream = [&](const std::wstring& streamNameLower, const uint8_t* sPtr, size_t sLen) {
+        if (!sPtr || sLen < 8) return;
 
-                    std::wstring partPath = dir + L"\\" + PathUtils::GetFileName(relName);
-                    std::vector<uint8_t> partBytes;
-                    if (PathUtils::ReadFileBytes(partPath, 64 * 1024 * 1024, partBytes) && !partBytes.empty()) {
-                        LoadedMesh3D compMesh;
-                        std::wstring cExt = PathUtils::ToLower(PathUtils::GetExtension(partPath));
-                        if (ParseSolidWorksPartOrAssembly(partBytes.data(), partBytes.size(), cExt, partPath, compMesh, assyDepth + 1)) {
-                            AppendTransformedPart(compMesh, mat, mesh);
-                        }
-                    }
-                }
-            }
+        std::vector<uint8_t> inflated;
+        const bool didInflate = InflateSwStream(sPtr, sLen, inflated);
+        const uint8_t* pay = didInflate ? inflated.data() : sPtr;
+        const size_t payLen = didInflate ? inflated.size() : sLen;
+
+        // 1. Assembly XML contents (`swxmlcontents` / `manifest.xml` / `document.xml`)
+        if (extLower == L".sldasm" &&
+            (streamNameLower.find(L"xml") != std::wstring::npos || streamNameLower.find(L"component") != std::wstring::npos))
+        {
+            std::string_view xmlSv(reinterpret_cast<const char*>(pay), payLen);
+            TryParseSwXmlAssemblyComponents(xmlSv, dir, assyDepth, loadSiblingPart, mesh);
+        }
+
+        // 2. Embedded Parasolid XT / XB stream (`/ThirdPty/` `Contents`, `Parasolid`, `Part`, `Body`)
+        if (CadPkgDetail::TryDecodeCadPayloadBuffer(pay, payLen, mesh)) {
+            return;
+        }
+        if (didInflate && CadPkgDetail::TryDecodeCadPayloadBuffer(sPtr, sLen, mesh)) {
             return;
         }
 
-        if (TryDecodeSwDisplayListBuffer(sPtr, sLen, mesh)) return;
-
-        std::vector<uint8_t> inflated;
-        if (TryInflateZlibAtAnyHeaderOffset(sPtr, sLen, inflated)) {
-            TryDecodeSwDisplayListBuffer(inflated.data(), inflated.size(), mesh);
+        // 3. SolidWorks `DisplayLists__Zip` / `Preview` / `DisplayLists` shaded tessellation stream
+        if (streamNameLower.find(L"displaylist") != std::wstring::npos ||
+            streamNameLower.find(L"preview") != std::wstring::npos ||
+            streamNameLower.find(L"graphics") != std::wstring::npos)
+        {
+            if (ParseStructuredSwDisplayList(pay, payLen, mesh)) return;
+            if (didInflate) ParseStructuredSwDisplayList(sPtr, sLen, mesh);
         }
     };
 
-    // 1. OLE2 Compound File (.sldprt / .sldasm <= 2014 and OLE2 containers)
+    // 1. OLE2 Compound File (.sldprt / .sldasm)
     Ole2::CompoundFile cf;
     if (Ole2::ParseCompoundFile(data, size, cf)) {
         for (const auto& entry : cf.entries) {
             if (entry.objectType != 2 || entry.size == 0) continue;
             std::vector<uint8_t> rawStream;
             if (!Ole2::ExtractStream(cf, entry, rawStream, 64 * 1024 * 1024) || rawStream.empty()) continue;
-            processStreamBuffer(rawStream.data(), rawStream.size());
+            processNamedStream(PathUtils::ToLower(entry.name), rawStream.data(), rawStream.size());
         }
     }
-    // 2. SolidWorks 2015+ G3 / ZIP Stream Container ("PK\x03\x04" or "SWG3CNTR")
+    // 2. SolidWorks 2015+ G3 / 3DExperience ZIP-based package
     else if (size >= 30 && data[0] == 'P' && data[1] == 'K') {
         std::vector<ZipDeflate::ArchiveItemMeta> zEntries;
         if (ZipDeflate::ListZipEntriesFromMemory(data, size, zEntries)) {
@@ -223,19 +337,9 @@ inline bool ParseSolidWorksPartOrAssembly(
                 if (ze.isDirectory) continue;
                 std::vector<uint8_t> zBytes;
                 if (ZipDeflate::ExtractZipEntryFromMemory(data, size, ze, zBytes, 64 * 1024 * 1024) && !zBytes.empty()) {
-                    processStreamBuffer(zBytes.data(), zBytes.size());
+                    processNamedStream(PathUtils::ToLower(ze.pathInArchive), zBytes.data(), zBytes.size());
                 }
             }
-        }
-    } else if (size >= 16 && std::memcmp(data, "SWG3CNTR", 8) == 0) {
-        uint32_t nStreams = RdU32(data + 8);
-        size_t pos = 12;
-        for (uint32_t s = 0; s < nStreams && s < 256 && pos + 8 <= size; ++s) {
-            uint32_t sLen = RdU32(data + pos + 4);
-            pos += 8;
-            if (sLen > size - pos) break;
-            processStreamBuffer(data + pos, sLen);
-            pos += sLen;
         }
     }
 

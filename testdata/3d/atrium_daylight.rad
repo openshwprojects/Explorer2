@@ -1,0 +1,50 @@
+# LBNL Radiance Architectural Daylighting Atrium Scene
+void plastic limestone
+0
+0
+5 0.72 0.70 0.65 0.02 0.05
+
+void alias column_mat limestone
+
+void glass skylight_glazing
+0
+0
+3 0.88 0.91 0.90
+
+# Floor slab polygon (16m x 12m)
+limestone polygon atrium_floor
+0
+0
+12
+  -8.0 -6.0  0.0
+   8.0 -6.0  0.0
+   8.0  6.0  0.0
+  -8.0  6.0  0.0
+
+# Skylight oculus ring & dome sphere + structural columns & bench !genbox
+column_mat cylinder col_nw
+0
+0
+7  -5.5  3.5 0.0   -5.5  3.5 6.0   0.35
+
+column_mat cylinder col_ne
+0
+0
+7   5.5  3.5 0.0    5.5  3.5 6.0   0.35
+
+column_mat cone spire_lantern
+0
+0
+8   0.0  0.0 6.0    0.0  0.0 8.5   2.4  0.3
+
+skylight_glazing ring oculus_collar
+0
+0
+8   0.0  0.0 6.0    0.0  0.0 1.0   1.2  3.6
+
+skylight_glazing sphere sun_orb
+0
+0
+4   0.0  0.0 4.2   0.75
+
+!genbox limestone bench_south 4.0 0.8 0.55 | xform -t -2.0 -4.0 0.0

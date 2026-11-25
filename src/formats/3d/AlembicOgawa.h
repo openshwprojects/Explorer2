@@ -7,8 +7,8 @@ namespace Formats {
 // ============================================================================
 // Public Entry Point 2: Alembic Ogawa (.abc) Hierarchical Xform + DAG Instancing
 // ============================================================================
-inline bool ParseAlembicOgawaComplete(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
-    using namespace Detail3D100;
+inline bool ParseAlembicOgawaMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
+    using namespace DetailDccScene;
     using DetailScad::Mat4;
 
     if (!data || size < 24 || std::memcmp(data, "Ogawa", 5) != 0) return false;

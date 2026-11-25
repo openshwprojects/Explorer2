@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 // ============================================================================
 // #27. EA Games BIGF / BIG4 Archive (.big — Raw + EA RefPack 0x10FB Decompression)
@@ -197,10 +197,10 @@ inline bool ParseEaBigArchive(const uint8_t* data, size_t size, ArchiveSummaryIn
     return ParseOrExtractEaBigArchive(data, size, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectEaBigArchive(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseEaBigArchive(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseEaBigArchive(data, size, outInfo);
 }
 
 inline bool ExtractEaBigArchiveEntry(
@@ -209,7 +209,7 @@ inline bool ExtractEaBigArchiveEntry(
     const std::wstring& want,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc200::ParseOrExtractEaBigArchive(data, size, nullptr, &want, &outBytes);
+    return DetailUnixAndLegacyArc::ParseOrExtractEaBigArchive(data, size, nullptr, &want, &outBytes);
 }
 
 } // namespace Explorer2::Formats

@@ -1,0 +1,52 @@
+# Motion Analysis EVa HTR Skeletal Motion Capture
+[Header]
+FileType "htr"
+DataType "HTRS"
+FileVersion 1
+NumSegments 9
+NumFrames 3
+DataFrameRate 60
+EulerRotationOrder ZYX
+CalibrationUnits mm
+RotationUnits Degrees
+GlobalAxisofGravity Y
+BoneLengthAxis Y
+
+[SegmentNames&Hierarchy]
+Pelvis GLOBAL
+Spine Pelvis
+Head Spine
+LeftArm Spine
+LeftForearm LeftArm
+RightArm Spine
+RightForearm RightArm
+LeftThigh Pelvis
+RightThigh Pelvis
+
+[BasePosition]
+Pelvis       0.0   950.0   0.0    0.0   0.0    0.0   140.0
+Spine        0.0   140.0   0.0    0.0   0.0    0.0   380.0
+Head         0.0   380.0   0.0    0.0   0.0    0.0   210.0
+LeftArm   -190.0   340.0   0.0    0.0   0.0   65.0   280.0
+LeftForearm  0.0   280.0   0.0   15.0   0.0   20.0   250.0
+RightArm   190.0   340.0   0.0    0.0   0.0  -65.0   280.0
+RightForearm 0.0   280.0   0.0   15.0   0.0  -20.0   250.0
+LeftThigh -105.0     0.0   0.0  -20.0   0.0  175.0   430.0
+RightThigh 105.0     0.0   0.0   25.0   0.0 -175.0   430.0
+
+[Pelvis]
+1   0.0   965.0   10.0   5.0   8.0   0.0   1.000
+2   4.0   990.0   35.0   8.0  12.0   2.0   1.000
+3   8.0  1010.0   60.0  10.0  16.0   3.0   1.000
+
+[LeftArm]
+1 -190.0  340.0    0.0  12.0   0.0  55.0   1.000
+2 -190.0  340.0    0.0  24.0   0.0  45.0   1.000
+3 -190.0  340.0    0.0  36.0   0.0  35.0   1.000
+
+[RightArm]
+1  190.0  340.0    0.0 -12.0   0.0 -55.0   1.000
+2  190.0  340.0    0.0 -24.0   0.0 -45.0   1.000
+3  190.0  340.0    0.0 -36.0   0.0 -35.0   1.000
+
+[EndOfFile]

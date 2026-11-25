@@ -1,4 +1,5 @@
 #pragma once
+#include "../../ReaderTextUtils.h"
 // AndroidSparseImg.h — Zero-dependency C++20 Android Sparse Filesystem Image (.simg -> ext2/3/4 & EROFS) reader.
 
 #include "../../ByteIO.h"
@@ -8,6 +9,7 @@
 #include "../../StreamCodecs.h"
 #include "../../PathUtils.h"
 #include "../common/ArchiveFormatCommon.h"
+#include "../common/VirtualDiskCommon.h"
 #include "LinuxErofs.h"
 
 #include <algorithm>
@@ -40,38 +42,11 @@ using ::Explorer2::ByteIO::RdU32BE;
 using ::Explorer2::ByteIO::RdU64BE;
 
 inline bool EndsWithCI(const std::wstring& s, const wchar_t* suffix) {
-    const size_t sl = wcslen(suffix);
-    if (s.size() < sl) return false;
-    return _wcsicmp(s.c_str() + (s.size() - sl), suffix) == 0;
+    return ::Explorer2::ReaderText::EndsWithWideCI(s, suffix);
 }
-
-inline std::string AsciiLower(std::string_view sv) {
-    std::string out(sv);
-    for (char& ch : out) {
-        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-    }
-    return out;
-}
-
-inline std::string_view TrimAsciiSV(std::string_view sv) {
-    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r')) sv.remove_prefix(1);
-    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r')) sv.remove_suffix(1);
-    return sv;
-}
-
-inline void CalendarToDosDateTime(
-    int year, int month, int day,
-    int hour, int minute, int second,
-    uint16_t& outDate, uint16_t& outTime)
-{
-    outDate = 0;
-    outTime = 0;
-    if (year < 1980 || year > 2107 || month < 1 || month > 12 || day < 1 || day > 31) return;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) return;
-    if (second == 60) second = 59;
-    outDate = static_cast<uint16_t>(((year - 1980) << 9) | (month << 5) | day);
-    outTime = static_cast<uint16_t>((hour << 11) | (minute << 5) | (second / 2));
-}
+inline std::string AsciiLower(std::string_view sv) { return ::Explorer2::ReaderText::ToLowerAscii(sv); }
+inline std::string_view TrimAsciiSV(std::string_view sv) { return ::Explorer2::ReaderText::TrimCrTabSpace(sv); }
+using ::Explorer2::ReaderText::CalendarToDosDateTime;
 
 struct SimgExtent {
     uint64_t vStart = 0;
@@ -84,7 +59,7 @@ struct SimgExtent {
 inline bool BuildAndroidSimgReader(
     const uint8_t* data,
     size_t size,
-    DetailArc100::VirtualDiskReader& outReader)
+    DetailDiskAndGameArc::VirtualDiskReader& outReader)
 {
     if (!data || size < 40u) return false;
     if (RdU32LE(data + 0) != 0xED26FF3Au) return false;
@@ -227,7 +202,7 @@ inline bool ParseOrExtractAndroidSimg(
     const std::wstring* extractTargetNorm,
     std::vector<uint8_t>* outExtracted)
 {
-    DetailArc100::VirtualDiskReader simgReader;
+    DetailDiskAndGameArc::VirtualDiskReader simgReader;
     if (!DetailAndroidSimg::BuildAndroidSimgReader(data, size, simgReader)) return false;
 
     // 1. Check direct LBA 0 filesystem superblock (ext2/ext3/ext4 or EROFS)
@@ -237,7 +212,7 @@ inline bool ParseOrExtractAndroidSimg(
             if (DetailAndroidSimg::RdU16LE(sbProbe + 56) == 0xEF53u) { // ext2 / ext3 / ext4
                 ArchiveSummaryInfo dummy;
                 ArchiveSummaryInfo& target = outInfo ? *outInfo : dummy;
-                if (!DetailArc100::InspectOrExtractExtFsOnReader(
+                if (!DetailDiskAndGameArc::InspectOrExtractExtFsOnReader(
                         simgReader, 0, simgReader.virtualSize, L"", target, extractTargetNorm, outExtracted))
                 {
                     return false;
@@ -250,7 +225,7 @@ inline bool ParseOrExtractAndroidSimg(
                 return true;
             }
             if (DetailAndroidSimg::RdU32LE(sbProbe + 0) == 0xE0F5E1E2u) { // Linux EROFS
-                if (!DetailArc200::ParseOrExtractErofsOnReader(
+                if (!DetailUnixAndLegacyArc::ParseOrExtractErofsOnReader(
                         0, simgReader.virtualSize, false, simgReader.readBytes, L"",
                         outInfo, extractTargetNorm, outExtracted))
                 {
@@ -267,8 +242,8 @@ inline bool ParseOrExtractAndroidSimg(
     }
 
     // 2. Check GPT / MBR partitions inside sparse disk image
-    std::vector<DetailArc100::DiscoveredPartition> parts;
-    DetailArc100::DiscoverDiskPartitions(simgReader, parts);
+    std::vector<DetailDiskAndGameArc::DiscoveredPartition> parts;
+    DetailDiskAndGameArc::DiscoverDiskPartitions(simgReader, parts);
     if (!parts.empty() && !(parts.size() == 1u && parts[0].byteOffset == 0u)) {
         bool mountedAny = false;
         ArchiveSummaryInfo dummy;
@@ -278,14 +253,14 @@ inline bool ParseOrExtractAndroidSimg(
             std::wstring pfx = (parts.size() > 1u)
                 ? (pt.label.empty() ? (L"Partition_" + std::to_wstring(i + 1u)) : pt.label)
                 : L"";
-            if (DetailArc100::InspectOrExtractExtFsOnReader(
+            if (DetailDiskAndGameArc::InspectOrExtractExtFsOnReader(
                     simgReader, pt.byteOffset, pt.byteLength, pfx, target, extractTargetNorm, outExtracted))
             {
                 if (extractTargetNorm) return true;
                 mountedAny = true;
                 continue;
             }
-            if (DetailArc200::ParseOrExtractErofsOnReader(
+            if (DetailUnixAndLegacyArc::ParseOrExtractErofsOnReader(
                     pt.byteOffset, pt.byteOffset + pt.byteLength, false, simgReader.readBytes, pfx,
                     outInfo, extractTargetNorm, outExtracted))
             {

@@ -6,7 +6,7 @@ namespace Formats {
 
 // 3. Biere AIGER And-Inverter Graph (.aig Binary & .aag ASCII)
 inline bool ParseAigerNetlistBoard(const uint8_t* data, size_t size, ParsedEdaBoard& out) {
-    using namespace DetailGateTdms;
+    using namespace DetailGateAndDaqEda;
     if (!data || size < 10 || size > 32 * 1024 * 1024) return false;
     bool isBin = (std::memcmp(data, "aig ", 4) == 0);
     bool isAsc = (std::memcmp(data, "aag ", 4) == 0);
@@ -15,10 +15,26 @@ inline bool ParseAigerNetlistBoard(const uint8_t* data, size_t size, ParsedEdaBo
     size_t eol0 = 4;
     while (eol0 < size && data[eol0] != '\n') ++eol0;
     if (eol0 >= size) return false;
-    std::string hdrLine(reinterpret_cast<const char*>(data + 4), eol0 - 4);
-    unsigned int M = 0, I = 0, L = 0, O = 0, A = 0;
-    if (sscanf_s(hdrLine.c_str(), "%u %u %u %u %u", &M, &I, &L, &O, &A) < 5) return false;
-    if (M < I + L + A || (I + L + O + A) == 0 || M > 500000u) return false;
+    std::string_view hdrRem(reinterpret_cast<const char*>(data + 4), eol0 - 4);
+    std::string_view tM, tI, tL, tO, tA;
+    uint64_t M64 = 0, I64 = 0, L64 = 0, O64 = 0, A64 = 0;
+    if (!ReaderText::NextTokenSv(hdrRem, tM) || !ReaderText::ParseUint64Sv(tM, M64) ||
+        !ReaderText::NextTokenSv(hdrRem, tI) || !ReaderText::ParseUint64Sv(tI, I64) ||
+        !ReaderText::NextTokenSv(hdrRem, tL) || !ReaderText::ParseUint64Sv(tL, L64) ||
+        !ReaderText::NextTokenSv(hdrRem, tO) || !ReaderText::ParseUint64Sv(tO, O64) ||
+        !ReaderText::NextTokenSv(hdrRem, tA) || !ReaderText::ParseUint64Sv(tA, A64)) {
+        return false;
+    }
+    if (M64 > 500000ULL || O64 > 500000ULL ||
+        I64 > M64 || L64 > M64 || A64 > M64 ||
+        (I64 + L64 + A64) > M64 || (I64 + L64 + O64 + A64) == 0ULL) {
+        return false;
+    }
+    const uint32_t M = static_cast<uint32_t>(M64);
+    const uint32_t I = static_cast<uint32_t>(I64);
+    const uint32_t L = static_cast<uint32_t>(L64);
+    const uint32_t O = static_cast<uint32_t>(O64);
+    const uint32_t A = static_cast<uint32_t>(A64);
 
     size_t pos = eol0 + 1;
     auto readLineStr = [&](std::string& sOut) -> bool {
@@ -40,20 +56,31 @@ inline bool ParseAigerNetlistBoard(const uint8_t* data, size_t size, ParsedEdaBo
     std::vector<AigAnd> ands;
     ands.reserve(std::min<size_t>(A, 2048));
 
+    auto parseU32Tok = [](std::string_view& rem, uint32_t maxLit, uint32_t& outVal) -> bool {
+        std::string_view tk;
+        uint64_t v = 0;
+        if (!ReaderText::NextTokenSv(rem, tk) || !ReaderText::ParseUint64Sv(tk, v) || v > maxLit) return false;
+        outVal = static_cast<uint32_t>(v);
+        return true;
+    };
+    const uint32_t maxAllowedLit = 2u * M + 1u;
+
     if (isBin) {
         for (uint32_t i = 0; i < I; ++i) inputLits[i] = 2u * (i + 1u);
         for (uint32_t i = 0; i < L; ++i) {
             std::string ln;
             if (!readLineStr(ln)) return false;
-            unsigned int nxt = 0;
-            if (sscanf_s(ln.c_str(), "%u", &nxt) < 1) return false;
+            std::string_view rem(ln);
+            uint32_t nxt = 0;
+            if (!parseU32Tok(rem, maxAllowedLit, nxt)) return false;
             latches[i] = { 2u * (I + i + 1u), nxt };
         }
         for (uint32_t i = 0; i < O; ++i) {
             std::string ln;
             if (!readLineStr(ln)) return false;
-            unsigned int ol = 0;
-            if (sscanf_s(ln.c_str(), "%u", &ol) < 1) return false;
+            std::string_view rem(ln);
+            uint32_t ol = 0;
+            if (!parseU32Tok(rem, maxAllowedLit, ol)) return false;
             outputs[i] = ol;
         }
         // Binary LEB128 delta-encoded AND gates
@@ -82,29 +109,35 @@ inline bool ParseAigerNetlistBoard(const uint8_t* data, size_t size, ParsedEdaBo
         for (uint32_t i = 0; i < I; ++i) {
             std::string ln;
             if (!readLineStr(ln)) return false;
-            unsigned int il = 0;
-            if (sscanf_s(ln.c_str(), "%u", &il) < 1) return false;
+            std::string_view rem(ln);
+            uint32_t il = 0;
+            if (!parseU32Tok(rem, maxAllowedLit, il)) return false;
             inputLits[i] = il;
         }
         for (uint32_t i = 0; i < L; ++i) {
             std::string ln;
             if (!readLineStr(ln)) return false;
-            unsigned int ll = 0, nxt = 0;
-            if (sscanf_s(ln.c_str(), "%u %u", &ll, &nxt) < 2) return false;
+            std::string_view rem(ln);
+            uint32_t ll = 0, nxt = 0;
+            if (!parseU32Tok(rem, maxAllowedLit, ll) || !parseU32Tok(rem, maxAllowedLit, nxt)) return false;
             latches[i] = { ll, nxt };
         }
         for (uint32_t i = 0; i < O; ++i) {
             std::string ln;
             if (!readLineStr(ln)) return false;
-            unsigned int ol = 0;
-            if (sscanf_s(ln.c_str(), "%u", &ol) < 1) return false;
+            std::string_view rem(ln);
+            uint32_t ol = 0;
+            if (!parseU32Tok(rem, maxAllowedLit, ol)) return false;
             outputs[i] = ol;
         }
         for (uint32_t i = 0; i < A; ++i) {
             std::string ln;
             if (!readLineStr(ln)) return false;
-            unsigned int lhs = 0, r0 = 0, r1 = 0;
-            if (sscanf_s(ln.c_str(), "%u %u %u", &lhs, &r0, &r1) < 3) return false;
+            std::string_view rem(ln);
+            uint32_t lhs = 0, r0 = 0, r1 = 0;
+            if (!parseU32Tok(rem, maxAllowedLit, lhs) ||
+                !parseU32Tok(rem, maxAllowedLit, r0) ||
+                !parseU32Tok(rem, maxAllowedLit, r1)) return false;
             if (ands.size() < 1024) ands.push_back({ lhs, r0, r1 });
         }
     }

@@ -8,7 +8,7 @@ namespace Formats {
 // 2. Enhanced Autodesk 3ds Max (.max — Raw + RFC 1950 Zlib OLE2 "Scene", 32/64-bit chunks, TriObject + MNMesh)
 // ============================================================================
 inline bool Parse3dsMaxEnhanced(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
-    using namespace ModoZbMaxC4dDetail;
+    using namespace DetailDccSculpt;
     Ole2::CompoundFile cf;
     if (!Ole2::ParseCompoundFile(data, size, cf)) return false;
 

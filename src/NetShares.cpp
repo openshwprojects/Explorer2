@@ -1,6 +1,7 @@
 #include "NetShares.h"
 
 #include "PathUtils.h"
+#include "LinuxStorage.h"
 #include "VirtualFolders.h"
 
 #include <winnetwk.h>
@@ -119,25 +120,6 @@ struct MountEntry {
     std::string fsType;
 };
 
-// /proc/self/mounts writes a space, tab, newline or backslash inside a field as a backslash and three octal digits
-// ("/mnt/Moje\040Dokumenty"); this turns such a field back into the real text
-std::string DecodeMountField(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 3 < s.size() &&
-            s[i + 1] >= '0' && s[i + 1] <= '3' &&
-            s[i + 2] >= '0' && s[i + 2] <= '7' &&
-            s[i + 3] >= '0' && s[i + 3] <= '7') {
-            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
-            i += 3;
-        } else {
-            out.push_back(s[i]);
-        }
-    }
-    return out;
-}
-
 std::vector<MountEntry> ReadMounts() {
     std::vector<MountEntry> out;
     std::ifstream mf("/proc/self/mounts");
@@ -146,7 +128,7 @@ std::vector<MountEntry> ReadMounts() {
         std::istringstream iss(line);
         std::string dev, mnt, fstype;
         if (!(iss >> dev >> mnt >> fstype)) continue;
-        out.push_back(MountEntry{ DecodeMountField(dev), DecodeMountField(mnt), fstype });
+        out.push_back(MountEntry{ LinuxStorage::DecodeMountField(dev), LinuxStorage::DecodeMountField(mnt), fstype });
     }
     return out;
 }
@@ -169,16 +151,7 @@ std::shared_ptr<const std::vector<MountEntry>> CachedMounts() {
 // File systems on another machine: a folder on one is asked in the background before the window opens it, like a UNC
 // path, because stat() or a listing there waits for the server (forever for a hard NFS mount whose server is gone)
 bool IsNetworkFsType(const std::string& fsType) {
-    static const char* const kTypes[] = {
-        "cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs", "davfs", "sshfs",
-        "afs", "coda", "ncpfs", "lustre", "gpfs", "beegfs",
-        "fuse.sshfs", "fuse.rclone", "fuse.gvfsd-fuse", "fuse.s3fs", "fuse.curlftpfs", "fuse.smbnetfs",
-        "fuse.glusterfs", "fuse.ceph-fuse"
-    };
-    for (const char* t : kTypes) {
-        if (fsType == t) return true;
-    }
-    return false;
+    return LinuxStorage::IsRemoteNetworkFsType(fsType);
 }
 
 // Length of "/run/user/<uid>/gvfs" at the start of the path (followed by '/' or by nothing), or 0. gvfs, GNOME's

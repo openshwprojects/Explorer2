@@ -2,7 +2,7 @@
 // VobSubIdx.h — DVD VobSub Subtitle Index (.idx) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseVobSubIdx(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
@@ -69,10 +69,10 @@ inline bool ParseVobSubIdx(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
 inline bool ParseVobSubIdxDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    return DetailMedia100::ParseVobSubIdx(raw, out);
+    return DetailMediaAndScoreDoc::ParseVobSubIdx(raw, out);
 }
 
 } // namespace Formats

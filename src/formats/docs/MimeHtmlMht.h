@@ -33,14 +33,14 @@ inline std::string DetectHtmlMetaCharset(std::string_view htmlBytes) {
 inline void WalkMhtmlMime(const std::vector<std::pair<std::string, std::string>>& headers,
                           std::string_view body, int depth, MhtmlParsed& mp) {
     if (depth > 8) return;
-    const std::string ctype = DetailMedia100::MimeHeader(headers, "content-type");
+    const std::string ctype = DetailMediaAndScoreDoc::MimeHeader(headers, "content-type");
     std::string media = PathUtils::ToLowerAscii(PathUtils::TrimAscii(std::string_view(ctype).substr(0, ctype.find(';'))));
     if (media.empty()) media = (depth == 0) ? "text/html" : "text/plain";
 
     if (media.rfind("multipart/", 0) == 0) {
-        std::string startP = PathUtils::WideToUtf8(DetailMedia100::MimeParam(ctype, "start"));
+        std::string startP = PathUtils::WideToUtf8(DetailMediaAndScoreDoc::MimeParam(ctype, "start"));
         if (!startP.empty() && mp.startCid.empty()) mp.startCid = startP;
-        const std::string boundary = PathUtils::WideToUtf8(DetailMedia100::MimeParam(ctype, "boundary"));
+        const std::string boundary = PathUtils::WideToUtf8(DetailMediaAndScoreDoc::MimeParam(ctype, "boundary"));
         if (boundary.empty()) return;
         const std::string delim = "--" + boundary;
         auto nextDelim = [&](size_t from) {
@@ -60,17 +60,17 @@ inline void WalkMhtmlMime(const std::vector<std::pair<std::string, std::string>>
             if (partEnd > partStart && body[partEnd - 1] == '\n') --partEnd;
             if (partEnd > partStart && body[partEnd - 1] == '\r') --partEnd;
             std::string_view ph, pb;
-            DetailMedia100::SplitMimeEntity(body.substr(partStart, partEnd - partStart), ph, pb);
-            WalkMhtmlMime(DetailMedia100::ParseMimeHeaders(ph), pb, depth + 1, mp);
+            DetailMediaAndScoreDoc::SplitMimeEntity(body.substr(partStart, partEnd - partStart), ph, pb);
+            WalkMhtmlMime(DetailMediaAndScoreDoc::ParseMimeHeaders(ph), pb, depth + 1, mp);
             pos = next;
         }
         return;
     }
 
-    const std::string cteRaw = std::string(PathUtils::TrimAscii(DetailMedia100::MimeHeader(headers, "content-transfer-encoding")));
+    const std::string cteRaw = std::string(PathUtils::TrimAscii(DetailMediaAndScoreDoc::MimeHeader(headers, "content-transfer-encoding")));
     const std::string cte = PathUtils::ToLowerAscii(cteRaw);
-    const std::string cLoc = DetailMedia100::MimeHeader(headers, "content-location");
-    const std::string cId  = DetailMedia100::MimeHeader(headers, "content-id");
+    const std::string cLoc = DetailMediaAndScoreDoc::MimeHeader(headers, "content-location");
+    const std::string cId  = DetailMediaAndScoreDoc::MimeHeader(headers, "content-id");
 
     std::string decodedBytes;
     if (cte == "base64") {
@@ -78,16 +78,16 @@ inline void WalkMhtmlMime(const std::vector<std::pair<std::string, std::string>>
         ::Explorer2::Base64::Decode(body, bin, ::Explorer2::Base64::Mode::Lenient, 32u * 1024u * 1024u);
         decodedBytes.assign(reinterpret_cast<const char*>(bin.data()), bin.size());
     } else if (cte == "quoted-printable") {
-        decodedBytes = DetailMedia100::DecodeQuotedPrintable(body);
+        decodedBytes = DetailMediaAndScoreDoc::DecodeQuotedPrintable(body);
     } else {
         decodedBytes.assign(body.data(), body.size());
     }
 
     bool matchesStart = (!mp.startCid.empty() && !cId.empty() && cId == mp.startCid);
     if (media == "text/html" && (mp.primaryHtml.empty() || matchesStart)) {
-        std::string cs = PathUtils::WideToUtf8(DetailMedia100::MimeParam(ctype, "charset"));
+        std::string cs = PathUtils::WideToUtf8(DetailMediaAndScoreDoc::MimeParam(ctype, "charset"));
         if (cs.empty()) cs = DetectHtmlMetaCharset(decodedBytes);
-        mp.primaryHtml = DetailMedia100::DecodeCharsetText(decodedBytes, cs);
+        mp.primaryHtml = DetailMediaAndScoreDoc::DecodeCharsetText(decodedBytes, cs);
         if (depth > 0 && mp.resources.size() < 512) {
             std::string loc = !cLoc.empty() ? cLoc : (!cId.empty() ? cId : "(primary document)");
             mp.resources.push_back({ PathUtils::Utf8ToWide(loc), PathUtils::Utf8ToWide(media),
@@ -96,13 +96,13 @@ inline void WalkMhtmlMime(const std::vector<std::pair<std::string, std::string>>
         return;
     }
     if (media == "text/plain" && mp.fallbackPlain.empty()) {
-        std::string cs = PathUtils::WideToUtf8(DetailMedia100::MimeParam(ctype, "charset"));
-        mp.fallbackPlain = DetailMedia100::DecodeCharsetText(decodedBytes, cs);
+        std::string cs = PathUtils::WideToUtf8(DetailMediaAndScoreDoc::MimeParam(ctype, "charset"));
+        mp.fallbackPlain = DetailMediaAndScoreDoc::DecodeCharsetText(decodedBytes, cs);
     }
 
     if (mp.resources.size() < 512) {
         std::string loc = !cLoc.empty() ? cLoc : (!cId.empty() ? cId : "");
-        if (loc.empty()) loc = PathUtils::WideToUtf8(DetailMedia100::MimeParam(ctype, "name"));
+        if (loc.empty()) loc = PathUtils::WideToUtf8(DetailMediaAndScoreDoc::MimeParam(ctype, "name"));
         if (loc.empty()) loc = "(inline " + media + ")";
         mp.resources.push_back({
             PathUtils::Utf8ToWide(loc),
@@ -237,17 +237,17 @@ inline bool ParseMimeHtmlMht(const std::vector<uint8_t>& raw, const std::wstring
     std::string_view sv = ::Explorer2::Json::StripUtf8Bom(std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size()));
 
     std::string_view hdrBlock, bodyBlock;
-    DetailMedia100::SplitMimeEntity(sv, hdrBlock, bodyBlock);
-    auto headers = DetailMedia100::ParseMimeHeaders(hdrBlock);
+    DetailMediaAndScoreDoc::SplitMimeEntity(sv, hdrBlock, bodyBlock);
+    auto headers = DetailMediaAndScoreDoc::ParseMimeHeaders(hdrBlock);
     if (headers.empty()) return false;
 
-    const std::string mimeVer = DetailMedia100::MimeHeader(headers, "mime-version");
-    const std::string ctype   = DetailMedia100::MimeHeader(headers, "content-type");
-    const std::string snapLoc = DetailMedia100::MimeHeader(headers, "snapshot-content-location");
-    const std::string contLoc = DetailMedia100::MimeHeader(headers, "content-location");
-    const std::string fromHdr = DetailMedia100::MimeHeader(headers, "from");
-    const std::string subjHdr = DetailMedia100::MimeHeader(headers, "subject");
-    const std::string dateHdr = DetailMedia100::MimeHeader(headers, "date");
+    const std::string mimeVer = DetailMediaAndScoreDoc::MimeHeader(headers, "mime-version");
+    const std::string ctype   = DetailMediaAndScoreDoc::MimeHeader(headers, "content-type");
+    const std::string snapLoc = DetailMediaAndScoreDoc::MimeHeader(headers, "snapshot-content-location");
+    const std::string contLoc = DetailMediaAndScoreDoc::MimeHeader(headers, "content-location");
+    const std::string fromHdr = DetailMediaAndScoreDoc::MimeHeader(headers, "from");
+    const std::string subjHdr = DetailMediaAndScoreDoc::MimeHeader(headers, "subject");
+    const std::string dateHdr = DetailMediaAndScoreDoc::MimeHeader(headers, "date");
 
     std::string lowCtype = PathUtils::ToLowerAscii(ctype);
     if (mimeVer.empty() && lowCtype.find("multipart/") == std::string::npos &&
@@ -267,8 +267,8 @@ inline bool ParseMimeHtmlMht(const std::vector<uint8_t>& raw, const std::wstring
         out.paragraphs.push_back({ PathUtils::Trim(mp.fallbackPlain), 0, false, false });
     }
 
-    std::wstring subjW = DetailMedia100::DecodeRfc2047Header(subjHdr);
-    std::wstring fromW = DetailMedia100::DecodeRfc2047Header(fromHdr);
+    std::wstring subjW = DetailMediaAndScoreDoc::DecodeRfc2047Header(subjHdr);
+    std::wstring fromW = DetailMediaAndScoreDoc::DecodeRfc2047Header(fromHdr);
     std::wstring urlW  = PathUtils::Utf8ToWide(!snapLoc.empty() ? snapLoc : contLoc);
 
     SpreadsheetSheet sumSh;

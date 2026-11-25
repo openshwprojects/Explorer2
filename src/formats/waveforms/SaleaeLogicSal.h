@@ -5,7 +5,7 @@
 namespace Formats {
 
 inline bool ParseSaleaeLogicSalBoard(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
-    // #72. Saleae Logic 2 Capture (.sal — ZIP with optional meta.json + digital-<N>.bin & analog-<N>.bin "<SALEAE>")
+    // Saleae Logic 2 Capture (.sal — ZIP with optional meta.json + digital-<N>.bin & analog-<N>.bin "<SALEAE>")
     if (ext == L".sal") {
         if (size < 22 || data[0] != 'P' || data[1] != 'K') return false;
 
@@ -132,137 +132,60 @@ inline bool ParseSaleaeLogicSalBoard(const uint8_t* data, size_t size, const std
             std::vector<uint8_t> metaBytes;
             if (ZipDeflate::ExtractZipEntryFromMemory(data, size, metaEntryName.c_str(), metaBytes) && !metaBytes.empty()) {
                 std::string_view msv(reinterpret_cast<const char*>(metaBytes.data()), metaBytes.size());
+                Json::Value metaRoot;
+                if (Json::ParseDocument(msv, metaRoot)) {
+                    auto walkMetaJson = [&](auto& self, const Json::Value& node, int parentKind) -> void {
+                        if (node.IsObject()) {
+                            if (metaDigitalRateHz == 0ULL) {
+                                int64_t sr = node.GetInt64("digital", 0);
+                                if (sr <= 0) sr = node.GetInt64("sampleRate", 0);
+                                if (sr > 0) metaDigitalRateHz = static_cast<uint64_t>(sr);
+                            }
 
-                auto extractJsonStr = [](std::string_view obj, std::string_view key, std::string& outVal) -> bool {
-                    size_t pos = 0;
-                    while (pos < obj.size()) {
-                        size_t q = obj.find('"', pos);
-                        if (q == std::string_view::npos || q + key.size() + 1 >= obj.size()) return false;
-                        if (obj.substr(q + 1, key.size()) == key && obj[q + 1 + key.size()] == '"') {
-                            size_t p = q + 2 + key.size();
-                            while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
-                            if (p < obj.size() && obj[p] == ':') {
-                                ++p;
-                                while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
-                                if (p < obj.size() && obj[p] == '"') {
-                                    ++p;
-                                    std::string res;
-                                    while (p < obj.size() && obj[p] != '"') {
-                                        if (obj[p] == '\\' && p + 1 < obj.size()) ++p;
-                                        res.push_back(obj[p++]);
+                            const std::string nmStr = node.GetString("name");
+                            if (!nmStr.empty()) {
+                                const auto* chSub = node.Find("channel");
+                                const bool hasChObj = (chSub && chSub->IsObject());
+                                int64_t chIdx64 = node.GetInt64("index", -1);
+                                if (chIdx64 < 0) chIdx64 = node.GetInt64("deviceChannel", -1);
+                                if (chIdx64 < 0 && !hasChObj) chIdx64 = node.GetInt64("channel", -1);
+                                if (chIdx64 < 0 && hasChObj) {
+                                    chIdx64 = chSub->GetInt64("deviceChannel", -1);
+                                    if (chIdx64 < 0) chIdx64 = chSub->GetInt64("index", -1);
+                                    if (chIdx64 < 0) chIdx64 = chSub->GetInt64("channel", -1);
+                                }
+
+                                if (chIdx64 >= 0 && chIdx64 < 64) {
+                                    int kind = parentKind;
+                                    std::string typeStr = ReaderText::ToLowerAscii(node.GetString("type"));
+                                    if (typeStr.empty() && hasChObj) {
+                                        typeStr = ReaderText::ToLowerAscii(chSub->GetString("type"));
                                     }
-                                    outVal = std::move(res);
-                                    return true;
+                                    if (!typeStr.empty()) {
+                                        if (typeStr.find("analog") != std::string::npos || typeStr == "1") kind = 1;
+                                        else if (typeStr.find("digital") != std::string::npos || typeStr == "0") kind = 0;
+                                    }
+                                    const std::wstring wName = PathUtils::Utf8ToWide(nmStr);
+                                    if (kind == 0) digCustomNames[chIdx64] = wName;
+                                    else if (kind == 1) anaCustomNames[chIdx64] = wName;
+                                    else anyCustomNames[chIdx64] = wName;
                                 }
                             }
-                        }
-                        pos = q + 1;
-                    }
-                    return false;
-                };
 
-                auto extractJsonInt = [](std::string_view obj, std::string_view key, int64_t& outVal) -> bool {
-                    size_t pos = 0;
-                    while (pos < obj.size()) {
-                        size_t q = obj.find('"', pos);
-                        if (q == std::string_view::npos || q + key.size() + 1 >= obj.size()) return false;
-                        if (obj.substr(q + 1, key.size()) == key && obj[q + 1 + key.size()] == '"') {
-                            size_t p = q + 2 + key.size();
-                            while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
-                            if (p < obj.size() && obj[p] == ':') {
-                                ++p;
-                                while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\t' || obj[p] == '\r' || obj[p] == '\n')) ++p;
-                                if (p < obj.size() && ((obj[p] >= '0' && obj[p] <= '9') || obj[p] == '-')) {
-                                    bool neg = (obj[p] == '-');
-                                    if (neg) ++p;
-                                    if (p >= obj.size() || obj[p] < '0' || obj[p] > '9') return false;
-                                    int64_t v = 0;
-                                    while (p < obj.size() && obj[p] >= '0' && obj[p] <= '9') {
-                                        v = v * 10 + (obj[p++] - '0');
-                                    }
-                                    outVal = neg ? -v : v;
-                                    return true;
-                                }
+                            for (const auto& [k, v] : node.objVal) {
+                                int childKind = parentKind;
+                                const std::string kLow = ReaderText::ToLowerAscii(k);
+                                if (kLow.find("analog") != std::string::npos) childKind = 1;
+                                else if (kLow.find("digital") != std::string::npos) childKind = 0;
+                                self(self, v, childKind);
+                            }
+                        } else if (node.IsArray()) {
+                            for (const auto& elem : node.arrVal) {
+                                self(self, elem, parentKind);
                             }
                         }
-                        pos = q + 1;
-                    }
-                    return false;
-                };
-
-                int64_t srVal = 0;
-                if (extractJsonInt(msv, "digital", srVal) && srVal > 0) {
-                    metaDigitalRateHz = static_cast<uint64_t>(srVal);
-                } else if (extractJsonInt(msv, "sampleRate", srVal) && srVal > 0) {
-                    metaDigitalRateHz = static_cast<uint64_t>(srVal);
-                }
-
-                // Scan shallow JSON objects { ... } containing "name" + channel index
-                bool inQuote = false;
-                for (size_t i = 0; i < msv.size(); ++i) {
-                    char c = msv[i];
-                    if (c == '"' && (i == 0 || msv[i - 1] != '\\')) {
-                        inQuote = !inQuote;
-                        continue;
-                    }
-                    if (inQuote || c != '{') continue;
-
-                    int depth = 1;
-                    int nestedObjs = 0;
-                    bool qInner = false;
-                    size_t j = i + 1;
-                    for (; j < msv.size() && (j - i) <= 1024; ++j) {
-                        char cj = msv[j];
-                        if (cj == '"' && msv[j - 1] != '\\') {
-                            qInner = !qInner;
-                            continue;
-                        }
-                        if (qInner) continue;
-                        if (cj == '{') { ++depth; ++nestedObjs; }
-                        else if (cj == '}') {
-                            --depth;
-                            if (depth == 0) break;
-                        }
-                    }
-                    if (depth != 0 || nestedObjs > 1) continue;
-
-                    std::string_view obj = msv.substr(i, j - i + 1);
-                    std::string nmStr;
-                    if (!extractJsonStr(obj, "name", nmStr) || nmStr.empty()) continue;
-
-                    int64_t chIdx64 = -1;
-                    if (!extractJsonInt(obj, "index", chIdx64)) {
-                        if (!extractJsonInt(obj, "deviceChannel", chIdx64)) {
-                            extractJsonInt(obj, "channel", chIdx64);
-                        }
-                    }
-                    if (chIdx64 < 0 || chIdx64 >= 64) continue;
-
-                    int kind = -1; // 0 = digital, 1 = analog
-                    std::string typeStr;
-                    if (extractJsonStr(obj, "type", typeStr)) {
-                        for (char& tc : typeStr) {
-                            if (tc >= 'A' && tc <= 'Z') tc = static_cast<char>(tc + ('a' - 'A'));
-                        }
-                        if (typeStr.find("analog") != std::string::npos || typeStr == "1") kind = 1;
-                        else if (typeStr.find("digital") != std::string::npos || typeStr == "0") kind = 0;
-                    }
-                    if (kind < 0) {
-                        size_t ctxStart = (i > 200) ? (i - 200) : 0;
-                        std::string ctxLower(msv.substr(ctxStart, i - ctxStart));
-                        for (char& tc : ctxLower) {
-                            if (tc >= 'A' && tc <= 'Z') tc = static_cast<char>(tc + ('a' - 'A'));
-                        }
-                        size_t pAna = ctxLower.rfind("analog");
-                        size_t pDig = ctxLower.rfind("digital");
-                        if (pAna != std::string::npos && (pDig == std::string::npos || pAna > pDig)) kind = 1;
-                        else if (pDig != std::string::npos) kind = 0;
-                    }
-
-                    std::wstring wName = PathUtils::Utf8ToWide(nmStr);
-                    if (kind == 0) digCustomNames[chIdx64] = wName;
-                    else if (kind == 1) anaCustomNames[chIdx64] = wName;
-                    else anyCustomNames[chIdx64] = wName;
+                    };
+                    walkMetaJson(walkMetaJson, metaRoot, -1);
                 }
             }
         }
@@ -298,19 +221,19 @@ inline bool ParseSaleaeLogicSalBoard(const uint8_t* data, size_t size, const std
             if (!ZipDeflate::ExtractZipEntryFromMemory(data, size, df.entryName.c_str(), dig)) return false;
             if (dig.size() < 44u || std::memcmp(dig.data(), "<SALEAE>", 8) != 0) return false;
 
-            int32_t ver  = static_cast<int32_t>(DetailEda200::RdU32LE(dig.data() + 8));
-            int32_t type = static_cast<int32_t>(DetailEda200::RdU32LE(dig.data() + 12));
+            int32_t ver  = static_cast<int32_t>(DetailIndustrialAndWaveEda::RdU32LE(dig.data() + 8));
+            int32_t type = static_cast<int32_t>(DetailIndustrialAndWaveEda::RdU32LE(dig.data() + 12));
             if (type != 0 || (ver != 0 && ver != 1)) return false;
 
             auto tryParseChunkHeader = [&](size_t hdrOff, uint32_t& outInit, double& outBegin, double& outEnd, uint64_t& outTrans, size_t& outDataOff) -> bool {
                 if (hdrOff + 28u > dig.size()) return false;
-                uint32_t initRaw = DetailEda200::RdU32LE(dig.data() + hdrOff);
+                uint32_t initRaw = DetailIndustrialAndWaveEda::RdU32LE(dig.data() + hdrOff);
                 if (initRaw > 1u) return false;
                 double bt = 0.0, et = 0.0;
                 std::memcpy(&bt, dig.data() + hdrOff + 4u, 8);
                 std::memcpy(&et, dig.data() + hdrOff + 12u, 8);
                 if (!std::isfinite(bt) || !std::isfinite(et) || bt > et) return false;
-                uint64_t nt = DetailEda200::RdU64LE(dig.data() + hdrOff + 20u);
+                uint64_t nt = DetailIndustrialAndWaveEda::RdU64LE(dig.data() + hdrOff + 20u);
                 size_t dataOff = hdrOff + 28u;
                 if (nt > (dig.size() - dataOff) / 8u) return false;
                 outInit = initRaw;
@@ -332,7 +255,7 @@ inline bool ParseSaleaeLogicSalBoard(const uint8_t* data, size_t size, const std
                 // Version 1: either direct chunk header at +16 or uint64 numChunks at +16 followed by chunk header at +24
                 if (!tryParseChunkHeader(16u, initState, bTime, eTime, nTrans, transOff)) {
                     if (dig.size() < 52u) return false;
-                    uint64_t numChunks = DetailEda200::RdU64LE(dig.data() + 16u);
+                    uint64_t numChunks = DetailIndustrialAndWaveEda::RdU64LE(dig.data() + 16u);
                     if (numChunks == 0ULL || numChunks > 65536ULL) return false;
                     if (!tryParseChunkHeader(24u, initState, bTime, eTime, nTrans, transOff)) return false;
                 }
@@ -378,15 +301,15 @@ inline bool ParseSaleaeLogicSalBoard(const uint8_t* data, size_t size, const std
             if (!ZipDeflate::ExtractZipEntryFromMemory(data, size, af.entryName.c_str(), ana)) return false;
             if (ana.size() < 48u || std::memcmp(ana.data(), "<SALEAE>", 8) != 0) return false;
 
-            int32_t ver  = static_cast<int32_t>(DetailEda200::RdU32LE(ana.data() + 8));
-            int32_t type = static_cast<int32_t>(DetailEda200::RdU32LE(ana.data() + 12));
+            int32_t ver  = static_cast<int32_t>(DetailIndustrialAndWaveEda::RdU32LE(ana.data() + 8));
+            int32_t type = static_cast<int32_t>(DetailIndustrialAndWaveEda::RdU32LE(ana.data() + 12));
             if (type != 1 || (ver != 0 && ver != 1)) return false;
 
             double bTime = 0.0;
             std::memcpy(&bTime, ana.data() + 16u, 8);
-            uint64_t sRate = DetailEda200::RdU64LE(ana.data() + 24u);
-            uint64_t down  = DetailEda200::RdU64LE(ana.data() + 32u);
-            uint64_t nSamp = DetailEda200::RdU64LE(ana.data() + 40u);
+            uint64_t sRate = DetailIndustrialAndWaveEda::RdU64LE(ana.data() + 24u);
+            uint64_t down  = DetailIndustrialAndWaveEda::RdU64LE(ana.data() + 32u);
+            uint64_t nSamp = DetailIndustrialAndWaveEda::RdU64LE(ana.data() + 40u);
 
             if (!std::isfinite(bTime) || sRate == 0ULL || nSamp == 0ULL) return false;
             if (nSamp > (ana.size() - 48u) / 4u) return false;
@@ -474,7 +397,7 @@ inline bool ParseSaleaeLogicSalBoard(const uint8_t* data, size_t size, const std
                           std::to_wstring(digChannels.size()) + L"D, " +
                           std::to_wstring(anaChannels.size()) + L"A)";
 
-        DetailEda200::DrawGraticule(out, -40.0f, -24.0f, 80.0f, 48.0f, 16, 8);
+        DetailIndustrialAndWaveEda::DrawGraticule(out, -40.0f, -24.0f, 80.0f, 48.0f, 16, 8);
 
         std::wstring hdrSummary = L"Saleae Logic 2 (" + std::to_wstring(digChannels.size()) + L" digital, " +
                                   std::to_wstring(anaChannels.size()) + L" analog";
@@ -532,8 +455,12 @@ inline bool ParseSaleaeLogicSalBoard(const uint8_t* data, size_t size, const std
 
             out.labels.push_back({ -49.5f, centerY, 0.95f, EdaLayerId::TopSilk, ac.label });
 
-            wchar_t vRangeBuf[64] = {};
-            swprintf_s(vRangeBuf, L"[%.2f..%.2fV]", static_cast<double>(ac.vMin), static_cast<double>(ac.vMax));
+            wchar_t vRangeBuf[96] = {};
+            if (std::fabs(ac.vMin) >= 1e9f || std::fabs(ac.vMax) >= 1e9f)
+                std::swprintf(vRangeBuf, std::size(vRangeBuf), L"[%.3g..%.3gV]", static_cast<double>(ac.vMin), static_cast<double>(ac.vMax));
+            else
+                std::swprintf(vRangeBuf, std::size(vRangeBuf), L"[%.2f..%.2fV]", static_cast<double>(ac.vMin), static_cast<double>(ac.vMax));
+            vRangeBuf[std::size(vRangeBuf) - 1] = L'\0';
             out.labels.push_back({ 40.6f, centerY, 0.85f, EdaLayerId::TopSilk, vRangeBuf });
 
             const float vSpan = ac.vMax - ac.vMin;

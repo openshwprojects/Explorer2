@@ -2,11 +2,11 @@
 // VobSubMpegSub.h — DVD VobSub MPEG-2 PS SPU Binary Stream (.sub) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseVobSubSpu(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     // 1. VobSub Binary MPEG-2 PS (.sub starting with 0x000001BA)
-    if (raw.size() >= 14 && DetailSys100::RdU32BE(raw.data()) == 0x000001BAu) {
+    if (raw.size() >= 14 && DetailBinarySysDoc::RdU32BE(raw.data()) == 0x000001BAu) {
         SpreadsheetSheet spu;
         spu.name = L"VobSub_Packets";
         spu.rows.push_back({ L"#", L"Substream ID", L"PTS", L"PES Length" });
@@ -21,7 +21,7 @@ inline bool ParseVobSubSpu(const std::vector<uint8_t>& raw, ParsedOfficeDocument
                     pos += 14 + stuff;
                     continue;
                 }
-                uint16_t pesLen = DetailSys100::RdU16BE(raw.data() + pos + 4);
+                uint16_t pesLen = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 4);
                 if (code == 0xBD && pos + 9 <= raw.size() && pesLen >= 4) {
                     uint8_t flags2 = raw[pos + 7];
                     uint8_t hdrDataLen = raw[pos + 8];
@@ -38,7 +38,7 @@ inline bool ParseVobSubSpu(const std::vector<uint8_t>& raw, ParsedOfficeDocument
                     uint8_t subId = (subIdOff < raw.size()) ? raw[subIdOff] : 0;
                     spu.rows.push_back({
                         std::to_wstring(++pktIdx),
-                        DetailSys100::Hex32(subId),
+                        DetailBinarySysDoc::Hex32(subId),
                         FormatPts90kHz(pts),
                         std::to_wstring(pesLen)
                     });
@@ -61,10 +61,10 @@ inline bool ParseVobSubSpu(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     return false;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
 inline bool ParseVobSubSpuDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    return DetailMedia100::ParseVobSubSpu(raw, out);
+    return DetailMediaAndScoreDoc::ParseVobSubSpu(raw, out);
 }
 
 } // namespace Formats

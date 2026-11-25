@@ -2,19 +2,19 @@
 // FlStudioFlp.h — FL Studio Project (.flp) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseFlStudioFlp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 22 || std::memcmp(raw.data(), "FLhd", 4) != 0 ||
-        DetailSys100::RdU32LE(raw.data() + 4) != 6 || std::memcmp(raw.data() + 14, "FLdt", 4) != 0)
+        DetailBinarySysDoc::RdU32LE(raw.data() + 4) != 6 || std::memcmp(raw.data() + 14, "FLdt", 4) != 0)
     {
         return false;
     }
 
-    int16_t flpFormat = static_cast<int16_t>(DetailSys100::RdU16LE(raw.data() + 8));
-    uint16_t numChannels = DetailSys100::RdU16LE(raw.data() + 10);
-    uint16_t ppq = DetailSys100::RdU16LE(raw.data() + 12);
-    uint32_t dataLen = DetailSys100::RdU32LE(raw.data() + 18);
+    int16_t flpFormat = static_cast<int16_t>(DetailBinarySysDoc::RdU16LE(raw.data() + 8));
+    uint16_t numChannels = DetailBinarySysDoc::RdU16LE(raw.data() + 10);
+    uint16_t ppq = DetailBinarySysDoc::RdU16LE(raw.data() + 12);
+    uint32_t dataLen = DetailBinarySysDoc::RdU32LE(raw.data() + 18);
 
     size_t pos = 22;
     size_t end = std::min<size_t>(raw.size(), 22ULL + dataLen);
@@ -47,12 +47,12 @@ inline bool ParseFlStudioFlp(const std::vector<uint8_t>& raw, ParsedOfficeDocume
             pos += 1;
         } else if (ev < 128) {
             if (pos + 2 > end) break;
-            uint16_t w = DetailSys100::RdU16LE(raw.data() + pos);
+            uint16_t w = DetailBinarySysDoc::RdU16LE(raw.data() + pos);
             pos += 2;
             if (ev == 66 && tempoBpm == 0.0) tempoBpm = static_cast<double>(w);
         } else if (ev < 192) {
             if (pos + 4 > end) break;
-            uint32_t dw = DetailSys100::RdU32LE(raw.data() + pos);
+            uint32_t dw = DetailBinarySysDoc::RdU32LE(raw.data() + pos);
             pos += 4;
             if (ev == 156) tempoBpm = static_cast<double>(dw) / 1000.0;
         } else {
@@ -133,8 +133,8 @@ inline bool ParseFlStudioFlp(const std::vector<uint8_t>& raw, ParsedOfficeDocume
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseFlStudioFlpDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseFlStudioFlp(raw, out); }
+inline bool ParseFlStudioFlpDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseFlStudioFlp(raw, out); }
 
 } // namespace Formats

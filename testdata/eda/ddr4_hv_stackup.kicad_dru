@@ -1,0 +1,21 @@
+(version 1)
+
+# High-speed DDR4 90-ohm differential impedance & 400V HV creepage rules
+(rule "DDR4_DiffPair_90R"
+  (layer "F.Cu")
+  (constraint track_width (min 0.11mm) (opt 0.125mm) (max 0.16mm))
+  (constraint diff_pair_gap (min 0.14mm) (opt 0.15mm) (max 0.18mm))
+  (constraint skew (max 1.25mm))
+  (condition "A.NetClass == 'DDR4_DIFF'"))
+
+(rule "HV_Primary_Creepage"
+  (severity error)
+  (constraint clearance (min 2.5mm))
+  (constraint track_width (min 0.8mm) (opt 1.2mm))
+  (condition "A.HasNetclass('HV_400V')"))
+
+(rule "HDI_Laser_MicroVia"
+  (layer "In1.Cu")
+  (constraint via_diameter (min 0.25mm) (opt 0.30mm))
+  (constraint via_drill (min 0.10mm) (opt 0.12mm))
+  (condition "A.Type == 'Via'"))

@@ -8,17 +8,17 @@ namespace Formats {
 // ============================================================================
 inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 64 || raw[0] != 'M' || raw[1] != 'Z') return false;
-    const uint32_t peOff = DetailSys100::RdU32LE(raw.data() + 60);
+    const uint32_t peOff = DetailBinarySysDoc::RdU32LE(raw.data() + 60);
     if (peOff + 24 > raw.size() || std::memcmp(raw.data() + peOff, "PE\0\0", 4) != 0) return false;
 
     const uint8_t* coff = raw.data() + peOff + 4;
-    const uint16_t machine      = DetailSys100::RdU16LE(coff + 0);
-    const uint16_t numSections  = DetailSys100::RdU16LE(coff + 2);
-    const uint32_t timeStamp    = DetailSys100::RdU32LE(coff + 4);
-    const uint16_t optHdrSize   = DetailSys100::RdU16LE(coff + 16);
-    const uint16_t chars        = DetailSys100::RdU16LE(coff + 18);
+    const uint16_t machine      = DetailBinarySysDoc::RdU16LE(coff + 0);
+    const uint16_t numSections  = DetailBinarySysDoc::RdU16LE(coff + 2);
+    const uint32_t timeStamp    = DetailBinarySysDoc::RdU32LE(coff + 4);
+    const uint16_t optHdrSize   = DetailBinarySysDoc::RdU16LE(coff + 16);
+    const uint16_t chars        = DetailBinarySysDoc::RdU16LE(coff + 18);
 
-    std::wstring arch = L"Unknown (" + DetailSys100::Hex32(machine) + L")";
+    std::wstring arch = L"Unknown (" + DetailBinarySysDoc::Hex32(machine) + L")";
     if (machine == 0x8664) arch = L"x64 / AMD64 (0x8664)";
     else if (machine == 0x014C) arch = L"x86 / i386 (0x014C)";
     else if (machine == 0xAA64) arch = L"ARM64 / AArch64 (0xAA64)";
@@ -36,7 +36,7 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
     hdrSheet.rows.push_back({ L"Target Architecture", arch });
     hdrSheet.rows.push_back({ L"File Type", (chars & 0x2000) ? L"Dynamic-Link Library (DLL)" : L"Executable Image (EXE/SYS)" });
     hdrSheet.rows.push_back({ L"Section Count", std::to_wstring(numSections) });
-    hdrSheet.rows.push_back({ L"Compiler Timestamp", DetailSys100::FormatUnixTimeUtc(timeStamp) });
+    hdrSheet.rows.push_back({ L"Compiler Timestamp", DetailBinarySysDoc::FormatUnixTimeUtc(timeStamp) });
 
     bool isPe64 = false;
     uint32_t expRva = 0, expSize = 0;
@@ -44,14 +44,14 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
 
     const size_t optOff = peOff + 24;
     if (optHdrSize >= 24 && optOff + optHdrSize <= raw.size()) {
-        const uint16_t optMagic = DetailSys100::RdU16LE(raw.data() + optOff);
+        const uint16_t optMagic = DetailBinarySysDoc::RdU16LE(raw.data() + optOff);
         if (optMagic != 0x010B && optMagic != 0x020B && optMagic != 0x0107) return false;
         isPe64 = (optMagic == 0x020B);
-        const uint32_t entryRva = DetailSys100::RdU32LE(raw.data() + optOff + 16);
-        const uint64_t imgBase  = (isPe64 && optHdrSize >= 32) ? DetailSys100::RdU64LE(raw.data() + optOff + 24)
-                                                               : ((optHdrSize >= 32) ? DetailSys100::RdU32LE(raw.data() + optOff + 28) : 0);
-        const uint16_t subsys   = optHdrSize >= 70 ? DetailSys100::RdU16LE(raw.data() + optOff + 68) : 0;
-        const uint16_t dllChars = optHdrSize >= 72 ? DetailSys100::RdU16LE(raw.data() + optOff + 70) : 0;
+        const uint32_t entryRva = DetailBinarySysDoc::RdU32LE(raw.data() + optOff + 16);
+        const uint64_t imgBase  = (isPe64 && optHdrSize >= 32) ? DetailBinarySysDoc::RdU64LE(raw.data() + optOff + 24)
+                                                               : ((optHdrSize >= 32) ? DetailBinarySysDoc::RdU32LE(raw.data() + optOff + 28) : 0);
+        const uint16_t subsys   = optHdrSize >= 70 ? DetailBinarySysDoc::RdU16LE(raw.data() + optOff + 68) : 0;
+        const uint16_t dllChars = optHdrSize >= 72 ? DetailBinarySysDoc::RdU16LE(raw.data() + optOff + 70) : 0;
 
         std::wstring subsysName = std::to_wstring(subsys);
         switch (subsys) {
@@ -64,8 +64,8 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
         }
 
         hdrSheet.rows.push_back({ L"PE Format", isPe64 ? L"PE32+ (64-bit)" : L"PE32 (32-bit)" });
-        hdrSheet.rows.push_back({ L"Entry Point RVA", DetailSys100::Hex32(entryRva) });
-        hdrSheet.rows.push_back({ L"Image Base", DetailSys100::Hex64(imgBase) });
+        hdrSheet.rows.push_back({ L"Entry Point RVA", DetailBinarySysDoc::Hex32(entryRva) });
+        hdrSheet.rows.push_back({ L"Image Base", DetailBinarySysDoc::Hex64(imgBase) });
         hdrSheet.rows.push_back({ L"Subsystem", subsysName });
 
         std::wstring secFlags;
@@ -79,14 +79,14 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
         const size_t ddCountOff = isPe64 ? (optOff + 108) : (optOff + 92);
         const size_t ddTableOff = isPe64 ? (optOff + 112) : (optOff + 96);
         if (ddTableOff <= optOff + optHdrSize && ddCountOff + 4 <= raw.size()) {
-            const uint32_t numRva = std::min<uint32_t>(DetailSys100::RdU32LE(raw.data() + ddCountOff), 16u);
+            const uint32_t numRva = std::min<uint32_t>(DetailBinarySysDoc::RdU32LE(raw.data() + ddCountOff), 16u);
             if (numRva >= 1 && ddTableOff + 8 <= optOff + optHdrSize && ddTableOff + 8 <= raw.size()) {
-                expRva  = DetailSys100::RdU32LE(raw.data() + ddTableOff + 0);
-                expSize = DetailSys100::RdU32LE(raw.data() + ddTableOff + 4);
+                expRva  = DetailBinarySysDoc::RdU32LE(raw.data() + ddTableOff + 0);
+                expSize = DetailBinarySysDoc::RdU32LE(raw.data() + ddTableOff + 4);
             }
             if (numRva >= 2 && ddTableOff + 16 <= optOff + optHdrSize && ddTableOff + 16 <= raw.size()) {
-                impRva  = DetailSys100::RdU32LE(raw.data() + ddTableOff + 8);
-                impSize = DetailSys100::RdU32LE(raw.data() + ddTableOff + 12);
+                impRva  = DetailBinarySysDoc::RdU32LE(raw.data() + ddTableOff + 8);
+                impSize = DetailBinarySysDoc::RdU32LE(raw.data() + ddTableOff + 12);
             }
         }
     }
@@ -106,11 +106,11 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
             const uint8_t* s = raw.data() + secOff + static_cast<size_t>(i) * 40;
             PeSec ps;
             ps.name    = std::string(reinterpret_cast<const char*>(s), strnlen(reinterpret_cast<const char*>(s), 8));
-            ps.vsize   = DetailSys100::RdU32LE(s + 8);
-            ps.vaddr   = DetailSys100::RdU32LE(s + 12);
-            ps.rawSize = DetailSys100::RdU32LE(s + 16);
-            ps.rawPtr  = DetailSys100::RdU32LE(s + 20);
-            ps.flags   = DetailSys100::RdU32LE(s + 36);
+            ps.vsize   = DetailBinarySysDoc::RdU32LE(s + 8);
+            ps.vaddr   = DetailBinarySysDoc::RdU32LE(s + 12);
+            ps.rawSize = DetailBinarySysDoc::RdU32LE(s + 16);
+            ps.rawPtr  = DetailBinarySysDoc::RdU32LE(s + 20);
+            ps.flags   = DetailBinarySysDoc::RdU32LE(s + 36);
             if (ps.rawPtr > 0 && ps.rawPtr < minRawPtr) minRawPtr = ps.rawPtr;
             secs.push_back(ps);
 
@@ -121,9 +121,9 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
             if (ps.flags & 0x00000020u) perm += L" [CODE]";
             secSheet.rows.push_back({
                 PathUtils::Utf8ToWide(ps.name),
-                DetailSys100::Hex32(ps.vaddr),
+                DetailBinarySysDoc::Hex32(ps.vaddr),
                 PathUtils::FormatByteSize(ps.vsize),
-                DetailSys100::Hex32(ps.rawPtr),
+                DetailBinarySysDoc::Hex32(ps.rawPtr),
                 PathUtils::FormatByteSize(ps.rawSize),
                 perm
             });
@@ -156,14 +156,14 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
     if (impRva > 0) {
         size_t dOff = rvaToOff(impRva);
         for (size_t di = 0; di < 256 && dOff + 20 <= raw.size(); ++di, dOff += 20) {
-            const uint32_t origThunk = DetailSys100::RdU32LE(raw.data() + dOff + 0);
-            const uint32_t nameRva   = DetailSys100::RdU32LE(raw.data() + dOff + 12);
-            const uint32_t firstThk  = DetailSys100::RdU32LE(raw.data() + dOff + 16);
+            const uint32_t origThunk = DetailBinarySysDoc::RdU32LE(raw.data() + dOff + 0);
+            const uint32_t nameRva   = DetailBinarySysDoc::RdU32LE(raw.data() + dOff + 12);
+            const uint32_t firstThk  = DetailBinarySysDoc::RdU32LE(raw.data() + dOff + 16);
             if (origThunk == 0 && nameRva == 0 && firstThk == 0) break;
             if (impSize > 0 && di * 20 >= impSize) break;
 
             const size_t nameOff = rvaToOff(nameRva);
-            const std::string dllStr = DetailSys100::ReadCStrBounded(raw, nameOff, 256);
+            const std::string dllStr = DetailBinarySysDoc::ReadCStrBounded(raw, nameOff, 256);
             if (dllStr.empty()) continue;
             const std::wstring dllWide = PathUtils::Utf8ToWide(dllStr);
             ++importedDllCount;
@@ -174,8 +174,8 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
             bool anyInDll = false;
 
             for (size_t ti = 0; ti < 4096 && tOff + thunkSz <= raw.size() && impSheet.rows.size() <= 2000; ++ti, tOff += thunkSz) {
-                const uint64_t val = isPe64 ? DetailSys100::RdU64LE(raw.data() + tOff)
-                                            : DetailSys100::RdU32LE(raw.data() + tOff);
+                const uint64_t val = isPe64 ? DetailBinarySysDoc::RdU64LE(raw.data() + tOff)
+                                            : DetailBinarySysDoc::RdU32LE(raw.data() + tOff);
                 if (val == 0) break;
                 const bool byOrdinal = isPe64 ? ((val & (1ULL << 63)) != 0) : ((val & 0x80000000u) != 0);
                 if (byOrdinal) {
@@ -187,8 +187,8 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
                     const uint32_t hnRva = static_cast<uint32_t>(val & 0x7FFFFFFFu);
                     const size_t hnOff = rvaToOff(hnRva);
                     if (hnOff + 3 <= raw.size()) {
-                        const uint16_t hint = DetailSys100::RdU16LE(raw.data() + hnOff);
-                        const std::string fn = DetailSys100::ReadCStrBounded(raw, hnOff + 2, 256);
+                        const uint16_t hint = DetailBinarySysDoc::RdU16LE(raw.data() + hnOff);
+                        const std::string fn = DetailBinarySysDoc::ReadCStrBounded(raw, hnOff + 2, 256);
                         impSheet.rows.push_back({ dllWide, std::to_wstring(hint), PathUtils::Utf8ToWide(fn) });
                         ++importedSymCount;
                         anyInDll = true;
@@ -211,15 +211,15 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
     if (expRva > 0) {
         const size_t eOff = rvaToOff(expRva);
         if (eOff + 40 <= raw.size()) {
-            const uint32_t expNameRva   = DetailSys100::RdU32LE(raw.data() + eOff + 12);
-            const uint32_t ordBase      = DetailSys100::RdU32LE(raw.data() + eOff + 16);
-            const uint32_t numFuncs     = std::min<uint32_t>(DetailSys100::RdU32LE(raw.data() + eOff + 20), 16384u);
-            const uint32_t numNames     = std::min<uint32_t>(DetailSys100::RdU32LE(raw.data() + eOff + 24), 16384u);
-            const uint32_t funcsRva     = DetailSys100::RdU32LE(raw.data() + eOff + 28);
-            const uint32_t namesRva     = DetailSys100::RdU32LE(raw.data() + eOff + 32);
-            const uint32_t ordsRva      = DetailSys100::RdU32LE(raw.data() + eOff + 36);
+            const uint32_t expNameRva   = DetailBinarySysDoc::RdU32LE(raw.data() + eOff + 12);
+            const uint32_t ordBase      = DetailBinarySysDoc::RdU32LE(raw.data() + eOff + 16);
+            const uint32_t numFuncs     = std::min<uint32_t>(DetailBinarySysDoc::RdU32LE(raw.data() + eOff + 20), 16384u);
+            const uint32_t numNames     = std::min<uint32_t>(DetailBinarySysDoc::RdU32LE(raw.data() + eOff + 24), 16384u);
+            const uint32_t funcsRva     = DetailBinarySysDoc::RdU32LE(raw.data() + eOff + 28);
+            const uint32_t namesRva     = DetailBinarySysDoc::RdU32LE(raw.data() + eOff + 32);
+            const uint32_t ordsRva      = DetailBinarySysDoc::RdU32LE(raw.data() + eOff + 36);
 
-            const std::string modNameStr = DetailSys100::ReadCStrBounded(raw, rvaToOff(expNameRva), 256);
+            const std::string modNameStr = DetailBinarySysDoc::ReadCStrBounded(raw, rvaToOff(expNameRva), 256);
             const std::wstring modWide   = modNameStr.empty() ? L"(module)" : PathUtils::Utf8ToWide(modNameStr);
 
             const size_t funcsOff = rvaToOff(funcsRva);
@@ -231,18 +231,18 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
                 for (uint32_t i = 0; i < numNames && expSheet.rows.size() <= 2000; ++i) {
                     if (namesOff + static_cast<size_t>(i) * 4 + 4 > raw.size() ||
                         ordsOff + static_cast<size_t>(i) * 2 + 2 > raw.size()) break;
-                    const uint32_t fnRva  = DetailSys100::RdU32LE(raw.data() + namesOff + static_cast<size_t>(i) * 4);
-                    const uint16_t ordIdx = DetailSys100::RdU16LE(raw.data() + ordsOff + static_cast<size_t>(i) * 2);
-                    const std::string fnStr = DetailSys100::ReadCStrBounded(raw, rvaToOff(fnRva), 256);
+                    const uint32_t fnRva  = DetailBinarySysDoc::RdU32LE(raw.data() + namesOff + static_cast<size_t>(i) * 4);
+                    const uint16_t ordIdx = DetailBinarySysDoc::RdU16LE(raw.data() + ordsOff + static_cast<size_t>(i) * 2);
+                    const std::string fnStr = DetailBinarySysDoc::ReadCStrBounded(raw, rvaToOff(fnRva), 256);
 
                     uint32_t symRva = 0;
                     if (ordIdx < numFuncs && funcsOff + static_cast<size_t>(ordIdx) * 4 + 4 <= raw.size()) {
-                        symRva = DetailSys100::RdU32LE(raw.data() + funcsOff + static_cast<size_t>(ordIdx) * 4);
+                        symRva = DetailBinarySysDoc::RdU32LE(raw.data() + funcsOff + static_cast<size_t>(ordIdx) * 4);
                         covered[ordIdx] = 1;
                     }
-                    std::wstring targetStr = DetailSys100::Hex32(symRva);
+                    std::wstring targetStr = DetailBinarySysDoc::Hex32(symRva);
                     if (expSize > 0 && symRva >= expRva && symRva < expRva + expSize) {
-                        const std::string fwd = DetailSys100::ReadCStrBounded(raw, rvaToOff(symRva), 256);
+                        const std::string fwd = DetailBinarySysDoc::ReadCStrBounded(raw, rvaToOff(symRva), 256);
                         if (!fwd.empty()) targetStr = L"-> " + PathUtils::Utf8ToWide(fwd);
                     }
                     expSheet.rows.push_back({ modWide, std::to_wstring(ordBase + ordIdx), PathUtils::Utf8ToWide(fnStr), targetStr });
@@ -251,9 +251,9 @@ inline bool ParseWindowsPeBinary(const std::vector<uint8_t>& raw, ParsedOfficeDo
             }
             for (uint32_t fi = 0; fi < numFuncs && expSheet.rows.size() <= 2000; ++fi) {
                 if (covered[fi] || funcsOff + static_cast<size_t>(fi) * 4 + 4 > raw.size()) continue;
-                const uint32_t symRva = DetailSys100::RdU32LE(raw.data() + funcsOff + static_cast<size_t>(fi) * 4);
+                const uint32_t symRva = DetailBinarySysDoc::RdU32LE(raw.data() + funcsOff + static_cast<size_t>(fi) * 4);
                 if (symRva == 0) continue;
-                expSheet.rows.push_back({ modWide, std::to_wstring(ordBase + fi), L"(ordinal export)", DetailSys100::Hex32(symRva) });
+                expSheet.rows.push_back({ modWide, std::to_wstring(ordBase + fi), L"(ordinal export)", DetailBinarySysDoc::Hex32(symRva) });
                 ++exportedSymCount;
             }
         }

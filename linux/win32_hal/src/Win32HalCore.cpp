@@ -23,6 +23,7 @@
 #include <tlhelp32.h>
 
 #include "PathUtils.h"
+#include "LinuxStorage.h"
 #include "LinuxTrash.h"     // which trash an item goes to (the home one or its drive's own), shared with the app
 
 #include <algorithm>
@@ -978,21 +979,7 @@ std::mutex g_mountTableMutex;
 std::vector<HalMount> g_mountTable;
 ULONGLONG g_mountTableTick = 0;
 
-// /proc/self/mounts writes a space as \040, a tab as \011, a newline as \012 and a backslash as \134
-std::string DecodeMountField(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 3 < s.size() &&
-            s[i + 1] >= '0' && s[i + 1] <= '7' && s[i + 2] >= '0' && s[i + 2] <= '7' && s[i + 3] >= '0' && s[i + 3] <= '7') {
-            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
-            i += 3;
-        } else {
-            out.push_back(s[i]);
-        }
-    }
-    return out;
-}
+using Explorer2::LinuxStorage::DecodeMountField;
 
 // "/a/./b//c/../d" -> "/a/b/d", without asking the file system: a symbolic link on the way is not resolved,
 // because resolving one can wait for ever on a network mount that stopped answering
@@ -1019,12 +1006,7 @@ std::string NormalizeAbsolutePath(const std::string& p) {
 }
 
 UINT ClassifyMount(const HalMount& m) {
-    static const char* const kRemoteTypes[] = {
-        "cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs", "fuse.glusterfs", "davfs", "afs",
-        "ncpfs", "sshfs", "fuse.sshfs", "fuse.rclone", "fuse.gvfsd-fuse" };
-    for (const char* t : kRemoteTypes) {
-        if (m.fsType == t) return DRIVE_REMOTE;
-    }
+    if (Explorer2::LinuxStorage::IsRemoteNetworkFsType(m.fsType)) return DRIVE_REMOTE;
     if (m.fsType == "iso9660" || m.fsType == "udf") return DRIVE_CDROM;
     if (m.device.rfind("/dev/", 0) != 0) return DRIVE_FIXED;     // tmpfs, overlay, proc and other virtual file systems
     // /dev/mapper/... and /dev/disk/by-.../... are links to the device node (all of it lives in devtmpfs)

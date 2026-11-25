@@ -1,0 +1,73 @@
+xsi 0360txt 0032
+SI_FileInfo {
+    "ZeroEngine_ModSDK",
+    "Explorer2_ModdingEE",
+}
+SI_Model MDL-hovertank_root {
+    SI_Transform SRT-hovertank_root {
+        1.0, 1.0, 1.0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0,
+    }
+    SI_Mesh MSH-chassis {
+        SI_Shape SHP-chassis-ORG {
+            2,
+            "ORDERED",
+            8,
+            "POSITION",
+            -6.0, 0.0, -9.0,
+             6.0, 0.0, -9.0,
+             6.0, 3.0, -9.0,
+            -6.0, 3.0, -9.0,
+            -5.0, 0.0,  9.0,
+             5.0, 0.0,  9.0,
+             5.0, 2.5,  9.0,
+            -5.0, 2.5,  9.0,
+            1,
+            "NORMAL",
+            0.0, 1.0, 0.0,
+        }
+        SI_PolygonList PL-chassis {
+            6,
+            "NORMAL",
+            "mat_armor",
+            24,
+            4, 4, 4, 4, 4, 4,
+            0, 1, 2, 3,
+            4, 7, 6, 5,
+            0, 4, 5, 1,
+            1, 5, 6, 2,
+            2, 6, 7, 3,
+            3, 7, 4, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        }
+    }
+    SI_Model MDL-turret {
+        SI_Transform SRT-turret {
+            1.0, 1.0, 1.0,
+            0.0, 0.0, 0.0,
+            0.0, 3.0, 1.0,
+        }
+        SI_Mesh MSH-turret {
+            SI_Shape SHP-turret-ORG {
+                1,
+                "ORDERED",
+                4,
+                "POSITION",
+                -2.5, 0.0, -2.5,
+                 2.5, 0.0, -2.5,
+                 0.0, 0.0,  4.5,
+                 0.0, 3.5,  0.0,
+            }
+            SI_TriangleList TL-turret {
+                4,
+                "",
+                "mat_turret",
+                0, 1, 2,
+                0, 1, 3,
+                1, 2, 3,
+                2, 0, 3,
+            }
+        }
+    }
+}

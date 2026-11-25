@@ -2,7 +2,7 @@
 // ReaperRpp.h — REAPER DAW Project (.rpp) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseReaperRpp(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     std::string_view sv(reinterpret_cast<const char*>(raw.data()), raw.size());
@@ -138,8 +138,8 @@ inline bool ParseReaperRpp(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseReaperRppDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseReaperRpp(raw, out); }
+inline bool ParseReaperRppDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseReaperRpp(raw, out); }
 
 } // namespace Formats

@@ -1,238 +1,140 @@
 #pragma once
-// XilinxConstraintsXdc.h — Xilinx Vivado Timing & Ballout Constraints (.xdc) Reader
+// XilinxConstraintsXdc.h — Xilinx Vivado Design Constraints (.xdc) Reader
+// Uses shared TclTimingPinCommon.h (with backslash line continuations, BGA + numeric QFP pin support,
+// and SDC/XDC timing constraint diagram fallback) and FpgaPinConstraintsCommon.h.
 // NOTE: Included inside `namespace Explorer2` in src/EdaReaders.cpp. Do NOT add `#include` directives here.
 
 namespace Formats {
 
-inline bool ParseXilinxConstraintsXdcBoard(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
+inline bool ParseXilinxConstraintsXdcBoard(
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& ext,
+    ParsedEdaBoard& out)
+{
+    if (ext != L".xdc" || !data || size < 10 || size > (16u << 20)) return false;
+
     std::string_view sv(reinterpret_cast<const char*>(data), size);
-    if (ext == L".xdc") {
-        for (unsigned char c : sv) {
-            if (c == 0) return false;
-        }
-        // Validate balanced Tcl square/curly brackets so corrupt/truncated Tcl scripts fail cleanly
-        {
-            int sq = 0, cb = 0;
-            bool inQ = false;
-            for (size_t i = 0; i < sv.size(); ++i) {
-                char c = sv[i];
-                if (!inQ && c == '#') {
-                    while (i < sv.size() && sv[i] != '\n') ++i;
-                    continue;
-                }
-                if (c == '\\' && i + 1 < sv.size()) { ++i; continue; }
-                if (c == '"') { inQ = !inQ; continue; }
-                if (!inQ) {
-                    if (c == '[') ++sq;
-                    else if (c == ']') { if (--sq < 0) return false; }
-                    else if (c == '{') ++cb;
-                    else if (c == '}') { if (--cb < 0) return false; }
-                }
-            }
-            if (inQ || sq != 0 || cb != 0) return false;
-        }
+    std::vector<std::string> cmds;
+    if (!TclTimingPin::ExtractLogicalTclCommands(sv, cmds) || cmds.empty()) return false;
 
-        struct PinAssign { int row = 0, col = 0; std::wstring sig; std::wstring iostd; };
-        struct ClockSpec { std::wstring name; double periodNs = 10.0; };
-        struct IoDelaySpec { std::wstring port; double delayNs = 0.0; bool isOutput = false; };
+    std::vector<FpgaPinCommon::FpgaPinEntry> pins;
+    std::unordered_map<std::string, size_t> pinBySignal;
+    std::vector<TclTimingPin::TclClockDef> tclClocks;
+    std::vector<TclTimingPin::TclIoDelay> ioDelays;
+    std::vector<TclTimingPin::TclTimingException> exceptions;
+    size_t miscTiming = 0;
+    size_t recognizedCmds = 0;
 
-        std::vector<PinAssign> pins;
-        std::map<std::wstring, std::wstring> sigIoStd;
-        std::vector<ClockSpec> clocks;
-        std::vector<IoDelaySpec> ioDelays;
-        size_t exceptionCount = 0;
-        std::string partDevice;
-        int maxRow = 7, maxCol = 7;
+    auto ensurePin = [&](const std::string& sig) -> FpgaPinCommon::FpgaPinEntry& {
+        auto it = pinBySignal.find(sig);
+        if (it != pinBySignal.end()) return pins[it->second];
+        FpgaPinCommon::FpgaPinEntry pe;
+        pe.signal = sig;
+        if (ContainsTextCI(sig, "clk") || ContainsTextCI(sig, "clock")) pe.isClock = true;
+        pinBySignal.emplace(sig, pins.size());
+        pins.push_back(std::move(pe));
+        return pins.back();
+    };
 
-        size_t pos = 0;
-        while (pos < sv.size() && pins.size() < 2048) {
-            size_t eol = sv.find('\n', pos);
-            if (eol == std::string_view::npos) eol = sv.size();
-            std::string ln(sv.substr(pos, eol - pos));
-            pos = eol + 1;
-            size_t f = ln.find_first_not_of(" \t\r");
-            if (f == std::string::npos || ln[f] == '#') continue;
+    for (const auto& cmdStr : cmds) {
+        std::vector<std::string> toks;
+        TclTimingPin::TokenizeTclCommand(cmdStr, toks);
+        if (toks.empty()) continue;
 
-            auto extractFlagArg = [&](const char* flag) -> std::string {
-                size_t fp = ln.find(flag);
-                if (fp == std::string::npos) return {};
-                size_t s1 = ln.find_first_not_of(" \t\"", fp + std::strlen(flag));
-                if (s1 == std::string::npos) return {};
-                size_t s2 = ln.find_first_of(" \t\"\r]", s1);
-                return ln.substr(s1, (s2 == std::string::npos ? ln.size() : s2) - s1);
-            };
-            auto extractGetPorts = [&]() -> std::string {
-                size_t gp = ln.find("get_ports");
-                if (gp == std::string::npos) gp = ln.find("get_pins");
-                if (gp == std::string::npos) return {};
-                size_t s1 = ln.find_first_not_of(" \t{[\"", gp + 9);
-                size_t s2 = (s1 != std::string::npos) ? ln.find_first_of(" \t}]\"\r", s1) : std::string::npos;
-                return (s1 != std::string::npos) ? ln.substr(s1, (s2 == std::string::npos ? ln.size() : s2) - s1) : std::string{};
-            };
+        const std::string verb = TclTimingPin::LowerAscii(toks[0]);
+        if (verb == "set_property") {
+            ++recognizedCmds;
+            // Supports both `set_property PACKAGE_PIN A12 [get_ports clk]` AND
+            // `set_property -dict { PACKAGE_PIN A12 IOSTANDARD LVCMOS33 } [get_ports {clk}]`
+            std::string dictStr;
+            std::vector<std::string> targets;
+            if (!toks.empty()) TclTimingPin::ExtractTargetNamesFromArg(toks.back(), targets);
+            if (targets.empty()) continue;
 
-            if (ln.find("create_clock") != std::string::npos || ln.find("create_generated_clock") != std::string::npos) {
-                std::string clkNm = extractFlagArg("-name");
-                if (clkNm.empty()) clkNm = extractGetPorts();
-                if (clkNm.empty()) clkNm = "clk" + std::to_string(clocks.size() + 1);
-                double per = 10.0;
-                std::string perS = extractFlagArg("-period");
-                if (!perS.empty()) per = std::max(0.05, std::strtod(perS.c_str(), nullptr));
-                else {
-                    std::string divS = extractFlagArg("-divide_by");
-                    if (!divS.empty() && !clocks.empty()) per = clocks.front().periodNs * std::max(1, std::atoi(divS.c_str()));
-                }
-                clocks.push_back({ PathUtils::Utf8ToWide(clkNm), per });
-            } else if (ln.find("set_input_delay") != std::string::npos || ln.find("set_output_delay") != std::string::npos) {
-                bool isOut = (ln.find("set_output_delay") != std::string::npos);
-                std::string prt = extractGetPorts();
-                // Find numeric delay token (first standalone float/number not preceded by -clock)
-                double dly = 2.0;
-                for (size_t ti = 0; ti < ln.size(); ++ti) {
-                    if ((ln[ti] == '-' && ti + 1 < ln.size() && std::isdigit(static_cast<unsigned char>(ln[ti + 1]))) ||
-                        (std::isdigit(static_cast<unsigned char>(ln[ti])) && (ti == 0 || ln[ti - 1] == ' ' || ln[ti - 1] == '\t'))) {
-                        dly = std::strtod(ln.c_str() + ti, nullptr);
-                        break;
+            if (TclTimingPin::FindFlagValue(toks, "-dict", dictStr)) {
+                std::vector<std::string> kv;
+                TclTimingPin::TokenizeTclCommand(dictStr, kv);
+                for (size_t k = 0; k + 1 < kv.size(); k += 2) {
+                    const std::string prop = TclTimingPin::UpperAscii(kv[k]);
+                    const std::string& val = kv[k + 1];
+                    for (const auto& sig : targets) {
+                        auto& pe = ensurePin(sig);
+                        if (prop == "PACKAGE_PIN" || prop == "LOC") {
+                            std::string normSite;
+                            pe.site = TclTimingPin::NormalizePackagePinSite(val, normSite) ? normSite : val;
+                        } else if (prop == "IOSTANDARD") {
+                            pe.ioStd = val;
+                        } else if (prop == "PULLUP" && (ReaderText::AsciiEqCI(val, "true") || val == "1")) {
+                            pe.hasPullup = true;
+                        }
                     }
                 }
-                if (ioDelays.size() < 64) {
-                    ioDelays.push_back({ PathUtils::Utf8ToWide(prt.empty() ? "io" : prt), dly, isOut });
+            } else if (toks.size() >= 4) {
+                // Find first two non-flag positional args (`<prop> <value>`) before `[get_ports ...]`
+                std::vector<std::string> posArgs;
+                for (size_t i = 1; i + 1 < toks.size(); ++i) {
+                    if (!toks[i].empty() && toks[i][0] == '-') continue;
+                    posArgs.push_back(toks[i]);
                 }
-            } else if (ln.find("set_false_path") != std::string::npos ||
-                       ln.find("set_multicycle_path") != std::string::npos ||
-                       ln.find("set_clock_groups") != std::string::npos ||
-                       ln.find("set_max_delay") != std::string::npos) {
-                ++exceptionCount;
-            }
-
-            // Xilinx XDC IOSTANDARD
-            size_t ios = ln.find("IOSTANDARD");
-            if (ios != std::string::npos) {
-                size_t bs = ln.find_first_not_of(" \t", ios + 10);
-                size_t be = (bs != std::string::npos) ? ln.find_first_of(" \t]", bs) : std::string::npos;
-                std::string stdName = (bs != std::string::npos) ? ln.substr(bs, (be == std::string::npos ? ln.size() : be) - bs) : "";
-                std::string sig = extractGetPorts();
-                if (!sig.empty() && !stdName.empty()) sigIoStd[PathUtils::Utf8ToWide(sig)] = PathUtils::Utf8ToWide(stdName);
-            }
-
-            // Xilinx XDC: set_property PACKAGE_PIN <ball> [get_ports <sig>]
-            size_t pp = ln.find("PACKAGE_PIN");
-            if (pp != std::string::npos) {
-                size_t bs = ln.find_first_not_of(" \t", pp + 11);
-                size_t be = (bs != std::string::npos) ? ln.find_first_of(" \t]", bs) : std::string::npos;
-                int r = 0, c = 0;
-                if (bs != std::string::npos && DetailEda200::ParseBgaBallCoord(std::string_view(ln).substr(bs, (be == std::string::npos ? ln.size() : be) - bs), r, c)) {
-                    std::string sig = extractGetPorts();
-                    if (sig.empty()) sig = "IO";
-                    maxRow = std::max(maxRow, r); maxCol = std::max(maxCol, c);
-                    pins.push_back({ r, c, PathUtils::Utf8ToWide(sig), L"" });
-                }
-            }
-        }
-
-        if (pins.empty() && clocks.empty() && ioDelays.empty() && exceptionCount == 0) {
-            return false;
-        }
-
-        // Timing-only SDC/XDC diagram: render true period-scaled clock waveforms + I/O setup/hold budget bars!
-        if (pins.empty()) {
-            out.kind = EdaDocKind::KiCadSch;
-            out.formatTitle = (ext == L".xdc")
-                ? L"Xilinx Timing Constraints (.xdc — "
-                : L"Synopsys Design Timing Constraints (.sdc — ";
-            out.formatTitle += std::to_wstring(clocks.size()) + L" clocks, " + std::to_wstring(ioDelays.size()) + L" I/O delays)";
-
-            double maxPer = 1.0;
-            for (const auto& ck : clocks) maxPer = std::max(maxPer, ck.periodNs);
-            const float x0 = -30.0f, plotW = 80.0f;
-            float y = 24.0f;
-
-            for (size_t ci = 0; ci < clocks.size() && ci < 16; ++ci) {
-                const auto& ck = clocks[ci];
-                double freqMhz = 1000.0 / std::max(0.01, ck.periodNs);
-                wchar_t clkLbl[160] = {};
-                swprintf_s(clkLbl, L"%s (T=%.3g ns, %.1f MHz)", ck.name.c_str(), ck.periodNs, freqMhz);
-                out.labels.push_back({ -54.0f, y, 0.95f, EdaLayerId::SchLabel, clkLbl });
-
-                // Number of cycles across window proportional to maxPer / ck.periodNs
-                double cycles = std::clamp((maxPer * 3.0) / std::max(0.05, ck.periodNs), 1.5, 24.0);
-                float halfPeriodW = static_cast<float>(plotW / (cycles * 2.0));
-                float cx = x0;
-                bool high = true;
-                EdaLayerId lid = (ci & 1) ? EdaLayerId::TopCopper : EdaLayerId::SchWire;
-                while (cx < x0 + plotW - 0.05f) {
-                    float nx = std::min(x0 + plotW, cx + halfPeriodW);
-                    float yLvl = y + (high ? 2.0f : -2.0f);
-                    float yOpp = y + (high ? -2.0f : 2.0f);
-                    out.traces.push_back({ cx, yLvl, nx, yLvl, 0.28f, lid, static_cast<int>(ci + 1) });
-                    if (nx < x0 + plotW - 0.02f) {
-                        out.traces.push_back({ nx, yLvl, nx, yOpp, 0.26f, lid, static_cast<int>(ci + 1) });
+                if (posArgs.size() >= 2) {
+                    const std::string prop = TclTimingPin::UpperAscii(posArgs[0]);
+                    const std::string& val = posArgs[1];
+                    for (const auto& sig : targets) {
+                        auto& pe = ensurePin(sig);
+                        if (prop == "PACKAGE_PIN" || prop == "LOC") {
+                            std::string normSite;
+                            pe.site = TclTimingPin::NormalizePackagePinSite(val, normSite) ? normSite : val;
+                        } else if (prop == "IOSTANDARD") {
+                            pe.ioStd = val;
+                        } else if (prop == "PULLUP" && (ReaderText::AsciiEqCI(val, "true") || val == "1")) {
+                            pe.hasPullup = true;
+                        }
                     }
-                    cx = nx;
-                    high = !high;
                 }
-                y -= 6.5f;
             }
-
-            for (size_t di = 0; di < ioDelays.size() && di < 16; ++di) {
-                const auto& io = ioDelays[di];
-                float barFrac = std::clamp(static_cast<float>(std::fabs(io.delayNs) / std::max(1.0, maxPer)), 0.08f, 0.95f);
-                float bw = plotW * barFrac;
-                EdaLayerId lid = io.isOutput ? EdaLayerId::BottomCopper : EdaLayerId::InnerCopper;
-                DetailEda100::AddRectOutline(out, x0 + bw * 0.5f, y, bw, 3.0f, lid, 0.26f);
-                wchar_t dLbl[128] = {};
-                swprintf_s(dLbl, L"%s %s: %.2f ns", io.isOutput ? L"OUT" : L"IN", io.port.c_str(), io.delayNs);
-                out.labels.push_back({ -54.0f, y, 0.9f, EdaLayerId::SchLabel, dLbl });
-                y -= 5.2f;
-            }
-            if (exceptionCount > 0) {
-                out.labels.push_back({ x0, y, 0.95f, EdaLayerId::TopSilk,
-                    L"Timing Exceptions (false/multicycle/clock_groups): " + std::to_wstring(exceptionCount) });
-            }
-            out.netCount = std::max<size_t>(1, clocks.size() + ioDelays.size());
-            return !out.traces.empty() || !out.labels.empty();
+        } else if (TclTimingPin::TryConsumeTimingCommand(toks, tclClocks, ioDelays, exceptions, miscTiming)) {
+            ++recognizedCmds;
+        } else if (verb == "create_pblock" || verb == "add_cells_to_pblock" || verb == "resize_pblock" ||
+                   verb == "current_design" || verb == "set_Operating_conditions" || verb == "set") {
+            ++recognizedCmds;
         }
-
-        out.kind = EdaDocKind::KiCadPcb;
-        out.formatTitle = (ext == L".qsf") ? L"Intel Quartus FPGA Pinout & Settings (.qsf" :
-                          (ext == L".xdc") ? L"Xilinx Vivado FPGA Constraints & Ballout (.xdc" :
-                                             L"Synopsys Design Constraints (.sdc";
-        if (!partDevice.empty()) out.formatTitle += L" — " + PathUtils::Utf8ToWide(partDevice);
-        out.formatTitle += L")";
-
-        int gridR = std::clamp(maxRow + 1, 6, 32);
-        int gridC = std::clamp(maxCol + 1, 6, 32);
-        float pitch = 1.6f;
-        float pkgW = gridC * pitch + 4.0f, pkgH = gridR * pitch + 4.0f;
-        DetailEda100::AddRectOutline(out, 0.0f, 0.0f, pkgW, pkgH, EdaLayerId::EdgeCuts, 0.4f);
-
-        for (int r = 0; r < gridR; ++r) {
-            for (int c = 0; c < gridC; ++c) {
-                float bx = (c - (gridC - 1) * 0.5f) * pitch;
-                float by = ((gridR - 1) * 0.5f - r) * pitch;
-                out.circles.push_back({ bx, by, 0.42f, 0.12f, false, EdaLayerId::BottomSilk });
-            }
-        }
-        for (const auto& pa : pins) {
-            float bx = (pa.col - (gridC - 1) * 0.5f) * pitch;
-            float by = ((gridR - 1) * 0.5f - pa.row) * pitch;
-            auto itStd = sigIoStd.find(pa.sig);
-            std::wstring stdStr = (itStd != sigIoStd.end()) ? itStd->second : L"";
-            EdaLayerId lid = (stdStr.find(L"LVDS") != std::wstring::npos || stdStr.find(L"DIFF") != std::wstring::npos)
-                ? EdaLayerId::TopCopper : EdaLayerId::PadsThrough;
-            out.pads.push_back({ bx, by, 0.95f, 0.95f, 0.0f, 0.0f, 0, lid, pa.sig, stdStr });
-            out.labels.push_back({ bx, by, 0.65f, EdaLayerId::TopSilk, pa.sig });
-        }
-        EdaComponent3D fpgaDie;
-        fpgaDie.refDes = partDevice.empty() ? L"U1_FPGA" : PathUtils::Utf8ToWide(partDevice);
-        fpgaDie.footprint = L"FBGA";
-        fpgaDie.widthMm = pkgW * 0.45f; fpgaDie.lengthMm = pkgH * 0.45f; fpgaDie.heightMm = 1.8f;
-        fpgaDie.pinCount = static_cast<int>(pins.size());
-        fpgaDie.category = EdaPartCategory::IC_Package;
-        out.components.push_back(fpgaDie);
-        out.netCount = std::max<size_t>(1, pins.size() + clocks.size());
-        return true;
     }
-    return false;
+
+    if (recognizedCmds == 0) return false;
+
+    // Filter pins that actually received a physical site assignment (`PACKAGE_PIN` / `LOC`)
+    std::vector<FpgaPinCommon::FpgaPinEntry> assignedPins;
+    for (auto& pe : pins) {
+        if (!pe.site.empty()) {
+            for (const auto& ck : tclClocks) {
+                if (ck.targetPort == pe.signal || ck.name == pe.signal) pe.isClock = true;
+            }
+            assignedPins.push_back(std::move(pe));
+        }
+    }
+
+    if (!assignedPins.empty()) {
+        std::vector<FpgaPinCommon::FpgaClockSpec> clkSpecs;
+        for (const auto& ck : tclClocks) {
+            if (ck.periodNs > 0.0) clkSpecs.push_back({ ck.name, 1000.0 / ck.periodNs });
+        }
+        return FpgaPinCommon::EmitFpgaPinoutBoard(
+            L"Xilinx Vivado Design Constraints (.xdc)",
+            L"XILINX_VIVADO_PKG",
+            assignedPins,
+            clkSpecs,
+            out);
+    }
+
+    // Timing-only `.xdc` file (clocks / I/O delays / CDC exceptions without PACKAGE_PINs)
+    return TclTimingPin::RenderTimingDiagramBoard(
+        L"Xilinx Vivado Timing Constraints (.xdc)",
+        tclClocks,
+        ioDelays,
+        exceptions,
+        miscTiming,
+        out);
 }
 
 } // namespace Formats

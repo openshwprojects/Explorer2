@@ -2,7 +2,7 @@
 // DjVuDoc.h — AT&T DjVu Document (.djvu / .djv) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // ============================================================================
 // 11. AT&T DjVu Document (.djvu / .djv — EA IFF 85 AT&TFORM)
@@ -12,7 +12,7 @@ inline bool ParseDjVuDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     std::string rootType(reinterpret_cast<const char*>(raw.data() + 12), 4);
     if (rootType != "DJVU" && rootType != "DJVM" && rootType != "DJVI" && rootType != "THUM") return false;
 
-    uint32_t formSize = DetailSys100::RdU32BE(raw.data() + 8);
+    uint32_t formSize = DetailBinarySysDoc::RdU32BE(raw.data() + 8);
     uint16_t dirmFiles = 0;
     size_t pageCount = 0;
 
@@ -27,7 +27,7 @@ inline bool ParseDjVuDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocum
         size_t pos = start;
         while (pos + 8 <= limit && pos + 8 <= raw.size() && pages.rows.size() < 2048) {
             std::string cid(reinterpret_cast<const char*>(raw.data() + pos), 4);
-            uint32_t csz = DetailSys100::RdU32BE(raw.data() + pos + 4);
+            uint32_t csz = DetailBinarySysDoc::RdU32BE(raw.data() + pos + 4);
             size_t body = pos + 8;
             size_t bodyEnd = std::min<size_t>(raw.size(), std::min<size_t>(limit, body + csz));
             const uint8_t* p = raw.data() + body;
@@ -44,13 +44,13 @@ inline bool ParseDjVuDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocum
             } else {
                 std::wstring desc;
                 if (cid == "DIRM" && avail >= 3) {
-                    dirmFiles = DetailSys100::RdU16BE(p + 1);
+                    dirmFiles = DetailBinarySysDoc::RdU16BE(p + 1);
                     desc = ((p[0] & 0x80u) ? L"Bundled" : L"Indirect") + std::wstring(L", files=") + std::to_wstring(dirmFiles);
                 } else if (cid == "INFO" && avail >= 10) {
-                    uint16_t w = DetailSys100::RdU16BE(p);
-                    uint16_t h = DetailSys100::RdU16BE(p + 2);
+                    uint16_t w = DetailBinarySysDoc::RdU16BE(p);
+                    uint16_t h = DetailBinarySysDoc::RdU16BE(p + 2);
                     uint8_t minV = p[4], majV = p[5];
-                    uint16_t dpi = DetailSys100::RdU16LE(p + 6);
+                    uint16_t dpi = DetailBinarySysDoc::RdU16LE(p + 6);
                     uint8_t gamma = p[8];
                     if (pageCount == 0 && rootType == "DJVU") pageCount = 1;
                     wchar_t gbuf[128] = {};
@@ -112,8 +112,8 @@ inline bool ParseDjVuDocument(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseDjVuDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseDjVuDocument(raw, out); }
+inline bool ParseDjVuDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseDjVuDocument(raw, out); }
 
 } // namespace Formats

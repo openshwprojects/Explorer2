@@ -1,0 +1,30 @@
+// OpenGEX 2.0 Mech Turret Sample
+Metric (key = "up") { string { "z" } }
+GeometryNode $node_base {
+    Name { string { "TurretPod" } }
+    ObjectRef { ref { $geo_pod } }
+    Translation { float[3] { { 0.0, 0.0, 1.5 } } }
+}
+GeometryObject $geo_pod {
+    Mesh (primitive = "triangles") {
+        VertexArray (attrib = "position") {
+            float[3] {
+                { -1.2, -1.0, 0.0 },
+                {  1.2, -1.0, 0.0 },
+                {  1.2,  1.0, 0.0 },
+                { -1.2,  1.0, 0.0 },
+                {  0.0,  0.2, 1.8 }
+            }
+        }
+        IndexArray {
+            uint32[3] {
+                { 0, 2, 1 },
+                { 0, 3, 2 },
+                { 0, 1, 4 },
+                { 1, 2, 4 },
+                { 2, 3, 4 },
+                { 3, 0, 4 }
+            }
+        }
+    }
+}

@@ -6,7 +6,7 @@ namespace Formats {
 
 inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
     std::string_view sv(reinterpret_cast<const char*>(data), size);
-    // #64. IBIS Signal Integrity Model (.ibs — ANSI/EIA-656 v3.2–v7.2)
+    // IBIS Signal Integrity Model (.ibs — ANSI/EIA-656 v3.2–v7.2)
     if (ext == L".ibs") {
         for (size_t i = 0; i < size; ++i) {
             if (data[i] == 0) return false;
@@ -22,7 +22,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
         auto parseIbisVal = [](std::string_view tok, double& outV) -> bool {
             while (!tok.empty() && static_cast<unsigned char>(tok.front()) <= 0x20u) tok.remove_prefix(1);
             while (!tok.empty() && static_cast<unsigned char>(tok.back()) <= 0x20u) tok.remove_suffix(1);
-            if (tok.empty() || _strnicmp(tok.data(), "NA", 2) == 0) return false;
+            if (tok.empty() || ReaderText::StartsWithCI(tok, "NA")) return false;
             char buf[64] = {};
             std::memcpy(buf, tok.data(), std::min<size_t>(tok.size(), 63));
             char* ep = nullptr;
@@ -108,7 +108,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
             if (ln.front() == '[') {
                 size_t rb = ln.find(']');
                 if (rb == std::string_view::npos) continue;
-                std::string kw = DetailKiCadSymSesPos::LowerAsciiSymSes(ln.substr(1, rb - 1));
+                std::string kw = DetailBoardPlacementEda::LowerAsciiSymSes(ln.substr(1, rb - 1));
                 std::string_view arg = ln.substr(rb + 1);
                 while (!arg.empty() && static_cast<unsigned char>(arg.front()) <= 0x20u) arg.remove_prefix(1);
 
@@ -142,7 +142,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
             if (curSec == 1) {
                 splitWs(ln, toks);
                 if (toks.size() >= 2) {
-                    std::string k = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[0]);
+                    std::string k = DetailBoardPlacementEda::LowerAsciiSymSes(toks[0]);
                     double v = 0.0;
                     if (parseIbisVal(toks[1], v)) {
                         if (k == "r_pkg") { rPkg = v; hasPkgRlc = true; }
@@ -171,7 +171,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
                 if (eq != std::string_view::npos) normLn[eq] = ' ';
                 splitWs(normLn, toks);
                 if (toks.size() >= 2) {
-                    std::string k = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[0]);
+                    std::string k = DetailBoardPlacementEda::LowerAsciiSymSes(toks[0]);
                     double v = 0.0;
                     if (k == "model_type" && modelType.empty()) modelType = std::string(toks[1]);
                     else if (k == "vinl" && parseIbisVal(toks[1], v)) { vinl = v; hasThresh = true; }
@@ -183,8 +183,8 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
                 for (char& ch : normLn) if (ch == '=' || ch == '/') ch = ' ';
                 splitWs(normLn, toks);
                 if (toks.size() >= 3) {
-                    std::string k0 = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[0]);
-                    std::string k1 = DetailKiCadSymSesPos::LowerAsciiSymSes(toks[1]);
+                    std::string k0 = DetailBoardPlacementEda::LowerAsciiSymSes(toks[0]);
+                    std::string k1 = DetailBoardPlacementEda::LowerAsciiSymSes(toks[1]);
                     double dv = 0.0, dt = 0.0;
                     if (k0 == "dv" && parseIbisVal(toks[2], dv) && toks.size() >= 4 && parseIbisVal(toks[3], dt) && dt > 1e-15) {
                         if (k1 == "dt_r") { dvDtRise = (dv / dt) * 1e-9; hasRamp = true; }
@@ -235,7 +235,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
         out.labels.push_back({ -44.0f, plotY0 + plotH + 7.0f, 1.12f, EdaLayerId::SchLabel, title });
 
         if (showVi) {
-            DetailEda200::DrawGraticule(out, viX0, plotY0, viW, plotH, 8, 8);
+            DetailIndustrialAndWaveEda::DrawGraticule(out, viX0, plotY0, viW, plotH, 8, 8);
             double vMin = 1e300, vMax = -1e300, iMin = 1e300, iMax = -1e300;
             for (const auto& ct : curves) {
                 if (ct.isVt || ct.pts.size() < 2) continue;
@@ -268,7 +268,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
             int cIdx = 0;
             for (const auto& ct : curves) {
                 if (ct.isVt || ct.pts.size() < 2) continue;
-                std::string kl = DetailKiCadSymSesPos::LowerAsciiSymSes(ct.kind);
+                std::string kl = DetailBoardPlacementEda::LowerAsciiSymSes(ct.kind);
                 EdaLayerId lid = (kl == "pulldown") ? EdaLayerId::TopCopper
                                : (kl == "pullup")   ? EdaLayerId::BottomCopper
                                : (kl == "gnd clamp")? EdaLayerId::SchWire
@@ -284,20 +284,12 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
                         out.traces.push_back({ mapViX(p0.x), mapViY(p0.yMax), mapViX(p1.x), mapViY(p1.yMax), 0.14f, lid, cIdx + 1 });
                     }
                 }
-                EdaComponent3D mc;
-                mc.refDes = PathUtils::Utf8ToWide(ct.kind);
-                mc.value = std::to_wstring(ct.pts.size()) + L" V-I pts";
-                mc.footprint = L"IBIS_VI";
-                mc.x = mapViX(ct.pts[ct.pts.size() / 2].x);
-                mc.y = mapViY(ct.pts[ct.pts.size() / 2].yTyp);
-                mc.widthMm = 3.0f; mc.lengthMm = 2.0f;
-                out.components.push_back(std::move(mc));
                 ++cIdx;
             }
         }
 
         if (showVt) {
-            DetailEda200::DrawGraticule(out, vtX0, plotY0, vtW, plotH, 8, 8);
+            DetailIndustrialAndWaveEda::DrawGraticule(out, vtX0, plotY0, vtW, plotH, 8, 8);
             if (validVtCurves > 0) {
                 double tMin = 1e300, tMax = -1e300, vMin = 1e300, vMax = -1e300;
                 for (const auto& ct : curves) {
@@ -337,7 +329,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
                 int wIdx = 10;
                 for (const auto& ct : curves) {
                     if (!ct.isVt || ct.pts.size() < 2) continue;
-                    bool isRise = (DetailKiCadSymSesPos::LowerAsciiSymSes(ct.kind).find("rising") != std::string::npos);
+                    bool isRise = (DetailBoardPlacementEda::LowerAsciiSymSes(ct.kind).find("rising") != std::string::npos);
                     EdaLayerId lid = isRise ? EdaLayerId::SchWire : EdaLayerId::InnerCopper;
                     for (size_t i = 1; i < ct.pts.size(); ++i) {
                         const auto& p0 = ct.pts[i - 1];
@@ -350,14 +342,6 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
                             out.traces.push_back({ mapVtX(p0.x), mapVtY(p0.yMax), mapVtX(p1.x), mapVtY(p1.yMax), 0.14f, lid, wIdx });
                         }
                     }
-                    EdaComponent3D wc;
-                    wc.refDes = PathUtils::Utf8ToWide(ct.kind);
-                    wc.value = std::to_wstring(ct.pts.size()) + L" V-T pts";
-                    wc.footprint = L"IBIS_VT";
-                    wc.x = mapVtX(ct.pts[ct.pts.size() / 2].x);
-                    wc.y = mapVtY(ct.pts[ct.pts.size() / 2].yTyp);
-                    wc.widthMm = 3.0f; wc.lengthMm = 2.0f;
-                    out.components.push_back(std::move(wc));
                     ++wIdx;
                 }
             } else if (hasRamp) {
@@ -394,7 +378,7 @@ inline bool ParseIbisModelBoard(const uint8_t* data, size_t size, const std::wst
             const size_t nShowPins = std::min<size_t>(pins.size(), 24u);
             const float stripW = std::max(28.0f, static_cast<float>(nShowPins) * 3.4f + 4.0f);
             const float stripCx = 0.0f, stripCy = plotY0 - 8.5f, stripH = 5.5f;
-            DetailEda100::AddRectOutline(out, stripCx, stripCy, stripW, stripH, EdaLayerId::SchSymbol, 0.28f);
+            DetailSiliconAndBusEda::AddRectOutline(out, stripCx, stripCy, stripW, stripH, EdaLayerId::SchSymbol, 0.28f);
             float startX = stripCx - stripW * 0.5f + 2.8f;
             float pitch = (nShowPins > 1) ? ((stripW - 5.6f) / static_cast<float>(nShowPins - 1)) : 0.0f;
             for (size_t pi = 0; pi < nShowPins; ++pi) {

@@ -1,5 +1,5 @@
 #pragma once
-// AsicLef.h — #25 ASIC Library Exchange Format (.lef) v5.8 Macro, Pin Port (RECT/POLYGON/PATH), OBS & Tech Layer Parser
+// AsicLef.h — ASIC Library Exchange Format (.lef) v5.8 Macro, Pin Port (RECT/POLYGON/PATH), OBS & Tech Layer Parser
 
 namespace Formats {
 
@@ -83,7 +83,7 @@ inline void ScanLefMacrosForDef(std::string_view sv, std::unordered_map<std::str
             std::string_view tw = nextTok();
             std::string_view by = nextTok();
             std::string_view th = nextTok();
-            if (!tw.empty() && (_strnicmp(by.data(), "BY", 2) == 0) && !th.empty()) {
+            if (!tw.empty() && ReaderText::AsciiEqCI(by, "BY") && !th.empty()) {
                 float w = std::strtof(std::string(tw).c_str(), nullptr);
                 float h = std::strtof(std::string(th).c_str(), nullptr);
                 if (w > 0.01f && h > 0.01f) {
@@ -269,7 +269,7 @@ inline bool ParseAsicLefBoard(std::string_view sv, ParsedEdaBoard& out) {
                 std::string_view tw = nextTok();
                 std::string_view by = nextTok();
                 std::string_view th = nextTok();
-                if (parseFloatSv(tw, w) && (_strnicmp(by.data(), "BY", 2) == 0) && parseFloatSv(th, h) && w > 0.0f && h > 0.0f) {
+                if (parseFloatSv(tw, w) && ReaderText::AsciiEqCI(by, "BY") && parseFloatSv(th, h) && w > 0.0f && h > 0.0f) {
                     curMacro->w = w;
                     curMacro->h = h;
                     curMacro->hasSize = true;

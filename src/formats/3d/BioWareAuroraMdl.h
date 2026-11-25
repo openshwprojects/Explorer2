@@ -85,7 +85,7 @@ inline bool IsLikelyBioWareBinaryMdl(const uint8_t* data, size_t size) {
         if (namePtr[i] < 0x20 || namePtr[i] >= 0x7F) return false;
     }
     uint32_t rootNodeOff = BwU32(data + 12 + 40);
-    return rootNodeOff >= 80 && rootNodeOff + 80 <= rawSize;
+    return rootNodeOff >= 80 && static_cast<uint64_t>(rootNodeOff) + 80ULL <= rawSize;
 }
 
 inline bool IsLikelyBioWareAsciiMdl(std::string_view sv) {
@@ -115,7 +115,7 @@ inline bool ParseOdysseyBinaryMdlPair(
     const bool isKotor2 = (fp1 == 4285200u || fp1 == 4285872u || fp1 == 4216880u || fp1 == 4216816u);
 
     const uint32_t rootNodeOff = BwU32(base + 40);
-    if (rootNodeOff < 80 || rootNodeOff + 80 > rawSize) return false;
+    if (rootNodeOff < 80 || static_cast<uint64_t>(rootNodeOff) + 80ULL > rawSize) return false;
 
     // Animation count in Model Header (+80..+196): animArray offset(+88), count(+92) relative to base
     size_t animCount = 0;
@@ -133,7 +133,7 @@ inline bool ParseOdysseyBinaryMdlPair(
     {
         if (depth > 96 || visitedNodes.size() > 8192) return false;
         if (!visitedNodes.insert(nodeOff).second) return true;
-        if (nodeOff + 80 > rawSize) return false;
+        if (static_cast<uint64_t>(nodeOff) + 80ULL > rawSize) return false;
 
         const uint8_t* nh = base + nodeOff;
         uint16_t flags = BwU16(nh + 0);
@@ -185,7 +185,7 @@ inline bool ParseOdysseyBinaryMdlPair(
         if ((flags & 0x0020u) != 0 && (flags & 0x0400u) == 0) {
             const size_t tmSize = isKotor2 ? 340u : 332u;
             const size_t mOff   = isKotor2 ? 260u : 252u;
-            if (nodeOff + 80 + tmSize > rawSize) return false;
+            if (static_cast<uint64_t>(nodeOff) + 80ULL + tmSize > rawSize) return false;
             const uint8_t* tm = base + nodeOff + 80;
 
             uint32_t facesOff   = BwU32(tm + 8);
@@ -207,7 +207,7 @@ inline bool ParseOdysseyBinaryMdlPair(
 
                 // 1) Prefer interleaved companion .mdx vertex stream when present and valid
                 if (mdxData && mdxSize > 0 && mdxStride >= 12 && mdxStride <= 256 &&
-                    mdxPosOff != 0xFFFFFFFFu && mdxPosOff + 12 <= mdxStride &&
+                    mdxPosOff != 0xFFFFFFFFu && static_cast<uint64_t>(mdxPosOff) + 12ULL <= mdxStride &&
                     static_cast<uint64_t>(mdxDataOff) + static_cast<uint64_t>(vertCount) * mdxStride <= mdxSize)
                 {
                     for (uint16_t vi = 0; vi < vertCount; ++vi) {

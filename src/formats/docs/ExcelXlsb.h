@@ -22,105 +22,12 @@ using ::Explorer2::ByteIO::RdF64LE;
 using ::Explorer2::ByteIO::RdF64BE;
 
 
-inline std::wstring DecodeUtf16Span(const uint8_t* p, size_t charCount, bool bigEndian) {
-    std::wstring out;
-    out.reserve(std::min<size_t>(charCount, 65536u));
-    for (size_t i = 0; i < charCount; ++i) {
-        uint16_t u = bigEndian ? RdU16BE(p + i * 2u) : RdU16LE(p + i * 2u);
-        if (u == 0) break;
-        if (u >= 0xD800u && u <= 0xDBFFu && i + 1u < charCount) {
-            uint16_t lo = bigEndian ? RdU16BE(p + (i + 1u) * 2u) : RdU16LE(p + (i + 1u) * 2u);
-            if (lo >= 0xDC00u && lo <= 0xDFFFu) {
-                PathUtils::AppendUtf16(out, 0x10000u + (((static_cast<uint32_t>(u) - 0xD800u) << 10) | (lo - 0xDC00u)));
-                ++i;
-                continue;
-            }
-        }
-        PathUtils::AppendUtf16(out, u);
-    }
-    return out;
-}
+using ::Explorer2::ReaderText::DecodeUtf16Span;
+using ::Explorer2::ReaderText::CivilFromDays1970;
+using ::Explorer2::ReaderText::FormatUnixUtc;
 
-inline void CivilFromDays1970(int64_t z, int& outY, int& outM, int& outD) {
-    z += 719468LL;
-    const int64_t era = (z >= 0 ? z : z - 146096LL) / 146097LL;
-    const uint32_t doe = static_cast<uint32_t>(z - era * 146097LL);
-    const uint32_t yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
-    const int64_t y = static_cast<int64_t>(yoe) + era * 400LL;
-    const uint32_t doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
-    const uint32_t mp = (5u * doy + 2u) / 153u;
-    outD = static_cast<int>(doy - (153u * mp + 2u) / 5u + 1u);
-    outM = static_cast<int>((mp < 10u) ? (mp + 3u) : (mp - 9u));
-    outY = static_cast<int>(y + (outM <= 2 ? 1 : 0));
-}
-
-inline std::wstring FormatUnixUtc(int64_t unixSec) {
-    int64_t days = (unixSec >= 0) ? (unixSec / 86400LL) : ((unixSec - 86399LL) / 86400LL);
-    int64_t sod = unixSec - days * 86400LL;
-    int y = 1970, m = 1, d = 1;
-    CivilFromDays1970(days, y, m, d);
-    int hh = static_cast<int>(sod / 3600LL);
-    int mm = static_cast<int>((sod % 3600LL) / 60LL);
-    int ss = static_cast<int>(sod % 60LL);
-    wchar_t buf[64] = {};
-    swprintf_s(buf, L"%04d-%02d-%02d %02d:%02d:%02d UTC", y, m, d, hh, mm, ss);
-    return buf;
-}
-
-inline std::wstring NormalizeArchiveKey(std::wstring_view sv) {
-    std::wstring r;
-    r.reserve(sv.size());
-    for (wchar_t ch : sv) {
-        if (ch == L'\\') ch = L'/';
-        if (r.empty() && ch == L'/') continue;
-        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch + (L'a' - L'A'));
-        r.push_back(ch);
-    }
-    return r;
-}
-
-struct ZipPackageReader {
-    std::wstring filePath;
-    const uint8_t* memData = nullptr;
-    size_t memLen = 0;
-    bool fromDisk = false;
-    std::vector<ZipDeflate::ArchiveItemMeta> entries;
-
-    bool Open(const std::wstring& fullPath, const std::vector<uint8_t>& raw) {
-        entries.clear();
-        if (!fullPath.empty() && ZipDeflate::ListZipEntriesFromFile(fullPath, entries) && !entries.empty()) {
-            filePath = fullPath;
-            fromDisk = true;
-            return true;
-        }
-        if (!raw.empty() && ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries) && !entries.empty()) {
-            memData = raw.data();
-            memLen = raw.size();
-            fromDisk = false;
-            return true;
-        }
-        return false;
-    }
-
-    const ZipDeflate::ArchiveItemMeta* FindEntry(std::wstring_view wantNormPath) const {
-        std::wstring want = NormalizeArchiveKey(wantNormPath);
-        for (const auto& e : entries) {
-            if (!e.isDirectory && NormalizeArchiveKey(e.pathInArchive) == want) return &e;
-        }
-        return nullptr;
-    }
-
-    bool ExtractEntry(const ZipDeflate::ArchiveItemMeta& e, std::vector<uint8_t>& outBytes, size_t maxBytes = 64u * 1024u * 1024u) const {
-        outBytes.clear();
-        if (fromDisk) return ZipDeflate::ExtractZipEntryFromFile(filePath, e, outBytes, maxBytes);
-        return ZipDeflate::ExtractZipEntryFromMemory(memData, memLen, e, outBytes, maxBytes);
-    }
-
-    bool ExtractByPath(std::wstring_view wantPath, std::vector<uint8_t>& outBytes, size_t maxBytes = 64u * 1024u * 1024u) const {
-        const auto* e = FindEntry(wantPath);
-        return e ? ExtractEntry(*e, outBytes, maxBytes) : false;
-    }
-};
+inline std::wstring NormalizeArchiveKey(std::wstring_view sv) { return Formats::NormalizeZipArchiveKey(sv); }
+using ZipPackageReader = Formats::ZipPackageReader;
 
 enum class XlsbFmtKind : uint8_t { General, Date, Time, DateTime, Percent };
 

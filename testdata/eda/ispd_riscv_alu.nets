@@ -1,0 +1,50 @@
+UCLA nets 1.0
+
+NumNets : 12
+NumPins : 33
+
+NetDegree : 4   clk_net
+  pad_clk      O :  3.0  0.0
+  u_sram_rf    I : -19.0 -8.0
+  u_ff_y0      I : -5.0  0.0
+  u_ff_y1      I : -5.0  0.0
+NetDegree : 3   rst_net
+  pad_rst_n    O :  3.0  0.0
+  u_ff_y0      I :  0.0 -5.0
+  u_ff_y1      I :  0.0 -5.0
+NetDegree : 3   op_a0_net
+  pad_op_a0    O :  0.0  3.0
+  u_dec_0      I : -4.0  0.0
+  u_xor_0      I : -5.0  2.0
+NetDegree : 3   op_b0_net
+  pad_op_b0    O :  0.0  3.0
+  u_dec_1      I : -4.0  0.0
+  u_xor_1      I : -5.0  2.0
+NetDegree : 3   rf_rd_data0
+  u_sram_rf    O : -19.0  4.0
+  u_and_0      I :  4.0  0.0
+  u_mux_0      I :  5.0  0.0
+NetDegree : 3   mul_prod0
+  u_mul_mac    O :  0.0 -9.0
+  u_mux_1      I :  0.0  5.0
+  u_shf_0      I :  6.0  0.0
+NetDegree : 3   carry_chain0
+  u_xor_0      O :  5.0  0.0
+  u_carry_0    I : -6.0  0.0
+  u_carry_1    I : -6.0  0.0
+NetDegree : 3   alu_mux_bus0
+  u_carry_1    O :  6.0  0.0
+  u_or_0       O : -4.0  0.0
+  u_mux_0      I : -5.0  0.0
+NetDegree : 2   alu_reg_d0
+  u_mux_0      O :  0.0  5.0
+  u_ff_y0      I :  5.0  0.0
+NetDegree : 2   alu_reg_d1
+  u_mux_1      O :  0.0  5.0
+  u_ff_y1      I :  5.0  0.0
+NetDegree : 2   alu_out_y0
+  u_ff_y0      O :  5.0  2.0
+  pad_alu_y0   I : -3.0  0.0
+NetDegree : 2   zero_flag_net
+  u_cmp_z      O :  4.0  0.0
+  pad_zero_flg I : -3.0  0.0

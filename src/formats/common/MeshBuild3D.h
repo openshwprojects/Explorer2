@@ -57,6 +57,46 @@ inline void BsplineBasisFuns(int span, double u, int p, const std::vector<double
     }
 }
 
+// Evaluates all `n` Cox-de Boor B-spline basis values at parameter `t` over knot vector `U` (size >= n + deg + 1)
+inline void EvalNurbsBasisAll(int n, int deg, const std::vector<double>& U, double t, std::vector<double>& outB) {
+    outB.assign(static_cast<size_t>(n), 0.0);
+    const int order = deg + 1;
+    const double tMin = U[static_cast<size_t>(deg)];
+    const double tMax = U[static_cast<size_t>(n)];
+    if (t <= tMin) t = tMin;
+    if (t >= tMax) {
+        outB[static_cast<size_t>(n - 1)] = 1.0;
+        return;
+    }
+    int span = deg;
+    for (int i = deg; i < n; ++i) {
+        if (t >= U[static_cast<size_t>(i)] && t < U[static_cast<size_t>(i + 1)]) {
+            span = i;
+            break;
+        }
+    }
+    std::vector<double> N(static_cast<size_t>(order), 0.0);
+    std::vector<double> L(static_cast<size_t>(order), 0.0);
+    std::vector<double> R(static_cast<size_t>(order), 0.0);
+    N[0] = 1.0;
+    for (int j = 1; j <= deg; ++j) {
+        L[static_cast<size_t>(j)] = t - U[static_cast<size_t>(span + 1 - j)];
+        R[static_cast<size_t>(j)] = U[static_cast<size_t>(span + j)] - t;
+        double saved = 0.0;
+        for (int r = 0; r < j; ++r) {
+            const double denom = R[static_cast<size_t>(r + 1)] + L[static_cast<size_t>(j - r)];
+            const double tmp = (std::fabs(denom) > 1e-15) ? (N[static_cast<size_t>(r)] / denom) : 0.0;
+            N[static_cast<size_t>(r)] = saved + R[static_cast<size_t>(r + 1)] * tmp;
+            saved = L[static_cast<size_t>(j - r)] * tmp;
+        }
+        N[static_cast<size_t>(j)] = saved;
+    }
+    for (int j = 0; j <= deg; ++j) {
+        const int idx = span - deg + j;
+        if (idx >= 0 && idx < n) outB[static_cast<size_t>(idx)] = N[static_cast<size_t>(j)];
+    }
+}
+
 // Thin triangular prism from a to b (half-width `rad`) so line-only data (edges, polylines, wire frames)
 // shows up in the triangle renderer. Degenerate segments add nothing.
 inline void EmitEdgeStrut(LoadedMesh3D& mesh, const Vec3f& a, const Vec3f& b, float rad) {
@@ -313,7 +353,67 @@ inline void EmitPlanarPolygon(LoadedMesh3D& mesh, const std::vector<Vec3f>& oute
     EarClip2DWithHoles(outer2D, outerIdx, holes2D, holesIdx, reverse, mesh.tris);
 }
 
+inline void AppendOctahedralBonePrism(
+    std::vector<Vec3f>& verts,
+    std::vector<MeshTriangle>& tris,
+    const Vec3f& p0,
+    const Vec3f& p1,
+    float halfWidthRatio = 0.12f,
+    float minHalfW = 1e-4f)
+{
+    Vec3f d = { p1.x - p0.x, p1.y - p0.y, p1.z - p0.z };
+    float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    if (!std::isfinite(len) || len < 1e-5f) return;
+
+    Vec3f ax = { d.x / len, d.y / len, d.z / len };
+    Vec3f ref = (std::fabs(ax.y) < 0.9f) ? Vec3f{ 0.0f, 1.0f, 0.0f } : Vec3f{ 1.0f, 0.0f, 0.0f };
+    Vec3f u = {
+        ax.y * ref.z - ax.z * ref.y,
+        ax.z * ref.x - ax.x * ref.z,
+        ax.x * ref.y - ax.y * ref.x
+    };
+    float uLen = std::sqrt(u.x * u.x + u.y * u.y + u.z * u.z);
+    if (uLen < 1e-6f) return;
+    u = { u.x / uLen, u.y / uLen, u.z / uLen };
+    Vec3f v = {
+        ax.y * u.z - ax.z * u.y,
+        ax.z * u.x - ax.x * u.z,
+        ax.x * u.y - ax.y * u.x
+    };
+
+    Vec3f mid = { p0.x + d.x * 0.28f, p0.y + d.y * 0.28f, p0.z + d.z * 0.28f };
+    float hw = std::max(len * halfWidthRatio, minHalfW);
+
+    uint32_t b = static_cast<uint32_t>(verts.size());
+    verts.push_back(p0);
+    verts.push_back(p1);
+    verts.push_back({ mid.x + u.x * hw, mid.y + u.y * hw, mid.z + u.z * hw });
+    verts.push_back({ mid.x + v.x * hw, mid.y + v.y * hw, mid.z + v.z * hw });
+    verts.push_back({ mid.x - u.x * hw, mid.y - u.y * hw, mid.z - u.z * hw });
+    verts.push_back({ mid.x - v.x * hw, mid.y - v.y * hw, mid.z - v.z * hw });
+
+    tris.push_back({ b + 0, b + 3, b + 2, {} });
+    tris.push_back({ b + 0, b + 4, b + 3, {} });
+    tris.push_back({ b + 0, b + 5, b + 4, {} });
+    tris.push_back({ b + 0, b + 2, b + 5, {} });
+    tris.push_back({ b + 2, b + 3, b + 1, {} });
+    tris.push_back({ b + 3, b + 4, b + 1, {} });
+    tris.push_back({ b + 4, b + 5, b + 1, {} });
+    tris.push_back({ b + 5, b + 2, b + 1, {} });
+}
+
+inline void AppendOctahedralBonePrism(
+    LoadedMesh3D& mesh,
+    const Vec3f& p0,
+    const Vec3f& p1,
+    float halfWidthRatio = 0.12f,
+    float minHalfW = 1e-4f)
+{
+    AppendOctahedralBonePrism(mesh.vertices, mesh.tris, p0, p1, halfWidthRatio, minHalfW);
+}
+
 inline void FinalizeMeshBoundsAndNormals(LoadedMesh3D& mesh) {
+    if (mesh.loadedOk) return;
     mesh.rawVertexCount = mesh.vertices.size();
     mesh.rawTriangleCount = mesh.tris.size();
     if (mesh.vertices.empty() || mesh.tris.empty()) return;

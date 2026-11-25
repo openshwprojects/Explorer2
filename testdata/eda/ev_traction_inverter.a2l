@@ -1,0 +1,43 @@
+/* TriCore TC387 Traction Inverter ECU XCP Calibration Database */
+ASAP2_VERSION 1 71
+/begin PROJECT EV_TRACTION_INV "800V SiC Traction Inverter Control"
+  /begin HEADER "Release 2026.11" VERSION "V4.2" /end HEADER
+  /begin MODULE TC387_FOC "Field Oriented Control Core0"
+    /begin MOD_PAR "Aurora Calibration Flash + DSPR0"
+      /begin MEMORY_SEGMENT CAL_FLASH "Calibration Flash" DATA FLASH INTERN 0x80180000 0x00010000 -1 -1 -1 -1 -1 /end MEMORY_SEGMENT
+      /begin MEMORY_SEGMENT DSPR0_RAM "Core0 Fast RAM" VARIABLES RAM INTERN 0x70000000 0x0003C000 -1 -1 -1 -1 -1 /end MEMORY_SEGMENT
+    /end MOD_PAR
+
+    /begin COMPU_METHOD CM_RPM "Speed RPM" LINEAR "%6.1" "rpm"
+      COEFFS_LINEAR 0.25 0.0
+    /end COMPU_METHOD
+    /begin COMPU_METHOD CM_NM "Torque Nm" LINEAR "%6.2" "Nm"
+      COEFFS_LINEAR 0.1 -500.0
+    /end COMPU_METHOD
+
+    /begin AXIS_PTS AX_RPM_BP "Rotor speed breakpoints"
+      0x80180100 N_RotorSpeed REC_U16 0.0 CM_RPM 16 0.0 18000.0
+    /end AXIS_PTS
+
+    /begin CHARACTERISTIC K_DeadTimeNs "SiC Gate Deadtime"
+      VALUE 0x80180010 Scalar_U16 0.0 NO_COMPU_METHOD 150.0 1200.0
+    /end CHARACTERISTIC
+
+    /begin CHARACTERISTIC M_IqMaxMap "Peak Q-Axis Torque Map"
+      MAP 0x80180400 Map_I16 0.0 CM_NM -450.0 450.0
+      /begin AXIS_DESCR COM_AXIS N_RotorSpeed CM_RPM 16 0.0 18000.0
+        AXIS_PTS_REF AX_RPM_BP
+      /end AXIS_DESCR
+    /end CHARACTERISTIC
+
+    /begin MEASUREMENT N_RotorSpeed "Measured Resolver Speed"
+      UWORD CM_RPM 1 0.0 0.0 18000.0
+      ECU_ADDRESS 0x70001020
+    /end MEASUREMENT
+
+    /begin MEASUREMENT Tq_EstAirgap "Estimated Electromagnetic Torque"
+      FLOAT32_IEEE CM_NM 1 0.0 -450.0 450.0
+      ECU_ADDRESS 0x70001024
+    /end MEASUREMENT
+  /end MODULE
+/end PROJECT

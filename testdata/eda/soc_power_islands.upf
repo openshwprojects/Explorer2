@@ -1,0 +1,50 @@
+# IEEE 1801-2018 Low-Power Intent for Heterogeneous Edge AI SoC
+upf_version 2.1
+set_design_top edge_ai_soc_top
+
+create_supply_port VDD_AON -direction in
+create_supply_port VDD_CPU -direction in
+create_supply_port VDD_NPU -direction in
+create_supply_port VSS     -direction in
+
+create_supply_net VDD_AON
+create_supply_net VDD_CPU
+create_supply_net VDD_CPU_SW
+create_supply_net VDD_NPU
+create_supply_net VDD_NPU_SW
+create_supply_net VSS
+
+create_power_domain PD_TOP -include_scope \
+    -elements {u_pmu u_always_on_rtc}
+set_domain_supply_net PD_TOP -primary_power_net VDD_AON -primary_ground_net VSS
+
+create_power_domain PD_CPU \
+    -elements {u_riscv_cluster u_l2_sram}
+set_domain_supply_net PD_CPU -primary_power_net VDD_CPU_SW -primary_ground_net VSS
+
+create_power_domain PD_NPU \
+    -elements {u_systolic_mac u_weight_buf}
+set_domain_supply_net PD_NPU -primary_power_net VDD_NPU_SW -primary_ground_net VSS
+
+create_power_switch psw_cpu_hdr \
+    -domain PD_CPU \
+    -input_supply_port {vin VDD_CPU} \
+    -output_supply_port {vout VDD_CPU_SW} \
+    -control_port {sleep_en u_pmu/cpu_pwr_en}
+
+create_power_switch psw_npu_hdr \
+    -domain PD_NPU \
+    -input_supply_port {vin VDD_NPU} \
+    -output_supply_port {vout VDD_NPU_SW} \
+    -control_port {sleep_en u_pmu/npu_pwr_en}
+
+set_isolation iso_cpu_out -domain PD_CPU -isolation_power_net VDD_AON -clamp_value 0 -applies_to outputs
+set_level_shifter ls_cpu_to_top -domain PD_CPU -applies_to outputs -rule low_to_high
+set_retention ret_cpu_state -domain PD_CPU -retention_power_net VDD_AON
+
+set_isolation iso_npu_out -domain PD_NPU -isolation_power_net VDD_AON -clamp_value 0 -applies_to outputs
+
+create_pst soc_pst -supplies {VDD_AON VDD_CPU_SW VDD_NPU_SW}
+add_pst_state FULL_TURBO    -pst soc_pst -state {0.90V 0.85V 0.80V}
+add_pst_state NPU_GATED     -pst soc_pst -state {0.90V 0.85V OFF}
+add_pst_state CPU_RETENTION -pst soc_pst -state {0.90V OFF   OFF}

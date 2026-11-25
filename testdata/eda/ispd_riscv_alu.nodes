@@ -1,0 +1,28 @@
+UCLA nodes 1.0
+# 14 standard cells + 2 fixed macros + 6 perimeter I/O pads
+
+NumNodes :      22
+NumTerminals :   8
+
+u_sram_rf      38   28   terminal
+u_mul_mac      26   18   terminal
+pad_clk         6    6   terminal
+pad_rst_n       6    6   terminal
+pad_op_a0       6    6   terminal
+pad_op_b0       6    6   terminal
+pad_alu_y0      6    6   terminal
+pad_zero_flg    6    6   terminal
+u_dec_0         8   10
+u_dec_1         8   10
+u_xor_0        10   10
+u_xor_1        10   10
+u_and_0         8   10
+u_or_0          8   10
+u_carry_0      12   10
+u_carry_1      12   10
+u_mux_0        10   10
+u_mux_1        10   10
+u_shf_0        12   10
+u_ff_y0        10   10
+u_ff_y1        10   10
+u_cmp_z         8   10

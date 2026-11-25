@@ -6,14 +6,14 @@ namespace Formats {
 inline bool ParseLibPcapDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 24) return false;
 
-    const uint32_t magicLE = DetailSys100::RdU32LE(raw.data());
+    const uint32_t magicLE = DetailBinarySysDoc::RdU32LE(raw.data());
 
     // Branch B: Classic libpcap (.pcap)
     const bool pcapLE = (magicLE == 0xA1B2C3D4u || magicLE == 0xA1B23C4Du);
     const bool pcapBE = (magicLE == 0xD4C3B2A1u || magicLE == 0x4D3CB2A1u);
     if (!pcapLE && !pcapBE) return false;
 
-    auto rd32 = [&](size_t o) -> uint32_t { return pcapBE ? DetailSys100::RdU32BE(raw.data() + o) : DetailSys100::RdU32LE(raw.data() + o); };
+    auto rd32 = [&](size_t o) -> uint32_t { return pcapBE ? DetailBinarySysDoc::RdU32BE(raw.data() + o) : DetailBinarySysDoc::RdU32LE(raw.data() + o); };
     const uint16_t linkType = static_cast<uint16_t>(rd32(20) & 0xFFFFu);
 
     SpreadsheetSheet pktSh;

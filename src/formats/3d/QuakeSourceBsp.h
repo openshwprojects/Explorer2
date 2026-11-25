@@ -180,14 +180,179 @@ inline bool ParseBspLevelMesh(const uint8_t* data, size_t size, LoadedMesh3D& me
         }
     }
 
-    // 3. Valve Source Engine "VBSP" (v19, v20, v21)
+    // 3. Valve Source Engine "VBSP" (v17–v25, with LZMA lump decompression & LUMP_DISPINFO terrain grids)
     if (std::memcmp(data, "VBSP", 4) == 0 && size >= 8 + 64 * 16) {
         int32_t ver = RdI32LE(data + 4);
         if (ver < 17 || ver > 25) return false;
-        auto lOff = [&](int l) { return static_cast<size_t>(RdU32LE(data + 8 + l * 16)); };
-        auto lLen = [&](int l) { return static_cast<size_t>(RdU32LE(data + 8 + l * 16 + 4)); };
-        return emitSurfEdgeBsp(lOff(3), lLen(3), lOff(12), lLen(12), lOff(13), lLen(13),
-                               lOff(7), lLen(7), 56u, 4u, 8u, L"Valve Source Engine VBSP Map (.bsp)");
+
+        // Detect standard lump_t (fileofs@+0, filelen@+4) vs L4D2/Portal2 lump_t (version@+0, fileofs@+4, filelen@+8)
+        bool l4d2Order = false;
+        {
+            uint32_t stdOfs3 = RdU32LE(data + 8 + 3 * 16 + 0);
+            uint32_t stdLen3 = RdU32LE(data + 8 + 3 * 16 + 4);
+            uint32_t altVer3 = RdU32LE(data + 8 + 3 * 16 + 0);
+            uint32_t altOfs3 = RdU32LE(data + 8 + 3 * 16 + 4);
+            uint32_t altLen3 = RdU32LE(data + 8 + 3 * 16 + 8);
+            bool stdOk = (stdLen3 > 0 && stdOfs3 >= 1032u && static_cast<uint64_t>(stdOfs3) + stdLen3 <= size);
+            bool altOk = (altVer3 <= 8u && altLen3 > 0 && altOfs3 >= 1032u && static_cast<uint64_t>(altOfs3) + altLen3 <= size);
+            if (!stdOk && altOk) l4d2Order = true;
+        }
+
+        auto getVbspLump = [&](int l, std::vector<uint8_t>& decoded) -> std::pair<const uint8_t*, size_t> {
+            const uint8_t* lh = data + 8 + l * 16;
+            size_t off = static_cast<size_t>(RdU32LE(lh + (l4d2Order ? 4 : 0)));
+            size_t len = static_cast<size_t>(RdU32LE(lh + (l4d2Order ? 8 : 4)));
+            if (len == 0 || off > size || len > size - off) return { nullptr, 0 };
+            const uint8_t* raw = data + off;
+            if (len >= 17u && std::memcmp(raw, "LZMA", 4) == 0) {
+                uint32_t actualSize = RdU32LE(raw + 4);
+                uint32_t lzmaSize   = RdU32LE(raw + 8);
+                uint8_t  propsByte  = raw[12];
+                uint32_t dictSize   = RdU32LE(raw + 13);
+                if (actualSize == 0 || actualSize > (128u << 20) || 17ULL + lzmaSize > len) {
+                    return { nullptr, 0 };
+                }
+                if (!::Explorer2::StreamCodecs::DecompressLzma1(
+                        propsByte, dictSize, raw + 17, lzmaSize, decoded, actualSize, true, 128u << 20))
+                {
+                    return { nullptr, 0 };
+                }
+                return { decoded.data(), decoded.size() };
+            }
+            return { raw, len };
+        };
+
+        std::vector<uint8_t> decV, decE, decSE, decF, decDI, decDV;
+        auto [vPtr, vLen]   = getVbspLump(3,  decV);  // LUMP_VERTEXES
+        auto [fPtr, fLen]   = getVbspLump(7,  decF);  // LUMP_FACES
+        auto [ePtr, eLen]   = getVbspLump(12, decE);  // LUMP_EDGES
+        auto [sePtr, seLen] = getVbspLump(13, decSE); // LUMP_SURFEDGES
+        auto [diPtr, diLen] = getVbspLump(26, decDI); // LUMP_DISPINFO (176B per ddispinfo_t)
+        auto [dvPtr, dvLen] = getVbspLump(33, decDV); // LUMP_DISP_VERTS (20B per CDispVert)
+        if (!vPtr || !fPtr || !ePtr || !sePtr) return false;
+
+        const size_t nVerts = vLen / 12u;
+        const size_t nEdges = eLen / 4u;
+        const size_t nSurfE = seLen / 4u;
+        const size_t nFaces = fLen / 56u;
+        const size_t nDispInfos = diPtr ? (diLen / 176u) : 0u;
+        const size_t nDispVerts = dvPtr ? (dvLen / 20u)  : 0u;
+        if (nVerts < 3 || nEdges < 3 || nSurfE < 3 || nFaces == 0 || nVerts > 2000000 || nFaces > 2000000) {
+            return false;
+        }
+
+        std::vector<Vec3f> srcVerts(nVerts);
+        mesh.vertices.resize(nVerts);
+        for (size_t i = 0; i < nVerts; ++i) {
+            float x = RdF32LE(vPtr + i * 12u + 0);
+            float y = RdF32LE(vPtr + i * 12u + 4);
+            float z = RdF32LE(vPtr + i * 12u + 8);
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+            srcVerts[i]      = { x, y, z };
+            mesh.vertices[i] = { x, z, -y }; // Source Z-up -> Explorer2 Y-up
+        }
+
+        for (size_t f = 0; f < nFaces; ++f) {
+            const uint8_t* fp = fPtr + f * 56u;
+            int32_t firstEdge = RdI32LE(fp + 4);
+            int16_t numEdges  = RdI16LE(fp + 8);
+            int16_t dispIdx   = RdI16LE(fp + 12); // dface_t::dispinfo at +12
+            if (firstEdge < 0 || numEdges < 3 || static_cast<size_t>(firstEdge + numEdges) > nSurfE) continue;
+
+            std::vector<uint32_t> ring;
+            ring.reserve(static_cast<size_t>(numEdges));
+            for (int16_t k = 0; k < numEdges; ++k) {
+                int32_t se = RdI32LE(sePtr + static_cast<size_t>(firstEdge + k) * 4u);
+                size_t eIdx = static_cast<size_t>(se >= 0 ? se : -se);
+                if (eIdx >= nEdges) continue;
+                uint16_t v0 = RdU16LE(ePtr + eIdx * 4u + 0);
+                uint16_t v1 = RdU16LE(ePtr + eIdx * 4u + 2);
+                uint16_t vi = (se >= 0) ? v0 : v1;
+                if (vi < nVerts) ring.push_back(vi);
+            }
+            if (ring.size() < 3) continue;
+
+            // Triangulate LUMP_DISPINFO terrain displacement surface if present on this quad face!
+            if (dispIdx >= 0 && static_cast<size_t>(dispIdx) < nDispInfos && ring.size() == 4 && dvPtr) {
+                const uint8_t* dp = diPtr + static_cast<size_t>(dispIdx) * 176u;
+                float sx = RdF32LE(dp + 0), sy = RdF32LE(dp + 4), sz = RdF32LE(dp + 8);
+                int32_t dvStart = RdI32LE(dp + 12);
+                int32_t power   = RdI32LE(dp + 20);
+                if (power >= 2 && power <= 4 && dvStart >= 0 && std::isfinite(sx) && std::isfinite(sy) && std::isfinite(sz)) {
+                    const size_t side = (static_cast<size_t>(1) << power) + 1u;
+                    const size_t gridCount = side * side;
+                    if (static_cast<size_t>(dvStart) + gridCount <= nDispVerts) {
+                        size_t startCorner = 0;
+                        float bestD2 = 1e30f;
+                        for (size_t k = 0; k < 4; ++k) {
+                            const Vec3f& cv = srcVerts[ring[k]];
+                            float dx = cv.x - sx, dy = cv.y - sy, dz = cv.z - sz;
+                            float d2 = dx * dx + dy * dy + dz * dz;
+                            if (d2 < bestD2) { bestD2 = d2; startCorner = k; }
+                        }
+                        const Vec3f& c0 = srcVerts[ring[(startCorner + 0) & 3u]];
+                        const Vec3f& c1 = srcVerts[ring[(startCorner + 1) & 3u]];
+                        const Vec3f& c2 = srcVerts[ring[(startCorner + 2) & 3u]];
+                        const Vec3f& c3 = srcVerts[ring[(startCorner + 3) & 3u]];
+
+                        const uint32_t dBase = static_cast<uint32_t>(mesh.vertices.size());
+                        const float invN = 1.0f / static_cast<float>(side - 1u);
+                        bool okDisp = true;
+                        for (size_t iy = 0; iy < side; ++iy) {
+                            float v = static_cast<float>(iy) * invN;
+                            Vec3f left  = { c0.x + (c1.x - c0.x) * v, c0.y + (c1.y - c0.y) * v, c0.z + (c1.z - c0.z) * v };
+                            Vec3f right = { c3.x + (c2.x - c3.x) * v, c3.y + (c2.y - c3.y) * v, c3.z + (c2.z - c3.z) * v };
+                            for (size_t ix = 0; ix < side; ++ix) {
+                                float u = static_cast<float>(ix) * invN;
+                                Vec3f bp = { left.x + (right.x - left.x) * u,
+                                             left.y + (right.y - left.y) * u,
+                                             left.z + (right.z - left.z) * u };
+                                const uint8_t* cvp = dvPtr + (static_cast<size_t>(dvStart) + iy * side + ix) * 20u;
+                                float vx = RdF32LE(cvp + 0), vy = RdF32LE(cvp + 4), vz = RdF32LE(cvp + 8);
+                                float dist = RdF32LE(cvp + 12);
+                                if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz) || !std::isfinite(dist)) {
+                                    okDisp = false;
+                                    break;
+                                }
+                                float wx = bp.x + vx * dist;
+                                float wy = bp.y + vy * dist;
+                                float wz = bp.z + vz * dist;
+                                mesh.vertices.push_back({ wx, wz, -wy });
+                            }
+                            if (!okDisp) break;
+                        }
+                        if (okDisp) {
+                            const uint32_t stride = static_cast<uint32_t>(side);
+                            for (uint32_t iy = 0; iy + 1u < stride; ++iy) {
+                                for (uint32_t ix = 0; ix + 1u < stride; ++ix) {
+                                    uint32_t a = dBase + iy * stride + ix;
+                                    uint32_t b = a + 1u;
+                                    uint32_t c = a + stride;
+                                    uint32_t d = c + 1u;
+                                    if (((ix + iy) & 1u) != 0u) {
+                                        mesh.tris.push_back({ a, c, b, {} });
+                                        mesh.tris.push_back({ b, c, d, {} });
+                                    } else {
+                                        mesh.tris.push_back({ a, c, d, {} });
+                                        mesh.tris.push_back({ a, d, b, {} });
+                                    }
+                                }
+                            }
+                            continue; // Displaced surface replaces flat base quad!
+                        }
+                    }
+                }
+            }
+
+            for (size_t k = 1; k + 1 < ring.size(); ++k) {
+                if (ring[0] != ring[k] && ring[k] != ring[k + 1] && ring[0] != ring[k + 1]) {
+                    mesh.tris.push_back({ ring[0], ring[k], ring[k + 1], {} });
+                }
+            }
+        }
+        if (mesh.tris.empty()) { mesh.vertices.clear(); return false; }
+        mesh.formatName = L"Valve Source Engine VBSP Map (.bsp)";
+        return true;
     }
 
     return false;

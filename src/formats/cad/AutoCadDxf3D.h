@@ -494,7 +494,7 @@ inline bool ParseAutoCadDxf3DMesh(const uint8_t* data, size_t size, LoadedMesh3D
             }
             if (std::hypot(x2 - x1, y2 - y1) + std::fabs(z2 - z1) > 1e-5) {
                 LoadedMesh3D tmp;
-                Detail3D100::AddLineStrut(tmp, { static_cast<float>(x1), static_cast<float>(y1), static_cast<float>(z1) },
+                DetailDccScene::AddLineStrut(tmp, { static_cast<float>(x1), static_cast<float>(y1), static_cast<float>(z1) },
                                                { static_cast<float>(x2), static_cast<float>(y2), static_cast<float>(z2) }, 0.04f);
                 uint32_t b = static_cast<uint32_t>(activeTarget->verts.size());
                 for (const auto& v : tmp.vertices) activeTarget->verts.push_back({ v.x, v.y, v.z });

@@ -23,7 +23,6 @@ inline bool ParseEagleBoardXml(std::string_view xml, ParsedEdaBoard& out) {
     bool inPackage = false;
     bool inNet     = false;
 
-    const auto& addCurvedOrStraightWire = DetailEagleXml::AddCurvedOrStraightWire;
     const auto& parseEagleRot = DetailEagleXml::ParseEagleRot;
 
     size_t pos = 0;
@@ -66,83 +65,14 @@ inline bool ParseEagleBoardXml(std::string_view xml, ParsedEdaBoard& out) {
         }
 
         if (inPackage && !currentPkgName.empty()) {
-            std::string pkgKey = currentLibName.empty() ? currentPkgName : (currentLibName + ":" + currentPkgName);
-            auto recordPkg = [&](EaglePkgDef& pkg) {
-                if (tag.rfind("smd ", 0) == 0) {
-                    EdaPadPrim p;
-                    p.x = GetXmlFloat(tag, "x");
-                    p.y = GetXmlFloat(tag, "y");
-                    p.w = GetXmlFloat(tag, "dx", 1.0f);
-                    p.h = GetXmlFloat(tag, "dy", 1.0f);
-                    int lyr = GetXmlInt(tag, "layer", 1);
-                    p.layer = (lyr == 16) ? EdaLayerId::BottomCopper : EdaLayerId::TopCopper;
-                    p.shape = 1;
-                    std::string_view nm;
-                    if (GetXmlAttr(tag, "name", nm)) p.pinName = PathUtils::Utf8ToWide(nm);
-                    pkg.localPads.push_back(p);
-                    pkg.minX = std::min(pkg.minX, p.x - p.w * 0.5f);
-                    pkg.maxX = std::max(pkg.maxX, p.x + p.w * 0.5f);
-                    pkg.minY = std::min(pkg.minY, p.y - p.h * 0.5f);
-                    pkg.maxY = std::max(pkg.maxY, p.y + p.h * 0.5f);
-                } else if (tag.rfind("pad ", 0) == 0) {
-                    EdaPadPrim p;
-                    p.x = GetXmlFloat(tag, "x");
-                    p.y = GetXmlFloat(tag, "y");
-                    p.drill = GetXmlFloat(tag, "drill", 0.8f);
-                    float diam = GetXmlFloat(tag, "diameter", p.drill * 1.75f);
-                    if (diam <= 0.01f) diam = p.drill * 1.75f;
-                    p.w = diam;
-                    p.h = diam;
-                    p.layer = EdaLayerId::PadsThrough;
-                    p.shape = 0;
-                    std::string_view nm;
-                    if (GetXmlAttr(tag, "name", nm)) p.pinName = PathUtils::Utf8ToWide(nm);
-                    pkg.localPads.push_back(p);
-                    pkg.minX = std::min(pkg.minX, p.x - diam * 0.5f);
-                    pkg.maxX = std::max(pkg.maxX, p.x + diam * 0.5f);
-                    pkg.minY = std::min(pkg.minY, p.y - diam * 0.5f);
-                    pkg.maxY = std::max(pkg.maxY, p.y + diam * 0.5f);
-                } else if (tag.rfind("wire ", 0) == 0) {
-                    EdaTraceSeg seg;
-                    seg.x1 = GetXmlFloat(tag, "x1");
-                    seg.y1 = GetXmlFloat(tag, "y1");
-                    seg.x2 = GetXmlFloat(tag, "x2");
-                    seg.y2 = GetXmlFloat(tag, "y2");
-                    seg.width = std::max(0.12f, GetXmlFloat(tag, "width", 0.15f));
-                    seg.layer = EdaLayerId::TopSilk;
-                    pkg.localSilk.push_back(seg);
-                    pkg.minX = std::min({ pkg.minX, seg.x1, seg.x2 });
-                    pkg.maxX = std::max({ pkg.maxX, seg.x1, seg.x2 });
-                    pkg.minY = std::min({ pkg.minY, seg.y1, seg.y2 });
-                    pkg.maxY = std::max({ pkg.maxY, seg.y1, seg.y2 });
-                }
-            };
-            recordPkg(pkgMap[currentPkgName]);
-            if (!currentLibName.empty()) recordPkg(pkgMap[pkgKey]);
+            RecordEaglePackageTag(tag, currentLibName, currentPkgName, pkgMap);
             continue;
         }
 
-        if (tag.rfind("wire ", 0) == 0) {
-            int lyr = GetXmlInt(tag, "layer", isSch ? 91 : 1);
-            if (!isSch && (lyr == 19 || lyr >= 100)) continue;
-            float x1 = GetXmlFloat(tag, "x1");
-            float y1 = GetXmlFloat(tag, "y1");
-            float x2 = GetXmlFloat(tag, "x2");
-            float y2 = GetXmlFloat(tag, "y2");
-            float curve = GetXmlFloat(tag, "curve", 0.0f);
-            float w = std::max(0.15f, GetXmlFloat(tag, "width", 0.25f));
-            EdaLayerId lid = (isSch && inNet) ? EdaLayerId::SchWire : MapEagleLayer(lyr, isSch);
-            addCurvedOrStraightWire(out.traces, x1, y1, x2, y2, curve, w, lid);
-        } else if (tag.rfind("rectangle ", 0) == 0) {
-            int lyr = GetXmlInt(tag, "layer", isSch ? 94 : 21);
-            float x1 = GetXmlFloat(tag, "x1"), y1 = GetXmlFloat(tag, "y1");
-            float x2 = GetXmlFloat(tag, "x2"), y2 = GetXmlFloat(tag, "y2");
-            EdaLayerId lid = MapEagleLayer(lyr, isSch);
-            out.traces.push_back({ x1, y1, x2, y1, 0.22f, lid, 0 });
-            out.traces.push_back({ x2, y1, x2, y2, 0.22f, lid, 0 });
-            out.traces.push_back({ x2, y2, x1, y2, 0.22f, lid, 0 });
-            out.traces.push_back({ x1, y2, x1, y1, 0.22f, lid, 0 });
-        } else if (tag.rfind("via ", 0) == 0 || tag.rfind("hole ", 0) == 0) {
+        if (TryParseEagleCommonDrawTag(xml, pos, tag, isSch, inNet, currentNetName, out)) {
+            continue;
+        }
+        if (tag.rfind("via ", 0) == 0 || tag.rfind("hole ", 0) == 0) {
             EdaViaPrim v;
             v.x = GetXmlFloat(tag, "x");
             v.y = GetXmlFloat(tag, "y");
@@ -150,32 +80,6 @@ inline bool ParseEagleBoardXml(std::string_view xml, ParsedEdaBoard& out) {
             v.diameter = GetXmlFloat(tag, "diameter", v.drill * 1.8f);
             if (v.diameter <= v.drill) v.diameter = v.drill * 1.8f;
             out.vias.push_back(v);
-        } else if (tag.rfind("text ", 0) == 0 && tag.back() != '/') {
-            size_t endTxt = xml.find("</text>", pos);
-            if (endTxt != std::string_view::npos) {
-                std::string_view body = xml.substr(pos, endTxt - pos);
-                if (!body.empty() && body[0] != '>' && out.labels.size() < 2048) {
-                    float tx = GetXmlFloat(tag, "x");
-                    float ty = GetXmlFloat(tag, "y");
-                    float sz = std::clamp(GetXmlFloat(tag, "size", 1.27f), 0.7f, 4.0f);
-                    int lyr = GetXmlInt(tag, "layer", isSch ? 94 : 21);
-                    out.labels.push_back({ tx, ty, sz, MapEagleLayer(lyr, isSch), PathUtils::Utf8ToWide(body) });
-                }
-                pos = endTxt + 7;
-            }
-        } else if (tag.rfind("circle ", 0) == 0) {
-            EdaCirclePrim c;
-            c.cx = GetXmlFloat(tag, "x");
-            c.cy = GetXmlFloat(tag, "y");
-            c.radius = GetXmlFloat(tag, "radius", 1.0f);
-            c.width = std::max(0.15f, GetXmlFloat(tag, "width", 0.2f));
-            c.layer = MapEagleLayer(GetXmlInt(tag, "layer", 21), isSch);
-            out.circles.push_back(c);
-        } else if (tag.rfind("signal ", 0) == 0 || tag.rfind("net ", 0) == 0) {
-            ++out.netCount;
-            std::string_view nn;
-            if (GetXmlAttr(tag, "name", nn)) currentNetName.assign(nn.data(), nn.size());
-            if (tag.back() != '/') inNet = true;
         } else if (tag.rfind("element ", 0) == 0 && !isSch) {
             std::string_view nameSv, pkgSv, libSv, valSv, rotSv;
             GetXmlAttr(tag, "name", nameSv);

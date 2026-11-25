@@ -27,7 +27,7 @@ inline bool DecodePhotometricIES(const uint8_t* data, size_t size, const std::ws
         return s;
     };
     auto startsWithICase = [](std::string_view s, std::string_view pfx) -> bool {
-        return s.size() >= pfx.size() && DetailImg100::EqualsIgnoreCaseAscii(s.substr(0, pfx.size()), pfx);
+        return s.size() >= pfx.size() && DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(s.substr(0, pfx.size()), pfx);
     };
 
     while (pos < sv.size()) {

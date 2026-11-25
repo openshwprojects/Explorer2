@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 inline bool ParseOrExtractErofsOnReader(
     uint64_t partBase,
@@ -602,10 +602,10 @@ inline bool ParseOrExtractLinuxErofs(
     return false;
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectLinuxErofs(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseOrExtractLinuxErofs(data, size, &outInfo, nullptr, nullptr);
+    return DetailUnixAndLegacyArc::ParseOrExtractLinuxErofs(data, size, &outInfo, nullptr, nullptr);
 }
 
 inline bool ExtractLinuxErofsEntry(
@@ -614,7 +614,7 @@ inline bool ExtractLinuxErofsEntry(
     const std::wstring& want,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc200::ParseOrExtractLinuxErofs(data, size, nullptr, &want, &outBytes);
+    return DetailUnixAndLegacyArc::ParseOrExtractLinuxErofs(data, size, nullptr, &want, &outBytes);
 }
 
 } // namespace Explorer2::Formats

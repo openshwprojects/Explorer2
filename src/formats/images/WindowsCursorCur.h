@@ -10,9 +10,9 @@ namespace DetailArtFont {
 // ----------------------------------------------------------------------------
 inline bool DecodeCurCursor(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
     if (!data || size < 22) return false;
-    uint16_t idReserved = DetailImg100::RdU16LE(data + 0);
-    uint16_t idType     = DetailImg100::RdU16LE(data + 2);
-    uint16_t idCount    = DetailImg100::RdU16LE(data + 4);
+    uint16_t idReserved = DetailLayeredAndHdrImg::RdU16LE(data + 0);
+    uint16_t idType     = DetailLayeredAndHdrImg::RdU16LE(data + 2);
+    uint16_t idCount    = DetailLayeredAndHdrImg::RdU16LE(data + 4);
     if (idReserved != 0u || idType != 2u || idCount == 0u || idCount > 256u) return false;
     if (6u + static_cast<size_t>(idCount) * 16u > size) return false;
 
@@ -23,15 +23,15 @@ inline bool DecodeCurCursor(const uint8_t* data, size_t size, ExtendedImageInfo&
         const uint8_t* ent = data + 6u + static_cast<size_t>(i) * 16u;
         uint32_t w = (ent[0] == 0u) ? 256u : ent[0];
         uint32_t h = (ent[1] == 0u) ? 256u : ent[1];
-        uint32_t bytesInRes = DetailImg100::RdU32LE(ent + 8);
-        uint32_t imgOff     = DetailImg100::RdU32LE(ent + 12);
+        uint32_t bytesInRes = DetailLayeredAndHdrImg::RdU32LE(ent + 8);
+        uint32_t imgOff     = DetailLayeredAndHdrImg::RdU32LE(ent + 12);
         if (bytesInRes < 16u || imgOff < 6u + static_cast<size_t>(idCount) * 16u ||
             imgOff > size || bytesInRes > size - imgOff) {
             continue;
         }
         uint32_t bpp = 32u;
         if (bytesInRes >= 40u && std::memcmp(data + imgOff, "\x89PNG\r\n\x1A\n", 8) != 0) {
-            bpp = DetailImg100::RdU16LE(data + imgOff + 14);
+            bpp = DetailLayeredAndHdrImg::RdU16LE(data + imgOff + 14);
         }
         uint64_t score = static_cast<uint64_t>(w) * h * 64ull + bpp;
         if (score > bestScore || bestIdx == SIZE_MAX) {
@@ -42,17 +42,18 @@ inline bool DecodeCurCursor(const uint8_t* data, size_t size, ExtendedImageInfo&
     if (bestIdx == SIZE_MAX) return false;
 
     const uint8_t* ent = data + 6u + bestIdx * 16u;
-    uint16_t hotX = DetailImg100::RdU16LE(ent + 4);
-    uint16_t hotY = DetailImg100::RdU16LE(ent + 6);
-    uint32_t bytesInRes = DetailImg100::RdU32LE(ent + 8);
-    uint32_t imgOff     = DetailImg100::RdU32LE(ent + 12);
+    uint16_t hotX = DetailLayeredAndHdrImg::RdU16LE(ent + 4);
+    uint16_t hotY = DetailLayeredAndHdrImg::RdU16LE(ent + 6);
+    uint32_t bytesInRes = DetailLayeredAndHdrImg::RdU32LE(ent + 8);
+    uint32_t imgOff     = DetailLayeredAndHdrImg::RdU32LE(ent + 12);
     const uint8_t* img  = data + imgOff;
 
     std::wstring fmtLabel = L"Windows Cursor (.cur, Hotspot " + std::to_wstring(hotX) + L"," + std::to_wstring(hotY) + L")";
 
-    // Case A: Embedded PNG cursor frame
+    // Case A: Embedded PNG cursor frame (pure-C++ PNG first so Linux decodes PNG cursors without WIC)
     if (bytesInRes >= 24u && std::memcmp(img, "\x89PNG\r\n\x1A\n", 8) == 0) {
-        if (DetailImg100::DecodeEmbeddedWicBuffer(img, bytesInRes, fmtLabel, outInfo)) {
+        if (DetailPngPure::DecodePngToImageInfo(img, bytesInRes, fmtLabel, outInfo) ||
+            DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(img, bytesInRes, fmtLabel, outInfo)) {
             outInfo.origWidth = outInfo.width;
             outInfo.origHeight = outInfo.height;
             return true;
@@ -62,13 +63,13 @@ inline bool DecodeCurCursor(const uint8_t* data, size_t size, ExtendedImageInfo&
 
     // Case B: BITMAPINFOHEADER DIB (XOR color bitmap + 1-bit AND mask)
     if (bytesInRes < 40u) return false;
-    uint32_t biSize   = DetailImg100::RdU32LE(img + 0);
-    int32_t  biWidth  = static_cast<int32_t>(DetailImg100::RdU32LE(img + 4));
-    int32_t  biHeight = static_cast<int32_t>(DetailImg100::RdU32LE(img + 8));
-    uint16_t biPlanes = DetailImg100::RdU16LE(img + 12);
-    uint16_t biBits   = DetailImg100::RdU16LE(img + 14);
-    uint32_t biComp   = DetailImg100::RdU32LE(img + 16);
-    uint32_t biClrUsed= DetailImg100::RdU32LE(img + 32);
+    uint32_t biSize   = DetailLayeredAndHdrImg::RdU32LE(img + 0);
+    int32_t  biWidth  = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(img + 4));
+    int32_t  biHeight = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(img + 8));
+    uint16_t biPlanes = DetailLayeredAndHdrImg::RdU16LE(img + 12);
+    uint16_t biBits   = DetailLayeredAndHdrImg::RdU16LE(img + 14);
+    uint32_t biComp   = DetailLayeredAndHdrImg::RdU32LE(img + 16);
+    uint32_t biClrUsed= DetailLayeredAndHdrImg::RdU32LE(img + 32);
 
     if (biSize < 40u || biSize > bytesInRes || biPlanes != 1u || biComp != 0u ||
         biWidth <= 0 || biWidth > 1024 || biHeight == 0) {

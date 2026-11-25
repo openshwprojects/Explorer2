@@ -6,7 +6,7 @@ namespace Formats {
 // ============================================================================
 // #82. Redis RDB Memory Snapshot (.rdb) — v1..v12 + LZF + Ziplist + Listpack + Intset + Streams
 // ============================================================================
-namespace DetailDocs200 {
+namespace DetailStructuredDataDoc {
 
 inline bool ReadRdbLen(const uint8_t* data, size_t size, size_t& pos, uint64_t& outLen, bool& outIsEncoded) {
     outIsEncoded = false;
@@ -40,36 +40,6 @@ inline bool ReadRdbLen(const uint8_t* data, size_t size, size_t& pos, uint64_t& 
     outIsEncoded = true;
     outLen = first & 0x3Fu;
     return true;
-}
-
-inline bool DecompressRdbLzf(const uint8_t* in, size_t inLen, size_t expectedOutLen, std::vector<uint8_t>& out) {
-    out.clear();
-    if (expectedOutLen > 32u * 1024u * 1024u) return false;
-    out.reserve(std::min<size_t>(expectedOutLen, inLen * 32u + 256u));
-    size_t ip = 0;
-    while (ip < inLen) {
-        uint32_t ctrl = in[ip++];
-        if (ctrl < 32u) {
-            size_t litLen = static_cast<size_t>(ctrl) + 1u;
-            if (litLen > inLen - ip || out.size() + litLen > expectedOutLen) return false;
-            out.insert(out.end(), in + ip, in + ip + litLen);
-            ip += litLen;
-        } else {
-            size_t len = (ctrl >> 5) + 2u;
-            size_t refOff = static_cast<size_t>(ctrl & 0x1Fu) << 8;
-            if (len == 9u) {
-                if (ip >= inLen) return false;
-                len += in[ip++];
-            }
-            if (ip >= inLen) return false;
-            refOff += static_cast<size_t>(in[ip++]) + 1u;
-            if (refOff > out.size() || out.size() + len > expectedOutLen) return false;
-            for (size_t k = 0; k < len; ++k) {
-                out.push_back(out[out.size() - refOff]);
-            }
-        }
-    }
-    return out.size() == expectedOutLen;
 }
 
 inline std::wstring FormatRdbBytesPreview(const uint8_t* p, size_t n) {
@@ -121,7 +91,7 @@ inline bool ReadRdbRawBytes(const uint8_t* data, size_t size, size_t& pos, std::
         if (!ReadRdbLen(data, size, pos, clen, encA) || encA ||
             !ReadRdbLen(data, size, pos, ulen, encB) || encB) return false;
         if (clen > size - pos) return false;
-        if (!DecompressRdbLzf(data + pos, static_cast<size_t>(clen), static_cast<size_t>(ulen), outBytes)) return false;
+        if (!::Explorer2::StreamCodecs::DecompressLibLzf(data + pos, static_cast<size_t>(clen), outBytes, static_cast<size_t>(ulen), 32u * 1024u * 1024u)) return false;
         pos += static_cast<size_t>(clen);
         return true;
     }
@@ -348,9 +318,9 @@ inline bool SkipRdbModuleValue(const uint8_t* data, size_t size, size_t& pos) {
     return false;
 }
 
-} // namespace DetailDocs200
+} // namespace DetailStructuredDataDoc
 
-inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
+inline bool ParseRedisRdbSnapshot(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 9 || std::memcmp(raw.data(), "REDIS", 5) != 0) return false;
     std::string verStr(reinterpret_cast<const char*>(raw.data() + 5), 4);
     for (char c : verStr) if (c < '0' || c > '9') return false;
@@ -403,39 +373,39 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         if (op == 0xFFu) { sawEof = true; break; }
         if (op == 0xFAu) { // AUX
             std::wstring k, v;
-            if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, k) ||
-                !DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, v)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, k) ||
+                !DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, v)) { parseErr = true; break; }
             auxSh.rows.push_back({ k, v });
             continue;
         }
         if (op == 0xFEu) { // SELECTDB
             bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, curDb, enc) || enc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, curDb, enc) || enc) { parseErr = true; break; }
             continue;
         }
         if (op == 0xFBu) { // RESIZEDB
             uint64_t dbSz = 0, expSz = 0; bool encA = false, encB = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, dbSz, encA) || encA ||
-                !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, expSz, encB) || encB) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, dbSz, encA) || encA ||
+                !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, expSz, encB) || encB) { parseErr = true; break; }
             auxSh.rows.push_back({ L"DB #" + std::to_wstring(curDb) + L" Hash Table Size",
                                    std::to_wstring(dbSz) + L" keys (" + std::to_wstring(expSz) + L" expiring)" });
             continue;
         }
         if (op == 0xFDu) { // EXPIRETIME (sec)
             if (pos + 4 > raw.size()) { parseErr = true; break; }
-            pendingTtl = std::to_wstring(DetailDocs200::RdU32LE(raw.data() + pos)) + L" s";
+            pendingTtl = std::to_wstring(DetailStructuredDataDoc::RdU32LE(raw.data() + pos)) + L" s";
             pos += 4;
             continue;
         }
         if (op == 0xFCu) { // EXPIRETIMEMS (ms)
             if (pos + 8 > raw.size()) { parseErr = true; break; }
-            pendingTtl = std::to_wstring(DetailDocs200::RdU64LE(raw.data() + pos)) + L" ms";
+            pendingTtl = std::to_wstring(DetailStructuredDataDoc::RdU64LE(raw.data() + pos)) + L" ms";
             pos += 8;
             continue;
         }
         if (op == 0xF8u) { // LRU idle
             uint64_t lru = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, lru, enc)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, lru, enc)) { parseErr = true; break; }
             continue;
         }
         if (op == 0xF9u) { // LFU freq
@@ -445,42 +415,42 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         }
         if (op == 0xF7u) { // MODULE_AUX
             uint64_t modId = 0, whenOp = 0, when = 0; bool e1 = false, e2 = false, e3 = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, modId, e1) ||
-                !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, whenOp, e2) ||
-                !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, when, e3) ||
-                !DetailDocs200::SkipRdbModuleValue(raw.data(), raw.size(), pos)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, modId, e1) ||
+                !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, whenOp, e2) ||
+                !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, when, e3) ||
+                !DetailStructuredDataDoc::SkipRdbModuleValue(raw.data(), raw.size(), pos)) { parseErr = true; break; }
             continue;
         }
         if (op == 0xF6u || op == 0xF5u) { // FUNCTION2 / FUNCTION_PRE_GA
             std::wstring fnCode;
-            if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, fnCode)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, fnCode)) { parseErr = true; break; }
             auxSh.rows.push_back({ L"Redis Function Library", fnCode });
             continue;
         }
         if (op == 0xF4u) { // SLOT_INFO (Redis 7.4+)
             uint64_t s1 = 0, s2 = 0, s3 = 0; bool e1 = false, e2 = false, e3 = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, s1, e1) ||
-                !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, s2, e2) ||
-                !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, s3, e3)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, s1, e1) ||
+                !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, s2, e2) ||
+                !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, s3, e3)) { parseErr = true; break; }
             continue;
         }
 
         std::wstring key;
-        if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, key)) { parseErr = true; break; }
+        if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, key)) { parseErr = true; break; }
 
         std::wstring typeLabel;
         std::wstring preview;
 
         if (op == 0x00u) { // STRING
             typeLabel = L"STRING";
-            if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, preview)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, preview)) { parseErr = true; break; }
         } else if (op == 0x01u || op == 0x02u) { // LIST / SET
             typeLabel = (op == 0x01u) ? L"LIST" : L"SET";
             uint64_t cnt = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, cnt, enc) || enc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, cnt, enc) || enc) { parseErr = true; break; }
             for (uint64_t i = 0; i < cnt; ++i) {
                 std::wstring elem;
-                if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, elem)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, elem)) { parseErr = true; break; }
                 if (i < 4) { if (i) preview += L", "; preview += elem; }
             }
             if (parseErr) break;
@@ -488,13 +458,13 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         } else if (op == 0x03u || op == 0x05u) { // ZSET / ZSET_2 (IEEE binary64 double)
             typeLabel = (op == 0x05u) ? L"ZSET_2" : L"ZSET";
             uint64_t cnt = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, cnt, enc) || enc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, cnt, enc) || enc) { parseErr = true; break; }
             for (uint64_t i = 0; i < cnt; ++i) {
                 std::wstring member, scoreStr;
-                if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, member)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, member)) { parseErr = true; break; }
                 if (op == 0x05u) {
                     if (pos + 8 > raw.size()) { parseErr = true; break; }
-                    scoreStr = DetailDocs200::FormatRdbDoubleVal(::Explorer2::ByteIO::RdF64LE(raw.data() + pos));
+                    scoreStr = DetailStructuredDataDoc::FormatRdbDoubleVal(::Explorer2::ByteIO::RdF64LE(raw.data() + pos));
                     pos += 8;
                 } else {
                     if (pos >= raw.size()) { parseErr = true; break; }
@@ -515,11 +485,11 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         } else if (op == 0x04u) { // HASH
             typeLabel = L"HASH";
             uint64_t cnt = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, cnt, enc) || enc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, cnt, enc) || enc) { parseErr = true; break; }
             for (uint64_t i = 0; i < cnt; ++i) {
                 std::wstring hk, hv;
-                if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, hk) ||
-                    !DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, hv)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, hk) ||
+                    !DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, hv)) { parseErr = true; break; }
                 if (i < 3) { if (i) preview += L", "; preview += hk + L"=" + hv; }
             }
             if (parseErr) break;
@@ -527,15 +497,15 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         } else if (op == 0x07u) { // MODULE_2
             typeLabel = L"MODULE_2";
             uint64_t modId = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, modId, enc) ||
-                !DetailDocs200::SkipRdbModuleValue(raw.data(), raw.size(), pos)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, modId, enc) ||
+                !DetailStructuredDataDoc::SkipRdbModuleValue(raw.data(), raw.size(), pos)) { parseErr = true; break; }
             preview = L"Module ID " + std::to_wstring(modId);
         } else if (op == 0x09u) { // HASH_ZIPMAP
             typeLabel = L"HASH (ZIPMAP)";
             std::vector<uint8_t> zm;
             std::vector<std::pair<std::wstring, std::wstring>> pairs;
-            if (!DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, zm) ||
-                !DetailDocs200::DecodeRdbZipmap(zm, pairs)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, zm) ||
+                !DetailStructuredDataDoc::DecodeRdbZipmap(zm, pairs)) { parseErr = true; break; }
             for (size_t i = 0; i < std::min<size_t>(pairs.size(), 3u); ++i) {
                 if (i) preview += L", ";
                 preview += pairs[i].first + L"=" + pairs[i].second;
@@ -544,8 +514,8 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         } else if (op == 0x0Au || op == 0x0Cu || op == 0x0Du) { // LIST_ZIPLIST / ZSET_ZIPLIST / HASH_ZIPLIST
             std::vector<uint8_t> zl;
             std::vector<std::wstring> elems;
-            if (!DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, zl) ||
-                !DetailDocs200::DecodeRdbZiplist(zl, elems)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, zl) ||
+                !DetailStructuredDataDoc::DecodeRdbZiplist(zl, elems)) { parseErr = true; break; }
             if (op == 0x0Au) {
                 typeLabel = L"LIST (ZIPLIST)";
                 preview = joinPreviewList(elems, 4);
@@ -560,19 +530,19 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
             typeLabel = L"SET (INTSET)";
             std::vector<uint8_t> is;
             std::vector<std::wstring> elems;
-            if (!DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, is) ||
-                !DetailDocs200::DecodeRdbIntset(is, elems)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, is) ||
+                !DetailStructuredDataDoc::DecodeRdbIntset(is, elems)) { parseErr = true; break; }
             preview = joinPreviewList(elems, 5);
         } else if (op == 0x0Eu) { // LIST_QUICKLIST
             typeLabel = L"LIST (QUICKLIST)";
             uint64_t nodeCnt = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, nodeCnt, enc) || enc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, nodeCnt, enc) || enc) { parseErr = true; break; }
             std::vector<std::wstring> allElems;
             for (uint64_t n = 0; n < nodeCnt; ++n) {
                 std::vector<uint8_t> zl;
                 std::vector<std::wstring> nodeElems;
-                if (!DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, zl) ||
-                    !DetailDocs200::DecodeRdbZiplist(zl, nodeElems)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, zl) ||
+                    !DetailStructuredDataDoc::DecodeRdbZiplist(zl, nodeElems)) { parseErr = true; break; }
                 for (auto& e : nodeElems) {
                     if (allElems.size() < 65536) allElems.push_back(std::move(e));
                 }
@@ -582,18 +552,18 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         } else if (op == 0x12u) { // LIST_QUICKLIST_2
             typeLabel = L"LIST (QUICKLIST_2)";
             uint64_t nodeCnt = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, nodeCnt, enc) || enc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, nodeCnt, enc) || enc) { parseErr = true; break; }
             std::vector<std::wstring> allElems;
             for (uint64_t n = 0; n < nodeCnt; ++n) {
                 uint64_t container = 0; bool cEnc = false;
                 std::vector<uint8_t> blob;
-                if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, container, cEnc) || cEnc ||
-                    !DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, blob)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, container, cEnc) || cEnc ||
+                    !DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, blob)) { parseErr = true; break; }
                 if (container == 1u) { // PLAIN
-                    if (allElems.size() < 65536) allElems.push_back(DetailDocs200::FormatRdbBytesPreview(blob.data(), blob.size()));
+                    if (allElems.size() < 65536) allElems.push_back(DetailStructuredDataDoc::FormatRdbBytesPreview(blob.data(), blob.size()));
                 } else if (container == 2u) { // PACKED (listpack)
                     std::vector<std::wstring> nodeElems;
-                    if (!DetailDocs200::DecodeRdbListpack(blob, nodeElems)) { parseErr = true; break; }
+                    if (!DetailStructuredDataDoc::DecodeRdbListpack(blob, nodeElems)) { parseErr = true; break; }
                     for (auto& e : nodeElems) {
                         if (allElems.size() < 65536) allElems.push_back(std::move(e));
                     }
@@ -607,8 +577,8 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         } else if (op == 0x10u || op == 0x11u || op == 0x14u || op == 0x06u) { // HASH_LISTPACK / ZSET_LISTPACK / SET_LISTPACK
             std::vector<uint8_t> lp;
             std::vector<std::wstring> elems;
-            if (!DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, lp) ||
-                !DetailDocs200::DecodeRdbListpack(lp, elems)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, lp) ||
+                !DetailStructuredDataDoc::DecodeRdbListpack(lp, elems)) { parseErr = true; break; }
             if (op == 0x10u) {
                 typeLabel = L"HASH (LISTPACK)";
                 preview = joinPreviewPairs(elems, L'=', 3);
@@ -622,65 +592,65 @@ inline bool ParseRedisRdb200(const std::vector<uint8_t>& raw, ParsedOfficeDocume
         } else if (op == 0x0Fu || op == 0x13u || op == 0x15u) { // STREAM_LISTPACKS / _2 / _3
             typeLabel = (op == 0x15u) ? L"STREAM (v3)" : ((op == 0x13u) ? L"STREAM (v2)" : L"STREAM");
             uint64_t nLp = 0; bool enc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, nLp, enc) || enc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, nLp, enc) || enc) { parseErr = true; break; }
             std::vector<std::wstring> sampleFields;
             for (uint64_t i = 0; i < nLp; ++i) {
                 std::vector<uint8_t> nodeId, lpBlob;
-                if (!DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, nodeId) ||
-                    !DetailDocs200::ReadRdbRawBytes(raw.data(), raw.size(), pos, lpBlob)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, nodeId) ||
+                    !DetailStructuredDataDoc::ReadRdbRawBytes(raw.data(), raw.size(), pos, lpBlob)) { parseErr = true; break; }
                 if (i == 0) {
                     std::vector<std::wstring> lpElems;
-                    if (DetailDocs200::DecodeRdbListpack(lpBlob, lpElems)) {
+                    if (DetailStructuredDataDoc::DecodeRdbListpack(lpBlob, lpElems)) {
                         for (size_t k = 0; k < std::min<size_t>(lpElems.size(), 8u); ++k) sampleFields.push_back(lpElems[k]);
                     }
                 }
             }
             if (parseErr) break;
             uint64_t items = 0, lastMs = 0, lastSeq = 0; bool e1 = false, e2 = false, e3 = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, items, e1) ||
-                !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, lastMs, e2) ||
-                !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, lastSeq, e3)) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, items, e1) ||
+                !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, lastMs, e2) ||
+                !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, lastSeq, e3)) { parseErr = true; break; }
             if (op >= 0x13u) {
                 uint64_t fMs = 0, fSeq = 0, dMs = 0, dSeq = 0, added = 0; bool ex = false;
-                if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, fMs, ex) ||
-                    !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, fSeq, ex) ||
-                    !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, dMs, ex) ||
-                    !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, dSeq, ex) ||
-                    !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, added, ex)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, fMs, ex) ||
+                    !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, fSeq, ex) ||
+                    !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, dMs, ex) ||
+                    !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, dSeq, ex) ||
+                    !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, added, ex)) { parseErr = true; break; }
             }
             uint64_t cgroups = 0; bool cgEnc = false;
-            if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, cgroups, cgEnc) || cgEnc) { parseErr = true; break; }
+            if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, cgroups, cgEnc) || cgEnc) { parseErr = true; break; }
             std::wstring cgNames;
             for (uint64_t g = 0; g < cgroups; ++g) {
                 std::wstring gname;
                 uint64_t gMs = 0, gSeq = 0; bool ge = false;
-                if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, gname) ||
-                    !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, gMs, ge) ||
-                    !DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, gSeq, ge)) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, gname) ||
+                    !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, gMs, ge) ||
+                    !DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, gSeq, ge)) { parseErr = true; break; }
                 if (g < 3) { if (g) cgNames += L", "; cgNames += gname; }
                 if (op >= 0x13u) {
                     uint64_t entriesRead = 0;
-                    if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, entriesRead, ge)) { parseErr = true; break; }
+                    if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, entriesRead, ge)) { parseErr = true; break; }
                 }
                 uint64_t pelSz = 0;
-                if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, pelSz, ge) || ge) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, pelSz, ge) || ge) { parseErr = true; break; }
                 for (uint64_t pe = 0; pe < pelSz; ++pe) {
                     if (pos + 24 > raw.size()) { parseErr = true; break; }
                     pos += 24; // 16B rawid + 8B delivery_time
                     uint64_t delivCnt = 0;
-                    if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, delivCnt, ge)) { parseErr = true; break; }
+                    if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, delivCnt, ge)) { parseErr = true; break; }
                 }
                 if (parseErr) break;
                 uint64_t nCons = 0;
-                if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, nCons, ge) || ge) { parseErr = true; break; }
+                if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, nCons, ge) || ge) { parseErr = true; break; }
                 for (uint64_t c = 0; c < nCons; ++c) {
                     std::wstring cname;
-                    if (!DetailDocs200::ReadRdbString(raw.data(), raw.size(), pos, cname)) { parseErr = true; break; }
+                    if (!DetailStructuredDataDoc::ReadRdbString(raw.data(), raw.size(), pos, cname)) { parseErr = true; break; }
                     size_t timeBytes = (op >= 0x15u) ? 16u : 8u;
                     if (pos + timeBytes > raw.size()) { parseErr = true; break; }
                     pos += timeBytes;
                     uint64_t cpelSz = 0;
-                    if (!DetailDocs200::ReadRdbLen(raw.data(), raw.size(), pos, cpelSz, ge) || ge) { parseErr = true; break; }
+                    if (!DetailStructuredDataDoc::ReadRdbLen(raw.data(), raw.size(), pos, cpelSz, ge) || ge) { parseErr = true; break; }
                     if (cpelSz > (raw.size() - pos) / 16u) { parseErr = true; break; }
                     pos += static_cast<size_t>(cpelSz) * 16u;
                 }

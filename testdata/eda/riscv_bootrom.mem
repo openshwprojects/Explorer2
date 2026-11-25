@@ -1,0 +1,9 @@
+// RISC-V RV32I BootROM + Trap Vector ($readmemh / Vivado updatemem)
+/* Reset section @ 0x0000 */
+@00000000
+0000_0297 0102_8293 3052_9073 0000_006F
+DEAD_BEEF 1234_5678 9ABC_DEF0 0FED_CBA9
+
+// Machine trap handler @ 0x0100
+@00000100
+3420_2F73 000F_5463 3020_0073 0000_0013

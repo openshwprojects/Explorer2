@@ -1,7 +1,9 @@
 #pragma once
+#include "../../ReaderTextUtils.h"
 // UdfImage.h — ECMA-167 / Universal Disk Format (UDF 1.02–2.60) optical & disk image reader (.udf).
 
 #include "../common/ArchiveFormatCommon.h"
+#include "../common/VirtualDiskCommon.h"
 
 namespace Explorer2::Formats {
 
@@ -15,38 +17,11 @@ using ::Explorer2::ByteIO::RdU32BE;
 using ::Explorer2::ByteIO::RdU64BE;
 
 inline bool EndsWithCI(const std::wstring& s, const wchar_t* suffix) {
-    const size_t sl = wcslen(suffix);
-    if (s.size() < sl) return false;
-    return _wcsicmp(s.c_str() + (s.size() - sl), suffix) == 0;
+    return ::Explorer2::ReaderText::EndsWithWideCI(s, suffix);
 }
-
-inline std::string AsciiLower(std::string_view sv) {
-    std::string out(sv);
-    for (char& ch : out) {
-        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-    }
-    return out;
-}
-
-inline std::string_view TrimAsciiSV(std::string_view sv) {
-    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r')) sv.remove_prefix(1);
-    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r')) sv.remove_suffix(1);
-    return sv;
-}
-
-inline void CalendarToDosDateTime(
-    int year, int month, int day,
-    int hour, int minute, int second,
-    uint16_t& outDate, uint16_t& outTime)
-{
-    outDate = 0;
-    outTime = 0;
-    if (year < 1980 || year > 2107 || month < 1 || month > 12 || day < 1 || day > 31) return;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) return;
-    if (second == 60) second = 59;
-    outDate = static_cast<uint16_t>(((year - 1980) << 9) | (month << 5) | day);
-    outTime = static_cast<uint16_t>((hour << 11) | (minute << 5) | (second / 2));
-}
+inline std::string AsciiLower(std::string_view sv) { return ::Explorer2::ReaderText::ToLowerAscii(sv); }
+inline std::string_view TrimAsciiSV(std::string_view sv) { return ::Explorer2::ReaderText::TrimCrTabSpace(sv); }
+using ::Explorer2::ReaderText::CalendarToDosDateTime;
 
 inline bool ValidateUdfTag(const uint8_t* buf, size_t len, uint16_t expectedTagId = 0) {
     if (!buf || len < 16u) return false;
@@ -131,7 +106,7 @@ struct UdfResolvedRun {
 };
 
 struct UdfVolumeContext {
-    const DetailArc100::VirtualDiskReader* reader = nullptr;
+    const DetailDiskAndGameArc::VirtualDiskReader* reader = nullptr;
     uint64_t partBase = 0;
     uint32_t sectorSize = 2048;
     uint32_t logBlkSize = 2048;
@@ -394,7 +369,7 @@ inline bool ReadUdfIcbContent(
 }
 
 inline bool ParseOrExtractUdfOnReader(
-    const DetailArc100::VirtualDiskReader& reader,
+    const DetailDiskAndGameArc::VirtualDiskReader& reader,
     uint64_t partBase,
     const std::wstring& prefixDir,
     ArchiveSummaryInfo* outInfo,
@@ -685,6 +660,24 @@ inline bool ParseOrExtractUdfOnReader(
 
 } // namespace DetailUdfNrg
 
+inline bool HasUdfSignatures(const uint8_t* data, size_t size) {
+    if (!data || size < 65536u) return false;
+    for (size_t v = 32768u; v + 2048u <= std::min<size_t>(size, 98304u); v += 2048u) {
+        if (std::memcmp(data + v + 1u, "NSR02", 5) == 0 || std::memcmp(data + v + 1u, "NSR03", 5) == 0) {
+            return true;
+        }
+    }
+    if (size >= 257u * 2048u && DetailUdfNrg::ValidateUdfTag(data + 256u * 2048u, 512u, 2u) &&
+        DetailUdfNrg::RdU32LE(data + 256u * 2048u + 12u) == 256u) {
+        return true;
+    }
+    if (size >= 257u * 512u && DetailUdfNrg::ValidateUdfTag(data + 256u * 512u, 512u, 2u) &&
+        DetailUdfNrg::RdU32LE(data + 256u * 512u + 12u) == 256u) {
+        return true;
+    }
+    return false;
+}
+
 inline bool ParseOrExtractUdfImage(
     const uint8_t* data,
     size_t size,
@@ -694,28 +687,10 @@ inline bool ParseOrExtractUdfImage(
     std::vector<uint8_t>* outExtracted)
 {
     if (extLower == L".nrg") return false;
-
-    // 2. Standalone UDF Image (.udf, or pure UDF optical image without ISO 9660 PVD)
-    const bool hasIsoPvd = (size >= 0x8800u && data[0x8000u] == 1u && std::memcmp(data + 0x8001u, "CD001", 5) == 0);
-    if (extLower == L".iso" && hasIsoPvd) return false;
-    bool likelyUdf = (extLower == L".udf");
-    if (!likelyUdf && size >= 65536u) {
-        // Quick signature check at 32 KB VRS ("NSR02" / "NSR03") or sector 256 AVDP (tagId == 2)
-        for (size_t v = 32768u; v + 2048u <= std::min<size_t>(size, 98304u); v += 2048u) {
-            if (std::memcmp(data + v + 1u, "NSR02", 5) == 0 || std::memcmp(data + v + 1u, "NSR03", 5) == 0) {
-                likelyUdf = true;
-                break;
-            }
-        }
-        if (!likelyUdf && size >= 257u * 2048u && DetailUdfNrg::ValidateUdfTag(data + 256u * 2048u, 512u, 2u) &&
-            DetailUdfNrg::RdU32LE(data + 256u * 2048u + 12u) == 256u)
-        {
-            likelyUdf = true;
-        }
-    }
+    const bool likelyUdf = (extLower == L".udf") || HasUdfSignatures(data, size);
     if (!likelyUdf) return false;
 
-    DetailArc100::VirtualDiskReader rawUdf;
+    DetailDiskAndGameArc::VirtualDiskReader rawUdf;
     rawUdf.virtualSize = size;
     rawUdf.formatName  = L"UDF Optical Image";
     rawUdf.directRawBuffer = true;
@@ -725,6 +700,65 @@ inline bool ParseOrExtractUdfImage(
         return true;
     };
     return DetailUdfNrg::ParseOrExtractUdfOnReader(rawUdf, 0, L"", outInfo, extractTargetNorm, outExtracted);
+}
+
+// Hybrid ISO 9660 + UDF optical disc helper: DVD/Windows/Blu-ray .iso images often contain a 1-file ISO 9660
+// README.TXT bridge stub alongside the full UDF filesystem. Prefer UDF whenever UDF is valid and has more entries!
+inline bool InspectIsoOrHybridUdf(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
+    ArchiveSummaryInfo isoInfo;
+    const bool okIso = InspectIso9660(data, size, isoInfo) && isoInfo.valid;
+
+    if (HasUdfSignatures(data, size)) {
+        ArchiveSummaryInfo udfInfo;
+        if (ParseOrExtractUdfImage(data, size, L".iso", &udfInfo, nullptr, nullptr) && udfInfo.valid) {
+            auto countFiles = [](const ArchiveSummaryInfo& inf) -> size_t {
+                size_t n = 0;
+                for (const auto& e : inf.entries) {
+                    if (!e.isDirectory) ++n;
+                }
+                return n;
+            };
+            const size_t udfFiles = countFiles(udfInfo);
+            const size_t isoFiles = okIso ? countFiles(isoInfo) : 0u;
+            if (!okIso || udfFiles > isoFiles || (udfFiles == isoFiles && udfInfo.entries.size() > isoInfo.entries.size())) {
+                outInfo = std::move(udfInfo);
+                return true;
+            }
+        }
+    }
+
+    if (okIso) {
+        outInfo = std::move(isoInfo);
+        return true;
+    }
+    return false;
+}
+
+inline bool ExtractIsoOrHybridUdfEntry(
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& normTarget,
+    std::vector<uint8_t>& outBytes)
+{
+    if (HasUdfSignatures(data, size)) {
+        ArchiveSummaryInfo isoInfo;
+        ArchiveSummaryInfo udfInfo;
+        const bool okIso = InspectIso9660(data, size, isoInfo) && isoInfo.valid;
+        const bool okUdf = ParseOrExtractUdfImage(data, size, L".iso", &udfInfo, nullptr, nullptr) && udfInfo.valid;
+        if (okUdf && (!okIso || udfInfo.entries.size() >= isoInfo.entries.size())) {
+            if (ParseOrExtractUdfImage(data, size, L".iso", nullptr, &normTarget, &outBytes)) {
+                return true;
+            }
+        }
+        if (ExtractIso9660Entry(data, size, normTarget, outBytes)) {
+            return true;
+        }
+        if (okUdf && ParseOrExtractUdfImage(data, size, L".iso", nullptr, &normTarget, &outBytes)) {
+            return true;
+        }
+        return false;
+    }
+    return ExtractIso9660Entry(data, size, normTarget, outBytes);
 }
 
 } // namespace Explorer2::Formats

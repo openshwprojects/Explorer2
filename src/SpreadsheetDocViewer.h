@@ -15,7 +15,7 @@ namespace Explorer2 {
 class SpreadsheetDocViewer {
 public:
     SpreadsheetDocViewer() = default;
-    ~SpreadsheetDocViewer() = default;
+    ~SpreadsheetDocViewer();
 
     // The readers themselves live in DocReaders.cpp
     static bool IsSpreadsheetOrDocExtension(const std::wstring& extLower) {
@@ -25,7 +25,7 @@ public:
         return DocReaders::InspectOfficeFile(fullPath, outDoc);
     }
 
-    void Initialize(HWND parentHwnd);
+    void Initialize(HWND parentHwnd, IDWriteFactory* dwriteFactory = nullptr);
     void Shutdown();
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
@@ -52,10 +52,27 @@ public:
     bool OnMouseMove(float x, float y);
     bool OnMouseUp();
     bool OnMouseWheel(short delta, float x, float y);
+    bool OnMouseHWheel(short delta, float x, float y);
+    bool WantsHorizontalResizeCursor(float x, float y) const;
+
+    int TopRow() const { return m_topRow; }
+    int LeftCol() const { return m_leftCol; }
+    float DocScrollY() const { return m_docScrollY; }
+    const D2D1_RECT_F& VScrollThumbRect() const { return m_vScrollThumbRect; }
+    const D2D1_RECT_F& HScrollThumbRect() const { return m_hScrollThumbRect; }
 
 private:
+    static constexpr float kDefaultCellWidth = 108.0f;
+    static constexpr float kMinCellWidth = 48.0f;
+    static constexpr float kMaxCellWidth = 640.0f;
+
     void SortActiveSheetByColumn(int colIdx);
     void RecomputeColumnStats(int colIdx);
+    void ResetColumnWidthsForActiveSheet();
+    void AutoFitColumnWidth(int colIdx);
+    float GetColWidth(int colIdx) const;
+    int HitColumnResizeHandle(float x, float y) const;
+    int HitColumnAtX(float x) const;
 
     enum BtnId : int {
         BTN_NONE = 0,
@@ -74,6 +91,9 @@ private:
     };
 
     HWND m_parentHwnd = nullptr;
+    IDWriteTextFormat* m_fmtCellTrim = nullptr;
+    IDWriteTextFormat* m_fmtHeaderTrim = nullptr;
+    std::wstring m_lineScratch;
     std::wstring m_currentPath;
     ParsedOfficeDocument m_doc;
 
@@ -84,7 +104,18 @@ private:
     bool m_sortAscending = true;
     int m_topRow = 0;
     int m_leftCol = 0;
+    int m_maxTopRow = 0;
+    int m_maxLeftCol = 0;
+    int m_visDataRows = 1;
     float m_docScrollY = 0.0f;
+    float m_maxDocScrollY = 0.0f;
+
+    std::vector<float> m_colWidths;
+    int m_resizingCol = -1;
+    float m_resizeStartX = 0.0f;
+    float m_resizeStartW = kDefaultCellWidth;
+    ULONGLONG m_lastDividerClickTick = 0;
+    int m_lastDividerClickCol = -1;
 
     // Column statistics for selected column
     size_t m_statNumericCount = 0;
@@ -94,6 +125,7 @@ private:
     double m_statMax = 0.0;
 
     int m_hoverBtnId = 0;
+    int m_hoverScrollPart = 0; // 0 = none, 1 = vertical thumb, 2 = horizontal thumb
     bool m_showMapView = true;
     float m_mapZoom = 1.0f;
     float m_mapPanX = 0.0f;
@@ -101,8 +133,15 @@ private:
     bool m_mapDragging = false;
     float m_mapDragStartX = 0.0f;
     float m_mapDragStartY = 0.0f;
+    bool m_draggingVScroll = false;
+    bool m_draggingHScroll = false;
+    float m_scrollDragOffset = 0.0f;
     D2D1_RECT_F m_gridBodyRect = {};
     D2D1_RECT_F m_colHeaderRect = {};
+    D2D1_RECT_F m_vScrollTrackRect = {};
+    D2D1_RECT_F m_vScrollThumbRect = {};
+    D2D1_RECT_F m_hScrollTrackRect = {};
+    D2D1_RECT_F m_hScrollThumbRect = {};
     std::vector<HitRect> m_toolbarHits;
 };
 

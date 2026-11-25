@@ -18,7 +18,7 @@ inline bool DecodeAnsiArt(const uint8_t* data, size_t size, ExtendedImageInfo& o
         uint8_t dataType = sauce[94];
         uint8_t fileType = sauce[95];
         if (dataType == 1 && (fileType <= 2)) {
-            uint16_t tInfo1 = DetailImg100::RdU16LE(sauce + 96);
+            uint16_t tInfo1 = DetailLayeredAndHdrImg::RdU16LE(sauce + 96);
             if (tInfo1 >= 1 && tInfo1 <= 320) cols = static_cast<int>(tInfo1);
             // ACiD SAUCE v00.5 places TFlags at offset 105; also check 106 when non-ASCII bitfield
             uint8_t tFlags = sauce[105];

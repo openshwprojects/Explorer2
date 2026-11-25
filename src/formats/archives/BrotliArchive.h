@@ -1,4 +1,5 @@
 #pragma once
+#include "../../ReaderTextUtils.h"
 // BrotliArchive.h — Zero-dependency C++20 RFC 7932 Brotli Stream & Tarball (.br, .tbr, .tar.br) archive reader.
 
 #include "../../ByteIO.h"
@@ -39,38 +40,11 @@ using ::Explorer2::ByteIO::RdU32BE;
 using ::Explorer2::ByteIO::RdU64BE;
 
 inline bool EndsWithCI(const std::wstring& s, const wchar_t* suffix) {
-    const size_t sl = wcslen(suffix);
-    if (s.size() < sl) return false;
-    return _wcsicmp(s.c_str() + (s.size() - sl), suffix) == 0;
+    return ::Explorer2::ReaderText::EndsWithWideCI(s, suffix);
 }
-
-inline std::string AsciiLower(std::string_view sv) {
-    std::string out(sv);
-    for (char& ch : out) {
-        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
-    }
-    return out;
-}
-
-inline std::string_view TrimAsciiSV(std::string_view sv) {
-    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r')) sv.remove_prefix(1);
-    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r')) sv.remove_suffix(1);
-    return sv;
-}
-
-inline void CalendarToDosDateTime(
-    int year, int month, int day,
-    int hour, int minute, int second,
-    uint16_t& outDate, uint16_t& outTime)
-{
-    outDate = 0;
-    outTime = 0;
-    if (year < 1980 || year > 2107 || month < 1 || month > 12 || day < 1 || day > 31) return;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60) return;
-    if (second == 60) second = 59;
-    outDate = static_cast<uint16_t>(((year - 1980) << 9) | (month << 5) | day);
-    outTime = static_cast<uint16_t>((hour << 11) | (minute << 5) | (second / 2));
-}
+inline std::string AsciiLower(std::string_view sv) { return ::Explorer2::ReaderText::ToLowerAscii(sv); }
+inline std::string_view TrimAsciiSV(std::string_view sv) { return ::Explorer2::ReaderText::TrimCrTabSpace(sv); }
+using ::Explorer2::ReaderText::CalendarToDosDateTime;
 
 struct BrotliDecompCache {
     std::wstring normKey;

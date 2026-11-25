@@ -129,7 +129,7 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
             float y1 = GetSchCoordMm(kv, "location.y") + offsetY;
             float x2 = GetSchCoordMm(kv, "corner.x", (x1 - offsetX) + 10.16f) + offsetX;
             float y2 = GetSchCoordMm(kv, "corner.y", (y1 - offsetY) + 7.62f) + offsetY;
-            DetailEda100::AddRectOutline(out, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f, std::fabs(x2 - x1), std::fabs(y2 - y1), EdaLayerId::SchSymbol, 0.30f);
+            DetailSiliconAndBusEda::AddRectOutline(out, (x1 + x2) * 0.5f, (y1 + y2) * 0.5f, std::fabs(x2 - x1), std::fabs(y2 - y1), EdaLayerId::SchSymbol, 0.30f);
             expandOwnerBody(x1, y1);
             expandOwnerBody(x2, y2);
             ++decodedCount;
@@ -263,7 +263,7 @@ inline bool ProcessSchRecords(const std::vector<KvMap>& records, ParsedEdaBoard&
             c.lengthMm = 5.08f;
         }
         if (!cb.hasBody) {
-            DetailEda100::AddRectOutline(out, c.x, c.y, c.widthMm, c.lengthMm, EdaLayerId::SchSymbol, 0.28f);
+            DetailSiliconAndBusEda::AddRectOutline(out, c.x, c.y, c.widthMm, c.lengthMm, EdaLayerId::SchSymbol, 0.28f);
         }
         c.category = ClassifyComponent(c.refDes, c.footprint, c.widthMm, c.lengthMm, c.heightMm, c.pinCount);
         out.components.push_back(c);
@@ -348,7 +348,7 @@ inline bool ParseAltiumSchDocBoard(const uint8_t* data, size_t size, const std::
 
     // Case 2: Pipe-delimited ASCII Altium export (|RECORD=...|...)
     std::string_view sv(reinterpret_cast<const char*>(data), size);
-    if (!DetailEda100::ContainsAsciiI(sv, "RECORD=")) return false;
+    if (!DetailSiliconAndBusEda::ContainsAsciiI(sv, "RECORD=")) return false;
 
     std::vector<DetailAltium::KvMap> asciiRecords;
     size_t pos = 0;
@@ -357,7 +357,7 @@ inline bool ParseAltiumSchDocBoard(const uint8_t* data, size_t size, const std::
         if (eol == std::string_view::npos) eol = sv.size();
         std::string_view ln = sv.substr(pos, eol - pos);
         pos = eol + 1;
-        if (!DetailEda100::ContainsAsciiI(ln, "RECORD=")) continue;
+        if (!DetailSiliconAndBusEda::ContainsAsciiI(ln, "RECORD=")) continue;
         DetailAltium::KvMap kv = DetailAltium::ParsePipeRecord(ln);
         if (!kv.empty()) asciiRecords.push_back(std::move(kv));
     }

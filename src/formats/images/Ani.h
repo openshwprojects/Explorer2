@@ -38,70 +38,8 @@ inline uint8_t ExtractBitfield8(uint32_t px, uint32_t mask) {
 }
 
 inline bool DecodePngViaWic(const uint8_t* pngData, size_t pngSize, ExtendedImageInfo& outInfo) {
-#if !defined(_WIN32) && !defined(E2_WIN32_HAL)
-    return false;   // the Linux build of the readers has no Windows Imaging Component (WIC)
-#else
-    if (!pngData || pngSize < 8 || pngSize > 0x7FFFFFFFu) return false;
-    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    bool needUninit = (hrCo == S_OK || hrCo == S_FALSE);
-
-    bool ok = false;
-    IWICImagingFactory* factory = nullptr;
-    IWICStream* stream = nullptr;
-    IWICBitmapDecoder* decoder = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
-    IWICFormatConverter* converter = nullptr;
-
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
-    if (SUCCEEDED(hr) && factory) {
-        hr = factory->CreateStream(&stream);
-        if (SUCCEEDED(hr) && stream) {
-            hr = stream->InitializeFromMemory(const_cast<BYTE*>(pngData), static_cast<DWORD>(pngSize));
-        }
-        if (SUCCEEDED(hr)) {
-            hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
-        }
-        if (SUCCEEDED(hr) && decoder) {
-            hr = decoder->GetFrame(0, &frame);
-        }
-        UINT w = 0, h = 0;
-        if (SUCCEEDED(hr) && frame) {
-            hr = frame->GetSize(&w, &h);
-            if (SUCCEEDED(hr) && (w == 0 || h == 0 || w > 1024u || h > 1024u)) {
-                hr = E_FAIL;
-            }
-        }
-        if (SUCCEEDED(hr) && frame) {
-            hr = factory->CreateFormatConverter(&converter);
-        }
-        if (SUCCEEDED(hr) && converter) {
-            hr = converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA,
-                                       WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
-        }
-        if (SUCCEEDED(hr) && converter) {
-            size_t totalBytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
-            outInfo.bgraPixels.resize(totalBytes);
-            hr = converter->CopyPixels(nullptr, w * 4u, static_cast<UINT>(totalBytes), outInfo.bgraPixels.data());
-            if (SUCCEEDED(hr)) {
-                outInfo.width = w;
-                outInfo.height = h;
-                outInfo.channels = 4;
-                outInfo.bitsPerChannel = 8;
-                outInfo.formatName = L"Windows Animated Cursor (.ani)";
-                outInfo.valid = true;
-                ok = true;
-            }
-        }
-    }
-
-    if (converter) converter->Release();
-    if (frame) frame->Release();
-    if (decoder) decoder->Release();
-    if (stream) stream->Release();
-    if (factory) factory->Release();
-    if (needUninit) CoUninitialize();
-    return ok;
-#endif
+    return DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(
+        pngData, pngSize, L"Windows Animated Cursor (.ani)", outInfo, 1024u);
 }
 
 inline bool DecodeIcoDibEntry(const uint8_t* sub, size_t subLen, uint8_t dirH, ExtendedImageInfo& outInfo) {

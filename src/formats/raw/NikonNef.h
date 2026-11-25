@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailImg200 {
+namespace DetailVectorAndRawImg {
 
 // ============================================================================
 // 3. Nikon NEF Compressed / Lossless Huffman Sensor Unpacker (Compression == 34713)
@@ -183,10 +183,10 @@ inline bool UnpackNikonNefHuffmanSensor(
     return true;
 }
 
-} // namespace DetailImg200
+} // namespace DetailVectorAndRawImg
 
 inline bool DecodeNikonNef(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DetailImg200::ParseTiffRawIfds(data, size, L"Nikon NEF RAW (.nef)", outInfo);
+    return DetailVectorAndRawImg::ParseTiffRawIfds(data, size, L"Nikon NEF RAW (.nef)", outInfo);
 }
 
 } // namespace Formats

@@ -6,7 +6,7 @@ namespace Formats {
 
 // 2. Berkeley BLIF / Yosys EBLIF Gate-Level Netlist (.blif / .eblif)
 inline bool ParseBlifNetlistBoard(std::string_view sv, ParsedEdaBoard& out) {
-    using namespace DetailGateTdms;
+    using namespace DetailGateAndDaqEda;
     for (unsigned char c : sv) {
         if (c == 0) return false;
     }

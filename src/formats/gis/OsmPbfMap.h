@@ -10,11 +10,11 @@ inline int64_t ZigZag64(uint64_t v) {
 }
 
 inline bool SkipPbWire(const uint8_t* d, size_t sz, size_t& pos, uint8_t wt) {
-    if (wt == 0) { uint64_t v = 0; return DetailDocs200::ReadVarint64(d, sz, pos, v); }
+    if (wt == 0) { uint64_t v = 0; return DetailStructuredDataDoc::ReadVarint64(d, sz, pos, v); }
     if (wt == 1) { if (pos + 8 > sz) return false; pos += 8; return true; }
     if (wt == 2) {
         uint64_t ln = 0;
-        if (!DetailDocs200::ReadVarint64(d, sz, pos, ln) || ln > sz - pos) return false;
+        if (!DetailStructuredDataDoc::ReadVarint64(d, sz, pos, ln) || ln > sz - pos) return false;
         pos += static_cast<size_t>(ln);
         return true;
     }
@@ -24,7 +24,7 @@ inline bool SkipPbWire(const uint8_t* d, size_t sz, size_t& pos, uint8_t wt) {
 
 inline bool ReadPbBytes(const uint8_t* d, size_t sz, size_t& pos, const uint8_t*& outPtr, size_t& outLen) {
     uint64_t ln = 0;
-    if (!DetailDocs200::ReadVarint64(d, sz, pos, ln) || ln > sz - pos) return false;
+    if (!DetailStructuredDataDoc::ReadVarint64(d, sz, pos, ln) || ln > sz - pos) return false;
     outPtr = d + pos;
     outLen = static_cast<size_t>(ln);
     pos += outLen;
@@ -38,7 +38,7 @@ inline bool ParseOsmBlobHeader(const uint8_t* d, size_t sz, std::string& outType
     size_t pos = 0;
     while (pos < sz) {
         uint64_t tag = 0;
-        if (!DetailDocs200::ReadVarint64(d, sz, pos, tag) || tag == 0) return false;
+        if (!DetailStructuredDataDoc::ReadVarint64(d, sz, pos, tag) || tag == 0) return false;
         uint32_t fn = static_cast<uint32_t>(tag >> 3);
         uint8_t wt = static_cast<uint8_t>(tag & 0x07u);
         if (fn == 1 && wt == 2) {
@@ -47,7 +47,7 @@ inline bool ParseOsmBlobHeader(const uint8_t* d, size_t sz, std::string& outType
             outType.assign(reinterpret_cast<const char*>(p), n);
         } else if (fn == 3 && wt == 0) {
             uint64_t v = 0;
-            if (!DetailDocs200::ReadVarint64(d, sz, pos, v) || v > 64ULL * 1024ULL * 1024ULL) return false;
+            if (!DetailStructuredDataDoc::ReadVarint64(d, sz, pos, v) || v > 64ULL * 1024ULL * 1024ULL) return false;
             outDataSize = static_cast<uint32_t>(v);
             hasDataSize = true;
         } else {
@@ -66,11 +66,11 @@ inline bool DecompressOsmBlob(const uint8_t* d, size_t sz, std::vector<uint8_t>&
     size_t pos = 0;
     while (pos < sz) {
         uint64_t tag = 0;
-        if (!DetailDocs200::ReadVarint64(d, sz, pos, tag) || tag == 0) return false;
+        if (!DetailStructuredDataDoc::ReadVarint64(d, sz, pos, tag) || tag == 0) return false;
         uint32_t fn = static_cast<uint32_t>(tag >> 3);
         uint8_t wt = static_cast<uint8_t>(tag & 0x07u);
         if (fn == 1 && wt == 2) { if (!ReadPbBytes(d, sz, pos, rawPtr, rawLen)) return false; }
-        else if (fn == 2 && wt == 0) { if (!DetailDocs200::ReadVarint64(d, sz, pos, rawSizeHint)) return false; }
+        else if (fn == 2 && wt == 0) { if (!DetailStructuredDataDoc::ReadVarint64(d, sz, pos, rawSizeHint)) return false; }
         else if (fn == 3 && wt == 2) { if (!ReadPbBytes(d, sz, pos, zlibPtr, zlibLen)) return false; }
         else if (fn == 4 && wt == 2) { if (!ReadPbBytes(d, sz, pos, lzmaPtr, lzmaLen)) return false; }
         else if (fn == 6 && wt == 2) { if (!ReadPbBytes(d, sz, pos, zstdPtr, zstdLen)) return false; }
@@ -97,8 +97,8 @@ inline bool DecompressOsmBlob(const uint8_t* d, size_t sz, std::vector<uint8_t>&
         if (::Explorer2::StreamCodecs::DecompressXzStream(lzmaPtr, lzmaLen, outBytes, kMaxBlobOut)) return true;
         if (lzmaLen > 13) {
             uint8_t props = lzmaPtr[0];
-            uint32_t dictSz = DetailDocs200::RdU32LE(lzmaPtr + 1);
-            uint64_t hdrUncomp = DetailDocs200::RdU64LE(lzmaPtr + 5);
+            uint32_t dictSz = DetailStructuredDataDoc::RdU32LE(lzmaPtr + 1);
+            uint64_t hdrUncomp = DetailStructuredDataDoc::RdU64LE(lzmaPtr + 5);
             bool known = (hdrUncomp != UINT64_MAX) || (rawSizeHint > 0);
             uint64_t want = (hdrUncomp != UINT64_MAX) ? hdrUncomp : rawSizeHint;
             if (::Explorer2::StreamCodecs::DecompressLzma1(props, dictSz, lzmaPtr + 13, lzmaLen - 13, outBytes, want, known, kMaxBlobOut)) {
@@ -107,7 +107,7 @@ inline bool DecompressOsmBlob(const uint8_t* d, size_t sz, std::vector<uint8_t>&
         }
         if (lzmaLen > 5 && rawSizeHint > 0) {
             uint8_t props = lzmaPtr[0];
-            uint32_t dictSz = DetailDocs200::RdU32LE(lzmaPtr + 1);
+            uint32_t dictSz = DetailStructuredDataDoc::RdU32LE(lzmaPtr + 1);
             if (::Explorer2::StreamCodecs::DecompressLzma1(props, dictSz, lzmaPtr + 5, lzmaLen - 5, outBytes, rawSizeHint, true, kMaxBlobOut)) {
                 return true;
             }
@@ -164,7 +164,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
 
     SpreadsheetSheet waysSh;
     waysSh.name = L"OSM_Ways";
-    waysSh.rows.push_back({ L"Way ID", L"Node Count", L"Start -> End Ref", L"Name", L"Feature", L"Tags" });
+    waysSh.rows.push_back({ L"Way ID", L"Node Count", L"Start -> End Ref", L"Coordinates", L"Name", L"Feature", L"Tags" });
 
     SpreadsheetSheet relsSh;
     relsSh.name = L"OSM_Relations";
@@ -184,7 +184,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
     while (filePos + 4 <= fileSize && blobCount < 1024) {
         const uint8_t* lenBytes = source.Read(filePos, 4, ioBuf);
         if (!lenBytes) break;
-        uint32_t hdrLen = DetailDocs200::RdU32BE(lenBytes);
+        uint32_t hdrLen = DetailStructuredDataDoc::RdU32BE(lenBytes);
         if (hdrLen < 4 || hdrLen > 65536 || filePos + 4 + hdrLen > fileSize) {
             if (blobCount == 0) return false;
             break;
@@ -225,7 +225,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
             size_t hp = 0;
             while (hp < blobDec.size()) {
                 uint64_t tag = 0;
-                if (!DetailDocs200::ReadVarint64(blobDec.data(), blobDec.size(), hp, tag) || tag == 0) return false;
+                if (!DetailStructuredDataDoc::ReadVarint64(blobDec.data(), blobDec.size(), hp, tag) || tag == 0) return false;
                 uint32_t fn = static_cast<uint32_t>(tag >> 3);
                 uint8_t wt = static_cast<uint8_t>(tag & 0x07u);
                 if (fn == 1 && wt == 2) { // HeaderBBox
@@ -234,10 +234,10 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                     size_t xp = 0;
                     while (xp < bl) {
                         uint64_t btag = 0, bv = 0;
-                        if (!DetailDocs200::ReadVarint64(bp, bl, xp, btag)) break;
+                        if (!DetailStructuredDataDoc::ReadVarint64(bp, bl, xp, btag)) break;
                         uint32_t bfn = static_cast<uint32_t>(btag >> 3);
                         uint8_t bwt = static_cast<uint8_t>(btag & 0x07u);
-                        if (bwt == 0 && DetailDocs200::ReadVarint64(bp, bl, xp, bv)) {
+                        if (bwt == 0 && DetailStructuredDataDoc::ReadVarint64(bp, bl, xp, bv)) {
                             double deg = static_cast<double>(ZigZag64(bv)) * 1e-9;
                             if (bfn == 1) minLon = deg;
                             else if (bfn == 2) maxLon = deg;
@@ -269,7 +269,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
             size_t pp = 0;
             while (pp < blobDec.size()) {
                 uint64_t tag = 0;
-                if (!DetailDocs200::ReadVarint64(blobDec.data(), blobDec.size(), pp, tag) || tag == 0) return false;
+                if (!DetailStructuredDataDoc::ReadVarint64(blobDec.data(), blobDec.size(), pp, tag) || tag == 0) return false;
                 uint32_t fn = static_cast<uint32_t>(tag >> 3);
                 uint8_t wt = static_cast<uint8_t>(tag & 0x07u);
                 if (fn == 1 && wt == 2) { // StringTable
@@ -278,7 +278,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                     size_t sp = 0;
                     while (sp < stl && strTab.size() < 250000) {
                         uint64_t stag = 0;
-                        if (!DetailDocs200::ReadVarint64(stp, stl, sp, stag)) break;
+                        if (!DetailStructuredDataDoc::ReadVarint64(stp, stl, sp, stag)) break;
                         if ((stag >> 3) == 1 && (stag & 7u) == 2) {
                             const uint8_t* ep = nullptr; size_t el = 0;
                             if (!ReadPbBytes(stp, stl, sp, ep, el)) break;
@@ -291,15 +291,15 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                     groups.emplace_back(gp, gl);
                 } else if (fn == 17 && wt == 0) {
                     uint64_t v = 0;
-                    if (!DetailDocs200::ReadVarint64(blobDec.data(), blobDec.size(), pp, v)) return false;
+                    if (!DetailStructuredDataDoc::ReadVarint64(blobDec.data(), blobDec.size(), pp, v)) return false;
                     granularity = static_cast<int32_t>(static_cast<uint32_t>(v));
                 } else if (fn == 19 && wt == 0) {
                     uint64_t v = 0;
-                    if (!DetailDocs200::ReadVarint64(blobDec.data(), blobDec.size(), pp, v)) return false;
+                    if (!DetailStructuredDataDoc::ReadVarint64(blobDec.data(), blobDec.size(), pp, v)) return false;
                     latOffset = static_cast<int64_t>(v);
                 } else if (fn == 20 && wt == 0) {
                     uint64_t v = 0;
-                    if (!DetailDocs200::ReadVarint64(blobDec.data(), blobDec.size(), pp, v)) return false;
+                    if (!DetailStructuredDataDoc::ReadVarint64(blobDec.data(), blobDec.size(), pp, v)) return false;
                     lonOffset = static_cast<int64_t>(v);
                 } else {
                     if (!SkipPbWire(blobDec.data(), blobDec.size(), pp, wt)) return false;
@@ -310,7 +310,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                 size_t k = 0;
                 while (k < n && dst.size() < 200000) {
                     uint64_t v = 0;
-                    if (!DetailDocs200::ReadVarint64(p, n, k, v)) break;
+                    if (!DetailStructuredDataDoc::ReadVarint64(p, n, k, v)) break;
                     dst.push_back(static_cast<uint32_t>(v));
                 }
             };
@@ -320,7 +320,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                 size_t gpos = 0;
                 while (gpos < gl) {
                     uint64_t gtag = 0;
-                    if (!DetailDocs200::ReadVarint64(gp, gl, gpos, gtag) || gtag == 0) break;
+                    if (!DetailStructuredDataDoc::ReadVarint64(gp, gl, gpos, gtag) || gtag == 0) break;
                     uint32_t gfn = static_cast<uint32_t>(gtag >> 3);
                     uint8_t gwt = static_cast<uint8_t>(gtag & 0x07u);
                     if (gwt != 2) {
@@ -336,16 +336,16 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                         size_t np = 0;
                         while (np < ml) {
                             uint64_t ntag = 0;
-                            if (!DetailDocs200::ReadVarint64(mp, ml, np, ntag)) break;
+                            if (!DetailStructuredDataDoc::ReadVarint64(mp, ml, np, ntag)) break;
                             uint32_t nfn = static_cast<uint32_t>(ntag >> 3);
                             uint8_t nwt = static_cast<uint8_t>(ntag & 7u);
-                            if (nfn == 1 && nwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, np, v); nid = ZigZag64(v); }
+                            if (nfn == 1 && nwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, np, v); nid = ZigZag64(v); }
                             else if (nfn == 2 && nwt == 2) { const uint8_t* p2; size_t l2; if (ReadPbBytes(mp, ml, np, p2, l2)) readPackedU32(p2, l2, keys); }
-                            else if (nfn == 2 && nwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, np, v); keys.push_back(static_cast<uint32_t>(v)); }
+                            else if (nfn == 2 && nwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, np, v); keys.push_back(static_cast<uint32_t>(v)); }
                             else if (nfn == 3 && nwt == 2) { const uint8_t* p2; size_t l2; if (ReadPbBytes(mp, ml, np, p2, l2)) readPackedU32(p2, l2, vals); }
-                            else if (nfn == 3 && nwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, np, v); vals.push_back(static_cast<uint32_t>(v)); }
-                            else if (nfn == 8 && nwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, np, v); nlat = ZigZag64(v); }
-                            else if (nfn == 9 && nwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, np, v); nlon = ZigZag64(v); }
+                            else if (nfn == 3 && nwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, np, v); vals.push_back(static_cast<uint32_t>(v)); }
+                            else if (nfn == 8 && nwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, np, v); nlat = ZigZag64(v); }
+                            else if (nfn == 9 && nwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, np, v); nlon = ZigZag64(v); }
                             else if (!SkipPbWire(mp, ml, np, nwt)) break;
                         }
                         double lat = 1e-9 * static_cast<double>(latOffset + granularity * nlat);
@@ -370,7 +370,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                         size_t dp = 0;
                         while (dp < ml) {
                             uint64_t dtag = 0;
-                            if (!DetailDocs200::ReadVarint64(mp, ml, dp, dtag)) break;
+                            if (!DetailStructuredDataDoc::ReadVarint64(mp, ml, dp, dtag)) break;
                             uint32_t dfn = static_cast<uint32_t>(dtag >> 3);
                             uint8_t dwt = static_cast<uint8_t>(dtag & 7u);
                             if ((dfn == 1 || dfn == 8 || dfn == 9) && dwt == 2) {
@@ -381,7 +381,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                                 size_t sk = 0;
                                 while (sk < sl && target.size() < 200000) {
                                     uint64_t v = 0;
-                                    if (!DetailDocs200::ReadVarint64(sp, sl, sk, v)) break;
+                                    if (!DetailStructuredDataDoc::ReadVarint64(sp, sl, sk, v)) break;
                                     acc += ZigZag64(v);
                                     target.push_back(acc);
                                 }
@@ -430,14 +430,14 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                         size_t wp = 0;
                         while (wp < ml) {
                             uint64_t wtag = 0;
-                            if (!DetailDocs200::ReadVarint64(mp, ml, wp, wtag)) break;
+                            if (!DetailStructuredDataDoc::ReadVarint64(mp, ml, wp, wtag)) break;
                             uint32_t wfn = static_cast<uint32_t>(wtag >> 3);
                             uint8_t wwt = static_cast<uint8_t>(wtag & 7u);
-                            if (wfn == 1 && wwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, wp, v); wid = static_cast<int64_t>(v); }
+                            if (wfn == 1 && wwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, wp, v); wid = static_cast<int64_t>(v); }
                             else if (wfn == 2 && wwt == 2) { const uint8_t* p2; size_t l2; if (ReadPbBytes(mp, ml, wp, p2, l2)) readPackedU32(p2, l2, keys); }
-                            else if (wfn == 2 && wwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, wp, v); keys.push_back(static_cast<uint32_t>(v)); }
+                            else if (wfn == 2 && wwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, wp, v); keys.push_back(static_cast<uint32_t>(v)); }
                             else if (wfn == 3 && wwt == 2) { const uint8_t* p2; size_t l2; if (ReadPbBytes(mp, ml, wp, p2, l2)) readPackedU32(p2, l2, vals); }
-                            else if (wfn == 3 && wwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, wp, v); vals.push_back(static_cast<uint32_t>(v)); }
+                            else if (wfn == 3 && wwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, wp, v); vals.push_back(static_cast<uint32_t>(v)); }
                             else if (wfn == 8 && wwt == 2) {
                                 const uint8_t* rp = nullptr; size_t rl = 0;
                                 if (ReadPbBytes(mp, ml, wp, rp, rl)) {
@@ -445,7 +445,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                                     size_t rk = 0;
                                     while (rk < rl && refs.size() < 65536) {
                                         uint64_t v = 0;
-                                        if (!DetailDocs200::ReadVarint64(rp, rl, rk, v)) break;
+                                        if (!DetailStructuredDataDoc::ReadVarint64(rp, rl, rk, v)) break;
                                         rAcc += ZigZag64(v);
                                         refs.push_back(rAcc);
                                     }
@@ -453,15 +453,42 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                             } else if (!SkipPbWire(mp, ml, wp, wwt)) break;
                         }
                         ++totalWays;
+                        std::wstring nameW, featW, tagsW;
+                        SummarizeOsmTags(strTab, keys, vals, nameW, featW, tagsW);
+                        int wayRowIdx = -1;
+                        std::wstring coordStr;
+                        size_t resolvedVerts = 0;
+                        double firstLat = 0.0, firstLon = 0.0, lastLat = 0.0, lastLon = 0.0;
+                        bool hasFirst = false;
+                        std::wstring wayLbl = !nameW.empty() ? nameW : (!featW.empty() ? featW : (L"Way " + std::to_wstring(wid)));
+                        for (size_t ri = 0; ri < refs.size(); ++ri) {
+                            auto itC = nodeCoords.find(refs[ri]);
+                            if (itC != nodeCoords.end()) {
+                                if (!hasFirst) { firstLat = itC->second.first; firstLon = itC->second.second; hasFirst = true; }
+                                lastLat = itC->second.first;
+                                lastLon = itC->second.second;
+                                ++resolvedVerts;
+                                if (out.geoPoints.size() < 4096) {
+                                    Formats::AddGeoPoint(out, itC->second.first, itC->second.second, 0.0,
+                                        waysSh.rows.size() <= 1500 ? static_cast<int>(waysSh.rows.size()) : -1, wayLbl, 4096);
+                                }
+                            }
+                        }
+                        if (hasFirst) {
+                            coordStr = L"(" + fmtDeg(firstLat) + L", " + fmtDeg(firstLon) + L")";
+                            if (resolvedVerts >= 2) {
+                                coordStr += L" -> (" + fmtDeg(lastLat) + L", " + fmtDeg(lastLon) + L")";
+                            }
+                        }
                         if (waysSh.rows.size() <= 1500) {
-                            std::wstring nameW, featW, tagsW;
-                            SummarizeOsmTags(strTab, keys, vals, nameW, featW, tagsW);
+                            wayRowIdx = static_cast<int>(waysSh.rows.size());
+                            (void)wayRowIdx;
                             std::wstring spanStr;
                             if (!refs.empty()) {
                                 spanStr = std::to_wstring(refs.front()) + L" -> " + std::to_wstring(refs.back());
                                 if (refs.size() >= 3 && refs.front() == refs.back()) spanStr += L" (closed)";
                             }
-                            waysSh.rows.push_back({ std::to_wstring(wid), std::to_wstring(refs.size()), spanStr, nameW, featW, tagsW });
+                            waysSh.rows.push_back({ std::to_wstring(wid), std::to_wstring(refs.size()), spanStr, coordStr, nameW, featW, tagsW });
                         }
                     } else if (gfn == 4) { // Relation
                         int64_t rid = 0;
@@ -470,10 +497,10 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                         size_t rp = 0;
                         while (rp < ml) {
                             uint64_t rtag = 0;
-                            if (!DetailDocs200::ReadVarint64(mp, ml, rp, rtag)) break;
+                            if (!DetailStructuredDataDoc::ReadVarint64(mp, ml, rp, rtag)) break;
                             uint32_t rfn = static_cast<uint32_t>(rtag >> 3);
                             uint8_t rwt = static_cast<uint8_t>(rtag & 7u);
-                            if (rfn == 1 && rwt == 0) { uint64_t v = 0; DetailDocs200::ReadVarint64(mp, ml, rp, v); rid = static_cast<int64_t>(v); }
+                            if (rfn == 1 && rwt == 0) { uint64_t v = 0; DetailStructuredDataDoc::ReadVarint64(mp, ml, rp, v); rid = static_cast<int64_t>(v); }
                             else if (rfn == 2 && rwt == 2) { const uint8_t* p2; size_t l2; if (ReadPbBytes(mp, ml, rp, p2, l2)) readPackedU32(p2, l2, keys); }
                             else if (rfn == 3 && rwt == 2) { const uint8_t* p2; size_t l2; if (ReadPbBytes(mp, ml, rp, p2, l2)) readPackedU32(p2, l2, vals); }
                             else if (rfn == 8 && rwt == 2) { const uint8_t* p2; size_t l2; if (ReadPbBytes(mp, ml, rp, p2, l2)) readPackedU32(p2, l2, roles); }
@@ -484,7 +511,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
                                     size_t mk = 0;
                                     while (mk < l2 && memIds.size() < 65536) {
                                         uint64_t v = 0;
-                                        if (!DetailDocs200::ReadVarint64(p2, l2, mk, v)) break;
+                                        if (!DetailStructuredDataDoc::ReadVarint64(p2, l2, mk, v)) break;
                                         mAcc += ZigZag64(v);
                                         memIds.push_back(mAcc);
                                     }
@@ -561,7 +588,7 @@ inline bool ParseOsmPbfFile(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
 inline bool ParseOsmPbfMapDoc(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
     // Check if .pbf is an OpenStreetMap Binary PBF stream ([uint32BE hdrLen][BlobHeader { type = "OSMHeader"/"OSMData" }])
     if (ext == L".pbf" && raw.size() >= 12) {
-        uint32_t hdrLen = DetailDocs200::RdU32BE(raw.data());
+        uint32_t hdrLen = DetailStructuredDataDoc::RdU32BE(raw.data());
         if (hdrLen >= 4 && hdrLen <= 65536 && 4u + hdrLen <= raw.size()) {
             std::string btype;
             uint32_t dataSize = 0;

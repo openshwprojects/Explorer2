@@ -8,7 +8,7 @@ namespace Formats {
 // 1. Foundry Modo Scene / Object (.lxo — IFF "FORM" + "LXOB" / "LXOP")
 // ============================================================================
 inline bool ParseModoLxo(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
-    using namespace ModoZbMaxC4dDetail;
+    using namespace DetailDccSculpt;
     if (!data || size < 20 || std::memcmp(data, "FORM", 4) != 0) return false;
     uint32_t formSize = RdU32BE(data + 4);
     if (formSize < 12) return false;

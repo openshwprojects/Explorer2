@@ -76,10 +76,10 @@ inline bool ParseAuthenticodeCatDoc(const std::vector<uint8_t>& raw, const std::
             std::wstring s;
             s.reserve(len / 2);
             for (size_t i = 0; i + 2 <= len; i += 2) {
-                uint16_t u = bigEndian ? DetailDocs200::RdU16BE(p + i) : DetailDocs200::RdU16LE(p + i);
+                uint16_t u = bigEndian ? DetailStructuredDataDoc::RdU16BE(p + i) : DetailStructuredDataDoc::RdU16LE(p + i);
                 if (u == 0) break;
                 if (u >= 0xD800u && u <= 0xDBFFu && i + 4 <= len) {
-                    uint16_t lo = bigEndian ? DetailDocs200::RdU16BE(p + i + 2) : DetailDocs200::RdU16LE(p + i + 2);
+                    uint16_t lo = bigEndian ? DetailStructuredDataDoc::RdU16BE(p + i + 2) : DetailStructuredDataDoc::RdU16LE(p + i + 2);
                     if (lo >= 0xDC00u && lo <= 0xDFFFu) {
                         PathUtils::AppendUtf16(s, 0x10000u + (((static_cast<uint32_t>(u) - 0xD800u) << 10) | (lo - 0xDC00u)));
                         i += 2;
@@ -99,7 +99,7 @@ inline bool ParseAuthenticodeCatDoc(const std::vector<uint8_t>& raw, const std::
                     bool looksUtf16LE = true;
                     size_t nonNullChars = 0;
                     for (size_t i = 0; i + 2 <= t.valLen; i += 2) {
-                        uint16_t ch = DetailDocs200::RdU16LE(t.val + i);
+                        uint16_t ch = DetailStructuredDataDoc::RdU16LE(t.val + i);
                         if (ch == 0 && i + 2 == t.valLen) break;
                         if (ch < 0x20u || (ch >= 0x7Fu && ch < 0xA0u) || (ch >= 0xD800u && ch <= 0xDFFFu)) {
                             looksUtf16LE = false;
@@ -110,7 +110,7 @@ inline bool ParseAuthenticodeCatDoc(const std::vector<uint8_t>& raw, const std::
                     }
                     if (looksUtf16LE && nonNullChars > 0) return decodeBmpOrUtf16(t.val, t.valLen, false);
                 }
-                if (DetailDocs200::IsMostlyPrintableUtf8(t.val, t.valLen)) {
+                if (DetailStructuredDataDoc::IsMostlyPrintableUtf8(t.val, t.valLen)) {
                     return PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(t.val), t.valLen));
                 }
                 return PathUtils::HexBytes(t.val, t.valLen, L':', 64);

@@ -2,7 +2,7 @@
 // OutlookMsg.h — Microsoft Outlook MAPI Message (.msg) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseOutlookMsg(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     Ole2::CompoundFile cf;
@@ -202,8 +202,8 @@ inline bool ParseOutlookMsg(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseOutlookMsgDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseOutlookMsg(raw, out); }
+inline bool ParseOutlookMsgDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseOutlookMsg(raw, out); }
 
 } // namespace Formats

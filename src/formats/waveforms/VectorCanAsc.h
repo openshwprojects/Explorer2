@@ -21,8 +21,8 @@ inline bool ParseVectorCanAscBoard(const uint8_t* data, size_t size, const std::
             while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.remove_suffix(1);
             if (ln.empty() || ln[0] == ';' || ln.rfind("//", 0) == 0) continue;
 
-            if (DetailEda100::ContainsAsciiI(ln, "base dec")) { baseDec = true; continue; }
-            if (DetailEda100::ContainsAsciiI(ln, "base hex")) { baseDec = false; continue; }
+            if (DetailSiliconAndBusEda::ContainsAsciiI(ln, "base dec")) { baseDec = true; continue; }
+            if (DetailSiliconAndBusEda::ContainsAsciiI(ln, "base hex")) { baseDec = false; continue; }
             if (!((ln[0] >= '0' && ln[0] <= '9') || ln[0] == '.')) continue;
 
             std::vector<std::string_view> toks;
@@ -41,12 +41,12 @@ inline bool ParseVectorCanAscBoard(const uint8_t* data, size_t size, const std::
             double ts = std::strtod(tbuf, nullptr);
 
             // CANFD line: <ts> CANFD <ch> Rx|Tx <id> [<sym>] <brs> <esi> <dlc> <dataLen> <b0> ...
-            if (DetailEda100::ContainsAsciiI(toks[1], "CANFD") && toks.size() >= 10) {
+            if (DetailSiliconAndBusEda::ContainsAsciiI(toks[1], "CANFD") && toks.size() >= 10) {
                 DetailCan::CanFrame f;
                 f.timestamp = ts;
                 f.isFd = true;
                 f.channel = static_cast<uint16_t>(std::atoi(std::string(toks[2]).c_str()));
-                f.isTx = DetailEda100::ContainsAsciiI(toks[3], "Tx");
+                f.isTx = DetailSiliconAndBusEda::ContainsAsciiI(toks[3], "Tx");
                 std::string idStr(toks[4]);
                 if (!idStr.empty() && (idStr.back() == 'x' || idStr.back() == 'X')) {
                     f.extId = true;
@@ -68,7 +68,7 @@ inline bool ParseVectorCanAscBoard(const uint8_t* data, size_t size, const std::
             }
 
             // Classic CAN frame: <ts> <ch> <id>[x] Rx|Tx d <dlc> <b0> ...
-            if ((DetailEda100::ContainsAsciiI(toks[3], "Rx") || DetailEda100::ContainsAsciiI(toks[3], "Tx")) &&
+            if ((DetailSiliconAndBusEda::ContainsAsciiI(toks[3], "Rx") || DetailSiliconAndBusEda::ContainsAsciiI(toks[3], "Tx")) &&
                 (toks[4] == "d" || toks[4] == "D"))
             {
                 DetailCan::CanFrame f;
@@ -83,7 +83,7 @@ inline bool ParseVectorCanAscBoard(const uint8_t* data, size_t size, const std::
                 unsigned long parsedId = std::strtoul(idStr.c_str(), &idEnd, baseDec ? 10 : 16);
                 if (idEnd == idStr.c_str()) continue;
                 f.canId = static_cast<uint32_t>(parsedId) & 0x1FFFFFFFu;
-                f.isTx = DetailEda100::ContainsAsciiI(toks[3], "Tx");
+                f.isTx = DetailSiliconAndBusEda::ContainsAsciiI(toks[3], "Tx");
                 int dlc = std::clamp(std::atoi(std::string(toks[5]).c_str()), 0, 64);
                 f.dlcBytes = static_cast<uint8_t>(std::min<size_t>(dlc, toks.size() - 6));
                 for (uint8_t b = 0; b < f.dlcBytes; ++b) {

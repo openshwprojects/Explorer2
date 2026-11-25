@@ -5,7 +5,7 @@
 namespace Formats {
 
 inline bool ParseSemiOasisBoard(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
-    // #66. SEMI P39 OASIS Wafer Mask Layout (.oas — "%SEMI-OASIS\r\n")
+    // SEMI P39 OASIS Wafer Mask Layout (.oas — "%SEMI-OASIS\r\n")
     if (ext == L".oas" || (size >= 13 && std::memcmp(data, "%SEMI-OASIS\r\n", 13) == 0)) {
         if (size < 13 || std::memcmp(data, "%SEMI-OASIS\r\n", 13) != 0) return false;
         out.kind = EdaDocKind::KiCadPcb;
@@ -96,13 +96,13 @@ inline bool ParseSemiOasisBoard(const uint8_t* data, size_t size, const std::wst
                 }
                 case 6: {
                     if (p + 4 > n) { ok = false; return 1.0; }
-                    uint32_t bits = DetailEda200::RdU32LE(b + p); p += 4;
+                    uint32_t bits = DetailIndustrialAndWaveEda::RdU32LE(b + p); p += 4;
                     float fv = 1.0f; std::memcpy(&fv, &bits, 4);
                     return static_cast<double>(fv);
                 }
                 case 7: {
                     if (p + 8 > n) { ok = false; return 1.0; }
-                    uint64_t bits = DetailEda200::RdU64LE(b + p); p += 8;
+                    uint64_t bits = DetailIndustrialAndWaveEda::RdU64LE(b + p); p += 8;
                     double dv = 1.0; std::memcpy(&dv, &bits, 8);
                     return dv;
                 }

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package schemaVersion="1.7.28" xmlns:xs="http://www.w3.org/2001/XMLSchema-instance">
+  <vendor>STMicroelectronics</vendor>
+  <name>STM32H7xx_DFP</name>
+  <description>STMicroelectronics STM32H7 Series Device Support</description>
+  <releases>
+    <release version="3.1.1" date="2026-05-10">Added dual-core H745/H755 updates</release>
+  </releases>
+  <devices>
+    <family Dfamily="STM32H7 Series" Dvendor="STMicroelectronics:13">
+      <processor Dcore="Cortex-M7" Dfpu="DP_FPU" Dmpu="MPU" Dclock="480000000"/>
+      <subFamily DsubFamily="STM32H743">
+        <debug svd="CMSIS/SVD/STM32H743.svd"/>
+        <device Dname="STM32H743ZITx">
+          <memory name="FLASH_BANK1" access="rx" start="0x08000000" size="0x00100000" startup="1"/>
+          <memory name="DTCMRAM"     access="rwx" start="0x20000000" size="0x00020000" startup="0"/>
+          <memory name="AXI_SRAM"    access="rwx" start="0x24000000" size="0x00080000" startup="0"/>
+        </device>
+      </subFamily>
+    </family>
+  </devices>
+  <boards>
+    <board vendor="STMicroelectronics" name="NUCLEO-H743ZI2" revision="MB1364-E01">
+      <mountedDevice Dname="STM32H743ZITx"/>
+    </board>
+  </boards>
+  <components>
+    <component Cclass="Device" Cgroup="Startup" Cversion="1.11.0">
+      <description>System Startup for STM32H7xx</description>
+    </component>
+  </components>
+</package>

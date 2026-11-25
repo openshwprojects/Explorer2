@@ -173,7 +173,7 @@ inline bool InspectSilkroadPk2(const uint8_t* data, size_t size, ArchiveSummaryI
                     item.compressedSize = e.size;
                     item.rawDataOffset = e.position;
                     item.compressionMethod = 0;            // stored as it is
-                    if (e.modifyTime) DetailArc100::FileTimeU64ToDos(e.modifyTime, item.dosDate, item.dosTime);
+                    if (e.modifyTime) DetailDiskAndGameArc::FileTimeU64ToDos(e.modifyTime, item.dosDate, item.dosTime);
                     outInfo.entries.push_back(std::move(item));
                 }
             }

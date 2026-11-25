@@ -6,12 +6,8 @@ namespace Formats {
 
 namespace DetailFdtDtb {
 
-inline void DrawBoxRect(ParsedEdaBoard& out, float x0, float y0, float x1, float y1, float strokeW, EdaLayerId lid, int netId = 0) {
-    out.traces.push_back({ x0, y0, x1, y0, strokeW, lid, netId });
-    out.traces.push_back({ x1, y0, x1, y1, strokeW, lid, netId });
-    out.traces.push_back({ x1, y1, x0, y1, strokeW, lid, netId });
-    out.traces.push_back({ x0, y1, x0, y0, strokeW, lid, netId });
-}
+using ::Explorer2::DrawEdaBoxRect;
+inline void DrawBoxRect(ParsedEdaBoard& out, float x0, float y0, float x1, float y1, float strokeW, EdaLayerId lid, int netId = 0) { DrawEdaBoxRect(out, x0, y0, x1, y1, strokeW, lid, netId); }
 
 inline std::wstring FormatHex64(uint64_t val) {
     char buf[32] = {};

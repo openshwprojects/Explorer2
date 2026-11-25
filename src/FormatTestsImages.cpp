@@ -4023,10 +4023,11 @@ void RunFormatTestsImages(TestCounter& tc) {
             cr2Ljpeg.insert(cr2Ljpeg.end(), lj.begin(), lj.end());
         }
 
-        // Fujifilm .raf with raw CFA directory (0x5C->108) + 16x16 16-bit BE RGGB CFA at 120 (no embedded JPEG)
+        // Fujifilm .raf with raw CFA directory (0x5C->108, len=12) + 16x16 16-bit BE RGGB CFA at 120 (no embedded JPEG)
         std::vector<uint8_t> rafCfa(108, 0);
         std::memcpy(rafCfa.data(), "FUJIFILMCCD-RAW 0201", 20);
         rafCfa[95]  = 108u; // cfaHdrOff = 108 BE
+        rafCfa[99]  = 12u;  // cfaHdrLen = 12 BE
         rafCfa[103] = 120u; // cfaDataOff = 120 BE
         rafCfa[106] = 0x02; rafCfa[107] = 0x00; // cfaDataLen = 512 BE
         PushU32BE(rafCfa, 1u);      // numRecs = 1
@@ -4195,18 +4196,62 @@ void RunFormatTestsImages(TestCounter& tc) {
         verifyPair(L"Stage15.Images.CorelCdr_RiffDispAndZipThumb",
                    L"riff.cdr", cdrRiff, L"zip.cdr", cdrZip, L".cdr", 20);
 
-        // Affinity .afphoto with 00 FF 4B 41 magic + Zlib-compressed 'Thmb' BMP stream
-        std::vector<uint8_t> zThumbBmp = CompressZlibFixed(bmpBlue);
-        std::vector<uint8_t> afThmb = { 0x00, 0xFF, 0x4B, 0x41, 0x08, 0x00, 0x00, 0x00, 'T', 'h', 'm', 'b', 0, 0, 0, 0 };
-        afThmb.insert(afThmb.end(), zThumbBmp.begin(), zThumbBmp.end());
+        // Spec-valid Serif Affinity Persona container (00 FF 4B 41 + #Fil Zlib 'Thmb' piece + #FAT piece table + #Inf trailer)
+        auto buildAffinityPersonaContainer = [&](const std::vector<uint8_t>& thumbImg) {
+            std::vector<uint8_t> zThumb = CompressZlibFixed(thumbImg);
+            std::vector<uint8_t> af = {
+                0x00, 0xFF, 0x4B, 0x41, 0x09, 0x00, 0x00, 0x00,
+                'P', 'r', 's', 'n', 0x00, 0x00, 0x00, 0x00
+            };
+            const uint64_t pieceOff = af.size(); // 16
+            af.insert(af.end(), { '#', 'F', 'i', 'l', 0x01u }); // Zlib piece wrapper
+            af.insert(af.end(), zThumb.begin(), zThumb.end());
+            const uint64_t pieceCompLen = af.size() - pieceOff;
+
+            const uint64_t fatOff = af.size();
+            std::vector<uint8_t> fat = { '#', 'F', 'A', 'T' };
+            PushU32LE(fat, 1u); // 1 piece descriptor at offset 8
+            PushU64LE(fat, pieceOff);
+            PushU64LE(fat, static_cast<uint64_t>(thumbImg.size()));
+            PushU64LE(fat, pieceCompLen);
+            PushU32LE(fat, ComputeCrc32Ieee(thumbImg.data(), thumbImg.size()));
+            PushU32LE(fat, 0u);
+            fat.insert(fat.end(), { 'T', 'h', 'm', 'b', 0x01u, 0x00u, 0x00u, 0x00u });
+            af.insert(af.end(), fat.begin(), fat.end());
+
+            af.insert(af.end(), { '#', 'I', 'n', 'f' });
+            PushU64LE(af, fatOff);
+            PushU64LE(af, static_cast<uint64_t>(fat.size()));
+            PushU32LE(af, 0u);
+            return af;
+        };
+
+        std::vector<uint8_t> dibAmber = buildDib24(16, 16, 240, 170, 25);
+        std::vector<uint8_t> bmpAmber(14u + dibAmber.size(), 0);
+        bmpAmber[0] = 'B'; bmpAmber[1] = 'M';
+        uint32_t bmpAmbSz = static_cast<uint32_t>(bmpAmber.size()), bmpAmbOff = 54u;
+        std::memcpy(bmpAmber.data() + 2, &bmpAmbSz, 4);
+        std::memcpy(bmpAmber.data() + 10, &bmpAmbOff, 4);
+        std::memcpy(bmpAmber.data() + 14, dibAmber.data(), dibAmber.size());
+
+        std::vector<uint8_t> afPhoto  = buildAffinityPersonaContainer(bmpBlue);
+        std::vector<uint8_t> afDesign = buildAffinityPersonaContainer(bmpAmber);
+        verifyPair(L"Stage15.Images.AffinityPersona_FatInfPair",
+                   L"doc.afphoto", afPhoto, L"art.afdesign", afDesign, L".afdesign", 20);
 
         ExtendedImageInfo afInfo, badCdrAff;
-        bool afOk = ImageFormatLoader::DecodeImageMemory(afThmb.data(), afThmb.size(), L".afphoto", 0, afInfo) &&
-                    afInfo.valid && afInfo.width == 16 && afInfo.height == 16;
+        bool afOk = ImageFormatLoader::DecodeImageMemory(afPhoto.data(), afPhoto.size(), L".afphoto", 0, afInfo) &&
+                    afInfo.valid && afInfo.width == 16 && afInfo.height == 16 &&
+                    afInfo.formatName == L"Affinity Photo (.afphoto)";
         std::vector<uint8_t> emptyRiffCdr = { 'R', 'I', 'F', 'F', 12, 0, 0, 0, 'C', 'D', 'R', 'v', 'J', 'U', 'N', 'K', 0, 0, 0, 0 };
-        std::vector<uint8_t> emptyAfPhoto = { 0x00, 0xFF, 0x4B, 0x41, 0x01, 0x02, 0x03, 0x04, 'N', 'O', 'N', 'E', 0, 0, 0, 0 };
+        std::vector<uint8_t> emptyAfPhoto = { 0x00, 0xFF, 0x4B, 0x41, 0x01, 0x02, 0x03, 0x04, 'N', 'O', 'N', 'E', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        // Raw image bytes placed deep inside an Affinity header without #FAT/#Inf must NOT decode via blind byte-scanning
+        std::vector<uint8_t> unindexedAfBmp(320, 0);
+        unindexedAfBmp[0] = 0x00; unindexedAfBmp[1] = 0xFF; unindexedAfBmp[2] = 0x4B; unindexedAfBmp[3] = 0x41;
+        unindexedAfBmp.insert(unindexedAfBmp.end(), bmpBlue.begin(), bmpBlue.end());
         bool cdrAffRej = !ImageFormatLoader::DecodeImageMemory(emptyRiffCdr.data(), emptyRiffCdr.size(), L".cdr", 0, badCdrAff) &&
-                         !ImageFormatLoader::DecodeImageMemory(emptyAfPhoto.data(), emptyAfPhoto.size(), L".afphoto", 0, badCdrAff);
+                         !ImageFormatLoader::DecodeImageMemory(emptyAfPhoto.data(), emptyAfPhoto.size(), L".afphoto", 0, badCdrAff) &&
+                         !ImageFormatLoader::DecodeImageMemory(unindexedAfBmp.data(), unindexedAfBmp.size(), L".afphoto", 0, badCdrAff);
         tc.Record(afOk && cdrAffRej, L"Stage15.Images.AffinityZlibThmbAndRejectFakeCard");
     }
 
@@ -5819,7 +5864,8 @@ void RunFormatTestsImages(TestCounter& tc) {
         tc.Record(svgzOk && svgzRej, L"Stage15.Images.CompressedSvgz_ExactMatchWithSvgAndRejectNonSvgGzip");
     }
 
-    RunFormatTestsImagesBatch70(tc);
+    RunFormatTestsImagesStudioRaw(tc);
+    RunFormatTestsImagesGpuGame(tc);
 }
 
 } // namespace Explorer2::SelfTestSuite

@@ -2,7 +2,7 @@
 // OggVorbisAudio.h — Xiph Ogg Vorbis (.ogg) Audio Inspector
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseOggVorbis(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
     OggStreamWalk walk;
@@ -22,9 +22,9 @@ inline bool ParseOggVorbis(const std::vector<uint8_t>& raw, const std::wstring& 
     if (bos.size() >= 30 && bos[0] == 0x01 && std::memcmp(bos.data() + 1, "vorbis", 6) == 0) {
         codec = L"Xiph Vorbis";
         channels = bos[11];
-        sampleRate = DetailSys100::RdU32LE(bos.data() + 12);
+        sampleRate = DetailBinarySysDoc::RdU32LE(bos.data() + 12);
         granuleRate = sampleRate;
-        nominalBitrate = static_cast<int32_t>(DetailSys100::RdU32LE(bos.data() + 20));
+        nominalBitrate = static_cast<int32_t>(DetailBinarySysDoc::RdU32LE(bos.data() + 20));
     } else if (bos.size() >= 8 && std::memcmp(bos.data(), "\x7F" "FLAC", 5) == 0) {
         codec = L"Ogg FLAC";
     } else if (bos.size() >= 7 && std::memcmp(bos.data(), "\x80theora", 7) == 0) {
@@ -46,10 +46,10 @@ inline bool ParseOggVorbis(const std::vector<uint8_t>& raw, const std::wstring& 
         codec, channels, sampleRate, granuleRate, 0, nominalBitrate, L"", vendor, comments, out);
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
 inline bool ParseOggVorbisAudioDoc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
-    return DetailMedia100::ParseOggVorbis(raw, extLower, out);
+    return DetailMediaAndScoreDoc::ParseOggVorbis(raw, extLower, out);
 }
 
 } // namespace Formats

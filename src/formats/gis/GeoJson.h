@@ -101,7 +101,9 @@ struct Walker {
 };
 
 inline std::wstring FormatCoord(double v) {
-    wchar_t buf[48];
+    if (!std::isfinite(v)) return L"0";
+    wchar_t buf[64] = {};
+    if (std::fabs(v) >= 1e12) return (swprintf_s(buf, L"%.6g", v), std::wstring(buf));
     swprintf_s(buf, L"%.6f", v);
     std::wstring s = buf;
     while (!s.empty() && s.back() == L'0') s.pop_back();

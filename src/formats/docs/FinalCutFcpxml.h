@@ -2,7 +2,7 @@
 // FinalCutFcpxml.h — Final Cut Pro XML Timeline (.fcpxml) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseFcpXml(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     std::string_view xml(reinterpret_cast<const char*>(raw.data()), raw.size());
@@ -93,8 +93,8 @@ inline bool ParseFcpXml(const std::vector<uint8_t>& raw, ParsedOfficeDocument& o
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseFinalCutFcpxmlDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseFcpXml(raw, out); }
+inline bool ParseFinalCutFcpxmlDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseFcpXml(raw, out); }
 
 } // namespace Formats

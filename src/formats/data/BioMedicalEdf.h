@@ -44,11 +44,14 @@ inline bool ParseBioMedicalEdfDoc(const std::vector<uint8_t>& raw, ParsedOfficeD
                            L"Range / Samples", L"Sampling Rate", L"Prefiltering" });
     std::string start = field(168, 8) + " " + field(176, 8);
     std::wstring total;
-    if (nRecords > 0 && recDuration > 0) {
-        wchar_t buf[64];
+    if (nRecords > 0 && recDuration > 0 && std::isfinite(nRecords) && std::isfinite(recDuration)) {
+        wchar_t buf[128] = {};
         double secs = nRecords * recDuration;
-        swprintf_s(buf, L"%.0f records x %g s = %.1f s", nRecords, recDuration, secs);
-        total = buf;
+        if (std::swprintf(buf, std::size(buf), L"%.6g records x %g s = %.6g s", nRecords, recDuration, secs) > 0) {
+            total = buf;
+        } else {
+            total = w(field(236, 8)) + L" records";
+        }
     } else {
         total = w(field(236, 8)) + L" records";
     }

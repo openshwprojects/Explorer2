@@ -23,7 +23,7 @@ inline bool ParseOpenPgpPacketDoc(const std::vector<uint8_t>& raw, const std::ws
                 // Strip CRC24 line starting with '='
                 size_t crcEq = b64.rfind("\n=");
                 if (crcEq != std::string_view::npos) b64 = b64.substr(0, crcEq);
-                decoded = DetailDocs200::DecodeBase64Block(b64);
+                decoded = DetailStructuredDataDoc::DecodeBase64Block(b64);
                 pktData = decoded.data();
                 pktSize = decoded.size();
             }
@@ -82,7 +82,7 @@ inline bool ParseOpenPgpPacketDoc(const std::vector<uint8_t>& raw, const std::ws
                     bodyLen = ((static_cast<size_t>(l0 - 192) << 8) + pktData[pos++]) + 192;
                 } else if (l0 == 255) {
                     if (pos + 4 > pktSize) break;
-                    bodyLen = DetailDocs200::RdU32BE(pktData + pos);
+                    bodyLen = DetailStructuredDataDoc::RdU32BE(pktData + pos);
                     pos += 4;
                 } else {
                     bodyLen = 1ull << (l0 & 0x1Fu); // Partial body length
@@ -91,8 +91,8 @@ inline bool ParseOpenPgpPacketDoc(const std::vector<uint8_t>& raw, const std::ws
                 tag = (ctb >> 2) & 0x0Fu;
                 uint8_t ltype = ctb & 0x03u;
                 if (ltype == 0) { if (pos >= pktSize) break; bodyLen = pktData[pos++]; }
-                else if (ltype == 1) { if (pos + 2 > pktSize) break; bodyLen = DetailDocs200::RdU16BE(pktData + pos); pos += 2; }
-                else if (ltype == 2) { if (pos + 4 > pktSize) break; bodyLen = DetailDocs200::RdU32BE(pktData + pos); pos += 4; }
+                else if (ltype == 1) { if (pos + 2 > pktSize) break; bodyLen = DetailStructuredDataDoc::RdU16BE(pktData + pos); pos += 2; }
+                else if (ltype == 2) { if (pos + 4 > pktSize) break; bodyLen = DetailStructuredDataDoc::RdU32BE(pktData + pos); pos += 4; }
                 else bodyLen = pktSize - pos;
             }
             if (bodyLen > pktSize - pos) bodyLen = pktSize - pos;
@@ -103,7 +103,7 @@ inline bool ParseOpenPgpPacketDoc(const std::vector<uint8_t>& raw, const std::ws
                 detail = L"UID: " + PathUtils::Utf8ToWide(std::string_view(reinterpret_cast<const char*>(body), bodyLen));
             } else if ((tag == 6 || tag == 14 || tag == 5 || tag == 7) && bodyLen >= 6) {
                 uint8_t ver = body[0];
-                uint32_t ts = DetailDocs200::RdU32BE(body + 1);
+                uint32_t ts = DetailStructuredDataDoc::RdU32BE(body + 1);
                 uint8_t alg = (ver == 4) ? body[5] : (bodyLen >= 8 ? body[7] : 0);
                 detail = L"v" + std::to_wstring(ver) + L" " + pgpAlgName(alg) + L" (Created Unix=" + std::to_wstring(ts) + L")";
             } else if (tag == 2 && bodyLen >= 4) {
@@ -111,7 +111,7 @@ inline bool ParseOpenPgpPacketDoc(const std::vector<uint8_t>& raw, const std::ws
                 uint8_t pkAlg = (ver == 4) ? body[2] : (bodyLen >= 17 ? body[15] : 0);
                 detail = L"v" + std::to_wstring(ver) + L" Sig via " + pgpAlgName(pkAlg);
             } else if (tag == 1 && bodyLen >= 10) {
-                detail = L"Recipient KeyID: " + DetailDocs200::HexBytes(body + 1, 8, 8) + L" (" + pgpAlgName(body[9]) + L")";
+                detail = L"Recipient KeyID: " + DetailStructuredDataDoc::HexBytes(body + 1, 8, 8) + L" (" + pgpAlgName(body[9]) + L")";
             }
 
             sh.rows.push_back({ std::to_wstring(++idx), pgpTagName(tag), std::to_wstring(bodyLen) + L" B", detail });

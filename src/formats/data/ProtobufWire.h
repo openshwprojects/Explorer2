@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailDocs200 {
+namespace DetailStructuredDataDoc {
 
 inline bool WalkProtobuf(const uint8_t* data, size_t size, const std::wstring& prefix, int depth,
                          SpreadsheetSheet* outSheet, size_t& ioRows) {
@@ -84,7 +84,7 @@ inline bool WalkProtobuf(const uint8_t* data, size_t size, const std::wstring& p
     return fields > 0;
 }
 
-} // namespace DetailDocs200
+} // namespace DetailStructuredDataDoc
 
 
 inline bool ParseProtobufWireDoc(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
@@ -95,7 +95,7 @@ inline bool ParseProtobufWireDoc(const std::vector<uint8_t>& raw, const std::wst
     sh.rows.push_back({ L"Field Path", L"Tag #", L"Wire Type", L"Decoded Value" });
 
     size_t rows = 0;
-    if (!DetailDocs200::WalkProtobuf(raw.data(), raw.size(), L"", 0, &sh, rows)) return false;
+    if (!DetailStructuredDataDoc::WalkProtobuf(raw.data(), raw.size(), L"", 0, &sh, rows)) return false;
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;

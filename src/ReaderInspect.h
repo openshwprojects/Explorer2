@@ -281,7 +281,8 @@ inline void RunReaders(const std::wstring& path, size_t i, std::string& summary,
             summary = DescribeArchive(arc);
             if (!listed) return false;
             // Unpack the first file as well, for the formats Explorer2 unpacks with its own code
-            if (arc.formatName.rfind(L"ZIP", 0) == 0 || arc.formatName.rfind(L"TAR", 0) == 0) {
+            if (arc.formatName.rfind(L"ZIP", 0) == 0 || arc.formatName.rfind(L"TAR", 0) == 0 ||
+                ArchiveReaders::IsGamePakArchiveExtension(ext)) {
                 for (const auto& entry : arc.entries) {
                     if (entry.isDirectory) continue;
                     std::vector<uint8_t> bytes;

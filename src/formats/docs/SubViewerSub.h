@@ -2,7 +2,7 @@
 // SubViewerSub.h — SubViewer Timestamped Text Subtitle (.sub) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseSubViewerSub(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     // SubViewer HH:MM:SS.cc,HH:MM:SS.cc
@@ -48,10 +48,10 @@ inline bool ParseSubViewerSub(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
 inline bool ParseSubViewerSubDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    return DetailMedia100::ParseSubViewerSub(raw, out);
+    return DetailMediaAndScoreDoc::ParseSubViewerSub(raw, out);
 }
 
 } // namespace Formats

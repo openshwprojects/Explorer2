@@ -1,15 +1,17 @@
 #pragma once
-// SpssSav.h — SPSS System File (.sav) Reader
+// SpssSav.h — SPSS System File (.sav / .zsav — $FL2 & $FL3 Zlib Block Reader)
 
 namespace Formats {
 namespace AiDataDetail {
 
 // ============================================================================
-// 11. SPSS System File (.sav — $FL2 / $FL3)
+// 11. SPSS System File (.sav / .zsav — $FL2 / $FL3)
 // ============================================================================
 inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 176) return false;
-    if (std::memcmp(raw.data(), "$FL2", 4) != 0 && std::memcmp(raw.data(), "$FL3", 4) != 0) return false;
+    const bool isFl2 = (std::memcmp(raw.data(), "$FL2", 4) == 0);
+    const bool isFl3 = (std::memcmp(raw.data(), "$FL3", 4) == 0);
+    if (!isFl2 && !isFl3) return false;
 
     int32_t layoutLE = RdI32LE(raw.data() + 60);
     int32_t layoutBE = RdI32BE(raw.data() + 60);
@@ -18,7 +20,10 @@ inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
     else if (layoutBE == 2 || layoutBE == 3) be = true;
     else return false;
 
-    auto rdI32 = [&](size_t off) { return be ? RdI32BE(raw.data() + off) : RdI32LE(raw.data() + off); };
+    auto rdI32Buf = [&](const uint8_t* p) { return be ? RdI32BE(p) : RdI32LE(p); };
+    auto rdI64Buf = [&](const uint8_t* p) { return be ? RdI64BE(p) : RdI64LE(p); };
+    auto rdU64Buf = [&](const uint8_t* p) { return be ? RdU64BE(p) : RdU64LE(p); };
+    auto rdI32 = [&](size_t off) { return rdI32Buf(raw.data() + off); };
     auto rdF64 = [&](size_t off) { return be ? RdF64BE(raw.data() + off) : RdF64LE(raw.data() + off); };
 
     int32_t nominalCaseSize = rdI32(64);
@@ -163,10 +168,68 @@ inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
 
     if (!foundEnd || cols.empty()) return false;
 
+    size_t slotsPerCase = slotToCol.size();
+    if (nominalCaseSize > 0 && static_cast<size_t>(nominalCaseSize) > slotsPerCase) {
+        slotsPerCase = static_cast<size_t>(nominalCaseSize);
+    }
+    size_t maxCases = (ncases > 0) ? static_cast<size_t>(std::min<int32_t>(ncases, 500)) : 500;
+
+    // For $FL3 / ZSAV (compressed == 2), read zheader -> ztrailer -> zlib-inflate data blocks into bytecode buffer
+    SourceBytes source(raw, out);
+    std::vector<uint8_t> zsavBytecode;
+    uint32_t zsavBlocksTotal = 0;
+    uint32_t zsavBlocksInflated = 0;
+    if (compressed == 2 || isFl3) {
+        std::vector<uint8_t> ioBuf;
+        const uint8_t* zhdr = source.Read(pos, 24, ioBuf);
+        if (zhdr) {
+            uint64_t zhdrOfs = rdU64Buf(zhdr + 0);
+            uint64_t ztrlOfs = rdU64Buf(zhdr + 8);
+            uint64_t ztrlLen = rdU64Buf(zhdr + 16);
+            (void)zhdrOfs;
+            if (ztrlLen >= 24 && ztrlLen <= 32ULL * 1024ULL * 1024ULL && ztrlOfs + ztrlLen <= source.Size()) {
+                std::vector<uint8_t> trlBuf;
+                const uint8_t* ztrl = source.Read(ztrlOfs, static_cast<size_t>(ztrlLen), trlBuf);
+                if (ztrl) {
+                    int64_t zBias = rdI64Buf(ztrl + 0);
+                    int32_t nBlocks = rdI32Buf(ztrl + 20);
+                    if (bias == 0.0 && zBias < 0) bias = static_cast<double>(-zBias);
+                    if (nBlocks > 0 && 24ULL + static_cast<uint64_t>(nBlocks) * 24ULL <= ztrlLen) {
+                        zsavBlocksTotal = static_cast<uint32_t>(nBlocks);
+                        const size_t wantStreamBytes = std::min<size_t>(
+                            32u * 1024u * 1024u,
+                            std::max<size_t>(262144u, maxCases * std::max<size_t>(slotsPerCase, 1u) * 10u + 4096u));
+                        std::vector<uint8_t> compBuf, blkOut;
+                        for (int32_t b = 0; b < nBlocks && zsavBytecode.size() < wantStreamBytes; ++b) {
+                            const uint8_t* bd = ztrl + 24 + static_cast<size_t>(b) * 24;
+                            int64_t compOfs  = rdI64Buf(bd + 8);
+                            int32_t uncompSz = rdI32Buf(bd + 16);
+                            int32_t compSz   = rdI32Buf(bd + 20);
+                            if (compOfs < 0 || compSz <= 0 || uncompSz <= 0 ||
+                                uncompSz > 32 * 1024 * 1024 || compSz > 32 * 1024 * 1024) break;
+                            const uint8_t* cp = source.Read(static_cast<uint64_t>(compOfs), static_cast<size_t>(compSz), compBuf);
+                            if (!cp) break;
+                            size_t capOut = static_cast<size_t>(uncompSz) + 64u;
+                            if (!ZipDeflate::InflateZlib(cp, static_cast<size_t>(compSz), blkOut, capOut) &&
+                                !ZipDeflate::InflateRaw(cp, static_cast<size_t>(compSz), blkOut, capOut)) {
+                                break;
+                            }
+                            zsavBytecode.insert(zsavBytecode.end(), blkOut.begin(), blkOut.end());
+                            ++zsavBlocksInflated;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     SpreadsheetSheet varSh;
     varSh.name = L"SPSS_Variables";
     varSh.rows.push_back({ L"#", L"Variable Name", L"Type", L"Variable Label", L"File Info" });
-    varSh.rows.push_back({ L"(meta)", fileLabel, compressed == 1 ? L"Bytecode Compressed" : (compressed == 2 ? L"ZSAV" : L"Uncompressed"),
+    std::wstring compLabel = (compressed == 1) ? L"Bytecode Compressed"
+                           : ((compressed == 2 || isFl3) ? (L"ZSAV Zlib (" + std::to_wstring(zsavBlocksInflated) + L"/" + std::to_wstring(zsavBlocksTotal) + L" blocks)")
+                                                         : L"Uncompressed");
+    varSh.rows.push_back({ L"(meta)", fileLabel, compLabel,
         L"Cases: " + std::to_wstring(ncases), cDate + L" " + cTime });
     for (size_t i = 0; i < cols.size(); ++i) {
         varSh.rows.push_back({
@@ -185,12 +248,12 @@ inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
     for (const auto& c : cols) hdr.push_back(c.displayName);
     dataSh.rows.push_back(std::move(hdr));
 
-    size_t slotsPerCase = slotToCol.size();
-    if (nominalCaseSize > 0 && static_cast<size_t>(nominalCaseSize) > slotsPerCase) {
-        slotsPerCase = static_cast<size_t>(nominalCaseSize);
-    }
+    // Decode SPSS 8-byte slots (uncompressed, $FL2 bytecode-compressed, or $FL3 ZSAV inflated bytecode)
+    const bool useBytecode = (compressed == 1) || ((compressed == 2 || isFl3) && !zsavBytecode.empty());
+    const uint8_t* bcPtr = (compressed == 2 || isFl3) ? zsavBytecode.data() : raw.data();
+    const size_t   bcEnd = (compressed == 2 || isFl3) ? zsavBytecode.size() : raw.size();
+    size_t         bcPos = (compressed == 2 || isFl3) ? 0u : pos;
 
-    // Decode SPSS 8-byte slots (uncompressed or bytecode-compressed)
     uint8_t cluster[8] = {};
     int clusterIdx = 8;
     bool eofReached = false;
@@ -199,7 +262,7 @@ inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
         isSysMiss = false;
         isNumVal = false;
         numVal = 0.0;
-        if (compressed == 0) {
+        if (compressed == 0 && !isFl3) {
             if (pos + 8 > raw.size()) return false;
             std::memcpy(outSlot, raw.data() + pos, 8);
             pos += 8;
@@ -208,22 +271,22 @@ inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
             else { isNumVal = true; numVal = dv; }
             return true;
         }
-        if (compressed != 1) return false;
+        if (!useBytecode) return false;
 
         while (!eofReached) {
             if (clusterIdx >= 8) {
-                if (pos + 8 > raw.size()) return false;
-                std::memcpy(cluster, raw.data() + pos, 8);
-                pos += 8;
+                if (bcPos + 8 > bcEnd) return false;
+                std::memcpy(cluster, bcPtr + bcPos, 8);
+                bcPos += 8;
                 clusterIdx = 0;
             }
             uint8_t code = cluster[clusterIdx++];
             if (code == 0) continue; // padding/ignore
             if (code == 252) { eofReached = true; return false; }
             if (code == 253) { // literal 8-byte slot
-                if (pos + 8 > raw.size()) return false;
-                std::memcpy(outSlot, raw.data() + pos, 8);
-                pos += 8;
+                if (bcPos + 8 > bcEnd) return false;
+                std::memcpy(outSlot, bcPtr + bcPos, 8);
+                bcPos += 8;
                 double dv = be ? RdF64BE(outSlot) : RdF64LE(outSlot);
                 if (!std::isfinite(dv) || std::fabs(dv) > 1e307) isSysMiss = true;
                 else { isNumVal = true; numVal = dv; }
@@ -247,7 +310,6 @@ inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
         return false;
     };
 
-    size_t maxCases = (ncases > 0) ? static_cast<size_t>(std::min<int32_t>(ncases, 500)) : 500;
     for (size_t r = 0; r < maxCases && slotsPerCase > 0; ++r) {
         std::vector<std::wstring> row(cols.size());
         std::string strAccum;
@@ -302,7 +364,10 @@ inline bool ParseSpssSav(const std::vector<uint8_t>& raw, ParsedOfficeDocument& 
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
-    out.formatTitle = L"SPSS Statistical System Dataset (.sav)";
+    out.formatTitle = (compressed == 2 || isFl3)
+        ? L"SPSS ZSAV Compressed Dataset (.zsav)"
+        : L"SPSS Statistical System Dataset (.sav)";
+    if (source.ReadPastHead() && !source.ReadFailed()) out.sourceReadFully = true;
     if (dataSh.rows.size() > 1) {
         out.sheets.push_back(std::move(dataSh));
         out.sheets.push_back(std::move(varSh));

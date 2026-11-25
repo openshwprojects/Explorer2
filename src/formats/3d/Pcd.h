@@ -69,47 +69,6 @@ inline uint32_t ReadPcdPackedRgbLE(const uint8_t* p, char type, uint32_t sz) {
     return 0x00DCE6F2u;
 }
 
-// Official PCL LibLZF decompressor (lzf_decompress).
-inline bool DecompressPcdLzf(const uint8_t* src, size_t srcLen, std::vector<uint8_t>& dst, size_t uncompressedSize) {
-    if (!src || srcLen == 0 || uncompressedSize == 0) return false;
-    dst.assign(uncompressedSize, 0);
-    const uint8_t* ip = src;
-    const uint8_t* const iend = src + srcLen;
-    size_t op = 0;
-
-    while (ip < iend) {
-        uint32_t ctrl = *ip++;
-        if (ctrl < 32u) {
-            uint32_t len = ctrl + 1u;
-            if (static_cast<size_t>(iend - ip) < len || op + len > uncompressedSize) {
-                return false;
-            }
-            std::memcpy(dst.data() + op, ip, len);
-            ip += len;
-            op += len;
-        } else {
-            uint32_t len = ctrl >> 5;
-            if (len == 7u) {
-                if (ip >= iend) return false;
-                len += *ip++;
-            }
-            len += 2u;
-            if (ip >= iend) return false;
-            size_t refOff = (static_cast<size_t>(ctrl & 0x1Fu) << 8) + static_cast<size_t>(*ip++) + 1u;
-            if (refOff > op || op + len > uncompressedSize) {
-                return false;
-            }
-            size_t refPos = op - refOff;
-            uint8_t* outPtr = dst.data();
-            for (uint32_t k = 0; k < len; ++k) {
-                outPtr[op + k] = outPtr[refPos + k];
-            }
-            op += len;
-        }
-    }
-    return (ip == iend) && (op == uncompressedSize);
-}
-
 struct PcdSamplePoint {
     Vec3f pos;
     uint32_t rgb = 0x00DCE6F2u;
@@ -275,7 +234,9 @@ inline bool ParsePcdPointCloud(const uint8_t* data, size_t size, LoadedMesh3D& m
         }
 
         std::vector<uint8_t> decomp;
-        if (!DetailPcd::DecompressPcdLzf(bp, compressedSize, decomp, uncompressedSize)) {
+        if (!::Explorer2::StreamCodecs::DecompressLibLzf(
+                bp, compressedSize, decomp, uncompressedSize, 256u * 1024u * 1024u) ||
+            decomp.size() != uncompressedSize) {
             return false;
         }
 

@@ -1,0 +1,14 @@
+# AXI4-Lite Read Channel Handshake Controller FSM (UC Berkeley KISS2)
+.i 2
+.o 2
+.p 7
+.s 4
+.r IDLE
+0- IDLE  IDLE  00
+1- IDLE  ARACK 10
+-0 ARACK RWAIT 01
+-1 ARACK RRESP 01
+-0 RWAIT RWAIT 01
+-1 RWAIT RRESP 01
+-- RRESP IDLE  00
+.e

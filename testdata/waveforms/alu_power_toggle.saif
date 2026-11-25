@@ -1,0 +1,14 @@
+(SAIFILE
+  (SAIFVERSION "2.0")
+  (DIRECTION "backward")
+  (DESIGN "riscv_alu_core")
+  (TIMESCALE 1 ps)
+  (DURATION 10000)
+  (INSTANCE u_alu
+    (NET
+      (clk_i     (T0 5000) (T1 5000) (TX 0) (TC 2000))
+      (carry_q   (T0 7400) (T1 2600) (TX 0) (TC 640))
+      (zero_flag (T0 9100) (T1  900) (TX 0) (TC 110))
+    )
+  )
+)

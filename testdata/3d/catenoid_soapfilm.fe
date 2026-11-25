@@ -1,0 +1,73 @@
+// Surface Evolver Catenoid Minimal Soap Film
+PARAMETER r_outer = 5.0
+PARAMETER r_waist = 2.8
+PARAMETER h_ring  = 4.0
+
+vertices
+   1    5.0000    0.0000  -4.0000 fixed
+   2    2.5000    4.3301  -4.0000 fixed
+   3   -2.5000    4.3301  -4.0000 fixed
+   4   -5.0000    0.0000  -4.0000 fixed
+   5   -2.5000   -4.3301  -4.0000 fixed
+   6    2.5000   -4.3301  -4.0000 fixed
+   7    2.8000    0.0000   0.0000
+   8    1.4000    2.4249   0.0000
+   9   -1.4000    2.4249   0.0000
+  10   -2.8000    0.0000   0.0000
+  11   -1.4000   -2.4249   0.0000
+  12    1.4000   -2.4249   0.0000
+  13    5.0000    0.0000   4.0000 fixed
+  14    2.5000    4.3301   4.0000 fixed
+  15   -2.5000    4.3301   4.0000 fixed
+  16   -5.0000    0.0000   4.0000 fixed
+  17   -2.5000   -4.3301   4.0000 fixed
+  18    2.5000   -4.3301   4.0000 fixed
+
+edges
+   1   1   2
+   2   2   3
+   3   3   4
+   4   4   5
+   5   5   6
+   6   6   1
+   7   7   8
+   8   8   9
+   9   9  10
+  10  10  11
+  11  11  12
+  12  12   7
+  13  13  14
+  14  14  15
+  15  15  16
+  16  16  17
+  17  17  18
+  18  18  13
+  19   1   7
+  20   2   8
+  21   3   9
+  22   4  10
+  23   5  11
+  24   6  12
+  25   7  13
+  26   8  14
+  27   9  15
+  28  10  16
+  29  11  17
+  30  12  18
+
+faces
+   1     1   20   -7  -19  tension 1 color lightblue
+   2     7   26  -13  -25  tension 1 color cyan
+   3     2   21   -8  -20  tension 1 color lightblue
+   4     8   27  -14  -26  tension 1 color cyan
+   5     3   22   -9  -21  tension 1 color lightblue
+   6     9   28  -15  -27  tension 1 color cyan
+   7     4   23  -10  -22  tension 1 color lightblue
+   8    10   29  -16  -28  tension 1 color cyan
+   9     5   24  -11  -23  tension 1 color lightblue
+  10    11   30  -17  -29  tension 1 color cyan
+  11     6   19  -12  -24  tension 1 color lightblue
+  12    12   25  -18  -30  tension 1 color cyan
+
+read
+g 5;

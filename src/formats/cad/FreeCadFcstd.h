@@ -80,7 +80,7 @@ inline bool ParseFreeCadFcstd(const uint8_t* data, size_t size, LoadedMesh3D& me
         if (ext == L".bms") {
             okSub = ParseFreeCadBinaryMeshStream(partBytes.data(), partBytes.size(), sub);
         } else {
-            okSub = ParseCadKernels200(partBytes.data(), partBytes.size(), L".brep", sub);
+            okSub = ParseCadKernelArchiveOrStream(partBytes.data(), partBytes.size(), L".brep", sub);
         }
         if (okSub && !sub.vertices.empty() && !sub.tris.empty()) {
             Placement3D pl;

@@ -2,7 +2,7 @@
 // AbletonAls.h — Ableton Live Set (.als) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // Ableton Live Set (.als, gzip-compressed XML): <Ableton> <LiveSet> <Tracks> lists the tracks in the order Live
 // shows them (audio / MIDI / group / return). Each row: the track's own Name/EffectiveName, the group it sits in
@@ -124,8 +124,8 @@ inline bool ParseAbletonAls(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseAbletonAlsDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseAbletonAls(raw, out); }
+inline bool ParseAbletonAlsDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseAbletonAls(raw, out); }
 
 } // namespace Formats

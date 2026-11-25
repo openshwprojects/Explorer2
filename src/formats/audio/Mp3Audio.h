@@ -2,7 +2,7 @@
 // Mp3Audio.h — MPEG Audio + ID3v1/v2 + Xing/VBRI (.mp3) Inspector
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // ============================================================================
 // 2. MPEG Audio + ID3v2.2 / v2.3 / v2.4 + ID3v1 + Xing/VBRI (.mp3)
@@ -84,7 +84,7 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
                    (static_cast<uint32_t>(raw[pos + 1] & 0x7F) << 14) |
                    (static_cast<uint32_t>(raw[pos + 2] & 0x7F) << 7) |
                    static_cast<uint32_t>(raw[pos + 3] & 0x7F))
-                : DetailSys100::RdU32BE(raw.data() + pos);
+                : DetailBinarySysDoc::RdU32BE(raw.data() + pos);
             pos += (id3Major == 4) ? extSz : (4ULL + extSz);
         }
 
@@ -112,12 +112,12 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
                             (static_cast<uint32_t>(fp[6] & 0x7F) << 7)  |
                             static_cast<uint32_t>(fp[7] & 0x7F);
                 } else {
-                    fSize = DetailSys100::RdU32BE(fp + 4);
+                    fSize = DetailBinarySysDoc::RdU32BE(fp + 4);
                 }
-                fFlags = DetailSys100::RdU16BE(fp + 8);
+                fFlags = DetailBinarySysDoc::RdU16BE(fp + 8);
             } else {
-                fSize = DetailSys100::RdU32BE(fp + 4);
-                fFlags = DetailSys100::RdU16BE(fp + 8);
+                fSize = DetailBinarySysDoc::RdU32BE(fp + 4);
+                fFlags = DetailBinarySysDoc::RdU16BE(fp + 8);
             }
             pos += hdrLen;
             if (fSize == 0 || pos + fSize > tagEnd) break;
@@ -250,7 +250,7 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
 
     auto decodeFrameAt = [&](size_t off, int& outVerBits, int& outLayerNum, int& outKbps, int& outHz, int& outChanMode, size_t& outFrameLen) -> bool {
         if (off + 4 > raw.size()) return false;
-        uint32_t h = DetailSys100::RdU32BE(raw.data() + off);
+        uint32_t h = DetailBinarySysDoc::RdU32BE(raw.data() + off);
         if ((h & 0xFFE00000u) != 0xFFE00000u) return false;
         int verBits = static_cast<int>((h >> 19) & 3u);
         int layBits = static_cast<int>((h >> 17) & 3u);
@@ -360,16 +360,16 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
         for (size_t p = frameOff + 4; p + 16 <= fEnd && p <= frameOff + 64; ++p) {
             if (std::memcmp(raw.data() + p, "Xing", 4) == 0 || std::memcmp(raw.data() + p, "Info", 4) == 0) {
                 rateMode = (std::memcmp(raw.data() + p, "Xing", 4) == 0) ? L"VBR (Xing)" : L"CBR (Info)";
-                uint32_t xFlags = DetailSys100::RdU32BE(raw.data() + p + 4);
+                uint32_t xFlags = DetailBinarySysDoc::RdU32BE(raw.data() + p + 4);
                 size_t xp = p + 8;
-                if ((xFlags & 1u) != 0 && xp + 4 <= fEnd) { vbrFrames = DetailSys100::RdU32BE(raw.data() + xp); xp += 4; }
-                if ((xFlags & 2u) != 0 && xp + 4 <= fEnd) { vbrBytes = DetailSys100::RdU32BE(raw.data() + xp); }
+                if ((xFlags & 1u) != 0 && xp + 4 <= fEnd) { vbrFrames = DetailBinarySysDoc::RdU32BE(raw.data() + xp); xp += 4; }
+                if ((xFlags & 2u) != 0 && xp + 4 <= fEnd) { vbrBytes = DetailBinarySysDoc::RdU32BE(raw.data() + xp); }
                 break;
             }
             if (std::memcmp(raw.data() + p, "VBRI", 4) == 0 && p + 18 <= fEnd) {
                 rateMode = L"VBR (Fraunhofer VBRI)";
-                vbrBytes  = DetailSys100::RdU32BE(raw.data() + p + 10);
-                vbrFrames = DetailSys100::RdU32BE(raw.data() + p + 14);
+                vbrBytes  = DetailBinarySysDoc::RdU32BE(raw.data() + p + 10);
+                vbrFrames = DetailBinarySysDoc::RdU32BE(raw.data() + p + 14);
                 break;
             }
         }
@@ -418,8 +418,8 @@ inline bool ParseMp3Audio(const std::vector<uint8_t>& raw, ParsedOfficeDocument&
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseMp3AudioDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseMp3Audio(raw, out); }
+inline bool ParseMp3AudioDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseMp3Audio(raw, out); }
 
 } // namespace Formats

@@ -1,0 +1,34 @@
+$date
+  Nov 22, 2026
+$end
+$version
+  Icarus Verilog $dumpports EVCD Exporter
+$end
+$timescale 1ns $end
+$scope module i2c_slave_dut $end
+$var port 1 <0 SCL $end
+$var port 1 <1 SDA $end
+$var port [7:0] <2 RX_BYTE $end
+$upscope $end
+$enddefinitions $end
+$dumpports
+pD 6 0 <0
+pU 0 5 <1
+pL 6 0 <2
+$end
+#10
+pU 0 6 <0
+pD 6 0 <1
+#20
+pD 6 0 <0
+#30
+pU 0 6 <0
+pHLHLHLHL 6 6 <2
+#40
+pD 6 0 <0
+pL 6 0 <1
+#50
+pU 0 6 <0
+pZ 0 0 <1
+pHHHHHHHH 0 6 <2
+$vcdclose #60 $end

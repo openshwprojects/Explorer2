@@ -1,0 +1,32 @@
+{
+  "global": {
+    "core:datatype": "ci16_le",
+    "core:sample_rate": 2000000.0,
+    "core:version": "1.0.0",
+    "core:hw": "Ettus USRP B210 (915 MHz ISM LoRa/FSK Receiver)",
+    "core:description": "915 MHz LoRa CSS Up-Chirp Preamble + GFSK Telemetry Ack"
+  },
+  "captures": [
+    {
+      "core:sample_start": 0,
+      "core:frequency": 915000000.0,
+      "core:datetime": "2025-05-12T10:15:00Z"
+    }
+  ],
+  "annotations": [
+    {
+      "core:sample_start": 128,
+      "core:sample_count": 1024,
+      "core:freq_lower_edge": 914875000.0,
+      "core:freq_upper_edge": 915125000.0,
+      "core:label": "LoRa_SF7_BW250k_UpChirp"
+    },
+    {
+      "core:sample_start": 1344,
+      "core:sample_count": 512,
+      "core:freq_lower_edge": 915200000.0,
+      "core:freq_upper_edge": 915350000.0,
+      "core:label": "GFSK_ACK_Burst"
+    }
+  ]
+}

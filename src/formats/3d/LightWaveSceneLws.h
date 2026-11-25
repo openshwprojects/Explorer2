@@ -147,7 +147,7 @@ inline std::wstring ResolveObjectPath(const std::wstring& sceneDir, const std::s
 } // namespace DetailLws
 
 inline bool ParseLightWaveScene(std::string_view sv, const std::wstring& scenePath, LoadedMesh3D& mesh) {
-    using namespace Detail3D100;
+    using namespace DetailDccScene;
     using DetailLws::Item;
     using DetailLws::Key;
     using M4 = DetailScad::Mat4;
@@ -425,6 +425,11 @@ inline bool ParseLightWaveScene(std::string_view sv, const std::wstring& scenePa
     }
     if (cut) status += L"; pokazano część (za duża scena)";
     mesh.statusMessage = status;
+    if (objItems > 0 && objPlaced == 0) {
+        mesh.vertices.clear();
+        mesh.tris.clear();
+        return false;
+    }
     return !mesh.vertices.empty() && !mesh.tris.empty();
 }
 

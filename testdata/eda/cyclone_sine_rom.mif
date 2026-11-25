@@ -1,0 +1,67 @@
+% Intel Quartus Prime DDS Quarter-Wave Sine ROM %
+-- 64 words x 12-bit unsigned hex
+DEPTH = 64;
+WIDTH = 12;
+ADDRESS_RADIX = HEX;
+DATA_RADIX = HEX;
+
+CONTENT
+BEGIN
+  00 : 800;
+  01 : 8E0;
+  02 : 9BE;
+  03 : A96;
+  04 : B66;
+  05 : C2B;
+  06 : CE3;
+  07 : D8A;
+  08 : E20;
+  09 : EA2;
+  0A : F0F;
+  0B : F65;
+  0C : FA4;
+  0D : FC9;
+  0E : FD6;
+  0F : FC9;
+  10 : FA4;
+  11 : F65;
+  12 : F0F;
+  13 : EA2;
+  14 : E20;
+  15 : D8A;
+  16 : CE3;
+  17 : C2B;
+  18 : B66;
+  19 : A96;
+  1A : 9BE;
+  1B : 8E0;
+  1C : 800;
+  1D : 71F;
+  1E : 641;
+  1F : 569;
+  20 : 499;
+  21 : 3D4;
+  22 : 31C;
+  23 : 275;
+  24 : 1DF;
+  25 : 15D;
+  26 : 0F0;
+  27 : 09A;
+  28 : 05B;
+  29 : 036;
+  2A : 029;
+  2B : 036;
+  2C : 05B;
+  2D : 09A;
+  2E : 0F0;
+  2F : 15D;
+  30 : 1DF;
+  31 : 275;
+  32 : 31C;
+  33 : 3D4;
+  34 : 499;
+  35 : 569;
+  36 : 641;
+  37 : 71F;
+  [38..3F] : 000;
+END;

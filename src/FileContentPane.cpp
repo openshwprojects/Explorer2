@@ -8,6 +8,7 @@
 #include "RepoBrowser.h"
 #include "ReaderGuard.h"
 #include "ThreadUtils.h"
+#include "JsonDom.h"
 #include "formats/common/AiModelDispatch.h"
 #include <shellapi.h>
 #include <bcrypt.h>
@@ -33,39 +34,6 @@ static D2D1_COLOR_F FcpColor(uint32_t rgb, float a = 1.0f) {
 
 static bool IsAiModelExtension(const std::wstring& ext) {
     return AiModels::IsSupportedAiModelExt(ext);
-}
-
-static void CopyUnicodeToClipboard(HWND hwnd, const std::wstring& text) {
-    if (text.empty()) return;
-    if (OpenClipboard(hwnd)) {
-        EmptyClipboard();
-        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (hMem) {
-            void* p = GlobalLock(hMem);
-            if (p) {
-                std::memcpy(p, text.c_str(), bytes);
-                GlobalUnlock(hMem);
-                SetClipboardData(CF_UNICODETEXT, hMem);
-            }
-        }
-        CloseClipboard();
-    }
-}
-
-static std::wstring Utf8ToWideStr(const char* data, size_t len) {
-    if (!data || len == 0) return L"";
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, data, static_cast<int>(len), nullptr, 0);
-    if (wlen <= 0) {
-        wlen = MultiByteToWideChar(1252, 0, data, static_cast<int>(len), nullptr, 0);
-        if (wlen <= 0) return L"";
-        std::wstring out(static_cast<size_t>(wlen), L'\0');
-        MultiByteToWideChar(1252, 0, data, static_cast<int>(len), out.data(), wlen);
-        return out;
-    }
-    std::wstring out(static_cast<size_t>(wlen), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, data, static_cast<int>(len), out.data(), wlen);
-    return out;
 }
 
 static void ParseSdParametersString(const std::wstring& rawParams, ImageMetadataSummary& out) {
@@ -114,58 +82,78 @@ static void ParseSdParametersString(const std::wstring& rawParams, ImageMetadata
 
 static void ParseComfyUiJsonPrompt(const std::wstring& jsonText, ImageMetadataSummary& out) {
     if (jsonText.empty()) return;
+    Json::Value root;
+    const std::string utf8 = PathUtils::WideToUtf8(jsonText);
+    if (!Json::ParseDocument(utf8, root) || !root.IsObject()) return;
+
     out.hasAiMeta = true;
     out.generator = L"ComfyUI";
 
-    // Look for "text": "..." fields inside CLIPTextEncode or prompt nodes
-    size_t pos = 0;
-    while ((pos = jsonText.find(L"\"text\"", pos)) != std::wstring::npos) {
-        size_t colon = jsonText.find(L':', pos + 6);
-        if (colon == std::wstring::npos) break;
-        size_t q1 = jsonText.find(L'"', colon + 1);
-        if (q1 == std::wstring::npos || q1 > colon + 12) { pos = colon + 1; continue; }
-        std::wstring val;
-        size_t i = q1 + 1;
-        while (i < jsonText.size()) {
-            if (jsonText[i] == L'\\' && i + 1 < jsonText.size()) {
-                val.push_back(jsonText[i + 1]);
-                i += 2;
-            } else if (jsonText[i] == L'"') {
-                break;
-            } else {
-                val.push_back(jsonText[i]);
-                ++i;
-            }
-        }
-        val = PathUtils::Trim(val);
-        if (val.size() >= 4 && val.find(L"node") == std::wstring::npos) {
-            if (out.positivePrompt.empty()) out.positivePrompt = val;
-            else if (out.negativePrompt.empty() && val != out.positivePrompt) out.negativePrompt = val;
-        }
-        pos = i + 1;
+    const Json::Value* graph = &root;
+    if (const Json::Value* inner = root.Find("prompt"); inner && inner->IsObject()) {
+        graph = inner;
     }
 
-    auto findNumericJson = [&](const wchar_t* key) -> std::wstring {
-        size_t p = jsonText.find(key);
-        if (p == std::wstring::npos) return L"";
-        size_t c = jsonText.find(L':', p + wcslen(key));
-        if (c == std::wstring::npos) return L"";
-        size_t s = jsonText.find_first_of(L"0123456789", c + 1);
-        if (s == std::wstring::npos || s > c + 12) return L"";
-        size_t e = jsonText.find_first_not_of(L"0123456789.", s);
-        return jsonText.substr(s, (e == std::wstring::npos ? jsonText.size() : e) - s);
+    auto resolveNodeText = [&](const Json::Value* ref) -> std::wstring {
+        if (!ref) return {};
+        if (ref->IsString()) return PathUtils::Trim(PathUtils::Utf8ToWide(ref->strVal));
+        if (ref->IsArray() && !ref->arrVal.empty() && ref->arrVal[0].IsString()) {
+            if (const Json::Value* target = graph->Find(ref->arrVal[0].strVal); target && target->IsObject()) {
+                if (const Json::Value* inp = target->Find("inputs"); inp && inp->IsObject()) {
+                    for (const char* k : { "text", "text_g", "text_l", "prompt", "positive" }) {
+                        if (const Json::Value* tv = inp->Find(k); tv && tv->IsString() && !tv->strVal.empty()) {
+                            return PathUtils::Trim(PathUtils::Utf8ToWide(tv->strVal));
+                        }
+                    }
+                }
+            }
+        }
+        return {};
     };
-    if (out.seed.empty()) out.seed = findNumericJson(L"\"seed\"");
-    if (out.seed.empty()) out.seed = findNumericJson(L"\"noise_seed\"");
-    if (out.steps.empty()) out.steps = findNumericJson(L"\"steps\"");
-    if (out.cfgScale.empty()) out.cfgScale = findNumericJson(L"\"cfg\"");
 
-    size_t ckpt = jsonText.find(L"\"ckpt_name\"");
-    if (ckpt != std::wstring::npos) {
-        size_t q1 = jsonText.find(L'"', ckpt + 11);
-        size_t q2 = (q1 != std::wstring::npos) ? jsonText.find(L'"', q1 + 1) : std::wstring::npos;
-        if (q1 != std::wstring::npos && q2 != std::wstring::npos) {
-            out.modelName = jsonText.substr(q1 + 1, q2 - q1 - 1);
+    auto numOrStr = [](const Json::Value* v) -> std::wstring {
+        if (!v) return {};
+        if (v->IsNumber() || v->IsString()) return PathUtils::Trim(PathUtils::Utf8ToWide(v->strVal));
+        return {};
+    };
+
+    // First pass: follow KSampler / SamplerCustom positive & negative links for exact prompt role attribution
+    for (const auto& [nodeId, node] : graph->objVal) {
+        (void)nodeId;
+        if (!node.IsObject()) continue;
+        const std::string cls = node.GetString("class_type");
+        const Json::Value* inputs = node.Find("inputs");
+        if (!inputs || !inputs->IsObject()) continue;
+
+        if (out.seed.empty()) out.seed = numOrStr(inputs->Find("seed"));
+        if (out.seed.empty()) out.seed = numOrStr(inputs->Find("noise_seed"));
+        if (out.steps.empty()) out.steps = numOrStr(inputs->Find("steps"));
+        if (out.cfgScale.empty()) out.cfgScale = numOrStr(inputs->Find("cfg"));
+        if (out.cfgScale.empty()) out.cfgScale = numOrStr(inputs->Find("guidance"));
+        if (out.sampler.empty()) out.sampler = numOrStr(inputs->Find("sampler_name"));
+        if (out.modelName.empty()) out.modelName = numOrStr(inputs->Find("ckpt_name"));
+        if (out.modelName.empty()) out.modelName = numOrStr(inputs->Find("unet_name"));
+
+        if (cls.find("Sampler") != std::string::npos || inputs->Find("positive") || inputs->Find("negative")) {
+            if (out.positivePrompt.empty()) out.positivePrompt = resolveNodeText(inputs->Find("positive"));
+            if (out.negativePrompt.empty()) out.negativePrompt = resolveNodeText(inputs->Find("negative"));
+        }
+    }
+
+    // Fallback pass: scan CLIPTextEncode / prompt nodes in graph order
+    for (const auto& [nodeId, node] : graph->objVal) {
+        (void)nodeId;
+        if (!node.IsObject()) continue;
+        const Json::Value* inputs = node.Find("inputs");
+        if (!inputs || !inputs->IsObject()) continue;
+        for (const char* key : { "text", "text_g", "prompt" }) {
+            const Json::Value* tv = inputs->Find(key);
+            if (!tv || !tv->IsString()) continue;
+            std::wstring val = PathUtils::Trim(PathUtils::Utf8ToWide(tv->strVal));
+            if (val.size() >= 2) {
+                if (out.positivePrompt.empty()) out.positivePrompt = val;
+                else if (out.negativePrompt.empty() && val != out.positivePrompt) out.negativePrompt = val;
+            }
         }
     }
 }
@@ -228,7 +216,7 @@ static ImageMetadataSummary InspectImageMetadata(const std::wstring& path) {
                         if (valStart < buf.size()) ++valStart;
                     }
                     if (valStart < buf.size()) {
-                        std::wstring textVal = Utf8ToWideStr(buf.data() + valStart, buf.size() - valStart);
+                        std::wstring textVal = PathUtils::Utf8ToWide(std::string_view(buf.data() + valStart, buf.size() - valStart));
                         if (_stricmp(key.c_str(), "parameters") == 0 || _stricmp(key.c_str(), "Comment") == 0 || _stricmp(key.c_str(), "Description") == 0) {
                             if (textVal.find(L"{") == 0 && textVal.find(L"\"prompt\"") != std::wstring::npos) {
                                 ParseComfyUiJsonPrompt(textVal, res);
@@ -269,7 +257,7 @@ static ImageMetadataSummary InspectImageMetadata(const std::wstring& path) {
                                     std::wstring out;
                                     if (SUCCEEDED(q->GetMetadataByName(query, &pv))) {
                                         if (pv.vt == VT_LPWSTR && pv.pwszVal) out = pv.pwszVal;
-                                        else if (pv.vt == VT_LPSTR && pv.pszVal) out = Utf8ToWideStr(pv.pszVal, std::strlen(pv.pszVal));
+                                        else if (pv.vt == VT_LPSTR && pv.pszVal) out = PathUtils::Utf8ToWide(std::string_view(pv.pszVal, std::strlen(pv.pszVal)));
                                     }
                                     PropVariantClear(&pv);
                                     return PathUtils::Trim(out);
@@ -1067,12 +1055,20 @@ void FileContentPane::Initialize(
     IDWriteFactory* dwriteFactory)
 {
     m_parentHwnd = parentHwnd;
+    if (dwriteFactory) {
+        if (!m_fmtSmallTrim) {
+            PathUtils::CreateTrimmedTextFormat(dwriteFactory, L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, 11.0f, &m_fmtSmallTrim);
+        }
+        if (!m_fmtBoldTrim) {
+            PathUtils::CreateTrimmedTextFormat(dwriteFactory, L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.0f, &m_fmtBoldTrim);
+        }
+    }
     m_notepad.Initialize(parentHwnd, hInstance, dwriteFactory);
     m_hex.Initialize(parentHwnd, dwriteFactory);
     m_model3D.Initialize(parentHwnd, d2dFactory);
-    m_eda.Initialize(parentHwnd, d2dFactory);
-    m_office.Initialize(parentHwnd);
-    m_archive.Initialize(parentHwnd);
+    m_eda.Initialize(parentHwnd, d2dFactory, dwriteFactory);
+    m_office.Initialize(parentHwnd, dwriteFactory);
+    m_archive.Initialize(parentHwnd, dwriteFactory);
     m_pdf.Initialize(parentHwnd);
     m_pdf.SetPagesDrawnByOwner(true);       // turned pages are drawn by the preview worker
 }
@@ -1086,6 +1082,14 @@ void FileContentPane::Shutdown() {
     m_office.Shutdown();
     m_archive.Shutdown();
     m_pdf.Shutdown();
+    if (m_fmtSmallTrim) {
+        m_fmtSmallTrim->Release();
+        m_fmtSmallTrim = nullptr;
+    }
+    if (m_fmtBoldTrim) {
+        m_fmtBoldTrim->Release();
+        m_fmtBoldTrim = nullptr;
+    }
 }
 
 void FileContentPane::HideNativeControls() {
@@ -1546,12 +1550,13 @@ void FileContentPane::Draw(
         hdrTitle = L"\xD83D\xDCC4 " + m_currentEntry.name;
         if (!m_currentEntry.sizeStr.empty()) hdrTitle += L"  (" + m_currentEntry.sizeStr + L")";   // not known for a git file
     }
+    IDWriteTextFormat* smallTrim = m_fmtSmallTrim ? m_fmtSmallTrim : fmtSmall;
+    IDWriteTextFormat* boldTrim  = m_fmtBoldTrim ? m_fmtBoldTrim : fmtBold;
+
     D2D1_RECT_F titleR = D2D1::RectF(hdrR.left + 8.0f, hdrR.top + 2.0f, std::max(hdrR.left + 20.0f, rx - 4.0f), hdrR.bottom);
     brush->SetColor(FcpColor(0x0F172A));
     // Cut at the first mode button: a long name used to be drawn over the buttons
-    rt->PushAxisAlignedClip(titleR, D2D1_ANTIALIAS_MODE_ALIASED);
-    rt->DrawTextW(hdrTitle.c_str(), static_cast<UINT32>(hdrTitle.size()), fmtBold, titleR, brush);
-    rt->PopAxisAlignedClip();
+    PathUtils::DrawSingleLineClipped(rt, hdrTitle, boldTrim, titleR, brush, m_lineScratch);
 
     m_bodyRect = D2D1::RectF(innerR.left, hdrR.bottom, innerR.right, innerR.bottom);
 
@@ -1565,7 +1570,7 @@ void FileContentPane::Draw(
         rt->DrawLine(D2D1::Point2F(hashBar.left, hashBar.bottom - 0.5f), D2D1::Point2F(hashBar.right, hashBar.bottom - 0.5f), brush, 1.0f);
         brush->SetColor(FcpColor(0x166534));
         D2D1_RECT_F hTxt = D2D1::RectF(hashBar.left + 8.0f, hashBar.top + 2.0f, hashBar.right - 8.0f, hashBar.bottom - 2.0f);
-        rt->DrawTextW(m_hashSummary.c_str(), static_cast<UINT32>(m_hashSummary.size()), fmtSmall, hTxt, brush);
+        PathUtils::DrawSingleLineClipped(rt, m_hashSummary, smallTrim, hTxt, brush, m_lineScratch);
     }
 
     // 3. Dispatch Body Rendering to the active specialized viewer
@@ -1620,8 +1625,8 @@ void FileContentPane::Draw(
                : L"Contents: %zu folders, %zu files   \x2022   Files size: %s   (double-click = open)",
             m_dirFolderCount, m_dirFileCount, bytesStr.c_str());
         brush->SetColor(FcpColor(0x334155));
-        rt->DrawTextW(sumBuf, static_cast<UINT32>(wcslen(sumBuf)), fmtSmall,
-            D2D1::RectF(bannerR.left + 10.0f, bannerR.top, bannerR.right - 10.0f, bannerR.bottom), brush);
+        PathUtils::DrawSingleLineClipped(rt, sumBuf, smallTrim,
+            D2D1::RectF(bannerR.left + 10.0f, bannerR.top, bannerR.right - 10.0f, bannerR.bottom), brush, m_lineScratch);
 
         D2D1_RECT_F colR = D2D1::RectF(m_bodyRect.left, bannerR.bottom, m_bodyRect.right, bannerR.bottom + colHdrH);
         brush->SetColor(FcpColor(0xF1F5F9));
@@ -1636,16 +1641,16 @@ void FileContentPane::Draw(
         float nameColRight = std::max(colR.left + 80.0f, listRight - sizeColW - dateColW);
 
         brush->SetColor(FcpColor(0x475569));
-        rt->DrawTextW(pl ? L"Nazwa" : L"Name", pl ? 5 : 4, fmtBold,
-            D2D1::RectF(colR.left + 10.0f, colR.top, nameColRight - 4.0f, colR.bottom), brush);
+        PathUtils::DrawSingleLineClipped(rt, pl ? L"Nazwa" : L"Name", boldTrim,
+            D2D1::RectF(colR.left + 10.0f, colR.top, nameColRight - 4.0f, colR.bottom), brush, m_lineScratch);
         if (nameColRight + dateColW <= listRight) {
-            rt->DrawTextW(pl ? L"Data modyfikacji" : L"Date modified", pl ? 16 : 13, fmtBold,
-                D2D1::RectF(nameColRight + 4.0f, colR.top, nameColRight + dateColW - 4.0f, colR.bottom), brush);
+            PathUtils::DrawSingleLineClipped(rt, pl ? L"Data modyfikacji" : L"Date modified", boldTrim,
+                D2D1::RectF(nameColRight + 4.0f, colR.top, nameColRight + dateColW - 4.0f, colR.bottom), brush, m_lineScratch);
         }
-        fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-        rt->DrawTextW(pl ? L"Rozmiar" : L"Size", pl ? 7 : 4, fmtBold,
-            D2D1::RectF(listRight - sizeColW, colR.top, listRight - 8.0f, colR.bottom), brush);
-        fmtBold->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        boldTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        PathUtils::DrawSingleLineClipped(rt, pl ? L"Rozmiar" : L"Size", boldTrim,
+            D2D1::RectF(listRight - sizeColW, colR.top, listRight - 8.0f, colR.bottom), brush, m_lineScratch);
+        boldTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
 
         m_dirListRect = D2D1::RectF(m_bodyRect.left, colR.bottom, listRight, m_bodyRect.bottom);
         float rowH = 22.0f;
@@ -1692,21 +1697,21 @@ void FileContentPane::Draw(
                 }
 
                 brush->SetColor(FcpColor(0x0F172A));
-                rt->DrawTextW(item.name.c_str(), static_cast<UINT32>(item.name.size()), fmtRegular,
-                    D2D1::RectF(rowR.left + 26.0f, rowR.top, nameColRight - 4.0f, rowR.bottom), brush);
+                PathUtils::DrawSingleLineClipped(rt, item.name, fmtRegular,
+                    D2D1::RectF(rowR.left + 26.0f, rowR.top, nameColRight - 4.0f, rowR.bottom), brush, m_lineScratch);
 
                 if (nameColRight + dateColW <= listRight) {
                     brush->SetColor(FcpColor(0x64748B));
-                    rt->DrawTextW(item.dateStr.c_str(), static_cast<UINT32>(item.dateStr.size()), fmtSmall,
-                        D2D1::RectF(nameColRight + 4.0f, rowR.top, nameColRight + dateColW - 4.0f, rowR.bottom), brush);
+                    PathUtils::DrawSingleLineClipped(rt, item.dateStr, smallTrim,
+                        D2D1::RectF(nameColRight + 4.0f, rowR.top, nameColRight + dateColW - 4.0f, rowR.bottom), brush, m_lineScratch);
                 }
 
                 if (!item.isDirectory && !item.sizeStr.empty()) {
                     brush->SetColor(FcpColor(0x475569));
-                    fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-                    rt->DrawTextW(item.sizeStr.c_str(), static_cast<UINT32>(item.sizeStr.size()), fmtSmall,
-                        D2D1::RectF(listRight - sizeColW, rowR.top, listRight - 8.0f, rowR.bottom), brush);
-                    fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+                    smallTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    PathUtils::DrawSingleLineClipped(rt, item.sizeStr, smallTrim,
+                        D2D1::RectF(listRight - sizeColW, rowR.top, listRight - 8.0f, rowR.bottom), brush, m_lineScratch);
+                    smallTrim->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
                 }
             }
             rt->PopAxisAlignedClip();
@@ -1765,6 +1770,8 @@ void FileContentPane::Draw(
         rt->DrawRoundedRectangle(D2D1::RoundedRect(cardR, 6.0f, 6.0f), brush, 1.0f);
 
         if (!m_aiModelInfo.valid) {
+            m_aiModelScrollTrackRect = {};
+            m_aiModelScrollThumbRect = {};
             std::wstring errMsg = pl
                 ? L"Nie udało się odczytać nagłówka modelu AI (.safetensors / .gguf / .onnx)."
                 : L"Could not parse AI model header (.safetensors / .gguf / .onnx).";
@@ -1773,19 +1780,34 @@ void FileContentPane::Draw(
             break;
         }
 
-        rt->PushAxisAlignedClip(cardR, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        constexpr float aiSbW = 12.0f;
+        float contentRight = std::max(cardR.left + 40.0f, cardR.right - aiSbW);
+        D2D1_RECT_F cardContentR = D2D1::RectF(cardR.left, cardR.top + 1.0f, contentRight, cardR.bottom - 1.0f);
+        m_aiModelScrollTrackRect = D2D1::RectF(contentRight, cardR.top + 2.0f, cardR.right - 1.0f, cardR.bottom - 2.0f);
+
+        float totalAiH = 10.0f + 30.0f + 52.0f + static_cast<float>(m_aiModelInfo.kvRows.size()) * 22.0f + 12.0f;
+        if (!m_aiModelInfo.tensors.empty()) {
+            totalAiH += 10.0f + 22.0f + 23.0f + static_cast<float>(m_aiModelInfo.tensors.size()) * 20.0f;
+        }
+        float cardViewH = std::max(1.0f, cardR.bottom - cardR.top);
+        m_aiModelMaxScrollY = std::max(0.0f, totalAiH - cardViewH);
+        m_aiModelScrollY = std::clamp(m_aiModelScrollY, 0.0f, m_aiModelMaxScrollY);
+
+        rt->PushAxisAlignedClip(cardContentR, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         float y = cardR.top + 10.0f - m_aiModelScrollY;
         float lx = cardR.left + 14.0f;
-        float rxCard = cardR.right - 14.0f;
+        float rxCard = contentRight - 10.0f;
 
         // Top badge + Copy Metadata button
         std::wstring title = L"\xD83E\xDDE0 " + m_aiModelInfo.formatName +
             (m_aiModelInfo.modelTitle.empty() ? L"" : (L"  \x2014  " + m_aiModelInfo.modelTitle));
         brush->SetColor(FcpColor(0x0F172A));
-        rt->DrawTextW(title.c_str(), static_cast<UINT32>(title.size()), fmtBold, D2D1::RectF(lx, y, rxCard - 130.0f, y + 24.0f), brush);
+        PathUtils::DrawSingleLineClipped(rt, title, boldTrim, D2D1::RectF(lx, y, rxCard - 130.0f, y + 24.0f), brush, m_lineScratch);
 
         D2D1_RECT_F copyMetaBtn = D2D1::RectF(rxCard - 124.0f, y, rxCard, y + 24.0f);
-        m_headerHits.push_back({ HBTN_COPY_MODEL_META, copyMetaBtn });
+        if (copyMetaBtn.bottom >= cardContentR.top && copyMetaBtn.top <= cardContentR.bottom) {
+            m_headerHits.push_back({ HBTN_COPY_MODEL_META, copyMetaBtn });
+        }
         bool hovCopyMeta = (m_hoverHeaderBtn == HBTN_COPY_MODEL_META);
         brush->SetColor(hovCopyMeta ? FcpColor(0xDBEAFE) : FcpColor(0xEFF6FF));
         rt->FillRoundedRectangle(D2D1::RoundedRect(copyMetaBtn, 3.5f, 3.5f), brush);
@@ -1794,7 +1816,7 @@ void FileContentPane::Draw(
         brush->SetColor(FcpColor(0x1D4ED8));
         const wchar_t* cpLbl = pl ? L"\xD83D\xDCCB Kopiuj info" : L"\xD83D\xDCCB Copy Meta";
         fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        rt->DrawTextW(cpLbl, static_cast<UINT32>(wcslen(cpLbl)), fmtSmall, copyMetaBtn, brush);
+        rt->DrawTextW(cpLbl, static_cast<UINT32>(wcslen(cpLbl)), fmtSmall, copyMetaBtn, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
         fmtSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         y += 30.0f;
 
@@ -1816,7 +1838,12 @@ void FileContentPane::Draw(
         brush->SetColor(FcpColor(0xBFDBFE));
         rt->DrawRoundedRectangle(D2D1::RoundedRect(sumBox, 4.0f, 4.0f), brush, 1.0f);
         brush->SetColor(FcpColor(0x1E3A8A));
-        rt->DrawTextW(metrics.c_str(), static_cast<UINT32>(metrics.size()), fmtSmall, D2D1::RectF(sumBox.left + 8.0f, sumBox.top + 4.0f, sumBox.right - 8.0f, sumBox.bottom - 4.0f), brush);
+        DWRITE_WORD_WRAPPING prevWrap = smallTrim->GetWordWrapping();
+        smallTrim->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        rt->DrawTextW(metrics.c_str(), static_cast<UINT32>(metrics.size()), smallTrim,
+            D2D1::RectF(sumBox.left + 8.0f, sumBox.top + 2.0f, sumBox.right - 8.0f, sumBox.bottom - 2.0f),
+            brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        smallTrim->SetWordWrapping(prevWrap);
         y += 52.0f;
 
         // Key-Value Metadata rows
@@ -1829,11 +1856,11 @@ void FileContentPane::Draw(
                 }
                 float keyW = std::min(190.0f, (rxCard - lx) * 0.42f);
                 brush->SetColor(FcpColor(0x475569));
-                rt->DrawTextW(m_aiModelInfo.kvRows[i].first.c_str(), static_cast<UINT32>(m_aiModelInfo.kvRows[i].first.size()), fmtBold,
-                    D2D1::RectF(lx + 6.0f, y + 2.0f, lx + keyW, y + 20.0f), brush);
+                PathUtils::DrawSingleLineClipped(rt, m_aiModelInfo.kvRows[i].first, boldTrim,
+                    D2D1::RectF(lx + 6.0f, y + 1.0f, lx + keyW, y + 21.0f), brush, m_lineScratch);
                 brush->SetColor(FcpColor(0x0F172A));
-                rt->DrawTextW(m_aiModelInfo.kvRows[i].second.c_str(), static_cast<UINT32>(m_aiModelInfo.kvRows[i].second.size()), fmtSmall,
-                    D2D1::RectF(lx + keyW + 8.0f, y + 2.0f, rxCard - 6.0f, y + 20.0f), brush);
+                PathUtils::DrawSingleLineClipped(rt, m_aiModelInfo.kvRows[i].second, smallTrim,
+                    D2D1::RectF(lx + keyW + 8.0f, y + 1.0f, rxCard - 6.0f, y + 21.0f), brush, m_lineScratch);
             }
             y += 22.0f;
         }
@@ -1848,8 +1875,8 @@ void FileContentPane::Draw(
                     : L"") + L")";
             if (y + 24.0f >= cardR.top && y <= cardR.bottom) {
                 brush->SetColor(FcpColor(0x1E293B));
-                rt->DrawTextW(tblTitle.c_str(), static_cast<UINT32>(tblTitle.size()), fmtBold,
-                    D2D1::RectF(lx, y, rxCard, y + 20.0f), brush);
+                PathUtils::DrawSingleLineClipped(rt, tblTitle, boldTrim,
+                    D2D1::RectF(lx, y, rxCard, y + 20.0f), brush, m_lineScratch);
             }
             y += 22.0f;
 
@@ -1871,10 +1898,10 @@ void FileContentPane::Draw(
                 const wchar_t* hDType = L"DType";
                 const wchar_t* hShape = pl ? L"Kształt" : L"Shape";
                 const wchar_t* hSize  = pl ? L"Parametry / Rozmiar" : L"Params / Size";
-                rt->DrawTextW(hName,  static_cast<UINT32>(wcslen(hName)),  fmtBold, D2D1::RectF(xName + 6.0f,  y + 2.0f, xType - 4.0f,  y + 20.0f), brush);
-                rt->DrawTextW(hDType, static_cast<UINT32>(wcslen(hDType)), fmtBold, D2D1::RectF(xType + 4.0f,  y + 2.0f, xShape - 4.0f, y + 20.0f), brush);
-                rt->DrawTextW(hShape, static_cast<UINT32>(wcslen(hShape)), fmtBold, D2D1::RectF(xShape + 4.0f, y + 2.0f, xSize - 4.0f,  y + 20.0f), brush);
-                rt->DrawTextW(hSize,  static_cast<UINT32>(wcslen(hSize)),  fmtBold, D2D1::RectF(xSize + 4.0f,  y + 2.0f, rxCard - 6.0f, y + 20.0f), brush);
+                PathUtils::DrawSingleLineClipped(rt, hName,  boldTrim, D2D1::RectF(xName + 6.0f,  y + 1.0f, xType - 4.0f,  y + 21.0f), brush, m_lineScratch);
+                PathUtils::DrawSingleLineClipped(rt, hDType, boldTrim, D2D1::RectF(xType + 4.0f,  y + 1.0f, xShape - 4.0f, y + 21.0f), brush, m_lineScratch);
+                PathUtils::DrawSingleLineClipped(rt, hShape, boldTrim, D2D1::RectF(xShape + 4.0f, y + 1.0f, xSize - 4.0f,  y + 21.0f), brush, m_lineScratch);
+                PathUtils::DrawSingleLineClipped(rt, hSize,  boldTrim, D2D1::RectF(xSize + 4.0f,  y + 1.0f, rxCard - 6.0f, y + 21.0f), brush, m_lineScratch);
             }
             y += 23.0f;
 
@@ -1896,18 +1923,36 @@ void FileContentPane::Draw(
                         psCell = L"dynamic";
                     }
                     brush->SetColor(FcpColor(0x0F172A));
-                    rt->DrawTextW(te.name.c_str(),  static_cast<UINT32>(te.name.size()),  fmtSmall, D2D1::RectF(xName + 6.0f,  y + 1.0f, xType - 4.0f,  y + 19.0f), brush);
+                    PathUtils::DrawSingleLineClipped(rt, te.name,  smallTrim, D2D1::RectF(xName + 6.0f,  y, xType - 4.0f,  y + 20.0f), brush, m_lineScratch);
                     brush->SetColor(FcpColor(0x1D4ED8));
-                    rt->DrawTextW(te.dtype.c_str(), static_cast<UINT32>(te.dtype.size()), fmtSmall, D2D1::RectF(xType + 4.0f,  y + 1.0f, xShape - 4.0f, y + 19.0f), brush);
+                    PathUtils::DrawSingleLineClipped(rt, te.dtype, smallTrim, D2D1::RectF(xType + 4.0f,  y, xShape - 4.0f, y + 20.0f), brush, m_lineScratch);
                     brush->SetColor(FcpColor(0x334155));
-                    rt->DrawTextW(te.shape.c_str(), static_cast<UINT32>(te.shape.size()), fmtSmall, D2D1::RectF(xShape + 4.0f, y + 1.0f, xSize - 4.0f,  y + 19.0f), brush);
+                    PathUtils::DrawSingleLineClipped(rt, te.shape, smallTrim, D2D1::RectF(xShape + 4.0f, y, xSize - 4.0f,  y + 20.0f), brush, m_lineScratch);
                     brush->SetColor(FcpColor(0x475569));
-                    rt->DrawTextW(psCell.c_str(),   static_cast<UINT32>(psCell.size()),   fmtSmall, D2D1::RectF(xSize + 4.0f,  y + 1.0f, rxCard - 6.0f, y + 19.0f), brush);
+                    PathUtils::DrawSingleLineClipped(rt, psCell,   smallTrim, D2D1::RectF(xSize + 4.0f,  y, rxCard - 6.0f, y + 20.0f), brush, m_lineScratch);
                 }
                 y += 20.0f;
             }
         }
         rt->PopAxisAlignedClip();
+
+        // Scrollbar for AI Model Inspector
+        brush->SetColor(FcpColor(0xF1F5F9));
+        rt->FillRectangle(m_aiModelScrollTrackRect, brush);
+        brush->SetColor(FcpColor(0xE2E8F0));
+        rt->DrawLine(D2D1::Point2F(m_aiModelScrollTrackRect.left, m_aiModelScrollTrackRect.top),
+                     D2D1::Point2F(m_aiModelScrollTrackRect.left, m_aiModelScrollTrackRect.bottom), brush, 0.8f);
+        if (m_aiModelMaxScrollY > 0.0f && m_aiModelScrollTrackRect.bottom > m_aiModelScrollTrackRect.top + 8.0f) {
+            float trackH = m_aiModelScrollTrackRect.bottom - m_aiModelScrollTrackRect.top;
+            float thumbH = std::clamp(trackH * (cardViewH / std::max(1.0f, totalAiH)), 24.0f, trackH);
+            float frac = m_aiModelScrollY / m_aiModelMaxScrollY;
+            float thumbTop = m_aiModelScrollTrackRect.top + frac * (trackH - thumbH);
+            m_aiModelScrollThumbRect = D2D1::RectF(m_aiModelScrollTrackRect.left + 2.0f, thumbTop, m_aiModelScrollTrackRect.right - 2.0f, thumbTop + thumbH);
+            brush->SetColor(m_aiModelDraggingScroll ? FcpColor(0x0078D7) : FcpColor(0x94A3B8));
+            rt->FillRoundedRectangle(D2D1::RoundedRect(m_aiModelScrollThumbRect, 3.0f, 3.0f), brush);
+        } else {
+            m_aiModelScrollThumbRect = {};
+        }
         break;
     }
 
@@ -1982,7 +2027,7 @@ void FileContentPane::Draw(
             D2D1_RECT_F dimR = D2D1::RectF(nextBtnX + 4.0f, toolBtn.top, botBar.right - 10.0f, toolBtn.bottom);
             if (dimR.right > dimR.left + 40.0f) {
                 brush->SetColor(FcpColor(0x475569));
-                rt->DrawTextW(dimBuf, static_cast<UINT32>(wcslen(dimBuf)), fmtSmall, dimR, brush);
+                PathUtils::DrawSingleLineClipped(rt, dimBuf, smallTrim, dimR, brush, m_lineScratch);
             }
         }
 
@@ -1997,21 +2042,28 @@ void FileContentPane::Draw(
                 if (!m_imgMeta.sampler.empty()) paramLine += L"  \x2022  " + m_imgMeta.sampler;
 
                 brush->SetColor(FcpColor(0x0369A1));
-                rt->DrawTextW(paramLine.c_str(), static_cast<UINT32>(paramLine.size()), fmtBold,
-                    D2D1::RectF(botBar.left + 10.0f, metaTop, botBar.right - 10.0f, metaTop + 19.0f), brush);
+                PathUtils::DrawSingleLineClipped(rt, paramLine, boldTrim,
+                    D2D1::RectF(botBar.left + 10.0f, metaTop, botBar.right - 10.0f, metaTop + 19.0f), brush, m_lineScratch);
 
                 std::wstring promptDisp = (pl ? L"Prompt: " : L"Prompt: ") + m_imgMeta.positivePrompt;
                 if (!m_imgMeta.negativePrompt.empty()) {
                     promptDisp += (pl ? L"\nNegatywny: " : L"\nNegative: ") + m_imgMeta.negativePrompt;
                 }
                 brush->SetColor(FcpColor(0x1E293B));
-                rt->DrawTextW(promptDisp.c_str(), static_cast<UINT32>(promptDisp.size()), fmtSmall,
-                    D2D1::RectF(botBar.left + 10.0f, metaTop + 20.0f, botBar.right - 10.0f, botBar.bottom - 4.0f), brush);
+                DWRITE_WORD_WRAPPING prevWrap = smallTrim->GetWordWrapping();
+                DWRITE_PARAGRAPH_ALIGNMENT prevPara = smallTrim->GetParagraphAlignment();
+                smallTrim->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+                smallTrim->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                rt->DrawTextW(promptDisp.c_str(), static_cast<UINT32>(promptDisp.size()), smallTrim,
+                    D2D1::RectF(botBar.left + 10.0f, metaTop + 20.0f, botBar.right - 10.0f, botBar.bottom - 4.0f),
+                    brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                smallTrim->SetParagraphAlignment(prevPara);
+                smallTrim->SetWordWrapping(prevWrap);
             } else if (m_imgMeta.hasExif) {
                 std::wstring exifLine = L"\xD83D\xDCF7 EXIF:  " + m_imgMeta.exifSummary;
                 brush->SetColor(FcpColor(0x1E293B));
-                rt->DrawTextW(exifLine.c_str(), static_cast<UINT32>(exifLine.size()), fmtSmall,
-                    D2D1::RectF(botBar.left + 10.0f, metaTop, botBar.right - 10.0f, botBar.bottom - 4.0f), brush);
+                PathUtils::DrawSingleLineClipped(rt, exifLine, smallTrim,
+                    D2D1::RectF(botBar.left + 10.0f, metaTop, botBar.right - 10.0f, botBar.bottom - 4.0f), brush, m_lineScratch);
             }
         }
         break;
@@ -2134,7 +2186,8 @@ bool FileContentPane::OnMouseDown(
                     if (!m_currentEntry.fullPath.empty()) {
                         if (ComputeFileHashes(m_currentEntry.fullPath, m_hashSummary, m_sha256Hex)) {
                             m_hashFilePath = m_currentEntry.fullPath;
-                            CopyUnicodeToClipboard(m_parentHwnd, m_sha256Hex.empty() ? m_hashSummary : m_sha256Hex);
+                            const std::wstring& toCopy = m_sha256Hex.empty() ? m_hashSummary : m_sha256Hex;
+                            if (!toCopy.empty()) PathUtils::CopyWideToClipboard(m_parentHwnd, toCopy);
                             if (outStatusToast) {
                                 *outStatusToast = (lang == Lang::PL ? L"\x2713 Obliczono i skopiowano SHA-256 / CRC32: " : L"\x2713 Calculated & copied SHA-256 / CRC32: ") +
                                     (m_sha256Hex.empty() ? m_hashSummary : m_sha256Hex.substr(0, 24) + L"...");
@@ -2143,15 +2196,15 @@ bool FileContentPane::OnMouseDown(
                     }
                     return true;
                 case HBTN_COPY_PROMPT:
-                    CopyUnicodeToClipboard(m_parentHwnd, m_imgMeta.positivePrompt);
+                    if (!m_imgMeta.positivePrompt.empty()) PathUtils::CopyWideToClipboard(m_parentHwnd, m_imgMeta.positivePrompt);
                     if (outStatusToast) *outStatusToast = (lang == Lang::PL ? L"\x2713 Skopiowano pozytywny prompt AI do schowka" : L"\x2713 Copied AI positive prompt to clipboard");
                     return true;
                 case HBTN_COPY_NEG_PROMPT:
-                    CopyUnicodeToClipboard(m_parentHwnd, m_imgMeta.negativePrompt);
+                    if (!m_imgMeta.negativePrompt.empty()) PathUtils::CopyWideToClipboard(m_parentHwnd, m_imgMeta.negativePrompt);
                     if (outStatusToast) *outStatusToast = (lang == Lang::PL ? L"\x2713 Skopiowano negatywny prompt AI do schowka" : L"\x2713 Copied AI negative prompt to clipboard");
                     return true;
                 case HBTN_COPY_SEED:
-                    CopyUnicodeToClipboard(m_parentHwnd, m_imgMeta.seed);
+                    if (!m_imgMeta.seed.empty()) PathUtils::CopyWideToClipboard(m_parentHwnd, m_imgMeta.seed);
                     if (outStatusToast) *outStatusToast = (lang == Lang::PL ? L"\x2713 Skopiowano Seed: " : L"\x2713 Copied Seed: ") + m_imgMeta.seed;
                     return true;
                 case HBTN_COPY_MODEL_META: {
@@ -2173,7 +2226,7 @@ bool FileContentPane::OnMouseDown(
                                     std::to_wstring(te.paramCount) + L" (" + PathUtils::FormatByteSize(te.byteSize) + L")\r\n";
                         }
                     }
-                    CopyUnicodeToClipboard(m_parentHwnd, dump);
+                    if (!dump.empty()) PathUtils::CopyWideToClipboard(m_parentHwnd, dump);
                     if (outStatusToast) *outStatusToast = (lang == Lang::PL ? L"\x2713 Skopiowano metadane modelu AI do schowka" : L"\x2713 Copied AI model metadata to clipboard");
                     return true;
                 }
@@ -2316,6 +2369,24 @@ bool FileContentPane::OnMouseDown(
         }
         break;
     }
+    case ResolvedContentKind::AiModelInspector: {
+        if (!rightButton && m_aiModelMaxScrollY > 0.0f && PathUtils::PtInRectF(x, y, m_aiModelScrollTrackRect)) {
+            float trackH = std::max(1.0f, m_aiModelScrollTrackRect.bottom - m_aiModelScrollTrackRect.top);
+            float thumbH = std::max(24.0f, m_aiModelScrollThumbRect.bottom - m_aiModelScrollThumbRect.top);
+            if (PathUtils::PtInRectF(x, y, m_aiModelScrollThumbRect)) {
+                m_aiModelDraggingScroll = true;
+                m_aiModelScrollDragOffset = y - m_aiModelScrollThumbRect.top;
+            } else {
+                float usable = std::max(1.0f, trackH - thumbH);
+                float frac = std::clamp((y - thumbH * 0.5f - m_aiModelScrollTrackRect.top) / usable, 0.0f, 1.0f);
+                m_aiModelScrollY = frac * m_aiModelMaxScrollY;
+                m_aiModelDraggingScroll = true;
+                m_aiModelScrollDragOffset = thumbH * 0.5f;
+            }
+            return true;
+        }
+        break;
+    }
     default:
         break;
     }
@@ -2386,6 +2457,16 @@ bool FileContentPane::OnMouseMove(float x, float y, WPARAM keyFlags) {
     case ResolvedContentKind::ArchiveSubExplorer:
         if (m_archive.OnMouseMove(x, y)) changed = true;
         break;
+    case ResolvedContentKind::AiModelInspector:
+        if (m_aiModelDraggingScroll) {
+            float trackH = std::max(1.0f, m_aiModelScrollTrackRect.bottom - m_aiModelScrollTrackRect.top);
+            float thumbH = std::max(24.0f, m_aiModelScrollThumbRect.bottom - m_aiModelScrollThumbRect.top);
+            float usable = std::max(1.0f, trackH - thumbH);
+            float frac = std::clamp((y - m_aiModelScrollDragOffset - m_aiModelScrollTrackRect.top) / usable, 0.0f, 1.0f);
+            m_aiModelScrollY = frac * m_aiModelMaxScrollY;
+            return true;
+        }
+        break;
     default:
         break;
     }
@@ -2396,6 +2477,10 @@ bool FileContentPane::OnMouseUp() {
     bool changed = false;
     if (m_dirDraggingScroll) {
         m_dirDraggingScroll = false;
+        changed = true;
+    }
+    if (m_aiModelDraggingScroll) {
+        m_aiModelDraggingScroll = false;
         changed = true;
     }
     if (m_notepad.OnMouseUp()) changed = true;
@@ -2446,8 +2531,28 @@ bool FileContentPane::OnMouseWheel(short delta, float x, float y) {
     if (m_resolvedKind == ResolvedContentKind::AiModelInspector) {
         int notches = delta / WHEEL_DELTA;
         if (notches == 0) notches = (delta > 0) ? 1 : -1;
-        m_aiModelScrollY = std::max(0.0f, m_aiModelScrollY - notches * 44.0f);
+        m_aiModelScrollY = std::clamp(m_aiModelScrollY - notches * 44.0f, 0.0f, m_aiModelMaxScrollY);
         return true;
+    }
+    return false;
+}
+
+bool FileContentPane::OnMouseHWheel(short delta, float x, float y) {
+    if (!PathUtils::PtInRectF(x, y, m_paneRect)) return false;
+    if (BodyShowsWaitNote() || m_fetchFailed) return true;
+    if (m_resolvedKind == ResolvedContentKind::OfficeDocument) {
+        return m_office.OnMouseHWheel(delta, x, y);
+    }
+    return false;
+}
+
+bool FileContentPane::WantsHorizontalResizeCursor(float x, float y) const {
+    if (!PathUtils::PtInRectF(x, y, m_paneRect) && m_resolvedKind != ResolvedContentKind::OfficeDocument) {
+        return false;
+    }
+    if (BodyShowsWaitNote() || m_fetchFailed) return false;
+    if (m_resolvedKind == ResolvedContentKind::OfficeDocument) {
+        return m_office.WantsHorizontalResizeCursor(x, y);
     }
     return false;
 }

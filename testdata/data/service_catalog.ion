@@ -1,0 +1,20 @@
+$ion_1_0
+// Service mesh catalog in Amazon Ion 1.0 text notation
+service::{
+  id: 'svc_gateway',
+  host: "edge-eu-central-1.internal",
+  port: 8443,
+  latency_ms: 1.85d0,
+  updated: 2026-05-10T08:15:30Z,
+  healthy: true,
+  protocols: [http2, grpc]
+}
+service::{
+  id: 'svc_ledger',
+  host: "ledger-core-01.internal",
+  port: 9090,
+  latency_ms: 0.42d0,
+  updated: 2026-05-10T08:16:00Z,
+  healthy: true,
+  protocols: [grpc]
+}

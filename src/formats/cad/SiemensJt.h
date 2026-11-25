@@ -46,7 +46,7 @@ struct JtStream {
 
     uint16_t ReadU16() {
         if (!ok || pos + 2 > len) { ok = false; return 0; }
-        uint16_t v = isBE ? Detail3D200::RdU16BE(buf + pos) : Detail3D200::RdU16LE(buf + pos);
+        uint16_t v = isBE ? DetailMeshSciCad::RdU16BE(buf + pos) : DetailMeshSciCad::RdU16LE(buf + pos);
         pos += 2;
         return v;
     }
@@ -55,7 +55,7 @@ struct JtStream {
 
     uint32_t ReadU32() {
         if (!ok || pos + 4 > len) { ok = false; return 0; }
-        uint32_t v = isBE ? Detail3D200::RdU32BE(buf + pos) : Detail3D200::RdU32LE(buf + pos);
+        uint32_t v = isBE ? DetailMeshSciCad::RdU32BE(buf + pos) : DetailMeshSciCad::RdU32LE(buf + pos);
         pos += 4;
         return v;
     }
@@ -64,7 +64,7 @@ struct JtStream {
 
     uint64_t ReadU64() {
         if (!ok || pos + 8 > len) { ok = false; return 0; }
-        uint64_t v = isBE ? Detail3D200::RdU64BE(buf + pos) : Detail3D200::RdU64LE(buf + pos);
+        uint64_t v = isBE ? DetailMeshSciCad::RdU64BE(buf + pos) : DetailMeshSciCad::RdU64LE(buf + pos);
         pos += 8;
         return v;
     }
@@ -700,12 +700,12 @@ inline bool ParseVertexBasedShapeCompressedRepAt(
 
     if (stripVerts.empty()) return false;
     if (isPolyLine) {
-        float r = Detail3D200::ComputePointCloudSpan(stripVerts) * 0.012f;
+        float r = DetailMeshSciCad::ComputePointCloudSpan(stripVerts) * 0.012f;
         for (size_t s = 0; s + 1u < stripOffsets.size(); ++s) {
             uint32_t a = static_cast<uint32_t>(stripOffsets[s]);
             uint32_t b = static_cast<uint32_t>(stripOffsets[s + 1u]);
             for (uint32_t k = a; k + 1u < b && k + 1u < stripVerts.size(); ++k) {
-                Detail3D200::AddStrut3D(mesh, stripVerts[k], stripVerts[k + 1u], r);
+                DetailMeshSciCad::AddStrut3D(mesh, stripVerts[k], stripVerts[k + 1u], r);
             }
         }
         return !mesh.tris.empty();
@@ -736,7 +736,7 @@ inline bool DecompressJtSegmentPayload(
     outLen = rawSegPayLen;
     if (rawSegPayLen < 9u) return true;
 
-    auto rdU32 = [&](const uint8_t* p) -> uint32_t { return isBE ? Detail3D200::RdU32BE(p) : Detail3D200::RdU32LE(p); };
+    auto rdU32 = [&](const uint8_t* p) -> uint32_t { return isBE ? DetailMeshSciCad::RdU32BE(p) : DetailMeshSciCad::RdU32LE(p); };
     uint32_t compFlag = rdU32(rawSegPay);
     uint32_t compLen  = rdU32(rawSegPay + 4);
     uint8_t  compAlg  = rawSegPay[8];
@@ -758,8 +758,8 @@ inline bool DecompressJtSegmentPayload(
         if (cLen >= 12u && cSrc[0] == 0xFDu && std::memcmp(cSrc + 1, "7zXZ\0", 5) == 0) {
             if (!StreamCodecs::DecompressXzStream(cSrc, cLen, storage, 64 * 1024 * 1024)) return false;
         } else if (cLen >= 13u && cSrc[0] < 225u) {
-            uint32_t dictSz = Detail3D200::RdU32LE(cSrc + 1);
-            uint64_t unpSz  = Detail3D200::RdU64LE(cSrc + 5);
+            uint32_t dictSz = DetailMeshSciCad::RdU32LE(cSrc + 1);
+            uint64_t unpSz  = DetailMeshSciCad::RdU64LE(cSrc + 5);
             bool known = (unpSz != 0xFFFFFFFFFFFFFFFFULL && unpSz <= 64ULL * 1024ULL * 1024ULL);
             if (!StreamCodecs::DecompressLzma1(cSrc[0], dictSz, cSrc + 13, cLen - 13u,
                                                storage, known ? unpSz : 0ULL, known, 64 * 1024 * 1024))
@@ -772,7 +772,7 @@ inline bool DecompressJtSegmentPayload(
                 }
             }
         } else if (cLen >= 6u && cSrc[0] < 225u) {
-            uint32_t dictSz = Detail3D200::RdU32LE(cSrc + 1);
+            uint32_t dictSz = DetailMeshSciCad::RdU32LE(cSrc + 1);
             if (!StreamCodecs::DecompressLzma1(cSrc[0], dictSz, cSrc + 5, cLen - 5u,
                                                storage, 0ULL, false, 64 * 1024 * 1024))
             {
@@ -872,9 +872,9 @@ inline bool ParseSiemensJt(const uint8_t* data, size_t size, const std::wstring&
         uint8_t byteOrder = data[80];
         if (byteOrder > 1) return false;
         bool isBE = (byteOrder == 1);
-        auto rdU32 = [&](const uint8_t* p) -> uint32_t { return isBE ? Detail3D200::RdU32BE(p) : Detail3D200::RdU32LE(p); };
-        auto rdU64 = [&](const uint8_t* p) -> uint64_t { return isBE ? Detail3D200::RdU64BE(p) : Detail3D200::RdU64LE(p); };
-        auto rdF32 = [&](const uint8_t* p) -> float    { return isBE ? Detail3D200::RdF32BE(p) : Detail3D200::RdF32LE(p); };
+        auto rdU32 = [&](const uint8_t* p) -> uint32_t { return isBE ? DetailMeshSciCad::RdU32BE(p) : DetailMeshSciCad::RdU32LE(p); };
+        auto rdU64 = [&](const uint8_t* p) -> uint64_t { return isBE ? DetailMeshSciCad::RdU64BE(p) : DetailMeshSciCad::RdU64LE(p); };
+        auto rdF32 = [&](const uint8_t* p) -> float    { return isBE ? DetailMeshSciCad::RdF32BE(p) : DetailMeshSciCad::RdF32LE(p); };
 
         int majorVer = std::atoi(std::string(sv.substr(8, 4)).c_str());
         uint64_t tocOffset = (majorVer >= 10 && size >= 93) ? rdU64(data + 85) : static_cast<uint64_t>(rdU32(data + 85));

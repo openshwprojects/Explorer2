@@ -469,7 +469,8 @@ inline bool RunDwgObjectDecodePass(
             objType = br.ReadBS();
         }
 
-        bool isKnownFixed = (objType == 19 || objType == 28 || objType == 13 || objType == 14);
+        bool isKnownFixed = (objType == 19 || objType == 28 || objType == 13 || objType == 14 ||
+                             objType == 37 || objType == 38 || objType == 39);
         bool isMeshClass  = (objType >= 500) &&
                             (!meshClassIds.empty() ? (meshClassIds.count(objType) > 0) : useR2010Framing);
         if (!isKnownFixed && !isMeshClass) {
@@ -590,7 +591,7 @@ inline bool RunDwgObjectDecodePass(
             }
             if (br.bitPos > maxObjBit) continue;
             if (ValidCadPt(sx, sy, sz) && ValidCadPt(ex, ey, ez)) {
-                Detail3D100::AddLineStrut(mesh, CadZUpToYUp(sx, sy, sz), CadZUpToYUp(ex, ey, ez), 0.04f);
+                DetailDccScene::AddLineStrut(mesh, CadZUpToYUp(sx, sy, sz), CadZUpToYUp(ex, ey, ez), 0.04f);
             }
         } else if (objType == 13) { // VERTEX_PFACE
             br.ReadRC(); // flags
@@ -614,6 +615,63 @@ inline bool RunDwgObjectDecodePass(
                 if (i4 >= 0 && i4 != i3 && static_cast<size_t>(i4) < pfaceVerts.size()) {
                     mesh.vertices.push_back(pfaceVerts[static_cast<size_t>(i4)]);
                     mesh.tris.push_back({ b + 0, b + 2, b + 3, {} });
+                }
+            }
+        } else if (objType == 37 || objType == 38 || objType == 39) { // REGION (37), 3DSOLID (38), BODY (39) — Embedded ACIS SAT / SAB
+            // Parse AcDbModelerGeometry: optional wireframe curves + ACIS v1 (XOR-159 SAT) or v2 (Binary SAB)
+            uint8_t acisEmpty = br.ReadB();
+            if (!acisEmpty && br.HasBits(18)) {
+                (void)br.ReadB(); // unknown bit
+                int16_t acisVer = br.ReadBS();
+                if (acisVer == 1) {
+                    std::string satDecoded;
+                    for (int guard = 0; guard < 16384 && br.HasBits(16) && br.bitPos <= maxObjBit; ++guard) {
+                        int32_t blkLen = br.ReadBL();
+                        if (blkLen <= 0) break;
+                        if (blkLen > 4 * 1024 * 1024 || br.bitPos + static_cast<size_t>(blkLen) * 8u > maxObjBit) break;
+                        satDecoded.reserve(satDecoded.size() + static_cast<size_t>(blkLen) + 1u);
+                        for (int32_t k = 0; k < blkLen; ++k) {
+                            uint8_t c = br.ReadRC();
+                            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                                satDecoded.push_back(static_cast<char>(c));
+                            } else {
+                                satDecoded.push_back(static_cast<char>(159 - static_cast<int>(c)));
+                            }
+                        }
+                        satDecoded.push_back('\n');
+                    }
+                    if (!satDecoded.empty()) {
+                        if (satDecoded.find("End-of-ACIS-data") == std::string::npos) {
+                            satDecoded += "End-of-ACIS-data\n";
+                        }
+                        LoadedMesh3D sub;
+                        if (ParseSpatialAcisSat(reinterpret_cast<const uint8_t*>(satDecoded.data()), satDecoded.size(), L".sat", sub) &&
+                            !sub.tris.empty())
+                        {
+                            uint32_t b = static_cast<uint32_t>(mesh.vertices.size());
+                            mesh.vertices.insert(mesh.vertices.end(), sub.vertices.begin(), sub.vertices.end());
+                            for (const auto& t : sub.tris) mesh.tris.push_back({ b + t.i0, b + t.i1, b + t.i2, {} });
+                        }
+                    }
+                } else if (acisVer == 2) {
+                    // Extract remaining object byte payload and locate "ACIS BinaryFile" / "ASM BinaryFile"
+                    std::vector<uint8_t> sabRaw;
+                    size_t remBytes = (maxObjBit > br.bitPos) ? ((maxObjBit - br.bitPos) / 8u) : 0u;
+                    if (remBytes >= 16u && remBytes <= 32 * 1024 * 1024) {
+                        sabRaw.resize(remBytes);
+                        for (size_t k = 0; k < remBytes; ++k) sabRaw[k] = br.ReadRC();
+                        std::string_view rsv(reinterpret_cast<const char*>(sabRaw.data()), sabRaw.size());
+                        size_t mPos = rsv.find("ACIS BinaryFile");
+                        if (mPos == std::string_view::npos) mPos = rsv.find("ASM BinaryFile");
+                        if (mPos != std::string_view::npos) {
+                            LoadedMesh3D sub;
+                            if (ParseSpatialAcisSat(sabRaw.data() + mPos, sabRaw.size() - mPos, L".sab", sub) && !sub.tris.empty()) {
+                                uint32_t b = static_cast<uint32_t>(mesh.vertices.size());
+                                mesh.vertices.insert(mesh.vertices.end(), sub.vertices.begin(), sub.vertices.end());
+                                for (const auto& t : sub.tris) mesh.tris.push_back({ b + t.i0, b + t.i1, b + t.i2, {} });
+                            }
+                        }
+                    }
                 }
             }
         } else if (isMeshClass) { // MESH (AcDbSubDMesh — AutoCAD 2010+ Subdivision / Polygon Mesh)
@@ -748,7 +806,7 @@ inline bool DecodeDwgObjectsFromHandleMap(
 // ============================================================================
 // 1. Complete AutoCAD DWG 3D Parser (AC1009, AC1012-AC1015, AC1018-AC1032)
 // ============================================================================
-inline bool ParseAutoCadDwgComplete(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
+inline bool ParseAutoCadDwgMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     using namespace DwgDxfDetail;
     if (!data || size < 64 || std::memcmp(data, "AC10", 4) != 0) return false;
 
@@ -856,7 +914,7 @@ inline bool ParseAutoCadDwgComplete(const uint8_t* data, size_t size, LoadedMesh
         //   Header (20 bytes): [uint32 numDescriptions][uint32 compressed][uint32 maxSize][uint32 encrypted][uint32 numDescriptions2]
         uint32_t numDescs = RdU32LE(secMapBuf.data() + 0);
         size_t dp = 20u;
-        std::vector<uint8_t> handlesStream, objectsStream, classesStream;
+        std::vector<uint8_t> handlesStream, objectsStream, classesStream, acdsStream;
 
         for (uint32_t d = 0; d < numDescs && dp + 96u <= secMapBuf.size(); ++d) {
             uint64_t dataSz   = RdU64LE(secMapBuf.data() + dp + 0);
@@ -871,9 +929,11 @@ inline bool ParseAutoCadDwgComplete(const uint8_t* data, size_t size, LoadedMesh
             bool wantHandles = (std::strcmp(secName, "AcDb:Handles") == 0);
             bool wantObjects = (std::strcmp(secName, "AcDb:AcDbObjects") == 0);
             bool wantClasses = (std::strcmp(secName, "AcDb:Classes") == 0);
+            bool wantAcDs    = (std::strcmp(secName, "AcDb:AcDsPrototype_1b") == 0);
             std::vector<uint8_t>* target = wantHandles ? &handlesStream
                                          : (wantObjects ? &objectsStream
-                                         : (wantClasses ? &classesStream : nullptr));
+                                         : (wantClasses ? &classesStream
+                                         : (wantAcDs ? &acdsStream : nullptr)));
 
             for (uint32_t pg = 0; pg < pageCnt; ++pg) {
                 int32_t pgNum  = RdI32LE(secMapBuf.data() + dp + 0);
@@ -906,15 +966,35 @@ inline bool ParseAutoCadDwgComplete(const uint8_t* data, size_t size, LoadedMesh
             }
         }
 
-        if (handlesStream.empty() || objectsStream.empty()) return false;
-        if (!DecodeDwgObjectsFromHandleMap(objectsStream.data(), objectsStream.size(),
-                                           handlesStream.data(), handlesStream.size(),
-                                           relVer, mesh,
-                                           classesStream.empty() ? nullptr : classesStream.data(),
-                                           classesStream.size()))
-        {
-            return false;
+        bool decodedAny = false;
+        if (!handlesStream.empty() && !objectsStream.empty()) {
+            decodedAny = DecodeDwgObjectsFromHandleMap(
+                objectsStream.data(), objectsStream.size(),
+                handlesStream.data(), handlesStream.size(),
+                relVer, mesh,
+                classesStream.empty() ? nullptr : classesStream.data(),
+                classesStream.size());
         }
+        // R2013+ (AC1027 / AC1032) stores 3DSOLID ACIS/ASM SAB streams in AcDb:AcDsPrototype_1b
+        if (!acdsStream.empty()) {
+            std::string_view dsv(reinterpret_cast<const char*>(acdsStream.data()), acdsStream.size());
+            for (const char* magic : { "ASM BinaryFile", "ACIS BinaryFile" }) {
+                size_t searchPos = 0;
+                while (searchPos < dsv.size()) {
+                    size_t hit = dsv.find(magic, searchPos);
+                    if (hit == std::string_view::npos) break;
+                    LoadedMesh3D sub;
+                    if (ParseSpatialAcisSat(acdsStream.data() + hit, acdsStream.size() - hit, L".sab", sub) && !sub.tris.empty()) {
+                        uint32_t b = static_cast<uint32_t>(mesh.vertices.size());
+                        mesh.vertices.insert(mesh.vertices.end(), sub.vertices.begin(), sub.vertices.end());
+                        for (const auto& t : sub.tris) mesh.tris.push_back({ b + t.i0, b + t.i1, b + t.i2, {} });
+                        decodedAny = true;
+                    }
+                    searchPos = hit + 15u;
+                }
+            }
+        }
+        if (!decodedAny || mesh.vertices.empty() || mesh.tris.empty()) return false;
         mesh.formatName = L"AutoCAD Modern Drawing (.dwg " + std::wstring(ver6.begin(), ver6.end()) + L")";
         return true;
     }

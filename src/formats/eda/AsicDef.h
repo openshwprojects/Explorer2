@@ -1,5 +1,5 @@
 #pragma once
-// AsicDef.h — #25 ASIC Design Exchange Format (.def) v5.8 Rectilinear DIEAREA, Orientations, PINS, SPECIALNETS, Routed * Wildcards & VIAS
+// AsicDef.h — ASIC Design Exchange Format (.def) v5.8 Rectilinear DIEAREA, Orientations, PINS, SPECIALNETS, Routed * Wildcards & VIAS
 
 namespace Formats {
 
@@ -48,24 +48,13 @@ inline bool ParseAsicDefBoard(std::string_view sv, ParsedEdaBoard& out) {
     // Load any companion .lef files from the same directory so standard-cell dimensions & pins match!
     std::unordered_map<std::string, LefMacroSummary> companionMacros;
     if (!out.filePath.empty()) {
-        size_t sep = out.filePath.find_last_of(L"\\/");
-        if (sep != std::wstring::npos) {
-            std::wstring dir = out.filePath.substr(0, sep);
-            WIN32_FIND_DATAW fd{};
-            HANDLE hFind = FindFirstFileW((dir + L"\\*.lef").c_str(), &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                int lefLoaded = 0;
-                do {
-                    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && lefLoaded < 8) {
-                        std::vector<uint8_t> lefBytes;
-                        if (PathUtils::ReadFileBytes(dir + L"\\" + fd.cFileName, 8 * 1024 * 1024, lefBytes) && !lefBytes.empty()) {
-                            std::string_view lsv(reinterpret_cast<const char*>(lefBytes.data()), lefBytes.size());
-                            ScanLefMacrosForDef(lsv, companionMacros);
-                            ++lefLoaded;
-                        }
-                    }
-                } while (FindNextFileW(hFind, &fd));
-                FindClose(hFind);
+        std::vector<std::wstring> lefFiles;
+        ListCompanionFilesByExt(out.filePath, ".lef", 8u, lefFiles);
+        for (const auto& lefFile : lefFiles) {
+            std::vector<uint8_t> lefBytes;
+            if (PathUtils::ReadFileBytes(lefFile, 8 * 1024 * 1024, lefBytes) && !lefBytes.empty()) {
+                std::string_view lsv(reinterpret_cast<const char*>(lefBytes.data()), lefBytes.size());
+                ScanLefMacrosForDef(lsv, companionMacros);
             }
         }
     }

@@ -4,8 +4,8 @@
 
 namespace Formats {
 
-// #75. Automotive LIN Network Description File (.ldf) — Schematic Bus Topology
-inline bool ParseLinLdf200(std::string_view sv, ParsedEdaBoard& out) {
+// Automotive LIN Network Description File (.ldf) — Schematic Bus Topology
+inline bool ParseLinBusLdfBoard(std::string_view sv, ParsedEdaBoard& out) {
     auto drawSchRect = [&](float cx, float cy, float w, float h, float strokeW, EdaLayerId lid, int netId = 0) {
         DrawFieldbusSchRect(out, cx, cy, w, h, strokeW, lid, netId);
     };
@@ -37,7 +37,7 @@ inline bool ParseLinLdf200(std::string_view sv, ParsedEdaBoard& out) {
         auto findBlockBody = [&](const char* kw, size_t startFrom = 0) -> std::string_view {
             size_t p = clean.find(kw, startFrom);
             while (p != std::string::npos) {
-                bool okBefore = (p == 0 || !std::isalnum(static_cast<unsigned char>(clean[p - 1])) && clean[p - 1] != '_');
+                bool okBefore = (p == 0 || (!std::isalnum(static_cast<unsigned char>(clean[p - 1])) && clean[p - 1] != '_'));
                 size_t after = p + std::strlen(kw);
                 bool okAfter = (after >= clean.size() || (!std::isalnum(static_cast<unsigned char>(clean[after])) && clean[after] != '_'));
                 if (okBefore && okAfter) {

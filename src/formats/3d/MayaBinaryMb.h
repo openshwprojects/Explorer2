@@ -29,7 +29,7 @@ inline bool ParseMayaBinary(const uint8_t* data, size_t size, LoadedMesh3D& mesh
         while (p + hdrSz <= end) {
             char tag[5] = {};
             std::memcpy(tag, data + p, 4);
-            uint64_t cLen = isFor8 ? Detail3D100::RdU64BE(data + p + 8) : Detail3D100::RdU32BE(data + p + 4);
+            uint64_t cLen = isFor8 ? DetailDccScene::RdU64BE(data + p + 8) : DetailDccScene::RdU32BE(data + p + 4);
             p += hdrSz;
             if (cLen > end - p) break;
             size_t cEnd = p + static_cast<size_t>(cLen);
@@ -51,9 +51,9 @@ inline bool ParseMayaBinary(const uint8_t* data, size_t size, LoadedMesh3D& mesh
                         vrts.resize(nv);
                         for (size_t i = 0; i < nv; ++i) {
                             vrts[i] = {
-                                Detail3D100::RdF32BE(data + p + i * 12 + 0),
-                                Detail3D100::RdF32BE(data + p + i * 12 + 4),
-                                Detail3D100::RdF32BE(data + p + i * 12 + 8)
+                                DetailDccScene::RdF32BE(data + p + i * 12 + 0),
+                                DetailDccScene::RdF32BE(data + p + i * 12 + 4),
+                                DetailDccScene::RdF32BE(data + p + i * 12 + 8)
                             };
                         }
                     }
@@ -63,8 +63,8 @@ inline bool ParseMayaBinary(const uint8_t* data, size_t size, LoadedMesh3D& mesh
                     if (stride == 12 && (cLen % 9) == 0 && !vrts.empty()) {
                         // Disambiguate 36-byte chunk: check if stride 12 produces valid vertex indices
                         for (size_t k = 0; k < cLen; k += 12) {
-                            int32_t a = static_cast<int32_t>(Detail3D100::RdU32BE(data + p + k));
-                            int32_t b = static_cast<int32_t>(Detail3D100::RdU32BE(data + p + k + 4));
+                            int32_t a = static_cast<int32_t>(DetailDccScene::RdU32BE(data + p + k));
+                            int32_t b = static_cast<int32_t>(DetailDccScene::RdU32BE(data + p + k + 4));
                             if (a < 0 || b < 0 || static_cast<size_t>(a) >= vrts.size() || static_cast<size_t>(b) >= vrts.size()) {
                                 stride = 9;
                                 break;
@@ -75,8 +75,8 @@ inline bool ParseMayaBinary(const uint8_t* data, size_t size, LoadedMesh3D& mesh
                         size_t ne = static_cast<size_t>(cLen) / stride;
                         edges.resize(ne);
                         for (size_t i = 0; i < ne; ++i) {
-                            edges[i].v0 = static_cast<int32_t>(Detail3D100::RdU32BE(data + p + i * stride + 0));
-                            edges[i].v1 = static_cast<int32_t>(Detail3D100::RdU32BE(data + p + i * stride + 4));
+                            edges[i].v0 = static_cast<int32_t>(DetailDccScene::RdU32BE(data + p + i * stride + 0));
+                            edges[i].v1 = static_cast<int32_t>(DetailDccScene::RdU32BE(data + p + i * stride + 4));
                         }
                     }
                 } else if ((std::memcmp(tag, "FACE", 4) == 0 || std::memcmp(tag, "POLY", 4) == 0) && cLen >= 12 && (cLen % 4) == 0) {
@@ -86,14 +86,14 @@ inline bool ParseMayaBinary(const uint8_t* data, size_t size, LoadedMesh3D& mesh
                     size_t idx = 0;
                     std::vector<std::vector<int32_t>> parsedA;
                     while (idx < nInts) {
-                        int32_t cnt = static_cast<int32_t>(Detail3D100::RdU32BE(data + p + idx * 4));
+                        int32_t cnt = static_cast<int32_t>(DetailDccScene::RdU32BE(data + p + idx * 4));
                         if (cnt < 3 || cnt > 256 || idx + 1 + static_cast<size_t>(cnt) > nInts) {
                             countPrefixedOk = false;
                             break;
                         }
                         std::vector<int32_t> loop(cnt);
                         for (int32_t k = 0; k < cnt; ++k) {
-                            loop[k] = static_cast<int32_t>(Detail3D100::RdU32BE(data + p + (idx + 1 + k) * 4));
+                            loop[k] = static_cast<int32_t>(DetailDccScene::RdU32BE(data + p + (idx + 1 + k) * 4));
                         }
                         parsedA.push_back(std::move(loop));
                         idx += 1 + static_cast<size_t>(cnt);
@@ -104,7 +104,7 @@ inline bool ParseMayaBinary(const uint8_t* data, size_t size, LoadedMesh3D& mesh
                         // Format B: Maya packed polyFaces stream (bit 30 = reversed edge, bit 31 = end of loop)
                         std::vector<int32_t> curLoop;
                         for (size_t k = 0; k < nInts; ++k) {
-                            uint32_t w = Detail3D100::RdU32BE(data + p + k * 4);
+                            uint32_t w = DetailDccScene::RdU32BE(data + p + k * 4);
                             bool endLoop = (w & 0x80000000u) != 0;
                             bool revEdge = (w & 0x40000000u) != 0;
                             int32_t eIdx = static_cast<int32_t>(w & 0x3FFFFFFFu);
@@ -128,7 +128,7 @@ inline bool ParseMayaBinary(const uint8_t* data, size_t size, LoadedMesh3D& mesh
         }
     };
 
-    uint64_t rootLen = isFor8 ? Detail3D100::RdU64BE(data + 8) : Detail3D100::RdU32BE(data + 4);
+    uint64_t rootLen = isFor8 ? DetailDccScene::RdU64BE(data + 8) : DetailDccScene::RdU32BE(data + 4);
     size_t rootEnd = std::min<size_t>(size, (isFor8 ? 16 : 8) + static_cast<size_t>(rootLen));
     size_t bodyStart = isFor8 ? 24 : 12;
     if (bodyStart < rootEnd) {

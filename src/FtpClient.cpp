@@ -4,6 +4,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "FtpClient.h"
+#include "Base64.h"
 #include "PathUtils.h"
 #include "FileEngine.h"
 #include "AppLog.h"
@@ -289,43 +290,6 @@ std::wstring UrlEncodeRemotePathForCurl(const std::wstring& remotePath) {
         }
     }
     if (out.empty() || out.front() != L'/') out.insert(out.begin(), L'/');
-    return out;
-}
-
-std::string DecodeBase64String(const std::string& in) {
-    static const int8_t kDecTable[256] = {
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
-    };
-    std::string out;
-    out.reserve((in.size() * 3) / 4);
-    uint32_t val = 0;
-    int valb = -8;
-    for (unsigned char c : in) {
-        int8_t d = kDecTable[c];
-        if (d == -1) continue;
-        if (d == -2) break; // '=' padding
-        val = (val << 6) + static_cast<uint32_t>(d);
-        valb += 6;
-        if (valb >= 0) {
-            out.push_back(static_cast<char>((val >> valb) & 0xFF));
-            valb -= 8;
-        }
-    }
     return out;
 }
 
@@ -2258,7 +2222,9 @@ std::vector<FtpBookmark> FtpClient::ImportFileZillaSites(const std::wstring& cus
             std::string passRaw = ExtractXmlTagValue(block, "Pass", &passAttrs);
             std::string passDecoded;
             if (passAttrs.find("base64") != std::string::npos) {
-                passDecoded = DecodeBase64String(passRaw);
+                std::vector<uint8_t> decBytes;
+                Base64::Decode(passRaw, decBytes, Base64::Mode::Lenient);
+                passDecoded.assign(reinterpret_cast<const char*>(decBytes.data()), decBytes.size());
             } else {
                 passDecoded = UnescapeXmlText(passRaw);
             }

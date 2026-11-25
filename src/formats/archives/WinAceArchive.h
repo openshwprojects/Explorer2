@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 inline bool ParseWinAceArchive(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
     // #38. WinACE Archive — Magic "**ACE**" at offset 7
@@ -54,10 +54,10 @@ inline bool ParseWinAceArchive(const uint8_t* data, size_t size, ArchiveSummaryI
     return false;
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectWinAceArchive(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseWinAceArchive(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseWinAceArchive(data, size, outInfo);
 }
 
 } // namespace Explorer2::Formats

@@ -13,72 +13,6 @@ using ::Explorer2::ByteIO::RdU32BE;
 using ::Explorer2::ByteIO::RdU64LE;
 using ::Explorer2::ByteIO::RdU64BE;
 
-inline std::wstring Utf8ToWideStr(std::string_view sv) {
-    std::wstring out;
-    out.reserve(sv.size());
-    size_t i = 0;
-    while (i < sv.size()) {
-        uint8_t b0 = static_cast<uint8_t>(sv[i]);
-        uint32_t cp = 0xFFFDu;
-        if (b0 < 0x80u) {
-            cp = b0;
-            ++i;
-        } else if ((b0 & 0xE0u) == 0xC0u && i + 1 < sv.size()) {
-            uint8_t b1 = static_cast<uint8_t>(sv[i + 1]);
-            if ((b1 & 0xC0u) == 0x80u) {
-                cp = ((static_cast<uint32_t>(b0 & 0x1Fu) << 6) | (b1 & 0x3Fu));
-                if (cp < 0x80u) cp = 0xFFFDu;
-                i += 2;
-            } else {
-                ++i;
-            }
-        } else if ((b0 & 0xF0u) == 0xE0u && i + 2 < sv.size()) {
-            uint8_t b1 = static_cast<uint8_t>(sv[i + 1]);
-            uint8_t b2 = static_cast<uint8_t>(sv[i + 2]);
-            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
-                cp = (static_cast<uint32_t>(b0 & 0x0Fu) << 12) |
-                     (static_cast<uint32_t>(b1 & 0x3Fu) << 6) |
-                     (b2 & 0x3Fu);
-                if (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu)) cp = 0xFFFDu;
-                i += 3;
-            } else {
-                ++i;
-            }
-        } else if ((b0 & 0xF8u) == 0xF0u && i + 3 < sv.size()) {
-            uint8_t b1 = static_cast<uint8_t>(sv[i + 1]);
-            uint8_t b2 = static_cast<uint8_t>(sv[i + 2]);
-            uint8_t b3 = static_cast<uint8_t>(sv[i + 3]);
-            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
-                cp = (static_cast<uint32_t>(b0 & 0x07u) << 18) |
-                     (static_cast<uint32_t>(b1 & 0x3Fu) << 12) |
-                     (static_cast<uint32_t>(b2 & 0x3Fu) << 6) |
-                     (b3 & 0x3Fu);
-                if (cp < 0x10000u || cp > 0x10FFFFu) cp = 0xFFFDu;
-                i += 4;
-            } else {
-                ++i;
-            }
-        } else {
-            ++i;
-        }
-
-        if constexpr (sizeof(wchar_t) == 2) {
-            if (cp <= 0xFFFFu) {
-                out.push_back(static_cast<wchar_t>(cp));
-            } else {
-                uint32_t v = cp - 0x10000u;
-                out.push_back(static_cast<wchar_t>(0xD800u + (v >> 10)));
-                out.push_back(static_cast<wchar_t>(0xDC00u + (v & 0x3FFu)));
-            }
-        } else {
-            out.push_back(static_cast<wchar_t>(cp));
-        }
-    }
-    return out;
-}
-
-// Pure-C++ PNG decoder (1/2/4/8/16-bit Gray, RGB, Indexed+PLTE+tRNS, GrayAlpha, RGBA; non-interlaced & Adam7)
-
 struct NrbfValue {
     enum class Kind : uint8_t { Null, Bool, Int, Float, String, ObjectRef, InlineObjId };
     Kind kind = Kind::Null;
@@ -787,7 +721,7 @@ inline bool DecodePaintDotNet(const uint8_t* data, size_t size, ExtendedImageInf
 
             if (const NrbfValue* nv = propObj->FindField("name")) {
                 std::string s = nrbf.ResolveString(nv);
-                if (!s.empty()) lm.name = Utf8ToWideStr(s);
+                if (!s.empty()) lm.name = PathUtils::Utf8ToWide(s);
             }
             if (const NrbfValue* vv = propObj->FindField("visible"); vv && vv->kind == NrbfValue::Kind::Bool) {
                 lm.visible = vv->boolVal;

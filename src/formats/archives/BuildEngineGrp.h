@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 // ============================================================================
 // #28. Build Engine GRP Archive (.grp — "KenSilverman")
@@ -38,10 +38,10 @@ inline bool ParseBuildGrp(const uint8_t* data, size_t size, ArchiveSummaryInfo& 
     return outInfo.valid;
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectBuildEngineGrp(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseBuildGrp(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseBuildGrp(data, size, outInfo);
 }
 
 } // namespace Explorer2::Formats

@@ -370,6 +370,9 @@ private:
     void StartDeleteJob(const std::vector<std::wstring>& paths, bool permanent);
     bool ReportDeleteJobResult(const TransferCompletionEvent& ev);
     void ShowDeleteFailures(const TransferCompletionEvent& ev);
+    void ShowTransferLockFailures(const TransferCompletionEvent& ev);
+    void OpenLockInspectorForTransferJob(int jobId);
+    void OpenLockInspectorForPaths(const std::vector<std::wstring>& rawPaths);
     void PerformUndoDelete();
     void CopySelected(bool isCut);
     void PasteIntoCurrent(bool forceVerifyXxHash = false);
@@ -510,6 +513,7 @@ private:
     int m_editingSearchFieldCmd = 0; // CMD_SEARCH_EDIT_DATE_FROM / TO / SIZE_MIN / SIZE_MAX / CUSTOM_EXT
     ULONGLONG m_folderScanFinishedTick = 0;
     bool m_wasFolderScanning = false;
+    ULONGLONG m_nextFolderSizeSyncTick = 0;     // the work timer fetches new folder sizes no sooner than this
 
     // Data model
     std::vector<FileEntry> m_allItems;

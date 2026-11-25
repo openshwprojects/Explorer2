@@ -2,23 +2,23 @@
 // TrackerXm.h — FastTracker II Extended Module (.xm) Inspector
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseTrackerXm(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 80 || std::memcmp(raw.data(), "Extended Module: ", 17) != 0 || raw[37] != 0x1A) return false;
 
     std::wstring modName     = FixedAsciiField(raw.data() + 17, 20);
     std::wstring trackerName = FixedAsciiField(raw.data() + 38, 20);
-    uint16_t xmVer       = DetailSys100::RdU16LE(raw.data() + 58);
-    uint32_t hdrSize     = DetailSys100::RdU32LE(raw.data() + 60);
-    uint16_t songLen     = DetailSys100::RdU16LE(raw.data() + 64);
-    uint16_t restartPos  = DetailSys100::RdU16LE(raw.data() + 66);
-    uint16_t numChans    = DetailSys100::RdU16LE(raw.data() + 68);
-    uint16_t numPats     = DetailSys100::RdU16LE(raw.data() + 70);
-    uint16_t numInsts    = DetailSys100::RdU16LE(raw.data() + 72);
-    uint16_t flags       = DetailSys100::RdU16LE(raw.data() + 74);
-    uint16_t defTempo    = DetailSys100::RdU16LE(raw.data() + 76);
-    uint16_t defBpm      = DetailSys100::RdU16LE(raw.data() + 78);
+    uint16_t xmVer       = DetailBinarySysDoc::RdU16LE(raw.data() + 58);
+    uint32_t hdrSize     = DetailBinarySysDoc::RdU32LE(raw.data() + 60);
+    uint16_t songLen     = DetailBinarySysDoc::RdU16LE(raw.data() + 64);
+    uint16_t restartPos  = DetailBinarySysDoc::RdU16LE(raw.data() + 66);
+    uint16_t numChans    = DetailBinarySysDoc::RdU16LE(raw.data() + 68);
+    uint16_t numPats     = DetailBinarySysDoc::RdU16LE(raw.data() + 70);
+    uint16_t numInsts    = DetailBinarySysDoc::RdU16LE(raw.data() + 72);
+    uint16_t flags       = DetailBinarySysDoc::RdU16LE(raw.data() + 74);
+    uint16_t defTempo    = DetailBinarySysDoc::RdU16LE(raw.data() + 76);
+    uint16_t defBpm      = DetailBinarySysDoc::RdU16LE(raw.data() + 78);
 
     out.kind = OfficeFileKind::SqliteDb;
     out.isSpreadsheet = true;
@@ -43,9 +43,9 @@ inline bool ParseTrackerXm(const std::vector<uint8_t>& raw, ParsedOfficeDocument
 
     size_t pos = 60ULL + hdrSize;
     for (uint16_t p = 0; p < numPats && pos + 9 <= raw.size(); ++p) {
-        uint32_t pHdrLen = DetailSys100::RdU32LE(raw.data() + pos);
-        uint16_t nRows   = DetailSys100::RdU16LE(raw.data() + pos + 5);
-        uint16_t pkSize  = DetailSys100::RdU16LE(raw.data() + pos + 7);
+        uint32_t pHdrLen = DetailBinarySysDoc::RdU32LE(raw.data() + pos);
+        uint16_t nRows   = DetailBinarySysDoc::RdU16LE(raw.data() + pos + 5);
+        uint16_t pkSize  = DetailBinarySysDoc::RdU16LE(raw.data() + pos + 7);
         patSh.rows.push_back({ std::to_wstring(p), std::to_wstring(nRows), std::to_wstring(pkSize) });
         if (pHdrLen < 7 || pos + pHdrLen + pkSize > raw.size()) { pos = raw.size(); break; }
         pos += pHdrLen + pkSize;
@@ -56,17 +56,17 @@ inline bool ParseTrackerXm(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     insSh.name = L"Instruments";
     insSh.rows.push_back({ L"Inst #", L"Instrument Name", L"Num Samples", L"Total Sample Bytes" });
     for (uint16_t i = 0; i < numInsts && pos + 29 <= raw.size(); ++i) {
-        uint32_t iSize = DetailSys100::RdU32LE(raw.data() + pos);
+        uint32_t iSize = DetailBinarySysDoc::RdU32LE(raw.data() + pos);
         if (iSize < 29 || pos + iSize > raw.size()) break;
         std::wstring iName = FixedAsciiField(raw.data() + pos + 4, 22);
-        uint16_t nSmp = DetailSys100::RdU16LE(raw.data() + pos + 27);
-        uint32_t smpHdrSize = (nSmp > 0 && iSize >= 33) ? DetailSys100::RdU32LE(raw.data() + pos + 29) : 40;
+        uint16_t nSmp = DetailBinarySysDoc::RdU16LE(raw.data() + pos + 27);
+        uint32_t smpHdrSize = (nSmp > 0 && iSize >= 33) ? DetailBinarySysDoc::RdU32LE(raw.data() + pos + 29) : 40;
         if (smpHdrSize == 0 || smpHdrSize > 4096) smpHdrSize = 40;
         pos += iSize;
 
         uint64_t totalSmpBytes = 0;
         for (uint16_t s = 0; s < nSmp && pos + smpHdrSize <= raw.size(); ++s) {
-            if (smpHdrSize >= 4) totalSmpBytes += DetailSys100::RdU32LE(raw.data() + pos);
+            if (smpHdrSize >= 4) totalSmpBytes += DetailBinarySysDoc::RdU32LE(raw.data() + pos);
             pos += smpHdrSize;
         }
         insSh.rows.push_back({ std::to_wstring(i + 1), iName, std::to_wstring(nSmp), std::to_wstring(totalSmpBytes) });
@@ -82,8 +82,8 @@ inline bool ParseTrackerXm(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseTrackerXmDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseTrackerXm(raw, out); }
+inline bool ParseTrackerXmDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseTrackerXm(raw, out); }
 
 } // namespace Formats

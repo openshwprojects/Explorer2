@@ -50,7 +50,7 @@ inline bool ParseVectorCanDbcBoard(const uint8_t* data, size_t size, const std::
                     m.extId = (rawId & 0x80000000u) != 0;
                     m.canId = rawId & 0x1FFFFFFFu;
                     m.dlc = std::clamp(dlc, 1, 64);
-                    m.name = DetailEda100::TrimAsciiView(msgName);
+                    m.name = DetailSiliconAndBusEda::TrimAsciiView(msgName);
                     m.txNode = txNode;
                     msgs.push_back(std::move(m));
                 }
@@ -59,7 +59,7 @@ inline bool ParseVectorCanDbcBoard(const uint8_t* data, size_t size, const std::
                 if (colon != std::string_view::npos) {
                     std::string_view hdrPart = ln.substr(4, colon - 4);
                     size_t nameEnd = hdrPart.find_first_of(" \t");
-                    std::string sigName = DetailEda100::TrimAsciiView(hdrPart.substr(0, nameEnd));
+                    std::string sigName = DetailSiliconAndBusEda::TrimAsciiView(hdrPart.substr(0, nameEnd));
                     std::string spec(ln.substr(colon + 1));
 
                     int startBit = 0, bitSize = 8;
@@ -118,13 +118,13 @@ inline bool ParseVectorCanDbcBoard(const uint8_t* data, size_t size, const std::
             node.heightMm = 1.5f;
             node.category = EdaPartCategory::IC_Package;
             out.components.push_back(node);
-            DetailEda100::AddRectOutline(out, node.x, node.y, node.widthMm, node.lengthMm, EdaLayerId::SchSymbol, 0.28f);
+            DetailSiliconAndBusEda::AddRectOutline(out, node.x, node.y, node.widthMm, node.lengthMm, EdaLayerId::SchSymbol, 0.28f);
             out.labels.push_back({ node.x, yRow + 1.0f, 1.0f, EdaLayerId::SchLabel, node.refDes });
             out.labels.push_back({ node.x, yRow - 1.5f, 0.85f, EdaLayerId::TopSilk, idHex });
 
             // Bitfield payload bar (-22.0f .. +46.0f = 68.0 mm for `totalBits`)
             const float barX0 = -22.0f, barW = 68.0f, barH = 5.4f;
-            DetailEda100::AddRectOutline(out, barX0 + barW * 0.5f, yRow, barW, barH, EdaLayerId::EdgeCuts, 0.22f);
+            DetailSiliconAndBusEda::AddRectOutline(out, barX0 + barW * 0.5f, yRow, barW, barH, EdaLayerId::EdgeCuts, 0.22f);
             for (int b = 1; b < m.dlc && b < 16; ++b) {
                 float bx = barX0 + (static_cast<float>(b * 8) / static_cast<float>(totalBits)) * barW;
                 out.traces.push_back({ bx, yRow - barH * 0.5f, bx, yRow + barH * 0.5f, 0.10f, EdaLayerId::BottomSilk, 0 });
@@ -139,7 +139,7 @@ inline bool ParseVectorCanDbcBoard(const uint8_t* data, size_t size, const std::
                 float scx = sx0 + sw * 0.5f;
 
                 EdaLayerId slid = (si % 2 == 0) ? EdaLayerId::TopCopper : EdaLayerId::SchWire;
-                DetailEda100::AddRectOutline(out, scx, yRow, sw, barH - 1.0f, slid, 0.30f);
+                DetailSiliconAndBusEda::AddRectOutline(out, scx, yRow, sw, barH - 1.0f, slid, 0.30f);
                 out.pads.push_back({ scx, yRow, std::max(0.8f, sw - 0.6f), barH - 1.8f, 0.0f, 0.0f, 1,
                     s.littleEndian ? EdaLayerId::TopCopper : EdaLayerId::BottomCopper,
                     PathUtils::Utf8ToWide(s.name), PathUtils::Utf8ToWide(s.unit) });

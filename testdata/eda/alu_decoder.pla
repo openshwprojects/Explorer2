@@ -1,0 +1,14 @@
+# Berkeley Espresso PLA: 4-bit RISC ALU Control Decoder
+.i 4
+.o 4
+.ilb op3 op2 op1 op0
+.ob add_en sub_en shift_en branch_en
+.p 6
+.type fd
+0000 1000
+0001 1000
+0010 0100
+01-0 0010
+100- 0001
+1111 1100
+.e

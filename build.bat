@@ -34,20 +34,65 @@ if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 rem The slowest translation units come first: /MP compiles the list in order, so a heavy file at the end would start only when everything else is done.
 cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\EdaReaders.cpp ^
+    src\EdaReadersAsicBitstream.cpp ^
+    src\EdaReadersScopeAuto.cpp ^
     src\DocReaders.cpp ^
+    src\DocReadersSecurityBin.cpp ^
+    src\DocReadersSciAiData.cpp ^
+    src\DocReadersAudioMedia.cpp ^
     src\Mesh3DReaders.cpp ^
+    src\Mesh3DReadersCadBrep.cpp ^
+    src\Mesh3DReadersRiggedEngine.cpp ^
     src\ArchiveReaders.cpp ^
+    src\ImageFormatLoader.cpp ^
     src\ExplorerApp.cpp ^
     src\ExplorerAppRender.cpp ^
-    src\ImageFormatLoader.cpp ^
     src\SelfTestSuite.cpp ^
+    src\FormatTestsImages.cpp ^
     src\FormatTestsDocs.cpp ^
+    src\FormatTestsArchives.cpp ^
+    src\FormatTests3D.cpp ^
+    src\FormatTestsEda.cpp ^
+    src\FormatTestsDocsSystem.cpp ^
+    src\FormatTests3DCadSci.cpp ^
+    src\FormatTests3DGameConsole.cpp ^
+    src\FormatTestsImagesStudioRaw.cpp ^
+    src\FormatTestsImagesGpuGame.cpp ^
+    src\FormatTestsEdaVlsiFpga.cpp ^
+    src\FormatTestsEdaWaveformsBus.cpp ^
+    src\FormatTestsDocsAnalyticsForensics.cpp ^
+    src\FormatTestsDocsGameLoc.cpp ^
+    src\FormatTestsArchivesSystemPak.cpp ^
+    src\Mesh3DReadersEngineeringGame.cpp ^
+    src\Mesh3DReadersVoxelSci.cpp ^
+    src\Mesh3DReadersSkeletalScene.cpp ^
+    src\Mesh3DReadersConsoleGame.cpp ^
+    src\EdaReadersVlsiWave.cpp ^
+    src\EdaReadersFpgaBoard.cpp ^
+    src\EdaReadersSiliconDiag.cpp ^
+    src\EdaReadersCircuitBench.cpp ^
+    src\ImageReadersWorkstationRetro.cpp ^
+    src\ImageReadersConsoleRetro.cpp ^
+    src\ImageReadersGameTextures.cpp ^
+    src\DocReadersAnalyticsForensics.cpp ^
+    src\DocReadersCatalogRpg.cpp ^
+    src\DocReadersGameWorldLoc.cpp ^
+    src\ArchiveReadersSystemRetro.cpp ^
+    src\ArchiveReadersClassicPak.cpp ^
+    src\ArchiveReadersEnginePak.cpp ^
+    src\ArchiveReadersStrategyFpsPak.cpp ^
+    src\StreamCodecs.cpp ^
     src\Model3DViewer.cpp ^
     src\EdaViewer.cpp ^
     src\SpreadsheetDocViewer.cpp ^
     src\ArchiveExplorer.cpp ^
-    src\main.cpp ^
+    src\FileContentPane.cpp ^
+    src\FileLockInspector.cpp ^
     src\FileEngine.cpp ^
+    src\TransferManager.cpp ^
+    src\FtpClient.cpp ^
+    src\SelfTestVcs.cpp ^
+    src\main.cpp ^
     src\ImageCache.cpp ^
     src\ShellMenuEmulator.cpp ^
     src\MediaPlayer.cpp ^
@@ -60,24 +105,14 @@ cl.exe /nologo /MP /std:c++20 /O2 /utf-8 /EHsc /W3 %E2_VER_CL% ^
     src\ToolProcess.cpp ^
     src\RepoBrowser.cpp ^
     src\NetShares.cpp ^
-    src\AppLog.cpp ^
-    src\ZipDeflate.cpp ^
+    src\BackupManager.cpp ^
     src\NotepadViewer.cpp ^
     src\HexViewer.cpp ^
     src\PdfViewer.cpp ^
+    src\ZipDeflate.cpp ^
+    src\AppLog.cpp ^
     src\WinRtShim.cpp ^
     src\Win7ApiShims.cpp ^
-    src\BackupManager.cpp ^
-    src\TransferManager.cpp ^
-    src\FtpClient.cpp ^
-    src\FileContentPane.cpp ^
-    src\FormatTests3D.cpp ^
-    src\FormatTestsEda.cpp ^
-    src\FormatTestsImages.cpp ^
-    src\FormatTestsDocsB.cpp ^
-    src\FormatTestsArchives.cpp ^
-    src\FormatTestsBatch70.cpp ^
-    src\SelfTestVcs.cpp ^
     /Fo:build\ ^
     /Fe:Explorer2.exe ^
     /link /SUBSYSTEM:WINDOWS build\Explorer2.res ^
@@ -95,10 +130,7 @@ if "%E2_LINK_RC%"=="0" (
 )
 
 if "%E2_LINK_RC%"=="0" (
-    del /Q build\Explorer2_v6.running*.bak >nul 2>&1
-    if exist Explorer2_v6.exe move /Y Explorer2_v6.exe build\Explorer2_v6.running.%RANDOM%_%TIME:~6,2%.bak >nul 2>&1
-    copy /Y Explorer2.exe Explorer2_v6.exe >nul 2>&1
-    del /Q build\Explorer2.running.bak >nul 2>&1
+    del /Q build\Explorer2.running*.bak >nul 2>&1
     echo Build succeeded: Explorer2.exe
 ) else (
     echo Build failed with code %E2_LINK_RC%

@@ -2,7 +2,7 @@
 // BluraySup.h — Blu-ray PGS Subtitle Stream (.sup) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseBluraySup(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 13 || raw[0] != 'P' || raw[1] != 'G') return false;
@@ -18,21 +18,21 @@ inline bool ParseBluraySup(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     size_t segIdx = 0;
     while (pos + 13 <= raw.size()) {
         if (raw[pos] != 'P' || raw[pos + 1] != 'G') break;
-        uint32_t pts = DetailSys100::RdU32BE(raw.data() + pos + 2);
+        uint32_t pts = DetailBinarySysDoc::RdU32BE(raw.data() + pos + 2);
         uint8_t sType = raw[pos + 10];
-        uint16_t sSize = DetailSys100::RdU16BE(raw.data() + pos + 11);
+        uint16_t sSize = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 11);
         if (pos + 13 + sSize > raw.size()) break;
         const uint8_t* p = raw.data() + pos + 13;
 
-        std::wstring typeName = DetailSys100::Hex32(sType);
+        std::wstring typeName = DetailBinarySysDoc::Hex32(sType);
         std::wstring detail;
         if (sType == 0x16) {
             typeName = L"PCS (Presentation)";
             ++pcsCount;
             if (sSize >= 11) {
-                videoW = DetailSys100::RdU16BE(p);
-                videoH = DetailSys100::RdU16BE(p + 2);
-                uint16_t compNum = DetailSys100::RdU16BE(p + 5);
+                videoW = DetailBinarySysDoc::RdU16BE(p);
+                videoH = DetailBinarySysDoc::RdU16BE(p + 2);
+                uint16_t compNum = DetailBinarySysDoc::RdU16BE(p + 5);
                 uint8_t nObjs = p[10];
                 detail = std::to_wstring(videoW) + L"x" + std::to_wstring(videoH) +
                          L", comp#" + std::to_wstring(compNum) + L", objs=" + std::to_wstring(nObjs);
@@ -47,8 +47,8 @@ inline bool ParseBluraySup(const std::vector<uint8_t>& raw, ParsedOfficeDocument
             typeName = L"ODS (Bitmap Object)";
             ++odsCount;
             if (sSize >= 11 && (p[3] & 0x80u) != 0) {
-                uint16_t bw = DetailSys100::RdU16BE(p + 7);
-                uint16_t bh = DetailSys100::RdU16BE(p + 9);
+                uint16_t bw = DetailBinarySysDoc::RdU16BE(p + 7);
+                uint16_t bh = DetailBinarySysDoc::RdU16BE(p + 9);
                 detail = L"Bitmap " + std::to_wstring(bw) + L"x" + std::to_wstring(bh);
             }
         } else if (sType == 0x80) {
@@ -87,8 +87,8 @@ inline bool ParseBluraySup(const std::vector<uint8_t>& raw, ParsedOfficeDocument
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseBluraySupDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseBluraySup(raw, out); }
+inline bool ParseBluraySupDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseBluraySup(raw, out); }
 
 } // namespace Formats

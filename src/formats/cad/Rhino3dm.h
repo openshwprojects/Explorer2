@@ -369,7 +369,7 @@ inline bool BuildExtrusionFromProfile2D(
 
 } // namespace Rhino3dmDetail
 
-inline bool ParseRhino3dmComplete(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
+inline bool ParseRhino3dmMesh(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     using namespace Rhino3dmDetail;
     if (!data || size < 48 || std::memcmp(data, "3D Geometry File Format ", 24) != 0) return false;
 
@@ -565,7 +565,7 @@ inline bool ParseRhino3dmComplete(const uint8_t* data, size_t size, LoadedMesh3D
                                 pts[static_cast<size_t>(i)] = { static_cast<float>(x), static_cast<float>(y), static_cast<float>(z) };
                             }
                             for (int32_t i = 0; i + 1 < cnt; ++i) {
-                                Detail3D100::AddLineStrut(tmpStruts, pts[static_cast<size_t>(i)], pts[static_cast<size_t>(i + 1)], 0.03f);
+                                DetailDccScene::AddLineStrut(tmpStruts, pts[static_cast<size_t>(i)], pts[static_cast<size_t>(i + 1)], 0.03f);
                             }
                             uint32_t b = static_cast<uint32_t>(dstPart.vertsRhino.size());
                             for (const auto& v : tmpStruts.vertices) dstPart.vertsRhino.push_back({ v.x, v.y, v.z });

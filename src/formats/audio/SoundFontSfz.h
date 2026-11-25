@@ -2,7 +2,7 @@
 // SoundFontSfz.h — SFZ Instrument Definition (.sfz) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseSoundFontSfz(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 8) return false;
@@ -144,8 +144,8 @@ inline bool ParseSoundFontSfz(const std::vector<uint8_t>& raw, ParsedOfficeDocum
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseSoundFontSfzDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseSoundFontSfz(raw, out); }
+inline bool ParseSoundFontSfzDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseSoundFontSfz(raw, out); }
 
 } // namespace Formats

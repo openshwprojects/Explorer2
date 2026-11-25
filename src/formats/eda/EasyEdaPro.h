@@ -301,21 +301,15 @@ inline bool ParseEasyEdaProFile(const uint8_t* data, size_t size, const std::wst
 
         // Try loading companion PCB/*.epcb from disk if present alongside .eprj
         if (!fullPath.empty()) {
-            size_t sep = fullPath.find_last_of(L"\\/");
-            if (sep != std::wstring::npos) {
-                std::wstring dir = fullPath.substr(0, sep);
-                WIN32_FIND_DATAW fd{};
-                HANDLE hFind = FindFirstFileW((dir + L"\\*.epcb").c_str(), &fd);
-                if (hFind != INVALID_HANDLE_VALUE) {
-                    std::wstring epcbFile = dir + L"\\" + fd.cFileName;
-                    FindClose(hFind);
-                    std::vector<uint8_t> eb;
-                    if (PathUtils::ReadFileBytes(epcbFile, 16 * 1024 * 1024, eb) && !eb.empty()) {
-                        std::string_view esv(reinterpret_cast<const char*>(eb.data()), eb.size());
-                        if (ParseEasyEdaProJsonLines(esv, out)) {
-                            out.formatTitle = L"EasyEDA Pro Project (.eprj + .epcb)";
-                            return true;
-                        }
+            std::vector<std::wstring> epcbFiles;
+            ListCompanionFilesByExt(fullPath, ".epcb", 4u, epcbFiles);
+            for (const auto& epcbFile : epcbFiles) {
+                std::vector<uint8_t> eb;
+                if (PathUtils::ReadFileBytes(epcbFile, 16 * 1024 * 1024, eb) && !eb.empty()) {
+                    std::string_view esv(reinterpret_cast<const char*>(eb.data()), eb.size());
+                    if (ParseEasyEdaProJsonLines(esv, out)) {
+                        out.formatTitle = L"EasyEDA Pro Project (.eprj + .epcb)";
+                        return true;
                     }
                 }
             }

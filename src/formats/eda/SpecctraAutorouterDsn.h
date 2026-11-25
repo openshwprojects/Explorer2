@@ -285,7 +285,7 @@ inline bool ParseSpecctraSExprBoard(std::string_view sv, ParsedEdaBoard& out) {
                         if (!AtomFloat(pl.list[2], rx) || !AtomFloat(pl.list[3], ry)) continue;
                         std::string sideStr = pl.list[4].atom;
                         AtomFloat(pl.list[5], rdeg);
-                        bool backSide = (_stricmp(sideStr.c_str(), "back") == 0 || _stricmp(sideStr.c_str(), "bottom") == 0);
+                        bool backSide = (ReaderText::AsciiEqCI(sideStr, "back") || ReaderText::AsciiEqCI(sideStr, "bottom"));
 
                         std::string partVal;
                         for (size_t ai = 6; ai < pl.list.size(); ++ai) {

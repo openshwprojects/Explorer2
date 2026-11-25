@@ -23,7 +23,7 @@ namespace Explorer2 {
 class ArchiveExplorer {
 public:
     ArchiveExplorer() = default;
-    ~ArchiveExplorer() = default;
+    ~ArchiveExplorer();
 
     // The readers themselves live in ArchiveReaders.cpp (see ArchiveReaders.h for what each does)
     static bool IsArchiveExtension(const std::wstring& extLower) { return ArchiveReaders::IsArchiveExtension(extLower); }
@@ -51,7 +51,7 @@ public:
     }
 
     // Right-Side File Content Pane UI methods
-    void Initialize(HWND parentHwnd);
+    void Initialize(HWND parentHwnd, IDWriteFactory* dwriteFactory = nullptr);
     void Shutdown();
 
     void LoadFile(const std::wstring& fullPath, bool forceReload = false);
@@ -141,6 +141,9 @@ private:
     };
 
     HWND m_parentHwnd = nullptr;
+    IDWriteTextFormat* m_fmtSmallTrim = nullptr;
+    IDWriteTextFormat* m_fmtBoldTrim = nullptr;
+    std::wstring m_lineScratch;
     std::wstring m_archivePath;
     std::wstring m_currentInnerDir; // "" for root, or "folder/sub"
     ArchiveSummaryInfo m_summary;

@@ -11,7 +11,7 @@ namespace Formats {
 // ============================================================================
 inline bool DecodeAppleICNS(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
     if (!data || size < 16 || std::memcmp(data, "icns", 4) != 0) return false;
-    uint32_t fileLen = DetailImg100::RdU32BE(data + 4);
+    uint32_t fileLen = DetailLayeredAndHdrImg::RdU32BE(data + 4);
     size_t parseLimit = (fileLen >= 16 && fileLen <= size) ? static_cast<size_t>(fileLen) : size;
 
     struct IcnsChunk {
@@ -29,8 +29,8 @@ inline bool DecodeAppleICNS(const uint8_t* data, size_t size, ExtendedImageInfo&
     std::vector<IcnsChunk> chunks;
     size_t pos = 8;
     while (pos + 8 <= parseLimit) {
-        uint32_t tag = DetailImg100::RdU32BE(data + pos);
-        uint32_t blkLen = DetailImg100::RdU32BE(data + pos + 4);
+        uint32_t tag = DetailLayeredAndHdrImg::RdU32BE(data + pos);
+        uint32_t blkLen = DetailLayeredAndHdrImg::RdU32BE(data + pos + 4);
         if (blkLen < 8 || blkLen > parseLimit - pos) break;
         chunks.push_back({ tag, data + pos + 8, static_cast<size_t>(blkLen - 8) });
         pos += blkLen;
@@ -146,7 +146,7 @@ inline bool DecodeAppleICNS(const uint8_t* data, size_t size, ExtendedImageInfo&
             (ch.len >= 4 && ch.payload[0] == 0xFF && ch.payload[1] == 0xD8 && ch.payload[2] == 0xFF);
         if (looksCompressedImg) {
             ExtendedImageInfo wicInfo;
-            if (DetailImg100::DecodeEmbeddedWicBuffer(ch.payload, ch.len, L"Apple macOS Icon (.icns)", wicInfo)) {
+            if (DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(ch.payload, ch.len, L"Apple macOS Icon (.icns)", wicInfo)) {
                 uint32_t area = wicInfo.width * wicInfo.height;
                 if (area > best.area) {
                     best.area = area;

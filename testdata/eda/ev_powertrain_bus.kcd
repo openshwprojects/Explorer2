@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<NetworkDefinition xmlns="http://kayak.2codeornot2code.org/1.0" version="1.0">
+  <Document name="EV Powertrain CAN" version="2.1"/>
+  <Node id="1" name="VCU_Master"/>
+  <Node id="2" name="Inverter_MCU"/>
+  <Node id="3" name="BMS_Pack"/>
+  <Bus name="PT_CAN_FD" baudrate="500000">
+    <Message id="0x101" name="TorqueCommand" length="8" interval="10">
+      <Producer><NodeRef id="1"/></Producer>
+      <Signal name="ReqTorqueNm" offset="0" length="16"><Value slope="0.1" intercept="-500" unit="Nm"/></Signal>
+      <Signal name="DriveMode" offset="16" length="4"/>
+      <Signal name="AliveCounter" offset="56" length="8"/>
+    </Message>
+    <Message id="0x185" name="MotorTelemetry" length="8" interval="10">
+      <Producer><NodeRef id="2"/></Producer>
+      <Signal name="RotorRPM" offset="0" length="16"><Value slope="1" unit="rpm"/></Signal>
+      <Signal name="StatorTempC" offset="16" length="8"><Value slope="1" intercept="-40" unit="C"/></Signal>
+      <Signal name="PhaseCurrentA" offset="24" length="16"><Value slope="0.1" unit="A"/></Signal>
+    </Message>
+    <Message id="0x220" name="BatteryPackState" length="8" interval="50">
+      <Producer><NodeRef id="3"/></Producer>
+      <Signal name="PackVoltageV" offset="0" length="16"><Value slope="0.05" unit="V"/></Signal>
+      <Signal name="StateOfCharge" offset="16" length="8"><Value slope="0.5" unit="%"/></Signal>
+      <Signal name="MaxDischargeKw" offset="24" length="16"><Value slope="0.1" unit="kW"/></Signal>
+    </Message>
+  </Bus>
+</NetworkDefinition>

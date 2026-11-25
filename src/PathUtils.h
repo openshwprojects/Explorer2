@@ -108,6 +108,34 @@ inline std::wstring NormalizePathKey(std::wstring_view sv) {
     return key;
 }
 
+// Strips "\\?\" or "\\?\UNC\" extended-length Win32 prefix back to a display/DOS/UNC path.
+inline std::wstring StripExtendedWinPrefix(std::wstring_view sv) {
+    if (sv.size() >= 8 &&
+        (sv.substr(0, 8) == L"\\\\?\\UNC\\" || sv.substr(0, 8) == L"\\\\?\\unc\\"))
+    {
+        return L"\\\\" + std::wstring(sv.substr(8));
+    }
+    if (sv.size() >= 4 && sv.substr(0, 4) == L"\\\\?\\") {
+        return std::wstring(sv.substr(4));
+    }
+    return std::wstring(sv);
+}
+
+// Converts an absolute DOS ("C:\...") or UNC ("\\server\share...") path to "\\?\" extended Win32 form on Windows.
+inline std::wstring ToExtendedWinPath(std::wstring_view sv) {
+    if (sv.empty()) return {};
+#ifdef _WIN32
+    if (sv.size() >= 4 && sv.substr(0, 4) == L"\\\\?\\") return std::wstring(sv);
+    if (sv.size() >= 2 && sv[0] == L'\\' && sv[1] == L'\\') {
+        return L"\\\\?\\UNC\\" + std::wstring(sv.substr(2));
+    }
+    if (sv.size() >= 2 && sv[1] == L':') {
+        return L"\\\\?\\" + std::wstring(sv);
+    }
+#endif
+    return std::wstring(sv);
+}
+
 inline std::wstring GetParentPath(std::wstring_view sv) {
     std::wstring clean = TrimTrailingSlashes(sv);
     if (clean == L"/") return L"";
@@ -358,8 +386,74 @@ inline void DrawToolbarButton(
     }
     DWRITE_TEXT_ALIGNMENT prevAlign = fmt->GetTextAlignment();
     fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    rt->DrawText(label, static_cast<UINT32>(wcslen(label)), fmt, r, brush);
+    rt->DrawText(label, static_cast<UINT32>(wcslen(label)), fmt, r, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
     fmt->SetTextAlignment(prevAlign);
+}
+
+// Creates a single-line, vertically centered text format that trims overflowing text with an ellipsis
+inline void CreateTrimmedTextFormat(
+    IDWriteFactory* dwriteFactory,
+    const wchar_t* family,
+    DWRITE_FONT_WEIGHT weight,
+    float fontSize,
+    IDWriteTextFormat** outFmt)
+{
+    if (!outFmt) return;
+    *outFmt = nullptr;
+    if (!dwriteFactory) return;
+    dwriteFactory->CreateTextFormat(
+        family, nullptr,
+        weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        fontSize, L"pl-PL", outFmt);
+    if (*outFmt) {
+        (*outFmt)->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        (*outFmt)->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        DWRITE_TRIMMING trim = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+        IDWriteInlineObject* ellipsis = nullptr;
+        dwriteFactory->CreateEllipsisTrimmingSign(*outFmt, &ellipsis);
+        (*outFmt)->SetTrimming(&trim, ellipsis);
+        if (ellipsis) ellipsis->Release();
+    }
+}
+
+// Returns s directly when already single-line, or flattens CR/LF/TAB runs into spaces in scratch
+inline std::wstring_view SingleLineView(std::wstring_view s, std::wstring& scratch) {
+    if (s.find_first_of(L"\r\n\t") == std::wstring_view::npos) {
+        return s;
+    }
+    scratch.clear();
+    scratch.reserve(s.size());
+    bool prevSpace = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t ch = s[i];
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') {
+            if (ch == L'\r' && i + 1 < s.size() && s[i + 1] == L'\n') ++i;
+            if (!prevSpace && !scratch.empty()) {
+                scratch.push_back(L' ');
+                prevSpace = true;
+            }
+        } else {
+            scratch.push_back(ch);
+            prevSpace = (ch == L' ');
+        }
+    }
+    return scratch;
+}
+
+// Draws text strictly on one line and clipped to rect so a cell or column never bleeds into neighbors
+inline void DrawSingleLineClipped(
+    ID2D1RenderTarget* rt,
+    std::wstring_view text,
+    IDWriteTextFormat* fmt,
+    const D2D1_RECT_F& rect,
+    ID2D1Brush* brush,
+    std::wstring& scratch)
+{
+    if (!rt || !fmt || !brush || text.empty() || rect.right <= rect.left || rect.bottom <= rect.top) return;
+    std::wstring_view line = SingleLineView(text, scratch);
+    if (!line.empty()) {
+        rt->DrawText(line.data(), static_cast<UINT32>(line.size()), fmt, rect, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
 }
 
 // Computes an aspect-ratio-preserving centered rectangle inside bounds

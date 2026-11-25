@@ -2,7 +2,7 @@
 // OpusAudio.h — IETF / Xiph Opus Audio (.opus) Inspector
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseOpusAudio(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
     OggStreamWalk walk;
@@ -13,10 +13,10 @@ inline bool ParseOpusAudio(const std::vector<uint8_t>& raw, const std::wstring& 
 
     std::wstring codec = L"IETF / Xiph Opus (v" + std::to_wstring(bos[8]) + L")";
     uint32_t channels = bos[9];
-    uint16_t preSkip = DetailSys100::RdU16LE(bos.data() + 10);
-    uint32_t sampleRate = DetailSys100::RdU32LE(bos.data() + 12);
+    uint16_t preSkip = DetailBinarySysDoc::RdU16LE(bos.data() + 10);
+    uint32_t sampleRate = DetailBinarySysDoc::RdU32LE(bos.data() + 12);
     uint32_t granuleRate = 48000;
-    int16_t gain = static_cast<int16_t>(DetailSys100::RdU16LE(bos.data() + 16));
+    int16_t gain = static_cast<int16_t>(DetailBinarySysDoc::RdU16LE(bos.data() + 16));
     std::wstring extraCodecInfo = L"PreSkip=" + std::to_wstring(preSkip) + L", Gain=" + std::to_wstring(gain) + L", MapFamily=" + std::to_wstring(bos[18]);
 
     std::wstring vendor;
@@ -34,10 +34,10 @@ inline bool ParseOpusAudio(const std::vector<uint8_t>& raw, const std::wstring& 
         codec, channels, sampleRate, granuleRate, preSkip, 0, extraCodecInfo, vendor, comments, out);
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
 inline bool ParseOpusAudioDoc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) {
-    return DetailMedia100::ParseOpusAudio(raw, extLower, out);
+    return DetailMediaAndScoreDoc::ParseOpusAudio(raw, extLower, out);
 }
 
 } // namespace Formats

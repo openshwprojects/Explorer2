@@ -165,6 +165,8 @@ struct Strings {
     const wchar_t* ctxRestore;
     const wchar_t* ctxRestoreAll;
     const wchar_t* ctxEmptyRecycleBin;
+    const wchar_t* ctxCheckLocks;
+    const wchar_t* btnInspectLocks;
 };
 
 inline const Strings kStringsPL = {
@@ -253,7 +255,9 @@ inline const Strings kStringsPL = {
     L"Przywróć",
     L"Przywróć",
     L"Przywróć wszystkie elementy",
-    L"Opróżnij Kosz"
+    L"Opróżnij Kosz",
+    L"Sprawdź co blokuje usunięcie (procesy)...",
+    L"\xD83D\xDD12 Zbadaj blokady"
 };
 
 inline const Strings kStringsEN = {
@@ -342,7 +346,9 @@ inline const Strings kStringsEN = {
     L"Restore",
     L"Restore",
     L"Restore all items",
-    L"Empty Recycle Bin"
+    L"Empty Recycle Bin",
+    L"Check what is locking this...",
+    L"\xD83D\xDD12 Inspect Locks"
 };
 
 inline const Strings& GetStrings(Lang lang) {

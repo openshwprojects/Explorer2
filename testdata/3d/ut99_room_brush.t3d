@@ -1,0 +1,30 @@
+Begin Map
+Begin Actor Class=Brush Name=Brush1
+    CsgOper=CSG_Add
+    Location=(X=64.000000,Y=0.000000,Z=128.000000)
+    Begin Brush Name=Model2
+        Begin PolyList
+            Begin Polygon Texture=BaseWall Flags=0
+                Origin   -00128.000000,-00128.000000,-00128.000000
+                Normal   +00000.000000,+00000.000000,-00001.000000
+                Vertex   -00128.000000,-00128.000000,-00128.000000
+                Vertex   -00128.000000,+00128.000000,-00128.000000
+                Vertex   +00128.000000,+00128.000000,-00128.000000
+                Vertex   +00128.000000,-00128.000000,-00128.000000
+            End Polygon
+            Begin Polygon Texture=BaseWall Flags=0
+                Vertex   -00128.000000,-00128.000000,+00128.000000
+                Vertex   +00128.000000,-00128.000000,+00128.000000
+                Vertex   +00128.000000,+00128.000000,+00128.000000
+                Vertex   -00128.000000,+00128.000000,+00128.000000
+            End Polygon
+            Begin Polygon Texture=TrimSteel Flags=0
+                Vertex   -00128.000000,-00128.000000,-00128.000000
+                Vertex   +00128.000000,-00128.000000,-00128.000000
+                Vertex   +00128.000000,-00128.000000,+00128.000000
+                Vertex   -00128.000000,-00128.000000,+00128.000000
+            End Polygon
+        End PolyList
+    End Brush
+End Actor
+End Map

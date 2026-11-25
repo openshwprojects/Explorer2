@@ -1575,7 +1575,7 @@ inline bool DecodeJpeg2000(const uint8_t* data, size_t size, const std::wstring&
     DecodedJ2kCodestream dec;
     if (!DecodeJ2kCodestream(csPtr, csLen, dec)) {
         // Optional Windows WIC fallback for Part-2 JPX extensions if OS WIC JP2 codec is installed
-        return DetailImg100::DecodeEmbeddedWicBuffer(data, size, L"JPEG 2000 (.jp2)", outInfo);
+        return DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data, size, L"JPEG 2000 (.jp2)", outInfo);
     }
 
     uint32_t w = dec.width, h = dec.height;

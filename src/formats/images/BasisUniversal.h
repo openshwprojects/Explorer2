@@ -8,25 +8,25 @@ inline bool DecodeBasisUniversal(const uint8_t* data, size_t size, ExtendedImage
     const std::wstring extLower = L".basis";
     // Basis Universal (.basis): magic 's','B' (0x4273 LE), 77-byte basis_file_header + 23-byte basis_slice_desc
     if (size < 100 || data[0] != 's' || data[1] != 'B') return false;
-    uint16_t hdrVer        = DetailImg100::RdU16LE(data + 2);
-    uint16_t hdrSize       = DetailImg100::RdU16LE(data + 4);
-    uint16_t hdrCrc16      = DetailImg100::RdU16LE(data + 6);
-    uint32_t dataSize      = DetailImg100::RdU32LE(data + 8);
-    uint16_t dataCrc16     = DetailImg100::RdU16LE(data + 12);
-    uint32_t totalSlices   = DetailImg100::RdU24LE(data + 14);
-    uint32_t totalImages   = DetailImg100::RdU24LE(data + 17);
+    uint16_t hdrVer        = DetailLayeredAndHdrImg::RdU16LE(data + 2);
+    uint16_t hdrSize       = DetailLayeredAndHdrImg::RdU16LE(data + 4);
+    uint16_t hdrCrc16      = DetailLayeredAndHdrImg::RdU16LE(data + 6);
+    uint32_t dataSize      = DetailLayeredAndHdrImg::RdU32LE(data + 8);
+    uint16_t dataCrc16     = DetailLayeredAndHdrImg::RdU16LE(data + 12);
+    uint32_t totalSlices   = DetailLayeredAndHdrImg::RdU24LE(data + 14);
+    uint32_t totalImages   = DetailLayeredAndHdrImg::RdU24LE(data + 17);
     uint8_t  texFormat     = data[20]; // 0 = cETC1S, 1 = cUASTC4x4
-    uint16_t flags         = DetailImg100::RdU16LE(data + 21);
+    uint16_t flags         = DetailLayeredAndHdrImg::RdU16LE(data + 21);
     uint8_t  texType       = data[23]; // 3 = cBASISTexTypeVideoFrames
-    uint16_t numEndpoints  = DetailImg100::RdU16LE(data + 39);
-    uint32_t epCbOfs       = DetailImg100::RdU32LE(data + 41);
-    uint32_t epCbSize      = DetailImg100::RdU24LE(data + 45);
-    uint16_t numSelectors  = DetailImg100::RdU16LE(data + 48);
-    uint32_t selCbOfs      = DetailImg100::RdU32LE(data + 50);
-    uint32_t selCbSize     = DetailImg100::RdU24LE(data + 54);
-    uint32_t tablesOfs     = DetailImg100::RdU32LE(data + 57);
-    uint32_t tablesSize    = DetailImg100::RdU32LE(data + 61);
-    uint32_t sliceDescOfs  = DetailImg100::RdU32LE(data + 65);
+    uint16_t numEndpoints  = DetailLayeredAndHdrImg::RdU16LE(data + 39);
+    uint32_t epCbOfs       = DetailLayeredAndHdrImg::RdU32LE(data + 41);
+    uint32_t epCbSize      = DetailLayeredAndHdrImg::RdU24LE(data + 45);
+    uint16_t numSelectors  = DetailLayeredAndHdrImg::RdU16LE(data + 48);
+    uint32_t selCbOfs      = DetailLayeredAndHdrImg::RdU32LE(data + 50);
+    uint32_t selCbSize     = DetailLayeredAndHdrImg::RdU24LE(data + 54);
+    uint32_t tablesOfs     = DetailLayeredAndHdrImg::RdU32LE(data + 57);
+    uint32_t tablesSize    = DetailLayeredAndHdrImg::RdU32LE(data + 61);
+    uint32_t sliceDescOfs  = DetailLayeredAndHdrImg::RdU32LE(data + 65);
 
     if (hdrVer == 0 || hdrSize < 77 || hdrSize > size || totalSlices == 0 || totalImages == 0 || dataSize == 0) {
         return false;
@@ -56,15 +56,15 @@ inline bool DecodeBasisUniversal(const uint8_t* data, size_t size, ExtendedImage
         }
     }
     const uint8_t* chosenSlice = data + sliceDescOfs + chosenIdx * 23u;
-    uint32_t chosenImgIdx = DetailImg100::RdU24LE(chosenSlice + 0);
+    uint32_t chosenImgIdx = DetailLayeredAndHdrImg::RdU24LE(chosenSlice + 0);
     uint8_t  chosenLvlIdx = chosenSlice[3];
-    uint32_t origW        = DetailImg100::RdU16LE(chosenSlice + 5);
-    uint32_t origH        = DetailImg100::RdU16LE(chosenSlice + 7);
-    uint32_t blocksX      = DetailImg100::RdU16LE(chosenSlice + 9);
-    uint32_t blocksY      = DetailImg100::RdU16LE(chosenSlice + 11);
-    uint32_t sliceOfs     = DetailImg100::RdU32LE(chosenSlice + 13);
-    uint32_t sliceSize    = DetailImg100::RdU32LE(chosenSlice + 17);
-    uint16_t sliceCrc16   = DetailImg100::RdU16LE(chosenSlice + 21);
+    uint32_t origW        = DetailLayeredAndHdrImg::RdU16LE(chosenSlice + 5);
+    uint32_t origH        = DetailLayeredAndHdrImg::RdU16LE(chosenSlice + 7);
+    uint32_t blocksX      = DetailLayeredAndHdrImg::RdU16LE(chosenSlice + 9);
+    uint32_t blocksY      = DetailLayeredAndHdrImg::RdU16LE(chosenSlice + 11);
+    uint32_t sliceOfs     = DetailLayeredAndHdrImg::RdU32LE(chosenSlice + 13);
+    uint32_t sliceSize    = DetailLayeredAndHdrImg::RdU32LE(chosenSlice + 17);
+    uint16_t sliceCrc16   = DetailLayeredAndHdrImg::RdU16LE(chosenSlice + 21);
 
     if (origW == 0 || origH == 0 || origW > 8192 || origH > 8192 || blocksX == 0 || blocksY == 0) {
         return false;
@@ -143,16 +143,16 @@ inline bool DecodeBasisUniversal(const uint8_t* data, size_t size, ExtendedImage
     bool hasAlpha = false;
     if (chosenIdx + 1u < totalSlices) {
         const uint8_t* alphaDesc = data + sliceDescOfs + (chosenIdx + 1u) * 23u;
-        uint32_t aImgIdx = DetailImg100::RdU24LE(alphaDesc + 0);
+        uint32_t aImgIdx = DetailLayeredAndHdrImg::RdU24LE(alphaDesc + 0);
         uint8_t  aLvlIdx = alphaDesc[3];
         uint8_t  aFlags  = alphaDesc[4];
         if (aImgIdx == chosenImgIdx && aLvlIdx == chosenLvlIdx &&
             ((flags & 0x04u) != 0u || (flags & 0x02u) != 0u || (aFlags & 0x01u) != 0u)) {
-            uint32_t aBlocksX = DetailImg100::RdU16LE(alphaDesc + 9);
-            uint32_t aBlocksY = DetailImg100::RdU16LE(alphaDesc + 11);
-            uint32_t aOfs     = DetailImg100::RdU32LE(alphaDesc + 13);
-            uint32_t aSize    = DetailImg100::RdU32LE(alphaDesc + 17);
-            uint16_t aCrc16   = DetailImg100::RdU16LE(alphaDesc + 21);
+            uint32_t aBlocksX = DetailLayeredAndHdrImg::RdU16LE(alphaDesc + 9);
+            uint32_t aBlocksY = DetailLayeredAndHdrImg::RdU16LE(alphaDesc + 11);
+            uint32_t aOfs     = DetailLayeredAndHdrImg::RdU32LE(alphaDesc + 13);
+            uint32_t aSize    = DetailLayeredAndHdrImg::RdU32LE(alphaDesc + 17);
+            uint16_t aCrc16   = DetailLayeredAndHdrImg::RdU16LE(alphaDesc + 21);
             if (aBlocksX != blocksX || aBlocksY != blocksY ||
                 aSize == 0 || aOfs < hdrSize || aOfs > size || aSize > size - aOfs) {
                 return false;

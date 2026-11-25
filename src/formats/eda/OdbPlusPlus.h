@@ -4,7 +4,7 @@
 
 namespace Formats {
 
-namespace DetailMfg69 {
+namespace DetailBoardFabEda {
 
 struct OdbPkgDims {
     std::string name;
@@ -30,14 +30,14 @@ inline void ParseOdbEdaData(
         if (ln.empty() || ln[0] == '#') continue;
 
         if (ln.rfind("UNITS=", 0) == 0) {
-            isMm = DetailEda100::ContainsAsciiI(ln.substr(6), "MM");
+            isMm = DetailSiliconAndBusEda::ContainsAsciiI(ln.substr(6), "MM");
             uScale = isMm ? 1.0f : 25.4f;
         } else if (ln == "U MM") {
             isMm = true; uScale = 1.0f;
         } else if (ln == "U INCH" || ln == "U IN") {
             isMm = false; uScale = 25.4f;
         } else if (ln.rfind("NET ", 0) == 0 && ln.size() > 4) {
-            std::string rest = DetailEda100::TrimAsciiView(ln.substr(4));
+            std::string rest = DetailSiliconAndBusEda::TrimAsciiView(ln.substr(4));
             size_t sp = rest.find_first_of(" \t;");
             std::string netNm = (sp == std::string::npos) ? rest : rest.substr(0, sp);
             if (!netNm.empty() && netNm != "$NONE$") outNets.insert(netNm);
@@ -71,7 +71,7 @@ inline void ParseOdbFeaturesStreamV2(
 {
     bool isMm = false;
     float uScale = 25.4f;
-    std::unordered_map<int, DetailEda100::OdbSymInfo> symTable;
+    std::unordered_map<int, DetailSiliconAndBusEda::OdbSymInfo> symTable;
 
     bool inPolygon = false;
     bool polyIsIsland = true;
@@ -93,7 +93,7 @@ inline void ParseOdbFeaturesStreamV2(
         if (geomLn.empty()) continue;
 
         if (geomLn.rfind("UNITS=", 0) == 0) {
-            isMm = DetailEda100::ContainsAsciiI(geomLn.substr(6), "MM");
+            isMm = DetailSiliconAndBusEda::ContainsAsciiI(geomLn.substr(6), "MM");
             uScale = isMm ? 1.0f : 25.4f;
             continue;
         }
@@ -104,7 +104,7 @@ inline void ParseOdbFeaturesStreamV2(
             int idx = 0, consumed = 0;
             std::string tmp(geomLn.substr(1));
             if (sscanf_s(tmp.c_str(), "%d%n", &idx, &consumed) == 1 && consumed > 0) {
-                symTable[idx] = DetailEda100::ParseOdbSymbolDef(std::string_view(tmp).substr(consumed), isMm);
+                symTable[idx] = DetailSiliconAndBusEda::ParseOdbSymbolDef(std::string_view(tmp).substr(consumed), isMm);
                 ++validRecords;
             }
             continue;
@@ -131,7 +131,7 @@ inline void ParseOdbFeaturesStreamV2(
             int n = sscanf_s(tmp.c_str(), "%f %f %d %c %d %d %f",
                              &px, &py, &symIdx, &pol, 1, &dcode, &orient, &customAng);
             if (n >= 2) {
-                DetailEda100::OdbSymInfo si;
+                DetailSiliconAndBusEda::OdbSymInfo si;
                 si.wMm = 1.0f; si.hMm = 1.0f; si.shape = 0;
                 if (n >= 3 && symTable.count(symIdx)) si = symTable[symIdx];
                 float rotDeg = 0.0f;
@@ -158,7 +158,7 @@ inline void ParseOdbFeaturesStreamV2(
                 float w = (n >= 7 && symTable.count(symIdx)) ? symTable[symIdx].wMm : 0.25f;
                 bool cw = (cwCh == 'Y' || cwCh == 'y' || cwCh == '1');
                 EdaLayerId lid = isProfile ? EdaLayerId::EdgeCuts : layerId;
-                DetailEda100::AddTessellatedArc(out, xs * uScale, ys * uScale, xe * uScale, ye * uScale,
+                DetailSiliconAndBusEda::AddTessellatedArc(out, xs * uScale, ys * uScale, xe * uScale, ye * uScale,
                                                 xc * uScale, yc * uScale, cw, w, lid, 1);
                 ++validRecords;
             }
@@ -189,7 +189,7 @@ inline void ParseOdbFeaturesStreamV2(
             std::string tmp(geomLn.substr(3));
             if (sscanf_s(tmp.c_str(), "%f %f %f %f %c", &xe, &ye, &xc, &yc, &cwCh, 1) >= 4 && !polyPts.empty()) {
                 EdaLayerId lid = isProfile ? EdaLayerId::EdgeCuts : layerId;
-                DetailEda100::AddTessellatedArc(out, polyPts.back().first, polyPts.back().second,
+                DetailSiliconAndBusEda::AddTessellatedArc(out, polyPts.back().first, polyPts.back().second,
                     xe * uScale, ye * uScale, xc * uScale, yc * uScale,
                     cwCh == 'Y' || cwCh == 'y', isProfile ? 0.32f : 0.20f, lid, 0);
                 polyPts.push_back({ xe * uScale, ye * uScale });
@@ -213,17 +213,17 @@ inline void ParseOdbFeaturesStreamV2(
     }
 }
 
-} // namespace DetailMfg69
+} // namespace DetailBoardFabEda
 
 inline bool IsLikelyOdbPlusPlusArchiveBytes(const uint8_t* data, size_t size) {
     if (!data || size < 16) return false;
     if (size >= 10 && data[0] == 0x1F && data[1] == 0x8B) {
         std::vector<uint8_t> gunz;
         if (!ZipDeflate::InflateGzip(data, size, gunz, 16 * 1024 * 1024) || gunz.empty()) return false;
-        return DetailMfg69::TarBufferHasOdbSignature(gunz.data(), gunz.size());
+        return DetailBoardFabEda::TarBufferHasOdbSignature(gunz.data(), gunz.size());
     }
-    if (DetailEda100::LooksLikeTarBlock(data, size)) {
-        return DetailMfg69::TarBufferHasOdbSignature(data, size);
+    if (DetailSiliconAndBusEda::LooksLikeTarBlock(data, size)) {
+        return DetailBoardFabEda::TarBufferHasOdbSignature(data, size);
     }
     if (size >= 4 && data[0] == 'P' && data[1] == 'K' && data[2] == 0x03 && data[3] == 0x04) {
         std::vector<ZipDeflate::ArchiveItemMeta> entries;
@@ -231,7 +231,7 @@ inline bool IsLikelyOdbPlusPlusArchiveBytes(const uint8_t* data, size_t size) {
         for (const auto& e : entries) {
             std::string low = PathUtils::ToLowerAscii(PathUtils::WideToUtf8(e.pathInArchive));
             for (char& ch : low) if (ch == '\\') ch = '/';
-            if (DetailMfg69::HasOdbPathSignature(low)) return true;
+            if (DetailBoardFabEda::HasOdbPathSignature(low)) return true;
         }
     }
     return false;
@@ -262,24 +262,24 @@ inline bool ParseOdbPlusPlusBoard(
             {
                 std::vector<uint8_t> rawEntry;
                 if (ZipDeflate::ExtractZipEntryFromMemory(data, size, e, rawEntry, 32 * 1024 * 1024) && !rawEntry.empty()) {
-                    vfiles.push_back({ low, DetailEda100::UnpackMaybeCompressedText(rawEntry.data(), rawEntry.size()) });
+                    vfiles.push_back({ low, DetailSiliconAndBusEda::UnpackMaybeCompressedText(rawEntry.data(), rawEntry.size()) });
                 }
             }
         }
     } else if (size >= 10 && data[0] == 0x1F && data[1] == 0x8B) {
         std::vector<uint8_t> gunz;
         if (!ZipDeflate::InflateGzip(data, size, gunz, 64 * 1024 * 1024) || gunz.empty()) return false;
-        if (DetailEda100::LooksLikeTarBlock(gunz.data(), gunz.size())) {
-            if (!DetailMfg69::TarBufferHasOdbSignature(gunz.data(), gunz.size())) return false; // Reject generic .tgz!
-            DetailMfg69::ExtractOdbTarEntriesFull(gunz.data(), gunz.size(), vfiles);
+        if (DetailSiliconAndBusEda::LooksLikeTarBlock(gunz.data(), gunz.size())) {
+            if (!DetailBoardFabEda::TarBufferHasOdbSignature(gunz.data(), gunz.size())) return false; // Reject generic .tgz!
+            DetailBoardFabEda::ExtractOdbTarEntriesFull(gunz.data(), gunz.size(), vfiles);
         } else if (extLower == L".odb") {
             vfiles.push_back({ "layers/top/features", std::string(reinterpret_cast<const char*>(gunz.data()), gunz.size()) });
         } else {
             return false;
         }
-    } else if (DetailEda100::LooksLikeTarBlock(data, size)) {
-        if (!DetailMfg69::TarBufferHasOdbSignature(data, size)) return false;
-        DetailMfg69::ExtractOdbTarEntriesFull(data, size, vfiles);
+    } else if (DetailSiliconAndBusEda::LooksLikeTarBlock(data, size)) {
+        if (!DetailBoardFabEda::TarBufferHasOdbSignature(data, size)) return false;
+        DetailBoardFabEda::ExtractOdbTarEntriesFull(data, size, vfiles);
     } else if (extLower == L".odb") {
         bool hasOdbMarker = (sv.find("UNITS=") != std::string_view::npos ||
                              sv.find("\n$0 ") != std::string_view::npos ||
@@ -304,14 +304,14 @@ inline bool ParseOdbPlusPlusBoard(
         : L"ODB++ PCB Manufacturing Archive (.odb)";
 
     std::unordered_map<std::string, EdaLayerId> matrixLayerMap;
-    std::vector<DetailMfg69::OdbPkgDims> pkgDims;
+    std::vector<DetailBoardFabEda::OdbPkgDims> pkgDims;
     std::set<std::string> edaNets;
 
     for (const auto& vf : vfiles) {
         if (vf.first.find("matrix") != std::string::npos) {
-            DetailEda100::ParseOdbMatrixLayers(vf.second, matrixLayerMap);
+            DetailSiliconAndBusEda::ParseOdbMatrixLayers(vf.second, matrixLayerMap);
         } else if (vf.first.find("eda/data") != std::string::npos) {
-            DetailMfg69::ParseOdbEdaData(vf.second, pkgDims, edaNets);
+            DetailBoardFabEda::ParseOdbEdaData(vf.second, pkgDims, edaNets);
         }
     }
 
@@ -322,7 +322,7 @@ inline bool ParseOdbPlusPlusBoard(
         if (path.find("components") != std::string::npos) {
             bool isBot = (path.find("comp_+_bot") != std::string::npos || path.find("bottom") != std::string::npos);
             size_t before = out.components.size();
-            DetailEda100::ParseOdbComponentsStream(vf.second, isBot, out, validRecords);
+            DetailSiliconAndBusEda::ParseOdbComponentsStream(vf.second, isBot, out, validRecords);
             for (size_t ci = before; ci < out.components.size(); ++ci) {
                 auto& comp = out.components[ci];
                 if (comp.footprint.rfind(L"PKG_", 0) == 0) {
@@ -337,7 +337,7 @@ inline bool ParseOdbPlusPlusBoard(
                 }
             }
         } else if (path.find("profile") != std::string::npos) {
-            DetailMfg69::ParseOdbFeaturesStreamV2(vf.second, EdaLayerId::EdgeCuts, true, out, validRecords);
+            DetailBoardFabEda::ParseOdbFeaturesStreamV2(vf.second, EdaLayerId::EdgeCuts, true, out, validRecords);
         } else if (path.find("features") != std::string::npos) {
             std::string layerName = "top";
             size_t lpos = path.find("layers/");
@@ -348,8 +348,8 @@ inline bool ParseOdbPlusPlusBoard(
             }
             if (layerName.find("mask") != std::string::npos || layerName.find("paste") != std::string::npos) continue;
             auto it = matrixLayerMap.find(layerName);
-            EdaLayerId lid = (it != matrixLayerMap.end()) ? it->second : DetailEda100::ClassifyIpcLayerName(layerName);
-            DetailMfg69::ParseOdbFeaturesStreamV2(vf.second, lid, false, out, validRecords);
+            EdaLayerId lid = (it != matrixLayerMap.end()) ? it->second : DetailSiliconAndBusEda::ClassifyIpcLayerName(layerName);
+            DetailBoardFabEda::ParseOdbFeaturesStreamV2(vf.second, lid, false, out, validRecords);
         }
     }
 

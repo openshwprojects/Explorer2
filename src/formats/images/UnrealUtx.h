@@ -5,17 +5,17 @@ namespace Formats {
 
 inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
     if (!data || size < 36) return false;
-    if (DetailImg100::RdU32LE(data) != 0x9E2A83C1u) return false;
+    if (DetailLayeredAndHdrImg::RdU32LE(data) != 0x9E2A83C1u) return false;
 
-    uint16_t ueVersion    = DetailImg100::RdU16LE(data + 4);
-    uint16_t licenseeVer  = DetailImg100::RdU16LE(data + 6);
-    uint32_t packageFlags = DetailImg100::RdU32LE(data + 8);
-    uint32_t nameCount    = DetailImg100::RdU32LE(data + 12);
-    uint32_t nameOffset   = DetailImg100::RdU32LE(data + 16);
-    uint32_t exportCount  = DetailImg100::RdU32LE(data + 20);
-    uint32_t exportOffset = DetailImg100::RdU32LE(data + 24);
-    uint32_t importCount  = DetailImg100::RdU32LE(data + 28);
-    uint32_t importOffset = DetailImg100::RdU32LE(data + 32);
+    uint16_t ueVersion    = DetailLayeredAndHdrImg::RdU16LE(data + 4);
+    uint16_t licenseeVer  = DetailLayeredAndHdrImg::RdU16LE(data + 6);
+    uint32_t packageFlags = DetailLayeredAndHdrImg::RdU32LE(data + 8);
+    uint32_t nameCount    = DetailLayeredAndHdrImg::RdU32LE(data + 12);
+    uint32_t nameOffset   = DetailLayeredAndHdrImg::RdU32LE(data + 16);
+    uint32_t exportCount  = DetailLayeredAndHdrImg::RdU32LE(data + 20);
+    uint32_t exportOffset = DetailLayeredAndHdrImg::RdU32LE(data + 24);
+    uint32_t importCount  = DetailLayeredAndHdrImg::RdU32LE(data + 28);
+    uint32_t importOffset = DetailLayeredAndHdrImg::RdU32LE(data + 32);
     (void)licenseeVer;
     (void)packageFlags;
 
@@ -74,7 +74,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
                     size_t charCount = static_cast<size_t>(-slen);
                     if (charCount > 4096 || charCount * 2 > size - p) return false;
                     for (size_t c = 0; c < charCount; ++c) {
-                        uint16_t wc = DetailImg100::RdU16LE(data + p + c * 2);
+                        uint16_t wc = DetailLayeredAndHdrImg::RdU16LE(data + p + c * 2);
                         if (wc == 0) break;
                         nm.push_back(wc < 128 ? static_cast<char>(wc) : '?');
                     }
@@ -108,7 +108,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
             if (!rdCompactIndex(p, size, imp.classPackage)) return false;
             if (!rdCompactIndex(p, size, imp.className)) return false;
             if (p + 4 > size) return false;
-            imp.packageIndex = static_cast<int32_t>(DetailImg100::RdU32LE(data + p));
+            imp.packageIndex = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + p));
             p += 4;
             if (!rdCompactIndex(p, size, imp.objectName)) return false;
             imports.push_back(imp);
@@ -134,11 +134,11 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
             if (!rdCompactIndex(p, size, exp.classIndex)) return false;
             if (!rdCompactIndex(p, size, exp.superIndex)) return false;
             if (p + 4 > size) return false;
-            exp.groupIndex = static_cast<int32_t>(DetailImg100::RdU32LE(data + p));
+            exp.groupIndex = static_cast<int32_t>(DetailLayeredAndHdrImg::RdU32LE(data + p));
             p += 4;
             if (!rdCompactIndex(p, size, exp.objectName)) return false;
             if (p + 4 > size) return false;
-            exp.objectFlags = DetailImg100::RdU32LE(data + p);
+            exp.objectFlags = DetailLayeredAndHdrImg::RdU32LE(data + p);
             p += 4;
             if (!rdCompactIndex(p, size, exp.serialSize)) return false;
             if (exp.serialSize > 0) {
@@ -185,7 +185,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
             if (!rdCompactIndex(p, endLimit, nameIdx)) return false;
             std::string_view propName = getName(nameIdx);
             if (propName.empty()) return false;
-            if (DetailImg100::EqualsIgnoreCaseAscii(propName, "None")) {
+            if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "None")) {
                 return true;
             }
 
@@ -204,7 +204,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
             size_t propValSize = 0;
             if (propType == 3) { // BoolProperty: value stored directly in bit 7 of info byte
                 propValSize = 0;
-                if (DetailImg100::EqualsIgnoreCaseAscii(propName, "bMasked")) {
+                if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "bMasked")) {
                     outProps.bMasked = arrayOrBool;
                 }
             } else {
@@ -220,12 +220,12 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
                     break;
                 case 6:
                     if (p + 2 > endLimit) return false;
-                    propValSize = DetailImg100::RdU16LE(data + p);
+                    propValSize = DetailLayeredAndHdrImg::RdU16LE(data + p);
                     p += 2;
                     break;
                 case 7:
                     if (p + 4 > endLimit) return false;
-                    propValSize = DetailImg100::RdU32LE(data + p);
+                    propValSize = DetailLayeredAndHdrImg::RdU32LE(data + p);
                     p += 4;
                     break;
                 }
@@ -244,21 +244,21 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
 
             if (propValSize > endLimit - p) return false;
             size_t valPos = p;
-            if (DetailImg100::EqualsIgnoreCaseAscii(propName, "Format") && propValSize == 1) {
+            if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "Format") && propValSize == 1) {
                 outProps.format = data[valPos];
-            } else if (DetailImg100::EqualsIgnoreCaseAscii(propName, "Palette") && propType == 5) {
+            } else if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "Palette") && propType == 5) {
                 size_t rp = valPos;
                 int32_t refIdx = 0;
                 if (rdCompactIndex(rp, valPos + propValSize, refIdx)) {
                     outProps.paletteRef = refIdx;
                 }
-            } else if (DetailImg100::EqualsIgnoreCaseAscii(propName, "USize") && propValSize == 4) {
-                outProps.uSize = DetailImg100::RdU32LE(data + valPos);
-            } else if (DetailImg100::EqualsIgnoreCaseAscii(propName, "VSize") && propValSize == 4) {
-                outProps.vSize = DetailImg100::RdU32LE(data + valPos);
-            } else if (DetailImg100::EqualsIgnoreCaseAscii(propName, "UBits") && propValSize == 1 && outProps.uSize == 0 && data[valPos] <= 13) {
+            } else if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "USize") && propValSize == 4) {
+                outProps.uSize = DetailLayeredAndHdrImg::RdU32LE(data + valPos);
+            } else if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "VSize") && propValSize == 4) {
+                outProps.vSize = DetailLayeredAndHdrImg::RdU32LE(data + valPos);
+            } else if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "UBits") && propValSize == 1 && outProps.uSize == 0 && data[valPos] <= 13) {
                 outProps.uSize = 1u << data[valPos];
-            } else if (DetailImg100::EqualsIgnoreCaseAscii(propName, "VBits") && propValSize == 1 && outProps.vSize == 0 && data[valPos] <= 13) {
+            } else if (DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(propName, "VBits") && propValSize == 1 && outProps.vSize == 0 && data[valPos] <= 13) {
                 outProps.vSize = 1u << data[valPos];
             }
             p += propValSize;
@@ -282,7 +282,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
         if (startOff > size || len > size - startOff) continue;
 
         std::string_view cls = resolveClassName(exp.classIndex);
-        if (!DetailImg100::EqualsIgnoreCaseAscii(cls, "Palette")) continue;
+        if (!DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(cls, "Palette")) continue;
 
         size_t p = startOff;
         size_t endOff = startOff + len;
@@ -330,10 +330,10 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
         if (startOff > size || len > size - startOff) continue;
 
         std::string_view cls = resolveClassName(exp.classIndex);
-        if (!DetailImg100::EqualsIgnoreCaseAscii(cls, "Texture") &&
-            !DetailImg100::EqualsIgnoreCaseAscii(cls, "FractalTexture") &&
-            !DetailImg100::EqualsIgnoreCaseAscii(cls, "WetTexture") &&
-            !DetailImg100::EqualsIgnoreCaseAscii(cls, "FireTexture")) {
+        if (!DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(cls, "Texture") &&
+            !DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(cls, "FractalTexture") &&
+            !DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(cls, "WetTexture") &&
+            !DetailLayeredAndHdrImg::EqualsIgnoreCaseAscii(cls, "FireTexture")) {
             continue;
         }
 
@@ -362,8 +362,8 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
             outLen = dLen;
             size_t tail = mp + dLen;
             if (tail + 8 <= endOff) {
-                uint32_t tw = DetailImg100::RdU32LE(data + tail + 0);
-                uint32_t th = DetailImg100::RdU32LE(data + tail + 4);
+                uint32_t tw = DetailLayeredAndHdrImg::RdU32LE(data + tail + 0);
+                uint32_t th = DetailLayeredAndHdrImg::RdU32LE(data + tail + 4);
                 if (tw >= 1 && tw <= 8192 && th >= 1 && th <= 8192) {
                     outW = tw;
                     outH = th;
@@ -375,7 +375,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
         bool gotMip = false;
         // Variant A: UE2 TLazyArray (uint32LE skipPos followed by FCompactIndex count + bytes, where skipPos == mpAfter + count)
         if (!gotMip && p + 5 <= endOff) {
-            uint32_t skipPos = DetailImg100::RdU32LE(data + p);
+            uint32_t skipPos = DetailLayeredAndHdrImg::RdU32LE(data + p);
             size_t mp = p + 4;
             int32_t dc = 0;
             if (rdCompactIndex(mp, endOff, dc) && dc > 0 && mp + static_cast<size_t>(dc) == static_cast<size_t>(skipPos)) {
@@ -384,7 +384,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
         }
         // Variant B: UE1 UT99 FMipmap (uint32LE widthOffset + TLazyArray uint32LE skipPos + FCompactIndex count + bytes)
         if (!gotMip && p + 9 <= endOff) {
-            uint32_t skipPos = DetailImg100::RdU32LE(data + p + 4);
+            uint32_t skipPos = DetailLayeredAndHdrImg::RdU32LE(data + p + 4);
             size_t mp = p + 8;
             int32_t dc = 0;
             if (rdCompactIndex(mp, endOff, dc) && dc > 0 && mp + static_cast<size_t>(dc) == static_cast<size_t>(skipPos)) {
@@ -453,7 +453,7 @@ inline bool DecodeUnrealUtx(const uint8_t* data, size_t size, ExtendedImageInfo&
                 cand.bgraPixels.resize(pxCount * 4);
                 for (size_t i = 0; i < pxCount; ++i) {
                     uint8_t r, g, b;
-                    GpuTex::UnpackRgb565(DetailImg100::RdU16LE(mipBytes + i * 2), r, g, b);
+                    GpuTex::UnpackRgb565(DetailLayeredAndHdrImg::RdU16LE(mipBytes + i * 2), r, g, b);
                     WritePremulBGRA(&cand.bgraPixels[i * 4], r, g, b, 255);
                 }
                 cand.formatName = L"Unreal Engine Texture RGB16 (.utx)";

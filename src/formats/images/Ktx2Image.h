@@ -6,28 +6,28 @@ namespace Formats {
 inline bool DecodeKtx2Image(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
     static const uint8_t kKtx2Sig[12] = { 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
     if (!data || size < 104 || std::memcmp(data, kKtx2Sig, 12) != 0) return false;
-        uint32_t vkFormat = DetailImg100::RdU32LE(data + 12);
-        uint32_t w = DetailImg100::RdU32LE(data + 20);
-        uint32_t h = DetailImg100::RdU32LE(data + 24);
+        uint32_t vkFormat = DetailLayeredAndHdrImg::RdU32LE(data + 12);
+        uint32_t w = DetailLayeredAndHdrImg::RdU32LE(data + 20);
+        uint32_t h = DetailLayeredAndHdrImg::RdU32LE(data + 24);
         if (h == 0) h = 1; // 1D KTX2 texture
-        uint32_t d = std::max(1u, DetailImg100::RdU32LE(data + 28));
-        uint32_t layers = std::max(1u, DetailImg100::RdU32LE(data + 32));
-        uint32_t faces = std::max(1u, DetailImg100::RdU32LE(data + 36));
-        uint32_t levelCount = std::max(1u, DetailImg100::RdU32LE(data + 40));
-        uint32_t supercomp = DetailImg100::RdU32LE(data + 44);
-        uint32_t dfdByteOff = DetailImg100::RdU32LE(data + 48);
-        uint32_t dfdByteLen = DetailImg100::RdU32LE(data + 52);
-        uint64_t sgdByteOff = DetailImg100::RdU64LE(data + 64);
-        uint64_t sgdByteLen = DetailImg100::RdU64LE(data + 72);
+        uint32_t d = std::max(1u, DetailLayeredAndHdrImg::RdU32LE(data + 28));
+        uint32_t layers = std::max(1u, DetailLayeredAndHdrImg::RdU32LE(data + 32));
+        uint32_t faces = std::max(1u, DetailLayeredAndHdrImg::RdU32LE(data + 36));
+        uint32_t levelCount = std::max(1u, DetailLayeredAndHdrImg::RdU32LE(data + 40));
+        uint32_t supercomp = DetailLayeredAndHdrImg::RdU32LE(data + 44);
+        uint32_t dfdByteOff = DetailLayeredAndHdrImg::RdU32LE(data + 48);
+        uint32_t dfdByteLen = DetailLayeredAndHdrImg::RdU32LE(data + 52);
+        uint64_t sgdByteOff = DetailLayeredAndHdrImg::RdU64LE(data + 64);
+        uint64_t sgdByteLen = DetailLayeredAndHdrImg::RdU64LE(data + 72);
         if (w == 0 || w > 8192 || h > 8192 || levelCount > 32) return false;
 
         size_t levelIndexEnd = 80ull + static_cast<size_t>(levelCount) * 24ull;
         if (levelIndexEnd > size) return false;
 
         // KTX 2.0 Section 3.9.7: levels[0] at byte offset 80 is mip level 0 (largest resolution)
-        uint64_t byteOff = DetailImg100::RdU64LE(data + 80);
-        uint64_t byteLen = DetailImg100::RdU64LE(data + 88);
-        uint64_t uncompLen = DetailImg100::RdU64LE(data + 96);
+        uint64_t byteOff = DetailLayeredAndHdrImg::RdU64LE(data + 80);
+        uint64_t byteLen = DetailLayeredAndHdrImg::RdU64LE(data + 88);
+        uint64_t uncompLen = DetailLayeredAndHdrImg::RdU64LE(data + 96);
         if (byteLen == 0 || byteOff < levelIndexEnd || byteOff > size || byteLen > size - byteOff) {
             return false;
         }
@@ -50,12 +50,12 @@ inline bool DecodeKtx2Image(const uint8_t* data, size_t size, ExtendedImageInfo&
                 return false;
             }
             const uint8_t* sgd = data + static_cast<size_t>(sgdByteOff);
-            uint16_t endpointCount    = DetailImg100::RdU16LE(sgd + 0);
-            uint16_t selectorCount    = DetailImg100::RdU16LE(sgd + 2);
-            uint32_t endpointsByteLen = DetailImg100::RdU32LE(sgd + 4);
-            uint32_t selectorsByteLen = DetailImg100::RdU32LE(sgd + 8);
-            uint32_t tablesByteLen    = DetailImg100::RdU32LE(sgd + 12);
-            uint32_t extendedByteLen  = DetailImg100::RdU32LE(sgd + 16);
+            uint16_t endpointCount    = DetailLayeredAndHdrImg::RdU16LE(sgd + 0);
+            uint16_t selectorCount    = DetailLayeredAndHdrImg::RdU16LE(sgd + 2);
+            uint32_t endpointsByteLen = DetailLayeredAndHdrImg::RdU32LE(sgd + 4);
+            uint32_t selectorsByteLen = DetailLayeredAndHdrImg::RdU32LE(sgd + 8);
+            uint32_t tablesByteLen    = DetailLayeredAndHdrImg::RdU32LE(sgd + 12);
+            uint32_t extendedByteLen  = DetailLayeredAndHdrImg::RdU32LE(sgd + 16);
             if (endpointCount == 0 || selectorCount == 0 ||
                 endpointsByteLen == 0 || selectorsByteLen == 0 || tablesByteLen == 0) {
                 return false;
@@ -64,11 +64,11 @@ inline bool DecodeKtx2Image(const uint8_t* data, size_t size, ExtendedImageInfo&
             if (sgdRequired > sgdByteLen) return false;
 
             // Mip 0, layer 0, face 0, slice 0 descriptor at sgd + 20
-            uint32_t imageFlags    = DetailImg100::RdU32LE(sgd + 20);
-            uint32_t rgbSliceOff   = DetailImg100::RdU32LE(sgd + 24);
-            uint32_t rgbSliceLen   = DetailImg100::RdU32LE(sgd + 28);
-            uint32_t alphaSliceOff = DetailImg100::RdU32LE(sgd + 32);
-            uint32_t alphaSliceLen = DetailImg100::RdU32LE(sgd + 36);
+            uint32_t imageFlags    = DetailLayeredAndHdrImg::RdU32LE(sgd + 20);
+            uint32_t rgbSliceOff   = DetailLayeredAndHdrImg::RdU32LE(sgd + 24);
+            uint32_t rgbSliceLen   = DetailLayeredAndHdrImg::RdU32LE(sgd + 28);
+            uint32_t alphaSliceOff = DetailLayeredAndHdrImg::RdU32LE(sgd + 32);
+            uint32_t alphaSliceLen = DetailLayeredAndHdrImg::RdU32LE(sgd + 36);
             if (rgbSliceLen == 0 || rgbSliceOff > byteLen || rgbSliceLen > byteLen - rgbSliceOff) {
                 return false;
             }
@@ -251,10 +251,10 @@ inline bool DecodeKtx2Image(const uint8_t* data, size_t size, ExtendedImageInfo&
             std::vector<float> flt(pxCount * 4, 0.0f);
             for (size_t i = 0; i < pxCount; ++i) {
                 const uint8_t* sp = mipPtr + i * ch * 2;
-                float r = GpuTex::HalfToFloat(DetailImg100::RdU16LE(sp));
-                float g = (ch >= 2) ? GpuTex::HalfToFloat(DetailImg100::RdU16LE(sp + 2)) : r;
-                float b = (ch >= 3) ? GpuTex::HalfToFloat(DetailImg100::RdU16LE(sp + 4)) : (ch == 1 ? r : 0.0f);
-                float a = (ch >= 4) ? GpuTex::HalfToFloat(DetailImg100::RdU16LE(sp + 6)) : 1.0f;
+                float r = GpuTex::HalfToFloat(DetailLayeredAndHdrImg::RdU16LE(sp));
+                float g = (ch >= 2) ? GpuTex::HalfToFloat(DetailLayeredAndHdrImg::RdU16LE(sp + 2)) : r;
+                float b = (ch >= 3) ? GpuTex::HalfToFloat(DetailLayeredAndHdrImg::RdU16LE(sp + 4)) : (ch == 1 ? r : 0.0f);
+                float a = (ch >= 4) ? GpuTex::HalfToFloat(DetailLayeredAndHdrImg::RdU16LE(sp + 6)) : 1.0f;
                 flt[i * 4 + 0] = r; flt[i * 4 + 1] = g; flt[i * 4 + 2] = b; flt[i * 4 + 3] = a;
             }
             GpuTex::ConvertFloatRgbaToBgra(flt.data(), w, h, false, outInfo.bgraPixels);

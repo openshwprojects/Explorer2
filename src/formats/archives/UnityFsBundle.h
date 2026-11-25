@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 // ============================================================================
 // #22. UnityFS AssetBundle (.bundle / .unity3d — "UnityFS\0")
@@ -260,10 +260,10 @@ inline bool ParseUnityFsBundle(const uint8_t* data, size_t size, ArchiveSummaryI
     return ParseOrExtractUnityFsBundle(data, size, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectUnityFsBundle(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseUnityFsBundle(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseUnityFsBundle(data, size, outInfo);
 }
 
 inline bool ExtractUnityFsBundleEntry(
@@ -272,7 +272,7 @@ inline bool ExtractUnityFsBundleEntry(
     const std::wstring& want,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc200::ParseOrExtractUnityFsBundle(data, size, nullptr, &want, &outBytes);
+    return DetailUnixAndLegacyArc::ParseOrExtractUnityFsBundle(data, size, nullptr, &want, &outBytes);
 }
 
 } // namespace Explorer2::Formats

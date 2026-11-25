@@ -2,7 +2,7 @@
 // KindleMobi.h — Mobipocket / Kindle E-Book (.mobi/.azw/.azw3/.prc) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // ============================================================================
 // 10. Mobipocket / Kindle E-Book (.mobi / .azw / .azw3 / .prc — PalmDB + LZ77 + HUFF/CDIC + KF8)
@@ -27,9 +27,9 @@ struct MobiHuffCdicCtx {
 
     bool Init(const uint8_t* huff, size_t huffLen) {
         if (!huff || huffLen < 24 || std::memcmp(huff, "HUFF", 4) != 0) return false;
-        uint32_t hdrLen = DetailSys100::RdU32BE(huff + 4);
-        uint32_t off1   = DetailSys100::RdU32BE(huff + 8);
-        uint32_t off2   = DetailSys100::RdU32BE(huff + 12);
+        uint32_t hdrLen = DetailBinarySysDoc::RdU32BE(huff + 4);
+        uint32_t off1   = DetailBinarySysDoc::RdU32BE(huff + 8);
+        uint32_t off2   = DetailBinarySysDoc::RdU32BE(huff + 12);
         if (hdrLen < 24 || off1 > huffLen || 1024u > huffLen - off1 ||
             off2 > huffLen || 256u > huffLen - off2) {
             return false;
@@ -38,19 +38,19 @@ struct MobiHuffCdicCtx {
         // Auto-detect BE vs LE on dict1 (HUFF+16 bit 0..1 == 3 indicates LE on rare Palm builds; standard Kindle is BE)
         size_t validBE = 0, validLE = 0;
         for (size_t i = 0; i < 256; ++i) {
-            uint32_t vbe = DetailSys100::RdU32BE(huff + off1 + i * 4);
-            uint32_t vle = DetailSys100::RdU32LE(huff + off1 + i * 4);
+            uint32_t vbe = DetailBinarySysDoc::RdU32BE(huff + off1 + i * 4);
+            uint32_t vle = DetailBinarySysDoc::RdU32LE(huff + off1 + i * 4);
             uint8_t clBe = vbe & 0x1Fu, clLe = vle & 0x1Fu;
             if (clBe >= 1 && clBe <= 32 && (vbe & 0x60u) == 0 && (!((vbe & 0x80u) != 0) || clBe <= 8)) ++validBE;
             if (clLe >= 1 && clLe <= 32 && (vle & 0x60u) == 0 && (!((vle & 0x80u) != 0) || clLe <= 8)) ++validLE;
         }
         if (std::max(validBE, validLE) == 0) return false;
-        const uint32_t huffFlags = DetailSys100::RdU32BE(huff + 16);
+        const uint32_t huffFlags = DetailBinarySysDoc::RdU32BE(huff + 16);
         const bool useLE = ((huffFlags & 3u) == 3u) ? (validLE >= validBE) : (validLE > validBE + 32u);
 
         for (size_t i = 0; i < 256; ++i) {
-            uint32_t v = useLE ? DetailSys100::RdU32LE(huff + off1 + i * 4)
-                               : DetailSys100::RdU32BE(huff + off1 + i * 4);
+            uint32_t v = useLE ? DetailBinarySysDoc::RdU32LE(huff + off1 + i * 4)
+                               : DetailBinarySysDoc::RdU32BE(huff + off1 + i * 4);
             uint8_t cl = static_cast<uint8_t>(v & 0x1Fu);
             bool term = (v & 0x80u) != 0 && cl >= 1 && cl <= 8;
             uint64_t mcRaw = v >> 8;
@@ -62,10 +62,10 @@ struct MobiHuffCdicCtx {
         mincode[0] = 0;
         maxcode[0] = 0;
         for (uint32_t cl = 1; cl <= 32; ++cl) {
-            uint32_t mnRaw = useLE ? DetailSys100::RdU32LE(huff + off2 + (cl - 1u) * 8u)
-                                   : DetailSys100::RdU32BE(huff + off2 + (cl - 1u) * 8u);
-            uint32_t mxRaw = useLE ? DetailSys100::RdU32LE(huff + off2 + (cl - 1u) * 8u + 4u)
-                                   : DetailSys100::RdU32BE(huff + off2 + (cl - 1u) * 8u + 4u);
+            uint32_t mnRaw = useLE ? DetailBinarySysDoc::RdU32LE(huff + off2 + (cl - 1u) * 8u)
+                                   : DetailBinarySysDoc::RdU32BE(huff + off2 + (cl - 1u) * 8u);
+            uint32_t mxRaw = useLE ? DetailBinarySysDoc::RdU32LE(huff + off2 + (cl - 1u) * 8u + 4u)
+                                   : DetailBinarySysDoc::RdU32BE(huff + off2 + (cl - 1u) * 8u + 4u);
             mincode[cl] = (cl == 32u) ? static_cast<uint64_t>(mnRaw) : (static_cast<uint64_t>(mnRaw) << (32u - cl));
             maxcode[cl] = (cl == 32u) ? static_cast<uint64_t>(mxRaw) : (((static_cast<uint64_t>(mxRaw) + 1ULL) << (32u - cl)) - 1ULL);
         }
@@ -74,9 +74,9 @@ struct MobiHuffCdicCtx {
 
     bool AddCdic(const uint8_t* cdic, size_t cdicLen) {
         if (!cdic || cdicLen < 16 || std::memcmp(cdic, "CDIC", 4) != 0) return false;
-        uint32_t hdrLen     = DetailSys100::RdU32BE(cdic + 4);
-        uint32_t numPhrases = DetailSys100::RdU32BE(cdic + 8);
-        uint32_t bits       = DetailSys100::RdU32BE(cdic + 12);
+        uint32_t hdrLen     = DetailBinarySysDoc::RdU32BE(cdic + 4);
+        uint32_t numPhrases = DetailBinarySysDoc::RdU32BE(cdic + 8);
+        uint32_t bits       = DetailBinarySysDoc::RdU32BE(cdic + 12);
         if (hdrLen != 16 || bits == 0 || bits > 16) return false;
         if (slices.empty()) cdicBits = bits;
         else if (bits != cdicBits) return false;
@@ -131,9 +131,9 @@ struct MobiHuffCdicCtx {
             if (sliceIdx >= slices.size() || entryIdx >= slices[sliceIdx].numEntries) return false;
 
             const auto& sl = slices[sliceIdx];
-            uint16_t phrOff = DetailSys100::RdU16BE(sl.base + static_cast<size_t>(entryIdx) * 2u);
+            uint16_t phrOff = DetailBinarySysDoc::RdU16BE(sl.base + static_cast<size_t>(entryIdx) * 2u);
             if (static_cast<size_t>(phrOff) + 2u > sl.len) return false;
-            uint16_t blenAndFlag = DetailSys100::RdU16BE(sl.base + phrOff);
+            uint16_t blenAndFlag = DetailBinarySysDoc::RdU16BE(sl.base + phrOff);
             size_t blen = blenAndFlag & 0x7FFFu;
             if (static_cast<size_t>(phrOff) + 2u + blen > sl.len) return false;
             const uint8_t* phrBytes = sl.base + phrOff + 2u;
@@ -162,12 +162,12 @@ inline bool ParseMobiPalmDb(const std::vector<uint8_t>& raw, const std::wstring&
     if (!isBookMobi && !isTextRead) return false;
 
     std::wstring pdbName = FixedAsciiField(raw.data(), 32);
-    uint16_t numRecords = DetailSys100::RdU16BE(raw.data() + 76);
+    uint16_t numRecords = DetailBinarySysDoc::RdU16BE(raw.data() + 76);
     if (numRecords == 0 || 78ULL + static_cast<size_t>(numRecords) * 8ULL > raw.size()) return false;
 
     std::vector<uint32_t> recOff(numRecords);
     for (uint16_t i = 0; i < numRecords; ++i) {
-        recOff[i] = DetailSys100::RdU32BE(raw.data() + 78 + static_cast<size_t>(i) * 8);
+        recOff[i] = DetailBinarySysDoc::RdU32BE(raw.data() + 78 + static_cast<size_t>(i) * 8);
     }
     auto getRecEnd = [&](uint16_t idx) -> size_t {
         uint32_t start = recOff[idx];
@@ -208,11 +208,11 @@ inline bool ParseMobiPalmDb(const std::vector<uint8_t>& raw, const std::wstring&
         const size_t r0Len = rEnd - recOff[hdrRecIdx];
 
         mh.rec0Idx     = hdrRecIdx;
-        mh.compression = DetailSys100::RdU16BE(r0);
-        mh.textLength  = DetailSys100::RdU32BE(r0 + 4);
-        mh.textRecCnt  = DetailSys100::RdU16BE(r0 + 8);
-        mh.recSize     = DetailSys100::RdU16BE(r0 + 10);
-        mh.encType     = DetailSys100::RdU16BE(r0 + 12);
+        mh.compression = DetailBinarySysDoc::RdU16BE(r0);
+        mh.textLength  = DetailBinarySysDoc::RdU32BE(r0 + 4);
+        mh.textRecCnt  = DetailBinarySysDoc::RdU16BE(r0 + 8);
+        mh.recSize     = DetailBinarySysDoc::RdU16BE(r0 + 10);
+        mh.encType     = DetailBinarySysDoc::RdU16BE(r0 + 12);
 
         auto decodeStr = [&](const uint8_t* p, size_t n) -> std::wstring {
             if (mh.textEncoding == 1252) return Latin1OrCp1252ToWide(p, n);
@@ -221,48 +221,48 @@ inline bool ParseMobiPalmDb(const std::vector<uint8_t>& raw, const std::wstring&
 
         if (r0Len >= 24 && std::memcmp(r0 + 16, "MOBI", 4) == 0) {
             const uint8_t* mobiHdr = r0 + 16;
-            uint32_t mobiHdrLen = DetailSys100::RdU32BE(mobiHdr + 4);
+            uint32_t mobiHdrLen = DetailBinarySysDoc::RdU32BE(mobiHdr + 4);
             if (r0Len >= 40) {
-                mh.textEncoding = DetailSys100::RdU32BE(r0 + 28);
-                mh.mobiVer      = DetailSys100::RdU32BE(r0 + 36);
+                mh.textEncoding = DetailBinarySysDoc::RdU32BE(r0 + 28);
+                mh.mobiVer      = DetailBinarySysDoc::RdU32BE(r0 + 36);
             }
             if (mobiHdrLen >= 76 && r0Len >= 92) {
-                uint32_t fnOff = DetailSys100::RdU32BE(r0 + 84);
-                uint32_t fnLen = DetailSys100::RdU32BE(r0 + 88);
+                uint32_t fnOff = DetailBinarySysDoc::RdU32BE(r0 + 84);
+                uint32_t fnLen = DetailBinarySysDoc::RdU32BE(r0 + 88);
                 if (fnOff < r0Len && fnLen > 0 && fnLen <= r0Len - fnOff) {
                     std::wstring ft = decodeStr(r0 + fnOff, fnLen);
                     if (!ft.empty()) mh.fullTitle = ft;
                 }
             }
             if (mobiHdrLen >= 104 && r0Len >= 120) {
-                mh.huffRecIdx = DetailSys100::RdU32BE(mobiHdr + 96);  // r0 + 112
-                mh.huffRecCnt = DetailSys100::RdU32BE(mobiHdr + 100); // r0 + 116
+                mh.huffRecIdx = DetailBinarySysDoc::RdU32BE(mobiHdr + 96);  // r0 + 112
+                mh.huffRecCnt = DetailBinarySysDoc::RdU32BE(mobiHdr + 100); // r0 + 116
             }
             if (mh.mobiVer >= 8 && mobiHdrLen >= 184 && r0Len >= 200) {
-                mh.fdstRecIdx  = DetailSys100::RdU32BE(r0 + 192);
-                mh.fdstFlowCnt = DetailSys100::RdU32BE(r0 + 196);
+                mh.fdstRecIdx  = DetailBinarySysDoc::RdU32BE(r0 + 192);
+                mh.fdstFlowCnt = DetailBinarySysDoc::RdU32BE(r0 + 196);
             }
-            uint32_t exthFlags = (mobiHdrLen >= 116 && r0Len >= 132) ? DetailSys100::RdU32BE(r0 + 128) : 0;
+            uint32_t exthFlags = (mobiHdrLen >= 116 && r0Len >= 132) ? DetailBinarySysDoc::RdU32BE(r0 + 128) : 0;
             if (mobiHdrLen >= 228 && r0Len >= 244) {
-                mh.extraDataFlags = DetailSys100::RdU16BE(r0 + 242);
+                mh.extraDataFlags = DetailBinarySysDoc::RdU16BE(r0 + 242);
             }
 
             size_t exthOff = 16ULL + mobiHdrLen;
             if ((exthFlags & 0x40u) != 0 && exthOff + 12 <= r0Len && std::memcmp(r0 + exthOff, "EXTH", 4) == 0) {
-                uint32_t exthLen = DetailSys100::RdU32BE(r0 + exthOff + 4);
-                uint32_t exthCnt = DetailSys100::RdU32BE(r0 + exthOff + 8);
+                uint32_t exthLen = DetailBinarySysDoc::RdU32BE(r0 + exthOff + 4);
+                uint32_t exthCnt = DetailBinarySysDoc::RdU32BE(r0 + exthOff + 8);
                 size_t ep = exthOff + 12;
                 size_t eLimit = std::min<size_t>(r0Len, exthOff + exthLen);
                 for (uint32_t i = 0; i < exthCnt && i < 256 && ep + 8 <= eLimit; ++i) {
-                    uint32_t rType = DetailSys100::RdU32BE(r0 + ep);
-                    uint32_t rLen  = DetailSys100::RdU32BE(r0 + ep + 4);
+                    uint32_t rType = DetailBinarySysDoc::RdU32BE(r0 + ep);
+                    uint32_t rLen  = DetailBinarySysDoc::RdU32BE(r0 + ep + 4);
                     if (rLen < 8 || ep + rLen > eLimit) break;
                     const uint8_t* rp = r0 + ep + 8;
                     size_t payLen = rLen - 8;
                     ep += rLen;
 
                     if (rType == 121 && payLen == 4) { // EXTH 121 = KF8 BOUNDARY record index
-                        mh.kf8BoundaryRec = DetailSys100::RdU32BE(rp);
+                        mh.kf8BoundaryRec = DetailBinarySysDoc::RdU32BE(rp);
                         continue;
                     }
                     auto exthLabel = [](uint32_t t) -> const wchar_t* {
@@ -430,12 +430,12 @@ inline bool ParseMobiPalmDb(const std::vector<uint8_t>& raw, const std::wstring&
             const uint8_t* fp = raw.data() + recOff[fRec];
             size_t fLen = fEnd - recOff[fRec];
             if (fLen >= 20 && std::memcmp(fp, "FDST", 4) == 0) {
-                uint32_t secOff = DetailSys100::RdU32BE(fp + 4);
-                uint32_t nFlows = DetailSys100::RdU32BE(fp + 8);
+                uint32_t secOff = DetailBinarySysDoc::RdU32BE(fp + 4);
+                uint32_t nFlows = DetailBinarySysDoc::RdU32BE(fp + 8);
                 parsedFlows = nFlows;
                 if (nFlows >= 1 && secOff + 8 <= fLen) {
-                    uint32_t f0Start = DetailSys100::RdU32BE(fp + secOff);
-                    uint32_t f0End   = DetailSys100::RdU32BE(fp + secOff + 4);
+                    uint32_t f0Start = DetailBinarySysDoc::RdU32BE(fp + secOff);
+                    uint32_t f0End   = DetailBinarySysDoc::RdU32BE(fp + secOff + 4);
                     if (f0Start == 0 && f0End > 0 && f0End < markupLen) {
                         markupLen = f0End;
                     }
@@ -491,8 +491,8 @@ inline bool ParseMobiPalmDb(const std::vector<uint8_t>& raw, const std::wstring&
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseKindleMobiDoc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) { return DetailMedia100::ParseMobiPalmDb(raw, extLower, out); }
+inline bool ParseKindleMobiDoc(const std::vector<uint8_t>& raw, const std::wstring& extLower, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseMobiPalmDb(raw, extLower, out); }
 
 } // namespace Formats

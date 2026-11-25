@@ -106,9 +106,11 @@ inline bool CompositeOraFromStackXml(
         std::vector<uint8_t> layerBytes;
         if (!ZipDeflate::ExtractZipEntryFromMemory(zipData, zipSize, *ent, layerBytes) || layerBytes.empty()) continue;
         ExtendedImageInfo lImg;
-        if (!DetailImg100::DecodeEmbeddedWicBuffer(layerBytes.data(), layerBytes.size(), L"ORA Layer", lImg) || !lImg.valid) {
+        if (!DetailPngPure::DecodePngToImageInfo(layerBytes.data(), layerBytes.size(), L"ORA Layer", lImg) &&
+            !DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(layerBytes.data(), layerBytes.size(), L"ORA Layer", lImg)) {
             continue;
         }
+        if (!lImg.valid) continue;
         ++compositedCount;
         for (uint32_t ly = 0; ly < lImg.height; ++ly) {
             int dy = it->y + static_cast<int>(ly);

@@ -4,10 +4,10 @@
 
 namespace Formats {
 
-namespace DetailMfg69 {
+namespace DetailBoardFabEda {
 
 // ============================================================================
-// Upgraded IPC-2581 Rev B / C XML Parser (.cvg / .ipc2581)
+// IPC-2581 Rev B / C XML Parser (.cvg / .ipc2581)
 // ============================================================================
 inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
     for (unsigned char c : sv) {
@@ -147,9 +147,9 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
         } else if (tname == "CadHeader" || tname == "Units") {
             std::string_view u;
             if (GetXmlAttr(tag, "units", u)) {
-                if (DetailEda100::ContainsAsciiI(u, "INCH")) unitScale = 25.4f;
-                else if (DetailEda100::ContainsAsciiI(u, "MICRON")) unitScale = 0.001f;
-                else if (DetailEda100::ContainsAsciiI(u, "MIL") && !DetailEda100::ContainsAsciiI(u, "MILLI")) unitScale = 0.0254f;
+                if (DetailSiliconAndBusEda::ContainsAsciiI(u, "INCH")) unitScale = 25.4f;
+                else if (DetailSiliconAndBusEda::ContainsAsciiI(u, "MICRON")) unitScale = 0.001f;
+                else if (DetailSiliconAndBusEda::ContainsAsciiI(u, "MIL") && !DetailSiliconAndBusEda::ContainsAsciiI(u, "MILLI")) unitScale = 0.0254f;
                 else unitScale = 1.0f;
             }
         } else if (tname == "EntryLineDesc") {
@@ -202,7 +202,7 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
             if (GetXmlAttr(tag, "name", nm)) {
                 GetXmlAttr(tag, "layerFunction", fn);
                 GetXmlAttr(tag, "side", sd);
-                layerMap[std::string(nm)] = DetailEda100::ClassifyIpcLayerName(nm, fn, sd);
+                layerMap[std::string(nm)] = DetailSiliconAndBusEda::ClassifyIpcLayerName(nm, fn, sd);
             }
         } else if (tname == "Profile") {
             if (!selfClosing) inProfile = true;
@@ -235,24 +235,24 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
             float cx = GetXmlFloat(tag, "centerX") * unitScale;
             float cy = GetXmlFloat(tag, "centerY") * unitScale;
             std::string_view cwSv;
-            bool cw = GetXmlAttr(tag, "clockwise", cwSv) && DetailEda100::ContainsAsciiI(cwSv, "true");
+            bool cw = GetXmlAttr(tag, "clockwise", cwSv) && DetailSiliconAndBusEda::ContainsAsciiI(cwSv, "true");
             if (!curPackageName.empty()) {
                 trackPkgPt(nx, ny);
             } else if (!polyPts.empty()) {
                 float w = (polyLayer == EdaLayerId::EdgeCuts) ? 0.30f : std::max(0.12f, activeLineWidth);
-                DetailEda100::AddTessellatedArc(out, polyPts.back().first, polyPts.back().second, nx, ny, cx, cy, cw, w, polyLayer, activeNetId);
+                DetailSiliconAndBusEda::AddTessellatedArc(out, polyPts.back().first, polyPts.back().second, nx, ny, cx, cy, cw, w, polyLayer, activeNetId);
                 polyPts.push_back({ nx, ny });
             }
         } else if (tname == "LayerFeature") {
             std::string_view lref;
             if (GetXmlAttr(tag, "layerRef", lref)) {
                 auto it = layerMap.find(std::string(lref));
-                activeLayer = (it != layerMap.end()) ? it->second : DetailEda100::ClassifyIpcLayerName(lref);
+                activeLayer = (it != layerMap.end()) ? it->second : DetailSiliconAndBusEda::ClassifyIpcLayerName(lref);
             }
         } else if (tname == "Set" || tname == "LogicalNet") {
             std::string_view netSv, usageSv;
             if (GetXmlAttr(tag, "padUsage", usageSv)) {
-                setIsVia = DetailEda100::ContainsAsciiI(usageSv, "VIA");
+                setIsVia = DetailSiliconAndBusEda::ContainsAsciiI(usageSv, "VIA");
             }
             if (GetXmlAttr(tag, "net", netSv) && !netSv.empty() && netSv != "No Net") {
                 netNames.insert(std::string(netSv));
@@ -277,10 +277,10 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
             float xc = GetXmlFloat(tag, "centerX") * unitScale;
             float yc = GetXmlFloat(tag, "centerY") * unitScale;
             std::string_view cwSv;
-            bool cw = GetXmlAttr(tag, "clockwise", cwSv) && DetailEda100::ContainsAsciiI(cwSv, "true");
+            bool cw = GetXmlAttr(tag, "clockwise", cwSv) && DetailSiliconAndBusEda::ContainsAsciiI(cwSv, "true");
             float lw = GetXmlFloat(tag, "lineWidth", -1.0f);
             float w = (lw > 0.0f) ? (lw * unitScale) : activeLineWidth;
-            DetailEda100::AddTessellatedArc(out, xs, ys, xe, ye, xc, yc, cw, std::max(0.08f, w),
+            DetailSiliconAndBusEda::AddTessellatedArc(out, xs, ys, xe, ye, xc, yc, cw, std::max(0.08f, w),
                 inProfile ? EdaLayerId::EdgeCuts : activeLayer, activeNetId);
         } else if ((tname == "Pad" || tname == "Via") && curPackageName.empty() && curPadstackDefId.empty()) {
             curPad = EdaPadPrim{};
@@ -326,7 +326,7 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
         } else if (tname == "Hole" && curPackageName.empty()) {
             float d = std::max(0.15f, GetXmlFloat(tag, "diameter", 0.4f) * unitScale);
             std::string_view plSv;
-            bool nonPlated = GetXmlAttr(tag, "platingStatus", plSv) && DetailEda100::ContainsAsciiI(plSv, "NONPLATED");
+            bool nonPlated = GetXmlAttr(tag, "platingStatus", plSv) && DetailSiliconAndBusEda::ContainsAsciiI(plSv, "NONPLATED");
             if (inPad) {
                 curPad.drill = d;
                 curPad.layer = EdaLayerId::PadsThrough;
@@ -343,7 +343,7 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
             if (GetXmlAttr(tag, "part", partSv)) curComp.value = PathUtils::Utf8ToWide(partSv);
             if (GetXmlAttr(tag, "packageRef", pkgSv)) curComp.footprint = PathUtils::Utf8ToWide(pkgSv);
             if (GetXmlAttr(tag, "layerRef", lyrSv)) {
-                EdaLayerId cl = DetailEda100::ClassifyIpcLayerName(lyrSv);
+                EdaLayerId cl = DetailSiliconAndBusEda::ClassifyIpcLayerName(lyrSv);
                 curComp.bottomSide = (cl == EdaLayerId::BottomCopper || cl == EdaLayerId::BottomSilk);
             }
             curComp.rotDeg = GetXmlFloat(tag, "rotation", 0.0f);
@@ -370,7 +370,7 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
         } else if (tname == "Xform") {
             float rot = GetXmlFloat(tag, "rotation", -9999.0f);
             std::string_view mirSv;
-            bool mir = GetXmlAttr(tag, "mirror", mirSv) && DetailEda100::ContainsAsciiI(mirSv, "true");
+            bool mir = GetXmlAttr(tag, "mirror", mirSv) && DetailSiliconAndBusEda::ContainsAsciiI(mirSv, "true");
             if (inPad && rot > -9000.0f) curPad.rotDeg = rot;
             if (inComponent) {
                 if (rot > -9000.0f) curComp.rotDeg = rot;
@@ -389,11 +389,11 @@ inline bool ParseIpc2581RevBC(std::string_view sv, ParsedEdaBoard& out) {
     return true;
 }
 
-} // namespace DetailMfg69
+} // namespace DetailBoardFabEda
 
 inline bool ParseIpc2581Board(std::string_view sv, ParsedEdaBoard& out) {
     if (sv.size() < 12) return false;
-    return DetailMfg69::ParseIpc2581RevBC(sv, out);
+    return DetailBoardFabEda::ParseIpc2581RevBC(sv, out);
 }
 
 } // namespace Formats

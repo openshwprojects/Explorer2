@@ -51,8 +51,13 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
 
 - Transfer queue for copy, move and delete: pause and resume, resuming interrupted copies, speed
   limit, conflict policies and checksum verification
-- Own delete engine: handles long paths, read-only items and names Explorer cannot remove, never
-  follows junctions or symlinks, and lists every item it could not delete so it can be retried.
+- Own delete engine and File Lock Inspector ("Unlocker"): handles long paths, read-only items and
+  names Explorer cannot remove, never follows junctions or symlinks, and lists every item it could
+  not delete so it can be retried. When a file or folder is locked during delete, move or inline
+  rename, the lock inspector identifies holding processes across open kernel handles, memory-mapped
+  sections / loaded DLLs, directory-change watchers, working directories and Windows services, and
+  supports non-destructive remote handle closing (with double TOCTOU object verification and
+  protected-process guards), service stop, reboot-deferred deletion and UAC-elevated unlocking.
   A Recycle Bin delete never turns into a permanent one: an item the bin cannot take is reported
   and left in place
 - FTP and FTPS client with bookmarks and dual-pane transfers
@@ -66,17 +71,19 @@ Pre-built Windows x64 binaries (Setup installer, standalone `.exe`, portable `.z
 
 ## File formats
 
-Common image formats are decoded through the Windows Imaging Component. Everything else is read by
-code in [`src/formats/`](src/formats), one header per format family. A sample of what is covered:
+Common image formats are decoded through pure-C++ decoders and the Windows Imaging Component. Everything else is read by
+code in [`src/formats/`](src/formats), strictly one file format per header across semantic domain folders (`images`, `raw`,
+`3d`, `cad`, `archives`, `eda`, `waveforms`, `docs`, `data`, `gis`, `audio`, `security`, `ai`, and shared `common` helpers).
+A sample of what is covered:
 
 | Area | Examples |
 | --- | --- |
-| Images | TGA, PSD, XCF, DDS, HDR, Netpbm, PCX, QOI, SVG, KTX, FITS |
-| 3D models | OBJ, STL, PLY, 3DS, FBX, MD2, MD3, GLB, COLLADA, Blender, 3MF, VTK |
-| Electronics and CAD | KiCad, Eagle, Gerber, Excellon, DXF, Specctra DSN, Intel HEX, GDSII |
-| Documents and data | CSV, XLSX, ODS, DOCX, ODT, RTF, PPTX, EPUB, FB2, PDF, SQLite, DBF |
-| Archives | ZIP, TAR, gzip, RAR4, RAR5, 7z |
-| Game files | PK3 / PK4 / IWD packages, Quake and SiN PAK, GTA IMG (with its DFF models, TXD textures and COL collisions), Silkroad PK2, Valve VPK, Blizzard MPQ, Bethesda BSA, Doom WAD |
+| Images & RAW | PNG, TGA, PSD/PSB, XCF, OpenEXR, DDS, KTX/KTX2, ASTC, WebP, AVIF, HEIC, JPEG XL, Clip Studio `.clip`, Procreate, Affinity, Alias PIX, Utah RLE, MIFF, Khoros VIFF, Amiga `.info`, Atari DEGAS, C64 Koala, ZX Spectrum `.scr`, Xbox `.xpr`, Godot `.stex`/`.ctex`, Doom 3 `.bimage`, X11 `.xwd`, TTF/OTF/TTC/WOFF/WOFF2, CR3/NEF/ARW/RAF/RW2/DNG |
+| 3D models & CAD | OBJ, STL, PLY, 3DS, FBX, GLB/glTF, USD/USDC/USDZ, COLLADA, Blender, Cinema 4D, ZBrush `.ztl`/`.zpr`, Granny2 `.gr2`, STEP/IGES, Parasolid `.x_t`/`.x_b`, ACIS `.sat`/`.sab`, SolidWorks, Inventor, Solid Edge, SpaceClaim, DWG/DXF, Autodesk DWF/DWFx, CLI slices, Abaqus `.inp`, ANSYS `.cdb`/`.cas`, Nastran `.nas`, X-Plane `.obj8`, Minecraft/Minetest schematics, PS1 `.tmd`, Westwood `.w3d`, Halo `.jms` |
+| Electronics & Waveforms | KiCad, Eagle (`.brd`/`.sch`/`.dru`), Altium, OrCAD (`.dsn`/`.olb`), QSPICE `.qsch`, Gerber/ODB++/IPC-2581, Microwind `.msk`, GDSII/OASIS, LEF/DEF, ISPD Bookshelf, Liberty `.lib`, Berkeley `.eqn`/`.pla`, Jam `.jbc`, Xilinx/Lattice/Altera bitstreams, VCD/FST/LXT2/VZT, Yokogawa `.wvf`, DSLogic `.dsl`, Sigrok `.sr`, Rigol/LeCroy/Tektronix scopes, Touchstone `.s1p`–`.s8p`, SigMF |
+| Documents, Data & Security | CSV, XLSX, ODS, DOCX, ODT, RTF, PPTX, ODP, Visio `.vsdx`, Apple iWork, EPUB, FB2, PDF, SQLite, Parquet, Arrow/Feather, Avro, HDF5, NetCDF, SAS/SPSS/Stata, Amazon Ion, UBJSON, Mozilla `.jsonlz4`, Quicken `.qif`, OFX/QFX, Mapbox `.mvt`, WKT/WKB, Core Audio `.caf`, WavPack `.wv`, SPC/VGM/VGZ/NSF/SID, Windows `.evtx`/Registry/Jump Lists, Safari `.binarycookies`, PKCS#12/JKS/X.509 |
+| Archives & Filesystems | ZIP/ZIP64 (Deflate, BZip2, LZMA, Zstd, XZ), TAR, 7z (LZMA/LZMA2/BCJ2), RAR4/RAR5, CAB (Stored/MSZIP/LZX), DMG (Zlib/BZ2/LZFSE/LZMA), WIM, ISO9660/UDF, FAT12/16/32, exFAT, NTFS, ext2/3/4, HFS+, SquashFS, ROMFS, CramFS, QCOW2/VMDK/VDI/VHDX, ALZ, ZOO, ARC, StuffIt `.sit` |
+| Game archives | PK3 / PK4 / IWD, Quake/SiN PAK, GTA IMG, Silkroad PK2, Valve VPK & Steam GCF, Blizzard MPQ, Bethesda BSA/BA2, Nintendo SARC/SZS & NARC, BioWare ERF/RIM/KEY+BIF, Doom/Quake/Half-Life WAD, Ensemble BAR/DRS, Heroes III LOD |
 
 Depth varies. The common formats get a full viewer, while many of the rarer ones are inspectors
 that show a file's header, structure and metadata rather than rendering it.
@@ -129,15 +136,13 @@ Most formats are decoded by Explorer2's own code, and the Linux build reads ever
 `testdata/` that the Windows build reads, except the ones that need what is listed here. What
 Windows itself decodes is left out on Linux, and those files are turned down:
 
-- PNG and JPEG data inside other formats, which Windows decodes with WIC: PNG frames in animated
-  cursors, DICOM images with JPEG-compressed pixels, OpenRaster layers, embedded PNG, JPEG,
-  JPEG 2000 and JPEG XL images, and the HEIF and AVIF items Explorer2's own decoders leave to WIC
-- H.264 and the HEVC streams that need Media Foundation (`.avci`, some HEIF files)
-- font specimens and WOFF2 fonts (GDI, DirectWrite), and EMF / WMF metafiles (GDI)
+- JPEG data inside other formats where WIC is used (DICOM images with JPEG-compressed pixels,
+  embedded JPEG / JPEG 2000 streams), and lossy/inter AVIF and HEIF items that Explorer2's pure-C++
+  intra decoders hand off to Media Foundation / WIC
+- EMF / WMF metafiles (GDI)
 - Windows 10 compressed Prefetch files (the decompressor is in `ntdll.dll`)
-- PDF (Windows' own PDF renderer)
-- unpacking CAB archives (SetupAPI), and RAR and 7z entries that need 7-Zip or UnRAR. Listing
-  these archives works.
+- RAR4 (`unpack29`) entries and exotic 7z codecs that need 7-Zip or UnRAR (ZIP/ZIP64, CAB, RAR5,
+  7z LZMA/LZMA2/BCJ2, DMG LZFSE/LZMA/Zlib/BZip2, WOFF2/Brotli and PNG unpack natively in pure C++).
 
 Certificates are shown as their ASN.1 structure instead of CryptoAPI's decoded fields. Legacy
 8-bit text that Windows decodes with the system code page is decoded as Windows-1252.

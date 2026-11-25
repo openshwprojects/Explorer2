@@ -2,10 +2,11 @@
 // VdiDisk.h — VirtualBox VDI virtual disk reader (.vdi — 0xBEDA107F).
 
 #include "../common/ArchiveFormatCommon.h"
+#include "../common/VirtualDiskCommon.h"
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
 inline bool BuildVdiDiskReader(
     const uint8_t* data,
@@ -15,7 +16,7 @@ inline bool BuildVdiDiskReader(
     outReader = {};
     if (!data || size < 512) return false;
 
-    // 5. VirtualBox VDI (0xBEDA107F at offset 64)
+    // VirtualBox VDI (0xBEDA107F at offset 64)
     if (size >= 400 && RdU32LE(data + 64) == 0xBEDA107Fu) {
         uint32_t offsetBlocks = RdU32LE(data + 340);
         uint32_t offsetData   = RdU32LE(data + 344);
@@ -27,7 +28,7 @@ inline bool BuildVdiDiskReader(
         outReader.virtualSize = virtSize;
         outReader.formatName  = L"VirtualBox VDI Disk";
         outReader.readBytes = [=](uint64_t diskOff, uint8_t* dst, size_t len) -> bool {
-            if (diskOff + len > virtSize) return false;
+            if (diskOff > virtSize || len > virtSize - diskOff) return false;
             size_t done = 0;
             while (done < len) {
                 uint64_t cur = diskOff + done;
@@ -35,13 +36,16 @@ inline bool BuildVdiDiskReader(
                 uint64_t offInBlk = cur % blockSize;
                 size_t chunk = static_cast<size_t>(std::min<uint64_t>(len - done, blockSize - offInBlk));
                 bool filled = false;
-                if (blkIdx < blocksInHdd && offsetBlocks + (blkIdx + 1) * 4 <= size) {
-                    uint32_t physBlk = RdU32LE(data + static_cast<size_t>(offsetBlocks + blkIdx * 4));
+                if (blkIdx < blocksInHdd && (blkIdx + 1ULL) * 4ULL <= size - offsetBlocks) {
+                    uint32_t physBlk = RdU32LE(data + static_cast<size_t>(offsetBlocks + blkIdx * 4ULL));
                     if (physBlk < 0xFFFFFFFEu) {
-                        uint64_t phys = static_cast<uint64_t>(offsetData) + static_cast<uint64_t>(physBlk) * blockSize + offInBlk;
-                        if (phys + chunk <= size) {
-                            std::memcpy(dst + done, data + static_cast<size_t>(phys), chunk);
-                            filled = true;
+                        uint64_t blkOff = static_cast<uint64_t>(physBlk) * blockSize;
+                        if (blkOff <= size - offsetData && offInBlk <= size - offsetData - blkOff) {
+                            uint64_t phys = static_cast<uint64_t>(offsetData) + blkOff + offInBlk;
+                            if (phys <= size && chunk <= size - static_cast<size_t>(phys)) {
+                                std::memcpy(dst + done, data + static_cast<size_t>(phys), chunk);
+                                filled = true;
+                            }
                         }
                     }
                 }
@@ -56,7 +60,7 @@ inline bool BuildVdiDiskReader(
     return false;
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool ParseOrExtractVdiDisk(
     const uint8_t* data,
@@ -65,9 +69,9 @@ inline bool ParseOrExtractVdiDisk(
     const std::wstring* extractTargetNorm = nullptr,
     std::vector<uint8_t>* outExtracted = nullptr)
 {
-    DetailArc100::VirtualDiskReader reader;
-    if (!DetailArc100::BuildVdiDiskReader(data, size, reader)) return false;
-    return DetailArc100::InspectOrExtractVirtualDiskReader(reader, size, outInfo, extractTargetNorm, outExtracted);
+    DetailDiskAndGameArc::VirtualDiskReader reader;
+    if (!DetailDiskAndGameArc::BuildVdiDiskReader(data, size, reader)) return false;
+    return DetailDiskAndGameArc::InspectOrExtractVirtualDiskReader(reader, size, outInfo, extractTargetNorm, outExtracted);
 }
 
 inline bool InspectVdiDisk(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {

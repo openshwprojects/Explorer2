@@ -1,5 +1,6 @@
 #pragma once
 #include "../../ByteIO.h"
+#include "../../ReaderTextUtils.h"
 #include "../common/MeshBuild3D.h"
 // LDrawCad.h — Zero-dependency C++20 LDraw LEGO CAD Model & Multi-Part Document (.ldr, .mpd) reader.
 
@@ -22,91 +23,14 @@ using ::Explorer2::ByteIO::RdU64BE;
 using ::Explorer2::ByteIO::RdF32BE;
 using ::Explorer2::ByteIO::RdF64BE;
 
-inline std::string_view TrimSv(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) s.remove_prefix(1);
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.remove_suffix(1);
-    return s;
-}
-
-inline std::string ToLowerStr(std::string_view s) {
-    std::string out(s);
-    for (char& c : out) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return out;
-}
-
-inline std::string ToUpperStr(std::string_view s) {
-    std::string out(s);
-    for (char& c : out) {
-        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    }
-    return out;
-}
-
-inline bool NextTokenSv(std::string_view& line, std::string_view& outTok) {
-    while (!line.empty() && (line.front() == ' ' || line.front() == '\t' || line.front() == '\r')) line.remove_prefix(1);
-    if (line.empty()) return false;
-    size_t i = 0;
-    while (i < line.size() && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') ++i;
-    outTok = line.substr(0, i);
-    line.remove_prefix(i);
-    return true;
-}
-
-inline bool ParseFloatSv(std::string_view tok, float& outVal) {
-    tok = TrimSv(tok);
-    if (tok.empty()) return false;
-    if (tok.front() == '+') tok.remove_prefix(1);
-    if (tok.empty()) return false;
-    float v = 0.0f;
-    auto res = std::from_chars(tok.data(), tok.data() + tok.size(), v);
-    if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size() || !std::isfinite(v)) return false;
-    outVal = v;
-    return true;
-}
-
-inline bool ParseDoubleSv(std::string_view tok, double& outVal) {
-    tok = TrimSv(tok);
-    if (tok.empty()) return false;
-    if (tok.front() == '+') tok.remove_prefix(1);
-    if (tok.empty()) return false;
-    double v = 0.0;
-    auto res = std::from_chars(tok.data(), tok.data() + tok.size(), v);
-    if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size() || !std::isfinite(v)) return false;
-    outVal = v;
-    return true;
-}
-
-inline bool ParseIntSv(std::string_view tok, int& outVal) {
-    tok = TrimSv(tok);
-    if (tok.empty()) return false;
-    if (tok.front() == '+') tok.remove_prefix(1);
-    if (tok.size() >= 3 && tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
-        uint32_t u = 0;
-        auto res = std::from_chars(tok.data() + 2, tok.data() + tok.size(), u, 16);
-        if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size()) return false;
-        outVal = static_cast<int>(u);
-        return true;
-    }
-    int v = 0;
-    auto res = std::from_chars(tok.data(), tok.data() + tok.size(), v, 10);
-    if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size()) return false;
-    outVal = v;
-    return true;
-}
-
-inline bool IsSafeRelativeSubFile(std::string_view rel) {
-    if (rel.empty() || rel.size() > 260) return false;
-    if (rel.front() == '/' || rel.front() == '\\') return false;
-    if (rel.find(':') != std::string_view::npos) return false;
-    if (rel.find("..") != std::string_view::npos) return false;
-    for (char c : rel) {
-        unsigned char uc = static_cast<unsigned char>(c);
-        if (uc < 32u) return false;
-    }
-    return true;
-}
+using ::Explorer2::ReaderText::TrimSv;
+inline std::string ToLowerStr(std::string_view s) { return ::Explorer2::ReaderText::ToLowerAscii(s); }
+inline std::string ToUpperStr(std::string_view s) { return ::Explorer2::ReaderText::ToUpperAscii(s); }
+using ::Explorer2::ReaderText::NextTokenSv;
+using ::Explorer2::ReaderText::ParseFloatSv;
+using ::Explorer2::ReaderText::ParseDoubleSv;
+using ::Explorer2::ReaderText::ParseIntSv;
+using ::Explorer2::ReaderText::IsSafeRelativeSubFile;
 
 // ============================================================================
 // 1. LDraw LEGO CAD (.ldr, .mpd) Helpers

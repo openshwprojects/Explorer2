@@ -6,12 +6,8 @@ namespace Formats {
 
 namespace DetailLeCroyTrc {
 
-inline void DrawBoxRect(ParsedEdaBoard& out, float x0, float y0, float x1, float y1, float strokeW, EdaLayerId lid, int netId = 0) {
-    out.traces.push_back({ x0, y0, x1, y0, strokeW, lid, netId });
-    out.traces.push_back({ x1, y0, x1, y1, strokeW, lid, netId });
-    out.traces.push_back({ x1, y1, x0, y1, strokeW, lid, netId });
-    out.traces.push_back({ x0, y1, x0, y0, strokeW, lid, netId });
-}
+using ::Explorer2::DrawEdaBoxRect;
+inline void DrawBoxRect(ParsedEdaBoard& out, float x0, float y0, float x1, float y1, float strokeW, EdaLayerId lid, int netId = 0) { DrawEdaBoxRect(out, x0, y0, x1, y1, strokeW, lid, netId); }
 
 inline void DrawScopeGraticule(ParsedEdaBoard& out, float x0, float y0, float w, float h, int nx = 10, int ny = 8) {
     DrawBoxRect(out, x0, y0, x0 + w, y0 + h, 0.35f, EdaLayerId::EdgeCuts, 0);

@@ -3563,16 +3563,22 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
     m_solidBrush->SetColor(HexColor(0xF5F6F7));
     m_rt->FillRectangle(rect, m_solidBrush);
 
+    // Which folders are being scanned right now, asked once for the whole list. (The engine was asked about
+    // each folder on its own, three times in every paint: 36,000 lock round trips for a folder with 12,000
+    // subfolders, against the four scan workers.)
+    std::vector<char> inFlightNow;
+    m_fileEngine.GetFoldersInFlight(m_items, inFlightNow);
+
     // Compute total known directory size & folder scanning progress
     uint64_t totalBytes = 0;
     int totalFolders = 0;
     int doneFolders = 0;
-    for (const auto& it : m_items) {
+    for (size_t i = 0; i < m_items.size(); ++i) {
+        const FileEntry& it = m_items[i];
         totalBytes += it.size;
         if (it.isDirectory) {
             ++totalFolders;
-            bool inFlight = m_fileEngine.IsFolderInFlight(it.normKey);
-            if (!inFlight && !it.sizeStr.empty() && it.sizeStr != L"...") {
+            if (!inFlightNow[i] && !it.sizeStr.empty() && it.sizeStr != L"...") {
                 ++doneFolders;
             }
         }
@@ -3875,12 +3881,13 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
                     continue;
                 }
 
-                // It's a nested subfolder — check if we can subdivide further (up to depth 3)
+                // It's a nested subfolder — check if we can subdivide further (up to depth 3). Its children are
+                // asked for only when the block has room for them: the list is copied under the engine's lock
                 std::vector<TreemapChildNode> subChildren;
-                bool hasSub = (depth < 3) && !c.normKey.empty() &&
+                bool hasSub = (depth < 3) && cw >= 28.0f && ch >= 24.0f && !c.normKey.empty() &&
                               m_fileEngine.GetFolderTreemapChildren(c.normKey, subChildren) &&
                               !subChildren.empty();
-                if (!hasSub || cw < 28.0f || ch < 24.0f) {
+                if (!hasSub) {
                     drawLeafBlock(cr, nodeCol, c.name, c.size, false);
                     continue;
                 }
@@ -3922,7 +3929,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
         topInputs.reserve(m_items.size());
         for (int i = 0; i < static_cast<int>(m_items.size()); ++i) {
             const FileEntry& it = m_items[i];
-            bool inFlight = it.isDirectory && (m_fileEngine.IsFolderInFlight(it.normKey) || it.sizeStr.empty() || it.sizeStr == L"...");
+            bool inFlight = it.isDirectory && (inFlightNow[i] != 0 || it.sizeStr.empty() || it.sizeStr == L"...");
             double w = 0.0;
             if (it.size > 0) {
                 w = static_cast<double>(it.size);
@@ -3951,7 +3958,7 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
             float h0 = r0.bottom - r0.top;
             if (w0 <= 0.5f || h0 <= 0.5f) continue;
 
-            bool folderInFlight = item.isDirectory && (m_fileEngine.IsFolderInFlight(item.normKey) || item.sizeStr.empty() || item.sizeStr == L"...");
+            bool folderInFlight = item.isDirectory && (inFlightNow[itemIdx] != 0 || item.sizeStr.empty() || item.sizeStr == L"...");
             uint32_t topCol = item.isDirectory ? 0x0078D7 : GetTreemapCategoryColor(item.ext, false, 0);
 
             // Register level-0 hit node first (so deeper children pushed later win reverse hit-test)
@@ -3973,8 +3980,11 @@ void ExplorerApp::DrawProportionsView(const D2D1_RECT_F& rect) {
                 continue;
             }
 
-            bool hasChildren1 = m_fileEngine.GetFolderTreemapChildren(item.normKey, children1) && !children1.empty();
-            if (!hasChildren1 || w0 < 24.0f || h0 < 22.0f) {
+            // A block with no room for children is drawn whole, and its list of children is not asked for (it
+            // was copied out of the engine for every folder, in every paint, before the block's size was looked at)
+            bool hasChildren1 = w0 >= 24.0f && h0 >= 22.0f &&
+                                m_fileEngine.GetFolderTreemapChildren(item.normKey, children1) && !children1.empty();
+            if (!hasChildren1) {
                 uint32_t col = folderInFlight ? 0x64748B : 0x475569;
                 drawLeafBlock(r0, col, L"\xD83D\xDCC1 " + item.displayName, item.size, folderInFlight);
                 continue;
@@ -5231,10 +5241,14 @@ void ExplorerApp::DrawPieChartView(const D2D1_RECT_F& rect) {
     int totalFolders = 0;
     int doneFolders = 0;
 
+    // Which folders are being scanned right now, asked once for the whole list (see DrawProportionsView)
+    std::vector<char> inFlightNow;
+    m_fileEngine.GetFoldersInFlight(m_items, inFlightNow);
+
     for (int i = 0; i < static_cast<int>(m_items.size()); ++i) {
         const auto& it = m_items[i];
         bool inFlight = it.isDirectory && !it.isDrive &&
-                        (m_fileEngine.IsFolderInFlight(it.normKey) || it.sizeStr.empty() || it.sizeStr == L"...");
+                        (inFlightNow[i] != 0 || it.sizeStr.empty() || it.sizeStr == L"...");
         if (it.isDirectory && !it.isDrive) {
             totalFolders++;
             if (!inFlight) doneFolders++;
@@ -8035,6 +8049,7 @@ void ExplorerApp::DrawBackupsView(const D2D1_RECT_F& rect) {
 
 void ExplorerApp::DrawTransfersView(const D2D1_RECT_F& rect) {
     const bool pl = (m_lang == Lang::PL);
+    const Strings& s = GetStrings(m_lang);
     const std::vector<TransferJobSnapshot> jobs = m_transfers.SnapshotJobs();
     const TransferAggregateTelemetry tel = m_transfers.GetTelemetry();
     const TransferConfig cfg = m_transfers.GetConfig();
@@ -8286,6 +8301,13 @@ void ExplorerApp::DrawTransfersView(const D2D1_RECT_F& rect) {
                 if (!j.errors.empty()) {
                     rowBtn(96.0f, (pl ? L"\x21BB Ponów (" : L"\x21BB Retry (") + std::to_wstring(j.errors.size()) + L")",
                            CMD_XFER_JOB_RETRY_FAILED, idStr);
+                    bool hasLocalErr = false;
+                    for (const auto& fe : j.errors) {
+                        if (!fe.srcPath.empty() && !FtpClient::IsFtpPath(fe.srcPath)) { hasLocalErr = true; break; }
+                    }
+                    if (hasLocalErr) {
+                        rowBtn(116.0f, s.btnInspectLocks, CMD_CTX_CHECK_LOCKS, idStr);
+                    }
                 }
                 if (!isTerminal && !isDelete) {
                     rowBtn(138.0f, TransferManager::FormatConflictPolicy(j.conflictPolicy, pl),
@@ -8408,12 +8430,16 @@ void ExplorerApp::DrawTransfersView(const D2D1_RECT_F& rect) {
             (selJob->errors.empty()
                 ? (pl ? L"  \x2022  BRAK BŁĘDÓW (0)" : L"  \x2022  ZERO ERRORS (0)")
                 : ((pl ? L"  \x2022  LISTA BŁĘDÓW (" : L"  \x2022  ERROR INSPECTOR (") + std::to_wstring(selJob->errors.size()) + L")")),
-            selJob->errors.empty() ? 0x059669 : 0xDC2626, false, 220.0f);
+            selJob->errors.empty() ? 0x059669 : 0xDC2626, false, selJob->errors.empty() ? 220.0f : 344.0f);
 
         if (!selJob->errors.empty()) {
+            const std::wstring selIdStr = std::to_wstring(selJob->id);
             DrawCardTinyButton(D2D1::RectF(leftX + availW - 208.0f, curY + 4.0f, leftX + availW - 8.0f, curY + 25.0f),
                                pl ? L"\x21BB Ponów błędne w tym zadaniu" : L"\x21BB Retry failed in job",
-                               CMD_XFER_JOB_RETRY_FAILED, std::to_wstring(selJob->id));
+                               CMD_XFER_JOB_RETRY_FAILED, selIdStr);
+            DrawCardTinyButton(D2D1::RectF(leftX + availW - 332.0f, curY + 4.0f, leftX + availW - 214.0f, curY + 25.0f),
+                               s.btnInspectLocks,
+                               CMD_CTX_CHECK_LOCKS, selIdStr);
         }
 
         float dy = curY + 35.0f;

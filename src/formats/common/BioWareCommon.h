@@ -1,7 +1,19 @@
 #pragma once
 // BioWareCommon.h — Shared BioWare Aurora/Odyssey resource table & binary I/O helpers.
-// Included inside namespace Explorer2.
+#if defined(E2_BIOWARE_TOP_LEVEL) || !defined(E2_DRACO_NOINLINE)
+#include "../../PlatformCompat.h"
+#include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <string>
+
+namespace Explorer2::Formats {
+#else
 namespace Formats {
+#endif
 namespace BioWareDetail {
 
 inline uint16_t BwU16(const uint8_t* p) { uint16_t v = 0; std::memcpy(&v, p, 2); return v; }
@@ -66,13 +78,14 @@ inline std::wstring ResTypeToExtension(uint16_t rt) {
     }
 }
 
-inline std::wstring ReadFixedResRef16(const uint8_t* p) {
+inline std::wstring ReadFixedResRef(const uint8_t* p, size_t maxChars) {
     std::wstring out;
-    out.reserve(16);
-    for (size_t i = 0; i < 16; ++i) {
+    out.reserve(maxChars);
+    for (size_t i = 0; i < maxChars; ++i) {
         uint8_t c = p[i];
         if (c == 0) break;
-        if (c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+        if (c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|') {
             return {};
         }
         out.push_back(static_cast<wchar_t>(std::tolower(c)));
@@ -81,5 +94,13 @@ inline std::wstring ReadFixedResRef16(const uint8_t* p) {
     return out;
 }
 
+inline std::wstring ReadFixedResRef16(const uint8_t* p) {
+    return ReadFixedResRef(p, 16);
+}
+
 } // namespace BioWareDetail
+#if defined(E2_BIOWARE_TOP_LEVEL) || !defined(E2_DRACO_NOINLINE)
+} // namespace Explorer2::Formats
+#else
 } // namespace Formats
+#endif

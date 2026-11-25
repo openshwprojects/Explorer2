@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailImg200 {
+namespace DetailVectorAndRawImg {
 
 // ============================================================================
 // 4. Panasonic Lumix RW2 12-bit 14-Pixel-per-16-Byte Sensor Unpacker
@@ -66,10 +66,10 @@ inline bool UnpackPanasonicRw2Sensor(
     return true;
 }
 
-} // namespace DetailImg200
+} // namespace DetailVectorAndRawImg
 
 inline bool DecodePanasonicRw2(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DetailImg200::ParseTiffRawIfds(data, size, L"Panasonic Lumix RW2 RAW (.rw2)", outInfo);
+    return DetailVectorAndRawImg::ParseTiffRawIfds(data, size, L"Panasonic Lumix RW2 RAW (.rw2)", outInfo);
 }
 
 } // namespace Formats

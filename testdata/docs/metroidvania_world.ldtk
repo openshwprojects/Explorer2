@@ -1,0 +1,42 @@
+{
+  "jsonVersion": "1.5.3",
+  "worldLayout": "GridVania",
+  "worldGridWidth": 256,
+  "worldGridHeight": 192,
+  "defs": {
+    "layers": [
+      { "identifier": "Collisions", "__type": "IntGrid", "gridSize": 16 }
+    ],
+    "entities": [
+      { "identifier": "SaveStatue", "width": 16, "height": 32, "maxCount": 4 }
+    ],
+    "tilesets": [
+      { "identifier": "CavernTiles", "pxWid": 256, "pxHei": 256, "relPath": "atlas/cavern.png" }
+    ]
+  },
+  "levels": [
+    {
+      "identifier": "Level_0_Entrance",
+      "worldX": 0,
+      "worldY": 0,
+      "pxWid": 512,
+      "pxHei": 384,
+      "layerInstances": [
+        {
+          "__identifier": "Entities",
+          "entityInstances": [
+            { "__identifier": "SaveStatue" }
+          ]
+        }
+      ]
+    },
+    {
+      "identifier": "Level_1_Crypt",
+      "worldX": 512,
+      "worldY": 0,
+      "pxWid": 768,
+      "pxHei": 384,
+      "layerInstances": []
+    }
+  ]
+}

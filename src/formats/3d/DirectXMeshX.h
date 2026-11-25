@@ -150,47 +150,47 @@ inline bool ParseDirectXMeshX(const uint8_t* data, size_t size, LoadedMesh3D& me
         };
 
         while (pos + 2 <= size) {
-            uint16_t tok = Detail3D200::RdU16LE(data + pos);
+            uint16_t tok = DetailMeshSciCad::RdU16LE(data + pos);
             pos += 2;
             if (tok == 1) { // TOKEN_NAME
                 if (pos + 4 > size) break;
-                uint32_t len = Detail3D200::RdU32LE(data + pos); pos += 4;
+                uint32_t len = DetailMeshSciCad::RdU32LE(data + pos); pos += 4;
                 if (pos + len > size) break;
                 std::string_view nm(reinterpret_cast<const char*>(data + pos), len);
                 pos += len;
                 if (!inTemplate && meshDepth < 0 && nm == "Mesh") pendingMesh = true;
             } else if (tok == 2) { // TOKEN_STRING
                 if (pos + 4 > size) break;
-                uint32_t len = Detail3D200::RdU32LE(data + pos); pos += 4;
+                uint32_t len = DetailMeshSciCad::RdU32LE(data + pos); pos += 4;
                 if (pos + len + 2 > size) break;
                 pos += len + 2; // string + terminator token
             } else if (tok == 3) { // TOKEN_INTEGER
                 if (pos + 4 > size) break;
-                int32_t v = static_cast<int32_t>(Detail3D200::RdU32LE(data + pos)); pos += 4;
+                int32_t v = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + pos)); pos += 4;
                 if (meshDepth >= 0 && braceDepth == meshDepth) meshInts.push_back(v);
             } else if (tok == 5) { // TOKEN_GUID
                 if (pos + 16 > size) break;
                 pos += 16;
             } else if (tok == 6) { // TOKEN_INTEGER_LIST
                 if (pos + 4 > size) break;
-                uint32_t cnt = Detail3D200::RdU32LE(data + pos); pos += 4;
+                uint32_t cnt = DetailMeshSciCad::RdU32LE(data + pos); pos += 4;
                 if (cnt > 4000000 || pos + static_cast<size_t>(cnt) * 4 > size) break;
                 if (meshDepth >= 0 && braceDepth == meshDepth) {
                     for (uint32_t i = 0; i < cnt; ++i) {
-                        meshInts.push_back(static_cast<int32_t>(Detail3D200::RdU32LE(data + pos + static_cast<size_t>(i) * 4)));
+                        meshInts.push_back(static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + pos + static_cast<size_t>(i) * 4)));
                     }
                 }
                 pos += static_cast<size_t>(cnt) * 4;
             } else if (tok == 7) { // TOKEN_FLOAT_LIST
                 if (pos + 4 > size) break;
-                uint32_t cnt = Detail3D200::RdU32LE(data + pos); pos += 4;
+                uint32_t cnt = DetailMeshSciCad::RdU32LE(data + pos); pos += 4;
                 size_t elemSz = isDouble ? 8 : 4;
                 if (cnt > 4000000 || pos + static_cast<size_t>(cnt) * elemSz > size) break;
                 if (meshDepth >= 0 && braceDepth == meshDepth) {
                     for (uint32_t i = 0; i < cnt; ++i) {
                         float fv = isDouble
-                            ? static_cast<float>(Detail3D200::RdF64LE(data + pos + static_cast<size_t>(i) * 8))
-                            : Detail3D200::RdF32LE(data + pos + static_cast<size_t>(i) * 4);
+                            ? static_cast<float>(DetailMeshSciCad::RdF64LE(data + pos + static_cast<size_t>(i) * 8))
+                            : DetailMeshSciCad::RdF32LE(data + pos + static_cast<size_t>(i) * 4);
                         meshFloats.push_back(fv);
                     }
                 }

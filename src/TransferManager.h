@@ -303,6 +303,11 @@ private:
     void ExecuteJobWorker(std::shared_ptr<InternalJob> job);
     void ExecuteFtpJobWorker(std::shared_ptr<InternalJob> job);
     void ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job);
+    void FinalizeWorkerJob(
+        InternalJob& job,
+        bool persistQueue,
+        const std::function<std::wstring(TransferJobState, uint64_t, size_t, double)>& formatSummary);
+    static void CollectUniqueSourceParentDirs(const std::vector<std::wstring>& sources, std::vector<std::wstring>& outDirs);
     void RunRecycleBinPhase(InternalJob& job);
     bool CheckPreFlightDiskSpaceOrAutoPause(InternalJob& job);
     void SaveQueueState();

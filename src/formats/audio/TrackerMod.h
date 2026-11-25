@@ -2,7 +2,7 @@
 // TrackerMod.h — ProTracker / Amiga Module (.mod) Inspector
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // ============================================================================
 // 4. Demoscene Tracker Modules (.mod / .xm / .s3m / .it)
@@ -55,12 +55,12 @@ inline bool ParseTrackerMod(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
     for (int i = 0; i < 31; ++i) {
         const uint8_t* sp = raw.data() + 20 + i * 30;
         std::wstring sName = FixedAsciiField(sp, 22);
-        uint32_t lenBytes = static_cast<uint32_t>(DetailSys100::RdU16BE(sp + 22)) * 2u;
+        uint32_t lenBytes = static_cast<uint32_t>(DetailBinarySysDoc::RdU16BE(sp + 22)) * 2u;
         int ft = sp[24] & 0x0F;
         if (ft >= 8) ft -= 16;
         uint8_t vol = sp[25];
-        uint32_t loopStart = static_cast<uint32_t>(DetailSys100::RdU16BE(sp + 26)) * 2u;
-        uint32_t loopLen   = static_cast<uint32_t>(DetailSys100::RdU16BE(sp + 28)) * 2u;
+        uint32_t loopStart = static_cast<uint32_t>(DetailBinarySysDoc::RdU16BE(sp + 26)) * 2u;
+        uint32_t loopLen   = static_cast<uint32_t>(DetailBinarySysDoc::RdU16BE(sp + 28)) * 2u;
         if (!sName.empty() || lenBytes > 0) {
             smp.rows.push_back({
                 std::to_wstring(i + 1), sName, std::to_wstring(lenBytes),
@@ -77,8 +77,8 @@ inline bool ParseTrackerMod(const std::vector<uint8_t>& raw, ParsedOfficeDocumen
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseTrackerModDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseTrackerMod(raw, out); }
+inline bool ParseTrackerModDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseTrackerMod(raw, out); }
 
 } // namespace Formats

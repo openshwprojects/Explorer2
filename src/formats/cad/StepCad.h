@@ -883,38 +883,7 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
     };
 
     // 6. Triangulate all ADVANCED_FACE & FACE_SURFACE B-Rep faces (including NURBS, Sphere, Torus & Assemblies)
-    auto evalStepNurbsBasis = [](int n, int deg, const std::vector<double>& U, double t, std::vector<double>& outB) {
-        outB.assign(static_cast<size_t>(n), 0.0);
-        int order = deg + 1;
-        double tMin = U[static_cast<size_t>(deg)];
-        double tMax = U[static_cast<size_t>(n)];
-        if (t <= tMin) t = tMin;
-        if (t >= tMax) { outB[static_cast<size_t>(n - 1)] = 1.0; return; }
-        int span = deg;
-        for (int i = deg; i < n; ++i) {
-            if (t >= U[static_cast<size_t>(i)] && t < U[static_cast<size_t>(i + 1)]) { span = i; break; }
-        }
-        std::vector<double> N(static_cast<size_t>(order), 0.0);
-        std::vector<double> L(static_cast<size_t>(order), 0.0);
-        std::vector<double> R(static_cast<size_t>(order), 0.0);
-        N[0] = 1.0;
-        for (int j = 1; j <= deg; ++j) {
-            L[static_cast<size_t>(j)] = t - U[static_cast<size_t>(span + 1 - j)];
-            R[static_cast<size_t>(j)] = U[static_cast<size_t>(span + j)] - t;
-            double saved = 0.0;
-            for (int r = 0; r < j; ++r) {
-                double denom = R[static_cast<size_t>(r + 1)] + L[static_cast<size_t>(j - r)];
-                double tmp = (std::fabs(denom) > 1e-15) ? (N[static_cast<size_t>(r)] / denom) : 0.0;
-                N[static_cast<size_t>(r)] = saved + R[static_cast<size_t>(r + 1)] * tmp;
-                saved = L[static_cast<size_t>(j - r)] * tmp;
-            }
-            N[static_cast<size_t>(j)] = saved;
-        }
-        for (int j = 0; j <= deg; ++j) {
-            int idx = span - deg + j;
-            if (idx >= 0 && idx < n) outB[static_cast<size_t>(idx)] = N[static_cast<size_t>(j)];
-        }
-    };
+    const auto& evalStepNurbsBasis = MeshBuild3D::EvalNurbsBasisAll;
 
     auto expandMultKnots = [](int nCtrl, int deg, const std::vector<double>& mults, const std::vector<double>& vals) -> std::vector<double> {
         std::vector<double> U;
@@ -1153,7 +1122,7 @@ inline bool ParseStepCadMesh(std::string_view sv, LoadedMesh3D& mesh) {
                 // A surface without weights gets a grid of 1s, so that the loop below always reads the weight from
                 // the grid. With `hasRat ? weight : 1.0` in it, MSVC 19.36 /O2 splits the loop in two and drops the
                 // x and y sums from the weighted copy: every rational surface came out flat on a line
-                // (testdata/samples70/step_nurbs_airfoil.step). Multiplying by 1.0 changes no result.
+                // (testdata/cad/step_nurbs_airfoil.step). Multiplying by 1.0 changes no result.
                 bool hasRat = static_cast<int>(weightGrid.size()) == nU;
                 for (const auto& wRow : weightGrid) if (static_cast<int>(wRow.size()) != nV) hasRat = false;
                 if (!hasRat) weightGrid.assign(static_cast<size_t>(nU), std::vector<double>(static_cast<size_t>(nV), 1.0));

@@ -13,9 +13,9 @@ inline bool ParseSpecctraSessionSesBoard(std::string_view sv, const std::wstring
         sv.remove_prefix(3);
     }
 
-    // #62. Specctra Autorouter Routed Session (.ses)
+    // Specctra Autorouter Routed Session (.ses)
     if (ext == L".ses") {
-        using namespace DetailKiCadSymSesPos;
+        using namespace DetailBoardPlacementEda;
         if (sv.find("(session") == std::string_view::npos && sv.find("(routes") == std::string_view::npos) {
             return false;
         }
@@ -156,7 +156,7 @@ inline bool ParseSpecctraSessionSesBoard(std::string_view sv, const std::wstring
                                         DetailSpecctra::AtomFloat(wsub.list[7], cx) && DetailSpecctra::AtomFloat(wsub.list[8], cy))
                                     {
                                         float wMm = std::clamp(static_cast<float>(wRaw * rScale), 0.10f, 4.0f);
-                                        DetailEda100::AddTessellatedArc(
+                                        DetailSiliconAndBusEda::AddTessellatedArc(
                                             out, static_cast<float>(sx * rScale), static_cast<float>(sy * rScale),
                                             static_cast<float>(ex * rScale), static_cast<float>(ey * rScale),
                                             static_cast<float>(cx * rScale), static_cast<float>(cy * rScale),
@@ -203,7 +203,7 @@ inline bool ParseSpecctraSessionSesBoard(std::string_view sv, const std::wstring
                             comp.widthMm = 2.4f; comp.lengthMm = 1.6f; comp.heightMm = 1.0f;
                             comp.category = ClassifyComponent(comp.refDes, comp.footprint, comp.widthMm, comp.lengthMm, comp.heightMm, comp.pinCount);
                             EdaLayerId silkL = comp.bottomSide ? EdaLayerId::BottomSilk : EdaLayerId::TopSilk;
-                            DetailEda100::AddRectOutline(out, comp.x, comp.y, comp.widthMm, comp.lengthMm, silkL, 0.16f);
+                            DetailSiliconAndBusEda::AddRectOutline(out, comp.x, comp.y, comp.widthMm, comp.lengthMm, silkL, 0.16f);
                             out.labels.push_back({ comp.x, comp.y, 0.85f, silkL, comp.refDes });
                             out.components.push_back(std::move(comp));
                         }

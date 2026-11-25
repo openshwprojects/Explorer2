@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 inline bool DecodeLhaLzs(const uint8_t* src, size_t compSize, uint64_t uncompSize, std::vector<uint8_t>& outBytes) {
     outBytes.clear();
@@ -213,10 +213,10 @@ inline bool ParseLhaArchive(const uint8_t* data, size_t size, ArchiveSummaryInfo
     return false;
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectLhaArchive(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseLhaArchive(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseLhaArchive(data, size, outInfo);
 }
 
 inline bool ExtractLhaArchiveEntry(
@@ -227,7 +227,7 @@ inline bool ExtractLhaArchiveEntry(
 {
     if (size >= 24 && data[2] == '-' && (data[3] == 'l' || data[3] == 'p') && data[6] == '-') {
         ArchiveSummaryInfo info;
-        if (DetailArc200::ParseLhaArchive(data, size, info)) {
+        if (DetailUnixAndLegacyArc::ParseLhaArchive(data, size, info)) {
             for (const auto& e : info.entries) {
                 if (!e.isDirectory && _wcsicmp(e.pathInArchive.c_str(), want.c_str()) == 0) {
                     if (e.rawDataOffset > size || e.compressedSize > size - static_cast<size_t>(e.rawDataOffset)) {
@@ -242,19 +242,19 @@ inline bool ExtractLhaArchiveEntry(
                         return true;
                     }
                     if (e.compressionMethod == 4 || e.compressionMethod == 5) {
-                        return DetailArc200::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 14u, 4u, outBytes);
+                        return DetailUnixAndLegacyArc::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 14u, 4u, outBytes);
                     }
                     if (e.compressionMethod == 6) {
-                        return DetailArc200::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 16u, 5u, outBytes);
+                        return DetailUnixAndLegacyArc::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 16u, 5u, outBytes);
                     }
                     if (e.compressionMethod == 7) {
-                        return DetailArc200::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 17u, 5u, outBytes);
+                        return DetailUnixAndLegacyArc::DecodeLhaArjBlockHuff(p, cLen, e.uncompressedSize, 17u, 5u, outBytes);
                     }
                     if (e.compressionMethod == 16) {
-                        return DetailArc200::DecodeLhaLzs(p, cLen, e.uncompressedSize, outBytes);
+                        return DetailUnixAndLegacyArc::DecodeLhaLzs(p, cLen, e.uncompressedSize, outBytes);
                     }
                     if (e.compressionMethod == 17) {
-                        return DetailArc200::DecodeLhaLz5(p, cLen, e.uncompressedSize, outBytes);
+                        return DetailUnixAndLegacyArc::DecodeLhaLz5(p, cLen, e.uncompressedSize, outBytes);
                     }
                     return false;
                 }

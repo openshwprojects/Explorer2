@@ -137,9 +137,17 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
                         for (const auto& sw : rc.subWords) {
                             if (sw == "nurbs" || sw == "rat" || sw == "rational") { isRat = true; break; }
                         }
+                        if (!std::isfinite(rc.subNums[0]) || !std::isfinite(rc.subNums[1]) ||
+                            rc.subNums[0] < 1.0 || rc.subNums[0] > 15.0 ||
+                            rc.subNums[1] < 1.0 || rc.subNums[1] > 15.0) {
+                            continue;
+                        }
                         int uDeg = static_cast<int>(std::llround(rc.subNums[0]));
                         int vDeg = static_cast<int>(std::llround(rc.subNums[1]));
-                        if (uDeg >= 1 && uDeg <= 15 && vDeg >= 1 && vDeg <= 15 && rc.subNums.size() >= 6) {
+                        if (uDeg >= 1 && uDeg <= 15 && vDeg >= 1 && vDeg <= 15 && rc.subNums.size() >= 6 &&
+                            std::isfinite(rc.subNums[2]) && std::isfinite(rc.subNums[3]) &&
+                            rc.subNums[2] >= 1.0 && rc.subNums[2] <= 256.0 &&
+                            rc.subNums[3] >= 1.0 && rc.subNums[3] <= 256.0) {
                             int nU = static_cast<int>(std::llround(rc.subNums[2]));
                             int nV = static_cast<int>(std::llround(rc.subNums[3]));
                             size_t sp = 4;
@@ -403,30 +411,38 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
         bool hasSabMagic = (size >= 15 && (std::memcmp(data, "ACIS BinaryFile", 15) == 0 ||
                                            std::memcmp(data, "ASM BinaryFile", 14) == 0));
         if (ext == L".sab" || hasSabMagic) {
-            if (!hasSabMagic || size < 31) return false;
+            if (!hasSabMagic || size < 28) return false;
             size_t magicLen = (std::memcmp(data, "ACIS BinaryFile", 15) == 0 ||
                               (size >= 15 && std::memcmp(data, "ASM BinaryFile ", 15) == 0)) ? 15 : 14;
-            if (magicLen + 16 > size) return false;
+            if (magicLen + 13 > size) return false;
 
-            int32_t acisVer     = static_cast<int32_t>(Detail3D200::RdU32LE(data + magicLen + 0));
-            int32_t numRecords  = static_cast<int32_t>(Detail3D200::RdU32LE(data + magicLen + 4));
-            int32_t numEntities = static_cast<int32_t>(Detail3D200::RdU32LE(data + magicLen + 8));
+            int32_t acisVer     = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + magicLen + 0));
+            int32_t numRecords  = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + magicLen + 4));
+            int32_t numEntities = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + magicLen + 8));
             (void)numEntities;
             if (acisVer < 100 || acisVer > 99999 || numRecords < 0) return false;
             mesh.formatName = L"Spatial ACIS Binary Solid (.sab)";
 
-            auto isIdentBytes = [&](size_t off, uint8_t len) -> bool {
-                if (len == 0 || len > 48 || off + len > size) return false;
-                for (uint8_t i = 0; i < len; ++i) {
+            auto isPrintableAsciiSpan = [&](size_t off, size_t len) -> bool {
+                if (len == 0 || len > 255 || off + len > size) return false;
+                for (size_t i = 0; i < len; ++i) {
                     uint8_t c = data[off + i];
-                    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                              (c >= '0' && c <= '9') || c == '-' || c == '_';
-                    if (!ok) return false;
+                    if (c < 0x20u || c > 0x7Eu) return false;
                 }
                 return true;
             };
 
+            // ACIS <= 207 uses 4x int32 header (16B); ACIS v208+ / ASM BinaryFile may encode hasHistory as 1B TAG_TRUE/TAG_FALSE (0x0A/0x0B) at +12
             size_t p = magicLen + 16;
+            if ((data[magicLen + 12] == 0x0Au || data[magicLen + 12] == 0x0Bu) &&
+                magicLen + 15 <= size && data[magicLen + 13] == 0x07u &&
+                isPrintableAsciiSpan(magicLen + 15, data[magicLen + 14]))
+            {
+                p = magicLen + 13;
+            } else if (magicLen + 16 > size) {
+                return false;
+            }
+
             int headerStringsRem = 3;
             int headerDoublesRem = 3;
             bool inHeader = true;
@@ -437,34 +453,65 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
             int32_t explicitIdx = -1;
             int braceDepth = 0;
 
+            auto recordBoolSense = [&](bool isTrue) {
+                if (inHeader) return;
+                if (braceDepth == 0) {
+                    if (cur.type == "face" || cur.type == "coedge" || cur.type == "edge") {
+                        bool hasSense = false;
+                        for (const auto& w : cur.words) {
+                            if (w == "forward" || w == "reversed") { hasSense = true; break; }
+                        }
+                        if (!hasSense) cur.words.push_back(isTrue ? "forward" : "reversed");
+                    }
+                } else if (cur.type.find("surface") != std::string::npos && isTrue && cur.subNums.empty()) {
+                    // In ACIS/ASM binary spline-surface subtype, rational flag before degree may be TAG_TRUE
+                    cur.subWords.push_back("nurbs");
+                }
+            };
+
+            auto handleStringToken = [&](std::string s) -> bool {
+                if (s == "End-of-ACIS-data" || s == "End-of-ASM-data") return false;
+                if (inHeader) {
+                    if (headerStringsRem > 0) --headerStringsRem;
+                    if (headerDoublesRem <= 0 && headerStringsRem <= 0) inHeader = false;
+                } else if (braceDepth == 0) {
+                    cur.words.push_back(std::move(s));
+                } else {
+                    cur.subWords.push_back(std::move(s));
+                }
+                return true;
+            };
+
             while (p < size && recs.size() < 200000) {
                 uint8_t tag = data[p++];
-                if (tag == 0x02) { // TAG_CHAR
+                if (tag == 0x01 || tag == 0x02) { // TAG_UCHAR / TAG_CHAR (1B)
                     if (p + 1 > size) break;
                     p += 1;
-                } else if (tag == 0x03) { // TAG_SHORT
+                } else if (tag == 0x03) { // TAG_SHORT (2B)
                     if (p + 2 > size) break;
+                    int16_t sv16 = ::Explorer2::ByteIO::RdI16LE(data + p);
                     p += 2;
-                } else if (tag == 0x04) { // TAG_LONG (int32)
+                    if (!inHeader && braceDepth > 0) cur.subNums.push_back(static_cast<double>(sv16));
+                } else if (tag == 0x04) { // TAG_LONG (4B int32)
                     if (p + 4 > size) break;
-                    int32_t iv = static_cast<int32_t>(Detail3D200::RdU32LE(data + p));
+                    int32_t iv = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + p));
                     p += 4;
                     if (!inHeader) {
                         if (braceDepth > 0) cur.subNums.push_back(static_cast<double>(iv));
                         else if (cur.type.empty()) explicitIdx = (iv < 0) ? -iv : iv;
                         else cur.nums.push_back(static_cast<double>(iv));
                     }
-                } else if (tag == 0x05) { // TAG_FLOAT
+                } else if (tag == 0x05) { // TAG_FLOAT (4B)
                     if (p + 4 > size) break;
-                    double dv = static_cast<double>(Detail3D200::RdF32LE(data + p));
+                    double dv = static_cast<double>(DetailMeshSciCad::RdF32LE(data + p));
                     p += 4;
                     if (!inHeader) {
                         if (braceDepth == 0) cur.nums.push_back(dv);
                         else                 cur.subNums.push_back(dv);
                     }
-                } else if (tag == 0x06) { // TAG_DOUBLE
+                } else if (tag == 0x06) { // TAG_DOUBLE (8B)
                     if (p + 8 > size) break;
-                    double dv = Detail3D200::RdF64LE(data + p);
+                    double dv = DetailMeshSciCad::RdF64LE(data + p);
                     p += 8;
                     if (inHeader) {
                         if (--headerDoublesRem <= 0 && headerStringsRem <= 0) inHeader = false;
@@ -478,118 +525,152 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
                     if (p + slen > size) break;
                     std::string s(reinterpret_cast<const char*>(data + p), slen);
                     p += slen;
-                    if (inHeader) {
-                        if (headerStringsRem > 0) --headerStringsRem;
-                        if (headerDoublesRem <= 0 && headerStringsRem <= 0) inHeader = false;
-                    } else if (braceDepth == 0 && (s == "forward" || s == "reversed")) {
-                        cur.words.push_back(std::move(s));
-                    }
+                    if (!handleStringToken(std::move(s))) break;
                 } else if (tag == 0x08) { // TAG_UTF8_U16
                     if (p + 2 > size) break;
-                    uint16_t slen = Detail3D200::RdU16LE(data + p); p += 2;
+                    uint16_t slen = DetailMeshSciCad::RdU16LE(data + p); p += 2;
                     if (p + slen > size) break;
+                    std::string s(reinterpret_cast<const char*>(data + p), slen);
                     p += slen;
-                    if (inHeader && headerStringsRem > 0) --headerStringsRem;
+                    if (!handleStringToken(std::move(s))) break;
                 } else if (tag == 0x09) { // TAG_UTF8_U32
                     if (p + 4 > size) break;
-                    uint32_t slen = Detail3D200::RdU32LE(data + p); p += 4;
-                    if (slen > 1000000 || p + slen > size) break;
+                    uint32_t slen = DetailMeshSciCad::RdU32LE(data + p); p += 4;
+                    if (slen > 4000000u || p + slen > size) break;
+                    std::string s(reinterpret_cast<const char*>(data + p), slen);
                     p += slen;
-                    if (inHeader && headerStringsRem > 0) --headerStringsRem;
-                } else if (tag == 0x0A) { // TAG_TRUE (ACIS logical true: "forward" on face/coedge/edge)
-                    if (!inHeader && braceDepth == 0 &&
-                        (cur.type == "face" || cur.type == "coedge" || cur.type == "edge"))
-                    {
-                        bool hasSense = false;
-                        for (const auto& w : cur.words) if (w == "forward" || w == "reversed") hasSense = true;
-                        if (!hasSense) cur.words.push_back("forward");
-                    }
-                } else if (tag == 0x0B) { // TAG_FALSE (ACIS logical false: "reversed" on face/coedge/edge)
-                    if (!inHeader && braceDepth == 0 &&
-                        (cur.type == "face" || cur.type == "coedge" || cur.type == "edge"))
-                    {
-                        bool hasSense = false;
-                        for (const auto& w : cur.words) if (w == "forward" || w == "reversed") hasSense = true;
-                        if (!hasSense) cur.words.push_back("reversed");
-                    }
-                } else if (tag == 0x0C) { // TAG_POINTER ($idx)
+                    if (!handleStringToken(std::move(s))) break;
+                } else if (tag == 0x0A) { // TAG_TRUE (0B)
+                    recordBoolSense(true);
+                } else if (tag == 0x0B) { // TAG_FALSE (0B)
+                    recordBoolSense(false);
+                } else if (tag == 0x0C) { // TAG_POINTER ($idx, 4B)
                     if (p + 4 > size) break;
-                    int32_t ref = static_cast<int32_t>(Detail3D200::RdU32LE(data + p));
+                    int32_t ref = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + p));
                     p += 4;
                     inHeader = false;
                     if (braceDepth == 0) cur.ptrs.push_back(ref);
-                } else if (tag == 0x0D) { // TAG_IDENT
-                    if (p < size && isIdentBytes(p + 1, data[p])) {
-                        uint8_t slen = data[p++];
-                        std::string id(reinterpret_cast<const char*>(data + p), slen);
-                        p += slen;
-                        if (id == "End-of-ACIS-data" || id == "End-of-ASM-data") break;
-                        inHeader = false;
-                        if (braceDepth == 0) {
-                            if (cur.type.empty()) cur.type = std::move(id);
-                            else cur.words.push_back(std::move(id));
-                        } else {
-                            cur.subWords.push_back(std::move(id));
-                        }
-                    } else if (p + 8 <= size) {
-                        double dv = Detail3D200::RdF64LE(data + p);
-                        p += 8;
-                        if (inHeader) {
-                            if (--headerDoublesRem <= 0 && headerStringsRem <= 0) inHeader = false;
-                        } else if (braceDepth == 0) {
-                            cur.nums.push_back(dv);
-                        } else {
-                            cur.subNums.push_back(dv);
-                        }
+                } else if (tag == 0x0D) { // TAG_IDENT (1B len + chars)
+                    if (p >= size) break;
+                    uint8_t slen = data[p++];
+                    if (slen == 0 || p + slen > size) break;
+                    std::string id(reinterpret_cast<const char*>(data + p), slen);
+                    p += slen;
+                    if (id == "End-of-ACIS-data" || id == "End-of-ASM-data") break;
+                    if (id == "asmheader" && inHeader) continue;
+                    inHeader = false;
+                    if (braceDepth == 0) {
+                        if (cur.type.empty()) cur.type = std::move(id);
+                        else cur.words.push_back(std::move(id));
                     } else {
-                        break;
+                        cur.subWords.push_back(std::move(id));
                     }
-                } else if (tag == 0x0E) { // TAG_SUBIDENT
+                } else if (tag == 0x0E) { // TAG_SUBIDENT (1B len + chars)
                     if (p >= size) break;
                     uint8_t slen = data[p++];
                     if (p + slen > size) break;
                     std::string sub(reinterpret_cast<const char*>(data + p), slen);
                     p += slen;
-                    if (braceDepth == 0 && !cur.type.empty()) cur.type += "-" + sub;
+                    inHeader = false;
+                    if (braceDepth == 0) {
+                        if (cur.type.empty()) cur.type = std::move(sub);
+                        else cur.type += "-" + sub;
+                    } else {
+                        cur.subWords.push_back(std::move(sub));
+                    }
                 } else if (tag == 0x0F) { // TAG_SUBTYPE_OPEN '{'
+                    inHeader = false;
                     ++braceDepth;
                 } else if (tag == 0x10) { // TAG_SUBTYPE_CLOSE '}'
                     if (braceDepth > 0) --braceDepth;
                 } else if (tag == 0x11) { // TAG_TERMINATOR '#'
-                    inHeader = false;
+                    if (inHeader) {
+                        inHeader = false;
+                        cur = AcisRawRec{};
+                        explicitIdx = -1;
+                        continue;
+                    }
                     braceDepth = 0;
-                    if (!cur.type.empty()) {
+                    if (!cur.type.empty() && cur.type != "asmheader") {
                         int32_t idx = (explicitIdx >= 0 && explicitIdx < 200000) ? explicitIdx : nextSeqIdx;
                         nextSeqIdx = std::max(nextSeqIdx, idx + 1);
                         if (static_cast<size_t>(idx) >= recs.size()) recs.resize(static_cast<size_t>(idx) + 1);
                         recs[static_cast<size_t>(idx)] = std::move(cur);
+                    } else {
+                        ++nextSeqIdx;
                     }
                     cur = AcisRawRec{};
                     explicitIdx = -1;
-                } else if (tag == 0x13 || tag == 0x14) { // TAG_POSITION / TAG_VECTOR (3 IEEE-754 doubles)
+                } else if (tag == 0x12) { // TAG_UTF16_U8 / short wide string (1B char count * 2B)
+                    if (p >= size) break;
+                    uint8_t wlen = data[p++];
+                    if (p + static_cast<size_t>(wlen) * 2u > size) break;
+                    p += static_cast<size_t>(wlen) * 2u;
+                } else if (tag == 0x13 || tag == 0x14) { // TAG_POSITION / TAG_VECTOR (3 IEEE-754 doubles = 24B)
                     if (p + 24 > size) break;
                     inHeader = false;
-                    double d0 = Detail3D200::RdF64LE(data + p + 0);
-                    double d1 = Detail3D200::RdF64LE(data + p + 8);
-                    double d2 = Detail3D200::RdF64LE(data + p + 16);
+                    double d0 = DetailMeshSciCad::RdF64LE(data + p + 0);
+                    double d1 = DetailMeshSciCad::RdF64LE(data + p + 8);
+                    double d2 = DetailMeshSciCad::RdF64LE(data + p + 16);
                     p += 24;
                     if (braceDepth == 0) {
                         cur.nums.push_back(d0); cur.nums.push_back(d1); cur.nums.push_back(d2);
                     } else {
                         cur.subNums.push_back(d0); cur.subNums.push_back(d1); cur.subNums.push_back(d2);
                     }
-                } else if (tag == 0x15) { // TAG_ENUM
+                } else if (tag == 0x15) { // TAG_ENUM (4B int32 enum in ACIS v200+/ASM, or 1B-counted ident in legacy writers)
                     if (p >= size) break;
-                    if (isIdentBytes(p + 1, data[p])) {
-                        uint8_t slen = data[p++];
-                        std::string en(reinterpret_cast<const char*>(data + p), slen);
-                        p += slen;
-                        if (!inHeader && braceDepth == 0) cur.words.push_back(std::move(en));
+                    uint8_t candLen = data[p];
+                    bool isCountedEnumStr = (candLen >= 2 && candLen <= 32 && p + 1 + candLen < size &&
+                                             isPrintableAsciiSpan(p + 1, candLen) &&
+                                             data[p + 1 + candLen] >= 0x01u && data[p + 1 + candLen] <= 0x1Fu);
+                    if (isCountedEnumStr) {
+                        ++p;
+                        std::string en(reinterpret_cast<const char*>(data + p), candLen);
+                        p += candLen;
+                        if (!inHeader) {
+                            if (braceDepth == 0) cur.words.push_back(std::move(en));
+                            else cur.subWords.push_back(std::move(en));
+                        }
                     } else if (p + 4 <= size) {
+                        int32_t ev = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + p));
                         p += 4;
+                        if (!inHeader && braceDepth == 0 && (cur.type == "face" || cur.type == "coedge" || cur.type == "edge")) {
+                            bool hasSense = false;
+                            for (const auto& w : cur.words) if (w == "forward" || w == "reversed") hasSense = true;
+                            if (!hasSense && (ev == 0 || ev == 1)) {
+                                cur.words.push_back(ev == 0 ? "forward" : "reversed");
+                            }
+                        }
                     } else {
                         break;
                     }
+                } else if (tag == 0x16) { // TAG_INT64 (8B, ACIS/ASM 64-bit)
+                    if (p + 8 > size) break;
+                    int64_t iv64 = ::Explorer2::ByteIO::RdI64LE(data + p);
+                    p += 8;
+                    if (!inHeader) {
+                        if (braceDepth > 0) cur.subNums.push_back(static_cast<double>(iv64));
+                        else cur.nums.push_back(static_cast<double>(iv64));
+                    }
+                } else if (tag == 0x17) { // TAG_SUBTYPE_REF / entity subtype ID (4B)
+                    if (p + 4 > size) break;
+                    p += 4;
+                } else if (tag == 0x18) { // TAG_UTF16_U16 (2B char count * 2B)
+                    if (p + 2 > size) break;
+                    uint16_t wlen = DetailMeshSciCad::RdU16LE(data + p); p += 2;
+                    if (p + static_cast<size_t>(wlen) * 2u > size) break;
+                    p += static_cast<size_t>(wlen) * 2u;
+                } else if (tag == 0x19) { // TAG_UTF16_U32 (4B char count * 2B)
+                    if (p + 4 > size) break;
+                    uint32_t wlen = DetailMeshSciCad::RdU32LE(data + p); p += 4;
+                    if (wlen > 2000000u || p + static_cast<size_t>(wlen) * 2u > size) break;
+                    p += static_cast<size_t>(wlen) * 2u;
+                } else if (tag == 0x1A) { // TAG_TRANSFORM_IDENTITY / zero-byte marker
+                    // 0-byte tag
+                } else if (tag >= 0x1B && tag <= 0x1F) { // Extended ASM v220+ 4-byte numeric/flag tags
+                    if (p + 4 > size) break;
+                    p += 4;
                 } else {
                     break;
                 }
@@ -610,19 +691,22 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
             skipWs();
             if (pos >= sv.size()) return false;
 
-            // Validate ACIS ASCII header: either "<version 100..9999> <numRec> <numEnt> <flags>" OR "ACIS ..." / "ASM ..."
+            // Validate ACIS ASCII header: either "<version 100..99999> <numRec> <numEnt> <flags>" OR "ACIS ..." / "ASM ..."
             bool validHeader = false;
             if (sv[pos] >= '1' && sv[pos] <= '9') {
-                const char* hs = sv.data() + pos;
-                char* e1 = nullptr; long verInt = std::strtol(hs, &e1, 10);
-                char* e2 = nullptr; long nRec   = (e1 != hs) ? std::strtol(e1, &e2, 10) : -1;
-                char* e3 = nullptr; long nEnt   = (e2 != e1) ? std::strtol(e2, &e3, 10) : -1;
-                char* e4 = nullptr; long hFlg   = (e3 != e2) ? std::strtol(e3, &e4, 10) : -1;
-                (void)nEnt; (void)hFlg;
-                if (e4 != e3 && verInt >= 100 && verInt <= 99999 && nRec >= 0) {
+                size_t nl1 = sv.find('\n', pos);
+                std::string_view l1 = sv.substr(pos, (nl1 == std::string_view::npos ? sv.size() : nl1) - pos);
+                std::string_view rem = l1, tVer, tRec, tEnt, tFlg;
+                int64_t verInt = -1, nRec = -1, nEnt = -1, hFlg = -1;
+                if (ReaderText::NextTokenSv(rem, tVer) && ReaderText::ParseInt64Sv(tVer, verInt) &&
+                    ReaderText::NextTokenSv(rem, tRec) && ReaderText::ParseInt64Sv(tRec, nRec) &&
+                    ReaderText::NextTokenSv(rem, tEnt) && ReaderText::ParseInt64Sv(tEnt, nEnt) &&
+                    ReaderText::NextTokenSv(rem, tFlg) && ReaderText::ParseInt64Sv(tFlg, hFlg) &&
+                    verInt >= 100 && verInt <= 99999 && nRec >= 0)
+                {
+                    (void)nEnt; (void)hFlg;
                     validHeader = true;
                     // Advance past header line 1 (counts), plus optional line 2 (product strings) & line 3 (units/tolerances)
-                    size_t nl1 = sv.find('\n', static_cast<size_t>(e4 - sv.data()));
                     pos = (nl1 == std::string_view::npos) ? sv.size() : (nl1 + 1);
                     for (int hLine = 0; hLine < 2 && pos < sv.size(); ++hLine) {
                         size_t nl = sv.find('\n', pos);
@@ -631,19 +715,21 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
                         pos = (nl == std::string_view::npos) ? sv.size() : (nl + 1);
                     }
                 }
-            } else if (sv.substr(pos, 4) == "ACIS" || sv.substr(pos, 3) == "ASM") {
+            } else if (sv.substr(pos).starts_with("ACIS") || sv.substr(pos).starts_with("ASM")) {
                 validHeader = true;
                 size_t nl = sv.find('\n', pos);
                 pos = (nl == std::string_view::npos) ? sv.size() : (nl + 1);
                 // Skip optional unit/tolerance header line if it does not contain '#'
                 skipWs();
-                size_t nl2 = sv.find('\n', pos);
-                std::string_view l2 = sv.substr(pos, (nl2 == std::string_view::npos ? sv.size() : nl2) - pos);
-                if (l2.find('#') == std::string_view::npos && l2.find('$') == std::string_view::npos) {
-                    pos = (nl2 == std::string_view::npos) ? sv.size() : (nl2 + 1);
+                if (pos < sv.size()) {
+                    size_t nl2 = sv.find('\n', pos);
+                    std::string_view l2 = sv.substr(pos, (nl2 == std::string_view::npos ? sv.size() : nl2) - pos);
+                    if (l2.find('#') == std::string_view::npos && l2.find('$') == std::string_view::npos) {
+                        pos = (nl2 == std::string_view::npos) ? sv.size() : (nl2 + 1);
+                    }
                 }
             }
-            if (!validHeader || sv.find('#', pos) == std::string_view::npos) return false;
+            if (!validHeader || pos >= sv.size() || sv.find('#', pos) == std::string_view::npos) return false;
 
             mesh.formatName = L"Spatial ACIS Solid Model (.sat)";
 
@@ -657,6 +743,9 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
             auto isAcisWordChar = [](char c) -> bool {
                 return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                        (c >= '0' && c <= '9') || c == '-' || c == '_';
+            };
+            auto isAcisDelim = [](char c) -> bool {
+                return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '#' || c == '{' || c == '}';
             };
 
             while (pos < sv.size() && recs.size() < 200000) {
@@ -684,13 +773,13 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
                 // Counted string literal: @<len> <chars>
                 if (ch == '@') {
                     ++pos;
-                    const char* sp = sv.data() + pos;
-                    char* ep = nullptr;
-                    long slen = std::strtol(sp, &ep, 10);
-                    if (ep != sp && slen >= 0) {
-                        pos = static_cast<size_t>(ep - sv.data());
+                    size_t dEnd = pos;
+                    while (dEnd < sv.size() && sv[dEnd] >= '0' && sv[dEnd] <= '9') ++dEnd;
+                    int64_t slen = -1;
+                    if (dEnd > pos && ReaderText::ParseInt64Sv(sv.substr(pos, dEnd - pos), slen) && slen >= 0) {
+                        pos = dEnd;
                         if (pos < sv.size() && (sv[pos] == ' ' || sv[pos] == '\t')) ++pos;
-                        size_t adv = std::min<size_t>(static_cast<size_t>(slen), sv.size() - pos);
+                        size_t adv = std::min<size_t>(static_cast<size_t>(std::min<int64_t>(slen, 1000000)), sv.size() - pos);
                         std::string lit(sv.substr(pos, adv));
                         pos += adv;
                         if (braceDepth == 0 && (lit == "forward" || lit == "reversed")) {
@@ -704,11 +793,14 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
                 // Entity pointer reference: $<int>
                 if (ch == '$') {
                     ++pos;
-                    const char* sp = sv.data() + pos;
-                    char* ep = nullptr;
-                    long ref = std::strtol(sp, &ep, 10);
-                    if (ep != sp) {
-                        pos = static_cast<size_t>(ep - sv.data());
+                    size_t dEnd = pos;
+                    if (dEnd < sv.size() && (sv[dEnd] == '-' || sv[dEnd] == '+')) ++dEnd;
+                    while (dEnd < sv.size() && sv[dEnd] >= '0' && sv[dEnd] <= '9') ++dEnd;
+                    int64_t ref = -1;
+                    if (dEnd > pos && ReaderText::ParseInt64Sv(sv.substr(pos, dEnd - pos), ref) &&
+                        ref >= -2147483647LL && ref <= 2147483647LL)
+                    {
+                        pos = dEnd;
                         if (braceDepth == 0) cur.ptrs.push_back(static_cast<int32_t>(ref));
                     }
                     atRecordStart = false;
@@ -719,24 +811,28 @@ inline bool ParseSpatialAcisSat(const uint8_t* data, size_t size, const std::wst
                 if (atRecordStart && braceDepth == 0 && ch == '-' && pos + 1 < sv.size() &&
                     sv[pos + 1] >= '0' && sv[pos + 1] <= '9')
                 {
-                    const char* sp = sv.data() + pos + 1;
-                    char* ep = nullptr;
-                    long rIdx = std::strtol(sp, &ep, 10);
-                    if (ep != sp && (ep == sv.data() + sv.size() || *ep == ' ' || *ep == '\t' || *ep == '\r' || *ep == '\n')) {
-                        explicitIdx = static_cast<int32_t>(rIdx);
-                        pos = static_cast<size_t>(ep - sv.data());
-                        atRecordStart = false;
-                        continue;
+                    size_t dEnd = pos + 1;
+                    while (dEnd < sv.size() && sv[dEnd] >= '0' && sv[dEnd] <= '9') ++dEnd;
+                    int64_t rIdx = -1;
+                    if (dEnd == sv.size() || sv[dEnd] == ' ' || sv[dEnd] == '\t' || sv[dEnd] == '\r' || sv[dEnd] == '\n') {
+                        if (ReaderText::ParseInt64Sv(sv.substr(pos + 1, dEnd - (pos + 1)), rIdx) &&
+                            rIdx >= 0 && rIdx < 200000)
+                        {
+                            explicitIdx = static_cast<int32_t>(rIdx);
+                            pos = dEnd;
+                            atRecordStart = false;
+                            continue;
+                        }
                     }
                 }
 
                 // Number token (float / int)
                 if ((ch >= '0' && ch <= '9') || ch == '-' || ch == '+' || ch == '.') {
-                    const char* sp = sv.data() + pos;
-                    char* ep = nullptr;
-                    double dv = std::strtod(sp, &ep);
-                    if (ep != sp && (ep == sv.data() + sv.size() || !isAcisWordChar(*ep))) {
-                        pos = static_cast<size_t>(ep - sv.data());
+                    size_t tokEnd = pos;
+                    while (tokEnd < sv.size() && !isAcisDelim(sv[tokEnd])) ++tokEnd;
+                    double dv = 0.0;
+                    if (tokEnd > pos && ReaderText::ParseDoubleSv(sv.substr(pos, tokEnd - pos), dv)) {
+                        pos = tokEnd;
                         if (std::isfinite(dv)) {
                             if (braceDepth == 0) cur.nums.push_back(dv);
                             else                 cur.subNums.push_back(dv);

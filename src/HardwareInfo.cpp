@@ -979,41 +979,9 @@ std::vector<HwPhysicalDisk> DiscoverLinuxPhysicalDisks() {
     return out;
 }
 
-// /proc/self/mounts writes a space, tab, newline or backslash inside a field as a backslash and three octal digits
-// ("/mnt/Moje\040Dokumenty"); this turns such a field back into the real text.
-std::string DecodeMountField(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 3 < s.size() &&
-            s[i + 1] >= '0' && s[i + 1] <= '3' &&
-            s[i + 2] >= '0' && s[i + 2] <= '7' &&
-            s[i + 3] >= '0' && s[i + 3] <= '7') {
-            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
-            i += 3;
-        } else {
-            out.push_back(s[i]);
-        }
-    }
-    return out;
-}
-
-bool IsNetworkFsType(const std::string& fsType) {
-    static const char* const kNetwork[] = {
-        "cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "davfs", "ceph", "glusterfs",
-        "afs", "coda", "ncpfs", "lustre", "gpfs", "beegfs"
-    };
-    for (const char* t : kNetwork) {
-        if (fsType == t) return true;
-    }
-    return false;
-}
-
-// FUSE file systems answer through a user-space daemon (sshfs, rclone, gvfs, ...), which may itself wait for a server.
-// "fuseblk" is left out: it is a local disk (NTFS through ntfs-3g, exFAT).
-bool IsFuseFsType(const std::string& fsType) {
-    return fsType == "fuse" || fsType == "sshfs" || fsType.rfind("fuse.", 0) == 0;
-}
+using LinuxStorage::DecodeMountField;
+using LinuxStorage::IsCoreNetworkFsType;
+using LinuxStorage::IsFuseDaemonFsType;
 
 // statvfs() of a network or FUSE mount waits for the server or the FUSE daemon, and a hard NFS mount whose server is
 // gone never returns. The call runs on a detached helper thread that owns everything it touches, and the caller waits
@@ -1102,8 +1070,8 @@ std::vector<HwLogicalVolume> DiscoverLinuxVolumes(bool askRemote) {
         if (!seenMnts.insert(mnt).second) continue;
 
         // Decided before anything touches the mount: a remote one is not even stat()ed for the duplicate check
-        const bool isNet = IsNetworkFsType(fstype);
-        const bool isFuse = !isNet && IsFuseFsType(fstype);
+        const bool isNet = IsCoreNetworkFsType(fstype);
+        const bool isFuse = !isNet && IsFuseDaemonFsType(fstype);
         HwLogicalVolume v;
         v.rootPath     = PathUtils::Utf8ToWide(mnt);
         v.label        = PathUtils::Utf8ToWide(dev);
@@ -1138,7 +1106,81 @@ std::vector<HwLogicalVolume> DiscoverLinuxVolumes(bool askRemote) {
     }
     return out;
 }
+#else
+void EnumerateWin32LogicalVolumes(std::vector<HwLogicalVolume>& outVolumes) {
+    wchar_t driveStrings[512] = {};
+    DWORD dLen = GetLogicalDriveStringsW(511, driveStrings);
+    const wchar_t* p = driveStrings;
+    while (p < driveStrings + dLen && *p) {
+        std::wstring root = p;
+        p += wcslen(p) + 1;
+
+        UINT dtype = GetDriveTypeW(root.c_str());
+        if (dtype == DRIVE_CDROM) continue;
+
+        HwLogicalVolume vol;
+        vol.rootPath = root;
+        if (dtype == DRIVE_FIXED) vol.driveTypeStr = L"Lokalny (Fixed)";
+        else if (dtype == DRIVE_REMOTE) vol.driveTypeStr = L"Sieciowy (NAS/SMB)";
+        else if (dtype == DRIVE_REMOVABLE) vol.driveTypeStr = L"Wymienny (USB)";
+        else vol.driveTypeStr = L"Wolumin";
+
+        if (dtype == DRIVE_REMOTE) {
+            // Never call GetDiskFreeSpaceExW on DRIVE_REMOTE synchronously (blocks for seconds on offline NAS shares!)
+            std::wstring netSubKey = L"Network\\" + std::wstring(1, root[0]);
+            vol.label = ReadRegSz(HKEY_CURRENT_USER, netSubKey.c_str(), L"RemotePath");
+            vol.fileSystem = L"SMB / CIFS";
+            vol.isReady = false;
+        } else {
+            ULARGE_INTEGER avail = {}, total = {}, freeB = {};
+            if (GetDiskFreeSpaceExW(root.c_str(), &avail, &total, &freeB) && total.QuadPart > 0) {
+                vol.totalBytes = total.QuadPart;
+                vol.freeBytes  = freeB.QuadPart;
+                vol.usedBytes  = (total.QuadPart >= freeB.QuadPart) ? (total.QuadPart - freeB.QuadPart) : 0;
+                vol.usedPct    = static_cast<float>(static_cast<double>(vol.usedBytes) * 100.0 / static_cast<double>(vol.totalBytes));
+                vol.isReady    = true;
+
+                wchar_t vName[MAX_PATH] = {};
+                wchar_t fsName[MAX_PATH] = {};
+                DWORD serial = 0, maxComp = 0, fsFlags = 0;
+                if (GetVolumeInformationW(root.c_str(), vName, MAX_PATH, &serial, &maxComp, &fsFlags, fsName, MAX_PATH)) {
+                    vol.label = vName;
+                    vol.fileSystem = fsName;
+                    vol.serialNumber = serial;
+                    vol.isCompressed = (fsFlags & FILE_VOLUME_IS_COMPRESSED) != 0;
+                    vol.isEncrypted  = (fsFlags & FILE_SUPPORTS_ENCRYPTION) != 0;
+                }
+            } else {
+                vol.isReady = false;
+            }
+        }
+        outVolumes.push_back(std::move(vol));
+    }
+}
 #endif
+
+void CarryOverPreviousDiskSmartAndTemps(HwPhysicalDisk& pd, const std::vector<HwPhysicalDisk>& previousDisks) {
+    for (const auto& old : previousDisks) {
+        if (old.index == pd.index && old.model == pd.model) {
+            pd.tempHistory = old.tempHistory;
+            pd.tempPeakC = std::max(pd.tempPeakC, old.tempPeakC);
+            if (old.smartState != HwSmartState::NotQueried) {
+                // Keep previously collected SMART fields until SMART is queried again
+                pd.smartState = old.smartState;
+                pd.healthLevel = old.healthLevel;
+                pd.lifeRemainingPct = old.lifeRemainingPct;
+                pd.powerOnHours = old.powerOnHours;
+                pd.powerCycles = old.powerCycles;
+                pd.bytesWritten = old.bytesWritten;
+                pd.bytesRead = old.bytesRead;
+                pd.smartAttrs = old.smartAttrs;
+                pd.smartNote = old.smartNote;
+                pd.smartSource = old.smartSource;
+            }
+            break;
+        }
+    }
+}
 
 } // namespace
 
@@ -1446,56 +1488,8 @@ void HardwareInspector::QueryFastVolumes() {
     m_volumes.clear();
 #ifndef _WIN32
     m_volumes = DiscoverLinuxVolumes(false);   // the window's thread: network and FUSE mounts are not touched
-    return;
 #else
-    wchar_t driveStrings[512] = {};
-    DWORD dLen = GetLogicalDriveStringsW(511, driveStrings);
-    const wchar_t* p = driveStrings;
-    while (p < driveStrings + dLen && *p) {
-        std::wstring root = p;
-        p += wcslen(p) + 1;
-
-        UINT dtype = GetDriveTypeW(root.c_str());
-        if (dtype == DRIVE_CDROM) continue;
-
-        HwLogicalVolume vol;
-        vol.rootPath = root;
-        if (dtype == DRIVE_FIXED) vol.driveTypeStr = L"Lokalny (Fixed)";
-        else if (dtype == DRIVE_REMOTE) vol.driveTypeStr = L"Sieciowy (NAS/SMB)";
-        else if (dtype == DRIVE_REMOVABLE) vol.driveTypeStr = L"Wymienny (USB)";
-        else vol.driveTypeStr = L"Wolumin";
-
-        if (dtype == DRIVE_REMOTE) {
-            // Never call GetDiskFreeSpaceExW on DRIVE_REMOTE synchronously (blocks for seconds on offline NAS shares!)
-            std::wstring netSubKey = L"Network\\" + std::wstring(1, root[0]);
-            vol.label = ReadRegSz(HKEY_CURRENT_USER, netSubKey.c_str(), L"RemotePath");
-            vol.fileSystem = L"SMB / CIFS";
-            vol.isReady = false;
-        } else {
-            ULARGE_INTEGER avail = {}, total = {}, freeB = {};
-            if (GetDiskFreeSpaceExW(root.c_str(), &avail, &total, &freeB) && total.QuadPart > 0) {
-                vol.totalBytes = total.QuadPart;
-                vol.freeBytes  = freeB.QuadPart;
-                vol.usedBytes  = (total.QuadPart >= freeB.QuadPart) ? (total.QuadPart - freeB.QuadPart) : 0;
-                vol.usedPct    = static_cast<float>(static_cast<double>(vol.usedBytes) * 100.0 / static_cast<double>(vol.totalBytes));
-                vol.isReady    = true;
-
-                wchar_t vName[MAX_PATH] = {};
-                wchar_t fsName[MAX_PATH] = {};
-                DWORD serial = 0, maxComp = 0, fsFlags = 0;
-                if (GetVolumeInformationW(root.c_str(), vName, MAX_PATH, &serial, &maxComp, &fsFlags, fsName, MAX_PATH)) {
-                    vol.label = vName;
-                    vol.fileSystem = fsName;
-                    vol.serialNumber = serial;
-                    vol.isCompressed = (fsFlags & FILE_VOLUME_IS_COMPRESSED) != 0;
-                    vol.isEncrypted  = (fsFlags & FILE_SUPPORTS_ENCRYPTION) != 0;
-                }
-            } else {
-                vol.isReady = false;
-            }
-        }
-        m_volumes.push_back(std::move(vol));
-    }
+    EnumerateWin32LogicalVolumes(m_volumes);
 #endif
 }
 
@@ -2095,105 +2089,22 @@ void HardwareInspector::QueryPhysicalDisksAndVolumes() {
 #ifndef _WIN32
     m_wState.physDisks = DiscoverLinuxPhysicalDisks();
     for (auto& pd : m_wState.physDisks) {
-        for (const auto& old : previousDisks) {
-            if (old.index == pd.index && old.model == pd.model) {
-                pd.tempHistory = old.tempHistory;
-                pd.tempPeakC = std::max(pd.tempPeakC, old.tempPeakC);
-                if (old.smartState != HwSmartState::NotQueried) {
-                    // What was read before stays until SMART is read again (as on Windows)
-                    pd.smartState = old.smartState;
-                    pd.healthLevel = old.healthLevel;
-                    pd.lifeRemainingPct = old.lifeRemainingPct;
-                    pd.powerOnHours = old.powerOnHours;
-                    pd.powerCycles = old.powerCycles;
-                    pd.bytesWritten = old.bytesWritten;
-                    pd.bytesRead = old.bytesRead;
-                    pd.smartAttrs = old.smartAttrs;
-                    pd.smartNote = old.smartNote;
-                    pd.smartSource = old.smartSource;
-                }
-                break;
-            }
-        }
+        CarryOverPreviousDiskSmartAndTemps(pd, previousDisks);
     }
     m_wState.volumes = DiscoverLinuxVolumes(true);   // the worker: network and FUSE sizes, each with a time limit
-    return;
 #else
     // 1. Physical drives (\\.\PhysicalDrive0..15), with their first temperature; what the last pass learned about a
     // drive (temperature history, SMART) stays with it
     for (int d = 0; d < 16; ++d) {
         HwPhysicalDisk pd;
         if (ReadPhysicalDisk(d, true, pd)) {
-            for (const auto& old : previousDisks) {
-                if (old.index == pd.index && old.model == pd.model) {
-                    pd.tempHistory = old.tempHistory;
-                    pd.tempPeakC = std::max(pd.tempPeakC, old.tempPeakC);
-                    if (old.smartState != HwSmartState::NotQueried) {
-                        pd.smartState = old.smartState;
-                        pd.healthLevel = old.healthLevel;
-                        pd.lifeRemainingPct = old.lifeRemainingPct;
-                        pd.powerOnHours = old.powerOnHours;
-                        pd.powerCycles = old.powerCycles;
-                        pd.bytesWritten = old.bytesWritten;
-                        pd.bytesRead = old.bytesRead;
-                        pd.smartAttrs = old.smartAttrs;
-                    }
-                    break;
-                }
-            }
-            m_wState.physDisks.push_back(pd);
+            CarryOverPreviousDiskSmartAndTemps(pd, previousDisks);
+            m_wState.physDisks.push_back(std::move(pd));
         }
     }
 
     // 2. Enumerate Logical Volumes
-    wchar_t driveStrings[512] = {};
-    DWORD dLen = GetLogicalDriveStringsW(511, driveStrings);
-    const wchar_t* p = driveStrings;
-    while (p < driveStrings + dLen && *p) {
-        std::wstring root = p;
-        p += wcslen(p) + 1;
-
-        UINT dtype = GetDriveTypeW(root.c_str());
-        if (dtype == DRIVE_CDROM) continue;
-
-        HwLogicalVolume vol;
-        vol.rootPath = root;
-        if (dtype == DRIVE_FIXED) vol.driveTypeStr = L"Lokalny (Fixed)";
-        else if (dtype == DRIVE_REMOTE) vol.driveTypeStr = L"Sieciowy (NAS/SMB)";
-        else if (dtype == DRIVE_REMOVABLE) vol.driveTypeStr = L"Wymienny (USB)";
-        else vol.driveTypeStr = L"Wolumin";
-
-        if (dtype == DRIVE_REMOTE) {
-            // Never call GetDiskFreeSpaceExW on DRIVE_REMOTE: unreachable SMB/NAS shares block for 5-15s in mrxsmb.sys!
-            std::wstring netSubKey = L"Network\\" + std::wstring(1, root[0]);
-            vol.label = ReadRegSz(HKEY_CURRENT_USER, netSubKey.c_str(), L"RemotePath");
-            vol.fileSystem = L"SMB / CIFS";
-            vol.isReady = false;
-        } else {
-            ULARGE_INTEGER avail = {}, total = {}, freeB = {};
-            if (GetDiskFreeSpaceExW(root.c_str(), &avail, &total, &freeB) && total.QuadPart > 0) {
-                vol.totalBytes = total.QuadPart;
-                vol.freeBytes  = freeB.QuadPart;
-                vol.usedBytes  = (total.QuadPart >= freeB.QuadPart) ? (total.QuadPart - freeB.QuadPart) : 0;
-                vol.usedPct    = static_cast<float>(static_cast<double>(vol.usedBytes) * 100.0 / static_cast<double>(vol.totalBytes));
-                vol.isReady    = true;
-
-                wchar_t vName[MAX_PATH] = {};
-                wchar_t fsName[MAX_PATH] = {};
-                DWORD serial = 0, maxComp = 0, fsFlags = 0;
-                if (GetVolumeInformationW(root.c_str(), vName, MAX_PATH, &serial, &maxComp, &fsFlags, fsName, MAX_PATH)) {
-                    vol.label = vName;
-                    vol.fileSystem = fsName;
-                    vol.serialNumber = serial;
-                    vol.isCompressed = (fsFlags & FILE_VOLUME_IS_COMPRESSED) != 0;
-                    vol.isEncrypted  = (fsFlags & FILE_SUPPORTS_ENCRYPTION) != 0;
-                }
-            } else {
-                vol.isReady = false;
-            }
-        }
-        m_wState.volumes.push_back(vol);
-    }
+    EnumerateWin32LogicalVolumes(m_wState.volumes);
 #endif
 }
 

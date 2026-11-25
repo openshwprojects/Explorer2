@@ -11,11 +11,11 @@ inline bool DecodeSmpteDpx(const uint8_t* data, size_t size, ExtendedImageInfo& 
     const bool isLittle = isDpxLE;
     auto rd16 = [&](size_t off) -> uint16_t {
         if (off + 2 > size) return 0;
-        return isLittle ? DetailImg100::RdU16LE(data + off) : DetailImg100::RdU16BE(data + off);
+        return isLittle ? DetailLayeredAndHdrImg::RdU16LE(data + off) : DetailLayeredAndHdrImg::RdU16BE(data + off);
     };
     auto rd32 = [&](size_t off) -> uint32_t {
         if (off + 4 > size) return 0;
-        return isLittle ? DetailImg100::RdU32LE(data + off) : DetailImg100::RdU32BE(data + off);
+        return isLittle ? DetailLayeredAndHdrImg::RdU32LE(data + off) : DetailLayeredAndHdrImg::RdU32BE(data + off);
     };
     using DpxElemSpec = DetailDpxCin::DpxElemSpec;
     uint32_t dataOff = rd32(4);

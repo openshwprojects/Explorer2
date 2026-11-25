@@ -7,11 +7,11 @@ namespace Formats {
 // 43. Java JVM Bytecode Class File (.class — 0xCAFEBABE Constant Pool, Fields & Methods)
 // ============================================================================
 inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    if (raw.size() < 24 || DetailSys100::RdU32BE(raw.data()) != 0xCAFEBABEu) return false;
+    if (raw.size() < 24 || DetailBinarySysDoc::RdU32BE(raw.data()) != 0xCAFEBABEu) return false;
 
-    const uint16_t minorV = DetailSys100::RdU16BE(raw.data() + 4);
-    const uint16_t majorV = DetailSys100::RdU16BE(raw.data() + 6);
-    const uint16_t cpCnt  = DetailSys100::RdU16BE(raw.data() + 8);
+    const uint16_t minorV = DetailBinarySysDoc::RdU16BE(raw.data() + 4);
+    const uint16_t majorV = DetailBinarySysDoc::RdU16BE(raw.data() + 6);
+    const uint16_t cpCnt  = DetailBinarySysDoc::RdU16BE(raw.data() + 8);
     if (majorV < 45 || majorV > 100 || cpCnt < 1) return false;
 
     std::vector<std::string> cpUtf8(cpCnt);
@@ -24,7 +24,7 @@ inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocu
         switch (tag) {
             case 1: { // CONSTANT_Utf8
                 if (pos + 2 > raw.size()) return false;
-                const uint16_t len = DetailSys100::RdU16BE(raw.data() + pos);
+                const uint16_t len = DetailBinarySysDoc::RdU16BE(raw.data() + pos);
                 pos += 2;
                 if (pos + len > raw.size()) return false;
                 cpUtf8[i].assign(reinterpret_cast<const char*>(raw.data() + pos), len);
@@ -52,7 +52,7 @@ inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocu
             case 19:// Module
             case 20:// Package
                 if (pos + 2 > raw.size()) return false;
-                cpClassRef[i] = DetailSys100::RdU16BE(raw.data() + pos);
+                cpClassRef[i] = DetailBinarySysDoc::RdU16BE(raw.data() + pos);
                 pos += 2;
                 break;
             case 8: // String
@@ -70,10 +70,10 @@ inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     }
 
     if (pos + 8 > raw.size()) return false;
-    const uint16_t accessFlags = DetailSys100::RdU16BE(raw.data() + pos + 0);
-    const uint16_t thisClass   = DetailSys100::RdU16BE(raw.data() + pos + 2);
-    const uint16_t superClass  = DetailSys100::RdU16BE(raw.data() + pos + 4);
-    const uint16_t ifaceCount  = DetailSys100::RdU16BE(raw.data() + pos + 6);
+    const uint16_t accessFlags = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 0);
+    const uint16_t thisClass   = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 2);
+    const uint16_t superClass  = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 4);
+    const uint16_t ifaceCount  = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 6);
     pos += 8;
 
     auto getUtf8 = [&](uint16_t idx) -> std::wstring {
@@ -90,7 +90,7 @@ inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     if (pos + static_cast<size_t>(ifaceCount) * 2 > raw.size()) return false;
     std::wstring ifaceList;
     for (uint16_t i = 0; i < ifaceCount; ++i) {
-        const uint16_t ii = DetailSys100::RdU16BE(raw.data() + pos + i * 2);
+        const uint16_t ii = DetailBinarySysDoc::RdU16BE(raw.data() + pos + i * 2);
         if (i > 0) ifaceList += L", ";
         ifaceList += getClassName(ii);
     }
@@ -117,16 +117,16 @@ inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocu
 
     uint16_t fieldsCnt = 0, methodsCnt = 0;
     if (pos + 2 <= raw.size()) {
-        fieldsCnt = DetailSys100::RdU16BE(raw.data() + pos);
+        fieldsCnt = DetailBinarySysDoc::RdU16BE(raw.data() + pos);
         pos += 2;
         for (uint16_t f = 0; f < fieldsCnt && pos + 8 <= raw.size(); ++f) {
-            const uint16_t ff   = DetailSys100::RdU16BE(raw.data() + pos + 0);
-            const uint16_t fn   = DetailSys100::RdU16BE(raw.data() + pos + 2);
-            const uint16_t fd   = DetailSys100::RdU16BE(raw.data() + pos + 4);
-            const uint16_t acnt = DetailSys100::RdU16BE(raw.data() + pos + 6);
+            const uint16_t ff   = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 0);
+            const uint16_t fn   = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 2);
+            const uint16_t fd   = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 4);
+            const uint16_t acnt = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 6);
             pos += 8;
             for (uint16_t a = 0; a < acnt && pos + 6 <= raw.size(); ++a) {
-                const uint32_t alen = DetailSys100::RdU32BE(raw.data() + pos + 2);
+                const uint32_t alen = DetailBinarySysDoc::RdU32BE(raw.data() + pos + 2);
                 pos += 6;
                 if (pos + alen > raw.size()) { pos = raw.size(); break; }
                 pos += alen;
@@ -138,28 +138,28 @@ inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocu
     }
 
     if (pos + 2 <= raw.size()) {
-        methodsCnt = DetailSys100::RdU16BE(raw.data() + pos);
+        methodsCnt = DetailBinarySysDoc::RdU16BE(raw.data() + pos);
         pos += 2;
         for (uint16_t m = 0; m < methodsCnt && pos + 8 <= raw.size(); ++m) {
-            const uint16_t mf   = DetailSys100::RdU16BE(raw.data() + pos + 0);
-            const uint16_t mn   = DetailSys100::RdU16BE(raw.data() + pos + 2);
-            const uint16_t md   = DetailSys100::RdU16BE(raw.data() + pos + 4);
-            const uint16_t acnt = DetailSys100::RdU16BE(raw.data() + pos + 6);
+            const uint16_t mf   = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 0);
+            const uint16_t mn   = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 2);
+            const uint16_t md   = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 4);
+            const uint16_t acnt = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 6);
             pos += 8;
             std::wstring codeInfo = L"(abstract/native)";
             for (uint16_t a = 0; a < acnt && pos + 6 <= raw.size(); ++a) {
-                const uint16_t aname = DetailSys100::RdU16BE(raw.data() + pos + 0);
-                const uint32_t alen  = DetailSys100::RdU32BE(raw.data() + pos + 2);
+                const uint16_t aname = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 0);
+                const uint32_t alen  = DetailBinarySysDoc::RdU32BE(raw.data() + pos + 2);
                 pos += 6;
                 if (pos + alen > raw.size()) { pos = raw.size(); break; }
                 if (aname < cpUtf8.size() && cpUtf8[aname] == "Code") {
                     if (majorV >= 46 && alen >= 8) {
-                        const uint16_t maxStack  = DetailSys100::RdU16BE(raw.data() + pos + 0);
-                        const uint16_t maxLocals = DetailSys100::RdU16BE(raw.data() + pos + 2);
-                        const uint32_t codeLen   = DetailSys100::RdU32BE(raw.data() + pos + 4);
+                        const uint16_t maxStack  = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 0);
+                        const uint16_t maxLocals = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 2);
+                        const uint32_t codeLen   = DetailBinarySysDoc::RdU32BE(raw.data() + pos + 4);
                         codeInfo = L"stack=" + std::to_wstring(maxStack) + L", locals=" + std::to_wstring(maxLocals) + L", code=" + std::to_wstring(codeLen) + L" B";
                     } else if (alen >= 4) {
-                        codeInfo = L"stack=" + std::to_wstring(raw[pos]) + L", locals=" + std::to_wstring(raw[pos + 1]) + L", code=" + std::to_wstring(DetailSys100::RdU16BE(raw.data() + pos + 2)) + L" B";
+                        codeInfo = L"stack=" + std::to_wstring(raw[pos]) + L", locals=" + std::to_wstring(raw[pos + 1]) + L", code=" + std::to_wstring(DetailBinarySysDoc::RdU16BE(raw.data() + pos + 2)) + L" B";
                     }
                 }
                 pos += alen;
@@ -172,15 +172,15 @@ inline bool ParseJavaClassFile(const std::vector<uint8_t>& raw, ParsedOfficeDocu
 
     std::wstring sourceFile;
     if (pos + 2 <= raw.size()) {
-        const uint16_t clsAttrs = DetailSys100::RdU16BE(raw.data() + pos);
+        const uint16_t clsAttrs = DetailBinarySysDoc::RdU16BE(raw.data() + pos);
         pos += 2;
         for (uint16_t a = 0; a < clsAttrs && pos + 6 <= raw.size(); ++a) {
-            const uint16_t aname = DetailSys100::RdU16BE(raw.data() + pos + 0);
-            const uint32_t alen  = DetailSys100::RdU32BE(raw.data() + pos + 2);
+            const uint16_t aname = DetailBinarySysDoc::RdU16BE(raw.data() + pos + 0);
+            const uint32_t alen  = DetailBinarySysDoc::RdU32BE(raw.data() + pos + 2);
             pos += 6;
             if (pos + alen > raw.size()) break;
             if (aname < cpUtf8.size() && cpUtf8[aname] == "SourceFile" && alen == 2) {
-                sourceFile = getUtf8(DetailSys100::RdU16BE(raw.data() + pos));
+                sourceFile = getUtf8(DetailBinarySysDoc::RdU16BE(raw.data() + pos));
             }
             pos += alen;
         }

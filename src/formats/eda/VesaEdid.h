@@ -12,16 +12,21 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
     if (!data || size < 128 || std::memcmp(data, kEdidMagic, 8) != 0) return false;
     if (data[18] == 0 || data[18] > 4) return false;
 
+    // Strictly verify VESA E-EDID 128-byte modulo-256 base-block checksum
+    uint32_t baseSum = 0;
+    for (size_t i = 0; i < 128u; ++i) baseSum += data[i];
+    if ((baseSum & 0xFFu) != 0u) return false;
+
     out.kind = EdaDocKind::KiCadSch;
 
-    uint16_t mfgRaw = DetailEda100::RdU16BE(data + 8);
+    uint16_t mfgRaw = DetailSiliconAndBusEda::RdU16BE(data + 8);
     wchar_t c1 = static_cast<wchar_t>(L'A' + (((mfgRaw >> 10) & 0x1Fu) ? (((mfgRaw >> 10) & 0x1Fu) - 1u) : 0u));
     wchar_t c2 = static_cast<wchar_t>(L'A' + (((mfgRaw >> 5)  & 0x1Fu) ? (((mfgRaw >> 5)  & 0x1Fu) - 1u) : 0u));
     wchar_t c3 = static_cast<wchar_t>(L'A' + ((mfgRaw         & 0x1Fu) ? ((mfgRaw         & 0x1Fu) - 1u) : 0u));
     std::wstring mfg = { c1, c2, c3 };
 
-    uint16_t prodCode  = DetailEda100::RdU16LE(data + 10);
-    uint32_t serialNum = DetailEda100::RdU32LE(data + 12);
+    uint16_t prodCode  = DetailSiliconAndBusEda::RdU16LE(data + 10);
+    uint32_t serialNum = DetailSiliconAndBusEda::RdU32LE(data + 12);
     int mfgWeek = data[16];
     int mfgYear = 1990 + data[17];
     int edidVer = data[18], edidRev = data[19];
@@ -62,7 +67,7 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
     int minVHz = 0, maxVHz = 0, maxPixClkMHz = 0;
 
     auto parseDtd = [&](const uint8_t* d) {
-        uint16_t pixClk10k = DetailEda100::RdU16LE(d);
+        uint16_t pixClk10k = DetailSiliconAndBusEda::RdU16LE(d);
         if (pixClk10k == 0) return;
         int ha = d[2] | ((d[4] & 0xF0) << 4);
         int hb = d[3] | ((d[4] & 0x0F) << 8);
@@ -82,7 +87,7 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
 
     for (int i = 0; i < 4; ++i) {
         const uint8_t* d = data + 54 + i * 18;
-        if (DetailEda100::RdU16LE(d) != 0) {
+        if (DetailSiliconAndBusEda::RdU16LE(d) != 0) {
             parseDtd(d);
         } else if (d[2] == 0) {
             uint8_t tag = d[3];
@@ -90,7 +95,7 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
                 std::string s(reinterpret_cast<const char*>(d + 5), 13);
                 size_t nl = s.find('\n');
                 if (nl != std::string::npos) s.resize(nl);
-                std::wstring ws = PathUtils::Utf8ToWide(DetailEda100::TrimAsciiView(s));
+                std::wstring ws = PathUtils::Utf8ToWide(DetailSiliconAndBusEda::TrimAsciiView(s));
                 if (tag == 0xFC) monName = ws;
                 else if (tag == 0xFF) monSerial = ws;
                 else monText = ws;
@@ -108,6 +113,9 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
     bool hasHdmi = false;
     for (int ei = 0; ei < extCount && static_cast<size_t>((ei + 2) * 128) <= size; ++ei) {
         const uint8_t* ext = data + (ei + 1) * 128;
+        uint32_t extSum = 0;
+        for (size_t k = 0; k < 128u; ++k) extSum += ext[k];
+        if ((extSum & 0xFFu) != 0u) return false;
         if (ext[0] == 0x02) { // CTA-861
             uint8_t dtdOff = ext[2];
             if (dtdOff >= 4 && dtdOff <= 127) {
@@ -129,7 +137,7 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
                     cp += blkLen;
                 }
                 for (size_t dp = dtdOff; dp + 18 <= 127; dp += 18) {
-                    if (DetailEda100::RdU16LE(ext + dp) != 0) parseDtd(ext + dp);
+                    if (DetailSiliconAndBusEda::RdU16LE(ext + dp) != 0) parseDtd(ext + dp);
                 }
             }
         }
@@ -148,12 +156,12 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
     // Outer total blanking timing frame + inner active display frame
     float blankScaleX = (prefHActive > 0) ? (static_cast<float>(prefHActive + prefHBlank) / static_cast<float>(prefHActive)) : 1.08f;
     float blankScaleY = (prefVActive > 0) ? (static_cast<float>(prefVActive + prefVBlank) / static_cast<float>(prefVActive)) : 1.05f;
-    DetailEda100::AddRectOutline(out, -12.0f, 0.0f, panelW * blankScaleX, panelH * blankScaleY, EdaLayerId::BottomSilk, 0.16f);
-    DetailEda100::AddRectOutline(out, -12.0f, 0.0f, panelW, panelH, EdaLayerId::EdgeCuts, 0.45f);
+    DetailSiliconAndBusEda::AddRectOutline(out, -12.0f, 0.0f, panelW * blankScaleX, panelH * blankScaleY, EdaLayerId::BottomSilk, 0.16f);
+    DetailSiliconAndBusEda::AddRectOutline(out, -12.0f, 0.0f, panelW, panelH, EdaLayerId::EdgeCuts, 0.45f);
 
     // CIE 1931 RGB Chromaticity Gamut Triangle on right side (x: +28..+54, y: -14..+14)
     const float gx0 = 28.0f, gy0 = -14.0f, gSpan = 26.0f;
-    DetailEda100::AddRectOutline(out, gx0 + gSpan * 0.5f, gy0 + gSpan * 0.5f, gSpan, gSpan, EdaLayerId::SchSymbol, 0.20f);
+    DetailSiliconAndBusEda::AddRectOutline(out, gx0 + gSpan * 0.5f, gy0 + gSpan * 0.5f, gSpan, gSpan, EdaLayerId::SchSymbol, 0.20f);
     if (rx > 0.01f || gx > 0.01f || bx > 0.01f) {
         float prx = gx0 + rx * gSpan, pry = gy0 + ry * gSpan;
         float pgx = gx0 + gx * gSpan, pgy = gy0 + gy * gSpan;
@@ -174,24 +182,6 @@ inline bool ParseVesaEdid(const uint8_t* data, size_t size, ParsedEdaBoard& out)
     } else {
         swprintf_s(resInfo, L"EDID v%d.%d (%s, %d x %d cm)", edidVer, edidRev, iface.c_str(), hScreenCm, vScreenCm);
     }
-
-    EdaComponent3D panelComp;
-    panelComp.refDes = dispName;
-    panelComp.value = resInfo;
-    panelComp.footprint = L"EDID_PANEL";
-    panelComp.x = -12.0f; panelComp.y = 0.0f;
-    panelComp.widthMm = panelW * 0.9f; panelComp.lengthMm = panelH * 0.9f; panelComp.heightMm = 1.2f;
-    panelComp.category = EdaPartCategory::IC_Package;
-    out.components.push_back(panelComp);
-
-    EdaComponent3D eep;
-    eep.refDes = L"U_EDID";
-    eep.value = L"24C02_DDC";
-    eep.footprint = L"SOIC-8";
-    eep.x = gx0 + gSpan * 0.5f; eep.y = -18.5f;
-    eep.widthMm = 5.0f; eep.lengthMm = 4.0f; eep.heightMm = 1.5f;
-    eep.category = EdaPartCategory::IC_Package;
-    out.components.push_back(eep);
 
     out.labels.push_back({ -12.0f, 5.0f, 1.35f, EdaLayerId::SchLabel, dispName });
     out.labels.push_back({ -12.0f, 0.0f, 1.15f, EdaLayerId::TopSilk, resInfo });

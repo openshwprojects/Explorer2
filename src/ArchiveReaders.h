@@ -44,4 +44,34 @@ bool ExtractEntireArchiveToFolder(const std::wstring& archivePath, const std::ws
 using ToolRun = ArchiveToolRun;
 ToolRun RunToolAndWait(const std::wstring& exePath, const std::wstring& args, DWORD timeoutMs);
 
+bool IsGamePakArchiveExtension(const std::wstring& extLower);
+bool TryInspectGamePakArchive(
+    const std::wstring& archivePath,
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& extLower,
+    ArchiveSummaryInfo& outInfo);
+bool TryExtractGamePakArchive(
+    const std::wstring& archivePath,
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& extLower,
+    const std::wstring& normTarget,
+    std::vector<uint8_t>& outBytes);
+
+bool IsSystemRetroArchiveExtension(const std::wstring& extLower);
+bool TryInspectSystemRetroArchive(
+    const std::wstring& archivePath,
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& extLower,
+    ArchiveSummaryInfo& outInfo);
+bool TryExtractSystemRetroArchive(
+    const std::wstring& archivePath,
+    const uint8_t* data,
+    size_t size,
+    const std::wstring& extLower,
+    const std::wstring& normTarget,
+    std::vector<uint8_t>& outBytes);
+
 } // namespace Explorer2::ArchiveReaders

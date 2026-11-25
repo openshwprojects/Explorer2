@@ -575,4 +575,64 @@ inline std::string ParseMountedAt(const std::string& toolOutput) {
     return (!path.empty() && path[0] == '/') ? path : std::string();
 }
 
+// ---- /proc/self/mounts and /proc/self/mountinfo field decoding & file-system classification -------------------
+
+// /proc/self/mounts and mountinfo write space (\040), tab (\011), newline (\012), and backslash (\134) as 3 octal digits.
+inline std::string DecodeMountField(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() &&
+            s[i + 1] >= '0' && s[i + 1] <= '3' &&
+            s[i + 2] >= '0' && s[i + 2] <= '7' &&
+            s[i + 3] >= '0' && s[i + 3] <= '7') {
+            out.push_back(static_cast<char>(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')));
+            i += 3;
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+// Kernel / cluster network file systems whose stat()/statvfs() waits on a remote server.
+inline bool IsCoreNetworkFsType(std::string_view fsType) {
+    static constexpr std::string_view kTypes[] = {
+        "cifs", "smb3", "smbfs", "nfs", "nfs4", "9p", "ceph", "glusterfs", "davfs",
+        "afs", "coda", "ncpfs", "lustre", "gpfs", "beegfs"
+    };
+    for (std::string_view t : kTypes) {
+        if (fsType == t) return true;
+    }
+    return false;
+}
+
+// Remote network file systems, including known network-backed FUSE daemons (excludes local FUSE mounts like AppImages).
+inline bool IsRemoteNetworkFsType(std::string_view fsType) {
+    if (IsCoreNetworkFsType(fsType)) return true;
+    static constexpr std::string_view kNetFuse[] = {
+        "sshfs", "fuse.sshfs", "fuse.rclone", "fuse.gvfsd-fuse", "fuse.s3fs",
+        "fuse.curlftpfs", "fuse.smbnetfs", "fuse.glusterfs", "fuse.ceph-fuse"
+    };
+    for (std::string_view t : kNetFuse) {
+        if (fsType == t) return true;
+    }
+    return false;
+}
+
+// User-space FUSE daemons ("fuseblk" is deliberately excluded: it backs local NTFS/exFAT block devices).
+inline bool IsFuseDaemonFsType(std::string_view fsType) {
+    return fsType == "fuse" || fsType == "sshfs" || fsType.rfind("fuse.", 0) == 0;
+}
+
+// Host-shared hypervisor / VM folder file systems.
+inline bool IsVmSharedFsType(std::string_view fsType) {
+    return fsType == "vboxsf" || fsType == "vmhgfs" || fsType == "virtiofs";
+}
+
+// Any network, FUSE daemon, or VM-shared file system whose calls should not block UI threads synchronously.
+inline bool IsNetworkOrFuseFsType(std::string_view fsType) {
+    return IsCoreNetworkFsType(fsType) || IsFuseDaemonFsType(fsType) || IsVmSharedFsType(fsType);
+}
+
 } // namespace Explorer2::LinuxStorage

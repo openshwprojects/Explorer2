@@ -2,7 +2,7 @@
 // CmxEdl.h — CMX 3600 Edit Decision List (.edl) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 // ============================================================================
 // 7. NLE Video Timelines (.edl, .fcpxml, .otio)
@@ -97,8 +97,8 @@ inline bool ParseCmxEdl(const std::vector<uint8_t>& raw, ParsedOfficeDocument& o
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
-inline bool ParseCmxEdlDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMedia100::ParseCmxEdl(raw, out); }
+inline bool ParseCmxEdlDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) { return DetailMediaAndScoreDoc::ParseCmxEdl(raw, out); }
 
 } // namespace Formats

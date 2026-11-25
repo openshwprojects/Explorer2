@@ -20,26 +20,17 @@ inline std::wstring FormatUtcMillis(int64_t ms) {
     int min  = static_cast<int>((remSec % 3600LL) / 60LL);
     int sec  = static_cast<int>(remSec % 60LL);
 
-    // Howard Hinnant civil_from_days
-    int64_t z = days + 719468LL;
-    int64_t era = (z >= 0 ? z : z - 146096LL) / 146097LL;
-    uint64_t doe = static_cast<uint64_t>(z - era * 146097LL);
-    uint64_t yoe = (doe - doe / 1460ULL + doe / 36524ULL - doe / 146096ULL) / 365ULL;
-    int64_t y = static_cast<int64_t>(yoe) + era * 400LL;
-    uint64_t doy = doe - (365ULL * yoe + yoe / 4ULL - yoe / 100ULL);
-    uint64_t mp = (5ULL * doy + 2ULL) / 153ULL;
-    unsigned d = static_cast<unsigned>(doy - (153ULL * mp + 2ULL) / 5ULL + 1ULL);
-    unsigned m = static_cast<unsigned>(mp < 10ULL ? mp + 3ULL : mp - 9ULL);
-    y += (m <= 2);
+    int y = 1970, m = 1, d = 1;
+    ::Explorer2::ReaderText::CivilFromDays1970(days, y, m, d);
 
     int64_t fracMs = ms - totalSec * 1000LL;
     wchar_t buf[80] = {};
     if (fracMs > 0) {
-        swprintf_s(buf, L"%04lld-%02u-%02u %02d:%02d:%02d.%03lld UTC",
-            static_cast<long long>(y), m, d, hour, min, sec, static_cast<long long>(fracMs));
+        swprintf_s(buf, L"%04d-%02d-%02d %02d:%02d:%02d.%03lld UTC",
+            y, m, d, hour, min, sec, static_cast<long long>(fracMs));
     } else {
-        swprintf_s(buf, L"%04lld-%02u-%02u %02d:%02d:%02d UTC",
-            static_cast<long long>(y), m, d, hour, min, sec);
+        swprintf_s(buf, L"%04d-%02d-%02d %02d:%02d:%02d UTC",
+            y, m, d, hour, min, sec);
     }
     return buf;
 }

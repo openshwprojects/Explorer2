@@ -1,0 +1,25 @@
+| JEDEC DDR4 SO-DIMM Rank-0 Signal Integrity Topology
+[Begin Board Description] 1.0
+[Manufacturer] DeepCircuit Labs
+[Board Name] DDR4_260PIN_SODIMM
+[Number Of Pins] 260
+[Reference Designator Map]
+U1 mt40a1g8_ddr4.ibs
+U2 mt40a1g8_ddr4.ibs
+
+[Path Description] DQ0_FLYBY
+Pin J1.A11
+Len = 0.012  L = 3.2n  R = 0.08  C = 1.1p /
+Fork
+  Len = 0.002  L = 0.6n  R = 0.02  C = 0.3p /
+  Node U1.G2
+Endfork
+Len = 0.015  L = 3.8n  R = 0.10  C = 1.3p /
+Node U2.G2
+
+[Path Description] DQS0_P
+Pin J1.A13
+Len = 0.014  L = 3.5n  R = 0.09  C = 1.2p /
+Node U1.F7
+
+[End Board Description]

@@ -5,7 +5,7 @@ namespace Formats {
 
 inline bool ParseAppleIwaDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     std::vector<uint8_t> decomp;
-    if (!DetailDocs200::UnframeIwaStream(raw, decomp)) return false;
+    if (!DetailStructuredDataDoc::UnframeIwaStream(raw, decomp)) return false;
 
     SpreadsheetSheet sh;
     sh.name = L"Package_And_Text";
@@ -19,7 +19,7 @@ inline bool ParseAppleIwaDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocume
 
     size_t validIwaFiles = 0;
     size_t validIwaObjects = 0;
-    if (!DetailDocs200::ParseIwaProtobufStream(decomp, L"Document.iwa", sh, cellsSh, validIwaFiles, validIwaObjects) || validIwaObjects == 0) {
+    if (!DetailStructuredDataDoc::ParseIwaProtobufStream(decomp, L"Document.iwa", sh, cellsSh, validIwaFiles, validIwaObjects) || validIwaObjects == 0) {
         return false;
     }
 

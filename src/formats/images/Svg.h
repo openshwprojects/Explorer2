@@ -619,8 +619,10 @@ inline bool DecodeSVG(const uint8_t* data, size_t size, uint32_t maxDimension, E
         return false;
     };
 
+    bool drewVisiblePixel = false;
     auto blendPixel = [&](int px, int py, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
         if (px < 0 || py < 0 || px >= static_cast<int>(outW) || py >= static_cast<int>(outH) || a == 0) return;
+        drewVisiblePixel = true;
         uint8_t* dst = &outInfo.bgraPixels[(static_cast<size_t>(py) * outW + px) * 4];
         if (a == 255 || dst[3] == 0) {
             WritePremulBGRA(dst, r, g, b, a);
@@ -834,6 +836,195 @@ inline bool DecodeSVG(const uint8_t* data, size_t size, uint32_t maxDimension, E
         }
     };
 
+    struct SvgCssRule {
+        std::string selector;
+        int specificity = 0; // 1 = tag, 10 = .class, 11 = tag.class, 100 = #id
+        std::vector<std::pair<std::string, std::string>> props;
+    };
+    std::vector<SvgCssRule> cssRules;
+
+    // Pre-scan <style>...</style> blocks for CSS rules (.class, #id, tag, tag.class)
+    {
+        size_t sPos = svgTag;
+        while ((sPos = sv.find("<style", sPos)) != std::string_view::npos) {
+            char nxt = (sPos + 6 < sv.size()) ? sv[sPos + 6] : '>';
+            if (nxt != ' ' && nxt != '\t' && nxt != '\r' && nxt != '\n' && nxt != '>') {
+                sPos += 6;
+                continue;
+            }
+            size_t stGt = findTagClose(sPos);
+            if (stGt == std::string_view::npos) break;
+            size_t stEnd = sv.find("</style", stGt + 1);
+            if (stEnd == std::string_view::npos) break;
+            std::string rawCss(sv.substr(stGt + 1, stEnd - stGt - 1));
+            sPos = stEnd + 7;
+
+            // Unwrap <![CDATA[ ... ]]> and strip /* ... */ comments
+            std::string cleanCss;
+            cleanCss.reserve(rawCss.size());
+            for (size_t i = 0; i < rawCss.size(); ) {
+                if (i + 9 <= rawCss.size() && std::memcmp(&rawCss[i], "<![CDATA[", 9) == 0) { i += 9; continue; }
+                if (i + 3 <= rawCss.size() && std::memcmp(&rawCss[i], "]]>", 3) == 0) { i += 3; continue; }
+                if (i + 2 <= rawCss.size() && rawCss[i] == '/' && rawCss[i + 1] == '*') {
+                    size_t cEnd = rawCss.find("*/", i + 2);
+                    if (cEnd == std::string::npos) break;
+                    i = cEnd + 2;
+                    continue;
+                }
+                cleanCss.push_back(rawCss[i++]);
+            }
+
+            std::string_view cv(cleanCss);
+            size_t cp = 0;
+            while (cp < cv.size()) {
+                size_t lb = cv.find('{', cp);
+                if (lb == std::string_view::npos) break;
+                size_t rb = cv.find('}', lb + 1);
+                if (rb == std::string_view::npos) break;
+                std::string_view selGroup = trimSv(cv.substr(cp, lb - cp));
+                std::string_view body     = trimSv(cv.substr(lb + 1, rb - lb - 1));
+                cp = rb + 1;
+
+                // Skip @media / @keyframes nested outer wrappers linearly
+                if (!selGroup.empty() && selGroup.front() == '@') continue;
+
+                std::vector<std::pair<std::string, std::string>> decls;
+                size_t dp = 0;
+                while (dp < body.size()) {
+                    size_t semi = body.find(';', dp);
+                    if (semi == std::string_view::npos) semi = body.size();
+                    std::string_view item = trimSv(body.substr(dp, semi - dp));
+                    size_t colon = item.find(':');
+                    if (colon != std::string_view::npos) {
+                        std::string k(trimSv(item.substr(0, colon)));
+                        std::string_view v = trimSv(item.substr(colon + 1));
+                        size_t bang = v.find("!important");
+                        if (bang != std::string_view::npos) v = trimSv(v.substr(0, bang));
+                        for (char& ch : k) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+                        if (!k.empty() && !v.empty()) decls.push_back({ std::move(k), std::string(v) });
+                    }
+                    dp = semi + 1;
+                }
+                if (decls.empty()) continue;
+
+                size_t sp = 0;
+                while (sp < selGroup.size()) {
+                    size_t comma = selGroup.find(',', sp);
+                    if (comma == std::string_view::npos) comma = selGroup.size();
+                    std::string_view sel = trimSv(selGroup.substr(sp, comma - sp));
+                    // Take rightmost compound selector if descendant combinator exists
+                    size_t lastSpace = sel.find_last_of(" \t\r\n>");
+                    if (lastSpace != std::string_view::npos) sel = trimSv(sel.substr(lastSpace + 1));
+                    if (!sel.empty() && cssRules.size() < 2048u) {
+                        int spec = 1;
+                        if (sel[0] == '#') spec = 100;
+                        else if (sel[0] == '.') spec = 10;
+                        else if (sel.find('.') != std::string_view::npos) spec = 11;
+                        cssRules.push_back({ std::string(sel), spec, decls });
+                    }
+                    sp = comma + 1;
+                }
+            }
+        }
+        std::stable_sort(cssRules.begin(), cssRules.end(), [](const SvgCssRule& a, const SvgCssRule& b) {
+            return a.specificity < b.specificity;
+        });
+    }
+
+    // Pre-index elements carrying id="..." (including <symbol>, <g>, and shapes inside <defs>) for <use href="#...">
+    struct SvgRefNode {
+        bool isSymbol = false;
+        bool hasViewBox = false;
+        float vbX = 0.0f, vbY = 0.0f, vbW = 0.0f, vbH = 0.0f;
+        std::string_view openTag;
+        std::string_view xmlSlice;
+    };
+    std::unordered_map<std::string, SvgRefNode> idNodes;
+    {
+        auto findMatchingEnd = [&](size_t openLt, size_t openGt, std::string_view tagName) -> std::pair<size_t, size_t> {
+            int depth = 1;
+            size_t scan = openGt + 1;
+            while (scan < sv.size()) {
+                size_t nlt = sv.find('<', scan);
+                if (nlt == std::string_view::npos) break;
+                if (nlt + 4 <= sv.size() && sv.substr(nlt, 4) == "<!--") {
+                    size_t ec = sv.find("-->", nlt + 4);
+                    if (ec == std::string_view::npos) break;
+                    scan = ec + 3; continue;
+                }
+                size_t ngt = findTagClose(nlt);
+                if (ngt == std::string_view::npos) break;
+                std::string_view rt = trimSv(sv.substr(nlt + 1, ngt - nlt - 1));
+                scan = ngt + 1;
+                if (rt.empty() || rt[0] == '!' || rt[0] == '?') continue;
+                if (rt[0] == '/') {
+                    std::string_view cn = trimSv(rt.substr(1));
+                    size_t cl = cn.find(':');
+                    if (cl != std::string_view::npos) cn.remove_prefix(cl + 1);
+                    if (cn == tagName && --depth == 0) return { nlt, ngt + 1 };
+                } else if (rt.back() != '/') {
+                    size_t ne = 0;
+                    while (ne < rt.size() && rt[ne] != ' ' && rt[ne] != '\t' && rt[ne] != '\r' && rt[ne] != '\n') ++ne;
+                    std::string_view en = rt.substr(0, ne);
+                    size_t cl = en.find(':');
+                    if (cl != std::string_view::npos) en.remove_prefix(cl + 1);
+                    if (en == tagName) ++depth;
+                }
+            }
+            return { openGt + 1, openGt + 1 };
+        };
+
+        size_t ip = svgClose + 1;
+        while (ip < sv.size() && idNodes.size() < 1024u) {
+            size_t lt = sv.find('<', ip);
+            if (lt == std::string_view::npos) break;
+            if (lt + 4 <= sv.size() && sv.substr(lt, 4) == "<!--") {
+                size_t ec = sv.find("-->", lt + 4);
+                if (ec == std::string_view::npos) break;
+                ip = ec + 3; continue;
+            }
+            size_t gt = findTagClose(lt);
+            if (gt == std::string_view::npos) break;
+            std::string_view rt = trimSv(sv.substr(lt + 1, gt - lt - 1));
+            ip = gt + 1;
+            if (rt.empty() || rt[0] == '/' || rt[0] == '!' || rt[0] == '?') continue;
+            bool sc = (rt.back() == '/');
+            if (sc) rt = trimSv(rt.substr(0, rt.size() - 1));
+            size_t ne = 0;
+            while (ne < rt.size() && rt[ne] != ' ' && rt[ne] != '\t' && rt[ne] != '\r' && rt[ne] != '\n') ++ne;
+            std::string_view el = rt.substr(0, ne);
+            size_t cl = el.find(':');
+            if (cl != std::string_view::npos) el.remove_prefix(cl + 1);
+            if (el == "linearGradient" || el == "radialGradient" || el == "style" || el == "defs") continue;
+
+            std::string_view idVal = trimSv(extractAttr(rt, "id"));
+            if (!idVal.empty()) {
+                SvgRefNode node{};
+                node.isSymbol = (el == "symbol");
+                node.openTag = rt;
+                std::string_view symVb = extractAttr(rt, "viewBox");
+                if (!symVb.empty()) {
+                    std::string vbs(symVb);
+                    for (char& c : vbs) if (c == ',') c = ' ';
+                    if (sscanf_s(vbs.c_str(), "%f %f %f %f", &node.vbX, &node.vbY, &node.vbW, &node.vbH) == 4 &&
+                        node.vbW > 0.0f && node.vbH > 0.0f)
+                    {
+                        node.hasViewBox = true;
+                    }
+                }
+                if (sc) {
+                    node.xmlSlice = node.isSymbol ? std::string_view{} : sv.substr(lt, gt - lt + 1);
+                } else {
+                    auto [closeLt, closeEnd] = findMatchingEnd(lt, gt, el);
+                    node.xmlSlice = node.isSymbol
+                        ? sv.substr(gt + 1, closeLt - (gt + 1))
+                        : sv.substr(lt, closeEnd - lt);
+                }
+                idNodes[std::string(idVal)] = node;
+            }
+        }
+    }
+
     struct SvgState {
         std::string elemName;
         SvgMat2D ctm{};
@@ -847,39 +1038,94 @@ inline bool DecodeSVG(const uint8_t* data, size_t size, uint32_t maxDimension, E
         bool hidden = false;
     };
 
+    auto applySingleStyleProp = [&](std::string_view prop, std::string_view val, SvgState& st) {
+        if (val.empty()) return;
+        if (prop == "fill") parsePaintSpec(val, st.fill);
+        else if (prop == "stroke") parsePaintSpec(val, st.stroke);
+        else if (prop == "stroke-width") {
+            float sw = static_cast<float>(std::atof(std::string(val).c_str()));
+            if (sw >= 0.0f) st.strokeWidth = sw;
+        }
+        else if (prop == "fill-opacity") st.fillOpacity = parseOpacityAttr(val, st.fillOpacity);
+        else if (prop == "stroke-opacity") st.strokeOpacity = parseOpacityAttr(val, st.strokeOpacity);
+        else if (prop == "opacity") st.opacity *= parseOpacityAttr(val, 1.0f);
+        else if (prop == "fill-rule") st.evenOdd = eqIgnoreCase(val, "evenodd");
+        else if (prop == "display" && eqIgnoreCase(val, "none")) st.hidden = true;
+        else if (prop == "visibility" && (eqIgnoreCase(val, "hidden") || eqIgnoreCase(val, "collapse"))) st.hidden = true;
+    };
+
+    auto hasClassToken = [&](std::string_view classAttr, std::string_view wantCls) -> bool {
+        size_t p = 0;
+        while (p < classAttr.size()) {
+            while (p < classAttr.size() && (classAttr[p] == ' ' || classAttr[p] == '\t' || classAttr[p] == '\r' || classAttr[p] == '\n')) ++p;
+            if (p >= classAttr.size()) break;
+            size_t e = p;
+            while (e < classAttr.size() && classAttr[e] != ' ' && classAttr[e] != '\t' && classAttr[e] != '\r' && classAttr[e] != '\n') ++e;
+            if (classAttr.substr(p, e - p) == wantCls) return true;
+            p = e;
+        }
+        return false;
+    };
+
     auto applyAttrsToState = [&](std::string_view tag, SvgState& st) {
         std::string_view tf = extractAttr(tag, "transform");
         if (!tf.empty()) {
             st.ctm = SvgMat2D::Multiply(st.ctm, parseTransform(tf));
         }
-        std::string_view fillAttr = extractStyleOrAttr(tag, "fill");
-        if (!fillAttr.empty()) parsePaintSpec(fillAttr, st.fill);
 
-        std::string_view strokeAttr = extractStyleOrAttr(tag, "stroke");
-        if (!strokeAttr.empty()) parsePaintSpec(strokeAttr, st.stroke);
+        // 1. XML presentation attributes (lowest CSS cascade specificity)
+        static constexpr std::string_view kPresProps[] = {
+            "fill", "stroke", "stroke-width", "fill-opacity", "stroke-opacity",
+            "opacity", "fill-rule", "display", "visibility"
+        };
+        for (std::string_view pn : kPresProps) {
+            std::string_view av = trimSv(extractAttr(tag, pn));
+            if (!av.empty()) applySingleStyleProp(pn, av, st);
+        }
 
-        std::string_view swAttr = extractStyleOrAttr(tag, "stroke-width");
-        if (!swAttr.empty()) {
-            float sw = static_cast<float>(std::atof(std::string(swAttr).c_str()));
-            if (sw >= 0.0f) st.strokeWidth = sw;
+        // 2. Matching <style> CSS rules (tag, .class, tag.class, #id)
+        if (!cssRules.empty()) {
+            std::string_view idAttr  = trimSv(extractAttr(tag, "id"));
+            std::string_view clsAttr = trimSv(extractAttr(tag, "class"));
+            for (const auto& rule : cssRules) {
+                bool match = false;
+                if (rule.selector[0] == '#') {
+                    match = (!idAttr.empty() && idAttr == std::string_view(rule.selector).substr(1));
+                } else if (rule.selector[0] == '.') {
+                    match = (!clsAttr.empty() && hasClassToken(clsAttr, std::string_view(rule.selector).substr(1)));
+                } else if (size_t dot = rule.selector.find('.'); dot != std::string::npos) {
+                    match = (st.elemName == std::string_view(rule.selector).substr(0, dot)) &&
+                            (!clsAttr.empty() && hasClassToken(clsAttr, std::string_view(rule.selector).substr(dot + 1)));
+                } else {
+                    match = eqIgnoreCase(st.elemName, rule.selector);
+                }
+                if (match) {
+                    for (const auto& kv : rule.props) {
+                        applySingleStyleProp(kv.first, kv.second, st);
+                    }
+                }
+            }
         }
-        st.fillOpacity   = parseOpacityAttr(extractStyleOrAttr(tag, "fill-opacity"), st.fillOpacity);
-        st.strokeOpacity = parseOpacityAttr(extractStyleOrAttr(tag, "stroke-opacity"), st.strokeOpacity);
-        // Element/group `opacity` multiplies cumulative opacity
-        float elemOp = parseOpacityAttr(extractStyleOrAttr(tag, "opacity"), 1.0f);
-        st.opacity *= elemOp;
 
-        std::string_view frAttr = extractStyleOrAttr(tag, "fill-rule");
-        if (!frAttr.empty()) {
-            st.evenOdd = eqIgnoreCase(frAttr, "evenodd");
-        }
-        std::string_view dispAttr = extractStyleOrAttr(tag, "display");
-        if (eqIgnoreCase(dispAttr, "none")) {
-            st.hidden = true;
-        }
-        std::string_view visAttr = extractStyleOrAttr(tag, "visibility");
-        if (eqIgnoreCase(visAttr, "hidden") || eqIgnoreCase(visAttr, "collapse")) {
-            st.hidden = true;
+        // 3. Inline style="..." attribute (highest specificity)
+        std::string_view styleSv = extractAttr(tag, "style");
+        if (!styleSv.empty()) {
+            size_t sp = 0;
+            while (sp < styleSv.size()) {
+                size_t semi = styleSv.find(';', sp);
+                if (semi == std::string_view::npos) semi = styleSv.size();
+                std::string_view item = trimSv(styleSv.substr(sp, semi - sp));
+                size_t colon = item.find(':');
+                if (colon != std::string_view::npos) {
+                    std::string propName(trimSv(item.substr(0, colon)));
+                    for (char& ch : propName) if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch + 32);
+                    std::string_view propVal = trimSv(item.substr(colon + 1));
+                    size_t bang = propVal.find("!important");
+                    if (bang != std::string_view::npos) propVal = trimSv(propVal.substr(0, bang));
+                    applySingleStyleProp(propName, propVal, st);
+                }
+                sp = semi + 1;
+            }
         }
     };
 
@@ -897,474 +1143,646 @@ inline bool DecodeSVG(const uint8_t* data, size_t size, uint32_t maxDimension, E
     std::vector<SvgState> stateStack;
     stateStack.push_back(rootState);
 
+    auto findTagCloseIn = [](std::string_view src, size_t startLt) -> size_t {
+        char quote = 0;
+        for (size_t i = startLt + 1; i < src.size(); ++i) {
+            char c = src[i];
+            if (quote != 0) {
+                if (c == quote) quote = 0;
+            } else {
+                if (c == '"' || c == '\'') quote = c;
+                else if (c == '>') return i;
+            }
+        }
+        return std::string_view::npos;
+    };
+
     int activeGradientIdx = -1;
 
-    size_t pos = svgClose + 1;
-    while (pos < sv.size()) {
-        size_t lt = sv.find('<', pos);
-        if (lt == std::string_view::npos) break;
+    std::function<void(std::string_view, std::vector<SvgState>&, int)> renderFragment =
+        [&](std::string_view frag, std::vector<SvgState>& stateStack, int useDepth)
+    {
+        size_t pos = 0;
+        while (pos < frag.size()) {
+            size_t lt = frag.find('<', pos);
+            if (lt == std::string_view::npos) break;
 
-        // Skip XML comments <!-- ... -->
-        if (lt + 4 <= sv.size() && sv.substr(lt, 4) == "<!--") {
-            size_t endComment = sv.find("-->", lt + 4);
-            if (endComment == std::string_view::npos) break;
-            pos = endComment + 3;
-            continue;
-        }
-        // Skip CDATA <![CDATA[ ... ]]>
-        if (lt + 9 <= sv.size() && sv.substr(lt, 9) == "<![CDATA[") {
-            size_t endCdata = sv.find("]]>", lt + 9);
-            if (endCdata == std::string_view::npos) break;
-            pos = endCdata + 3;
-            continue;
-        }
-
-        size_t gt = findTagClose(lt);
-        if (gt == std::string_view::npos) break;
-        std::string_view rawTag = trimSv(sv.substr(lt + 1, gt - lt - 1));
-        pos = gt + 1;
-        if (rawTag.empty() || rawTag[0] == '!' || rawTag[0] == '?') continue;
-
-        // Handle closing tag </elem>
-        if (rawTag[0] == '/') {
-            std::string_view closeName = trimSv(rawTag.substr(1));
-            size_t colonPos = closeName.find(':');
-            if (colonPos != std::string_view::npos) closeName.remove_prefix(colonPos + 1);
-            if (closeName == "linearGradient" || closeName == "radialGradient") {
-                activeGradientIdx = -1;
+            // Skip XML comments <!-- ... -->
+            if (lt + 4 <= frag.size() && frag.substr(lt, 4) == "<!--") {
+                size_t endComment = frag.find("-->", lt + 4);
+                if (endComment == std::string_view::npos) break;
+                pos = endComment + 3;
+                continue;
             }
-            if (closeName == "svg" && stateStack.size() <= 1) {
-                break;
+            // Skip CDATA <![CDATA[ ... ]]>
+            if (lt + 9 <= frag.size() && frag.substr(lt, 9) == "<![CDATA[") {
+                size_t endCdata = frag.find("]]>", lt + 9);
+                if (endCdata == std::string_view::npos) break;
+                pos = endCdata + 3;
+                continue;
             }
-            for (size_t si = stateStack.size(); si > 1; --si) {
-                if (stateStack[si - 1].elemName == closeName) {
-                    stateStack.resize(si - 1);
+
+            size_t gt = findTagCloseIn(frag, lt);
+            if (gt == std::string_view::npos) break;
+            std::string_view rawTag = trimSv(frag.substr(lt + 1, gt - lt - 1));
+            pos = gt + 1;
+            if (rawTag.empty() || rawTag[0] == '!' || rawTag[0] == '?') continue;
+
+            // Handle closing tag </elem>
+            if (rawTag[0] == '/') {
+                std::string_view closeName = trimSv(rawTag.substr(1));
+                size_t colonPos = closeName.find(':');
+                if (colonPos != std::string_view::npos) closeName.remove_prefix(colonPos + 1);
+                if (closeName == "linearGradient" || closeName == "radialGradient") {
+                    activeGradientIdx = -1;
+                }
+                if (closeName == "svg" && stateStack.size() <= 1 && useDepth == 0) {
                     break;
                 }
-            }
-            continue;
-        }
-
-        bool selfClosing = false;
-        if (!rawTag.empty() && rawTag.back() == '/') {
-            selfClosing = true;
-            rawTag.remove_suffix(1);
-            rawTag = trimSv(rawTag);
-        }
-
-        size_t nameEnd = 0;
-        while (nameEnd < rawTag.size() && rawTag[nameEnd] != ' ' && rawTag[nameEnd] != '\t' &&
-               rawTag[nameEnd] != '\r' && rawTag[nameEnd] != '\n') {
-            ++nameEnd;
-        }
-        std::string_view elem = rawTag.substr(0, nameEnd);
-        size_t nsColon = elem.find(':');
-        if (nsColon != std::string_view::npos) elem.remove_prefix(nsColon + 1);
-
-        // Parse <linearGradient>, <radialGradient>, and <stop> even inside <defs>
-        if (elem == "linearGradient" || elem == "radialGradient") {
-            SvgGradientDef gd{};
-            gd.id = std::string(trimSv(extractAttr(rawTag, "id")));
-            gd.isRadial = (elem == "radialGradient");
-            std::string_view href = extractAttr(rawTag, "href");
-            if (href.empty()) href = extractAttr(rawTag, "xlink:href");
-            href = trimSv(href);
-            if (!href.empty() && href.front() == '#') href.remove_prefix(1);
-            gd.hrefId.assign(href.data(), href.size());
-
-            // Copy defaults from referenced gradient if already defined
-            if (!gd.hrefId.empty()) {
-                if (const SvgGradientDef* parentG = findGradient(gd.hrefId)) {
-                    bool keepRadial = gd.isRadial;
-                    std::string keepId = gd.id, keepHref = gd.hrefId;
-                    gd = *parentG;
-                    gd.id = std::move(keepId);
-                    gd.hrefId = std::move(keepHref);
-                    gd.isRadial = keepRadial;
-                    gd.stops.clear();
-                }
-            }
-
-            std::string_view gu = extractAttr(rawTag, "gradientUnits");
-            if (gu == "userSpaceOnUse") gd.userSpaceOnUse = true;
-            else if (gu == "objectBoundingBox") gd.userSpaceOnUse = false;
-
-            std::string_view sm = extractAttr(rawTag, "spreadMethod");
-            if (sm == "reflect") gd.spreadMethod = 1;
-            else if (sm == "repeat") gd.spreadMethod = 2;
-            else if (sm == "pad") gd.spreadMethod = 0;
-
-            std::string_view gtAttr = extractAttr(rawTag, "gradientTransform");
-            if (!gtAttr.empty()) {
-                gd.gradTransform = parseTransform(gtAttr);
-                gd.hasTransform = true;
-            }
-            if (!gd.isRadial) {
-                gd.hasX1 = parseGradCoord(extractAttr(rawTag, "x1"), gd.x1) || gd.hasX1;
-                gd.hasY1 = parseGradCoord(extractAttr(rawTag, "y1"), gd.y1) || gd.hasY1;
-                gd.hasX2 = parseGradCoord(extractAttr(rawTag, "x2"), gd.x2) || gd.hasX2;
-                gd.hasY2 = parseGradCoord(extractAttr(rawTag, "y2"), gd.y2) || gd.hasY2;
-            } else {
-                gd.hasCx = parseGradCoord(extractAttr(rawTag, "cx"), gd.cx) || gd.hasCx;
-                gd.hasCy = parseGradCoord(extractAttr(rawTag, "cy"), gd.cy) || gd.hasCy;
-                gd.hasR  = parseGradCoord(extractAttr(rawTag, "r"),  gd.r)  || gd.hasR;
-                gd.hasFx = parseGradCoord(extractAttr(rawTag, "fx"), gd.fx) || gd.hasFx;
-                gd.hasFy = parseGradCoord(extractAttr(rawTag, "fy"), gd.fy) || gd.hasFy;
-            }
-
-            gradients.push_back(std::move(gd));
-            activeGradientIdx = selfClosing ? -1 : static_cast<int>(gradients.size()) - 1;
-            if (!selfClosing) {
-                SvgState child = stateStack.back();
-                child.elemName.assign(elem.data(), elem.size());
-                child.hidden = true;
-                stateStack.push_back(std::move(child));
-            }
-            continue;
-        }
-
-        if (elem == "stop") {
-            if (activeGradientIdx >= 0 && activeGradientIdx < static_cast<int>(gradients.size())) {
-                SvgGradStop st{};
-                SvgGradCoord offC{ 0.0f, false };
-                if (parseGradCoord(extractAttr(rawTag, "offset"), offC)) {
-                    st.offset = std::clamp(offC.val, 0.0f, 1.0f);
-                }
-                if (!gradients[activeGradientIdx].stops.empty()) {
-                    st.offset = std::max(st.offset, gradients[activeGradientIdx].stops.back().offset);
-                }
-                uint8_t cr = 0, cg = 0, cb = 0, ca = 255;
-                std::string_view sc = extractStyleOrAttr(rawTag, "stop-color");
-                if (!sc.empty()) {
-                    parseSvgColor(sc, cr, cg, cb, ca);
-                }
-                float so = parseOpacityAttr(extractStyleOrAttr(rawTag, "stop-opacity"), 1.0f);
-                st.r = cr; st.g = cg; st.b = cb;
-                st.a = static_cast<uint8_t>(std::clamp(ca * so + 0.5f, 0.0f, 255.0f));
-                gradients[activeGradientIdx].stops.push_back(st);
-            }
-            if (!selfClosing) {
-                SvgState child = stateStack.back();
-                child.elemName = "stop";
-                child.hidden = true;
-                stateStack.push_back(std::move(child));
-            }
-            continue;
-        }
-
-        SvgState cur = stateStack.back();
-        cur.elemName.assign(elem.data(), elem.size());
-        if (isNonRenderingContainer(elem)) {
-            cur.hidden = true;
-        }
-        applyAttrsToState(rawTag, cur);
-
-        if (!selfClosing && (elem == "g" || elem == "svg" || elem == "a" || isNonRenderingContainer(elem))) {
-            stateStack.push_back(cur);
-            continue;
-        }
-        if (!selfClosing) {
-            stateStack.push_back(cur);
-        }
-        if (cur.hidden) {
-            continue;
-        }
-
-        SvgMat2D invElemCtm{};
-        cur.ctm.Invert(invElemCtm);
-        const float fillAlphaMul   = std::clamp(cur.opacity * cur.fillOpacity, 0.0f, 1.0f);
-        const float strokeAlphaMul = std::clamp(cur.opacity * cur.strokeOpacity, 0.0f, 1.0f);
-        const float strokeWorldW   = cur.strokeWidth * cur.ctm.ScaleFactor();
-
-        auto renderShapeRings = [&](const std::vector<std::vector<std::pair<float, float>>>& localRings,
-                                    const std::vector<bool>& closedFlags,
-                                    bool allowFill)
-        {
-            if (localRings.empty()) return;
-            SvgLocalBBox bbox{};
-            std::vector<std::vector<std::pair<float, float>>> worldRings;
-            worldRings.reserve(localRings.size());
-            for (const auto& lr : localRings) {
-                std::vector<std::pair<float, float>> wr;
-                wr.reserve(lr.size());
-                for (const auto& p : lr) {
-                    bbox.Add(p.first, p.second);
-                    wr.push_back(cur.ctm.Apply(p.first, p.second));
-                }
-                worldRings.push_back(std::move(wr));
-            }
-            if (!bbox.Valid()) { bbox.minX = bbox.minY = 0.0f; bbox.maxX = bbox.maxY = 1.0f; }
-
-            if (allowFill && cur.fill.kind != SvgPaintSpec::None && fillAlphaMul > 0.0f) {
-                fillCompoundWorldRings(worldRings, cur.evenOdd, cur.fill, invElemCtm, bbox, fillAlphaMul);
-            }
-            if (cur.stroke.kind != SvgPaintSpec::None && strokeAlphaMul > 0.0f && cur.strokeWidth > 0.0f) {
-                for (size_t ri = 0; ri < worldRings.size(); ++ri) {
-                    const auto& wr = worldRings[ri];
-                    for (size_t i = 0; i + 1 < wr.size(); ++i) {
-                        drawThickSeg(wr[i].first, wr[i].second, wr[i + 1].first, wr[i + 1].second,
-                                     strokeWorldW, cur.stroke, invElemCtm, bbox, strokeAlphaMul);
-                    }
-                    if (ri < closedFlags.size() && closedFlags[ri] && wr.size() >= 3) {
-                        drawThickSeg(wr.back().first, wr.back().second, wr.front().first, wr.front().second,
-                                     strokeWorldW, cur.stroke, invElemCtm, bbox, strokeAlphaMul);
+                for (size_t si = stateStack.size(); si > 1; --si) {
+                    if (stateStack[si - 1].elemName == closeName) {
+                        stateStack.resize(si - 1);
+                        break;
                     }
                 }
+                continue;
             }
-        };
 
-        if (elem == "rect") {
-            float x  = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x")).c_str()));
-            float y  = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y")).c_str()));
-            float rw = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "width")).c_str()));
-            float rh = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "height")).c_str()));
-            if (rw > 0.0f && rh > 0.0f) {
-                std::string_view rxSv = extractAttr(rawTag, "rx");
-                std::string_view rySv = extractAttr(rawTag, "ry");
-                float crx = rxSv.empty() ? -1.0f : static_cast<float>(std::atof(std::string(rxSv).c_str()));
-                float cry = rySv.empty() ? -1.0f : static_cast<float>(std::atof(std::string(rySv).c_str()));
-                if (crx < 0.0f && cry >= 0.0f) crx = cry;
-                if (cry < 0.0f && crx >= 0.0f) cry = crx;
-                crx = std::clamp(crx, 0.0f, rw * 0.5f);
-                cry = std::clamp(cry, 0.0f, rh * 0.5f);
+            bool selfClosing = false;
+            if (!rawTag.empty() && rawTag.back() == '/') {
+                selfClosing = true;
+                rawTag.remove_suffix(1);
+                rawTag = trimSv(rawTag);
+            }
 
-                std::vector<std::pair<float, float>> pts;
-                if (crx > 1e-4f && cry > 1e-4f) {
-                    constexpr float kHalfPi = 1.5707963268f;
-                    auto addCorner = [&](float ccx, float ccy, float a0) {
-                        for (int s = 0; s <= 8; ++s) {
-                            float ang = a0 + kHalfPi * (static_cast<float>(s) / 8.0f);
-                            pts.push_back({ ccx + std::cos(ang) * crx, ccy + std::sin(ang) * cry });
-                        }
-                    };
-                    addCorner(x + rw - crx, y + cry,      -kHalfPi);
-                    addCorner(x + rw - crx, y + rh - cry,  0.0f);
-                    addCorner(x + crx,      y + rh - cry,  kHalfPi);
-                    addCorner(x + crx,      y + cry,       kHalfPi * 2.0f);
+            size_t nameEnd = 0;
+            while (nameEnd < rawTag.size() && rawTag[nameEnd] != ' ' && rawTag[nameEnd] != '\t' &&
+                   rawTag[nameEnd] != '\r' && rawTag[nameEnd] != '\n') {
+                ++nameEnd;
+            }
+            std::string_view elem = rawTag.substr(0, nameEnd);
+            size_t nsColon = elem.find(':');
+            if (nsColon != std::string_view::npos) elem.remove_prefix(nsColon + 1);
+
+            // Parse <linearGradient>, <radialGradient>, and <stop> even inside <defs>
+            if (useDepth == 0 && (elem == "linearGradient" || elem == "radialGradient")) {
+                SvgGradientDef gd{};
+                gd.id = std::string(trimSv(extractAttr(rawTag, "id")));
+                gd.isRadial = (elem == "radialGradient");
+                std::string_view href = extractAttr(rawTag, "href");
+                if (href.empty()) href = extractAttr(rawTag, "xlink:href");
+                href = trimSv(href);
+                if (!href.empty() && href.front() == '#') href.remove_prefix(1);
+                gd.hrefId.assign(href.data(), href.size());
+
+                if (!gd.hrefId.empty()) {
+                    if (const SvgGradientDef* parentG = findGradient(gd.hrefId)) {
+                        bool keepRadial = gd.isRadial;
+                        std::string keepId = gd.id, keepHref = gd.hrefId;
+                        gd = *parentG;
+                        gd.id = std::move(keepId);
+                        gd.hrefId = std::move(keepHref);
+                        gd.isRadial = keepRadial;
+                        gd.stops.clear();
+                    }
+                }
+
+                std::string_view gu = extractAttr(rawTag, "gradientUnits");
+                if (gu == "userSpaceOnUse") gd.userSpaceOnUse = true;
+                else if (gu == "objectBoundingBox") gd.userSpaceOnUse = false;
+
+                std::string_view sm = extractAttr(rawTag, "spreadMethod");
+                if (sm == "reflect") gd.spreadMethod = 1;
+                else if (sm == "repeat") gd.spreadMethod = 2;
+                else if (sm == "pad") gd.spreadMethod = 0;
+
+                std::string_view gtAttr = extractAttr(rawTag, "gradientTransform");
+                if (!gtAttr.empty()) {
+                    gd.gradTransform = parseTransform(gtAttr);
+                    gd.hasTransform = true;
+                }
+                if (!gd.isRadial) {
+                    gd.hasX1 = parseGradCoord(extractAttr(rawTag, "x1"), gd.x1) || gd.hasX1;
+                    gd.hasY1 = parseGradCoord(extractAttr(rawTag, "y1"), gd.y1) || gd.hasY1;
+                    gd.hasX2 = parseGradCoord(extractAttr(rawTag, "x2"), gd.x2) || gd.hasX2;
+                    gd.hasY2 = parseGradCoord(extractAttr(rawTag, "y2"), gd.y2) || gd.hasY2;
                 } else {
-                    pts = { { x, y }, { x + rw, y }, { x + rw, y + rh }, { x, y + rh } };
+                    gd.hasCx = parseGradCoord(extractAttr(rawTag, "cx"), gd.cx) || gd.hasCx;
+                    gd.hasCy = parseGradCoord(extractAttr(rawTag, "cy"), gd.cy) || gd.hasCy;
+                    gd.hasR  = parseGradCoord(extractAttr(rawTag, "r"),  gd.r)  || gd.hasR;
+                    gd.hasFx = parseGradCoord(extractAttr(rawTag, "fx"), gd.fx) || gd.hasFx;
+                    gd.hasFy = parseGradCoord(extractAttr(rawTag, "fy"), gd.fy) || gd.hasFy;
                 }
-                renderShapeRings({ std::move(pts) }, { true }, true);
-            }
-        } else if (elem == "circle" || elem == "ellipse") {
-            float cx = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "cx")).c_str()));
-            float cy = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "cy")).c_str()));
-            float rx = (elem == "circle")
-                ? static_cast<float>(std::atof(std::string(extractAttr(rawTag, "r")).c_str()))
-                : static_cast<float>(std::atof(std::string(extractAttr(rawTag, "rx")).c_str()));
-            float ry = (elem == "circle") ? rx : static_cast<float>(std::atof(std::string(extractAttr(rawTag, "ry")).c_str()));
-            if (rx > 0.0f && ry > 0.0f) {
-                std::vector<std::pair<float, float>> pts;
-                pts.reserve(64);
-                for (int i = 0; i < 64; ++i) {
-                    float a = static_cast<float>(i) * (6.283185307f / 64.0f);
-                    pts.push_back({ cx + std::cos(a) * rx, cy + std::sin(a) * ry });
-                }
-                renderShapeRings({ std::move(pts) }, { true }, true);
-            }
-        } else if (elem == "line") {
-            float x1 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x1")).c_str()));
-            float y1 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y1")).c_str()));
-            float x2 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x2")).c_str()));
-            float y2 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y2")).c_str()));
-            renderShapeRings({ { { x1, y1 }, { x2, y2 } } }, { false }, false);
-        } else if (elem == "polygon" || elem == "polyline") {
-            std::string ptsStr(extractAttr(rawTag, "points"));
-            for (char& c : ptsStr) if (c == ',') c = ' ';
-            std::vector<std::pair<float, float>> pts;
-            const char* p = ptsStr.c_str();
-            while (*p) {
-                while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
-                if (!*p) break;
-                char* n1 = nullptr;
-                float x = std::strtof(p, &n1);
-                if (n1 == p) break;
-                p = n1;
-                while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
-                char* n2 = nullptr;
-                float y = std::strtof(p, &n2);
-                if (n2 == p) break;
-                p = n2;
-                pts.push_back({ x, y });
-            }
-            bool isPoly = (elem == "polygon");
-            renderShapeRings({ std::move(pts) }, { isPoly }, true);
-        } else if (elem == "path") {
-            std::string_view dAttr = extractAttr(rawTag, "d");
-            std::vector<std::vector<std::pair<float, float>>> rings;
-            std::vector<bool> closedFlags;
-            std::vector<std::pair<float, float>> poly;
-            float curX = 0.0f, curY = 0.0f, startX = 0.0f, startY = 0.0f;
-            float lastCtrlX = 0.0f, lastCtrlY = 0.0f;
-            char cmd = 0, prevCmd = 0;
 
-            const char* p = dAttr.data();
-            const char* end = dAttr.data() + dAttr.size();
-            auto skipSep = [&]() {
-                while (p < end && (*p == ' ' || *p == '\t' || *p == ',' || *p == '\r' || *p == '\n')) ++p;
-            };
-            auto isCmdChar = [](char c) -> bool {
-                switch (c) {
-                    case 'M': case 'm': case 'Z': case 'z': case 'L': case 'l':
-                    case 'H': case 'h': case 'V': case 'v': case 'C': case 'c':
-                    case 'S': case 's': case 'Q': case 'q': case 'T': case 't':
-                    case 'A': case 'a': return true;
-                    default: return false;
+                gradients.push_back(std::move(gd));
+                activeGradientIdx = selfClosing ? -1 : static_cast<int>(gradients.size()) - 1;
+                if (!selfClosing) {
+                    SvgState child = stateStack.back();
+                    child.elemName.assign(elem.data(), elem.size());
+                    child.hidden = true;
+                    stateStack.push_back(std::move(child));
                 }
-            };
-            auto readFloat = [&]() -> float {
-                skipSep();
-                if (p >= end) return 0.0f;
-                char* next = nullptr;
-                float v = std::strtof(p, &next);
-                if (next > p) p = next;
-                else ++p;
-                return v;
-            };
-            // Dedicated single-character '0'/'1' flag lexer for minified SVG elliptical arcs (e.g., "a10,10 0 0110,0")
-            auto readArcFlag = [&]() -> bool {
-                skipSep();
-                if (p < end && (*p == '0' || *p == '1')) {
-                    return (*p++ == '1');
-                }
-                return readFloat() != 0.0f;
-            };
+                continue;
+            }
 
-            while (p < end) {
-                skipSep();
-                if (p >= end) break;
-                if (isCmdChar(*p)) {
-                    cmd = *p++;
-                    if (cmd == 'Z' || cmd == 'z') {
-                        if (!poly.empty()) {
-                            poly.push_back({ startX, startY });
-                            rings.push_back(std::move(poly));
-                            closedFlags.push_back(true);
-                            poly.clear();
+            if (useDepth == 0 && elem == "stop") {
+                if (activeGradientIdx >= 0 && activeGradientIdx < static_cast<int>(gradients.size())) {
+                    SvgGradStop st{};
+                    SvgGradCoord offC{ 0.0f, false };
+                    if (parseGradCoord(extractAttr(rawTag, "offset"), offC)) {
+                        st.offset = std::clamp(offC.val, 0.0f, 1.0f);
+                    }
+                    if (!gradients[activeGradientIdx].stops.empty()) {
+                        st.offset = std::max(st.offset, gradients[activeGradientIdx].stops.back().offset);
+                    }
+                    uint8_t cr = 0, cg = 0, cb = 0, ca = 255;
+                    std::string_view sc = extractStyleOrAttr(rawTag, "stop-color");
+                    if (!sc.empty()) {
+                        parseSvgColor(sc, cr, cg, cb, ca);
+                    }
+                    float so = parseOpacityAttr(extractStyleOrAttr(rawTag, "stop-opacity"), 1.0f);
+                    st.r = cr; st.g = cg; st.b = cb;
+                    st.a = static_cast<uint8_t>(std::clamp(ca * so + 0.5f, 0.0f, 255.0f));
+                    gradients[activeGradientIdx].stops.push_back(st);
+                }
+                if (!selfClosing) {
+                    SvgState child = stateStack.back();
+                    child.elemName = "stop";
+                    child.hidden = true;
+                    stateStack.push_back(std::move(child));
+                }
+                continue;
+            }
+
+            SvgState cur = stateStack.back();
+            cur.elemName.assign(elem.data(), elem.size());
+            if (isNonRenderingContainer(elem)) {
+                cur.hidden = true;
+            }
+            applyAttrsToState(rawTag, cur);
+
+            if (!selfClosing && (elem == "g" || elem == "svg" || elem == "a" || isNonRenderingContainer(elem))) {
+                stateStack.push_back(cur);
+                continue;
+            }
+            if (!selfClosing) {
+                stateStack.push_back(cur);
+            }
+            if (cur.hidden) {
+                continue;
+            }
+
+            // <use href="#..."> / <use xlink:href="#..."> instancing of <defs> / <symbol> / shapes
+            if (elem == "use") {
+                if (useDepth < 8) {
+                    std::string_view href = extractAttr(rawTag, "href");
+                    if (href.empty()) href = extractAttr(rawTag, "xlink:href");
+                    href = trimSv(href);
+                    if (!href.empty() && href.front() == '#') href.remove_prefix(1);
+                    if (!href.empty()) {
+                        auto it = idNodes.find(std::string(href));
+                        if (it != idNodes.end() && !it->second.xmlSlice.empty()) {
+                            const SvgRefNode& ref = it->second;
+                            const float ux = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x")).c_str()));
+                            const float uy = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y")).c_str()));
+                            const float uw = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "width")).c_str()));
+                            const float uh = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "height")).c_str()));
+
+                            SvgState inst = cur;
+                            inst.elemName = "g";
+                            inst.ctm = SvgMat2D::Multiply(inst.ctm, { 1.0f, 0.0f, 0.0f, 1.0f, ux, uy });
+                            if (ref.isSymbol) {
+                                applyAttrsToState(ref.openTag, inst);
+                                if (ref.hasViewBox && uw > 0.0f && uh > 0.0f) {
+                                    const float sx = uw / ref.vbW;
+                                    const float sy = uh / ref.vbH;
+                                    inst.ctm = SvgMat2D::Multiply(inst.ctm, { sx, 0.0f, 0.0f, sy, -ref.vbX * sx, -ref.vbY * sy });
+                                }
+                            }
+                            std::vector<SvgState> subStack = { inst };
+                            renderFragment(ref.xmlSlice, subStack, useDepth + 1);
                         }
-                        curX = startX; curY = startY;
-                        lastCtrlX = curX; lastCtrlY = curY;
-                        prevCmd = cmd;
+                    }
+                }
+                continue;
+            }
+
+            // <image href="data:image/png;base64,..."> embedded raster rendering
+            if (elem == "image") {
+                std::string_view href = extractAttr(rawTag, "href");
+                if (href.empty()) href = extractAttr(rawTag, "xlink:href");
+                href = trimSv(href);
+                if (href.size() > 16u && eqIgnoreCase(href.substr(0, 11), "data:image/")) {
+                    size_t comma = href.find(',');
+                    if (comma != std::string_view::npos) {
+                        std::string_view meta = href.substr(11, comma - 11);
+                        if (meta.find("base64") != std::string_view::npos || meta.find("BASE64") != std::string_view::npos) {
+                            std::vector<uint8_t> rawImg;
+                            if (::Explorer2::Base64::Decode(href.substr(comma + 1), rawImg, ::Explorer2::Base64::Mode::Lenient, 32 * 1024 * 1024) &&
+                                rawImg.size() >= 16u)
+                            {
+                                uint32_t picW = 0, picH = 0;
+                                std::vector<uint8_t> picBgra;
+                                bool imgDecoded = false;
+                                {
+                                    ExtendedImageInfo pngTmpInfo;
+                                    if (GpuTex::DecodePngToImageInfo(rawImg.data(), rawImg.size(), L"", pngTmpInfo) && pngTmpInfo.valid) {
+                                        picW = pngTmpInfo.width;
+                                        picH = pngTmpInfo.height;
+                                        picBgra = std::move(pngTmpInfo.bgraPixels);
+                                        imgDecoded = true;
+                                    }
+                                }
+#if defined(_WIN32) || defined(E2_WIN32_HAL)
+                                if (!imgDecoded) {
+                                    // Optional WIC fallback for data:image/jpeg;base64 or data:image/gif;base64
+                                    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                                    const bool needUninit = SUCCEEDED(hrCom);
+                                    Microsoft::WRL::ComPtr<IWICImagingFactory> fac;
+                                    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac)))) {
+                                        Microsoft::WRL::ComPtr<IWICStream> stm;
+                                        Microsoft::WRL::ComPtr<IWICBitmapDecoder> dec;
+                                        Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frm;
+                                        Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
+                                        if (SUCCEEDED(fac->CreateStream(&stm)) &&
+                                            SUCCEEDED(stm->InitializeFromMemory(rawImg.data(), static_cast<DWORD>(rawImg.size()))) &&
+                                            SUCCEEDED(fac->CreateDecoderFromStream(stm.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &dec)) &&
+                                            SUCCEEDED(dec->GetFrame(0, &frm)) &&
+                                            SUCCEEDED(frm->GetSize(&picW, &picH)) && picW > 0 && picH > 0 && picW <= 8192 && picH <= 8192 &&
+                                            SUCCEEDED(fac->CreateFormatConverter(&conv)) &&
+                                            SUCCEEDED(conv->Initialize(frm.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
+                                        {
+                                            std::vector<uint8_t> tmp(static_cast<size_t>(picW) * picH * 4u);
+                                            if (SUCCEEDED(conv->CopyPixels(nullptr, picW * 4u, static_cast<UINT>(tmp.size()), tmp.data()))) {
+                                                picBgra.resize(tmp.size());
+                                                for (size_t i = 0; i < static_cast<size_t>(picW) * picH; ++i) {
+                                                    WritePremulBGRA(&picBgra[i * 4u], tmp[i * 4u + 2u], tmp[i * 4u + 1u], tmp[i * 4u + 0u], tmp[i * 4u + 3u]);
+                                                }
+                                                imgDecoded = true;
+                                            }
+                                        }
+                                    }
+                                    if (needUninit) CoUninitialize();
+                                }
+#endif
+                                if (imgDecoded && picW > 0 && picH > 0 && picBgra.size() >= static_cast<size_t>(picW) * picH * 4u) {
+                                    const float ix = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x")).c_str()));
+                                    const float iy = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y")).c_str()));
+                                    float iw = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "width")).c_str()));
+                                    float ih = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "height")).c_str()));
+                                    if (iw <= 0.0f) iw = static_cast<float>(picW);
+                                    if (ih <= 0.0f) ih = static_cast<float>(picH);
+
+                                    SvgMat2D invImgCtm{};
+                                    if (cur.ctm.Invert(invImgCtm) && cur.opacity > 0.0f) {
+                                        const std::pair<float, float> corners[4] = {
+                                            cur.ctm.Apply(ix, iy),
+                                            cur.ctm.Apply(ix + iw, iy),
+                                            cur.ctm.Apply(ix + iw, iy + ih),
+                                            cur.ctm.Apply(ix, iy + ih)
+                                        };
+                                        float minSx = 1e9f, minSy = 1e9f, maxSx = -1e9f, maxSy = -1e9f;
+                                        for (const auto& c : corners) {
+                                            float sx = (c.first - vbX) * scaleX;
+                                            float sy = (c.second - vbY) * scaleY;
+                                            minSx = std::min(minSx, sx); maxSx = std::max(maxSx, sx);
+                                            minSy = std::min(minSy, sy); maxSy = std::max(maxSy, sy);
+                                        }
+                                        int px0 = std::max(0, static_cast<int>(std::floor(minSx)));
+                                        int py0 = std::max(0, static_cast<int>(std::floor(minSy)));
+                                        int px1 = std::min(static_cast<int>(outW) - 1, static_cast<int>(std::ceil(maxSx)));
+                                        int py1 = std::min(static_cast<int>(outH) - 1, static_cast<int>(std::ceil(maxSy)));
+                                        for (int py = py0; py <= py1; ++py) {
+                                            for (int px = px0; px <= px1; ++px) {
+                                                float wx = (px + 0.5f) / scaleX + vbX;
+                                                float wy = (py + 0.5f) / scaleY + vbY;
+                                                auto [lx, ly] = invImgCtm.Apply(wx, wy);
+                                                if (lx < ix || lx >= ix + iw || ly < iy || ly >= iy + ih) continue;
+                                                uint32_t sx = std::min(picW - 1u, static_cast<uint32_t>(((lx - ix) / iw) * picW));
+                                                uint32_t sy = std::min(picH - 1u, static_cast<uint32_t>(((ly - iy) / ih) * picH));
+                                                const uint8_t* sp = &picBgra[(static_cast<size_t>(sy) * picW + sx) * 4u];
+                                                if (sp[3] == 0u) continue;
+                                                uint8_t sr = sp[2], sg = sp[1], sb = sp[0], sa = sp[3];
+                                                if (sa < 255u) {
+                                                    sr = static_cast<uint8_t>(std::min<uint32_t>(255u, (static_cast<uint32_t>(sr) * 255u + sa / 2u) / sa));
+                                                    sg = static_cast<uint8_t>(std::min<uint32_t>(255u, (static_cast<uint32_t>(sg) * 255u + sa / 2u) / sa));
+                                                    sb = static_cast<uint8_t>(std::min<uint32_t>(255u, (static_cast<uint32_t>(sb) * 255u + sa / 2u) / sa));
+                                                }
+                                                uint8_t effA = static_cast<uint8_t>(std::clamp(sa * cur.opacity + 0.5f, 0.0f, 255.0f));
+                                                blendPixel(px, py, sr, sg, sb, effA);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            SvgMat2D invElemCtm{};
+            cur.ctm.Invert(invElemCtm);
+            const float fillAlphaMul   = std::clamp(cur.opacity * cur.fillOpacity, 0.0f, 1.0f);
+            const float strokeAlphaMul = std::clamp(cur.opacity * cur.strokeOpacity, 0.0f, 1.0f);
+            const float strokeWorldW   = cur.strokeWidth * cur.ctm.ScaleFactor();
+
+            auto renderShapeRings = [&](const std::vector<std::vector<std::pair<float, float>>>& localRings,
+                                        const std::vector<bool>& closedFlags,
+                                        bool allowFill)
+            {
+                if (localRings.empty()) return;
+                SvgLocalBBox bbox{};
+                std::vector<std::vector<std::pair<float, float>>> worldRings;
+                worldRings.reserve(localRings.size());
+                for (const auto& lr : localRings) {
+                    std::vector<std::pair<float, float>> wr;
+                    wr.reserve(lr.size());
+                    for (const auto& p : lr) {
+                        bbox.Add(p.first, p.second);
+                        wr.push_back(cur.ctm.Apply(p.first, p.second));
+                    }
+                    worldRings.push_back(std::move(wr));
+                }
+                if (!bbox.Valid()) { bbox.minX = bbox.minY = 0.0f; bbox.maxX = bbox.maxY = 1.0f; }
+
+                if (allowFill && cur.fill.kind != SvgPaintSpec::None && fillAlphaMul > 0.0f) {
+                    fillCompoundWorldRings(worldRings, cur.evenOdd, cur.fill, invElemCtm, bbox, fillAlphaMul);
+                }
+                if (cur.stroke.kind != SvgPaintSpec::None && strokeAlphaMul > 0.0f && cur.strokeWidth > 0.0f) {
+                    for (size_t ri = 0; ri < worldRings.size(); ++ri) {
+                        const auto& wr = worldRings[ri];
+                        for (size_t i = 0; i + 1 < wr.size(); ++i) {
+                            drawThickSeg(wr[i].first, wr[i].second, wr[i + 1].first, wr[i + 1].second,
+                                         strokeWorldW, cur.stroke, invElemCtm, bbox, strokeAlphaMul);
+                        }
+                        if (ri < closedFlags.size() && closedFlags[ri] && wr.size() >= 3) {
+                            drawThickSeg(wr.back().first, wr.back().second, wr.front().first, wr.front().second,
+                                         strokeWorldW, cur.stroke, invElemCtm, bbox, strokeAlphaMul);
+                        }
+                    }
+                }
+            };
+
+            if (elem == "rect") {
+                float x  = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x")).c_str()));
+                float y  = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y")).c_str()));
+                float rw = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "width")).c_str()));
+                float rh = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "height")).c_str()));
+                if (rw > 0.0f && rh > 0.0f) {
+                    std::string_view rxSv = extractAttr(rawTag, "rx");
+                    std::string_view rySv = extractAttr(rawTag, "ry");
+                    float crx = rxSv.empty() ? -1.0f : static_cast<float>(std::atof(std::string(rxSv).c_str()));
+                    float cry = rySv.empty() ? -1.0f : static_cast<float>(std::atof(std::string(rySv).c_str()));
+                    if (crx < 0.0f && cry >= 0.0f) crx = cry;
+                    if (cry < 0.0f && crx >= 0.0f) cry = crx;
+                    crx = std::clamp(crx, 0.0f, rw * 0.5f);
+                    cry = std::clamp(cry, 0.0f, rh * 0.5f);
+
+                    std::vector<std::pair<float, float>> pts;
+                    if (crx > 1e-4f && cry > 1e-4f) {
+                        constexpr float kHalfPi = 1.5707963268f;
+                        auto addCorner = [&](float ccx, float ccy, float a0) {
+                            for (int s = 0; s <= 8; ++s) {
+                                float ang = a0 + kHalfPi * (static_cast<float>(s) / 8.0f);
+                                pts.push_back({ ccx + std::cos(ang) * crx, ccy + std::sin(ang) * cry });
+                            }
+                        };
+                        addCorner(x + rw - crx, y + cry,      -kHalfPi);
+                        addCorner(x + rw - crx, y + rh - cry,  0.0f);
+                        addCorner(x + crx,      y + rh - cry,  kHalfPi);
+                        addCorner(x + crx,      y + cry,       kHalfPi * 2.0f);
+                    } else {
+                        pts = { { x, y }, { x + rw, y }, { x + rw, y + rh }, { x, y + rh } };
+                    }
+                    renderShapeRings({ std::move(pts) }, { true }, true);
+                }
+            } else if (elem == "circle" || elem == "ellipse") {
+                float cx = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "cx")).c_str()));
+                float cy = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "cy")).c_str()));
+                float rx = (elem == "circle")
+                    ? static_cast<float>(std::atof(std::string(extractAttr(rawTag, "r")).c_str()))
+                    : static_cast<float>(std::atof(std::string(extractAttr(rawTag, "rx")).c_str()));
+                float ry = (elem == "circle") ? rx : static_cast<float>(std::atof(std::string(extractAttr(rawTag, "ry")).c_str()));
+                if (rx > 0.0f && ry > 0.0f) {
+                    std::vector<std::pair<float, float>> pts;
+                    pts.reserve(64);
+                    for (int i = 0; i < 64; ++i) {
+                        float a = static_cast<float>(i) * (6.283185307f / 64.0f);
+                        pts.push_back({ cx + std::cos(a) * rx, cy + std::sin(a) * ry });
+                    }
+                    renderShapeRings({ std::move(pts) }, { true }, true);
+                }
+            } else if (elem == "line") {
+                float x1 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x1")).c_str()));
+                float y1 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y1")).c_str()));
+                float x2 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "x2")).c_str()));
+                float y2 = static_cast<float>(std::atof(std::string(extractAttr(rawTag, "y2")).c_str()));
+                renderShapeRings({ { { x1, y1 }, { x2, y2 } } }, { false }, false);
+            } else if (elem == "polygon" || elem == "polyline") {
+                std::string ptsStr(extractAttr(rawTag, "points"));
+                for (char& c : ptsStr) if (c == ',') c = ' ';
+                std::vector<std::pair<float, float>> pts;
+                const char* p = ptsStr.c_str();
+                while (*p) {
+                    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+                    if (!*p) break;
+                    char* n1 = nullptr;
+                    float x = std::strtof(p, &n1);
+                    if (n1 == p) break;
+                    p = n1;
+                    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+                    char* n2 = nullptr;
+                    float y = std::strtof(p, &n2);
+                    if (n2 == p) break;
+                    p = n2;
+                    pts.push_back({ x, y });
+                }
+                bool isPoly = (elem == "polygon");
+                renderShapeRings({ std::move(pts) }, { isPoly }, true);
+            } else if (elem == "path") {
+                std::string_view dAttr = extractAttr(rawTag, "d");
+                std::vector<std::vector<std::pair<float, float>>> rings;
+                std::vector<bool> closedFlags;
+                std::vector<std::pair<float, float>> poly;
+                float curX = 0.0f, curY = 0.0f, startX = 0.0f, startY = 0.0f;
+                float lastCtrlX = 0.0f, lastCtrlY = 0.0f;
+                char cmd = 0, prevCmd = 0;
+
+                const char* p = dAttr.data();
+                const char* end = dAttr.data() + dAttr.size();
+                auto skipSep = [&]() {
+                    while (p < end && (*p == ' ' || *p == '\t' || *p == ',' || *p == '\r' || *p == '\n')) ++p;
+                };
+                auto isCmdChar = [](char c) -> bool {
+                    switch (c) {
+                        case 'M': case 'm': case 'Z': case 'z': case 'L': case 'l':
+                        case 'H': case 'h': case 'V': case 'v': case 'C': case 'c':
+                        case 'S': case 's': case 'Q': case 'q': case 'T': case 't':
+                        case 'A': case 'a': return true;
+                        default: return false;
+                    }
+                };
+                auto readFloat = [&]() -> float {
+                    skipSep();
+                    if (p >= end) return 0.0f;
+                    char* next = nullptr;
+                    float v = std::strtof(p, &next);
+                    if (next > p) p = next;
+                    else ++p;
+                    return v;
+                };
+                auto readArcFlag = [&]() -> bool {
+                    skipSep();
+                    if (p < end && (*p == '0' || *p == '1')) {
+                        return (*p++ == '1');
+                    }
+                    return readFloat() != 0.0f;
+                };
+
+                while (p < end) {
+                    skipSep();
+                    if (p >= end) break;
+                    if (isCmdChar(*p)) {
+                        cmd = *p++;
+                        if (cmd == 'Z' || cmd == 'z') {
+                            if (!poly.empty()) {
+                                poly.push_back({ startX, startY });
+                                rings.push_back(std::move(poly));
+                                closedFlags.push_back(true);
+                                poly.clear();
+                            }
+                            curX = startX; curY = startY;
+                            lastCtrlX = curX; lastCtrlY = curY;
+                            prevCmd = cmd;
+                            continue;
+                        }
+                    } else if (cmd == 0) {
+                        ++p;
                         continue;
                     }
-                } else if (cmd == 0) {
-                    ++p;
-                    continue;
-                }
 
-                if (cmd == 'M' || cmd == 'm') {
-                    if (!poly.empty()) {
-                        rings.push_back(std::move(poly));
-                        closedFlags.push_back(false);
-                        poly.clear();
+                    if (cmd == 'M' || cmd == 'm') {
+                        if (!poly.empty()) {
+                            rings.push_back(std::move(poly));
+                            closedFlags.push_back(false);
+                            poly.clear();
+                        }
+                        float x = readFloat(), y = readFloat();
+                        curX = (cmd == 'm') ? (curX + x) : x;
+                        curY = (cmd == 'm') ? (curY + y) : y;
+                        startX = curX; startY = curY;
+                        lastCtrlX = curX; lastCtrlY = curY;
+                        poly.push_back({ curX, curY });
+                        prevCmd = cmd;
+                        cmd = (cmd == 'm') ? 'l' : 'L';
+                    } else if (cmd == 'L' || cmd == 'l') {
+                        float x = readFloat(), y = readFloat();
+                        curX = (cmd == 'l') ? (curX + x) : x;
+                        curY = (cmd == 'l') ? (curY + y) : y;
+                        lastCtrlX = curX; lastCtrlY = curY;
+                        poly.push_back({ curX, curY });
+                        prevCmd = cmd;
+                    } else if (cmd == 'H' || cmd == 'h') {
+                        float x = readFloat();
+                        curX = (cmd == 'h') ? (curX + x) : x;
+                        lastCtrlX = curX; lastCtrlY = curY;
+                        poly.push_back({ curX, curY });
+                        prevCmd = cmd;
+                    } else if (cmd == 'V' || cmd == 'v') {
+                        float y = readFloat();
+                        curY = (cmd == 'v') ? (curY + y) : y;
+                        lastCtrlX = curX; lastCtrlY = curY;
+                        poly.push_back({ curX, curY });
+                        prevCmd = cmd;
+                    } else if (cmd == 'C' || cmd == 'c') {
+                        float x1 = readFloat(), y1 = readFloat();
+                        float x2 = readFloat(), y2 = readFloat();
+                        float x  = readFloat(), y  = readFloat();
+                        if (cmd == 'c') { x1 += curX; y1 += curY; x2 += curX; y2 += curY; x += curX; y += curY; }
+                        for (int s = 1; s <= 12; ++s) {
+                            float t = s / 12.0f, it = 1.0f - t;
+                            float bx = it*it*it*curX + 3.0f*it*it*t*x1 + 3.0f*it*t*t*x2 + t*t*t*x;
+                            float by = it*it*it*curY + 3.0f*it*it*t*y1 + 3.0f*it*t*t*y2 + t*t*t*y;
+                            poly.push_back({ bx, by });
+                        }
+                        lastCtrlX = x2; lastCtrlY = y2;
+                        curX = x; curY = y;
+                        prevCmd = cmd;
+                    } else if (cmd == 'S' || cmd == 's') {
+                        bool reflect = (prevCmd == 'C' || prevCmd == 'c' || prevCmd == 'S' || prevCmd == 's');
+                        float x1 = reflect ? (2.0f * curX - lastCtrlX) : curX;
+                        float y1 = reflect ? (2.0f * curY - lastCtrlY) : curY;
+                        float x2 = readFloat(), y2 = readFloat();
+                        float x  = readFloat(), y  = readFloat();
+                        if (cmd == 's') { x2 += curX; y2 += curY; x += curX; y += curY; }
+                        for (int s = 1; s <= 12; ++s) {
+                            float t = s / 12.0f, it = 1.0f - t;
+                            float bx = it*it*it*curX + 3.0f*it*it*t*x1 + 3.0f*it*t*t*x2 + t*t*t*x;
+                            float by = it*it*it*curY + 3.0f*it*it*t*y1 + 3.0f*it*t*t*y2 + t*t*t*y;
+                            poly.push_back({ bx, by });
+                        }
+                        lastCtrlX = x2; lastCtrlY = y2;
+                        curX = x; curY = y;
+                        prevCmd = cmd;
+                    } else if (cmd == 'Q' || cmd == 'q') {
+                        float x1 = readFloat(), y1 = readFloat();
+                        float x  = readFloat(), y  = readFloat();
+                        if (cmd == 'q') { x1 += curX; y1 += curY; x += curX; y += curY; }
+                        for (int s = 1; s <= 12; ++s) {
+                            float t = s / 12.0f, it = 1.0f - t;
+                            float bx = it*it*curX + 2.0f*it*t*x1 + t*t*x;
+                            float by = it*it*curY + 2.0f*it*t*y1 + t*t*y;
+                            poly.push_back({ bx, by });
+                        }
+                        lastCtrlX = x1; lastCtrlY = y1;
+                        curX = x; curY = y;
+                        prevCmd = cmd;
+                    } else if (cmd == 'T' || cmd == 't') {
+                        bool reflect = (prevCmd == 'Q' || prevCmd == 'q' || prevCmd == 'T' || prevCmd == 't');
+                        float x1 = reflect ? (2.0f * curX - lastCtrlX) : curX;
+                        float y1 = reflect ? (2.0f * curY - lastCtrlY) : curY;
+                        float x  = readFloat(), y  = readFloat();
+                        if (cmd == 't') { x += curX; y += curY; }
+                        for (int s = 1; s <= 12; ++s) {
+                            float t = s / 12.0f, it = 1.0f - t;
+                            float bx = it*it*curX + 2.0f*it*t*x1 + t*t*x;
+                            float by = it*it*curY + 2.0f*it*t*y1 + t*t*y;
+                            poly.push_back({ bx, by });
+                        }
+                        lastCtrlX = x1; lastCtrlY = y1;
+                        curX = x; curY = y;
+                        prevCmd = cmd;
+                    } else if (cmd == 'A' || cmd == 'a') {
+                        float rx = readFloat();
+                        float ry = readFloat();
+                        float rot = readFloat();
+                        bool largeArc = readArcFlag();
+                        bool sweep = readArcFlag();
+                        float x = readFloat(), y = readFloat();
+                        if (cmd == 'a') { x += curX; y += curY; }
+                        appendSvgEllipticalArc(poly, curX, curY, rx, ry, rot, largeArc, sweep, x, y);
+                        curX = x; curY = y;
+                        lastCtrlX = curX; lastCtrlY = curY;
+                        prevCmd = cmd;
+                    } else {
+                        ++p;
                     }
-                    float x = readFloat(), y = readFloat();
-                    curX = (cmd == 'm') ? (curX + x) : x;
-                    curY = (cmd == 'm') ? (curY + y) : y;
-                    startX = curX; startY = curY;
-                    lastCtrlX = curX; lastCtrlY = curY;
-                    poly.push_back({ curX, curY });
-                    prevCmd = cmd;
-                    cmd = (cmd == 'm') ? 'l' : 'L';
-                } else if (cmd == 'L' || cmd == 'l') {
-                    float x = readFloat(), y = readFloat();
-                    curX = (cmd == 'l') ? (curX + x) : x;
-                    curY = (cmd == 'l') ? (curY + y) : y;
-                    lastCtrlX = curX; lastCtrlY = curY;
-                    poly.push_back({ curX, curY });
-                    prevCmd = cmd;
-                } else if (cmd == 'H' || cmd == 'h') {
-                    float x = readFloat();
-                    curX = (cmd == 'h') ? (curX + x) : x;
-                    lastCtrlX = curX; lastCtrlY = curY;
-                    poly.push_back({ curX, curY });
-                    prevCmd = cmd;
-                } else if (cmd == 'V' || cmd == 'v') {
-                    float y = readFloat();
-                    curY = (cmd == 'v') ? (curY + y) : y;
-                    lastCtrlX = curX; lastCtrlY = curY;
-                    poly.push_back({ curX, curY });
-                    prevCmd = cmd;
-                } else if (cmd == 'C' || cmd == 'c') {
-                    float x1 = readFloat(), y1 = readFloat();
-                    float x2 = readFloat(), y2 = readFloat();
-                    float x  = readFloat(), y  = readFloat();
-                    if (cmd == 'c') { x1 += curX; y1 += curY; x2 += curX; y2 += curY; x += curX; y += curY; }
-                    for (int s = 1; s <= 12; ++s) {
-                        float t = s / 12.0f, it = 1.0f - t;
-                        float bx = it*it*it*curX + 3.0f*it*it*t*x1 + 3.0f*it*t*t*x2 + t*t*t*x;
-                        float by = it*it*it*curY + 3.0f*it*it*t*y1 + 3.0f*it*t*t*y2 + t*t*t*y;
-                        poly.push_back({ bx, by });
-                    }
-                    lastCtrlX = x2; lastCtrlY = y2;
-                    curX = x; curY = y;
-                    prevCmd = cmd;
-                } else if (cmd == 'S' || cmd == 's') {
-                    bool reflect = (prevCmd == 'C' || prevCmd == 'c' || prevCmd == 'S' || prevCmd == 's');
-                    float x1 = reflect ? (2.0f * curX - lastCtrlX) : curX;
-                    float y1 = reflect ? (2.0f * curY - lastCtrlY) : curY;
-                    float x2 = readFloat(), y2 = readFloat();
-                    float x  = readFloat(), y  = readFloat();
-                    if (cmd == 's') { x2 += curX; y2 += curY; x += curX; y += curY; }
-                    for (int s = 1; s <= 12; ++s) {
-                        float t = s / 12.0f, it = 1.0f - t;
-                        float bx = it*it*it*curX + 3.0f*it*it*t*x1 + 3.0f*it*t*t*x2 + t*t*t*x;
-                        float by = it*it*it*curY + 3.0f*it*it*t*y1 + 3.0f*it*t*t*y2 + t*t*t*y;
-                        poly.push_back({ bx, by });
-                    }
-                    lastCtrlX = x2; lastCtrlY = y2;
-                    curX = x; curY = y;
-                    prevCmd = cmd;
-                } else if (cmd == 'Q' || cmd == 'q') {
-                    float x1 = readFloat(), y1 = readFloat();
-                    float x  = readFloat(), y  = readFloat();
-                    if (cmd == 'q') { x1 += curX; y1 += curY; x += curX; y += curY; }
-                    for (int s = 1; s <= 12; ++s) {
-                        float t = s / 12.0f, it = 1.0f - t;
-                        float bx = it*it*curX + 2.0f*it*t*x1 + t*t*x;
-                        float by = it*it*curY + 2.0f*it*t*y1 + t*t*y;
-                        poly.push_back({ bx, by });
-                    }
-                    lastCtrlX = x1; lastCtrlY = y1;
-                    curX = x; curY = y;
-                    prevCmd = cmd;
-                } else if (cmd == 'T' || cmd == 't') {
-                    bool reflect = (prevCmd == 'Q' || prevCmd == 'q' || prevCmd == 'T' || prevCmd == 't');
-                    float x1 = reflect ? (2.0f * curX - lastCtrlX) : curX;
-                    float y1 = reflect ? (2.0f * curY - lastCtrlY) : curY;
-                    float x  = readFloat(), y  = readFloat();
-                    if (cmd == 't') { x += curX; y += curY; }
-                    for (int s = 1; s <= 12; ++s) {
-                        float t = s / 12.0f, it = 1.0f - t;
-                        float bx = it*it*curX + 2.0f*it*t*x1 + t*t*x;
-                        float by = it*it*curY + 2.0f*it*t*y1 + t*t*y;
-                        poly.push_back({ bx, by });
-                    }
-                    lastCtrlX = x1; lastCtrlY = y1;
-                    curX = x; curY = y;
-                    prevCmd = cmd;
-                } else if (cmd == 'A' || cmd == 'a') {
-                    float rx = readFloat();
-                    float ry = readFloat();
-                    float rot = readFloat();
-                    bool largeArc = readArcFlag();
-                    bool sweep = readArcFlag();
-                    float x = readFloat(), y = readFloat();
-                    if (cmd == 'a') { x += curX; y += curY; }
-                    appendSvgEllipticalArc(poly, curX, curY, rx, ry, rot, largeArc, sweep, x, y);
-                    curX = x; curY = y;
-                    lastCtrlX = curX; lastCtrlY = curY;
-                    prevCmd = cmd;
-                } else {
-                    ++p;
                 }
+                if (!poly.empty()) {
+                    rings.push_back(std::move(poly));
+                    closedFlags.push_back(false);
+                }
+                renderShapeRings(rings, closedFlags, true);
             }
-            if (!poly.empty()) {
-                rings.push_back(std::move(poly));
-                closedFlags.push_back(false);
-            }
-            renderShapeRings(rings, closedFlags, true);
         }
+    };
+
+    renderFragment(sv.substr(svgClose + 1), stateStack, 0);
+
+    if (!drewVisiblePixel) {
+        outInfo = {};
+        return false;
     }
 
     outInfo.valid = true;

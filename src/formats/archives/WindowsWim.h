@@ -1,16 +1,14 @@
 #pragma once
 // WindowsWim.h — Windows Imaging Format (.wim, .esd — "MSWIM\0\0\0", XPRESS Huffman & LZX).
+// Uses shared Explorer2::Lzx::Decoder (src/LzxDecoder.h) for LZX chunks (with E8 translation undo & stored-block alignment).
 
 #include "../common/ArchiveFormatCommon.h"
+#include "../../LzxDecoder.h"
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
-// ============================================================================
-// 32. Windows Imaging Format (.wim / .esd — "MSWIM\0\0\0")
-//     XPRESS Huffman + LZX Chunked Resources, XML Manifest, RESHDR Lookup & DIRENTRY Tree
-// ============================================================================
 struct WimResEntry {
     uint64_t wimOffset = 0;
     uint64_t compSize = 0;
@@ -49,7 +47,6 @@ inline bool DecompressXpressHuffmanChunk(
         nextCode[bits] = code;
     }
     if (code + blCount[15] > 32768u) return false;
-    // Allow single-symbol degenerate tree (nonZeroSyms == 1 && blCount[1] == 1), otherwise require full Kraft tree
     if (nonZeroSyms > 1 && (code + blCount[15]) != 32768u) return false;
 
     std::vector<uint16_t> decTbl(32768u, 0xFFFFu);
@@ -71,7 +68,7 @@ inline bool DecompressXpressHuffmanChunk(
     }
 
     uint32_t bitBuf = (static_cast<uint32_t>(RdU16LE(src + 256)) << 16) | RdU16LE(src + 258);
-    int extraBits = 16; // validBits = 16 + extraBits; refill next U16LE when extraBits < 0
+    int extraBits = 16;
     size_t inPos = 260;
 
     auto consumeBits = [&](int n) -> bool {
@@ -145,308 +142,7 @@ inline bool DecompressXpressHuffmanChunk(
     return true;
 }
 
-// [MS-PATCH] / WIM LZX Chunk Decompressor (window reset per WIM chunk, 16-bit LE MSB bitstream)
-inline bool DecompressWimLzxChunk(
-    const uint8_t* src,
-    size_t srcLen,
-    uint8_t* dst,
-    size_t dstLen,
-    uint32_t windowSize)
-{
-    if (dstLen == 0) return true;
-    if (srcLen < 2) return false;
-
-    // Determine LZX position slot count from windowSize (32KB -> 30 slots, 64KB -> 32, ..., 2MB -> 50)
-    int wndBits = 15;
-    while ((1u << wndBits) < windowSize && wndBits < 21) ++wndBits;
-    static const uint32_t kPosBase[51] = {
-        0,1,2,3,4,6,8,12,16,24,32,48,64,96,128,192,256,384,512,768,1024,1536,2048,3072,
-        4096,6144,8192,12288,16384,24576,32768,49152,65536,98304,131072,196608,262144,
-        393216,524288,655360,786432,917504,1048576,1179648,1310720,1441792,1572864,1703936,
-        1835008,1966080,2097152
-    };
-    static const uint8_t kExtraBits[51] = {
-        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,
-        15,15,16,16,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17
-    };
-    uint32_t numPosSlots = (wndBits == 20) ? 42u : ((wndBits == 21) ? 50u : static_cast<uint32_t>(wndBits * 2));
-    uint32_t mainTreeSyms = 256u + numPosSlots * 8u;
-
-    uint64_t bitBuf = 0;
-    int validBits = 0;
-    size_t inPos = 0;
-    auto ensureBits = [&](int need) -> bool {
-        while (validBits < need) {
-            uint16_t w = 0;
-            if (inPos + 2 <= srcLen) {
-                w = RdU16LE(src + inPos);
-                inPos += 2;
-            } else if (inPos < srcLen) {
-                w = static_cast<uint16_t>(src[inPos++]);
-            } else {
-                if (validBits >= need) break;
-                return false;
-            }
-            bitBuf |= (static_cast<uint64_t>(w) << (48 - validBits));
-            validBits += 16;
-        }
-        return true;
-    };
-    auto peekBits = [&](int n) -> uint32_t {
-        return (n == 0) ? 0u : static_cast<uint32_t>(bitBuf >> (64 - n));
-    };
-    auto dropBits = [&](int n) {
-        bitBuf <<= n;
-        validBits -= n;
-    };
-    auto readBits = [&](int n, uint32_t& outV) -> bool {
-        if (n == 0) { outV = 0; return true; }
-        if (!ensureBits(n)) return false;
-        outV = peekBits(n);
-        dropBits(n);
-        return true;
-    };
-
-    auto buildHuff = [](const uint8_t* lens, uint32_t nSyms, int maxB, std::vector<uint16_t>& tbl) -> bool {
-        uint32_t tblSz = 1u << maxB;
-        tbl.assign(tblSz, 0xFFFFu);
-        uint32_t cnt[17] = {};
-        uint32_t nz = 0;
-        for (uint32_t i = 0; i < nSyms; ++i) {
-            if (lens[i] > maxB) return false;
-            if (lens[i] > 0) { ++cnt[lens[i]]; ++nz; }
-        }
-        if (nz == 0) return true;
-        uint32_t nextC[17] = {};
-        uint32_t c = 0;
-        for (int b = 1; b <= maxB; ++b) {
-            c = (c + cnt[b - 1]) << 1;
-            nextC[b] = c;
-        }
-        if (c + cnt[maxB] > tblSz) return false;
-        for (uint32_t s = 0; s < nSyms; ++s) {
-            uint8_t l = lens[s];
-            if (l == 0) continue;
-            uint32_t code = nextC[l]++;
-            uint32_t sh = static_cast<uint32_t>(maxB - l);
-            uint32_t st = code << sh;
-            uint32_t n  = 1u << sh;
-            if (st + n > tblSz) return false;
-            uint16_t v = static_cast<uint16_t>((static_cast<uint16_t>(l) << 10) | s);
-            for (uint32_t k = 0; k < n; ++k) tbl[st + k] = v;
-        }
-        if (nz == 1) {
-            for (uint32_t k = 0; k < tblSz; ++k) if (tbl[k] == 0xFFFFu) tbl[k] = tbl[0];
-        }
-        return true;
-    };
-
-    auto decodeSym = [&](const std::vector<uint16_t>& tbl, int maxB, uint32_t& outSym) -> bool {
-        if (validBits < maxB) ensureBits(maxB);
-        if (validBits <= 0) return false;
-        uint16_t e = tbl[peekBits(maxB)];
-        if (e == 0xFFFFu) return false;
-        int l = e >> 10;
-        if (validBits < l) return false;
-        dropBits(l);
-        outSym = e & 0x3FFu;
-        return true;
-    };
-
-    auto readLzxTreeLengths = [&](uint8_t* lens, uint32_t startSym, uint32_t count) -> bool {
-        uint8_t preLens[20] = {};
-        for (int i = 0; i < 20; ++i) {
-            uint32_t v = 0;
-            if (!readBits(4, v)) return false;
-            preLens[i] = static_cast<uint8_t>(v);
-        }
-        std::vector<uint16_t> preTbl;
-        if (!buildHuff(preLens, 20, 16, preTbl)) return false;
-
-        uint32_t i = startSym;
-        uint32_t endSym = startSym + count;
-        while (i < endSym) {
-            uint32_t z = 0;
-            if (!decodeSym(preTbl, 16, z)) return false;
-            if (z == 17u) {
-                uint32_t run = 0;
-                if (!readBits(4, run)) return false;
-                run += 4u;
-                for (uint32_t k = 0; k < run && i < endSym; ++k) lens[i++] = 0;
-            } else if (z == 18u) {
-                uint32_t run = 0;
-                if (!readBits(5, run)) return false;
-                run += 20u;
-                for (uint32_t k = 0; k < run && i < endSym; ++k) lens[i++] = 0;
-            } else if (z == 19u) {
-                uint32_t run = 0, sym2 = 0;
-                if (!readBits(1, run) || !decodeSym(preTbl, 16, sym2) || sym2 > 16u) return false;
-                run += 4u;
-                uint8_t val = static_cast<uint8_t>((17 + static_cast<int>(lens[i]) - static_cast<int>(sym2)) % 17);
-                for (uint32_t k = 0; k < run && i < endSym; ++k) lens[i++] = val;
-            } else {
-                lens[i] = static_cast<uint8_t>((17 + static_cast<int>(lens[i]) - static_cast<int>(z)) % 17);
-                ++i;
-            }
-        }
-        return true;
-    };
-
-    // WIM LZX chunk header: 1-bit E8 translation flag (if 1, followed by 32-bit filesize)
-    uint32_t e8Flag = 0, e8FileSize = 0;
-    if (!readBits(1, e8Flag)) return false;
-    if (e8Flag != 0) {
-        uint32_t hi = 0, lo = 0;
-        if (!readBits(16, hi) || !readBits(16, lo)) return false;
-        e8FileSize = (hi << 16) | lo;
-    }
-    (void)e8FileSize;
-
-    std::vector<uint8_t> mainLens(mainTreeSyms, 0), lenLens(249, 0);
-    uint8_t alignLens[8] = {};
-    std::vector<uint16_t> mainTbl, lenTbl, alignTbl;
-    uint32_t R0 = 1, R1 = 1, R2 = 1;
-    size_t outPos = 0;
-
-    while (outPos < dstLen) {
-        uint32_t blkType = 0, szBit = 0, blkLen = 0;
-        if (!readBits(3, blkType) || blkType == 0 || blkType > 3) return false;
-        if (!readBits(1, szBit)) return false;
-        if (szBit != 0) {
-            blkLen = 32768u; // WIM LZX compact 1-bit size indicator when chunkSize <= 32KB
-        } else {
-            //Wait: check standard 24-bit vs WIM 16-bit block size: in WIM LZX (chunkSize=32768), if bit==1 blockSize=32768, else 16-bit blockSize!
-            if (windowSize <= 32768u) {
-                if (!readBits(16, blkLen)) return false;
-            } else {
-                uint32_t bHi = 0, bLo = 0;
-                if (!readBits(8, bHi) || !readBits(16, bLo)) return false;
-                blkLen = (bHi << 16) | bLo;
-            }
-        }
-        if (blkLen == 0) break;
-        size_t blkEnd = std::min<size_t>(dstLen, outPos + blkLen);
-
-        if (blkType == 3u) {
-            // Uncompressed LZX block: align bitstream to 16-bit boundary, read R0, R1, R2 (3 x u32 LE)
-            int rem = validBits & 15;
-            if (rem > 0) dropBits(rem);
-            // Put back buffered 16-bit words or read from bitBuf/src
-            auto readRawU32 = [&](uint32_t& v) -> bool {
-                uint8_t b[4] = {};
-                for (int k = 0; k < 4; ++k) {
-                    if (validBits >= 8) {
-                        // Note: 16-bit words were loaded LE into MSB, so low byte of original word is bits 7..0 of the 16-bit word!
-                    }
-                    (void)b;
-                }
-                // Rewind inPos by buffered whole 16-bit words
-                return false;
-            };
-            (void)readRawU32;
-            size_t bufferedWords = static_cast<size_t>(validBits / 16);
-            if (bufferedWords * 2 <= inPos) {
-                inPos -= bufferedWords * 2;
-                bitBuf = 0;
-                validBits = 0;
-            }
-            if (inPos + 12 > srcLen) return false;
-            R0 = RdU32LE(src + inPos + 0);
-            R1 = RdU32LE(src + inPos + 4);
-            R2 = RdU32LE(src + inPos + 8);
-            inPos += 12;
-            size_t rawCopy = blkEnd - outPos;
-            if (inPos + rawCopy > srcLen) return false;
-            std::memcpy(dst + outPos, src + inPos, rawCopy);
-            inPos += rawCopy;
-            if ((rawCopy & 1u) != 0 && inPos < srcLen) ++inPos;
-            outPos = blkEnd;
-            continue;
-        }
-
-        if (blkType == 2u) {
-            for (int i = 0; i < 8; ++i) {
-                uint32_t v = 0;
-                if (!readBits(3, v)) return false;
-                alignLens[i] = static_cast<uint8_t>(v);
-            }
-            if (!buildHuff(alignLens, 8, 8, alignTbl)) return false;
-        }
-
-        if (!readLzxTreeLengths(mainLens.data(), 0, 256) ||
-            !readLzxTreeLengths(mainLens.data(), 256, mainTreeSyms - 256) ||
-            !readLzxTreeLengths(lenLens.data(), 0, 249))
-        {
-            return false;
-        }
-        if (!buildHuff(mainLens.data(), mainTreeSyms, 16, mainTbl) ||
-            !buildHuff(lenLens.data(), 249, 16, lenTbl))
-        {
-            return false;
-        }
-
-        while (outPos < blkEnd) {
-            uint32_t mainSym = 0;
-            if (!decodeSym(mainTbl, 16, mainSym)) return false;
-            if (mainSym < 256u) {
-                dst[outPos++] = static_cast<uint8_t>(mainSym);
-            } else {
-                uint32_t m = mainSym - 256u;
-                uint32_t posSlot = m >> 3;
-                uint32_t lenHdr  = m & 7u;
-                size_t matchLen  = 0;
-                if (lenHdr == 7u) {
-                    uint32_t lSym = 0;
-                    if (!decodeSym(lenTbl, 16, lSym)) return false;
-                    matchLen = static_cast<size_t>(lSym) + 9u;
-                } else {
-                    matchLen = static_cast<size_t>(lenHdr) + 2u;
-                }
-
-                uint32_t matchOff = 0;
-                if (posSlot == 0) {
-                    matchOff = R0;
-                } else if (posSlot == 1) {
-                    matchOff = R1; R1 = R0; R0 = matchOff;
-                } else if (posSlot == 2) {
-                    matchOff = R2; R2 = R0; R0 = matchOff;
-                } else {
-                    if (posSlot >= 51u) return false;
-                    int eb = kExtraBits[posSlot];
-                    uint32_t formattedOff = kPosBase[posSlot];
-                    if (blkType == 2u && eb >= 3) {
-                        uint32_t vHi = 0, al = 0;
-                        if (eb > 3 && !readBits(eb - 3, vHi)) return false;
-                        if (!decodeSym(alignTbl, 8, al)) return false;
-                        formattedOff += (vHi << 3) + al;
-                    } else if (eb > 0) {
-                        uint32_t ex = 0;
-                        if (eb > 16) {
-                            uint32_t eHi = 0, eLo = 0;
-                            if (!readBits(eb - 16, eHi) || !readBits(16, eLo)) return false;
-                            ex = (eHi << 16) | eLo;
-                        } else {
-                            if (!readBits(eb, ex)) return false;
-                        }
-                        formattedOff += ex;
-                    }
-                    if (formattedOff < 2u) return false;
-                    matchOff = formattedOff - 2u;
-                    R2 = R1; R1 = R0; R0 = matchOff;
-                }
-
-                if (matchOff == 0 || matchOff > outPos || matchLen > dstLen - outPos) return false;
-                for (size_t k = 0; k < matchLen; ++k) {
-                    dst[outPos + k] = dst[outPos - matchOff + k];
-                }
-                outPos += matchLen;
-            }
-        }
-    }
-    return outPos == dstLen;
-}
-
-// [MS-WIM] Chunked Resource Reader (Uncompressed, XPRESS Huffman, or LZX)
+// [MS-WIM] Chunked Resource Reader (Uncompressed, XPRESS Huffman, or LZX via Explorer2::Lzx::Decoder)
 inline bool DecompressWimResource(
     const uint8_t* wimData,
     size_t wimSize,
@@ -469,7 +165,7 @@ inline bool DecompressWimResource(
 
     if (res.origSize == 0) return true;
     if (res.origSize > maxBytes || res.compSize == 0) return false;
-    if ((wimHeaderFlags & 0x00080000u) != 0) return false; // LZMS solid .esd requires solid block table
+    if ((wimHeaderFlags & 0x00080000u) != 0) return false; // LZMS solid .esd
 
     uint32_t chunkSize = (wimChunkSize >= 512u && wimChunkSize <= 64u * 1024u * 1024u &&
                           (wimChunkSize & (wimChunkSize - 1u)) == 0)
@@ -487,6 +183,10 @@ inline bool DecompressWimResource(
     outBuf.resize(static_cast<size_t>(res.origSize));
     bool isLzx    = (wimHeaderFlags & 0x00040000u) != 0;
     bool isXpress = (wimHeaderFlags & 0x00020000u) != 0 || !isLzx;
+
+    int lzxWndBits = 15;
+    while ((1u << lzxWndBits) < chunkSize && lzxWndBits < 21) ++lzxWndBits;
+    const std::vector<uint64_t> emptyFrameOffs;
 
     for (uint64_t c = 0; c < numChunks; ++c) {
         uint64_t cStart = 0;
@@ -510,7 +210,6 @@ inline bool DecompressWimResource(
             : static_cast<size_t>(res.origSize - dstOff);
 
         if (compLen == dstLen) {
-            // Per [MS-WIM], chunks whose compressed size equals target uncompressed size are stored raw!
             std::memcpy(outBuf.data() + dstOff, compBase + static_cast<size_t>(cStart), dstLen);
         } else {
             if (compLen == 0 || compLen > dstLen) {
@@ -523,7 +222,15 @@ inline bool DecompressWimResource(
                 ok = DecompressXpressHuffmanChunk(cPtr, compLen, outBuf.data() + dstOff, dstLen);
             }
             if (!ok && isLzx) {
-                ok = DecompressWimLzxChunk(cPtr, compLen, outBuf.data() + dstOff, dstLen, chunkSize);
+                // Pad with 2 trailing zero bytes so odd-sized LZX chunks never starve the 16-bit LE word reader
+                std::vector<uint8_t> padded(compLen + 2u, 0u);
+                std::memcpy(padded.data(), cPtr, compLen);
+                std::vector<uint8_t> lzxChunk;
+                ::Explorer2::Lzx::Decoder dec(padded.data(), padded.size(), lzxWndBits, 0u, emptyFrameOffs);
+                if (dec.Decode(dstLen, lzxChunk) && lzxChunk.size() == dstLen) {
+                    std::memcpy(outBuf.data() + dstOff, lzxChunk.data(), dstLen);
+                    ok = true;
+                }
             }
             if (!ok) {
                 outBuf.clear();
@@ -551,15 +258,15 @@ inline bool WalkOrExtractWimDirEntryTree(
     std::vector<uint8_t>* outExtracted,
     bool& outExtractedOk)
 {
-    if (depth > 20 || dirOffset + 102 > metaLen) return false;
+    if (depth > 20 || dirOffset > metaLen || metaLen - dirOffset < 102) return false;
     if (outInfo && outInfo->entries.size() >= 30000) return true;
     if (!visitedOffsets.insert(dirOffset).second) return true;
 
     size_t pos = dirOffset;
-    while (pos + 8 <= metaLen) {
+    while (pos <= metaLen && metaLen - pos >= 8) {
         if (outInfo && outInfo->entries.size() >= 30000) break;
         uint64_t liLength = RdU64LE(metaBuf + pos);
-        if (liLength == 0) break; // End of directory list
+        if (liLength == 0) break;
         if (liLength < 102 || liLength > metaLen - pos) break;
 
         const uint8_t* de   = metaBuf + pos;
@@ -638,7 +345,9 @@ inline bool WalkOrExtractWimDirEntryTree(
             if (extractTargetNorm && outExtractedOk) return true;
         }
 
-        pos += static_cast<size_t>((liLength + 7ULL) & ~7ULL);
+        uint64_t step = (liLength + 7ULL) & ~7ULL;
+        if (step > metaLen - pos) break;
+        pos += static_cast<size_t>(step);
     }
     return true;
 }
@@ -650,7 +359,7 @@ inline bool ParseOrExtractWindowsWim(
     const std::wstring* extractTargetNorm = nullptr,
     std::vector<uint8_t>* outExtracted = nullptr)
 {
-    if (size < 208 || std::memcmp(data, "MSWIM\0\0\0", 8) != 0) return false;
+    if (!data || size < 208 || std::memcmp(data, "MSWIM\0\0\0", 8) != 0) return false;
     uint32_t cbSize      = RdU32LE(data + 8);
     uint32_t dwVersion   = RdU32LE(data + 12);
     uint32_t dwFlags     = RdU32LE(data + 16);
@@ -676,7 +385,6 @@ inline bool ParseOrExtractWindowsWim(
     WimResEntry rhXml       = readResHdr(72);
     WimResEntry rhBootMeta  = readResHdr(96);
 
-    // 1. Parse UTF-16LE / UTF-8 XML Manifest (uncompressed or compressed)
     struct WimXmlImage {
         uint32_t index = 1;
         std::wstring name;
@@ -745,7 +453,6 @@ inline bool ParseOrExtractWindowsWim(
         }
     }
 
-    // 2. Parse Lookup Table (50-byte RESHDR_DISK_LONG records)
     std::vector<WimResEntry> lookupTable;
     std::vector<WimResEntry> metadataResources;
     std::vector<uint8_t> tblBytes;
@@ -770,7 +477,6 @@ inline bool ParseOrExtractWindowsWim(
         metadataResources.push_back(rhBootMeta);
     }
 
-    // 3. Decompress and walk each Metadata Resource (SECURITYBLOCK_DISK -> root DIRENTRY tree)
     size_t walkedImages = 0;
     for (size_t m = 0; m < metadataResources.size(); ++m) {
         const auto& mr = metadataResources[m];
@@ -780,7 +486,7 @@ inline bool ParseOrExtractWindowsWim(
 
         uint32_t secLen = RdU32LE(metaBytes.data());
         size_t rootDirOff = (secLen == 0) ? 8u : static_cast<size_t>((static_cast<uint64_t>(secLen) + 7ULL) & ~7ULL);
-        if (rootDirOff + 102 > metaBytes.size()) continue;
+        if (rootDirOff > metaBytes.size() || metaBytes.size() - rootDirOff < 102) continue;
 
         std::wstring imgPrefix;
         if (m < xmlImages.size() && !xmlImages[m].name.empty()) {
@@ -808,7 +514,6 @@ inline bool ParseOrExtractWindowsWim(
     if (extractTargetNorm) return false;
     if (!outInfo) return false;
 
-    // Never emit fake Image_1 placeholder entries when metadata fails to decode!
     if (walkedImages == 0) {
         outInfo->entries.clear();
         outInfo->valid = false;
@@ -832,10 +537,10 @@ inline bool ExtractWimEntryFromMemory(
     return ParseOrExtractWindowsWim(data, size, nullptr, &normTarget, &outBytes);
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool InspectWindowsWim(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc100::ParseWindowsWim(data, size, outInfo);
+    return DetailDiskAndGameArc::ParseWindowsWim(data, size, outInfo);
 }
 
 inline bool ExtractWindowsWimEntry(
@@ -844,7 +549,7 @@ inline bool ExtractWindowsWimEntry(
     const std::wstring& normTarget,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc100::ExtractWimEntryFromMemory(data, size, normTarget, outBytes);
+    return DetailDiskAndGameArc::ExtractWimEntryFromMemory(data, size, normTarget, outBytes);
 }
 
 } // namespace Explorer2::Formats

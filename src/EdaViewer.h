@@ -17,7 +17,7 @@ public:
     EdaViewer() = default;
     ~EdaViewer();
 
-    void Initialize(HWND notifyHwnd, ID2D1Factory* d2dFactory);
+    void Initialize(HWND notifyHwnd, ID2D1Factory* d2dFactory, IDWriteFactory* dwriteFactory = nullptr);
     void Shutdown();
 
     // The readers themselves live in EdaReaders.cpp
@@ -100,6 +100,8 @@ private:
 
     HWND m_notifyHwnd = nullptr;
     ID2D1Factory* m_d2dFactory = nullptr;
+    IDWriteTextFormat* m_fmtSmallTrim = nullptr;
+    std::wstring m_lineScratch;
 
     std::wstring m_currentPath;
     ParsedEdaBoard m_board;

@@ -6,7 +6,7 @@ namespace Formats {
 // ============================================================================
 // #81. Microsoft Access Database (.accdb / .mdb) — Real Jet3 & Jet4/ACE Engine
 // ============================================================================
-namespace DetailDocs200 {
+namespace DetailStructuredDataDoc {
 
 struct JetColDef {
     uint8_t colType = 0;
@@ -80,25 +80,16 @@ inline std::wstring FormatOleDate(double oleDays) {
     int64_t days = sec / 86400;
     int64_t rem = sec % 86400;
     if (rem < 0) { rem += 86400; --days; }
-    // Howard Hinnant civil_from_days algorithm
-    int64_t z = days + 719468;
-    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    uint32_t doe = static_cast<uint32_t>(z - era * 146097);
-    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t y = static_cast<int64_t>(yoe) + era * 400;
-    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    uint32_t mp = (5 * doy + 2) / 153;
-    uint32_t d = doy - (153 * mp + 2) / 5 + 1;
-    uint32_t m = mp < 10 ? mp + 3 : mp - 9;
-    if (m <= 2) ++y;
+    int y = 1970, m = 1, d = 1;
+    ::Explorer2::ReaderText::CivilFromDays1970(days, y, m, d);
     wchar_t buf[48] = {};
     if (rem == 0) {
-        swprintf_s(buf, L"%04lld-%02u-%02u", static_cast<long long>(y), m, d);
+        swprintf_s(buf, L"%04d-%02d-%02d", y, m, d);
     } else {
         uint32_t hh = static_cast<uint32_t>(rem / 3600);
         uint32_t mm = static_cast<uint32_t>((rem % 3600) / 60);
         uint32_t ss = static_cast<uint32_t>(rem % 60);
-        swprintf_s(buf, L"%04lld-%02u-%02u %02u:%02u:%02u", static_cast<long long>(y), m, d, hh, mm, ss);
+        swprintf_s(buf, L"%04d-%02d-%02d %02u:%02u:%02u", y, m, d, hh, mm, ss);
     }
     return buf;
 }
@@ -473,15 +464,15 @@ inline void CollectJetTableRows(const std::vector<uint8_t>& raw, size_t pageSize
     }
 }
 
-} // namespace DetailDocs200
+} // namespace DetailStructuredDataDoc
 
-inline bool ParseAccessDatabase200(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
+inline bool ParseAccessDatabaseMdb(const std::vector<uint8_t>& raw, const std::wstring& ext, ParsedOfficeDocument& out) {
     if (raw.size() < 32) return false;
     bool isAce = (std::memcmp(raw.data() + 4, "Standard ACE DB", 15) == 0);
     bool isJet = (std::memcmp(raw.data() + 4, "Standard Jet DB", 15) == 0);
     if (!isAce && !isJet) return false;
 
-    uint32_t verCode = DetailDocs200::RdU32LE(raw.data() + 0x14);
+    uint32_t verCode = DetailStructuredDataDoc::RdU32LE(raw.data() + 0x14);
     bool isJet3 = (isJet && verCode == 0);
     size_t pageSize = isJet3 ? 2048u : 4096u;
     if (raw.size() < pageSize * 2u) return false;
@@ -496,24 +487,24 @@ inline bool ParseAccessDatabase200(const std::vector<uint8_t>& raw, const std::w
     for (size_t pg = 1; pg < numPages; ++pg) {
         const uint8_t* p = raw.data() + pg * pageSize;
         if (p[0] == 0x02u) {
-            uint32_t nextPg = DetailDocs200::RdU32LE(p + 4u);
+            uint32_t nextPg = DetailStructuredDataDoc::RdU32LE(p + 4u);
             if (nextPg > 0u && nextPg < numPages && nextPg != pg) {
                 isContTdef[nextPg] = true;
             }
         } else if (p[0] == 0x01u && std::memcmp(p + 4u, "LVAL", 4) != 0) {
-            uint32_t ownerTdef = DetailDocs200::RdU32LE(p + 4u);
+            uint32_t ownerTdef = DetailStructuredDataDoc::RdU32LE(p + 4u);
             if (ownerTdef > 0u && ownerTdef < numPages) {
                 ownerDataPairs.push_back({ ownerTdef, static_cast<uint32_t>(pg) });
             }
         }
     }
 
-    std::vector<DetailDocs200::JetTableDef> tables;
+    std::vector<DetailStructuredDataDoc::JetTableDef> tables;
     int msysIdx = -1;
     for (uint32_t pg = 1; pg < static_cast<uint32_t>(numPages); ++pg) {
         if (raw[static_cast<size_t>(pg) * pageSize] != 0x02u || isContTdef[pg]) continue;
-        DetailDocs200::JetTableDef td;
-        if (DetailDocs200::ParseJetTdefChain(raw, pageSize, isJet3, pg, td)) {
+        DetailStructuredDataDoc::JetTableDef td;
+        if (DetailStructuredDataDoc::ParseJetTdefChain(raw, pageSize, isJet3, pg, td)) {
             if (pg == 2u) {
                 td.name = L"MSysObjects";
                 td.isSystem = true;
@@ -547,7 +538,7 @@ inline bool ParseAccessDatabase200(const std::vector<uint8_t>& raw, const std::w
         }
         if (idCol >= 0 && nameCol >= 0) {
             std::vector<std::vector<std::wstring>> catRows;
-            DetailDocs200::CollectJetTableRows(raw, pageSize, isJet3, msys, getDataPagesFor(2u), catRows, 1000);
+            DetailStructuredDataDoc::CollectJetTableRows(raw, pageSize, isJet3, msys, getDataPagesFor(2u), catRows, 1000);
             for (const auto& r : catRows) {
                 if (static_cast<size_t>(std::max(idCol, nameCol)) >= r.size()) continue;
                 const std::wstring& nm = r[static_cast<size_t>(nameCol)];
@@ -598,7 +589,7 @@ inline bool ParseAccessDatabase200(const std::vector<uint8_t>& raw, const std::w
     size_t userSheetsEmitted = 0;
     for (const auto& td : tables) {
         std::vector<std::vector<std::wstring>> dataRows;
-        DetailDocs200::CollectJetTableRows(raw, pageSize, isJet3, td, getDataPagesFor(td.tdefPage), dataRows, 500);
+        DetailStructuredDataDoc::CollectJetTableRows(raw, pageSize, isJet3, td, getDataPagesFor(td.tdefPage), dataRows, 500);
 
         schemaSh.rows.push_back({
             td.name,
@@ -632,7 +623,7 @@ inline bool ParseAccessDatabase200(const std::vector<uint8_t>& raw, const std::w
         for (const auto& c : msys.cols) hdrRow.push_back(c.name);
         msh.rows.push_back(std::move(hdrRow));
         std::vector<std::vector<std::wstring>> catRows;
-        DetailDocs200::CollectJetTableRows(raw, pageSize, isJet3, msys, getDataPagesFor(2u), catRows, 200);
+        DetailStructuredDataDoc::CollectJetTableRows(raw, pageSize, isJet3, msys, getDataPagesFor(2u), catRows, 200);
         for (auto& dr : catRows) msh.rows.push_back(std::move(dr));
         out.sheets.push_back(std::move(msh));
     }

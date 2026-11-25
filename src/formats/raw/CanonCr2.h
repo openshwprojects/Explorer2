@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailImg200 {
+namespace DetailVectorAndRawImg {
 
 // Canon .cr2 horizontal slice unslicing (tag 0xC640: [count, sliceWidth, lastSliceWidth])
 inline void UnsliceCanonCr2Sensor(
@@ -43,10 +43,10 @@ inline void UnsliceCanonCr2Sensor(
     }
 }
 
-} // namespace DetailImg200
+} // namespace DetailVectorAndRawImg
 
 inline bool DecodeCanonCr2(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DetailImg200::ParseTiffRawIfds(data, size, L"Canon CR2 RAW (.cr2)", outInfo);
+    return DetailVectorAndRawImg::ParseTiffRawIfds(data, size, L"Canon CR2 RAW (.cr2)", outInfo);
 }
 
 } // namespace Formats

@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc200 {
+namespace DetailUnixAndLegacyArc {
 
 // ============================================================================
 // #26. Blizzard MoPaQ Archive (.mpq — "MPQ\x1A" / "MPQ\x1B")
@@ -445,10 +445,10 @@ inline bool ParseBlizzardMpq(const uint8_t* data, size_t size, ArchiveSummaryInf
     return ParseOrExtractBlizzardMpq(data, size, &outInfo, nullptr, nullptr);
 }
 
-} // namespace DetailArc200
+} // namespace DetailUnixAndLegacyArc
 
 inline bool InspectBlizzardMpq(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc200::ParseBlizzardMpq(data, size, outInfo);
+    return DetailUnixAndLegacyArc::ParseBlizzardMpq(data, size, outInfo);
 }
 
 inline bool ExtractBlizzardMpqEntry(
@@ -457,7 +457,7 @@ inline bool ExtractBlizzardMpqEntry(
     const std::wstring& want,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc200::ParseOrExtractBlizzardMpq(data, size, nullptr, &want, &outBytes);
+    return DetailUnixAndLegacyArc::ParseOrExtractBlizzardMpq(data, size, nullptr, &want, &outBytes);
 }
 
 } // namespace Explorer2::Formats

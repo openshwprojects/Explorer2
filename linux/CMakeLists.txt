@@ -2,7 +2,7 @@
 #
 # Targets:
 #   explorer2-readers  - Standalone headless format reader CLI
-#   explorer2-stage15  - Stage 15 format + VCS test runner
+#   explorer2-format-tests  - Stage 15 format + VCS test runner
 #   explorer2          - Complete Explorer2 Linux application + CLI modes (--version, --self-test, --inspect-files, --dump-hw, --monitor-daemon)
 #
 # Options:
@@ -48,10 +48,36 @@ find_package(Threads REQUIRED)
 # 1. Shared object library for the heavy format readers + core Win32/WIC/Net/Sys HAL
 add_library(e2_readers_obj OBJECT
     ${E2_SRC}/ArchiveReaders.cpp
+    ${E2_SRC}/ArchiveReadersClassicPak.cpp
+    ${E2_SRC}/ArchiveReadersEnginePak.cpp
+    ${E2_SRC}/ArchiveReadersStrategyFpsPak.cpp
+    ${E2_SRC}/ArchiveReadersSystemRetro.cpp
     ${E2_SRC}/DocReaders.cpp
+    ${E2_SRC}/DocReadersSecurityBin.cpp
+    ${E2_SRC}/DocReadersSciAiData.cpp
+    ${E2_SRC}/DocReadersAudioMedia.cpp
+    ${E2_SRC}/DocReadersCatalogRpg.cpp
+    ${E2_SRC}/DocReadersGameWorldLoc.cpp
+    ${E2_SRC}/DocReadersAnalyticsForensics.cpp
     ${E2_SRC}/EdaReaders.cpp
+    ${E2_SRC}/EdaReadersAsicBitstream.cpp
+    ${E2_SRC}/EdaReadersScopeAuto.cpp
+    ${E2_SRC}/EdaReadersVlsiWave.cpp
+    ${E2_SRC}/EdaReadersFpgaBoard.cpp
+    ${E2_SRC}/EdaReadersSiliconDiag.cpp
+    ${E2_SRC}/EdaReadersCircuitBench.cpp
     ${E2_SRC}/ImageFormatLoader.cpp
+    ${E2_SRC}/ImageReadersConsoleRetro.cpp
+    ${E2_SRC}/ImageReadersGameTextures.cpp
+    ${E2_SRC}/ImageReadersWorkstationRetro.cpp
     ${E2_SRC}/Mesh3DReaders.cpp
+    ${E2_SRC}/Mesh3DReadersCadBrep.cpp
+    ${E2_SRC}/Mesh3DReadersRiggedEngine.cpp
+    ${E2_SRC}/Mesh3DReadersVoxelSci.cpp
+    ${E2_SRC}/Mesh3DReadersSkeletalScene.cpp
+    ${E2_SRC}/Mesh3DReadersConsoleGame.cpp
+    ${E2_SRC}/Mesh3DReadersEngineeringGame.cpp
+    ${E2_SRC}/StreamCodecs.cpp
     ${E2_SRC}/ZipDeflate.cpp
     ${E2_HAL_SRC}/Win32HalCore.cpp
     ${E2_HAL_SRC}/WicHal.cpp
@@ -79,12 +105,20 @@ add_library(e2_viewers_tests_obj OBJECT
     ${E2_SRC}/SvnWorkingCopy.cpp
     ${E2_SRC}/RepoBrowser.cpp
     ${E2_SRC}/FormatTests3D.cpp
+    ${E2_SRC}/FormatTests3DCadSci.cpp
+    ${E2_SRC}/FormatTests3DGameConsole.cpp
     ${E2_SRC}/FormatTestsEda.cpp
+    ${E2_SRC}/FormatTestsEdaVlsiFpga.cpp
+    ${E2_SRC}/FormatTestsEdaWaveformsBus.cpp
     ${E2_SRC}/FormatTestsImages.cpp
+    ${E2_SRC}/FormatTestsImagesStudioRaw.cpp
+    ${E2_SRC}/FormatTestsImagesGpuGame.cpp
     ${E2_SRC}/FormatTestsDocs.cpp
-    ${E2_SRC}/FormatTestsDocsB.cpp
+    ${E2_SRC}/FormatTestsDocsSystem.cpp
+    ${E2_SRC}/FormatTestsDocsAnalyticsForensics.cpp
+    ${E2_SRC}/FormatTestsDocsGameLoc.cpp
     ${E2_SRC}/FormatTestsArchives.cpp
-    ${E2_SRC}/FormatTestsBatch70.cpp
+    ${E2_SRC}/FormatTestsArchivesSystemPak.cpp
     ${E2_SRC}/SelfTestVcs.cpp)
 
 target_include_directories(e2_viewers_tests_obj PRIVATE ${E2_HAL_INC} ${E2_SRC})
@@ -104,17 +138,17 @@ target_compile_options(explorer2-readers PRIVATE -Wall -Wno-unknown-pragmas)
 target_link_libraries(explorer2-readers PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
 # Target B: Stage 15 + VCS Test Runner
-add_executable(explorer2-stage15
+add_executable(explorer2-format-tests
     $<TARGET_OBJECTS:e2_readers_obj>
     $<TARGET_OBJECTS:e2_viewers_tests_obj>
     AppLogLinux.cpp
-    Stage15Runner.cpp)
+    FormatTestsRunner.cpp)
 
-target_include_directories(explorer2-stage15 PRIVATE ${E2_HAL_INC} ${E2_SRC})
-target_compile_definitions(explorer2-stage15 PRIVATE E2_WIN32_HAL=1 UNICODE _UNICODE)
-set_target_properties(explorer2-stage15 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-target_compile_options(explorer2-stage15 PRIVATE -Wall -Wno-unknown-pragmas)
-target_link_libraries(explorer2-stage15 PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+target_include_directories(explorer2-format-tests PRIVATE ${E2_HAL_INC} ${E2_SRC})
+target_compile_definitions(explorer2-format-tests PRIVATE E2_WIN32_HAL=1 UNICODE _UNICODE)
+set_target_properties(explorer2-format-tests PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+target_compile_options(explorer2-format-tests PRIVATE -Wall -Wno-unknown-pragmas)
+target_link_libraries(explorer2-format-tests PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
 # Target C: Complete Explorer2 Application (all 43 cross-platform TUs + WinMainEntry)
 add_executable(explorer2
@@ -135,6 +169,7 @@ add_executable(explorer2
     ${E2_SRC}/AppLog.cpp
     ${E2_SRC}/BackupManager.cpp
     ${E2_SRC}/TransferManager.cpp
+    ${E2_SRC}/FileLockInspector.cpp
     ${E2_SRC}/FtpClient.cpp
     ${E2_SRC}/FileContentPane.cpp
     ${E2_HAL_SRC}/X11GuiHal.cpp
@@ -147,10 +182,10 @@ target_compile_options(explorer2 PRIVATE -Wall -Wno-unknown-pragmas)
 target_link_libraries(explorer2 PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
 if(EXPLORER2_SANITIZE)
-    foreach(tgt e2_readers_obj e2_viewers_tests_obj explorer2-readers explorer2-stage15 explorer2)
+    foreach(tgt e2_readers_obj e2_viewers_tests_obj explorer2-readers explorer2-format-tests explorer2)
         target_compile_options(${tgt} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
     endforeach()
-    foreach(exe explorer2-readers explorer2-stage15 explorer2)
+    foreach(exe explorer2-readers explorer2-format-tests explorer2)
         target_link_options(${exe} PRIVATE -fsanitize=address,undefined)
     endforeach()
 elseif(E2_STATIC_LINUX)
@@ -160,12 +195,12 @@ elseif(E2_STATIC_LINUX)
     target_link_libraries(explorer2 PRIVATE X11 xcb Xau Xdmcp)
     # musl gives a new thread 128 KiB of stack, where the readers' and workers' deep recursion overflows; it takes
     # the default for its threads from the PT_GNU_STACK size this option sets (glibc uses the 8 MiB stack limit)
-    foreach(exe explorer2-readers explorer2-stage15 explorer2)
+    foreach(exe explorer2-readers explorer2-format-tests explorer2)
         target_link_options(${exe} PRIVATE -static -Wl,-z,stack-size=2097152)
     endforeach()
 else()
     # Statically link libstdc++ and libgcc so portable binaries do not need libstdc++.so.6 / libgcc_s.so.1 at runtime
-    foreach(exe explorer2-readers explorer2-stage15 explorer2)
+    foreach(exe explorer2-readers explorer2-format-tests explorer2)
         target_link_options(${exe} PRIVATE -static-libstdc++ -static-libgcc)
     endforeach()
 endif()

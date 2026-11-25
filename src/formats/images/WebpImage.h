@@ -1261,7 +1261,7 @@ inline bool DecodeWebpPureCpp(const uint8_t* data, size_t size, ExtendedImageInf
             return true;
         }
         // Fallback to OS WIC WebP decoder for complex B_PRED / segmented VP8 streams
-        return DetailImg100::DecodeEmbeddedWicBuffer(data, size, L"WebP Raster (.webp)", outInfo);
+        return DetailLayeredAndHdrImg::DecodeEmbeddedWicBuffer(data, size, L"WebP Raster (.webp)", outInfo);
     }
 
     return false;

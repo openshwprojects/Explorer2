@@ -1,0 +1,36 @@
+magic
+tech sky130A
+magscale 1 2
+timestamp 1700000000
+<< nwell >>
+rect -10 48 90 108
+<< pdiff >>
+rect 10 62 70 92
+<< ndiff >>
+rect 10 12 70 40
+<< polysilicon >>
+rect 24 4 32 100
+rect 48 4 56 100
+<< localinterconnect >>
+rect 0 96 80 106
+rect 0 0 80 10
+rect 60 22 72 76
+<< met1 >>
+rect -6 94 86 108
+rect -6 -2 86 12
+rect 22 44 34 56
+rect 46 44 58 56
+rect 62 44 84 56
+<< mcon >>
+rect 26 48 30 52
+rect 50 48 54 52
+rect 64 48 68 52
+rect 14 98 18 102
+rect 38 2 42 6
+<< labels >>
+rlabel met1 -6 94 4 108 1 VPWR
+rlabel met1 -6 -2 4 12 1 VGND
+rlabel met1 22 44 34 56 1 A
+rlabel met1 46 44 58 56 1 B
+rlabel met1 76 44 84 56 3 Y
+<< end >>

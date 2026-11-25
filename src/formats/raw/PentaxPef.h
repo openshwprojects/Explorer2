@@ -3,7 +3,7 @@
 
 namespace Formats {
 
-namespace DetailImg200 {
+namespace DetailVectorAndRawImg {
 
 // ============================================================================
 // 6. Pentax PEF Lossless Huffman Sensor Unpacker (Compression == 65535)
@@ -183,10 +183,10 @@ inline bool UnpackPentaxPefHuffmanSensor(
     return true;
 }
 
-} // namespace DetailImg200
+} // namespace DetailVectorAndRawImg
 
 inline bool DecodePentaxPef(const uint8_t* data, size_t size, ExtendedImageInfo& outInfo) {
-    return DetailImg200::ParseTiffRawIfds(data, size, L"Pentax PEF RAW (.pef)", outInfo);
+    return DetailVectorAndRawImg::ParseTiffRawIfds(data, size, L"Pentax PEF RAW (.pef)", outInfo);
 }
 
 } // namespace Formats

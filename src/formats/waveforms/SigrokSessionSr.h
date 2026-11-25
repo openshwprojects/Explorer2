@@ -5,7 +5,7 @@
 namespace Formats {
 
 inline bool ParseSigrokSessionSrBoard(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
-    // #71. Sigrok / PulseView Logic & Mixed-Signal Analyzer Session (.sr — ZIP with metadata + multi-chunk logic-1-N & analog-1-M-N)
+    // Sigrok / PulseView Logic & Mixed-Signal Analyzer Session (.sr — ZIP with metadata + multi-chunk logic-1-N & analog-1-M-N)
     if (ext == L".sr") {
         if (size < 22 || data[0] != 'P' || data[1] != 'K') return false;
 
@@ -165,7 +165,7 @@ inline bool ParseSigrokSessionSrBoard(const uint8_t* data, size_t size, const st
         out.formatTitle += L")";
         out.netCount = totalLanes;
 
-        DetailEda200::DrawGraticule(out, -40.0f, -24.0f, 80.0f, 48.0f, 16, 8);
+        DetailIndustrialAndWaveEda::DrawGraticule(out, -40.0f, -24.0f, 80.0f, 48.0f, 16, 8);
 
         const float laneH = 44.0f / static_cast<float>(totalLanes);
         const float halfAmp = std::min(laneH * 0.36f, 2.4f);

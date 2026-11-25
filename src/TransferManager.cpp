@@ -192,9 +192,6 @@ std::wstring ToExtPath(const std::wstring& raw) {
     for (wchar_t& ch : p) {
         if (ch == L'/') ch = L'\\';
     }
-    if (p.rfind(L"\\\\", 0) == 0) {
-        return L"\\\\?\\UNC\\" + p.substr(2);
-    }
     if (p.size() >= 2 && p[1] == L':') {
         if (p.size() == 2) p.push_back(L'\\');
         // Mapped network redirectors (WebDAV, NAS/Samba, WinFsp) can reject "\\?\Z:\..." on short paths:
@@ -205,9 +202,8 @@ std::wstring ToExtPath(const std::wstring& raw) {
                 return p;
             }
         }
-        return L"\\\\?\\" + p;
     }
-    return p;
+    return PathUtils::ToExtendedWinPath(p);
 }
 
 std::wstring FormatWin32Err(DWORD err) {
@@ -2005,12 +2001,7 @@ bool TransferManager::CancelOrRemoveJob(int jobId) {
                         ev.recycle = target->recycle;
                         ev.finalState = TransferJobState::Cancelled;
                         ev.sources = target->sources;
-                        for (const auto& s : target->sources) {
-                            std::wstring parent = FtpClient::IsFtpPath(s) ? FtpClient::GetParentFtpUrl(s) : PathUtils::GetParentPath(s);
-                            if (!parent.empty() && std::find(ev.sourceDirs.begin(), ev.sourceDirs.end(), parent) == ev.sourceDirs.end()) {
-                                ev.sourceDirs.push_back(std::move(parent));
-                            }
-                        }
+                        CollectUniqueSourceParentDirs(target->sources, ev.sourceDirs);
                         ev.doneFiles = target->doneFiles.load();
                         ev.doneBytes = target->doneBytes.load();
                         m_completions.push_back(std::move(ev));
@@ -2433,6 +2424,90 @@ void TransferManager::ThrottleBytes(uint64_t bytesJustTransferred, InternalJob& 
     if (sleepMs > 0 && !job.cancelled.load(std::memory_order_relaxed)) {
         Sleep(sleepMs);
     }
+}
+
+void TransferManager::CollectUniqueSourceParentDirs(
+    const std::vector<std::wstring>& sources,
+    std::vector<std::wstring>& outDirs)
+{
+    for (const auto& s : sources) {
+        std::wstring parent = FtpClient::IsFtpPath(s) ? FtpClient::GetParentFtpUrl(s) : PathUtils::GetParentPath(s);
+        if (!parent.empty() && std::find(outDirs.begin(), outDirs.end(), parent) == outDirs.end()) {
+            outDirs.push_back(std::move(parent));
+        }
+    }
+}
+
+void TransferManager::FinalizeWorkerJob(
+    InternalJob& job,
+    bool persistQueue,
+    const std::function<std::wstring(TransferJobState, uint64_t, size_t, double)>& formatSummary)
+{
+    const ULONGLONG endTick = GetTickCount64();
+    uint64_t activeMs = 1ULL;
+    size_t errCount = 0;
+    TransferJobState finalSt = TransferJobState::Completed;
+    std::vector<TransferFileError> firstErrors;
+    std::vector<std::wstring> notRecyclableOut;
+    {
+        std::lock_guard<std::mutex> jlk(job.jobMutex);
+        if (job.pauseBeginTick > 0 && endTick > job.pauseBeginTick) {
+            job.pausedAccumMs += (endTick - job.pauseBeginTick);
+            job.pauseBeginTick = 0;
+        }
+        const uint64_t rawElapsed = (endTick > job.startTick) ? (endTick - job.startTick) : 1ULL;
+        activeMs = (rawElapsed > job.pausedAccumMs) ? (rawElapsed - job.pausedAccumMs) : 1ULL;
+        if (activeMs == 0) activeMs = 1;
+        job.finalElapsedMs = activeMs;
+
+        errCount = job.errors.size();
+        firstErrors.assign(job.errors.begin(), job.errors.begin() + static_cast<ptrdiff_t>(std::min<size_t>(errCount, 8)));
+        notRecyclableOut = job.notRecyclablePaths;
+        job.liveSpeedBps = 0.0;
+        job.currentFile.clear();
+
+        if (job.cancelled.load())      finalSt = TransferJobState::Cancelled;
+        else if (errCount > 0)         finalSt = TransferJobState::CompletedWithErrors;
+        job.state.store(finalSt);
+    }
+
+    const double avgBps = (job.op == TransferOp::Delete)
+        ? 0.0
+        : (static_cast<double>(job.doneBytes.load()) * 1000.0) / static_cast<double>(activeMs);
+    {
+        std::wstring summary = formatSummary(finalSt, activeMs, errCount, avgBps);
+        std::lock_guard<std::mutex> jlk(job.jobMutex);
+        job.summaryText = std::move(summary);
+    }
+
+    TransferCompletionEvent ev;
+    ev.jobId = job.id;
+    ev.op = job.op;
+    ev.recycle = job.recycle;
+    ev.finalState = finalSt;
+    ev.targetDir = job.targetDir;
+    ev.sources = job.sources;
+    CollectUniqueSourceParentDirs(job.sources, ev.sourceDirs);
+    ev.doneFiles = job.doneFiles.load();
+    ev.skippedFiles = job.skippedFiles.load();
+    ev.doneBytes = job.doneBytes.load();
+    ev.elapsedMs = activeMs;
+    ev.avgBytesPerSec = avgBps;
+    ev.errorCount = errCount;
+    ev.notRecyclablePaths = std::move(notRecyclableOut);
+    ev.firstErrors = std::move(firstErrors);
+
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_completions.push_back(std::move(ev));
+        TrimCompletionEvents(m_completions);
+        job.threadFinished.store(true);
+    }
+    if (persistQueue) {
+        SaveQueueState();
+    }
+    m_cv.notify_all();
+    NotifyUi(true);
 }
 
 void TransferManager::NotifyUi(bool isCompletion) {
@@ -2985,32 +3060,7 @@ void TransferManager::ExecuteFtpJobWorker(std::shared_ptr<InternalJob> job) {
 
     // PHASE 4: Finalize FTP Job State & Notify UI
     FtpClient::InvalidateListingCache();
-    ULONGLONG endTick = GetTickCount64();
-    uint64_t activeMs = 1ULL;
-    size_t errCount = 0;
-    TransferJobState finalSt = TransferJobState::Completed;
-    {
-        std::lock_guard<std::mutex> jlk(job->jobMutex);
-        if (job->pauseBeginTick > 0 && endTick > job->pauseBeginTick) {
-            job->pausedAccumMs += (endTick - job->pauseBeginTick);
-            job->pauseBeginTick = 0;
-        }
-        uint64_t rawElapsed = (endTick > job->startTick) ? (endTick - job->startTick) : 1ULL;
-        activeMs = (rawElapsed > job->pausedAccumMs) ? (rawElapsed - job->pausedAccumMs) : 1ULL;
-        if (activeMs == 0) activeMs = 1;
-        job->finalElapsedMs = activeMs;
-
-        errCount = job->errors.size();
-        job->liveSpeedBps = 0.0;
-        job->currentFile.clear();
-
-        if (job->cancelled.load()) finalSt = TransferJobState::Cancelled;
-        else if (errCount > 0)     finalSt = TransferJobState::CompletedWithErrors;
-        job->state.store(finalSt);
-    }
-
-    double avgBps = (static_cast<double>(job->doneBytes.load()) * 1000.0) / static_cast<double>(activeMs);
-    {
+    FinalizeWorkerJob(*job, true, [&](TransferJobState finalSt, uint64_t activeMs, size_t errCount, double avgBps) -> std::wstring {
         wchar_t sumBuf[384] = {};
         if (finalSt == TransferJobState::Cancelled) {
             swprintf_s(sumBuf, L"Anulowano FTP (%llu/%llu plików)",
@@ -3030,35 +3080,8 @@ void TransferManager::ExecuteFtpJobWorker(std::shared_ptr<InternalJob> job) {
                 static_cast<double>(activeMs) / 1000.0,
                 FormatSpeed(avgBps).c_str());
         }
-        std::lock_guard<std::mutex> jlk(job->jobMutex);
-        job->summaryText = sumBuf;
-    }
-
-    TransferCompletionEvent ev;
-    ev.jobId = job->id;
-    ev.op = job->op;
-    ev.finalState = finalSt;
-    ev.targetDir = job->targetDir;
-    for (const auto& s : job->sources) {
-        std::wstring p = FtpClient::IsFtpPath(s) ? FtpClient::GetParentFtpUrl(s) : PathUtils::GetParentPath(s);
-        if (!p.empty()) ev.sourceDirs.push_back(p);
-    }
-    ev.doneFiles = job->doneFiles.load();
-    ev.skippedFiles = job->skippedFiles.load();
-    ev.doneBytes = job->doneBytes.load();
-    ev.elapsedMs = activeMs;
-    ev.avgBytesPerSec = avgBps;
-    ev.errorCount = errCount;
-
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        m_completions.push_back(std::move(ev));
-        TrimCompletionEvents(m_completions);
-        job->threadFinished.store(true);
-    }
-    SaveQueueState();
-    m_cv.notify_all();
-    NotifyUi(true);
+        return sumBuf;
+    });
 }
 
 // ============================================================================
@@ -3668,35 +3691,7 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
     // ------------------------------------------------------------------------
     // PHASE 4: Finalize State, Summary, Log & Completion Notification
     // ------------------------------------------------------------------------
-    ULONGLONG endTick = GetTickCount64();
-    uint64_t activeMs = 1ULL;
-    size_t errCount = 0;
-    TransferJobState finalSt = TransferJobState::Completed;
-    {
-        std::lock_guard<std::mutex> jlk(job->jobMutex);
-        if (job->pauseBeginTick > 0 && endTick > job->pauseBeginTick) {
-            job->pausedAccumMs += (endTick - job->pauseBeginTick);
-            job->pauseBeginTick = 0;
-        }
-        uint64_t rawElapsed = (endTick > job->startTick) ? (endTick - job->startTick) : 1ULL;
-        activeMs = (rawElapsed > job->pausedAccumMs) ? (rawElapsed - job->pausedAccumMs) : 1ULL;
-        if (activeMs == 0) activeMs = 1;
-        job->finalElapsedMs = activeMs;
-
-        errCount = job->errors.size();
-        job->liveSpeedBps = 0.0;
-        job->currentFile.clear();
-
-        if (job->cancelled.load()) {
-            finalSt = TransferJobState::Cancelled;
-        } else if (errCount > 0) {
-            finalSt = TransferJobState::CompletedWithErrors;
-        }
-        job->state.store(finalSt);
-    }
-
-    double avgBps = (static_cast<double>(job->doneBytes.load()) * 1000.0) / static_cast<double>(activeMs);
-    {
+    FinalizeWorkerJob(*job, true, [&](TransferJobState finalSt, uint64_t activeMs, size_t errCount, double avgBps) -> std::wstring {
         wchar_t sumBuf[384] = {};
         if (finalSt == TransferJobState::Cancelled) {
             swprintf_s(sumBuf, L"Anulowano (%llu/%llu plików)",
@@ -3716,35 +3711,8 @@ void TransferManager::ExecuteJobWorker(std::shared_ptr<InternalJob> job) {
                 static_cast<double>(activeMs) / 1000.0,
                 FormatSpeed(avgBps).c_str());
         }
-        std::lock_guard<std::mutex> jlk(job->jobMutex);
-        job->summaryText = sumBuf;
-    }
-
-    TransferCompletionEvent ev;
-    ev.jobId = job->id;
-    ev.op = job->op;
-    ev.finalState = finalSt;
-    ev.targetDir = job->targetDir;
-    for (const auto& s : job->sources) {
-        std::wstring p = PathUtils::GetParentPath(s);
-        if (!p.empty()) ev.sourceDirs.push_back(p);
-    }
-    ev.doneFiles = job->doneFiles.load();
-    ev.skippedFiles = job->skippedFiles.load();
-    ev.doneBytes = job->doneBytes.load();
-    ev.elapsedMs = activeMs;
-    ev.avgBytesPerSec = avgBps;
-    ev.errorCount = errCount;
-
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        m_completions.push_back(std::move(ev));
-        TrimCompletionEvents(m_completions);
-        job->threadFinished.store(true);
-    }
-    SaveQueueState();
-    m_cv.notify_all();
-    NotifyUi(true);
+        return sumBuf;
+    });
 }
 
 // ============================================================================
@@ -4225,9 +4193,7 @@ bool TransferManager::IsDeleteRefused(const std::wstring& rawPath) {
     if (p.empty() || IsVirtualFolder(p)) return true;
 
     // Judge "\\?\C:\x" like "C:\x" and "\\?\UNC\server\share\x" like "\\server\share\x"
-    if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) p = L"\\\\" + p.substr(8);
-    else if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
-    p = PathUtils::TrimTrailingSlashes(p);
+    p = PathUtils::TrimTrailingSlashes(PathUtils::StripExtendedWinPrefix(p));
 
     size_t firstComponent = 0;
     if (p.size() >= 2 && p[1] == L':') {
@@ -4274,9 +4240,8 @@ bool TransferManager::PathHasNoRecycleBin(const std::wstring& rawPath) {
     for (wchar_t& ch : p) {
         if (ch == L'/') ch = L'\\';
     }
-    if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) return true;   // extended UNC network share
-    if (p.rfind(L"\\\\?\\", 0) == 0) p = p.substr(4);
-    if (p.rfind(L"\\\\", 0) == 0) return true;          // standard UNC network share (\\server\share\...)
+    p = PathUtils::StripExtendedWinPrefix(p);
+    if (p.rfind(L"\\\\", 0) == 0) return true;          // standard or extended UNC network share (\\server\share\...)
 #ifndef _WIN32
     if (p == L"\\proc" || p.rfind(L"\\proc\\", 0) == 0 ||
         p == L"\\sys"  || p.rfind(L"\\sys\\", 0) == 0 ||
@@ -4783,38 +4748,7 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
         }
     }
 
-    const ULONGLONG endTick = GetTickCount64();
-    uint64_t activeMs = 1ULL;
-    size_t errCount = 0;
-    TransferJobState finalSt = TransferJobState::Completed;
-    std::vector<TransferFileError> firstErrors;
-    std::vector<std::wstring> notRecyclableOut;
-    {
-        std::lock_guard<std::mutex> jlk(job->jobMutex);
-        if (job->pauseBeginTick > 0 && endTick > job->pauseBeginTick) {
-            job->pausedAccumMs += (endTick - job->pauseBeginTick);
-            job->pauseBeginTick = 0;
-        }
-        const uint64_t rawElapsed = (endTick > job->startTick) ? (endTick - job->startTick) : 1ULL;
-        activeMs = (rawElapsed > job->pausedAccumMs) ? (rawElapsed - job->pausedAccumMs) : 1ULL;
-        if (activeMs == 0) activeMs = 1;
-        job->finalElapsedMs = activeMs;
-
-        errCount = job->errors.size();
-        firstErrors.assign(job->errors.begin(), job->errors.begin() + static_cast<ptrdiff_t>(std::min<size_t>(errCount, 8)));
-        notRecyclableOut = job->notRecyclablePaths;
-        job->liveSpeedBps = 0.0;
-        job->currentFile.clear();
-
-        if (job->cancelled.load()) {
-            finalSt = TransferJobState::Cancelled;
-        } else if (errCount > 0) {
-            finalSt = TransferJobState::CompletedWithErrors;
-        }
-        job->state.store(finalSt);
-    }
-
-    {
+    FinalizeWorkerJob(*job, false, [&](TransferJobState finalSt, uint64_t activeMs, size_t errCount, double) -> std::wstring {
         const unsigned long long doneItems = static_cast<unsigned long long>(job->doneFiles.load());
         const unsigned long long totalItems = static_cast<unsigned long long>(job->totalFiles.load());
         wchar_t sumBuf[384] = {};
@@ -4828,37 +4762,8 @@ void TransferManager::ExecuteDeleteJobWorker(std::shared_ptr<InternalJob> job) {
             swprintf_s(sumBuf, L"OK: usunięto trwale %llu el. (%s) w %.2f s", doneItems,
                 FileEngine::FormatSizeDetailed(job->doneBytes.load()).c_str(), static_cast<double>(activeMs) / 1000.0);
         }
-        std::lock_guard<std::mutex> jlk(job->jobMutex);
-        job->summaryText = sumBuf;
-    }
-
-    TransferCompletionEvent ev;
-    ev.jobId = job->id;
-    ev.op = TransferOp::Delete;
-    ev.recycle = job->recycle;
-    ev.finalState = finalSt;
-    ev.sources = job->sources;
-    for (const auto& s : job->sources) {
-        std::wstring parent = FtpClient::IsFtpPath(s) ? FtpClient::GetParentFtpUrl(s) : PathUtils::GetParentPath(s);
-        if (!parent.empty() && std::find(ev.sourceDirs.begin(), ev.sourceDirs.end(), parent) == ev.sourceDirs.end()) {
-            ev.sourceDirs.push_back(std::move(parent));
-        }
-    }
-    ev.doneFiles = job->doneFiles.load();
-    ev.doneBytes = job->doneBytes.load();
-    ev.elapsedMs = activeMs;
-    ev.errorCount = errCount;
-    ev.notRecyclablePaths = std::move(notRecyclableOut);
-    ev.firstErrors = std::move(firstErrors);
-
-    {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        m_completions.push_back(std::move(ev));
-        TrimCompletionEvents(m_completions);
-        job->threadFinished.store(true);
-    }
-    m_cv.notify_all();
-    NotifyUi(true);
+        return sumBuf;
+    });
 }
 
 // ============================================================================

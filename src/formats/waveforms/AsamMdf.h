@@ -4,15 +4,15 @@
 
 namespace Formats {
 
-// #74. ASAM MDF 3.x & MDF 4.x ECU Telemetry (.mdf / .mf4 — "MDF     " / "UnFinMF ")
-inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
+// ASAM MDF 3.x & MDF 4.x ECU Telemetry (.mdf / .mf4 — "MDF     " / "UnFinMF ")
+inline bool ParseAsamMdfWaveform(const uint8_t* data, size_t size, const std::wstring& ext, ParsedEdaBoard& out) {
     if (ext == L".mf4" || ext == L".mdf") {
         if (size < 64) return false;
         if (std::memcmp(data, "MDF     ", 8) != 0 && std::memcmp(data, "UnFinMF ", 8) != 0) return false;
 
         std::string verStr(reinterpret_cast<const char*>(data + 8), strnlen(reinterpret_cast<const char*>(data + 8), 8));
         while (!verStr.empty() && (verStr.back() == ' ' || verStr.back() == '\0')) verStr.pop_back();
-        const uint16_t idVerNum = DetailEda200::RdU16LE(data + 28);
+        const uint16_t idVerNum = DetailIndustrialAndWaveEda::RdU16LE(data + 28);
 
         struct MdfConv {
             uint8_t type = 0; // 0=identity, 1=linear P1+P2*x, 2=rational
@@ -52,7 +52,7 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
             const uint8_t* p = rec + byteOff;
             if (dType == 4u && bitOff == 0u) { // FLOAT_LE
                 if (bitCnt == 32u) {
-                    uint32_t u = DetailEda200::RdU32LE(p);
+                    uint32_t u = DetailIndustrialAndWaveEda::RdU32LE(p);
                     float fv = 0.0f;
                     std::memcpy(&fv, &u, 4);
                     if (!std::isfinite(fv)) return false;
@@ -60,7 +60,7 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                     return true;
                 }
                 if (bitCnt == 64u) {
-                    uint64_t u = DetailEda200::RdU64LE(p);
+                    uint64_t u = DetailIndustrialAndWaveEda::RdU64LE(p);
                     double dv = 0.0;
                     std::memcpy(&dv, &u, 8);
                     if (!std::isfinite(dv)) return false;
@@ -71,7 +71,7 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
             }
             if (dType == 5u && bitOff == 0u) { // FLOAT_BE
                 if (bitCnt == 32u) {
-                    uint32_t u = DetailEda200::RdU32BE(p);
+                    uint32_t u = DetailIndustrialAndWaveEda::RdU32BE(p);
                     float fv = 0.0f;
                     std::memcpy(&fv, &u, 4);
                     if (!std::isfinite(fv)) return false;
@@ -79,8 +79,8 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                     return true;
                 }
                 if (bitCnt == 64u) {
-                    uint64_t u = (static_cast<uint64_t>(DetailEda200::RdU32BE(p)) << 32) |
-                                 static_cast<uint64_t>(DetailEda200::RdU32BE(p + 4));
+                    uint64_t u = (static_cast<uint64_t>(DetailIndustrialAndWaveEda::RdU32BE(p)) << 32) |
+                                 static_cast<uint64_t>(DetailIndustrialAndWaveEda::RdU32BE(p + 4));
                     double dv = 0.0;
                     std::memcpy(&dv, &u, 8);
                     if (!std::isfinite(dv)) return false;
@@ -95,9 +95,9 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
             const bool isBE = (dType == 1u || dType == 3u);
             if (!isBE) {
                 if (bitOff == 0u && bitCnt == 8u)  uval = p[0];
-                else if (bitOff == 0u && bitCnt == 16u) uval = DetailEda200::RdU16LE(p);
-                else if (bitOff == 0u && bitCnt == 32u) uval = DetailEda200::RdU32LE(p);
-                else if (bitOff == 0u && bitCnt == 64u) uval = DetailEda200::RdU64LE(p);
+                else if (bitOff == 0u && bitCnt == 16u) uval = DetailIndustrialAndWaveEda::RdU16LE(p);
+                else if (bitOff == 0u && bitCnt == 32u) uval = DetailIndustrialAndWaveEda::RdU32LE(p);
+                else if (bitOff == 0u && bitCnt == 64u) uval = DetailIndustrialAndWaveEda::RdU64LE(p);
                 else {
                     for (uint32_t b = 0; b < bitCnt; ++b) {
                         uint32_t totBit = static_cast<uint32_t>(bitOff) + b;
@@ -150,14 +150,14 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                 const size_t o = static_cast<size_t>(off);
                 if (data[o] != '#' || data[o + 1] != '#') return false;
                 std::memcpy(b.id, data + o, 4);
-                uint64_t blkLen = DetailEda200::RdU64LE(data + o + 8);
-                uint64_t lnkCnt = DetailEda200::RdU64LE(data + o + 16);
+                uint64_t blkLen = DetailIndustrialAndWaveEda::RdU64LE(data + o + 8);
+                uint64_t lnkCnt = DetailIndustrialAndWaveEda::RdU64LE(data + o + 16);
                 if (lnkCnt > 65536ULL) return false;
                 uint64_t hdrBytes = 24ULL + lnkCnt * 8ULL;
                 if (blkLen < hdrBytes || off + blkLen > size) return false;
                 b.links.resize(static_cast<size_t>(lnkCnt));
                 for (size_t i = 0; i < b.links.size(); ++i) {
-                    b.links[i] = DetailEda200::RdU64LE(data + o + 24 + i * 8);
+                    b.links[i] = DetailIndustrialAndWaveEda::RdU64LE(data + o + 24 + i * 8);
                 }
                 b.dataOff = off + hdrBytes;
                 b.dataLen = blkLen - hdrBytes;
@@ -165,7 +165,7 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
             };
 
             auto rdMdf4F64 = [&](size_t off) -> double {
-                uint64_t u = DetailEda200::RdU64LE(data + off);
+                uint64_t u = DetailIndustrialAndWaveEda::RdU64LE(data + off);
                 double dv = 0.0;
                 std::memcpy(&dv, &u, 8);
                 return dv;
@@ -207,7 +207,7 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                 }
                 const size_t doff = static_cast<size_t>(cb.dataOff);
                 cv.type = data[doff + 0];
-                uint16_t valCnt = DetailEda200::RdU16LE(data + doff + 6);
+                uint16_t valCnt = DetailIndustrialAndWaveEda::RdU16LE(data + doff + 6);
                 size_t paramOff = 0;
                 if (cb.dataLen >= 24ULL + static_cast<uint64_t>(valCnt) * 8ULL) {
                     paramOff = doff + 24;
@@ -240,9 +240,9 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                     if (db.dataLen < 24ULL) return;
                     const size_t doff = static_cast<size_t>(db.dataOff);
                     const uint8_t zipType = data[doff + 2];
-                    const uint32_t zipParam = DetailEda200::RdU32LE(data + doff + 4);
-                    const uint64_t orgLen = DetailEda200::RdU64LE(data + doff + 8);
-                    const uint64_t cmpLen = DetailEda200::RdU64LE(data + doff + 16);
+                    const uint32_t zipParam = DetailIndustrialAndWaveEda::RdU32LE(data + doff + 4);
+                    const uint64_t orgLen = DetailIndustrialAndWaveEda::RdU64LE(data + doff + 8);
+                    const uint64_t cmpLen = DetailIndustrialAndWaveEda::RdU64LE(data + doff + 16);
                     if (orgLen == 0ULL || orgLen > kMaxDataStream || 24ULL + cmpLen > db.dataLen) return;
 
                     const uint8_t* cmpPtr = data + doff + 24;
@@ -339,14 +339,14 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                     const size_t cdo = static_cast<size_t>(cg.dataOff);
 
                     Mdf4CgSpec cgSpec;
-                    cgSpec.recId = DetailEda200::RdU64LE(data + cdo + 0);
-                    cgSpec.cycleCnt = DetailEda200::RdU64LE(data + cdo + 8);
+                    cgSpec.recId = DetailIndustrialAndWaveEda::RdU64LE(data + cdo + 0);
+                    cgSpec.cycleCnt = DetailIndustrialAndWaveEda::RdU64LE(data + cdo + 8);
                     if (cg.dataLen >= 32ULL) {
-                        cgSpec.dataBytes  = DetailEda200::RdU32LE(data + cdo + 24);
-                        cgSpec.invalBytes = DetailEda200::RdU32LE(data + cdo + 28);
+                        cgSpec.dataBytes  = DetailIndustrialAndWaveEda::RdU32LE(data + cdo + 24);
+                        cgSpec.invalBytes = DetailIndustrialAndWaveEda::RdU32LE(data + cdo + 28);
                     } else {
-                        cgSpec.dataBytes  = DetailEda200::RdU32LE(data + cdo + 16);
-                        cgSpec.invalBytes = DetailEda200::RdU32LE(data + cdo + 20);
+                        cgSpec.dataBytes  = DetailIndustrialAndWaveEda::RdU32LE(data + cdo + 16);
+                        cgSpec.invalBytes = DetailIndustrialAndWaveEda::RdU32LE(data + cdo + 20);
                     }
 
                     std::set<uint64_t> visitedCN;
@@ -361,8 +361,8 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                         cs.cnType   = data[ndo + 0];
                         cs.dataType = data[ndo + 2];
                         cs.bitOff   = data[ndo + 3];
-                        cs.byteOff  = DetailEda200::RdU32LE(data + ndo + 4);
-                        cs.bitCnt   = DetailEda200::RdU32LE(data + ndo + 8);
+                        cs.byteOff  = DetailIndustrialAndWaveEda::RdU32LE(data + ndo + 4);
+                        cs.bitCnt   = DetailIndustrialAndWaveEda::RdU32LE(data + ndo + 8);
                         if (cn.links.size() > 2 && cn.links[2] != 0ULL) cs.name = rdMdf4Text(cn.links[2]);
                         if (cn.links.size() > 4 && cn.links[4] != 0ULL) cs.conv = rdMdf4Conv(cn.links[4]);
                         if (cn.links.size() > 6 && cn.links[6] != 0ULL && cs.conv.unit.empty()) cs.unit = rdMdf4Text(cn.links[6]);
@@ -406,9 +406,9 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
                             while (rp + recIdSize <= rawStream.size() && recPtrs.size() < 65536u) {
                                 uint64_t rid = 0;
                                 if (recIdSize == 1u) rid = rawStream[rp];
-                                else if (recIdSize == 2u) rid = DetailEda200::RdU16LE(rawStream.data() + rp);
-                                else if (recIdSize == 4u) rid = DetailEda200::RdU32LE(rawStream.data() + rp);
-                                else rid = DetailEda200::RdU64LE(rawStream.data() + rp);
+                                else if (recIdSize == 2u) rid = DetailIndustrialAndWaveEda::RdU16LE(rawStream.data() + rp);
+                                else if (recIdSize == 4u) rid = DetailIndustrialAndWaveEda::RdU32LE(rawStream.data() + rp);
+                                else rid = DetailIndustrialAndWaveEda::RdU64LE(rawStream.data() + rp);
 
                                 auto szIt = idToPaySz.find(rid);
                                 if (szIt == idToPaySz.end() || szIt->second == 0u || rp + recIdSize + szIt->second > rawStream.size()) break;
@@ -472,18 +472,18 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
             }
         } else {
             // ASAM MDF 3.x ("HD" / "DG" / "CG" / "CN" / "CC" / "TX")
-            const bool be = (DetailEda200::RdU16LE(data + 24) != 0u);
+            const bool be = (DetailIndustrialAndWaveEda::RdU16LE(data + 24) != 0u);
             auto rd16 = [&](size_t o) -> uint16_t {
-                return be ? DetailEda200::RdU16BE(data + o) : DetailEda200::RdU16LE(data + o);
+                return be ? DetailIndustrialAndWaveEda::RdU16BE(data + o) : DetailIndustrialAndWaveEda::RdU16LE(data + o);
             };
             auto rd32 = [&](size_t o) -> uint32_t {
-                return be ? DetailEda200::RdU32BE(data + o) : DetailEda200::RdU32LE(data + o);
+                return be ? DetailIndustrialAndWaveEda::RdU32BE(data + o) : DetailIndustrialAndWaveEda::RdU32LE(data + o);
             };
             auto rdF64 = [&](size_t o) -> double {
                 uint64_t u = be
-                    ? ((static_cast<uint64_t>(DetailEda200::RdU32BE(data + o)) << 32) |
-                        static_cast<uint64_t>(DetailEda200::RdU32BE(data + o + 4)))
-                    : DetailEda200::RdU64LE(data + o);
+                    ? ((static_cast<uint64_t>(DetailIndustrialAndWaveEda::RdU32BE(data + o)) << 32) |
+                        static_cast<uint64_t>(DetailIndustrialAndWaveEda::RdU32BE(data + o + 4)))
+                    : DetailIndustrialAndWaveEda::RdU64LE(data + o);
                 double dv = 0.0;
                 std::memcpy(&dv, &u, 8);
                 return dv;
@@ -748,7 +748,7 @@ inline bool ParseAsamMdf200(const uint8_t* data, size_t size, const std::wstring
         out.formatTitle = L"ASAM MDF " + PathUtils::Utf8ToWide(verStr) + L" ECU Telemetry (" +
                           std::to_wstring(channels.size()) + L" ch, " + ext + L")";
 
-        DetailEda200::DrawGraticule(out, -40.0f, -24.0f, 80.0f, 48.0f, 10, 8);
+        DetailIndustrialAndWaveEda::DrawGraticule(out, -40.0f, -24.0f, 80.0f, 48.0f, 10, 8);
 
         wchar_t tSpanBuf[128] = {};
         swprintf_s(tSpanBuf, L"ASAM MDF %hs — %zu ch | t = [%.3g .. %.3g s]",

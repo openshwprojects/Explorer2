@@ -1,0 +1,25 @@
+# Berkeley SIS 2-Bit Carry-Lookahead ALU Slice with Parity Check
+NAME = alu_slice_4bit;
+INORDER = a0 a1 b0 b1 cin op_sub op_logic;
+OUTORDER = y0 y1 cout parity_even;
+
+b0_eff = b0 ^ op_sub;
+b1_eff = b1 ^ op_sub;
+
+p0 = a0 ^ b0_eff;
+g0 = a0 * b0_eff;
+p1 = a1 ^ b1_eff;
+g1 = a1 * b1_eff;
+
+c1 = g0 + (p0 * cin);
+cout = g1 + (p1 * g0) + (p1 * p0 * cin);
+
+arith0 = p0 ^ cin;
+arith1 = p1 ^ c1;
+
+logic0 = (a0 & b0) + (!op_sub * (a0 | b0));
+logic1 = (a1 & b1) + (!op_sub * (a1 | b1));
+
+y0 = (!op_logic * arith0) + (op_logic * logic0);
+y1 = (!op_logic * arith1) + (op_logic * logic1);
+parity_even = !(y0 ^ y1 ^ cout);

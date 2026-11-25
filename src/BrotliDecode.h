@@ -8,6 +8,9 @@
 
 namespace Explorer2::Brotli {
 
+// Implemented in StreamCodecs.cpp (RFC 7932 Appendix A & B static dictionary + Section 8 transformations).
+bool ResolveStaticDictionaryWord(size_t copyLen, size_t dictIndex, uint8_t outBuf[64], size_t& outLen);
+
 struct BitReader {
     const uint8_t* data = nullptr;
     size_t size = 0;
@@ -395,7 +398,7 @@ inline uint8_t LiteralContext(uint8_t p1, uint8_t p2, uint8_t mode) {
         4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
         4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
         5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
-        6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7
+        5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,7
     };
     if (mode == 2u) return static_cast<uint8_t>(kLut0[p1] | kLut1[p2]);
     return static_cast<uint8_t>((kLut2[p1] << 3u) | kLut2[p2]);
@@ -607,7 +610,6 @@ inline bool Decompress(const uint8_t* src, size_t srcSize, std::vector<uint8_t>&
             }
             produced += insLen;
             if (produced == mlen) break;
-            if (copyLen > mlen - produced) return false;
 
             int32_t dist = 0;
             bool recordInRing = false;
@@ -646,7 +648,23 @@ inline bool Decompress(const uint8_t* src, size_t srcSize, std::vector<uint8_t>&
             if (dist <= 0) return false;
             size_t uDist = static_cast<size_t>(dist);
             size_t maxAllowed = std::min(out.size(), maxBackDist);
-            if (uDist > maxAllowed) return false;
+            if (uDist > maxAllowed) {
+                uint8_t dictWord[64];
+                size_t dictLen = 0u;
+                if (!ResolveStaticDictionaryWord(copyLen, uDist - maxAllowed - 1u, dictWord, dictLen)) {
+                    return false;
+                }
+                if (dictLen > mlen - produced) return false;
+                for (size_t k = 0; k < dictLen; ++k) {
+                    uint8_t b = dictWord[k];
+                    out.push_back(b);
+                    prevByte2 = prevByte1;
+                    prevByte1 = b;
+                }
+                produced += dictLen;
+                continue;
+            }
+            if (copyLen > mlen - produced) return false;
             if (recordInRing) {
                 distRing[distRingIdx & 3u] = dist;
                 ++distRingIdx;

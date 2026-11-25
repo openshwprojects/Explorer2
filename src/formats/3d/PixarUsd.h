@@ -4,548 +4,6 @@
 
 namespace Formats {
 
-// ============================================================================
-// 66. Pixar Universal Scene Description (.usd / .usda / .usdc / .usdz)
-// ============================================================================
-inline bool ParsePixarUsdMesh(const uint8_t* data, size_t size, const std::wstring& extLower, LoadedMesh3D& mesh) {
-    using namespace Detail3D100;
-
-    // 1. .usdz uncompressed/deflate ZIP archive -> inspect inner .usdc / .usda / .usd stages
-    if (size >= 4 && data[0] == 'P' && data[1] == 'K') {
-        std::vector<ZipDeflate::ArchiveItemMeta> entries;
-        if (ZipDeflate::ListZipEntriesFromMemory(data, size, entries)) {
-            for (const auto& e : entries) {
-                if (e.isDirectory) continue;
-                std::wstring innerExt = PathUtils::GetExtension(e.pathInArchive);
-                if (innerExt == L".usda" || innerExt == L".usd" || innerExt == L".usdc") {
-                    std::vector<uint8_t> innerBytes;
-                    if (ZipDeflate::ExtractZipEntryFromMemory(data, size, e, innerBytes) && !innerBytes.empty()) {
-                        if (ParsePixarUsdMesh(innerBytes.data(), innerBytes.size(), innerExt, mesh)) {
-                            mesh.formatName = L"Pixar USDZ Package (.usdz)";
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    // 2. Binary Crate ("PXR-USDC") 88-byte Bootstrap -> TOC -> TOKENS, FIELDS, FIELDSETS, PATHS, SPECS
-    if (size >= 88 && std::memcmp(data, "PXR-USDC", 8) == 0) {
-        mesh.formatName = L"Pixar OpenUSD Binary Crate (.usdc)";
-        const uint8_t verMaj = data[8];
-        const uint8_t verMin = data[9];
-        const uint64_t tocOff = RdU64LE(data + 16);
-        if (tocOff < 88 || tocOff + 8 > size) return false;
-
-        const uint64_t numSecs = RdU64LE(data + static_cast<size_t>(tocOff));
-        if (numSecs == 0 || numSecs > 64 || tocOff + 8 + numSecs * 32 > size) return false;
-
-        struct CrateSec { uint64_t start = 0, len = 0; bool present = false; };
-        CrateSec secTokens, secFields, secFieldSets, secPaths, secSpecs;
-        for (uint64_t s = 0; s < numSecs; ++s) {
-            const uint8_t* sp = data + static_cast<size_t>(tocOff + 8 + s * 32);
-            char nm[17] = {};
-            std::memcpy(nm, sp, 16);
-            uint64_t st = RdU64LE(sp + 16);
-            uint64_t ln = RdU64LE(sp + 24);
-            if (st > size || ln > size - st) continue;
-            std::string_view name(nm);
-            if (name == "TOKENS")         secTokens    = { st, ln, true };
-            else if (name == "FIELDS")    secFields    = { st, ln, true };
-            else if (name == "FIELDSETS") secFieldSets = { st, ln, true };
-            else if (name == "PATHS")     secPaths     = { st, ln, true };
-            else if (name == "SPECS")     secSpecs     = { st, ln, true };
-        }
-        if (!secTokens.present || !secFields.present) return false;
-
-        // 2a. Decode TOKENS
-        std::vector<std::string> tokens;
-        {
-            const uint8_t* tp = data + static_cast<size_t>(secTokens.start);
-            size_t tLen = static_cast<size_t>(secTokens.len);
-            if (tLen < 16) return false;
-            uint64_t numToks = RdU64LE(tp);
-            if (numToks > 2000000) return false;
-            std::vector<uint8_t> tokBuf;
-            if (verMaj > 0 || verMin >= 4) {
-                if (tLen < 24) return false;
-                uint64_t uncompSz = RdU64LE(tp + 8);
-                uint64_t compSz   = RdU64LE(tp + 16);
-                if (24 + compSz > tLen) return false;
-                if (!TfFastDecompress(tp + 24, static_cast<size_t>(compSz), static_cast<size_t>(uncompSz), tokBuf)) return false;
-            } else {
-                uint64_t uncompSz = RdU64LE(tp + 8);
-                if (16 + uncompSz > tLen) return false;
-                tokBuf.assign(tp + 16, tp + 16 + static_cast<size_t>(uncompSz));
-            }
-            tokens.reserve(static_cast<size_t>(numToks));
-            size_t p = 0;
-            while (p < tokBuf.size() && tokens.size() < numToks) {
-                size_t s = p;
-                while (p < tokBuf.size() && tokBuf[p] != 0) ++p;
-                tokens.emplace_back(reinterpret_cast<const char*>(tokBuf.data() + s), p - s);
-                ++p;
-            }
-        }
-
-        // 2b. Decode FIELDS (token indices + 64-bit ValueReps)
-        struct CrateField { uint32_t tokIdx = 0; uint64_t rep = 0; };
-        std::vector<CrateField> fields;
-        {
-            const uint8_t* fp = data + static_cast<size_t>(secFields.start);
-            size_t fLen = static_cast<size_t>(secFields.len);
-            if (fLen < 24) return false;
-            uint64_t numFields = RdU64LE(fp);
-            if (numFields == 0 || numFields > 4000000) return false;
-            size_t off = 8;
-            uint64_t tokCompSz = RdU64LE(fp + off); off += 8;
-            if (off + tokCompSz + 8 > fLen) return false;
-            std::vector<int32_t> tokIdxs;
-            if (!UsdDecompressInts32(fp + off, static_cast<size_t>(tokCompSz), static_cast<size_t>(numFields), tokIdxs)) return false;
-            off += static_cast<size_t>(tokCompSz);
-
-            uint64_t repCompSz = RdU64LE(fp + off); off += 8;
-            if (off + repCompSz > fLen) return false;
-            std::vector<uint8_t> repBytes;
-            if (!TfFastDecompress(fp + off, static_cast<size_t>(repCompSz), static_cast<size_t>(numFields) * 8, repBytes)) return false;
-            if (repBytes.size() < static_cast<size_t>(numFields) * 8) return false;
-
-            fields.resize(static_cast<size_t>(numFields));
-            for (size_t i = 0; i < static_cast<size_t>(numFields); ++i) {
-                fields[i].tokIdx = static_cast<uint32_t>(tokIdxs[i]);
-                fields[i].rep    = RdU64LE(repBytes.data() + i * 8);
-            }
-        }
-
-        // Helper to unpack Vec3f/Vec3d and Int/UInt arrays from a Crate ValueRep
-        const bool use64BitArrayCount = (verMaj > 0 || verMin >= 5);
-
-        std::function<bool(uint64_t, std::vector<Vec3f>&, int)> decodeVec3Array = [&](uint64_t rep, std::vector<Vec3f>& outPts, int depth) -> bool {
-            if (depth > 4) return false;
-            bool isArray   = (rep & (1ULL << 63)) != 0;
-            bool isInlined = (rep & (1ULL << 62)) != 0;
-            bool isComp    = (rep & (1ULL << 61)) != 0;
-            uint8_t tEnum  = static_cast<uint8_t>((rep >> 48) & 0xFFu);
-            uint64_t pay   = rep & ((1ULL << 48) - 1ULL);
-
-            // TimeSamples (type 46): dereference first sample's ValueRep!
-            if (tEnum == 46 && !isInlined && pay + 24 <= size) {
-                size_t p = static_cast<size_t>(pay);
-                int64_t rel1 = static_cast<int64_t>(RdU64LE(data + p));
-                size_t vPos = p + static_cast<size_t>(rel1);
-                // After times ValueRep lies int64 rel2 -> uint64 numValues + ValueRep[numValues]
-                if (vPos + 16 <= size) {
-                    size_t valBlock = p + 8;
-                    int64_t rel2 = static_cast<int64_t>(RdU64LE(data + valBlock));
-                    size_t arrPos = valBlock + static_cast<size_t>(rel2);
-                    if (arrPos + 16 <= size) {
-                        uint64_t nVals = RdU64LE(data + arrPos);
-                        if (nVals >= 1) return decodeVec3Array(RdU64LE(data + arrPos + 8), outPts, depth + 1);
-                    }
-                }
-                return false;
-            }
-
-            if (!isArray || isInlined || (tEnum != 19 && tEnum != 20)) return false;
-            if (pay + 8 > size) return false;
-            size_t p = static_cast<size_t>(pay);
-            uint64_t nElem = use64BitArrayCount ? RdU64LE(data + p) : RdU32LE(data + p);
-            p += use64BitArrayCount ? 8 : 4;
-            if (nElem == 0 || nElem > 2000000) return false;
-
-            size_t elemSz = (tEnum == 19) ? 12 : 24;
-            std::vector<uint8_t> decomp;
-            const uint8_t* rawPtr = nullptr;
-            if (isComp) {
-                if (p + 8 > size) return false;
-                uint64_t cSz = RdU64LE(data + p); p += 8;
-                if (p + cSz > size) return false;
-                if (!TfFastDecompress(data + p, static_cast<size_t>(cSz), static_cast<size_t>(nElem) * elemSz, decomp)) return false;
-                if (decomp.size() < static_cast<size_t>(nElem) * elemSz) return false;
-                rawPtr = decomp.data();
-            } else {
-                if (p + static_cast<size_t>(nElem) * elemSz > size) return false;
-                rawPtr = data + p;
-            }
-
-            outPts.resize(static_cast<size_t>(nElem));
-            for (size_t i = 0; i < static_cast<size_t>(nElem); ++i) {
-                if (tEnum == 19) {
-                    const uint8_t* vp = rawPtr + i * 12;
-                    outPts[i] = { RdF32LE(vp + 0), RdF32LE(vp + 4), RdF32LE(vp + 8) };
-                } else {
-                    const uint8_t* vp = rawPtr + i * 24;
-                    outPts[i] = { static_cast<float>(RdF64LE(vp + 0)), static_cast<float>(RdF64LE(vp + 8)), static_cast<float>(RdF64LE(vp + 16)) };
-                }
-            }
-            return true;
-        };
-
-        std::function<bool(uint64_t, std::vector<int32_t>&, int)> decodeIntArray = [&](uint64_t rep, std::vector<int32_t>& outInts, int depth) -> bool {
-            if (depth > 4) return false;
-            bool isArray   = (rep & (1ULL << 63)) != 0;
-            bool isInlined = (rep & (1ULL << 62)) != 0;
-            bool isComp    = (rep & (1ULL << 61)) != 0;
-            uint8_t tEnum  = static_cast<uint8_t>((rep >> 48) & 0xFFu);
-            uint64_t pay   = rep & ((1ULL << 48) - 1ULL);
-
-            if (tEnum == 46 && !isInlined && pay + 24 <= size) {
-                size_t valBlock = static_cast<size_t>(pay) + 8;
-                int64_t rel2 = static_cast<int64_t>(RdU64LE(data + valBlock));
-                size_t arrPos = valBlock + static_cast<size_t>(rel2);
-                if (arrPos + 16 <= size && RdU64LE(data + arrPos) >= 1) {
-                    return decodeIntArray(RdU64LE(data + arrPos + 8), outInts, depth + 1);
-                }
-                return false;
-            }
-
-            if (!isArray || isInlined || (tEnum != 3 && tEnum != 4)) return false;
-            if (pay + 8 > size) return false;
-            size_t p = static_cast<size_t>(pay);
-            uint64_t nElem = use64BitArrayCount ? RdU64LE(data + p) : RdU32LE(data + p);
-            p += use64BitArrayCount ? 8 : 4;
-            if (nElem == 0 || nElem > 6000000) return false;
-
-            if (isComp) {
-                if (p + 8 > size) return false;
-                uint64_t cSz = RdU64LE(data + p); p += 8;
-                if (p + cSz > size) return false;
-                return UsdDecompressInts32(data + p, static_cast<size_t>(cSz), static_cast<size_t>(nElem), outInts);
-            } else {
-                if (p + static_cast<size_t>(nElem) * 4 > size) return false;
-                outInts.resize(static_cast<size_t>(nElem));
-                for (size_t i = 0; i < static_cast<size_t>(nElem); ++i) {
-                    outInts[i] = static_cast<int32_t>(RdU32LE(data + p + i * 4));
-                }
-                return true;
-            }
-        };
-
-        auto emitUsdMesh = [&](const std::vector<Vec3f>& pts, const std::vector<int32_t>& counts, const std::vector<int32_t>& indices) {
-            if (pts.empty() || indices.empty()) return;
-            uint32_t vBase = static_cast<uint32_t>(mesh.vertices.size());
-            for (const auto& p : pts) mesh.vertices.push_back(p);
-
-            if (counts.empty()) {
-                for (size_t i = 0; i + 2 < indices.size(); i += 3) {
-                    int32_t a = indices[i], b = indices[i + 1], c = indices[i + 2];
-                    if (a >= 0 && b >= 0 && c >= 0 &&
-                        static_cast<size_t>(a) < pts.size() &&
-                        static_cast<size_t>(b) < pts.size() &&
-                        static_cast<size_t>(c) < pts.size())
-                    {
-                        mesh.tris.push_back({ vBase + static_cast<uint32_t>(a), vBase + static_cast<uint32_t>(b), vBase + static_cast<uint32_t>(c), {} });
-                    }
-                }
-            } else {
-                size_t k = 0;
-                for (int32_t cnt : counts) {
-                    if (cnt >= 3 && k + static_cast<size_t>(cnt) <= indices.size()) {
-                        int32_t i0 = indices[k];
-                        if (i0 >= 0 && static_cast<size_t>(i0) < pts.size()) {
-                            for (int32_t t = 1; t + 1 < cnt; ++t) {
-                                int32_t i1 = indices[k + t], i2 = indices[k + t + 1];
-                                if (i1 >= 0 && i2 >= 0 &&
-                                    static_cast<size_t>(i1) < pts.size() &&
-                                    static_cast<size_t>(i2) < pts.size())
-                                {
-                                    mesh.tris.push_back({ vBase + static_cast<uint32_t>(i0), vBase + static_cast<uint32_t>(i1), vBase + static_cast<uint32_t>(i2), {} });
-                                }
-                            }
-                        }
-                    }
-                    if (cnt > 0) k += static_cast<size_t>(cnt);
-                }
-            }
-        };
-
-        // 2c. Decode FIELDSETS, PATHS, and SPECS to associate .points, .faceVertexCounts, .faceVertexIndices per Mesh Prim
-        std::vector<int32_t> fieldSets;
-        if (secFieldSets.present && secFieldSets.len >= 16) {
-            const uint8_t* fsp = data + static_cast<size_t>(secFieldSets.start);
-            uint64_t nFs = RdU64LE(fsp);
-            uint64_t cSz = RdU64LE(fsp + 8);
-            if (nFs <= 8000000 && 16 + cSz <= secFieldSets.len) {
-                UsdDecompressInts32(fsp + 16, static_cast<size_t>(cSz), static_cast<size_t>(nFs), fieldSets);
-            }
-        }
-
-        struct PrimMeshAttrs {
-            uint64_t pointsRep = 0;
-            uint64_t countsRep = 0;
-            uint64_t indicesRep = 0;
-        };
-        std::map<int32_t, PrimMeshAttrs> primAttrs;
-
-        if (secPaths.present && secSpecs.present && !fieldSets.empty()) {
-            // Decode compressed PATHS tree: numPaths(8), then (pathIndexes, elementTokenIndexes, jumps)
-            const uint8_t* pp = data + static_cast<size_t>(secPaths.start);
-            size_t pLen = static_cast<size_t>(secPaths.len);
-            if (pLen >= 24) {
-                size_t off = 0;
-                uint64_t totalPaths = RdU64LE(pp + off); off += 8;
-                // Crate v0.4+ stores numEncodedPaths after totalPaths if compressed
-                uint64_t nEncPaths = totalPaths;
-                if (verMaj > 0 || verMin >= 4) {
-                    if (off + 8 <= pLen) { nEncPaths = RdU64LE(pp + off); off += 8; }
-                }
-                std::vector<int32_t> pathIdxs, elemToks, jumps;
-                auto rdIntVec = [&](std::vector<int32_t>& dst) -> bool {
-                    if (off + 8 > pLen) return false;
-                    uint64_t cSz = RdU64LE(pp + off); off += 8;
-                    if (off + cSz > pLen) return false;
-                    bool ok = UsdDecompressInts32(pp + off, static_cast<size_t>(cSz), static_cast<size_t>(nEncPaths), dst);
-                    off += static_cast<size_t>(cSz);
-                    return ok;
-                };
-                if (nEncPaths > 0 && nEncPaths <= 4000000 && rdIntVec(pathIdxs) && rdIntVec(elemToks) && rdIntVec(jumps)) {
-                    // Reconstruct parent path index for each pathIndex (negative elemTok means property ".attr" on parent prim!)
-                    std::unordered_map<int32_t, std::pair<int32_t, std::string>> propPathInfo; // pathIdx -> (parentPrimPathIdx, propName)
-                    std::function<void(size_t, int32_t, int)> walkPaths = [&](size_t cur, int32_t parentPathIdx, int depth) {
-                        if (cur >= nEncPaths || depth > 512) return;
-                        while (cur < nEncPaths) {
-                            int32_t thisPathIdx = pathIdxs[cur];
-                            int32_t et = elemToks[cur];
-                            if (et < 0) {
-                                uint32_t tIdx = static_cast<uint32_t>(-et);
-                                if (tIdx < tokens.size()) {
-                                    propPathInfo[thisPathIdx] = { parentPathIdx, tokens[tIdx] };
-                                }
-                            }
-                            int32_t jmp = jumps[cur];
-                            bool hasChild   = (jmp > 0 || jmp == -1);
-                            bool hasSibling = (jmp >= 0);
-                            if (hasChild) {
-                                walkPaths(cur + 1, thisPathIdx, depth + 1);
-                            }
-                            if (!hasSibling) break;
-                            cur = (jmp > 0) ? (cur + static_cast<size_t>(jmp)) : (cur + 1);
-                        }
-                    };
-                    walkPaths(0, -1, 0);
-
-                    // Decode SPECS: numSpecs(8), pathIndexes, fieldSetIndexes, specTypes
-                    const uint8_t* sp = data + static_cast<size_t>(secSpecs.start);
-                    size_t sLen = static_cast<size_t>(secSpecs.len);
-                    if (sLen >= 32) {
-                        size_t soff = 0;
-                        uint64_t nSpecs = RdU64LE(sp + soff); soff += 8;
-                        std::vector<int32_t> specPaths, specFs, specTypes;
-                        auto rdSpecVec = [&](std::vector<int32_t>& dst) -> bool {
-                            if (soff + 8 > sLen) return false;
-                            uint64_t cSz = RdU64LE(sp + soff); soff += 8;
-                            if (soff + cSz > sLen) return false;
-                            bool ok = UsdDecompressInts32(sp + soff, static_cast<size_t>(cSz), static_cast<size_t>(nSpecs), dst);
-                            soff += static_cast<size_t>(cSz);
-                            return ok;
-                        };
-                        if (nSpecs > 0 && nSpecs <= 4000000 && rdSpecVec(specPaths) && rdSpecVec(specFs) && rdSpecVec(specTypes)) {
-                            for (size_t i = 0; i < static_cast<size_t>(nSpecs); ++i) {
-                                auto pit = propPathInfo.find(specPaths[i]);
-                                if (pit == propPathInfo.end()) continue;
-                                const std::string& pName = pit->second.second;
-                                if (pName != "points" && pName != "faceVertexCounts" && pName != "faceVertexIndices") continue;
-
-                                int32_t fsIdx = specFs[i];
-                                if (fsIdx < 0 || static_cast<size_t>(fsIdx) >= fieldSets.size()) continue;
-                                uint64_t valRep = 0;
-                                for (size_t k = static_cast<size_t>(fsIdx); k < fieldSets.size() && fieldSets[k] >= 0; ++k) {
-                                    uint32_t fIdx = static_cast<uint32_t>(fieldSets[k]);
-                                    if (fIdx >= fields.size()) continue;
-                                    uint32_t ft = fields[fIdx].tokIdx;
-                                    if (ft < tokens.size() && (tokens[ft] == "default" || tokens[ft] == "timeSamples")) {
-                                        valRep = fields[fIdx].rep;
-                                        if (tokens[ft] == "default") break;
-                                    }
-                                }
-                                if (valRep != 0) {
-                                    auto& pm = primAttrs[pit->second.first];
-                                    if (pName == "points")            pm.pointsRep  = valRep;
-                                    if (pName == "faceVertexCounts")  pm.countsRep  = valRep;
-                                    if (pName == "faceVertexIndices") pm.indicesRep = valRep;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (const auto& [primId, pm] : primAttrs) {
-            if (pm.pointsRep == 0 || pm.indicesRep == 0) continue;
-            std::vector<Vec3f> pts;
-            std::vector<int32_t> counts, indices;
-            if (decodeVec3Array(pm.pointsRep, pts, 0) && decodeIntArray(pm.indicesRep, indices, 0)) {
-                if (pm.countsRep != 0) decodeIntArray(pm.countsRep, counts, 0);
-                emitUsdMesh(pts, counts, indices);
-            }
-        }
-
-        // Direct FIELDS fallback if PATHS used a different layout version
-        if (mesh.tris.empty()) {
-            std::vector<Vec3f> lastPts;
-            std::vector<int32_t> intArrs[2];
-            int nIntArr = 0;
-            for (const auto& f : fields) {
-                if ((f.rep & (1ULL << 63)) == 0) continue;
-                uint8_t tEnum = static_cast<uint8_t>((f.rep >> 48) & 0xFFu);
-                if (tEnum == 19 || tEnum == 20) {
-                    if (!lastPts.empty() && nIntArr >= 1) {
-                        if (nIntArr == 2 && intArrs[0].size() <= intArrs[1].size()) emitUsdMesh(lastPts, intArrs[0], intArrs[1]);
-                        else if (nIntArr == 2) emitUsdMesh(lastPts, intArrs[1], intArrs[0]);
-                        else emitUsdMesh(lastPts, {}, intArrs[0]);
-                        lastPts.clear(); intArrs[0].clear(); intArrs[1].clear(); nIntArr = 0;
-                    }
-                    decodeVec3Array(f.rep, lastPts, 0);
-                } else if ((tEnum == 3 || tEnum == 4) && !lastPts.empty() && nIntArr < 2) {
-                    if (decodeIntArray(f.rep, intArrs[nIntArr], 0)) ++nIntArr;
-                }
-            }
-            if (!lastPts.empty() && nIntArr >= 1) {
-                if (nIntArr == 2 && intArrs[0].size() <= intArrs[1].size()) emitUsdMesh(lastPts, intArrs[0], intArrs[1]);
-                else if (nIntArr == 2) emitUsdMesh(lastPts, intArrs[1], intArrs[0]);
-                else emitUsdMesh(lastPts, {}, intArrs[0]);
-            }
-        }
-
-        return !mesh.vertices.empty() && !mesh.tris.empty();
-    }
-
-    // 3. Pixar USD ASCII Stage (.usda / ASCII .usd) — supports multiple Mesh prims + xformOp:translate/scale
-    std::string_view sv(reinterpret_cast<const char*>(data), size);
-    if (sv.rfind("#usda", 0) == 0 || (sv.find("def Mesh") != std::string_view::npos && sv.find("points") != std::string_view::npos)) {
-        mesh.formatName = L"Pixar USD ASCII Stage (.usda)";
-
-        auto parseMeshScope = [&](std::string_view scope) {
-            Vec3f xlate = { 0, 0, 0 }, scl = { 1, 1, 1 };
-            size_t trP = scope.find("xformOp:translate");
-            if (trP != std::string_view::npos) {
-                size_t lp = scope.find('(', trP), rp = scope.find(')', trP);
-                if (lp != std::string_view::npos && rp != std::string_view::npos && rp > lp) {
-                    std::vector<double> c;
-                    DetailStep::ParseFloatTuple(scope.substr(lp, rp - lp + 1), c);
-                    if (c.size() >= 3) xlate = { static_cast<float>(c[0]), static_cast<float>(c[1]), static_cast<float>(c[2]) };
-                }
-            }
-            size_t scP = scope.find("xformOp:scale");
-            if (scP != std::string_view::npos) {
-                size_t lp = scope.find('(', scP), rp = scope.find(')', scP);
-                if (lp != std::string_view::npos && rp != std::string_view::npos && rp > lp) {
-                    std::vector<double> c;
-                    DetailStep::ParseFloatTuple(scope.substr(lp, rp - lp + 1), c);
-                    if (c.size() >= 3) scl = { static_cast<float>(c[0]), static_cast<float>(c[1]), static_cast<float>(c[2]) };
-                }
-            }
-
-            std::vector<Vec3f> pts;
-            size_t ptsKey = scope.find("points");
-            while (ptsKey != std::string_view::npos) {
-                size_t eq = scope.find('=', ptsKey);
-                size_t b1 = (eq != std::string_view::npos) ? scope.find('[', eq) : std::string_view::npos;
-                if (b1 != std::string_view::npos && b1 - ptsKey < 48) {
-                    size_t b2 = scope.find(']', b1);
-                    if (b2 != std::string_view::npos) {
-                        std::string_view blk = scope.substr(b1 + 1, b2 - b1 - 1);
-                        size_t p = 0;
-                        while ((p = blk.find('(', p)) != std::string_view::npos && pts.size() < 200000) {
-                            size_t pe = blk.find(')', p);
-                            if (pe == std::string_view::npos) break;
-                            std::vector<double> c;
-                            DetailStep::ParseFloatTuple(blk.substr(p, pe - p + 1), c);
-                            if (c.size() >= 3) {
-                                pts.push_back({
-                                    static_cast<float>(c[0]) * scl.x + xlate.x,
-                                    static_cast<float>(c[1]) * scl.y + xlate.y,
-                                    static_cast<float>(c[2]) * scl.z + xlate.z
-                                });
-                            }
-                            p = pe + 1;
-                        }
-                    }
-                    break;
-                }
-                ptsKey = scope.find("points", ptsKey + 6);
-            }
-            if (pts.empty()) return;
-
-            auto readIntBracket = [&](const char* key, std::vector<int>& out) {
-                size_t kp = scope.find(key);
-                if (kp == std::string_view::npos) return;
-                size_t b1 = scope.find('[', kp), b2 = scope.find(']', kp);
-                if (b1 == std::string_view::npos || b2 == std::string_view::npos || b2 <= b1) return;
-                const char* cur = scope.data() + b1 + 1;
-                const char* end = scope.data() + b2;
-                while (cur < end) {
-                    while (cur < end && (*cur < '0' || *cur > '9') && *cur != '-') ++cur;
-                    if (cur >= end) break;
-                    char* ep = nullptr;
-                    long v = std::strtol(cur, &ep, 10);
-                    if (ep == cur) { ++cur; continue; }
-                    out.push_back(static_cast<int>(v));
-                    cur = ep;
-                }
-            };
-            std::vector<int> counts, indices;
-            readIntBracket("faceVertexCounts", counts);
-            readIntBracket("faceVertexIndices", indices);
-            if (indices.empty()) return;
-
-            uint32_t vBase = static_cast<uint32_t>(mesh.vertices.size());
-            for (const auto& p : pts) mesh.vertices.push_back(p);
-            if (counts.empty()) {
-                for (size_t i = 0; i + 2 < indices.size(); i += 3) {
-                    if (indices[i] >= 0 && indices[i + 1] >= 0 && indices[i + 2] >= 0 &&
-                        static_cast<size_t>(indices[i]) < pts.size() &&
-                        static_cast<size_t>(indices[i + 1]) < pts.size() &&
-                        static_cast<size_t>(indices[i + 2]) < pts.size())
-                    {
-                        mesh.tris.push_back({ vBase + static_cast<uint32_t>(indices[i]), vBase + static_cast<uint32_t>(indices[i + 1]), vBase + static_cast<uint32_t>(indices[i + 2]), {} });
-                    }
-                }
-            } else {
-                size_t k = 0;
-                for (int c : counts) {
-                    if (c >= 3 && k + static_cast<size_t>(c) <= indices.size() && indices[k] >= 0 && static_cast<size_t>(indices[k]) < pts.size()) {
-                        for (int t = 1; t + 1 < c; ++t) {
-                            int i1 = indices[k + t], i2 = indices[k + t + 1];
-                            if (i1 >= 0 && i2 >= 0 && static_cast<size_t>(i1) < pts.size() && static_cast<size_t>(i2) < pts.size()) {
-                                mesh.tris.push_back({ vBase + static_cast<uint32_t>(indices[k]), vBase + static_cast<uint32_t>(i1), vBase + static_cast<uint32_t>(i2), {} });
-                            }
-                        }
-                    }
-                    if (c > 0) k += static_cast<size_t>(c);
-                }
-            }
-        };
-
-        size_t dm = sv.find("def Mesh");
-        if (dm == std::string_view::npos) {
-            parseMeshScope(sv);
-        } else {
-            while (dm != std::string_view::npos) {
-                size_t ob = sv.find('{', dm);
-                if (ob == std::string_view::npos) break;
-                int depth = 1;
-                size_t p = ob + 1;
-                while (p < sv.size() && depth > 0) {
-                    if (sv[p] == '{') ++depth;
-                    else if (sv[p] == '}') --depth;
-                    ++p;
-                }
-                parseMeshScope(sv.substr(ob, p - ob));
-                dm = sv.find("def Mesh", p);
-            }
-        }
-        return !mesh.vertices.empty() && !mesh.tris.empty();
-    }
-
-    (void)extLower;
-    return false;
-}
-
-
 namespace UsdAbcDetail {
 
 struct UsdLocalMesh {
@@ -676,6 +134,7 @@ struct UsdPrimNode {
     std::string specifier = "def"; // "def", "over", "class"
     std::string typeName;          // "Xform", "Mesh", "PointInstancer", "Cube", "Sphere", "Scope", ...
     bool resetXformStack = false;
+    bool zUpStage = false;         // Set on pseudo-root nodes[0] when stage upAxis = "Z"
     Mat4 localXform = Mat4::Identity();
 
     UsdLocalMesh geom;
@@ -723,6 +182,27 @@ inline std::string StripUsdaComments(std::string_view sv) {
     return out;
 }
 
+inline bool ExtractStageUpAxisIsZ(std::string_view hdrMeta) {
+    size_t pos = 0;
+    while ((pos = hdrMeta.find("upAxis", pos)) != std::string_view::npos) {
+        bool prevOk = (pos == 0) || !std::isalnum(static_cast<unsigned char>(hdrMeta[pos - 1]));
+        bool nextOk = (pos + 6 >= hdrMeta.size()) || !std::isalnum(static_cast<unsigned char>(hdrMeta[pos + 6]));
+        if (prevOk && nextOk) {
+            size_t eq = hdrMeta.find('=', pos + 6);
+            if (eq != std::string_view::npos) {
+                size_t p = eq + 1;
+                while (p < hdrMeta.size() && std::isspace(static_cast<unsigned char>(hdrMeta[p]))) ++p;
+                if (p + 2 < hdrMeta.size() && (hdrMeta[p] == '"' || hdrMeta[p] == '\'')) {
+                    char axis = hdrMeta[p + 1];
+                    return (axis == 'Z' || axis == 'z');
+                }
+            }
+        }
+        pos += 6;
+    }
+    return false;
+}
+
 inline void ParseUsdaPrimBodyAttributes(std::string_view bodyNoChildren, UsdPrimNode& node) {
     // 1. Parse xformOp attributes & xformOpOrder
     std::unordered_map<std::string, Mat4> opMats;
@@ -763,7 +243,6 @@ inline void ParseUsdaPrimBodyAttributes(std::string_view bodyNoChildren, UsdPrim
             ++ne;
         }
         std::string opName(bodyNoChildren.substr(ns, ne - ns));
-        // Ignore if inside quotes (i.e. inside xformOpOrder = ["xformOp:..."])
         bool inQuotes = (ns > 0 && bodyNoChildren[ns - 1] == '"');
         size_t eq = bodyNoChildren.find('=', ne);
         size_t nl = bodyNoChildren.find('\n', ne);
@@ -834,7 +313,6 @@ inline void ParseUsdaPrimBodyAttributes(std::string_view bodyNoChildren, UsdPrim
     }
     node.localXform = accum;
 
-    // Helpers for bracket arrays
     auto findKeyBracket = [&](const char* key) -> std::string_view {
         size_t kp = 0;
         size_t kLen = std::strlen(key);
@@ -844,7 +322,6 @@ inline void ParseUsdaPrimBodyAttributes(std::string_view bodyNoChildren, UsdPrim
             if (prevOk && nextOk) {
                 size_t eq = bodyNoChildren.find('=', kp + kLen);
                 if (eq != std::string_view::npos && eq - (kp + kLen) < 32) {
-                    // Support timeSamples = { 0: [ ... ] } as well as = [ ... ]
                     size_t b1 = bodyNoChildren.find('[', eq);
                     if (b1 != std::string_view::npos && b1 - eq < 64) {
                         size_t b2 = bodyNoChildren.find(']', b1);
@@ -954,7 +431,6 @@ inline void ParseUsdaPrimBodyAttributes(std::string_view bodyNoChildren, UsdPrim
             }
         }
 
-        // Parse rel prototypes = [</World/ProtoA>, </World/ProtoB>] or rel prototypes = </World/ProtoA>
         size_t prKey = bodyNoChildren.find("prototypes");
         if (prKey != std::string_view::npos) {
             size_t eq = bodyNoChildren.find('=', prKey);
@@ -981,7 +457,8 @@ inline void ParseUsdaPrimBodyAttributes(std::string_view bodyNoChildren, UsdPrim
 inline bool ParseUsdaSceneTree(std::string_view rawSv, std::vector<UsdPrimNode>& nodes) {
     if (rawSv.rfind("#usda", 0) != 0 &&
         rawSv.find("def ") == std::string_view::npos &&
-        rawSv.find("over ") == std::string_view::npos)
+        rawSv.find("over ") == std::string_view::npos &&
+        rawSv.find("faceVertexIndices") == std::string_view::npos)
     {
         return false;
     }
@@ -1023,15 +500,12 @@ inline bool ParseUsdaSceneTree(std::string_view rawSv, std::vector<UsdPrimNode>&
             }
             if (p >= end) break;
 
-            // Check if a child prim starts here: "def ", "over ", or "class " at statement boundary
             auto matchSpec = [&](const char* kw) -> bool {
                 size_t kl = std::strlen(kw);
                 if (p + kl >= end || s.compare(p, kl, kw) != 0) return false;
                 if (!std::isspace(static_cast<unsigned char>(s[p + kl]))) return false;
-                // Look ahead for "PrimName" followed by optional (...) and '{'
                 size_t scan = p + kl;
                 while (scan < end && std::isspace(static_cast<unsigned char>(s[scan]))) ++scan;
-                // Optional TypeName identifier
                 if (scan < end && (std::isalpha(static_cast<unsigned char>(s[scan])) || s[scan] == '_')) {
                     while (scan < end && (std::isalnum(static_cast<unsigned char>(s[scan])) || s[scan] == '_')) ++scan;
                     while (scan < end && std::isspace(static_cast<unsigned char>(s[scan]))) ++scan;
@@ -1101,7 +575,6 @@ inline bool ParseUsdaSceneTree(std::string_view rawSv, std::vector<UsdPrimNode>&
                 }
             }
 
-            // Copy one line or bracketed block to ownAttrText
             if (s[p] == '{') {
                 size_t bc = findMatchingBrace(p, '{', '}');
                 if (bc != std::string_view::npos && bc < end) {
@@ -1119,10 +592,21 @@ inline bool ParseUsdaSceneTree(std::string_view rawSv, std::vector<UsdPrimNode>&
 
         if (parentIdx > 0 && !ownAttrText.empty()) {
             ParseUsdaPrimBodyAttributes(ownAttrText, nodes[parentIdx]);
+        } else if (parentIdx == 0 && nodes.size() == 1 && ownAttrText.find("faceVertexIndices") != std::string_view::npos) {
+            UsdPrimNode implicitMesh;
+            implicitMesh.name = "Mesh";
+            implicitMesh.fullPath = "/Mesh";
+            implicitMesh.specifier = "def";
+            implicitMesh.typeName = "Mesh";
+            ParseUsdaPrimBodyAttributes(ownAttrText, implicitMesh);
+            if (!implicitMesh.geom.verts.empty()) {
+                int myIdx = static_cast<int>(nodes.size());
+                nodes.push_back(std::move(implicitMesh));
+                nodes[0].children.push_back(myIdx);
+            }
         }
     };
 
-    // Skip top-level stage metadata (...) if present right after #usda 1.0
     size_t scanStart = 0;
     size_t nl0 = s.find('\n');
     if (nl0 != std::string_view::npos && s.substr(0, nl0).find("usda") != std::string_view::npos) {
@@ -1131,8 +615,10 @@ inline bool ParseUsdaSceneTree(std::string_view rawSv, std::vector<UsdPrimNode>&
         if (scanStart < s.size() && s[scanStart] == '(') {
             size_t mc = findMatchingBrace(scanStart, '(', ')');
             if (mc != std::string_view::npos) {
-                // Also extract subLayers = [@...@] if present in stage header!
                 std::string_view hdrMeta = s.substr(scanStart + 1, mc - scanStart - 1);
+                if (ExtractStageUpAxisIsZ(hdrMeta)) {
+                    nodes[0].zUpStage = true;
+                }
                 size_t at1 = 0;
                 while ((at1 = hdrMeta.find('@', at1)) != std::string_view::npos) {
                     size_t at2 = hdrMeta.find('@', at1 + 1);
@@ -1154,7 +640,7 @@ inline bool ParseUsdaSceneTree(std::string_view rawSv, std::vector<UsdPrimNode>&
 // Binary Crate ("PXR-USDC") Scene-Graph Decoder (PATHS + SPECS + Xform + PointInstancer)
 // ============================================================================
 inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<UsdPrimNode>& nodes) {
-    using namespace Detail3D100;
+    using namespace DetailDccScene;
     if (size < 88 || std::memcmp(data, "PXR-USDC", 8) != 0) return false;
 
     const uint8_t verMaj = data[8];
@@ -1394,14 +880,14 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         bool isComp    = (rep & (1ULL << 61)) != 0;
         uint8_t tEnum  = static_cast<uint8_t>((rep >> 48) & 0xFFu);
         uint64_t pay   = rep & ((1ULL << 48) - 1ULL);
-        // Crate TypeEnum: Quatd=26(32B), Quatf=27(16B), Quath=28(8B)
-        if (!isArray || isInlined || (tEnum != 26 && tEnum != 27 && tEnum != 28)) return false;
+        // Pixar OpenUSD Crate TypeEnum (crateDataTypes.h): Quatd = 16 (32B), Quatf = 17 (16B), Quath = 18 (8B)
+        if (!isArray || isInlined || (tEnum != 16 && tEnum != 17 && tEnum != 18)) return false;
         if (pay + 8 > size) return false;
         size_t p = static_cast<size_t>(pay);
         uint64_t nElem = use64BitArrayCount ? RdU64LE(data + p) : RdU32LE(data + p);
         p += use64BitArrayCount ? 8 : 4;
         if (nElem == 0 || nElem > 2000000) return false;
-        size_t elemSz = (tEnum == 26) ? 32 : ((tEnum == 27) ? 16 : 8);
+        size_t elemSz = (tEnum == 16) ? 32 : ((tEnum == 17) ? 16 : 8);
         std::vector<uint8_t> decomp;
         const uint8_t* rawPtr = nullptr;
         if (isComp) {
@@ -1418,16 +904,41 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         outWXYZ.resize(static_cast<size_t>(nElem));
         for (size_t i = 0; i < static_cast<size_t>(nElem); ++i) {
             const uint8_t* qp = rawPtr + i * elemSz;
-            // Pixar GfQuat binary memory layout is (i, j, k, real) = (x, y, z, w)!
-            if (tEnum == 26) {
+            // Pixar GfQuat binary memory layout is (i, j, k, real) = (x, y, z, w)
+            if (tEnum == 16) {
                 outWXYZ[i] = { static_cast<float>(RdF64LE(qp + 24)), static_cast<float>(RdF64LE(qp + 0)), static_cast<float>(RdF64LE(qp + 8)), static_cast<float>(RdF64LE(qp + 16)) };
-            } else if (tEnum == 27) {
+            } else if (tEnum == 17) {
                 outWXYZ[i] = { RdF32LE(qp + 12), RdF32LE(qp + 0), RdF32LE(qp + 4), RdF32LE(qp + 8) };
             } else {
                 outWXYZ[i] = { HalfToFloat17(RdU16LE(qp + 6)), HalfToFloat17(RdU16LE(qp + 0)), HalfToFloat17(RdU16LE(qp + 2)), HalfToFloat17(RdU16LE(qp + 4)) };
             }
         }
         return true;
+    };
+
+    auto decodeSingleQuat = [&](uint64_t repIn, std::array<float, 4>& outWXYZ) -> bool {
+        uint64_t rep   = derefTimeSampleFirst(repIn);
+        bool isArray   = (rep & (1ULL << 63)) != 0;
+        bool isInlined = (rep & (1ULL << 62)) != 0;
+        uint8_t tEnum  = static_cast<uint8_t>((rep >> 48) & 0xFFu);
+        uint64_t pay   = rep & ((1ULL << 48) - 1ULL);
+        if (isArray || isInlined) return false;
+        if (tEnum == 16 && pay + 32 <= size) {
+            const uint8_t* qp = data + static_cast<size_t>(pay);
+            outWXYZ = { static_cast<float>(RdF64LE(qp + 24)), static_cast<float>(RdF64LE(qp + 0)), static_cast<float>(RdF64LE(qp + 8)), static_cast<float>(RdF64LE(qp + 16)) };
+            return true;
+        }
+        if (tEnum == 17 && pay + 16 <= size) {
+            const uint8_t* qp = data + static_cast<size_t>(pay);
+            outWXYZ = { RdF32LE(qp + 12), RdF32LE(qp + 0), RdF32LE(qp + 4), RdF32LE(qp + 8) };
+            return true;
+        }
+        if (tEnum == 18 && pay + 8 <= size) {
+            const uint8_t* qp = data + static_cast<size_t>(pay);
+            outWXYZ = { HalfToFloat17(RdU16LE(qp + 6)), HalfToFloat17(RdU16LE(qp + 0)), HalfToFloat17(RdU16LE(qp + 2)), HalfToFloat17(RdU16LE(qp + 4)) };
+            return true;
+        }
+        return false;
     };
 
     auto decodeIntArray = [&](uint64_t repIn, std::vector<int32_t>& outInts) -> bool {
@@ -1465,12 +976,6 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         uint8_t tEnum  = static_cast<uint8_t>((rep >> 48) & 0xFFu);
         uint64_t pay   = rep & ((1ULL << 48) - 1ULL);
         if (isArray) return false;
-        // Crate TypeEnum: Vec3i=18, Vec3h=19, Vec3f=20, Vec3d=21 (note: array flag bit 63 distinguishes Vec3f vs Vec3f[]!)
-        // Wait: in Pixar Crate TypeEnum (crateDataTypes.h):
-        // Bool=1, UChar=2, Int=3, UInt=4, Int64=5, UInt64=6, Half=7, Float=8, Double=9,
-        // String=10, Token=11, AssetPath=12, Matrix2d=13, Matrix3d=14, Matrix4d=15,
-        // Quatd=16, Quatf=17, Quath=18, Vec2d=19.. wait! Let's check Extended3D100.h line 1164!
-        // In Extended3D100.h line 1164, Vec3f=19, Vec3d=20! Let's support BOTH inlined int8[3] AND out-of-line 12B/24B!
         if (isInlined) {
             int8_t b0 = static_cast<int8_t>(pay & 0xFFu);
             int8_t b1 = static_cast<int8_t>((pay >> 8) & 0xFFu);
@@ -1496,7 +1001,6 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         uint8_t tEnum  = static_cast<uint8_t>((rep >> 48) & 0xFFu);
         uint64_t pay   = rep & ((1ULL << 48) - 1ULL);
         if (isArray) return false;
-        // Matrix4d in Crate: either inlined diagonal int8[4] or 16 doubles (128 bytes) at payload offset (tEnum 15 or 13)
         if (isInlined && (tEnum == 15 || tEnum == 13)) {
             int8_t d0 = static_cast<int8_t>(pay & 0xFFu);
             int8_t d1 = static_cast<int8_t>((pay >> 8) & 0xFFu);
@@ -1519,7 +1023,6 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         uint64_t pay   = rep & ((1ULL << 48) - 1ULL);
         if (isInlined || pay + 8 > size) return;
 
-        // PathListOp (ListOpHeader 1B bitmask + vector<uint32_t pathIndex> per bit) OR PathVector (uint64 n + uint32[n])
         auto appendPathVecAt = [&](size_t& pos) -> bool {
             if (pos + 8 > size) return false;
             uint64_t n = RdU64LE(data + pos); pos += 8;
@@ -1533,7 +1036,6 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
             return true;
         };
 
-        // Check PathVector first (tEnum == 42 or direct count) vs PathListOp (1-byte bitmask: bit0=IsExplicit, bit1=ExplicitItems, bit2=Added, bit3=Deleted, bit4=Ordered, bit5=Prepended, bit6=Appended)
         if (tEnum == 42) {
             size_t pos = static_cast<size_t>(pay);
             appendPathVecAt(pos);
@@ -1550,7 +1052,7 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         }
     };
 
-    // 5. Walk SPECS to populate Prim types, Xform ops, Meshes, and PointInstancers
+    // 5. Walk SPECS to populate Prim types, stage upAxis, Xform ops, Meshes, and PointInstancers
     const uint8_t* sp = data + static_cast<size_t>(secSpecs.start);
     size_t sLen = static_cast<size_t>(secSpecs.len);
     if (sLen < 32) return false;
@@ -1598,6 +1100,9 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
                 } else if (fn == "specifier" && (rep & (1ULL << 62)) != 0) {
                     uint32_t spv = static_cast<uint32_t>(pay & 0xFFu);
                     nd.specifier = (spv == 1) ? "over" : ((spv == 2) ? "class" : "def");
+                } else if (primIt->second == 0 && fn == "upAxis" && (rep & (1ULL << 62)) != 0 && pay < tokens.size()) {
+                    const std::string& ax = tokens[static_cast<size_t>(pay)];
+                    if (ax == "Z" || ax == "z") nodes[0].zUpStage = true;
                 }
             }
             continue;
@@ -1624,7 +1129,6 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
                 decodeTargetPathList(fields[fIdx].rep, nd.protoPaths);
             }
         }
-        // Also check any field on "prototypes" relationship for PathListOp / PathVector
         if (attrName == "prototypes" && nd.protoPaths.empty()) {
             for (size_t k = static_cast<size_t>(fsIdx); k < fieldSets.size() && fieldSets[k] >= 0; ++k) {
                 uint32_t fIdx = static_cast<uint32_t>(fieldSets[k]);
@@ -1641,7 +1145,6 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         else if (attrName.rfind("xformOp:", 0) == 0) {
             rp.xformOps.push_back({ attrName, valRep });
         } else if (attrName == "xformOpOrder") {
-            // TokenVector (uint64 n + uint32 tokIdx[n]) or Token[] array
             uint64_t pay = valRep & ((1ULL << 48) - 1ULL);
             bool isInlined = (valRep & (1ULL << 62)) != 0;
             if (!isInlined && pay + 8 <= size) {
@@ -1676,6 +1179,7 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
         for (const auto& [opNm, rep] : rp.xformOps) {
             Mat4 m = Mat4::Identity();
             Vec3f v = { 0, 0, 0 };
+            std::array<float, 4> qwxyz = { 1, 0, 0, 0 };
             if (opNm.rfind("xformOp:transform", 0) == 0 && decodeSingleMatrix4d(rep, m)) {
                 opMap[opNm] = m; impOrder.push_back(opNm);
             } else if (opNm.rfind("xformOp:translate", 0) == 0 && decodeSingleVec3(rep, v)) {
@@ -1684,6 +1188,8 @@ inline bool ParseUsdcSceneTree(const uint8_t* data, size_t size, std::vector<Usd
                 opMap[opNm] = Mat4::Scale(v.x, v.y, v.z); impOrder.push_back(opNm);
             } else if (opNm.rfind("xformOp:rotateXYZ", 0) == 0 && decodeSingleVec3(rep, v)) {
                 opMap[opNm] = Mat4::RotateXYZ(v.x, v.y, v.z); impOrder.push_back(opNm);
+            } else if (opNm.rfind("xformOp:orient", 0) == 0 && decodeSingleQuat(rep, qwxyz)) {
+                opMap[opNm] = QuatToMat4(qwxyz[0], qwxyz[1], qwxyz[2], qwxyz[3]); impOrder.push_back(opNm);
             }
         }
         const auto& ord = rp.xformOrder.empty() ? impOrder : rp.xformOrder;
@@ -1727,9 +1233,7 @@ inline void EvaluateUsdStageNodes(
             for (const std::string& refAsset : refs) {
                 std::vector<UsdPrimNode> subNodes;
                 if (!loadExternalStage(refAsset, subNodes) || subNodes.size() <= 1) continue;
-                // Find default/first concrete root child in subNodes (or graft all root children)
                 int baseOffset = static_cast<int>(nodes.size()) - 1;
-                // Copy subNodes[1..end] into nodes, remapping child indices
                 for (size_t k = 1; k < subNodes.size(); ++k) {
                     UsdPrimNode cp = std::move(subNodes[k]);
                     for (int& ch : cp.children) ch += baseOffset;
@@ -1740,7 +1244,6 @@ inline void EvaluateUsdStageNodes(
                         nodes[0].children.push_back(rootCh + baseOffset);
                     }
                 } else if (subNodes[0].children.size() == 1) {
-                    // Single root prim in referenced asset merges into referencing prim (classic USD reference!)
                     int srcRoot = subNodes[0].children[0] + baseOffset;
                     if (nodes[i].geom.verts.empty() && !nodes[srcRoot].geom.verts.empty()) {
                         nodes[i].geom = nodes[srcRoot].geom;
@@ -1773,9 +1276,7 @@ inline void EvaluateUsdStageNodes(
     for (size_t i = 1; i < nodes.size(); ++i) {
         UsdPrimNode& nd = nodes[i];
         if (nd.protoIndices.empty() && nd.piPositions.empty()) continue;
-        // If prototypes relationship was empty or pointed to a Scope container, resolve prototypes:
         if (nd.protoPaths.empty()) {
-            // Check child named "Prototypes" or direct children of PointInstancer
             for (int ch : nd.children) {
                 if (nodes[ch].name == "Prototypes" && !nodes[ch].children.empty()) {
                     for (int pch : nodes[ch].children) nd.protoPaths.push_back(nodes[pch].fullPath);
@@ -1790,7 +1291,6 @@ inline void EvaluateUsdStageNodes(
         }
     }
 
-    // Helper to bake a prototype subtree in prototype-root-relative space (including prototype's own localXform)
     std::function<void(int, const Mat4&, UsdLocalMesh&, int)> bakeSubtreeLocal =
         [&](int idx, const Mat4& parentMat, UsdLocalMesh& dst, int depth)
     {
@@ -1805,6 +1305,11 @@ inline void EvaluateUsdStageNodes(
         }
     };
 
+    // Rotate Z-up stages (upAxis = "Z") by -90 deg around X so (x, y, z) -> (x, z, -y) in right-handed Y-up space
+    const Mat4 rootBasis = nodes[0].zUpStage
+        ? Mat4::RotateAxisAngle(-90.0f, 1.0f, 0.0f, 0.0f)
+        : Mat4::Identity();
+
     // 3. Traverse stage hierarchy, emitting transformed meshes and expanding PointInstancers
     std::function<void(int, const Mat4&, int)> walkStage =
         [&](int idx, const Mat4& parentWorld, int depth)
@@ -1816,15 +1321,14 @@ inline void EvaluateUsdStageNodes(
         }
 
         Mat4 worldMat = (idx == 0)
-            ? Mat4::Identity()
-            : (nd.resetXformStack ? nd.localXform : Mat4::Mul(parentWorld, nd.localXform));
+            ? parentWorld
+            : (nd.resetXformStack ? Mat4::Mul(rootBasis, nd.localXform) : Mat4::Mul(parentWorld, nd.localXform));
 
         if (idx > 0 && nd.specifier == "def") {
             if (!nd.geom.verts.empty() && !nd.geom.tris.empty()) {
                 AppendTransformedLocalMesh(nd.geom, worldMat, outMesh);
             }
 
-            // Expand PointInstancer!
             if (!nd.piPositions.empty() && !nd.protoPaths.empty()) {
                 std::vector<UsdLocalMesh> bakedProtos(nd.protoPaths.size());
                 for (size_t p = 0; p < nd.protoPaths.size(); ++p) {
@@ -1863,7 +1367,7 @@ inline void EvaluateUsdStageNodes(
         }
     };
 
-    walkStage(0, Mat4::Identity(), 0);
+    walkStage(0, rootBasis, 0);
 }
 
 inline bool ParseSingleUsdBufferToNodes(const uint8_t* data, size_t size, std::vector<UsdPrimNode>& outNodes) {
@@ -1879,9 +1383,9 @@ inline bool ParseSingleUsdBufferToNodes(const uint8_t* data, size_t size, std::v
 
 
 // ============================================================================
-// Public Entry Point 1: Pixar OpenUSD (.usd, .usda, .usdc, .usdz)
+// Public Entry Point: Pixar OpenUSD (.usd, .usda, .usdc, .usdz)
 // ============================================================================
-inline bool ParsePixarUsdComplete(
+inline bool ParsePixarUsdStage(
     const uint8_t* data,
     size_t size,
     const std::wstring& extLower,
@@ -1889,6 +1393,7 @@ inline bool ParsePixarUsdComplete(
     LoadedMesh3D& mesh)
 {
     using namespace UsdAbcDetail;
+    (void)extLower;
     if (!data || size < 6) return false;
     mesh.vertices.clear();
     mesh.tris.clear();
@@ -1937,15 +1442,16 @@ inline bool ParsePixarUsdComplete(
             return false;
         };
 
-        std::vector<UsdPrimNode> rootNodes;
-        if (ParseSingleUsdBufferToNodes(layers[0].bytes.data(), layers[0].bytes.size(), rootNodes)) {
-            EvaluateUsdStageNodes(rootNodes, resolveZipLayer, mesh, 0);
+        for (const auto& ly : layers) {
+            std::vector<UsdPrimNode> rootNodes;
+            if (ParseSingleUsdBufferToNodes(ly.bytes.data(), ly.bytes.size(), rootNodes)) {
+                EvaluateUsdStageNodes(rootNodes, resolveZipLayer, mesh, 0);
+                if (!mesh.vertices.empty() && !mesh.tris.empty()) break;
+            }
         }
-        if (mesh.vertices.empty() || mesh.tris.empty()) {
-            if (!ParsePixarUsdMesh(data, size, extLower, mesh)) return false;
-        }
+        if (mesh.vertices.empty() || mesh.tris.empty()) return false;
         mesh.formatName = L"Pixar USDZ Package (.usdz)";
-        return !mesh.vertices.empty() && !mesh.tris.empty();
+        return true;
     }
 
     // 2. Standalone .usda / .usdc / .usd with optional sibling @asset@ resolution on disk
@@ -1956,7 +1462,6 @@ inline bool ParsePixarUsdComplete(
         while (cleanRef.rfind("./", 0) == 0) cleanRef.erase(0, 2);
         std::wstring wRel;
         for (char c : cleanRef) wRel.push_back((c == '/') ? L'\\' : static_cast<wchar_t>(static_cast<unsigned char>(c)));
-        // Prevent parent traversal outside folder unless safe relative path
         std::wstring cand = baseDir + L"\\" + PathUtils::GetFileName(wRel);
         std::vector<uint8_t> subBytes;
         if (!PathUtils::ReadFileBytes(cand, 64 * 1024 * 1024, subBytes) || subBytes.empty()) return false;
@@ -1968,15 +1473,12 @@ inline bool ParsePixarUsdComplete(
     if (ParseSingleUsdBufferToNodes(data, size, stageNodes)) {
         EvaluateUsdStageNodes(stageNodes, resolveDiskLayer, mesh, 0);
     }
-
-    if (mesh.vertices.empty() || mesh.tris.empty()) {
-        if (!ParsePixarUsdMesh(data, size, extLower, mesh)) return false;
-    }
+    if (mesh.vertices.empty() || mesh.tris.empty()) return false;
 
     mesh.formatName = isCrate
         ? L"Pixar OpenUSD Binary Crate (.usdc)"
         : L"Pixar OpenUSD ASCII Stage (.usda)";
-    return !mesh.vertices.empty() && !mesh.tris.empty();
+    return true;
 }
 
 } // namespace Formats

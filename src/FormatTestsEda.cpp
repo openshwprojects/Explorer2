@@ -1500,7 +1500,7 @@ void RunFormatTestsEda(TestCounter& tc) {
     }
 
     // ------------------------------------------------------------------------
-    // 6. Xilinx FPGA .bit & STM32 DfuSe .dfu Firmware Images + corrupt rejection
+    // 6. Xilinx & Lattice FPGA .bit + STM32 DfuSe .dfu Firmware Images + corrupt rejection
     // ------------------------------------------------------------------------
     {
         auto bitA = BuildXilinxBitFile(false);
@@ -1508,23 +1508,49 @@ void RunFormatTestsEda(TestCounter& tc) {
         auto dfuA = BuildStm32DfuFile(false);
         auto dfuB = BuildStm32DfuFile(true);
 
-        ParsedEdaBoard xA, xB, uA, uB, badBit, badDfu;
-        bool okXA = WriteAndInspect(dir + L"\\a.bit", bitA.data(), bitA.size(), xA);
-        bool okXB = WriteAndInspect(dir + L"\\b.bit", bitB.data(), bitB.size(), xB);
-        bool okUA = WriteAndInspect(dir + L"\\a.dfu", dfuA.data(), dfuA.size(), uA);
-        bool okUB = WriteAndInspect(dir + L"\\b.dfu", dfuB.data(), dfuB.size(), uB);
+        // Lattice iCE40 (0x7EAA997E) & ECP5 (0xFFFFBDB3) bitstreams -> genuine die floorplans, zero fake SOIC-8
+        std::vector<uint8_t> iceBit = { 0xFF, 0x00, 'i','C','E','4','0','U','P','5','K', 0x00, 0x00, 0xFF,
+                                        0x7E, 0xAA, 0x99, 0x7E,
+                                        0x11, 0x00,             // BANK_NUMBER 0
+                                        0x62, 0x00, 0x40,       // BANK_WIDTH 64 (8 bytes/row)
+                                        0x72, 0x00, 0x14,       // BANK_HEIGHT 20
+                                        0x01, 0x01 };           // CRAM_DATA (160 bytes + 0x00 0x00)
+        for (size_t i = 0; i < 160u; ++i) iceBit.push_back(static_cast<uint8_t>((i % 5u == 0u) ? 0x5Au : 0x00u));
+        iceBit.insert(iceBit.end(), { 0x00, 0x00, 0x22, 0xAB, 0xCD, 0x01, 0x06 });
+
+        std::vector<uint8_t> ecpBit = { 0xFF, 0xFF, 0xBD, 0xB3,
+                                        0xE2, 0x00, 0x00, 0x00, 0x41, 0x11, 0x20, 0x43, // VERIFY_ID LFE5U-45F
+                                        0x46, 0x00, 0x00, 0x00,                         // LSC_INIT_ADDRESS
+                                        0x82, 0x00, 0x00, 0x04 };                       // LSC_PROG_INCR_RTI (4 frames)
+        for (size_t i = 0; i < 96u; ++i) ecpBit.push_back(static_cast<uint8_t>(0x3Cu ^ static_cast<uint8_t>(i * 3u)));
+        ecpBit.insert(ecpBit.end(), { 0x5E, 0x00, 0x00, 0x00 }); // ISC_PROGRAM_DONE
+
+        ParsedEdaBoard xA, xB, bIce, bEcp, uA, uB, badBit, badDfu;
+        bool okXA  = WriteAndInspect(dir + L"\\a.bit", bitA.data(), bitA.size(), xA);
+        bool okXB  = WriteAndInspect(dir + L"\\b.bit", bitB.data(), bitB.size(), xB);
+        bool okIce = WriteAndInspect(dir + L"\\ice40_up5k.bit", iceBit.data(), iceBit.size(), bIce);
+        bool okEcp = WriteAndInspect(dir + L"\\ecp5_45f.bit", ecpBit.data(), ecpBit.size(), bEcp);
+        bool okUA  = WriteAndInspect(dir + L"\\a.dfu", dfuA.data(), dfuA.size(), uA);
+        bool okUB  = WriteAndInspect(dir + L"\\b.dfu", dfuB.data(), dfuB.size(), uB);
 
         const uint8_t garbage[64] = { 0x00, 0x01, 0x02, 0x03, 0x55, 0xAA };
         bool rejBit = !WriteAndInspect(dir + L"\\bad.bit", garbage, sizeof(garbage), badBit);
         bool rejDfu = !WriteAndInspect(dir + L"\\bad.dfu", garbage, sizeof(garbage), badDfu);
 
-        bool pass = okXA && okXB && okUA && okUB &&
+        bool pass = okXA && okXB && okIce && okEcp && okUA && okUB &&
                     xA.formatTitle.find(L"xc7a35t") != std::wstring::npos &&
                     xB.formatTitle.find(L"xc7k325t") != std::wstring::npos &&
+                    xA.components.size() == 1u && xA.components[0].footprint == L"XILINX_DIE" &&
+                    xB.components.size() == 1u && xB.components[0].footprint == L"XILINX_DIE" &&
+                    bIce.components.size() == 1u && bIce.components[0].footprint == L"LATTICE_ICE40_DIE" &&
+                    bIce.formatTitle.find(L"iCE40UP5K") != std::wstring::npos &&
+                    bEcp.components.size() == 1u && bEcp.components[0].footprint == L"LATTICE_ECP5_DIE" &&
+                    bEcp.formatTitle.find(L"LFE5U-45F") != std::wstring::npos &&
                     xB.pads.size() > xA.pads.size() &&
                     uA.components.size() == 1 && uB.components.size() == 3 &&
                     uA.formatTitle.find(L"0483:DF11") != std::wstring::npos &&
                     HashEdaGeometry(xA) != HashEdaGeometry(xB) &&
+                    HashEdaGeometry(bIce) != HashEdaGeometry(bEcp) &&
                     HashEdaGeometry(uA) != HashEdaGeometry(uB) &&
                     rejBit && rejDfu;
 
@@ -1788,7 +1814,9 @@ void RunFormatTestsEda(TestCounter& tc) {
             out.push_back(static_cast<uint8_t>(m[1]));
             out.push_back(static_cast<uint8_t>(m[2]));
             out.push_back(0u);
-            uint8_t cnt[4] = {};
+            uint8_t ver[4] = {}; // bytes 4..7 reserved/version word in 12-byte Quartus SOF/POF header
+            out.insert(out.end(), ver, ver + 4);
+            uint8_t cnt[4] = {}; // bytes 8..11 packet count
             PutU32LE(cnt, 3u);
             out.insert(out.end(), cnt, cnt + 4);
 
@@ -1826,7 +1854,7 @@ void RunFormatTestsEda(TestCounter& tc) {
         bool okP1 = WriteAndInspect(dir + L"\\max10.pof",    pof1.data(), pof1.size(), p1);
 
         const uint8_t nonAltera[64] = { 'B', 'A', 'D', '!', 1, 0, 0, 0, 2, 0, 8, 0, 0, 0 };
-        std::vector<uint8_t> truncSof = { 'S', 'O', 'F', 0, 2, 0, 0, 0, 2, 0, 0xFF, 0x0F, 0, 0, 'E', 'P' };
+        std::vector<uint8_t> truncSof = { 'S', 'O', 'F', 0, 0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0xFF, 0x0F, 0, 0, 'E', 'P' };
         bool rejSofGarbage = !WriteAndInspect(dir + L"\\garbage.sof", nonAltera, sizeof(nonAltera), badSof1);
         bool rejSofTrunc   = !WriteAndInspect(dir + L"\\trunc.sof", truncSof.data(), truncSof.size(), badSof2);
 
@@ -2729,17 +2757,18 @@ void RunFormatTestsEda(TestCounter& tc) {
         // Verify VCD timestamps were normalized rather than exploding to curTime * 0.5f (= 5000)
         bool vcdNormalized = (bVcd.maxX < 250.0f && bVcd.minX > -80.0f);
 
-        bool passItem18 = okGds && rejGds &&
-                          (bGds.maxX - bGds.minX) > 90.0f && (bGds.maxY - bGds.minY) > 20.0f &&
-                          bGds.traces.size() >= 28u && hasLabelSubstr(bGds, L"VDD_RAIL") &&
-                          okVcd && rejVcd && vcdNormalized &&
-                          hasLabelSubstr(bVcd, L"wdata") &&
-                          (hasLabelSubstr(bVcd, L"AC") || hasLabelSubstr(bVcd, L"ac")) &&
-                          okS2pMa && okS2pRi && okS1p && rejSnp &&
-                          hasCurveVariation(bS2pMa) && hasCurveVariation(bS2pRi) && hasCurveVariation(bS1p) &&
-                          hasLabelSubstr(bS2pMa, L"S11") && hasLabelSubstr(bS2pMa, L"S21");
+        bool passGdsVcdSnp = okGds && rejGds &&
+                             (bGds.maxX - bGds.minX) > 90.0f && (bGds.maxY - bGds.minY) > 20.0f &&
+                             bGds.traces.size() >= 28u && hasLabelSubstr(bGds, L"VDD_RAIL") &&
+                             okVcd && rejVcd && vcdNormalized &&
+                             hasLabelSubstr(bVcd, L"wdata") &&
+                             (hasLabelSubstr(bVcd, L"AC") || hasLabelSubstr(bVcd, L"ac")) &&
+                             okS2pMa && okS2pRi && okS1p && rejSnp &&
+                             bS2pMa.components.empty() && bS2pRi.components.empty() && bS1p.components.empty() &&
+                             hasCurveVariation(bS2pMa) && hasCurveVariation(bS2pRi) && hasCurveVariation(bS1p) &&
+                             hasLabelSubstr(bS2pMa, L"S11") && hasLabelSubstr(bS2pMa, L"S21");
 
-        tc.Record(passItem18, L"Stage15.Eda.GdsiiHierarchy_VcdMultiBitBus_TouchstoneMaRi",
+        tc.Record(passGdsVcdSnp, L"Stage15.Eda.GdsiiHierarchy_VcdMultiBitBus_TouchstoneMaRi",
             L"gdsSpanX=" + std::to_wstring(static_cast<int>(bGds.maxX - bGds.minX)) +
             L" vcdMaxX=" + std::to_wstring(static_cast<int>(bVcd.maxX)) +
             L" s2pMaTr=" + std::to_wstring(bS2pMa.traces.size()));
@@ -2908,18 +2937,18 @@ void RunFormatTestsEda(TestCounter& tc) {
         bool okSrec  = WriteAndInspect(dir + L"\\stm32_app.srec",   validSrec.data(),     validSrec.size(),     bSrec);
         bool rejSrec = !WriteAndInspect(dir + L"\\corrupt.srec",    badCksumSrec.data(),  badCksumSrec.size(),  badSrec);
 
-        bool passItem19 = okCir && rejCir &&
-                          bCir.netCount >= 4u && bCir.components.size() >= 6u && bCir.traces.size() > 30u &&
-                          hasLabelSubstr(bCir, L"R1") && hasLabelSubstr(bCir, L"M1") &&
-                          okEagS && bEagS.pads.size() >= 3u && bEagS.traces.size() >= 4u &&
-                          hasLabelSubstr(bEagS, L"AUDIO_IN") &&
-                          okKiS && bKiS.pads.size() >= 2u && bKiS.traces.size() >= 6u &&
-                          hasLabelSubstr(bKiS, L"VCC_3V3") && hasLabelSubstr(bKiS, L"R1") &&
-                          okHex && rejHex && okSrec && rejSrec &&
-                          hasLabelSubstr(bHex, L"0x08040000") && hasLabelSubstr(bSrec, L"0x08040000") &&
-                          bHex.components.size() >= 1u && bSrec.components.size() >= 1u;
+        bool passSpiceSchHex = okCir && rejCir &&
+                               bCir.netCount >= 4u && bCir.components.size() >= 6u && bCir.traces.size() > 30u &&
+                               hasLabelSubstr(bCir, L"R1") && hasLabelSubstr(bCir, L"M1") &&
+                               okEagS && bEagS.pads.size() >= 3u && bEagS.traces.size() >= 4u &&
+                               hasLabelSubstr(bEagS, L"AUDIO_IN") &&
+                               okKiS && bKiS.pads.size() >= 2u && bKiS.traces.size() >= 6u &&
+                               hasLabelSubstr(bKiS, L"VCC_3V3") && hasLabelSubstr(bKiS, L"R1") &&
+                               okHex && rejHex && okSrec && rejSrec &&
+                               hasLabelSubstr(bHex, L"0x08040000") && hasLabelSubstr(bSrec, L"0x08040000") &&
+                               bHex.components.size() >= 1u && bSrec.components.size() >= 1u;
 
-        tc.Record(passItem19, L"Stage15.Eda.SpiceNetlist_EagleKiCadSchSymbols_ChecksummedHexSrec",
+        tc.Record(passSpiceSchHex, L"Stage15.Eda.SpiceNetlist_EagleKiCadSchSymbols_ChecksummedHexSrec",
             L"spiceNets=" + std::to_wstring(bCir.netCount) +
             L" eagPads=" + std::to_wstring(bEagS.pads.size()) +
             L" kiPads=" + std::to_wstring(bKiS.pads.size()));
@@ -3078,16 +3107,16 @@ void RunFormatTestsEda(TestCounter& tc) {
         bool okPos  = WriteAndInspect(dir + L"\\pnp_jlcpcb.cpl", validPos.data(), validPos.size(), bPos);
         bool rejPos = !WriteAndInspect(dir + L"\\prose.pos", prosePos, std::strlen(prosePos), badPos);
 
-        bool passItem18b = okSym && rejSym &&
-                           bSym.components.size() == 2u && bSym.pads.size() == 6u && !bSym.circles.empty() &&
-                           hasLabelSubstr(bSym, L"DRV8303") &&
-                           okSes && rejSes &&
-                           bSes.components.size() == 2u && bSes.vias.size() == 1u && bSes.netCount == 2u &&
-                           okPos && rejPos &&
-                           bPos.components.size() == 3u && bPos.pads.size() >= 37u &&
-                           std::fabs(bPos.components[0].x - 25.4f) < 0.15f;
+        bool passSymSesPos = okSym && rejSym &&
+                             bSym.components.size() == 2u && bSym.pads.size() == 6u && !bSym.circles.empty() &&
+                             hasLabelSubstr(bSym, L"DRV8303") &&
+                             okSes && rejSes &&
+                             bSes.components.size() == 2u && bSes.vias.size() == 1u && bSes.netCount == 2u &&
+                             okPos && rejPos &&
+                             bPos.components.size() == 3u && bPos.pads.size() >= 37u &&
+                             std::fabs(bPos.components[0].x - 25.4f) < 0.15f;
 
-        tc.Record(passItem18b, L"Stage15.Eda.KiCadSym_SpecctraSes_PickAndPlacePosCpl",
+        tc.Record(passSymSesPos, L"Stage15.Eda.KiCadSym_SpecctraSes_PickAndPlacePosCpl",
             L"symPads=" + std::to_wstring(bSym.pads.size()) +
             L" sesVias=" + std::to_wstring(bSes.vias.size()) +
             L" posPads=" + std::to_wstring(bPos.pads.size()));
@@ -3177,14 +3206,14 @@ void RunFormatTestsEda(TestCounter& tc) {
         bool rejIbs = !WriteAndInspect(dir + L"\\empty.ibs", emptyIbs, std::strlen(emptyIbs), badIbs);
         bool okS4p  = WriteAndInspect(dir + L"\\pcie_ch.s4p", validS4p.data(), validS4p.size(), bS4p);
 
-        bool passItem19b = okIbs && rejIbs &&
-                           bIbs.pads.size() == 4u && bIbs.traces.size() >= 25u &&
-                           hasLabelSubstr(bIbs, L"XC7K325T_FFG900") &&
-                           hasLabelSubstr(bIbs, L"V-I") && hasLabelSubstr(bIbs, L"V-T") &&
-                           okS4p && bS4p.traces.size() >= 16u &&
-                           hasLabelSubstr(bS4p, L"SDD21") && hasLabelSubstr(bS4p, L"SDD11");
+        bool passIbsS4p = okIbs && rejIbs &&
+                          bIbs.pads.size() == 4u && bIbs.traces.size() >= 25u &&
+                          hasLabelSubstr(bIbs, L"XC7K325T_FFG900") &&
+                          hasLabelSubstr(bIbs, L"V-I") && hasLabelSubstr(bIbs, L"V-T") &&
+                          okS4p && bS4p.components.empty() && bS4p.traces.size() >= 16u &&
+                          hasLabelSubstr(bS4p, L"SDD21") && hasLabelSubstr(bS4p, L"SDD11");
 
-        tc.Record(passItem19b, L"Stage15.Eda.IbisViVtPinout_And_TouchstoneS4pDifferential",
+        tc.Record(passIbsS4p, L"Stage15.Eda.IbisViVtPinout_And_TouchstoneS4pDifferential",
             L"ibsTr=" + std::to_wstring(bIbs.traces.size()) +
             L" s4pTr=" + std::to_wstring(bS4p.traces.size()));
     }
@@ -3525,19 +3554,21 @@ void RunFormatTestsEda(TestCounter& tc) {
         bool okHpgl  = WriteAndInspect(dir + L"\\fab_plot.plt", validHpgl.data(), validHpgl.size(), bHpgl);
         bool rejHpgl = !WriteAndInspect(dir + L"\\notes.plt", prosePlt, std::strlen(prosePlt), badHpgl);
 
-        bool passItem21 = okAltRpd && okXilRpd && rejRpd &&
-                          bAltRpd.formatTitle.find(L"Altera AS") != std::wstring::npos &&
-                          bXilRpd.formatTitle.find(L"Xilinx") != std::wstring::npos &&
-                          hasLabelSubstr(bXilRpd, L"0x0362D093") &&
-                          HashEdaGeometry(bAltRpd) != HashEdaGeometry(bXilRpd) &&
-                          okRealOrc && bRealOrc.components.size() == 1u && bRealOrc.pads.size() == 3u &&
-                          hasLabelSubstr(bRealOrc, L"U3 (ADS1115)") &&
-                          hasLabelSubstr(bRealOrc, L"I2C_SDA") &&
-                          okHpgl && rejHpgl &&
-                          bHpgl.netCount == 3u && bHpgl.traces.size() >= 20u &&
-                          hasLabelSubstr(bHpgl, L"TOP_COPPER_PU100,200_CI50");
+        bool passRpdOrcHpgl = okAltRpd && okXilRpd && rejRpd &&
+                              bAltRpd.components.size() == 1u && bAltRpd.components[0].footprint == L"ALTERA_AS_DIE" &&
+                              bXilRpd.components.size() == 1u && bXilRpd.components[0].footprint == L"XILINX_DIE" &&
+                              bAltRpd.formatTitle.find(L"Altera AS") != std::wstring::npos &&
+                              bXilRpd.formatTitle.find(L"Xilinx") != std::wstring::npos &&
+                              hasLabelSubstr(bXilRpd, L"0x0362D093") &&
+                              HashEdaGeometry(bAltRpd) != HashEdaGeometry(bXilRpd) &&
+                              okRealOrc && bRealOrc.components.size() == 1u && bRealOrc.pads.size() == 3u &&
+                              hasLabelSubstr(bRealOrc, L"U3 (ADS1115)") &&
+                              hasLabelSubstr(bRealOrc, L"I2C_SDA") &&
+                              okHpgl && rejHpgl &&
+                              bHpgl.netCount == 3u && bHpgl.traces.size() >= 20u &&
+                              hasLabelSubstr(bHpgl, L"TOP_COPPER_PU100,200_CI50");
 
-        tc.Record(passItem21, L"Stage15.Eda.FpgaRpdSync_RealOrCadBin_And_Hpgl2Full",
+        tc.Record(passRpdOrcHpgl, L"Stage15.Eda.FpgaRpdSync_RealOrCadBin_And_Hpgl2Full",
             L"orcPads=" + std::to_wstring(bRealOrc.pads.size()) +
             L" hpglTr=" + std::to_wstring(bHpgl.traces.size()));
     }
@@ -3763,7 +3794,7 @@ void RunFormatTestsEda(TestCounter& tc) {
     }
 
     // ------------------------------------------------------------------------
-    // 24. Rigol DS1000Z (0xA5 0xA5 0x38 0x00) 2-Channel .wfm + Fallback Compatibility
+    // 24. Rigol DS1000Z (0xA5 0xA5 0x38 0x00) & DS1000E (0xA5 0xA5 0x00 0x00) .wfm + Strict Header Validation
     // ------------------------------------------------------------------------
     {
         auto hasLabelSubstr = [](const ParsedEdaBoard& b, std::wstring_view sub) -> bool {
@@ -3807,16 +3838,26 @@ void RunFormatTestsEda(TestCounter& tc) {
             ds1000z[dataOff + i * 2u + 1u] = static_cast<uint8_t>(std::clamp(s2, 0, 255));
         }
 
-        // Legacy minimal 260+ byte synthetic Rigol .wfm fallback (zero structured channel flags)
-        std::vector<uint8_t> legacyWfm(256u + 64u, 0);
-        legacyWfm[0] = 0xA5u; legacyWfm[1] = 0xA5u;
-        PutU32LE(legacyWfm.data() + 28, 64u);
-        PutU32LE(legacyWfm.data() + 36, 1000000u); // 1V/div in uV
-        for (size_t i = 0; i < 64u; ++i) legacyWfm[256u + i] = static_cast<uint8_t>(90u + (i % 40u) * 2u);
+        // Genuine Rigol DS1000E/D 276-byte header (sub-magic 0x0000, CH1 enabled at byte 49, 500 MSa/s)
+        std::vector<uint8_t> ds1000e(276u + 64u, 0);
+        ds1000e[0] = 0xA5u; ds1000e[1] = 0xA5u;
+        PutU32LE(ds1000e.data() + 28, 64u);
+        PutU32LE(ds1000e.data() + 36, 1000000u); // 1.00 V/div in uV
+        PutF32LE(ds1000e.data() + 44, 1.0f);     // 1X probe
+        ds1000e[49] = 1u;                        // CH1 enabled flag
+        PutF32LE(ds1000e.data() + 100, 500.0e6f);// 500.0 MSa/s
+        for (size_t i = 0; i < 64u; ++i) ds1000e[276u + i] = static_cast<uint8_t>(90u + (i % 40u) * 2u);
 
-        ParsedEdaBoard bRigZ, bRigLegacy;
-        bool okRigZ   = WriteAndInspect(dir + L"\\rigol_ds1054z_2ch.wfm", ds1000z.data(), ds1000z.size(), bRigZ);
-        bool okLegacy = WriteAndInspect(dir + L"\\rigol_legacy_1ch.wfm", legacyWfm.data(), legacyWfm.size(), bRigLegacy);
+        // Synthetic zero-channel-flag 0xA5 0xA5 buffer MUST be rejected (no raw-byte .wfm fallback!)
+        std::vector<uint8_t> zeroFlagsWfm(276u + 64u, 0);
+        zeroFlagsWfm[0] = 0xA5u; zeroFlagsWfm[1] = 0xA5u;
+        PutU32LE(zeroFlagsWfm.data() + 28, 64u);
+        PutU32LE(zeroFlagsWfm.data() + 36, 1000000u);
+
+        ParsedEdaBoard bRigZ, bRigE, badZeroFlags;
+        bool okRigZ      = WriteAndInspect(dir + L"\\rigol_ds1054z_2ch.wfm", ds1000z.data(), ds1000z.size(), bRigZ);
+        bool okRigE      = WriteAndInspect(dir + L"\\rigol_ds1052e_1ch.wfm", ds1000e.data(), ds1000e.size(), bRigE);
+        bool rejZeroFlag = !WriteAndInspect(dir + L"\\rigol_zero_flags.wfm", zeroFlagsWfm.data(), zeroFlagsWfm.size(), badZeroFlags);
 
         bool sawTopCh1 = false, sawBotCh2 = false;
         for (const auto& t : bRigZ.traces) {
@@ -3824,17 +3865,19 @@ void RunFormatTestsEda(TestCounter& tc) {
             if (t.layer == EdaLayerId::BottomCopper) sawBotCh2 = true;
         }
 
-        bool passRigol = okRigZ && okLegacy &&
-                         bRigZ.netCount == 2u &&
+        bool passRigol = okRigZ && okRigE && rejZeroFlag &&
+                         bRigZ.netCount == 2u && bRigE.netCount == 1u &&
                          sawTopCh1 && sawBotCh2 &&
                          bRigZ.formatTitle.find(L"DS1054Z") != std::wstring::npos &&
                          bRigZ.formatTitle.find(L"2 chs") != std::wstring::npos &&
+                         bRigE.formatTitle.find(L"DS1000E/D") != std::wstring::npos &&
                          hasLabelSubstr(bRigZ, L"CH1") &&
                          hasLabelSubstr(bRigZ, L"CH2") &&
                          hasLabelSubstr(bRigZ, L"GSa/s") &&
-                         HashEdaGeometry(bRigZ) != HashEdaGeometry(bRigLegacy);
+                         hasLabelSubstr(bRigE, L"MSa/s") &&
+                         HashEdaGeometry(bRigZ) != HashEdaGeometry(bRigE);
 
-        tc.Record(passRigol, L"Stage15.Eda.RigolDs1000zMultiChannel_And_LegacyFallback",
+        tc.Record(passRigol, L"Stage15.Eda.RigolDs1000zAndDs1000e_StrictChannelHeaders",
             L"rigZTraces=" + std::to_wstring(bRigZ.traces.size()) +
             L" nets=" + std::to_wstring(bRigZ.netCount));
     }
@@ -4177,7 +4220,8 @@ void RunFormatTestsEda(TestCounter& tc) {
     }
 
     RemoveDirectoryW(dir.c_str());
-    RunFormatTestsEdaBatch70(tc);
+    RunFormatTestsEdaVlsiFpga(tc);
+    RunFormatTestsEdaWaveformsBus(tc);
 }
 
 } // namespace Explorer2::SelfTestSuite

@@ -6,7 +6,7 @@ namespace Formats {
 
 // 1. EDIF 2 0 0 Gate-Level Netlist (.edif / .edn)
 inline bool ParseEdifNetlistBoard(std::string_view sv, ParsedEdaBoard& out) {
-    using namespace DetailGateTdms;
+    using namespace DetailGateAndDaqEda;
     std::vector<DetailSpecctra::SNode> roots;
     if (!DetailSpecctra::ParseSExprTree(sv, roots) || roots.empty()) return false;
 

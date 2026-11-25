@@ -6,17 +6,17 @@ namespace Formats {
 inline bool ParsePcapNgCapture(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     if (raw.size() < 24) return false;
 
-    const uint32_t magicLE = DetailSys100::RdU32LE(raw.data());
+    const uint32_t magicLE = DetailBinarySysDoc::RdU32LE(raw.data());
 
     // Branch A: PCAP-NG (Section Header Block 0x0A0D0D0A)
     if (magicLE == 0x0A0D0D0Au) {
         if (raw.size() < 28) return false;
-        const uint32_t bom = DetailSys100::RdU32LE(raw.data() + 8);
+        const uint32_t bom = DetailBinarySysDoc::RdU32LE(raw.data() + 8);
         if (bom != 0x1A2B3C4Du && bom != 0x4D3C2B1Au) return false;
         const bool isBE = (bom == 0x4D3C2B1Au);
 
-        auto rd16 = [&](size_t o) -> uint16_t { return isBE ? DetailSys100::RdU16BE(raw.data() + o) : DetailSys100::RdU16LE(raw.data() + o); };
-        auto rd32 = [&](size_t o) -> uint32_t { return isBE ? DetailSys100::RdU32BE(raw.data() + o) : DetailSys100::RdU32LE(raw.data() + o); };
+        auto rd16 = [&](size_t o) -> uint16_t { return isBE ? DetailBinarySysDoc::RdU16BE(raw.data() + o) : DetailBinarySysDoc::RdU16LE(raw.data() + o); };
+        auto rd32 = [&](size_t o) -> uint32_t { return isBE ? DetailBinarySysDoc::RdU32BE(raw.data() + o) : DetailBinarySysDoc::RdU32LE(raw.data() + o); };
 
         struct IfaceDesc { uint16_t linkType = 1; std::wstring name; double tsScaleSec = 1e-6; };
         std::vector<IfaceDesc> ifaces;
@@ -89,8 +89,10 @@ inline bool ParsePcapNgCapture(const std::vector<uint8_t>& raw, ParsedOfficeDocu
                     const std::wstring ifName = (ifId < ifaces.size()) ? ifaces[ifId].name : (L"if" + std::to_wstring(ifId));
                     const double scale = (ifId < ifaces.size()) ? ifaces[ifId].tsScaleSec : 1e-6;
                     const uint64_t tsRaw = (static_cast<uint64_t>(tsHigh) << 32) | tsLow;
-                    wchar_t tsBuf[48] = {};
-                    swprintf_s(tsBuf, L"%.6f", static_cast<double>(tsRaw) * scale);
+                    const double tsSec = static_cast<double>(tsRaw) * scale;
+                    wchar_t tsBuf[64] = {};
+                    if (!std::isfinite(tsSec) || std::fabs(tsSec) >= 1e12) swprintf_s(tsBuf, L"%.6g", tsSec);
+                    else swprintf_s(tsBuf, L"%.6f", tsSec);
 
                     std::wstring proto, src, dst, info;
                     DetailPcap::DissectPacketL2L4(lt, raw.data() + pos + 28, capLen, proto, src, dst, info);

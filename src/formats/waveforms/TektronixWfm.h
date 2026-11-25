@@ -23,18 +23,18 @@ inline bool ParseTektronixWfmBoard(const uint8_t* data, size_t size, ParsedEdaBo
 
             auto rdU16 = [&](size_t o) -> uint16_t {
                 return be ? static_cast<uint16_t>((static_cast<uint16_t>(data[o]) << 8) | data[o + 1])
-                          : DetailEda200::RdU16LE(data + o);
+                          : DetailIndustrialAndWaveEda::RdU16LE(data + o);
             };
             auto rdU32 = [&](size_t o) -> uint32_t {
                 return be ? ((static_cast<uint32_t>(data[o]) << 24) |
                              (static_cast<uint32_t>(data[o + 1]) << 16) |
                              (static_cast<uint32_t>(data[o + 2]) << 8) |
                              static_cast<uint32_t>(data[o + 3]))
-                          : DetailEda200::RdU32LE(data + o);
+                          : DetailIndustrialAndWaveEda::RdU32LE(data + o);
             };
             auto rdU64 = [&](size_t o) -> uint64_t {
                 return be ? ((static_cast<uint64_t>(rdU32(o)) << 32) | rdU32(o + 4))
-                          : DetailEda200::RdU64LE(data + o);
+                          : DetailIndustrialAndWaveEda::RdU64LE(data + o);
             };
             auto rdF64 = [&](size_t o) -> double {
                 uint64_t bits = rdU64(o);
@@ -108,7 +108,7 @@ inline bool ParseTektronixWfmBoard(const uint8_t* data, size_t size, ParsedEdaBo
         else {
             return false;
         }
-        return DetailEda200::RenderSingleScopeTrace(out, samples, fmtTitle, metaLabel);
+        return DetailIndustrialAndWaveEda::RenderSingleScopeTrace(out, samples, fmtTitle, metaLabel);
 }
 
 } // namespace Formats

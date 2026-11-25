@@ -5,7 +5,7 @@
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
 inline bool ParseOrExtractBethesdaBsa(
     const uint8_t* data,
@@ -193,10 +193,10 @@ inline bool ParseOrExtractBethesdaBsa(
     return false;
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool InspectBethesdaBsa(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {
-    return DetailArc100::ParseOrExtractBethesdaBsa(data, size, &outInfo, nullptr, nullptr);
+    return DetailDiskAndGameArc::ParseOrExtractBethesdaBsa(data, size, &outInfo, nullptr, nullptr);
 }
 
 inline bool ExtractBethesdaBsaEntry(
@@ -205,7 +205,7 @@ inline bool ExtractBethesdaBsaEntry(
     const std::wstring& normTarget,
     std::vector<uint8_t>& outBytes)
 {
-    return DetailArc100::ParseOrExtractBethesdaBsa(data, size, nullptr, &normTarget, &outBytes);
+    return DetailDiskAndGameArc::ParseOrExtractBethesdaBsa(data, size, nullptr, &normTarget, &outBytes);
 }
 
 } // namespace Explorer2::Formats

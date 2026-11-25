@@ -37,7 +37,10 @@ struct MergeFolderResult {
 struct FolderSizeTask {
     std::wstring path;
     std::wstring normKey;
-    uint64_t generation = 0;
+    // Set when this scan is to end without a result (see FileEngine::RequestFolderSizes, forceRefresh). Every
+    // scan has a mark of its own: one that has been told to stop stores nothing any more, whatever was
+    // queued for the same folder after it.
+    std::shared_ptr<std::atomic<bool>> stop;
 };
 
 struct RecycleBinRecord {
@@ -57,6 +60,14 @@ public:
 
     // Live Directory Change Watcher (ReadDirectoryChangesW -> WM_APP_DIR_CHANGED)
     void WatchDirectory(const std::wstring& dirPath);
+    // The watcher posts one WM_APP_DIR_CHANGED and then waits for the window: the next one is posted only
+    // after the window has called DirChangeHandled, and not before a pause of a few times `tookMs` (the time
+    // the window needed to list the folder again) is over. A message makes the window read and sort the whole
+    // folder; posted every 250 ms for a folder of 15,000 entries that changes all the time (the Temp folder),
+    // the messages piled up faster than they could be handled, and since Windows paints only when no posted
+    // message waits, the window stood still for as long as the changes went on. Every way out of the
+    // window's WM_APP_DIR_CHANGED handler has to call this, also when it did not refresh.
+    void DirChangeHandled(uint64_t tookMs);
 
     // Ultra-fast directory enumeration (< 5ms for 10,000 files)
     std::vector<FileEntry> EnumerateDirectory(
@@ -130,7 +141,33 @@ public:
     bool IsFolderInFlight(const std::wstring& normKey) const;
     std::wstring GetActiveScanningSamplePath() const;
     bool HasAnyCachedFolderSizes(const std::vector<FileEntry>& entries) const;
+    // Queues the folders among `entries` (one listing, as a rule: the one the window shows) whose size or
+    // list of children is not known yet. They go to the head of the queue, and those of them that wait in it
+    // from an earlier request move up with them: scans of other folders, which may wait by the thousand, come
+    // after. A folder that has been scanned is not scanned again, whatever happens to it later: forceRefresh
+    // (the "Przelicz" button) is for that. It forgets what is known about the entries and about everything
+    // inside them, ends the scans of those folders and starts new ones at once: a scan of some other folder
+    // that is running makes way for them (it stops, leaves nothing behind and starts over at the end of the
+    // queue). (A forced rescan used to drop every other scan: the navigation tree's sizes asked for by the same
+    // click were never worked out, and of a scan stopped half way the part counted so far stayed behind and
+    // passed for the whole size.)
     void RequestFolderSizes(const std::vector<FileEntry>& entries, bool forceRefresh);
+    // Which of `entries` are folders that are being scanned or wait for it: one answer for each entry (1 or
+    // 0), all of them under one lock. For the views that ask about every entry in every paint (the paint of a
+    // folder with 12,000 subfolders asked IsFolderInFlight 36,000 times).
+    void GetFoldersInFlight(const std::vector<FileEntry>& entries, std::vector<char>& outInFlight) const;
+    // How the window learns of new sizes. The workers do not tell it result by result: a folder with thousands
+    // of subfolders made thousands of messages, each of which had the window read every size again, with
+    // WM_PAINT waiting behind them. They only note that something is new; the window asks on its work timer
+    // (TakeFolderSizesChanged, true once per batch of news) and gets one WM_APP_FOLDER_SIZE_UPDATED when the
+    // last worker has run out of work. It calls AcknowledgeSizeNotification when it takes that message, before
+    // it reads the sizes, so that a result stored after that is announced again.
+    bool TakeFolderSizesChanged() { return m_folderSizesChanged.exchange(false); }
+    void AcknowledgeSizeNotification() { m_sizeNotifyPending.store(false); }
+    // For the self-tests: how many folders have been queued for a scan since the engine started (a scan that
+    // made way and starts over is not counted again), and the folders that wait now, in the order they are taken
+    uint64_t FolderScansQueued() const;
+    std::vector<std::wstring> WaitingFolderScans() const;
 
     // Single-lock batch sync of folder sizes from hash table into FileEntry / TreeNode vectors
     void SyncDirectorySizes(std::vector<FileEntry>& entries);
@@ -260,7 +297,7 @@ private:
 
     // Folder Size Hash Table + Background Worker Pool
     void FolderSizeWorkerLoop();
-    uint64_t ComputeFolderSizeRecursive(const std::wstring& dirPath, int depth, uint64_t generation, bool& outAborted);
+    uint64_t ComputeFolderSizeRecursive(const std::wstring& dirPath, int depth, const std::atomic<bool>& stop, bool& outAborted);
 
     mutable std::mutex m_sizeMutex;
     std::condition_variable m_sizeCv;
@@ -268,12 +305,18 @@ private:
     std::deque<FolderSizeTask> m_sizeQueue;
     std::unordered_map<std::wstring, uint64_t> m_folderSizeCache;   // Hash table: normKey -> recursive bytes
     std::unordered_map<std::wstring, std::vector<TreemapChildNode>> m_folderChildrenCache; // normKey -> top child blocks
-    std::unordered_map<std::wstring, bool> m_folderSizeInFlight;    // Currently calculating
+    // Folders being scanned or waiting for it
+    struct SizeScan {
+        std::shared_ptr<std::atomic<bool>> stop;    // the stop mark of the folder's scan (FolderSizeTask::stop)
+        bool running = false;                       // a worker has taken it from the queue
+    };
+    std::unordered_map<std::wstring, SizeScan> m_folderSizeInFlight;
+    uint64_t m_folderScansQueued = 0;                               // see FolderScansQueued
     std::wstring m_currentScanSample;                               // Live subfolder path currently being scanned
     std::atomic<uint64_t> m_lastPartialNotifyTick{ 0 };
-    std::atomic<uint64_t> m_sizeGeneration{ 1 };
     std::atomic<int> m_activeSizeWorkers{ 0 };
-    std::atomic<bool> m_sizeNotifyPending{ false };
+    std::atomic<bool> m_sizeNotifyPending{ false };                 // a WM_APP_FOLDER_SIZE_UPDATED of the workers waits to be handled
+    std::atomic<bool> m_folderSizesChanged{ false };                // see TakeFolderSizesChanged
 
     // File-type icons looked up on a worker thread (see RefreshIconIndices)
     void QueueExtIconLookup(const std::wstring& extLower);
@@ -336,6 +379,12 @@ private:
 
     // Live Directory Watcher Worker
     void DirWatcherWorkerLoop();
+    // Whether the window is ready for the next WM_APP_DIR_CHANGED (see DirChangeHandled), and the posting of it
+    bool WindowTakesDirChange(uint64_t nowTick) const;
+    void PostDirChanged();
+    std::atomic<int> m_dirChangesWaiting{ 0 };          // posted, and the window has not said yet that it dealt with them
+    std::atomic<uint64_t> m_dirChangePostedTick{ 0 };   // when the last one was posted
+    std::atomic<uint64_t> m_dirChangeNotBefore{ 0 };    // the end of the pause after the window's last refresh
     std::thread m_watcherThread;
     mutable std::mutex m_watcherMutex;
     std::condition_variable m_watcherCv;

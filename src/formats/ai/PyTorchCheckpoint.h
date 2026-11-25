@@ -1,12 +1,9 @@
 #pragma once
-// PyTorchCheckpoint.h — PyTorch Checkpoint (.pt / .pth / .ckpt) Reader
+// PyTorchCheckpoint.h — PyTorch Checkpoint (.pt / .pth / .ckpt) Reader (File-Backed ZIP + Pickle Protocols 0-5)
 
 namespace Formats {
 namespace AiDataDetail {
 
-// ============================================================================
-// 5. PyTorch Checkpoint (.pt / .pth / .ckpt — ZIP + Pickle VM)
-// ============================================================================
 struct PickleVal {
     enum Kind { Other, Int, Float, Str, Tuple, Storage, Tensor } kind = Other;
     int64_t ival = 0;
@@ -34,14 +31,33 @@ inline bool WalkPyTorchPickle(
     std::vector<PyTorchTensorDesc>& outTensors,
     std::vector<std::pair<std::string, std::string>>& outScalarKv)
 {
-    if (!data || size < 2 || data[0] != 0x80u || data[1] < 2 || data[1] > 5) return false;
-    size_t pos = 2;
+    if (!data || size < 2) return false;
+    size_t pos = 0;
+    if (data[0] == 0x80u) {
+        if (data[1] > 5) return false;
+        pos = 2;
+    } else if (data[0] != '(' && data[0] != '}' && data[0] != ']' && data[0] != 'c' &&
+               data[0] != 'd' && data[0] != 'l' && data[0] != 'I' && data[0] != 'L' &&
+               data[0] != 'F' && data[0] != 'S' && data[0] != 'V') {
+        return false;
+    }
 
     std::vector<PickleVal> stack;
     std::vector<size_t> marks;
     std::unordered_map<uint32_t, PickleVal> memo;
     uint32_t nextMemoId = 0;
     bool sawStop = false;
+
+    auto readLine = [&](std::string_view& outLine) -> bool {
+        size_t nl = pos;
+        while (nl < size && data[nl] != '\n') ++nl;
+        if (nl >= size) return false;
+        size_t end = nl;
+        if (end > pos && data[end - 1] == '\r') --end;
+        outLine = std::string_view(reinterpret_cast<const char*>(data + pos), end - pos);
+        pos = nl + 1;
+        return true;
+    };
 
     auto popMark = [&](std::vector<PickleVal>& popped) -> bool {
         if (marks.empty()) return false;
@@ -75,12 +91,52 @@ inline bool WalkPyTorchPickle(
         uint8_t op = data[pos++];
         switch (op) {
             case 0x80: if (pos + 1 > size) return false; pos += 1; break; // PROTO
-            case 0x95: if (pos + 8 > size) return false; pos += 8; break; // FRAME (skip 8B frame length; opcodes follow inline!)
+            case 0x95: if (pos + 8 > size) return false; pos += 8; break; // FRAME
             case '.': sawStop = true; break;                              // STOP
             case '(': marks.push_back(stack.size()); break;               // MARK
             case '}': case ']': stack.push_back(PickleVal{}); break;      // EMPTY_DICT / EMPTY_LIST
             case ')': { PickleVal t; t.kind = PickleVal::Tuple; stack.push_back(std::move(t)); break; }
             case 'N': case 0x88: case 0x89: stack.push_back(PickleVal{}); break; // NONE / NEWTRUE / NEWFALSE
+            case 'I': case 'L': { // Protocol 0 INT / LONG
+                std::string_view ln;
+                if (!readLine(ln)) return false;
+                if (!ln.empty() && (ln.back() == 'L' || ln.back() == 'l')) ln.remove_suffix(1);
+                PickleVal v;
+                if (ln == "00" || ln == "01") {
+                    v.kind = PickleVal::Int;
+                    v.ival = (ln == "01") ? 1 : 0;
+                } else {
+                    v.kind = PickleVal::Int;
+                    std::from_chars(ln.data(), ln.data() + ln.size(), v.ival);
+                }
+                stack.push_back(v);
+                break;
+            }
+            case 'F': { // Protocol 0 FLOAT
+                std::string_view ln;
+                if (!readLine(ln)) return false;
+                std::string tmp(ln);
+                PickleVal v; v.kind = PickleVal::Float; v.fval = std::strtod(tmp.c_str(), nullptr);
+                stack.push_back(v);
+                break;
+            }
+            case 'S': { // Protocol 0 STRING (quoted)
+                std::string_view ln;
+                if (!readLine(ln)) return false;
+                if (ln.size() >= 2 && ((ln.front() == '\'' && ln.back() == '\'') || (ln.front() == '"' && ln.back() == '"'))) {
+                    ln = ln.substr(1, ln.size() - 2);
+                }
+                PickleVal v; v.kind = PickleVal::Str; v.str.assign(ln.data(), std::min<size_t>(ln.size(), 4096));
+                stack.push_back(std::move(v));
+                break;
+            }
+            case 'V': { // Protocol 0 UNICODE
+                std::string_view ln;
+                if (!readLine(ln)) return false;
+                PickleVal v; v.kind = PickleVal::Str; v.str.assign(ln.data(), std::min<size_t>(ln.size(), 4096));
+                stack.push_back(std::move(v));
+                break;
+            }
             case 'K': { if (pos + 1 > size) return false; PickleVal v; v.kind = PickleVal::Int; v.ival = data[pos++]; stack.push_back(v); break; }
             case 'M': { if (pos + 2 > size) return false; PickleVal v; v.kind = PickleVal::Int; v.ival = RdU16LE(data + pos); pos += 2; stack.push_back(v); break; }
             case 'J': { if (pos + 4 > size) return false; PickleVal v; v.kind = PickleVal::Int; v.ival = RdI32LE(data + pos); pos += 4; stack.push_back(v); break; }
@@ -88,10 +144,26 @@ inline bool WalkPyTorchPickle(
                 if (pos >= size) return false;
                 uint8_t n = data[pos++];
                 if (n > size - pos) return false;
-                int64_t iv = 0;
-                for (uint8_t i = 0; i < std::min<uint8_t>(n, 8); ++i) iv |= static_cast<int64_t>(data[pos + i]) << (i * 8);
+                uint64_t uv = 0;
+                for (uint8_t i = 0; i < std::min<uint8_t>(n, 8); ++i) uv |= static_cast<uint64_t>(data[pos + i]) << (i * 8);
+                if (n > 0 && n < 8 && (data[pos + n - 1] & 0x80u) != 0) {
+                    uv |= (~0ULL) << (n * 8);
+                }
                 pos += n;
-                PickleVal v; v.kind = PickleVal::Int; v.ival = iv; stack.push_back(v);
+                PickleVal v; v.kind = PickleVal::Int; v.ival = static_cast<int64_t>(uv); stack.push_back(v);
+                break;
+            }
+            case 0x8B: { // LONG4
+                if (pos + 4 > size) return false;
+                uint32_t n = RdU32LE(data + pos); pos += 4;
+                if (n > size - pos) return false;
+                uint64_t uv = 0;
+                for (uint32_t i = 0; i < std::min<uint32_t>(n, 8u); ++i) uv |= static_cast<uint64_t>(data[pos + i]) << (i * 8);
+                if (n > 0 && n < 8 && (data[pos + n - 1] & 0x80u) != 0) {
+                    uv |= (~0ULL) << (n * 8);
+                }
+                pos += n;
+                PickleVal v; v.kind = PickleVal::Int; v.ival = static_cast<int64_t>(uv); stack.push_back(v);
                 break;
             }
             case 'G': {
@@ -115,23 +187,21 @@ inline bool WalkPyTorchPickle(
                 stack.push_back(std::move(v));
                 break;
             }
-            case 0x8D: case 0x8E: { // BINUNICODE8 / BINBYTES8
+            case 0x8D: case 0x8E: case 0x96: { // BINUNICODE8 / BINBYTES8 / BYTEARRAY8
                 if (pos + 8 > size) return false;
                 uint64_t n = RdU64LE(data + pos); pos += 8;
                 if (n > size - pos) return false;
-                PickleVal v; v.kind = PickleVal::Str; v.str.assign(reinterpret_cast<const char*>(data + pos), static_cast<size_t>(std::min<uint64_t>(n, 4096))); pos += static_cast<size_t>(n);
+                PickleVal v; v.kind = PickleVal::Str;
+                v.str.assign(reinterpret_cast<const char*>(data + pos), static_cast<size_t>(std::min<uint64_t>(n, 4096)));
+                pos += static_cast<size_t>(n);
                 stack.push_back(std::move(v));
                 break;
             }
             case 'c': { // GLOBAL module\nname\n
-                size_t nl1 = pos; while (nl1 < size && data[nl1] != '\n') ++nl1;
-                if (nl1 >= size) return false;
-                size_t nl2 = nl1 + 1; while (nl2 < size && data[nl2] != '\n') ++nl2;
-                if (nl2 >= size) return false;
+                std::string_view mod, nm;
+                if (!readLine(mod) || !readLine(nm)) return false;
                 PickleVal v; v.kind = PickleVal::Str;
-                v.str = std::string(reinterpret_cast<const char*>(data + pos), nl1 - pos) + "." +
-                        std::string(reinterpret_cast<const char*>(data + nl1 + 1), nl2 - nl1 - 1);
-                pos = nl2 + 1;
+                v.str = std::string(mod) + "." + std::string(nm);
                 stack.push_back(std::move(v));
                 break;
             }
@@ -150,6 +220,20 @@ inline bool WalkPyTorchPickle(
                 stack.push_back(std::move(t));
                 break;
             }
+            case 'l': { // LIST from mark
+                std::vector<PickleVal> items;
+                if (!popMark(items)) return false;
+                PickleVal l; l.kind = PickleVal::Tuple; l.items = std::move(items);
+                stack.push_back(std::move(l));
+                break;
+            }
+            case 'd': { // DICT from mark
+                std::vector<PickleVal> kvs;
+                if (!popMark(kvs)) return false;
+                for (size_t i = 0; i + 1 < kvs.size(); i += 2) recordKv(kvs[i], kvs[i + 1]);
+                stack.push_back(PickleVal{});
+                break;
+            }
             case 0x85: case 0x86: case 0x87: { // TUPLE1 / TUPLE2 / TUPLE3
                 size_t cnt = (op == 0x85) ? 1 : (op == 0x86 ? 2 : 3);
                 if (stack.size() < cnt) return false;
@@ -157,6 +241,13 @@ inline bool WalkPyTorchPickle(
                 t.items.assign(stack.end() - static_cast<ptrdiff_t>(cnt), stack.end());
                 stack.resize(stack.size() - cnt);
                 stack.push_back(std::move(t));
+                break;
+            }
+            case 'P': { // PERSID (Protocol 0)
+                std::string_view ln;
+                if (!readLine(ln)) return false;
+                PickleVal st; st.kind = PickleVal::Storage; st.storageKey = std::string(ln);
+                stack.push_back(std::move(st));
                 break;
             }
             case 'Q': { // BINPERSID
@@ -170,6 +261,19 @@ inline bool WalkPyTorchPickle(
                     st.storageNumel = pid.items[4].ival;
                 }
                 stack.push_back(std::move(st));
+                break;
+            }
+            case 0x92: { // NEWOBJ_EX: cls, args, kwargs -> obj
+                if (stack.size() < 3) return false;
+                stack.pop_back(); // kwargs
+                PickleVal args = std::move(stack.back()); stack.pop_back();
+                PickleVal fn = std::move(stack.back()); stack.pop_back();
+                PickleVal res;
+                if (args.kind == PickleVal::Tuple && !args.items.empty() && args.items[0].kind == PickleVal::Storage) {
+                    res = std::move(args.items[0]);
+                }
+                (void)fn;
+                stack.push_back(std::move(res));
                 break;
             }
             case 'R': case 0x81: { // REDUCE / NEWOBJ
@@ -189,12 +293,9 @@ inline bool WalkPyTorchPickle(
                     if (args.items.size() >= 4 && args.items[3].kind == PickleVal::Tuple) {
                         for (const auto& d : args.items[3].items) res.stride.push_back(d.ival);
                     }
-                    if (outTensors.size() < 512) {
-                        // Also record anonymous tensor in case pickle root is a single tensor
-                        if (stack.empty()) {
-                            PyTorchTensorDesc td{ "(root_tensor)", res.storageType, res.storageKey, res.shape, res.stride };
-                            outTensors.push_back(std::move(td));
-                        }
+                    if (outTensors.size() < 512 && stack.empty()) {
+                        PyTorchTensorDesc td{ "(root_tensor)", res.storageType, res.storageKey, res.shape, res.stride };
+                        outTensors.push_back(std::move(td));
                     }
                 } else if (args.kind == PickleVal::Tuple && args.items.size() == 1 && args.items[0].kind != PickleVal::Other) {
                     res = std::move(args.items[0]);
@@ -202,11 +303,7 @@ inline bool WalkPyTorchPickle(
                 stack.push_back(std::move(res));
                 break;
             }
-            case 'b': { // BUILD
-                if (stack.size() < 2) return false;
-                stack.pop_back();
-                break;
-            }
+            case 'b': { if (stack.size() < 2) return false; stack.pop_back(); break; } // BUILD
             case 's': { // SETITEM
                 if (stack.size() < 3) return false;
                 PickleVal v = std::move(stack.back()); stack.pop_back();
@@ -222,15 +319,33 @@ inline bool WalkPyTorchPickle(
             }
             case 'a': { if (stack.size() < 2) return false; stack.pop_back(); break; } // APPEND
             case 'e': { std::vector<PickleVal> items; if (!popMark(items) || stack.empty()) return false; break; } // APPENDS
+            case 'p': { // PUT (Protocol 0)
+                std::string_view ln;
+                if (!readLine(ln) || stack.empty()) return false;
+                uint32_t mid = 0; std::from_chars(ln.data(), ln.data() + ln.size(), mid);
+                memo[mid] = stack.back();
+                break;
+            }
+            case 'g': { // GET (Protocol 0)
+                std::string_view ln;
+                if (!readLine(ln)) return false;
+                uint32_t mid = 0; std::from_chars(ln.data(), ln.data() + ln.size(), mid);
+                stack.push_back(memo[mid]);
+                break;
+            }
             case 'q': { if (pos >= size || stack.empty()) return false; memo[data[pos++]] = stack.back(); break; } // BINPUT
             case 'r': { if (pos + 4 > size || stack.empty()) return false; memo[RdU32LE(data + pos)] = stack.back(); pos += 4; break; } // LONG_BINPUT
             case 0x94: { if (stack.empty()) return false; memo[nextMemoId++] = stack.back(); break; } // MEMOIZE
             case 'h': { if (pos >= size) return false; stack.push_back(memo[data[pos++]]); break; } // BINGET
             case 'j': { if (pos + 4 > size) return false; stack.push_back(memo[RdU32LE(data + pos)]); pos += 4; break; } // LONG_BINGET
             case '0': { if (stack.empty()) return false; stack.pop_back(); break; } // POP
+            case '1': { std::vector<PickleVal> discarded; if (!popMark(discarded)) return false; break; } // POP_MARK
             case '2': { if (stack.empty()) return false; stack.push_back(stack.back()); break; } // DUP
+            case 0x8F: stack.push_back(PickleVal{}); break; // EMPTY_SET
+            case 0x90: { std::vector<PickleVal> items; if (!popMark(items) || stack.empty()) return false; break; } // ADDITEMS
+            case 0x91: { std::vector<PickleVal> items; if (!popMark(items)) return false; stack.push_back(PickleVal{}); break; } // FROZENSET
+            case 0x97: case 0x98: break; // NEXT_BUFFER / READONLY_BUFFER (Protocol 5)
             default:
-                // Unknown opcode -> stop cleanly if we already decoded structure, else fail
                 return !outTensors.empty() || !outScalarKv.empty();
         }
     }
@@ -250,28 +365,43 @@ inline bool ParsePyTorchCheckpoint(const std::vector<uint8_t>& raw, const std::w
     std::unordered_map<std::string, std::vector<uint8_t>> storageBlobs;
     std::wstring archiveVer;
 
-    if (raw.size() >= 22 && raw[0] == 'P' && raw[1] == 'K') {
-        std::vector<ZipDeflate::ArchiveItemMeta> entries;
-        if (!ZipDeflate::ListZipEntriesFromMemory(raw.data(), raw.size(), entries) || entries.empty()) return false;
-
+    std::vector<ZipDeflate::ArchiveItemMeta> entries;
+    bool usedFile = false;
+    if ((raw.size() >= 4 && raw[0] == 'P' && raw[1] == 'K') &&
+        DetailStructuredDataDoc::ListZipPackage(raw, out, entries, usedFile) && !entries.empty())
+    {
+        SourceBytes zipSrc(raw, out);
         std::vector<uint8_t> pklBytes;
         for (const auto& e : entries) {
             if (e.isDirectory) continue;
             std::wstring pLow = PathUtils::ToLower(e.pathInArchive);
             if (pLow.size() >= 8 && pLow.substr(pLow.size() - 8) == L"data.pkl") {
-                ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, pklBytes);
+                DetailStructuredDataDoc::ExtractZipPackageEntry(raw, out, usedFile, e, pklBytes);
             } else if (pklBytes.empty() && PathUtils::ToLower(PathUtils::GetExtension(e.pathInArchive)) == L".pkl") {
-                ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, pklBytes);
+                DetailStructuredDataDoc::ExtractZipPackageEntry(raw, out, usedFile, e, pklBytes);
             } else if (pLow.size() >= 7 && pLow.substr(pLow.size() - 7) == L"version") {
                 std::vector<uint8_t> vb;
-                if (ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, vb)) {
+                if (DetailStructuredDataDoc::ExtractZipPackageEntry(raw, out, usedFile, e, vb)) {
                     archiveVer = PathUtils::Trim(CleanAsciiFixed(vb.data(), vb.size()));
                 }
             } else if (pLow.find(L"/data/") != std::wstring::npos || pLow.find(L"\\data\\") != std::wstring::npos) {
-                if (storageBlobs.size() < 32 && e.uncompressedSize <= 4 * 1024 * 1024) {
-                    std::vector<uint8_t> sb;
-                    if (ZipDeflate::ExtractZipEntryFromMemory(raw.data(), raw.size(), e, sb)) {
-                        storageBlobs[PathUtils::WideToUtf8(e.name)] = std::move(sb);
+                if (storageBlobs.size() < 64) {
+                    if (e.uncompressedSize <= 4 * 1024 * 1024) {
+                        std::vector<uint8_t> sb;
+                        if (DetailStructuredDataDoc::ExtractZipPackageEntry(raw, out, usedFile, e, sb)) {
+                            storageBlobs[PathUtils::WideToUtf8(e.name)] = std::move(sb);
+                        }
+                    } else if (e.compressionMethod == 0 && e.uncompressedSize >= 4) {
+                        // Stream first 64 bytes of large uncompressed weight tensor without loading whole tensor into RAM
+                        uint8_t lfh[30] = {};
+                        if (DetailBinarySysDoc::ReadSourceExact(zipSrc, e.localHeaderOffset, lfh, 30) && RdU32LE(lfh) == 0x04034B50u) {
+                            uint64_t dataOff = e.localHeaderOffset + 30ULL + RdU16LE(lfh + 26) + RdU16LE(lfh + 28);
+                            const size_t peekLen = static_cast<size_t>(std::min<uint64_t>(e.uncompressedSize, 64ULL));
+                            std::vector<uint8_t> sb;
+                            if (DetailBinarySysDoc::ReadSourceVec(zipSrc, dataOff, peekLen, sb)) {
+                                storageBlobs[PathUtils::WideToUtf8(e.name)] = std::move(sb);
+                            }
+                        }
                     }
                 }
             }
@@ -279,8 +409,8 @@ inline bool ParsePyTorchCheckpoint(const std::vector<uint8_t>& raw, const std::w
         if (pklBytes.empty() || !WalkPyTorchPickle(pklBytes.data(), pklBytes.size(), tensors, scalars)) {
             return false;
         }
-    } else if (raw.size() >= 4 && raw[0] == 0x80u && raw[1] >= 2 && raw[1] <= 5) {
-        if (!WalkPyTorchPickle(raw.data(), raw.size(), tensors, scalars)) return false;
+    } else if (raw.size() >= 2 && WalkPyTorchPickle(raw.data(), raw.size(), tensors, scalars)) {
+        // Direct raw pickle checkpoint
     } else {
         return false;
     }

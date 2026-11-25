@@ -4,8 +4,8 @@
 
 namespace Formats {
 
-// #77. CiA 306 CANopen Electronic Data Sheet / Device Configuration (.eds / .dcf)
-inline bool ParseCanOpenEds200(std::string_view sv, const std::wstring& ext, ParsedEdaBoard& out) {
+// CiA 306 CANopen Electronic Data Sheet / Device Configuration (.eds / .dcf)
+inline bool ParseCanOpenEdsBoard(std::string_view sv, const std::wstring& ext, ParsedEdaBoard& out) {
     auto drawSchRect = [&](float cx, float cy, float w, float h, float strokeW, EdaLayerId lid, int netId = 0) {
         DrawFieldbusSchRect(out, cx, cy, w, h, strokeW, lid, netId);
     };

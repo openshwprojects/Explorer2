@@ -27,9 +27,38 @@ E2_DRACO_NOINLINE inline bool ParseVtkXmlRectilinear(const uint8_t* data, size_t
             if (ci < 3) DecodeDataArrayDoubles(oTag, inner, cfg, coords[ci++]);
         });
         if (coords[0].size() < nx || coords[1].size() < ny || coords[2].size() < nz) return false;
-        DetailVtk::EmitStructuredBoundaryVtk(mesh, nx, ny, nz, [&](size_t i, size_t j, size_t k) -> Vec3f {
-            return { static_cast<float>(coords[0][i]), static_cast<float>(coords[1][j]), static_cast<float>(coords[2][k]) };
-        });
+
+        std::vector<double> pointScalars, cellScalars;
+        std::string_view pdSec = FindXmlElementBody(rgXml, "PointData");
+        if (!pdSec.empty()) {
+            ForEachDataArrayInSection(pdSec, [&](std::string_view oTag, std::string_view inner) {
+                if (pointScalars.empty()) DecodeDataArrayDoubles(oTag, inner, cfg, pointScalars);
+            });
+        }
+        std::string_view cdSec = FindXmlElementBody(rgXml, "CellData");
+        if (!cdSec.empty()) {
+            ForEachDataArrayInSection(cdSec, [&](std::string_view oTag, std::string_view inner) {
+                if (cellScalars.empty()) DecodeDataArrayDoubles(oTag, inner, cfg, cellScalars);
+            });
+        }
+
+        const bool emittedIso = DetailVtk::TryEmitScalarVolumeIsoSurface(
+            mesh, nx, ny, nz, pointScalars, cellScalars,
+            [&](double gx, double gy, double gz) -> Vec3f {
+                return {
+                    static_cast<float>(DetailVtk::EvalRectilinearCoordVtk(coords[0], nx, gx)),
+                    static_cast<float>(DetailVtk::EvalRectilinearCoordVtk(coords[1], ny, gy)),
+                    static_cast<float>(DetailVtk::EvalRectilinearCoordVtk(coords[2], nz, gz))
+                };
+            });
+        if (!emittedIso) {
+            const bool is2DXY = (nz == 1 && nx >= 2 && ny >= 2 && pointScalars.size() >= nx * ny);
+            DetailVtk::EmitStructuredBoundaryVtk(mesh, nx, ny, nz, [&](size_t i, size_t j, size_t k) -> Vec3f {
+                double z = coords[2][k];
+                if (is2DXY) z += pointScalars[j * nx + i];
+                return { static_cast<float>(coords[0][i]), static_cast<float>(coords[1][j]), static_cast<float>(z) };
+            });
+        }
         mesh.formatName = L"VTK XML RectilinearGrid (.vtr)";
     return !mesh.vertices.empty() && !mesh.tris.empty();
 }

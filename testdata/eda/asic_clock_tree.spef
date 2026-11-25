@@ -1,0 +1,57 @@
+*SPEF "IEEE 1481-2009"
+*DESIGN "riscv_alu_tile"
+*DATE "Sun Nov 22 12:00:00 2026"
+*VENDOR "Explorer2 RC Extractor"
+*PROGRAM "StarRC_Synth"
+*VERSION "1.0"
+*DESIGN_FLOW "PIN_CAP NONE" "NAME_SCOPE LOCAL"
+*DIVIDER /
+*DELIMITER :
+*BUS_DELIMITER [ ]
+*T_UNIT 1 PS
+*C_UNIT 1 FF
+*R_UNIT 1 OHM
+*L_UNIT 1 NH
+
+*NAME_MAP
+*1 clk_core
+*2 u_clk_buf_l1
+*3 u_pc_reg_0
+*4 u_pc_reg_1
+*5 alu_carry_n3
+*6 u_cla_g0
+*7 u_sum_xor_7
+
+*PORTS
+*1 I *C 0.0 20.0
+
+*D_NET *1 42.6
+*CONN
+*P *1 I *C 0.0 20.0
+*I *2:Z O *C 8.0 20.0 *D CLKBUF_X8
+*I *3:CK I *C 38.0 24.0 *D DFFRPQ_X2
+*I *4:CK I *C 42.0 16.0 *D DFFRPQ_X2
+*CAP
+1 *2:Z 8.4
+2 *1:1 11.2
+3 *3:CK 11.5
+4 *4:CK 11.5
+*RES
+1 *2:Z *1:1 6.8
+2 *1:1 *3:CK 9.4
+3 *1:1 *4:CK 10.2
+*END
+
+*D_NET *5 24.8
+*CONN
+*I *6:Y O *C 10.0 6.0 *D AOI21_X2
+*I *7:A I *C 36.0 6.0 *D XOR2_X2
+*CAP
+1 *6:Y 7.2
+2 *5:1 8.1
+3 *7:A 6.0
+4 *5:1 *1:1 3.5
+*RES
+1 *6:Y *5:1 14.5
+2 *5:1 *7:A 12.0
+*END

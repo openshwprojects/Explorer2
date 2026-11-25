@@ -2,10 +2,11 @@
 // VhdxDisk.h — Hyper-V VHDX virtual disk reader (.vhdx — "vhdxfile").
 
 #include "../common/ArchiveFormatCommon.h"
+#include "../common/VirtualDiskCommon.h"
 
 namespace Explorer2::Formats {
 
-namespace DetailArc100 {
+namespace DetailDiskAndGameArc {
 
 inline bool BuildVhdxDiskReader(
     const uint8_t* data,
@@ -15,7 +16,7 @@ inline bool BuildVhdxDiskReader(
     outReader = {};
     if (!data || size < 512) return false;
 
-    // 2. Hyper-V VHDX ("vhdxfile")
+    // Hyper-V VHDX ("vhdxfile")
     if (size >= 65536 && std::memcmp(data, "vhdxfile", 8) == 0) {
         static const uint8_t kBatGuid[16]  = { 0x66,0x77,0xC2,0x2D,0x23,0xF6,0x00,0x42,0x9D,0x64,0x11,0x5E,0x9B,0xFD,0x4A,0x08 };
         static const uint8_t kMetaGuid[16] = { 0x06,0xA2,0x7C,0x8B,0x90,0x47,0x9A,0x4B,0xB8,0xFE,0x57,0x5F,0x05,0x0F,0x88,0x6E };
@@ -26,7 +27,7 @@ inline bool BuildVhdxDiskReader(
         const size_t regCandidates[3] = { 0x30000, 0x40000, 0x10000 };
         size_t regPos = SIZE_MAX;
         for (size_t cand : regCandidates) {
-            if (cand + 16 <= size && std::memcmp(data + cand, "regi", 4) == 0) {
+            if (cand <= size - 16 && std::memcmp(data + cand, "regi", 4) == 0) {
                 regPos = cand;
                 break;
             }
@@ -35,8 +36,8 @@ inline bool BuildVhdxDiskReader(
 
         uint32_t regCount = std::min<uint32_t>(RdU32LE(data + regPos + 8), 2047);
         uint64_t batOff = 0, batLen = 0, metaOff = 0, metaLen = 0;
-        for (uint32_t i = 0; i < regCount && regPos + 16 + (i + 1) * 32 <= size; ++i) {
-            const uint8_t* re = data + regPos + 16 + i * 32;
+        for (uint32_t i = 0; i < regCount && static_cast<uint64_t>(i + 1ULL) * 32ULL <= size - regPos - 16; ++i) {
+            const uint8_t* re = data + regPos + 16 + static_cast<size_t>(i) * 32;
             if (std::memcmp(re, kBatGuid, 16) == 0) {
                 batOff = RdU64LE(re + 16);
                 batLen = RdU32LE(re + 24);
@@ -45,17 +46,21 @@ inline bool BuildVhdxDiskReader(
                 metaLen = RdU32LE(re + 24);
             }
         }
-        if (metaOff == 0 || metaOff + 32 > size || std::memcmp(data + metaOff, "metadata", 8) != 0) return false;
+        if (metaOff == 0 || metaOff > size - 32 || std::memcmp(data + static_cast<size_t>(metaOff), "metadata", 8) != 0) {
+            return false;
+        }
 
-        uint16_t metaCount = std::min<uint16_t>(RdU16LE(data + metaOff + 10), 2047);
+        const size_t metaBase = static_cast<size_t>(metaOff);
+        uint16_t metaCount = std::min<uint16_t>(RdU16LE(data + metaBase + 10), 2047);
         uint32_t blockSize = 0, logicalSector = 512;
         uint64_t virtSize = 0;
-        for (uint16_t i = 0; i < metaCount && metaOff + 32 + (i + 1) * 32 <= size; ++i) {
-            const uint8_t* me = data + metaOff + 32 + i * 32;
+        for (uint16_t i = 0; i < metaCount && static_cast<uint64_t>(i + 1ULL) * 32ULL <= size - metaBase - 32; ++i) {
+            const uint8_t* me = data + metaBase + 32 + static_cast<size_t>(i) * 32;
             uint32_t itemOff = RdU32LE(me + 16);
             uint32_t itemLen = RdU32LE(me + 20);
-            if (itemOff + itemLen > metaLen || metaOff + itemOff + itemLen > size) continue;
-            const uint8_t* val = data + static_cast<size_t>(metaOff + itemOff);
+            if (itemOff > metaLen || itemLen > metaLen - itemOff) continue;
+            if (itemOff > size - metaBase || itemLen > size - metaBase - itemOff) continue;
+            const uint8_t* val = data + metaBase + itemOff;
             if (std::memcmp(me, kFileParamGuid, 16) == 0 && itemLen >= 4) {
                 blockSize = RdU32LE(val);
             } else if (std::memcmp(me, kVirtSizeGuid, 16) == 0 && itemLen >= 8) {
@@ -73,7 +78,7 @@ inline bool BuildVhdxDiskReader(
         outReader.virtualSize = virtSize;
         outReader.formatName  = L"Hyper-V VHDX Disk";
         outReader.readBytes = [=](uint64_t diskOff, uint8_t* dst, size_t len) -> bool {
-            if (diskOff + len > virtSize) return false;
+            if (diskOff > virtSize || len > virtSize - diskOff) return false;
             size_t done = 0;
             while (done < len) {
                 uint64_t cur = diskOff + done;
@@ -83,11 +88,13 @@ inline bool BuildVhdxDiskReader(
 
                 uint64_t batIdx = pBlk + (chunkRatio > 0 ? (pBlk / chunkRatio) : 0);
                 bool filled = false;
-                if ((batIdx + 1) * 8 <= batLen && batOff + (batIdx + 1) * 8 <= size) {
-                    uint64_t entry = RdU64LE(data + static_cast<size_t>(batOff + batIdx * 8));
+                if (batIdx < batLen / 8ULL && (batIdx + 1ULL) * 8ULL <= size - batOff) {
+                    uint64_t entry = RdU64LE(data + static_cast<size_t>(batOff + batIdx * 8ULL));
                     if ((entry & 0x7ULL) == 6ULL) { // PAYLOAD_BLOCK_FULLY_PRESENT
                         uint64_t physBase = entry & 0xFFFFFFFFFFF00000ULL;
-                        if (physBase > 0 && physBase + offInBlk + chunk <= size) {
+                        if (physBase > 0 && physBase <= size && offInBlk <= size - physBase &&
+                            chunk <= size - physBase - offInBlk)
+                        {
                             std::memcpy(dst + done, data + static_cast<size_t>(physBase + offInBlk), chunk);
                             filled = true;
                         }
@@ -104,7 +111,7 @@ inline bool BuildVhdxDiskReader(
     return false;
 }
 
-} // namespace DetailArc100
+} // namespace DetailDiskAndGameArc
 
 inline bool ParseOrExtractVhdxDisk(
     const uint8_t* data,
@@ -113,9 +120,9 @@ inline bool ParseOrExtractVhdxDisk(
     const std::wstring* extractTargetNorm = nullptr,
     std::vector<uint8_t>* outExtracted = nullptr)
 {
-    DetailArc100::VirtualDiskReader reader;
-    if (!DetailArc100::BuildVhdxDiskReader(data, size, reader)) return false;
-    return DetailArc100::InspectOrExtractVirtualDiskReader(reader, size, outInfo, extractTargetNorm, outExtracted);
+    DetailDiskAndGameArc::VirtualDiskReader reader;
+    if (!DetailDiskAndGameArc::BuildVhdxDiskReader(data, size, reader)) return false;
+    return DetailDiskAndGameArc::InspectOrExtractVirtualDiskReader(reader, size, outInfo, extractTargetNorm, outExtracted);
 }
 
 inline bool InspectVhdxDisk(const uint8_t* data, size_t size, ArchiveSummaryInfo& outInfo) {

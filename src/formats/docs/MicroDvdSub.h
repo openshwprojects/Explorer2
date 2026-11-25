@@ -2,7 +2,7 @@
 // MicroDvdSub.h — MicroDVD Frame-Based Text Subtitle (.sub) Reader
 
 namespace Formats {
-namespace DetailMedia100 {
+namespace DetailMediaAndScoreDoc {
 
 inline bool ParseMicroDvdSub(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
     // MicroDVD {startFrame}{endFrame}Text
@@ -55,10 +55,10 @@ inline bool ParseMicroDvdSub(const std::vector<uint8_t>& raw, ParsedOfficeDocume
     return true;
 }
 
-} // namespace DetailMedia100
+} // namespace DetailMediaAndScoreDoc
 
 inline bool ParseMicroDvdSubDoc(const std::vector<uint8_t>& raw, ParsedOfficeDocument& out) {
-    return DetailMedia100::ParseMicroDvdSub(raw, out);
+    return DetailMediaAndScoreDoc::ParseMicroDvdSub(raw, out);
 }
 
 } // namespace Formats

@@ -4656,7 +4656,8 @@ void RunFormatTests3D(TestCounter& tc) {
         assertRejected(L"Stage15.3D.Reject.NonX3dXML", writeText(L"not_x3d.x3d", "<?xml version=\"1.0\"?><svg><Box size=\"2 2 2\"/></svg>"));
     }
 
-    RunFormatTests3DBatch70(tc);
+    RunFormatTests3DCadSci(tc);
+    RunFormatTests3DGameConsole(tc);
 
     // ========================================================================
     // 25. AutoCAD R2018 (AC1032) Genuine UMC + BOT 2-Bit Object Header & AcDbSubDMesh (.dwg)

@@ -9,13 +9,13 @@ namespace Formats {
 // ============================================================================
 inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& mesh) {
     if (size < 16 || std::memcmp(data, "MS3D000000", 10) != 0) return false;
-    int32_t ver = static_cast<int32_t>(Detail3D200::RdU32LE(data + 10));
+    int32_t ver = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + 10));
     if (ver < 3 || ver > 4) return false;
     mesh.formatName = L"MilkShape 3D Skeletal Mesh (.ms3d)";
 
     size_t pos = 14;
     if (pos + 2 > size) return false;
-    uint16_t nVerts = Detail3D200::RdU16LE(data + pos); pos += 2;
+    uint16_t nVerts = DetailMeshSciCad::RdU16LE(data + pos); pos += 2;
     if (nVerts == 0 || pos + static_cast<size_t>(nVerts) * 15 + 2 > size) return false;
 
     std::vector<Vec3f> bindVerts;
@@ -24,23 +24,23 @@ inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& m
     primaryBoneIds.reserve(nVerts);
     for (uint16_t i = 0; i < nVerts; ++i) {
         const uint8_t* vp = data + pos + static_cast<size_t>(i) * 15;
-        float vx = Detail3D200::RdF32LE(vp + 1);
-        float vy = Detail3D200::RdF32LE(vp + 5);
-        float vz = Detail3D200::RdF32LE(vp + 9);
+        float vx = DetailMeshSciCad::RdF32LE(vp + 1);
+        float vy = DetailMeshSciCad::RdF32LE(vp + 5);
+        float vz = DetailMeshSciCad::RdF32LE(vp + 9);
         if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz)) return false;
         bindVerts.push_back({ vx, vy, vz });
         primaryBoneIds.push_back(static_cast<int8_t>(vp[13]));
     }
     pos += static_cast<size_t>(nVerts) * 15;
 
-    uint16_t nTris = Detail3D200::RdU16LE(data + pos); pos += 2;
+    uint16_t nTris = DetailMeshSciCad::RdU16LE(data + pos); pos += 2;
     if (nTris == 0 || pos + static_cast<size_t>(nTris) * 70 > size) return false;
     mesh.tris.reserve(nTris);
     for (uint16_t t = 0; t < nTris; ++t) {
         const uint8_t* tp = data + pos + static_cast<size_t>(t) * 70;
-        uint16_t i0 = Detail3D200::RdU16LE(tp + 2);
-        uint16_t i1 = Detail3D200::RdU16LE(tp + 4);
-        uint16_t i2 = Detail3D200::RdU16LE(tp + 6);
+        uint16_t i0 = DetailMeshSciCad::RdU16LE(tp + 2);
+        uint16_t i1 = DetailMeshSciCad::RdU16LE(tp + 4);
+        uint16_t i2 = DetailMeshSciCad::RdU16LE(tp + 6);
         if (i0 < nVerts && i1 < nVerts && i2 < nVerts) {
             mesh.tris.push_back({ i0, i1, i2, {} });
         }
@@ -109,30 +109,30 @@ inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& m
 
     bool skeletonApplied = false;
     if (pos + 2 <= size) {
-        uint16_t nGroups = Detail3D200::RdU16LE(data + pos); pos += 2;
+        uint16_t nGroups = DetailMeshSciCad::RdU16LE(data + pos); pos += 2;
         bool groupsOk = true;
         for (uint16_t g = 0; g < nGroups; ++g) {
             if (pos + 35 > size) { groupsOk = false; break; }
-            uint16_t gTris = Detail3D200::RdU16LE(data + pos + 33);
+            uint16_t gTris = DetailMeshSciCad::RdU16LE(data + pos + 33);
             size_t step = 35u + static_cast<size_t>(gTris) * 2u + 1u;
             if (pos + step > size) { groupsOk = false; break; }
             pos += step;
         }
         if (groupsOk && pos + 2 <= size) {
-            uint16_t nMats = Detail3D200::RdU16LE(data + pos); pos += 2;
+            uint16_t nMats = DetailMeshSciCad::RdU16LE(data + pos); pos += 2;
             size_t matsBytes = static_cast<size_t>(nMats) * 361u;
             if (pos + matsBytes + 14u <= size) {
                 pos += matsBytes;
-                float animFps = Detail3D200::RdF32LE(data + pos + 0);
-                float curTime = Detail3D200::RdF32LE(data + pos + 4);
-                int32_t totalFrames = static_cast<int32_t>(Detail3D200::RdU32LE(data + pos + 8));
+                float animFps = DetailMeshSciCad::RdF32LE(data + pos + 0);
+                float curTime = DetailMeshSciCad::RdF32LE(data + pos + 4);
+                int32_t totalFrames = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + pos + 8));
                 pos += 12;
                 if (totalFrames > 1 && totalFrames < 1000000) {
                     mesh.animFrameCount = static_cast<size_t>(totalFrames);
                 }
                 (void)animFps;
 
-                uint16_t nJoints = Detail3D200::RdU16LE(data + pos); pos += 2;
+                uint16_t nJoints = DetailMeshSciCad::RdU16LE(data + pos); pos += 2;
                 struct MsKey { float time = 0.0f; float v[3] = {}; };
                 struct MsJoint {
                     std::string name, parentName;
@@ -151,31 +151,31 @@ inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& m
                         MsJoint mj;
                         mj.name = parseFixedName32(data + pos + 1);
                         mj.parentName = parseFixedName32(data + pos + 33);
-                        mj.bindRot[0] = Detail3D200::RdF32LE(data + pos + 65);
-                        mj.bindRot[1] = Detail3D200::RdF32LE(data + pos + 69);
-                        mj.bindRot[2] = Detail3D200::RdF32LE(data + pos + 73);
-                        mj.bindPos[0] = Detail3D200::RdF32LE(data + pos + 77);
-                        mj.bindPos[1] = Detail3D200::RdF32LE(data + pos + 81);
-                        mj.bindPos[2] = Detail3D200::RdF32LE(data + pos + 85);
-                        uint16_t nRotK = Detail3D200::RdU16LE(data + pos + 89);
-                        uint16_t nPosK = Detail3D200::RdU16LE(data + pos + 91);
+                        mj.bindRot[0] = DetailMeshSciCad::RdF32LE(data + pos + 65);
+                        mj.bindRot[1] = DetailMeshSciCad::RdF32LE(data + pos + 69);
+                        mj.bindRot[2] = DetailMeshSciCad::RdF32LE(data + pos + 73);
+                        mj.bindPos[0] = DetailMeshSciCad::RdF32LE(data + pos + 77);
+                        mj.bindPos[1] = DetailMeshSciCad::RdF32LE(data + pos + 81);
+                        mj.bindPos[2] = DetailMeshSciCad::RdF32LE(data + pos + 85);
+                        uint16_t nRotK = DetailMeshSciCad::RdU16LE(data + pos + 89);
+                        uint16_t nPosK = DetailMeshSciCad::RdU16LE(data + pos + 91);
                         pos += 93;
                         size_t kBytes = (static_cast<size_t>(nRotK) + static_cast<size_t>(nPosK)) * 16u;
                         if (pos + kBytes > size) { jointsOk = false; break; }
                         mj.rotKeys.resize(nRotK);
                         for (uint16_t k = 0; k < nRotK; ++k) {
-                            mj.rotKeys[k].time = Detail3D200::RdF32LE(data + pos + 0);
-                            mj.rotKeys[k].v[0] = Detail3D200::RdF32LE(data + pos + 4);
-                            mj.rotKeys[k].v[1] = Detail3D200::RdF32LE(data + pos + 8);
-                            mj.rotKeys[k].v[2] = Detail3D200::RdF32LE(data + pos + 12);
+                            mj.rotKeys[k].time = DetailMeshSciCad::RdF32LE(data + pos + 0);
+                            mj.rotKeys[k].v[0] = DetailMeshSciCad::RdF32LE(data + pos + 4);
+                            mj.rotKeys[k].v[1] = DetailMeshSciCad::RdF32LE(data + pos + 8);
+                            mj.rotKeys[k].v[2] = DetailMeshSciCad::RdF32LE(data + pos + 12);
                             pos += 16;
                         }
                         mj.posKeys.resize(nPosK);
                         for (uint16_t k = 0; k < nPosK; ++k) {
-                            mj.posKeys[k].time = Detail3D200::RdF32LE(data + pos + 0);
-                            mj.posKeys[k].v[0] = Detail3D200::RdF32LE(data + pos + 4);
-                            mj.posKeys[k].v[1] = Detail3D200::RdF32LE(data + pos + 8);
-                            mj.posKeys[k].v[2] = Detail3D200::RdF32LE(data + pos + 12);
+                            mj.posKeys[k].time = DetailMeshSciCad::RdF32LE(data + pos + 0);
+                            mj.posKeys[k].v[0] = DetailMeshSciCad::RdF32LE(data + pos + 4);
+                            mj.posKeys[k].v[1] = DetailMeshSciCad::RdF32LE(data + pos + 8);
+                            mj.posKeys[k].v[2] = DetailMeshSciCad::RdF32LE(data + pos + 12);
                             pos += 16;
                         }
                         joints.push_back(std::move(mj));
@@ -195,28 +195,28 @@ inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& m
                     }
 
                     if (pos + 4 <= size) {
-                        int32_t commentSubVer = static_cast<int32_t>(Detail3D200::RdU32LE(data + pos));
+                        int32_t commentSubVer = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + pos));
                         if (commentSubVer == 1) {
                             size_t cPos = pos + 4;
                             bool commentsOk = true;
                             // 3 indexed comment lists (group, material, joint) + 1 model comment flag
                             for (int listIdx = 0; listIdx < 3 && commentsOk; ++listIdx) {
                                 if (cPos + 4 > size) { commentsOk = false; break; }
-                                uint32_t nCom = Detail3D200::RdU32LE(data + cPos); cPos += 4;
+                                uint32_t nCom = DetailMeshSciCad::RdU32LE(data + cPos); cPos += 4;
                                 if (nCom > 65536) { commentsOk = false; break; }
                                 for (uint32_t ci = 0; ci < nCom; ++ci) {
                                     if (cPos + 8 > size) { commentsOk = false; break; }
-                                    uint32_t cLen = Detail3D200::RdU32LE(data + cPos + 4);
+                                    uint32_t cLen = DetailMeshSciCad::RdU32LE(data + cPos + 4);
                                     cPos += 8;
                                     if (cLen > size - cPos) { commentsOk = false; break; }
                                     cPos += cLen;
                                 }
                             }
                             if (commentsOk && cPos + 4 <= size) {
-                                uint32_t hasModelCom = Detail3D200::RdU32LE(data + cPos); cPos += 4;
+                                uint32_t hasModelCom = DetailMeshSciCad::RdU32LE(data + cPos); cPos += 4;
                                 if (hasModelCom == 1) {
                                     if (cPos + 4 <= size) {
-                                        uint32_t mLen = Detail3D200::RdU32LE(data + cPos); cPos += 4;
+                                        uint32_t mLen = DetailMeshSciCad::RdU32LE(data + cPos); cPos += 4;
                                         if (mLen <= size - cPos) cPos += mLen;
                                         else commentsOk = false;
                                     } else commentsOk = false;
@@ -229,7 +229,7 @@ inline bool ParseMilkShapeMs3d(const uint8_t* data, size_t size, LoadedMesh3D& m
                     }
 
                     if (pos + 4 <= size) {
-                        int32_t vExtraSubVer = static_cast<int32_t>(Detail3D200::RdU32LE(data + pos));
+                        int32_t vExtraSubVer = static_cast<int32_t>(DetailMeshSciCad::RdU32LE(data + pos));
                         size_t recSz = (vExtraSubVer == 1) ? 6u : (vExtraSubVer == 2) ? 10u : (vExtraSubVer == 3) ? 14u : 0u;
                         if (recSz > 0 && pos + 4u + static_cast<size_t>(nVerts) * recSz <= size) {
                             pos += 4;

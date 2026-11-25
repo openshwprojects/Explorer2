@@ -1,0 +1,59 @@
+UCLA scl 1.0
+# Created by generate_samples_eda_waveforms.py — RISC-V ALU + RegFile Floorplan
+
+NumRows : 6
+
+CoreRow Horizontal
+  Coordinate    :   12
+  Height        :   10
+  Sitewidth     :    1
+  Sitespacing   :    1
+  Siteorient    :    N
+  Sitesymmetry  :    Y
+  SubrowOrigin  :   12   NumSites :  116
+End
+CoreRow Horizontal
+  Coordinate    :   22
+  Height        :   10
+  Sitewidth     :    1
+  Sitespacing   :    1
+  Siteorient    :   FS
+  Sitesymmetry  :    Y
+  SubrowOrigin  :   12   NumSites :  116
+End
+CoreRow Horizontal
+  Coordinate    :   32
+  Height        :   10
+  Sitewidth     :    1
+  Sitespacing   :    1
+  Siteorient    :    N
+  Sitesymmetry  :    Y
+  SubrowOrigin  :   12   NumSites :  116
+End
+CoreRow Horizontal
+  Coordinate    :   42
+  Height        :   10
+  Sitewidth     :    1
+  Sitespacing   :    1
+  Siteorient    :   FS
+  Sitesymmetry  :    Y
+  SubrowOrigin  :   12   NumSites :   74
+End
+CoreRow Horizontal
+  Coordinate    :   52
+  Height        :   10
+  Sitewidth     :    1
+  Sitespacing   :    1
+  Siteorient    :    N
+  Sitesymmetry  :    Y
+  SubrowOrigin  :   12   NumSites :   74
+End
+CoreRow Horizontal
+  Coordinate    :   62
+  Height        :   10
+  Sitewidth     :    1
+  Sitespacing   :    1
+  Siteorient    :   FS
+  Sitesymmetry  :    Y
+  SubrowOrigin  :   12   NumSites :   74
+End

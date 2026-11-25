@@ -1,0 +1,19 @@
+# Inter-Quake Export
+joint "root" -1
+	pq 0.0 0.0 0.0 0.0 0.0 0.0 1.0
+joint "turret" 0
+	pq 0.0 0.0 1.2 0.0 0.0 0.0 1.0
+
+mesh "hull"
+	material "models/bot/hull_plate"
+	vp -1.0 -1.0 0.0
+	vp  1.0 -1.0 0.0
+	vp  1.0  1.0 0.0
+	vp -1.0  1.0 0.0
+	vp  0.0  0.0 1.6
+	fm 0 2 1
+	fm 0 3 2
+	fm 0 1 4
+	fm 1 2 4
+	fm 2 3 4
+	fm 3 0 4
